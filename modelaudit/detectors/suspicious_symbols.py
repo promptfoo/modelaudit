@@ -1,5 +1,6 @@
 """Security pattern definitions shared across ModelAudit scanners."""
 
+import re
 from typing import Any
 
 from modelaudit.config.generated_keras_layers import GENERATED_KNOWN_SAFE_KERAS_LAYER_CLASSES
@@ -859,6 +860,49 @@ SUSPICIOUS_CONFIG_PATTERNS = {
 # JINJA2 TEMPLATE INJECTION PATTERNS
 # =============================================================================
 
+JINJA2_NAMED_GLOBAL_ACCESS_PATTERN: re.Pattern[str] = re.compile(
+    r"(?<![\w.])(?P<root>lipsum|get_flashed_messages)\s*\.\s*__globals__\b"
+)
+
+
+def mask_quoted_jinja_text(text: str) -> str:
+    """Replace quoted Jinja expression text with spaces while preserving offsets."""
+    unquoted = list(text)
+    quote: str | None = None
+    escaped = False
+    for index, character in enumerate(text):
+        if quote is None:
+            if character in {"'", '"'}:
+                quote = character
+                unquoted[index] = " "
+            continue
+
+        unquoted[index] = " "
+        if escaped:
+            escaped = False
+        elif character == "\\":
+            escaped = True
+        elif character == quote:
+            quote = None
+    return "".join(unquoted)
+
+
+def find_unquoted_jinja_named_global_access(text: str) -> list[str]:
+    """Return named Jinja global accesses outside quoted expression text."""
+    unquoted_text = mask_quoted_jinja_text(text)
+    roots: list[str] = []
+
+    for match in JINJA2_NAMED_GLOBAL_ACCESS_PATTERN.finditer(unquoted_text):
+        previous = match.start() - 1
+        while previous >= 0 and unquoted_text[previous].isspace():
+            previous -= 1
+        if previous >= 0 and unquoted_text[previous] == ".":
+            continue
+        roots.append(match.group("root"))
+
+    return roots
+
+
 # Jinja2 Server-Side Template Injection (SSTI) patterns
 # These patterns detect potential template injection vulnerabilities in ML model templates
 # Primarily targeting CVE-2024-34359 and similar SSTI attack vectors in ML contexts
@@ -912,7 +956,7 @@ JINJA2_SSTI_PATTERNS = {
     # These patterns access global namespaces to reach restricted functions
     "global_access": [
         # Direct global access
-        r"__globals__\[",  # Access globals dictionary
+        r"__globals__\s*\[",  # Access globals dictionary
         r"__builtins__\[",  # Access builtins dictionary
         r"__init__\.__globals__",  # Access through __init__ method
         # Framework-specific global access
