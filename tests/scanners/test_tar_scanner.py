@@ -3,6 +3,7 @@ import io
 import lzma
 import os
 import pickle
+import random
 import tarfile
 import tempfile
 import zipfile
@@ -3253,7 +3254,7 @@ class TestTarScanner:
         archive_path = tmp_path / "terminal-empty-member.tar.gz"
         raw_tar = io.BytesIO()
         with tarfile.open(fileobj=raw_tar, mode="w") as archive:
-            payload = os.urandom(128 * 1024)
+            payload = random.Random(0).randbytes(128 * 1024)
             info = tarfile.TarInfo("weights.bin")
             info.size = len(payload)
             archive.addfile(info, io.BytesIO(payload))
