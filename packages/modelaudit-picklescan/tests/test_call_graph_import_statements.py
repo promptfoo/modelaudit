@@ -11,6 +11,7 @@ import py_compile
 import subprocess
 import sys
 import threading
+import typing
 import zipfile
 from contextvars import copy_context
 from importlib.machinery import (
@@ -23,6 +24,7 @@ from importlib.machinery import (
 )
 from importlib.util import find_spec
 from pathlib import Path
+from types import FunctionType
 from typing import Any
 from zipimport import zipimporter
 
@@ -3044,6 +3046,119 @@ def test_call_graph_models_getattr_default_callable_fallbacks() -> None:
     )
 
 
+def _is_typing_readonly_guard(statement: ast.stmt) -> bool:
+    if not isinstance(statement, ast.If) or not isinstance(statement.test, ast.Call):
+        return False
+    test = statement.test
+    return (
+        isinstance(test.func, ast.Name)
+        and test.func.id == "hasattr"
+        and len(test.args) == 2
+        and isinstance(test.args[0], ast.Name)
+        and test.args[0].id == "typing"
+        and isinstance(test.args[1], ast.Constant)
+        and test.args[1].value == "ReadOnly"
+    )
+
+
+def test_runtime_guard_selects_live_typing_extensions_export() -> None:
+    typing_extensions = pytest.importorskip("typing_extensions")
+    source_path = Path(typing_extensions.__file__)
+    tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
+
+    statements = call_graph._runtime_selected_module_statements(
+        tree.body, "typing_extensions"
+    )
+
+    assert not any(_is_typing_readonly_guard(statement) for statement in statements)
+    if typing_extensions.get_type_hints is typing.get_type_hints:
+        assert any(
+            isinstance(statement, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "get_type_hints"
+                for target in statement.targets
+            )
+            for statement in statements
+        )
+    else:
+        assert any(
+            isinstance(statement, ast.FunctionDef)
+            and statement.name == "get_type_hints"
+            for statement in statements
+        )
+
+
+def test_runtime_guard_keeps_mutated_typing_extensions_export_ambiguous(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    typing_extensions = pytest.importorskip("typing_extensions")
+    source_path = Path(typing_extensions.__file__)
+    tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
+    monkeypatch.setattr(typing_extensions, "get_type_hints", object())
+
+    statements = call_graph._runtime_selected_module_statements(
+        tree.body, "typing_extensions"
+    )
+
+    assert any(_is_typing_readonly_guard(statement) for statement in statements)
+
+
+def test_runtime_guard_keeps_shared_replacement_alias_ambiguous(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    typing_extensions = pytest.importorskip("typing_extensions")
+    source_path = Path(typing_extensions.__file__)
+    tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
+
+    def replacement(*_args: object, **_kwargs: object) -> dict[str, object]:
+        return {}
+
+    monkeypatch.setattr(typing, "get_type_hints", replacement)
+    monkeypatch.setattr(typing_extensions, "get_type_hints", replacement)
+
+    statements = call_graph._runtime_selected_module_statements(
+        tree.body, "typing_extensions"
+    )
+
+    assert any(_is_typing_readonly_guard(statement) for statement in statements)
+
+
+def test_runtime_guard_keeps_source_location_forgery_ambiguous(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    typing_extensions = pytest.importorskip("typing_extensions")
+    source_path = Path(typing_extensions.__file__)
+    tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
+    guard = next(
+        statement
+        for statement in tree.body
+        if _is_typing_readonly_guard(statement)
+    )
+    assert isinstance(guard, ast.If)
+    wrapper = next(
+        statement
+        for statement in guard.orelse
+        if isinstance(statement, ast.FunctionDef)
+        and statement.name == "get_type_hints"
+    )
+
+    def replacement(*_args: object, **_kwargs: object) -> dict[str, object]:
+        return {}
+
+    forged_code = replacement.__code__.replace(
+        co_filename=str(source_path),
+        co_firstlineno=wrapper.lineno,
+    )
+    forged = FunctionType(forged_code, vars(typing_extensions), "get_type_hints")
+    monkeypatch.setattr(typing_extensions, "get_type_hints", forged)
+
+    statements = call_graph._runtime_selected_module_statements(
+        tree.body, "typing_extensions"
+    )
+
+    assert any(_is_typing_readonly_guard(statement) for statement in statements)
+
+
 def test_call_graph_models_version_gated_typing_extensions_definitions() -> None:
     pytest.importorskip("typing_extensions")
 
@@ -3051,10 +3166,16 @@ def test_call_graph_models_version_gated_typing_extensions_definitions() -> None
     calls = call_graph._calls_for_function(function_name) or ()
     path = call_graph._find_sink_path(function_name)
 
-    assert call_graph._call_graph_entrypoints(function_name) == (function_name,)
-    assert "typing.get_type_hints" in calls
+    if hasattr(typing, "ReadOnly"):
+        assert (
+            call_graph._resolve_function_target(function_name)
+            == "typing.get_type_hints"
+        )
+    else:
+        assert call_graph._call_graph_entrypoints(function_name) == (function_name,)
+        assert "typing.get_type_hints" in calls
     assert path is not None
-    assert path[0] == function_name
+    assert path[0] in {function_name, "typing.get_type_hints"}
     assert path[-1] in {"builtins.compile", "builtins.eval"}
 
 
