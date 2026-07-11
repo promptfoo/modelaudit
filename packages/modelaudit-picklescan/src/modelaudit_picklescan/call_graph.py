@@ -6224,10 +6224,7 @@ def _typing_extensions_runtime_guard_value(
 
     aliases_get_type_hints = any(
         isinstance(branch_statement, ast.Assign)
-        and any(
-            isinstance(target, ast.Name) and target.id == "get_type_hints"
-            for target in branch_statement.targets
-        )
+        and any(isinstance(target, ast.Name) and target.id == "get_type_hints" for target in branch_statement.targets)
         and isinstance(branch_statement.value, ast.Attribute)
         and isinstance(branch_statement.value.value, ast.Name)
         and branch_statement.value.value.id == "typing"
@@ -6298,9 +6295,7 @@ def _runtime_selected_module_statements(
             guard_value = _typing_extensions_runtime_guard_value(statement, module_name)
             if guard_value is not None:
                 active_branch = statement.body if guard_value else statement.orelse
-                selected.extend(
-                    _runtime_selected_module_statements(active_branch, module_name)
-                )
+                selected.extend(_runtime_selected_module_statements(active_branch, module_name))
                 continue
         selected.append(statement)
     return tuple(selected)
@@ -6310,9 +6305,7 @@ def _module_level_statements(
     tree: ast.Module,
     module_name: str | None = None,
 ) -> tuple[ast.stmt, ...]:
-    return _definition_scope_statements(
-        _runtime_selected_module_statements(tree.body, module_name)
-    )
+    return _definition_scope_statements(_runtime_selected_module_statements(tree.body, module_name))
 
 
 def _module_initialization_statement_is_inert(statement: ast.stmt) -> bool:
