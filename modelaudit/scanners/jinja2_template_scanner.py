@@ -1459,10 +1459,11 @@ class Jinja2TemplateScanner(BaseScanner):
             location,
         )
         detections.extend(named_detections)
+        named_receiver_roots = "|".join(re.escape(receiver) for receiver in sorted(covered_global_receivers))
         named_receiver_pattern = (
             re.compile(
-                rf"(?<!\w)(?:{'|'.join(re.escape(receiver) for receiver in sorted(covered_global_receivers))})"
-                r"\s*\)*\s*\.\s*__globals__\b"
+                rf"(?<!\w)(?:(?:{named_receiver_roots})|\(\s*(?:{named_receiver_roots})\s*\))"
+                r"\s*\.\s*__globals__\b"
             )
             if covered_global_receivers
             else None
@@ -1694,6 +1695,15 @@ class Jinja2TemplateScanner(BaseScanner):
                     and receiver.name not in shadowed
                 ):
                     matches.append(receiver.name)
+
+            if isinstance(node, jinja2.nodes.CondExpr):
+                visit(node.test, shadowed, dangerous_aliases, node)
+                truth = constant_truth(node.test)
+                if truth is not False:
+                    visit(node.expr1, shadowed, dangerous_aliases, node)
+                if truth is not True:
+                    visit(node.expr2, shadowed, dangerous_aliases, node)
+                return
 
             if isinstance(node, jinja2.nodes.Assign):
                 visit(node.node, shadowed, dangerous_aliases, node)
