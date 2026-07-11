@@ -1542,9 +1542,7 @@ class Jinja2TemplateScanner(BaseScanner):
         if matches is None:
             matches = self._fallback_named_global_access(executable_spans)
 
-        covered_receivers = (
-            {"lipsum", "get_flashed_messages"} if parsed_succeeded else set(matches)
-        )
+        covered_receivers = {"lipsum", "get_flashed_messages"} if parsed_succeeded else set(matches)
 
         return [
             DetectionResult(
@@ -1582,14 +1580,8 @@ class Jinja2TemplateScanner(BaseScanner):
         )
 
         def stored_names(node: Any) -> set[str]:
-            return {
-                name.name
-                for name in node.find_all(jinja2.nodes.Name)
-                if name.ctx in {"param", "store"}
-            } | (
-                {node.name}
-                if isinstance(node, jinja2.nodes.Name) and node.ctx in {"param", "store"}
-                else set()
+            return {name.name for name in node.find_all(jinja2.nodes.Name) if name.ctx in {"param", "store"}} | (
+                {node.name} if isinstance(node, jinja2.nodes.Name) and node.ctx in {"param", "store"} else set()
             )
 
         def is_safe_literal(node: Any) -> bool:
@@ -1605,8 +1597,7 @@ class Jinja2TemplateScanner(BaseScanner):
             dangerous_aliases: set[str],
         ) -> bool:
             return isinstance(node, jinja2.nodes.Name) and (
-                node.name in dangerous_aliases
-                or (node.name in named_roots and node.name not in shadowed)
+                node.name in dangerous_aliases or (node.name in named_roots and node.name not in shadowed)
             )
 
         def update_bindings(
@@ -1645,8 +1636,7 @@ class Jinja2TemplateScanner(BaseScanner):
                 return
 
             safe_value = is_safe_literal(value) or (
-                isinstance(value, jinja2.nodes.Name)
-                and value.name in source_shadowed
+                isinstance(value, jinja2.nodes.Name) and value.name in source_shadowed
             )
             dangerous_value = is_dangerous_name(
                 value,
@@ -1708,10 +1698,7 @@ class Jinja2TemplateScanner(BaseScanner):
 
             if isinstance(node, jinja2.nodes.FromImport):
                 visit(node.template, shadowed, dangerous_aliases, node)
-                imported_names = {
-                    imported[1] if isinstance(imported, tuple) else imported
-                    for imported in node.names
-                }
+                imported_names = {imported[1] if isinstance(imported, tuple) else imported for imported in node.names}
                 shadowed.update(imported_names)
                 dangerous_aliases.difference_update(imported_names)
                 return
@@ -1764,12 +1751,8 @@ class Jinja2TemplateScanner(BaseScanner):
                             source_dangerous_aliases=dangerous_aliases,
                         )
                         iteration_states.append((item_shadowed, item_dangerous))
-                    body_shadowed = set.intersection(
-                        *(state[0] for state in iteration_states)
-                    )
-                    body_dangerous = set().union(
-                        *(state[1] for state in iteration_states)
-                    )
+                    body_shadowed = set.intersection(*(state[0] for state in iteration_states))
+                    body_dangerous = set().union(*(state[1] for state in iteration_states))
                 else:
                     body_shadowed = shadowed | target_names
                     body_dangerous = dangerous_aliases - target_names
