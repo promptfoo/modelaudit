@@ -6259,7 +6259,9 @@ def _typing_extensions_runtime_guard_value(
     typing_namespace = vars(typing_module)
     exported = extension_namespace.get("get_type_hints")
     typing_export = typing_namespace.get("get_type_hints")
-    trusted_typing_export: FunctionType | None = typing_export if type(typing_export) is FunctionType else None
+    trusted_typing_export: FunctionType | None = None
+    if type(typing_export) is FunctionType:
+        trusted_typing_export = cast(FunctionType, typing_export)
     if (
         trusted_typing_export is not None
         and exported is trusted_typing_export
