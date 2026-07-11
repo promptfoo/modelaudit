@@ -10,9 +10,13 @@ from collections.abc import Iterable
 from typing import Any, BinaryIO, ClassVar, NamedTuple
 from urllib.parse import unquote
 
-from modelaudit.detectors.suspicious_symbols import JINJA2_SSTI_PATTERNS
+from modelaudit.detectors.suspicious_symbols import (
+    JINJA2_SSTI_PATTERNS,
+    mask_quoted_jinja_text,
+)
 
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
+from .jinja2_template_scanner import Jinja2TemplateScanner
 
 # Map ggml_type enum to (block_size, type_size) for comprehensive validation
 # Values derived from ggml source
@@ -2129,8 +2133,14 @@ class GgufScanner(BaseScanner):
 
     @classmethod
     def _oversized_chat_template_security_evidence(cls, value: str) -> list[dict[str, str]]:
+        executable_spans = Jinja2TemplateScanner.executable_template_spans(value)
+        if Jinja2TemplateScanner.conservative_named_global_access(executable_spans):
+            return [{"evidence_type": "template_injection", "pattern": "jinja2_named_global_access"}]
         for pattern_type, pattern in _GGUF_CHAT_TEMPLATE_METADATA_PATTERNS:
-            if pattern.search(value):
+            if any(
+                pattern.search(mask_quoted_jinja_text(span) if pattern.pattern == r"__globals__\s*\[" else span)
+                for span in executable_spans
+            ):
                 return [{"evidence_type": "template_injection", "pattern": f"jinja2_{pattern_type}"}]
         return []
 
