@@ -2136,7 +2136,10 @@ class GgufScanner(BaseScanner):
         named_global_access = False
         has_statement = False
         matched_patterns: set[str] = set()
-        for span in Jinja2TemplateScanner.iter_executable_template_spans(value):
+        for span in Jinja2TemplateScanner.iter_executable_template_spans(
+            value,
+            max_span_chars=_GGUF_DEFAULT_MAX_TEMPLATE_SIZE,
+        ):
             masked_span = mask_quoted_jinja_text(span)
             has_statement = has_statement or "{%" in masked_span
             named_global_access = named_global_access or bool(
