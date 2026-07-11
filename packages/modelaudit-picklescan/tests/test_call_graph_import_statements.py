@@ -3134,9 +3134,7 @@ def test_runtime_guard_selects_live_builtin_sentinel_branch() -> None:
             for statement in statements
         )
     else:
-        assert any(
-            isinstance(statement, ast.ClassDef) and statement.name == "sentinel" for statement in statements
-        )
+        assert any(isinstance(statement, ast.ClassDef) and statement.name == "sentinel" for statement in statements)
 
 
 def test_runtime_guard_keeps_dynamic_builtin_sentinel_ambiguous(
