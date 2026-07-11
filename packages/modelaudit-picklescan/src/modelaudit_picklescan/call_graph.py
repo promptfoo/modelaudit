@@ -6226,6 +6226,26 @@ def _typing_extensions_runtime_guard_value(
     ):
         return None
 
+    extension_module = sys.modules.get("typing_extensions")
+    typing_module = sys.modules.get("typing")
+    if (
+        type(extension_module) is not ModuleType
+        or type(typing_module) is not ModuleType
+        or _trusted_module_origin_kind("typing_extensions") != "site_packages"
+        or _trusted_module_origin_kind("typing") != "stdlib"
+    ):
+        return None
+
+    _mark_shared_source_snapshot_unreusable()
+    extension_namespace = vars(extension_module)
+    typing_namespace = vars(typing_module)
+    if "ReadOnly" in typing_namespace:
+        guard_value = True
+    elif "__getattr__" in typing_namespace:
+        return None
+    else:
+        guard_value = False
+
     aliases_get_type_hints = any(
         isinstance(branch_statement, ast.Assign)
         and any(isinstance(target, ast.Name) and target.id == "get_type_hints" for target in branch_statement.targets)
@@ -6244,36 +6264,26 @@ def _typing_extensions_runtime_guard_value(
         ),
         None,
     )
+    if not aliases_get_type_hints and wrapper is None:
+        return guard_value
     if not aliases_get_type_hints or wrapper is None:
         return None
 
-    extension_module = sys.modules.get("typing_extensions")
-    typing_module = sys.modules.get("typing")
-    if (
-        type(extension_module) is not ModuleType
-        or type(typing_module) is not ModuleType
-        or _trusted_module_origin_kind("typing_extensions") != "site_packages"
-        or _trusted_module_origin_kind("typing") != "stdlib"
-        or "__getattr__" in vars(extension_module)
-        or "__getattr__" in vars(typing_module)
-    ):
-        return None
-
-    extension_namespace = vars(extension_module)
-    typing_namespace = vars(typing_module)
     exported = cast(object, extension_namespace.get("get_type_hints"))
     typing_export = cast(object, typing_namespace.get("get_type_hints"))
-    if (
-        _is_exact_function(typing_export)
-        and exported is typing_export
-        and typing_export.__name__ == "get_type_hints"
-        and typing_export.__globals__ is typing_namespace
-        and _function_owner_matches_trusted_source(
-            typing_export,
-            expected_module="typing",
-        )
-    ):
-        return True
+    if guard_value:
+        if (
+            _is_exact_function(typing_export)
+            and exported is typing_export
+            and typing_export.__name__ == "get_type_hints"
+            and typing_export.__globals__ is typing_namespace
+            and _function_owner_matches_trusted_source(
+                typing_export,
+                expected_module="typing",
+            )
+        ):
+            return True
+        return None
     if (
         type(exported) is not FunctionType
         or exported.__name__ != "get_type_hints"
@@ -6287,7 +6297,6 @@ def _typing_extensions_runtime_guard_value(
     ):
         return None
     return False
-
 
 def _runtime_selected_module_statements(
     statements: Iterable[ast.stmt],
