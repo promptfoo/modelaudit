@@ -28,7 +28,7 @@ classifiers = [
 ]
 requires-python = ">=3.10,<3.14"
 dependencies = [
-    "click>=8.1.7",
+    "click>=8.3.3",
     "yaspin>=2.5.0",
     # NumPy version depends on Python version for compatibility
     # Python 3.10: NumPy 1.x (NumPy 2.x requires Python >=3.11)
