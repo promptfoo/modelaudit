@@ -3108,7 +3108,7 @@ mod tests {
 
     #[test]
     fn base64_prefix_gate_recognizes_complete_long_protocol0_scalar_pickle() {
-        for opcode in [b'F', b'I', b'L', b'P', b'S', b'V'] {
+        for opcode in *b"FILPSV" {
             let payload = long_protocol0_line_payload_for_test(opcode);
             let encoded = encode_base64_for_test(&payload);
 
@@ -3166,7 +3166,7 @@ mod tests {
 
     #[test]
     fn encoded_probe_windows_keep_long_scalar_candidates_at_each_decoded_offset() {
-        for opcode in [b'F', b'I', b'L', b'P', b'S', b'V', b'g', b'p'] {
+        for opcode in *b"FILPSVgp" {
             let payload = long_protocol0_line_payload_for_test(opcode);
             for prefix_len in 0..3usize {
                 let mut wrapped = vec![b'X'; prefix_len];

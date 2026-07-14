@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import builtins
 import importlib
 import io
 import os
@@ -11,6 +12,7 @@ import py_compile
 import subprocess
 import sys
 import threading
+import typing
 import zipfile
 from contextvars import copy_context
 from importlib.machinery import (
@@ -23,6 +25,7 @@ from importlib.machinery import (
 )
 from importlib.util import find_spec
 from pathlib import Path
+from types import FunctionType
 from typing import Any
 from zipimport import zipimporter
 
@@ -3044,6 +3047,196 @@ def test_call_graph_models_getattr_default_callable_fallbacks() -> None:
     )
 
 
+def _is_typing_readonly_guard(statement: ast.stmt) -> bool:
+    if not isinstance(statement, ast.If) or not isinstance(statement.test, ast.Call):
+        return False
+    test = statement.test
+    return (
+        isinstance(test.func, ast.Name)
+        and test.func.id == "hasattr"
+        and len(test.args) == 2
+        and isinstance(test.args[0], ast.Name)
+        and test.args[0].id == "typing"
+        and isinstance(test.args[1], ast.Constant)
+        and test.args[1].value == "ReadOnly"
+    )
+
+
+def _is_typing_get_type_hints_guard(statement: ast.stmt) -> bool:
+    return (
+        _is_typing_readonly_guard(statement)
+        and isinstance(statement, ast.If)
+        and any(
+            isinstance(branch_statement, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "get_type_hints" for target in branch_statement.targets
+            )
+            for branch_statement in statement.body
+        )
+        and any(
+            isinstance(branch_statement, ast.FunctionDef) and branch_statement.name == "get_type_hints"
+            for branch_statement in statement.orelse
+        )
+    )
+
+
+def _is_builtin_sentinel_guard(statement: ast.stmt) -> bool:
+    if not isinstance(statement, ast.If) or not isinstance(statement.test, ast.Call):
+        return False
+    test = statement.test
+    return (
+        isinstance(test.func, ast.Name)
+        and test.func.id == "hasattr"
+        and len(test.args) == 2
+        and isinstance(test.args[0], ast.Name)
+        and test.args[0].id == "builtins"
+        and isinstance(test.args[1], ast.Constant)
+        and test.args[1].value == "sentinel"
+    )
+
+
+def test_runtime_guard_selects_live_typing_extensions_export() -> None:
+    typing_extensions = pytest.importorskip("typing_extensions")
+    source_path = Path(typing_extensions.__file__)
+    tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
+    guard = next(statement for statement in tree.body if _is_typing_get_type_hints_guard(statement))
+
+    statements = call_graph._runtime_selected_module_statements(tree.body, "typing_extensions")
+
+    assert guard not in statements
+    if typing_extensions.get_type_hints is typing.get_type_hints:
+        assert any(
+            isinstance(statement, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == "get_type_hints" for target in statement.targets)
+            for statement in statements
+        )
+    else:
+        assert any(
+            isinstance(statement, ast.FunctionDef) and statement.name == "get_type_hints" for statement in statements
+        )
+
+
+def test_runtime_guard_selects_live_builtin_sentinel_branch() -> None:
+    typing_extensions = pytest.importorskip("typing_extensions")
+    source_path = Path(typing_extensions.__file__)
+    tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
+    guard = next((statement for statement in tree.body if _is_builtin_sentinel_guard(statement)), None)
+    if guard is None:
+        pytest.skip("installed typing_extensions has no builtins.sentinel runtime guard")
+
+    statements = call_graph._runtime_selected_module_statements(tree.body, "typing_extensions")
+
+    assert guard not in statements
+    if hasattr(builtins, "sentinel"):
+        assert any(
+            isinstance(statement, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == "sentinel" for target in statement.targets)
+            for statement in statements
+        )
+    else:
+        assert any(isinstance(statement, ast.ClassDef) and statement.name == "sentinel" for statement in statements)
+
+
+def test_runtime_guard_keeps_dynamic_builtin_sentinel_ambiguous(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    typing_extensions = pytest.importorskip("typing_extensions")
+    builtins_namespace = call_graph._IMPORT_RUNTIME_BUILTINS
+    assert isinstance(builtins_namespace, dict)
+    if "sentinel" in builtins_namespace:
+        pytest.skip("builtins.sentinel is directly available")
+    source_path = Path(typing_extensions.__file__)
+    tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
+    guard = next((statement for statement in tree.body if _is_builtin_sentinel_guard(statement)), None)
+    if guard is None:
+        pytest.skip("installed typing_extensions has no builtins.sentinel runtime guard")
+    monkeypatch.setitem(builtins_namespace, "__getattr__", lambda _name: object())
+
+    assert hasattr(builtins, "sentinel")
+    statements = call_graph._runtime_selected_module_statements(tree.body, "typing_extensions")
+
+    assert guard in statements
+
+
+def test_runtime_guard_marks_unloaded_module_snapshot_unreusable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    typing_extensions = pytest.importorskip("typing_extensions")
+    source_path = Path(typing_extensions.__file__)
+    tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
+    guard = next(statement for statement in tree.body if _is_typing_get_type_hints_guard(statement))
+    assert isinstance(guard, ast.If)
+    monkeypatch.delitem(sys.modules, "typing_extensions")
+
+    with call_graph.shared_source_sensitive_caches():
+        snapshot = call_graph._SHARED_SOURCE_SENSITIVE_SNAPSHOT.get()
+        assert snapshot is not None
+        snapshot.reusable = True
+
+        assert call_graph._typing_extensions_runtime_guard_value(guard, "typing_extensions") is None
+        assert snapshot.reusable is False
+
+
+def test_runtime_guard_keeps_mutated_typing_extensions_export_ambiguous(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    typing_extensions = pytest.importorskip("typing_extensions")
+    source_path = Path(typing_extensions.__file__)
+    tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
+    monkeypatch.setattr(typing_extensions, "get_type_hints", object())
+
+    statements = call_graph._runtime_selected_module_statements(tree.body, "typing_extensions")
+
+    assert any(_is_typing_get_type_hints_guard(statement) for statement in statements)
+
+
+def test_runtime_guard_keeps_shared_replacement_alias_ambiguous(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    typing_extensions = pytest.importorskip("typing_extensions")
+    source_path = Path(typing_extensions.__file__)
+    tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
+
+    def replacement(*_args: object, **_kwargs: object) -> dict[str, object]:
+        return {}
+
+    monkeypatch.setattr(typing, "get_type_hints", replacement)
+    monkeypatch.setattr(typing_extensions, "get_type_hints", replacement)
+
+    statements = call_graph._runtime_selected_module_statements(tree.body, "typing_extensions")
+
+    assert any(_is_typing_get_type_hints_guard(statement) for statement in statements)
+
+
+def test_runtime_guard_keeps_source_location_forgery_ambiguous(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    typing_extensions = pytest.importorskip("typing_extensions")
+    source_path = Path(typing_extensions.__file__)
+    tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
+    guard = next(statement for statement in tree.body if _is_typing_get_type_hints_guard(statement))
+    assert isinstance(guard, ast.If)
+    wrapper = next(
+        statement
+        for statement in guard.orelse
+        if isinstance(statement, ast.FunctionDef) and statement.name == "get_type_hints"
+    )
+
+    def replacement(*_args: object, **_kwargs: object) -> dict[str, object]:
+        return {}
+
+    forged_code = replacement.__code__.replace(
+        co_filename=str(source_path),
+        co_firstlineno=wrapper.lineno,
+    )
+    forged = FunctionType(forged_code, vars(typing_extensions), "get_type_hints")
+    monkeypatch.setattr(typing_extensions, "get_type_hints", forged)
+
+    statements = call_graph._runtime_selected_module_statements(tree.body, "typing_extensions")
+
+    assert any(_is_typing_get_type_hints_guard(statement) for statement in statements)
+
+
 def test_call_graph_models_version_gated_typing_extensions_definitions() -> None:
     pytest.importorskip("typing_extensions")
 
@@ -3051,10 +3244,13 @@ def test_call_graph_models_version_gated_typing_extensions_definitions() -> None
     calls = call_graph._calls_for_function(function_name) or ()
     path = call_graph._find_sink_path(function_name)
 
-    assert call_graph._call_graph_entrypoints(function_name) == (function_name,)
-    assert "typing.get_type_hints" in calls
+    if hasattr(typing, "ReadOnly"):
+        assert call_graph._resolve_function_target(function_name) == "typing.get_type_hints"
+    else:
+        assert call_graph._call_graph_entrypoints(function_name) == (function_name,)
+        assert "typing.get_type_hints" in calls
     assert path is not None
-    assert path[0] == function_name
+    assert path[0] in {function_name, "typing.get_type_hints"}
     assert path[-1] in {"builtins.compile", "builtins.eval"}
 
 
