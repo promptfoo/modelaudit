@@ -307,6 +307,8 @@ class TestJinja2TemplateScannerPatternCategories:
             "{% from 'helpers.j2' import helper as lipsum %}{{ lipsum.__globals__.os }}",
             "{% macro lipsum() %}{% endmacro %}{{ lipsum.__globals__.os }}",
             "{% macro lipsum() %}{{ lipsum.__globals__.os }}{% endmacro %}",
+            "{{ [lipsum, {}][1].__globals__.os }}",
+            "{{ {'danger': lipsum, 'safe': {}}['safe'].__globals__.os }}",
         ],
     )
     def test_named_global_access_ignores_ast_local_bindings(

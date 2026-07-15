@@ -1673,11 +1673,22 @@ class Jinja2TemplateScanner(BaseScanner):
                 node.node,
                 (jinja2.nodes.List, jinja2.nodes.Tuple, jinja2.nodes.Dict),
             ):
-                values = (
-                    [item.value for item in node.node.items]
-                    if isinstance(node.node, jinja2.nodes.Dict)
-                    else node.node.items
-                )
+                if isinstance(node.node, jinja2.nodes.Dict):
+                    values = [
+                        item.value
+                        for item in node.node.items
+                        if not isinstance(node.arg, jinja2.nodes.Const)
+                        or not isinstance(item.key, jinja2.nodes.Const)
+                        or item.key.value == node.arg.value
+                    ]
+                elif isinstance(node.arg, jinja2.nodes.Const) and type(node.arg.value) is int:
+                    values = (
+                        [node.node.items[node.arg.value]]
+                        if -len(node.node.items) <= node.arg.value < len(node.node.items)
+                        else []
+                    )
+                else:
+                    values = node.node.items
                 return next(
                     (
                         root
