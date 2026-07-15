@@ -524,6 +524,26 @@ class TestJinja2TemplateScannerPatternCategories:
         assert len(statement_global_checks) == 1
         assert statement_global_checks[0].details.get("match_text") == "__globals__["
 
+    def test_named_global_access_supports_jinja_without_namespace_nodes(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        if not jinja2_template_scanner.HAS_JINJA2_SANDBOX:
+            pytest.skip("Jinja2 AST unavailable")
+        monkeypatch.delattr(jinja2_template_scanner.jinja2.nodes, "NSRef", raising=False)
+        template_file = tmp_path / "no-nsref.jinja"
+        template_file.write_text("{{ lipsum.__globals__.os }}")
+
+        result = Jinja2TemplateScanner({"enable_sandbox_test": False}).scan(str(template_file))
+
+        assert any(
+            check.status == CheckStatus.FAILED
+            and check.details
+            and check.details.get("pattern_type") == "global_access"
+            for check in result.checks
+        )
+
     def test_detects_builtins_access(self, tmp_path: Path) -> None:
         """Test detection of __builtins__ access patterns."""
         template_file = tmp_path / "builtins.jinja"

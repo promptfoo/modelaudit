@@ -1577,6 +1577,7 @@ class Jinja2TemplateScanner(BaseScanner):
         matches: list[str] = []
         named_roots = {"lipsum", "get_flashed_messages"}
         with_node_type = getattr(jinja2.nodes, "With", None)
+        nsref_node_type = getattr(jinja2.nodes, "NSRef", None)
         isolated_scope_types = tuple(
             node_type
             for name in (
@@ -1592,7 +1593,7 @@ class Jinja2TemplateScanner(BaseScanner):
             names = {name.name for name in node.find_all(jinja2.nodes.Name) if name.ctx in {"param", "store"}}
             if isinstance(node, jinja2.nodes.Name) and node.ctx in {"param", "store"}:
                 names.add(node.name)
-            if isinstance(node, jinja2.nodes.NSRef):
+            if nsref_node_type is not None and isinstance(node, nsref_node_type):
                 names.add(f"{node.name}.{node.attr}")
             return names
 
