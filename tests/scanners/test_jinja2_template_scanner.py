@@ -230,6 +230,29 @@ class TestJinja2TemplateScannerPatternCategories:
             ("parenthesized-expression-globals", "{{ ((none or lipsum).__globals__)['os'] }}"),
             ("nested-receiver-subscript", "{{ obj.lipsum.__globals__['os'] }}"),
             ("spaced-nested-receiver-subscript", "{{ obj . lipsum.__globals__['os'] }}"),
+            ("aliased-global-get", "{% set saved = lipsum %}{{ saved.__globals__.get('os') }}"),
+            ("aliased-global-subscript", "{% set saved = lipsum %}{{ saved.__globals__['os'] }}"),
+            ("conditional-global-get", "{{ (lipsum if condition else {}).__globals__.get('os') }}"),
+            ("dynamic-or-global-get", "{{ (lipsum or safe).__globals__.get('os') }}"),
+            ("dynamic-and-global-get", "{{ (safe and lipsum).__globals__.get('os') }}"),
+            ("list-index-global-get", "{{ [safe, lipsum][index].__globals__.get('os') }}"),
+            ("dict-key-global-get", "{{ {'safe': safe, 'pwn': lipsum}[key].__globals__.get('os') }}"),
+            (
+                "filtered-loop-global-subscript",
+                "{% for lipsum in [lipsum|default({})] %}{{ lipsum.__globals__['os'] }}{% endfor %}",
+            ),
+            (
+                "filtered-set-global-subscript",
+                "{% set lipsum = lipsum|default({}) %}{{ lipsum.__globals__['os'] }}",
+            ),
+            (
+                "filtered-with-global-subscript",
+                "{% with lipsum = lipsum|default({}) %}{{ lipsum.__globals__['os'] }}{% endwith %}",
+            ),
+            (
+                "mapped-loop-global-subscript",
+                "{% for lipsum in [lipsum]|map('default', {}) %}{{ lipsum.__globals__['os'] }}{% endfor %}",
+            ),
         ],
     )
     def test_detects_named_global_access_once(
@@ -422,6 +445,10 @@ class TestJinja2TemplateScannerPatternCategories:
         parenthesized_file.write_text("{{ ( (lipsum) ).__globals__.os }}")
         expression_receiver_file = tmp_path / "expression-receiver.jinja"
         expression_receiver_file.write_text("{{ (none or lipsum).__globals__.get('os') }}")
+        aliased_receiver_file = tmp_path / "aliased-receiver.jinja"
+        aliased_receiver_file.write_text("{% set saved = lipsum %}{{ saved.__globals__.get('os') }}")
+        quoted_get_file = tmp_path / "quoted-get.jinja"
+        quoted_get_file.write_text("{{ \"docs: saved.__globals__.get('os')\" }}")
         unmatched_file = tmp_path / "unmatched.jinja"
         unmatched_file.write_text("{{ ( lipsum.__globals__.os }}")
         nested_receiver_file = tmp_path / "nested-receiver.jinja"
@@ -435,6 +462,8 @@ class TestJinja2TemplateScannerPatternCategories:
         quoted_result = Jinja2TemplateScanner().scan(str(quoted_file))
         parenthesized_result = Jinja2TemplateScanner().scan(str(parenthesized_file))
         expression_receiver_result = Jinja2TemplateScanner().scan(str(expression_receiver_file))
+        aliased_receiver_result = Jinja2TemplateScanner().scan(str(aliased_receiver_file))
+        quoted_get_result = Jinja2TemplateScanner().scan(str(quoted_get_file))
         unmatched_result = Jinja2TemplateScanner().scan(str(unmatched_file))
         nested_receiver_result = Jinja2TemplateScanner().scan(str(nested_receiver_file))
         scoped_result = Jinja2TemplateScanner().scan(str(scoped_file))
@@ -458,12 +487,22 @@ class TestJinja2TemplateScannerPatternCategories:
             and check.details.get("pattern_type") == "global_access"
             for check in expression_receiver_result.checks
         )
+        assert any(
+            check.status == CheckStatus.FAILED
+            and check.details
+            and check.details.get("pattern_type") == "global_access"
+            for check in aliased_receiver_result.checks
+        )
         assert not any(
             check.status == CheckStatus.FAILED
             and check.details
             and check.details.get("pattern_type") == "global_access"
             for check in (
-                quoted_result.checks + unmatched_result.checks + nested_receiver_result.checks + scoped_result.checks
+                quoted_result.checks
+                + quoted_get_result.checks
+                + unmatched_result.checks
+                + nested_receiver_result.checks
+                + scoped_result.checks
             )
         )
         statement_global_checks = [

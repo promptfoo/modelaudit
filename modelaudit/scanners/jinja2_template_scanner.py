@@ -100,7 +100,7 @@ _DETECTION_MESSAGE_LABELS = {
     "sandbox_violation": "sandbox violation",
 }
 _MAX_REPORTED_TEMPLATE_LOCATIONS = 20
-_QUOTE_SENSITIVE_GLOBAL_SUBSCRIPT_PATTERN = r"__globals__(?:\s*\))*\s*\["
+_QUOTE_SENSITIVE_GLOBAL_SUBSCRIPT_PATTERN = r"__globals__(?:\s*\))*\s*(?:\[|\.\s*get\s*\()"
 _RAW_PARSE_FALLBACK_CONTEXT_BYTES = 1024
 _RAW_PARSE_FALLBACK_MAX_WINDOWS = 8
 _RAW_PARSE_FALLBACK_READ_BYTES = 256 * 1024
@@ -1462,7 +1462,8 @@ class Jinja2TemplateScanner(BaseScanner):
         named_receiver_roots = "|".join(re.escape(receiver) for receiver in sorted(covered_global_receivers))
         named_receiver_pattern = (
             re.compile(
-                rf"(?<!\w)(?P<open>(?:\(\s*)*)(?:{named_receiver_roots})(?P<close>(?:\s*\))*)"
+                rf"(?<!\w)(?P<open>(?:\(\s*)*)(?:(?:none|false|0)\s+or\s+)?"
+                rf"(?:{named_receiver_roots})(?P<close>(?:\s*\))*)"
                 r"\s*\.\s*__globals__\b(?P<globals_close>(?:\s*\))*)"
             )
             if covered_global_receivers
@@ -1547,11 +1548,10 @@ class Jinja2TemplateScanner(BaseScanner):
         location: str,
     ) -> tuple[list[DetectionResult], frozenset[str]]:
         matches = self._parsed_named_global_access(template_content)
-        parsed_succeeded = matches is not None
         if matches is None:
             matches = self._fallback_named_global_access(executable_spans)
 
-        covered_receivers = {"lipsum", "get_flashed_messages"} if parsed_succeeded else set(matches)
+        covered_receivers = set(matches)
 
         return [
             DetectionResult(

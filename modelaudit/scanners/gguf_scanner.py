@@ -2280,7 +2280,7 @@ class GgufScanner(BaseScanner):
                         shadowed_named_roots.update(cls._iter_unquoted_named_targets(value, start, in_match.start()))
 
             for pattern_type, pattern in _GGUF_CHAT_TEMPLATE_METADATA_PATTERNS:
-                if pattern.pattern == r"__globals__(?:\s*\))*\s*\[":
+                if pattern.pattern == r"__globals__(?:\s*\))*\s*(?:\[|\.\s*get\s*\(":
                     matched = next(cls._iter_unquoted_template_matches(value, start, end, pattern), None) is not None
                 else:
                     matched = pattern.search(value, start, end) is not None
