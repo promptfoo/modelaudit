@@ -232,6 +232,11 @@ class TestJinja2TemplateScannerPatternCategories:
             ("spaced-nested-receiver-subscript", "{{ obj . lipsum.__globals__['os'] }}"),
             ("aliased-global-get", "{% set saved = lipsum %}{{ saved.__globals__.get('os') }}"),
             ("aliased-global-dot", "{% set saved = lipsum %}{{ saved.__globals__.os }}"),
+            (
+                "namespace-global-dot",
+                "{% set ns = namespace() %}{% set ns.saved = lipsum %}{{ ns.saved.__globals__.os }}",
+            ),
+            ("filtered-alias-global-dot", "{% set saved = lipsum|default({}) %}{{ saved.__globals__.os }}"),
             ("aliased-global-subscript", "{% set saved = lipsum %}{{ saved.__globals__['os'] }}"),
             ("conditional-global-get", "{{ (lipsum if condition else {}).__globals__.get('os') }}"),
             ("conditional-global-dot", "{{ (lipsum if condition else {}).__globals__.os }}"),

@@ -223,14 +223,16 @@ _GGUF_JINJA_NAMED_ROOT_PATTERN = re.compile(r"(?<![\w.])(?P<root>lipsum|get_flas
 _GGUF_JINJA_NAMED_ROOTS = frozenset({"lipsum", "get_flashed_messages"})
 _GGUF_JINJA_GLOBAL_RECEIVER_PATTERN = re.compile(
     r"(?<![\w.(])(?P<open>(?:\(\s*)*)(?:(?:none|false|0)\s+or\s+)?"
-    r"(?P<root>[A-Za-z_]\w*)(?P<close>(?:\s*\))*)\s*\.\s*__globals__\b",
+    r"(?P<root>[A-Za-z_]\w*(?:\s*\.\s*[A-Za-z_]\w*)?)(?P<close>(?:\s*\))*)\s*\.\s*__globals__\b",
 )
 _GGUF_JINJA_COMPOSITE_GLOBAL_RECEIVER_PATTERN = re.compile(
     r"(?<![\w.])(?P<open>\()[^()]{0,256}\b(?P<root>lipsum|get_flashed_messages)\b"
     r"[^()]{0,256}(?P<close>\))\s*\.\s*__globals__\b",
 )
 _GGUF_JINJA_SIMPLE_SET_ALIAS_PATTERN = re.compile(
-    r"\bset\s+(?P<target>[A-Za-z_]\w*)\s*=\s*(?P<source>[A-Za-z_]\w*)\s*-?%}",
+    r"\bset\s+(?P<target>[A-Za-z_]\w*(?:\s*\.\s*[A-Za-z_]\w*)?)\s*=\s*"
+    r"(?P<source>[A-Za-z_]\w*(?:\s*\.\s*[A-Za-z_]\w*)?)"
+    r"(?:\s*\|\s*default\s*\([^()]*\))?\s*-?%}",
 )
 _GGUF_JINJA_FOR_IN_PATTERN = re.compile(r"\bin\b")
 _GGUF_JINJA_SCOPE_OPENERS = frozenset({"if", "for", "with", "block", "macro", "call", "filter", "autoescape"})
@@ -2251,10 +2253,11 @@ class GgufScanner(BaseScanner):
                     previous = match.start() - 1
                     while previous >= start and value[previous].isspace():
                         previous -= 1
+                    receiver_root = "".join(match.group("root").split())
                     if (previous < start or value[previous] not in ".(") and (
                         scope_tracking_exhausted
-                        or match.group("root") in dangerous_aliases
-                        or match.group("root") in _GGUF_JINJA_NAMED_ROOTS - shadowed_named_roots
+                        or receiver_root in dangerous_aliases
+                        or receiver_root in _GGUF_JINJA_NAMED_ROOTS - shadowed_named_roots
                     ):
                         has_unshadowed_named_global_access = True
 
@@ -2283,8 +2286,8 @@ class GgufScanner(BaseScanner):
                         None,
                     )
                     if alias_match is not None:
-                        target = alias_match.group("target")
-                        source = alias_match.group("source")
+                        target = "".join(alias_match.group("target").split())
+                        source = "".join(alias_match.group("source").split())
                         if source in dangerous_aliases or source in _GGUF_JINJA_NAMED_ROOTS - shadowed_named_roots:
                             dangerous_aliases.add(target)
                             shadowed_named_roots.discard(target)

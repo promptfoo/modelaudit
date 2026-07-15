@@ -1589,9 +1589,12 @@ class Jinja2TemplateScanner(BaseScanner):
         )
 
         def stored_names(node: Any) -> set[str]:
-            return {name.name for name in node.find_all(jinja2.nodes.Name) if name.ctx in {"param", "store"}} | (
-                {node.name} if isinstance(node, jinja2.nodes.Name) and node.ctx in {"param", "store"} else set()
-            )
+            names = {name.name for name in node.find_all(jinja2.nodes.Name) if name.ctx in {"param", "store"}}
+            if isinstance(node, jinja2.nodes.Name) and node.ctx in {"param", "store"}:
+                names.add(node.name)
+            if isinstance(node, jinja2.nodes.NSRef):
+                names.add(f"{node.name}.{node.attr}")
+            return names
 
         def constant_truth(node: Any) -> bool | None:
             if isinstance(node, jinja2.nodes.Const):
@@ -1607,6 +1610,10 @@ class Jinja2TemplateScanner(BaseScanner):
         ) -> bool:
             if isinstance(node, jinja2.nodes.Name):
                 return node.name in dangerous_aliases or (node.name in named_roots and node.name not in shadowed)
+            if isinstance(node, jinja2.nodes.Getattr) and isinstance(node.node, jinja2.nodes.Name):
+                return f"{node.node.name}.{node.attr}" in dangerous_aliases
+            if isinstance(node, jinja2.nodes.Filter) and node.name == "default":
+                return is_dangerous_name(node.node, shadowed, dangerous_aliases)
             if isinstance(node, jinja2.nodes.CondExpr):
                 truth = constant_truth(node.test)
                 if truth is not None:
@@ -1647,6 +1654,11 @@ class Jinja2TemplateScanner(BaseScanner):
         def direct_named_root(node: Any, shadowed: set[str], dangerous_aliases: set[str]) -> str | None:
             if isinstance(node, jinja2.nodes.Name):
                 return node.name if node.name in dangerous_aliases or node.name in named_roots - shadowed else None
+            if isinstance(node, jinja2.nodes.Getattr) and isinstance(node.node, jinja2.nodes.Name):
+                receiver = f"{node.node.name}.{node.attr}"
+                return receiver if receiver in dangerous_aliases else None
+            if isinstance(node, jinja2.nodes.Filter) and node.name == "default":
+                return direct_named_root(node.node, shadowed, dangerous_aliases)
             if isinstance(node, jinja2.nodes.CondExpr):
                 truth = constant_truth(node.test)
                 candidates = (node.expr1, node.expr2) if truth is None else (node.expr1 if truth else node.expr2,)
