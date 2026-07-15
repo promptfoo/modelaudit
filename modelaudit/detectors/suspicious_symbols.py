@@ -861,7 +861,8 @@ SUSPICIOUS_CONFIG_PATTERNS = {
 # =============================================================================
 
 JINJA2_NAMED_GLOBAL_ACCESS_PATTERN: re.Pattern[str] = re.compile(
-    r"(?<![\w.(])(?P<open>(?:\(\s*)*)\s*(?P<root>lipsum|get_flashed_messages)(?P<close>(?:\s*\))*)\s*\.\s*__globals__\b"
+    r"(?<![\w.(])(?P<open>(?:\(\s*)*)(?:(?:none|false|0)\s+or\s+)?"
+    r"(?P<root>lipsum|get_flashed_messages)(?P<close>(?:\s*\))*)\s*\.\s*__globals__\b"
 )
 
 
@@ -958,7 +959,7 @@ JINJA2_SSTI_PATTERNS = {
     # These patterns access global namespaces to reach restricted functions
     "global_access": [
         # Direct global access
-        r"__globals__\s*\)*\s*\[",  # Access globals dictionary, including parenthesized access
+        r"__globals__(?:\s*\))*\s*\[",  # Access globals dictionary, including parenthesized access
         r"__builtins__\[",  # Access builtins dictionary
         r"__init__\.__globals__",  # Access through __init__ method
         # Framework-specific global access

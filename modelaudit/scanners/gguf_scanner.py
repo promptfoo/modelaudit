@@ -220,6 +220,9 @@ _GGUF_CHAT_TEMPLATE_METADATA_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] =
     for pattern in JINJA2_SSTI_PATTERNS.get(pattern_type, [])
 )
 _GGUF_JINJA_NAMED_ROOT_PATTERN = re.compile(r"(?<!\w)(?P<root>lipsum|get_flashed_messages)\b")
+_GGUF_JINJA_ASSIGNMENT_OPERATOR_PATTERN = re.compile(r"(?<![=!<>])=(?!=)")
+_GGUF_JINJA_NAMED_WITH_TARGET_PATTERN = re.compile(r"(?<!\w)(?P<root>lipsum|get_flashed_messages)\s*=(?!=)")
+_GGUF_JINJA_FOR_IN_PATTERN = re.compile(r"\bin\b")
 _GGUF_TIMEOUT_OPTIONS_WITH_VALUE = frozenset({"-k", "--kill-after"})
 _GGUF_TIMEOUT_DURATION_PATTERN = re.compile(r"^\d+(?:\.\d+)?[smhd]?$")
 _GGUF_REMOTE_URL_SCHEMES = ("http://", "https://", "ftp://")
@@ -2168,15 +2171,47 @@ class GgufScanner(BaseScanner):
         matched_patterns: set[str] = set()
         for start, end, is_statement in Jinja2TemplateScanner.iter_executable_template_ranges(value):
             if is_statement:
-                statement_named_roots.update(
-                    match.group("root")
-                    for match in cls._iter_unquoted_template_matches(
-                        value,
-                        start,
-                        end,
-                        _GGUF_JINJA_NAMED_ROOT_PATTERN,
+                tag_name = Jinja2TemplateScanner._jinja_block_tag_name_at(value, start, end)
+                if tag_name == "set":
+                    assignment = next(
+                        cls._iter_unquoted_template_matches(value, start, end, _GGUF_JINJA_ASSIGNMENT_OPERATOR_PATTERN),
+                        None,
                     )
-                )
+                    target_end = assignment.start() if assignment is not None else end
+                    statement_named_roots.update(
+                        match.group("root")
+                        for match in cls._iter_unquoted_template_matches(
+                            value,
+                            start,
+                            target_end,
+                            _GGUF_JINJA_NAMED_ROOT_PATTERN,
+                        )
+                    )
+                elif tag_name == "with":
+                    statement_named_roots.update(
+                        match.group("root")
+                        for match in cls._iter_unquoted_template_matches(
+                            value,
+                            start,
+                            end,
+                            _GGUF_JINJA_NAMED_WITH_TARGET_PATTERN,
+                        )
+                    )
+                elif tag_name == "for":
+                    in_match = next(
+                        cls._iter_unquoted_template_matches(value, start, end, _GGUF_JINJA_FOR_IN_PATTERN),
+                        None,
+                    )
+                    if in_match is not None:
+                        statement_named_roots.update(
+                            match.group("root")
+                            for match in cls._iter_unquoted_template_matches(
+                                value,
+                                start,
+                                in_match.start(),
+                                _GGUF_JINJA_NAMED_ROOT_PATTERN,
+                            )
+                        )
             for match in cls._iter_unquoted_template_matches(
                 value,
                 start,
@@ -2192,7 +2227,7 @@ class GgufScanner(BaseScanner):
                     named_global_roots.add(match.group("root"))
 
             for pattern_type, pattern in _GGUF_CHAT_TEMPLATE_METADATA_PATTERNS:
-                if pattern.pattern == r"__globals__\s*\)*\s*\[":
+                if pattern.pattern == r"__globals__(?:\s*\))*\s*\[":
                     matched = next(cls._iter_unquoted_template_matches(value, start, end, pattern), None) is not None
                 else:
                     matched = pattern.search(value, start, end) is not None

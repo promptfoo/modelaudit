@@ -100,7 +100,7 @@ _DETECTION_MESSAGE_LABELS = {
     "sandbox_violation": "sandbox violation",
 }
 _MAX_REPORTED_TEMPLATE_LOCATIONS = 20
-_QUOTE_SENSITIVE_GLOBAL_SUBSCRIPT_PATTERN = r"__globals__\s*\)*\s*\["
+_QUOTE_SENSITIVE_GLOBAL_SUBSCRIPT_PATTERN = r"__globals__(?:\s*\))*\s*\["
 _RAW_PARSE_FALLBACK_CONTEXT_BYTES = 1024
 _RAW_PARSE_FALLBACK_MAX_WINDOWS = 8
 _RAW_PARSE_FALLBACK_READ_BYTES = 256 * 1024
@@ -1462,8 +1462,8 @@ class Jinja2TemplateScanner(BaseScanner):
         named_receiver_roots = "|".join(re.escape(receiver) for receiver in sorted(covered_global_receivers))
         named_receiver_pattern = (
             re.compile(
-                rf"(?<!\w)(?P<open>\(*)\s*(?:{named_receiver_roots})\s*(?P<close>\)*)"
-                r"\s*\.\s*__globals__\b"
+                rf"(?<!\w)(?P<open>(?:\(\s*)*)(?:{named_receiver_roots})(?P<close>(?:\s*\))*)"
+                r"\s*\.\s*__globals__\b(?P<globals_close>(?:\s*\))*)"
             )
             if covered_global_receivers
             else None
@@ -1487,7 +1487,9 @@ class Jinja2TemplateScanner(BaseScanner):
                     ):
                         named_ranges: list[tuple[int, int]] = []
                         for named_match in named_receiver_pattern.finditer(pattern_text):
-                            if len(named_match.group("open")) != len(named_match.group("close")):
+                            if named_match.group("open").count("(") != named_match.group("close").count(
+                                ")"
+                            ) + named_match.group("globals_close").count(")"):
                                 continue
                             boundary = named_match.start() - 1
                             while boundary >= 0 and pattern_text[boundary].isspace():

@@ -420,6 +420,8 @@ class TestJinja2TemplateScannerPatternCategories:
         quoted_file.write_text("{{ \"docs: (lipsum).__globals__ ['os']\" }}")
         parenthesized_file = tmp_path / "parenthesized.jinja"
         parenthesized_file.write_text("{{ ( (lipsum) ).__globals__.os }}")
+        expression_receiver_file = tmp_path / "expression-receiver.jinja"
+        expression_receiver_file.write_text("{{ (none or lipsum).__globals__.get('os') }}")
         unmatched_file = tmp_path / "unmatched.jinja"
         unmatched_file.write_text("{{ ( lipsum.__globals__.os }}")
         nested_receiver_file = tmp_path / "nested-receiver.jinja"
@@ -432,6 +434,7 @@ class TestJinja2TemplateScannerPatternCategories:
         direct_result = Jinja2TemplateScanner().scan(str(direct_file))
         quoted_result = Jinja2TemplateScanner().scan(str(quoted_file))
         parenthesized_result = Jinja2TemplateScanner().scan(str(parenthesized_file))
+        expression_receiver_result = Jinja2TemplateScanner().scan(str(expression_receiver_file))
         unmatched_result = Jinja2TemplateScanner().scan(str(unmatched_file))
         nested_receiver_result = Jinja2TemplateScanner().scan(str(nested_receiver_file))
         scoped_result = Jinja2TemplateScanner().scan(str(scoped_file))
@@ -448,6 +451,12 @@ class TestJinja2TemplateScannerPatternCategories:
             and check.details
             and check.details.get("pattern_type") == "global_access"
             for check in parenthesized_result.checks
+        )
+        assert any(
+            check.status == CheckStatus.FAILED
+            and check.details
+            and check.details.get("pattern_type") == "global_access"
+            for check in expression_receiver_result.checks
         )
         assert not any(
             check.status == CheckStatus.FAILED

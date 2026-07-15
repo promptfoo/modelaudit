@@ -958,10 +958,36 @@ def test_gguf_oversized_chat_template_allows_unrelated_statements() -> None:
     assert evidence == [{"evidence_type": "template_injection", "pattern": "jinja2_named_global_access"}]
 
 
-def test_gguf_oversized_chat_template_suppresses_root_shadowing_statement() -> None:
-    template = "{% for lipsum in safe_values %}{{ lipsum.__globals__.os }}{% endfor %}"
+@pytest.mark.parametrize(
+    "template",
+    [
+        "{% for lipsum in safe_values %}{{ lipsum.__globals__.os }}{% endfor %}",
+        "{% set safe, lipsum = 0, {} %}{{ lipsum.__globals__.os }}",
+        "{% set lipsum %}docs{% endset %}{{ lipsum.__globals__.os }}",
+        "{% with safe = 0, lipsum = {} %}{{ lipsum.__globals__.os }}{% endwith %}",
+    ],
+)
+def test_gguf_oversized_chat_template_suppresses_root_shadowing_statement(template: str) -> None:
 
     assert GgufScanner._oversized_chat_template_security_evidence(template) == []
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "{% if lipsum %}",
+        "{% if lipsum == none %}",
+        "{% for message in lipsum %}",
+        "{% set other = lipsum %}",
+        "{% with other = lipsum, safe = 1 %}",
+    ],
+)
+def test_gguf_oversized_chat_template_keeps_root_after_statement_read(statement: str) -> None:
+    template = statement + "{{ lipsum.__globals__.get('os').popen('id') }}"
+
+    evidence = GgufScanner._oversized_chat_template_security_evidence(template)
+
+    assert evidence == [{"evidence_type": "template_injection", "pattern": "jinja2_named_global_access"}]
 
 
 def test_gguf_oversized_chat_template_ignores_large_quoted_named_gadget() -> None:
