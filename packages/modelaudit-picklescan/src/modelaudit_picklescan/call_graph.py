@@ -50,11 +50,15 @@ from types import (
     ModuleType,
     WrapperDescriptorType,
 )
-from typing import Any, Protocol, TypeVar, cast
+from typing import Any, Protocol, TypeGuard, TypeVar, cast
 from zipimport import zipimporter
 
 _MAX_DISTRIBUTIONS_PER_TOP_LEVEL = 16
 _MAX_STARTUP_DISTRIBUTION_NAMES = 4096
+
+
+def _is_exact_function(value: object) -> TypeGuard[FunctionType]:
+    return type(value) is FunctionType
 
 
 def _capture_startup_distribution_roots() -> Mapping[str, tuple[tuple[Path, Path], ...]]:
@@ -6085,7 +6089,7 @@ def _module_source_context(module_name: str) -> _ModuleSourceContext | None:
         return None
 
     is_package = source_path.name == "__init__.py"
-    module_statements = _module_level_statements(tree)
+    module_statements = _module_level_statements(tree, module_name)
     return _ModuleSourceContext(source_path=source_path, module_statements=module_statements, is_package=is_package)
 
 
@@ -6203,8 +6207,131 @@ def _bytecode_cache_can_override_source(
     return cache_bytes[16:] != marshal.dumps(source_code)
 
 
-def _module_level_statements(tree: ast.Module) -> tuple[ast.stmt, ...]:
-    return _definition_scope_statements(tree.body)
+def _typing_extensions_runtime_guard_value(
+    statement: ast.If,
+    module_name: str | None,
+) -> bool | None:
+    test = statement.test
+    if (
+        module_name != "typing_extensions"
+        or not isinstance(test, ast.Call)
+        or not isinstance(test.func, ast.Name)
+        or test.func.id != "hasattr"
+        or len(test.args) != 2
+        or test.keywords
+        or not isinstance(test.args[0], ast.Name)
+        or not isinstance(test.args[1], ast.Constant)
+    ):
+        return None
+    guard = (test.args[0].id, test.args[1].value)
+    if guard not in {("typing", "ReadOnly"), ("builtins", "sentinel")}:
+        return None
+
+    _mark_shared_source_snapshot_unreusable()
+    extension_module = sys.modules.get("typing_extensions")
+    if type(extension_module) is not ModuleType or _trusted_module_origin_kind("typing_extensions") != "site_packages":
+        return None
+    extension_namespace = vars(extension_module)
+
+    if guard == ("builtins", "sentinel"):
+        builtins_module = extension_namespace.get("builtins")
+        if (
+            type(builtins_module) is not ModuleType
+            or type(_IMPORT_RUNTIME_BUILTINS) is not dict
+            or vars(builtins_module) is not _IMPORT_RUNTIME_BUILTINS
+        ):
+            return None
+        if "sentinel" in _IMPORT_RUNTIME_BUILTINS:
+            return True
+        if "__getattr__" in _IMPORT_RUNTIME_BUILTINS:
+            return None
+        return False
+
+    typing_module = sys.modules.get("typing")
+    if type(typing_module) is not ModuleType or _trusted_module_origin_kind("typing") != "stdlib":
+        return None
+    typing_namespace = vars(typing_module)
+    if "ReadOnly" in typing_namespace:
+        guard_value = True
+    elif "__getattr__" in typing_namespace:
+        return None
+    else:
+        guard_value = False
+
+    aliases_get_type_hints = any(
+        isinstance(branch_statement, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "get_type_hints" for target in branch_statement.targets)
+        and isinstance(branch_statement.value, ast.Attribute)
+        and isinstance(branch_statement.value.value, ast.Name)
+        and branch_statement.value.value.id == "typing"
+        and branch_statement.value.attr == "get_type_hints"
+        for branch_statement in statement.body
+    )
+    wrapper = next(
+        (
+            branch_statement
+            for branch_statement in statement.orelse
+            if isinstance(branch_statement, ast.FunctionDef | ast.AsyncFunctionDef)
+            and branch_statement.name == "get_type_hints"
+        ),
+        None,
+    )
+    if not aliases_get_type_hints and wrapper is None:
+        return guard_value
+    if not aliases_get_type_hints or wrapper is None:
+        return None
+
+    exported = cast(object, extension_namespace.get("get_type_hints"))
+    typing_export = cast(object, typing_namespace.get("get_type_hints"))
+    if guard_value:
+        if (
+            _is_exact_function(typing_export)
+            and exported is typing_export
+            and typing_export.__name__ == "get_type_hints"
+            and typing_export.__globals__ is typing_namespace
+            and _function_owner_matches_trusted_source(
+                typing_export,
+                expected_module="typing",
+            )
+        ):
+            return True
+        return None
+    if (
+        type(exported) is not FunctionType
+        or exported.__name__ != "get_type_hints"
+        or exported.__globals__ is not extension_namespace
+        or extension_namespace.get("typing") is not typing_module
+        or exported.__code__.co_firstlineno != wrapper.lineno
+        or not _function_owner_matches_trusted_source(
+            exported,
+            expected_module="typing_extensions",
+        )
+    ):
+        return None
+    return False
+
+
+def _runtime_selected_module_statements(
+    statements: Iterable[ast.stmt],
+    module_name: str | None = None,
+) -> tuple[ast.stmt, ...]:
+    selected: list[ast.stmt] = []
+    for statement in statements:
+        if isinstance(statement, ast.If):
+            guard_value = _typing_extensions_runtime_guard_value(statement, module_name)
+            if guard_value is not None:
+                active_branch = statement.body if guard_value else statement.orelse
+                selected.extend(_runtime_selected_module_statements(active_branch, module_name))
+                continue
+        selected.append(statement)
+    return tuple(selected)
+
+
+def _module_level_statements(
+    tree: ast.Module,
+    module_name: str | None = None,
+) -> tuple[ast.stmt, ...]:
+    return _definition_scope_statements(_runtime_selected_module_statements(tree.body, module_name))
 
 
 def _module_initialization_statement_is_inert(statement: ast.stmt) -> bool:
@@ -6811,7 +6938,7 @@ def _source_function_context(
     except Exception:
         return None
 
-    module_statements = _module_level_statements(tree)
+    module_statements = _module_level_statements(tree, module_name)
     function_node = _find_qualified_function_def(module_statements, qualified_name)
     if function_node is None:
         return _inherited_source_function_context(module_statements, module_name, source_path, qualified_name)
@@ -6863,7 +6990,7 @@ def _source_class_context(class_name: str) -> _ClassSourceContext | None:
     except Exception:
         return None
 
-    module_statements = _module_level_statements(tree)
+    module_statements = _module_level_statements(tree, module_name)
     class_node = _find_qualified_class_def(module_statements, qualified_name)
     if class_node is None:
         return None
@@ -7317,6 +7444,8 @@ def _assignment_alias_value(
     ):
         return resolved
     alias_target = _static_import_reference_alias(resolved) or resolved
+    if module_name == "typing_extensions" and alias_target == "typing.get_type_hints":
+        return resolved
     if alias_target.startswith(f"{module_name}."):
         return None
     current_source_path = _resolve_module_source(module_name)
@@ -7624,7 +7753,7 @@ def _constructor_parameter_self_attribute_targets(class_name: str, parameter_nam
     except Exception:
         return ()
 
-    class_node = _find_qualified_class_def(_module_level_statements(tree), qualified_name)
+    class_node = _find_qualified_class_def(_module_level_statements(tree, module_name), qualified_name)
     if class_node is None:
         return ()
     init_node = next(

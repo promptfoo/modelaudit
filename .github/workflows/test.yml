@@ -1031,7 +1031,7 @@ jobs:
 
       - name: Run standalone package tests
         run: |
-          uv run --with pytest --with pytest-xdist pytest -n auto tests --tb=short
+          uv run --with pytest --with pytest-xdist --with 'typing-extensions>=4.14' pytest -n auto tests --tb=short
 
       - name: Build standalone package
         run: |
