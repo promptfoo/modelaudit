@@ -1644,19 +1644,48 @@ class Jinja2TemplateScanner(BaseScanner):
                 return is_dangerous_name(node.node.items[node.arg.value], shadowed, dangerous_aliases)
             return False
 
-        def direct_named_root(node: Any, shadowed: set[str]) -> str | None:
+        def direct_named_root(node: Any, shadowed: set[str], dangerous_aliases: set[str]) -> str | None:
             if isinstance(node, jinja2.nodes.Name):
-                return node.name if node.name in named_roots and node.name not in shadowed else None
+                return node.name if node.name in dangerous_aliases or node.name in named_roots - shadowed else None
             if isinstance(node, jinja2.nodes.CondExpr):
                 truth = constant_truth(node.test)
-                if truth is None:
-                    return None
-                selected = node.expr1 if truth else node.expr2
-                return direct_named_root(selected, shadowed) if selected is not None else None
-            if isinstance(node, jinja2.nodes.And):
-                return direct_named_root(node.right, shadowed) if constant_truth(node.left) is True else None
-            if isinstance(node, jinja2.nodes.Or):
-                return direct_named_root(node.right, shadowed) if constant_truth(node.left) is False else None
+                candidates = (node.expr1, node.expr2) if truth is None else (node.expr1 if truth else node.expr2,)
+                return next(
+                    (
+                        root
+                        for candidate in candidates
+                        if candidate is not None
+                        and (root := direct_named_root(candidate, shadowed, dangerous_aliases)) is not None
+                    ),
+                    None,
+                )
+            if isinstance(node, (jinja2.nodes.And, jinja2.nodes.Or)):
+                truth = constant_truth(node.left)
+                if truth is not None:
+                    selected = node.right if truth == isinstance(node, jinja2.nodes.And) else node.left
+                    return direct_named_root(selected, shadowed, dangerous_aliases)
+                return direct_named_root(node.left, shadowed, dangerous_aliases) or direct_named_root(
+                    node.right,
+                    shadowed,
+                    dangerous_aliases,
+                )
+            if isinstance(node, jinja2.nodes.Getitem) and isinstance(
+                node.node,
+                (jinja2.nodes.List, jinja2.nodes.Tuple, jinja2.nodes.Dict),
+            ):
+                values = (
+                    [item.value for item in node.node.items]
+                    if isinstance(node.node, jinja2.nodes.Dict)
+                    else node.node.items
+                )
+                return next(
+                    (
+                        root
+                        for value in values
+                        if (root := direct_named_root(value, shadowed, dangerous_aliases)) is not None
+                    ),
+                    None,
+                )
             return None
 
         def update_bindings(
@@ -1715,11 +1744,17 @@ class Jinja2TemplateScanner(BaseScanner):
         ) -> None:
             if isinstance(node, jinja2.nodes.Getattr):
                 receiver = node.node
-                receiver_root = direct_named_root(receiver, shadowed)
+                receiver_root = direct_named_root(receiver, shadowed, dangerous_aliases)
                 if (
                     node.attr == "__globals__"
                     and receiver_root is not None
-                    and (isinstance(receiver, jinja2.nodes.Name) or not isinstance(parent, jinja2.nodes.Getitem))
+                    and (
+                        isinstance(receiver, jinja2.nodes.Name)
+                        or (
+                            not isinstance(parent, jinja2.nodes.Getitem)
+                            and not (isinstance(parent, jinja2.nodes.Getattr) and parent.attr == "get")
+                        )
+                    )
                 ):
                     matches.append(receiver_root)
 

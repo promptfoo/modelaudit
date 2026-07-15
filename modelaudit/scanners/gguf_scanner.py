@@ -10,7 +10,7 @@ from collections.abc import Iterable, Iterator
 from typing import Any, BinaryIO, ClassVar, NamedTuple
 from urllib.parse import unquote
 
-from modelaudit.detectors.suspicious_symbols import JINJA2_NAMED_GLOBAL_ACCESS_PATTERN, JINJA2_SSTI_PATTERNS
+from modelaudit.detectors.suspicious_symbols import JINJA2_SSTI_PATTERNS
 
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 from .jinja2_template_scanner import Jinja2TemplateScanner
@@ -220,6 +220,18 @@ _GGUF_CHAT_TEMPLATE_METADATA_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] =
     for pattern in JINJA2_SSTI_PATTERNS.get(pattern_type, [])
 )
 _GGUF_JINJA_NAMED_ROOT_PATTERN = re.compile(r"(?<![\w.])(?P<root>lipsum|get_flashed_messages)\b")
+_GGUF_JINJA_NAMED_ROOTS = frozenset({"lipsum", "get_flashed_messages"})
+_GGUF_JINJA_GLOBAL_RECEIVER_PATTERN = re.compile(
+    r"(?<![\w.(])(?P<open>(?:\(\s*)*)(?:(?:none|false|0)\s+or\s+)?"
+    r"(?P<root>[A-Za-z_]\w*)(?P<close>(?:\s*\))*)\s*\.\s*__globals__\b",
+)
+_GGUF_JINJA_COMPOSITE_GLOBAL_RECEIVER_PATTERN = re.compile(
+    r"(?<![\w.])(?P<open>\()[^()]{0,256}\b(?P<root>lipsum|get_flashed_messages)\b"
+    r"[^()]{0,256}(?P<close>\))\s*\.\s*__globals__\b",
+)
+_GGUF_JINJA_SIMPLE_SET_ALIAS_PATTERN = re.compile(
+    r"\bset\s+(?P<target>[A-Za-z_]\w*)\s*=\s*(?P<source>[A-Za-z_]\w*)\s*-?%}",
+)
 _GGUF_JINJA_FOR_IN_PATTERN = re.compile(r"\bin\b")
 _GGUF_JINJA_SCOPE_OPENERS = frozenset({"if", "for", "with", "block", "macro", "call", "filter", "autoescape"})
 _GGUF_JINJA_MAX_TRACKED_SCOPE_DEPTH = 256
@@ -2210,7 +2222,8 @@ class GgufScanner(BaseScanner):
     @classmethod
     def _oversized_chat_template_security_evidence(cls, value: str) -> list[dict[str, str]]:
         shadowed_named_roots: set[str] = set()
-        scope_stack: list[tuple[str, set[str]]] = []
+        dangerous_aliases: set[str] = set()
+        scope_stack: list[tuple[str, set[str], set[str]]] = []
         scope_tracking_exhausted = False
         has_unshadowed_named_global_access = False
         matched_patterns: set[str] = set()
@@ -2220,39 +2233,40 @@ class GgufScanner(BaseScanner):
                 tag_name = Jinja2TemplateScanner._jinja_block_tag_name_at(value, start, end)
                 if tag_name in {"else", "elif"} and scope_stack:
                     shadowed_named_roots = scope_stack[-1][1].copy()
+                    dangerous_aliases = scope_stack[-1][2].copy()
                 elif tag_name is not None and tag_name.startswith("end"):
                     expected_opener = tag_name[3:]
                     if scope_stack and scope_stack[-1][0] == expected_opener:
-                        shadowed_named_roots = scope_stack.pop()[1]
+                        _opener, shadowed_named_roots, dangerous_aliases = scope_stack.pop()
                     elif expected_opener in _GGUF_JINJA_SCOPE_OPENERS:
                         scope_stack.clear()
                         shadowed_named_roots.clear()
+                        dangerous_aliases.clear()
                         scope_tracking_exhausted = True
 
-            for match in cls._iter_unquoted_template_matches(
-                value,
-                start,
-                end,
-                JINJA2_NAMED_GLOBAL_ACCESS_PATTERN,
-            ):
-                if match.group("open").count("(") != match.group("close").count(")"):
-                    continue
-                previous = match.start() - 1
-                while previous >= start and value[previous].isspace():
-                    previous -= 1
-                if (previous < start or value[previous] not in ".(") and (
-                    scope_tracking_exhausted or match.group("root") not in shadowed_named_roots
-                ):
-                    has_unshadowed_named_global_access = True
+            for access_pattern in (_GGUF_JINJA_GLOBAL_RECEIVER_PATTERN, _GGUF_JINJA_COMPOSITE_GLOBAL_RECEIVER_PATTERN):
+                for match in cls._iter_unquoted_template_matches(value, start, end, access_pattern):
+                    if match.group("open").count("(") != match.group("close").count(")"):
+                        continue
+                    previous = match.start() - 1
+                    while previous >= start and value[previous].isspace():
+                        previous -= 1
+                    if (previous < start or value[previous] not in ".(") and (
+                        scope_tracking_exhausted
+                        or match.group("root") in dangerous_aliases
+                        or match.group("root") in _GGUF_JINJA_NAMED_ROOTS - shadowed_named_roots
+                    ):
+                        has_unshadowed_named_global_access = True
 
             if is_statement and tag_name is not None and not scope_tracking_exhausted:
                 if tag_name in _GGUF_JINJA_SCOPE_OPENERS:
                     if len(scope_stack) >= _GGUF_JINJA_MAX_TRACKED_SCOPE_DEPTH:
                         scope_stack.clear()
                         shadowed_named_roots.clear()
+                        dangerous_aliases.clear()
                         scope_tracking_exhausted = True
                     else:
-                        scope_stack.append((tag_name, shadowed_named_roots.copy()))
+                        scope_stack.append((tag_name, shadowed_named_roots.copy(), dangerous_aliases.copy()))
 
                 if tag_name == "set":
                     target_end = next(
@@ -2264,6 +2278,20 @@ class GgufScanner(BaseScanner):
                         end,
                     )
                     shadowed_named_roots.update(cls._iter_unquoted_named_targets(value, start, target_end))
+                    alias_match = next(
+                        cls._iter_unquoted_template_matches(value, start, end, _GGUF_JINJA_SIMPLE_SET_ALIAS_PATTERN),
+                        None,
+                    )
+                    if alias_match is not None:
+                        target = alias_match.group("target")
+                        source = alias_match.group("source")
+                        if source in dangerous_aliases or source in _GGUF_JINJA_NAMED_ROOTS - shadowed_named_roots:
+                            dangerous_aliases.add(target)
+                            shadowed_named_roots.discard(target)
+                        else:
+                            dangerous_aliases.discard(target)
+                        if len(dangerous_aliases) > _GGUF_JINJA_MAX_TRACKED_SCOPE_DEPTH:
+                            scope_tracking_exhausted = True
                 elif tag_name == "with":
                     target_start = start
                     for delimiter, cursor in cls._iter_top_level_statement_delimiters(value, start, end):
