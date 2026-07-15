@@ -219,10 +219,10 @@ _GGUF_CHAT_TEMPLATE_METADATA_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] =
     for pattern_type in _GGUF_CHAT_TEMPLATE_METADATA_PATTERN_TYPES
     for pattern in JINJA2_SSTI_PATTERNS.get(pattern_type, [])
 )
-_GGUF_JINJA_NAMED_ROOT_PATTERN = re.compile(r"(?<!\w)(?P<root>lipsum|get_flashed_messages)\b")
-_GGUF_JINJA_ASSIGNMENT_OPERATOR_PATTERN = re.compile(r"(?<![=!<>])=(?!=)")
-_GGUF_JINJA_NAMED_WITH_TARGET_PATTERN = re.compile(r"(?<!\w)(?P<root>lipsum|get_flashed_messages)\s*=(?!=)")
+_GGUF_JINJA_NAMED_ROOT_PATTERN = re.compile(r"(?<![\w.])(?P<root>lipsum|get_flashed_messages)\b")
 _GGUF_JINJA_FOR_IN_PATTERN = re.compile(r"\bin\b")
+_GGUF_JINJA_SCOPE_OPENERS = frozenset({"if", "for", "with", "block", "macro", "call", "filter", "autoescape"})
+_GGUF_JINJA_MAX_TRACKED_SCOPE_DEPTH = 256
 _GGUF_TIMEOUT_OPTIONS_WITH_VALUE = frozenset({"-k", "--kill-after"})
 _GGUF_TIMEOUT_DURATION_PATTERN = re.compile(r"^\d+(?:\.\d+)?[smhd]?$")
 _GGUF_REMOTE_URL_SCHEMES = ("http://", "https://", "ftp://")
@@ -2164,54 +2164,71 @@ class GgufScanner(BaseScanner):
         if quote is None:
             yield from pattern.finditer(value, segment_start, end)
 
+    @staticmethod
+    def _iter_top_level_statement_delimiters(value: str, start: int, end: int) -> Iterator[tuple[str, int]]:
+        quote: str | None = None
+        escaped = False
+        depth = 0
+        cursor = start + 2
+        content_end = max(cursor, end - 2)
+        while cursor < content_end:
+            character = value[cursor]
+            if quote is not None:
+                if escaped:
+                    escaped = False
+                elif character == "\\":
+                    escaped = True
+                elif character == quote:
+                    quote = None
+                cursor += 1
+                continue
+
+            if character in {"'", '"'}:
+                quote = character
+            elif character in "([{":
+                depth += 1
+            elif character in ")]}":
+                depth = max(0, depth - 1)
+            elif depth == 0 and character in {",", "|"}:
+                yield character, cursor
+            elif depth == 0 and character == "=":
+                previous = value[cursor - 1] if cursor > start else ""
+                following = value[cursor + 1] if cursor + 1 < content_end else ""
+                if previous not in "=!<>" and following != "=":
+                    yield character, cursor
+            cursor += 1
+
+    @classmethod
+    def _iter_unquoted_named_targets(cls, value: str, start: int, end: int) -> Iterator[str]:
+        for match in cls._iter_unquoted_template_matches(value, start, end, _GGUF_JINJA_NAMED_ROOT_PATTERN):
+            previous = match.start() - 1
+            while previous >= start and value[previous].isspace():
+                previous -= 1
+            if previous < start or value[previous] != ".":
+                yield match.group("root")
+
     @classmethod
     def _oversized_chat_template_security_evidence(cls, value: str) -> list[dict[str, str]]:
-        named_global_roots: set[str] = set()
-        statement_named_roots: set[str] = set()
+        shadowed_named_roots: set[str] = set()
+        scope_stack: list[tuple[str, set[str]]] = []
+        scope_tracking_exhausted = False
+        has_unshadowed_named_global_access = False
         matched_patterns: set[str] = set()
         for start, end, is_statement in Jinja2TemplateScanner.iter_executable_template_ranges(value):
+            tag_name: str | None = None
             if is_statement:
                 tag_name = Jinja2TemplateScanner._jinja_block_tag_name_at(value, start, end)
-                if tag_name == "set":
-                    assignment = next(
-                        cls._iter_unquoted_template_matches(value, start, end, _GGUF_JINJA_ASSIGNMENT_OPERATOR_PATTERN),
-                        None,
-                    )
-                    target_end = assignment.start() if assignment is not None else end
-                    statement_named_roots.update(
-                        match.group("root")
-                        for match in cls._iter_unquoted_template_matches(
-                            value,
-                            start,
-                            target_end,
-                            _GGUF_JINJA_NAMED_ROOT_PATTERN,
-                        )
-                    )
-                elif tag_name == "with":
-                    statement_named_roots.update(
-                        match.group("root")
-                        for match in cls._iter_unquoted_template_matches(
-                            value,
-                            start,
-                            end,
-                            _GGUF_JINJA_NAMED_WITH_TARGET_PATTERN,
-                        )
-                    )
-                elif tag_name == "for":
-                    in_match = next(
-                        cls._iter_unquoted_template_matches(value, start, end, _GGUF_JINJA_FOR_IN_PATTERN),
-                        None,
-                    )
-                    if in_match is not None:
-                        statement_named_roots.update(
-                            match.group("root")
-                            for match in cls._iter_unquoted_template_matches(
-                                value,
-                                start,
-                                in_match.start(),
-                                _GGUF_JINJA_NAMED_ROOT_PATTERN,
-                            )
-                        )
+                if tag_name in {"else", "elif"} and scope_stack:
+                    shadowed_named_roots = scope_stack[-1][1].copy()
+                elif tag_name is not None and tag_name.startswith("end"):
+                    expected_opener = tag_name[3:]
+                    if scope_stack and scope_stack[-1][0] == expected_opener:
+                        shadowed_named_roots = scope_stack.pop()[1]
+                    elif expected_opener in _GGUF_JINJA_SCOPE_OPENERS:
+                        scope_stack.clear()
+                        shadowed_named_roots.clear()
+                        scope_tracking_exhausted = True
+
             for match in cls._iter_unquoted_template_matches(
                 value,
                 start,
@@ -2223,8 +2240,44 @@ class GgufScanner(BaseScanner):
                 previous = match.start() - 1
                 while previous >= start and value[previous].isspace():
                     previous -= 1
-                if previous < start or value[previous] not in ".(":
-                    named_global_roots.add(match.group("root"))
+                if (previous < start or value[previous] not in ".(") and (
+                    scope_tracking_exhausted or match.group("root") not in shadowed_named_roots
+                ):
+                    has_unshadowed_named_global_access = True
+
+            if is_statement and tag_name is not None and not scope_tracking_exhausted:
+                if tag_name in _GGUF_JINJA_SCOPE_OPENERS:
+                    if len(scope_stack) >= _GGUF_JINJA_MAX_TRACKED_SCOPE_DEPTH:
+                        scope_stack.clear()
+                        shadowed_named_roots.clear()
+                        scope_tracking_exhausted = True
+                    else:
+                        scope_stack.append((tag_name, shadowed_named_roots.copy()))
+
+                if tag_name == "set":
+                    target_end = next(
+                        (
+                            cursor
+                            for delimiter, cursor in cls._iter_top_level_statement_delimiters(value, start, end)
+                            if delimiter in {"=", "|"}
+                        ),
+                        end,
+                    )
+                    shadowed_named_roots.update(cls._iter_unquoted_named_targets(value, start, target_end))
+                elif tag_name == "with":
+                    target_start = start
+                    for delimiter, cursor in cls._iter_top_level_statement_delimiters(value, start, end):
+                        if delimiter == ",":
+                            target_start = cursor + 1
+                        elif delimiter == "=":
+                            shadowed_named_roots.update(cls._iter_unquoted_named_targets(value, target_start, cursor))
+                elif tag_name == "for":
+                    in_match = next(
+                        cls._iter_unquoted_template_matches(value, start, end, _GGUF_JINJA_FOR_IN_PATTERN),
+                        None,
+                    )
+                    if in_match is not None:
+                        shadowed_named_roots.update(cls._iter_unquoted_named_targets(value, start, in_match.start()))
 
             for pattern_type, pattern in _GGUF_CHAT_TEMPLATE_METADATA_PATTERNS:
                 if pattern.pattern == r"__globals__(?:\s*\))*\s*\[":
@@ -2234,7 +2287,7 @@ class GgufScanner(BaseScanner):
                 if matched:
                     matched_patterns.add(pattern_type)
 
-        if named_global_roots - statement_named_roots:
+        if has_unshadowed_named_global_access:
             return [{"evidence_type": "template_injection", "pattern": "jinja2_named_global_access"}]
         for pattern_type, _pattern in _GGUF_CHAT_TEMPLATE_METADATA_PATTERNS:
             if pattern_type in matched_patterns:

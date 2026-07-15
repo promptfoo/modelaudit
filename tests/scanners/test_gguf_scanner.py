@@ -990,6 +990,42 @@ def test_gguf_oversized_chat_template_keeps_root_after_statement_read(statement:
     assert evidence == [{"evidence_type": "template_injection", "pattern": "jinja2_named_global_access"}]
 
 
+@pytest.mark.parametrize(
+    "template",
+    [
+        "{% for lipsum in safe_values %}safe{% endfor %}{{ lipsum.__globals__.get('os') }}",
+        "{% with lipsum = {} %}safe{% endwith %}{{ lipsum.__globals__.get('os') }}",
+        "{{ lipsum.__globals__.get('os') }}{% set lipsum = {} %}",
+        "{% if false %}{% set lipsum = {} %}{% endif %}{{ lipsum.__globals__.get('os') }}",
+        "{% if true %}{% set lipsum = {} %}{% elif false %}{{ lipsum.__globals__.get('os') }}{% endif %}",
+        "{% block content %}{% set lipsum = {} %}{% endblock %}{{ lipsum.__globals__.get('os') }}",
+        "{% for lipsum in [] %}safe{% else %}{{ lipsum.__globals__.get('os') }}{% endfor %}",
+        "{% set lipsum = lipsum.__globals__.get('os') %}",
+        "{% with lipsum = lipsum.__globals__.get('os') %}safe{% endwith %}",
+        "{% for lipsum in [lipsum.__globals__.get('os')] %}safe{% endfor %}",
+        "{% set ns = namespace() %}{% set ns.lipsum = {} %}{{ lipsum.__globals__.get('os') }}",
+        "{% set ns = namespace() %}{% set ns . lipsum = {} %}{{ lipsum.__globals__.get('os') }}",
+        "{% set value|default(lipsum) %}safe{% endset %}{{ lipsum.__globals__.get('os') }}",
+        "{% with value = dict(a=1, lipsum={}) %}{{ lipsum.__globals__.get('os') }}{% endwith %}",
+        "{% with value = [dict(lipsum={})] %}{{ lipsum.__globals__.get('os') }}{% endwith %}",
+    ],
+)
+def test_gguf_oversized_chat_template_does_not_let_scoped_shadow_hide_global_access(template: str) -> None:
+    evidence = GgufScanner._oversized_chat_template_security_evidence(template)
+
+    assert evidence == [{"evidence_type": "template_injection", "pattern": "jinja2_named_global_access"}]
+
+
+def test_gguf_oversized_chat_template_keeps_detection_after_scope_tracking_limit() -> None:
+    template = (
+        ("{% if true %}" * 257) + "{% set lipsum = {} %}{{ lipsum.__globals__.get('os') }}" + ("{% endif %}" * 257)
+    )
+
+    evidence = GgufScanner._oversized_chat_template_security_evidence(template)
+
+    assert evidence == [{"evidence_type": "template_injection", "pattern": "jinja2_named_global_access"}]
+
+
 def test_gguf_oversized_chat_template_ignores_large_quoted_named_gadget() -> None:
     template = '{{ "' + (" " * 50001) + 'lipsum.__globals__.os" }}'
 
