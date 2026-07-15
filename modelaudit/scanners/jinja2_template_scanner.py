@@ -101,6 +101,11 @@ _DETECTION_MESSAGE_LABELS = {
 }
 _MAX_REPORTED_TEMPLATE_LOCATIONS = 20
 _QUOTE_SENSITIVE_GLOBAL_SUBSCRIPT_PATTERN = r"__globals__(?:\s*\))*\s*(?:\[|\.\s*get\s*\()"
+_FALLBACK_NAMED_BINDING_PATTERN = re.compile(
+    r"{%\s*(?:(?:set|with)\s+[^=]{0,1024}\b(?:lipsum|get_flashed_messages)\b\s*="
+    r"|for\s+[^%]{0,1024}\b(?:lipsum|get_flashed_messages)\b[^%]{0,1024}\bin\b"
+    r"|(?:macro|call)\s+[^%]{0,1024}\b(?:lipsum|get_flashed_messages)\b)",
+)
 _RAW_PARSE_FALLBACK_CONTEXT_BYTES = 1024
 _RAW_PARSE_FALLBACK_MAX_WINDOWS = 8
 _RAW_PARSE_FALLBACK_READ_BYTES = 256 * 1024
@@ -1641,15 +1646,27 @@ class Jinja2TemplateScanner(BaseScanner):
                     return left_dangerous or right_dangerous
                 selected = node.right if truth == isinstance(node, jinja2.nodes.And) else node.left
                 return is_dangerous_name(selected, shadowed, dangerous_aliases)
-            sequence_types = (jinja2.nodes.List, jinja2.nodes.Tuple)
-            if (
-                isinstance(node, jinja2.nodes.Getitem)
-                and isinstance(node.node, sequence_types)
-                and isinstance(node.arg, jinja2.nodes.Const)
-                and type(node.arg.value) is int
-                and -len(node.node.items) <= node.arg.value < len(node.node.items)
+            if isinstance(node, jinja2.nodes.Getitem) and isinstance(
+                node.node,
+                (jinja2.nodes.List, jinja2.nodes.Tuple, jinja2.nodes.Dict),
             ):
-                return is_dangerous_name(node.node.items[node.arg.value], shadowed, dangerous_aliases)
+                if isinstance(node.node, jinja2.nodes.Dict):
+                    values = [
+                        item.value
+                        for item in node.node.items
+                        if not isinstance(node.arg, jinja2.nodes.Const)
+                        or not isinstance(item.key, jinja2.nodes.Const)
+                        or item.key.value == node.arg.value
+                    ]
+                elif isinstance(node.arg, jinja2.nodes.Const) and type(node.arg.value) is int:
+                    values = (
+                        [node.node.items[node.arg.value]]
+                        if -len(node.node.items) <= node.arg.value < len(node.node.items)
+                        else []
+                    )
+                else:
+                    values = node.node.items
+                return any(is_dangerous_name(value, shadowed, dangerous_aliases) for value in values)
             return False
 
         def direct_named_root(node: Any, shadowed: set[str], dangerous_aliases: set[str]) -> str | None:
@@ -2010,7 +2027,10 @@ class Jinja2TemplateScanner(BaseScanner):
     @staticmethod
     def conservative_named_global_access(executable_spans: list[str]) -> list[str]:
         """Detect direct named gadgets only when fallback scope is unambiguous."""
-        if any("{%" in mask_quoted_jinja_text(span) for span in executable_spans):
+        if any(
+            _FALLBACK_NAMED_BINDING_PATTERN.search(mask_quoted_jinja_text(span)) is not None
+            for span in executable_spans
+        ):
             return []
         return [root for span in executable_spans for root in find_unquoted_jinja_named_global_access(span)]
 

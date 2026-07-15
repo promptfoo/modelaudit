@@ -368,6 +368,7 @@ class TestJinja2TemplateScannerPatternCategories:
             "{% import lipsum.__globals__.get('os') as helper %}",
             "{% from lipsum.__globals__.get('os') import helper %}",
             "{% set x | replace('a', lipsum.__globals__.os) %}a{% endset %}",
+            "{% set saved = {'pwn': lipsum}[key] %}{{ saved.__globals__.os['system']('id') }}",
         ],
     )
     def test_named_global_access_detects_ast_dynamic_rebindings(
@@ -466,6 +467,10 @@ class TestJinja2TemplateScannerPatternCategories:
         scoped_file.write_text("{% set lipsum = {'__globals__': {'os': 'docs'}} %}{{ lipsum.__globals__.os }}")
         statement_subscript_file = tmp_path / "statement-subscript.jinja"
         statement_subscript_file.write_text("{% if true %}{{ lipsum.__globals__['os'] }}{% endif %}")
+        unrelated_block_file = tmp_path / "unrelated-block.jinja"
+        unrelated_block_file.write_text(
+            "{% for message in messages %}{{ lipsum.__globals__.os['system']('id') }}{% endfor %}",
+        )
 
         direct_result = Jinja2TemplateScanner().scan(str(direct_file))
         quoted_result = Jinja2TemplateScanner().scan(str(quoted_file))
@@ -477,6 +482,7 @@ class TestJinja2TemplateScannerPatternCategories:
         nested_receiver_result = Jinja2TemplateScanner().scan(str(nested_receiver_file))
         scoped_result = Jinja2TemplateScanner().scan(str(scoped_file))
         statement_subscript_result = Jinja2TemplateScanner().scan(str(statement_subscript_file))
+        unrelated_block_result = Jinja2TemplateScanner().scan(str(unrelated_block_file))
 
         assert any(
             check.status == CheckStatus.FAILED
@@ -522,7 +528,13 @@ class TestJinja2TemplateScannerPatternCategories:
             and check.details.get("pattern_type") == "global_access"
         ]
         assert len(statement_global_checks) == 1
-        assert statement_global_checks[0].details.get("match_text") == "__globals__["
+        assert statement_global_checks[0].details.get("match_text") == "lipsum.__globals__"
+        assert any(
+            check.status == CheckStatus.FAILED
+            and check.details
+            and check.details.get("pattern_type") == "global_access"
+            for check in unrelated_block_result.checks
+        )
 
     def test_named_global_access_supports_jinja_without_namespace_nodes(
         self,

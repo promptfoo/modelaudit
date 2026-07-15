@@ -1052,6 +1052,11 @@ def test_gguf_oversized_chat_template_bounds_malformed_tag_name() -> None:
             "jinja2_named_global_access",
         ),
         ("{% set saved = lipsum|default({}) %}{{ saved.__globals__.os }}", "jinja2_named_global_access"),
+        ("{% set saved = (lipsum) %}{{ saved.__globals__.os.__dict__.system('id') }}", "jinja2_named_global_access"),
+        (
+            "{% if true %}{% set saved = lipsum %}{% endif %}{{ saved.__globals__.os['system']('id') }}",
+            "jinja2_named_global_access",
+        ),
         ("{{ (lipsum if condition else {}).__globals__.os }}", "jinja2_named_global_access"),
         ("Don't ignore {{ lipsum.__globals__.os }}", "jinja2_named_global_access"),
         ("{{ lipsum.__globals__ ['os'] }}", "jinja2_named_global_access"),

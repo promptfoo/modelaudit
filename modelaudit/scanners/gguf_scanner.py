@@ -231,7 +231,8 @@ _GGUF_JINJA_COMPOSITE_GLOBAL_RECEIVER_PATTERN = re.compile(
 )
 _GGUF_JINJA_SIMPLE_SET_ALIAS_PATTERN = re.compile(
     r"\bset\s+(?P<target>[A-Za-z_]\w*(?:\s*\.\s*[A-Za-z_]\w*)?)\s*=\s*"
-    r"(?P<source>[A-Za-z_]\w*(?:\s*\.\s*[A-Za-z_]\w*)?)"
+    r"(?P<open>(?:\(\s*)*)(?P<source>[A-Za-z_]\w*(?:\s*\.\s*[A-Za-z_]\w*)?)"
+    r"(?P<close>(?:\s*\))*)"
     r"(?:\s*\|\s*default\s*\([^()]*\))?\s*-?%}",
 )
 _GGUF_JINJA_FOR_IN_PATTERN = re.compile(r"\bin\b")
@@ -2235,11 +2236,20 @@ class GgufScanner(BaseScanner):
                 tag_name = Jinja2TemplateScanner._jinja_block_tag_name_at(value, start, end)
                 if tag_name in {"else", "elif"} and scope_stack:
                     shadowed_named_roots = scope_stack[-1][1].copy()
-                    dangerous_aliases = scope_stack[-1][2].copy()
+                    if scope_stack[-1][0] == "if":
+                        dangerous_aliases.update(scope_stack[-1][2])
+                    else:
+                        dangerous_aliases = scope_stack[-1][2].copy()
                 elif tag_name is not None and tag_name.startswith("end"):
                     expected_opener = tag_name[3:]
                     if scope_stack and scope_stack[-1][0] == expected_opener:
-                        _opener, shadowed_named_roots, dangerous_aliases = scope_stack.pop()
+                        opener, initial_shadowed, initial_aliases = scope_stack.pop()
+                        if opener == "if":
+                            shadowed_named_roots.intersection_update(initial_shadowed)
+                            dangerous_aliases.update(initial_aliases)
+                        else:
+                            shadowed_named_roots = initial_shadowed
+                            dangerous_aliases = initial_aliases
                     elif expected_opener in _GGUF_JINJA_SCOPE_OPENERS:
                         scope_stack.clear()
                         shadowed_named_roots.clear()
@@ -2285,7 +2295,9 @@ class GgufScanner(BaseScanner):
                         cls._iter_unquoted_template_matches(value, start, end, _GGUF_JINJA_SIMPLE_SET_ALIAS_PATTERN),
                         None,
                     )
-                    if alias_match is not None:
+                    if alias_match is not None and alias_match.group("open").count("(") == alias_match.group(
+                        "close"
+                    ).count(")"):
                         target = "".join(alias_match.group("target").split())
                         source = "".join(alias_match.group("source").split())
                         if source in dangerous_aliases or source in _GGUF_JINJA_NAMED_ROOTS - shadowed_named_roots:
