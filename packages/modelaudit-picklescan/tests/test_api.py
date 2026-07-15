@@ -39,7 +39,7 @@ from importlib.machinery import (
 from importlib.util import cache_from_source
 from pathlib import Path, PurePosixPath
 from types import CodeType, ModuleType
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import pytest
 
@@ -4763,7 +4763,7 @@ def test_scan_file_marks_hidden_pytorch_zip_probe_failure_inconclusive(
     def fail_hidden_probe_open(
         archive: zipfile.ZipFile,
         name: str | zipfile.ZipInfo,
-        mode: str = "r",
+        mode: Literal["r", "w"] = "r",
         pwd: bytes | None = None,
         *,
         force_zip64: bool = False,
@@ -4871,7 +4871,7 @@ def test_scan_file_returns_error_report_for_pytorch_zip_member_access_failure(
     def fail_member_open(
         archive: zipfile.ZipFile,
         name: str | zipfile.ZipInfo,
-        mode: str = "r",
+        mode: Literal["r", "w"] = "r",
         pwd: bytes | None = None,
         *,
         force_zip64: bool = False,
