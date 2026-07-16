@@ -409,6 +409,8 @@ class TestJinja2TemplateScannerPatternCategories:
         template: str,
         expected_detection: bool,
     ) -> None:
+        if not jinja2_template_scanner.HAS_JINJA2_SANDBOX:
+            pytest.skip("Jinja2 AST unavailable")
         template_file = tmp_path / "filtered-loop.jinja"
         template_file.write_text(template)
 

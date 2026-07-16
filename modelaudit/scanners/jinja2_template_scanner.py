@@ -106,6 +106,20 @@ _FALLBACK_NAMED_BINDING_PATTERN = re.compile(
     r"|for\s+[^%]{0,1024}\b(?:lipsum|get_flashed_messages)\b[^%]{0,1024}\bin\b"
     r"|(?:macro|call)\s+[^%]{0,1024}\b(?:lipsum|get_flashed_messages)\b)",
 )
+_FALLBACK_GLOBAL_RECEIVER_PATTERN = re.compile(
+    r"(?<![\w.(])(?P<open>(?:\(\s*)*)(?:(?:none|false|0)\s+or\s+)?"
+    r"(?P<root>[A-Za-z_]\w*(?:\s*\.\s*[A-Za-z_]\w*)?)(?P<close>(?:\s*\))*)\s*\.\s*__globals__\b",
+)
+_FALLBACK_COMPOSITE_GLOBAL_RECEIVER_PATTERN = re.compile(
+    r"(?<![\w.])(?P<open>\()[^()]{0,256}\b(?P<root>lipsum|get_flashed_messages)\b"
+    r"[^()]{0,256}(?P<close>\))\s*\.\s*__globals__\b",
+)
+_FALLBACK_SIMPLE_SET_ALIAS_PATTERN = re.compile(
+    r"\bset\s+(?P<target>[A-Za-z_]\w*(?:\s*\.\s*[A-Za-z_]\w*)?)\s*=\s*"
+    r"(?P<open>(?:\(\s*)*)(?P<source>[A-Za-z_]\w*(?:\s*\.\s*[A-Za-z_]\w*)?)"
+    r"(?P<close>(?:\s*\))*)"
+    r"(?:\s*\|\s*default\s*\([^()]*\))?\s*-?%}",
+)
 _RAW_PARSE_FALLBACK_CONTEXT_BYTES = 1024
 _RAW_PARSE_FALLBACK_MAX_WINDOWS = 8
 _RAW_PARSE_FALLBACK_READ_BYTES = 256 * 1024
@@ -2026,13 +2040,61 @@ class Jinja2TemplateScanner(BaseScanner):
 
     @staticmethod
     def conservative_named_global_access(executable_spans: list[str]) -> list[str]:
-        """Detect direct named gadgets only when fallback scope is unambiguous."""
+        """Detect bounded named-global gadgets when fallback scope is unambiguous."""
         if any(
             _FALLBACK_NAMED_BINDING_PATTERN.search(mask_quoted_jinja_text(span)) is not None
             for span in executable_spans
         ):
             return []
-        return [root for span in executable_spans for root in find_unquoted_jinja_named_global_access(span)]
+
+        named_roots = {"lipsum", "get_flashed_messages"}
+        dangerous_aliases: set[str] = set()
+        matches: list[str] = []
+        for span in executable_spans:
+            unquoted_span = mask_quoted_jinja_text(span)
+            alias_match = _FALLBACK_SIMPLE_SET_ALIAS_PATTERN.search(unquoted_span)
+            if alias_match is not None and alias_match.group("open").count("(") == alias_match.group("close").count(
+                ")"
+            ):
+                target = "".join(alias_match.group("target").split())
+                source = "".join(alias_match.group("source").split())
+                if source in named_roots or source in dangerous_aliases:
+                    dangerous_aliases.add(target)
+                else:
+                    dangerous_aliases.discard(target)
+
+            matches.extend(find_unquoted_jinja_named_global_access(span))
+            for access_pattern in (
+                _FALLBACK_GLOBAL_RECEIVER_PATTERN,
+                _FALLBACK_COMPOSITE_GLOBAL_RECEIVER_PATTERN,
+            ):
+                for match in access_pattern.finditer(unquoted_span):
+                    if match.group("open").count("(") != match.group("close").count(")"):
+                        continue
+                    previous = match.start() - 1
+                    while previous >= 0 and unquoted_span[previous].isspace():
+                        previous -= 1
+                    receiver = "".join(match.group("root").split())
+                    if previous >= 0 and unquoted_span[previous] in ".(":
+                        continue
+                    if receiver not in dangerous_aliases and access_pattern is _FALLBACK_GLOBAL_RECEIVER_PATTERN:
+                        continue
+                    root_previous = match.start("root") - 1
+                    while root_previous >= 0 and unquoted_span[root_previous].isspace():
+                        root_previous -= 1
+                    if (
+                        access_pattern is _FALLBACK_COMPOSITE_GLOBAL_RECEIVER_PATTERN
+                        and root_previous >= 0
+                        and unquoted_span[root_previous] == "."
+                    ):
+                        continue
+                    if access_pattern is _FALLBACK_COMPOSITE_GLOBAL_RECEIVER_PATTERN and re.match(
+                        r"(?:\s*\))*\s*(?:\[|\.\s*get\s*\()",
+                        unquoted_span[match.end() :],
+                    ):
+                        continue
+                    matches.append(receiver)
+        return matches
 
     @staticmethod
     def _fallback_named_global_access(
