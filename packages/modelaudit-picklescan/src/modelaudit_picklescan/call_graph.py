@@ -1717,6 +1717,7 @@ _RCE_SINK_EXACT = frozenset(
         "subprocess.check_call",
         "subprocess.check_output",
         "subprocess.run",
+        "typing._eval_type",
         "yaml.load",
         "yaml.unsafe_load",
     }

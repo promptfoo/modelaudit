@@ -15,6 +15,7 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- preserve malicious annotation-evaluation verdicts on Python 3.14 by treating typing._eval_type as an execution sink
 - resolve reviewed runtime `hasattr(typing, ...)` guards before flattening module scope so current `typing_extensions.get_type_hints` remains connected to its evaluation sinks
 - restore Windows call-graph detection by reconciling descriptor and path stats with a cross-view identity that omits `st_ctime` (Windows reports it differently across stat methods); previously every stdlib callable source read failed closed on Windows, collapsing call-graph verdicts to inconclusive
 - preserve POSIX `st_ctime` in call-graph source-read identity checks so same-size, same-mtime inode-reuse swaps still fail closed

@@ -3251,7 +3251,7 @@ def test_call_graph_models_version_gated_typing_extensions_definitions() -> None
         assert "typing.get_type_hints" in calls
     assert path is not None
     assert path[0] in {function_name, "typing.get_type_hints"}
-    assert path[-1] in {"builtins.compile", "builtins.eval"}
+    assert path[-1] in {"builtins.compile", "builtins.eval", "typing._eval_type"}
 
 
 def test_call_graph_models_required_arg_imports_when_pickle_supplies_args() -> None:
@@ -10152,11 +10152,14 @@ def test_scan_bytes_blocks_typing_extensions_get_type_hints_annotation_rce(tmp_p
     report = scan_bytes(payload, source="typing-extensions-get-type-hints-rce.pkl")
 
     assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_call_graph_finding_with_sink_prefix(
-        report,
-        "typing_extensions",
-        "get_type_hints",
-        "builtins.",
+    assert any(
+        _has_critical_call_graph_finding_with_sink_prefix(
+            report,
+            "typing_extensions",
+            "get_type_hints",
+            sink_prefix,
+        )
+        for sink_prefix in ("builtins.", "typing._eval_type")
     )
 
     assert not marker.exists()
