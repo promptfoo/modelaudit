@@ -219,21 +219,31 @@ _GGUF_CHAT_TEMPLATE_METADATA_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] =
     for pattern_type in _GGUF_CHAT_TEMPLATE_METADATA_PATTERN_TYPES
     for pattern in JINJA2_SSTI_PATTERNS.get(pattern_type, [])
 )
-_GGUF_JINJA_NAMED_ROOT_PATTERN = re.compile(r"(?<![\w.])(?P<root>lipsum|get_flashed_messages)\b")
-_GGUF_JINJA_NAMED_ROOTS = frozenset({"lipsum", "get_flashed_messages"})
+_GGUF_JINJA_NAMED_ROOT_PATTERN = re.compile(r"(?<![\w.])(?P<root>lipsum|get_flashed_messages|url_for)\b")
+_GGUF_JINJA_NAMED_ROOTS = frozenset({"lipsum", "get_flashed_messages", "url_for"})
 _GGUF_JINJA_GLOBAL_RECEIVER_PATTERN = re.compile(
     r"(?<![\w.(])(?P<open>(?:\(\s*)*)(?:(?:none|false|0)\s+or\s+)?"
     r"(?P<root>[A-Za-z_]\w*(?:\s*\.\s*[A-Za-z_]\w*)?)(?P<close>(?:\s*\))*)\s*\.\s*__globals__\b",
 )
 _GGUF_JINJA_COMPOSITE_GLOBAL_RECEIVER_PATTERN = re.compile(
-    r"(?<![\w.])(?P<open>\()[^()]{0,256}\b(?P<root>lipsum|get_flashed_messages)\b"
+    r"(?<![\w.])(?P<open>\()[^()]{0,256}\b(?P<root>lipsum|get_flashed_messages|url_for)\b"
     r"[^()]{0,256}(?P<close>\))\s*\.\s*__globals__\b",
+)
+_GGUF_JINJA_INDEXED_GLOBAL_RECEIVER_PATTERN = re.compile(
+    r"(?<![\w.])(?P<open>\[)[^\[\]()]{0,256}\b(?P<root>lipsum|get_flashed_messages|url_for)\b"
+    r"[^\[\]()]{0,256}(?P<close>\])\s*\[[^\[\]()]{0,256}\]\s*\.\s*__globals__\b",
 )
 _GGUF_JINJA_SIMPLE_SET_ALIAS_PATTERN = re.compile(
     r"\bset\s+(?P<target>[A-Za-z_]\w*(?:\s*\.\s*[A-Za-z_]\w*)?)\s*=\s*"
     r"(?P<open>(?:\(\s*)*)(?P<source>[A-Za-z_]\w*(?:\s*\.\s*[A-Za-z_]\w*)?)"
     r"(?P<close>(?:\s*\))*)"
     r"(?:\s*\|\s*default\s*\([^()]*\))?\s*-?%}",
+)
+_GGUF_JINJA_SIMPLE_WITH_ALIAS_PATTERN = re.compile(
+    r"(?:\bwith\s+|,\s*)(?P<target>[A-Za-z_]\w*(?:\s*\.\s*[A-Za-z_]\w*)?)\s*=\s*"
+    r"(?P<open>(?:\(\s*)*)(?P<source>[A-Za-z_]\w*(?:\s*\.\s*[A-Za-z_]\w*)?)"
+    r"(?P<close>(?:\s*\))*)"
+    r"(?:\s*\|\s*default\s*\([^()]*\))?\s*(?=,|-?%})",
 )
 _GGUF_JINJA_FOR_IN_PATTERN = re.compile(r"\bin\b")
 _GGUF_JINJA_SCOPE_OPENERS = frozenset({"if", "for", "with", "block", "macro", "call", "filter", "autoescape"})
@@ -2256,7 +2266,11 @@ class GgufScanner(BaseScanner):
                         dangerous_aliases.clear()
                         scope_tracking_exhausted = True
 
-            for access_pattern in (_GGUF_JINJA_GLOBAL_RECEIVER_PATTERN, _GGUF_JINJA_COMPOSITE_GLOBAL_RECEIVER_PATTERN):
+            for access_pattern in (
+                _GGUF_JINJA_GLOBAL_RECEIVER_PATTERN,
+                _GGUF_JINJA_COMPOSITE_GLOBAL_RECEIVER_PATTERN,
+                _GGUF_JINJA_INDEXED_GLOBAL_RECEIVER_PATTERN,
+            ):
                 for match in cls._iter_unquoted_template_matches(value, start, end, access_pattern):
                     if match.group("open").count("(") != match.group("close").count(")"):
                         continue
@@ -2264,6 +2278,16 @@ class GgufScanner(BaseScanner):
                     while previous >= start and value[previous].isspace():
                         previous -= 1
                     receiver_root = "".join(match.group("root").split())
+                    root_previous = match.start("root") - 1
+                    while root_previous >= start and value[root_previous].isspace():
+                        root_previous -= 1
+                    if (
+                        access_pattern
+                        in {_GGUF_JINJA_COMPOSITE_GLOBAL_RECEIVER_PATTERN, _GGUF_JINJA_INDEXED_GLOBAL_RECEIVER_PATTERN}
+                        and root_previous >= start
+                        and value[root_previous] == "."
+                    ):
+                        continue
                     if (previous < start or value[previous] not in ".(") and (
                         scope_tracking_exhausted
                         or receiver_root in dangerous_aliases
@@ -2282,6 +2306,8 @@ class GgufScanner(BaseScanner):
                         scope_stack.append((tag_name, shadowed_named_roots.copy(), dangerous_aliases.copy()))
 
                 if tag_name == "set":
+                    source_shadowed = shadowed_named_roots.copy()
+                    source_aliases = dangerous_aliases.copy()
                     target_end = next(
                         (
                             cursor
@@ -2300,7 +2326,7 @@ class GgufScanner(BaseScanner):
                     ).count(")"):
                         target = "".join(alias_match.group("target").split())
                         source = "".join(alias_match.group("source").split())
-                        if source in dangerous_aliases or source in _GGUF_JINJA_NAMED_ROOTS - shadowed_named_roots:
+                        if source in source_aliases or source in _GGUF_JINJA_NAMED_ROOTS - source_shadowed:
                             dangerous_aliases.add(target)
                             shadowed_named_roots.discard(target)
                         else:
@@ -2308,12 +2334,32 @@ class GgufScanner(BaseScanner):
                         if len(dangerous_aliases) > _GGUF_JINJA_MAX_TRACKED_SCOPE_DEPTH:
                             scope_tracking_exhausted = True
                 elif tag_name == "with":
+                    source_shadowed = shadowed_named_roots.copy()
+                    source_aliases = dangerous_aliases.copy()
                     target_start = start
                     for delimiter, cursor in cls._iter_top_level_statement_delimiters(value, start, end):
                         if delimiter == ",":
                             target_start = cursor + 1
                         elif delimiter == "=":
                             shadowed_named_roots.update(cls._iter_unquoted_named_targets(value, target_start, cursor))
+                    for alias_match in cls._iter_unquoted_template_matches(
+                        value,
+                        start,
+                        end,
+                        _GGUF_JINJA_SIMPLE_WITH_ALIAS_PATTERN,
+                    ):
+                        if alias_match.group("open").count("(") != alias_match.group("close").count(")"):
+                            continue
+                        target = "".join(alias_match.group("target").split())
+                        source = "".join(alias_match.group("source").split())
+                        if source in source_aliases or source in _GGUF_JINJA_NAMED_ROOTS - source_shadowed:
+                            dangerous_aliases.add(target)
+                            shadowed_named_roots.discard(target)
+                        else:
+                            dangerous_aliases.discard(target)
+                        if len(dangerous_aliases) > _GGUF_JINJA_MAX_TRACKED_SCOPE_DEPTH:
+                            scope_tracking_exhausted = True
+                            break
                 elif tag_name == "for":
                     in_match = next(
                         cls._iter_unquoted_template_matches(value, start, end, _GGUF_JINJA_FOR_IN_PATTERN),

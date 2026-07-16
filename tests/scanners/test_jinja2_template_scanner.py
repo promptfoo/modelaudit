@@ -220,6 +220,7 @@ class TestJinja2TemplateScannerPatternCategories:
             ("lipsum-spaced", "{{ lipsum . __globals__ . os }}"),
             ("flashes", "{{ get_flashed_messages.__globals__.os }}"),
             ("flashes-spaced", "{{ get_flashed_messages. __globals__ .os }}"),
+            ("url-for", "{{ url_for.__globals__.os.popen('id') }}"),
             ("lipsum-subscript", "{{ lipsum.__globals__['os'] }}"),
             ("lipsum-spaced-subscript", "{{ lipsum.__globals__ ['os'] }}"),
             ("lipsum-parenthesized-subscript", "{{ (lipsum.__globals__)['os'] }}"),
@@ -237,6 +238,7 @@ class TestJinja2TemplateScannerPatternCategories:
                 "{% set ns = namespace() %}{% set ns.saved = lipsum %}{{ ns.saved.__globals__.os }}",
             ),
             ("filtered-alias-global-dot", "{% set saved = lipsum|default({}) %}{{ saved.__globals__.os }}"),
+            ("default-fallback-global-dot", "{{ (missing|default(lipsum)).__globals__.os }}"),
             ("aliased-global-subscript", "{% set saved = lipsum %}{{ saved.__globals__['os'] }}"),
             ("conditional-global-get", "{{ (lipsum if condition else {}).__globals__.get('os') }}"),
             ("conditional-global-dot", "{{ (lipsum if condition else {}).__globals__.os }}"),
@@ -259,6 +261,10 @@ class TestJinja2TemplateScannerPatternCategories:
             (
                 "mapped-loop-global-subscript",
                 "{% for lipsum in [lipsum]|map('default', {}) %}{{ lipsum.__globals__['os'] }}{% endfor %}",
+            ),
+            (
+                "filtered-loop-alias-global-dot",
+                "{% for saved in [lipsum]|list %}{{ saved.__globals__.os }}{% endfor %}",
             ),
         ],
     )
@@ -314,6 +320,7 @@ class TestJinja2TemplateScannerPatternCategories:
             "{% macro lipsum() %}{{ lipsum.__globals__.os }}{% endmacro %}",
             "{{ [lipsum, {}][1].__globals__.os }}",
             "{{ {'danger': lipsum, 'safe': {}}['safe'].__globals__.os }}",
+            "{{ ({}|default(lipsum)).__globals__.os }}",
         ],
     )
     def test_named_global_access_ignores_ast_local_bindings(

@@ -102,23 +102,33 @@ _DETECTION_MESSAGE_LABELS = {
 _MAX_REPORTED_TEMPLATE_LOCATIONS = 20
 _QUOTE_SENSITIVE_GLOBAL_SUBSCRIPT_PATTERN = r"__globals__(?:\s*\))*\s*(?:\[|\.\s*get\s*\()"
 _FALLBACK_NAMED_BINDING_PATTERN = re.compile(
-    r"{%\s*(?:(?:set|with)\s+[^=]{0,1024}\b(?:lipsum|get_flashed_messages)\b\s*="
-    r"|for\s+[^%]{0,1024}\b(?:lipsum|get_flashed_messages)\b[^%]{0,1024}\bin\b"
-    r"|(?:macro|call)\s+[^%]{0,1024}\b(?:lipsum|get_flashed_messages)\b)",
+    r"{%\s*(?:(?:set|with)\s+[^=]{0,1024}\b(?:lipsum|get_flashed_messages|url_for)\b\s*="
+    r"|for\s+[^%]{0,1024}\b(?:lipsum|get_flashed_messages|url_for)\b[^%]{0,1024}\bin\b"
+    r"|(?:macro|call)\s+[^%]{0,1024}\b(?:lipsum|get_flashed_messages|url_for)\b)",
 )
 _FALLBACK_GLOBAL_RECEIVER_PATTERN = re.compile(
     r"(?<![\w.(])(?P<open>(?:\(\s*)*)(?:(?:none|false|0)\s+or\s+)?"
     r"(?P<root>[A-Za-z_]\w*(?:\s*\.\s*[A-Za-z_]\w*)?)(?P<close>(?:\s*\))*)\s*\.\s*__globals__\b",
 )
 _FALLBACK_COMPOSITE_GLOBAL_RECEIVER_PATTERN = re.compile(
-    r"(?<![\w.])(?P<open>\()[^()]{0,256}\b(?P<root>lipsum|get_flashed_messages)\b"
+    r"(?<![\w.])(?P<open>\()[^()]{0,256}\b(?P<root>lipsum|get_flashed_messages|url_for)\b"
     r"[^()]{0,256}(?P<close>\))\s*\.\s*__globals__\b",
 )
+_FALLBACK_DEFAULT_GLOBAL_RECEIVER_PATTERN = re.compile(
+    r"(?<![\w.])(?P<open>\()[^()]{0,256}\|\s*default\s*\(\s*"
+    r"(?P<root>lipsum|get_flashed_messages|url_for)\s*(?:,[^()]*)?\)\s*"
+    r"(?P<close>\))\s*\.\s*__globals__\b",
+)
 _FALLBACK_SIMPLE_SET_ALIAS_PATTERN = re.compile(
-    r"\bset\s+(?P<target>[A-Za-z_]\w*(?:\s*\.\s*[A-Za-z_]\w*)?)\s*=\s*"
+    r"\b(?:set|with)\s+(?P<target>[A-Za-z_]\w*(?:\s*\.\s*[A-Za-z_]\w*)?)\s*=\s*"
     r"(?P<open>(?:\(\s*)*)(?P<source>[A-Za-z_]\w*(?:\s*\.\s*[A-Za-z_]\w*)?)"
     r"(?P<close>(?:\s*\))*)"
     r"(?:\s*\|\s*default\s*\([^()]*\))?\s*-?%}",
+)
+_FALLBACK_SIMPLE_FOR_ALIAS_PATTERN = re.compile(
+    r"\bfor\s+(?P<target>[A-Za-z_]\w*)\s+in\s+\[\s*"
+    r"(?P<source>[A-Za-z_]\w*(?:\s*\.\s*[A-Za-z_]\w*)?)\s*\]"
+    r"(?:\s*\|\s*[A-Za-z_]\w*(?:\s*\([^()]*\))?)*\s*-?%}",
 )
 _RAW_PARSE_FALLBACK_CONTEXT_BYTES = 1024
 _RAW_PARSE_FALLBACK_MAX_WINDOWS = 8
@@ -1594,7 +1604,7 @@ class Jinja2TemplateScanner(BaseScanner):
             return None
 
         matches: list[str] = []
-        named_roots = {"lipsum", "get_flashed_messages"}
+        named_roots = {"lipsum", "get_flashed_messages", "url_for"}
         with_node_type = getattr(jinja2.nodes, "With", None)
         nsref_node_type = getattr(jinja2.nodes, "NSRef", None)
         isolated_scope_types = tuple(
@@ -1623,6 +1633,19 @@ class Jinja2TemplateScanner(BaseScanner):
                 return bool(node.items)
             return None
 
+        def default_filter_candidates(node: Any) -> tuple[Any, ...]:
+            if not node.args:
+                return (node.node,)
+            boolean_argument = next(
+                (keyword.value for keyword in node.kwargs if keyword.key == "boolean"),
+                node.args[1] if len(node.args) > 1 else None,
+            )
+            if isinstance(node.node, (jinja2.nodes.Const, jinja2.nodes.List, jinja2.nodes.Tuple, jinja2.nodes.Dict)):
+                if boolean_argument is not None and constant_truth(boolean_argument) is True:
+                    return (node.args[0],) if constant_truth(node.node) is False else (node.node,)
+                return (node.node,)
+            return node.node, node.args[0]
+
         def is_dangerous_name(
             node: Any,
             shadowed: set[str],
@@ -1633,7 +1656,10 @@ class Jinja2TemplateScanner(BaseScanner):
             if isinstance(node, jinja2.nodes.Getattr) and isinstance(node.node, jinja2.nodes.Name):
                 return f"{node.node.name}.{node.attr}" in dangerous_aliases
             if isinstance(node, jinja2.nodes.Filter) and node.name == "default":
-                return is_dangerous_name(node.node, shadowed, dangerous_aliases)
+                return any(
+                    is_dangerous_name(candidate, shadowed, dangerous_aliases)
+                    for candidate in default_filter_candidates(node)
+                )
             if isinstance(node, jinja2.nodes.CondExpr):
                 truth = constant_truth(node.test)
                 if truth is not None:
@@ -1690,7 +1716,14 @@ class Jinja2TemplateScanner(BaseScanner):
                 receiver = f"{node.node.name}.{node.attr}"
                 return receiver if receiver in dangerous_aliases else None
             if isinstance(node, jinja2.nodes.Filter) and node.name == "default":
-                return direct_named_root(node.node, shadowed, dangerous_aliases)
+                return next(
+                    (
+                        root
+                        for candidate in default_filter_candidates(node)
+                        if (root := direct_named_root(candidate, shadowed, dangerous_aliases)) is not None
+                    ),
+                    None,
+                )
             if isinstance(node, jinja2.nodes.CondExpr):
                 truth = constant_truth(node.test)
                 candidates = (node.expr1, node.expr2) if truth is None else (node.expr1 if truth else node.expr2,)
@@ -1900,10 +1933,13 @@ class Jinja2TemplateScanner(BaseScanner):
                 visit(node.iter, shadowed, dangerous_aliases, node)
                 target_names = stored_names(node.target)
                 literal_items: list[Any] | None = None
-                if isinstance(node.iter, (jinja2.nodes.List, jinja2.nodes.Tuple)):
-                    literal_items = list(node.iter.items)
-                elif isinstance(node.iter, jinja2.nodes.Dict):
-                    literal_items = [item.key for item in node.iter.items]
+                iterable_node: Any = node.iter
+                while isinstance(iterable_node, jinja2.nodes.Filter):
+                    iterable_node = iterable_node.node
+                if isinstance(iterable_node, (jinja2.nodes.List, jinja2.nodes.Tuple)):
+                    literal_items = list(iterable_node.items)
+                elif isinstance(iterable_node, jinja2.nodes.Dict):
+                    literal_items = [item.key for item in iterable_node.items]
 
                 if literal_items == []:
                     else_shadowed = shadowed.copy()
@@ -2047,7 +2083,7 @@ class Jinja2TemplateScanner(BaseScanner):
         ):
             return []
 
-        named_roots = {"lipsum", "get_flashed_messages"}
+        named_roots = {"lipsum", "get_flashed_messages", "url_for"}
         dangerous_aliases: set[str] = set()
         matches: list[str] = []
         for span in executable_spans:
@@ -2063,10 +2099,20 @@ class Jinja2TemplateScanner(BaseScanner):
                 else:
                     dangerous_aliases.discard(target)
 
+            for_alias_match = _FALLBACK_SIMPLE_FOR_ALIAS_PATTERN.search(unquoted_span)
+            if for_alias_match is not None:
+                target = for_alias_match.group("target")
+                source = "".join(for_alias_match.group("source").split())
+                if source in named_roots or source in dangerous_aliases:
+                    dangerous_aliases.add(target)
+                else:
+                    dangerous_aliases.discard(target)
+
             matches.extend(find_unquoted_jinja_named_global_access(span))
             for access_pattern in (
                 _FALLBACK_GLOBAL_RECEIVER_PATTERN,
                 _FALLBACK_COMPOSITE_GLOBAL_RECEIVER_PATTERN,
+                _FALLBACK_DEFAULT_GLOBAL_RECEIVER_PATTERN,
             ):
                 for match in access_pattern.finditer(unquoted_span):
                     if match.group("open").count("(") != match.group("close").count(")"):
@@ -2083,12 +2129,16 @@ class Jinja2TemplateScanner(BaseScanner):
                     while root_previous >= 0 and unquoted_span[root_previous].isspace():
                         root_previous -= 1
                     if (
-                        access_pattern is _FALLBACK_COMPOSITE_GLOBAL_RECEIVER_PATTERN
+                        access_pattern
+                        in {_FALLBACK_COMPOSITE_GLOBAL_RECEIVER_PATTERN, _FALLBACK_DEFAULT_GLOBAL_RECEIVER_PATTERN}
                         and root_previous >= 0
                         and unquoted_span[root_previous] == "."
                     ):
                         continue
-                    if access_pattern is _FALLBACK_COMPOSITE_GLOBAL_RECEIVER_PATTERN and re.match(
+                    if access_pattern in {
+                        _FALLBACK_COMPOSITE_GLOBAL_RECEIVER_PATTERN,
+                        _FALLBACK_DEFAULT_GLOBAL_RECEIVER_PATTERN,
+                    } and re.match(
                         r"(?:\s*\))*\s*(?:\[|\.\s*get\s*\()",
                         unquoted_span[match.end() :],
                     ):
