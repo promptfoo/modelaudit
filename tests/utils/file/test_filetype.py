@@ -1019,6 +1019,97 @@ def test_detect_file_format_from_magic_valid_safetensors_structure(tmp_path: Pat
     assert detect_file_format_from_magic(str(safetensors_path)) == "safetensors"
 
 
+def test_detect_file_format_from_magic_safetensors_header_length_resembling_ext_opcode(tmp_path: Path) -> None:
+    inner = {"t": {"dtype": "F32", "shape": [4], "data_offsets": [0, 16]}}
+    base = json.dumps(inner, separators=(",", ":"))
+    for header_len in (0x282, 0x382, 0x5E82):
+        header = (base + " " * (header_len - len(base))).encode()
+        safetensors_path = tmp_path / f"model-{header_len:x}.safetensors"
+        safetensors_path.write_bytes(struct.pack("<Q", len(header)) + header + b"\x00" * 16)
+        assert detect_file_format_from_magic(str(safetensors_path)) == "safetensors"
+
+
+def test_safetensors_pickle_overlap_ignores_ext_opcode_shaped_header_length() -> None:
+    inner = {"t": {"dtype": "F32", "shape": [4], "data_offsets": [0, 16]}}
+    base = json.dumps(inner, separators=(",", ":"))
+    header = (base + " " * (0x282 - len(base))).encode()
+    sample = struct.pack("<Q", len(header)) + header + b"\x00" * 16
+    assert file_detection.classify_safetensors_pickle_overlap_sample(sample, file_size=len(sample)) is not True
+
+
+def test_safetensors_pickle_overlap_still_flags_proto_prefixed_ext_stream() -> None:
+    sample = b"\x80\x04\x82\x02."
+    assert file_detection.classify_safetensors_pickle_overlap_sample(sample, file_size=len(sample)) is True
+
+
+def test_protocolless_bare_ext_collision_not_treated_as_pre_stop_signal() -> None:
+    # A bare EXT1 opcode followed by an invalid byte (the SafeTensors header-length
+    # collision shape) must not fail closed as a pre-STOP pickle security signal.
+    sample = b"\x82\x01\xff"
+    assert (
+        file_detection._classify_initial_pickle_security_signal(
+            sample, sample_is_prefix=False, available_stream_length=len(sample)
+        )
+        is not True
+    )
+
+
+def test_protocolless_ext_backed_constructor_still_fails_closed() -> None:
+    # EXT1 loads a registered class, EMPTY_TUPLE supplies args, NEWOBJ constructs it
+    # (invoking __new__), then the stream aborts before STOP. Excluding only bare EXT*
+    # must not stop the constructor opcode from failing closed to the pickle scanner.
+    sample = b"\x82\x01)\x81\xff"
+    assert (
+        file_detection._classify_initial_pickle_security_signal(
+            sample, sample_is_prefix=False, available_stream_length=len(sample)
+        )
+        is True
+    )
+
+
+def test_protocolless_ext_stream_flagged_once_it_coherently_continues() -> None:
+    # EXT1 (extension resolution/import) followed by an accepted opcode is a real
+    # pickle stream, not the immediate header-length collision, so it must fail
+    # closed even when it aborts before STOP. Contrast the bare-collision case above
+    # where the EXT* aborts with no accepted follow-on opcode.
+    sample = b"\x82\x01\x4e\x00"  # EXT1 1; NONE; <invalid>
+    assert (
+        file_detection._classify_initial_pickle_security_signal(
+            sample, sample_is_prefix=False, available_stream_length=len(sample)
+        )
+        is True
+    )
+
+
+def test_protocolless_ext_flagged_when_followon_opcode_decodes_but_is_context_invalid() -> None:
+    # EXT1 (extension resolution/import) followed by a byte that decodes as a real
+    # opcode (APPEND) which then fails its stack effect. The EXT* must be promoted the
+    # moment the follow-on opcode is decoded — CPython resolves the extension at EXT1
+    # before failing on APPEND — not only once the follow-on passes its stack effect.
+    sample = b"\x82\x01\x61\x00"  # EXT1 1; APPEND (context-invalid); <invalid>
+    assert (
+        file_detection._classify_initial_pickle_security_signal(
+            sample, sample_is_prefix=False, available_stream_length=len(sample)
+        )
+        is True
+    )
+
+
+def test_protocolless_ext_flagged_when_followon_opcode_argument_read_fails() -> None:
+    # EXT1 followed by a recognized opcode (BINUNICODE8, 0x8d) whose length/payload
+    # read then raises. The follow-on byte is a valid opcode, so the stream coherently
+    # continues past the EXT* — CPython resolves the extension at EXT1 before the
+    # argument read fails — and it must fail closed, not be treated as the collision
+    # (which is followed by an undecodable byte).
+    sample = b"\x82\x01\x8d\x00\x00\x00\x00\x00{}"  # EXT1 1; BINUNICODE8 <truncated len/payload>
+    assert (
+        file_detection._classify_initial_pickle_security_signal(
+            sample, sample_is_prefix=True, available_stream_length=len(sample) + 64
+        )
+        is True
+    )
+
+
 def test_detect_file_format_from_magic_metadata_only_safetensors_structure(tmp_path: Path) -> None:
     metadata = b"{}"
     safetensors_path = tmp_path / "metadata-only.unknown"

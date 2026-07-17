@@ -5633,14 +5633,18 @@ def _classify_initial_pickle_security_signal(
     while stream.tell() < len(sample):
         stream_start = stream.tell()
         has_reachable_security_opcode = False
+        has_pre_stop_security_signal = False
+        saw_proto = False
         stack: list[Any] = []
         try:
             for opcode, argument, _position in _gen_pickle_probe_ops(stream):
                 if _work_budget.remaining_opcodes <= 0:
-                    return True if has_reachable_security_opcode else None
+                    return True if has_pre_stop_security_signal else None
                 _work_budget.remaining_opcodes -= 1
                 saw_opcode = True
                 opcode_name = opcode.name
+                if opcode_name == "PROTO":
+                    saw_proto = True
                 if opcode_name == "FRAME":
                     _work_budget.saw_frame = True
                 invalid_opcode_argument = (
@@ -5662,7 +5666,7 @@ def _classify_initial_pickle_security_signal(
                     opcode_name in {"GLOBAL", "INST"} and not _is_valid_pickle_global_argument(argument)
                 )
                 if invalid_opcode_argument:
-                    return True if has_reachable_security_opcode else negative_result()
+                    return True if has_pre_stop_security_signal else negative_result()
                 if not _apply_pickle_stack_effect(
                     opcode,
                     argument,
@@ -5670,11 +5674,22 @@ def _classify_initial_pickle_security_signal(
                     memo,
                     _work_budget.hashability_cache,
                 ):
-                    if has_reachable_security_opcode:
+                    if has_pre_stop_security_signal:
                         return True
                     return negative_result()
                 if opcode_name in _BINARY_PICKLE_SECURITY_OPCODES:
                     has_reachable_security_opcode = True
+                    if saw_proto or opcode_name not in {"EXT1", "EXT2", "EXT4"}:
+                        has_pre_stop_security_signal = True
+                    elif stream.tell() < len(sample) and sample[stream.tell()] in _PICKLE_OPCODE_BY_BYTE:
+                        # A bare EXT* is only the SafeTensors header-length byte
+                        # collision when the byte after its argument is undecodable
+                        # (the collision aborts there). If that byte is a recognized
+                        # pickle opcode, the stream coherently continues — CPython
+                        # resolves/imports the extension at the EXT* regardless of
+                        # whether that follow-on opcode's own argument reads — so fail
+                        # closed to the pickle scanner.
+                        has_pre_stop_security_signal = True
                 if opcode_name != "STOP":
                     continue
 
@@ -5689,24 +5704,24 @@ def _classify_initial_pickle_security_signal(
                     return True
                 break
         except _PickleNumericOperandLimitExceeded:
-            return True if has_reachable_security_opcode else None
+            return True if has_pre_stop_security_signal else None
         except ValueError as exc:
             exc_message = str(exc)
             position_match = re.search(r"(?:at )?position (\d+)", exc_message)
             if position_match is not None and "opcode" in exc_message:
-                return True if has_reachable_security_opcode else negative_result()
-            if has_reachable_security_opcode:
+                return True if has_pre_stop_security_signal else negative_result()
+            if has_pre_stop_security_signal:
                 return True
             if sample_is_prefix and sample[stream_start] in _PICKLE_OPCODE_BY_BYTE:
                 return None
             return negative_result()
         except (MemoryError, RecursionError):
-            return True if has_reachable_security_opcode else None
+            return True if has_pre_stop_security_signal else None
         except Exception:
-            return True if has_reachable_security_opcode else None
+            return True if has_pre_stop_security_signal else None
 
         if stream.tell() <= stream_start:
-            return True if has_reachable_security_opcode else None
+            return True if has_pre_stop_security_signal else None
 
     if saw_alternate_inconclusive or (sample_is_prefix and saw_opcode):
         return None
