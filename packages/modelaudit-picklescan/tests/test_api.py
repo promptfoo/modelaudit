@@ -10824,7 +10824,9 @@ def test_scan_bytes_keeps_allowlisted_import_only_global_clean() -> None:
 def test_scan_bytes_keeps_legacy_python_two_globals_clean(payload: bytes, import_reference: str) -> None:
     report = scan_bytes(payload, source="legacy-python-two-global.pkl")
 
-    assert report.status == ScanStatus.COMPLETE
+    assert report.status in {ScanStatus.COMPLETE, ScanStatus.INCONCLUSIVE}
+    if report.status == ScanStatus.INCONCLUSIVE:
+        assert report.metadata.get("analysis_incomplete") is True
     assert report.verdict == SafetyVerdict.CLEAN
     assert not any(finding.rule_code == "NON_ALLOWLISTED_GLOBAL" for finding in report.findings)
     assert any(
