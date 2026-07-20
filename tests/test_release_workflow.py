@@ -300,7 +300,11 @@ def test_release_workflow_verifies_published_picklescan_package() -> None:
     wait_run = wait_step["run"]
     assert "https://pypi.org/pypi/modelaudit-picklescan/{version}/json" in wait_run
     assert "https://pypi.org/simple/modelaudit-picklescan/" in wait_run
-    assert "application/vnd.pypi.simple.v1+json" in wait_run
+    assert (
+        '"Accept": "application/vnd.pypi.simple.v1+json, application/vnd.pypi.simple.v1+html; q=0.1, '
+        'text/html; q=0.01"' in wait_run
+    )
+    assert '"Cache-Control": "max-age=0"' in wait_run
     assert "deadline = time.monotonic() + 600" in wait_run
     assert 'if not entry.get("yanked", False)' in wait_run
     assert "missing_simple={missing_simple}" in wait_run
@@ -468,7 +472,11 @@ def test_release_workflow_verifies_published_root_package_after_picklescan() -> 
     wait_run = wait_step["run"]
     assert "https://pypi.org/pypi/modelaudit/{version}/json" in wait_run
     assert "https://pypi.org/simple/modelaudit/" in wait_run
-    assert "application/vnd.pypi.simple.v1+json" in wait_run
+    assert (
+        '"Accept": "application/vnd.pypi.simple.v1+json, application/vnd.pypi.simple.v1+html; q=0.1, '
+        'text/html; q=0.01"' in wait_run
+    )
+    assert '"Cache-Control": "max-age=0"' in wait_run
     assert "deadline = time.monotonic() + 600" in wait_run
     assert 'if not entry.get("yanked", False)' in wait_run
     assert "missing_simple={missing_simple}" in wait_run

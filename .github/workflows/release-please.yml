@@ -955,7 +955,13 @@ jobs:
               try:
                   with urllib.request.urlopen(url, timeout=20) as response:
                       payload = json.load(response)
-                  request = urllib.request.Request(simple_url, headers={"Accept": "application/vnd.pypi.simple.v1+json"})
+                  request = urllib.request.Request(
+                      simple_url,
+                      headers={
+                          "Accept": "application/vnd.pypi.simple.v1+json, application/vnd.pypi.simple.v1+html; q=0.1, text/html; q=0.01",
+                          "Cache-Control": "max-age=0",
+                      },
+                  )
                   with urllib.request.urlopen(request, timeout=20) as response:
                       simple_payload = json.load(response)
                   filenames = {entry["filename"] for entry in payload.get("urls", [])}
@@ -1071,7 +1077,13 @@ jobs:
               try:
                   with urllib.request.urlopen(url, timeout=20) as response:
                       payload = json.load(response)
-                  request = urllib.request.Request(simple_url, headers={"Accept": "application/vnd.pypi.simple.v1+json"})
+                  request = urllib.request.Request(
+                      simple_url,
+                      headers={
+                          "Accept": "application/vnd.pypi.simple.v1+json, application/vnd.pypi.simple.v1+html; q=0.1, text/html; q=0.01",
+                          "Cache-Control": "max-age=0",
+                      },
+                  )
                   with urllib.request.urlopen(request, timeout=20) as response:
                       simple_payload = json.load(response)
                   filenames = {entry["filename"] for entry in payload.get("urls", [])}
