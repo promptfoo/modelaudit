@@ -173,6 +173,8 @@ docker run --rm -v "$(pwd)":/app ghcr.io/promptfoo/modelaudit:latest model.pkl
 ```
 
 The ONNX extra, including the ONNX portion of `modelaudit[all]`, is packaged for Python 3.10-3.12.
+PyTorch-containing extras require macOS 14 or newer on Apple Silicon because the patched PyTorch 2.13 wheels target
+`macosx_14_0_arm64`; use the core-only installation for static scanning on macOS 11-13.
 
 ## CLI Options
 
