@@ -273,6 +273,12 @@ jobs:
         with:
           enable-cache: true
 
+      - name: Pin Python version for root type check
+        run: |
+          # Match tool.mypy.python_version so version-gated dependency stubs use
+          # syntax valid for the minimum supported Python target.
+          uv python pin 3.10
+
       - name: Install Rust toolchain
         run: |
           rustup toolchain install stable --profile minimal

@@ -153,6 +153,16 @@ def test_release_workflow_picklescan_artifacts_stay_in_package_workspace() -> No
     }
 
 
+def test_release_workflow_pins_root_build_python_to_mypy_target() -> None:
+    workflow = _load_release_workflow()
+    steps = _job_steps(workflow, "build")
+
+    pin_step = _step_by_name(steps, "Pin Python version for root type check")
+    assert "uv python pin 3.10" in pin_step["run"]
+    assert steps.index(pin_step) < steps.index(_step_by_name(steps, "Sync dependencies"))
+    assert steps.index(pin_step) < steps.index(_step_by_name(steps, "Type check root package with mypy"))
+
+
 def test_release_workflow_refreshes_both_standalone_package_locks() -> None:
     workflow = _load_release_workflow()
     sync_job = _jobs(workflow)["sync-release-metadata"]
