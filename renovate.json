@@ -17,6 +17,11 @@
       "matchPackageNames": ["numpy"],
       "matchCurrentValue": "/<2\\.5/",
       "allowedVersions": "<2.5"
+    },
+    {
+      "description": "Keep Python updates within the project's supported 3.10-3.13 range.",
+      "matchPackageNames": ["python"],
+      "allowedVersions": "<3.14"
     }
   ],
   "vulnerabilityAlerts": {
