@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
-- **deps:** update PyTorch to 2.13.0 for CVE-2025-3000; PyTorch-containing extras now require macOS 14 or newer on Apple Silicon and standard (GIL-enabled) CPython 3.13 or Python 3.10-3.12; core-only remains available on CPython 3.13t
+- **deps:** update PyTorch to 2.13.0 for CVE-2025-3000; PyTorch-containing extras now require macOS 14 or newer on Apple Silicon and standard (GIL-enabled) CPython 3.13 or Python 3.10-3.12; CPython 3.13t is unsupported, while core-only remains available on macOS 11-13
 - **deps:** require Click 8.3.3 or newer to address PYSEC-2026-2132
 - **picklescan:** resolve reviewed runtime `hasattr` guards without losing call-graph sinks
 - **hashing:** preserve throughput while checking scan deadlines responsively
