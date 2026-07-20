@@ -278,17 +278,24 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
 
-      - name: Sync dependencies
-        run: uv sync --extra all-ci
+      - name: Type check root package with mypy
+        run: |
+          # Match tool.mypy.python_version so version-gated dependency stubs use valid syntax.
+          uv sync --python 3.10 --locked --extra all-ci
+          uv run --python 3.10 --locked mypy modelaudit/ tests/
+          uv cache prune --ci
+
+      - name: Sync dependencies for root runtime checks
+        run: |
+          # Keep the release security tests and artifact smoke tests on modern Python.
+          uv python pin 3.12
+          uv sync --locked --extra all-ci
 
       - name: Lint root package with Ruff
         run: uv run ruff check modelaudit/ tests/
 
       - name: Check root package formatting with Ruff
         run: uv run ruff format --check modelaudit/ tests/
-
-      - name: Type check root package with mypy
-        run: uv run mypy modelaudit/ tests/
 
       - name: Run root package tests
         run: |
@@ -925,10 +932,12 @@ jobs:
       - name: Wait for modelaudit-picklescan files on PyPI
         run: |
           python - <<'PY'
+          import gzip
           import json
           import os
           import time
           import urllib.request
+          import zlib
 
           version = os.environ["EXPECTED_VERSION"]
           expected_files = {
@@ -940,6 +949,7 @@ jobs:
               f"modelaudit_picklescan-{version}.tar.gz",
           }
           url = f"https://pypi.org/pypi/modelaudit-picklescan/{version}/json"
+          simple_url = "https://pypi.org/simple/modelaudit-picklescan/"
           deadline = time.monotonic() + 600
           last_status = "not checked"
 
@@ -947,13 +957,35 @@ jobs:
               try:
                   with urllib.request.urlopen(url, timeout=20) as response:
                       payload = json.load(response)
+                  request = urllib.request.Request(
+                      simple_url,
+                      headers={
+                          "Accept": "application/vnd.pypi.simple.v1+json, application/vnd.pypi.simple.v1+html; q=0.1, text/html; q=0.01",
+                          "Accept-Encoding": "gzip, deflate",
+                          "Cache-Control": "max-age=0",
+                      },
+                  )
+                  with urllib.request.urlopen(request, timeout=20) as response:
+                      simple_body = response.read()
+                      content_encoding = response.headers.get("Content-Encoding", "identity").lower()
+                  if content_encoding == "gzip":
+                      simple_body = gzip.decompress(simple_body)
+                  elif content_encoding == "deflate":
+                      simple_body = zlib.decompress(simple_body)
+                  elif content_encoding not in ("", "identity"):
+                      raise ValueError(f"Unsupported Simple API Content-Encoding: {content_encoding!r}")
+                  simple_payload = json.loads(simple_body)
                   filenames = {entry["filename"] for entry in payload.get("urls", [])}
+                  simple_filenames = {
+                      entry["filename"] for entry in simple_payload.get("files", []) if not entry.get("yanked", False)
+                  }
                   missing = sorted(expected_files - filenames)
+                  missing_simple = sorted(expected_files - simple_filenames)
                   info_version = payload.get("info", {}).get("version")
-                  if info_version == version and not missing:
+                  if info_version == version and not missing and not missing_simple:
                       print(f"PyPI has modelaudit-picklescan {version}: {sorted(filenames)}")
                       break
-                  last_status = f"version={info_version!r}, missing={missing}"
+                  last_status = f"version={info_version!r}, missing={missing}, missing_simple={missing_simple}"
               except Exception as exc:
                   last_status = repr(exc)
               time.sleep(10)
@@ -1037,10 +1069,12 @@ jobs:
       - name: Wait for modelaudit files on PyPI
         run: |
           python - <<'PY'
+          import gzip
           import json
           import os
           import time
           import urllib.request
+          import zlib
 
           version = os.environ["EXPECTED_VERSION"]
           expected_files = {
@@ -1048,6 +1082,7 @@ jobs:
               f"modelaudit-{version}.tar.gz",
           }
           url = f"https://pypi.org/pypi/modelaudit/{version}/json"
+          simple_url = "https://pypi.org/simple/modelaudit/"
           deadline = time.monotonic() + 600
           last_status = "not checked"
 
@@ -1055,13 +1090,35 @@ jobs:
               try:
                   with urllib.request.urlopen(url, timeout=20) as response:
                       payload = json.load(response)
+                  request = urllib.request.Request(
+                      simple_url,
+                      headers={
+                          "Accept": "application/vnd.pypi.simple.v1+json, application/vnd.pypi.simple.v1+html; q=0.1, text/html; q=0.01",
+                          "Accept-Encoding": "gzip, deflate",
+                          "Cache-Control": "max-age=0",
+                      },
+                  )
+                  with urllib.request.urlopen(request, timeout=20) as response:
+                      simple_body = response.read()
+                      content_encoding = response.headers.get("Content-Encoding", "identity").lower()
+                  if content_encoding == "gzip":
+                      simple_body = gzip.decompress(simple_body)
+                  elif content_encoding == "deflate":
+                      simple_body = zlib.decompress(simple_body)
+                  elif content_encoding not in ("", "identity"):
+                      raise ValueError(f"Unsupported Simple API Content-Encoding: {content_encoding!r}")
+                  simple_payload = json.loads(simple_body)
                   filenames = {entry["filename"] for entry in payload.get("urls", [])}
+                  simple_filenames = {
+                      entry["filename"] for entry in simple_payload.get("files", []) if not entry.get("yanked", False)
+                  }
                   missing = sorted(expected_files - filenames)
+                  missing_simple = sorted(expected_files - simple_filenames)
                   info_version = payload.get("info", {}).get("version")
-                  if info_version == version and not missing:
+                  if info_version == version and not missing and not missing_simple:
                       print(f"PyPI has modelaudit {version}: {sorted(filenames)}")
                       break
-                  last_status = f"version={info_version!r}, missing={missing}"
+                  last_status = f"version={info_version!r}, missing={missing}, missing_simple={missing_simple}"
               except Exception as exc:
                   last_status = repr(exc)
               time.sleep(10)

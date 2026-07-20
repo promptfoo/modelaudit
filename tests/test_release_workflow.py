@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import gzip
 import io
 import json
 import time
 import urllib.request
 import zipfile
+import zlib
 from pathlib import Path
 from typing import Any, cast
 
@@ -153,6 +155,29 @@ def test_release_workflow_picklescan_artifacts_stay_in_package_workspace() -> No
     }
 
 
+def test_release_workflow_restores_root_runtime_python_after_type_check() -> None:
+    workflow = _load_release_workflow()
+    steps = _job_steps(workflow, "build")
+
+    type_check_step = _step_by_name(steps, "Type check root package with mypy")
+    sync_step = _step_by_name(steps, "Sync dependencies for root runtime checks")
+    lint_step = _step_by_name(steps, "Lint root package with Ruff")
+    test_step = _step_by_name(steps, "Run root package tests")
+    build_step = _step_by_name(steps, "Build package")
+
+    assert "uv sync --python 3.10 --locked --extra all-ci" in type_check_step["run"]
+    assert "uv run --python 3.10 --locked mypy modelaudit/ tests/" in type_check_step["run"]
+    assert type_check_step["run"].index("uv run --python 3.10 --locked mypy") < type_check_step["run"].index(
+        "uv cache prune --ci"
+    )
+    assert "UV_PROJECT_ENVIRONMENT" not in type_check_step.get("env", {})
+    assert "uv python pin 3.12" in sync_step["run"]
+    assert "uv sync --locked --extra all-ci" in sync_step["run"]
+    assert "uv python pin 3.10" not in "\n".join(step.get("run", "") for step in steps)
+    assert steps.index(type_check_step) < steps.index(sync_step) < steps.index(lint_step) < steps.index(test_step)
+    assert steps.index(test_step) < steps.index(build_step)
+
+
 def test_release_workflow_refreshes_both_standalone_package_locks() -> None:
     workflow = _load_release_workflow()
     sync_job = _jobs(workflow)["sync-release-metadata"]
@@ -276,7 +301,18 @@ def test_release_workflow_verifies_published_picklescan_package() -> None:
     wait_step = _step_by_name(steps, "Wait for modelaudit-picklescan files on PyPI")
     wait_run = wait_step["run"]
     assert "https://pypi.org/pypi/modelaudit-picklescan/{version}/json" in wait_run
+    assert "https://pypi.org/simple/modelaudit-picklescan/" in wait_run
+    assert (
+        '"Accept": "application/vnd.pypi.simple.v1+json, application/vnd.pypi.simple.v1+html; q=0.1, '
+        'text/html; q=0.01"' in wait_run
+    )
+    assert '"Accept-Encoding": "gzip, deflate"' in wait_run
+    assert '"Cache-Control": "max-age=0"' in wait_run
+    assert 'content_encoding == "gzip"' in wait_run
+    assert 'content_encoding == "deflate"' in wait_run
     assert "deadline = time.monotonic() + 600" in wait_run
+    assert 'if not entry.get("yanked", False)' in wait_run
+    assert "missing_simple={missing_simple}" in wait_run
     for expected_fragment in (
         "modelaudit_picklescan-{version}-cp310-abi3-macosx_10_12_x86_64.whl",
         "modelaudit_picklescan-{version}-cp310-abi3-macosx_11_0_arm64.whl",
@@ -296,6 +332,86 @@ def test_release_workflow_verifies_published_picklescan_package() -> None:
     assert 'clean_report.status.value != "complete"' in smoke_run
     assert 'malicious_report.verdict.value != "malicious"' in smoke_run
     assert 'finding.rule_code == "DANGEROUS_CALL"' in smoke_run
+
+
+@pytest.mark.parametrize(
+    ("job_name", "step_name", "project", "version", "expected_files"),
+    [
+        (
+            "verify-picklescan-pypi",
+            "Wait for modelaudit-picklescan files on PyPI",
+            "modelaudit-picklescan",
+            "0.1.9",
+            (
+                "modelaudit_picklescan-0.1.9-cp310-abi3-macosx_10_12_x86_64.whl",
+                "modelaudit_picklescan-0.1.9-cp310-abi3-macosx_11_0_arm64.whl",
+                "modelaudit_picklescan-0.1.9-cp310-abi3-manylinux_2_28_aarch64.whl",
+                "modelaudit_picklescan-0.1.9-cp310-abi3-manylinux_2_28_x86_64.whl",
+                "modelaudit_picklescan-0.1.9-cp310-abi3-win_amd64.whl",
+                "modelaudit_picklescan-0.1.9.tar.gz",
+            ),
+        ),
+        (
+            "verify-pypi",
+            "Wait for modelaudit files on PyPI",
+            "modelaudit",
+            "0.2.50",
+            ("modelaudit-0.2.50-py3-none-any.whl", "modelaudit-0.2.50.tar.gz"),
+        ),
+    ],
+)
+@pytest.mark.parametrize("content_encoding", ["gzip", "deflate"])
+def test_release_workflow_waits_for_compressed_pypi_simple_index(
+    job_name: str,
+    step_name: str,
+    project: str,
+    version: str,
+    expected_files: tuple[str, ...],
+    content_encoding: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow = _load_release_workflow()
+    wait_run = _step_by_name(_job_steps(workflow, job_name), step_name)["run"]
+    lines = wait_run.splitlines()
+    assert lines[0] == "python - <<'PY'"
+    assert lines[-1] == "PY"
+    script = "\n".join(lines[1:-1])
+
+    class EncodedResponse(io.BytesIO):
+        def __init__(self, body: bytes, encoding: str) -> None:
+            super().__init__(body)
+            self.headers = {"Content-Encoding": encoding}
+
+    calls = {"api": 0, "simple": 0}
+    api_payload = {"info": {"version": version}, "urls": [{"filename": name} for name in expected_files]}
+
+    def fake_urlopen(url: str | urllib.request.Request, timeout: int = 20) -> io.BytesIO:
+        assert timeout == 20
+        if isinstance(url, str):
+            assert url == f"https://pypi.org/pypi/{project}/{version}/json"
+            calls["api"] += 1
+            return io.BytesIO(json.dumps(api_payload).encode())
+
+        assert url.full_url == f"https://pypi.org/simple/{project}/"
+        assert url.get_header("Accept-encoding") == "gzip, deflate"
+        assert url.get_header("Cache-control") == "max-age=0"
+        calls["simple"] += 1
+        files = [
+            {"filename": name, "yanked": calls["simple"] == 1 and index == 0}
+            for index, name in enumerate(expected_files)
+        ]
+        body = json.dumps({"files": files}).encode()
+        encoded_body = gzip.compress(body) if content_encoding == "gzip" else zlib.compress(body)
+        return EncodedResponse(encoded_body, content_encoding)
+
+    ticks = iter((0.0, 1.0, 2.0, 3.0))
+    monkeypatch.setenv("EXPECTED_VERSION", version)
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(time, "monotonic", lambda: next(ticks, 3.0))
+    monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+
+    exec(compile(script, "release-pypi-propagation-step", "exec"), {})
+    assert calls == {"api": 2, "simple": 2}
 
 
 def test_release_workflow_publishes_picklescan_before_dependent_root() -> None:
@@ -440,7 +556,18 @@ def test_release_workflow_verifies_published_root_package_after_picklescan() -> 
     wait_step = _step_by_name(steps, "Wait for modelaudit files on PyPI")
     wait_run = wait_step["run"]
     assert "https://pypi.org/pypi/modelaudit/{version}/json" in wait_run
+    assert "https://pypi.org/simple/modelaudit/" in wait_run
+    assert (
+        '"Accept": "application/vnd.pypi.simple.v1+json, application/vnd.pypi.simple.v1+html; q=0.1, '
+        'text/html; q=0.01"' in wait_run
+    )
+    assert '"Accept-Encoding": "gzip, deflate"' in wait_run
+    assert '"Cache-Control": "max-age=0"' in wait_run
+    assert 'content_encoding == "gzip"' in wait_run
+    assert 'content_encoding == "deflate"' in wait_run
     assert "deadline = time.monotonic() + 600" in wait_run
+    assert 'if not entry.get("yanked", False)' in wait_run
+    assert "missing_simple={missing_simple}" in wait_run
     assert "modelaudit-{version}-py3-none-any.whl" in wait_run
     assert "modelaudit-{version}.tar.gz" in wait_run
 
