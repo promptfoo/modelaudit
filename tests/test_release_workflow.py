@@ -129,6 +129,19 @@ def test_release_workflow_picklescan_artifacts_stay_in_package_workspace() -> No
     }
 
 
+def test_release_workflow_refreshes_both_standalone_package_locks() -> None:
+    release_steps = _job_steps(_load_release_workflow(), "release-please")
+
+    sync_step = _step_by_name(release_steps, "Sync standalone package lock with pyproject.toml")
+    assert sync_step["working-directory"] == "packages/modelaudit-picklescan"
+    sync_run = sync_step["run"]
+    assert "uv lock" in sync_run
+    assert "cargo check --manifest-path Cargo.toml\n" in sync_run
+    assert "cargo check --manifest-path Cargo.toml --locked" in sync_run
+    assert "git diff --quiet uv.lock Cargo.lock" in sync_run
+    assert "git add uv.lock Cargo.lock" in sync_run
+
+
 def test_release_workflow_verifies_published_picklescan_package() -> None:
     workflow = _load_release_workflow()
 
