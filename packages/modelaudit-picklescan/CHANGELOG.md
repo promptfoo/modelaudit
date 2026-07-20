@@ -7,12 +7,11 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.1.9](https://github.com/promptfoo/modelaudit/compare/modelaudit-picklescan-v0.1.8...modelaudit-picklescan-v0.1.9) (2026-07-20)
 
-
 ### Bug Fixes
 
-* **picklescan:** preserve POSIX ctime checks ([#1719](https://github.com/promptfoo/modelaudit/issues/1719)) ([cbde525](https://github.com/promptfoo/modelaudit/commit/cbde5250755288d783467420990bd9c5c15e4631))
-* **picklescan:** restore standalone CI ([#1742](https://github.com/promptfoo/modelaudit/issues/1742)) ([88632fe](https://github.com/promptfoo/modelaudit/commit/88632fe3eb113416e34cb911952ce0a56779e4fb))
-* restore cross-platform nightly CI safety ([#1704](https://github.com/promptfoo/modelaudit/issues/1704)) ([9df81da](https://github.com/promptfoo/modelaudit/commit/9df81dab9aed308024b814afddb617eee6ab3b1a))
+- **picklescan:** preserve POSIX ctime checks ([#1719](https://github.com/promptfoo/modelaudit/issues/1719)) ([cbde525](https://github.com/promptfoo/modelaudit/commit/cbde5250755288d783467420990bd9c5c15e4631))
+- **picklescan:** restore standalone CI ([#1742](https://github.com/promptfoo/modelaudit/issues/1742)) ([88632fe](https://github.com/promptfoo/modelaudit/commit/88632fe3eb113416e34cb911952ce0a56779e4fb))
+- restore cross-platform nightly CI safety ([#1704](https://github.com/promptfoo/modelaudit/issues/1704)) ([9df81da](https://github.com/promptfoo/modelaudit/commit/9df81dab9aed308024b814afddb617eee6ab3b1a))
 
 ## [0.1.8](https://github.com/promptfoo/modelaudit/compare/modelaudit-picklescan-v0.1.7...modelaudit-picklescan-v0.1.8) (2026-06-25)
 
