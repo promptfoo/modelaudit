@@ -932,10 +932,12 @@ jobs:
       - name: Wait for modelaudit-picklescan files on PyPI
         run: |
           python - <<'PY'
+          import gzip
           import json
           import os
           import time
           import urllib.request
+          import zlib
 
           version = os.environ["EXPECTED_VERSION"]
           expected_files = {
@@ -959,11 +961,20 @@ jobs:
                       simple_url,
                       headers={
                           "Accept": "application/vnd.pypi.simple.v1+json, application/vnd.pypi.simple.v1+html; q=0.1, text/html; q=0.01",
+                          "Accept-Encoding": "gzip, deflate",
                           "Cache-Control": "max-age=0",
                       },
                   )
                   with urllib.request.urlopen(request, timeout=20) as response:
-                      simple_payload = json.load(response)
+                      simple_body = response.read()
+                      content_encoding = response.headers.get("Content-Encoding", "identity").lower()
+                  if content_encoding == "gzip":
+                      simple_body = gzip.decompress(simple_body)
+                  elif content_encoding == "deflate":
+                      simple_body = zlib.decompress(simple_body)
+                  elif content_encoding not in ("", "identity"):
+                      raise ValueError(f"Unsupported Simple API Content-Encoding: {content_encoding!r}")
+                  simple_payload = json.loads(simple_body)
                   filenames = {entry["filename"] for entry in payload.get("urls", [])}
                   simple_filenames = {
                       entry["filename"] for entry in simple_payload.get("files", []) if not entry.get("yanked", False)
@@ -1058,10 +1069,12 @@ jobs:
       - name: Wait for modelaudit files on PyPI
         run: |
           python - <<'PY'
+          import gzip
           import json
           import os
           import time
           import urllib.request
+          import zlib
 
           version = os.environ["EXPECTED_VERSION"]
           expected_files = {
@@ -1081,11 +1094,20 @@ jobs:
                       simple_url,
                       headers={
                           "Accept": "application/vnd.pypi.simple.v1+json, application/vnd.pypi.simple.v1+html; q=0.1, text/html; q=0.01",
+                          "Accept-Encoding": "gzip, deflate",
                           "Cache-Control": "max-age=0",
                       },
                   )
                   with urllib.request.urlopen(request, timeout=20) as response:
-                      simple_payload = json.load(response)
+                      simple_body = response.read()
+                      content_encoding = response.headers.get("Content-Encoding", "identity").lower()
+                  if content_encoding == "gzip":
+                      simple_body = gzip.decompress(simple_body)
+                  elif content_encoding == "deflate":
+                      simple_body = zlib.decompress(simple_body)
+                  elif content_encoding not in ("", "identity"):
+                      raise ValueError(f"Unsupported Simple API Content-Encoding: {content_encoding!r}")
+                  simple_payload = json.loads(simple_body)
                   filenames = {entry["filename"] for entry in payload.get("urls", [])}
                   simple_filenames = {
                       entry["filename"] for entry in simple_payload.get("files", []) if not entry.get("yanked", False)
