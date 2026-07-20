@@ -5,6 +5,8 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
 ## [0.2.50](https://github.com/promptfoo/modelaudit/compare/v0.2.49...v0.2.50) (2026-07-20)
 
 ### Security
@@ -209,8 +211,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Documentation
 
 - add agent trace lessons ([#1627](https://github.com/promptfoo/modelaudit/issues/1627)) ([cadc17d](https://github.com/promptfoo/modelaudit/commit/cadc17d2e85a150fcb8a6571b17448c7b77ce2fc))
-
-## [Unreleased]
 
 ### Bug Fixes
 
@@ -537,8 +537,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Documentation
 
 - align picklescan version guidance ([#1279](https://github.com/promptfoo/modelaudit/issues/1279)) ([a53eb11](https://github.com/promptfoo/modelaudit/commit/a53eb112fcbdf4d6baca1ae0124aba8129cb95e1))
-
-## [Unreleased]
 
 ### Bug Fixes
 
@@ -880,8 +878,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - narrow scan coverage claims ([#1139](https://github.com/promptfoo/modelaudit/issues/1139)) ([47ec8cf](https://github.com/promptfoo/modelaudit/commit/47ec8cf3bc5a5ac3166757bbaae0c5a3c6adb73d))
 
-## [Unreleased]
-
 ### Bug Fixes
 
 - detect nested brace-format lookups that reach tracked `defaultdict` factories
@@ -997,8 +993,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - align README support and dependency guidance ([#1008](https://github.com/promptfoo/modelaudit/issues/1008)) ([5dcd62b](https://github.com/promptfoo/modelaudit/commit/5dcd62bad05ed9e661c2cafacc7ec1b4a4bad515))
 - clarify security report closure policy ([#1049](https://github.com/promptfoo/modelaudit/issues/1049)) ([d53e445](https://github.com/promptfoo/modelaudit/commit/d53e445609708909eee6822a5215289ed64d6c48))
 - prune stale planning artifacts ([#1010](https://github.com/promptfoo/modelaudit/issues/1010)) ([851cc10](https://github.com/promptfoo/modelaudit/commit/851cc102a8c1d40fce7433a1d221d6ff9acece5f))
-
-## [Unreleased]
 
 ### Added
 

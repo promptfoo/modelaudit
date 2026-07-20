@@ -5,6 +5,8 @@ All notable changes to `modelaudit-picklescan` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
 ## [0.1.9](https://github.com/promptfoo/modelaudit/compare/modelaudit-picklescan-v0.1.8...modelaudit-picklescan-v0.1.9) (2026-07-20)
 
 ### Bug Fixes
@@ -58,8 +60,6 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Documentation
 
 - add agent trace lessons ([#1627](https://github.com/promptfoo/modelaudit/issues/1627)) ([cadc17d](https://github.com/promptfoo/modelaudit/commit/cadc17d2e85a150fcb8a6571b17448c7b77ce2fc))
-
-## [Unreleased]
 
 ### Bug Fixes
 
@@ -141,8 +141,6 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Documentation
 
 - narrow scan coverage claims ([#1139](https://github.com/promptfoo/modelaudit/issues/1139)) ([47ec8cf](https://github.com/promptfoo/modelaudit/commit/47ec8cf3bc5a5ac3166757bbaae0c5a3c6adb73d))
-
-## [Unreleased]
 
 ### Bug Fixes
 
@@ -244,8 +242,6 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Documentation
 
 - align markdown with current repo state ([#1035](https://github.com/promptfoo/modelaudit/issues/1035)) ([690bc52](https://github.com/promptfoo/modelaudit/commit/690bc5274198eb3428db9779ada0bdc2d40702ee))
-
-## [Unreleased]
 
 ### Added
 
