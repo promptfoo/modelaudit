@@ -273,12 +273,6 @@ jobs:
         with:
           enable-cache: true
 
-      - name: Pin Python version for root type check
-        run: |
-          # Match tool.mypy.python_version so version-gated dependency stubs use
-          # syntax valid for the minimum supported Python target.
-          uv python pin 3.10
-
       - name: Install Rust toolchain
         run: |
           rustup toolchain install stable --profile minimal
@@ -294,7 +288,12 @@ jobs:
         run: uv run ruff format --check modelaudit/ tests/
 
       - name: Type check root package with mypy
-        run: uv run mypy modelaudit/ tests/
+        env:
+          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/modelaudit-mypy-venv
+        run: |
+          # Match tool.mypy.python_version without moving runtime tests off the runner Python.
+          uv sync --python 3.10 --frozen --extra all-ci
+          uv run --python 3.10 --frozen mypy modelaudit/ tests/
 
       - name: Run root package tests
         run: |

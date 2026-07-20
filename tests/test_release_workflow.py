@@ -153,14 +153,19 @@ def test_release_workflow_picklescan_artifacts_stay_in_package_workspace() -> No
     }
 
 
-def test_release_workflow_pins_root_build_python_to_mypy_target() -> None:
+def test_release_workflow_isolates_root_type_check_python_from_runtime_tests() -> None:
     workflow = _load_release_workflow()
     steps = _job_steps(workflow, "build")
 
-    pin_step = _step_by_name(steps, "Pin Python version for root type check")
-    assert "uv python pin 3.10" in pin_step["run"]
-    assert steps.index(pin_step) < steps.index(_step_by_name(steps, "Sync dependencies"))
-    assert steps.index(pin_step) < steps.index(_step_by_name(steps, "Type check root package with mypy"))
+    sync_step = _step_by_name(steps, "Sync dependencies")
+    type_check_step = _step_by_name(steps, "Type check root package with mypy")
+    test_step = _step_by_name(steps, "Run root package tests")
+
+    assert type_check_step["env"] == {"UV_PROJECT_ENVIRONMENT": "${{ runner.temp }}/modelaudit-mypy-venv"}
+    assert "uv sync --python 3.10 --frozen --extra all-ci" in type_check_step["run"]
+    assert "uv run --python 3.10 --frozen mypy modelaudit/ tests/" in type_check_step["run"]
+    assert "uv python pin 3.10" not in "\n".join(step.get("run", "") for step in steps)
+    assert steps.index(sync_step) < steps.index(type_check_step) < steps.index(test_step)
 
 
 def test_release_workflow_refreshes_both_standalone_package_locks() -> None:
