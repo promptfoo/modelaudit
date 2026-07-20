@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+import io
+import json
+import time
+import urllib.request
+import zipfile
 from pathlib import Path
 from typing import Any, cast
 
+import pytest
 import yaml
 
 
@@ -302,6 +308,95 @@ def test_release_workflow_publishes_picklescan_before_dependent_root() -> None:
     assert "needs.release-please.outputs.picklescan_release_created != 'true'" in job_condition
     assert "needs.verify-picklescan-pypi.result == 'success'" in job_condition
     assert job["needs"] == ["build", "release-please", "verify-picklescan-pypi"]
+
+    steps = _job_steps(workflow, "publish-pypi")
+    dependency_step = _step_by_name(steps, "Verify the root picklescan dependency is available on PyPI")
+    dependency_run = dependency_step["run"]
+    assert 'Path("dist").glob("modelaudit-*.whl")' in dependency_run
+    assert 'metadata.get_all("Requires-Dist")' in dependency_run
+    assert 're.sub(r"^modelaudit[-_]picklescan"' in dependency_run
+    assert 're.fullmatch(r"(?:==|!=|>=|<=|>|<)' in dependency_run
+    assert "https://pypi.org/pypi/modelaudit-picklescan/json" in dependency_run
+    assert 'entry.get("yanked", False)' in dependency_run
+    assert "deadline = time.monotonic() + 600" in dependency_run
+    assert "Refusing to publish modelaudit with an unavailable picklescan dependency" in dependency_run
+    assert "pip install" not in dependency_run
+    assert "uv lock" not in dependency_run
+    assert "git push" not in dependency_run
+    assert steps.index(dependency_step) < steps.index(_step_by_name(steps, "Publish to PyPI"))
+
+
+@pytest.mark.parametrize(
+    ("requirement", "published_version", "missing_wheel", "yanked_wheel", "should_pass"),
+    [
+        ("modelaudit-picklescan<0.2.0,>=0.1.9", "0.1.8", False, False, False),
+        ("modelaudit-picklescan<0.2.0,>=0.1.9", "0.1.9", True, False, False),
+        ("modelaudit-picklescan<0.2.0,>=0.1.9", "0.1.9", False, True, False),
+        ("modelaudit-picklescan<0.2.0,>=0.1.9", "0.1.9", False, False, True),
+        ("modelaudit-picklescan (>=0.1.9, <0.2.0)", "0.1.9", False, False, True),
+        ("modelaudit-picklescan>=0.1.9rc1,<0.2.0", "0.1.9", False, False, False),
+    ],
+)
+def test_root_publish_fails_closed_until_picklescan_is_available(
+    requirement: str,
+    published_version: str,
+    missing_wheel: bool,
+    yanked_wheel: bool,
+    should_pass: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow = _load_release_workflow()
+    step = _step_by_name(
+        _job_steps(workflow, "publish-pypi"),
+        "Verify the root picklescan dependency is available on PyPI",
+    )
+    lines = step["run"].splitlines()
+    assert lines[0] == "python - <<'PY'"
+    assert lines[-1] == "PY"
+    script = "\n".join(lines[1:-1])
+
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    with zipfile.ZipFile(dist / "modelaudit-0.2.50-py3-none-any.whl", "w") as archive:
+        archive.writestr(
+            "modelaudit-0.2.50.dist-info/METADATA",
+            f"Metadata-Version: 2.4\nName: modelaudit\nVersion: 0.2.50\nRequires-Dist: {requirement}\n",
+        )
+
+    expected_files = [
+        f"modelaudit_picklescan-{published_version}-cp310-abi3-macosx_10_12_x86_64.whl",
+        f"modelaudit_picklescan-{published_version}-cp310-abi3-macosx_11_0_arm64.whl",
+        f"modelaudit_picklescan-{published_version}-cp310-abi3-manylinux_2_28_aarch64.whl",
+        f"modelaudit_picklescan-{published_version}-cp310-abi3-manylinux_2_28_x86_64.whl",
+        f"modelaudit_picklescan-{published_version}-cp310-abi3-win_amd64.whl",
+        f"modelaudit_picklescan-{published_version}.tar.gz",
+    ]
+    if missing_wheel:
+        expected_files.pop()
+    payload = {
+        "releases": {
+            published_version: [
+                {"filename": filename, "yanked": yanked_wheel and index == 0}
+                for index, filename in enumerate(expected_files)
+            ]
+        }
+    }
+    ticks = iter((0.0, 1.0, 601.0, 602.0))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        lambda _url, timeout=20: io.BytesIO(json.dumps(payload).encode()),
+    )
+    monkeypatch.setattr(time, "monotonic", lambda: next(ticks, 602.0))
+    monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+
+    if should_pass:
+        exec(compile(script, "release-availability-step", "exec"), {})
+    else:
+        with pytest.raises(SystemExit):
+            exec(compile(script, "release-availability-step", "exec"), {})
 
 
 def test_release_workflow_verifies_published_root_package_after_picklescan() -> None:

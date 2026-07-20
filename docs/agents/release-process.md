@@ -124,9 +124,11 @@ Use the least disruptive path.
 - Fix workflow / secrets issues, then **re-run the failed publish job** (`gh run rerun <run-id> --failed`) OR dispatch the manual recovery path:
 
   ```bash
-  gh workflow run release-please.yml -f root_version=<X.Y.Z>
   gh workflow run release-please.yml -f picklescan_version=<X.Y.Z>
+  gh workflow run release-please.yml -f root_version=<X.Y.Z>
   ```
+
+- Publish the sibling first when a root release raises its `modelaudit-picklescan` floor. Root publication checks the built wheel requirement against complete, non-yanked PyPI files and fails closed until a compatible sibling release is available.
 
 ### A published version is broken (e.g. unresolvable deps)
 

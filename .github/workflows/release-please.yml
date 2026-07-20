@@ -783,6 +783,92 @@ jobs:
           name: dist
           path: dist/
 
+      - name: Verify the root picklescan dependency is available on PyPI
+        run: |
+          python - <<'PY'
+          import json
+          import re
+          import time
+          import urllib.request
+          import zipfile
+          from email.parser import Parser
+          from pathlib import Path
+
+          wheels = list(Path("dist").glob("modelaudit-*.whl"))
+          if len(wheels) != 1:
+              raise SystemExit(f"Expected one modelaudit wheel, found: {wheels}")
+
+          with zipfile.ZipFile(wheels[0]) as archive:
+              metadata_files = [name for name in archive.namelist() if name.endswith(".dist-info/METADATA")]
+              if len(metadata_files) != 1:
+                  raise SystemExit(f"Expected one wheel METADATA file, found: {metadata_files}")
+              metadata = Parser().parsestr(archive.read(metadata_files[0]).decode())
+
+          requirements = metadata.get_all("Requires-Dist") or []
+          picklescan_requirements = [
+              requirement.split(";", 1)[0].strip()
+              for requirement in requirements
+              if re.match(r"^modelaudit[-_]picklescan\b", requirement, re.IGNORECASE)
+          ]
+          if len(picklescan_requirements) != 1:
+              raise SystemExit(f"Expected one modelaudit-picklescan requirement, found: {picklescan_requirements}")
+
+          requirement = picklescan_requirements[0]
+          constraint = re.sub(r"^modelaudit[-_]picklescan", "", requirement, count=1, flags=re.IGNORECASE)
+          constraint = constraint.strip().removeprefix("(").removesuffix(")").replace(" ", "")
+          if not re.fullmatch(r"(?:==|!=|>=|<=|>|<)[0-9]+(?:\.[0-9]+){1,2}(?:,(?:==|!=|>=|<=|>|<)[0-9]+(?:\.[0-9]+){1,2})*", constraint):
+              raise SystemExit(f"Unsupported modelaudit-picklescan requirement: {requirement}")
+          specifiers = re.findall(r"(==|!=|>=|<=|>|<)([0-9]+(?:\.[0-9]+){1,2})", constraint)
+
+          def version_parts(value):
+              parts = tuple(int(part) for part in value.split("."))
+              return parts + (0,) * (3 - len(parts))
+
+          def matches(version):
+              comparisons = {
+                  "==": lambda left, right: left == right,
+                  "!=": lambda left, right: left != right,
+                  ">=": lambda left, right: left >= right,
+                  "<=": lambda left, right: left <= right,
+                  ">": lambda left, right: left > right,
+                  "<": lambda left, right: left < right,
+              }
+              return all(comparisons[operator](version, version_parts(value)) for operator, value in specifiers)
+
+          url = "https://pypi.org/pypi/modelaudit-picklescan/json"
+          deadline = time.monotonic() + 600
+          last_status = "not checked"
+
+          while time.monotonic() < deadline:
+              try:
+                  with urllib.request.urlopen(url, timeout=20) as response:
+                      releases = json.load(response).get("releases", {})
+                  compatible = []
+                  for version, files in releases.items():
+                      if not re.fullmatch(r"[0-9]+(?:\.[0-9]+){1,2}", version) or not matches(version_parts(version)):
+                          continue
+                      filenames = {entry["filename"] for entry in files if not entry.get("yanked", False)}
+                      expected_files = {
+                          f"modelaudit_picklescan-{version}-cp310-abi3-macosx_10_12_x86_64.whl",
+                          f"modelaudit_picklescan-{version}-cp310-abi3-macosx_11_0_arm64.whl",
+                          f"modelaudit_picklescan-{version}-cp310-abi3-manylinux_2_28_aarch64.whl",
+                          f"modelaudit_picklescan-{version}-cp310-abi3-manylinux_2_28_x86_64.whl",
+                          f"modelaudit_picklescan-{version}-cp310-abi3-win_amd64.whl",
+                          f"modelaudit_picklescan-{version}.tar.gz",
+                      }
+                      if expected_files <= filenames:
+                          compatible.append(version)
+                  if compatible:
+                      print(f"PyPI has compatible modelaudit-picklescan releases for {requirement}: {compatible}")
+                      break
+                  last_status = f"no complete, non-yanked release satisfies {requirement}"
+              except Exception as exc:
+                  last_status = repr(exc)
+              time.sleep(10)
+          else:
+              raise SystemExit(f"Refusing to publish modelaudit with an unavailable picklescan dependency: {last_status}")
+          PY
+
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1
         with:
