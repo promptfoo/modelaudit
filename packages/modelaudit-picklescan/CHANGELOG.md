@@ -20,13 +20,6 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **picklescan:** restore Windows call-graph detection via cross-view stat identity ([#1715](https://github.com/promptfoo/modelaudit/issues/1715)) ([51c0074](https://github.com/promptfoo/modelaudit/commit/51c00742ad1c090e5a3f61c1f0c6662e66d06a40))
 
-## [Unreleased]
-
-### Bug Fixes
-
-- restore Windows call-graph detection by reconciling descriptor and path stats with a cross-view identity that omits `st_ctime` (Windows reports it differently across stat methods); previously every stdlib callable source read failed closed on Windows, collapsing call-graph verdicts to inconclusive
-- preserve POSIX `st_ctime` in call-graph source-read identity checks so same-size, same-mtime inode-reuse swaps still fail closed
-
 ## [0.1.7](https://github.com/promptfoo/modelaudit/compare/modelaudit-picklescan-v0.1.6...modelaudit-picklescan-v0.1.7) (2026-06-24)
 
 ### Bug Fixes

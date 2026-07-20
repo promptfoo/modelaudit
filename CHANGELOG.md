@@ -20,13 +20,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **picklescan:** restore standalone CI ([#1742](https://github.com/promptfoo/modelaudit/issues/1742)) ([88632fe](https://github.com/promptfoo/modelaudit/commit/88632fe3eb113416e34cb911952ce0a56779e4fb))
 - restore cross-platform nightly CI safety ([#1704](https://github.com/promptfoo/modelaudit/issues/1704)) ([9df81da](https://github.com/promptfoo/modelaudit/commit/9df81dab9aed308024b814afddb617eee6ab3b1a))
 
-## [Unreleased]
-
-### Bug Fixes
-
-- **hashing:** preserve throughput while checking scan deadlines responsively
-- **cli:** handle interrupts during CLI startup without a traceback
-
 ## [0.2.49](https://github.com/promptfoo/modelaudit/compare/v0.2.48...v0.2.49) (2026-06-25)
 
 ### Bug Fixes
