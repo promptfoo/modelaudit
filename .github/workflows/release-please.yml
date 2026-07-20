@@ -283,6 +283,7 @@ jobs:
           # Match tool.mypy.python_version so version-gated dependency stubs use valid syntax.
           uv sync --python 3.10 --frozen --extra all-ci
           uv run --python 3.10 --frozen mypy modelaudit/ tests/
+          uv cache prune --ci
 
       - name: Sync dependencies for root runtime checks
         run: |
