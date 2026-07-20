@@ -312,8 +312,11 @@ def test_release_workflow_verifies_published_picklescan_package() -> None:
 
     smoke_step = _step_by_name(steps, "Install published modelaudit-picklescan and smoke test API")
     smoke_run = smoke_step["run"]
+    assert "for attempt in {1..30}; do" in smoke_run
     assert "--no-cache-dir" in smoke_run
     assert '"modelaudit-picklescan==${EXPECTED_VERSION}"' in smoke_run
+    assert 'if [[ "$attempt" -eq 30 ]]; then' in smoke_run
+    assert "PyPI simple index" in smoke_run
     assert 'md.version("modelaudit-picklescan")' in smoke_run
     assert 'find_spec("modelaudit_picklescan._rust")' in smoke_run
     assert 'clean_report.status.value != "complete"' in smoke_run
@@ -469,8 +472,11 @@ def test_release_workflow_verifies_published_root_package_after_picklescan() -> 
 
     smoke_step = _step_by_name(steps, "Install published modelaudit and run end-to-end smoke tests")
     smoke_run = smoke_step["run"]
+    assert "for attempt in {1..30}; do" in smoke_run
     assert "--no-cache-dir" in smoke_run
     assert '"modelaudit[all]==${EXPECTED_VERSION}"' in smoke_run
+    assert 'if [[ "$attempt" -eq 30 ]]; then' in smoke_run
+    assert "PyPI simple index" in smoke_run
     assert 'md.version("modelaudit")' in smoke_run
     assert 'md.version("modelaudit-picklescan")' in smoke_run
     assert 'os.environ.get("PICKLESCAN_RELEASE_CREATED") == "true"' in smoke_run

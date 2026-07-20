@@ -973,11 +973,20 @@ jobs:
           set -euo pipefail
           python -m venv /tmp/modelaudit-picklescan-pypi-smoke
           /tmp/modelaudit-picklescan-pypi-smoke/bin/python -m pip install --upgrade pip
-          /tmp/modelaudit-picklescan-pypi-smoke/bin/python -m pip install \
-            --no-cache-dir \
-            --retries 10 \
-            --timeout 60 \
-            "modelaudit-picklescan==${EXPECTED_VERSION}"
+          for attempt in {1..30}; do
+            if /tmp/modelaudit-picklescan-pypi-smoke/bin/python -m pip install \
+              --no-cache-dir \
+              --retries 10 \
+              --timeout 60 \
+              "modelaudit-picklescan==${EXPECTED_VERSION}"; then
+              break
+            fi
+            if [[ "$attempt" -eq 30 ]]; then
+              echo "Timed out waiting for modelaudit-picklescan ${EXPECTED_VERSION} on the PyPI simple index" >&2
+              exit 1
+            fi
+            sleep 10
+          done
 
           /tmp/modelaudit-picklescan-pypi-smoke/bin/python - <<'PY'
           import importlib.metadata as md
@@ -1081,11 +1090,20 @@ jobs:
           set -euo pipefail
           python -m venv /tmp/modelaudit-pypi-smoke
           /tmp/modelaudit-pypi-smoke/bin/python -m pip install --upgrade pip
-          /tmp/modelaudit-pypi-smoke/bin/python -m pip install \
-            --no-cache-dir \
-            --retries 10 \
-            --timeout 60 \
-            "modelaudit[all]==${EXPECTED_VERSION}"
+          for attempt in {1..30}; do
+            if /tmp/modelaudit-pypi-smoke/bin/python -m pip install \
+              --no-cache-dir \
+              --retries 10 \
+              --timeout 60 \
+              "modelaudit[all]==${EXPECTED_VERSION}"; then
+              break
+            fi
+            if [[ "$attempt" -eq 30 ]]; then
+              echo "Timed out waiting for modelaudit ${EXPECTED_VERSION} on the PyPI simple index" >&2
+              exit 1
+            fi
+            sleep 10
+          done
 
           /tmp/modelaudit-pypi-smoke/bin/python - <<'PY'
           import importlib.metadata as md
