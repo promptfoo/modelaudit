@@ -7,10 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.2.51](https://github.com/promptfoo/modelaudit/compare/v0.2.50...v0.2.51) (2026-07-20)
 
-
 ### Bug Fixes
 
-* recover root release build and PyPI smoke gates ([#1764](https://github.com/promptfoo/modelaudit/issues/1764)) ([fa350d9](https://github.com/promptfoo/modelaudit/commit/fa350d96d2e00e0d54c47f282b7f8e0f9660e077))
+- recover root release build and PyPI smoke gates ([#1764](https://github.com/promptfoo/modelaudit/issues/1764)) ([fa350d9](https://github.com/promptfoo/modelaudit/commit/fa350d96d2e00e0d54c47f282b7f8e0f9660e077))
 
 ## [Unreleased]
 
