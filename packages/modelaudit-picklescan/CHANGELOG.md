@@ -11,6 +11,7 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **picklescan:** preserve POSIX ctime checks ([#1719](https://github.com/promptfoo/modelaudit/issues/1719)) ([cbde525](https://github.com/promptfoo/modelaudit/commit/cbde5250755288d783467420990bd9c5c15e4631))
 - **picklescan:** restore standalone CI ([#1742](https://github.com/promptfoo/modelaudit/issues/1742)) ([88632fe](https://github.com/promptfoo/modelaudit/commit/88632fe3eb113416e34cb911952ce0a56779e4fb))
+- resolve reviewed runtime `hasattr(typing, ...)` guards before flattening module scope so current `typing_extensions.get_type_hints` remains connected to its evaluation sinks
 - restore cross-platform nightly CI safety ([#1704](https://github.com/promptfoo/modelaudit/issues/1704)) ([9df81da](https://github.com/promptfoo/modelaudit/commit/9df81dab9aed308024b814afddb617eee6ab3b1a))
 
 ## [0.1.8](https://github.com/promptfoo/modelaudit/compare/modelaudit-picklescan-v0.1.7...modelaudit-picklescan-v0.1.8) (2026-06-25)
@@ -23,7 +24,6 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
-- resolve reviewed runtime `hasattr(typing, ...)` guards before flattening module scope so current `typing_extensions.get_type_hints` remains connected to its evaluation sinks
 - restore Windows call-graph detection by reconciling descriptor and path stats with a cross-view identity that omits `st_ctime` (Windows reports it differently across stat methods); previously every stdlib callable source read failed closed on Windows, collapsing call-graph verdicts to inconclusive
 - preserve POSIX `st_ctime` in call-graph source-read identity checks so same-size, same-mtime inode-reuse swaps still fail closed
 
