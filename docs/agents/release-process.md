@@ -9,6 +9,8 @@ This repo is a monorepo with **two independently versioned PyPI packages**:
 
 Both packages are driven by a single [release-please](https://github.com/googleapis/release-please) workflow (`.github/workflows/release-please.yml`) with two components declared in `release-please-config.json` and current versions pinned in `.release-please-manifest.json`.
 
+The root release intentionally omits `package-name` and `component`. Release-please reads `project.name` from `pyproject.toml` for Python updates, while the empty branch component lets a root-only grouped Release PR match `release-please--branches--main` and keeps the existing `v{X.Y.Z}` tags. Restoring a non-empty `package-name` or `component` makes root-only releases look like a different component and silently skips publication after merge.
+
 The root `modelaudit` wheel declares a **hard dependency** on `modelaudit-picklescan>=0.1.9,<0.2.0` in `pyproject.toml`. When the sibling version crosses `0.2.0`, the constraint must be bumped in the same PR.
 
 ## Normal flow

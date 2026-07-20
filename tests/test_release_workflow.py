@@ -13,6 +13,11 @@ from typing import Any, cast
 import pytest
 import yaml
 
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - Python 3.10 compatibility
+    import tomli as tomllib  # type: ignore[no-redef]
+
 
 def _load_release_workflow() -> dict[str, Any]:
     workflow_path = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "release-please.yml"
@@ -49,6 +54,26 @@ def _jobs(workflow: dict[str, Any]) -> dict[str, Any]:
     jobs = workflow["jobs"]
     assert isinstance(jobs, dict)
     return jobs
+
+
+def test_release_please_keeps_root_componentless_for_grouped_root_only_releases() -> None:
+    root_dir = Path(__file__).resolve().parents[1]
+    release_config = json.loads((root_dir / "release-please-config.json").read_text(encoding="utf-8"))
+    root_package = release_config["packages"]["."]
+    picklescan_package = release_config["packages"]["packages/modelaudit-picklescan"]
+    pyproject = tomllib.loads((root_dir / "pyproject.toml").read_text(encoding="utf-8"))
+
+    assert release_config["include-component-in-tag"] is False
+    assert release_config["include-v-in-tag"] is True
+    assert release_config.get("separate-pull-requests", False) is False
+    assert root_package["release-type"] == "python"
+    assert "component" not in root_package
+    assert "package-name" not in root_package
+    assert root_package.get("separate-pull-requests", False) is False
+    assert pyproject["project"]["name"] == "modelaudit"
+    assert picklescan_package["component"] == "modelaudit-picklescan"
+    assert picklescan_package["include-component-in-tag"] is True
+    assert picklescan_package.get("separate-pull-requests", False) is False
 
 
 def test_release_workflow_manual_dispatch_inputs_and_guardrails() -> None:
