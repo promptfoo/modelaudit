@@ -281,15 +281,15 @@ jobs:
       - name: Type check root package with mypy
         run: |
           # Match tool.mypy.python_version so version-gated dependency stubs use valid syntax.
-          uv sync --python 3.10 --frozen --extra all-ci
-          uv run --python 3.10 --frozen mypy modelaudit/ tests/
+          uv sync --python 3.10 --locked --extra all-ci
+          uv run --python 3.10 --locked mypy modelaudit/ tests/
           uv cache prune --ci
 
       - name: Sync dependencies for root runtime checks
         run: |
           # Keep the release security tests and artifact smoke tests on modern Python.
           uv python pin 3.12
-          uv sync --frozen --extra all-ci
+          uv sync --locked --extra all-ci
 
       - name: Lint root package with Ruff
         run: uv run ruff check modelaudit/ tests/

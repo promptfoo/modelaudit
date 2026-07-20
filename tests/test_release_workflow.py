@@ -163,14 +163,14 @@ def test_release_workflow_restores_root_runtime_python_after_type_check() -> Non
     test_step = _step_by_name(steps, "Run root package tests")
     build_step = _step_by_name(steps, "Build package")
 
-    assert "uv sync --python 3.10 --frozen --extra all-ci" in type_check_step["run"]
-    assert "uv run --python 3.10 --frozen mypy modelaudit/ tests/" in type_check_step["run"]
-    assert type_check_step["run"].index("uv run --python 3.10 --frozen mypy") < type_check_step["run"].index(
+    assert "uv sync --python 3.10 --locked --extra all-ci" in type_check_step["run"]
+    assert "uv run --python 3.10 --locked mypy modelaudit/ tests/" in type_check_step["run"]
+    assert type_check_step["run"].index("uv run --python 3.10 --locked mypy") < type_check_step["run"].index(
         "uv cache prune --ci"
     )
     assert "UV_PROJECT_ENVIRONMENT" not in type_check_step.get("env", {})
     assert "uv python pin 3.12" in sync_step["run"]
-    assert "uv sync --frozen --extra all-ci" in sync_step["run"]
+    assert "uv sync --locked --extra all-ci" in sync_step["run"]
     assert "uv python pin 3.10" not in "\n".join(step.get("run", "") for step in steps)
     assert steps.index(type_check_step) < steps.index(sync_step) < steps.index(lint_step) < steps.index(test_step)
     assert steps.index(test_step) < steps.index(build_step)
