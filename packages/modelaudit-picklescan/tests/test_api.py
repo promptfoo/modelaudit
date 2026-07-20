@@ -10858,7 +10858,7 @@ def test_scan_bytes_keeps_allowlisted_import_only_global_clean() -> None:
 def test_scan_bytes_keeps_legacy_python_two_globals_clean(payload: bytes, import_reference: str) -> None:
     report = scan_bytes(payload, source="legacy-python-two-global.pkl")
 
-    if report.status == ScanStatus.INCONCLUSIVE:
+    if import_reference == "exceptions.ValueError" and report.status == ScanStatus.INCONCLUSIVE:
         assert report.metadata.get("analysis_incomplete") is True
         assert any(
             error.message
@@ -10888,7 +10888,7 @@ def test_scan_bytes_fails_closed_for_legacy_python_two_global_when_source_change
 
     monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", raise_source_stability_error)
 
-    report = scan_bytes(b"ccopy_reg\n_reconstructor\n.", source="legacy-python-two-global-source-change.pkl")
+    report = scan_bytes(b"cexceptions\nValueError\n.", source="legacy-python-two-global-source-change.pkl")
 
     assert report.status == ScanStatus.INCONCLUSIVE
     assert report.verdict == SafetyVerdict.UNKNOWN
@@ -10904,7 +10904,7 @@ def test_scan_bytes_fails_closed_for_legacy_python_two_global_when_source_change
     )
     assert not any(finding.rule_code == "NON_ALLOWLISTED_GLOBAL" for finding in report.findings)
     assert any(
-        ref["import_reference"] == "copy_reg._reconstructor" and ref["is_dangerous"] is False
+        ref["import_reference"] == "exceptions.ValueError" and ref["is_dangerous"] is False
         for ref in report.metadata["import_references"]
     )
 
