@@ -130,17 +130,23 @@ def test_release_workflow_picklescan_artifacts_stay_in_package_workspace() -> No
 
 
 def test_release_workflow_refreshes_both_standalone_package_locks() -> None:
-    release_steps = _job_steps(_load_release_workflow(), "release-please")
+    workflow = _load_release_workflow()
+    sync_job = _jobs(workflow)["sync-release-metadata"]
+    assert isinstance(sync_job, dict)
+    assert sync_job["permissions"] == {"contents": "read"}
+    assert sync_job["needs"] == "release-please"
+    assert sync_job["if"] == "needs.release-please.outputs.pr_branch != ''"
+    assert sync_job["outputs"] == {"source_sha": "${{ steps.source.outputs.sha }}"}
+    sync_steps = _job_steps(workflow, "sync-release-metadata")
 
-    sync_step = _step_by_name(release_steps, "Sync standalone package lock with pyproject.toml")
+    sync_step = _step_by_name(sync_steps, "Sync standalone package lock with pyproject.toml")
     assert sync_step["working-directory"] == "packages/modelaudit-picklescan"
     sync_run = sync_step["run"]
     assert "uv lock" in sync_run
     assert "cargo update --workspace --manifest-path Cargo.toml" in sync_run
     assert "cargo metadata --manifest-path Cargo.toml --locked --no-deps --format-version 1" in sync_run
     assert "cargo check" not in sync_run
-    assert "git diff --quiet uv.lock Cargo.lock" in sync_run
-    assert "git add uv.lock Cargo.lock" in sync_run
+    assert "git push" not in sync_run
 
 
 def test_release_changelogs_keep_one_current_unreleased_section() -> None:
@@ -151,6 +157,65 @@ def test_release_changelogs_keep_one_current_unreleased_section() -> None:
         headings = [line for line in changelog.read_text(encoding="utf-8").splitlines() if line.startswith("## ")]
         assert headings[0] == "## [Unreleased]"
         assert headings.count("## [Unreleased]") == 1
+
+
+def test_release_metadata_generation_does_not_keep_write_credentials() -> None:
+    workflow = _load_release_workflow()
+    sync_steps = _job_steps(workflow, "sync-release-metadata")
+    checkout_step = next(step for step in sync_steps if step.get("uses", "").startswith("actions/checkout@"))
+    assert checkout_step["with"]["persist-credentials"] is False
+
+    source_step = _step_by_name(sync_steps, "Record release metadata source")
+    assert source_step["id"] == "source"
+    assert 'echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"' in source_step["run"]
+
+    for name in (
+        "Sync uv.lock with pyproject.toml",
+        "Sync standalone package lock with pyproject.toml",
+        "Install Node dependencies",
+        "Format changelogs with Prettier",
+    ):
+        step = _step_by_name(sync_steps, name)
+        assert "GH_TOKEN" not in step.get("env", {})
+        assert "git push" not in step["run"]
+
+    upload_step = _step_by_name(sync_steps, "Upload release metadata")
+    assert upload_step["with"]["name"] == "modelaudit-release-metadata"
+    assert upload_step["with"]["if-no-files-found"] == "error"
+    assert upload_step["with"]["path"].splitlines() == [
+        "uv.lock",
+        "CHANGELOG.md",
+        "packages/modelaudit-picklescan/uv.lock",
+        "packages/modelaudit-picklescan/Cargo.lock",
+        "packages/modelaudit-picklescan/CHANGELOG.md",
+    ]
+
+    push_job = _jobs(workflow)["push-release-metadata"]
+    assert isinstance(push_job, dict)
+    assert push_job["permissions"] == {"contents": "write"}
+    assert push_job["needs"] == ["release-please", "sync-release-metadata"]
+    assert push_job["if"] == "needs.release-please.outputs.pr_branch != ''"
+    push_steps = _job_steps(workflow, "push-release-metadata")
+    push_checkout = next(step for step in push_steps if step.get("uses", "").startswith("actions/checkout@"))
+    assert push_checkout["with"]["persist-credentials"] is False
+
+    download_step = _step_by_name(push_steps, "Download release metadata")
+    assert download_step["with"] == {
+        "name": "modelaudit-release-metadata",
+        "path": "/tmp/modelaudit-release-metadata",
+    }
+
+    push_step = _step_by_name(push_steps, "Push release metadata updates")
+    assert push_step["env"] == {
+        "GH_TOKEN": "${{ secrets.GITHUB_TOKEN }}",
+        "PR_BRANCH": "${{ needs.release-please.outputs.pr_branch }}",
+        "EXPECTED_HEAD": "${{ needs.sync-release-metadata.outputs.source_sha }}",
+    }
+    assert '"$(git rev-parse HEAD)" != "$EXPECTED_HEAD"' in push_step["run"]
+    assert (
+        'git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:${PR_BRANCH}"'
+        in (push_step["run"])
+    )
 
 
 def test_release_workflow_verifies_published_picklescan_package() -> None:

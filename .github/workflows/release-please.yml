@@ -34,6 +34,7 @@ jobs:
       picklescan_tag_name: ${{ steps.manual.outputs.manual_release == 'true' && steps.manual.outputs.picklescan_tag_name || steps.release.outputs['packages/modelaudit-picklescan--tag_name'] }}
       picklescan_version: ${{ steps.manual.outputs.manual_release == 'true' && steps.manual.outputs.picklescan_version || steps.release.outputs['packages/modelaudit-picklescan--version'] }}
       pr_number: ${{ steps.release.outputs.pr && fromJSON(steps.release.outputs.pr).number || '' }}
+      pr_branch: ${{ steps.check-pr.outputs.pr_branch || '' }}
     steps:
       - name: Resolve manual release inputs
         id: manual
@@ -96,8 +97,6 @@ jobs:
               --notes "Manual recovery release for modelaudit-picklescan $PICKLESCAN_VERSION."
           fi
 
-      # Format changelogs immediately after release-please creates/updates a PR
-      # This runs for BOTH new PRs (prs_created) and existing PRs (pr output exists)
       - name: Check if PR exists
         id: check-pr
         run: |
@@ -109,85 +108,114 @@ jobs:
             echo "has_pr=false" >> "$GITHUB_OUTPUT"
           fi
 
+  sync-release-metadata:
+    if: needs.release-please.outputs.pr_branch != ''
+    runs-on: ubuntu-latest
+    needs: release-please
+    permissions:
+      contents: read
+    outputs:
+      source_sha: ${{ steps.source.outputs.sha }}
+    steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-        if: steps.check-pr.outputs.has_pr == 'true'
         with:
-          ref: ${{ steps.check-pr.outputs.pr_branch }}
-          # Shallow clone for speed - we only need to format and push
+          ref: ${{ needs.release-please.outputs.pr_branch }}
           fetch-depth: 1
+          persist-credentials: false
+
+      - name: Record release metadata source
+        id: source
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Install uv
-        if: steps.check-pr.outputs.has_pr == 'true'
         uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
 
       - name: Install Rust toolchain for standalone lock refresh
-        if: steps.check-pr.outputs.has_pr == 'true'
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
 
       - name: Sync uv.lock with pyproject.toml
-        if: steps.check-pr.outputs.has_pr == 'true'
-        run: |
-          uv lock
-          if git diff --quiet uv.lock; then
-            echo "✓ uv.lock already in sync"
-          else
-            echo "→ uv.lock updated to match pyproject.toml version bump"
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-            git add uv.lock
-            git commit -m "chore: sync uv.lock with pyproject.toml version bump"
-            git push
-            echo "✓ uv.lock committed and pushed"
-          fi
+        run: uv lock
 
       - name: Sync standalone package lock with pyproject.toml
-        if: steps.check-pr.outputs.has_pr == 'true'
         working-directory: packages/modelaudit-picklescan
         run: |
           uv lock
           cargo update --workspace --manifest-path Cargo.toml
           cargo metadata --manifest-path Cargo.toml --locked --no-deps --format-version 1 >/dev/null
-          if git diff --quiet uv.lock Cargo.lock; then
-            echo "✓ standalone package locks already in sync"
-          else
-            echo "→ standalone package locks updated to match the version bump"
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-            git add uv.lock Cargo.lock
-            git commit -m "chore: sync standalone package lock"
-            git push
-            echo "✓ standalone package locks committed and pushed"
-          fi
 
       - name: Setup Node.js
-        if: steps.check-pr.outputs.has_pr == 'true'
         uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
         with:
           node-version: "24"
 
       - name: Install Node dependencies
-        if: steps.check-pr.outputs.has_pr == 'true'
         run: npm ci --ignore-scripts
 
       - name: Format changelogs with Prettier
-        if: steps.check-pr.outputs.has_pr == 'true'
         run: |
-          echo "Formatting changelogs on branch: ${{ steps.check-pr.outputs.pr_branch }}"
+          echo "Formatting changelogs on branch: ${{ needs.release-please.outputs.pr_branch }}"
           npx prettier --write CHANGELOG.md packages/modelaudit-picklescan/CHANGELOG.md
 
-          if git diff --quiet CHANGELOG.md packages/modelaudit-picklescan/CHANGELOG.md; then
-            echo "✓ No formatting changes needed"
-          else
-            echo "→ Formatting changes detected, committing..."
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-            git add CHANGELOG.md packages/modelaudit-picklescan/CHANGELOG.md
-            git commit -m "chore: format changelogs with prettier"
-            git push
-            echo "✓ Formatting committed and pushed"
+      - name: Upload release metadata
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: modelaudit-release-metadata
+          if-no-files-found: error
+          path: |
+            uv.lock
+            CHANGELOG.md
+            packages/modelaudit-picklescan/uv.lock
+            packages/modelaudit-picklescan/Cargo.lock
+            packages/modelaudit-picklescan/CHANGELOG.md
+
+  push-release-metadata:
+    if: needs.release-please.outputs.pr_branch != ''
+    runs-on: ubuntu-latest
+    needs: [release-please, sync-release-metadata]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: ${{ needs.release-please.outputs.pr_branch }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Download release metadata
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: modelaudit-release-metadata
+          path: /tmp/modelaudit-release-metadata
+
+      - name: Push release metadata updates
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_BRANCH: ${{ needs.release-please.outputs.pr_branch }}
+          EXPECTED_HEAD: ${{ needs.sync-release-metadata.outputs.source_sha }}
+        run: |
+          if [[ "$(git rev-parse HEAD)" != "$EXPECTED_HEAD" ]]; then
+            echo "Release branch changed while metadata was generated; refusing to overwrite newer changes."
+            exit 1
           fi
+
+          cp /tmp/modelaudit-release-metadata/uv.lock uv.lock
+          cp /tmp/modelaudit-release-metadata/CHANGELOG.md CHANGELOG.md
+          cp /tmp/modelaudit-release-metadata/packages/modelaudit-picklescan/uv.lock packages/modelaudit-picklescan/uv.lock
+          cp /tmp/modelaudit-release-metadata/packages/modelaudit-picklescan/Cargo.lock packages/modelaudit-picklescan/Cargo.lock
+          cp /tmp/modelaudit-release-metadata/packages/modelaudit-picklescan/CHANGELOG.md packages/modelaudit-picklescan/CHANGELOG.md
+
+          if git diff --quiet uv.lock CHANGELOG.md packages/modelaudit-picklescan/uv.lock packages/modelaudit-picklescan/Cargo.lock packages/modelaudit-picklescan/CHANGELOG.md; then
+            echo "✓ Release metadata already in sync"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add uv.lock CHANGELOG.md packages/modelaudit-picklescan/uv.lock packages/modelaudit-picklescan/Cargo.lock packages/modelaudit-picklescan/CHANGELOG.md
+          git commit -m "chore: sync release metadata"
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:${PR_BRANCH}"
 
   build:
     if: needs.release-please.outputs.release_created == 'true'
