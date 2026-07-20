@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.50](https://github.com/promptfoo/modelaudit/compare/v0.2.49...v0.2.50) (2026-07-20)
+
+
+### Bug Fixes
+
+* **cache:** reuse stat without breaking public overrides ([#1732](https://github.com/promptfoo/modelaudit/issues/1732)) ([39cd664](https://github.com/promptfoo/modelaudit/commit/39cd664e3093eaf6e6b8e02ae78f4dd8c8174e3d))
+* **cli:** handle startup interrupts gracefully ([#1723](https://github.com/promptfoo/modelaudit/issues/1723)) ([839c7cf](https://github.com/promptfoo/modelaudit/commit/839c7cfc501b147af30bdd284e2e3612410f6f0b))
+* deep-merge partial auth config updates ([#1721](https://github.com/promptfoo/modelaudit/issues/1721)) ([8f33995](https://github.com/promptfoo/modelaudit/commit/8f3399506f8104135ed06effc34f490a68e1df7e))
+* **deps:** update NumPy to 2.5 on Python 3.12+ ([#1706](https://github.com/promptfoo/modelaudit/issues/1706)) ([eeba9b8](https://github.com/promptfoo/modelaudit/commit/eeba9b84db3b1e1e257892f6a0ccaf1bd5530dce))
+* **hashing:** adapt reads near scan deadlines ([#1734](https://github.com/promptfoo/modelaudit/issues/1734)) ([f23e1c0](https://github.com/promptfoo/modelaudit/commit/f23e1c030d4bdf24eb4052a0af0db8ff322ac7d1))
+* **picklescan:** preserve POSIX ctime checks ([#1719](https://github.com/promptfoo/modelaudit/issues/1719)) ([cbde525](https://github.com/promptfoo/modelaudit/commit/cbde5250755288d783467420990bd9c5c15e4631))
+* **picklescan:** restore standalone CI ([#1742](https://github.com/promptfoo/modelaudit/issues/1742)) ([88632fe](https://github.com/promptfoo/modelaudit/commit/88632fe3eb113416e34cb911952ce0a56779e4fb))
+* restore cross-platform nightly CI safety ([#1704](https://github.com/promptfoo/modelaudit/issues/1704)) ([9df81da](https://github.com/promptfoo/modelaudit/commit/9df81dab9aed308024b814afddb617eee6ab3b1a))
+
 ## [Unreleased]
 
 ### Bug Fixes
