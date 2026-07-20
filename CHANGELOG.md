@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **cache:** reuse stat without breaking public overrides ([#1732](https://github.com/promptfoo/modelaudit/issues/1732)) ([39cd664](https://github.com/promptfoo/modelaudit/commit/39cd664e3093eaf6e6b8e02ae78f4dd8c8174e3d))
 - **cli:** handle startup interrupts gracefully ([#1723](https://github.com/promptfoo/modelaudit/issues/1723)) ([839c7cf](https://github.com/promptfoo/modelaudit/commit/839c7cfc501b147af30bdd284e2e3612410f6f0b))
 - deep-merge partial auth config updates ([#1721](https://github.com/promptfoo/modelaudit/issues/1721)) ([8f33995](https://github.com/promptfoo/modelaudit/commit/8f3399506f8104135ed06effc34f490a68e1df7e))
+- **deps:** update PyTorch to 2.13.0 for CVE-2025-3000; PyTorch-containing extras now require macOS 14 or newer on Apple Silicon and standard (GIL-enabled) CPython 3.13 or Python 3.10-3.12; CPython 3.13t is unsupported, while core-only remains available on macOS 11-13
 - **deps:** require Click 8.3.3 or newer to address PYSEC-2026-2132
 - **deps:** require `modelaudit-picklescan>=0.1.9` so root upgrades receive the released scanner fixes
 - **deps:** update NumPy to 2.5 on Python 3.12+ while retaining NumPy 2.4 on Python 3.11, matching NumPy's supported Python versions ([#1706](https://github.com/promptfoo/modelaudit/issues/1706)) ([eeba9b8](https://github.com/promptfoo/modelaudit/commit/eeba9b84db3b1e1e257892f6a0ccaf1bd5530dce))
