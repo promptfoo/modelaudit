@@ -147,8 +147,8 @@ jobs:
         working-directory: packages/modelaudit-picklescan
         run: |
           uv lock
-          cargo check --manifest-path Cargo.toml
-          cargo check --manifest-path Cargo.toml --locked
+          cargo update --workspace --manifest-path Cargo.toml
+          cargo metadata --manifest-path Cargo.toml --locked --no-deps --format-version 1 >/dev/null
           if git diff --quiet uv.lock Cargo.lock; then
             echo "✓ standalone package locks already in sync"
           else

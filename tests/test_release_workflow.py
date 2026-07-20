@@ -136,8 +136,9 @@ def test_release_workflow_refreshes_both_standalone_package_locks() -> None:
     assert sync_step["working-directory"] == "packages/modelaudit-picklescan"
     sync_run = sync_step["run"]
     assert "uv lock" in sync_run
-    assert "cargo check --manifest-path Cargo.toml\n" in sync_run
-    assert "cargo check --manifest-path Cargo.toml --locked" in sync_run
+    assert "cargo update --workspace --manifest-path Cargo.toml" in sync_run
+    assert "cargo metadata --manifest-path Cargo.toml --locked --no-deps --format-version 1" in sync_run
+    assert "cargo check" not in sync_run
     assert "git diff --quiet uv.lock Cargo.lock" in sync_run
     assert "git add uv.lock Cargo.lock" in sync_run
 
