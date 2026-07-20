@@ -22,6 +22,12 @@
       "description": "Keep Python updates within the project's supported 3.10-3.13 range.",
       "matchPackageNames": ["python"],
       "allowedVersions": "<3.14"
+    },
+    {
+      "description": "Keep the TensorFlow image on a runtime supported by the tensorflow extra.",
+      "matchFileNames": ["Dockerfile.tensorflow"],
+      "matchPackageNames": ["python"],
+      "allowedVersions": "<3.13"
     }
   ],
   "vulnerabilityAlerts": {
