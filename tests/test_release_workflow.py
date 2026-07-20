@@ -299,7 +299,11 @@ def test_release_workflow_verifies_published_picklescan_package() -> None:
     wait_step = _step_by_name(steps, "Wait for modelaudit-picklescan files on PyPI")
     wait_run = wait_step["run"]
     assert "https://pypi.org/pypi/modelaudit-picklescan/{version}/json" in wait_run
+    assert "https://pypi.org/simple/modelaudit-picklescan/" in wait_run
+    assert "application/vnd.pypi.simple.v1+json" in wait_run
     assert "deadline = time.monotonic() + 600" in wait_run
+    assert 'if not entry.get("yanked", False)' in wait_run
+    assert "missing_simple={missing_simple}" in wait_run
     for expected_fragment in (
         "modelaudit_picklescan-{version}-cp310-abi3-macosx_10_12_x86_64.whl",
         "modelaudit_picklescan-{version}-cp310-abi3-macosx_11_0_arm64.whl",
@@ -312,13 +316,8 @@ def test_release_workflow_verifies_published_picklescan_package() -> None:
 
     smoke_step = _step_by_name(steps, "Install published modelaudit-picklescan and smoke test API")
     smoke_run = smoke_step["run"]
-    assert "for attempt in {1..30}; do" in smoke_run
     assert "--no-cache-dir" in smoke_run
     assert '"modelaudit-picklescan==${EXPECTED_VERSION}"' in smoke_run
-    assert 'if [[ "$attempt" -eq 30 ]]; then' in smoke_run
-    assert "PyPI simple index" in smoke_run
-    assert "exit 1" in smoke_run
-    assert "sleep 10" in smoke_run
     assert 'md.version("modelaudit-picklescan")' in smoke_run
     assert 'find_spec("modelaudit_picklescan._rust")' in smoke_run
     assert 'clean_report.status.value != "complete"' in smoke_run
@@ -468,19 +467,18 @@ def test_release_workflow_verifies_published_root_package_after_picklescan() -> 
     wait_step = _step_by_name(steps, "Wait for modelaudit files on PyPI")
     wait_run = wait_step["run"]
     assert "https://pypi.org/pypi/modelaudit/{version}/json" in wait_run
+    assert "https://pypi.org/simple/modelaudit/" in wait_run
+    assert "application/vnd.pypi.simple.v1+json" in wait_run
     assert "deadline = time.monotonic() + 600" in wait_run
+    assert 'if not entry.get("yanked", False)' in wait_run
+    assert "missing_simple={missing_simple}" in wait_run
     assert "modelaudit-{version}-py3-none-any.whl" in wait_run
     assert "modelaudit-{version}.tar.gz" in wait_run
 
     smoke_step = _step_by_name(steps, "Install published modelaudit and run end-to-end smoke tests")
     smoke_run = smoke_step["run"]
-    assert "for attempt in {1..30}; do" in smoke_run
     assert "--no-cache-dir" in smoke_run
     assert '"modelaudit[all]==${EXPECTED_VERSION}"' in smoke_run
-    assert 'if [[ "$attempt" -eq 30 ]]; then' in smoke_run
-    assert "PyPI simple index" in smoke_run
-    assert "exit 1" in smoke_run
-    assert "sleep 10" in smoke_run
     assert 'md.version("modelaudit")' in smoke_run
     assert 'md.version("modelaudit-picklescan")' in smoke_run
     assert 'os.environ.get("PICKLESCAN_RELEASE_CREATED") == "true"' in smoke_run
