@@ -65,7 +65,7 @@ tensorflow = [
     "tensorflow>=2.21,<2.22; python_version >= '3.11' and python_version < '3.13'",
 ]
 h5 = ["h5py>=3.1,<4.0"]
-pytorch = ["torch>=2.6.0,<3.0"]
+pytorch = ["torch>=2.13.0,<3.0"]
 safetensors = ["safetensors>=0.4.0"]
 # Temporary RC pin for CVE-2026-28500: the advisory targets onnx.hub.load(),
 # which ModelAudit does not call.
@@ -85,7 +85,7 @@ numpy1 = [
     "numpy>=2.4.3,<2.5; python_version == '3.11'",
     "numpy>=2.5,<2.6; python_version >= '3.12'",
     "h5py>=3.1,<4.0",
-    "torch>=2.6.0,<3.0",
+    "torch>=2.13.0,<3.0",
     "pyyaml>=6.0,<7.0",
     "safetensors>=0.4.0",
     # Temporary RC pin for CVE-2026-28500: the advisory targets onnx.hub.load(),
@@ -102,7 +102,7 @@ numpy1 = [
 # Note: TensorFlow removed - vendored protos handle SavedModel scanning without Keras CVE exposure
 all-ci = [
     "h5py>=3.1,<4.0",
-    "torch>=2.6.0,<3.0",
+    "torch>=2.13.0,<3.0",
     "pyyaml>=6.0,<7.0",
     "safetensors>=0.4.0",
     # Temporary RC pin for CVE-2026-28500: the advisory targets onnx.hub.load(),
@@ -129,7 +129,7 @@ all-ci-windows = [
 # Broad portable optional dependencies (excludes TensorFlow and platform-specific TensorRT)
 all = [
     "h5py>=3.1,<4.0",
-    "torch>=2.6.0,<3.0",
+    "torch>=2.13.0,<3.0",
     "pyyaml>=6.0,<7.0",
     "safetensors>=0.4.0",
     # Temporary RC pin for CVE-2026-28500: the advisory targets onnx.hub.load(),
