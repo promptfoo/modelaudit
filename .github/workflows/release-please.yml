@@ -9,6 +9,9 @@ on:
   push:
     branches:
       - main
+  repository_dispatch:
+    types:
+      - release-metadata-retry
   workflow_dispatch:
     inputs:
       root_version:
@@ -34,6 +37,7 @@ jobs:
       picklescan_tag_name: ${{ steps.manual.outputs.manual_release == 'true' && steps.manual.outputs.picklescan_tag_name || steps.release.outputs['packages/modelaudit-picklescan--tag_name'] }}
       picklescan_version: ${{ steps.manual.outputs.manual_release == 'true' && steps.manual.outputs.picklescan_version || steps.release.outputs['packages/modelaudit-picklescan--version'] }}
       pr_number: ${{ steps.release.outputs.pr && fromJSON(steps.release.outputs.pr).number || '' }}
+      pr_branch: ${{ steps.check-pr.outputs.pr_branch || '' }}
     steps:
       - name: Resolve manual release inputs
         id: manual
@@ -66,7 +70,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071 # v4
-        if: steps.manual.outputs.manual_release != 'true'
+        if: steps.manual.outputs.manual_release != 'true' && github.event_name != 'repository_dispatch'
         id: release
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -96,96 +100,162 @@ jobs:
               --notes "Manual recovery release for modelaudit-picklescan $PICKLESCAN_VERSION."
           fi
 
-      # Format changelogs immediately after release-please creates/updates a PR
-      # This runs for BOTH new PRs (prs_created) and existing PRs (pr output exists)
       - name: Check if PR exists
         id: check-pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_OUTPUT: ${{ steps.release.outputs.pr || '' }}
+          RETRY_EVENT: ${{ github.event.action || '' }}
+          RETRY_BRANCH: ${{ github.event.client_payload.pr_branch || '' }}
         run: |
-          PR_OUTPUT='${{ steps.release.outputs.pr }}'
-          if [ -n "$PR_OUTPUT" ] && [ "$PR_OUTPUT" != "null" ]; then
+          if [[ -n "$PR_OUTPUT" && "$PR_OUTPUT" != "null" ]]; then
             echo "has_pr=true" >> "$GITHUB_OUTPUT"
-            echo "pr_branch=$(echo '${{ steps.release.outputs.pr }}' | jq -r '.headBranchName')" >> "$GITHUB_OUTPUT"
+            echo "pr_branch=$(jq -r '.headBranchName' <<< "$PR_OUTPUT")" >> "$GITHUB_OUTPUT"
+          elif [[ "$RETRY_EVENT" == "release-metadata-retry" && "$RETRY_BRANCH" == "release-please--branches--main" ]]; then
+            OPEN_BRANCH=$(gh pr view "$RETRY_BRANCH" --repo "$GITHUB_REPOSITORY" --json state,headRefName --jq 'if .state == "OPEN" then .headRefName else "" end')
+            if [[ "$OPEN_BRANCH" != "$RETRY_BRANCH" ]]; then
+              echo "Requested release metadata retry has no matching open release PR."
+              exit 1
+            fi
+            echo "has_pr=true" >> "$GITHUB_OUTPUT"
+            echo "pr_branch=$OPEN_BRANCH" >> "$GITHUB_OUTPUT"
+          elif [[ "$RETRY_EVENT" == "release-metadata-retry" ]]; then
+            echo "Refusing release metadata retry for an unexpected branch."
+            exit 1
           else
             echo "has_pr=false" >> "$GITHUB_OUTPUT"
           fi
 
+  sync-release-metadata:
+    if: needs.release-please.outputs.pr_branch != ''
+    runs-on: ubuntu-latest
+    needs: release-please
+    permissions:
+      contents: read
+    outputs:
+      source_sha: ${{ steps.source.outputs.sha }}
+    steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-        if: steps.check-pr.outputs.has_pr == 'true'
         with:
-          ref: ${{ steps.check-pr.outputs.pr_branch }}
-          # Shallow clone for speed - we only need to format and push
+          ref: ${{ needs.release-please.outputs.pr_branch }}
           fetch-depth: 1
+          persist-credentials: false
+
+      - name: Record release metadata source
+        id: source
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Install uv
-        if: steps.check-pr.outputs.has_pr == 'true'
         uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
 
       - name: Install Rust toolchain for standalone lock refresh
-        if: steps.check-pr.outputs.has_pr == 'true'
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
 
       - name: Sync uv.lock with pyproject.toml
-        if: steps.check-pr.outputs.has_pr == 'true'
-        run: |
-          uv lock
-          if git diff --quiet uv.lock; then
-            echo "✓ uv.lock already in sync"
-          else
-            echo "→ uv.lock updated to match pyproject.toml version bump"
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-            git add uv.lock
-            git commit -m "chore: sync uv.lock with pyproject.toml version bump"
-            git push
-            echo "✓ uv.lock committed and pushed"
-          fi
+        run: uv lock
 
       - name: Sync standalone package lock with pyproject.toml
-        if: steps.check-pr.outputs.has_pr == 'true'
         working-directory: packages/modelaudit-picklescan
         run: |
           uv lock
-          if git diff --quiet uv.lock; then
-            echo "✓ packages/modelaudit-picklescan/uv.lock already in sync"
-          else
-            echo "→ packages/modelaudit-picklescan/uv.lock updated to match pyproject.toml"
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-            git add uv.lock
-            git commit -m "chore: sync standalone package lock"
-            git push
-            echo "✓ packages/modelaudit-picklescan/uv.lock committed and pushed"
-          fi
+          cargo update --workspace --manifest-path Cargo.toml
+          cargo metadata --manifest-path Cargo.toml --locked --no-deps --format-version 1 >/dev/null
 
       - name: Setup Node.js
-        if: steps.check-pr.outputs.has_pr == 'true'
         uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
         with:
           node-version: "24"
 
       - name: Install Node dependencies
-        if: steps.check-pr.outputs.has_pr == 'true'
         run: npm ci --ignore-scripts
 
       - name: Format changelogs with Prettier
-        if: steps.check-pr.outputs.has_pr == 'true'
         run: |
-          echo "Formatting changelogs on branch: ${{ steps.check-pr.outputs.pr_branch }}"
+          echo "Formatting changelogs on branch: ${{ needs.release-please.outputs.pr_branch }}"
           npx prettier --write CHANGELOG.md packages/modelaudit-picklescan/CHANGELOG.md
 
-          if git diff --quiet CHANGELOG.md packages/modelaudit-picklescan/CHANGELOG.md; then
-            echo "✓ No formatting changes needed"
-          else
-            echo "→ Formatting changes detected, committing..."
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-            git add CHANGELOG.md packages/modelaudit-picklescan/CHANGELOG.md
-            git commit -m "chore: format changelogs with prettier"
-            git push
-            echo "✓ Formatting committed and pushed"
+      - name: Upload release metadata
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: modelaudit-release-metadata-${{ github.run_attempt }}
+          if-no-files-found: error
+          path: |
+            uv.lock
+            CHANGELOG.md
+            packages/modelaudit-picklescan/uv.lock
+            packages/modelaudit-picklescan/Cargo.lock
+            packages/modelaudit-picklescan/CHANGELOG.md
+
+  push-release-metadata:
+    if: needs.release-please.outputs.pr_branch != ''
+    runs-on: ubuntu-latest
+    needs: [release-please, sync-release-metadata]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: ${{ needs.release-please.outputs.pr_branch }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Download release metadata
+        id: download-metadata
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: modelaudit-release-metadata-${{ github.run_attempt }}
+          path: /tmp/modelaudit-release-metadata
+
+      - name: Regenerate missing release metadata
+        if: steps.download-metadata.outcome != 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_BRANCH: ${{ needs.release-please.outputs.pr_branch }}
+          RETRY_EVENT: ${{ github.event.action || '' }}
+        run: |
+          if [[ "$RETRY_EVENT" == "release-metadata-retry" ]]; then
+            echo "Release metadata is still unavailable after a fresh generation run; refusing to dispatch another retry."
+            exit 1
           fi
+          if [[ "$PR_BRANCH" != "release-please--branches--main" ]]; then
+            echo "Refusing release metadata retry for an unexpected branch."
+            exit 1
+          fi
+          echo "Release metadata is unavailable for this retry; starting a fresh read-only generation run."
+          gh api "repos/${GITHUB_REPOSITORY}/dispatches" -f event_type=release-metadata-retry -f "client_payload[pr_branch]=$PR_BRANCH"
+          echo "Follow the new release-please run, or select Re-run all jobs to regenerate metadata."
+          exit 1
+
+      - name: Push release metadata updates
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_BRANCH: ${{ needs.release-please.outputs.pr_branch }}
+          EXPECTED_HEAD: ${{ needs.sync-release-metadata.outputs.source_sha }}
+        run: |
+          if [[ "$(git rev-parse HEAD)" != "$EXPECTED_HEAD" ]]; then
+            echo "Release branch changed while metadata was generated; refusing to overwrite newer changes."
+            exit 1
+          fi
+
+          cp /tmp/modelaudit-release-metadata/uv.lock uv.lock
+          cp /tmp/modelaudit-release-metadata/CHANGELOG.md CHANGELOG.md
+          cp /tmp/modelaudit-release-metadata/packages/modelaudit-picklescan/uv.lock packages/modelaudit-picklescan/uv.lock
+          cp /tmp/modelaudit-release-metadata/packages/modelaudit-picklescan/Cargo.lock packages/modelaudit-picklescan/Cargo.lock
+          cp /tmp/modelaudit-release-metadata/packages/modelaudit-picklescan/CHANGELOG.md packages/modelaudit-picklescan/CHANGELOG.md
+
+          if git diff --quiet uv.lock CHANGELOG.md packages/modelaudit-picklescan/uv.lock packages/modelaudit-picklescan/Cargo.lock packages/modelaudit-picklescan/CHANGELOG.md; then
+            echo "✓ Release metadata already in sync"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add uv.lock CHANGELOG.md packages/modelaudit-picklescan/uv.lock packages/modelaudit-picklescan/Cargo.lock packages/modelaudit-picklescan/CHANGELOG.md
+          git commit -m "chore: sync release metadata"
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:${PR_BRANCH}"
 
   build:
     if: needs.release-please.outputs.release_created == 'true'
@@ -712,6 +782,106 @@ jobs:
         with:
           name: dist
           path: dist/
+
+      - name: Verify the root picklescan dependency is available on PyPI
+        run: |
+          python - <<'PY'
+          import json
+          import re
+          import time
+          import urllib.request
+          import zipfile
+          from email.parser import Parser
+          from pathlib import Path
+
+          wheels = list(Path("dist").glob("modelaudit-*.whl"))
+          if len(wheels) != 1:
+              raise SystemExit(f"Expected one modelaudit wheel, found: {wheels}")
+
+          with zipfile.ZipFile(wheels[0]) as archive:
+              metadata_files = [name for name in archive.namelist() if name.endswith(".dist-info/METADATA")]
+              if len(metadata_files) != 1:
+                  raise SystemExit(f"Expected one wheel METADATA file, found: {metadata_files}")
+              metadata = Parser().parsestr(archive.read(metadata_files[0]).decode())
+
+          requirements = metadata.get_all("Requires-Dist") or []
+          picklescan_requirements = [
+              requirement.split(";", 1)[0].strip()
+              for requirement in requirements
+              if re.match(r"^modelaudit[-_]picklescan\b", requirement, re.IGNORECASE)
+          ]
+          if len(picklescan_requirements) != 1:
+              raise SystemExit(f"Expected one modelaudit-picklescan requirement, found: {picklescan_requirements}")
+
+          requirement = picklescan_requirements[0]
+          constraint = re.sub(r"^modelaudit[-_]picklescan", "", requirement, count=1, flags=re.IGNORECASE)
+          constraint = constraint.strip().removeprefix("(").removesuffix(")").replace(" ", "")
+          if not re.fullmatch(r"(?:==|!=|>=|<=|>|<)[0-9]+(?:\.[0-9]+){1,2}(?:,(?:==|!=|>=|<=|>|<)[0-9]+(?:\.[0-9]+){1,2})*", constraint):
+              raise SystemExit(f"Unsupported modelaudit-picklescan requirement: {requirement}")
+          specifiers = re.findall(r"(==|!=|>=|<=|>|<)([0-9]+(?:\.[0-9]+){1,2})", constraint)
+
+          def version_parts(value):
+              parts = tuple(int(part) for part in value.split("."))
+              return parts + (0,) * (3 - len(parts))
+
+          def published_version_parts(value):
+              match = re.fullmatch(r"([0-9]+(?:\.[0-9]+){1,2})(?:\.post([0-9]+))?", value)
+              if match is None:
+                  return None
+              post = int(match[2]) if match[2] is not None else -1
+              return version_parts(match[1]) + (post,)
+
+          def matches(version):
+              comparisons = {
+                  "==": lambda left, right: left == right,
+                  "!=": lambda left, right: left != right,
+                  ">=": lambda left, right: left >= right,
+                  "<=": lambda left, right: left <= right,
+                  ">": lambda left, right: left > right,
+                  "<": lambda left, right: left < right,
+              }
+              for operator, value in specifiers:
+                  target = version_parts(value) + (-1,)
+                  if operator == ">" and version[:3] == target[:3]:
+                      return False
+                  if not comparisons[operator](version, target):
+                      return False
+              return True
+
+          url = "https://pypi.org/pypi/modelaudit-picklescan/json"
+          deadline = time.monotonic() + 600
+          last_status = "not checked"
+
+          while time.monotonic() < deadline:
+              try:
+                  with urllib.request.urlopen(url, timeout=20) as response:
+                      releases = json.load(response).get("releases", {})
+                  compatible = []
+                  for version, files in releases.items():
+                      published_version = published_version_parts(version)
+                      if published_version is None or not matches(published_version):
+                          continue
+                      filenames = {entry["filename"] for entry in files if not entry.get("yanked", False)}
+                      expected_files = {
+                          f"modelaudit_picklescan-{version}-cp310-abi3-macosx_10_12_x86_64.whl",
+                          f"modelaudit_picklescan-{version}-cp310-abi3-macosx_11_0_arm64.whl",
+                          f"modelaudit_picklescan-{version}-cp310-abi3-manylinux_2_28_aarch64.whl",
+                          f"modelaudit_picklescan-{version}-cp310-abi3-manylinux_2_28_x86_64.whl",
+                          f"modelaudit_picklescan-{version}-cp310-abi3-win_amd64.whl",
+                          f"modelaudit_picklescan-{version}.tar.gz",
+                      }
+                      if expected_files <= filenames:
+                          compatible.append(version)
+                  if compatible:
+                      print(f"PyPI has compatible modelaudit-picklescan releases for {requirement}: {compatible}")
+                      break
+                  last_status = f"no complete, non-yanked release satisfies {requirement}"
+              except Exception as exc:
+                  last_status = repr(exc)
+              time.sleep(10)
+          else:
+              raise SystemExit(f"Refusing to publish modelaudit with an unavailable picklescan dependency: {last_status}")
+          PY
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1

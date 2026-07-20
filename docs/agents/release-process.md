@@ -9,7 +9,7 @@ This repo is a monorepo with **two independently versioned PyPI packages**:
 
 Both packages are driven by a single [release-please](https://github.com/googleapis/release-please) workflow (`.github/workflows/release-please.yml`) with two components declared in `release-please-config.json` and current versions pinned in `.release-please-manifest.json`.
 
-The root `modelaudit` wheel declares a **hard dependency** on `modelaudit-picklescan>=0.1.7,<0.2.0` in `pyproject.toml`. When the sibling version crosses `0.2.0`, the constraint must be bumped in the same PR.
+The root `modelaudit` wheel declares a **hard dependency** on `modelaudit-picklescan>=0.1.9,<0.2.0` in `pyproject.toml`. When the sibling version crosses `0.2.0`, the constraint must be bumped in the same PR.
 
 ## Normal flow
 
@@ -124,9 +124,11 @@ Use the least disruptive path.
 - Fix workflow / secrets issues, then **re-run the failed publish job** (`gh run rerun <run-id> --failed`) OR dispatch the manual recovery path:
 
   ```bash
-  gh workflow run release-please.yml -f root_version=<X.Y.Z>
   gh workflow run release-please.yml -f picklescan_version=<X.Y.Z>
+  gh workflow run release-please.yml -f root_version=<X.Y.Z>
   ```
+
+- Publish the sibling first when a root release raises its `modelaudit-picklescan` floor. Root publication checks the built wheel requirement against complete, non-yanked PyPI files and fails closed until a compatible sibling release is available.
 
 ### A published version is broken (e.g. unresolvable deps)
 
