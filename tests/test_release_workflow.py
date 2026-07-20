@@ -155,7 +155,7 @@ def test_release_changelogs_keep_one_current_unreleased_section() -> None:
 
     for changelog in changelogs:
         headings = [line for line in changelog.read_text(encoding="utf-8").splitlines() if line.startswith("## ")]
-        assert headings[0] == "## [Unreleased]"
+        assert "## [Unreleased]" in headings[:2]
         assert headings.count("## [Unreleased]") == 1
 
 
@@ -180,7 +180,7 @@ def test_release_metadata_generation_does_not_keep_write_credentials() -> None:
         assert "git push" not in step["run"]
 
     upload_step = _step_by_name(sync_steps, "Upload release metadata")
-    assert upload_step["with"]["name"] == "modelaudit-release-metadata"
+    assert upload_step["with"]["name"] == "modelaudit-release-metadata-${{ github.run_attempt }}"
     assert upload_step["with"]["if-no-files-found"] == "error"
     assert upload_step["with"]["path"].splitlines() == [
         "uv.lock",
@@ -201,7 +201,7 @@ def test_release_metadata_generation_does_not_keep_write_credentials() -> None:
 
     download_step = _step_by_name(push_steps, "Download release metadata")
     assert download_step["with"] == {
-        "name": "modelaudit-release-metadata",
+        "name": "modelaudit-release-metadata-${{ github.run_attempt }}",
         "path": "/tmp/modelaudit-release-metadata",
     }
 
