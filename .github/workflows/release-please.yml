@@ -9,6 +9,9 @@ on:
   push:
     branches:
       - main
+  repository_dispatch:
+    types:
+      - release-metadata-retry
   workflow_dispatch:
     inputs:
       root_version:
@@ -99,11 +102,26 @@ jobs:
 
       - name: Check if PR exists
         id: check-pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_OUTPUT: ${{ steps.release.outputs.pr || '' }}
+          RETRY_EVENT: ${{ github.event.action || '' }}
+          RETRY_BRANCH: ${{ github.event.client_payload.pr_branch || '' }}
         run: |
-          PR_OUTPUT='${{ steps.release.outputs.pr }}'
-          if [ -n "$PR_OUTPUT" ] && [ "$PR_OUTPUT" != "null" ]; then
+          if [[ -n "$PR_OUTPUT" && "$PR_OUTPUT" != "null" ]]; then
             echo "has_pr=true" >> "$GITHUB_OUTPUT"
-            echo "pr_branch=$(echo '${{ steps.release.outputs.pr }}' | jq -r '.headBranchName')" >> "$GITHUB_OUTPUT"
+            echo "pr_branch=$(jq -r '.headBranchName' <<< "$PR_OUTPUT")" >> "$GITHUB_OUTPUT"
+          elif [[ "$RETRY_EVENT" == "release-metadata-retry" && "$RETRY_BRANCH" == "release-please--branches--main" ]]; then
+            OPEN_BRANCH=$(gh pr view "$RETRY_BRANCH" --repo "$GITHUB_REPOSITORY" --json state,headRefName --jq 'if .state == "OPEN" then .headRefName else "" end')
+            if [[ "$OPEN_BRANCH" != "$RETRY_BRANCH" ]]; then
+              echo "Requested release metadata retry has no matching open release PR."
+              exit 1
+            fi
+            echo "has_pr=true" >> "$GITHUB_OUTPUT"
+            echo "pr_branch=$OPEN_BRANCH" >> "$GITHUB_OUTPUT"
+          elif [[ "$RETRY_EVENT" == "release-metadata-retry" ]]; then
+            echo "Refusing release metadata retry for an unexpected branch."
+            exit 1
           else
             echo "has_pr=false" >> "$GITHUB_OUTPUT"
           fi
@@ -184,10 +202,32 @@ jobs:
           persist-credentials: false
 
       - name: Download release metadata
+        id: download-metadata
+        continue-on-error: true
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: modelaudit-release-metadata-${{ github.run_attempt }}
           path: /tmp/modelaudit-release-metadata
+
+      - name: Regenerate missing release metadata
+        if: steps.download-metadata.outcome != 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_BRANCH: ${{ needs.release-please.outputs.pr_branch }}
+          RETRY_EVENT: ${{ github.event.action || '' }}
+        run: |
+          if [[ "$RETRY_EVENT" == "release-metadata-retry" ]]; then
+            echo "Release metadata is still unavailable after a fresh generation run; refusing to dispatch another retry."
+            exit 1
+          fi
+          if [[ "$PR_BRANCH" != "release-please--branches--main" ]]; then
+            echo "Refusing release metadata retry for an unexpected branch."
+            exit 1
+          fi
+          echo "Release metadata is unavailable for this retry; starting a fresh read-only generation run."
+          gh api "repos/${GITHUB_REPOSITORY}/dispatches" -f event_type=release-metadata-retry -f "client_payload[pr_branch]=$PR_BRANCH"
+          echo "Follow the new release-please run, or select Re-run all jobs to regenerate metadata."
+          exit 1
 
       - name: Push release metadata updates
         env:

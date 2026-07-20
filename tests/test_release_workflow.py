@@ -46,7 +46,9 @@ def _jobs(workflow: dict[str, Any]) -> dict[str, Any]:
 def test_release_workflow_manual_dispatch_inputs_and_guardrails() -> None:
     workflow = _load_release_workflow()
 
-    dispatch_inputs = _workflow_triggers(workflow)["workflow_dispatch"]["inputs"]
+    triggers = _workflow_triggers(workflow)
+    assert triggers["repository_dispatch"] == {"types": ["release-metadata-retry"]}
+    dispatch_inputs = triggers["workflow_dispatch"]["inputs"]
     assert dispatch_inputs == {
         "root_version": {
             "description": "Publish an already-versioned root modelaudit release, for example 0.2.39",
@@ -80,6 +82,19 @@ def test_release_workflow_manual_dispatch_inputs_and_guardrails() -> None:
     assert 'gh release view "$PICKLESCAN_TAG"' in ensure_release_run
     assert 'gh release create "$ROOT_TAG"' in ensure_release_run
     assert 'gh release create "$PICKLESCAN_TAG"' in ensure_release_run
+
+    check_pr_step = _step_by_name(release_steps, "Check if PR exists")
+    assert check_pr_step["env"] == {
+        "GH_TOKEN": "${{ secrets.GITHUB_TOKEN }}",
+        "PR_OUTPUT": "${{ steps.release.outputs.pr || '' }}",
+        "RETRY_EVENT": "${{ github.event.action || '' }}",
+        "RETRY_BRANCH": "${{ github.event.client_payload.pr_branch || '' }}",
+    }
+    check_pr_run = check_pr_step["run"]
+    assert '"$RETRY_BRANCH" == "release-please--branches--main"' in check_pr_run
+    assert 'gh pr view "$RETRY_BRANCH" --repo "$GITHUB_REPOSITORY" --json state,headRefName' in check_pr_run
+    assert '"$OPEN_BRANCH" != "$RETRY_BRANCH"' in check_pr_run
+    assert "Refusing release metadata retry for an unexpected branch." in check_pr_run
 
 
 def test_release_workflow_picklescan_artifacts_stay_in_package_workspace() -> None:
@@ -200,10 +215,31 @@ def test_release_metadata_generation_does_not_keep_write_credentials() -> None:
     assert push_checkout["with"]["persist-credentials"] is False
 
     download_step = _step_by_name(push_steps, "Download release metadata")
+    assert download_step["id"] == "download-metadata"
+    assert download_step["continue-on-error"] is True
     assert download_step["with"] == {
         "name": "modelaudit-release-metadata-${{ github.run_attempt }}",
         "path": "/tmp/modelaudit-release-metadata",
     }
+
+    retry_step = _step_by_name(push_steps, "Regenerate missing release metadata")
+    assert retry_step["if"] == "steps.download-metadata.outcome != 'success'"
+    assert retry_step["env"] == {
+        "GH_TOKEN": "${{ secrets.GITHUB_TOKEN }}",
+        "PR_BRANCH": "${{ needs.release-please.outputs.pr_branch }}",
+        "RETRY_EVENT": "${{ github.event.action || '' }}",
+    }
+    retry_run = retry_step["run"]
+    assert '"$RETRY_EVENT" == "release-metadata-retry"' in retry_run
+    assert '"$PR_BRANCH" != "release-please--branches--main"' in retry_run
+    assert (
+        'gh api "repos/${GITHUB_REPOSITORY}/dispatches" -f event_type=release-metadata-retry '
+        '-f "client_payload[pr_branch]=$PR_BRANCH"' in retry_run
+    )
+    assert "Re-run all jobs" in retry_run
+    assert "uv lock" not in retry_run
+    assert "git push" not in retry_run
+    assert "exit 1" in retry_run
 
     push_step = _step_by_name(push_steps, "Push release metadata updates")
     assert push_step["env"] == {
