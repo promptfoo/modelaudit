@@ -5,22 +5,28 @@ All notable changes to `modelaudit-picklescan` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
-
 ## [0.1.9](https://github.com/promptfoo/modelaudit/compare/modelaudit-picklescan-v0.1.8...modelaudit-picklescan-v0.1.9) (2026-07-20)
+
 
 ### Bug Fixes
 
-- **picklescan:** preserve POSIX ctime checks ([#1719](https://github.com/promptfoo/modelaudit/issues/1719)) ([cbde525](https://github.com/promptfoo/modelaudit/commit/cbde5250755288d783467420990bd9c5c15e4631))
-- **picklescan:** restore standalone CI ([#1742](https://github.com/promptfoo/modelaudit/issues/1742)) ([88632fe](https://github.com/promptfoo/modelaudit/commit/88632fe3eb113416e34cb911952ce0a56779e4fb))
-- resolve reviewed runtime `hasattr(typing, ...)` guards before flattening module scope so current `typing_extensions.get_type_hints` remains connected to its evaluation sinks
-- restore cross-platform nightly CI safety ([#1704](https://github.com/promptfoo/modelaudit/issues/1704)) ([9df81da](https://github.com/promptfoo/modelaudit/commit/9df81dab9aed308024b814afddb617eee6ab3b1a))
+* **picklescan:** preserve POSIX ctime checks ([#1719](https://github.com/promptfoo/modelaudit/issues/1719)) ([cbde525](https://github.com/promptfoo/modelaudit/commit/cbde5250755288d783467420990bd9c5c15e4631))
+* **picklescan:** restore standalone CI ([#1742](https://github.com/promptfoo/modelaudit/issues/1742)) ([88632fe](https://github.com/promptfoo/modelaudit/commit/88632fe3eb113416e34cb911952ce0a56779e4fb))
+* restore cross-platform nightly CI safety ([#1704](https://github.com/promptfoo/modelaudit/issues/1704)) ([9df81da](https://github.com/promptfoo/modelaudit/commit/9df81dab9aed308024b814afddb617eee6ab3b1a))
 
 ## [0.1.8](https://github.com/promptfoo/modelaudit/compare/modelaudit-picklescan-v0.1.7...modelaudit-picklescan-v0.1.8) (2026-06-25)
 
 ### Bug Fixes
 
 - **picklescan:** restore Windows call-graph detection via cross-view stat identity ([#1715](https://github.com/promptfoo/modelaudit/issues/1715)) ([51c0074](https://github.com/promptfoo/modelaudit/commit/51c00742ad1c090e5a3f61c1f0c6662e66d06a40))
+
+## [Unreleased]
+
+### Bug Fixes
+
+- resolve reviewed runtime `hasattr(typing, ...)` guards before flattening module scope so current `typing_extensions.get_type_hints` remains connected to its evaluation sinks
+- restore Windows call-graph detection by reconciling descriptor and path stats with a cross-view identity that omits `st_ctime` (Windows reports it differently across stat methods); previously every stdlib callable source read failed closed on Windows, collapsing call-graph verdicts to inconclusive
+- preserve POSIX `st_ctime` in call-graph source-read identity checks so same-size, same-mtime inode-reuse swaps still fail closed
 
 ## [0.1.7](https://github.com/promptfoo/modelaudit/compare/modelaudit-picklescan-v0.1.6...modelaudit-picklescan-v0.1.7) (2026-06-24)
 
@@ -60,6 +66,8 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Documentation
 
 - add agent trace lessons ([#1627](https://github.com/promptfoo/modelaudit/issues/1627)) ([cadc17d](https://github.com/promptfoo/modelaudit/commit/cadc17d2e85a150fcb8a6571b17448c7b77ce2fc))
+
+## [Unreleased]
 
 ### Bug Fixes
 
@@ -141,6 +149,8 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Documentation
 
 - narrow scan coverage claims ([#1139](https://github.com/promptfoo/modelaudit/issues/1139)) ([47ec8cf](https://github.com/promptfoo/modelaudit/commit/47ec8cf3bc5a5ac3166757bbaae0c5a3c6adb73d))
+
+## [Unreleased]
 
 ### Bug Fixes
 
@@ -242,6 +252,8 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Documentation
 
 - align markdown with current repo state ([#1035](https://github.com/promptfoo/modelaudit/issues/1035)) ([690bc52](https://github.com/promptfoo/modelaudit/commit/690bc5274198eb3428db9779ada0bdc2d40702ee))
+
+## [Unreleased]
 
 ### Added
 

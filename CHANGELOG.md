@@ -5,30 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
-
 ## [0.2.50](https://github.com/promptfoo/modelaudit/compare/v0.2.49...v0.2.50) (2026-07-20)
 
-### Security
-
-- validate Windows MLflow staging hardlinks with native file identities so aliases outside the staging tree fail closed
-- treat protocol-relative report sources as remote identifiers before any Windows UNC filesystem probe
-- reject premature pickle `STOP` opcodes inside Joblib NumPy wrapper streams and fail closed when wrapper validation cannot complete
 
 ### Bug Fixes
 
-- **cache:** reuse stat without breaking public overrides ([#1732](https://github.com/promptfoo/modelaudit/issues/1732)) ([39cd664](https://github.com/promptfoo/modelaudit/commit/39cd664e3093eaf6e6b8e02ae78f4dd8c8174e3d))
-- **cli:** handle startup interrupts gracefully ([#1723](https://github.com/promptfoo/modelaudit/issues/1723)) ([839c7cf](https://github.com/promptfoo/modelaudit/commit/839c7cfc501b147af30bdd284e2e3612410f6f0b))
-- deep-merge partial auth config updates ([#1721](https://github.com/promptfoo/modelaudit/issues/1721)) ([8f33995](https://github.com/promptfoo/modelaudit/commit/8f3399506f8104135ed06effc34f490a68e1df7e))
+* **cache:** reuse stat without breaking public overrides ([#1732](https://github.com/promptfoo/modelaudit/issues/1732)) ([39cd664](https://github.com/promptfoo/modelaudit/commit/39cd664e3093eaf6e6b8e02ae78f4dd8c8174e3d))
+* **cli:** handle startup interrupts gracefully ([#1723](https://github.com/promptfoo/modelaudit/issues/1723)) ([839c7cf](https://github.com/promptfoo/modelaudit/commit/839c7cfc501b147af30bdd284e2e3612410f6f0b))
+* deep-merge partial auth config updates ([#1721](https://github.com/promptfoo/modelaudit/issues/1721)) ([8f33995](https://github.com/promptfoo/modelaudit/commit/8f3399506f8104135ed06effc34f490a68e1df7e))
+* **deps:** update NumPy to 2.5 on Python 3.12+ ([#1706](https://github.com/promptfoo/modelaudit/issues/1706)) ([eeba9b8](https://github.com/promptfoo/modelaudit/commit/eeba9b84db3b1e1e257892f6a0ccaf1bd5530dce))
+* **hashing:** adapt reads near scan deadlines ([#1734](https://github.com/promptfoo/modelaudit/issues/1734)) ([f23e1c0](https://github.com/promptfoo/modelaudit/commit/f23e1c030d4bdf24eb4052a0af0db8ff322ac7d1))
+* **picklescan:** preserve POSIX ctime checks ([#1719](https://github.com/promptfoo/modelaudit/issues/1719)) ([cbde525](https://github.com/promptfoo/modelaudit/commit/cbde5250755288d783467420990bd9c5c15e4631))
+* **picklescan:** restore standalone CI ([#1742](https://github.com/promptfoo/modelaudit/issues/1742)) ([88632fe](https://github.com/promptfoo/modelaudit/commit/88632fe3eb113416e34cb911952ce0a56779e4fb))
+* restore cross-platform nightly CI safety ([#1704](https://github.com/promptfoo/modelaudit/issues/1704)) ([9df81da](https://github.com/promptfoo/modelaudit/commit/9df81dab9aed308024b814afddb617eee6ab3b1a))
+
+## [Unreleased]
+
+### Bug Fixes
+
 - **deps:** update PyTorch to 2.13.0 for CVE-2025-3000; PyTorch-containing extras now require macOS 14 or newer on Apple Silicon and standard (GIL-enabled) CPython 3.13 or Python 3.10-3.12; CPython 3.13t is unsupported, while core-only remains available on macOS 11-13
 - **deps:** require Click 8.3.3 or newer to address PYSEC-2026-2132
-- **deps:** require `modelaudit-picklescan>=0.1.9` so root upgrades receive the released scanner fixes
-- **deps:** update NumPy to 2.5 on Python 3.12+ while retaining NumPy 2.4 on Python 3.11, matching NumPy's supported Python versions ([#1706](https://github.com/promptfoo/modelaudit/issues/1706)) ([eeba9b8](https://github.com/promptfoo/modelaudit/commit/eeba9b84db3b1e1e257892f6a0ccaf1bd5530dce))
-- **hashing:** adapt reads near scan deadlines ([#1734](https://github.com/promptfoo/modelaudit/issues/1734)) ([f23e1c0](https://github.com/promptfoo/modelaudit/commit/f23e1c030d4bdf24eb4052a0af0db8ff322ac7d1))
-- **picklescan:** preserve POSIX ctime checks ([#1719](https://github.com/promptfoo/modelaudit/issues/1719)) ([cbde525](https://github.com/promptfoo/modelaudit/commit/cbde5250755288d783467420990bd9c5c15e4631))
 - **picklescan:** resolve reviewed runtime `hasattr` guards without losing call-graph sinks
-- **picklescan:** restore standalone CI ([#1742](https://github.com/promptfoo/modelaudit/issues/1742)) ([88632fe](https://github.com/promptfoo/modelaudit/commit/88632fe3eb113416e34cb911952ce0a56779e4fb))
-- restore cross-platform nightly CI safety ([#1704](https://github.com/promptfoo/modelaudit/issues/1704)) ([9df81da](https://github.com/promptfoo/modelaudit/commit/9df81dab9aed308024b814afddb617eee6ab3b1a))
+- **hashing:** preserve throughput while checking scan deadlines responsively
+- **cli:** handle interrupts during CLI startup without a traceback
 
 ## [0.2.49](https://github.com/promptfoo/modelaudit/compare/v0.2.48...v0.2.49) (2026-06-25)
 
@@ -213,8 +212,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - add agent trace lessons ([#1627](https://github.com/promptfoo/modelaudit/issues/1627)) ([cadc17d](https://github.com/promptfoo/modelaudit/commit/cadc17d2e85a150fcb8a6571b17448c7b77ce2fc))
 
+## [Unreleased]
+
+### Security
+
+- validate Windows MLflow staging hardlinks with native file identities so aliases outside the staging tree fail closed
+- treat protocol-relative report sources as remote identifiers before any Windows UNC filesystem probe
+- reject premature pickle `STOP` opcodes inside Joblib NumPy wrapper streams and fail closed when wrapper validation cannot complete
+
 ### Bug Fixes
 
+- support NumPy 2.5 on Python 3.12+ while retaining NumPy 2.4 on Python 3.11, matching NumPy's supported Python versions
 - require patched py7zr 1.1.3 for 7z support and preserve bounded nested format probes when it signals per-member completion
 - require patched `msgpack>=1.2.1` so default and optional installs avoid the `Unpacker` reuse crash advisory
 - stream large TAR and compressed-TAR model archives through TAR-specific inspection instead of generic whole-file read rejection, bound shared nested NeMo work after aggregate-budget exhaustion, preserve reachable findings at TAR and compressed-wrapper scan limits, preserve trusted HDF5 findings when overlapping TAR routing is inconclusive, prove compressed-stream ownership before bounding HDF5 user-block scans, and cap accepted compressed-wrapper zero padding
@@ -538,6 +546,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Documentation
 
 - align picklescan version guidance ([#1279](https://github.com/promptfoo/modelaudit/issues/1279)) ([a53eb11](https://github.com/promptfoo/modelaudit/commit/a53eb112fcbdf4d6baca1ae0124aba8129cb95e1))
+
+## [Unreleased]
 
 ### Bug Fixes
 
@@ -879,6 +889,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - narrow scan coverage claims ([#1139](https://github.com/promptfoo/modelaudit/issues/1139)) ([47ec8cf](https://github.com/promptfoo/modelaudit/commit/47ec8cf3bc5a5ac3166757bbaae0c5a3c6adb73d))
 
+## [Unreleased]
+
 ### Bug Fixes
 
 - detect nested brace-format lookups that reach tracked `defaultdict` factories
@@ -994,6 +1006,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - align README support and dependency guidance ([#1008](https://github.com/promptfoo/modelaudit/issues/1008)) ([5dcd62b](https://github.com/promptfoo/modelaudit/commit/5dcd62bad05ed9e661c2cafacc7ec1b4a4bad515))
 - clarify security report closure policy ([#1049](https://github.com/promptfoo/modelaudit/issues/1049)) ([d53e445](https://github.com/promptfoo/modelaudit/commit/d53e445609708909eee6822a5215289ed64d6c48))
 - prune stale planning artifacts ([#1010](https://github.com/promptfoo/modelaudit/issues/1010)) ([851cc10](https://github.com/promptfoo/modelaudit/commit/851cc102a8c1d40fce7433a1d221d6ff9acece5f))
+
+## [Unreleased]
 
 ### Added
 
