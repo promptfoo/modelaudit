@@ -142,6 +142,16 @@ def test_release_workflow_refreshes_both_standalone_package_locks() -> None:
     assert "git add uv.lock Cargo.lock" in sync_run
 
 
+def test_release_changelogs_keep_one_current_unreleased_section() -> None:
+    root_dir = Path(__file__).resolve().parents[1]
+    changelogs = (root_dir / "CHANGELOG.md", root_dir / "packages" / "modelaudit-picklescan" / "CHANGELOG.md")
+
+    for changelog in changelogs:
+        headings = [line for line in changelog.read_text(encoding="utf-8").splitlines() if line.startswith("## ")]
+        assert headings[0] == "## [Unreleased]"
+        assert headings.count("## [Unreleased]") == 1
+
+
 def test_release_workflow_verifies_published_picklescan_package() -> None:
     workflow = _load_release_workflow()
 
