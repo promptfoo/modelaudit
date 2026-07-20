@@ -70,7 +70,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071 # v4
-        if: steps.manual.outputs.manual_release != 'true'
+        if: steps.manual.outputs.manual_release != 'true' && github.event_name != 'repository_dispatch'
         id: release
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -824,6 +824,13 @@ jobs:
               parts = tuple(int(part) for part in value.split("."))
               return parts + (0,) * (3 - len(parts))
 
+          def published_version_parts(value):
+              match = re.fullmatch(r"([0-9]+(?:\.[0-9]+){1,2})(?:\.post([0-9]+))?", value)
+              if match is None:
+                  return None
+              post = int(match[2]) if match[2] is not None else -1
+              return version_parts(match[1]) + (post,)
+
           def matches(version):
               comparisons = {
                   "==": lambda left, right: left == right,
@@ -833,7 +840,13 @@ jobs:
                   ">": lambda left, right: left > right,
                   "<": lambda left, right: left < right,
               }
-              return all(comparisons[operator](version, version_parts(value)) for operator, value in specifiers)
+              for operator, value in specifiers:
+                  target = version_parts(value) + (-1,)
+                  if operator == ">" and version[:3] == target[:3]:
+                      return False
+                  if not comparisons[operator](version, target):
+                      return False
+              return True
 
           url = "https://pypi.org/pypi/modelaudit-picklescan/json"
           deadline = time.monotonic() + 600
@@ -845,7 +858,8 @@ jobs:
                       releases = json.load(response).get("releases", {})
                   compatible = []
                   for version, files in releases.items():
-                      if not re.fullmatch(r"[0-9]+(?:\.[0-9]+){1,2}", version) or not matches(version_parts(version)):
+                      published_version = published_version_parts(version)
+                      if published_version is None or not matches(published_version):
                           continue
                       filenames = {entry["filename"] for entry in files if not entry.get("yanked", False)}
                       expected_files = {

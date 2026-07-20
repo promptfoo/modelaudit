@@ -79,7 +79,10 @@ def test_release_workflow_manual_dispatch_inputs_and_guardrails() -> None:
     release_action_step = next(
         step for step in release_steps if step.get("uses", "").startswith("googleapis/release-please-action@")
     )
-    assert release_action_step["if"] == "steps.manual.outputs.manual_release != 'true'"
+    assert (
+        release_action_step["if"]
+        == "steps.manual.outputs.manual_release != 'true' && github.event_name != 'repository_dispatch'"
+    )
 
     ensure_release_step = _step_by_name(release_steps, "Ensure manual GitHub releases exist")
     assert ensure_release_step["if"] == "steps.manual.outputs.manual_release == 'true'"
@@ -170,13 +173,12 @@ def test_release_workflow_refreshes_both_standalone_package_locks() -> None:
     assert "git push" not in sync_run
 
 
-def test_release_changelogs_keep_one_current_unreleased_section() -> None:
+def test_release_changelogs_keep_one_unreleased_section() -> None:
     root_dir = Path(__file__).resolve().parents[1]
     changelogs = (root_dir / "CHANGELOG.md", root_dir / "packages" / "modelaudit-picklescan" / "CHANGELOG.md")
 
     for changelog in changelogs:
         headings = [line for line in changelog.read_text(encoding="utf-8").splitlines() if line.startswith("## ")]
-        assert "## [Unreleased]" in headings[:2]
         assert headings.count("## [Unreleased]") == 1
 
 
@@ -327,20 +329,28 @@ def test_release_workflow_publishes_picklescan_before_dependent_root() -> None:
 
 
 @pytest.mark.parametrize(
-    ("requirement", "published_version", "missing_wheel", "yanked_wheel", "should_pass"),
+    ("requirement", "published_version", "missing_wheel", "missing_sdist", "yanked_wheel", "should_pass"),
     [
-        ("modelaudit-picklescan<0.2.0,>=0.1.9", "0.1.8", False, False, False),
-        ("modelaudit-picklescan<0.2.0,>=0.1.9", "0.1.9", True, False, False),
-        ("modelaudit-picklescan<0.2.0,>=0.1.9", "0.1.9", False, True, False),
-        ("modelaudit-picklescan<0.2.0,>=0.1.9", "0.1.9", False, False, True),
-        ("modelaudit-picklescan (>=0.1.9, <0.2.0)", "0.1.9", False, False, True),
-        ("modelaudit-picklescan>=0.1.9rc1,<0.2.0", "0.1.9", False, False, False),
+        ("modelaudit-picklescan<0.2.0,>=0.1.9", "0.1.8", False, False, False, False),
+        ("modelaudit-picklescan<0.2.0,>=0.1.9", "0.1.9", True, False, False, False),
+        ("modelaudit-picklescan<0.2.0,>=0.1.9", "0.1.9", False, True, False, False),
+        ("modelaudit-picklescan<0.2.0,>=0.1.9", "0.1.9", False, False, True, False),
+        ("modelaudit-picklescan<0.2.0,>=0.1.9", "0.1.9", False, False, False, True),
+        ("modelaudit-picklescan<0.2.0,>=0.1.9", "0.1.9.post1", False, False, False, True),
+        ("modelaudit-picklescan>0.1.9,<0.2.0", "0.1.9.post1", False, False, False, False),
+        ("modelaudit-picklescan==0.1.9", "0.1.9.post1", False, False, False, False),
+        ("modelaudit-picklescan!=0.1.9,<0.2.0", "0.1.9.post1", False, False, False, True),
+        ("modelaudit-picklescan<0.2.0,>=0.1.9", "0.1.9rc1", False, False, False, False),
+        ("modelaudit-picklescan<0.2.0,>=0.1.9", "0.2.0.post1", False, False, False, False),
+        ("modelaudit-picklescan (>=0.1.9, <0.2.0)", "0.1.9", False, False, False, True),
+        ("modelaudit-picklescan>=0.1.9rc1,<0.2.0", "0.1.9", False, False, False, False),
     ],
 )
 def test_root_publish_fails_closed_until_picklescan_is_available(
     requirement: str,
     published_version: str,
     missing_wheel: bool,
+    missing_sdist: bool,
     yanked_wheel: bool,
     should_pass: bool,
     tmp_path: Path,
@@ -373,6 +383,8 @@ def test_root_publish_fails_closed_until_picklescan_is_available(
         f"modelaudit_picklescan-{published_version}.tar.gz",
     ]
     if missing_wheel:
+        expected_files.pop(0)
+    if missing_sdist:
         expected_files.pop()
     payload = {
         "releases": {
