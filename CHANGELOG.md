@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.2.50](https://github.com/promptfoo/modelaudit/compare/v0.2.49...v0.2.50) (2026-07-20)
 
+### Security
+
+- validate Windows MLflow staging hardlinks with native file identities so aliases outside the staging tree fail closed
+- treat protocol-relative report sources as remote identifiers before any Windows UNC filesystem probe
+- reject premature pickle `STOP` opcodes inside Joblib NumPy wrapper streams and fail closed when wrapper validation cannot complete
+
 ### Bug Fixes
 
 - **cache:** reuse stat without breaking public overrides ([#1732](https://github.com/promptfoo/modelaudit/issues/1732)) ([39cd664](https://github.com/promptfoo/modelaudit/commit/39cd664e3093eaf6e6b8e02ae78f4dd8c8174e3d))
@@ -14,7 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - deep-merge partial auth config updates ([#1721](https://github.com/promptfoo/modelaudit/issues/1721)) ([8f33995](https://github.com/promptfoo/modelaudit/commit/8f3399506f8104135ed06effc34f490a68e1df7e))
 - **deps:** require Click 8.3.3 or newer to address PYSEC-2026-2132
 - **deps:** require `modelaudit-picklescan>=0.1.9` so root upgrades receive the released scanner fixes
-- **deps:** update NumPy to 2.5 on Python 3.12+ ([#1706](https://github.com/promptfoo/modelaudit/issues/1706)) ([eeba9b8](https://github.com/promptfoo/modelaudit/commit/eeba9b84db3b1e1e257892f6a0ccaf1bd5530dce))
+- **deps:** update NumPy to 2.5 on Python 3.12+ while retaining NumPy 2.4 on Python 3.11, matching NumPy's supported Python versions ([#1706](https://github.com/promptfoo/modelaudit/issues/1706)) ([eeba9b8](https://github.com/promptfoo/modelaudit/commit/eeba9b84db3b1e1e257892f6a0ccaf1bd5530dce))
 - **hashing:** adapt reads near scan deadlines ([#1734](https://github.com/promptfoo/modelaudit/issues/1734)) ([f23e1c0](https://github.com/promptfoo/modelaudit/commit/f23e1c030d4bdf24eb4052a0af0db8ff322ac7d1))
 - **picklescan:** preserve POSIX ctime checks ([#1719](https://github.com/promptfoo/modelaudit/issues/1719)) ([cbde525](https://github.com/promptfoo/modelaudit/commit/cbde5250755288d783467420990bd9c5c15e4631))
 - **picklescan:** resolve reviewed runtime `hasattr` guards without losing call-graph sinks
@@ -206,15 +212,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Security
-
-- validate Windows MLflow staging hardlinks with native file identities so aliases outside the staging tree fail closed
-- treat protocol-relative report sources as remote identifiers before any Windows UNC filesystem probe
-- reject premature pickle `STOP` opcodes inside Joblib NumPy wrapper streams and fail closed when wrapper validation cannot complete
-
 ### Bug Fixes
 
-- support NumPy 2.5 on Python 3.12+ while retaining NumPy 2.4 on Python 3.11, matching NumPy's supported Python versions
 - require patched py7zr 1.1.3 for 7z support and preserve bounded nested format probes when it signals per-member completion
 - require patched `msgpack>=1.2.1` so default and optional installs avoid the `Unpacker` reuse crash advisory
 - stream large TAR and compressed-TAR model archives through TAR-specific inspection instead of generic whole-file read rejection, bound shared nested NeMo work after aggregate-budget exhaustion, preserve reachable findings at TAR and compressed-wrapper scan limits, preserve trusted HDF5 findings when overlapping TAR routing is inconclusive, prove compressed-stream ownership before bounding HDF5 user-block scans, and cap accepted compressed-wrapper zero padding
