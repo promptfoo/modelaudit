@@ -173,6 +173,10 @@ docker run --rm -v "$(pwd)":/app ghcr.io/promptfoo/modelaudit:latest model.pkl
 ```
 
 The ONNX extra, including the ONNX portion of `modelaudit[all]`, is packaged for Python 3.10-3.12.
+PyTorch-containing extras require Python 3.10-3.12 or standard (GIL-enabled) CPython 3.13; the patched PyTorch 2.13
+wheels do not support free-threaded CPython 3.13t. Use standard CPython, since ModelAudit's native pickle scanner also
+does not support CPython 3.13t. On Apple Silicon, PyTorch-containing extras require macOS 14 or newer because the wheels
+target `macosx_14_0_arm64`; the core-only installation remains available for static scanning on macOS 11-13.
 
 ## CLI Options
 
