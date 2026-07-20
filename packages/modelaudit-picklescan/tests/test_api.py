@@ -10778,14 +10778,48 @@ def test_scan_bytes_warns_on_invoked_trusted_import_reference_without_source_ana
     )
 
 
+def _assert_call_graph_source_stability_error(report: PickleReport) -> None:
+    assert report.metadata.get("analysis_incomplete") is True
+    assert any(
+        error.message
+        == "Python call-graph analysis could not complete: source changed during shared call-graph analysis"
+        and error.category == "call_graph_analysis_error"
+        and error.exception_type == "_CallGraphAnalysisLimitError"
+        and error.details.get("analysis") == "python_call_graph_source_stability"
+        and error.details.get("analysis_incomplete") is True
+        for error in report.errors
+    )
+
+
 @pytest.mark.parametrize("module", ["_xxsubinterpreters", "dotenv.main"])
 def test_scan_bytes_warns_on_unreviewed_name_from_module_with_dangerous_entries(module: str) -> None:
     report = scan_bytes(f"c{module}\nGadget\n.".encode(), source="dangerous-module-sibling.pkl")
 
-    assert report.status == ScanStatus.COMPLETE
+    if module == "dotenv.main" and report.status == ScanStatus.INCONCLUSIVE:
+        _assert_call_graph_source_stability_error(report)
+    else:
+        assert report.status == ScanStatus.COMPLETE
     assert report.verdict == SafetyVerdict.SUSPICIOUS
     assert any(
         finding.rule_code == "NON_ALLOWLISTED_GLOBAL" and finding.details.get("import_reference") == f"{module}.Gadget"
+        for finding in report.findings
+    )
+
+
+def test_scan_bytes_warns_on_unreviewed_dotenv_global_when_source_changes(monkeypatch: pytest.MonkeyPatch) -> None:
+    def raise_source_stability_error(_report_generation: int | None) -> None:
+        raise _CallGraphAnalysisLimitError("source changed during shared call-graph analysis")
+
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", raise_source_stability_error)
+
+    report = scan_bytes(b"cdotenv.main\nGadget\n.", source="dangerous-module-sibling-source-change.pkl")
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    _assert_call_graph_source_stability_error(report)
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and finding.details.get("import_reference") == "dotenv.main.Gadget"
         for finding in report.findings
     )
 
