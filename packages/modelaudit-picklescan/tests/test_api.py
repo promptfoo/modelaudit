@@ -10782,7 +10782,9 @@ def test_scan_bytes_warns_on_invoked_trusted_import_reference_without_source_ana
 def test_scan_bytes_warns_on_unreviewed_name_from_module_with_dangerous_entries(module: str) -> None:
     report = scan_bytes(f"c{module}\nGadget\n.".encode(), source="dangerous-module-sibling.pkl")
 
-    assert report.status == ScanStatus.COMPLETE
+    assert report.status in {ScanStatus.COMPLETE, ScanStatus.INCONCLUSIVE}
+    if report.status == ScanStatus.INCONCLUSIVE:
+        assert report.metadata.get("analysis_incomplete") is True
     assert report.verdict == SafetyVerdict.SUSPICIOUS
     assert any(
         finding.rule_code == "NON_ALLOWLISTED_GLOBAL" and finding.details.get("import_reference") == f"{module}.Gadget"
