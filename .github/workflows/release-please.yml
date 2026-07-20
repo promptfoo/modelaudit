@@ -278,22 +278,23 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
 
-      - name: Sync dependencies
-        run: uv sync --extra all-ci
+      - name: Type check root package with mypy
+        run: |
+          # Match tool.mypy.python_version so version-gated dependency stubs use valid syntax.
+          uv sync --python 3.10 --frozen --extra all-ci
+          uv run --python 3.10 --frozen mypy modelaudit/ tests/
+
+      - name: Sync dependencies for root runtime checks
+        run: |
+          # Keep the release security tests and artifact smoke tests on modern Python.
+          uv python pin 3.12
+          uv sync --frozen --extra all-ci
 
       - name: Lint root package with Ruff
         run: uv run ruff check modelaudit/ tests/
 
       - name: Check root package formatting with Ruff
         run: uv run ruff format --check modelaudit/ tests/
-
-      - name: Type check root package with mypy
-        env:
-          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/modelaudit-mypy-venv
-        run: |
-          # Match tool.mypy.python_version without moving runtime tests off the runner Python.
-          uv sync --python 3.10 --frozen --extra all-ci
-          uv run --python 3.10 --frozen mypy modelaudit/ tests/
 
       - name: Run root package tests
         run: |

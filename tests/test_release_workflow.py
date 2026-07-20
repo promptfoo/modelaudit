@@ -153,19 +153,24 @@ def test_release_workflow_picklescan_artifacts_stay_in_package_workspace() -> No
     }
 
 
-def test_release_workflow_isolates_root_type_check_python_from_runtime_tests() -> None:
+def test_release_workflow_restores_root_runtime_python_after_type_check() -> None:
     workflow = _load_release_workflow()
     steps = _job_steps(workflow, "build")
 
-    sync_step = _step_by_name(steps, "Sync dependencies")
     type_check_step = _step_by_name(steps, "Type check root package with mypy")
+    sync_step = _step_by_name(steps, "Sync dependencies for root runtime checks")
+    lint_step = _step_by_name(steps, "Lint root package with Ruff")
     test_step = _step_by_name(steps, "Run root package tests")
+    build_step = _step_by_name(steps, "Build package")
 
-    assert type_check_step["env"] == {"UV_PROJECT_ENVIRONMENT": "${{ runner.temp }}/modelaudit-mypy-venv"}
     assert "uv sync --python 3.10 --frozen --extra all-ci" in type_check_step["run"]
     assert "uv run --python 3.10 --frozen mypy modelaudit/ tests/" in type_check_step["run"]
+    assert "UV_PROJECT_ENVIRONMENT" not in type_check_step.get("env", {})
+    assert "uv python pin 3.12" in sync_step["run"]
+    assert "uv sync --frozen --extra all-ci" in sync_step["run"]
     assert "uv python pin 3.10" not in "\n".join(step.get("run", "") for step in steps)
-    assert steps.index(sync_step) < steps.index(type_check_step) < steps.index(test_step)
+    assert steps.index(type_check_step) < steps.index(sync_step) < steps.index(lint_step) < steps.index(test_step)
+    assert steps.index(test_step) < steps.index(build_step)
 
 
 def test_release_workflow_refreshes_both_standalone_package_locks() -> None:
