@@ -10,6 +10,7 @@ import datetime
 import decimal
 import faulthandler
 import functools
+import importlib
 import io
 import json
 import logging
@@ -24,7 +25,6 @@ import tarfile
 import uuid
 import warnings
 import zipfile
-from importlib import import_module, invalidate_caches
 from importlib import metadata as importlib_metadata
 from importlib.abc import Loader
 from importlib.machinery import (
@@ -7772,11 +7772,11 @@ def test_scan_bytes_uses_current_import_origin_instead_of_stale_loaded_source(
         encoding="utf-8",
     )
     monkeypatch.syspath_prepend(str(loaded_dir))
-    invalidate_caches()
-    imported_module = import_module(module_name)
+    importlib.invalidate_caches()
+    imported_module = importlib.import_module(module_name)
     assert Path(cast(str, imported_module.__file__)).parent == loaded_dir
     monkeypatch.syspath_prepend(str(active_dir))
-    invalidate_caches()
+    importlib.invalidate_caches()
     payload = f"c{module_name}\nGadget\n.".encode()
 
     try:
