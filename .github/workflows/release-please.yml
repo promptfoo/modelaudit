@@ -1450,6 +1450,7 @@ jobs:
           import json
           import os
           import re
+          import tarfile
           import urllib.request
           from pathlib import Path
 
@@ -1462,7 +1463,19 @@ jobs:
           if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
               raise SystemExit(f"Invalid root release version: {version!r}")
 
-          project = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))["project"]
+          max_metadata_bytes = 10 * 1024 * 1024
+          tagged_metadata = {}
+          for filename in ("pyproject.toml", "uv.lock"):
+              tagged_path = Path(filename)
+              tagged_size = tagged_path.stat().st_size
+              if tagged_size > max_metadata_bytes:
+                  raise SystemExit(f"Tagged root {filename} exceeds {max_metadata_bytes} bytes")
+              tagged_content = tagged_path.read_bytes()
+              if len(tagged_content) != tagged_size:
+                  raise SystemExit(f"Tagged root {filename} changed while it was being read")
+              tagged_metadata[filename] = tagged_content
+
+          project = tomllib.loads(tagged_metadata["pyproject.toml"].decode("utf-8"))["project"]
           if project.get("name") != "modelaudit" or project.get("version") != version:
               raise SystemExit(f"Tagged root project does not match modelaudit {version}: {project!r}")
 
@@ -1494,6 +1507,33 @@ jobs:
                       f"Recovered artifact SHA256 mismatch for {path.name}: {actual_digest} != {expected_digest}"
                   )
               print(f"Verified {path.name}: {actual_digest}")
+
+          required_members = {
+              f"modelaudit-{version}/{filename}": content for filename, content in tagged_metadata.items()
+          }
+          seen_members = set()
+          try:
+              with tarfile.open(Path("dist", f"modelaudit-{version}.tar.gz"), "r|gz") as archive:
+                  for member in archive:
+                      expected_content = required_members.get(member.name)
+                      if expected_content is None:
+                          continue
+                      if member.name in seen_members:
+                          raise SystemExit(f"Duplicate root metadata member in sdist: {member.name}")
+                      seen_members.add(member.name)
+                      if not member.isreg() or member.issym() or member.islnk():
+                          raise SystemExit(f"Root metadata member is not a regular file: {member.name}")
+                      if member.size > max_metadata_bytes or member.size != len(expected_content):
+                          raise SystemExit(f"Root metadata member has an unexpected size: {member.name}")
+                      member_file = archive.extractfile(member)
+                      if member_file is None or member_file.read(member.size + 1) != expected_content:
+                          raise SystemExit(f"Root metadata member does not match the release tag: {member.name}")
+          except (OSError, tarfile.TarError) as error:
+              raise SystemExit(f"Could not verify root sdist metadata: {error}") from error
+
+          if seen_members != set(required_members):
+              missing = sorted(set(required_members) - seen_members)
+              raise SystemExit(f"Root sdist is missing tagged metadata: {missing!r}")
           PY
 
       - name: Generate recovery integrity attestation

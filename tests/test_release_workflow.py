@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import sys
+import tarfile
 import time
 import urllib.request
 import zipfile
@@ -762,7 +763,10 @@ def test_release_workflow_recovers_root_provenance_without_republishing() -> Non
     verify_run = verify_step["run"]
     assert verify_step["env"] == {"EXPECTED_VERSION": "${{ needs.release-please.outputs.version }}"}
     assert 're.fullmatch(r"[0-9]+\\.[0-9]+\\.[0-9]+", version)' in verify_run
-    assert 'Path("pyproject.toml").read_text(encoding="utf-8")' in verify_run
+    assert 'for filename in ("pyproject.toml", "uv.lock")' in verify_run
+    assert "tagged_path.stat().st_size" in verify_run
+    assert "tagged_path.read_bytes()" in verify_run
+    assert "max_metadata_bytes = 10 * 1024 * 1024" in verify_run
     assert 'f"modelaudit-{version}-py3-none-any.whl"' in verify_run
     assert 'f"modelaudit-{version}.tar.gz"' in verify_run
     assert "path.is_symlink()" in verify_run
@@ -770,6 +774,12 @@ def test_release_workflow_recovers_root_provenance_without_republishing() -> Non
     assert 'entry.get("yanked", False)' in verify_run
     assert 'entry.get("digests", {}).get("sha256")' in verify_run
     assert "hashlib.sha256(path.read_bytes()).hexdigest()" in verify_run
+    assert 'f"modelaudit-{version}/{filename}"' in verify_run
+    assert 'tarfile.open(Path("dist", f"modelaudit-{version}.tar.gz"), "r|gz")' in verify_run
+    assert "member.name in seen_members" in verify_run
+    assert "not member.isreg() or member.issym() or member.islnk()" in verify_run
+    assert "member.size > max_metadata_bytes or member.size != len(expected_content)" in verify_run
+    assert "member_file.read(member.size + 1) != expected_content" in verify_run
 
     attest_step = _step_by_name(steps, "Generate recovery integrity attestation")
     assert attest_step["uses"] == "actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26"
@@ -936,6 +946,12 @@ def test_root_provenance_recovery_rejects_untrusted_source_runs(
         ("yanked", False),
         ("invalid-digest", False),
         ("hash-mismatch", False),
+        ("lock-mismatch", False),
+        ("pyproject-mismatch", False),
+        ("missing-sdist-metadata", False),
+        ("duplicate-sdist-metadata", False),
+        ("linked-sdist-metadata", False),
+        ("oversized-sdist-metadata", False),
     ],
 )
 def test_root_provenance_recovery_fails_closed_for_unverified_artifacts(
@@ -956,15 +972,46 @@ def test_root_provenance_recovery_fails_closed_for_unverified_artifacts(
     version = "0.2.50"
     wheel_name = f"modelaudit-{version}-py3-none-any.whl"
     sdist_name = f"modelaudit-{version}.tar.gz"
-    contents = {wheel_name: b"original wheel", sdist_name: b"original sdist"}
     dist_path = tmp_path / "dist"
     dist_path.mkdir()
-    for filename, content in contents.items():
-        (dist_path / filename).write_bytes(content)
+    (dist_path / wheel_name).write_bytes(b"original wheel")
     project_version = "0.2.49" if mutation == "wrong-tag-version" else version
-    (tmp_path / "pyproject.toml").write_text(
-        f'[project]\nname = "modelaudit"\nversion = "{project_version}"\n', encoding="utf-8"
-    )
+    project_content = f'[project]\nname = "modelaudit"\nversion = "{project_version}"\n'.encode()
+    lock_content = b'version = 1\nrevision = 3\nrequires-python = ">=3.10"\n'
+    (tmp_path / "pyproject.toml").write_bytes(project_content)
+    (tmp_path / "uv.lock").write_bytes(lock_content)
+
+    metadata_contents = {
+        f"modelaudit-{version}/pyproject.toml": project_content,
+        f"modelaudit-{version}/uv.lock": lock_content,
+    }
+    if mutation == "lock-mismatch":
+        metadata_contents[f"modelaudit-{version}/uv.lock"] = lock_content.replace(b"revision = 3", b"revision = 4")
+    elif mutation == "pyproject-mismatch":
+        metadata_contents[f"modelaudit-{version}/pyproject.toml"] = project_content.replace(
+            b"modelaudit", b"modelaudix"
+        )
+    elif mutation in {"missing-sdist-metadata", "linked-sdist-metadata"}:
+        metadata_contents.pop(f"modelaudit-{version}/uv.lock")
+    elif mutation == "oversized-sdist-metadata":
+        metadata_contents[f"modelaudit-{version}/uv.lock"] = b"0" * (10 * 1024 * 1024 + 1)
+
+    with tarfile.open(dist_path / sdist_name, "w:gz") as archive:
+        for member_name, content in metadata_contents.items():
+            member = tarfile.TarInfo(member_name)
+            member.size = len(content)
+            archive.addfile(member, io.BytesIO(content))
+        if mutation == "duplicate-sdist-metadata":
+            duplicate = tarfile.TarInfo(f"modelaudit-{version}/uv.lock")
+            duplicate.size = len(lock_content)
+            archive.addfile(duplicate, io.BytesIO(lock_content))
+        elif mutation == "linked-sdist-metadata":
+            link = tarfile.TarInfo(f"modelaudit-{version}/uv.lock")
+            link.type = tarfile.SYMTYPE
+            link.linkname = f"modelaudit-{version}/pyproject.toml"
+            archive.addfile(link)
+
+    contents = {filename: (dist_path / filename).read_bytes() for filename in (wheel_name, sdist_name)}
 
     urls: list[dict[str, Any]] = [
         {"filename": filename, "yanked": False, "digests": {"sha256": hashlib.sha256(content).hexdigest()}}
