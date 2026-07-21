@@ -1597,7 +1597,9 @@ jobs:
               raise SystemExit(f"PyPI returned an unexpected modelaudit version for {version}")
 
           urls = payload.get("urls")
-          if not isinstance(urls, list) or any(not isinstance(entry, dict) for entry in urls):
+          if not isinstance(urls, list) or any(
+              not isinstance(entry, dict) or not isinstance(entry.get("filename"), str) for entry in urls
+          ):
               raise SystemExit(f"PyPI returned an invalid artifact list for modelaudit {version}")
           published = {entry.get("filename"): entry for entry in urls}
           if len(published) != len(urls) or set(published) != expected:

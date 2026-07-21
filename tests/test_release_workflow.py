@@ -806,7 +806,7 @@ def test_release_workflow_recovers_root_provenance_without_republishing() -> Non
     assert "except (OSError, ValueError) as error:" in verify_run
     assert "Could not verify PyPI metadata for modelaudit" in verify_run
     assert 'not isinstance(payload, dict) or not isinstance(payload.get("info"), dict)' in verify_run
-    assert "not isinstance(urls, list) or any(not isinstance(entry, dict) for entry in urls)" in verify_run
+    assert 'not isinstance(entry, dict) or not isinstance(entry.get("filename"), str) for entry in urls' in verify_run
     assert 'entry.get("yanked", False)' in verify_run
     assert 'digests = entry.get("digests")' in verify_run
     assert "not isinstance(digests, dict)" in verify_run
@@ -1199,6 +1199,7 @@ def test_root_provenance_recovery_rejects_untrusted_source_runs(
         ("invalid-pypi-info", False),
         ("invalid-pypi-urls", False),
         ("invalid-pypi-entry", False),
+        ("invalid-pypi-filename", False),
         ("missing-pypi-file", False),
         ("yanked", False),
         ("invalid-pypi-digests", False),
@@ -1429,6 +1430,8 @@ def test_root_provenance_recovery_fails_closed_for_unverified_artifacts(
         payload["urls"] = {}
     elif mutation == "invalid-pypi-entry":
         payload["urls"] = ["not-an-artifact"]
+    elif mutation == "invalid-pypi-filename":
+        payload["urls"] = [{"filename": []}]
     elif mutation == "missing-pypi-file":
         urls.pop()
     elif mutation == "yanked":
@@ -1488,6 +1491,7 @@ def test_root_provenance_recovery_fails_closed_for_unverified_artifacts(
             "invalid-pypi-info": "PyPI returned invalid modelaudit metadata",
             "invalid-pypi-urls": "PyPI returned an invalid artifact list",
             "invalid-pypi-entry": "PyPI returned an invalid artifact list",
+            "invalid-pypi-filename": "PyPI returned an invalid artifact list",
             "invalid-pypi-digests": "PyPI did not return valid digests",
             "symlink-sdist-metadata-alias": "contains a linked member",
             "hardlink-sdist-member": "contains a linked member",
