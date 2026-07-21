@@ -1505,7 +1505,15 @@ jobs:
           if not isinstance(changed_files, list) or len(changed_files) > len(allowed_source_changes):
               raise SystemExit("Tagged root release and source run returned invalid changed-file metadata")
           if not all(
-              isinstance(entry, dict) and entry.get("filename") in allowed_source_changes for entry in changed_files
+              isinstance(entry, dict)
+              and entry.get("filename") in allowed_source_changes
+              and entry.get("status") in {"added", "modified", "removed", "renamed"}
+              and (
+                  entry.get("previous_filename") in allowed_source_changes
+                  if entry.get("status") == "renamed"
+                  else entry.get("previous_filename") is None
+              )
+              for entry in changed_files
           ):
               raise SystemExit("Tagged root release and source run differ outside the trusted release-repair files")
           print(

@@ -763,6 +763,10 @@ def test_release_workflow_recovers_root_provenance_without_republishing() -> Non
         'allowed_source_changes = {".github/workflows/release-please.yml", "tests/test_release_workflow.py"}'
         in source_run
     )
+    assert 'entry.get("status") in {"added", "modified", "removed", "renamed"}' in source_run
+    assert 'entry.get("previous_filename") in allowed_source_changes' in source_run
+    assert 'if entry.get("status") == "renamed"' in source_run
+    assert 'else entry.get("previous_filename") is None' in source_run
     assert 'echo "source_head_sha=$source_head_sha"' in source_run
     assert 'echo "tag_commit_sha=$tag_commit_sha"' in source_run
     assert '("build", "publish-pypi", "verify-pypi")' in source_run
@@ -889,7 +893,13 @@ def test_release_workflow_recovers_root_provenance_without_republishing() -> Non
         ("diverged-source-tag", False),
         ("behind-source-tag", False),
         ("wrong-source-tag-merge-base", False),
+        ("allowed-renamed-source-tag-file", True),
         ("unexpected-source-tag-file", False),
+        ("unexpected-renamed-source-tag-file", False),
+        ("unexpected-renamed-destination-tag-file", False),
+        ("invalid-renamed-source-tag-file", False),
+        ("unexpected-previous-source-tag-file", False),
+        ("invalid-source-tag-file-status", False),
         ("too-many-source-tag-files", False),
         ("invalid-source-tag-compare-metadata", False),
         ("invalid-tag-sha", False),
@@ -931,8 +941,8 @@ def test_root_provenance_recovery_rejects_untrusted_source_runs(
         "behind_by": 0,
         "merge_base_commit": {"sha": tag_commit_sha},
         "files": [
-            {"filename": ".github/workflows/release-please.yml"},
-            {"filename": "tests/test_release_workflow.py"},
+            {"filename": ".github/workflows/release-please.yml", "status": "modified"},
+            {"filename": "tests/test_release_workflow.py", "status": "modified"},
         ],
     }
     repository_metadata: dict[str, Any] = {"full_name": repository, "default_branch": "main"}
@@ -988,10 +998,48 @@ def test_root_provenance_recovery_rejects_untrusted_source_runs(
         source_relation_metadata["behind_by"] = 1
     elif mutation == "wrong-source-tag-merge-base":
         source_relation_metadata["merge_base_commit"]["sha"] = "0" * 40
+    elif mutation == "allowed-renamed-source-tag-file":
+        source_relation_metadata["files"] = [
+            {
+                "filename": ".github/workflows/release-please.yml",
+                "status": "renamed",
+                "previous_filename": "tests/test_release_workflow.py",
+            }
+        ]
     elif mutation == "unexpected-source-tag-file":
-        source_relation_metadata["files"] = [{"filename": "modelaudit/core.py"}]
+        source_relation_metadata["files"] = [{"filename": "modelaudit/core.py", "status": "modified"}]
+    elif mutation == "unexpected-renamed-source-tag-file":
+        source_relation_metadata["files"] = [
+            {
+                "filename": ".github/workflows/release-please.yml",
+                "status": "renamed",
+                "previous_filename": "modelaudit/core.py",
+            }
+        ]
+    elif mutation == "unexpected-renamed-destination-tag-file":
+        source_relation_metadata["files"] = [
+            {
+                "filename": "modelaudit/core.py",
+                "status": "renamed",
+                "previous_filename": ".github/workflows/release-please.yml",
+            }
+        ]
+    elif mutation == "invalid-renamed-source-tag-file":
+        source_relation_metadata["files"] = [{"filename": ".github/workflows/release-please.yml", "status": "renamed"}]
+    elif mutation == "unexpected-previous-source-tag-file":
+        source_relation_metadata["files"] = [
+            {
+                "filename": ".github/workflows/release-please.yml",
+                "status": "modified",
+                "previous_filename": "modelaudit/core.py",
+            }
+        ]
+    elif mutation == "invalid-source-tag-file-status":
+        source_relation_metadata["files"] = [{"filename": ".github/workflows/release-please.yml", "status": "copied"}]
     elif mutation == "too-many-source-tag-files":
-        source_relation_metadata["files"].append({"filename": ".github/workflows/release-please.yml"})
+        source_relation_metadata["files"].append(
+            {"filename": ".github/workflows/release-please.yml", "status": "modified"}
+        )
 
     run_path = tmp_path / "run.json"
     jobs_path = tmp_path / "jobs.json"
@@ -1102,7 +1150,13 @@ def test_root_provenance_recovery_rejects_untrusted_source_runs(
         "diverged-source-tag",
         "behind-source-tag",
         "wrong-source-tag-merge-base",
+        "allowed-renamed-source-tag-file",
         "unexpected-source-tag-file",
+        "unexpected-renamed-source-tag-file",
+        "unexpected-renamed-destination-tag-file",
+        "invalid-renamed-source-tag-file",
+        "unexpected-previous-source-tag-file",
+        "invalid-source-tag-file-status",
         "too-many-source-tag-files",
         "invalid-source-tag-compare-metadata",
     }:
