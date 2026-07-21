@@ -1303,9 +1303,10 @@ jobs:
         !cancelled() &&
         needs.release-please.outputs.release_created == 'true' &&
         needs.build.result == 'success' &&
-        needs.publish-pypi.result == 'success'
+        needs.publish-pypi.result == 'success' &&
+        needs.verify-pypi.result == 'success'
       }}
-    needs: [build, publish-pypi, release-please]
+    needs: [build, publish-pypi, verify-pypi, release-please]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -1630,7 +1631,8 @@ jobs:
                           raise SystemExit(f"Root sdist contains a linked member: {member.name}")
                       if not member.isreg() and not member.isdir():
                           raise SystemExit(f"Root sdist contains a non-file member: {member.name}")
-                      member_parts = member.name.split("/")
+                      member_name = member.name.removesuffix("/") if member.isdir() else member.name
+                      member_parts = member_name.split("/")
                       if (
                           member.name.startswith("/")
                           or re.match(r"^[A-Za-z]:", member.name)

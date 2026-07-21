@@ -18,7 +18,7 @@ The root `modelaudit` wheel declares a **hard dependency** on `modelaudit-pickle
 1. **Write Conventional Commits** — `feat:`, `fix:`, `docs:`, etc. Release-please uses these to compute the next version and the changelog entry.
 2. **Merge to `main`** — release-please creates or updates a "Release PR" per changed component. Commits that only touch `packages/modelaudit-picklescan/` feed the picklescan component; everything else feeds the root component.
 3. **Review and merge the Release PR** — release-please tags the release and the workflow runs the matching publish jobs:
-   - **For `modelaudit`** — `build` produces sdist+wheel → `publish-pypi` uploads via OIDC → `provenance` attests and uploads SBOM.
+   - **For `modelaudit`** — `build` produces sdist+wheel → `publish-pypi` uploads via OIDC → `verify-pypi` confirms the published package → `provenance` attests and uploads SBOM.
    - **For `modelaudit-picklescan`** — `build-picklescan-package` matrix builds 5 native wheels (Linux x86_64, Linux aarch64, macOS arm64, macOS x86_64, Windows x64) + sdist → `publish-picklescan-pypi` uploads → `picklescan-provenance` attests.
    - **When both release together** — the sibling package is published and verified on PyPI before the dependent root package is uploaded.
 

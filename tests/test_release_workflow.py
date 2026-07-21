@@ -696,7 +696,8 @@ def test_release_workflow_generates_root_provenance_after_successful_publish() -
     assert "needs.release-please.outputs.release_created == 'true'" in job_condition
     assert "needs.build.result == 'success'" in job_condition
     assert "needs.publish-pypi.result == 'success'" in job_condition
-    assert job["needs"] == ["build", "publish-pypi", "release-please"]
+    assert "needs.verify-pypi.result == 'success'" in job_condition
+    assert job["needs"] == ["build", "publish-pypi", "verify-pypi", "release-please"]
 
 
 def test_release_workflow_recovers_root_provenance_without_republishing() -> None:
@@ -805,6 +806,7 @@ def test_release_workflow_recovers_root_provenance_without_republishing() -> Non
     assert "member.size < 0 or member.size > max_sdist_member_bytes" in verify_run
     assert "declared_size > max_sdist_bytes" in verify_run
     assert "member.issym() or member.islnk()" in verify_run
+    assert 'member_name = member.name.removesuffix("/") if member.isdir() else member.name' in verify_run
     assert "not member.isreg() and not member.isdir()" in verify_run
     assert 'member.name.startswith("/")' in verify_run
     assert 're.match(r"^[A-Za-z]:", member.name)' in verify_run
@@ -1119,6 +1121,7 @@ def test_root_provenance_recovery_rejects_untrusted_source_runs(
     ("mutation", "should_pass"),
     [
         ("valid", True),
+        ("directory-sdist-member", True),
         ("invalid-version", False),
         ("wrong-tag-version", False),
         ("missing-local", False),
@@ -1141,6 +1144,7 @@ def test_root_provenance_recovery_rejects_untrusted_source_runs(
         ("drive-sdist-member", False),
         ("backslash-sdist-member", False),
         ("dot-sdist-member", False),
+        ("empty-segment-sdist-directory", False),
         ("case-sdist-metadata-alias", False),
         ("trailing-dot-sdist-metadata-alias", False),
         ("trailing-space-sdist-directory-alias", False),
@@ -1248,6 +1252,14 @@ def test_root_provenance_recovery_fails_closed_for_unverified_artifacts(
             member = tarfile.TarInfo(f"modelaudit-{version}/./other.lock")
             member.size = len(lock_content)
             archive.addfile(member, io.BytesIO(lock_content))
+        elif mutation == "directory-sdist-member":
+            directory = tarfile.TarInfo(f"modelaudit-{version}/modelaudit/")
+            directory.type = tarfile.DIRTYPE
+            archive.addfile(directory)
+        elif mutation == "empty-segment-sdist-directory":
+            directory = tarfile.TarInfo(f"modelaudit-{version}/modelaudit//nested/")
+            directory.type = tarfile.DIRTYPE
+            archive.addfile(directory)
         elif mutation == "case-sdist-metadata-alias":
             alias = tarfile.TarInfo(f"modelaudit-{version}/UV.LOCK")
             alias.size = len(lock_content)
@@ -1362,6 +1374,17 @@ def test_root_provenance_recovery_fails_closed_for_unverified_artifacts(
 
     monkeypatch.setattr(Path, "read_bytes", reject_whole_artifact_read)
 
+    if mutation == "directory-sdist-member":
+        original_tar_next = tarfile.TarFile.next
+
+        def preserve_directory_suffix(archive: tarfile.TarFile) -> tarfile.TarInfo | None:
+            member = original_tar_next(archive)
+            if member is not None and member.isdir():
+                member.name += "/"
+            return member
+
+        monkeypatch.setattr(tarfile.TarFile, "next", preserve_directory_suffix)
+
     if should_pass:
         exec(compile(script, "root-provenance-recovery-step", "exec"), {})
     else:
@@ -1375,6 +1398,7 @@ def test_root_provenance_recovery_fails_closed_for_unverified_artifacts(
             "drive-sdist-member": "contains an unsafe member path",
             "backslash-sdist-member": "contains an unsafe member path",
             "dot-sdist-member": "contains an unsafe member path",
+            "empty-segment-sdist-directory": "contains an unsafe member path",
             "case-sdist-metadata-alias": "contains a metadata path alias",
             "trailing-dot-sdist-metadata-alias": "contains an unsafe member path",
             "trailing-space-sdist-directory-alias": "contains an unsafe member path",
