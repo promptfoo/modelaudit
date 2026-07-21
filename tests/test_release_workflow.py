@@ -737,6 +737,8 @@ def test_release_workflow_recovers_root_provenance_without_republishing() -> Non
         "SOURCE_RUN_ID": "${{ needs.release-please.outputs.root_provenance_run_id }}",
     }
     assert '[[ ! "$SOURCE_RUN_ID" =~ ^[1-9][0-9]*$ ]]' in source_run
+    assert "tag_commit_sha=$(git rev-parse --verify 'HEAD^{commit}')" in source_run
+    assert '[[ ! "$tag_commit_sha" =~ ^[0-9a-f]{40}$ ]]' in source_run
     assert 'gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}"' in source_run
     assert "gh api --paginate --slurp" in source_run
     assert '"repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}/jobs?per_page=100"' in source_run
@@ -750,9 +752,10 @@ def test_release_workflow_recovers_root_provenance_without_republishing() -> Non
     assert 'head_repository.get("full_name") != repository' in source_run
     assert 're.fullmatch(r"[0-9a-f]{40}", head_sha)' in source_run
     assert '"repos/${GITHUB_REPOSITORY}/compare/${source_head_sha}...main"' in source_run
+    assert '"repos/${GITHUB_REPOSITORY}/compare/${tag_commit_sha}...main"' in source_run
     assert 'comparison.get("status") not in {"ahead", "identical"}' in source_run
     assert "not isinstance(behind_by, int) or isinstance(behind_by, bool) or behind_by != 0" in source_run
-    assert 'merge_base.get("sha") != source_head_sha' in source_run
+    assert 'merge_base.get("sha") != expected_sha' in source_run
     assert '("build", "publish-pypi", "verify-pypi")' in source_run
     assert "if len(matching) != 1" in source_run
     assert 'job.get("status") != "completed" or job.get("conclusion") != "success"' in source_run
@@ -864,6 +867,11 @@ def test_release_workflow_recovers_root_provenance_without_republishing() -> Non
         ("behind-head", False),
         ("wrong-merge-base", False),
         ("invalid-compare-metadata", False),
+        ("diverged-tag", False),
+        ("behind-tag", False),
+        ("wrong-tag-merge-base", False),
+        ("invalid-tag-compare-metadata", False),
+        ("invalid-tag-sha", False),
         ("invalid-run-id", False),
     ],
 )
@@ -877,6 +885,7 @@ def test_root_provenance_recovery_rejects_untrusted_source_runs(
     repository = "promptfoo/modelaudit"
     source_run_id = "not-a-run" if mutation == "invalid-run-id" else "29787069929"
     source_head_sha = "fa350d96d2e00e0d54c47f282b7f8e0f9660e077"
+    tag_commit_sha = "not-a-sha" if mutation == "invalid-tag-sha" else "2f3bb1656318cd5c53c80da5e2cb78b6de7e1b1b"
     run_metadata: dict[str, Any] = {
         "path": ".github/workflows/release-please.yml",
         "event": "push" if mutation == "push" else "workflow_dispatch",
@@ -890,6 +899,11 @@ def test_root_provenance_recovery_rejects_untrusted_source_runs(
         "status": "identical" if mutation == "push" else "ahead",
         "behind_by": 0,
         "merge_base_commit": {"sha": source_head_sha},
+    }
+    tag_compare_metadata: dict[str, Any] = {
+        "status": "ahead",
+        "behind_by": 0,
+        "merge_base_commit": {"sha": tag_commit_sha},
     }
     repository_metadata: dict[str, Any] = {"full_name": repository, "default_branch": "main"}
     jobs: list[dict[str, Any]] = [
@@ -932,17 +946,28 @@ def test_root_provenance_recovery_rejects_untrusted_source_runs(
         compare_metadata["behind_by"] = 1
     elif mutation == "wrong-merge-base":
         compare_metadata["merge_base_commit"]["sha"] = "0" * 40
+    elif mutation == "diverged-tag":
+        tag_compare_metadata["status"] = "diverged"
+    elif mutation == "behind-tag":
+        tag_compare_metadata["behind_by"] = 1
+    elif mutation == "wrong-tag-merge-base":
+        tag_compare_metadata["merge_base_commit"]["sha"] = "0" * 40
 
     run_path = tmp_path / "run.json"
     jobs_path = tmp_path / "jobs.json"
     repository_path = tmp_path / "repository.json"
     compare_path = tmp_path / "compare.json"
+    tag_compare_path = tmp_path / "tag-compare.json"
     calls_path = tmp_path / "calls.jsonl"
     run_path.write_text(json.dumps(run_metadata), encoding="utf-8")
     jobs_path.write_text(json.dumps([{"jobs": jobs[:2]}, {"jobs": jobs[2:]}]), encoding="utf-8")
     repository_path.write_text(json.dumps(repository_metadata), encoding="utf-8")
     compare_payload: dict[str, Any] | list[object] = [] if mutation == "invalid-compare-metadata" else compare_metadata
     compare_path.write_text(json.dumps(compare_payload), encoding="utf-8")
+    tag_compare_payload: dict[str, Any] | list[object] = (
+        [] if mutation == "invalid-tag-compare-metadata" else tag_compare_metadata
+    )
+    tag_compare_path.write_text(json.dumps(tag_compare_payload), encoding="utf-8")
     bin_path = tmp_path / "bin"
     bin_path.mkdir()
     gh_path = bin_path / "gh"
@@ -956,7 +981,8 @@ def test_root_provenance_recovery_rejects_untrusted_source_runs(
         "with Path(os.environ['CALLS_PATH']).open('a', encoding='utf-8') as handle:\n"
         "    handle.write(json.dumps(args) + '\\n')\n"
         "source = (\n"
-        "    'COMPARE_PATH' if '/compare/' in args[-1]\n"
+        "    'TAG_COMPARE_PATH' if f\"/compare/{os.environ['TAG_COMMIT_SHA']}...main\" in args[-1]\n"
+        "    else 'COMPARE_PATH' if '/compare/' in args[-1]\n"
         "    else 'JOBS_PATH' if '/jobs?' in args[-1]\n"
         "    else 'RUN_PATH' if '/actions/runs/' in args[-1]\n"
         "    else 'REPOSITORY_PATH'\n"
@@ -965,6 +991,16 @@ def test_root_provenance_recovery_rejects_untrusted_source_runs(
         encoding="utf-8",
     )
     gh_path.chmod(0o755)
+    git_path = bin_path / "git"
+    git_path.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os\n"
+        "import sys\n"
+        "assert sys.argv[1:] == ['rev-parse', '--verify', 'HEAD^{commit}']\n"
+        "print(os.environ['TAG_COMMIT_SHA'])\n",
+        encoding="utf-8",
+    )
+    git_path.chmod(0o755)
 
     result = subprocess.run(
         ["bash", "--noprofile", "--norc", "-euo", "pipefail", "-c", script],
@@ -977,6 +1013,8 @@ def test_root_provenance_recovery_rejects_untrusted_source_runs(
             "JOBS_PATH": str(jobs_path),
             "REPOSITORY_PATH": str(repository_path),
             "COMPARE_PATH": str(compare_path),
+            "TAG_COMPARE_PATH": str(tag_compare_path),
+            "TAG_COMMIT_SHA": tag_commit_sha,
             "CALLS_PATH": str(calls_path),
         },
         capture_output=True,
@@ -985,9 +1023,12 @@ def test_root_provenance_recovery_rejects_untrusted_source_runs(
     )
 
     assert (result.returncode == 0) is should_pass, result.stdout + result.stderr
-    if mutation == "invalid-run-id":
+    if mutation in {"invalid-run-id", "invalid-tag-sha"}:
         assert not calls_path.exists()
-        assert "requires a numeric source run ID" in result.stdout
+        expected_message = (
+            "requires a numeric source run ID" if mutation == "invalid-run-id" else "requires a valid tagged commit SHA"
+        )
+        assert expected_message in result.stdout
         return
     calls = [json.loads(line) for line in calls_path.read_text(encoding="utf-8").splitlines()]
     expected_calls = [
@@ -1003,8 +1044,13 @@ def test_root_provenance_recovery_rejects_untrusted_source_runs(
         "behind-head",
         "wrong-merge-base",
         "invalid-compare-metadata",
+        "diverged-tag",
+        "behind-tag",
+        "wrong-tag-merge-base",
+        "invalid-tag-compare-metadata",
     }:
         expected_calls.append(["api", f"repos/{repository}/compare/{source_head_sha}...main"])
+        expected_calls.append(["api", f"repos/{repository}/compare/{tag_commit_sha}...main"])
     assert calls == expected_calls
 
 

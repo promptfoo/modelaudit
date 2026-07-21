@@ -1390,11 +1390,18 @@ jobs:
             exit 1
           fi
 
+          tag_commit_sha=$(git rev-parse --verify 'HEAD^{commit}')
+          if [[ ! "$tag_commit_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Root provenance recovery requires a valid tagged commit SHA."
+            exit 1
+          fi
+
           run_metadata=$(mktemp)
           jobs_metadata=$(mktemp)
           repository_metadata=$(mktemp)
           compare_metadata=$(mktemp)
-          trap 'rm -f "$run_metadata" "$jobs_metadata" "$repository_metadata" "$compare_metadata"' EXIT
+          tag_compare_metadata=$(mktemp)
+          trap 'rm -f "$run_metadata" "$jobs_metadata" "$repository_metadata" "$compare_metadata" "$tag_compare_metadata"' EXIT
           gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}" > "$run_metadata"
           gh api --paginate --slurp \
             "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}/jobs?per_page=100" > "$jobs_metadata"
@@ -1457,8 +1464,11 @@ jobs:
           )
 
           gh api "repos/${GITHUB_REPOSITORY}/compare/${source_head_sha}...main" > "$compare_metadata"
+          gh api "repos/${GITHUB_REPOSITORY}/compare/${tag_commit_sha}...main" > "$tag_compare_metadata"
           export COMPARE_METADATA="$compare_metadata"
+          export TAG_COMPARE_METADATA="$tag_compare_metadata"
           export SOURCE_HEAD_SHA="$source_head_sha"
+          export TAG_COMMIT_SHA="$tag_commit_sha"
           python - <<'PY'
           import json
           import os
@@ -1466,18 +1476,26 @@ jobs:
 
           source_run_id = os.environ["SOURCE_RUN_ID"]
           source_head_sha = os.environ["SOURCE_HEAD_SHA"]
-          comparison = json.loads(Path(os.environ["COMPARE_METADATA"]).read_text(encoding="utf-8"))
-          if not isinstance(comparison, dict):
-              raise SystemExit(f"Source run {source_run_id} returned invalid branch comparison metadata")
-          if comparison.get("status") not in {"ahead", "identical"}:
-              raise SystemExit(f"Source run {source_run_id} does not belong to protected main history")
-          behind_by = comparison.get("behind_by")
-          if not isinstance(behind_by, int) or isinstance(behind_by, bool) or behind_by != 0:
-              raise SystemExit(f"Source run {source_run_id} is not an ancestor of protected main")
-          merge_base = comparison.get("merge_base_commit")
-          if not isinstance(merge_base, dict) or merge_base.get("sha") != source_head_sha:
-              raise SystemExit(f"Source run {source_run_id} has an untrusted merge base")
-          print(f"Verified original modelaudit publish run {source_run_id} at {source_head_sha}")
+          tag_commit_sha = os.environ["TAG_COMMIT_SHA"]
+          for label, expected_sha, metadata_path in (
+              (f"Source run {source_run_id}", source_head_sha, os.environ["COMPARE_METADATA"]),
+              ("Tagged root release", tag_commit_sha, os.environ["TAG_COMPARE_METADATA"]),
+          ):
+              comparison = json.loads(Path(metadata_path).read_text(encoding="utf-8"))
+              if not isinstance(comparison, dict):
+                  raise SystemExit(f"{label} returned invalid branch comparison metadata")
+              if comparison.get("status") not in {"ahead", "identical"}:
+                  raise SystemExit(f"{label} does not belong to protected main history")
+              behind_by = comparison.get("behind_by")
+              if not isinstance(behind_by, int) or isinstance(behind_by, bool) or behind_by != 0:
+                  raise SystemExit(f"{label} is not an ancestor of protected main")
+              merge_base = comparison.get("merge_base_commit")
+              if not isinstance(merge_base, dict) or merge_base.get("sha") != expected_sha:
+                  raise SystemExit(f"{label} has an untrusted merge base")
+          print(
+              f"Verified original modelaudit publish run {source_run_id} at {source_head_sha} "
+              f"and tagged root release at {tag_commit_sha}"
+          )
           PY
 
       - name: Download original root build artifacts
