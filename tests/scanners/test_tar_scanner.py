@@ -7,6 +7,8 @@ import random
 import tarfile
 import tempfile
 import zipfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, BinaryIO, Literal, cast
 
@@ -115,6 +117,30 @@ def test_borrow_or_open_tar_file_closes_only_owned_stream(tmp_path: Path) -> Non
         assert stream is borrowed
         assert stream.read(1) == b"\0"
     assert borrowed.closed is False
+
+
+def test_tar_probe_contexts_close_owned_streams(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    archive_path = tmp_path / "empty.tar"
+    with tarfile.open(archive_path, "w"):
+        pass
+
+    original_borrow = tar_scanner_module._borrow_or_open_tar_file
+    opened: list[BinaryIO] = []
+
+    @contextmanager
+    def tracking_borrow(path: str, raw_file: BinaryIO | None) -> Iterator[BinaryIO]:
+        with original_borrow(path, raw_file) as stream:
+            opened.append(stream)
+            yield stream
+
+    monkeypatch.setattr(tar_scanner_module, "_borrow_or_open_tar_file", tracking_borrow)
+
+    assert TarScanner._is_empty_tar_archive(str(archive_path))
+    with TarScanner()._open_tar_stream(str(archive_path)) as (archive, _, _):
+        assert archive.next() is None
+
+    assert len(opened) == 2
+    assert all(stream.closed for stream in opened)
 
 
 def _write_sparse_raw_tar(

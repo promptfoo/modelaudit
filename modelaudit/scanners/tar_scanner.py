@@ -655,8 +655,7 @@ class TarScanner(BaseScanner):
         raw_file: BinaryIO | None = None,
     ) -> Iterator[tuple[tarfile.TarFile, _TarBoundedStream | None, str | None]]:
         """Open raw TAR seekably or compressed TAR through bounded r| traversal."""
-        with ExitStack() as stack:
-            raw = stack.enter_context(_borrow_or_open_tar_file(path, raw_file))
+        with _borrow_or_open_tar_file(path, raw_file) as raw, ExitStack() as stack:
             if self.source_size_limit is not None:
                 raw = cast(BinaryIO, _TarSourcePrefixFile(raw, self._effective_source_size(path, raw)))
             raw.seek(0)
@@ -1065,8 +1064,7 @@ class TarScanner(BaseScanner):
             if file_size > max_read_size:
                 return False
 
-            with ExitStack() as stack:
-                file_obj = stack.enter_context(_borrow_or_open_tar_file(path, raw_file))
+            with _borrow_or_open_tar_file(path, raw_file) as file_obj:
                 original_offset = file_obj.tell()
                 try:
                     file_obj.seek(0)
