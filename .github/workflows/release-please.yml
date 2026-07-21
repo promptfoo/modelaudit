@@ -1589,7 +1589,11 @@ jobs:
               if entry.get("yanked", False):
                   raise SystemExit(f"Refusing to attest yanked PyPI artifact {path.name}")
               expected_digest = entry.get("digests", {}).get("sha256")
-              actual_digest = hashlib.sha256(path.read_bytes()).hexdigest()
+              digest = hashlib.sha256()
+              with path.open("rb") as artifact_file:
+                  for chunk in iter(lambda: artifact_file.read(1024 * 1024), b""):
+                      digest.update(chunk)
+              actual_digest = digest.hexdigest()
               if not isinstance(expected_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_digest):
                   raise SystemExit(f"PyPI did not return a valid SHA256 for {path.name}")
               if actual_digest != expected_digest:

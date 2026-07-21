@@ -795,7 +795,10 @@ def test_release_workflow_recovers_root_provenance_without_republishing() -> Non
     assert "https://pypi.org/pypi/modelaudit/{version}/json" in verify_run
     assert 'entry.get("yanked", False)' in verify_run
     assert 'entry.get("digests", {}).get("sha256")' in verify_run
-    assert "hashlib.sha256(path.read_bytes()).hexdigest()" in verify_run
+    assert "hashlib.sha256(path.read_bytes())" not in verify_run
+    assert 'with path.open("rb") as artifact_file:' in verify_run
+    assert "artifact_file.read(1024 * 1024)" in verify_run
+    assert "digest.update(chunk)" in verify_run
     assert 'f"modelaudit-{version}/{filename}"' in verify_run
     assert 'tarfile.open(Path("dist", f"modelaudit-{version}.tar.gz"), "r|gz")' in verify_run
     assert "member_count > max_sdist_members" in verify_run
@@ -1350,6 +1353,14 @@ def test_root_provenance_recovery_fails_closed_for_unverified_artifacts(
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("EXPECTED_VERSION", "v0.2.50" if mutation == "invalid-version" else version)
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    original_read_bytes = Path.read_bytes
+
+    def reject_whole_artifact_read(path: Path) -> bytes:
+        if path.parent == dist_path:
+            raise AssertionError(f"Recovered artifact was read into memory: {path.name}")
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", reject_whole_artifact_read)
 
     if should_pass:
         exec(compile(script, "root-provenance-recovery-step", "exec"), {})
