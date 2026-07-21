@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import gzip
+import hashlib
 import io
 import json
+import os
+import subprocess
 import time
 import urllib.request
 import zipfile
@@ -93,6 +96,11 @@ def test_release_workflow_manual_dispatch_inputs_and_guardrails() -> None:
             "required": False,
             "type": "string",
         },
+        "root_provenance_run_id": {
+            "description": "Recover root provenance from the original successful publish run, for example 29787069929",
+            "required": False,
+            "type": "string",
+        },
     }
 
     release_steps = _job_steps(workflow, "release-please")
@@ -101,6 +109,7 @@ def test_release_workflow_manual_dispatch_inputs_and_guardrails() -> None:
     assert manual_step["env"] == {
         "ROOT_VERSION": "${{ github.event.inputs.root_version || '' }}",
         "PICKLESCAN_VERSION": "${{ github.event.inputs.picklescan_version || '' }}",
+        "ROOT_PROVENANCE_RUN_ID": "${{ github.event.inputs.root_provenance_run_id || '' }}",
     }
 
     release_action_step = next(
@@ -112,7 +121,9 @@ def test_release_workflow_manual_dispatch_inputs_and_guardrails() -> None:
     )
 
     ensure_release_step = _step_by_name(release_steps, "Ensure manual GitHub releases exist")
-    assert ensure_release_step["if"] == "steps.manual.outputs.manual_release == 'true'"
+    assert ensure_release_step["if"] == (
+        "steps.manual.outputs.manual_release == 'true' && steps.manual.outputs.root_provenance_recovery != 'true'"
+    )
     ensure_release_run = ensure_release_step["run"]
     assert 'gh release view "$ROOT_TAG"' in ensure_release_run
     assert 'gh release view "$PICKLESCAN_TAG"' in ensure_release_run
@@ -131,6 +142,57 @@ def test_release_workflow_manual_dispatch_inputs_and_guardrails() -> None:
     assert 'gh pr view "$RETRY_BRANCH" --repo "$GITHUB_REPOSITORY" --json state,headRefName' in check_pr_run
     assert '"$OPEN_BRANCH" != "$RETRY_BRANCH"' in check_pr_run
     assert "Refusing release metadata retry for an unexpected branch." in check_pr_run
+
+
+@pytest.mark.parametrize(
+    ("root_version", "picklescan_version", "source_run_id", "expected_code", "expected_fragment"),
+    [
+        ("0.2.50", "", "29787069929", 0, "root_provenance_recovery=true"),
+        ("", "", "29787069929", 1, "requires root_version in X.Y.Z format"),
+        ("v0.2.50", "", "29787069929", 1, "requires root_version in X.Y.Z format"),
+        ("0.2.50", "", "not-a-run", 1, "requires a numeric source run ID"),
+        ("0.2.50", "0.1.9", "29787069929", 1, "cannot publish modelaudit-picklescan"),
+        ("0.2.50", "", "", 0, "release_created=true"),
+        ("", "0.1.9", "", 0, "picklescan_release_created=true"),
+        ("", "", "", 0, "manual_release=false"),
+    ],
+)
+def test_release_workflow_resolves_provenance_only_recovery_inputs(
+    root_version: str,
+    picklescan_version: str,
+    source_run_id: str,
+    expected_code: int,
+    expected_fragment: str,
+    tmp_path: Path,
+) -> None:
+    workflow = _load_release_workflow()
+    script = _step_by_name(_job_steps(workflow, "release-please"), "Resolve manual release inputs")["run"]
+    output_path = tmp_path / "github-output"
+
+    result = subprocess.run(
+        ["bash", "--noprofile", "--norc", "-euo", "pipefail", "-c", script],
+        env={
+            "PATH": os.environ["PATH"],
+            "GITHUB_OUTPUT": str(output_path),
+            "ROOT_VERSION": root_version,
+            "PICKLESCAN_VERSION": picklescan_version,
+            "ROOT_PROVENANCE_RUN_ID": source_run_id,
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == expected_code
+    output = output_path.read_text(encoding="utf-8") if output_path.exists() else result.stdout
+    assert expected_fragment in output
+    if source_run_id and expected_code == 0:
+        assert "manual_release=true" in output
+        assert "release_created=false" in output
+        assert "picklescan_release_created=false" in output
+        assert f"root_provenance_run_id={source_run_id}" in output
+        assert f"version={root_version}" in output
+        assert f"tag_name=v{root_version}" in output
 
 
 def test_release_workflow_picklescan_artifacts_stay_in_package_workspace() -> None:
@@ -618,3 +680,182 @@ def test_release_workflow_verifies_published_root_package_after_picklescan() -> 
     assert 'result.get("ruleId") == "S201"' in smoke_run
     assert 'sbom_report.get("bomFormat") != "CycloneDX"' in smoke_run
     assert "Malicious pickle payload executed during scan" in smoke_run
+
+
+def test_release_workflow_generates_root_provenance_after_successful_publish() -> None:
+    workflow = _load_release_workflow()
+
+    job = _jobs(workflow)["provenance"]
+    assert isinstance(job, dict)
+    job_condition = job["if"]
+    assert "always()" in job_condition
+    assert "!cancelled()" in job_condition
+    assert "needs.release-please.outputs.release_created == 'true'" in job_condition
+    assert "needs.build.result == 'success'" in job_condition
+    assert "needs.publish-pypi.result == 'success'" in job_condition
+    assert job["needs"] == ["build", "publish-pypi", "release-please"]
+
+
+def test_release_workflow_recovers_root_provenance_without_republishing() -> None:
+    workflow = _load_release_workflow()
+
+    release_job = _jobs(workflow)["release-please"]
+    assert isinstance(release_job, dict)
+    assert release_job["outputs"]["root_provenance_recovery"] == "${{ steps.manual.outputs.root_provenance_recovery }}"
+    assert release_job["outputs"]["root_provenance_run_id"] == "${{ steps.manual.outputs.root_provenance_run_id }}"
+
+    job = _jobs(workflow)["root-provenance-recovery"]
+    assert isinstance(job, dict)
+    job_condition = job["if"]
+    assert "!cancelled()" in job_condition
+    assert "needs.release-please.result == 'success'" in job_condition
+    assert "needs.release-please.outputs.root_provenance_recovery == 'true'" in job_condition
+    assert job["needs"] == "release-please"
+    assert job["permissions"] == {
+        "actions": "read",
+        "contents": "write",
+        "id-token": "write",
+        "attestations": "write",
+    }
+
+    steps = _job_steps(workflow, "root-provenance-recovery")
+    checkout_step = _step_by_name(steps, "Checkout tagged root release")
+    assert checkout_step["uses"] == "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd"
+    assert checkout_step["with"] == {
+        "ref": "${{ needs.release-please.outputs.tag_name }}",
+        "sparse-checkout": "pyproject.toml\nuv.lock\n",
+        "persist-credentials": False,
+    }
+
+    download_step = _step_by_name(steps, "Download original root build artifacts")
+    assert download_step["uses"] == "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"
+    assert download_step["with"] == {
+        "name": "dist",
+        "path": "dist/",
+        "github-token": "${{ secrets.GITHUB_TOKEN }}",
+        "repository": "${{ github.repository }}",
+        "run-id": "${{ needs.release-please.outputs.root_provenance_run_id }}",
+    }
+
+    verify_step = _step_by_name(steps, "Verify recovered root artifacts match PyPI")
+    verify_run = verify_step["run"]
+    assert verify_step["env"] == {"EXPECTED_VERSION": "${{ needs.release-please.outputs.version }}"}
+    assert 're.fullmatch(r"[0-9]+\\.[0-9]+\\.[0-9]+", version)' in verify_run
+    assert 'Path("pyproject.toml").read_text(encoding="utf-8")' in verify_run
+    assert 'f"modelaudit-{version}-py3-none-any.whl"' in verify_run
+    assert 'f"modelaudit-{version}.tar.gz"' in verify_run
+    assert "path.is_symlink()" in verify_run
+    assert "https://pypi.org/pypi/modelaudit/{version}/json" in verify_run
+    assert 'entry.get("yanked", False)' in verify_run
+    assert 'entry.get("digests", {}).get("sha256")' in verify_run
+    assert "hashlib.sha256(path.read_bytes()).hexdigest()" in verify_run
+
+    attest_step = _step_by_name(steps, "Generate recovery integrity attestation")
+    assert attest_step["uses"] == "actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26"
+    assert attest_step["with"]["subject-path"] == (
+        "dist/modelaudit-${{ needs.release-please.outputs.version }}-py3-none-any.whl\n"
+        "dist/modelaudit-${{ needs.release-please.outputs.version }}.tar.gz\n"
+    )
+    assert attest_step["with"]["predicate-type"] == "https://promptfoo.dev/modelaudit/attestations/recovery/v1"
+    assert json.loads(attest_step["with"]["predicate"]) == {
+        "package": "modelaudit",
+        "version": "${{ needs.release-please.outputs.version }}",
+        "tag": "${{ needs.release-please.outputs.tag_name }}",
+        "source_run_id": "${{ needs.release-please.outputs.root_provenance_run_id }}",
+        "pypi_json_url": "https://pypi.org/pypi/modelaudit/${{ needs.release-please.outputs.version }}/json",
+    }
+
+    sbom_step = _step_by_name(steps, "Generate SBOM from tagged root lockfile")
+    assert sbom_step["env"] == {"EXPECTED_VERSION": "${{ needs.release-please.outputs.version }}"}
+    assert "--frozen" in sbom_step["run"]
+    assert '--output-file "dist/modelaudit-${EXPECTED_VERSION}.cdx.json"' in sbom_step["run"]
+
+    upload_step = _step_by_name(steps, "Upload recovered root artifacts to GitHub Release")
+    assert upload_step["env"] == {
+        "GH_TOKEN": "${{ secrets.GITHUB_TOKEN }}",
+        "ROOT_TAG": "${{ needs.release-please.outputs.tag_name }}",
+    }
+    assert 'gh release view "$ROOT_TAG" --repo "$GITHUB_REPOSITORY"' in upload_step["run"]
+    assert 'gh release upload "$ROOT_TAG" dist/*' in upload_step["run"]
+    assert steps.index(download_step) < steps.index(verify_step) < steps.index(attest_step) < steps.index(sbom_step)
+    assert steps.index(sbom_step) < steps.index(upload_step)
+    assert not any(step.get("uses", "").startswith("pypa/gh-action-pypi-publish@") for step in steps)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "should_pass"),
+    [
+        ("valid", True),
+        ("invalid-version", False),
+        ("wrong-tag-version", False),
+        ("missing-local", False),
+        ("extra-local", False),
+        ("wrong-pypi-version", False),
+        ("missing-pypi-file", False),
+        ("yanked", False),
+        ("invalid-digest", False),
+        ("hash-mismatch", False),
+    ],
+)
+def test_root_provenance_recovery_fails_closed_for_unverified_artifacts(
+    mutation: str,
+    should_pass: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    workflow = _load_release_workflow()
+    verify_run = _step_by_name(
+        _job_steps(workflow, "root-provenance-recovery"), "Verify recovered root artifacts match PyPI"
+    )["run"]
+    lines = verify_run.splitlines()
+    assert lines[0] == "python - <<'PY'"
+    assert lines[-1] == "PY"
+    script = "\n".join(lines[1:-1])
+
+    version = "0.2.50"
+    wheel_name = f"modelaudit-{version}-py3-none-any.whl"
+    sdist_name = f"modelaudit-{version}.tar.gz"
+    contents = {wheel_name: b"original wheel", sdist_name: b"original sdist"}
+    dist_path = tmp_path / "dist"
+    dist_path.mkdir()
+    for filename, content in contents.items():
+        (dist_path / filename).write_bytes(content)
+    project_version = "0.2.49" if mutation == "wrong-tag-version" else version
+    (tmp_path / "pyproject.toml").write_text(
+        f'[project]\nname = "modelaudit"\nversion = "{project_version}"\n', encoding="utf-8"
+    )
+
+    urls: list[dict[str, Any]] = [
+        {"filename": filename, "yanked": False, "digests": {"sha256": hashlib.sha256(content).hexdigest()}}
+        for filename, content in contents.items()
+    ]
+    payload: dict[str, Any] = {"info": {"version": version}, "urls": urls}
+    if mutation == "missing-local":
+        (dist_path / sdist_name).unlink()
+    elif mutation == "extra-local":
+        (dist_path / "unexpected.txt").write_text("unexpected", encoding="utf-8")
+    elif mutation == "wrong-pypi-version":
+        payload["info"]["version"] = "0.2.49"
+    elif mutation == "missing-pypi-file":
+        urls.pop()
+    elif mutation == "yanked":
+        urls[0]["yanked"] = True
+    elif mutation == "invalid-digest":
+        urls[0]["digests"]["sha256"] = "not-a-sha256"
+    elif mutation == "hash-mismatch":
+        urls[0]["digests"]["sha256"] = "0" * 64
+
+    def fake_urlopen(url: str, timeout: int = 20) -> io.BytesIO:
+        assert url == f"https://pypi.org/pypi/modelaudit/{version}/json"
+        assert timeout == 20
+        return io.BytesIO(json.dumps(payload).encode())
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("EXPECTED_VERSION", "v0.2.50" if mutation == "invalid-version" else version)
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    if should_pass:
+        exec(compile(script, "root-provenance-recovery-step", "exec"), {})
+    else:
+        with pytest.raises(SystemExit):
+            exec(compile(script, "root-provenance-recovery-step", "exec"), {})

@@ -59,6 +59,16 @@ gh workflow run release-please.yml -f picklescan_version=<X.Y.Z>
 
 The workflow's `Resolve manual release inputs` step flips `manual_release=true`, skips the release-please action, ensures the GitHub release exists (creating it if not), then feeds `release_created=true` / `picklescan_release_created=true` into the publish jobs. `uv build` always reads from `pyproject.toml` at the current `HEAD`, so the tagged commit must already contain the target version; dispatching a version that does not match what's in `HEAD` will fail the PyPI upload.
 
+If root publication and PyPI verification succeeded but `provenance` was skipped or failed, do **not** re-run the publish path: PyPI filenames are immutable and a rebuilt artifact may not match the published bytes. Recover provenance from the original successful publish run instead:
+
+```bash
+gh workflow run release-please.yml --ref main \
+  -f root_version=<X.Y.Z> \
+  -f root_provenance_run_id=<original-run-id>
+```
+
+This provenance-only path skips release creation, builds, and publication. It checks out `v<X.Y.Z>`, downloads the original `dist` artifact, requires its wheel and sdist to exactly match the non-yanked PyPI SHA256 digests, then generates a recovery-integrity attestation and an SBOM from the tag's frozen `uv.lock` before uploading the files to the matching GitHub Release. The recovery attestation does **not** claim original SLSA build provenance; the original PyPI publish attestations remain the publisher record. The source run ID must be numeric, `root_version` must use `X.Y.Z`, and `picklescan_version` cannot be combined with this recovery mode.
+
 ## PyPI trusted publishing (first-time setup)
 
 Both packages publish via PyPI [Trusted Publishing](https://docs.pypi.org/trusted-publishers/). The `publish-pypi` and `publish-picklescan-pypi` jobs both use environment `pypi` and `id-token: write` permissions. PyPI is configured with an **active trusted publisher** on each project, scoped to owner `promptfoo`, repository `modelaudit`, workflow `release-please.yml`, environment `pypi`.

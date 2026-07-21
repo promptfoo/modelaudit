@@ -22,6 +22,10 @@ on:
         description: "Publish an already-versioned modelaudit-picklescan release, for example 0.1.2"
         required: false
         type: string
+      root_provenance_run_id:
+        description: "Recover root provenance from the original successful publish run, for example 29787069929"
+        required: false
+        type: string
 
 jobs:
   release-please:
@@ -36,6 +40,8 @@ jobs:
       picklescan_release_created: ${{ steps.manual.outputs.manual_release == 'true' && steps.manual.outputs.picklescan_release_created || steps.release.outputs['packages/modelaudit-picklescan--release_created'] }}
       picklescan_tag_name: ${{ steps.manual.outputs.manual_release == 'true' && steps.manual.outputs.picklescan_tag_name || steps.release.outputs['packages/modelaudit-picklescan--tag_name'] }}
       picklescan_version: ${{ steps.manual.outputs.manual_release == 'true' && steps.manual.outputs.picklescan_version || steps.release.outputs['packages/modelaudit-picklescan--version'] }}
+      root_provenance_recovery: ${{ steps.manual.outputs.root_provenance_recovery }}
+      root_provenance_run_id: ${{ steps.manual.outputs.root_provenance_run_id }}
       pr_number: ${{ steps.release.outputs.pr && fromJSON(steps.release.outputs.pr).number || '' }}
       pr_branch: ${{ steps.check-pr.outputs.pr_branch || '' }}
     steps:
@@ -44,7 +50,34 @@ jobs:
         env:
           ROOT_VERSION: ${{ github.event.inputs.root_version || '' }}
           PICKLESCAN_VERSION: ${{ github.event.inputs.picklescan_version || '' }}
+          ROOT_PROVENANCE_RUN_ID: ${{ github.event.inputs.root_provenance_run_id || '' }}
         run: |
+          if [[ -n "$ROOT_PROVENANCE_RUN_ID" ]]; then
+            if [[ ! "$ROOT_PROVENANCE_RUN_ID" =~ ^[1-9][0-9]*$ ]]; then
+              echo "Root provenance recovery requires a numeric source run ID."
+              exit 1
+            fi
+            if [[ ! "$ROOT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "Root provenance recovery requires root_version in X.Y.Z format."
+              exit 1
+            fi
+            if [[ -n "$PICKLESCAN_VERSION" ]]; then
+              echo "Root provenance recovery cannot publish modelaudit-picklescan."
+              exit 1
+            fi
+
+            {
+              echo "manual_release=true"
+              echo "release_created=false"
+              echo "picklescan_release_created=false"
+              echo "root_provenance_recovery=true"
+              echo "root_provenance_run_id=$ROOT_PROVENANCE_RUN_ID"
+              echo "version=$ROOT_VERSION"
+              echo "tag_name=v$ROOT_VERSION"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           {
             if [[ -n "$ROOT_VERSION" ]]; then
               echo "release_created=true"
@@ -76,7 +109,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Ensure manual GitHub releases exist
-        if: steps.manual.outputs.manual_release == 'true'
+        if: steps.manual.outputs.manual_release == 'true' && steps.manual.outputs.root_provenance_recovery != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ROOT_TAG: ${{ steps.manual.outputs.tag_name }}
@@ -1264,7 +1297,14 @@ jobs:
           PY
 
   provenance:
-    if: needs.release-please.outputs.release_created == 'true'
+    if: >-
+      ${{
+        always() &&
+        !cancelled() &&
+        needs.release-please.outputs.release_created == 'true' &&
+        needs.build.result == 'success' &&
+        needs.publish-pypi.result == 'success'
+      }}
     needs: [build, publish-pypi, release-please]
     runs-on: ubuntu-latest
     permissions:
@@ -1314,6 +1354,133 @@ jobs:
         run: |
           gh release upload "${{ needs.release-please.outputs.tag_name }}" dist/* \
             --repo "${{ github.repository }}" \
+            --clobber
+
+  root-provenance-recovery:
+    if: >-
+      ${{
+        !cancelled() &&
+        needs.release-please.result == 'success' &&
+        needs.release-please.outputs.root_provenance_recovery == 'true'
+      }}
+    needs: release-please
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Checkout tagged root release
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: ${{ needs.release-please.outputs.tag_name }}
+          sparse-checkout: |
+            pyproject.toml
+            uv.lock
+          persist-credentials: false
+
+      - name: Download original root build artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: dist
+          path: dist/
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.release-please.outputs.root_provenance_run_id }}
+
+      - name: Verify recovered root artifacts match PyPI
+        env:
+          EXPECTED_VERSION: ${{ needs.release-please.outputs.version }}
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          import re
+          import urllib.request
+          from pathlib import Path
+
+          try:
+              import tomllib
+          except ModuleNotFoundError:
+              import tomli as tomllib
+
+          version = os.environ["EXPECTED_VERSION"]
+          if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
+              raise SystemExit(f"Invalid root release version: {version!r}")
+
+          project = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))["project"]
+          if project.get("name") != "modelaudit" or project.get("version") != version:
+              raise SystemExit(f"Tagged root project does not match modelaudit {version}: {project!r}")
+
+          expected = {f"modelaudit-{version}-py3-none-any.whl", f"modelaudit-{version}.tar.gz"}
+          paths = list(Path("dist").iterdir())
+          if {path.name for path in paths} != expected or any(not path.is_file() or path.is_symlink() for path in paths):
+              raise SystemExit(f"Expected exactly the root wheel and sdist, found {[path.name for path in paths]!r}")
+
+          with urllib.request.urlopen(f"https://pypi.org/pypi/modelaudit/{version}/json", timeout=20) as response:
+              payload = json.load(response)
+          if payload.get("info", {}).get("version") != version:
+              raise SystemExit(f"PyPI returned an unexpected modelaudit version for {version}")
+
+          urls = payload.get("urls", [])
+          published = {entry.get("filename"): entry for entry in urls}
+          if len(published) != len(urls) or set(published) != expected:
+              raise SystemExit(f"PyPI files for modelaudit {version} do not match {sorted(expected)!r}")
+
+          for path in paths:
+              entry = published[path.name]
+              if entry.get("yanked", False):
+                  raise SystemExit(f"Refusing to attest yanked PyPI artifact {path.name}")
+              expected_digest = entry.get("digests", {}).get("sha256")
+              actual_digest = hashlib.sha256(path.read_bytes()).hexdigest()
+              if not isinstance(expected_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_digest):
+                  raise SystemExit(f"PyPI did not return a valid SHA256 for {path.name}")
+              if actual_digest != expected_digest:
+                  raise SystemExit(
+                      f"Recovered artifact SHA256 mismatch for {path.name}: {actual_digest} != {expected_digest}"
+                  )
+              print(f"Verified {path.name}: {actual_digest}")
+          PY
+
+      - name: Generate recovery integrity attestation
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
+        with:
+          subject-path: |
+            dist/modelaudit-${{ needs.release-please.outputs.version }}-py3-none-any.whl
+            dist/modelaudit-${{ needs.release-please.outputs.version }}.tar.gz
+          predicate-type: https://promptfoo.dev/modelaudit/attestations/recovery/v1
+          predicate: >-
+            {"package":"modelaudit","version":"${{ needs.release-please.outputs.version }}","tag":"${{ needs.release-please.outputs.tag_name }}","source_run_id":"${{ needs.release-please.outputs.root_provenance_run_id }}","pypi_json_url":"https://pypi.org/pypi/modelaudit/${{ needs.release-please.outputs.version }}/json"}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          enable-cache: true
+
+      - name: Generate SBOM from tagged root lockfile
+        env:
+          EXPECTED_VERSION: ${{ needs.release-please.outputs.version }}
+        run: |
+          uv export \
+            --frozen \
+            --no-dev \
+            --preview-features sbom-export \
+            --format cyclonedx1.5 \
+            --output-file "dist/modelaudit-${EXPECTED_VERSION}.cdx.json" \
+            > /dev/null
+          echo "SBOM generated:"
+          ls -la dist/*.cdx.json
+
+      - name: Upload recovered root artifacts to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ROOT_TAG: ${{ needs.release-please.outputs.tag_name }}
+        run: |
+          gh release view "$ROOT_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null
+          gh release upload "$ROOT_TAG" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
             --clobber
 
   picklescan-provenance:
