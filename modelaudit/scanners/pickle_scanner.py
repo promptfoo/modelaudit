@@ -700,7 +700,7 @@ def _probe_pickle_stream(
             if opcode.name == "STOP":
                 extent = None if position is None else position + 1 - offset
                 return extent, max(1, stream.tell() - offset), parsed_opcode
-    except Exception:
+    except Exception:  # Invalid or truncated streams have no trusted extent; callers continue bounded probing.
         pass
     return None, max(1, stream.tell() - offset), parsed_opcode
 

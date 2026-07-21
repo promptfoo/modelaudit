@@ -32,7 +32,7 @@ class _FakeResponse:
 
 
 class _FakeCloudConfig:
-    def __init__(self, api_host: str = "https://api.promptfoo.app", api_key: str | None = "secret-token"):
+    def __init__(self, api_host: str = "https://api.promptfoo.app", api_key: str | None = None):
         self.api_host = api_host
         self.api_key = api_key
         self.app_url = ""
@@ -313,6 +313,30 @@ def test_write_global_config_partial_deep_merges_cloud_section(
         "customField": "keep-me",
     }
     assert written["account"] == {"email": "user@example.com"}
+
+
+def test_write_global_config_partial_preserves_nested_none_and_siblings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_dir = tmp_path / "config"
+    fallback_dir = tmp_path / "home" / ".promptfoo"
+    _patch_config_paths(auth_config, monkeypatch, config_dir, fallback_dir)
+    auth_config.write_global_config(
+        auth_config.GlobalConfig(
+            {
+                "id": "fixed-id",
+                "account": {"email": "old@example.com", "name": "Keep Me", "organization": "promptfoo"},
+                "cloud": {"apiKey": "secret"},
+            }
+        )
+    )
+
+    auth_config.write_global_config_partial({"account": {"name": None}})
+
+    written = yaml.safe_load((config_dir / "promptfoo.yaml").read_text())
+    assert written["account"] == {"email": "old@example.com", "name": None, "organization": "promptfoo"}
+    assert written["cloud"] == {"apiKey": "secret"}
 
 
 def test_cloud_config_delete_clears_cloud_section_without_touching_account(

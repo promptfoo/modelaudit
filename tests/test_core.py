@@ -11,6 +11,7 @@ import hashlib
 import importlib
 import io
 import json
+import logging
 import lzma
 import os
 import pickle
@@ -49,6 +50,7 @@ from modelaudit.scanners import (
 )
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.jax_checkpoint_scanner import JaxCheckpointScanner
+from modelaudit.scanners.pickle_scanner import PickleScanner
 from modelaudit.scanners.tf_metagraph_scanner import _MAX_PARSE_BYTES
 from modelaudit.scanners.weight_distribution_scanner import WeightDistributionScanner
 from modelaudit.scanners.zip_scanner import ZipScanner
@@ -15815,6 +15817,41 @@ def test_scan_file_routes_misnamed_onnx_by_header(tmp_path: Path) -> None:
     result = scan_file(str(disguised_onnx))
 
     assert result.scanner_name == "onnx"
+
+
+def test_scan_file_keeps_untrusted_header_format_out_of_logs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    marker = "HEADER_SECRET_TEST_123"
+    model_path = tmp_path / "model.pkl"
+    model_path.write_bytes(pickle.dumps({"safe": True}, protocol=4))
+    monkeypatch.setattr(core_module, "detect_file_format", lambda _path: marker)
+    caplog.set_level(logging.DEBUG, logger="modelaudit.core")
+
+    result = scan_file(str(model_path), config={"cache_enabled": False})
+
+    format_check = _format_validation_check(result)
+    assert marker in format_check.message
+    assert marker not in caplog.text
+
+
+def test_preferred_scanner_keeps_untrusted_header_format_out_of_logs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    marker = "HEADER_SECRET_TEST_456"
+    model_path = tmp_path / "model.payload"
+    model_path.write_bytes(b"not a pickle")
+    monkeypatch.setitem(core_module.HEADER_FORMAT_TO_SCANNER_ID, marker, "pickle")
+    caplog.set_level(logging.DEBUG, logger="modelaudit.core")
+
+    handled = core_module._preferred_scanner_can_handle(PickleScanner, "pickle", marker, str(model_path), {})
+
+    assert handled is True
+    assert marker not in caplog.text
 
 
 def test_scan_file_demotes_pt_onnx_mismatch_after_validated_alternate_format(tmp_path: Path) -> None:

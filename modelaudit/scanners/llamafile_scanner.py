@@ -138,10 +138,6 @@ TORCH7_NETWORK_OR_SHELL_BYTES_RE = re.compile(
     rb"(?i)\b(?:https?://|ftp://|socket\.|luasocket|curl|wget|powershell(?:\.exe)?|"
     rb"cmd(?:\.exe)?\s+/c|/bin/sh|/bin/bash|bash\s+-c|sh\s+-c|netcat|nc\s+)"
 )
-SAFE_LOCALHOST_URL_RE = re.compile(
-    r"https?://(?:localhost|127(?:\.\d{1,3}){3}|0\.0\.0\.0|\[::1\]|::1)(?::\d+)?(?=[/?#\s]|$)(?:[/?#][^\s]*)?",
-    re.IGNORECASE,
-)
 SAFE_JSON_SCHEMA_URL_RE = re.compile(
     r"https?://(?:www\.)?json-schema\.org(?::\d+)?(?=[/?#\s]|$)(?:[/?#][^\s]*)?",
     re.IGNORECASE,
@@ -360,10 +356,10 @@ URL_TOKEN_RE = re.compile(
     re.IGNORECASE,
 )
 COMMAND_INDICATOR_RE = re.compile(
-    r"(?:\b(?:bash|sh|zsh|dash|ksh|fish)\s+-(?-i:(?![a-z]*n)[a-z]*c[a-z]*)(?:\s|$)"
-    r"|\bpython(?:\d+(?:\.\d+)?)?\s+-(?-i:c)(?:\s|$)"
+    r"(?:\b(?:bash|sh|zsh|dash|ksh|fish)\s+-(?-i:(?![a-z]*n)[a-z]*c[a-z]*)(?:\s|\Z)"
+    r"|\bpython(?:\d+(?:\.\d+)?)?\s+-(?-i:c)(?:\s|\Z)"
     r"|\bcmd(?:\.exe)?(?:\s+/(?:s|q|d|a|u|v(?::(?:on|off))?|e:(?:on|off)|f:(?:on|off))){0,8}"
-    r"\s+/(?:c|k)(?:\s|$)"
+    r"\s+/(?:c|k)(?:\s|\Z)"
     r"|\b(?:powershell|pwsh)(?:\.exe)?\s+(?:[-/][a-z]|invoke-(?:webrequest|restmethod|expression)\b|"
     r"start-process\b|iex\b|whoami\b|[^\s;|&]+\.(?:exe|ps1|cmd|bat)\b)"
     r"|\bos\.system\s*\("
@@ -1547,8 +1543,6 @@ def _shell_printf_output(format_string: str, arguments: list[str]) -> tuple[str,
             cursor = match.end()
         else:
             append_bounded(format_string[cursor:], decode_escapes=True)
-        if not conversions:
-            break
     output_truncated |= argument_index < len(arguments)
     return "".join(output), output_truncated
 
