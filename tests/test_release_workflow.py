@@ -614,8 +614,9 @@ def test_root_publish_fails_closed_until_picklescan_is_available(
     if should_pass:
         exec(compile(script, "release-availability-step", "exec"), {})
     else:
-        with pytest.raises(SystemExit):
+        with pytest.raises(SystemExit) as exc_info:
             exec(compile(script, "release-availability-step", "exec"), {})
+        assert exc_info.value.code not in (0, None)
 
 
 def test_release_workflow_verifies_published_root_package_after_picklescan() -> None:

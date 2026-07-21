@@ -53,8 +53,8 @@ def test_package_init_defers_scanner_result_imports() -> None:
     assert result.returncode == 0, result.stderr
 
 
-def test_interrupt_handler_basic():
-    """Test basic interrupt handler functionality."""
+def test_interrupt_handler_initialization_and_context() -> None:
+    """Test interrupt handler reset, initialization, and context behavior."""
     from modelaudit.utils.helpers.interrupt_handler import (
         get_interrupt_handler,
         interruptible_scan,
@@ -72,8 +72,8 @@ def test_interrupt_handler_basic():
         # Can't easily test actual signal handling in unit tests
 
 
-def test_interrupt_check():
-    """Test interrupt checking."""
+def test_interrupt_flag_detection_and_exception_raising() -> None:
+    """Test interrupt flag detection and KeyboardInterrupt raising."""
     from modelaudit.utils.helpers.interrupt_handler import (
         check_interrupted,
         get_interrupt_handler,
@@ -99,7 +99,7 @@ def test_interrupt_check():
 @pytest.mark.integration
 @pytest.mark.slow
 @pytest.mark.skipif(sys.platform == "win32", reason="SIGINT handling differs on Windows")
-def test_interrupt_during_scan():
+def test_interrupt_during_scan() -> None:
     """Test interrupting a scan in progress."""
     import pickle
 

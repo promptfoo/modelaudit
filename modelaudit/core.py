@@ -2429,10 +2429,9 @@ def _preferred_scanner_can_handle(
 
     if os.path.exists(path) and _is_direct_header_route(scanner_id, header_format):
         logger.debug(
-            "Using %s scanner for %s based on detected %s header despite can_handle rejection",
+            "Using %s scanner for %s based on a detected header despite can_handle rejection",
             scanner_class.name,
             path,
-            header_format,
         )
         return True
 
@@ -6695,7 +6694,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
     ):
         # Suppress expected container-vs-extension differences for known wrapper formats.
         discrepancy_msg = f"File extension indicates {ext_format} but header indicates {header_format}."
-        logger.debug(discrepancy_msg)
+        logger.debug("File extension and detected header disagree.")
 
     # Prefer scanners based on trusted structure rather than the filename alone.
     preferred_scanner: type[BaseScanner] | None = None
@@ -7280,11 +7279,11 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                     "validated_format": validated_alternate_format,
                 }
             )
-            logger.info(check_message)
+            logger.info("Validated alternate-format analysis selected for mismatched content.")
         elif not file_type_valid:
-            logger.warning(discrepancy_msg)
+            logger.warning("File type validation failed; extension and magic bytes disagree.")
         else:
-            logger.debug(discrepancy_msg)
+            logger.debug("File extension and detected header disagree.")
         result.add_check(
             name="Format Validation",
             passed=False,

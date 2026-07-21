@@ -4,11 +4,11 @@ from typing import Any
 
 import pytest
 
-import modelaudit.scanners.text_scanner as text_scanner_module
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
 from modelaudit.detectors import network_comm
 from modelaudit.scanner_results import SCAN_OUTCOME_MESSAGE_METADATA_KEY
+from modelaudit.scanners import text_scanner as text_scanner_module
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.text_scanner import (
     MAX_TEXT_FINDING_CONTEXT_BYTES,

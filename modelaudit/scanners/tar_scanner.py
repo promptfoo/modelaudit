@@ -137,6 +137,17 @@ def _tar_shared_scan_budget_exhausted(config: dict[str, Any]) -> bool:
 
 
 @contextmanager
+def _borrow_or_open_tar_file(path: str, raw_file: BinaryIO | None) -> Iterator[BinaryIO]:
+    """Borrow a caller-owned stream or close the file opened for this TAR probe."""
+    if raw_file is not None:
+        yield raw_file
+        return
+
+    with open(path, "rb") as file_obj:
+        yield file_obj
+
+
+@contextmanager
 def _tar_shared_scan_budget_scope(
     config: dict[str, Any],
     *,
@@ -644,8 +655,7 @@ class TarScanner(BaseScanner):
         raw_file: BinaryIO | None = None,
     ) -> Iterator[tuple[tarfile.TarFile, _TarBoundedStream | None, str | None]]:
         """Open raw TAR seekably or compressed TAR through bounded r| traversal."""
-        with ExitStack() as stack:
-            raw = raw_file if raw_file is not None else stack.enter_context(open(path, "rb"))
+        with _borrow_or_open_tar_file(path, raw_file) as raw, ExitStack() as stack:
             if self.source_size_limit is not None:
                 raw = cast(BinaryIO, _TarSourcePrefixFile(raw, self._effective_source_size(path, raw)))
             raw.seek(0)
@@ -1054,8 +1064,7 @@ class TarScanner(BaseScanner):
             if file_size > max_read_size:
                 return False
 
-            with ExitStack() as stack:
-                file_obj = raw_file if raw_file is not None else stack.enter_context(open(path, "rb"))
+            with _borrow_or_open_tar_file(path, raw_file) as file_obj:
                 original_offset = file_obj.tell()
                 try:
                     file_obj.seek(0)
@@ -1075,8 +1084,8 @@ class TarScanner(BaseScanner):
 
         try:
             import ctypes
+            import ctypes.wintypes
             import msvcrt
-            from ctypes import wintypes
         except ImportError:  # pragma: no cover - Windows stdlib provides these modules.
             return None
 
@@ -1091,19 +1100,19 @@ class TarScanner(BaseScanner):
         kernel32 = windows_ctypes.WinDLL("kernel32", use_last_error=True)
         device_io_control = kernel32.DeviceIoControl
         device_io_control.argtypes = [
-            wintypes.HANDLE,
-            wintypes.DWORD,
-            wintypes.LPVOID,
-            wintypes.DWORD,
-            wintypes.LPVOID,
-            wintypes.DWORD,
-            ctypes.POINTER(wintypes.DWORD),
-            wintypes.LPVOID,
+            ctypes.wintypes.HANDLE,
+            ctypes.wintypes.DWORD,
+            ctypes.wintypes.LPVOID,
+            ctypes.wintypes.DWORD,
+            ctypes.wintypes.LPVOID,
+            ctypes.wintypes.DWORD,
+            ctypes.POINTER(ctypes.wintypes.DWORD),
+            ctypes.wintypes.LPVOID,
         ]
-        device_io_control.restype = wintypes.BOOL
+        device_io_control.restype = ctypes.wintypes.BOOL
 
         try:
-            handle = wintypes.HANDLE(windows_msvcrt.get_osfhandle(file_obj.fileno()))
+            handle = ctypes.wintypes.HANDLE(windows_msvcrt.get_osfhandle(file_obj.fileno()))
         except OSError:
             return None
 
@@ -1112,7 +1121,7 @@ class TarScanner(BaseScanner):
         while query_offset < tail_end:
             query = _FileAllocatedRangeBuffer(query_offset, tail_end - query_offset)
             ranges = (_FileAllocatedRangeBuffer * output_range_count)()
-            bytes_returned = wintypes.DWORD()
+            bytes_returned = ctypes.wintypes.DWORD()
             succeeded = bool(
                 device_io_control(
                     handle,
