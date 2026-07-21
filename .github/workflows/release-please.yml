@@ -1500,6 +1500,7 @@ jobs:
           import posixpath
           import re
           import tarfile
+          import unicodedata
           import urllib.request
           from pathlib import Path
 
@@ -1563,8 +1564,13 @@ jobs:
           required_members = {
               f"modelaudit-{version}/{filename}": content for filename, content in tagged_metadata.items()
           }
-          normalized_required_members = {name.casefold(): name for name in required_members}
+          normalized_required_members = {
+              unicodedata.normalize("NFC", name).casefold(): name for name in required_members
+          }
           seen_members = set()
+          seen_paths = set()
+          seen_files = set()
+          seen_parent_paths = set()
           member_count = 0
           declared_size = 0
           try:
@@ -1591,10 +1597,22 @@ jobs:
                           or any(part.endswith((".", " ")) or ":" in part for part in member_parts)
                       ):
                           raise SystemExit(f"Root sdist contains an unsafe member path: {member.name}")
-                      normalized_name = posixpath.normpath(member.name).casefold()
+                      normalized_name = unicodedata.normalize("NFC", posixpath.normpath(member.name)).casefold()
                       canonical_name = normalized_required_members.get(normalized_name)
                       if canonical_name is not None and member.name != canonical_name:
                           raise SystemExit(f"Root sdist contains a metadata path alias: {member.name}")
+                      if normalized_name in seen_paths:
+                          raise SystemExit(f"Root sdist contains a duplicate or case-normalized path: {member.name}")
+                      normalized_parts = normalized_name.split("/")
+                      parent_paths = {
+                          "/".join(normalized_parts[:index]) for index in range(1, len(normalized_parts))
+                      }
+                      if parent_paths & seen_files or member.isreg() and normalized_name in seen_parent_paths:
+                          raise SystemExit(f"Root sdist contains a file/directory path conflict: {member.name}")
+                      seen_paths.add(normalized_name)
+                      seen_parent_paths.update(parent_paths)
+                      if member.isreg():
+                          seen_files.add(normalized_name)
                       expected_content = required_members.get(member.name)
                       if expected_content is None:
                           continue

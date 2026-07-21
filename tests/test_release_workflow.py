@@ -797,7 +797,10 @@ def test_release_workflow_recovers_root_provenance_without_republishing() -> Non
     assert '"\\\\" in member.name' in verify_run
     assert 'any(part in {"", ".", ".."} for part in member_parts)' in verify_run
     assert 'any(part.endswith((".", " ")) or ":" in part for part in member_parts)' in verify_run
-    assert "posixpath.normpath(member.name).casefold()" in verify_run
+    assert 'unicodedata.normalize("NFC", posixpath.normpath(member.name)).casefold()' in verify_run
+    assert "normalized_name in seen_paths" in verify_run
+    assert "parent_paths & seen_files" in verify_run
+    assert "normalized_name in seen_parent_paths" in verify_run
     assert "member.name != canonical_name" in verify_run
     assert "member.name in seen_members" in verify_run
     assert "if not member.isreg():" in verify_run
@@ -1037,6 +1040,12 @@ def test_root_provenance_recovery_rejects_untrusted_source_runs(
         ("special-sdist-member", False),
         ("oversized-sdist-member", False),
         ("too-many-sdist-members", False),
+        ("duplicate-nonmetadata", False),
+        ("case-alias-nonmetadata", False),
+        ("case-alias-directory", False),
+        ("unicode-alias-nonmetadata", False),
+        ("file-before-child", False),
+        ("child-before-file", False),
     ],
 )
 def test_root_provenance_recovery_fails_closed_for_unverified_artifacts(
@@ -1156,6 +1165,36 @@ def test_root_provenance_recovery_fails_closed_for_unverified_artifacts(
         elif mutation == "too-many-sdist-members":
             for index in range(10_000):
                 archive.addfile(tarfile.TarInfo(f"modelaudit-{version}/extra-{index}"))
+        elif mutation in {"duplicate-nonmetadata", "case-alias-nonmetadata", "unicode-alias-nonmetadata"}:
+            first_name = f"modelaudit-{version}/modelaudit/entry.py"
+            second_name = first_name
+            if mutation == "case-alias-nonmetadata":
+                second_name = f"modelaudit-{version}/modelaudit/ENTRY.py"
+            elif mutation == "unicode-alias-nonmetadata":
+                first_name = f"modelaudit-{version}/modelaudit/caf\u00e9.py"
+                second_name = f"modelaudit-{version}/modelaudit/cafe\u0301.py"
+            for member_name, content in ((first_name, b"safe"), (second_name, b"replaced")):
+                member = tarfile.TarInfo(member_name)
+                member.size = len(content)
+                archive.addfile(member, io.BytesIO(content))
+        elif mutation == "case-alias-directory":
+            for member_name in (
+                f"modelaudit-{version}/modelaudit/package",
+                f"modelaudit-{version}/modelaudit/PACKAGE",
+            ):
+                directory = tarfile.TarInfo(member_name)
+                directory.type = tarfile.DIRTYPE
+                archive.addfile(directory)
+        elif mutation in {"file-before-child", "child-before-file"}:
+            parent_name = f"modelaudit-{version}/modelaudit/parent"
+            child_name = f"{parent_name}/entry.py"
+            entries: list[tuple[str, bytes]] = [(parent_name, b"file"), (child_name, b"child")]
+            if mutation == "child-before-file":
+                entries.reverse()
+            for member_name, content in entries:
+                member = tarfile.TarInfo(member_name)
+                member.size = len(content)
+                archive.addfile(member, io.BytesIO(content))
 
     contents = {filename: (dist_path / filename).read_bytes() for filename in (wheel_name, sdist_name)}
 
@@ -1208,6 +1247,12 @@ def test_root_provenance_recovery_fails_closed_for_unverified_artifacts(
             "special-sdist-member": "contains a non-file member",
             "oversized-sdist-member": "member has an unsafe size",
             "too-many-sdist-members": "exceeds 10000 members",
+            "duplicate-nonmetadata": "contains a duplicate or case-normalized path",
+            "case-alias-nonmetadata": "contains a duplicate or case-normalized path",
+            "case-alias-directory": "contains a duplicate or case-normalized path",
+            "unicode-alias-nonmetadata": "contains a duplicate or case-normalized path",
+            "file-before-child": "contains a file/directory path conflict",
+            "child-before-file": "contains a file/directory path conflict",
         }
         if mutation in expected_errors:
             assert expected_errors[mutation] in str(error.value)
