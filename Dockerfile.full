@@ -61,7 +61,7 @@ RUN pip install --no-cache-dir \
 RUN pip install --no-cache-dir \
     "torch>=2.13.0,<3.0" --index-url https://download.pytorch.org/whl/cpu
 
-RUN pip install --no-cache-dir "setuptools>=78.1.1,<82"
+RUN pip install --no-cache-dir "setuptools>=83.0.0,<84"
 
 ARG UID=10001
 RUN adduser \
