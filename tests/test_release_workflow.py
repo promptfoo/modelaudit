@@ -767,6 +767,9 @@ def test_release_workflow_recovers_root_provenance_without_republishing() -> Non
     assert "tagged_path.stat().st_size" in verify_run
     assert "tagged_path.read_bytes()" in verify_run
     assert "max_metadata_bytes = 10 * 1024 * 1024" in verify_run
+    assert "max_sdist_members = 10_000" in verify_run
+    assert "max_sdist_member_bytes = 16 * 1024 * 1024" in verify_run
+    assert "max_sdist_bytes = 256 * 1024 * 1024" in verify_run
     assert 'f"modelaudit-{version}-py3-none-any.whl"' in verify_run
     assert 'f"modelaudit-{version}.tar.gz"' in verify_run
     assert "path.is_symlink()" in verify_run
@@ -776,8 +779,20 @@ def test_release_workflow_recovers_root_provenance_without_republishing() -> Non
     assert "hashlib.sha256(path.read_bytes()).hexdigest()" in verify_run
     assert 'f"modelaudit-{version}/{filename}"' in verify_run
     assert 'tarfile.open(Path("dist", f"modelaudit-{version}.tar.gz"), "r|gz")' in verify_run
+    assert "member_count > max_sdist_members" in verify_run
+    assert "member.size < 0 or member.size > max_sdist_member_bytes" in verify_run
+    assert "declared_size > max_sdist_bytes" in verify_run
+    assert "member.issym() or member.islnk()" in verify_run
+    assert "not member.isreg() and not member.isdir()" in verify_run
+    assert 'member.name.startswith("/")' in verify_run
+    assert 're.match(r"^[A-Za-z]:", member.name)' in verify_run
+    assert '"\\\\" in member.name' in verify_run
+    assert 'any(part in {"", ".", ".."} for part in member_parts)' in verify_run
+    assert 'any(part.endswith((".", " ")) or ":" in part for part in member_parts)' in verify_run
+    assert "posixpath.normpath(member.name).casefold()" in verify_run
+    assert "member.name != canonical_name" in verify_run
     assert "member.name in seen_members" in verify_run
-    assert "not member.isreg() or member.issym() or member.islnk()" in verify_run
+    assert "if not member.isreg():" in verify_run
     assert "member.size > max_metadata_bytes or member.size != len(expected_content)" in verify_run
     assert "member_file.read(member.size + 1) != expected_content" in verify_run
 
@@ -952,6 +967,20 @@ def test_root_provenance_recovery_rejects_untrusted_source_runs(
         ("duplicate-sdist-metadata", False),
         ("linked-sdist-metadata", False),
         ("oversized-sdist-metadata", False),
+        ("traversal-sdist-metadata-alias", False),
+        ("symlink-sdist-metadata-alias", False),
+        ("hardlink-sdist-member", False),
+        ("absolute-sdist-member", False),
+        ("drive-sdist-member", False),
+        ("backslash-sdist-member", False),
+        ("dot-sdist-member", False),
+        ("case-sdist-metadata-alias", False),
+        ("trailing-dot-sdist-metadata-alias", False),
+        ("trailing-space-sdist-directory-alias", False),
+        ("ads-sdist-member", False),
+        ("special-sdist-member", False),
+        ("oversized-sdist-member", False),
+        ("too-many-sdist-members", False),
     ],
 )
 def test_root_provenance_recovery_fails_closed_for_unverified_artifacts(
@@ -1010,6 +1039,67 @@ def test_root_provenance_recovery_fails_closed_for_unverified_artifacts(
             link.type = tarfile.SYMTYPE
             link.linkname = f"modelaudit-{version}/pyproject.toml"
             archive.addfile(link)
+        elif mutation == "traversal-sdist-metadata-alias":
+            alias = tarfile.TarInfo(f"modelaudit-{version}/sub/../uv.lock")
+            alias.size = len(lock_content)
+            archive.addfile(alias, io.BytesIO(lock_content))
+        elif mutation == "symlink-sdist-metadata-alias":
+            link = tarfile.TarInfo(f"modelaudit-{version}/sub")
+            link.type = tarfile.SYMTYPE
+            link.linkname = "."
+            archive.addfile(link)
+            alias = tarfile.TarInfo(f"modelaudit-{version}/sub/uv.lock")
+            alias.size = len(lock_content)
+            archive.addfile(alias, io.BytesIO(lock_content))
+        elif mutation == "hardlink-sdist-member":
+            link = tarfile.TarInfo(f"modelaudit-{version}/other.lock")
+            link.type = tarfile.LNKTYPE
+            link.linkname = f"modelaudit-{version}/uv.lock"
+            archive.addfile(link)
+        elif mutation == "absolute-sdist-member":
+            member = tarfile.TarInfo(f"/modelaudit-{version}/other.lock")
+            member.size = len(lock_content)
+            archive.addfile(member, io.BytesIO(lock_content))
+        elif mutation == "drive-sdist-member":
+            member = tarfile.TarInfo(f"C:/modelaudit-{version}/other.lock")
+            member.size = len(lock_content)
+            archive.addfile(member, io.BytesIO(lock_content))
+        elif mutation == "backslash-sdist-member":
+            member = tarfile.TarInfo(f"modelaudit-{version}\\other.lock")
+            member.size = len(lock_content)
+            archive.addfile(member, io.BytesIO(lock_content))
+        elif mutation == "dot-sdist-member":
+            member = tarfile.TarInfo(f"modelaudit-{version}/./other.lock")
+            member.size = len(lock_content)
+            archive.addfile(member, io.BytesIO(lock_content))
+        elif mutation == "case-sdist-metadata-alias":
+            alias = tarfile.TarInfo(f"modelaudit-{version}/UV.LOCK")
+            alias.size = len(lock_content)
+            archive.addfile(alias, io.BytesIO(lock_content))
+        elif mutation == "trailing-dot-sdist-metadata-alias":
+            alias = tarfile.TarInfo(f"modelaudit-{version}/uv.lock.")
+            alias.size = len(lock_content)
+            archive.addfile(alias, io.BytesIO(lock_content))
+        elif mutation == "trailing-space-sdist-directory-alias":
+            alias = tarfile.TarInfo(f"modelaudit-{version} /uv.lock")
+            alias.size = len(lock_content)
+            archive.addfile(alias, io.BytesIO(lock_content))
+        elif mutation == "ads-sdist-member":
+            member = tarfile.TarInfo(f"modelaudit-{version}/uv.lock:stream")
+            member.size = len(lock_content)
+            archive.addfile(member, io.BytesIO(lock_content))
+        elif mutation == "special-sdist-member":
+            member = tarfile.TarInfo(f"modelaudit-{version}/device")
+            member.type = tarfile.CHRTYPE
+            archive.addfile(member)
+        elif mutation == "oversized-sdist-member":
+            content = b"0" * (16 * 1024 * 1024 + 1)
+            member = tarfile.TarInfo(f"modelaudit-{version}/large.bin")
+            member.size = len(content)
+            archive.addfile(member, io.BytesIO(content))
+        elif mutation == "too-many-sdist-members":
+            for index in range(10_000):
+                archive.addfile(tarfile.TarInfo(f"modelaudit-{version}/extra-{index}"))
 
     contents = {filename: (dist_path / filename).read_bytes() for filename in (wheel_name, sdist_name)}
 
@@ -1045,5 +1135,23 @@ def test_root_provenance_recovery_fails_closed_for_unverified_artifacts(
     if should_pass:
         exec(compile(script, "root-provenance-recovery-step", "exec"), {})
     else:
-        with pytest.raises(SystemExit):
+        with pytest.raises(SystemExit) as error:
             exec(compile(script, "root-provenance-recovery-step", "exec"), {})
+        expected_errors = {
+            "traversal-sdist-metadata-alias": "contains an unsafe member path",
+            "symlink-sdist-metadata-alias": "contains a linked member",
+            "hardlink-sdist-member": "contains a linked member",
+            "absolute-sdist-member": "contains an unsafe member path",
+            "drive-sdist-member": "contains an unsafe member path",
+            "backslash-sdist-member": "contains an unsafe member path",
+            "dot-sdist-member": "contains an unsafe member path",
+            "case-sdist-metadata-alias": "contains a metadata path alias",
+            "trailing-dot-sdist-metadata-alias": "contains an unsafe member path",
+            "trailing-space-sdist-directory-alias": "contains an unsafe member path",
+            "ads-sdist-member": "contains an unsafe member path",
+            "special-sdist-member": "contains a non-file member",
+            "oversized-sdist-member": "member has an unsafe size",
+            "too-many-sdist-members": "exceeds 10000 members",
+        }
+        if mutation in expected_errors:
+            assert expected_errors[mutation] in str(error.value)
