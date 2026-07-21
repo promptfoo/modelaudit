@@ -137,7 +137,7 @@ def test_tar_probe_contexts_close_owned_streams(tmp_path: Path, monkeypatch: pyt
 
     assert TarScanner._is_empty_tar_archive(str(archive_path))
     with TarScanner()._open_tar_stream(str(archive_path)) as (archive, _, _):
-        assert archive.next() is None
+        assert archive.fileobj is opened[-1]
 
     assert len(opened) == 2
     assert all(stream.closed for stream in opened)
