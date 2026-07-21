@@ -1565,7 +1565,8 @@ jobs:
               f"modelaudit-{version}/{filename}": content for filename, content in tagged_metadata.items()
           }
           normalized_required_members = {
-              unicodedata.normalize("NFC", name).casefold(): name for name in required_members
+              unicodedata.normalize("NFC", unicodedata.normalize("NFC", name).casefold()): name
+              for name in required_members
           }
           seen_members = set()
           seen_paths = set()
@@ -1597,7 +1598,9 @@ jobs:
                           or any(part.endswith((".", " ")) or ":" in part for part in member_parts)
                       ):
                           raise SystemExit(f"Root sdist contains an unsafe member path: {member.name}")
-                      normalized_name = unicodedata.normalize("NFC", posixpath.normpath(member.name)).casefold()
+                      normalized_name = unicodedata.normalize(
+                          "NFC", unicodedata.normalize("NFC", posixpath.normpath(member.name)).casefold()
+                      )
                       canonical_name = normalized_required_members.get(normalized_name)
                       if canonical_name is not None and member.name != canonical_name:
                           raise SystemExit(f"Root sdist contains a metadata path alias: {member.name}")
