@@ -67,7 +67,7 @@ gh workflow run release-please.yml --ref main \
   -f root_provenance_run_id=<original-run-id>
 ```
 
-This provenance-only path skips release creation, builds, and publication. It checks out `v<X.Y.Z>`, downloads the original `dist` artifact, requires its wheel and sdist to exactly match the non-yanked PyPI SHA256 digests, then generates a recovery-integrity attestation and an SBOM from the tag's frozen `uv.lock` before uploading the files to the matching GitHub Release. The recovery attestation does **not** claim original SLSA build provenance; the original PyPI publish attestations remain the publisher record. The source run ID must be numeric, `root_version` must use `X.Y.Z`, and `picklescan_version` cannot be combined with this recovery mode.
+This provenance-only path skips release creation, builds, and publication. It checks out the fully qualified `refs/tags/v<X.Y.Z>` ref, verifies that the source is a successful release-please push or manual run from this repository with successful `build`, `publish-pypi`, and `verify-pypi` jobs, then downloads its original `dist` artifact. The wheel and sdist must exactly match the non-yanked PyPI SHA256 digests before the workflow generates a recovery-integrity attestation and an SBOM from the tag's frozen `uv.lock`, then uploads the files to the matching GitHub Release. The recovery attestation does **not** claim original SLSA build provenance; the original PyPI publish attestations remain the publisher record. The source run ID must be numeric, `root_version` must use `X.Y.Z`, and `picklescan_version` cannot be combined with this recovery mode.
 
 ## PyPI trusted publishing (first-time setup)
 

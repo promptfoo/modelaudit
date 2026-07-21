@@ -1374,11 +1374,63 @@ jobs:
       - name: Checkout tagged root release
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
-          ref: ${{ needs.release-please.outputs.tag_name }}
+          ref: refs/tags/${{ needs.release-please.outputs.tag_name }}
           sparse-checkout: |
             pyproject.toml
             uv.lock
           persist-credentials: false
+
+      - name: Verify original root publish run
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SOURCE_RUN_ID: ${{ needs.release-please.outputs.root_provenance_run_id }}
+        run: |
+          if [[ ! "$SOURCE_RUN_ID" =~ ^[1-9][0-9]*$ ]]; then
+            echo "Root provenance recovery requires a numeric source run ID."
+            exit 1
+          fi
+
+          run_metadata=$(mktemp)
+          jobs_metadata=$(mktemp)
+          trap 'rm -f "$run_metadata" "$jobs_metadata"' EXIT
+          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}" > "$run_metadata"
+          gh api --paginate --slurp \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}/jobs?per_page=100" > "$jobs_metadata"
+          export RUN_METADATA="$run_metadata"
+          export JOBS_METADATA="$jobs_metadata"
+
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          repository = os.environ["GITHUB_REPOSITORY"]
+          source_run_id = os.environ["SOURCE_RUN_ID"]
+          run = json.loads(Path(os.environ["RUN_METADATA"]).read_text(encoding="utf-8"))
+          if run.get("path") != ".github/workflows/release-please.yml":
+              raise SystemExit(f"Source run {source_run_id} is not a release-please workflow run")
+          if run.get("event") not in {"push", "workflow_dispatch"}:
+              raise SystemExit(f"Source run {source_run_id} has an unsupported event: {run.get('event')!r}")
+          if run.get("status") != "completed" or run.get("conclusion") != "success":
+              raise SystemExit(f"Source run {source_run_id} did not complete successfully")
+          if run.get("repository", {}).get("full_name") != repository:
+              raise SystemExit(f"Source run {source_run_id} belongs to a different repository")
+          if run.get("head_repository", {}).get("full_name") != repository:
+              raise SystemExit(f"Source run {source_run_id} has an untrusted head repository")
+
+          pages = json.loads(Path(os.environ["JOBS_METADATA"]).read_text(encoding="utf-8"))
+          if not isinstance(pages, list) or not pages:
+              raise SystemExit(f"Source run {source_run_id} returned no job pages")
+          jobs = [job for page in pages for job in page.get("jobs", [])]
+          for job_name in ("build", "publish-pypi", "verify-pypi"):
+              matching = [job for job in jobs if job.get("name") == job_name]
+              if len(matching) != 1:
+                  raise SystemExit(f"Source run {source_run_id} must contain exactly one {job_name} job")
+              job = matching[0]
+              if job.get("status") != "completed" or job.get("conclusion") != "success":
+                  raise SystemExit(f"Source run {source_run_id} {job_name} job did not complete successfully")
+          print(f"Verified original modelaudit publish run {source_run_id}")
+          PY
 
       - name: Download original root build artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8

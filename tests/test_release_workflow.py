@@ -722,10 +722,28 @@ def test_release_workflow_recovers_root_provenance_without_republishing() -> Non
     checkout_step = _step_by_name(steps, "Checkout tagged root release")
     assert checkout_step["uses"] == "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd"
     assert checkout_step["with"] == {
-        "ref": "${{ needs.release-please.outputs.tag_name }}",
+        "ref": "refs/tags/${{ needs.release-please.outputs.tag_name }}",
         "sparse-checkout": "pyproject.toml\nuv.lock\n",
         "persist-credentials": False,
     }
+
+    source_run_step = _step_by_name(steps, "Verify original root publish run")
+    source_run = source_run_step["run"]
+    assert source_run_step["env"] == {
+        "GH_TOKEN": "${{ secrets.GITHUB_TOKEN }}",
+        "SOURCE_RUN_ID": "${{ needs.release-please.outputs.root_provenance_run_id }}",
+    }
+    assert '[[ ! "$SOURCE_RUN_ID" =~ ^[1-9][0-9]*$ ]]' in source_run
+    assert 'gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}"' in source_run
+    assert "gh api --paginate --slurp" in source_run
+    assert '"repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}/jobs?per_page=100"' in source_run
+    assert 'run.get("path") != ".github/workflows/release-please.yml"' in source_run
+    assert 'run.get("event") not in {"push", "workflow_dispatch"}' in source_run
+    assert 'run.get("repository", {}).get("full_name") != repository' in source_run
+    assert 'run.get("head_repository", {}).get("full_name") != repository' in source_run
+    assert '("build", "publish-pypi", "verify-pypi")' in source_run
+    assert "if len(matching) != 1" in source_run
+    assert 'job.get("status") != "completed" or job.get("conclusion") != "success"' in source_run
 
     download_step = _step_by_name(steps, "Download original root build artifacts")
     assert download_step["uses"] == "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"
@@ -777,9 +795,123 @@ def test_release_workflow_recovers_root_provenance_without_republishing() -> Non
     }
     assert 'gh release view "$ROOT_TAG" --repo "$GITHUB_REPOSITORY"' in upload_step["run"]
     assert 'gh release upload "$ROOT_TAG" dist/*' in upload_step["run"]
-    assert steps.index(download_step) < steps.index(verify_step) < steps.index(attest_step) < steps.index(sbom_step)
+    assert steps.index(source_run_step) < steps.index(download_step) < steps.index(verify_step)
+    assert steps.index(verify_step) < steps.index(attest_step) < steps.index(sbom_step)
     assert steps.index(sbom_step) < steps.index(upload_step)
     assert not any(step.get("uses", "").startswith("pypa/gh-action-pypi-publish@") for step in steps)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "should_pass"),
+    [
+        ("workflow-dispatch", True),
+        ("push", True),
+        ("wrong-workflow", False),
+        ("pull-request", False),
+        ("wrong-repository", False),
+        ("wrong-head-repository", False),
+        ("run-in-progress", False),
+        ("run-failed", False),
+        ("missing-job", False),
+        ("duplicate-job", False),
+        ("job-in-progress", False),
+        ("job-failed", False),
+        ("invalid-run-id", False),
+    ],
+)
+def test_root_provenance_recovery_rejects_untrusted_source_runs(
+    mutation: str,
+    should_pass: bool,
+    tmp_path: Path,
+) -> None:
+    workflow = _load_release_workflow()
+    script = _step_by_name(_job_steps(workflow, "root-provenance-recovery"), "Verify original root publish run")["run"]
+    repository = "promptfoo/modelaudit"
+    source_run_id = "not-a-run" if mutation == "invalid-run-id" else "29787069929"
+    run_metadata: dict[str, Any] = {
+        "path": ".github/workflows/release-please.yml",
+        "event": "push" if mutation == "push" else "workflow_dispatch",
+        "status": "completed",
+        "conclusion": "success",
+        "repository": {"full_name": repository},
+        "head_repository": {"full_name": repository},
+    }
+    jobs: list[dict[str, Any]] = [
+        {"name": job_name, "status": "completed", "conclusion": "success"}
+        for job_name in ("release-please", "build", "publish-pypi", "verify-pypi", "provenance")
+    ]
+    if mutation == "wrong-workflow":
+        run_metadata["path"] = ".github/workflows/test.yml"
+    elif mutation == "pull-request":
+        run_metadata["event"] = "pull_request"
+    elif mutation == "wrong-repository":
+        run_metadata["repository"]["full_name"] = "attacker/modelaudit"
+    elif mutation == "wrong-head-repository":
+        run_metadata["head_repository"]["full_name"] = "attacker/modelaudit"
+    elif mutation == "run-in-progress":
+        run_metadata["status"] = "in_progress"
+        run_metadata["conclusion"] = None
+    elif mutation == "run-failed":
+        run_metadata["conclusion"] = "failure"
+    elif mutation == "missing-job":
+        jobs = [job for job in jobs if job["name"] != "verify-pypi"]
+    elif mutation == "duplicate-job":
+        jobs.append({"name": "publish-pypi", "status": "completed", "conclusion": "success"})
+    elif mutation == "job-in-progress":
+        jobs[2]["status"] = "in_progress"
+        jobs[2]["conclusion"] = None
+    elif mutation == "job-failed":
+        jobs[1]["conclusion"] = "failure"
+
+    run_path = tmp_path / "run.json"
+    jobs_path = tmp_path / "jobs.json"
+    calls_path = tmp_path / "calls.jsonl"
+    run_path.write_text(json.dumps(run_metadata), encoding="utf-8")
+    jobs_path.write_text(json.dumps([{"jobs": jobs[:2]}, {"jobs": jobs[2:]}]), encoding="utf-8")
+    bin_path = tmp_path / "bin"
+    bin_path.mkdir()
+    gh_path = bin_path / "gh"
+    gh_path.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json\n"
+        "import os\n"
+        "import sys\n"
+        "from pathlib import Path\n"
+        "args = sys.argv[1:]\n"
+        "with Path(os.environ['CALLS_PATH']).open('a', encoding='utf-8') as handle:\n"
+        "    handle.write(json.dumps(args) + '\\n')\n"
+        "source = 'JOBS_PATH' if '/jobs?' in args[-1] else 'RUN_PATH'\n"
+        "print(Path(os.environ[source]).read_text(encoding='utf-8'))\n",
+        encoding="utf-8",
+    )
+    gh_path.chmod(0o755)
+
+    result = subprocess.run(
+        ["bash", "--noprofile", "--norc", "-euo", "pipefail", "-c", script],
+        env={
+            "PATH": f"{bin_path}{os.pathsep}{os.environ['PATH']}",
+            "GH_TOKEN": "test-token",
+            "GITHUB_REPOSITORY": repository,
+            "SOURCE_RUN_ID": source_run_id,
+            "RUN_PATH": str(run_path),
+            "JOBS_PATH": str(jobs_path),
+            "CALLS_PATH": str(calls_path),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert (result.returncode == 0) is should_pass, result.stdout + result.stderr
+    if mutation == "invalid-run-id":
+        assert not calls_path.exists()
+        assert "requires a numeric source run ID" in result.stdout
+        return
+    calls = [json.loads(line) for line in calls_path.read_text(encoding="utf-8").splitlines()]
+    assert calls == [
+        ["api", f"repos/{repository}/actions/runs/{source_run_id}"],
+        ["api", "--paginate", "--slurp", f"repos/{repository}/actions/runs/{source_run_id}/jobs?per_page=100"],
+    ]
 
 
 @pytest.mark.parametrize(
