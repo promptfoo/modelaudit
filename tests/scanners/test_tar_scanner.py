@@ -7,6 +7,8 @@ import random
 import tarfile
 import tempfile
 import zipfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, BinaryIO, Literal, cast
 
@@ -68,28 +70,28 @@ def _mark_windows_file_sparse(file_obj: BinaryIO) -> None:
         return
 
     import ctypes
+    import ctypes.wintypes
     import msvcrt
-    from ctypes import wintypes
 
     windows_ctypes = cast(Any, ctypes)
     windows_msvcrt = cast(Any, msvcrt)
     kernel32 = windows_ctypes.WinDLL("kernel32", use_last_error=True)
     device_io_control = kernel32.DeviceIoControl
     device_io_control.argtypes = [
-        wintypes.HANDLE,
-        wintypes.DWORD,
-        wintypes.LPVOID,
-        wintypes.DWORD,
-        wintypes.LPVOID,
-        wintypes.DWORD,
-        ctypes.POINTER(wintypes.DWORD),
-        wintypes.LPVOID,
+        ctypes.wintypes.HANDLE,
+        ctypes.wintypes.DWORD,
+        ctypes.wintypes.LPVOID,
+        ctypes.wintypes.DWORD,
+        ctypes.wintypes.LPVOID,
+        ctypes.wintypes.DWORD,
+        ctypes.POINTER(ctypes.wintypes.DWORD),
+        ctypes.wintypes.LPVOID,
     ]
-    device_io_control.restype = wintypes.BOOL
-    bytes_returned = wintypes.DWORD()
+    device_io_control.restype = ctypes.wintypes.BOOL
+    bytes_returned = ctypes.wintypes.DWORD()
     succeeded = bool(
         device_io_control(
-            wintypes.HANDLE(windows_msvcrt.get_osfhandle(file_obj.fileno())),
+            ctypes.wintypes.HANDLE(windows_msvcrt.get_osfhandle(file_obj.fileno())),
             0x000900C4,
             None,
             0,
@@ -100,6 +102,45 @@ def _mark_windows_file_sparse(file_obj: BinaryIO) -> None:
         )
     )
     assert succeeded, f"FSCTL_SET_SPARSE failed: {windows_ctypes.get_last_error()}"
+
+
+def test_borrow_or_open_tar_file_closes_only_owned_stream(tmp_path: Path) -> None:
+    archive_path = tmp_path / "empty.tar"
+    archive_path.write_bytes(b"\0" * 1024)
+
+    with tar_scanner_module._borrow_or_open_tar_file(str(archive_path), None) as owned:
+        assert owned.read(1) == b"\0"
+    assert owned.closed
+
+    borrowed = io.BytesIO(b"\0" * 1024)
+    with tar_scanner_module._borrow_or_open_tar_file(str(archive_path), borrowed) as stream:
+        assert stream is borrowed
+        assert stream.read(1) == b"\0"
+    assert borrowed.closed is False
+
+
+def test_tar_probe_contexts_close_owned_streams(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    archive_path = tmp_path / "empty.tar"
+    with tarfile.open(archive_path, "w"):
+        pass
+
+    original_borrow = tar_scanner_module._borrow_or_open_tar_file
+    opened: list[BinaryIO] = []
+
+    @contextmanager
+    def tracking_borrow(path: str, raw_file: BinaryIO | None) -> Iterator[BinaryIO]:
+        with original_borrow(path, raw_file) as stream:
+            opened.append(stream)
+            yield stream
+
+    monkeypatch.setattr(tar_scanner_module, "_borrow_or_open_tar_file", tracking_borrow)
+
+    assert TarScanner._is_empty_tar_archive(str(archive_path))
+    with TarScanner()._open_tar_stream(str(archive_path)) as (archive, _, _):
+        assert archive.fileobj is opened[-1]
+
+    assert len(opened) == 2
+    assert all(stream.closed for stream in opened)
 
 
 def _write_sparse_raw_tar(

@@ -5,13 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Bug Fixes
+
+- avoid logging file-derived header-format values while preserving format-mismatch detections, and clean up CodeQL quality findings
+
 ## [0.2.51](https://github.com/promptfoo/modelaudit/compare/v0.2.50...v0.2.51) (2026-07-20)
 
 ### Bug Fixes
 
 - recover root release build and PyPI smoke gates ([#1764](https://github.com/promptfoo/modelaudit/issues/1764)) ([fa350d9](https://github.com/promptfoo/modelaudit/commit/fa350d96d2e00e0d54c47f282b7f8e0f9660e077))
-
-## [Unreleased]
 
 ## [0.2.50](https://github.com/promptfoo/modelaudit/compare/v0.2.49...v0.2.50) (2026-07-20)
 
@@ -2530,7 +2534,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **style**: improve code formatting and documentation standards (#12, #23)
 - **fix**: improve core scanner functionality and comprehensive test coverage (#11)
 
-[unreleased]: https://github.com/promptfoo/modelaudit/compare/v0.2.37...HEAD
+[unreleased]: https://github.com/promptfoo/modelaudit/compare/v0.2.51...HEAD
 [0.2.25]: https://github.com/promptfoo/modelaudit/compare/v0.2.24...v0.2.25
 [0.2.24]: https://github.com/promptfoo/modelaudit/compare/v0.2.23...v0.2.24
 [0.2.23]: https://github.com/promptfoo/modelaudit/compare/v0.2.22...v0.2.23

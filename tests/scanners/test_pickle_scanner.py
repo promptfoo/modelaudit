@@ -90,6 +90,17 @@ class BrokenRewindStream(io.BytesIO):
         raise OSError("rewind failed")
 
 
+def test_probe_pickle_stream_preserves_bounded_progress_for_truncated_opcode() -> None:
+    payload = b"\x80\x04X\x05\0\0\0ab"
+    stream = io.BytesIO(payload)
+
+    extent, consumed, parsed_opcode = pickle_scanner._probe_pickle_stream(stream)
+
+    assert extent is None
+    assert consumed == len(payload)
+    assert parsed_opcode is True
+
+
 class BrokenSupplementalReadStream(io.BytesIO):
     def __init__(self, initial_bytes: bytes) -> None:
         super().__init__(initial_bytes)

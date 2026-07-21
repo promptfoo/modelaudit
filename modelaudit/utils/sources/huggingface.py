@@ -1865,8 +1865,6 @@ def _parse_huggingface_response_file_size(response: Any, bytes_read: int, max_by
     headers = getattr(response, "headers", {})
     content_range = headers.get("Content-Range", "")
     if getattr(response, "status_code", None) == 206:
-        import re
-
         match = re.fullmatch(r"bytes 0-(\d+)/(\d+)", content_range.strip(), flags=re.IGNORECASE)
         if match is None:
             raise ValueError("partial Hugging Face response omitted a valid Content-Range")
@@ -2022,8 +2020,6 @@ def _read_huggingface_tail(
 
     budget.reserve(repo_id, read_size)
     try:
-        import re
-
         import requests
         from huggingface_hub import hf_hub_url
         from huggingface_hub.utils import build_hf_headers
@@ -2108,8 +2104,6 @@ def _read_huggingface_range(
     remote_end = remote_start + remote_size - 1
     budget.reserve(repo_id, remote_size)
     try:
-        import re
-
         import requests
         from huggingface_hub import hf_hub_url
         from huggingface_hub.utils import build_hf_headers
