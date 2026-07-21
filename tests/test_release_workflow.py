@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tarfile
 import time
+import urllib.error
 import urllib.request
 import zipfile
 import zlib
@@ -175,7 +176,7 @@ def test_release_workflow_resolves_provenance_only_recovery_inputs(
     result = subprocess.run(
         ["bash", "--noprofile", "--norc", "-euo", "pipefail", "-c", script],
         env={
-            "PATH": os.environ["PATH"],
+            **os.environ,
             "GITHUB_OUTPUT": str(output_path),
             "ROOT_VERSION": root_version,
             "PICKLESCAN_VERSION": picklescan_version,
@@ -798,8 +799,17 @@ def test_release_workflow_recovers_root_provenance_without_republishing() -> Non
     assert 'f"modelaudit-{version}.tar.gz"' in verify_run
     assert "path.is_symlink()" in verify_run
     assert "https://pypi.org/pypi/modelaudit/{version}/json" in verify_run
+    assert "pypi_metadata = response.read(max_metadata_bytes + 1)" in verify_run
+    assert "len(pypi_metadata) > max_metadata_bytes" in verify_run
+    assert "payload = json.loads(pypi_metadata)" in verify_run
+    assert "except (OSError, ValueError) as error:" in verify_run
+    assert "Could not verify PyPI metadata for modelaudit" in verify_run
+    assert 'not isinstance(payload, dict) or not isinstance(payload.get("info"), dict)' in verify_run
+    assert "not isinstance(urls, list) or any(not isinstance(entry, dict) for entry in urls)" in verify_run
     assert 'entry.get("yanked", False)' in verify_run
-    assert 'entry.get("digests", {}).get("sha256")' in verify_run
+    assert 'digests = entry.get("digests")' in verify_run
+    assert "not isinstance(digests, dict)" in verify_run
+    assert 'expected_digest = digests.get("sha256")' in verify_run
     assert "hashlib.sha256(path.read_bytes())" not in verify_run
     assert 'with path.open("rb") as artifact_file:' in verify_run
     assert "artifact_file.read(1024 * 1024)" in verify_run
@@ -1181,8 +1191,16 @@ def test_root_provenance_recovery_rejects_untrusted_source_runs(
         ("missing-local", False),
         ("extra-local", False),
         ("wrong-pypi-version", False),
+        ("pypi-error", False),
+        ("invalid-pypi-json", False),
+        ("oversized-pypi-metadata", False),
+        ("invalid-pypi-metadata", False),
+        ("invalid-pypi-info", False),
+        ("invalid-pypi-urls", False),
+        ("invalid-pypi-entry", False),
         ("missing-pypi-file", False),
         ("yanked", False),
+        ("invalid-pypi-digests", False),
         ("invalid-digest", False),
         ("hash-mismatch", False),
         ("lock-mismatch", False),
@@ -1395,25 +1413,41 @@ def test_root_provenance_recovery_fails_closed_for_unverified_artifacts(
         {"filename": filename, "yanked": False, "digests": {"sha256": hashlib.sha256(content).hexdigest()}}
         for filename, content in contents.items()
     ]
-    payload: dict[str, Any] = {"info": {"version": version}, "urls": urls}
+    payload: Any = {"info": {"version": version}, "urls": urls}
     if mutation == "missing-local":
         (dist_path / sdist_name).unlink()
     elif mutation == "extra-local":
         (dist_path / "unexpected.txt").write_text("unexpected", encoding="utf-8")
     elif mutation == "wrong-pypi-version":
         payload["info"]["version"] = "0.2.49"
+    elif mutation == "invalid-pypi-metadata":
+        payload = []
+    elif mutation == "invalid-pypi-info":
+        payload["info"] = []
+    elif mutation == "invalid-pypi-urls":
+        payload["urls"] = {}
+    elif mutation == "invalid-pypi-entry":
+        payload["urls"] = ["not-an-artifact"]
     elif mutation == "missing-pypi-file":
         urls.pop()
     elif mutation == "yanked":
         urls[0]["yanked"] = True
     elif mutation == "invalid-digest":
         urls[0]["digests"]["sha256"] = "not-a-sha256"
+    elif mutation == "invalid-pypi-digests":
+        urls[0]["digests"] = []
     elif mutation == "hash-mismatch":
         urls[0]["digests"]["sha256"] = "0" * 64
 
     def fake_urlopen(url: str, timeout: int = 20) -> io.BytesIO:
         assert url == f"https://pypi.org/pypi/modelaudit/{version}/json"
         assert timeout == 20
+        if mutation == "pypi-error":
+            raise urllib.error.URLError("simulated PyPI outage")
+        if mutation == "invalid-pypi-json":
+            return io.BytesIO(b"not-json")
+        if mutation == "oversized-pypi-metadata":
+            return io.BytesIO(b" " * (10 * 1024 * 1024 + 1))
         return io.BytesIO(json.dumps(payload).encode())
 
     monkeypatch.chdir(tmp_path)
@@ -1446,6 +1480,14 @@ def test_root_provenance_recovery_fails_closed_for_unverified_artifacts(
             exec(compile(script, "root-provenance-recovery-step", "exec"), {})
         expected_errors = {
             "traversal-sdist-metadata-alias": "contains an unsafe member path",
+            "pypi-error": "Could not verify PyPI metadata",
+            "invalid-pypi-json": "Could not verify PyPI metadata",
+            "oversized-pypi-metadata": "PyPI metadata for modelaudit 0.2.50 exceeds 10485760 bytes",
+            "invalid-pypi-metadata": "PyPI returned invalid modelaudit metadata",
+            "invalid-pypi-info": "PyPI returned invalid modelaudit metadata",
+            "invalid-pypi-urls": "PyPI returned an invalid artifact list",
+            "invalid-pypi-entry": "PyPI returned an invalid artifact list",
+            "invalid-pypi-digests": "PyPI did not return valid digests",
             "symlink-sdist-metadata-alias": "contains a linked member",
             "hardlink-sdist-member": "contains a linked member",
             "absolute-sdist-member": "contains an unsafe member path",

@@ -1583,12 +1583,22 @@ jobs:
           if {path.name for path in paths} != expected or any(not path.is_file() or path.is_symlink() for path in paths):
               raise SystemExit(f"Expected exactly the root wheel and sdist, found {[path.name for path in paths]!r}")
 
-          with urllib.request.urlopen(f"https://pypi.org/pypi/modelaudit/{version}/json", timeout=20) as response:
-              payload = json.load(response)
-          if payload.get("info", {}).get("version") != version:
+          try:
+              with urllib.request.urlopen(f"https://pypi.org/pypi/modelaudit/{version}/json", timeout=20) as response:
+                  pypi_metadata = response.read(max_metadata_bytes + 1)
+              if len(pypi_metadata) > max_metadata_bytes:
+                  raise SystemExit(f"PyPI metadata for modelaudit {version} exceeds {max_metadata_bytes} bytes")
+              payload = json.loads(pypi_metadata)
+          except (OSError, ValueError) as error:
+              raise SystemExit(f"Could not verify PyPI metadata for modelaudit {version}: {error}") from error
+          if not isinstance(payload, dict) or not isinstance(payload.get("info"), dict):
+              raise SystemExit(f"PyPI returned invalid modelaudit metadata for {version}")
+          if payload["info"].get("version") != version:
               raise SystemExit(f"PyPI returned an unexpected modelaudit version for {version}")
 
-          urls = payload.get("urls", [])
+          urls = payload.get("urls")
+          if not isinstance(urls, list) or any(not isinstance(entry, dict) for entry in urls):
+              raise SystemExit(f"PyPI returned an invalid artifact list for modelaudit {version}")
           published = {entry.get("filename"): entry for entry in urls}
           if len(published) != len(urls) or set(published) != expected:
               raise SystemExit(f"PyPI files for modelaudit {version} do not match {sorted(expected)!r}")
@@ -1597,7 +1607,10 @@ jobs:
               entry = published[path.name]
               if entry.get("yanked", False):
                   raise SystemExit(f"Refusing to attest yanked PyPI artifact {path.name}")
-              expected_digest = entry.get("digests", {}).get("sha256")
+              digests = entry.get("digests")
+              if not isinstance(digests, dict):
+                  raise SystemExit(f"PyPI did not return valid digests for {path.name}")
+              expected_digest = digests.get("sha256")
               digest = hashlib.sha256()
               with path.open("rb") as artifact_file:
                   for chunk in iter(lambda: artifact_file.read(1024 * 1024), b""):
