@@ -97,7 +97,7 @@ def test_release_workflow_manual_dispatch_inputs_and_guardrails() -> None:
             "type": "string",
         },
         "root_provenance_run_id": {
-            "description": "Recover root provenance from the original successful publish run, for example 29787069929",
+            "description": "Recover root provenance from the original verified publish run, for example 29787069929",
             "required": False,
             "type": "string",
         },
@@ -739,6 +739,7 @@ def test_release_workflow_recovers_root_provenance_without_republishing() -> Non
     assert '"repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}/jobs?per_page=100"' in source_run
     assert 'run.get("path") != ".github/workflows/release-please.yml"' in source_run
     assert 'run.get("event") not in {"push", "workflow_dispatch"}' in source_run
+    assert 'run.get("status") != "completed" or run.get("conclusion") not in {"success", "failure"}' in source_run
     assert 'run.get("repository", {}).get("full_name") != repository' in source_run
     assert 'run.get("head_repository", {}).get("full_name") != repository' in source_run
     assert '("build", "publish-pypi", "verify-pypi")' in source_run
@@ -811,7 +812,8 @@ def test_release_workflow_recovers_root_provenance_without_republishing() -> Non
         ("wrong-repository", False),
         ("wrong-head-repository", False),
         ("run-in-progress", False),
-        ("run-failed", False),
+        ("provenance-failed", True),
+        ("run-cancelled", False),
         ("missing-job", False),
         ("duplicate-job", False),
         ("job-in-progress", False),
@@ -851,8 +853,12 @@ def test_root_provenance_recovery_rejects_untrusted_source_runs(
     elif mutation == "run-in-progress":
         run_metadata["status"] = "in_progress"
         run_metadata["conclusion"] = None
-    elif mutation == "run-failed":
+    elif mutation == "provenance-failed":
         run_metadata["conclusion"] = "failure"
+        jobs[4]["conclusion"] = "failure"
+    elif mutation == "run-cancelled":
+        run_metadata["conclusion"] = "cancelled"
+        jobs[4]["conclusion"] = "cancelled"
     elif mutation == "missing-job":
         jobs = [job for job in jobs if job["name"] != "verify-pypi"]
     elif mutation == "duplicate-job":

@@ -23,7 +23,7 @@ on:
         required: false
         type: string
       root_provenance_run_id:
-        description: "Recover root provenance from the original successful publish run, for example 29787069929"
+        description: "Recover root provenance from the original verified publish run, for example 29787069929"
         required: false
         type: string
 
@@ -1411,8 +1411,8 @@ jobs:
               raise SystemExit(f"Source run {source_run_id} is not a release-please workflow run")
           if run.get("event") not in {"push", "workflow_dispatch"}:
               raise SystemExit(f"Source run {source_run_id} has an unsupported event: {run.get('event')!r}")
-          if run.get("status") != "completed" or run.get("conclusion") != "success":
-              raise SystemExit(f"Source run {source_run_id} did not complete successfully")
+          if run.get("status") != "completed" or run.get("conclusion") not in {"success", "failure"}:
+              raise SystemExit(f"Source run {source_run_id} did not complete with a supported conclusion")
           if run.get("repository", {}).get("full_name") != repository:
               raise SystemExit(f"Source run {source_run_id} belongs to a different repository")
           if run.get("head_repository", {}).get("full_name") != repository:
