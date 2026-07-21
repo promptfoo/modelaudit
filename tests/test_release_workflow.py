@@ -6,6 +6,7 @@ import io
 import json
 import os
 import subprocess
+import sys
 import time
 import urllib.request
 import zipfile
@@ -144,6 +145,7 @@ def test_release_workflow_manual_dispatch_inputs_and_guardrails() -> None:
     assert "Refusing release metadata retry for an unexpected branch." in check_pr_run
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Release workflow Bash execution requires POSIX filesystem semantics")
 @pytest.mark.parametrize(
     ("root_version", "picklescan_version", "source_run_id", "expected_code", "expected_fragment"),
     [
@@ -802,6 +804,7 @@ def test_release_workflow_recovers_root_provenance_without_republishing() -> Non
     assert not any(step.get("uses", "").startswith("pypa/gh-action-pypi-publish@") for step in steps)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Release workflow Bash mocks require POSIX filesystem semantics")
 @pytest.mark.parametrize(
     ("mutation", "should_pass"),
     [
@@ -895,7 +898,7 @@ def test_root_provenance_recovery_rejects_untrusted_source_runs(
     result = subprocess.run(
         ["bash", "--noprofile", "--norc", "-euo", "pipefail", "-c", script],
         env={
-            "PATH": f"{bin_path}{os.pathsep}{os.environ['PATH']}",
+            "PATH": f"{bin_path}{os.pathsep}{Path(sys.executable).parent}{os.pathsep}{os.environ['PATH']}",
             "GH_TOKEN": "test-token",
             "GITHUB_REPOSITORY": repository,
             "SOURCE_RUN_ID": source_run_id,
