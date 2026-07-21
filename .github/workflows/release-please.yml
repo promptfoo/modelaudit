@@ -1381,6 +1381,7 @@ jobs:
           persist-credentials: false
 
       - name: Verify original root publish run
+        id: verify-source
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SOURCE_RUN_ID: ${{ needs.release-please.outputs.root_provenance_run_id }}
@@ -1401,7 +1402,8 @@ jobs:
           repository_metadata=$(mktemp)
           compare_metadata=$(mktemp)
           tag_compare_metadata=$(mktemp)
-          trap 'rm -f "$run_metadata" "$jobs_metadata" "$repository_metadata" "$compare_metadata" "$tag_compare_metadata"' EXIT
+          source_relation_metadata=$(mktemp)
+          trap 'rm -f "$run_metadata" "$jobs_metadata" "$repository_metadata" "$compare_metadata" "$tag_compare_metadata" "$source_relation_metadata"' EXIT
           gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}" > "$run_metadata"
           gh api --paginate --slurp \
             "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}/jobs?per_page=100" > "$jobs_metadata"
@@ -1465,8 +1467,10 @@ jobs:
 
           gh api "repos/${GITHUB_REPOSITORY}/compare/${source_head_sha}...main" > "$compare_metadata"
           gh api "repos/${GITHUB_REPOSITORY}/compare/${tag_commit_sha}...main" > "$tag_compare_metadata"
+          gh api "repos/${GITHUB_REPOSITORY}/compare/${tag_commit_sha}...${source_head_sha}" > "$source_relation_metadata"
           export COMPARE_METADATA="$compare_metadata"
           export TAG_COMPARE_METADATA="$tag_compare_metadata"
+          export SOURCE_RELATION_METADATA="$source_relation_metadata"
           export SOURCE_HEAD_SHA="$source_head_sha"
           export TAG_COMMIT_SHA="$tag_commit_sha"
           python - <<'PY'
@@ -1480,6 +1484,7 @@ jobs:
           for label, expected_sha, metadata_path in (
               (f"Source run {source_run_id}", source_head_sha, os.environ["COMPARE_METADATA"]),
               ("Tagged root release", tag_commit_sha, os.environ["TAG_COMPARE_METADATA"]),
+              ("Tagged root release relative to source run", tag_commit_sha, os.environ["SOURCE_RELATION_METADATA"]),
           ):
               comparison = json.loads(Path(metadata_path).read_text(encoding="utf-8"))
               if not isinstance(comparison, dict):
@@ -1492,11 +1497,25 @@ jobs:
               merge_base = comparison.get("merge_base_commit")
               if not isinstance(merge_base, dict) or merge_base.get("sha") != expected_sha:
                   raise SystemExit(f"{label} has an untrusted merge base")
+
+          source_relation = json.loads(Path(os.environ["SOURCE_RELATION_METADATA"]).read_text(encoding="utf-8"))
+          changed_files = source_relation.get("files")
+          allowed_source_changes = {".github/workflows/release-please.yml", "tests/test_release_workflow.py"}
+          if not isinstance(changed_files, list) or len(changed_files) > len(allowed_source_changes):
+              raise SystemExit("Tagged root release and source run returned invalid changed-file metadata")
+          if not all(
+              isinstance(entry, dict) and entry.get("filename") in allowed_source_changes for entry in changed_files
+          ):
+              raise SystemExit("Tagged root release and source run differ outside the trusted release-repair files")
           print(
               f"Verified original modelaudit publish run {source_run_id} at {source_head_sha} "
               f"and tagged root release at {tag_commit_sha}"
           )
           PY
+          {
+            echo "source_head_sha=$source_head_sha"
+            echo "tag_commit_sha=$tag_commit_sha"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Download original root build artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -1663,7 +1682,7 @@ jobs:
             dist/modelaudit-${{ needs.release-please.outputs.version }}.tar.gz
           predicate-type: https://promptfoo.dev/modelaudit/attestations/recovery/v1
           predicate: >-
-            {"package":"modelaudit","version":"${{ needs.release-please.outputs.version }}","tag":"${{ needs.release-please.outputs.tag_name }}","source_run_id":"${{ needs.release-please.outputs.root_provenance_run_id }}","pypi_json_url":"https://pypi.org/pypi/modelaudit/${{ needs.release-please.outputs.version }}/json"}
+            {"package":"modelaudit","version":"${{ needs.release-please.outputs.version }}","tag":"${{ needs.release-please.outputs.tag_name }}","source_run_id":"${{ needs.release-please.outputs.root_provenance_run_id }}","source_commit":"${{ steps.verify-source.outputs.source_head_sha }}","tag_commit":"${{ steps.verify-source.outputs.tag_commit_sha }}","pypi_json_url":"https://pypi.org/pypi/modelaudit/${{ needs.release-please.outputs.version }}/json"}
 
       - name: Install uv
         uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7

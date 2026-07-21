@@ -732,6 +732,7 @@ def test_release_workflow_recovers_root_provenance_without_republishing() -> Non
 
     source_run_step = _step_by_name(steps, "Verify original root publish run")
     source_run = source_run_step["run"]
+    assert source_run_step["id"] == "verify-source"
     assert source_run_step["env"] == {
         "GH_TOKEN": "${{ secrets.GITHUB_TOKEN }}",
         "SOURCE_RUN_ID": "${{ needs.release-please.outputs.root_provenance_run_id }}",
@@ -753,9 +754,16 @@ def test_release_workflow_recovers_root_provenance_without_republishing() -> Non
     assert 're.fullmatch(r"[0-9a-f]{40}", head_sha)' in source_run
     assert '"repos/${GITHUB_REPOSITORY}/compare/${source_head_sha}...main"' in source_run
     assert '"repos/${GITHUB_REPOSITORY}/compare/${tag_commit_sha}...main"' in source_run
+    assert '"repos/${GITHUB_REPOSITORY}/compare/${tag_commit_sha}...${source_head_sha}"' in source_run
     assert 'comparison.get("status") not in {"ahead", "identical"}' in source_run
     assert "not isinstance(behind_by, int) or isinstance(behind_by, bool) or behind_by != 0" in source_run
     assert 'merge_base.get("sha") != expected_sha' in source_run
+    assert (
+        'allowed_source_changes = {".github/workflows/release-please.yml", "tests/test_release_workflow.py"}'
+        in source_run
+    )
+    assert 'echo "source_head_sha=$source_head_sha"' in source_run
+    assert 'echo "tag_commit_sha=$tag_commit_sha"' in source_run
     assert '("build", "publish-pypi", "verify-pypi")' in source_run
     assert "if len(matching) != 1" in source_run
     assert 'job.get("status") != "completed" or job.get("conclusion") != "success"' in source_run
@@ -823,6 +831,8 @@ def test_release_workflow_recovers_root_provenance_without_republishing() -> Non
         "version": "${{ needs.release-please.outputs.version }}",
         "tag": "${{ needs.release-please.outputs.tag_name }}",
         "source_run_id": "${{ needs.release-please.outputs.root_provenance_run_id }}",
+        "source_commit": "${{ steps.verify-source.outputs.source_head_sha }}",
+        "tag_commit": "${{ steps.verify-source.outputs.tag_commit_sha }}",
         "pypi_json_url": "https://pypi.org/pypi/modelaudit/${{ needs.release-please.outputs.version }}/json",
     }
 
@@ -871,6 +881,12 @@ def test_release_workflow_recovers_root_provenance_without_republishing() -> Non
         ("behind-tag", False),
         ("wrong-tag-merge-base", False),
         ("invalid-tag-compare-metadata", False),
+        ("diverged-source-tag", False),
+        ("behind-source-tag", False),
+        ("wrong-source-tag-merge-base", False),
+        ("unexpected-source-tag-file", False),
+        ("too-many-source-tag-files", False),
+        ("invalid-source-tag-compare-metadata", False),
         ("invalid-tag-sha", False),
         ("invalid-run-id", False),
     ],
@@ -904,6 +920,15 @@ def test_root_provenance_recovery_rejects_untrusted_source_runs(
         "status": "ahead",
         "behind_by": 0,
         "merge_base_commit": {"sha": tag_commit_sha},
+    }
+    source_relation_metadata: dict[str, Any] = {
+        "status": "ahead",
+        "behind_by": 0,
+        "merge_base_commit": {"sha": tag_commit_sha},
+        "files": [
+            {"filename": ".github/workflows/release-please.yml"},
+            {"filename": "tests/test_release_workflow.py"},
+        ],
     }
     repository_metadata: dict[str, Any] = {"full_name": repository, "default_branch": "main"}
     jobs: list[dict[str, Any]] = [
@@ -952,12 +977,24 @@ def test_root_provenance_recovery_rejects_untrusted_source_runs(
         tag_compare_metadata["behind_by"] = 1
     elif mutation == "wrong-tag-merge-base":
         tag_compare_metadata["merge_base_commit"]["sha"] = "0" * 40
+    elif mutation == "diverged-source-tag":
+        source_relation_metadata["status"] = "diverged"
+    elif mutation == "behind-source-tag":
+        source_relation_metadata["behind_by"] = 1
+    elif mutation == "wrong-source-tag-merge-base":
+        source_relation_metadata["merge_base_commit"]["sha"] = "0" * 40
+    elif mutation == "unexpected-source-tag-file":
+        source_relation_metadata["files"] = [{"filename": "modelaudit/core.py"}]
+    elif mutation == "too-many-source-tag-files":
+        source_relation_metadata["files"].append({"filename": ".github/workflows/release-please.yml"})
 
     run_path = tmp_path / "run.json"
     jobs_path = tmp_path / "jobs.json"
     repository_path = tmp_path / "repository.json"
     compare_path = tmp_path / "compare.json"
     tag_compare_path = tmp_path / "tag-compare.json"
+    source_relation_path = tmp_path / "source-relation.json"
+    outputs_path = tmp_path / "outputs.txt"
     calls_path = tmp_path / "calls.jsonl"
     run_path.write_text(json.dumps(run_metadata), encoding="utf-8")
     jobs_path.write_text(json.dumps([{"jobs": jobs[:2]}, {"jobs": jobs[2:]}]), encoding="utf-8")
@@ -968,6 +1005,10 @@ def test_root_provenance_recovery_rejects_untrusted_source_runs(
         [] if mutation == "invalid-tag-compare-metadata" else tag_compare_metadata
     )
     tag_compare_path.write_text(json.dumps(tag_compare_payload), encoding="utf-8")
+    source_relation_payload: dict[str, Any] | list[object] = (
+        [] if mutation == "invalid-source-tag-compare-metadata" else source_relation_metadata
+    )
+    source_relation_path.write_text(json.dumps(source_relation_payload), encoding="utf-8")
     bin_path = tmp_path / "bin"
     bin_path.mkdir()
     gh_path = bin_path / "gh"
@@ -981,7 +1022,9 @@ def test_root_provenance_recovery_rejects_untrusted_source_runs(
         "with Path(os.environ['CALLS_PATH']).open('a', encoding='utf-8') as handle:\n"
         "    handle.write(json.dumps(args) + '\\n')\n"
         "source = (\n"
-        "    'TAG_COMPARE_PATH' if f\"/compare/{os.environ['TAG_COMMIT_SHA']}...main\" in args[-1]\n"
+        "    'SOURCE_RELATION_PATH' "
+        "if f\"/compare/{os.environ['TAG_COMMIT_SHA']}...{os.environ['SOURCE_HEAD_SHA']}\" in args[-1]\n"
+        "    else 'TAG_COMPARE_PATH' if f\"/compare/{os.environ['TAG_COMMIT_SHA']}...main\" in args[-1]\n"
         "    else 'COMPARE_PATH' if '/compare/' in args[-1]\n"
         "    else 'JOBS_PATH' if '/jobs?' in args[-1]\n"
         "    else 'RUN_PATH' if '/actions/runs/' in args[-1]\n"
@@ -1014,7 +1057,10 @@ def test_root_provenance_recovery_rejects_untrusted_source_runs(
             "REPOSITORY_PATH": str(repository_path),
             "COMPARE_PATH": str(compare_path),
             "TAG_COMPARE_PATH": str(tag_compare_path),
+            "SOURCE_RELATION_PATH": str(source_relation_path),
+            "SOURCE_HEAD_SHA": source_head_sha,
             "TAG_COMMIT_SHA": tag_commit_sha,
+            "GITHUB_OUTPUT": str(outputs_path),
             "CALLS_PATH": str(calls_path),
         },
         capture_output=True,
@@ -1048,10 +1094,22 @@ def test_root_provenance_recovery_rejects_untrusted_source_runs(
         "behind-tag",
         "wrong-tag-merge-base",
         "invalid-tag-compare-metadata",
+        "diverged-source-tag",
+        "behind-source-tag",
+        "wrong-source-tag-merge-base",
+        "unexpected-source-tag-file",
+        "too-many-source-tag-files",
+        "invalid-source-tag-compare-metadata",
     }:
         expected_calls.append(["api", f"repos/{repository}/compare/{source_head_sha}...main"])
         expected_calls.append(["api", f"repos/{repository}/compare/{tag_commit_sha}...main"])
+        expected_calls.append(["api", f"repos/{repository}/compare/{tag_commit_sha}...{source_head_sha}"])
     assert calls == expected_calls
+    if should_pass:
+        assert outputs_path.read_text(encoding="utf-8").splitlines() == [
+            f"source_head_sha={source_head_sha}",
+            f"tag_commit_sha={tag_commit_sha}",
+        ]
 
 
 @pytest.mark.parametrize(
