@@ -1392,36 +1392,59 @@ jobs:
 
           run_metadata=$(mktemp)
           jobs_metadata=$(mktemp)
-          trap 'rm -f "$run_metadata" "$jobs_metadata"' EXIT
+          repository_metadata=$(mktemp)
+          compare_metadata=$(mktemp)
+          trap 'rm -f "$run_metadata" "$jobs_metadata" "$repository_metadata" "$compare_metadata"' EXIT
           gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}" > "$run_metadata"
           gh api --paginate --slurp \
             "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}/jobs?per_page=100" > "$jobs_metadata"
+          gh api "repos/${GITHUB_REPOSITORY}" > "$repository_metadata"
           export RUN_METADATA="$run_metadata"
           export JOBS_METADATA="$jobs_metadata"
+          export REPOSITORY_METADATA="$repository_metadata"
 
-          python - <<'PY'
+          source_head_sha=$(python - <<'PY'
           import json
           import os
+          import re
           from pathlib import Path
 
           repository = os.environ["GITHUB_REPOSITORY"]
           source_run_id = os.environ["SOURCE_RUN_ID"]
           run = json.loads(Path(os.environ["RUN_METADATA"]).read_text(encoding="utf-8"))
+          if not isinstance(run, dict):
+              raise SystemExit(f"Source run {source_run_id} returned invalid run metadata")
           if run.get("path") != ".github/workflows/release-please.yml":
               raise SystemExit(f"Source run {source_run_id} is not a release-please workflow run")
           if run.get("event") not in {"push", "workflow_dispatch"}:
               raise SystemExit(f"Source run {source_run_id} has an unsupported event: {run.get('event')!r}")
           if run.get("status") != "completed" or run.get("conclusion") not in {"success", "failure"}:
               raise SystemExit(f"Source run {source_run_id} did not complete with a supported conclusion")
-          if run.get("repository", {}).get("full_name") != repository:
+          source_repository = run.get("repository")
+          if not isinstance(source_repository, dict) or source_repository.get("full_name") != repository:
               raise SystemExit(f"Source run {source_run_id} belongs to a different repository")
-          if run.get("head_repository", {}).get("full_name") != repository:
+          repository_metadata = json.loads(Path(os.environ["REPOSITORY_METADATA"]).read_text(encoding="utf-8"))
+          if not isinstance(repository_metadata, dict) or repository_metadata.get("full_name") != repository:
+              raise SystemExit(f"Source run {source_run_id} returned invalid repository metadata")
+          if repository_metadata.get("default_branch") != "main":
+              raise SystemExit(f"Source run {source_run_id} repository does not use main as its default branch")
+          head_repository = run.get("head_repository")
+          if not isinstance(head_repository, dict) or head_repository.get("full_name") != repository:
               raise SystemExit(f"Source run {source_run_id} has an untrusted head repository")
+          head_sha = run.get("head_sha")
+          if not isinstance(head_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", head_sha):
+              raise SystemExit(f"Source run {source_run_id} returned an invalid head SHA")
 
           pages = json.loads(Path(os.environ["JOBS_METADATA"]).read_text(encoding="utf-8"))
           if not isinstance(pages, list) or not pages:
               raise SystemExit(f"Source run {source_run_id} returned no job pages")
-          jobs = [job for page in pages for job in page.get("jobs", [])]
+          jobs = []
+          for page in pages:
+              if not isinstance(page, dict) or not isinstance(page.get("jobs"), list):
+                  raise SystemExit(f"Source run {source_run_id} returned invalid job metadata")
+              if not all(isinstance(job, dict) for job in page["jobs"]):
+                  raise SystemExit(f"Source run {source_run_id} returned an invalid job")
+              jobs.extend(page["jobs"])
           for job_name in ("build", "publish-pypi", "verify-pypi"):
               matching = [job for job in jobs if job.get("name") == job_name]
               if len(matching) != 1:
@@ -1429,7 +1452,32 @@ jobs:
               job = matching[0]
               if job.get("status") != "completed" or job.get("conclusion") != "success":
                   raise SystemExit(f"Source run {source_run_id} {job_name} job did not complete successfully")
-          print(f"Verified original modelaudit publish run {source_run_id}")
+          print(head_sha)
+          PY
+          )
+
+          gh api "repos/${GITHUB_REPOSITORY}/compare/${source_head_sha}...main" > "$compare_metadata"
+          export COMPARE_METADATA="$compare_metadata"
+          export SOURCE_HEAD_SHA="$source_head_sha"
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          source_run_id = os.environ["SOURCE_RUN_ID"]
+          source_head_sha = os.environ["SOURCE_HEAD_SHA"]
+          comparison = json.loads(Path(os.environ["COMPARE_METADATA"]).read_text(encoding="utf-8"))
+          if not isinstance(comparison, dict):
+              raise SystemExit(f"Source run {source_run_id} returned invalid branch comparison metadata")
+          if comparison.get("status") not in {"ahead", "identical"}:
+              raise SystemExit(f"Source run {source_run_id} does not belong to protected main history")
+          behind_by = comparison.get("behind_by")
+          if not isinstance(behind_by, int) or isinstance(behind_by, bool) or behind_by != 0:
+              raise SystemExit(f"Source run {source_run_id} is not an ancestor of protected main")
+          merge_base = comparison.get("merge_base_commit")
+          if not isinstance(merge_base, dict) or merge_base.get("sha") != source_head_sha:
+              raise SystemExit(f"Source run {source_run_id} has an untrusted merge base")
+          print(f"Verified original modelaudit publish run {source_run_id} at {source_head_sha}")
           PY
 
       - name: Download original root build artifacts
