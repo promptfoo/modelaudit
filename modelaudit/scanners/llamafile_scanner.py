@@ -3923,6 +3923,14 @@ class LlamafileScanner(BaseScanner):
         }
         remaining_carve_bytes = max(0, self.max_payload_carve_bytes)
         selected_payload_metadata: dict[str, Any] | None = None
+        selected_raw_boundary_can_be_trusted = (
+            zip_payload is None
+            and gguf_offset is not None
+            and len(boundary_candidates) == 1
+            and mapped_executable_end is not None
+            and gguf_offset >= mapped_executable_end
+            and (not is_ape_executable or mapping_search_complete)
+        )
         for candidate_index, candidate_offset in enumerate(candidates_to_scan):
             remaining_candidates = len(candidates_to_scan) - candidate_index
             candidate_budget = remaining_carve_bytes // remaining_candidates
@@ -3938,6 +3946,7 @@ class LlamafileScanner(BaseScanner):
                 result,
                 candidate_offset,
                 payload_size=candidate_size,
+                container_owns_trailing=candidate_offset != gguf_offset or not selected_raw_boundary_can_be_trusted,
             )
             payload_bytes_scanned += scanned_bytes
             remaining_carve_bytes = max(0, remaining_carve_bytes - scanned_bytes)
@@ -4925,6 +4934,7 @@ class LlamafileScanner(BaseScanner):
         gguf_offset: int | None,
         *,
         payload_size: int | None = None,
+        container_owns_trailing: bool = True,
     ) -> tuple[int, bool]:
         if gguf_offset is None:
             file_size = self.get_file_size(str(path))
@@ -5003,6 +5013,7 @@ class LlamafileScanner(BaseScanner):
                 GGUF_PARSE_INCONCLUSIVE_REASON,
                 GGUF_STRUCTURE_INCONCLUSIVE_REASON,
                 GgufScanner,
+                _with_container_owned_gguf_trailing,
             )
 
             if not GgufScanner.can_handle(str(carved_path)):
@@ -5015,7 +5026,10 @@ class LlamafileScanner(BaseScanner):
                 )
                 return carve_size, False
 
-            embedded_result = GgufScanner(config=self.config).scan(str(carved_path))
+            embedded_config = (
+                _with_container_owned_gguf_trailing(self.config) if container_owns_trailing else self.config
+            )
+            embedded_result = GgufScanner(config=embedded_config).scan(str(carved_path))
             self._append_embedded_findings(result, embedded_result, gguf_offset)
             outcome_reasons = embedded_result.metadata.get("scan_outcome_reasons", [])
             invalid_structure_reasons = {GGUF_PARSE_INCONCLUSIVE_REASON, GGUF_STRUCTURE_INCONCLUSIVE_REASON}
