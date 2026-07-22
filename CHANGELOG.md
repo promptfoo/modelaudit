@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - recognize GGUF/ZIP polyglots, inspect embedded archive members, and flag unexplained GGUF trailing content
 - avoid logging file-derived header-format values while preserving format-mismatch detections, and clean up CodeQL quality findings
+- inspect LZ4-compressed Joblib payloads with bounded decompression and preserve fail-closed optional dependency handling; thanks to @PowerliftLog for the report
 
 ## [0.2.51](https://github.com/promptfoo/modelaudit/compare/v0.2.50...v0.2.51) (2026-07-20)
 

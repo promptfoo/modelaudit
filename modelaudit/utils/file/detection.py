@@ -10549,6 +10549,12 @@ def validate_file_type_with_formats(
         # Pickle files can be stored in various ways
         if ext_format == "pickle" and header_format in {"pickle", "zip", "jax_checkpoint"}:
             return True
+        if (
+            ext_format == "pickle"
+            and file_path.suffix.lower() == ".joblib"
+            and header_format in _COMPRESSED_EXTENSION_CODECS.values()
+        ):
+            return True
 
         # PyTorch binary files are flexible in format
         if ext_format == "pytorch_binary":
