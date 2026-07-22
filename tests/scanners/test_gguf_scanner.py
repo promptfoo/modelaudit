@@ -2534,6 +2534,51 @@ def test_ggml_variant_scanner_basic(tmp_path):
     assert result.metadata.get("magic") == "GGMF"
 
 
+@pytest.mark.parametrize(
+    ("magic", "suffix"),
+    [
+        (b"GGML", ".ggml"),
+        (b"GGMF", ".ggmf"),
+        (b"GGJT", ".ggjt"),
+        (b"GGLA", ".ggla"),
+        (b"GGSA", ".ggsa"),
+    ],
+    ids=["ggml", "ggmf", "ggjt", "ggla", "ggsa"],
+)
+def test_ggml_scanner_inspects_embedded_zip_polyglot_members(
+    tmp_path: Path,
+    magic: bytes,
+    suffix: str,
+) -> None:
+    path = tmp_path / f"polyglot{suffix}"
+    _write_ggml_variant_file(path, magic)
+    pickle_path = create_malicious_pickle(tmp_path / "payload.pkl")
+    _append_gguf_zip(path, {"payload.pkl": pickle_path.read_bytes(), "../escaped.txt": b"escape"})
+
+    direct = GgufScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+    for result in (direct, aggregate):
+        assert any(issue.rule_code == "S908" and issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+        assert any(issue.rule_code == "S201" and "system" in issue.message.lower() for issue in result.issues)
+        assert any(issue.rule_code == "S405" and "escaped.txt" in issue.message for issue in result.issues)
+    assert any(check.name == "GGML ZIP Polyglot Detection" for check in direct.checks)
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_ggml_scanner_does_not_misclassify_invalid_zip_near_match(tmp_path: Path) -> None:
+    path = tmp_path / "zip-near-match.ggml"
+    _write_ggml_file(path)
+    with path.open("ab") as handle:
+        handle.write(b"PK\x03\x04not-a-valid-archive")
+
+    result = GgufScanner().scan(str(path))
+
+    assert result.success is True
+    assert not any(issue.rule_code == "S908" for issue in result.issues)
+    assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
 def test_ggml_scanner_suspicious_version(tmp_path):
     """Test that GGML scanner handles unusual versions gracefully."""
     path = tmp_path / "unusual_version.ggml"

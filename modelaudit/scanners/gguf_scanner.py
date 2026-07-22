@@ -760,8 +760,8 @@ class GgufScanner(BaseScanner):
         )
         result.bytes_scanned = max(result.bytes_scanned, f.tell())
 
-    def _scan_zip_polyglot(self, result: ScanResult) -> bool:
-        """Inspect ZIP members even when GGUF metadata or tensor parsing fails."""
+    def _scan_zip_polyglot(self, result: ScanResult, *, format_name: str = "GGUF") -> bool:
+        """Inspect ZIP members even when GGUF/GGML header parsing fails."""
         if not zipfile.is_zipfile(self.current_file_path):
             return False
 
@@ -776,7 +776,7 @@ class GgufScanner(BaseScanner):
             self.current_file_path,
             result,
             archive_config,
-            context="GGUF trailing ZIP polyglot",
+            context=f"{format_name} trailing ZIP polyglot",
         )
         rejected_paths = result._private_metadata.get(
             _ZIP_CONTAINER_PREFLIGHT_REJECTED_PATHS_PRIVATE_METADATA_KEY,
@@ -789,9 +789,9 @@ class GgufScanner(BaseScanner):
             return False
 
         result.add_check(
-            name="GGUF ZIP Polyglot Detection",
+            name=f"{format_name} ZIP Polyglot Detection",
             passed=False,
-            message="GGUF file is also a valid ZIP archive and may contain hidden archive content",
+            message=f"{format_name} file is also a valid ZIP archive and may contain hidden archive content",
             severity=IssueSeverity.CRITICAL,
             location=self.current_file_path,
             details={"embedded_format": "zip"},
@@ -1050,6 +1050,7 @@ class GgufScanner(BaseScanner):
         """Basic GGML file validation with security checks."""
         result.metadata["format"] = "ggml"
         result.metadata["magic"] = magic.decode("ascii", "ignore")
+        self._scan_zip_polyglot(result, format_name="GGML")
 
         if file_size < 32:
             result.add_check(
