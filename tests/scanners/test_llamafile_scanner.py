@@ -1038,6 +1038,31 @@ def test_llamafile_scanner_trusts_complete_ape_mapping_search_before_benign_gguf
     assert not any(check.name == "Llamafile Runtime String Analysis" for check in result.checks)
 
 
+def test_llamafile_scanner_flags_pickle_tail_after_trusted_raw_gguf(tmp_path: Path) -> None:
+    binary = tmp_path / "mapped-raw-gguf-tail.llamafile"
+    pickle_path = create_malicious_pickle(tmp_path / "payload.pkl")
+    payload_offset = _write_sparse_mapped_llamafile(
+        binary,
+        "elf",
+        embedded_payload=b"GGUF" + struct.pack("<IQQ", 3, 0, 0) + pickle_path.read_bytes(),
+    )
+    config = {"llamafile_payload_scan_bytes": binary.stat().st_size, "llamafile_preview_bytes": 64}
+
+    direct = LlamafileScanner(config=config).scan(str(binary))
+    aggregate = scan_model_directory_or_file(str(binary), config=config, cache_scan_results=False)
+
+    assert direct.metadata["embedded_payload_offset"] == payload_offset
+    assert direct.metadata["embedded_payload_boundary_trusted"] is True
+    assert direct.metadata["embedded_payload_boundary_source"] == "executable_mapping"
+    assert any(
+        check.name == "Llamafile Embedded GGUF Trailing Content Validation"
+        and check.rule_code == "S902"
+        and check.severity == IssueSeverity.WARNING
+        for check in direct.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
 def test_llamafile_scanner_fails_closed_for_incomplete_ape_mapping_search(tmp_path: Path) -> None:
     binary = tmp_path / "bounded-ape-unscanned-runtime.llamafile"
     _write_ape_raw_llamafile(

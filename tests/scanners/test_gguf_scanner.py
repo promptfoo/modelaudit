@@ -576,6 +576,21 @@ def test_gguf_scanner_flags_zero_tensor_nonpadding_trailing_content(tmp_path: Pa
     )
 
 
+def test_gguf_scanner_reports_the_effective_trailing_padding_tolerance(tmp_path: Path) -> None:
+    path = tmp_path / "oversized-alignment-tail.gguf"
+    alignment = GgufScanner.MAX_TRAILING_PADDING_BYTES * 2
+    _write_aligned_gguf(path, alignment)
+    with path.open("ab") as handle:
+        handle.write(b"unexpected model data")
+
+    result = GgufScanner().scan(str(path))
+
+    checks = [check for check in result.checks if check.name == "GGUF Trailing Content Validation"]
+    assert len(checks) == 1
+    assert checks[0].details["alignment_tolerance"] == GgufScanner.MAX_TRAILING_PADDING_BYTES
+    assert checks[0].details["declared_alignment"] == alignment
+
+
 def test_gguf_scanner_does_not_trust_user_supplied_container_provenance(tmp_path: Path) -> None:
     path = tmp_path / "forged-provenance.gguf"
     _write_minimal_gguf(path, n_kv=0, n_tensors=0)

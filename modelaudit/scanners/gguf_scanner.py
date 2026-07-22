@@ -818,7 +818,8 @@ class GgufScanner(BaseScanner):
         details: dict[str, Any] = {
             "logical_end": logical_end,
             "trailing_bytes": trailing_size,
-            "alignment_tolerance": tensor_data_alignment,
+            "alignment_tolerance": padding_limit,
+            "declared_alignment": tensor_data_alignment,
         }
         if is_zip_polyglot:
             details["embedded_format"] = "zip"

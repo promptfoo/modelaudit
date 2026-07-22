@@ -5003,7 +5003,6 @@ class LlamafileScanner(BaseScanner):
                 GGUF_PARSE_INCONCLUSIVE_REASON,
                 GGUF_STRUCTURE_INCONCLUSIVE_REASON,
                 GgufScanner,
-                _with_container_owned_gguf_trailing,
             )
 
             if not GgufScanner.can_handle(str(carved_path)):
@@ -5016,9 +5015,7 @@ class LlamafileScanner(BaseScanner):
                 )
                 return carve_size, False
 
-            embedded_result = GgufScanner(config=_with_container_owned_gguf_trailing(self.config)).scan(
-                str(carved_path)
-            )
+            embedded_result = GgufScanner(config=self.config).scan(str(carved_path))
             self._append_embedded_findings(result, embedded_result, gguf_offset)
             outcome_reasons = embedded_result.metadata.get("scan_outcome_reasons", [])
             invalid_structure_reasons = {GGUF_PARSE_INCONCLUSIVE_REASON, GGUF_STRUCTURE_INCONCLUSIVE_REASON}
