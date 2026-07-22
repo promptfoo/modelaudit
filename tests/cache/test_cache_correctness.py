@@ -46,6 +46,8 @@ from modelaudit.cache.optimized_config import (
 )
 from modelaudit.cache.scan_results_cache import (
     _CALL_GRAPH_REGULAR_FILE_FINGERPRINT,
+    _MAX_IDENTITY_BARRIER_ATTEMPTS,
+    _MAX_IDENTITY_CAPTURE_ATTEMPTS,
     AncestorIdentity,
     ScanResultsCache,
     _current_module_source_path,
@@ -369,14 +371,14 @@ def test_capture_file_identity_retries_transient_change_clock_barrier(
     ) -> int:
         barrier_attempts["count"] += 1
         newest_token = cache._newest_identity_change_token(file_change_token, ancestor_identity)
-        return newest_token + int(barrier_attempts["count"] > 3)
+        return newest_token + int(barrier_attempts["count"] > _MAX_IDENTITY_BARRIER_ATTEMPTS)
 
     monkeypatch.setattr(cache, "_advance_change_clock", transient_barrier)
 
     identity = cache.capture_file_identity(str(file_path))
     try:
         assert identity[1].startswith("secure:")
-        assert barrier_attempts["count"] >= 4
+        assert barrier_attempts["count"] > _MAX_IDENTITY_BARRIER_ATTEMPTS
     finally:
         cache.release_ancestor_identity(identity[-1])
 
@@ -403,7 +405,7 @@ def test_capture_file_identity_fails_closed_for_persistent_change_clock_barrier(
     with pytest.raises(ValueError, match="File kept changing while capturing cache identity") as exc_info:
         cache.capture_file_identity(str(file_path))
 
-    assert barrier_attempts["count"] == 15
+    assert barrier_attempts["count"] == _MAX_IDENTITY_BARRIER_ATTEMPTS * _MAX_IDENTITY_CAPTURE_ATTEMPTS
     assert str(exc_info.value.__cause__).startswith("Cache identity barrier did not settle:")
 
 
