@@ -1345,7 +1345,7 @@ def _pth_site_directory_value(argument: ast.expr) -> str | None:
         or len(imported_module.args) != 1
         or imported_module.keywords
         or not isinstance(imported_module.args[0], ast.Constant)
-        or imported_module.args[0].value != "os"
+        or imported_module.args[0].value not in _REVIEWED_INERT_STDLIB_IMPORTS
     ):
         return None
     encoded_path = argument.args[0]
