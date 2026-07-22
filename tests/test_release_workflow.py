@@ -83,6 +83,20 @@ def test_release_please_keeps_root_componentless_for_grouped_root_only_releases(
     assert picklescan_package.get("separate-pull-requests", False) is False
 
 
+def test_root_release_requires_current_picklescan_version() -> None:
+    root_dir = Path(__file__).resolve().parents[1]
+    root_project = tomllib.loads((root_dir / "pyproject.toml").read_text(encoding="utf-8"))["project"]
+    picklescan_project = tomllib.loads(
+        (root_dir / "packages/modelaudit-picklescan/pyproject.toml").read_text(encoding="utf-8"),
+    )["project"]
+    picklescan_requirements = [
+        requirement for requirement in root_project["dependencies"] if requirement.startswith("modelaudit-picklescan")
+    ]
+
+    assert len(picklescan_requirements) == 1
+    assert picklescan_requirements[0].startswith(f"modelaudit-picklescan>={picklescan_project['version']},")
+
+
 def test_release_workflow_manual_dispatch_inputs_and_guardrails() -> None:
     workflow = _load_release_workflow()
 
