@@ -783,7 +783,7 @@ class GgufScanner(BaseScanner):
             (),
         )
         if (
-            isinstance(rejected_paths, list | tuple | set | frozenset)
+            isinstance(rejected_paths, (list, tuple, set, frozenset))
             and os.path.realpath(self.current_file_path) in rejected_paths
         ):
             return False
