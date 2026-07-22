@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.52](https://github.com/promptfoo/modelaudit/compare/v0.2.51...v0.2.52) (2026-07-22)
+
+
+### Bug Fixes
+
+* **cache:** retry transient identity barrier churn ([#1778](https://github.com/promptfoo/modelaudit/issues/1778)) ([72c8d22](https://github.com/promptfoo/modelaudit/commit/72c8d228876ef90f861ebdc58773dc3184d09548))
+* **deps:** update GitPython to 3.1.51 ([#1774](https://github.com/promptfoo/modelaudit/issues/1774)) ([e9b331b](https://github.com/promptfoo/modelaudit/commit/e9b331b06cf0b48faa561493fb1a695fd9d3dc5c))
+* **deps:** update pyasn1 to 0.6.4 ([#1772](https://github.com/promptfoo/modelaudit/issues/1772)) ([df81361](https://github.com/promptfoo/modelaudit/commit/df81361f6df8e10a22ac71f81ee2ca15f0fcc12a))
+* **deps:** update setuptools to 83.0.0 ([#1773](https://github.com/promptfoo/modelaudit/issues/1773)) ([8c805ff](https://github.com/promptfoo/modelaudit/commit/8c805fff4a6edf5f913f2cf23c5e04dde6567b9c))
+* harden GGUF/ZIP polyglot detection ([#1775](https://github.com/promptfoo/modelaudit/issues/1775)) ([665ed3a](https://github.com/promptfoo/modelaudit/commit/665ed3ab7c452f639c74e976c23ff0b92ea746d0))
+* harden LZ4-compressed Joblib inspection ([#1776](https://github.com/promptfoo/modelaudit/issues/1776)) ([fac0ede](https://github.com/promptfoo/modelaudit/commit/fac0edee89427e05cff7d8dffec343c1140c7755))
+* keep root-only release branches componentless ([#1766](https://github.com/promptfoo/modelaudit/issues/1766)) ([9b8c2ce](https://github.com/promptfoo/modelaudit/commit/9b8c2ce04388bc0b1d57d51d7cdad726ad27a9e6))
+* **picklescan:** recognize uv bytes-encoded package overlays ([#1777](https://github.com/promptfoo/modelaudit/issues/1777)) ([e9910fa](https://github.com/promptfoo/modelaudit/commit/e9910fac59db6fe0d286504cc6b85ac380617e0a))
+* recover root release provenance safely ([#1770](https://github.com/promptfoo/modelaudit/issues/1770)) ([1e0dcb6](https://github.com/promptfoo/modelaudit/commit/1e0dcb6e273a13aaa86f36a39b4586b0d2e3a97a))
+* resolve CodeQL quality and logging findings ([#1769](https://github.com/promptfoo/modelaudit/issues/1769)) ([573bbd8](https://github.com/promptfoo/modelaudit/commit/573bbd859501147413b2804df09299dc749e3e0c))
+
 ## [Unreleased]
 
 ### Bug Fixes
