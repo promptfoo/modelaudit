@@ -931,7 +931,9 @@ class ScanResultsCache:
                 preliminary_change_token = initial_change_token
                 preliminary_ancestor_identity = initial_ancestor_identity
             else:
-                raise ValueError(f"File kept changing while capturing cache identity: {file_path}")
+                last_change_error = ValueError(f"File kept changing while capturing cache identity: {file_path}")
+                time.sleep(0.01)
+                continue
 
             monitored_ancestor_identity = self._monitor_ancestor_identity(file_path, initial_ancestor_identity)
             try:

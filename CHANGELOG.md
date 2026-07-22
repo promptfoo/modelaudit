@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- retry transient cache identity-barrier churn without weakening fail-closed cache validation
 - avoid logging file-derived header-format values while preserving format-mismatch detections, and clean up CodeQL quality findings
 - inspect LZ4-compressed Joblib payloads with bounded decompression and preserve fail-closed optional dependency handling; thanks to @PowerliftLog for the report
 
