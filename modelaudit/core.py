@@ -6687,6 +6687,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             (ext_format == "pytorch_binary" and header_format in ["onnx", "zip", "pickle"] and ext == ".bin")
             or (ext_format == "pytorch_binary" and header_format == "pickle" and ext in [".pt", ".pth"])
             or (ext_format == "pickle" and header_format == "jax_checkpoint" and ext in [".ckpt", ".pickle"])
+            or (ext == ".joblib" and ext_format == "pickle" and header_format in _COMPRESSED_HEADER_FORMATS)
             or (ext_format == "keras" and header_format in ["zip", "hdf5"])
             or (ext_format == "protobuf" and header_format == "onnx" and ext == ".pb")
             or (ext_format == "skops" and header_format == "zip" and ext == ".skops")
