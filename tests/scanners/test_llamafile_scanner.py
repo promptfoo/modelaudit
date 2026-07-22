@@ -928,6 +928,25 @@ def test_llamafile_scanner_preserves_nested_gguf_trailing_content_validation(tmp
     )
 
 
+def test_llamafile_scanner_preserves_stored_gguf_pickle_tail_when_zip_scanner_is_disabled(tmp_path: Path) -> None:
+    binary = tmp_path / "ape-nested-gguf-pickle-tail.llamafile"
+    pickle_path = create_malicious_pickle(tmp_path / "payload.pkl")
+    embedded = b"GGUF" + struct.pack("<IQQ", 3, 0, 0) + pickle_path.read_bytes()
+    _write_ape_zip_llamafile(binary, embedded)
+    config = {"exclude_scanners": ["zip"]}
+
+    direct = LlamafileScanner(config=config).scan(str(binary))
+    aggregate = scan_model_directory_or_file(str(binary), config=config, cache_scan_results=False)
+
+    assert any(
+        check.name == "Llamafile Embedded GGUF Trailing Content Validation"
+        and check.rule_code == "S902"
+        and check.severity == IssueSeverity.WARNING
+        for check in direct.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
 @pytest.mark.parametrize("suppress_s908", [False, True], ids=["visible-s908", "suppressed-s908"])
 def test_llamafile_scanner_preserves_embedded_gguf_zip_rule_code(tmp_path: Path, suppress_s908: bool) -> None:
     binary = tmp_path / "raw-gguf-zip.llamafile"

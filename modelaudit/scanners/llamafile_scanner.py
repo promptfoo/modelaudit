@@ -3937,6 +3937,9 @@ class LlamafileScanner(BaseScanner):
             and gguf_offset >= mapped_executable_end
             and (not is_ape_executable or mapping_search_complete)
         )
+        selected_container_owns_trailing = (
+            zip_payload is not None and policy_from_config(self.config).allows("zip")
+        ) or (zip_payload is None and not selected_raw_boundary_can_be_trusted)
         for candidate_index, candidate_offset in enumerate(candidates_to_scan):
             remaining_candidates = len(candidates_to_scan) - candidate_index
             candidate_budget = remaining_carve_bytes // remaining_candidates
@@ -3952,7 +3955,7 @@ class LlamafileScanner(BaseScanner):
                 result,
                 candidate_offset,
                 payload_size=candidate_size,
-                container_owns_trailing=candidate_offset != gguf_offset or not selected_raw_boundary_can_be_trusted,
+                container_owns_trailing=candidate_offset != gguf_offset or selected_container_owns_trailing,
             )
             payload_bytes_scanned += scanned_bytes
             remaining_carve_bytes = max(0, remaining_carve_bytes - scanned_bytes)

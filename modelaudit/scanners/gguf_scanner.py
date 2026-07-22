@@ -12,6 +12,7 @@ from typing import Any, BinaryIO, ClassVar, NamedTuple
 from urllib.parse import unquote
 
 from modelaudit.detectors.suspicious_symbols import JINJA2_SSTI_PATTERNS
+from modelaudit.scanner_results import SUPPRESSED_FAILED_CHECKS_METADATA_KEY
 
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 
@@ -775,9 +776,15 @@ class GgufScanner(BaseScanner):
             archive_config,
             context="GGUF trailing ZIP polyglot",
         )
+        suppressed_checks = result._private_metadata.get(SUPPRESSED_FAILED_CHECKS_METADATA_KEY, ())
+        if not isinstance(suppressed_checks, list | tuple):
+            suppressed_checks = ()
         if any(
             check.name == "ZIP Central Directory Preflight" and check.location == self.current_file_path
             for check in result.checks
+        ) or any(
+            isinstance(check, dict) and check.get("name") == "ZIP Central Directory Preflight"
+            for check in suppressed_checks
         ):
             return False
 

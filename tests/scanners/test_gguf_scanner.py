@@ -692,6 +692,29 @@ def test_gguf_scanner_does_not_misclassify_corrupted_zip_directory_near_match(tm
     assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
 
 
+def test_gguf_scanner_keeps_corrupted_zip_directory_near_match_noncritical_when_s902_is_suppressed(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "suppressed-corrupted-zip-directory.gguf"
+    _write_minimal_gguf(path, n_kv=0, n_tensors=0)
+    _append_gguf_zip(path, {"first.txt": b"first", "second.txt": b"second"})
+    archive_bytes = bytearray(path.read_bytes())
+    eocd_offset = archive_bytes.rfind(b"PK\x05\x06")
+    directory_size = int.from_bytes(archive_bytes[eocd_offset + 12 : eocd_offset + 16], "little")
+    directory_start = eocd_offset - directory_size
+    second_record = archive_bytes.find(b"PK\x01\x02", directory_start + 4, eocd_offset)
+    assert second_record > directory_start
+    archive_bytes[second_record : second_record + 4] = b"NOPE"
+    path.write_bytes(archive_bytes)
+
+    set_config(ModelAuditConfig(suppress={"S902"}))
+    result = GgufScanner().scan(str(path))
+
+    assert "zip_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert not any(issue.rule_code == "S908" for issue in result.issues)
+    assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
 def test_gguf_scanner_honors_excluded_zip_scanner_for_polyglot(tmp_path: Path) -> None:
     path = tmp_path / "selected-polyglot.gguf"
     _write_minimal_gguf(path, n_kv=0, n_tensors=0)
