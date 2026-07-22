@@ -534,6 +534,32 @@ def test_gguf_scanner_inspects_zip_when_final_tensor_dimensions_are_invalid(tmp_
     assert any(issue.rule_code == "S201" and "system" in issue.message.lower() for issue in result.issues)
 
 
+@pytest.mark.parametrize(
+    ("n_kv", "n_tensors"),
+    [(0, GgufScanner.DEFAULT_MAX_TENSORS + 1), (GgufScanner.DEFAULT_MAX_METADATA_KEYS + 1, 0)],
+    ids=["tensor-limit", "metadata-limit"],
+)
+def test_gguf_scanner_inspects_zip_when_header_limits_stop_parsing(
+    tmp_path: Path,
+    n_kv: int,
+    n_tensors: int,
+) -> None:
+    path = tmp_path / "limited-polyglot.gguf"
+    _write_minimal_gguf(path, n_kv=n_kv, n_tensors=n_tensors)
+    pickle_path = create_malicious_pickle(tmp_path / "payload.pkl")
+    _append_gguf_zip(path, {"payload.pkl": pickle_path.read_bytes()})
+
+    assert zipfile.is_zipfile(path)
+
+    direct = GgufScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+    for result in (direct, aggregate):
+        assert any(issue.rule_code == "S908" and issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+        assert any(issue.rule_code == "S201" and "system" in issue.message.lower() for issue in result.issues)
+    assert determine_exit_code(aggregate) == 1
+
+
 def test_gguf_scanner_flags_zero_tensor_nonpadding_trailing_content(tmp_path: Path) -> None:
     path = tmp_path / "unexpected-tail.gguf"
     _write_minimal_gguf(path, n_kv=0, n_tensors=0)
@@ -574,6 +600,23 @@ def test_gguf_scanner_detects_polyglots_inside_trusted_containers(tmp_path: Path
 
     assert any(issue.rule_code == "S908" and issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
     assert any(issue.rule_code == "S201" and "system" in issue.message.lower() for issue in result.issues)
+
+
+def test_gguf_scanner_consumes_raw_carve_provenance_before_nested_zip_members(tmp_path: Path) -> None:
+    path = tmp_path / "wrapped-nested-tail.gguf"
+    nested = b"GGUF" + struct.pack("<IQQ", 3, 0, 0) + b"unexplained non-padding nested content"
+    _write_minimal_gguf(path, n_kv=0, n_tensors=0)
+    _append_gguf_zip(path, {"nested.gguf": nested})
+
+    result = GgufScanner(config=_with_container_owned_gguf_trailing(None)).scan(str(path))
+
+    assert any(
+        check.name == "GGUF Trailing Content Validation"
+        and check.severity == IssueSeverity.WARNING
+        and check.location is not None
+        and check.location.endswith(":nested.gguf")
+        for check in result.checks
+    )
 
 
 @pytest.mark.parametrize("has_tensor", [False, True], ids=["zero-tensor", "one-tensor"])

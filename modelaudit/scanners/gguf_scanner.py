@@ -476,6 +476,8 @@ class GgufScanner(BaseScanner):
 
     def _scan_gguf(self, f: BinaryIO, file_size: int, result: ScanResult) -> None:
         """Comprehensive GGUF file scanning with security checks."""
+        self._scan_zip_polyglot(result)
+
         if file_size < 24:
             result.add_check(
                 name="GGUF File Size Validation",
@@ -757,6 +759,32 @@ class GgufScanner(BaseScanner):
         )
         result.bytes_scanned = max(result.bytes_scanned, f.tell())
 
+    def _scan_zip_polyglot(self, result: ScanResult) -> None:
+        """Inspect ZIP members even when GGUF metadata or tensor parsing fails."""
+        if not zipfile.is_zipfile(self.current_file_path):
+            return
+
+        result.add_check(
+            name="GGUF ZIP Polyglot Detection",
+            passed=False,
+            message="GGUF file is also a valid ZIP archive and may contain hidden archive content",
+            severity=IssueSeverity.CRITICAL,
+            location=self.current_file_path,
+            details={"embedded_format": "zip"},
+            rule_code="S908",
+        )
+
+        from .archive_dispatch import merge_executable_zip_container_findings
+
+        archive_config = dict(self.config)
+        archive_config.pop(_GGUF_CONTAINER_OWNED_TRAILING_CONFIG_KEY, None)
+        merge_executable_zip_container_findings(
+            self.current_file_path,
+            result,
+            archive_config,
+            context="GGUF trailing ZIP polyglot",
+        )
+
     def _validate_trailing_content(
         self,
         f: BinaryIO,
@@ -805,28 +833,6 @@ class GgufScanner(BaseScanner):
                 details=details,
                 rule_code="S902",
             )
-
-        if not is_zip_polyglot:
-            return
-
-        result.add_check(
-            name="GGUF ZIP Polyglot Detection",
-            passed=False,
-            message="GGUF file is also a valid ZIP archive and may contain hidden archive content",
-            severity=IssueSeverity.CRITICAL,
-            location=self.current_file_path,
-            details=details,
-            rule_code="S908",
-        )
-
-        from .archive_dispatch import merge_executable_zip_container_findings
-
-        merge_executable_zip_container_findings(
-            self.current_file_path,
-            result,
-            self.config,
-            context="GGUF trailing ZIP polyglot",
-        )
 
     @staticmethod
     def _tensor_metadata_summary(tensor: _GgufTensorInfo) -> dict[str, Any]:
