@@ -9,7 +9,7 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
-- preserve trusted installed-package and malicious-pickle detection when uv encodes delegated site-package paths as bytes
+- preserve trusted installed-package and malicious-pickle detection when uv encodes delegated site-packages paths as bytes
 
 ## [0.1.9](https://github.com/promptfoo/modelaudit/compare/modelaudit-picklescan-v0.1.8...modelaudit-picklescan-v0.1.9) (2026-07-20)
 
