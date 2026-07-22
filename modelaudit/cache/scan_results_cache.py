@@ -931,7 +931,7 @@ class ScanResultsCache:
                 preliminary_change_token = initial_change_token
                 preliminary_ancestor_identity = initial_ancestor_identity
             else:
-                last_change_error = ValueError(f"File kept changing while capturing cache identity: {file_path}")
+                last_change_error = ValueError(f"Cache identity barrier did not settle: {file_path}")
                 time.sleep(0.01)
                 continue
 

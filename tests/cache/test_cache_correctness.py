@@ -400,10 +400,11 @@ def test_capture_file_identity_fails_closed_for_persistent_change_clock_barrier(
 
     monkeypatch.setattr(cache, "_advance_change_clock", blocked_barrier)
 
-    with pytest.raises(ValueError, match="File kept changing while capturing cache identity"):
+    with pytest.raises(ValueError, match="File kept changing while capturing cache identity") as exc_info:
         cache.capture_file_identity(str(file_path))
 
     assert barrier_attempts["count"] == 15
+    assert str(exc_info.value.__cause__).startswith("Cache identity barrier did not settle:")
 
 
 def test_capture_file_identity_advances_clock_before_hashing(
