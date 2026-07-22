@@ -9,7 +9,9 @@ import lzma
 import pickle
 import pickletools
 import struct
+import zipfile
 import zlib
+from collections.abc import Callable
 from importlib.metadata import PackageNotFoundError
 from pathlib import Path
 from unittest.mock import patch
@@ -22,6 +24,7 @@ from modelaudit.cache.cache_policy import should_cache_scan_result
 from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
 from modelaudit.scanner_results import ACTIONABLE_FAILED_CHECKS_METADATA_KEY, INCONCLUSIVE_SCAN_OUTCOME, Issue
 from modelaudit.scanners.base import Check, CheckStatus, IssueSeverity, ScanResult
+from modelaudit.scanners.compressed_scanner import CompressedScanner, _MissingOptionalDependencyError
 from modelaudit.scanners.joblib_scanner import (
     JoblibScanner,
     _is_safe_dtype_metadata,
@@ -32,6 +35,54 @@ from modelaudit.scanners.joblib_scanner import (
     _validated_numpy_dtype,
     np,
 )
+from modelaudit.utils.file.detection import validate_file_type_with_formats
+
+_LZ4_FRAME_MAGIC = b"\x04\x22\x4d\x18"
+
+
+class _FakeLz4FrameDecompressor:
+    def __init__(self, payloads: dict[bytes, bytes]) -> None:
+        self.payloads = payloads
+        self.remaining: bytes | None = None
+        self.trailing = b""
+        self.eof = False
+        self.needs_input = True
+        self.unused_data = b""
+
+    def decompress(self, data: bytes, max_length: int = -1) -> bytes:
+        if self.remaining is None:
+            if not data.startswith(_LZ4_FRAME_MAGIC):
+                raise OSError("Invalid lz4 frame")
+            marker_offset = len(_LZ4_FRAME_MAGIC)
+            marker = data[marker_offset : marker_offset + 1]
+            if marker not in self.payloads:
+                raise OSError("Invalid lz4 frame")
+            self.remaining = self.payloads[marker]
+            self.trailing = data[marker_offset + 1 :]
+
+        output_size = len(self.remaining) if max_length < 0 else min(len(self.remaining), max_length)
+        output, self.remaining = self.remaining[:output_size], self.remaining[output_size:]
+        self.needs_input = not self.remaining
+        if self.needs_input:
+            self.eof = True
+            self.unused_data = self.trailing
+        return output
+
+
+class _FakeLz4FrameModule:
+    def __init__(self, payloads: dict[bytes, bytes]) -> None:
+        self.payloads = payloads
+
+    def LZ4FrameDecompressor(self) -> _FakeLz4FrameDecompressor:
+        return _FakeLz4FrameDecompressor(self.payloads)
+
+
+def _install_fake_lz4(
+    monkeypatch: pytest.MonkeyPatch,
+    payloads: dict[bytes, bytes],
+) -> None:
+    fake_lz4_frame = _FakeLz4FrameModule(payloads)
+    monkeypatch.setattr(CompressedScanner, "_get_lz4_frame_module", staticmethod(lambda: fake_lz4_frame))
 
 
 class _Payload:
@@ -1352,6 +1403,179 @@ def test_scan_detects_bz2_compressed_pickle_joblib(tmp_path: Path) -> None:
 
     assert result.success is False
     assert _has_system_reduce_failure(result)
+
+
+def test_scan_detects_lz4_compressed_pickle_joblib(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_fake_lz4(monkeypatch, {b"M": pickle.dumps(_Payload(), protocol=4)})
+
+    result = _scan_payload(tmp_path, _LZ4_FRAME_MAGIC + b"M", "lz4_malicious.joblib")
+
+    assert result.success is False
+    assert result.metadata.get("operational_error") is not True
+    assert _has_system_reduce_failure(result)
+
+
+def test_scan_file_accepts_benign_lz4_joblib_without_format_warning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_lz4(monkeypatch, {b"S": pickle.dumps({"safe": [1, 2, 3]}, protocol=4)})
+    path = tmp_path / "lz4_benign.joblib"
+    path.write_bytes(_LZ4_FRAME_MAGIC + b"S")
+
+    result = scan_file(str(path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "joblib"
+    assert result.success is True
+    assert not any(check.rule_code == "S901" for check in result.checks)
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+
+def test_lz4_compressed_joblib_is_valid_but_renamed_pickle_is_not(tmp_path: Path) -> None:
+    joblib_path = tmp_path / "model.joblib"
+    pickle_path = tmp_path / "model.pkl"
+    joblib_path.write_bytes(_LZ4_FRAME_MAGIC + b"S")
+    pickle_path.write_bytes(_LZ4_FRAME_MAGIC + b"S")
+
+    assert validate_file_type_with_formats(str(joblib_path), "lz4", "pickle") is True
+    assert validate_file_type_with_formats(str(pickle_path), "lz4", "pickle") is False
+
+
+@pytest.mark.parametrize(
+    ("compress", "header_format"),
+    [
+        (zlib.compress, "zlib"),
+        (gzip.compress, "gzip"),
+        (bz2.compress, "bzip2"),
+        (lzma.compress, "xz"),
+    ],
+    ids=["zlib", "gzip", "bzip2", "xz"],
+)
+def test_known_compressed_joblib_codecs_remain_valid_without_format_warnings(
+    tmp_path: Path,
+    compress: Callable[[bytes], bytes],
+    header_format: str,
+) -> None:
+    path = tmp_path / f"{header_format}_benign.joblib"
+    path.write_bytes(compress(pickle.dumps({"safe": [1, 2, 3]}, protocol=4)))
+
+    result = scan_file(str(path), config={"cache_scan_results": False})
+
+    assert validate_file_type_with_formats(str(path), header_format, "pickle") is True
+    assert result.success is True
+    assert not any(check.rule_code == "S901" for check in result.checks)
+
+
+def test_lz4_compressed_malicious_joblib_produces_security_exit_code(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_lz4(monkeypatch, {b"M": pickle.dumps(_Payload(), protocol=4)})
+    path = tmp_path / "lz4_malicious.joblib"
+    path.write_bytes(_LZ4_FRAME_MAGIC + b"M")
+
+    result = scan_model_directory_or_file(str(path), cache_scan_results=False)
+
+    assert determine_exit_code(result) == 1
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+    assert not any(issue.rule_code == "S901" and issue.severity == IssueSeverity.WARNING for issue in result.issues)
+
+
+def test_lz4_compressed_joblib_missing_dependency_fails_closed_and_is_not_cacheable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def missing_lz4_dependency() -> object:
+        raise _MissingOptionalDependencyError("Optional dependency 'lz4' is not installed")
+
+    monkeypatch.setattr(CompressedScanner, "_get_lz4_frame_module", staticmethod(missing_lz4_dependency))
+    path = tmp_path / "missing_lz4.joblib"
+    path.write_bytes(_LZ4_FRAME_MAGIC + b"M")
+
+    result = JoblibScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_scan_results=False)
+
+    assert result.success is False
+    assert result.metadata["operational_error_reason"] == "joblib_wrapper_decode_failed"
+    assert any(
+        check.severity == IssueSeverity.INFO and "Optional dependency 'lz4'" in check.message for check in result.checks
+    )
+    assert should_cache_scan_result(result.to_dict(include_private_metadata=True)) is False
+    assert determine_exit_code(aggregate) == 2
+    assert not any(issue.severity == IssueSeverity.CRITICAL for issue in aggregate.issues)
+
+
+@pytest.mark.parametrize(
+    ("scanner_config", "expected_message"),
+    [
+        ({"max_decompressed_size": 16, "max_decompression_ratio": 1000.0}, "Decompressed size exceeded limit"),
+        ({"max_decompressed_size": 1024, "max_decompression_ratio": 2.0}, "Decompression ratio exceeded limit"),
+    ],
+    ids=["absolute-size", "compression-ratio"],
+)
+def test_lz4_compressed_joblib_honors_decompression_limits(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    scanner_config: dict[str, int | float],
+    expected_message: str,
+) -> None:
+    _install_fake_lz4(monkeypatch, {b"B": pickle.dumps({"safe": "A" * 128}, protocol=4)})
+    path = tmp_path / "lz4_bomb.joblib"
+    path.write_bytes(_LZ4_FRAME_MAGIC + b"B")
+
+    result = JoblibScanner(scanner_config).scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["operational_error_reason"] == "joblib_wrapper_decode_failed"
+    assert any(check.severity == IssueSeverity.INFO and expected_message in check.message for check in result.checks)
+
+
+def test_lz4_joblib_rejects_unscanned_pickle_trailer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_fake_lz4(monkeypatch, {b"S": pickle.dumps({"safe": True}, protocol=4)})
+    path = tmp_path / "lz4_trailer.joblib"
+    path.write_bytes(_LZ4_FRAME_MAGIC + b"S" + pickle.dumps(_Payload(), protocol=0))
+
+    result = JoblibScanner().scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["operational_error_reason"] == "joblib_wrapper_decode_failed"
+    assert any("Invalid lz4 stream" in check.message for check in result.checks)
+    assert not _has_system_reduce_failure(result)
+
+
+def test_lz4_joblib_does_not_accept_malicious_concatenated_frame(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_lz4(
+        monkeypatch,
+        {
+            b"S": pickle.dumps({"safe": True}, protocol=4),
+            b"M": pickle.dumps(_Payload(), protocol=4),
+        },
+    )
+    path = tmp_path / "lz4_concatenated.joblib"
+    path.write_bytes(_LZ4_FRAME_MAGIC + b"S" + _LZ4_FRAME_MAGIC + b"M")
+
+    result = JoblibScanner().scan(str(path))
+
+    assert result.success is False
+    assert _has_system_reduce_failure(result) or result.metadata.get("operational_error") is True
+
+
+def test_zip_routes_nested_lz4_joblib_to_embedded_pickle_analysis(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_lz4(monkeypatch, {b"M": pickle.dumps(_Payload(), protocol=4)})
+    archive_path = tmp_path / "models.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("nested/model.joblib", _LZ4_FRAME_MAGIC + b"M")
+
+    result = scan_model_directory_or_file(str(archive_path), cache_scan_results=False)
+
+    assert determine_exit_code(result) == 1
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
 
 
 def test_scan_detects_bz_prefixed_raw_pickle_joblib(tmp_path: Path) -> None:
