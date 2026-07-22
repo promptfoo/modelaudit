@@ -5000,6 +5000,7 @@ class LlamafileScanner(BaseScanner):
                 GGUF_PARSE_INCONCLUSIVE_REASON,
                 GGUF_STRUCTURE_INCONCLUSIVE_REASON,
                 GgufScanner,
+                _with_container_owned_gguf_trailing,
             )
 
             if not GgufScanner.can_handle(str(carved_path)):
@@ -5012,7 +5013,9 @@ class LlamafileScanner(BaseScanner):
                 )
                 return carve_size, False
 
-            embedded_result = GgufScanner(config=self.config).scan(str(carved_path))
+            embedded_result = GgufScanner(config=_with_container_owned_gguf_trailing(self.config)).scan(
+                str(carved_path)
+            )
             self._append_embedded_findings(result, embedded_result, gguf_offset)
             outcome_reasons = embedded_result.metadata.get("scan_outcome_reasons", [])
             invalid_structure_reasons = {GGUF_PARSE_INCONCLUSIVE_REASON, GGUF_STRUCTURE_INCONCLUSIVE_REASON}
@@ -5064,13 +5067,15 @@ class LlamafileScanner(BaseScanner):
 
     def _merge_polyglot_findings(self, path: Path, result: ScanResult, torch7_offset: int | None) -> None:
         """Preserve trusted secondary-format coverage for executable polyglots."""
+        from .gguf_scanner import _with_container_owned_gguf_trailing
+
         if torch7_offset is not None:
             self._merge_torch7_findings(path, result, torch7_offset)
 
         merge_executable_zip_container_findings(
             str(path),
             result,
-            self.config,
+            _with_container_owned_gguf_trailing(self.config),
             context="embedded executable ZIP polyglot",
         )
 

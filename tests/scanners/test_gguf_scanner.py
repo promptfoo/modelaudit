@@ -1,5 +1,6 @@
 """Comprehensive tests for the GGUF scanner."""
 
+import io
 import json
 import struct
 import sys
@@ -25,9 +26,10 @@ from modelaudit.scanners.gguf_scanner import (
     GGUF_STRUCTURE_INCONCLUSIVE_REASON,
     GGUF_TENSOR_LIMIT_INCONCLUSIVE_REASON,
     GgufScanner,
+    _with_container_owned_gguf_trailing,
 )
 from tests.cli_output import parse_click_json_output
-from tests.helpers import create_mock_gguf
+from tests.helpers import create_malicious_pickle, create_mock_gguf
 
 _RANK_262_TOKENIZER_ITEM_COUNT = 262_144
 
@@ -87,6 +89,42 @@ def _write_comprehensive_gguf(path):
 
         # Tensor data (8 * 4 bytes for f32)
         f.write(b"\0" * 32)
+
+
+def _write_aligned_gguf(path: Path, alignment: int) -> None:
+    """Create a single-tensor GGUF with an explicit supported alignment."""
+    with path.open("wb") as handle:
+        handle.write(b"GGUF")
+        handle.write(struct.pack("<I", 3))
+        handle.write(struct.pack("<Q", 1))
+        handle.write(struct.pack("<Q", 1))
+
+        key = b"general.alignment"
+        handle.write(struct.pack("<Q", len(key)))
+        handle.write(key)
+        handle.write(struct.pack("<I", 4))
+        handle.write(struct.pack("<I", alignment))
+        handle.write(b"\0" * ((alignment - (handle.tell() % alignment)) % alignment))
+
+        tensor_name = b"weight"
+        handle.write(struct.pack("<Q", len(tensor_name)))
+        handle.write(tensor_name)
+        handle.write(struct.pack("<I", 1))
+        handle.write(struct.pack("<Q", 8))
+        handle.write(struct.pack("<I", 0))
+        handle.write(struct.pack("<Q", 0))
+        handle.write(b"\0" * ((alignment - (handle.tell() % alignment)) % alignment))
+        handle.write(b"\0" * 32)
+
+
+def _append_gguf_zip(path: Path, entries: dict[str, bytes]) -> None:
+    """Append a valid ZIP archive to an existing GGUF fixture."""
+    archive_bytes = io.BytesIO()
+    with zipfile.ZipFile(archive_bytes, "w") as archive:
+        for name, contents in entries.items():
+            archive.writestr(name, contents)
+    with path.open("ab") as handle:
+        handle.write(archive_bytes.getvalue())
 
 
 def _write_ggml_file(path):
@@ -379,6 +417,149 @@ def test_gguf_scanner_basic_scan(tmp_path):
     assert result.metadata["format"] == "gguf"
     assert result.metadata["n_kv"] == 1
     assert result.metadata["n_tensors"] == 0
+
+
+@pytest.mark.parametrize("has_tensor", [False, True], ids=["zero-tensor", "one-tensor"])
+def test_gguf_scanner_inspects_embedded_zip_polyglot_members(tmp_path: Path, has_tensor: bool) -> None:
+    path = tmp_path / "polyglot.gguf"
+    if has_tensor:
+        _write_comprehensive_gguf(path)
+    else:
+        _write_minimal_gguf(path, n_kv=0, n_tensors=0)
+
+    pickle_path = create_malicious_pickle(tmp_path / "payload.pkl")
+    _append_gguf_zip(path, {"payload.pkl": pickle_path.read_bytes(), "../escaped.txt": b"escape"})
+
+    assert zipfile.is_zipfile(path)
+
+    direct = GgufScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+    for result in (direct, aggregate):
+        assert any(issue.rule_code == "S908" and issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+        assert any(issue.rule_code == "S201" and "system" in issue.message.lower() for issue in result.issues), [
+            (issue.rule_code, issue.message) for issue in result.issues
+        ]
+        assert any(issue.rule_code == "S405" and "escaped.txt" in issue.message for issue in result.issues)
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_gguf_scanner_inspects_zip_hidden_within_attacker_controlled_alignment(tmp_path: Path) -> None:
+    path = tmp_path / "high-alignment-polyglot.gguf"
+    alignment = 4096
+    _write_aligned_gguf(path, alignment)
+    declared_end = path.stat().st_size
+    pickle_path = create_malicious_pickle(tmp_path / "payload.pkl")
+    _append_gguf_zip(path, {"payload.pkl": pickle_path.read_bytes()})
+
+    assert path.stat().st_size - declared_end < alignment
+
+    result = GgufScanner().scan(str(path))
+
+    assert any(issue.rule_code == "S908" and issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+    assert any(issue.rule_code == "S201" and "system" in issue.message.lower() for issue in result.issues)
+
+
+def test_gguf_scanner_flags_zero_tensor_nonpadding_trailing_content(tmp_path: Path) -> None:
+    path = tmp_path / "unexpected-tail.gguf"
+    _write_minimal_gguf(path, n_kv=0, n_tensors=0)
+    with path.open("ab") as handle:
+        handle.write(b"unexpected model data")
+
+    result = GgufScanner().scan(str(path))
+
+    assert any(
+        check.name == "GGUF Trailing Content Validation"
+        and check.rule_code == "S902"
+        and check.severity == IssueSeverity.WARNING
+        for check in result.checks
+    )
+
+
+def test_gguf_scanner_does_not_trust_user_supplied_container_provenance(tmp_path: Path) -> None:
+    path = tmp_path / "forged-provenance.gguf"
+    _write_minimal_gguf(path, n_kv=0, n_tensors=0)
+    with path.open("ab") as handle:
+        handle.write(b"unexpected model data")
+
+    result = GgufScanner(config={"_modelaudit_gguf_container_owned_trailing": True}).scan(str(path))
+
+    assert any(
+        check.name == "GGUF Trailing Content Validation" and check.severity == IssueSeverity.WARNING
+        for check in result.checks
+    )
+
+
+def test_gguf_scanner_detects_polyglots_inside_trusted_containers(tmp_path: Path) -> None:
+    path = tmp_path / "wrapped-polyglot.gguf"
+    _write_minimal_gguf(path, n_kv=0, n_tensors=0)
+    pickle_path = create_malicious_pickle(tmp_path / "payload.pkl")
+    _append_gguf_zip(path, {"payload.pkl": pickle_path.read_bytes()})
+
+    result = GgufScanner(config=_with_container_owned_gguf_trailing(None)).scan(str(path))
+
+    assert any(issue.rule_code == "S908" and issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+    assert any(issue.rule_code == "S201" and "system" in issue.message.lower() for issue in result.issues)
+
+
+@pytest.mark.parametrize("has_tensor", [False, True], ids=["zero-tensor", "one-tensor"])
+def test_gguf_scanner_allows_bounded_zero_padding(tmp_path: Path, has_tensor: bool) -> None:
+    path = tmp_path / "zero-padded.gguf"
+    if has_tensor:
+        _write_comprehensive_gguf(path)
+    else:
+        _write_minimal_gguf(path, n_kv=0, n_tensors=0)
+    with path.open("ab") as handle:
+        handle.write(b"\0" * 16)
+
+    direct = GgufScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+    _assert_no_warning_or_critical_issues(direct)
+    assert determine_exit_code(aggregate) == 0
+
+
+def test_gguf_scanner_does_not_misclassify_invalid_zip_near_match(tmp_path: Path) -> None:
+    path = tmp_path / "zip-near-match.gguf"
+    _write_minimal_gguf(path, n_kv=0, n_tensors=0)
+    with path.open("ab") as handle:
+        handle.write(b"PK\x03\x04not-a-valid-archive")
+
+    result = GgufScanner().scan(str(path))
+
+    assert any(check.name == "GGUF Trailing Content Validation" for check in result.checks)
+    assert not any(issue.rule_code == "S908" for issue in result.issues)
+    assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
+def test_gguf_scanner_honors_excluded_zip_scanner_for_polyglot(tmp_path: Path) -> None:
+    path = tmp_path / "selected-polyglot.gguf"
+    _write_minimal_gguf(path, n_kv=0, n_tensors=0)
+    pickle_path = create_malicious_pickle(tmp_path / "payload.pkl")
+    _append_gguf_zip(path, {"payload.pkl": pickle_path.read_bytes()})
+
+    result = GgufScanner(config={"exclude_scanners": ["zip"]}).scan(str(path))
+
+    assert any(issue.rule_code == "S908" and issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+    assert not any(issue.rule_code == "S201" for issue in result.issues)
+    assert any(
+        check.name == "Scanner Selection" and check.details.get("skipped_scanner_id") == "zip"
+        for check in result.checks
+    )
+
+
+def test_gguf_polyglot_cli_blocks_malicious_nested_pickle(tmp_path: Path) -> None:
+    path = tmp_path / "cli-polyglot.gguf"
+    _write_minimal_gguf(path, n_kv=0, n_tensors=0)
+    pickle_path = create_malicious_pickle(tmp_path / "payload.pkl")
+    _append_gguf_zip(path, {"payload.pkl": pickle_path.read_bytes()})
+
+    result = CliRunner().invoke(cli, ["scan", str(path), "--format", "json", "--no-cache"])
+
+    assert result.exit_code == 1
+    payload = parse_click_json_output(result.output)
+    assert any(issue.get("rule_code") == "S908" for issue in payload["issues"])
+    assert any(issue.get("rule_code") == "S201" for issue in payload["issues"])
 
 
 def test_gguf_scanner_delegates_malicious_chat_templates_to_jinja_analysis(tmp_path: Path) -> None:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 import struct
+import zipfile
 from bisect import bisect_left
 from collections.abc import Iterable
 from typing import Any, BinaryIO, ClassVar, NamedTuple
@@ -50,6 +51,8 @@ GGUF_STRUCTURE_INCONCLUSIVE_REASON = "gguf_structure_validation_failed"
 GGUF_DUPLICATE_METADATA_INCONCLUSIVE_REASON = "gguf_duplicate_metadata_keys"
 GGUF_METADATA_LIMIT_INCONCLUSIVE_REASON = "gguf_metadata_limit_exceeded"
 GGUF_TENSOR_LIMIT_INCONCLUSIVE_REASON = "gguf_tensor_limit_exceeded"
+_GGUF_CONTAINER_OWNED_TRAILING_CONFIG_KEY = "_modelaudit_gguf_container_owned_trailing"
+_GGUF_CONTAINER_OWNED_TRAILING_TOKEN = object()
 _GGUF_MAX_METADATA_VALUE_SECURITY_CHECKS = 64
 _GGUF_NETWORK_REFERENCE_LIMIT = 64
 _GGUF_INERT_TOKENIZER_ARRAY_KEYS = frozenset({"tokenizer.ggml.merges", "tokenizer.ggml.tokens"})
@@ -267,6 +270,13 @@ class _GgufNetworkApiAliases(NamedTuple):
     truncated_function_aliases: tuple[str, ...]
 
 
+def _with_container_owned_gguf_trailing(config: dict[str, Any] | None) -> dict[str, Any]:
+    """Mark trusted GGUF children whose enclosing container owns their outer boundary."""
+    nested_config = dict(config or {})
+    nested_config[_GGUF_CONTAINER_OWNED_TRAILING_CONFIG_KEY] = _GGUF_CONTAINER_OWNED_TRAILING_TOKEN
+    return nested_config
+
+
 class GgufScanner(BaseScanner):
     """Scanner for GGUF/GGML model files with comprehensive parsing and security checks."""
 
@@ -282,6 +292,7 @@ class GgufScanner(BaseScanner):
     DEFAULT_MAX_TENSOR_INFO_BYTES: ClassVar[int] = 16 * 1024 * 1024
     DEFAULT_MAX_REPORTED_TENSORS: ClassVar[int] = 1024
     DEFAULT_MAX_REPORTED_TOKENIZER_METADATA_ARRAY_ITEMS: ClassVar[int] = 1024
+    MAX_TRAILING_PADDING_BYTES: ClassVar[int] = 64 * 1024
     # Include common GGML variant extensions as well
     supported_extensions: ClassVar[list[str]] = [
         ".gguf",
@@ -717,7 +728,100 @@ class GgufScanner(BaseScanner):
         if tensor_data_section_out_of_bounds:
             return
 
-        result.bytes_scanned = f.tell()
+        logical_end = metadata_end
+        if previous_tensor is not None:
+            type_info = _GGML_TYPE_INFO.get(previous_tensor.tensor_type)
+            if type_info is None or any(dimension <= 0 for dimension in previous_tensor.dims):
+                return
+            block_size, type_size = type_info
+            element_count = 1
+            for dimension in previous_tensor.dims:
+                element_count *= dimension
+            tensor_size = ((element_count + block_size - 1) // block_size) * type_size
+            logical_end = tensor_data_start + previous_tensor.offset + tensor_size
+            if logical_end > file_size:
+                return
+        elif n_tensors > 0:
+            return
+
+        self._validate_trailing_content(
+            f,
+            file_size,
+            result,
+            logical_end=logical_end,
+            tensor_data_alignment=tensor_data_alignment,
+        )
+        result.bytes_scanned = max(result.bytes_scanned, f.tell())
+
+    def _validate_trailing_content(
+        self,
+        f: BinaryIO,
+        file_size: int,
+        result: ScanResult,
+        *,
+        logical_end: int,
+        tensor_data_alignment: int,
+    ) -> None:
+        """Inspect unexplained bytes without letting file-controlled alignment hide content."""
+        trailing_size = file_size - logical_end
+        if trailing_size <= 0:
+            return
+
+        padding_limit = min(tensor_data_alignment, self.MAX_TRAILING_PADDING_BYTES)
+        if trailing_size <= padding_limit:
+            position = f.tell()
+            f.seek(logical_end)
+            padding = f.read(trailing_size)
+            f.seek(position)
+            if len(padding) == trailing_size and not any(padding):
+                return
+
+        is_zip_polyglot = zipfile.is_zipfile(self.current_file_path)
+        if (
+            not is_zip_polyglot
+            and self.config.get(_GGUF_CONTAINER_OWNED_TRAILING_CONFIG_KEY) is _GGUF_CONTAINER_OWNED_TRAILING_TOKEN
+        ):
+            return
+
+        details: dict[str, Any] = {
+            "logical_end": logical_end,
+            "trailing_bytes": trailing_size,
+            "alignment_tolerance": tensor_data_alignment,
+        }
+        if is_zip_polyglot:
+            details["embedded_format"] = "zip"
+
+        result.add_check(
+            name="GGUF Trailing Content Validation",
+            passed=False,
+            message=f"GGUF file contains {trailing_size} unexplained bytes after its declared content",
+            severity=IssueSeverity.WARNING,
+            location=self.current_file_path,
+            details=details,
+            rule_code="S902",
+        )
+
+        if not is_zip_polyglot:
+            return
+
+        result.add_check(
+            name="GGUF ZIP Polyglot Detection",
+            passed=False,
+            message="GGUF file is also a valid ZIP archive and may contain hidden archive content",
+            severity=IssueSeverity.CRITICAL,
+            location=self.current_file_path,
+            details=details,
+            rule_code="S908",
+        )
+
+        from .archive_dispatch import merge_executable_zip_container_findings
+
+        merge_executable_zip_container_findings(
+            self.current_file_path,
+            result,
+            self.config,
+            context="GGUF trailing ZIP polyglot",
+        )
 
     @staticmethod
     def _tensor_metadata_summary(tensor: _GgufTensorInfo) -> dict[str, Any]:
