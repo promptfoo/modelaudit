@@ -7,13 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Bug Fixes
-
-- retry transient cache identity-barrier churn without weakening fail-closed cache validation
-- recognize GGUF/ZIP polyglots, inspect embedded archive members, and flag unexplained GGUF trailing content
-- avoid logging file-derived header-format values while preserving format-mismatch detections, and clean up CodeQL quality findings
-- inspect LZ4-compressed Joblib payloads with bounded decompression and preserve fail-closed optional dependency handling; thanks to @PowerliftLog for the report
-
 ## [0.2.52](https://github.com/promptfoo/modelaudit/compare/v0.2.51...v0.2.52) (2026-07-22)
 
 ### Bug Fixes
@@ -23,7 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps:** update pyasn1 to 0.6.4 ([#1772](https://github.com/promptfoo/modelaudit/issues/1772)) ([df81361](https://github.com/promptfoo/modelaudit/commit/df81361f6df8e10a22ac71f81ee2ca15f0fcc12a))
 - **deps:** update setuptools to 83.0.0 ([#1773](https://github.com/promptfoo/modelaudit/issues/1773)) ([8c805ff](https://github.com/promptfoo/modelaudit/commit/8c805fff4a6edf5f913f2cf23c5e04dde6567b9c))
 - harden GGUF/ZIP polyglot detection ([#1775](https://github.com/promptfoo/modelaudit/issues/1775)) ([665ed3a](https://github.com/promptfoo/modelaudit/commit/665ed3ab7c452f639c74e976c23ff0b92ea746d0))
-- harden LZ4-compressed Joblib inspection ([#1776](https://github.com/promptfoo/modelaudit/issues/1776)) ([fac0ede](https://github.com/promptfoo/modelaudit/commit/fac0edee89427e05cff7d8dffec343c1140c7755))
+- harden LZ4-compressed Joblib inspection ([#1776](https://github.com/promptfoo/modelaudit/issues/1776)) ([fac0ede](https://github.com/promptfoo/modelaudit/commit/fac0edee89427e05cff7d8dffec343c1140c7755)); thanks to @PowerliftLog for the report
 - keep root-only release branches componentless ([#1766](https://github.com/promptfoo/modelaudit/issues/1766)) ([9b8c2ce](https://github.com/promptfoo/modelaudit/commit/9b8c2ce04388bc0b1d57d51d7cdad726ad27a9e6))
 - **picklescan:** recognize uv bytes-encoded package overlays ([#1777](https://github.com/promptfoo/modelaudit/issues/1777)) ([e9910fa](https://github.com/promptfoo/modelaudit/commit/e9910fac59db6fe0d286504cc6b85ac380617e0a))
 - recover root release provenance safely ([#1770](https://github.com/promptfoo/modelaudit/issues/1770)) ([1e0dcb6](https://github.com/promptfoo/modelaudit/commit/1e0dcb6e273a13aaa86f36a39b4586b0d2e3a97a))
@@ -2552,7 +2545,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **style**: improve code formatting and documentation standards (#12, #23)
 - **fix**: improve core scanner functionality and comprehensive test coverage (#11)
 
-[unreleased]: https://github.com/promptfoo/modelaudit/compare/v0.2.51...HEAD
+[unreleased]: https://github.com/promptfoo/modelaudit/compare/v0.2.52...HEAD
 [0.2.25]: https://github.com/promptfoo/modelaudit/compare/v0.2.24...v0.2.25
 [0.2.24]: https://github.com/promptfoo/modelaudit/compare/v0.2.23...v0.2.24
 [0.2.23]: https://github.com/promptfoo/modelaudit/compare/v0.2.22...v0.2.23

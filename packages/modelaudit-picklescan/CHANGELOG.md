@@ -5,17 +5,13 @@ All notable changes to `modelaudit-picklescan` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
 ## [0.1.10](https://github.com/promptfoo/modelaudit/compare/modelaudit-picklescan-v0.1.9...modelaudit-picklescan-v0.1.10) (2026-07-22)
 
 ### Bug Fixes
 
 - **picklescan:** recognize uv bytes-encoded package overlays ([#1777](https://github.com/promptfoo/modelaudit/issues/1777)) ([e9910fa](https://github.com/promptfoo/modelaudit/commit/e9910fac59db6fe0d286504cc6b85ac380617e0a))
-
-## [Unreleased]
-
-### Bug Fixes
-
-- preserve trusted installed-package and malicious-pickle detection when uv encodes delegated site-packages paths as bytes
 
 ## [0.1.9](https://github.com/promptfoo/modelaudit/compare/modelaudit-picklescan-v0.1.8...modelaudit-picklescan-v0.1.9) (2026-07-20)
 
