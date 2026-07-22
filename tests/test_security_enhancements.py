@@ -277,7 +277,11 @@ class TestNumPyScannerSecurity:
         size_issues = [issue for issue in result.issues if "too large" in issue.message.lower()]
         assert len(size_issues) > 0
 
-    def test_dangerous_dtype_reports_cve_info(self, tmp_path: Path) -> None:
+    def test_dangerous_dtype_reports_cve_info(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         """Object dtype arrays should emit informational CVE-2019-6446 context.
 
         CVE-2019-6446 concerns unsafe loading of NumPy object arrays when pickle
@@ -289,9 +293,25 @@ class TestNumPyScannerSecurity:
         npy_file = tmp_path / "object_dtype.npy"
         np.save(npy_file, np.array([{"key": "value"}], dtype=object), allow_pickle=True)
 
+        def successful_embedded_scan(
+            self: NumPyScanner,
+            file_obj: object,
+            payload_size: int,
+            context_path: str,
+        ) -> ScanResult:
+            assert context_path == str(npy_file)
+            assert payload_size > 0
+            embedded_result = ScanResult(scanner_name="pickle")
+            embedded_result.bytes_scanned = payload_size
+            embedded_result.finish(success=True)
+            return embedded_result
+
+        monkeypatch.setattr(NumPyScanner, "_scan_embedded_pickle_payload", successful_embedded_scan)
+
         result = scanner.scan(str(npy_file))
 
-        assert result.success is True
+        assert result.success is True, f"metadata={result.metadata!r}; issues={result.issues!r}"
+        assert result.metadata["embedded_pickle_scan_success"] is True
         cve_issues = [issue for issue in result.issues if "CVE-2019-6446" in issue.message]
         assert len(cve_issues) > 0
         assert all(issue.severity == IssueSeverity.INFO for issue in cve_issues)
