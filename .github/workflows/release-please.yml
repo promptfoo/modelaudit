@@ -1579,7 +1579,10 @@ jobs:
               raise SystemExit(f"Tagged root project does not match modelaudit {version}: {project!r}")
 
           expected = {f"modelaudit-{version}-py3-none-any.whl", f"modelaudit-{version}.tar.gz"}
-          paths = list(Path("dist").iterdir())
+          try:
+              paths = list(Path("dist").iterdir())
+          except OSError as error:
+              raise SystemExit(f"Could not inspect recovered root artifacts: {error}") from error
           if {path.name for path in paths} != expected or any(not path.is_file() or path.is_symlink() for path in paths):
               raise SystemExit(f"Expected exactly the root wheel and sdist, found {[path.name for path in paths]!r}")
 

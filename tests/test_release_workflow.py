@@ -13,6 +13,7 @@ import urllib.error
 import urllib.request
 import zipfile
 import zlib
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, cast
 
@@ -798,6 +799,8 @@ def test_release_workflow_recovers_root_provenance_without_republishing() -> Non
     assert "max_sdist_bytes = 256 * 1024 * 1024" in verify_run
     assert 'f"modelaudit-{version}-py3-none-any.whl"' in verify_run
     assert 'f"modelaudit-{version}.tar.gz"' in verify_run
+    assert 'paths = list(Path("dist").iterdir())' in verify_run
+    assert "Could not inspect recovered root artifacts" in verify_run
     assert "path.is_symlink()" in verify_run
     assert "https://pypi.org/pypi/modelaudit/{version}/json" in verify_run
     assert "pypi_metadata = response.read(max_metadata_bytes + 1)" in verify_run
@@ -1189,6 +1192,8 @@ def test_root_provenance_recovery_rejects_untrusted_source_runs(
         ("directory-sdist-member", True),
         ("invalid-version", False),
         ("wrong-tag-version", False),
+        ("missing-dist-directory", False),
+        ("unreadable-dist-directory", False),
         ("missing-local", False),
         ("extra-local", False),
         ("wrong-pypi-version", False),
@@ -1416,7 +1421,20 @@ def test_root_provenance_recovery_fails_closed_for_unverified_artifacts(
         for filename, content in contents.items()
     ]
     payload: Any = {"info": {"version": version}, "urls": urls}
-    if mutation == "missing-local":
+    if mutation == "missing-dist-directory":
+        for artifact_path in dist_path.iterdir():
+            artifact_path.unlink()
+        dist_path.rmdir()
+    elif mutation == "unreadable-dist-directory":
+        original_iterdir = Path.iterdir
+
+        def reject_artifact_directory(path: Path) -> Iterator[Path]:
+            if path.name == "dist":
+                raise PermissionError("simulated unreadable artifact directory")
+            return original_iterdir(path)
+
+        monkeypatch.setattr(Path, "iterdir", reject_artifact_directory)
+    elif mutation == "missing-local":
         (dist_path / sdist_name).unlink()
     elif mutation == "extra-local":
         (dist_path / "unexpected.txt").write_text("unexpected", encoding="utf-8")
@@ -1484,6 +1502,8 @@ def test_root_provenance_recovery_fails_closed_for_unverified_artifacts(
             exec(compile(script, "root-provenance-recovery-step", "exec"), {})
         expected_errors = {
             "traversal-sdist-metadata-alias": "contains an unsafe member path",
+            "missing-dist-directory": "Could not inspect recovered root artifacts",
+            "unreadable-dist-directory": "Could not inspect recovered root artifacts",
             "pypi-error": "Could not verify PyPI metadata",
             "invalid-pypi-json": "Could not verify PyPI metadata",
             "oversized-pypi-metadata": "PyPI metadata for modelaudit 0.2.50 exceeds 10485760 bytes",
