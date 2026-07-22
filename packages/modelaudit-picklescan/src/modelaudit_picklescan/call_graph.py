@@ -1329,6 +1329,31 @@ def _site_package_root_from_pth_value(value: str, trusted_root: Path) -> Path | 
         return None
 
 
+def _pth_site_directory_value(argument: ast.expr) -> str | None:
+    if isinstance(argument, ast.Constant) and isinstance(argument.value, str):
+        return argument.value
+    if not isinstance(argument, ast.Call) or len(argument.args) != 1 or argument.keywords:
+        return None
+    function = argument.func
+    if not isinstance(function, ast.Attribute) or function.attr != "fsdecode":
+        return None
+    imported_module = function.value
+    if (
+        not isinstance(imported_module, ast.Call)
+        or not isinstance(imported_module.func, ast.Name)
+        or imported_module.func.id != "__import__"
+        or len(imported_module.args) != 1
+        or imported_module.keywords
+        or not isinstance(imported_module.args[0], ast.Constant)
+        or imported_module.args[0].value != "os"
+    ):
+        return None
+    encoded_path = argument.args[0]
+    if not isinstance(encoded_path, ast.Constant) or type(encoded_path.value) is not bytes:
+        return None
+    return encoded_path.value.decode(sys.getfilesystemencoding(), errors="surrogateescape")
+
+
 def _pth_delegated_site_package_paths(pth_path: Path, trusted_root: Path) -> tuple[Path, ...]:
     try:
         if pth_path.stat().st_size > _MAX_TRUSTED_PTH_BYTES:
@@ -1361,11 +1386,11 @@ def _pth_delegated_site_package_paths(pth_path: Path, trusted_root: Path) -> tup
                     and isinstance(function.value, ast.Name)
                     and function.value.id == "site"
                     and function.attr == "addsitedir"
-                    and isinstance(argument, ast.Constant)
-                    and isinstance(argument.value, str)
                 ):
                     continue
-                values.append(argument.value)
+                value = _pth_site_directory_value(argument)
+                if value is not None:
+                    values.append(value)
         else:
             values.append(line)
 
