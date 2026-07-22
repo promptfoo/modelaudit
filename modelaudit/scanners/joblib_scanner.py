@@ -26,7 +26,7 @@ from modelaudit_picklescan.call_graph import import_only_reference_is_proven_tru
 from ..detectors.cve_patterns import analyze_cve_patterns, enhance_scan_result_with_cve
 from ..scanner_results import ACTIONABLE_FAILED_CHECKS_METADATA_KEY, mark_inconclusive_scan_result
 from ..scanner_selection import add_scanner_selection_skip_check, embedded_pickle_scanner
-from ..utils.file.detection import read_magic_bytes
+from ..utils.file.detection import _LZ4_FRAME_MAGIC, read_magic_bytes
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, Check, CheckStatus, IssueSeverity, ScanResult
 from .pickle_scanner import PickleScanner
 
@@ -37,7 +37,7 @@ _MAX_JOBLIB_DTYPE_VALIDATION_WORK = 65536
 _MAX_JOBLIB_CONTROL_OPCODES = 1000000
 _MAX_JOBLIB_ARRAY_DIMENSIONS = 64
 _NUMPY_DTYPE_HAS_OBJECT_FLAG = 1
-_JOBLIB_COMPRESSED_PREFIXES = (b"x", b"\x1f\x8b", b"]\x00", b"\xfd7zXZ")
+_JOBLIB_COMPRESSED_PREFIXES = (b"x", b"\x1f\x8b", b"]\x00", b"\xfd7zXZ", _LZ4_FRAME_MAGIC)
 _JOBLIB_NUMPY_ARRAY_WRAPPER_MODULE = "joblib.numpy_pickle"
 _JOBLIB_NUMPY_ARRAY_WRAPPER_NAME = "NumpyArrayWrapper"
 _JOBLIB_NUMPY_ARRAY_WRAPPER_REFERENCE = f"{_JOBLIB_NUMPY_ARRAY_WRAPPER_MODULE}.{_JOBLIB_NUMPY_ARRAY_WRAPPER_NAME}"
@@ -761,7 +761,27 @@ class JoblibScanner(BaseScanner):
         return bytes(decompressed)
 
     def _safe_decompress(self, data: bytes) -> bytes:
-        """Safely decompress data with bomb protection"""
+        """Safely decompress data with bomb protection."""
+        if data.startswith(_LZ4_FRAME_MAGIC):
+            from .compressed_scanner import CompressedScanner, _MissingOptionalDependencyError
+
+            try:
+                lz4_frame = CompressedScanner._get_lz4_frame_module()
+            except _MissingOptionalDependencyError as exc:
+                raise ValueError(str(exc)) from exc
+
+            destination = io.BytesIO()
+            CompressedScanner._read_lz4_stream_with_limits(
+                source=io.BytesIO(data),
+                destination=destination,
+                lz4_frame=lz4_frame,
+                max_decompressed_bytes=self.max_decompressed_size,
+                max_ratio=self.max_decompression_ratio,
+                compressed_size=len(data),
+                chunk_size=self.chunk_size,
+            )
+            return destination.getvalue()
+
         codec_attempts: list[tuple[str, Callable[[], Any]]] = [
             ("zlib", zlib.decompressobj),
             ("gzip", lambda: zlib.decompressobj(zlib.MAX_WBITS | 16)),
