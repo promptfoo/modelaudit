@@ -46,6 +46,8 @@ from modelaudit.cache.optimized_config import (
 )
 from modelaudit.cache.scan_results_cache import (
     _CALL_GRAPH_REGULAR_FILE_FINGERPRINT,
+    _MAX_IDENTITY_BARRIER_ATTEMPTS,
+    _MAX_IDENTITY_CAPTURE_ATTEMPTS,
     AncestorIdentity,
     ScanResultsCache,
     _current_module_source_path,
@@ -351,6 +353,60 @@ def test_capture_file_identity_retries_transient_monitor_start_change(
         assert comparisons["count"] > 1
     finally:
         cache.release_ancestor_identity(identity[-1])
+
+
+def test_capture_file_identity_retries_transient_change_clock_barrier(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    file_path = _make_cacheable_file(tmp_path)
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    barrier_attempts = {"count": 0}
+
+    def transient_barrier(
+        _path: str,
+        _probe: Any,
+        file_change_token: int,
+        ancestor_identity: AncestorIdentity,
+    ) -> int:
+        barrier_attempts["count"] += 1
+        newest_token = cache._newest_identity_change_token(file_change_token, ancestor_identity)
+        return newest_token + int(barrier_attempts["count"] > _MAX_IDENTITY_BARRIER_ATTEMPTS)
+
+    monkeypatch.setattr(cache, "_advance_change_clock", transient_barrier)
+
+    identity = cache.capture_file_identity(str(file_path))
+    try:
+        assert identity[1].startswith("secure:")
+        assert barrier_attempts["count"] > _MAX_IDENTITY_BARRIER_ATTEMPTS
+    finally:
+        cache.release_ancestor_identity(identity[-1])
+
+
+def test_capture_file_identity_fails_closed_for_persistent_change_clock_barrier(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    file_path = _make_cacheable_file(tmp_path)
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    barrier_attempts = {"count": 0}
+
+    def blocked_barrier(
+        _path: str,
+        _probe: Any,
+        file_change_token: int,
+        ancestor_identity: AncestorIdentity,
+    ) -> int:
+        barrier_attempts["count"] += 1
+        return cache._newest_identity_change_token(file_change_token, ancestor_identity)
+
+    monkeypatch.setattr(cache, "_advance_change_clock", blocked_barrier)
+
+    with pytest.raises(ValueError, match="File kept changing while capturing cache identity") as exc_info:
+        cache.capture_file_identity(str(file_path))
+
+    assert barrier_attempts["count"] == _MAX_IDENTITY_BARRIER_ATTEMPTS * _MAX_IDENTITY_CAPTURE_ATTEMPTS
+    assert str(exc_info.value.__cause__).startswith("Cache identity barrier did not settle:")
 
 
 def test_capture_file_identity_advances_clock_before_hashing(
@@ -2793,9 +2849,11 @@ def test_scan_cache_rejects_malformed_source_independent_call_graph_metadata(
 def test_scan_cache_rejects_source_independent_marker_with_source_inputs(
     tmp_path: Path,
     metadata_update: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     file_path = _make_cacheable_file(tmp_path, "model.pkl")
     cache = ScanResultsCache(str(tmp_path / "cache"))
+    _scope_cache_ancestor_identity_to_tree(cache, tmp_path, monkeypatch)
     version_context = build_cache_version_context({})
     metadata = {
         "pickle_report_status": "complete",
