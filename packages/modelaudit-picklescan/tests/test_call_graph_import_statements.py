@@ -289,6 +289,14 @@ def test_pth_site_directory_value_uses_filesystem_error_handler(
     assert call_graph._pth_site_directory_value(expression) == encoded_path.decode("utf-8", errors=filesystem_errors)
 
 
+def test_pth_site_directory_value_rejects_malformed_filesystem_bytes(monkeypatch: pytest.MonkeyPatch) -> None:
+    expression = ast.parse('__import__("os").fsdecode(b"\\xff")', mode="eval").body
+    monkeypatch.setattr(sys, "getfilesystemencoding", lambda: "utf-8")
+    monkeypatch.setattr(sys, "getfilesystemencodeerrors", lambda: "surrogatepass")
+
+    assert call_graph._pth_site_directory_value(expression) is None
+
+
 @pytest.mark.parametrize(
     "argument_template",
     [
