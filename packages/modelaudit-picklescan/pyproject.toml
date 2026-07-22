@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "modelaudit-picklescan"
-version = "0.1.9" # x-release-please-version
+version = "0.1.10" # x-release-please-version
 description = "Standalone pickle security scanner extracted from ModelAudit"
 authors = [
     { name = "Ian Webster", email = "ian@promptfoo.dev" },
