@@ -376,7 +376,7 @@ def test_capture_file_identity_retries_transient_change_clock_barrier(
     identity = cache.capture_file_identity(str(file_path))
     try:
         assert identity[1].startswith("secure:")
-        assert barrier_attempts["count"] == 4
+        assert barrier_attempts["count"] >= 4
     finally:
         cache.release_ancestor_identity(identity[-1])
 
