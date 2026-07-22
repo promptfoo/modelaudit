@@ -30,7 +30,7 @@ from ..utils.file.detection import (
     is_llamafile_executable,
 )
 from ._evidence_redaction import redact_evidence_string
-from .archive_dispatch import merge_executable_zip_container_findings
+from .archive_dispatch import _mark_zip_container_dispatched, merge_executable_zip_container_findings
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, CheckStatus, IssueSeverity, ScanResult
 
 __all__ = ["LLAMAFILE_MARKER", "LLAMAFILE_ROUTE_SCAN_BYTES", "LLAMAFILE_ROUTE_TAIL_SCAN_BYTES", "LlamafileScanner"]
@@ -4272,7 +4272,16 @@ class LlamafileScanner(BaseScanner):
                 },
             )
 
-        self._merge_polyglot_findings(path_obj, result, torch7_offset)
+        raw_gguf_zip_dispatched = zip_payload is None and any(
+            check.name == "Llamafile Embedded GGUF ZIP Polyglot Detection" and check.rule_code == "S908"
+            for check in result.checks
+        )
+        self._merge_polyglot_findings(
+            path_obj,
+            result,
+            torch7_offset,
+            skip_outer_zip=raw_gguf_zip_dispatched,
+        )
         if zip_member_scan_incomplete:
             mark_operational_scan_error(result, LLAMAFILE_GGUF_ZIP_MEMBER_INCOMPLETE_REASON)
 
@@ -5080,10 +5089,21 @@ class LlamafileScanner(BaseScanner):
         if reason not in reasons:
             reasons.append(reason)
 
-    def _merge_polyglot_findings(self, path: Path, result: ScanResult, torch7_offset: int | None) -> None:
+    def _merge_polyglot_findings(
+        self,
+        path: Path,
+        result: ScanResult,
+        torch7_offset: int | None,
+        *,
+        skip_outer_zip: bool = False,
+    ) -> None:
         """Preserve trusted secondary-format coverage for executable polyglots."""
         if torch7_offset is not None:
             self._merge_torch7_findings(path, result, torch7_offset)
+
+        if skip_outer_zip:
+            _mark_zip_container_dispatched(result, str(path))
+            return
 
         merge_executable_zip_container_findings(
             str(path),

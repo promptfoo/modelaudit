@@ -941,6 +941,27 @@ def test_llamafile_scanner_preserves_embedded_gguf_zip_rule_code(tmp_path: Path)
         and check.severity == IssueSeverity.CRITICAL
         for check in result.checks
     )
+    assert sum("REDUCE Opcode Safety Check" in check.name and check.rule_code == "S201" for check in result.checks) == 1
+    assert (
+        sum("Pickle Raw Content Detection" in check.name and check.rule_code == "S201" for check in result.checks) == 1
+    )
+
+
+def test_llamafile_scanner_keeps_outer_zip_coverage_for_nested_gguf_zip(tmp_path: Path) -> None:
+    binary = tmp_path / "nested-gguf-zip.llamafile"
+    pickle_path = create_malicious_pickle(tmp_path / "payload.pkl")
+    nested_archive = io.BytesIO()
+    with zipfile.ZipFile(nested_archive, "w") as archive:
+        archive.writestr("inner.pkl", pickle_path.read_bytes())
+    embedded = b"GGUF" + struct.pack("<IQQ", 3, 0, 0) + nested_archive.getvalue()
+    _write_ape_zip_llamafile(binary, embedded)
+    with zipfile.ZipFile(binary, "a") as archive:
+        archive.writestr("outer.pkl", pickle_path.read_bytes())
+
+    result = LlamafileScanner().scan(str(binary))
+
+    assert any(check.rule_code == "S201" and "inner.pkl" in (check.location or "") for check in result.checks)
+    assert any(check.rule_code == "S201" and "outer.pkl" in (check.location or "") for check in result.checks)
 
 
 def test_llamafile_scanner_does_not_trust_zip_boundary_inside_executable_mapping(tmp_path: Path) -> None:
