@@ -736,6 +736,28 @@ def test_gguf_scanner_keeps_corrupted_zip_directory_near_match_noncritical_when_
     assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
 
 
+def test_gguf_scanner_keeps_outer_zip_detection_when_nested_preflight_is_suppressed(tmp_path: Path) -> None:
+    path = tmp_path / "nested-corrupted-zip.gguf"
+    nested = io.BytesIO()
+    with zipfile.ZipFile(nested, "w") as archive:
+        archive.writestr("first.txt", b"first")
+        archive.writestr("second.txt", b"second")
+    nested_bytes = bytearray(nested.getvalue())
+    eocd_offset = nested_bytes.rfind(b"PK\x05\x06")
+    directory_size = int.from_bytes(nested_bytes[eocd_offset + 12 : eocd_offset + 16], "little")
+    directory_start = eocd_offset - directory_size
+    second_record = nested_bytes.find(b"PK\x01\x02", directory_start + 4, eocd_offset)
+    assert second_record > directory_start
+    nested_bytes[second_record : second_record + 4] = b"NOPE"
+    _write_minimal_gguf(path, n_kv=0, n_tensors=0)
+    _append_gguf_zip(path, {"nested.zip": bytes(nested_bytes)})
+
+    set_config(ModelAuditConfig(suppress={"S902"}))
+    result = GgufScanner().scan(str(path))
+
+    assert any(issue.rule_code == "S908" and issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
 def test_gguf_scanner_honors_excluded_zip_scanner_for_polyglot(tmp_path: Path) -> None:
     path = tmp_path / "selected-polyglot.gguf"
     _write_minimal_gguf(path, n_kv=0, n_tensors=0)

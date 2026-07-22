@@ -32,6 +32,7 @@ from ..utils.file.detection import (
 from ._evidence_redaction import redact_evidence_string
 from .archive_dispatch import (
     _ZIP_CONTAINER_DISPATCHED_PATHS_PRIVATE_METADATA_KEY,
+    _ZIP_CONTAINER_PREFLIGHT_REJECTED_PATHS_PRIVATE_METADATA_KEY,
     _mark_zip_container_dispatched,
     merge_executable_zip_container_findings,
 )
@@ -3929,17 +3930,9 @@ class LlamafileScanner(BaseScanner):
         selected_payload_metadata: dict[str, Any] | None = None
         selected_payload_bytes_scanned = 0
         selected_gguf_zip_dispatched = False
-        selected_raw_boundary_can_be_trusted = (
-            zip_payload is None
-            and gguf_offset is not None
-            and len(boundary_candidates) == 1
-            and mapped_executable_end is not None
-            and gguf_offset >= mapped_executable_end
-            and (not is_ape_executable or mapping_search_complete)
-        )
         selected_container_owns_trailing = (
             zip_payload is not None and policy_from_config(self.config).allows("zip")
-        ) or (zip_payload is None and not selected_raw_boundary_can_be_trusted)
+        ) or (zip_payload is None and not mapping_search_complete)
         for candidate_index, candidate_offset in enumerate(candidates_to_scan):
             remaining_candidates = len(candidates_to_scan) - candidate_index
             candidate_budget = remaining_carve_bytes // remaining_candidates
@@ -5055,12 +5048,16 @@ class LlamafileScanner(BaseScanner):
                 _ZIP_CONTAINER_DISPATCHED_PATHS_PRIVATE_METADATA_KEY,
                 (),
             )
+            rejected_paths = embedded_result._private_metadata.get(
+                _ZIP_CONTAINER_PREFLIGHT_REJECTED_PATHS_PRIVATE_METADATA_KEY,
+                (),
+            )
             zip_dispatched = (
                 isinstance(dispatched_paths, (list, tuple, set, frozenset))
                 and os.path.realpath(str(carved_path)) in dispatched_paths
-                and not any(
-                    check.name == "ZIP Central Directory Preflight" and check.location == str(carved_path)
-                    for check in embedded_result.checks
+                and not (
+                    isinstance(rejected_paths, (list, tuple, set, frozenset))
+                    and os.path.realpath(str(carved_path)) in rejected_paths
                 )
             )
             return carve_size, recognized, zip_dispatched

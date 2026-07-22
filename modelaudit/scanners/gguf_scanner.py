@@ -12,7 +12,6 @@ from typing import Any, BinaryIO, ClassVar, NamedTuple
 from urllib.parse import unquote
 
 from modelaudit.detectors.suspicious_symbols import JINJA2_SSTI_PATTERNS
-from modelaudit.scanner_results import SUPPRESSED_FAILED_CHECKS_METADATA_KEY
 
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 
@@ -766,7 +765,10 @@ class GgufScanner(BaseScanner):
         if not zipfile.is_zipfile(self.current_file_path):
             return False
 
-        from .archive_dispatch import merge_executable_zip_container_findings
+        from .archive_dispatch import (
+            _ZIP_CONTAINER_PREFLIGHT_REJECTED_PATHS_PRIVATE_METADATA_KEY,
+            merge_executable_zip_container_findings,
+        )
 
         archive_config = dict(self.config)
         archive_config.pop(_GGUF_CONTAINER_OWNED_TRAILING_CONFIG_KEY, None)
@@ -776,15 +778,13 @@ class GgufScanner(BaseScanner):
             archive_config,
             context="GGUF trailing ZIP polyglot",
         )
-        suppressed_checks = result._private_metadata.get(SUPPRESSED_FAILED_CHECKS_METADATA_KEY, ())
-        if not isinstance(suppressed_checks, list | tuple):
-            suppressed_checks = ()
-        if any(
-            check.name == "ZIP Central Directory Preflight" and check.location == self.current_file_path
-            for check in result.checks
-        ) or any(
-            isinstance(check, dict) and check.get("name") == "ZIP Central Directory Preflight"
-            for check in suppressed_checks
+        rejected_paths = result._private_metadata.get(
+            _ZIP_CONTAINER_PREFLIGHT_REJECTED_PATHS_PRIVATE_METADATA_KEY,
+            (),
+        )
+        if (
+            isinstance(rejected_paths, list | tuple | set | frozenset)
+            and os.path.realpath(self.current_file_path) in rejected_paths
         ):
             return False
 
