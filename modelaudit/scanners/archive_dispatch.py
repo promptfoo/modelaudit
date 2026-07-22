@@ -100,6 +100,7 @@ _TENSORFLOW_PROTOBUF_ROUTING_INCOMPLETE_REASON = "tensorflow_protobuf_routing_in
 SKIP_COMPOSED_ARCHIVE_MEMBER_SCAN_CONFIG_KEY = "_skip_composed_archive_member_scan"
 KNOWN_UNREADABLE_ARCHIVE_ENTRY_OFFSETS_CONFIG_KEY = "_known_unreadable_archive_entry_offsets"
 _ZIP_CONTAINER_DISPATCHED_PATHS_PRIVATE_METADATA_KEY = "_zip_container_dispatched_paths"
+_ZIP_CONTAINER_PREFLIGHT_REJECTED_PATHS_PRIVATE_METADATA_KEY = "_zip_container_preflight_rejected_paths"
 _MAX_HDF5_USERBLOCK_ZIP_SEGMENTS = 16
 _MAX_HDF5_USERBLOCK_ZIP_CANDIDATE_VALIDATIONS = 64
 _MAX_HDF5_USERBLOCK_ZIP_VALIDATION_READ_BYTES = 32 * 1024 * 1024
@@ -509,6 +510,20 @@ def _mark_zip_container_dispatched(result: ScanResult, path: str) -> None:
         dispatched_paths.append(normalized_path)
 
 
+def _mark_zip_container_preflight_rejected(result: ScanResult, path: str) -> None:
+    """Retain path-scoped ZIP preflight rejection across suppressed findings."""
+    rejected_paths = result._private_metadata.setdefault(
+        _ZIP_CONTAINER_PREFLIGHT_REJECTED_PATHS_PRIVATE_METADATA_KEY,
+        [],
+    )
+    if not isinstance(rejected_paths, list):
+        rejected_paths = []
+        result._private_metadata[_ZIP_CONTAINER_PREFLIGHT_REJECTED_PATHS_PRIVATE_METADATA_KEY] = rejected_paths
+    normalized_path = os.path.realpath(path)
+    if normalized_path not in rejected_paths:
+        rejected_paths.append(normalized_path)
+
+
 def merge_executable_zip_container_findings(
     path: str,
     result: ScanResult,
@@ -545,6 +560,7 @@ def merge_executable_zip_container_findings(
     except ZipPreflightRejected as exc:
         result.merge(exc.result)
         _mark_zip_container_dispatched(result, path)
+        _mark_zip_container_preflight_rejected(result, path)
         return
 
     subtype_config = dict(config or {})

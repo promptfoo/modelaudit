@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import struct
 import zipfile
 from pathlib import Path
@@ -9,6 +10,7 @@ from typing import Any
 import pytest
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
+from modelaudit.config import ModelAuditConfig, set_config
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanners import llamafile_scanner as llamafile_scanner_module
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
@@ -43,6 +45,7 @@ from modelaudit.scanners.llamafile_scanner import (
     LlamafileScanner,
     find_structural_torch7_offset,
 )
+from tests.helpers import create_malicious_pickle
 
 
 def _build_llamafile_blob(
@@ -182,8 +185,11 @@ def _write_ape_zip_llamafile(
     runtime: bytes = b"benign runtime",
     member_name: str = "weights/model.gguf",
     compression: int = zipfile.ZIP_STORED,
+    leading_member: tuple[str, bytes] | None = None,
 ) -> None:
     with zipfile.ZipFile(path, "w", compression=compression) as archive:
+        if leading_member is not None:
+            archive.writestr(*leading_member)
         archive.writestr(member_name, embedded_payload)
     archive_bytes = path.read_bytes()
     stub_size = 8192
@@ -863,6 +869,8 @@ def test_llamafile_scanner_fails_closed_for_compressed_zip_gguf_polyglot_coverag
     direct = LlamafileScanner().scan(str(binary))
 
     assert direct.success is False
+    assert direct.metadata["operational_error"] is True
+    assert direct.metadata["operational_error_reason"] == LLAMAFILE_GGUF_ZIP_MEMBER_INCOMPLETE_REASON
     assert LLAMAFILE_GGUF_ZIP_MEMBER_INCOMPLETE_REASON in direct.metadata["scan_outcome_reasons"]
     checks = [check for check in direct.checks if check.name == "Llamafile Embedded ZIP GGUF Polyglot Coverage"]
     assert len(checks) == 1
@@ -905,6 +913,147 @@ def test_llamafile_scanner_scans_trailing_gguf_inside_stored_zip_member(tmp_path
         check.name == "Llamafile Embedded Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
         for check in result.checks
     )
+
+
+def test_llamafile_scanner_preserves_nested_gguf_trailing_content_validation(tmp_path: Path) -> None:
+    binary = tmp_path / "ape-nested-gguf-tail.llamafile"
+    embedded = b"GGUF" + struct.pack("<IQQ", 3, 0, 0) + b"unexplained non-padding content"
+    _write_ape_zip_llamafile(binary, embedded)
+
+    result = LlamafileScanner().scan(str(binary))
+
+    assert any(
+        "GGUF Trailing Content Validation" in check.name and check.severity == IssueSeverity.WARNING
+        for check in result.checks
+    )
+
+
+def test_llamafile_scanner_preserves_stored_gguf_pickle_tail_when_zip_scanner_is_disabled(tmp_path: Path) -> None:
+    binary = tmp_path / "ape-nested-gguf-pickle-tail.llamafile"
+    pickle_path = create_malicious_pickle(tmp_path / "payload.pkl")
+    embedded = b"GGUF" + struct.pack("<IQQ", 3, 0, 0) + pickle_path.read_bytes()
+    _write_ape_zip_llamafile(binary, embedded)
+    config = {"exclude_scanners": ["zip"]}
+
+    direct = LlamafileScanner(config=config).scan(str(binary))
+    aggregate = scan_model_directory_or_file(str(binary), config=config, cache_scan_results=False)
+
+    assert any(
+        check.name == "Llamafile Embedded GGUF Trailing Content Validation"
+        and check.rule_code == "S902"
+        and check.severity == IssueSeverity.WARNING
+        for check in direct.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+@pytest.mark.parametrize("suppress_s908", [False, True], ids=["visible-s908", "suppressed-s908"])
+def test_llamafile_scanner_preserves_embedded_gguf_zip_rule_code(tmp_path: Path, suppress_s908: bool) -> None:
+    binary = tmp_path / "raw-gguf-zip.llamafile"
+    pickle_path = create_malicious_pickle(tmp_path / "payload.pkl")
+    archive_bytes = io.BytesIO()
+    with zipfile.ZipFile(archive_bytes, "w") as archive:
+        archive.writestr("payload.pkl", pickle_path.read_bytes())
+    embedded = b"\0" * 8192 + b"GGUF" + struct.pack("<IQQ", 3, 0, 0) + archive_bytes.getvalue()
+    binary.write_bytes(_build_llamafile_blob(embedded_payload=embedded))
+
+    if suppress_s908:
+        set_config(ModelAuditConfig(suppress={"S908"}))
+    result = LlamafileScanner().scan(str(binary))
+
+    assert (
+        any(
+            check.name == "Llamafile Embedded GGUF ZIP Polyglot Detection"
+            and check.rule_code == "S908"
+            and check.severity == IssueSeverity.CRITICAL
+            for check in result.checks
+        )
+        is not suppress_s908
+    )
+    assert sum("REDUCE Opcode Safety Check" in check.name and check.rule_code == "S201" for check in result.checks) == 1
+    assert (
+        sum("Pickle Raw Content Detection" in check.name and check.rule_code == "S201" for check in result.checks) == 1
+    )
+
+
+def test_llamafile_scanner_keeps_outer_zip_coverage_for_nested_gguf_zip(tmp_path: Path) -> None:
+    binary = tmp_path / "nested-gguf-zip.llamafile"
+    pickle_path = create_malicious_pickle(tmp_path / "payload.pkl")
+    nested_archive = io.BytesIO()
+    with zipfile.ZipFile(nested_archive, "w") as archive:
+        archive.writestr("inner.pkl", pickle_path.read_bytes())
+    embedded = b"GGUF" + struct.pack("<IQQ", 3, 0, 0) + nested_archive.getvalue()
+    _write_ape_zip_llamafile(binary, embedded)
+    with zipfile.ZipFile(binary, "a") as archive:
+        archive.writestr("outer.pkl", pickle_path.read_bytes())
+
+    result = LlamafileScanner().scan(str(binary))
+
+    assert any(check.rule_code == "S201" and "inner.pkl" in (check.location or "") for check in result.checks)
+    assert any(check.rule_code == "S201" and "outer.pkl" in (check.location or "") for check in result.checks)
+
+
+def test_llamafile_scanner_keeps_outer_zip_coverage_when_earlier_raw_candidate_is_zip(tmp_path: Path) -> None:
+    binary = tmp_path / "multiple-raw-gguf-candidates.llamafile"
+    pickle_path = create_malicious_pickle(tmp_path / "payload.pkl")
+    inner_archive = io.BytesIO()
+    with zipfile.ZipFile(inner_archive, "w") as archive:
+        archive.writestr("benign.txt", b"benign")
+    earlier_gguf = b"GGUF" + struct.pack("<IQQ", 3, 0, 0) + inner_archive.getvalue()
+    selected_gguf = b"GGUF" + struct.pack("<IQQ", 3, 0, 0) + b"selected content"
+    carrier = (b"\x00" * 128) + earlier_gguf + selected_gguf
+    with zipfile.ZipFile(binary, "w", compression=zipfile.ZIP_STORED) as archive:
+        archive.writestr("carrier.bin", carrier)
+        archive.writestr("payload.pkl", pickle_path.read_bytes())
+    archive_bytes = binary.read_bytes()
+    binary.write_bytes(_build_llamafile_blob(embedded_payload=(b"\x00" * 8192) + archive_bytes))
+
+    result = LlamafileScanner().scan(str(binary))
+
+    assert any(check.rule_code == "S201" and "payload.pkl" in (check.location or "") for check in result.checks)
+
+
+def test_llamafile_scanner_keeps_outer_zip_coverage_when_selected_preflight_is_suppressed(tmp_path: Path) -> None:
+    binary = tmp_path / "suppressed-selected-raw-gguf.llamafile"
+    pickle_path = create_malicious_pickle(tmp_path / "payload.pkl")
+    inner_archive = io.BytesIO()
+    with zipfile.ZipFile(inner_archive, "w") as archive:
+        archive.writestr("benign.txt", b"benign")
+    earlier_gguf = b"GGUF" + struct.pack("<IQQ", 3, 0, 0) + inner_archive.getvalue()
+    selected_gguf = b"GGUF" + struct.pack("<IQQ", 3, 0, 0) + b"selected content"
+    carrier = (b"\x00" * 128) + earlier_gguf + selected_gguf
+    with zipfile.ZipFile(binary, "w", compression=zipfile.ZIP_STORED) as archive:
+        archive.writestr("carrier.bin", carrier)
+        archive.writestr("payload.pkl", pickle_path.read_bytes())
+    archive_bytes = binary.read_bytes()
+    binary.write_bytes(_build_llamafile_blob(embedded_payload=(b"\x00" * 8192) + archive_bytes))
+
+    set_config(ModelAuditConfig(suppress={"S902"}))
+    result = LlamafileScanner().scan(str(binary))
+
+    assert any(check.rule_code == "S201" and "payload.pkl" in (check.location or "") for check in result.checks)
+
+
+def test_llamafile_scanner_keeps_completed_late_zip_member_security_exit(tmp_path: Path) -> None:
+    binary = tmp_path / "late-gguf-member.llamafile"
+    pickle_path = create_malicious_pickle(tmp_path / "payload.pkl")
+    _write_ape_zip_llamafile(
+        binary,
+        b"GGUF" + struct.pack("<IQQ", 3, 0, 0),
+        leading_member=("large-benign.bin", b"\x00" * (128 * 1024)),
+    )
+    with zipfile.ZipFile(binary, "a") as archive:
+        archive.writestr("payload.pkl", pickle_path.read_bytes())
+    config = {"llamafile_payload_scan_bytes": 64 * 1024}
+
+    direct = LlamafileScanner(config=config).scan(str(binary))
+    aggregate = scan_model_directory_or_file(str(binary), config=config, cache_scan_results=False)
+
+    assert direct.metadata["embedded_payload_offset"] > config["llamafile_payload_scan_bytes"]
+    assert direct.metadata.get("operational_error") is not True
+    assert LLAMAFILE_GGUF_ZIP_MEMBER_INCOMPLETE_REASON not in direct.metadata.get("scan_outcome_reasons", [])
+    assert any(check.rule_code == "S201" and "payload.pkl" in (check.location or "") for check in direct.checks)
+    assert determine_exit_code(aggregate) == 1
 
 
 def test_llamafile_scanner_does_not_trust_zip_boundary_inside_executable_mapping(tmp_path: Path) -> None:
@@ -1000,6 +1149,57 @@ def test_llamafile_scanner_trusts_complete_ape_mapping_search_before_benign_gguf
     assert result.metadata["embedded_payload_boundary_trusted"] is True
     assert result.metadata["embedded_payload_boundary_source"] == "executable_mapping"
     assert not any(check.name == "Llamafile Runtime String Analysis" for check in result.checks)
+
+
+def test_llamafile_scanner_flags_pickle_tail_after_trusted_raw_gguf(tmp_path: Path) -> None:
+    binary = tmp_path / "mapped-raw-gguf-tail.llamafile"
+    pickle_path = create_malicious_pickle(tmp_path / "payload.pkl")
+    payload_offset = _write_sparse_mapped_llamafile(
+        binary,
+        "elf",
+        embedded_payload=b"GGUF" + struct.pack("<IQQ", 3, 0, 0) + pickle_path.read_bytes(),
+    )
+    config = {"llamafile_payload_scan_bytes": binary.stat().st_size, "llamafile_preview_bytes": 64}
+
+    direct = LlamafileScanner(config=config).scan(str(binary))
+    aggregate = scan_model_directory_or_file(str(binary), config=config, cache_scan_results=False)
+
+    assert direct.metadata["embedded_payload_offset"] == payload_offset
+    assert direct.metadata["embedded_payload_boundary_trusted"] is True
+    assert direct.metadata["embedded_payload_boundary_source"] == "executable_mapping"
+    assert any(
+        check.name == "Llamafile Embedded GGUF Trailing Content Validation"
+        and check.rule_code == "S902"
+        and check.severity == IssueSeverity.WARNING
+        for check in direct.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_llamafile_scanner_flags_pickle_tail_after_untrusted_raw_gguf(tmp_path: Path) -> None:
+    binary = tmp_path / "untrusted-raw-gguf-tail.llamafile"
+    pickle_path = create_malicious_pickle(tmp_path / "payload.pkl")
+    malformed_fat_header = b"\xca\xfe\xba\xbe" + struct.pack(">IiiIII", 1, 0x01000007, 3, 0, 4, 0)
+    binary.write_bytes(
+        malformed_fat_header
+        + b"\x00llamafile runtime\x00"
+        + b"GGUF"
+        + struct.pack("<IQQ", 3, 0, 0)
+        + pickle_path.read_bytes()
+    )
+    config = {"llamafile_payload_scan_bytes": binary.stat().st_size}
+
+    direct = LlamafileScanner(config=config).scan(str(binary))
+    aggregate = scan_model_directory_or_file(str(binary), config=config, cache_scan_results=False)
+
+    assert direct.metadata["embedded_payload_boundary_trusted"] is False
+    assert any(
+        check.name == "Llamafile Embedded GGUF Trailing Content Validation"
+        and check.rule_code == "S902"
+        and check.severity == IssueSeverity.WARNING
+        for check in direct.checks
+    )
+    assert determine_exit_code(aggregate) == 1
 
 
 def test_llamafile_scanner_fails_closed_for_incomplete_ape_mapping_search(tmp_path: Path) -> None:
