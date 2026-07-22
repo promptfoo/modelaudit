@@ -797,6 +797,8 @@ def test_release_workflow_recovers_root_provenance_without_republishing() -> Non
     assert "max_sdist_members = 10_000" in verify_run
     assert "max_sdist_member_bytes = 16 * 1024 * 1024" in verify_run
     assert "max_sdist_bytes = 256 * 1024 * 1024" in verify_run
+    assert "Could not parse tagged root pyproject.toml" in verify_run
+    assert "Tagged root pyproject.toml has no valid [project] table" in verify_run
     assert 'f"modelaudit-{version}-py3-none-any.whl"' in verify_run
     assert 'f"modelaudit-{version}.tar.gz"' in verify_run
     assert 'paths = list(Path("dist").iterdir())' in verify_run
@@ -1192,6 +1194,10 @@ def test_root_provenance_recovery_rejects_untrusted_source_runs(
         ("directory-sdist-member", True),
         ("invalid-version", False),
         ("wrong-tag-version", False),
+        ("invalid-tag-toml", False),
+        ("invalid-tag-utf8", False),
+        ("missing-tag-project", False),
+        ("invalid-tag-project", False),
         ("missing-dist-directory", False),
         ("unreadable-dist-directory", False),
         ("missing-local", False),
@@ -1265,6 +1271,14 @@ def test_root_provenance_recovery_fails_closed_for_unverified_artifacts(
     (dist_path / wheel_name).write_bytes(b"original wheel")
     project_version = "0.2.49" if mutation == "wrong-tag-version" else version
     project_content = f'[project]\nname = "modelaudit"\nversion = "{project_version}"\n'.encode()
+    if mutation == "invalid-tag-toml":
+        project_content = b"[project\n"
+    elif mutation == "invalid-tag-utf8":
+        project_content = b"\xff"
+    elif mutation == "missing-tag-project":
+        project_content = b'[tool]\nname = "modelaudit"\n'
+    elif mutation == "invalid-tag-project":
+        project_content = b"project = []\n"
     lock_content = b'version = 1\nrevision = 3\nrequires-python = ">=3.10"\n'
     (tmp_path / "pyproject.toml").write_bytes(project_content)
     (tmp_path / "uv.lock").write_bytes(lock_content)
@@ -1501,6 +1515,10 @@ def test_root_provenance_recovery_fails_closed_for_unverified_artifacts(
         with pytest.raises(SystemExit) as error:
             exec(compile(script, "root-provenance-recovery-step", "exec"), {})
         expected_errors = {
+            "invalid-tag-toml": "Could not parse tagged root pyproject.toml",
+            "invalid-tag-utf8": "Could not parse tagged root pyproject.toml",
+            "missing-tag-project": "Tagged root pyproject.toml has no valid [project] table",
+            "invalid-tag-project": "Tagged root pyproject.toml has no valid [project] table",
             "traversal-sdist-metadata-alias": "contains an unsafe member path",
             "missing-dist-directory": "Could not inspect recovered root artifacts",
             "unreadable-dist-directory": "Could not inspect recovered root artifacts",

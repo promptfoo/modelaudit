@@ -1574,7 +1574,13 @@ jobs:
                   raise SystemExit(f"Tagged root {filename} changed while it was being read")
               tagged_metadata[filename] = tagged_content
 
-          project = tomllib.loads(tagged_metadata["pyproject.toml"].decode("utf-8"))["project"]
+          try:
+              tagged_project = tomllib.loads(tagged_metadata["pyproject.toml"].decode("utf-8"))
+          except (UnicodeError, ValueError) as error:
+              raise SystemExit(f"Could not parse tagged root pyproject.toml: {error}") from error
+          project = tagged_project.get("project")
+          if not isinstance(project, dict):
+              raise SystemExit("Tagged root pyproject.toml has no valid [project] table")
           if project.get("name") != "modelaudit" or project.get("version") != version:
               raise SystemExit(f"Tagged root project does not match modelaudit {version}: {project!r}")
 
