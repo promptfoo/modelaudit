@@ -865,6 +865,8 @@ def test_llamafile_scanner_fails_closed_for_compressed_zip_gguf_polyglot_coverag
     direct = LlamafileScanner().scan(str(binary))
 
     assert direct.success is False
+    assert direct.metadata["operational_error"] is True
+    assert direct.metadata["operational_error_reason"] == LLAMAFILE_GGUF_ZIP_MEMBER_INCOMPLETE_REASON
     assert LLAMAFILE_GGUF_ZIP_MEMBER_INCOMPLETE_REASON in direct.metadata["scan_outcome_reasons"]
     checks = [check for check in direct.checks if check.name == "Llamafile Embedded ZIP GGUF Polyglot Coverage"]
     assert len(checks) == 1
@@ -873,7 +875,7 @@ def test_llamafile_scanner_fails_closed_for_compressed_zip_gguf_polyglot_coverag
 
     aggregate = scan_model_directory_or_file(str(binary), cache_scan_results=False)
     assert aggregate.success is False
-    assert determine_exit_code(aggregate) == 1
+    assert determine_exit_code(aggregate) == 2
 
     cache_dir = tmp_path / "compressed-gguf-cache"
     reset_cache_manager()
@@ -885,7 +887,7 @@ def test_llamafile_scanner_fails_closed_for_compressed_zip_gguf_polyglot_coverag
             min_cache_file_size=0,
         )
         assert cached_aggregate.success is False
-        assert determine_exit_code(cached_aggregate) == 1
+        assert determine_exit_code(cached_aggregate) == 2
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
     finally:
         reset_cache_manager()

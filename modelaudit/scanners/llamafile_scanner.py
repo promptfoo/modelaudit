@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, BinaryIO, ClassVar
 from urllib.parse import urlsplit
 
+from ..core_results import mark_operational_scan_error
 from ..scanner_selection import add_scanner_selection_skip_check, policy_from_config
 from ..utils.file.detection import (
     LLAMAFILE_MARKER,
@@ -4263,6 +4264,8 @@ class LlamafileScanner(BaseScanner):
             )
 
         self._merge_polyglot_findings(path_obj, result, torch7_offset)
+        if zip_member_scan_incomplete:
+            mark_operational_scan_error(result, LLAMAFILE_GGUF_ZIP_MEMBER_INCOMPLETE_REASON)
 
         result.finish(
             success=not result.has_errors and result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
