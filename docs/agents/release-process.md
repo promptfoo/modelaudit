@@ -18,7 +18,7 @@ The root `modelaudit` wheel declares a **hard dependency** on `modelaudit-pickle
 1. **Write Conventional Commits** — `feat:`, `fix:`, `docs:`, etc. Release-please uses these to compute the next version and the changelog entry.
 2. **Merge to `main`** — release-please creates or updates a "Release PR" per changed component. Commits that only touch `packages/modelaudit-picklescan/` feed the picklescan component; everything else feeds the root component.
 3. **Review and merge the Release PR** — release-please tags the release and the workflow runs the matching publish jobs:
-   - **For `modelaudit`** — `build` produces sdist+wheel → `publish-pypi` uploads via OIDC → `provenance` attests and uploads SBOM.
+   - **For `modelaudit`** — `build` produces sdist+wheel → `publish-pypi` uploads via OIDC → `verify-pypi` confirms the published package → `provenance` attests and uploads SBOM.
    - **For `modelaudit-picklescan`** — `build-picklescan-package` matrix builds 5 native wheels (Linux x86_64, Linux aarch64, macOS arm64, macOS x86_64, Windows x64) + sdist → `publish-picklescan-pypi` uploads → `picklescan-provenance` attests.
    - **When both release together** — the sibling package is published and verified on PyPI before the dependent root package is uploaded.
 
@@ -58,6 +58,16 @@ gh workflow run release-please.yml -f picklescan_version=<X.Y.Z>
 ```
 
 The workflow's `Resolve manual release inputs` step flips `manual_release=true`, skips the release-please action, ensures the GitHub release exists (creating it if not), then feeds `release_created=true` / `picklescan_release_created=true` into the publish jobs. `uv build` always reads from `pyproject.toml` at the current `HEAD`, so the tagged commit must already contain the target version; dispatching a version that does not match what's in `HEAD` will fail the PyPI upload.
+
+If root publication and PyPI verification succeeded but `provenance` was skipped or failed, do **not** re-run the publish path: PyPI filenames are immutable and a rebuilt artifact may not match the published bytes. Recover provenance from the original verified publish run instead:
+
+```bash
+gh workflow run release-please.yml --ref main \
+  -f root_version=<X.Y.Z> \
+  -f root_provenance_run_id=<original-run-id>
+```
+
+This provenance-only path skips release creation, builds, and publication. It checks out the fully qualified `refs/tags/v<X.Y.Z>` ref, verifies that the source is a completed release-please push or manual run from this repository with successful `build`, `publish-pypi`, and `verify-pypi` jobs, and requires both the source run's immutable head commit and the checked-out tag commit to be ancestors of the protected `main` branch before downloading the original `dist` artifact. The tag must also be an ancestor of the source run; only `.github/workflows/release-please.yml` and `tests/test_release_workflow.py` may differ, including both sides of any rename, accommodating a release-build repair without allowing runtime source drift. This prevents a branch-dispatched workflow with fabricated release jobs or a moved tag from being signed as trusted. An overall `failure` conclusion is accepted so a failed `provenance` job can be recovered; cancelled, incomplete, or diverged source runs and tags are rejected. The wheel and sdist are hashed in bounded chunks and must exactly match the non-yanked PyPI SHA256 digests. The bounded sdist may contain only regular files and directories with safe paths; links, special files, duplicate paths, case or Unicode aliases, and file/directory conflicts are rejected, and it must contain exactly one `pyproject.toml` and `uv.lock` whose bytes match the tag. The workflow then generates a recovery-integrity attestation recording both immutable commits and an SBOM from the frozen lockfile, and uploads the files to the matching GitHub Release. The recovery attestation does **not** claim original SLSA build provenance; the original PyPI publish attestations remain the publisher record. The source run ID must be numeric, `root_version` must use `X.Y.Z`, and `picklescan_version` cannot be combined with this recovery mode.
 
 ## PyPI trusted publishing (first-time setup)
 
