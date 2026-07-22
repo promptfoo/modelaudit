@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Bug Fixes
+
+- retry transient cache identity-barrier churn without weakening fail-closed cache validation
+- recognize GGUF/ZIP polyglots, inspect embedded archive members, and flag unexplained GGUF trailing content
+- avoid logging file-derived header-format values while preserving format-mismatch detections, and clean up CodeQL quality findings
+- inspect LZ4-compressed Joblib payloads with bounded decompression and preserve fail-closed optional dependency handling; thanks to @PowerliftLog for the report
+
 ## [0.2.52](https://github.com/promptfoo/modelaudit/compare/v0.2.51...v0.2.52) (2026-07-22)
 
 ### Bug Fixes
@@ -19,15 +28,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **picklescan:** recognize uv bytes-encoded package overlays ([#1777](https://github.com/promptfoo/modelaudit/issues/1777)) ([e9910fa](https://github.com/promptfoo/modelaudit/commit/e9910fac59db6fe0d286504cc6b85ac380617e0a))
 - recover root release provenance safely ([#1770](https://github.com/promptfoo/modelaudit/issues/1770)) ([1e0dcb6](https://github.com/promptfoo/modelaudit/commit/1e0dcb6e273a13aaa86f36a39b4586b0d2e3a97a))
 - resolve CodeQL quality and logging findings ([#1769](https://github.com/promptfoo/modelaudit/issues/1769)) ([573bbd8](https://github.com/promptfoo/modelaudit/commit/573bbd859501147413b2804df09299dc749e3e0c))
-
-## [Unreleased]
-
-### Bug Fixes
-
-- retry transient cache identity-barrier churn without weakening fail-closed cache validation
-- recognize GGUF/ZIP polyglots, inspect embedded archive members, and flag unexplained GGUF trailing content
-- avoid logging file-derived header-format values while preserving format-mismatch detections, and clean up CodeQL quality findings
-- inspect LZ4-compressed Joblib payloads with bounded decompression and preserve fail-closed optional dependency handling; thanks to @PowerliftLog for the report
 
 ## [0.2.51](https://github.com/promptfoo/modelaudit/compare/v0.2.50...v0.2.51) (2026-07-20)
 
