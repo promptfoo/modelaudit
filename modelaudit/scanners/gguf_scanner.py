@@ -476,7 +476,7 @@ class GgufScanner(BaseScanner):
 
     def _scan_gguf(self, f: BinaryIO, file_size: int, result: ScanResult) -> None:
         """Comprehensive GGUF file scanning with security checks."""
-        self._scan_zip_polyglot(result)
+        is_zip_polyglot = self._scan_zip_polyglot(result)
 
         if file_size < 24:
             result.add_check(
@@ -756,13 +756,14 @@ class GgufScanner(BaseScanner):
             result,
             logical_end=logical_end,
             tensor_data_alignment=tensor_data_alignment,
+            is_zip_polyglot=is_zip_polyglot,
         )
         result.bytes_scanned = max(result.bytes_scanned, f.tell())
 
-    def _scan_zip_polyglot(self, result: ScanResult) -> None:
+    def _scan_zip_polyglot(self, result: ScanResult) -> bool:
         """Inspect ZIP members even when GGUF metadata or tensor parsing fails."""
         if not zipfile.is_zipfile(self.current_file_path):
-            return
+            return False
 
         from .archive_dispatch import merge_executable_zip_container_findings
 
@@ -778,7 +779,7 @@ class GgufScanner(BaseScanner):
             check.name == "ZIP Central Directory Preflight" and check.location == self.current_file_path
             for check in result.checks
         ):
-            return
+            return False
 
         result.add_check(
             name="GGUF ZIP Polyglot Detection",
@@ -789,6 +790,7 @@ class GgufScanner(BaseScanner):
             details={"embedded_format": "zip"},
             rule_code="S908",
         )
+        return True
 
     def _validate_trailing_content(
         self,
@@ -798,10 +800,10 @@ class GgufScanner(BaseScanner):
         *,
         logical_end: int,
         tensor_data_alignment: int,
+        is_zip_polyglot: bool,
     ) -> None:
         """Inspect unexplained bytes without letting file-controlled alignment hide content."""
         trailing_size = file_size - logical_end
-        is_zip_polyglot = zipfile.is_zipfile(self.current_file_path)
         if trailing_size <= 0 and not is_zip_polyglot:
             return
 

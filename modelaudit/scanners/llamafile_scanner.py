@@ -30,7 +30,11 @@ from ..utils.file.detection import (
     is_llamafile_executable,
 )
 from ._evidence_redaction import redact_evidence_string
-from .archive_dispatch import _mark_zip_container_dispatched, merge_executable_zip_container_findings
+from .archive_dispatch import (
+    _ZIP_CONTAINER_DISPATCHED_PATHS_PRIVATE_METADATA_KEY,
+    _mark_zip_container_dispatched,
+    merge_executable_zip_container_findings,
+)
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, CheckStatus, IssueSeverity, ScanResult
 
 __all__ = ["LLAMAFILE_MARKER", "LLAMAFILE_ROUTE_SCAN_BYTES", "LLAMAFILE_ROUTE_TAIL_SCAN_BYTES", "LlamafileScanner"]
@@ -3923,6 +3927,8 @@ class LlamafileScanner(BaseScanner):
         }
         remaining_carve_bytes = max(0, self.max_payload_carve_bytes)
         selected_payload_metadata: dict[str, Any] | None = None
+        selected_payload_bytes_scanned = 0
+        selected_gguf_zip_dispatched = False
         selected_raw_boundary_can_be_trusted = (
             zip_payload is None
             and gguf_offset is not None
@@ -3941,7 +3947,7 @@ class LlamafileScanner(BaseScanner):
                 else max(0, next_offset - candidate_offset)
             )
             candidate_size = min(candidate_size, candidate_budget)
-            scanned_bytes, recognized_candidate = self._scan_embedded_payload(
+            scanned_bytes, recognized_candidate, gguf_zip_dispatched = self._scan_embedded_payload(
                 path_obj,
                 result,
                 candidate_offset,
@@ -3953,6 +3959,8 @@ class LlamafileScanner(BaseScanner):
             if recognized_candidate:
                 recognized_offsets.add(candidate_offset)
             if candidate_offset == gguf_offset:
+                selected_payload_bytes_scanned = scanned_bytes
+                selected_gguf_zip_dispatched = gguf_zip_dispatched
                 selected_payload_metadata = {
                     "embedded_payload_offset": result.metadata.get("embedded_payload_offset"),
                     "embedded_payload_size": result.metadata.get("embedded_payload_size"),
@@ -3967,7 +3975,7 @@ class LlamafileScanner(BaseScanner):
                     result.metadata[key] = value
 
         if not gguf_candidates and zip_payload is None:
-            payload_bytes_scanned, _ = self._scan_embedded_payload(
+            payload_bytes_scanned, _, _ = self._scan_embedded_payload(
                 path_obj,
                 result,
                 None,
@@ -4020,9 +4028,7 @@ class LlamafileScanner(BaseScanner):
                 },
             )
         zip_member_scan_incomplete = compressed_zip_gguf or (
-            gguf_offset is not None
-            and payload_size is not None
-            and gguf_offset + payload_size > max(0, self.max_payload_scan_bytes)
+            payload_size is not None and selected_payload_bytes_scanned < payload_size
         )
         if zip_member_scan_incomplete:
             self._mark_inconclusive(result, LLAMAFILE_GGUF_ZIP_MEMBER_INCOMPLETE_REASON)
@@ -4272,10 +4278,7 @@ class LlamafileScanner(BaseScanner):
                 },
             )
 
-        raw_gguf_zip_dispatched = zip_payload is None and any(
-            check.name == "Llamafile Embedded GGUF ZIP Polyglot Detection" and check.rule_code == "S908"
-            for check in result.checks
-        )
+        raw_gguf_zip_dispatched = zip_payload is None and selected_gguf_zip_dispatched
         self._merge_polyglot_findings(
             path_obj,
             result,
@@ -4944,7 +4947,7 @@ class LlamafileScanner(BaseScanner):
         *,
         payload_size: int | None = None,
         container_owns_trailing: bool = True,
-    ) -> tuple[int, bool]:
+    ) -> tuple[int, bool, bool]:
         if gguf_offset is None:
             file_size = self.get_file_size(str(path))
             details = {"max_scan_bytes": self.max_payload_scan_bytes}
@@ -4964,7 +4967,7 @@ class LlamafileScanner(BaseScanner):
                 location=str(path),
                 details=details,
             )
-            return 0, False
+            return 0, False, False
 
         file_size = self.get_file_size(str(path))
         payload_available = max(0, file_size - gguf_offset)
@@ -5004,7 +5007,7 @@ class LlamafileScanner(BaseScanner):
                 location=f"{path} (llamafile:{gguf_offset})",
                 details={"offset": gguf_offset, "available_bytes": payload_available},
             )
-            return 0, False
+            return 0, False, False
 
         carved_path = self._carve_payload(path, gguf_offset, carve_size)
         if carved_path is None:
@@ -5015,7 +5018,7 @@ class LlamafileScanner(BaseScanner):
                 severity=IssueSeverity.CRITICAL,
                 location=f"{path} (llamafile:{gguf_offset})",
             )
-            return 0, False
+            return 0, False, False
 
         try:
             from modelaudit.scanners.gguf_scanner import (
@@ -5033,7 +5036,7 @@ class LlamafileScanner(BaseScanner):
                     severity=IssueSeverity.WARNING,
                     location=f"{path} (llamafile:{gguf_offset})",
                 )
-                return carve_size, False
+                return carve_size, False, False
 
             embedded_config = (
                 _with_container_owned_gguf_trailing(self.config) if container_owns_trailing else self.config
@@ -5045,7 +5048,19 @@ class LlamafileScanner(BaseScanner):
             recognized = isinstance(outcome_reasons, list) and not invalid_structure_reasons.intersection(
                 outcome_reasons
             )
-            return carve_size, recognized
+            dispatched_paths = embedded_result._private_metadata.get(
+                _ZIP_CONTAINER_DISPATCHED_PATHS_PRIVATE_METADATA_KEY,
+                (),
+            )
+            zip_dispatched = (
+                isinstance(dispatched_paths, (list, tuple, set, frozenset))
+                and os.path.realpath(str(carved_path)) in dispatched_paths
+                and not any(
+                    check.name == "ZIP Central Directory Preflight" and check.location == str(carved_path)
+                    for check in embedded_result.checks
+                )
+            )
+            return carve_size, recognized, zip_dispatched
         finally:
             carved_path.unlink(missing_ok=True)
 
