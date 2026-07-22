@@ -240,9 +240,11 @@ def test_trusted_origin_rejects_inactive_lookalike_environment(
     assert call_graph._trusted_module_origin_kind("_pytest._py.path") is None
 
 
+@pytest.mark.parametrize("encoded_path", [False, True], ids=["literal-path", "fsdecode-bytes-path"])
 def test_trusted_origin_recognizes_active_environment_delegated_overlay(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    encoded_path: bool,
 ) -> None:
     active_site_packages = tmp_path / "active" / "lib" / "python" / "site-packages"
     active_site_packages.mkdir(parents=True)
@@ -252,9 +254,13 @@ def test_trusted_origin_recognizes_active_environment_delegated_overlay(
     (overlay_site_packages / "_pytest" / "__init__.py").write_text("", encoding="utf-8")
     (package_dir / "__init__.py").write_text("", encoding="utf-8")
     (package_dir / "path.py").write_text("class LocalPath:\n    pass\n", encoding="utf-8")
+    overlay_argument = (
+        f'__import__("os").fsdecode({os.fsencode(overlay_site_packages)!r})'
+        if encoded_path
+        else repr(str(overlay_site_packages))
+    )
     (active_site_packages / "_uv_ephemeral_overlay.pth").write_text(
-        f"import site; site.addsitedir({str(overlay_site_packages)!r})\n",
-        encoding="utf-8",
+        f"import site; site.addsitedir({overlay_argument})\n", encoding="utf-8"
     )
     monkeypatch.setattr(call_graph, "_TRUSTED_SITE_PACKAGE_PATHS", (active_site_packages.resolve(),))
     monkeypatch.setattr(
@@ -268,6 +274,60 @@ def test_trusted_origin_recognizes_active_environment_delegated_overlay(
     call_graph._clear_source_sensitive_caches()
 
     assert call_graph._trusted_module_origin_kind("_pytest._py.path") == "site_packages"
+
+
+@pytest.mark.parametrize("filesystem_errors", ["surrogateescape", "surrogatepass"])
+def test_pth_site_directory_value_uses_filesystem_error_handler(
+    monkeypatch: pytest.MonkeyPatch,
+    filesystem_errors: str,
+) -> None:
+    encoded_path = b"overlay/\xed\xa0\x80/site-packages"
+    expression = ast.parse(f'__import__("os").fsdecode({encoded_path!r})', mode="eval").body
+    monkeypatch.setattr(sys, "getfilesystemencoding", lambda: "utf-8")
+    monkeypatch.setattr(sys, "getfilesystemencodeerrors", lambda: filesystem_errors)
+
+    assert call_graph._pth_site_directory_value(expression) == encoded_path.decode("utf-8", errors=filesystem_errors)
+
+
+def test_pth_site_directory_value_rejects_malformed_filesystem_bytes(monkeypatch: pytest.MonkeyPatch) -> None:
+    expression = ast.parse('__import__("os").fsdecode(b"\\xff")', mode="eval").body
+    monkeypatch.setattr(sys, "getfilesystemencoding", lambda: "utf-8")
+    monkeypatch.setattr(sys, "getfilesystemencodeerrors", lambda: "surrogatepass")
+
+    assert call_graph._pth_site_directory_value(expression) is None
+
+
+@pytest.mark.parametrize(
+    "argument_template",
+    [
+        '__import__("not_os").fsdecode({path})',
+        '__import__("os").not_fsdecode({path})',
+        '__import__("os").fsdecode({text_path})',
+        '__import__("os").fsdecode(__import__("pathlib").Path({marker}).write_text("executed"))',
+    ],
+    ids=["wrong-module", "wrong-decoder", "string-argument", "dynamic-argument"],
+)
+def test_trusted_origin_rejects_unreviewed_pth_decode_expressions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    argument_template: str,
+) -> None:
+    active_site_packages = tmp_path / "active" / "lib" / "python" / "site-packages"
+    active_site_packages.mkdir(parents=True)
+    overlay_site_packages = tmp_path / "overlay" / "lib" / "python" / "site-packages"
+    overlay_site_packages.mkdir(parents=True)
+    marker = tmp_path / "unexpected-pth-execution"
+    argument = argument_template.format(
+        path=repr(os.fsencode(overlay_site_packages)),
+        text_path=repr(str(overlay_site_packages)),
+        marker=repr(str(marker)),
+    )
+    pth_path = active_site_packages / "unreviewed-overlay.pth"
+    pth_path.write_text(f"import site; site.addsitedir({argument})\n", encoding="utf-8")
+    monkeypatch.setattr(call_graph, "_TRUSTED_SITE_PACKAGE_PATHS", (active_site_packages.resolve(),))
+
+    assert call_graph._trusted_delegated_site_package_paths() == ()
+    assert not marker.exists()
 
 
 def test_trusted_origin_ignores_nonexecuted_pth_addsitedir(
