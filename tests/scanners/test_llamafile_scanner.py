@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import struct
 import zipfile
 from pathlib import Path
@@ -43,6 +44,7 @@ from modelaudit.scanners.llamafile_scanner import (
     LlamafileScanner,
     find_structural_torch7_offset,
 )
+from tests.helpers import create_malicious_pickle
 
 
 def _build_llamafile_blob(
@@ -871,7 +873,7 @@ def test_llamafile_scanner_fails_closed_for_compressed_zip_gguf_polyglot_coverag
 
     aggregate = scan_model_directory_or_file(str(binary), cache_scan_results=False)
     assert aggregate.success is False
-    assert determine_exit_code(aggregate) == 2
+    assert determine_exit_code(aggregate) == 1
 
     cache_dir = tmp_path / "compressed-gguf-cache"
     reset_cache_manager()
@@ -883,7 +885,7 @@ def test_llamafile_scanner_fails_closed_for_compressed_zip_gguf_polyglot_coverag
             min_cache_file_size=0,
         )
         assert cached_aggregate.success is False
-        assert determine_exit_code(cached_aggregate) == 2
+        assert determine_exit_code(cached_aggregate) == 1
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
     finally:
         reset_cache_manager()
@@ -903,6 +905,38 @@ def test_llamafile_scanner_scans_trailing_gguf_inside_stored_zip_member(tmp_path
 
     assert any(
         check.name == "Llamafile Embedded Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_llamafile_scanner_preserves_nested_gguf_trailing_content_validation(tmp_path: Path) -> None:
+    binary = tmp_path / "ape-nested-gguf-tail.llamafile"
+    embedded = b"GGUF" + struct.pack("<IQQ", 3, 0, 0) + b"unexplained non-padding content"
+    _write_ape_zip_llamafile(binary, embedded)
+
+    result = LlamafileScanner().scan(str(binary))
+
+    assert any(
+        "GGUF Trailing Content Validation" in check.name and check.severity == IssueSeverity.WARNING
+        for check in result.checks
+    )
+
+
+def test_llamafile_scanner_preserves_embedded_gguf_zip_rule_code(tmp_path: Path) -> None:
+    binary = tmp_path / "raw-gguf-zip.llamafile"
+    pickle_path = create_malicious_pickle(tmp_path / "payload.pkl")
+    archive_bytes = io.BytesIO()
+    with zipfile.ZipFile(archive_bytes, "w") as archive:
+        archive.writestr("payload.pkl", pickle_path.read_bytes())
+    embedded = b"\0" * 8192 + b"GGUF" + struct.pack("<IQQ", 3, 0, 0) + archive_bytes.getvalue()
+    binary.write_bytes(_build_llamafile_blob(embedded_payload=embedded))
+
+    result = LlamafileScanner().scan(str(binary))
+
+    assert any(
+        check.name == "Llamafile Embedded GGUF ZIP Polyglot Detection"
+        and check.rule_code == "S908"
+        and check.severity == IssueSeverity.CRITICAL
         for check in result.checks
     )
 

@@ -730,19 +730,23 @@ class GgufScanner(BaseScanner):
 
         logical_end = metadata_end
         if previous_tensor is not None:
+            logical_end = file_size
             type_info = _GGML_TYPE_INFO.get(previous_tensor.tensor_type)
-            if type_info is None or any(dimension <= 0 for dimension in previous_tensor.dims):
-                return
-            block_size, type_size = type_info
-            element_count = 1
-            for dimension in previous_tensor.dims:
-                element_count *= dimension
-            tensor_size = ((element_count + block_size - 1) // block_size) * type_size
-            logical_end = tensor_data_start + previous_tensor.offset + tensor_size
-            if logical_end > file_size:
-                return
+            if type_info is not None and all(0 < dimension <= 2**31 for dimension in previous_tensor.dims):
+                block_size, type_size = type_info
+                tensor_abs_start = tensor_data_start + previous_tensor.offset
+                available_bytes = max(0, file_size - tensor_abs_start)
+                max_elements = (available_bytes // type_size) * block_size
+                element_count = 1
+                for dimension in previous_tensor.dims:
+                    if element_count > max_elements // dimension:
+                        break
+                    element_count *= dimension
+                else:
+                    tensor_size = ((element_count + block_size - 1) // block_size) * type_size
+                    logical_end = tensor_abs_start + tensor_size
         elif n_tensors > 0:
-            return
+            logical_end = file_size
 
         self._validate_trailing_content(
             f,
@@ -764,11 +768,12 @@ class GgufScanner(BaseScanner):
     ) -> None:
         """Inspect unexplained bytes without letting file-controlled alignment hide content."""
         trailing_size = file_size - logical_end
-        if trailing_size <= 0:
+        is_zip_polyglot = zipfile.is_zipfile(self.current_file_path)
+        if trailing_size <= 0 and not is_zip_polyglot:
             return
 
         padding_limit = min(tensor_data_alignment, self.MAX_TRAILING_PADDING_BYTES)
-        if trailing_size <= padding_limit:
+        if 0 < trailing_size <= padding_limit and not is_zip_polyglot:
             position = f.tell()
             f.seek(logical_end)
             padding = f.read(trailing_size)
@@ -776,7 +781,6 @@ class GgufScanner(BaseScanner):
             if len(padding) == trailing_size and not any(padding):
                 return
 
-        is_zip_polyglot = zipfile.is_zipfile(self.current_file_path)
         if (
             not is_zip_polyglot
             and self.config.get(_GGUF_CONTAINER_OWNED_TRAILING_CONFIG_KEY) is _GGUF_CONTAINER_OWNED_TRAILING_TOKEN
@@ -791,15 +795,16 @@ class GgufScanner(BaseScanner):
         if is_zip_polyglot:
             details["embedded_format"] = "zip"
 
-        result.add_check(
-            name="GGUF Trailing Content Validation",
-            passed=False,
-            message=f"GGUF file contains {trailing_size} unexplained bytes after its declared content",
-            severity=IssueSeverity.WARNING,
-            location=self.current_file_path,
-            details=details,
-            rule_code="S902",
-        )
+        if trailing_size > 0:
+            result.add_check(
+                name="GGUF Trailing Content Validation",
+                passed=False,
+                message=f"GGUF file contains {trailing_size} unexplained bytes after its declared content",
+                severity=IssueSeverity.WARNING,
+                location=self.current_file_path,
+                details=details,
+                rule_code="S902",
+            )
 
         if not is_zip_polyglot:
             return

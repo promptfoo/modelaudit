@@ -127,6 +127,46 @@ def _append_gguf_zip(path: Path, entries: dict[str, bytes]) -> None:
         handle.write(archive_bytes.getvalue())
 
 
+def _write_tensor_covered_gguf_zip(
+    path: Path,
+    entries: dict[str, bytes],
+    *,
+    declared_dimensions: tuple[int, ...] | None = None,
+) -> None:
+    """Create a valid GGUF whose declared tensor payload is also a ZIP archive."""
+    archive_bytes = io.BytesIO()
+    with zipfile.ZipFile(archive_bytes, "w") as archive:
+        for name, contents in entries.items():
+            archive.writestr(name, contents)
+    tensor_data = archive_bytes.getvalue()
+    tensor_elements = (len(tensor_data) + 3) // 4
+    dimensions = declared_dimensions or (tensor_elements,)
+
+    with path.open("wb") as handle:
+        handle.write(b"GGUF")
+        handle.write(struct.pack("<I", 3))
+        handle.write(struct.pack("<Q", 1))
+        handle.write(struct.pack("<Q", 1))
+
+        key = b"general.alignment"
+        handle.write(struct.pack("<Q", len(key)))
+        handle.write(key)
+        handle.write(struct.pack("<I", 4))
+        handle.write(struct.pack("<I", 32))
+        handle.write(b"\0" * ((32 - (handle.tell() % 32)) % 32))
+
+        tensor_name = b"weight"
+        handle.write(struct.pack("<Q", len(tensor_name)))
+        handle.write(tensor_name)
+        handle.write(struct.pack("<I", len(dimensions)))
+        for dimension in dimensions:
+            handle.write(struct.pack("<Q", dimension))
+        handle.write(struct.pack("<I", 0))
+        handle.write(struct.pack("<Q", 0))
+        handle.write(b"\0" * ((32 - (handle.tell() % 32)) % 32))
+        handle.write(tensor_data.ljust(tensor_elements * 4, b"\0"))
+
+
 def _write_ggml_file(path):
     """Create a basic GGML file for testing."""
     with open(path, "wb") as f:
@@ -456,6 +496,40 @@ def test_gguf_scanner_inspects_zip_hidden_within_attacker_controlled_alignment(t
 
     result = GgufScanner().scan(str(path))
 
+    assert any(issue.rule_code == "S908" and issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+    assert any(issue.rule_code == "S201" and "system" in issue.message.lower() for issue in result.issues)
+
+
+def test_gguf_scanner_inspects_zip_covered_by_declared_tensor_data(tmp_path: Path) -> None:
+    path = tmp_path / "tensor-covered-polyglot.gguf"
+    pickle_path = create_malicious_pickle(tmp_path / "payload.pkl")
+    _write_tensor_covered_gguf_zip(path, {"payload.pkl": pickle_path.read_bytes()})
+
+    assert zipfile.is_zipfile(path)
+
+    direct = GgufScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+    for result in (direct, aggregate):
+        assert any(issue.rule_code == "S908" and issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+        assert any(issue.rule_code == "S201" and "system" in issue.message.lower() for issue in result.issues)
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_gguf_scanner_inspects_zip_when_final_tensor_dimensions_are_invalid(tmp_path: Path) -> None:
+    path = tmp_path / "invalid-tensor-polyglot.gguf"
+    pickle_path = create_malicious_pickle(tmp_path / "payload.pkl")
+    _write_tensor_covered_gguf_zip(
+        path,
+        {"payload.pkl": pickle_path.read_bytes()},
+        declared_dimensions=(2**31 + 1,) * 512,
+    )
+
+    assert zipfile.is_zipfile(path)
+
+    result = GgufScanner().scan(str(path))
+
+    assert any(check.name == "Tensor Dimension Value Validation" for check in result.checks)
     assert any(issue.rule_code == "S908" and issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
     assert any(issue.rule_code == "S201" and "system" in issue.message.lower() for issue in result.issues)
 

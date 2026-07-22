@@ -5044,6 +5044,7 @@ class LlamafileScanner(BaseScanner):
                 location=prefixed_location,
                 details=details,
                 why=check.why,
+                rule_code=check.rule_code,
             )
 
         result.metadata["embedded_gguf_metadata"] = dict(embedded.metadata)
@@ -5067,15 +5068,13 @@ class LlamafileScanner(BaseScanner):
 
     def _merge_polyglot_findings(self, path: Path, result: ScanResult, torch7_offset: int | None) -> None:
         """Preserve trusted secondary-format coverage for executable polyglots."""
-        from .gguf_scanner import _with_container_owned_gguf_trailing
-
         if torch7_offset is not None:
             self._merge_torch7_findings(path, result, torch7_offset)
 
         merge_executable_zip_container_findings(
             str(path),
             result,
-            _with_container_owned_gguf_trailing(self.config),
+            self.config,
             context="embedded executable ZIP polyglot",
         )
 
