@@ -35,9 +35,7 @@ from modelaudit.scanners.joblib_scanner import (
     _validated_numpy_dtype,
     np,
 )
-from modelaudit.utils.file.detection import validate_file_type_with_formats
-
-_LZ4_FRAME_MAGIC = b"\x04\x22\x4d\x18"
+from modelaudit.utils.file.detection import _LZ4_FRAME_MAGIC, validate_file_type_with_formats
 
 
 class _FakeLz4FrameDecompressor:
