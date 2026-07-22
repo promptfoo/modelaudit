@@ -1351,7 +1351,7 @@ def _pth_site_directory_value(argument: ast.expr) -> str | None:
     encoded_path = argument.args[0]
     if not isinstance(encoded_path, ast.Constant) or type(encoded_path.value) is not bytes:
         return None
-    return encoded_path.value.decode(sys.getfilesystemencoding(), errors="surrogateescape")
+    return encoded_path.value.decode(sys.getfilesystemencoding(), errors=sys.getfilesystemencodeerrors())
 
 
 def _pth_delegated_site_package_paths(pth_path: Path, trusted_root: Path) -> tuple[Path, ...]:

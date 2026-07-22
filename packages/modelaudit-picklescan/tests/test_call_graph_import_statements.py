@@ -276,6 +276,19 @@ def test_trusted_origin_recognizes_active_environment_delegated_overlay(
     assert call_graph._trusted_module_origin_kind("_pytest._py.path") == "site_packages"
 
 
+@pytest.mark.parametrize("filesystem_errors", ["surrogateescape", "surrogatepass"])
+def test_pth_site_directory_value_uses_filesystem_error_handler(
+    monkeypatch: pytest.MonkeyPatch,
+    filesystem_errors: str,
+) -> None:
+    encoded_path = b"overlay/\xed\xa0\x80/site-packages"
+    expression = ast.parse(f'__import__("os").fsdecode({encoded_path!r})', mode="eval").body
+    monkeypatch.setattr(sys, "getfilesystemencoding", lambda: "utf-8")
+    monkeypatch.setattr(sys, "getfilesystemencodeerrors", lambda: filesystem_errors)
+
+    assert call_graph._pth_site_directory_value(expression) == encoded_path.decode("utf-8", errors=filesystem_errors)
+
+
 @pytest.mark.parametrize(
     "argument_template",
     [
