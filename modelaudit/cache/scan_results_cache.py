@@ -986,17 +986,16 @@ class ScanResultsCache:
                 return existing[0]
 
             if os.name == "nt":
-                candidates = [Path(tempfile.gettempdir())]
+                # Windows keeps TemporaryFile names visible and locked until close.
+                candidates = [Path(tempfile.gettempdir()), self.cache_dir]
             else:
                 candidates = [self.cache_dir, Path(tempfile.gettempdir())]
-            ancestor = Path(os.path.abspath(file_path)).parent
-            while True:
-                candidates.append(ancestor)
-                if ancestor.parent == ancestor:
-                    break
-                ancestor = ancestor.parent
-            if os.name == "nt":
-                candidates.append(self.cache_dir)
+                ancestor = Path(os.path.abspath(file_path)).parent
+                while True:
+                    candidates.append(ancestor)
+                    if ancestor.parent == ancestor:
+                        break
+                    ancestor = ancestor.parent
 
             checked: set[Path] = set()
             for candidate in candidates:

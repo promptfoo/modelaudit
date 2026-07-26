@@ -22,7 +22,7 @@ from importlib.machinery import (
 )
 from pathlib import Path
 from types import FunctionType, ModuleType
-from typing import Any
+from typing import Any, BinaryIO
 from zipimport import zipimporter
 
 import pytest
@@ -37,6 +37,7 @@ from modelaudit_picklescan.call_graph import (
 from modelaudit_picklescan.call_graph import _source_resolution_context as _picklescan_source_resolution_context
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
+from modelaudit.cache import scan_results_cache as scan_results_cache_module
 from modelaudit.cache.batch_operations import BatchCacheOperations
 from modelaudit.cache.optimized_config import (
     ConfigurationExtractor,
@@ -176,7 +177,8 @@ def test_cache_config_hash_preserves_128_bits(tmp_path: Path) -> None:
     assert len(config_hash) == 32
 
 
-def test_capture_file_identity_uses_target_filesystem_probe(
+@pytest.mark.skipif(os.name == "nt", reason="Windows probes must remain outside scanned content")
+def test_posix_capture_file_identity_uses_target_filesystem_probe(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -198,6 +200,34 @@ def test_capture_file_identity_uses_target_filesystem_probe(
     assert cache._change_clock_probes[file_stat.st_dev][1] == file_path.parent
     probe.close()
     cache._change_clock_probes.clear()
+
+
+def test_windows_change_clock_probe_avoids_scanned_ancestors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    file_path = _make_cacheable_file(tmp_path)
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    attempted_probe_dirs: list[str] = []
+
+    def record_probe_attempt(*_args: Any, dir: str | Path, **_kwargs: Any) -> BinaryIO:
+        attempted_probe_dirs.append(str(dir))
+        raise OSError("simulated probe creation failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "name", "nt")
+        patch.setattr(scan_results_cache_module, "Path", type(file_path))
+        patch.setattr(
+            cache,
+            "_directory_is_on_device",
+            lambda directory, _device: directory == file_path.parent,
+        )
+        patch.setattr(tempfile, "TemporaryFile", record_probe_attempt)
+
+        with pytest.raises(ValueError, match="No writable cache identity probe directory"):
+            cache._get_change_clock_probe(str(file_path), file_path.stat().st_dev)
+
+    assert attempted_probe_dirs == []
 
 
 def test_change_clock_probe_prefers_isolated_directory(tmp_path: Path) -> None:
