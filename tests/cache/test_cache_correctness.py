@@ -22,7 +22,7 @@ from importlib.machinery import (
 )
 from pathlib import Path
 from types import FunctionType, ModuleType
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, cast
 from zipimport import zipimporter
 
 import pytest
@@ -237,8 +237,35 @@ def test_change_clock_probe_prefers_isolated_directory(tmp_path: Path) -> None:
     file_stat, _file_hash, _change_token, ancestor_identity = cache.capture_file_identity(str(file_path))
 
     assert ancestor_identity
-    expected_probe_dir = Path(tempfile.gettempdir()) if os.name == "nt" else cache.cache_dir
-    assert cache._change_clock_probes[file_stat.st_dev][1] == expected_probe_dir
+    expected_probe_dirs = {Path(tempfile.gettempdir()), cache.cache_dir} if os.name == "nt" else {cache.cache_dir}
+    assert cache._change_clock_probes[file_stat.st_dev][1] in expected_probe_dirs
+
+
+def test_clear_cache_closes_reusable_change_clock_probes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    original_unlink = Path.unlink
+
+    with tempfile.NamedTemporaryFile(mode="w+b", dir=cache.cache_dir, delete=False) as probe:
+        probe_path = Path(probe.name)
+        cache._change_clock_probes[probe_path.stat().st_dev] = (cast(BinaryIO, probe), cache.cache_dir)
+
+        def reject_locked_probe(path: Path, *, missing_ok: bool = False) -> None:
+            if path == probe_path and not probe.closed:
+                raise PermissionError("Windows cannot unlink an open cache clock probe")
+            original_unlink(path, missing_ok=missing_ok)
+
+        monkeypatch.setattr(Path, "unlink", reject_locked_probe)
+
+        cache.clear_cache()
+
+        assert probe.closed is True
+
+    assert cache._change_clock_probes == {}
+    assert not probe_path.exists()
+    assert cache.metadata_file.exists()
 
 
 def test_windows_change_clock_probe_uses_existing_handle(

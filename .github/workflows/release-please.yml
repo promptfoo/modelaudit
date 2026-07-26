@@ -661,10 +661,10 @@ jobs:
           cargo test --manifest-path Cargo.toml
 
       - name: Lint standalone package with Ruff
-        run: uv run --with ruff ruff check src tests
+        run: uv run --with 'ruff==0.15.10' ruff check src tests
 
       - name: Check standalone package formatting with Ruff
-        run: uv run --with ruff ruff format --check src tests
+        run: uv run --with 'ruff==0.15.10' ruff format --check src tests
 
       - name: Type check standalone package with mypy
         run: uv run --with mypy mypy src tests

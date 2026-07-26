@@ -2078,6 +2078,11 @@ class ScanResultsCache:
 
         logger.debug("Clearing entire scan results cache")
 
+        with self._change_clock_probe_lock:
+            for probe, _directory in self._change_clock_probes.values():
+                probe.close()
+            self._change_clock_probes.clear()
+
         # Remove all cache files except metadata
         for item in self.cache_dir.iterdir():
             if item.name != "cache_metadata.json":

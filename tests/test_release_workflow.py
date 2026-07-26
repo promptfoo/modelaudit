@@ -98,6 +98,24 @@ def test_root_release_accepts_current_picklescan_version() -> None:
     assert Requirement(picklescan_requirements[0]).specifier.contains(picklescan_project["version"])
 
 
+def test_standalone_package_lint_uses_locked_root_ruff_version() -> None:
+    root_dir = Path(__file__).resolve().parents[1]
+    root_lock = tomllib.loads((root_dir / "uv.lock").read_text(encoding="utf-8"))
+    ruff_package = next(package for package in root_lock["package"] if package["name"] == "ruff")
+    expected_requirement = f"ruff=={ruff_package['version']}"
+    python_workflow = yaml.safe_load((root_dir / ".github" / "workflows" / "test.yml").read_text(encoding="utf-8"))
+    assert isinstance(python_workflow, dict)
+
+    for workflow, job_name in (
+        (_load_release_workflow(), "build-picklescan-package"),
+        (python_workflow, "picklescan-package"),
+    ):
+        for step in _job_steps(workflow, job_name):
+            run = step.get("run", "")
+            if "ruff check" in run or "ruff format" in run:
+                assert expected_requirement in run
+
+
 def test_release_workflow_manual_dispatch_inputs_and_guardrails() -> None:
     workflow = _load_release_workflow()
 
