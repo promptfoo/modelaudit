@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
+from ..utils.repository_context import REPOSITORY_SCAN_ROOT_CONFIG_KEY
 from .adaptive_cache_keys import AdaptiveCacheKeyGenerator
 from .cache_manager import CacheManager
 from .cache_policy import should_cache_scan_result
@@ -73,9 +74,21 @@ class BatchCacheOperations:
         cache_dir_groups = self._group_by_cache_directory(cache_lookups)
 
         # Process each cache directory concurrently
+        scan_config = version_context.get("scan_config") if version_context is not None else None
+        has_repository_scan_root = isinstance(scan_config, dict) and isinstance(
+            scan_config.get(REPOSITORY_SCAN_ROOT_CONFIG_KEY), str
+        )
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_group = {
-                executor.submit(self._process_cache_directory_group, group_files): group_files
+                (
+                    executor.submit(
+                        self._process_cache_directory_group,
+                        group_files,
+                        version_context=version_context,
+                    )
+                    if has_repository_scan_root
+                    else executor.submit(self._process_cache_directory_group, group_files)
+                ): group_files
                 for group, group_files in cache_dir_groups.items()
             }
 
@@ -119,7 +132,10 @@ class BatchCacheOperations:
         return groups
 
     def _process_cache_directory_group(
-        self, group_files: list[tuple[str, str, os.stat_result]]
+        self,
+        group_files: list[tuple[str, str, os.stat_result]],
+        *,
+        version_context: dict[str, Any] | None = None,
     ) -> dict[str, dict[str, Any] | None]:
         """Process all cache files in a single directory efficiently."""
         results: dict[str, dict[str, Any] | None] = {}
@@ -128,11 +144,19 @@ class BatchCacheOperations:
             try:
                 # Use optimized cache lookup
                 if self.cache_manager.cache is not None:
-                    cached_result = self.cache_manager.cache.get_cached_result_by_key(
-                        cache_key,
-                        file_path=file_path,
-                        file_stat=stat_result,
-                    )
+                    if version_context is None:
+                        cached_result = self.cache_manager.cache.get_cached_result_by_key(
+                            cache_key,
+                            file_path=file_path,
+                            file_stat=stat_result,
+                        )
+                    else:
+                        cached_result = self.cache_manager.cache.get_cached_result_by_key(
+                            cache_key,
+                            file_path=file_path,
+                            file_stat=stat_result,
+                            version_context=version_context,
+                        )
                 else:
                     cached_result = None
                 results[file_path] = cached_result
