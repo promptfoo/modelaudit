@@ -341,6 +341,14 @@ class _PytorchOrderedDictState:
     keys_with_tracked_provenance: set[object] = field(default_factory=set)
 
 
+class _PytorchDictionaryState(dict[Any, Any]):
+    __slots__ = ("contains_untrusted_storage",)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.contains_untrusted_storage = False
+
+
 @dataclass(frozen=True)
 class _AbstractGlobal:
     module: str
@@ -1890,7 +1898,6 @@ def _pytorch_storage_keys_from_pickle_bytes(
     trusted_canonical_batch_seen = False
     memo: dict[int, Any] = {}
     stack: list[Any] = []
-    dictionaries_with_untrusted_storage: dict[int, dict[Any, Any]] = {}
     referenced_keys: set[str] = set()
     storage_refs_by_key: dict[str, _PytorchStorageRef] = {}
     storage_global_positions: set[int] = set()
@@ -1965,7 +1972,7 @@ def _pytorch_storage_keys_from_pickle_bytes(
             return False
         seen.add(value_id)
         if isinstance(value, dict):
-            if storage_only and value_id in dictionaries_with_untrusted_storage:
+            if storage_only and isinstance(value, _PytorchDictionaryState) and value.contains_untrusted_storage:
                 return True
             return any(
                 value_contains_tracked_provenance(item, seen, storage_only=storage_only) for item in value.items()
@@ -1997,7 +2004,7 @@ def _pytorch_storage_keys_from_pickle_bytes(
         )
         prior_state_contains_untrusted_storage = any(
             (isinstance(value, _PytorchOrderedDictState) and value.contains_untrusted_storage)
-            or (isinstance(value, dict) and id(value) in dictionaries_with_untrusted_storage)
+            or (isinstance(value, _PytorchDictionaryState) and value.contains_untrusted_storage)
             for value in stack
         )
         if canonical_storage_context and (items_contain_untrusted_storage or prior_state_contains_untrusted_storage):
@@ -2018,8 +2025,8 @@ def _pytorch_storage_keys_from_pickle_bytes(
                     target.keys_with_tracked_provenance.discard(key)
             mutate_tracked_ordered_dict(target)
         elif isinstance(stack[-1], dict):
-            if items_contain_untrusted_storage:
-                dictionaries_with_untrusted_storage[id(stack[-1])] = stack[-1]
+            if isinstance(stack[-1], _PytorchDictionaryState):
+                stack[-1].contains_untrusted_storage |= items_contain_untrusted_storage
             for key, value in items:
                 if key in stack[-1] and value_contains_tracked_provenance(stack[-1][key]):
                     discarded_tracked_storage_references = True
@@ -2262,7 +2269,7 @@ def _pytorch_storage_keys_from_pickle_bytes(
             elif opcode_name == "EMPTY_LIST":
                 stack.append([])
             elif opcode_name == "EMPTY_DICT":
-                stack.append({})
+                stack.append(_PytorchDictionaryState())
             elif opcode_name == "TUPLE":
                 tuple_value = pop_marked_tuple()
                 if tuple_value is None:
@@ -2288,7 +2295,7 @@ def _pytorch_storage_keys_from_pickle_bytes(
                 if dict_items is None or len(dict_items) % 2 != 0:
                     clear_stack_after_malformed_provenance()
                 else:
-                    built_dict: dict[Any, Any] = {}
+                    built_dict = _PytorchDictionaryState()
                     for index in range(0, len(dict_items), 2):
                         key = dict_items[index]
                         value = dict_items[index + 1]
@@ -2299,7 +2306,7 @@ def _pytorch_storage_keys_from_pickle_bytes(
                             value is not canonical_tensor
                             and value_contains_tracked_provenance(value, storage_only=True)
                         ):
-                            dictionaries_with_untrusted_storage[id(built_dict)] = built_dict
+                            built_dict.contains_untrusted_storage = True
                         built_dict[key] = value
                     stack.append(built_dict)
             elif opcode_name in {"BININT", "BININT1", "BININT2", "LONG", "LONG1", "LONG4", "INT", "FLOAT", "BINFLOAT"}:
