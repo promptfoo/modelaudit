@@ -50,12 +50,6 @@ def test_text_scanner_verified_huggingface_image_readmes_match_immutable_revisio
             (4531, "d15a41ee108ddfa546bc931a553f108be8e9e0c4c3ff2978dab9ee31ba5193f0"),
         ),
         (
-            "apple/DFN2B-CLIP-ViT-B-16",
-            "8b023e8bb8b0a27c17859af548c9fc3105d6c29c",
-            (3707, "cbb1a81c3ce864dc6258a359e7e5a16205d269a32a91399c6c7acc92ebed8418"),
-            (3818, "f9c56fcf440a540c906f88a6bfcd723eada9b2ce7719a00df6456cde29f1eef5"),
-        ),
-        (
             "timm/convnext_femto.d1_in1k",
             "1e0c02df687c47abf0819e1a4f858293e17e0c50",
             (15646, "8be1d036fde8dd8d279b9d0d8d886da58ba5c76e7a59d6da662b89243a51a5e3"),
@@ -72,50 +66,70 @@ def test_text_scanner_verified_huggingface_image_readmes_match_immutable_revisio
         readme for _, _, lf_readme, crlf_readme in pinned_model_cards for readme in (lf_readme, crlf_readme)
     )
 
-    assert len(pinned_model_cards) == 4
+    assert len(pinned_model_cards) == 3
     assert all(len(revision) == 40 for _, revision, _, _ in pinned_model_cards)
-    assert len(expected_readmes) == 8
+    assert len(expected_readmes) == 6
     assert expected_readmes == text_scanner_module.VERIFIED_HUGGINGFACE_DOCUMENTATION_IMAGE_READMES
 
 
 # Fixture SPDX: Apache-2.0; attribution: Ross Wightman and timm.
 # Pinned source: timm/mobilenetv3_small_100.lamb_in1k@1824797e7887cbec1990e4adbd6675960a36c589.
+# Fixture SPDX: Apache-2.0; attribution: timm.
+# Pinned source: timm/convnext_femto.d1_in1k@1e0c02df687c47abf0819e1a4f858293e17e0c50.
+# Fixture SPDX: MIT; attribution: timm.
+# Pinned source: timm/repvgg_a0.rvgg_in1k@e292d220aa8b811232037f8aa6d6c8c552dbd0c0.
 @pytest.mark.parametrize(
-    ("crlf", "expected_size", "expected_sha256"),
+    ("fixture_name", "fixture_license", "lf_size", "lf_sha256", "crlf_size", "crlf_sha256"),
     [
         pytest.param(
-            False,
+            "timm_mobilenetv3_small_100.lamb_in1k_README.txt",
+            "apache-2.0",
             4386,
             "3950face80991c4f91fb1ead491d787639e08a737f948fd630dd938ae8f78c18",
-            id="lf",
-        ),
-        pytest.param(
-            True,
             4531,
             "d15a41ee108ddfa546bc931a553f108be8e9e0c4c3ff2978dab9ee31ba5193f0",
-            id="crlf",
+            id="mobilenet-apache-2.0",
+        ),
+        pytest.param(
+            "timm_convnext_femto.d1_in1k_README.txt",
+            "apache-2.0",
+            15646,
+            "8be1d036fde8dd8d279b9d0d8d886da58ba5c76e7a59d6da662b89243a51a5e3",
+            15844,
+            "5996269997efd68dfae50ababead126a2b33761510440c1355bf50854c72849d",
+            id="convnext-apache-2.0",
+        ),
+        pytest.param(
+            "timm_repvgg_a0.rvgg_in1k_README.txt",
+            "mit",
+            4515,
+            "76528d32891b0a14087eb2240065094ff2cea9cc04a41ebe7b28311711af830d",
+            4671,
+            "937369705c2ce5d8ef37a7b8b589a997ebdc76b05ad60cb05f1641777e4ebb69",
+            id="repvgg-mit",
         ),
     ],
 )
+@pytest.mark.parametrize("crlf", [False, True], ids=["lf", "crlf"])
 def test_text_scanner_real_huggingface_image_readme_preserves_production_security(
     tmp_path: Path,
+    fixture_name: str,
+    fixture_license: str,
+    lf_size: int,
+    lf_sha256: str,
+    crlf_size: int,
+    crlf_sha256: str,
     crlf: bool,
-    expected_size: int,
-    expected_sha256: str,
 ) -> None:
-    fixture_path = (
-        Path(__file__).resolve().parents[1]
-        / "assets"
-        / "huggingface_model_cards"
-        / "timm_mobilenetv3_small_100.lamb_in1k_README.txt"
-    )
+    fixture_path = Path(__file__).resolve().parents[1] / "assets" / "huggingface_model_cards" / fixture_name
     original = fixture_path.read_bytes()
-    assert len(original) == 4386
-    assert hashlib.sha256(original).hexdigest() == "3950face80991c4f91fb1ead491d787639e08a737f948fd630dd938ae8f78c18"
+    assert (len(original), hashlib.sha256(original).hexdigest()) == (lf_size, lf_sha256)
+    assert b"license: " + fixture_license.encode() in original.splitlines()
     assert b"\r" not in original
 
     payload = original.replace(b"\n", b"\r\n") if crlf else original
     digest = hashlib.sha256(payload).hexdigest()
+    expected_size, expected_sha256 = (crlf_size, crlf_sha256) if crlf else (lf_size, lf_sha256)
     assert (len(payload), digest) == (expected_size, expected_sha256)
     assert (len(payload), digest) in text_scanner_module.VERIFIED_HUGGINGFACE_DOCUMENTATION_IMAGE_READMES
 
@@ -148,6 +162,50 @@ def test_text_scanner_real_huggingface_image_readme_preserves_production_securit
         for check in _failed_network_detection_checks(malicious)
     )
     assert determine_exit_code(malicious_aggregate) == 1
+
+
+@pytest.mark.parametrize(
+    ("crlf", "excluded_size", "excluded_sha256"),
+    [
+        pytest.param(
+            False,
+            3707,
+            "cbb1a81c3ce864dc6258a359e7e5a16205d269a32a91399c6c7acc92ebed8418",
+            id="restricted-apple-lf",
+        ),
+        pytest.param(
+            True,
+            3818,
+            "f9c56fcf440a540c906f88a6bfcd723eada9b2ce7719a00df6456cde29f1eef5",
+            id="restricted-apple-crlf",
+        ),
+    ],
+)
+def test_text_scanner_restricted_huggingface_model_card_remains_actionable(
+    tmp_path: Path,
+    crlf: bool,
+    excluded_size: int,
+    excluded_sha256: str,
+) -> None:
+    assert (excluded_size, excluded_sha256) not in text_scanner_module.VERIFIED_HUGGINGFACE_DOCUMENTATION_IMAGE_READMES
+
+    payload = HUGGINGFACE_DOCUMENTATION_IMAGE_EXAMPLE.encode()
+    if crlf:
+        payload = payload.replace(b"\n", b"\r\n")
+    assert (len(payload), hashlib.sha256(payload).hexdigest()) not in (
+        text_scanner_module.VERIFIED_HUGGINGFACE_DOCUMENTATION_IMAGE_READMES
+    )
+    path = tmp_path / "README.md"
+    path.write_bytes(payload)
+
+    result = TextScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+    assert result.success is False
+    assert any(
+        check.details.get("function") == "urlopen" and check.severity == IssueSeverity.CRITICAL
+        for check in _failed_network_detection_checks(result)
+    )
+    assert determine_exit_code(aggregate) == 1
 
 
 def _trust_exact_huggingface_documentation_example(

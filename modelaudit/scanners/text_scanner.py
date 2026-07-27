@@ -52,9 +52,6 @@ VERIFIED_HUGGINGFACE_DOCUMENTATION_IMAGE_READMES: frozenset[tuple[int, str]] = f
         # timm/mobilenetv3_small_100.lamb_in1k@1824797e7887cbec1990e4adbd6675960a36c589 (LF, CRLF)
         (4386, "3950face80991c4f91fb1ead491d787639e08a737f948fd630dd938ae8f78c18"),
         (4531, "d15a41ee108ddfa546bc931a553f108be8e9e0c4c3ff2978dab9ee31ba5193f0"),
-        # apple/DFN2B-CLIP-ViT-B-16@8b023e8bb8b0a27c17859af548c9fc3105d6c29c (LF, CRLF)
-        (3707, "cbb1a81c3ce864dc6258a359e7e5a16205d269a32a91399c6c7acc92ebed8418"),
-        (3818, "f9c56fcf440a540c906f88a6bfcd723eada9b2ce7719a00df6456cde29f1eef5"),
         # timm/convnext_femto.d1_in1k@1e0c02df687c47abf0819e1a4f858293e17e0c50 (LF, CRLF)
         (15646, "8be1d036fde8dd8d279b9d0d8d886da58ba5c76e7a59d6da662b89243a51a5e3"),
         (15844, "5996269997efd68dfae50ababead126a2b33761510440c1355bf50854c72849d"),
