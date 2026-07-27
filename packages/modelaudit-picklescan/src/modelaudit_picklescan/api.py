@@ -2069,12 +2069,6 @@ def _pytorch_storage_keys_from_pickle_bytes(
             value = stack[pair_index + 1]
             if not setitems_entry_is_safe(key, value):
                 continue
-            if value is not canonical_tensor and not (
-                trusted_canonical_batch_seen
-                or any(item is canonical_tensor for item in stack[pair_index + 2 :])
-                or any(entry_value is canonical_tensor for _entry_key, entry_value in canonical_batch_entries)
-            ):
-                continue
             if canonical_batch_target is None:
                 canonical_batch_target = target
                 stack.insert(marker_index + 1, canonical_batch_placeholder)

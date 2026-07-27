@@ -3438,12 +3438,16 @@ def _write_large_batched_pytorch_state_dict(
     malicious: bool = False,
     entry_count: int = 600,
     leading_metadata: bool = False,
+    leading_metadata_count: int = 0,
     metadata_value: bytes = b"K\x01",
     trailing_metadata_count: int = 0,
 ) -> None:
     entries: list[bytes] = []
     if leading_metadata:
         metadata_key = b"_extra_state"
+        entries.append(b"X" + len(metadata_key).to_bytes(4, "little") + metadata_key + metadata_value)
+    for index in range(leading_metadata_count):
+        metadata_key = f"_extra_state_{index}".encode("ascii")
         entries.append(b"X" + len(metadata_key).to_bytes(4, "little") + metadata_key + metadata_value)
     for index in range(entry_count):
         key_bytes = f"weight_{index}".encode("ascii")
@@ -3514,6 +3518,47 @@ def test_pytorch_storage_trust_parses_large_metadata_after_canonical_batch(tmp_p
     assert parsed.parse_complete is True
     assert len(parsed.referenced_keys) == 600
     assert len(parsed.canonical_tensor_rebuild_invocations) == 600
+
+
+@pytest.mark.parametrize("leading_metadata_count", [510, 1000])
+def test_pytorch_storage_trust_parses_large_metadata_prefix_before_canonical_tensor(
+    tmp_path: Path,
+    leading_metadata_count: int,
+) -> None:
+    archive_path = tmp_path / f"large-metadata-prefix-{leading_metadata_count}.pt"
+    _write_large_batched_pytorch_state_dict(
+        archive_path,
+        entry_count=1,
+        leading_metadata_count=leading_metadata_count,
+    )
+    with zipfile.ZipFile(archive_path) as archive:
+        payload = archive.read("archive/data.pkl")
+
+    parsed = package_api._pytorch_storage_keys_from_pickle_bytes(payload)
+
+    assert parsed.parse_complete is True
+    assert parsed.referenced_keys == {"0"}
+    assert len(parsed.canonical_tensor_rebuild_invocations) == 1
+
+
+def test_scan_file_preserves_malicious_call_after_large_metadata_prefix(tmp_path: Path) -> None:
+    archive_path = tmp_path / "large-metadata-prefix-malicious.pt"
+    _write_large_batched_pytorch_state_dict(
+        archive_path,
+        entry_count=2,
+        leading_metadata_count=510,
+        malicious=True,
+    )
+
+    report = _scan_file_report_dict_subprocess(archive_path)
+
+    assert report["verdict"] == "malicious"
+    assert any(
+        finding["severity"] == "critical"
+        and finding["details"].get("module") in {"os", "posix", "nt"}
+        and finding["details"].get("name") == "system"
+        for finding in report["findings"]
+    )
 
 
 def test_pytorch_storage_trust_checks_deadline_during_metadata_provenance(
