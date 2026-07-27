@@ -1991,6 +1991,11 @@ def _pytorch_storage_keys_from_pickle_bytes(
                     invalidate_tensor_rebuild_proof()
                 stack[-1][key] = value
         else:
+            if any(
+                value_contains_tracked_provenance(key) or value_contains_tracked_provenance(value)
+                for key, value in items
+            ):
+                discarded_tracked_storage_references = True
             poison_stack_top()
 
     def pop_marked_tuple(*, max_width: int = _PYTORCH_STORAGE_TRUST_MAX_TUPLE_WIDTH) -> tuple[Any, ...] | None:
@@ -2213,8 +2218,13 @@ def _pytorch_storage_keys_from_pickle_bytes(
                 if len(stack) < 2:
                     clear_stack_after_malformed_provenance()
                     continue
-                name = _coerce_pickle_string_arg(stack.pop())
-                module = _coerce_pickle_string_arg(stack.pop())
+                name_value = stack.pop()
+                module_value = stack.pop()
+                if value_contains_tracked_provenance(name_value) or value_contains_tracked_provenance(module_value):
+                    discarded_tracked_storage_references = True
+                    invalidate_tensor_rebuild_proof()
+                name = _coerce_pickle_string_arg(name_value)
+                module = _coerce_pickle_string_arg(module_value)
                 stack.append(
                     _PickleGlobalRef(module, name, position) if module is not None and name is not None else None
                 )
@@ -2312,6 +2322,8 @@ def _pytorch_storage_keys_from_pickle_bytes(
                 if isinstance(stack[-1], list):
                     stack[-1].append(value)
                 else:
+                    if value_contains_tracked_provenance(value):
+                        discarded_tracked_storage_references = True
                     poison_stack_top()
             elif opcode_name == "APPENDS":
                 appended_items = pop_marked_tuple()
@@ -2321,6 +2333,8 @@ def _pytorch_storage_keys_from_pickle_bytes(
                 if isinstance(stack[-1], list):
                     stack[-1].extend(appended_items)
                 else:
+                    if any(value_contains_tracked_provenance(value) for value in appended_items):
+                        discarded_tracked_storage_references = True
                     poison_stack_top()
             elif opcode_name == "SETITEM":
                 if len(stack) < 3:

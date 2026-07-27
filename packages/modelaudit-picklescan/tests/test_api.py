@@ -3837,6 +3837,12 @@ def test_scan_file_preserves_hidden_malicious_storage_after_duplicate_state_key(
         "unsupported_additems",
         "append_wrong_target",
         "setitem_storage_target",
+        "append_value",
+        "appends_value",
+        "setitem_value",
+        "setitem_key",
+        "stackglobal_name",
+        "stackglobal_module",
     ],
 )
 def test_scan_file_preserves_hidden_malicious_storage_after_stack_discard(
@@ -3866,6 +3872,12 @@ def test_scan_file_preserves_hidden_malicious_storage_after_stack_discard(
         "unsupported_additems": b"\x8f(" + storage_reference + b"\x900h\x01.",
         "append_wrong_target": storage_reference + b"K\x00ah\x01.",
         "setitem_storage_target": storage_reference + b"K\x00K\x01sh\x01.",
+        "append_value": encoded_key("converted") + b"K\x00" + storage_reference + b"as.",
+        "appends_value": encoded_key("converted") + b"K\x00(" + storage_reference + b"es.",
+        "setitem_value": encoded_key("converted") + b"K\x00" + encoded_key("slot") + storage_reference + b"ss.",
+        "setitem_key": encoded_key("converted") + b"K\x00" + storage_reference + b"K\x00ss.",
+        "stackglobal_name": encoded_key("converted") + _short_binunicode(b"fake") + storage_reference + b"\x93s.",
+        "stackglobal_module": encoded_key("converted") + storage_reference + _short_binunicode(b"fake") + b"\x93s.",
     }
     payload = (
         b"\x80\x04"
