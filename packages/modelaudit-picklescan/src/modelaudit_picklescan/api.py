@@ -2225,7 +2225,22 @@ def _pytorch_storage_keys_from_pickle_bytes(
             if opcode_name == "STOP":
                 if canonical_batch_entries:
                     return _PytorchStorageReferenceParse(set(), {}, set(), set(), False, False)
-                if any(value_contains_tracked_provenance(value) for value in stack[:-1] if value is not marker):
+                repeated_canonical_memo_uses = (
+                    bool(stack)
+                    and stack[-1] is canonical_tensor
+                    and len(referenced_keys) == 1
+                    and all(
+                        value is canonical_tensor
+                        or (
+                            isinstance(value, _PickleGlobalRef)
+                            and (value.module, value.name) == ("torch._utils", "_rebuild_tensor_v2")
+                        )
+                        for value in stack[:-1]
+                    )
+                )
+                if not repeated_canonical_memo_uses and any(
+                    value_contains_tracked_provenance(value) for value in stack[:-1] if value is not marker
+                ):
                     discarded_tracked_storage_references = True
                     invalidate_tensor_rebuild_proof()
                 if not isinstance(_pos, int) or _pos + 1 != len(pickle_data):

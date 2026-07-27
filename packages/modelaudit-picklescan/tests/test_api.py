@@ -3931,6 +3931,7 @@ def test_scan_file_preserves_hidden_malicious_storage_after_duplicate_state_key(
         "stop_extra_storage",
         "stop_extra_storage_none",
         "stop_nested_storage",
+        "stop_extra_canonical_storage",
         "unsupported_frozenset",
         "unsupported_additems",
         "append_wrong_target",
@@ -3966,6 +3967,7 @@ def test_scan_file_preserves_hidden_malicious_storage_after_stack_discard(
         "stop_extra_storage": storage_reference + b"h\x01.",
         "stop_extra_storage_none": storage_reference + b"N.",
         "stop_nested_storage": b"]" + storage_reference + b"ah\x01.",
+        "stop_extra_canonical_storage": b".",
         "unsupported_frozenset": b"(" + storage_reference + b"\x910h\x01.",
         "unsupported_additems": b"\x8f(" + storage_reference + b"\x900h\x01.",
         "append_wrong_target": storage_reference + b"K\x00ah\x01.",
@@ -3985,6 +3987,19 @@ def test_scan_file_preserves_hidden_malicious_storage_after_stack_discard(
         + b"u"
         + trailers[discard_variant]
     )
+    if discard_variant == "stop_extra_canonical_storage":
+        payload = (
+            b"\x80\x04"
+            + _global(b"torch._utils", b"_rebuild_tensor_v2")
+            + b"q\x00"
+            + _pytorch_rebuild_tensor_v2_reduce_expr(
+                key="0",
+                storage_name="ByteStorage",
+                element_count=len(hidden_payload),
+            )
+            + _pytorch_rebuild_tensor_v2_reduce_expr(key="1")
+            + b"."
+        )
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.writestr("archive/data.pkl", payload)
         archive.writestr("archive/version", "3\n")
