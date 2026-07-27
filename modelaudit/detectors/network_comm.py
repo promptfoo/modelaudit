@@ -1924,9 +1924,11 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
     except (SyntaxError, UnicodeDecodeError, RecursionError, ValueError):
         return False
 
-    nodes = list(ast.walk(tree))
-    if len(nodes) > _MAX_README_IMAGE_EXAMPLE_AST_NODES:
-        return False
+    nodes: list[ast.AST] = []
+    for node in ast.walk(tree):
+        if len(nodes) >= _MAX_README_IMAGE_EXAMPLE_AST_NODES:
+            return False
+        nodes.append(node)
     parents = {id(child): parent for parent in nodes for child in ast.iter_child_nodes(parent)}
     imports = [
         statement
@@ -1961,6 +1963,8 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
             requests_calls.append(node)
     if not requests_calls:
         return False
+    if any(imports[0].lineno >= call.lineno for call in requests_calls):
+        return False
 
     protected_names = {"requests"}
     protected_names.update(
@@ -1981,14 +1985,26 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
     for node in nodes:
         if isinstance(node, ast.Import):
             for alias in node.names:
-                if alias.asname == "requests" or (alias.name == "requests" and node not in imports):
+                if (
+                    alias.name.split(".", maxsplit=1)[0] in {"builtins", "importlib", "sys"}
+                    or alias.asname == "requests"
+                    or (alias.name == "requests" and node not in imports)
+                ):
                     return False
         if isinstance(node, ast.ImportFrom) and (
-            node.module == "requests"
+            (node.module or "").split(".", maxsplit=1)[0] in {"builtins", "importlib", "requests", "sys"}
             or any(alias.name == "*" or alias.name == "requests" or alias.asname == "requests" for alias in node.names)
         ):
             return False
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name in protected_names:
+        if isinstance(node, ast.Match):
+            return False
+        if isinstance(node, ast.ClassDef):
+            return False
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and (
+            node.name in protected_names or node.decorator_list
+        ):
+            return False
+        if isinstance(node, (ast.Global, ast.Nonlocal)) and any(name in protected_names for name in node.names):
             return False
         if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
@@ -1997,7 +2013,7 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
         if (
             isinstance(node, ast.Name)
             and node.id in protected_names
-            and isinstance(node.ctx, ast.Store)
+            and isinstance(node.ctx, (ast.Store, ast.Del))
             and id(node) not in allowed_targets
         ):
             return False
@@ -2017,9 +2033,9 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
         if isinstance(node, ast.ExceptHandler) and node.name in protected_names:
             return False
         if (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id
+            isinstance(node, ast.Name)
+            and isinstance(node.ctx, ast.Load)
+            and node.id
             in {
                 "eval",
                 "exec",

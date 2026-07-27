@@ -2848,6 +2848,15 @@ class TestNetworkCommDetector:
             "class requests:\n    get = payload\nrequests.get(image_url, stream=True)",
             "import sys\nsys.modules['requests'] = payload\nrequests.get(image_url, stream=True)",
             "fetch = __import__('requests').post\nrequests.get(image_url, stream=True)\nfetch(input())",
+            "match [payload]:\n    case [*requests]:\n        requests.get(image_url, stream=True)",
+            "match payload:\n    case {'x': _, **image_url}:\n        requests.get(image_url, stream=True)",
+            "@mutate\ndef placeholder():\n    pass\nrequests.get(image_url, stream=True)",
+            "class Hook(metaclass=mutate):\n    pass\nrequests.get(image_url, stream=True)",
+            "import importlib\nfetch = importlib.import_module('requests').post\n"
+            "requests.get(image_url, stream=True)\nfetch(input())",
+            "del requests\nrequests.get(image_url, stream=True)",
+            "del image_url\nrequests.get(image_url, stream=True)",
+            "requests.get(image_url, stream=True)\nmatch payload:\n    case image_url:\n        fetch(image_url)",
         ],
     )
     def test_readme_python_example_preserves_rebound_or_unproven_requests(
@@ -2873,6 +2882,19 @@ class TestNetworkCommDetector:
         )
 
         findings = NetworkCommDetector().scan(data, "example.py")
+
+        assert any(finding["type"] == "network_library" for finding in findings)
+        assert any(finding["type"] == "network_function" for finding in findings)
+
+    def test_readme_official_sample_image_requires_requests_import_before_call(self) -> None:
+        data = (
+            b"```python\n"
+            b"image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            b"requests.get(image_url, stream=True)\n"
+            b"import requests\n```\n"
+        )
+
+        findings = NetworkCommDetector().scan(data, "README.md")
 
         assert any(finding["type"] == "network_library" for finding in findings)
         assert any(finding["type"] == "network_function" for finding in findings)
@@ -2912,6 +2934,24 @@ class TestNetworkCommDetector:
 
         assert len(validated_examples) == 1
         assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+
+    def test_readme_official_image_example_stops_at_bounded_ast_node_limit(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        visited_nodes: list[int] = []
+
+        def oversized_ast_walk(_tree: network_comm.ast.AST) -> Iterator[network_comm.ast.AST]:
+            for index in range(network_comm._MAX_README_IMAGE_EXAMPLE_AST_NODES + 50):
+                visited_nodes.append(index)
+                yield network_comm.ast.Pass()
+
+        monkeypatch.setattr(network_comm.ast, "walk", oversized_ast_walk)
+
+        assert not network_comm._is_valid_official_readme_sample_image_example(
+            b"import requests\nrequests.get('https://huggingface.co/org/model/resolve/main/sample.png', stream=True)\n"
+        )
+        assert len(visited_nodes) == network_comm._MAX_README_IMAGE_EXAMPLE_AST_NODES + 1
 
     def test_readme_official_image_in_different_fence_does_not_suppress_network_call(self) -> None:
         data = (
