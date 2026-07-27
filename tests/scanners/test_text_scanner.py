@@ -43,8 +43,12 @@ HUGGINGFACE_DOCUMENTATION_IMAGE_EXAMPLE = (
 
 def _trust_exact_huggingface_documentation_example(
     monkeypatch: pytest.MonkeyPatch,
+    *,
+    crlf: bool = False,
 ) -> bytes:
     payload = HUGGINGFACE_DOCUMENTATION_IMAGE_EXAMPLE.encode()
+    if crlf:
+        payload = payload.replace(b"\n", b"\r\n")
     monkeypatch.setattr(
         text_scanner_module,
         "VERIFIED_HUGGINGFACE_DOCUMENTATION_IMAGE_READMES",
@@ -57,12 +61,14 @@ def _trust_exact_huggingface_documentation_example(
     "filename",
     ["README.md", "README.markdown", "README.en.md", "model_card.md", "modelcard.markdown"],
 )
+@pytest.mark.parametrize("crlf", [False, True], ids=["lf", "crlf"])
 def test_text_scanner_verified_huggingface_image_documentation_is_informational(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     filename: str,
+    crlf: bool,
 ) -> None:
-    payload = _trust_exact_huggingface_documentation_example(monkeypatch)
+    payload = _trust_exact_huggingface_documentation_example(monkeypatch, crlf=crlf)
     text_path = tmp_path / filename
     text_path.write_bytes(payload)
 
@@ -135,14 +141,16 @@ def test_text_scanner_verified_huggingface_image_documentation_is_informational(
     ],
 )
 @pytest.mark.parametrize("prepend", [False, True], ids=["appended", "prepended"])
+@pytest.mark.parametrize("crlf", [False, True], ids=["lf", "crlf"])
 def test_text_scanner_modified_huggingface_image_documentation_fails_closed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     attack: str,
     prepend: bool,
+    crlf: bool,
 ) -> None:
-    trusted_payload = _trust_exact_huggingface_documentation_example(monkeypatch)
-    attack_payload = attack.encode()
+    trusted_payload = _trust_exact_huggingface_documentation_example(monkeypatch, crlf=crlf)
+    attack_payload = attack.replace("\n", "\r\n").encode() if crlf else attack.encode()
     payload = attack_payload + trusted_payload if prepend else trusted_payload + attack_payload
     text_path = tmp_path / "README.md"
     text_path.write_bytes(payload)
@@ -159,11 +167,13 @@ def test_text_scanner_modified_huggingface_image_documentation_fails_closed(
     assert determine_exit_code(aggregate) == 1
 
 
+@pytest.mark.parametrize("crlf", [False, True], ids=["lf", "crlf"])
 def test_text_scanner_same_length_modified_huggingface_image_documentation_fails_closed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    crlf: bool,
 ) -> None:
-    trusted_payload = _trust_exact_huggingface_documentation_example(monkeypatch)
+    trusted_payload = _trust_exact_huggingface_documentation_example(monkeypatch, crlf=crlf)
     payload = trusted_payload.replace(b"img = Image.open", b"out = Image.open", 1)
     text_path = tmp_path / "README.md"
     text_path.write_bytes(payload)
@@ -180,12 +190,14 @@ def test_text_scanner_same_length_modified_huggingface_image_documentation_fails
 
 
 @pytest.mark.parametrize("filename", ["README", "README.rst", "README.txt", "model_card.rst", "vocab.txt"])
+@pytest.mark.parametrize("crlf", [False, True], ids=["lf", "crlf"])
 def test_text_scanner_verified_huggingface_image_digest_does_not_weaken_non_markdown_files(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     filename: str,
+    crlf: bool,
 ) -> None:
-    payload = _trust_exact_huggingface_documentation_example(monkeypatch)
+    payload = _trust_exact_huggingface_documentation_example(monkeypatch, crlf=crlf)
     text_path = tmp_path / filename
     text_path.write_bytes(payload)
 
