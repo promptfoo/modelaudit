@@ -3732,13 +3732,25 @@ def test_scan_file_preserves_hidden_malicious_storage_after_noncanonical_setitem
     )
 
 
-@pytest.mark.parametrize("duplicate_variant", ["ordered_batch", "ordered_setitem", "nested_dict"])
+@pytest.mark.parametrize(
+    "duplicate_variant",
+    [
+        "ordered_batch",
+        "ordered_setitem",
+        "nested_dict",
+        "ordered_build",
+        "list_reduce",
+        "tuple_reduce",
+        "ordered_reduce",
+    ],
+)
 def test_scan_file_preserves_hidden_malicious_storage_after_duplicate_state_key(
     tmp_path: Path,
     duplicate_variant: str,
 ) -> None:
     archive_path = tmp_path / f"malicious-duplicate-state-{duplicate_variant}.pt"
     hidden_payload = b"S'" + b"A" * 5000 + b"'\n0cos\nsystem\n(S'echo duplicate-state-key'\ntR."
+    separate_storage = duplicate_variant in {"ordered_build", "list_reduce", "tuple_reduce", "ordered_reduce"}
 
     def encoded_key(value: str) -> bytes:
         raw = value.encode("ascii")
@@ -3746,9 +3758,9 @@ def test_scan_file_preserves_hidden_malicious_storage_after_duplicate_state_key(
 
     tensor_value = (
         _pytorch_rebuild_tensor_v2_payload(
-            key="0",
-            storage_name="ByteStorage",
-            element_count=len(hidden_payload),
+            key="1" if separate_storage else "0",
+            storage_name="LongStorage" if separate_storage else "ByteStorage",
+            element_count=3 if separate_storage else len(hidden_payload),
         )
         .removeprefix(b"\x80\x04")
         .removesuffix(b".")
@@ -3760,6 +3772,28 @@ def test_scan_file_preserves_hidden_malicious_storage_after_duplicate_state_key(
         entries.insert(1, encoded_key("same") + b"K\x00")
     elif duplicate_variant == "ordered_setitem":
         suffix = b"u" + encoded_key("same") + b"K\x00s."
+    elif duplicate_variant == "ordered_build":
+        storage_reference = _pytorch_storage_binpersid_expr(
+            key="0",
+            storage_name="ByteStorage",
+            element_count=len(hidden_payload),
+        )
+        suffix = b"u}(" + encoded_key("hidden") + storage_reference + b"ub."
+    elif duplicate_variant in {"list_reduce", "tuple_reduce", "ordered_reduce"}:
+        storage_reference = _pytorch_storage_binpersid_expr(
+            key="0",
+            storage_name="ByteStorage",
+            element_count=len(hidden_payload),
+        )
+        module_name = b"collections" if duplicate_variant == "ordered_reduce" else b"builtins"
+        callable_name = {
+            "list_reduce": b"list",
+            "tuple_reduce": b"tuple",
+            "ordered_reduce": b"OrderedDict",
+        }[duplicate_variant]
+        suffix = (
+            b"u" + encoded_key("converted") + _global(module_name, callable_name) + b"(" + storage_reference + b"tRs."
+        )
     else:
         storage_reference = _pytorch_storage_binpersid_expr(
             key="0",
@@ -3775,10 +3809,15 @@ def test_scan_file_preserves_hidden_malicious_storage_after_duplicate_state_key(
         archive.writestr("archive/version", "3\n")
         archive.writestr("archive/byteorder", "little")
         archive.writestr("archive/data/0", hidden_payload)
+        if separate_storage:
+            archive.writestr("archive/data/1", b"\x00" * 24)
 
     report = scan_file(archive_path)
 
-    assert package_api._trusted_pytorch_data_pkl_from_storage_member_sizes(payload, {"0": len(hidden_payload)}) is None
+    storage_sizes = {"0": len(hidden_payload)}
+    if separate_storage:
+        storage_sizes["1"] = 24
+    assert package_api._trusted_pytorch_data_pkl_from_storage_member_sizes(payload, storage_sizes) is None
     assert report.verdict == SafetyVerdict.MALICIOUS
     assert any(
         finding.severity == Severity.CRITICAL

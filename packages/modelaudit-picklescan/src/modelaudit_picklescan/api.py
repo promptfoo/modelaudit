@@ -2131,11 +2131,14 @@ def _pytorch_storage_keys_from_pickle_bytes(
         )
 
     def reduce_result(function: Any, args: Any, reduce_position: int) -> Any:
+        nonlocal discarded_tracked_storage_references
+
         if isinstance(function, _PickleGlobalRef) and (function.module, function.name) == (
             "collections",
             "OrderedDict",
         ):
             if args != () and value_contains_tracked_provenance(args):
+                discarded_tracked_storage_references = True
                 invalidate_tensor_rebuild_proof()
             return _PytorchOrderedDictState() if args == () else None
         if isinstance(function, _PickleGlobalRef) and (function.module, function.name) == (
@@ -2147,9 +2150,12 @@ def _pytorch_storage_keys_from_pickle_bytes(
                 canonical_tensor_rebuild_invocations.add((function.position, reduce_position))
                 return canonical_tensor
             else:
+                if value_contains_tracked_provenance(args):
+                    discarded_tracked_storage_references = True
                 invalidate_tensor_rebuild_proof()
             return None
         if value_contains_tracked_provenance(function) or value_contains_tracked_provenance(args):
+            discarded_tracked_storage_references = True
             invalidate_tensor_rebuild_proof()
         return None
 
@@ -2397,14 +2403,19 @@ def _pytorch_storage_keys_from_pickle_bytes(
                 state = stack.pop()
                 obj = stack.pop()
                 if isinstance(obj, _PytorchStorageRef):
+                    discarded_tracked_storage_references = True
                     invalidate_tensor_rebuild_proof()
                     stack.append(None)
                 elif isinstance(obj, _PytorchOrderedDictState):
                     if state is not None:
+                        if value_contains_tracked_provenance(state):
+                            discarded_tracked_storage_references = True
+                            invalidate_tensor_rebuild_proof()
                         mutate_tracked_ordered_dict(obj)
                     stack.append(obj)
                 else:
                     if value_contains_tracked_provenance(obj) or value_contains_tracked_provenance(state):
+                        discarded_tracked_storage_references = True
                         invalidate_tensor_rebuild_proof()
                     stack.append(obj if state is None else None)
             else:
