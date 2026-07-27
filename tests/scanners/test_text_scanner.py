@@ -78,6 +78,78 @@ def test_text_scanner_verified_huggingface_image_readmes_match_immutable_revisio
     assert expected_readmes == text_scanner_module.VERIFIED_HUGGINGFACE_DOCUMENTATION_IMAGE_READMES
 
 
+# Fixture SPDX: Apache-2.0; attribution: Ross Wightman and timm.
+# Pinned source: timm/mobilenetv3_small_100.lamb_in1k@1824797e7887cbec1990e4adbd6675960a36c589.
+@pytest.mark.parametrize(
+    ("crlf", "expected_size", "expected_sha256"),
+    [
+        pytest.param(
+            False,
+            4386,
+            "3950face80991c4f91fb1ead491d787639e08a737f948fd630dd938ae8f78c18",
+            id="lf",
+        ),
+        pytest.param(
+            True,
+            4531,
+            "d15a41ee108ddfa546bc931a553f108be8e9e0c4c3ff2978dab9ee31ba5193f0",
+            id="crlf",
+        ),
+    ],
+)
+def test_text_scanner_real_huggingface_image_readme_preserves_production_security(
+    tmp_path: Path,
+    crlf: bool,
+    expected_size: int,
+    expected_sha256: str,
+) -> None:
+    fixture_path = (
+        Path(__file__).resolve().parents[1]
+        / "assets"
+        / "huggingface_model_cards"
+        / "timm_mobilenetv3_small_100.lamb_in1k_README.txt"
+    )
+    original = fixture_path.read_bytes()
+    assert len(original) == 4386
+    assert hashlib.sha256(original).hexdigest() == "3950face80991c4f91fb1ead491d787639e08a737f948fd630dd938ae8f78c18"
+    assert b"\r" not in original
+
+    payload = original.replace(b"\n", b"\r\n") if crlf else original
+    digest = hashlib.sha256(payload).hexdigest()
+    assert (len(payload), digest) == (expected_size, expected_sha256)
+    assert (len(payload), digest) in text_scanner_module.VERIFIED_HUGGINGFACE_DOCUMENTATION_IMAGE_READMES
+
+    benign_path = tmp_path / "README.md"
+    benign_path.write_bytes(payload)
+    benign = TextScanner().scan(str(benign_path))
+    benign_aggregate = scan_model_directory_or_file(str(benign_path), cache_enabled=False)
+    network_checks = [
+        check
+        for check in benign.checks
+        if check.name == "Network Communication Detection"
+        and (check.details.get("function") == "urlopen" or check.details.get("library") == "urllib")
+    ]
+    assert {check.details.get("type") for check in network_checks} == {"network_function", "network_library"}
+    assert all(check.severity == IssueSeverity.INFO for check in network_checks)
+    assert benign.success is True
+    assert determine_exit_code(benign_aggregate) == 0
+
+    malicious_payload = payload.replace(b"img = Image.open", b"xmg = Image.open", 1)
+    assert len(malicious_payload) == len(payload)
+    assert sum(left != right for left, right in zip(payload, malicious_payload, strict=True)) == 1
+    malicious_path = tmp_path / "tampered" / "README.md"
+    malicious_path.parent.mkdir()
+    malicious_path.write_bytes(malicious_payload)
+    malicious = TextScanner().scan(str(malicious_path))
+    malicious_aggregate = scan_model_directory_or_file(str(malicious_path), cache_enabled=False)
+    assert malicious.success is False
+    assert any(
+        check.details.get("function") == "urlopen" and check.severity == IssueSeverity.CRITICAL
+        for check in _failed_network_detection_checks(malicious)
+    )
+    assert determine_exit_code(malicious_aggregate) == 1
+
+
 def _trust_exact_huggingface_documentation_example(
     monkeypatch: pytest.MonkeyPatch,
     *,
