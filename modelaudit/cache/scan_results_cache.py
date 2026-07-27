@@ -497,6 +497,18 @@ class ScanResultsCache:
             include_private_metadata=include_private_metadata,
         )
 
+    @staticmethod
+    def _configured_repository_scan_root(version_context: dict[str, Any] | None) -> Path | None:
+        if version_context is None:
+            return None
+        scan_config = version_context.get("scan_config")
+        if not isinstance(scan_config, dict):
+            return None
+        configured_root = scan_config.get(REPOSITORY_SCAN_ROOT_CONFIG_KEY)
+        if not isinstance(configured_root, str):
+            return None
+        return Path(configured_root).resolve(strict=False)
+
     def _get_cached_result_with_identity(
         self,
         file_path: str,
@@ -511,15 +523,7 @@ class ScanResultsCache:
                 logger.debug("Bypassing scan-result cache lookup for symlinked path %s", file_path)
                 return None, None
 
-            scan_root: Path | None = None
-            scan_config = version_context.get("scan_config") if version_context is not None else None
-            if isinstance(scan_config, dict):
-                configured_root = scan_config.get(REPOSITORY_SCAN_ROOT_CONFIG_KEY)
-                if isinstance(configured_root, str):
-                    candidate_root = Path(os.path.abspath(configured_root))
-                    scanned_parent = Path(os.path.abspath(file_path)).parent
-                    if candidate_root == scanned_parent or candidate_root in scanned_parent.parents:
-                        scan_root = candidate_root
+            scan_root = self._configured_repository_scan_root(version_context)
 
             uses_default_capture = (
                 getattr(self.capture_file_identity, "__func__", None) is ScanResultsCache.capture_file_identity
@@ -591,6 +595,7 @@ class ScanResultsCache:
         *,
         file_path: str | None = None,
         file_stat: os.stat_result | None = None,
+        version_context: dict[str, Any] | None = None,
         include_private_metadata: bool = False,
     ) -> dict[str, Any] | None:
         """
@@ -611,7 +616,18 @@ class ScanResultsCache:
                 if not self._get_cache_file_path(cache_key).exists():
                     self._record_cache_miss("not_found")
                     return None
-                file_identity = self.capture_file_identity(file_path)
+                scan_root = self._configured_repository_scan_root(version_context)
+                uses_default_capture = (
+                    getattr(self.capture_file_identity, "__func__", None) is ScanResultsCache.capture_file_identity
+                )
+                if scan_root is not None and uses_default_capture:
+                    file_identity = self._capture_file_identity(
+                        file_path,
+                        file_stat=file_stat,
+                        scan_root=scan_root,
+                    )
+                else:
+                    file_identity = self.capture_file_identity(file_path)
                 file_stat = file_identity[0]
             return self._get_cached_result_by_key(
                 cache_key,
@@ -1041,23 +1057,21 @@ class ScanResultsCache:
     ) -> BinaryIO:
         """Return a reusable probe whose inode lives on the scanned file's filesystem."""
         with self._change_clock_probe_lock:
-            scanned_parent = Path(os.path.abspath(file_path)).parent
-            normalized_scan_root = Path(os.path.abspath(scan_root)) if scan_root is not None else None
-            if (
-                normalized_scan_root is not None
-                and normalized_scan_root != scanned_parent
-                and normalized_scan_root not in scanned_parent.parents
-            ):
-                normalized_scan_root = None
+            try:
+                scanned_parent = Path(file_path).resolve(strict=False).parent
+                normalized_scan_root = scan_root.resolve(strict=False) if scan_root is not None else None
+            except (OSError, RuntimeError) as exc:
+                raise ValueError(f"No writable cache identity probe directory for: {file_path}") from exc
             protected_root = normalized_scan_root or scanned_parent
 
             existing = self._change_clock_probes.get(file_device)
             if existing is not None:
-                existing_directory = Path(os.path.abspath(existing[1]))
+                try:
+                    existing_directory = existing[1].resolve(strict=False)
+                except (OSError, RuntimeError) as exc:
+                    raise ValueError(f"No writable cache identity probe directory for: {file_path}") from exc
                 if os.name == "nt" and (
-                    existing_directory == protected_root
-                    or protected_root in existing_directory.parents
-                    or (normalized_scan_root is None and existing_directory in protected_root.parents)
+                    existing_directory == protected_root or protected_root in existing_directory.parents
                 ):
                     raise ValueError(f"No writable cache identity probe directory for: {file_path}")
                 return existing[0]
@@ -1076,16 +1090,17 @@ class ScanResultsCache:
 
             checked: set[Path] = set()
             for candidate in candidates:
-                normalized_candidate = Path(os.path.abspath(candidate))
+                try:
+                    normalized_candidate = candidate.resolve(strict=False)
+                except (OSError, RuntimeError):
+                    continue
                 if os.name == "nt" and (
-                    normalized_candidate == protected_root
-                    or protected_root in normalized_candidate.parents
-                    or (normalized_scan_root is None and normalized_candidate in protected_root.parents)
+                    normalized_candidate == protected_root or protected_root in normalized_candidate.parents
                 ):
                     continue
-                if candidate in checked:
+                if normalized_candidate in checked:
                     continue
-                checked.add(candidate)
+                checked.add(normalized_candidate)
                 if not self._directory_is_on_device(candidate, file_device):
                     continue
 
