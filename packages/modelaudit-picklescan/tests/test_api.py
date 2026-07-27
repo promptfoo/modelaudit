@@ -3872,15 +3872,16 @@ def test_scan_file_suppresses_rebuild_tensor_v2_for_large_batched_state_dict(tmp
     assert not any(finding["rule_code"] == "PERSISTENT_ID" for finding in report["findings"])
 
 
-@pytest.mark.parametrize("padding_bytes", [5000, 32_000])
+@pytest.mark.parametrize(("entry_count", "padding_bytes"), [(33, 5000), (100, 5000), (600, 5000), (600, 32_000)])
 def test_scan_file_preserves_hidden_malicious_storage_inside_compacted_canonical_tensor(
     tmp_path: Path,
+    entry_count: int,
     padding_bytes: int,
 ) -> None:
-    archive_path = tmp_path / f"malicious-compacted-canonical-{padding_bytes}.pt"
+    archive_path = tmp_path / f"malicious-compacted-canonical-{entry_count}-{padding_bytes}.pt"
     hidden_payload = b"S'" + b"A" * padding_bytes + b"'\n0cos\nsystem\n(S'echo compacted-storage'\ntR."
     entries: list[bytes] = []
-    for index in range(600):
+    for index in range(entry_count):
         key = _short_binunicode(f"weight_{index}".encode("ascii"))
         if index == 0:
             value = (
@@ -3901,14 +3902,14 @@ def test_scan_file_preserves_hidden_malicious_storage_inside_compacted_canonical
         archive.writestr("archive/version", "3\n")
         archive.writestr("archive/byteorder", "little")
         archive.writestr("archive/data/0", hidden_payload)
-        for index in range(1, 600):
+        for index in range(1, entry_count):
             archive.writestr(f"archive/data/{index}", b"\x00" * 24)
 
     parsed = package_api._pytorch_storage_keys_from_pickle_bytes(data_pkl)
     report = scan_file(archive_path)
 
     assert parsed.parse_complete is True
-    assert parsed.used_streaming_batch_compaction is True
+    assert parsed.accepted_oversized_state_batch is True
     assert report.verdict == SafetyVerdict.MALICIOUS
     assert any(
         finding.severity == Severity.CRITICAL
@@ -3918,6 +3919,35 @@ def test_scan_file_preserves_hidden_malicious_storage_inside_compacted_canonical
         and "archive/data/0" in finding.location
         for finding in report.findings
     )
+
+
+@pytest.mark.parametrize("container_kind", ["dict-setitem", "dict-setitems", "list", "tuple", "ordered-dict"])
+def test_scan_file_preserves_retained_benign_storage_container(
+    tmp_path: Path,
+    container_kind: str,
+) -> None:
+    archive_path = tmp_path / f"retained-storage-{container_kind}.pt"
+    storage = _pytorch_storage_binpersid_expr()
+    key = _short_binunicode(b"storage")
+    container = {
+        "dict-setitem": b"}" + key + storage + b"s",
+        "dict-setitems": b"}(" + key + storage + b"u",
+        "list": b"]" + storage + b"a",
+        "tuple": storage + b"\x85",
+        "ordered-dict": _pytorch_empty_ordered_dict_reduce_expr() + key + storage + b"s",
+    }[container_kind]
+    data_pkl = b"\x80\x04" + container + b"."
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", data_pkl)
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", b"\x00" * 24)
+
+    report = scan_file(archive_path)
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert not any(finding.rule_code == "PERSISTENT_ID" for finding in report.findings)
 
 
 @pytest.mark.parametrize(("leading_metadata", "metadata_value"), [(False, b"K\x01"), (True, b"}")])

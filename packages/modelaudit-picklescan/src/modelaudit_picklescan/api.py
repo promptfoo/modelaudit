@@ -391,6 +391,7 @@ class _PytorchStorageReferenceParse:
     all_persistent_ids_are_pytorch_storage: bool
     discarded_tracked_storage_references: bool = False
     used_streaming_batch_compaction: bool = False
+    accepted_oversized_state_batch: bool = False
 
 
 @dataclass(frozen=True)
@@ -1143,7 +1144,7 @@ def _validated_pytorch_storage_entry_ids(
         for storage_key in exact_trusted_storage_keys:
             entry_id = id(storage_entries_by_key[storage_key])
             trusted_entry_ids.add(entry_id)
-            if reference_parse.used_streaming_batch_compaction:
+            if reference_parse.used_streaming_batch_compaction or reference_parse.accepted_oversized_state_batch:
                 expanded_trust_entry_ids.add(entry_id)
         for storage_key in storage_probe_keys:
             storage_probe_entry_ids.add(id(storage_entries_by_key[storage_key]))
@@ -1876,6 +1877,7 @@ def _merge_pytorch_storage_reference_parses(
         all_persistent_ids_are_pytorch_storage=all(parsed.all_persistent_ids_are_pytorch_storage for parsed in parses),
         discarded_tracked_storage_references=any(parsed.discarded_tracked_storage_references for parsed in parses),
         used_streaming_batch_compaction=any(parsed.used_streaming_batch_compaction for parsed in parses),
+        accepted_oversized_state_batch=any(parsed.accepted_oversized_state_batch for parsed in parses),
     )
 
 
@@ -1920,6 +1922,7 @@ def _pytorch_storage_keys_from_pickle_bytes(
     all_persistent_ids_are_pytorch_storage = True
     discarded_tracked_storage_references = False
     used_streaming_batch_compaction = False
+    accepted_oversized_state_batch = False
     provenance_nodes_inspected = 0
 
     def invalidate_tensor_rebuild_proof() -> None:
@@ -2265,6 +2268,7 @@ def _pytorch_storage_keys_from_pickle_bytes(
                 if (
                     stack
                     and isinstance(stack[-1], (tuple, list, dict, _PytorchOrderedDictState))
+                    and canonical_tensor_rebuild_invocations
                     and (value_contains_tracked_provenance(stack[-1], storage_only=True))
                 ):
                     discarded_tracked_storage_references = True
@@ -2461,6 +2465,8 @@ def _pytorch_storage_keys_from_pickle_bytes(
                 batch_has_canonical_tensor = any(
                     setitems_entry_contains_canonical_tensor(value) for _key, value in setitem_pairs
                 )
+                if len(setitem_pairs) * 2 > _PYTORCH_STORAGE_TRUST_MAX_TUPLE_WIDTH:
+                    accepted_oversized_state_batch = True
                 if len(setitem_pairs) * 2 > _PYTORCH_STORAGE_TRUST_MAX_TUPLE_WIDTH and (
                     not tensor_rebuild_proof_valid
                     or not all(setitems_entry_is_safe(key, value) for key, value in setitem_pairs)
@@ -2558,6 +2564,7 @@ def _pytorch_storage_keys_from_pickle_bytes(
         all_persistent_ids_are_pytorch_storage=all_persistent_ids_are_pytorch_storage,
         discarded_tracked_storage_references=discarded_tracked_storage_references,
         used_streaming_batch_compaction=used_streaming_batch_compaction,
+        accepted_oversized_state_batch=accepted_oversized_state_batch,
     )
 
 
