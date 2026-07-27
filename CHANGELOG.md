@@ -7,12 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-
-- Avoid network false positives for bounded README examples that download sample images over HTTPS from Hugging Face.
-
 ### Bug Fixes
 
+- Avoid network false positives for bounded README examples that download sample images over HTTPS from Hugging Face.
 - Prevent Windows cache identity probes from creating locked temporary files inside scanned directories.
 
 ## [0.2.52](https://github.com/promptfoo/modelaudit/compare/v0.2.51...v0.2.52) (2026-07-22)

@@ -2859,6 +2859,11 @@ class TestNetworkCommDetector:
             "requests.get(image_url, stream=True)\nmatch payload:\n    case image_url:\n        fetch(image_url)",
             "builtins.exec('requests.get(input())')\nrequests.get(image_url, stream=True)",
             "namespace['exec']('requests.get(input())')\nrequests.get(image_url, stream=True)",
+            "from attacker import endpoint as image_url\nrequests.get(image_url, stream=True)",
+            "import attacker as image_url\nrequests.get(image_url, stream=True)",
+            "replace_requests_get()\nrequests.get(image_url, stream=True)",
+            "from attacker import install_hook\ninstall_hook()\nrequests.get(image_url, stream=True)",
+            "__builtins__['ex' + 'ec']('requests.get(input())')\nrequests.get(image_url, stream=True)",
         ],
     )
     def test_readme_python_example_preserves_rebound_or_unproven_requests(

@@ -1970,6 +1970,13 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
     protected_names.update(
         call.args[0].id for call in requests_calls if len(call.args) == 1 and isinstance(call.args[0], ast.Name)
     )
+    callable_assignments = {
+        target.id
+        for statement in tree.body
+        if isinstance(statement, ast.Assign) and isinstance(statement.value, ast.Call)
+        for target in statement.targets
+        if isinstance(target, ast.Name)
+    }
     allowed_targets: set[int] = set()
     assignments: dict[str, list[tuple[int, str | None]]] = {}
     for statement in tree.body:
@@ -1985,15 +1992,16 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
     for node in nodes:
         if isinstance(node, ast.Import):
             for alias in node.names:
+                imported_name = alias.asname or alias.name.split(".", maxsplit=1)[0]
                 if (
                     alias.name.split(".", maxsplit=1)[0] in {"builtins", "importlib", "sys"}
-                    or alias.asname == "requests"
+                    or (imported_name in protected_names and not (alias.name == "requests" and node in imports))
                     or (alias.name == "requests" and node not in imports)
                 ):
                     return False
         if isinstance(node, ast.ImportFrom) and (
             (node.module or "").split(".", maxsplit=1)[0] in {"builtins", "importlib", "requests", "sys"}
-            or any(alias.name == "*" or alias.name == "requests" or alias.asname == "requests" for alias in node.names)
+            or any(alias.name == "*" or (alias.asname or alias.name) in protected_names for alias in node.names)
         ):
             return False
         if isinstance(node, ast.Match):
@@ -2032,6 +2040,12 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
             return False
         if isinstance(node, ast.ExceptHandler) and node.name in protected_names:
             return False
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id not in callable_assignments | {"enumerate", "len", "print", "range", "round", "zip"}
+        ):
+            return False
         if isinstance(node, ast.Attribute) and node.attr in {"eval", "exec", "__import__"}:
             return False
         if (
@@ -2054,6 +2068,7 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
                 "delattr",
                 "vars",
                 "__import__",
+                "__builtins__",
             }
         ):
             return False
