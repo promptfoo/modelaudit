@@ -12,6 +12,7 @@ import threading
 import time
 from collections.abc import Callable, Iterable
 from contextlib import suppress
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass
 from importlib.machinery import (
     BYTECODE_SUFFIXES,
@@ -31,6 +32,11 @@ from .adaptive_cache_keys import AdaptiveCacheKeyGenerator
 from .optimized_config import build_cache_version_context
 
 logger = logging.getLogger(__name__)
+
+_CAPTURE_REPOSITORY_SCAN_ROOT: ContextVar[Path | None] = ContextVar(
+    "modelaudit_capture_repository_scan_root",
+    default=None,
+)
 
 _CALL_GRAPH_SOURCE_FINGERPRINTS_KEY = "call_graph_source_fingerprints"
 _CALL_GRAPH_SOURCE_FINGERPRINT_MAX_BYTES = 1024 * 1024
@@ -509,6 +515,17 @@ class ScanResultsCache:
             return None
         return Path(configured_root).resolve(strict=False)
 
+    def _capture_identity_with_repository_scan_root(
+        self,
+        file_path: str,
+        scan_root: Path,
+    ) -> ScannedFileIdentity:
+        root_token = _CAPTURE_REPOSITORY_SCAN_ROOT.set(scan_root)
+        try:
+            return self.capture_file_identity(file_path)
+        finally:
+            _CAPTURE_REPOSITORY_SCAN_ROOT.reset(root_token)
+
     def _get_cached_result_with_identity(
         self,
         file_path: str,
@@ -533,6 +550,11 @@ class ScanResultsCache:
                     file_path,
                     file_stat=file_stat,
                     scan_root=scan_root,
+                )
+            elif scan_root is not None:
+                file_identity = self._capture_identity_with_repository_scan_root(
+                    file_path,
+                    scan_root,
                 )
             elif uses_default_capture and file_stat is not None:
                 file_identity = self._capture_file_identity(file_path, file_stat=file_stat)
@@ -625,6 +647,11 @@ class ScanResultsCache:
                         file_path,
                         file_stat=file_stat,
                         scan_root=scan_root,
+                    )
+                elif scan_root is not None:
+                    file_identity = self._capture_identity_with_repository_scan_root(
+                        file_path,
+                        scan_root,
                     )
                 else:
                     file_identity = self.capture_file_identity(file_path)
@@ -926,7 +953,14 @@ class ScanResultsCache:
 
     def capture_file_identity(self, file_path: str) -> ScannedFileIdentity:
         """Capture a stable stat, content hash, and platform change token before scanning."""
-        return self._capture_file_identity(file_path, file_stat=None)
+        scan_root = _CAPTURE_REPOSITORY_SCAN_ROOT.get()
+        if scan_root is None:
+            return self._capture_file_identity(file_path, file_stat=None)
+        return self._capture_file_identity(
+            file_path,
+            file_stat=None,
+            scan_root=scan_root,
+        )
 
     def _capture_file_identity(
         self,
@@ -1104,8 +1138,7 @@ class ScanResultsCache:
             if os.name == "nt":
                 # Windows keeps TemporaryFile names visible and locked until close.
                 candidates = [Path(tempfile.gettempdir()), self.cache_dir]
-                if normalized_scan_root is not None:
-                    candidates.extend(normalized_scan_root.parents)
+                candidates.extend(protected_root.parents)
             else:
                 candidates = [self.cache_dir, Path(tempfile.gettempdir())]
                 ancestor = scanned_parent

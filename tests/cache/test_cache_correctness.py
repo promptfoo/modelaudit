@@ -508,6 +508,48 @@ def test_windows_change_clock_probe_preserves_temporary_directory_ancestor(
         cache._change_clock_probes.clear()
 
 
+def test_windows_change_clock_probe_uses_safe_ancestor_without_scan_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    volume_root = tmp_path / "model-volume"
+    scanned_parent = volume_root / "models"
+    scanned_parent.mkdir(parents=True)
+    file_path = _make_cacheable_file(scanned_parent)
+    file_device = file_path.stat().st_dev
+    off_device_cache = tmp_path / "off-device-cache"
+    off_device_temp = tmp_path / "off-device-temp"
+    cache = ScanResultsCache(str(off_device_cache))
+    safe_ancestor = scanned_parent.parent.resolve()
+    attempted_probe_dirs: list[Path] = []
+
+    with tempfile.TemporaryFile(mode="w+b", dir=safe_ancestor) as probe:
+
+        def create_safe_ancestor_probe(*_args: Any, dir: str | Path, **_kwargs: Any) -> BinaryIO:
+            attempted_probe_dirs.append(type(file_path)(dir))
+            return cast(BinaryIO, probe)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "name", "nt")
+            patch.setattr(scan_results_cache_module, "Path", type(file_path))
+            patch.setattr(tempfile, "gettempdir", lambda: str(off_device_temp))
+            patch.setattr(
+                cache,
+                "_directory_is_on_device",
+                lambda directory, _device: directory == safe_ancestor,
+            )
+            patch.setattr(tempfile, "TemporaryFile", create_safe_ancestor_probe)
+
+            selected_probe = cache._get_change_clock_probe(str(file_path), file_device)
+
+        assert selected_probe is probe
+        assert attempted_probe_dirs == [safe_ancestor]
+        assert safe_ancestor != scanned_parent
+        assert scanned_parent not in safe_ancestor.parents
+        assert cache._change_clock_probes[file_device] == (cast(BinaryIO, probe), safe_ancestor)
+        cache._change_clock_probes.clear()
+
+
 def test_windows_change_clock_probe_uses_safe_ancestor_outside_scan_root(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -854,6 +896,153 @@ def test_windows_batch_lookup_preserves_actual_repository_scan_root(
     assert results[str(file_path)] is None
     assert attempted_probe_dirs == []
     assert cache._change_clock_probes == {}
+
+
+def test_windows_cache_lookup_propagates_repository_root_through_legacy_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scan_root = tmp_path / "scan-root"
+    models = scan_root / "models"
+    models.mkdir(parents=True)
+    file_path = _make_cacheable_file(models)
+    unsafe_cache = scan_root / "cache"
+    off_device_temp = tmp_path / "off-device-temp"
+    attempted_probe_dirs: list[Path] = []
+
+    class LegacyCaptureCache(ScanResultsCache):
+        def __init__(self, cache_dir: str) -> None:
+            super().__init__(cache_dir)
+            self.capture_called = False
+
+        def capture_file_identity(self, path: str) -> Any:
+            self.capture_called = True
+            return super().capture_file_identity(path)
+
+    cache = LegacyCaptureCache(str(unsafe_cache))
+    version_context = build_cache_version_context({REPOSITORY_SCAN_ROOT_CONFIG_KEY: str(scan_root)})
+
+    def forbid_internal_probe(*_args: Any, dir: str | Path, **_kwargs: Any) -> BinaryIO:
+        attempted_probe_dirs.append(type(file_path)(dir))
+        raise OSError("a legacy override must not create a probe in the repository")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "name", "nt")
+        patch.setattr(scan_results_cache_module, "Path", type(file_path))
+        patch.setattr(tempfile, "gettempdir", lambda: str(off_device_temp))
+        patch.setattr(
+            cache,
+            "_directory_is_on_device",
+            lambda directory, _device: directory == unsafe_cache,
+        )
+        patch.setattr(tempfile, "TemporaryFile", forbid_internal_probe)
+
+        result = cache.get_cached_result_with_identity(
+            str(file_path),
+            version_context=version_context,
+        )
+
+    assert result == (None, None)
+    assert cache.capture_called is True
+    assert attempted_probe_dirs == []
+    assert cache._change_clock_probes == {}
+    assert scan_results_cache_module._CAPTURE_REPOSITORY_SCAN_ROOT.get() is None
+
+
+def test_windows_batch_lookup_propagates_repository_root_through_legacy_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scan_root = tmp_path / "scan-root"
+    models = scan_root / "models"
+    models.mkdir(parents=True)
+    file_path = _make_cacheable_file(models)
+    unsafe_cache = scan_root / "cache"
+    off_device_temp = tmp_path / "off-device-temp"
+
+    class LegacyCaptureCache(ScanResultsCache):
+        def __init__(self, cache_dir: str) -> None:
+            super().__init__(cache_dir)
+            self.capture_called = False
+
+        def capture_file_identity(self, path: str) -> Any:
+            self.capture_called = True
+            return super().capture_file_identity(path)
+
+    cache_manager = get_cache_manager(str(unsafe_cache), enabled=True)
+    cache = LegacyCaptureCache(str(unsafe_cache))
+    cache_manager.cache = cache
+    batch_operations = BatchCacheOperations(cache_manager)
+    version_context = build_cache_version_context({REPOSITORY_SCAN_ROOT_CONFIG_KEY: str(scan_root)})
+    expected = {
+        "checks": [],
+        "issues": [],
+        "metadata": {},
+        "scanner": "test",
+        "success": True,
+    }
+
+    assert cache_manager.store_result(
+        str(file_path),
+        expected,
+        version_context=version_context,
+        **_identity_kwargs(cache, str(file_path)),
+    )
+    cache_key = cache.generate_cache_key(str(file_path), version_context=version_context)
+    assert cache_key is not None
+    assert cache._get_cache_file_path(cache_key).exists()
+    for existing_probe, _probe_directory in tuple(cache._change_clock_probes.values()):
+        existing_probe.close()
+    cache._change_clock_probes.clear()
+    cache.capture_called = False
+    attempted_probe_dirs: list[Path] = []
+
+    def forbid_internal_probe(*_args: Any, dir: str | Path, **_kwargs: Any) -> BinaryIO:
+        attempted_probe_dirs.append(type(file_path)(dir))
+        raise OSError("a legacy batch override must not create a repository-root probe")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "name", "nt")
+        patch.setattr(scan_results_cache_module, "Path", type(file_path))
+        patch.setattr(tempfile, "gettempdir", lambda: str(off_device_temp))
+        patch.setattr(
+            cache,
+            "_directory_is_on_device",
+            lambda directory, _device: directory == unsafe_cache,
+        )
+        patch.setattr(tempfile, "TemporaryFile", forbid_internal_probe)
+
+        results = batch_operations.batch_lookup(
+            [str(file_path)],
+            version_context=version_context,
+        )
+
+    assert results[str(file_path)] is None
+    assert cache.capture_called is True
+    assert attempted_probe_dirs == []
+    assert cache._change_clock_probes == {}
+    assert scan_results_cache_module._CAPTURE_REPOSITORY_SCAN_ROOT.get() is None
+
+
+def test_repository_scan_root_context_resets_after_legacy_override_failure(
+    tmp_path: Path,
+) -> None:
+    scan_root = tmp_path / "scan-root"
+    scan_root.mkdir()
+    file_path = _make_cacheable_file(scan_root)
+
+    class FailingLegacyCaptureCache(ScanResultsCache):
+        def capture_file_identity(self, _path: str) -> Any:
+            raise ValueError("legacy identity capture deliberately failed")
+
+    cache = FailingLegacyCaptureCache(str(tmp_path / "isolated-cache"))
+    version_context = build_cache_version_context({REPOSITORY_SCAN_ROOT_CONFIG_KEY: str(scan_root)})
+
+    assert cache.get_cached_result_with_identity(
+        str(file_path),
+        version_context=version_context,
+    ) == (None, None)
+    assert scan_results_cache_module._CAPTURE_REPOSITORY_SCAN_ROOT.get() is None
 
 
 @pytest.mark.parametrize("safe_location", ("cache", "system_temp"))
