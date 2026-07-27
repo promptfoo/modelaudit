@@ -3438,11 +3438,12 @@ def _write_large_batched_pytorch_state_dict(
     malicious: bool = False,
     entry_count: int = 600,
     leading_metadata: bool = False,
+    metadata_value: bytes = b"K\x01",
 ) -> None:
     entries: list[bytes] = []
     if leading_metadata:
         metadata_key = b"_extra_state"
-        entries.append(b"X" + len(metadata_key).to_bytes(4, "little") + metadata_key + b"K\x01")
+        entries.append(b"X" + len(metadata_key).to_bytes(4, "little") + metadata_key + metadata_value)
     for index in range(entry_count):
         key_bytes = f"weight_{index}".encode("ascii")
         key = b"X" + len(key_bytes).to_bytes(4, "little") + key_bytes
@@ -3463,17 +3464,22 @@ def _write_large_batched_pytorch_state_dict(
             archive.writestr(f"archive/data/{index}", b"\x00" * 24)
 
 
-@pytest.mark.parametrize(("entry_count", "leading_metadata"), [(600, False), (1000, False), (600, True)])
+@pytest.mark.parametrize(
+    ("entry_count", "leading_metadata", "metadata_value"),
+    [(600, False, b"K\x01"), (1000, False, b"K\x01"), (600, True, b"K\x01"), (600, True, b"}")],
+)
 def test_pytorch_storage_trust_parses_large_batched_state_dict_without_framework(
     tmp_path: Path,
     entry_count: int,
     leading_metadata: bool,
+    metadata_value: bytes,
 ) -> None:
     archive_path = tmp_path / f"large-batched-state-{entry_count}-{leading_metadata}.pt"
     _write_large_batched_pytorch_state_dict(
         archive_path,
         entry_count=entry_count,
         leading_metadata=leading_metadata,
+        metadata_value=metadata_value,
     )
     with zipfile.ZipFile(archive_path) as archive:
         payload = archive.read("archive/data.pkl")
@@ -3498,13 +3504,19 @@ def test_scan_file_suppresses_rebuild_tensor_v2_for_large_batched_state_dict(tmp
     assert not any(finding["rule_code"] == "PERSISTENT_ID" for finding in report["findings"])
 
 
-@pytest.mark.parametrize("leading_metadata", [False, True])
+@pytest.mark.parametrize(("leading_metadata", "metadata_value"), [(False, b"K\x01"), (True, b"}")])
 def test_scan_file_preserves_malicious_call_in_large_batched_state_dict(
     tmp_path: Path,
     leading_metadata: bool,
+    metadata_value: bytes,
 ) -> None:
     archive_path = tmp_path / f"large-batched-malicious-state-{leading_metadata}.pt"
-    _write_large_batched_pytorch_state_dict(archive_path, malicious=True, leading_metadata=leading_metadata)
+    _write_large_batched_pytorch_state_dict(
+        archive_path,
+        malicious=True,
+        leading_metadata=leading_metadata,
+        metadata_value=metadata_value,
+    )
 
     report = _scan_file_report_dict_subprocess(archive_path)
 
@@ -3541,6 +3553,31 @@ def test_pytorch_storage_trust_rejects_canonical_setitems_beyond_bounded_batch(t
 
     assert parsed.parse_complete is False
     assert parsed.referenced_keys == set()
+    assert parsed.canonical_tensor_rebuild_invocations == set()
+
+
+def test_pytorch_storage_trust_invalidates_unfinished_compacted_batch(tmp_path: Path) -> None:
+    archive_path = tmp_path / "unfinished-canonical-batch.pt"
+    _write_large_batched_pytorch_state_dict(archive_path)
+    with zipfile.ZipFile(archive_path) as archive:
+        payload = archive.read("archive/data.pkl")
+
+    parsed = package_api._pytorch_storage_keys_from_pickle_bytes(payload[:-2] + b".")
+
+    assert parsed.parse_complete is False
+    assert parsed.referenced_keys == set()
+    assert parsed.canonical_tensor_rebuild_invocations == set()
+
+
+def test_pytorch_storage_trust_clears_compacted_batch_after_malformed_provenance(tmp_path: Path) -> None:
+    archive_path = tmp_path / "malformed-canonical-batch.pt"
+    _write_large_batched_pytorch_state_dict(archive_path)
+    with zipfile.ZipFile(archive_path) as archive:
+        payload = archive.read("archive/data.pkl")
+
+    parsed = package_api._pytorch_storage_keys_from_pickle_bytes(payload[:-2] + b"\x82\x01.")
+
+    assert parsed.parse_complete is True
     assert parsed.canonical_tensor_rebuild_invocations == set()
 
 

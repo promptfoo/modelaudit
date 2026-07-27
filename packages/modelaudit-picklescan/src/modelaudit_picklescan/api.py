@@ -1893,8 +1893,12 @@ def _pytorch_storage_keys_from_pickle_bytes(
         tensor_rebuild_proof_valid = False
 
     def clear_stack_after_malformed_provenance() -> None:
+        nonlocal canonical_batch_target
+
         invalidate_tensor_rebuild_proof()
         stack.clear()
+        canonical_batch_entries.clear()
+        canonical_batch_target = None
 
     def poison_stack_top() -> None:
         invalidate_tensor_rebuild_proof()
@@ -1971,7 +1975,10 @@ def _pytorch_storage_keys_from_pickle_bytes(
             value = stack[pair_index + 1]
             if not isinstance(key, str):
                 continue
-            if value is not canonical_tensor and not isinstance(value, (str, int, float, bytes, type(None))):
+            if value is not canonical_tensor and (
+                not isinstance(value, (str, int, float, bytes, type(None), tuple, list, dict))
+                or value_contains_tracked_provenance(value)
+            ):
                 continue
             if value is not canonical_tensor and not (
                 any(item is canonical_tensor for item in stack[pair_index + 2 :])
@@ -2119,6 +2126,8 @@ def _pytorch_storage_keys_from_pickle_bytes(
             if opcode_name in {"PROTO", "FRAME"}:
                 continue
             if opcode_name == "STOP":
+                if canonical_batch_entries:
+                    return _PytorchStorageReferenceParse(set(), {}, set(), set(), False, False)
                 if not isinstance(_pos, int) or _pos + 1 != len(pickle_data):
                     invalidate_tensor_rebuild_proof()
                 continue
