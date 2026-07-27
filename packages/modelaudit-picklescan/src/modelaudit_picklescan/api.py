@@ -390,6 +390,7 @@ class _PytorchStorageReferenceParse:
     parse_complete: bool
     all_persistent_ids_are_pytorch_storage: bool
     discarded_tracked_storage_references: bool = False
+    used_streaming_batch_compaction: bool = False
 
 
 @dataclass(frozen=True)
@@ -401,6 +402,7 @@ class _PytorchZipDataPickleTrust:
 @dataclass(frozen=True)
 class _PytorchZipStorageEntries:
     trusted_entry_ids: set[int]
+    expanded_trust_entry_ids: set[int]
     storage_probe_entry_ids: set[int]
     trusted_data_pkl_by_name: dict[str, _PytorchZipDataPickleTrust]
 
@@ -930,7 +932,11 @@ def _discover_pytorch_zip_pickle_entries(
             entry_id = id(entry)
             storage_probe_bytes = None
             if entry_id in storage_entries.trusted_entry_ids:
-                storage_probe_bytes = _TRUSTED_STORAGE_PICKLE_PROBE_BYTES
+                storage_probe_bytes = (
+                    _PICKLE_DISCOVERY_LONG_PROBE_BYTES
+                    if entry_id in storage_entries.expanded_trust_entry_ids
+                    else _TRUSTED_STORAGE_PICKLE_PROBE_BYTES
+                )
             elif entry_id in storage_entries.storage_probe_entry_ids:
                 storage_probe_bytes = _PICKLE_DISCOVERY_LONG_PROBE_BYTES
             if storage_probe_bytes is not None:
@@ -980,6 +986,7 @@ def _validated_pytorch_storage_entry_ids(
         entries_by_name.setdefault(name, []).append(entry)
 
     trusted_entry_ids: set[int] = set()
+    expanded_trust_entry_ids: set[int] = set()
     storage_probe_entry_ids: set[int] = set()
     trusted_data_pkl_by_name: dict[str, _PytorchZipDataPickleTrust] = {}
     notices: list[Notice] = []
@@ -1134,13 +1141,17 @@ def _validated_pytorch_storage_entry_ids(
                 ),
             )
         for storage_key in exact_trusted_storage_keys:
-            trusted_entry_ids.add(id(storage_entries_by_key[storage_key]))
+            entry_id = id(storage_entries_by_key[storage_key])
+            trusted_entry_ids.add(entry_id)
+            if reference_parse.used_streaming_batch_compaction:
+                expanded_trust_entry_ids.add(entry_id)
         for storage_key in storage_probe_keys:
             storage_probe_entry_ids.add(id(storage_entries_by_key[storage_key]))
 
     return (
         _PytorchZipStorageEntries(
             trusted_entry_ids=trusted_entry_ids,
+            expanded_trust_entry_ids=expanded_trust_entry_ids,
             storage_probe_entry_ids=storage_probe_entry_ids,
             trusted_data_pkl_by_name=trusted_data_pkl_by_name,
         ),
@@ -1864,6 +1875,7 @@ def _merge_pytorch_storage_reference_parses(
         parse_complete=True,
         all_persistent_ids_are_pytorch_storage=all(parsed.all_persistent_ids_are_pytorch_storage for parsed in parses),
         discarded_tracked_storage_references=any(parsed.discarded_tracked_storage_references for parsed in parses),
+        used_streaming_batch_compaction=any(parsed.used_streaming_batch_compaction for parsed in parses),
     )
 
 
@@ -1907,6 +1919,7 @@ def _pytorch_storage_keys_from_pickle_bytes(
     tensor_rebuild_proof_valid = True
     all_persistent_ids_are_pytorch_storage = True
     discarded_tracked_storage_references = False
+    used_streaming_batch_compaction = False
     provenance_nodes_inspected = 0
 
     def invalidate_tensor_rebuild_proof() -> None:
@@ -1988,7 +2001,11 @@ def _pytorch_storage_keys_from_pickle_bytes(
             or (
                 isinstance(value, (str, int, float, bytes, type(None), tuple, list, dict))
                 and not value_contains_tracked_provenance(value, storage_only=True)
-                and (not trusted_canonical_batch_seen or not value_contains_tracked_provenance(value))
+                and (
+                    not trusted_canonical_batch_seen
+                    or not value_contains_tracked_provenance(value)
+                    or setitems_entry_contains_canonical_tensor(value)
+                )
             )
         )
 
@@ -2069,7 +2086,7 @@ def _pytorch_storage_keys_from_pickle_bytes(
         return None
 
     def compact_canonical_setitems_stack() -> bool:
-        nonlocal canonical_batch_target
+        nonlocal canonical_batch_target, used_streaming_batch_compaction
 
         if len(canonical_batch_entries) >= _PYTORCH_STORAGE_TRUST_MAX_STACK_DEPTH:
             return False
@@ -2101,6 +2118,7 @@ def _pytorch_storage_keys_from_pickle_bytes(
                 pair_index += 1
             canonical_batch_entries.append((key, value))
             del stack[pair_index : pair_index + 2]
+            used_streaming_batch_compaction = True
             return True
         return False
 
@@ -2539,6 +2557,7 @@ def _pytorch_storage_keys_from_pickle_bytes(
         parse_complete=True,
         all_persistent_ids_are_pytorch_storage=all_persistent_ids_are_pytorch_storage,
         discarded_tracked_storage_references=discarded_tracked_storage_references,
+        used_streaming_batch_compaction=used_streaming_batch_compaction,
     )
 
 

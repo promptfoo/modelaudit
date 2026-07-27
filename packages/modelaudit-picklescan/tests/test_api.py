@@ -3720,6 +3720,35 @@ def test_pytorch_storage_trust_parses_large_batch_with_leading_nested_canonical_
     assert len(parsed.canonical_tensor_rebuild_invocations) == 601
 
 
+@pytest.mark.parametrize("container_kind", ["list", "tuple", "dictionary"])
+def test_pytorch_storage_trust_parses_nested_canonical_tensor_in_later_state_batch(
+    tmp_path: Path,
+    container_kind: Literal["list", "tuple", "dictionary"],
+) -> None:
+    archive_path = tmp_path / f"later-batch-nested-canonical-{container_kind}.pt"
+    _write_large_batched_pytorch_state_dict(archive_path, entry_count=1000)
+    with zipfile.ZipFile(archive_path) as archive:
+        first_batch = archive.read("archive/data.pkl")
+    nested_tensor = _pytorch_rebuild_tensor_v2_reduce_expr(key="1000")
+    nested_value = {
+        "list": b"]" + nested_tensor + b"a",
+        "tuple": nested_tensor + b"\x85",
+        "dictionary": b"}" + _short_binunicode(b"calibration") + nested_tensor + b"s",
+    }[container_kind]
+    later_entries = [_short_binunicode(b"_extra_state") + nested_value]
+    later_entries.extend(
+        _short_binunicode(f"weight_{index}".encode("ascii")) + _pytorch_rebuild_tensor_v2_reduce_expr(key=str(index))
+        for index in range(1001, 1033)
+    )
+    payload = first_batch.removesuffix(b".") + b"(" + b"".join(later_entries) + b"u."
+
+    parsed = package_api._pytorch_storage_keys_from_pickle_bytes(payload)
+
+    assert parsed.parse_complete is True
+    assert len(parsed.referenced_keys) == 1033
+    assert len(parsed.canonical_tensor_rebuild_invocations) == 1033
+
+
 @pytest.mark.parametrize(("leading_metadata_count", "split_batch"), [(510, False), (1000, False), (1000, True)])
 def test_pytorch_storage_trust_parses_large_metadata_prefix_before_canonical_tensor(
     tmp_path: Path,
@@ -3841,6 +3870,54 @@ def test_scan_file_suppresses_rebuild_tensor_v2_for_large_batched_state_dict(tmp
     assert report["verdict"] == "clean"
     assert _torch_rebuild_tensor_v2_warning_dicts(report) == []
     assert not any(finding["rule_code"] == "PERSISTENT_ID" for finding in report["findings"])
+
+
+@pytest.mark.parametrize("padding_bytes", [5000, 32_000])
+def test_scan_file_preserves_hidden_malicious_storage_inside_compacted_canonical_tensor(
+    tmp_path: Path,
+    padding_bytes: int,
+) -> None:
+    archive_path = tmp_path / f"malicious-compacted-canonical-{padding_bytes}.pt"
+    hidden_payload = b"S'" + b"A" * padding_bytes + b"'\n0cos\nsystem\n(S'echo compacted-storage'\ntR."
+    entries: list[bytes] = []
+    for index in range(600):
+        key = _short_binunicode(f"weight_{index}".encode("ascii"))
+        if index == 0:
+            value = (
+                _pytorch_rebuild_tensor_v2_payload(
+                    key="0",
+                    storage_name="ByteStorage",
+                    element_count=len(hidden_payload),
+                )
+                .removeprefix(b"\x80\x04")
+                .removesuffix(b".")
+            )
+        else:
+            value = _pytorch_rebuild_tensor_v2_reduce_expr(key=str(index))
+        entries.append(key + value)
+    data_pkl = b"\x80\x04" + _pytorch_empty_ordered_dict_reduce_expr() + b"(" + b"".join(entries) + b"u."
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", data_pkl)
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", hidden_payload)
+        for index in range(1, 600):
+            archive.writestr(f"archive/data/{index}", b"\x00" * 24)
+
+    parsed = package_api._pytorch_storage_keys_from_pickle_bytes(data_pkl)
+    report = scan_file(archive_path)
+
+    assert parsed.parse_complete is True
+    assert parsed.used_streaming_batch_compaction is True
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.severity == Severity.CRITICAL
+        and finding.details.get("module") in {"os", "posix", "nt"}
+        and finding.details.get("name") == "system"
+        and finding.location is not None
+        and "archive/data/0" in finding.location
+        for finding in report.findings
+    )
 
 
 @pytest.mark.parametrize(("leading_metadata", "metadata_value"), [(False, b"K\x01"), (True, b"}")])
