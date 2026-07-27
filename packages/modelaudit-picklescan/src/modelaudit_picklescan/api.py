@@ -1930,6 +1930,15 @@ def _pytorch_storage_keys_from_pickle_bytes(
             return any(value_contains_tracked_provenance(item, seen) for item in value.items())
         return any(value_contains_tracked_provenance(item, seen) for item in value)
 
+    def setitems_entry_is_safe(key: object, value: object) -> bool:
+        return isinstance(key, str) and (
+            value is canonical_tensor
+            or (
+                isinstance(value, (str, int, float, bytes, type(None), tuple, list, dict))
+                and not value_contains_tracked_provenance(value)
+            )
+        )
+
     def apply_setitems_to_target(items: tuple[tuple[Any, Any], ...]) -> None:
         if isinstance(stack[-1], _PytorchStorageRef):
             poison_stack_top()
@@ -1973,12 +1982,7 @@ def _pytorch_storage_keys_from_pickle_bytes(
                 continue
             key = stack[pair_index]
             value = stack[pair_index + 1]
-            if not isinstance(key, str):
-                continue
-            if value is not canonical_tensor and (
-                not isinstance(value, (str, int, float, bytes, type(None), tuple, list, dict))
-                or value_contains_tracked_provenance(value)
-            ):
+            if not setitems_entry_is_safe(key, value):
                 continue
             if value is not canonical_tensor and not (
                 any(item is canonical_tensor for item in stack[pair_index + 2 :])
@@ -2285,6 +2289,11 @@ def _pytorch_storage_keys_from_pickle_bytes(
                     setitem_pairs = tuple(
                         (setitem_items[index], setitem_items[index + 1]) for index in range(0, len(setitem_items), 2)
                     )
+                if len(setitem_pairs) * 2 > _PYTORCH_STORAGE_TRUST_MAX_TUPLE_WIDTH and (
+                    not any(value is canonical_tensor for _key, value in setitem_pairs)
+                    or not all(setitems_entry_is_safe(key, value) for key, value in setitem_pairs)
+                ):
+                    return _PytorchStorageReferenceParse(set(), {}, set(), set(), False, False)
                 apply_setitems_to_target(setitem_pairs)
             elif opcode_name == "BINPERSID":
                 pid = stack.pop() if stack else None

@@ -3540,6 +3540,55 @@ def test_pytorch_storage_trust_rejects_setitems_beyond_stack_limit() -> None:
     assert parsed.canonical_tensor_rebuild_invocations == set()
 
 
+def test_pytorch_storage_trust_preserves_noncanonical_setitems_width_limit() -> None:
+    entries = package_api._PYTORCH_STORAGE_TRUST_MAX_TUPLE_WIDTH // 2 + 1
+    payload = (
+        b"\x80\x04}("
+        + b"".join(
+            b"X" + len(key := f"key_{index}".encode("ascii")).to_bytes(4, "little") + key + b"K\x00"
+            for index in range(entries)
+        )
+        + b"u."
+    )
+
+    parsed = package_api._pytorch_storage_keys_from_pickle_bytes(payload)
+
+    assert parsed.parse_complete is False
+    assert parsed.referenced_keys == set()
+    assert parsed.canonical_tensor_rebuild_invocations == set()
+
+
+def test_scan_file_preserves_hidden_malicious_storage_after_noncanonical_setitems(tmp_path: Path) -> None:
+    archive_path = tmp_path / "malicious-noncanonical-state.pt"
+    hidden_payload = b"S'" + b"A" * 5000 + b"'\n0cos\nsystem\n(S'echo malicious-near-match'\ntR."
+    entries: list[bytes] = []
+    for index in range(package_api._PYTORCH_STORAGE_TRUST_MAX_TUPLE_WIDTH // 2 + 1):
+        key = f"key_{index}".encode("ascii")
+        entries.append(b"X" + len(key).to_bytes(4, "little") + key + b"K\x00")
+    storage_key = b"storage"
+    entries.append(
+        b"X"
+        + len(storage_key).to_bytes(4, "little")
+        + storage_key
+        + _pytorch_storage_binpersid_expr(key="0", storage_name="ByteStorage", element_count=len(hidden_payload))
+    )
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", b"\x80\x04}(" + b"".join(entries) + b"u.")
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", hidden_payload)
+
+    report = scan_file(archive_path)
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.severity == Severity.CRITICAL
+        and finding.details.get("module") in {"os", "posix", "nt"}
+        and finding.details.get("name") == "system"
+        for finding in report.findings
+    )
+
+
 def test_pytorch_storage_trust_rejects_canonical_setitems_beyond_bounded_batch(tmp_path: Path) -> None:
     archive_path = tmp_path / "oversized-canonical-batch.pt"
     _write_large_batched_pytorch_state_dict(
