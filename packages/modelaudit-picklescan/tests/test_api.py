@@ -3746,6 +3746,8 @@ def test_scan_file_preserves_hidden_malicious_storage_after_noncanonical_setitem
         "ordered_storage_value",
         "nested_storage_key",
         "leading_nested_ordered_storage",
+        "leading_plain_dict_storage_batch",
+        "leading_plain_dict_storage_setitem",
     ],
 )
 def test_scan_file_preserves_hidden_malicious_storage_after_duplicate_state_key(
@@ -3763,6 +3765,8 @@ def test_scan_file_preserves_hidden_malicious_storage_after_duplicate_state_key(
         "ordered_storage_value",
         "nested_storage_key",
         "leading_nested_ordered_storage",
+        "leading_plain_dict_storage_batch",
+        "leading_plain_dict_storage_setitem",
     }
 
     def encoded_key(value: str) -> bytes:
@@ -3812,6 +3816,8 @@ def test_scan_file_preserves_hidden_malicious_storage_after_duplicate_state_key(
         "ordered_storage_value",
         "nested_storage_key",
         "leading_nested_ordered_storage",
+        "leading_plain_dict_storage_batch",
+        "leading_plain_dict_storage_setitem",
     }:
         storage_reference = _pytorch_storage_binpersid_expr(
             key="0",
@@ -3847,6 +3853,10 @@ def test_scan_file_preserves_hidden_malicious_storage_after_duplicate_state_key(
             + b"".join(entries)
             + b"u."
         )
+    elif duplicate_variant in {"leading_plain_dict_storage_batch", "leading_plain_dict_storage_setitem"}:
+        hidden_entry = encoded_key("hidden") + storage_reference
+        initial_storage = b"(" + hidden_entry + b"u" if duplicate_variant.endswith("batch") else hidden_entry + b"s"
+        payload = b"\x80\x04}" + initial_storage + b"(" + b"".join(entries) + b"u."
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.writestr("archive/data.pkl", payload)
         archive.writestr("archive/version", "3\n")
