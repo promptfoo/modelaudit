@@ -9942,26 +9942,39 @@ def test_scan_bytes_warns_when_allowlisted_module_is_unresolved(monkeypatch: pyt
 
 
 @pytest.mark.parametrize(
-    ("module", "name"),
+    ("module", "name", "source_changes"),
     [
-        ("joblib.numpy_pickle", "NumpyArrayWrapper"),
-        ("numpy._core.multiarray", "_reconstruct"),
-        ("torch._utils", "_rebuild_tensor_v2"),
+        ("joblib.numpy_pickle", "NumpyArrayWrapper", False),
+        ("joblib.numpy_pickle", "NumpyArrayWrapper", True),
+        ("numpy._core.multiarray", "_reconstruct", False),
+        ("torch._utils", "_rebuild_tensor_v2", False),
     ],
 )
 def test_scan_bytes_warns_on_unresolved_framework_reconstruction_global(
     module: str,
     name: str,
+    source_changes: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
         "modelaudit_picklescan.call_graph._trusted_module_origin_kind",
         lambda _module_name: "unresolved",
     )
+    if source_changes:
+
+        def raise_source_stability_error(_report_generation: int | None) -> None:
+            raise _CallGraphAnalysisLimitError("source changed during shared call-graph analysis")
+
+        monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", raise_source_stability_error)
 
     report = scan_bytes(f"c{module}\n{name}\n.".encode(), source="unresolved-framework-global.pkl")
 
-    assert report.status == ScanStatus.COMPLETE
+    if report.status == ScanStatus.INCONCLUSIVE:
+        _assert_call_graph_source_stability_error(report)
+    else:
+        assert report.status == ScanStatus.COMPLETE
+    if source_changes:
+        assert report.status == ScanStatus.INCONCLUSIVE
     assert report.verdict == SafetyVerdict.SUSPICIOUS
     assert any(
         finding.rule_code == "NON_ALLOWLISTED_GLOBAL" and finding.details.get("import_reference") == f"{module}.{name}"
