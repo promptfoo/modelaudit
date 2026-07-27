@@ -3525,6 +3525,56 @@ def test_scan_file_preserves_hidden_malicious_storage_inside_enclosing_list(tmp_
     )
 
 
+@pytest.mark.parametrize("padding_entries", [2, 5])
+def test_scan_file_preserves_hidden_malicious_storage_after_padded_nested_dictionary_overwrite(
+    tmp_path: Path,
+    padding_entries: int,
+) -> None:
+    archive_path = tmp_path / f"malicious-padded-nested-state-{padding_entries}.pt"
+    hidden_payload = b"S'" + b"A" * 5000 + b"'\n0cos\nsystem\n(S'echo nested-dictionary-storage'\ntR."
+    hidden_tensor = (
+        _pytorch_rebuild_tensor_v2_payload(
+            key="0",
+            storage_name="ByteStorage",
+            element_count=len(hidden_payload),
+        )
+        .removeprefix(b"\x80\x04")
+        .removesuffix(b".")
+    )
+    padding = b"".join(_short_binunicode(f"pad_{index}".encode("ascii")) + b"K\x00" for index in range(padding_entries))
+    nested_dictionary = b"}(" + padding + _short_binunicode(b"hidden") + hidden_tensor + b"u"
+    entries = [
+        _short_binunicode(b"outer") + nested_dictionary,
+        _short_binunicode(b"outer") + b"K\x00",
+        _short_binunicode(b"safe") + _pytorch_rebuild_tensor_v2_reduce_expr(key="1"),
+    ]
+    entries.extend(_short_binunicode(f"metadata_{index}".encode("ascii")) + b"K\x01" for index in range(40))
+    data_pkl = b"\x80\x04" + _pytorch_empty_ordered_dict_reduce_expr() + b"(" + b"".join(entries) + b"u."
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", data_pkl)
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", hidden_payload)
+        archive.writestr("archive/data/1", b"\x00" * 24)
+
+    report = scan_file(archive_path)
+
+    assert (
+        package_api._trusted_pytorch_data_pkl_from_storage_member_sizes(
+            data_pkl,
+            {"0": len(hidden_payload), "1": 24},
+        )
+        is None
+    )
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.severity == Severity.CRITICAL
+        and finding.details.get("module") in {"os", "posix", "nt"}
+        and finding.details.get("name") == "system"
+        for finding in report.findings
+    )
+
+
 def test_scan_file_suppresses_rebuild_tensor_v2_for_real_ordered_state_dict(tmp_path: Path) -> None:
     _require_torch_distribution()
     import torch

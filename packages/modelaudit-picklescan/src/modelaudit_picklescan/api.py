@@ -1976,7 +1976,9 @@ def _pytorch_storage_keys_from_pickle_bytes(
             if storage_only and isinstance(value, _PytorchDictionaryState):
                 return value.contains_untrusted_storage
             return any(
-                value_contains_tracked_provenance(item, seen, storage_only=storage_only) for item in value.items()
+                value_contains_tracked_provenance(key, seen, storage_only=storage_only)
+                or value_contains_tracked_provenance(item, seen, storage_only=storage_only)
+                for key, item in value.items()
             )
         return any(value_contains_tracked_provenance(item, seen, storage_only=storage_only) for item in value)
 
