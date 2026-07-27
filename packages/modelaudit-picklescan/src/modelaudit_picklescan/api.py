@@ -1874,6 +1874,10 @@ def _pytorch_storage_keys_from_pickle_bytes(
         )
 
     marker = object()
+    canonical_tensor = object()
+    canonical_batch_placeholder = object()
+    canonical_batch_entries: list[tuple[str, object]] = []
+    canonical_batch_target: object | None = None
     memo: dict[int, Any] = {}
     stack: list[Any] = []
     referenced_keys: set[str] = set()
@@ -1940,13 +1944,56 @@ def _pytorch_storage_keys_from_pickle_bytes(
                 return tuple(reversed(items))
             items.append(item)
             if len(items) > max_width:
-                raise ValueError("PyTorch storage persistent ID tuple exceeded trust parser width")
+                raise ValueError("PyTorch storage trust parser marked collection exceeded its width limit")
         return None
 
+    def compact_canonical_setitems_stack() -> bool:
+        nonlocal canonical_batch_target
+
+        if len(canonical_batch_entries) >= _PYTORCH_STORAGE_TRUST_MAX_STACK_DEPTH:
+            return False
+        for marker_index, item in enumerate(stack):
+            if item is not marker or marker_index == 0:
+                continue
+            target = stack[marker_index - 1]
+            if not isinstance(target, dict | _PytorchOrderedDictState):
+                continue
+            if isinstance(target, _PytorchOrderedDictState) and target.used_as_hooks:
+                continue
+            if canonical_batch_target is not None and target is not canonical_batch_target:
+                continue
+            pair_index = marker_index + 1
+            if pair_index < len(stack) and stack[pair_index] is canonical_batch_placeholder:
+                pair_index += 1
+            if pair_index + 1 >= len(stack):
+                continue
+            key = stack[pair_index]
+            if not isinstance(key, str) or stack[pair_index + 1] is not canonical_tensor:
+                continue
+            if canonical_batch_target is None:
+                canonical_batch_target = target
+                stack.insert(marker_index + 1, canonical_batch_placeholder)
+                pair_index += 1
+            canonical_batch_entries.append((key, canonical_tensor))
+            del stack[pair_index : pair_index + 2]
+            return True
+        return False
+
     def within_limits() -> bool:
+        while len(stack) > _PYTORCH_STORAGE_TRUST_MAX_STACK_DEPTH:
+            if not compact_canonical_setitems_stack():
+                return False
+        if canonical_batch_entries and not any(
+            item is marker
+            and marker_index > 0
+            and stack[marker_index - 1] is canonical_batch_target
+            and marker_index + 1 < len(stack)
+            and stack[marker_index + 1] is canonical_batch_placeholder
+            for marker_index, item in enumerate(stack)
+        ):
+            return False
         return (
-            len(stack) <= _PYTORCH_STORAGE_TRUST_MAX_STACK_DEPTH
-            and len(memo) <= _PYTORCH_STORAGE_TRUST_MAX_MEMO_ENTRIES
+            len(memo) <= _PYTORCH_STORAGE_TRUST_MAX_MEMO_ENTRIES
             and len(referenced_keys) <= _PYTORCH_STORAGE_TRUST_MAX_REFERENCED_KEYS
         )
 
@@ -2041,6 +2088,7 @@ def _pytorch_storage_keys_from_pickle_bytes(
             tensor_rebuild_uses.add((function.position, reduce_position))
             if rebuild_tensor_v2_args_are_canonical(args):
                 canonical_tensor_rebuild_invocations.add((function.position, reduce_position))
+                return canonical_tensor
             else:
                 invalidate_tensor_rebuild_proof()
             return None
@@ -2194,11 +2242,33 @@ def _pytorch_storage_keys_from_pickle_bytes(
             elif opcode_name == "SETITEMS":
                 setitem_items = pop_marked_tuple(max_width=_PYTORCH_STORAGE_TRUST_MAX_STACK_DEPTH)
                 if setitem_items is None or len(setitem_items) % 2 != 0 or not stack:
-                    clear_stack_after_malformed_provenance()
-                    continue
-                apply_setitems_to_target(
-                    tuple((setitem_items[index], setitem_items[index + 1]) for index in range(0, len(setitem_items), 2))
-                )
+                    if (
+                        setitem_items is None
+                        or not setitem_items
+                        or setitem_items[0] is not canonical_batch_placeholder
+                        or not stack
+                        or stack[-1] is not canonical_batch_target
+                        or (len(setitem_items) - 1) % 2 != 0
+                    ):
+                        clear_stack_after_malformed_provenance()
+                        continue
+                    remaining_items = setitem_items[1:]
+                    if (
+                        len(canonical_batch_entries) + len(remaining_items) // 2
+                        > _PYTORCH_STORAGE_TRUST_MAX_STACK_DEPTH
+                    ):
+                        return _PytorchStorageReferenceParse(set(), {}, set(), set(), False, False)
+                    setitem_pairs = tuple(canonical_batch_entries) + tuple(
+                        (remaining_items[index], remaining_items[index + 1])
+                        for index in range(0, len(remaining_items), 2)
+                    )
+                    canonical_batch_entries.clear()
+                    canonical_batch_target = None
+                else:
+                    setitem_pairs = tuple(
+                        (setitem_items[index], setitem_items[index + 1]) for index in range(0, len(setitem_items), 2)
+                    )
+                apply_setitems_to_target(setitem_pairs)
             elif opcode_name == "BINPERSID":
                 pid = stack.pop() if stack else None
                 storage_ref = storage_ref_from_pid(pid)

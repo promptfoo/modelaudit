@@ -3432,8 +3432,7 @@ def test_scan_file_suppresses_rebuild_tensor_v2_for_real_ordered_state_dict(tmp_
     assert _torch_rebuild_tensor_v2_warning_dicts(report) == []
 
 
-def _write_large_batched_pytorch_state_dict(path: Path, *, malicious: bool = False) -> None:
-    entry_count = package_api._PYTORCH_STORAGE_TRUST_MAX_TUPLE_WIDTH // 2 + 1
+def _write_large_batched_pytorch_state_dict(path: Path, *, malicious: bool = False, entry_count: int = 600) -> None:
     entries: list[bytes] = []
     for index in range(entry_count):
         key_bytes = f"weight_{index}".encode("ascii")
@@ -3441,7 +3440,7 @@ def _write_large_batched_pytorch_state_dict(path: Path, *, malicious: bool = Fal
         if malicious and index == entry_count - 1:
             value = b"cos\nsystem\n(S'echo malicious-near-match'\ntR"
         elif index == 0:
-            value = _pytorch_rebuild_tensor_v2_payload(key=str(index))[2:-1]
+            value = _pytorch_rebuild_tensor_v2_payload(key=str(index)).removeprefix(b"\x80\x04").removesuffix(b".")
         else:
             value = _pytorch_rebuild_tensor_v2_reduce_expr(key=str(index))
         entries.append(key + value)
@@ -3455,16 +3454,20 @@ def _write_large_batched_pytorch_state_dict(path: Path, *, malicious: bool = Fal
             archive.writestr(f"archive/data/{index}", b"\x00" * 24)
 
 
-def test_pytorch_storage_trust_parses_large_batched_state_dict_without_framework(tmp_path: Path) -> None:
-    archive_path = tmp_path / "large-batched-state.pt"
-    _write_large_batched_pytorch_state_dict(archive_path)
+@pytest.mark.parametrize("entry_count", [600, 1000])
+def test_pytorch_storage_trust_parses_large_batched_state_dict_without_framework(
+    tmp_path: Path,
+    entry_count: int,
+) -> None:
+    archive_path = tmp_path / f"large-batched-state-{entry_count}.pt"
+    _write_large_batched_pytorch_state_dict(archive_path, entry_count=entry_count)
     with zipfile.ZipFile(archive_path) as archive:
         payload = archive.read("archive/data.pkl")
 
     parsed = package_api._pytorch_storage_keys_from_pickle_bytes(payload)
 
     assert parsed.parse_complete is True
-    assert len(parsed.referenced_keys) == package_api._PYTORCH_STORAGE_TRUST_MAX_TUPLE_WIDTH // 2 + 1
+    assert len(parsed.referenced_keys) == entry_count
     assert len(parsed.canonical_tensor_rebuild_invocations) == len(parsed.referenced_keys)
 
 
@@ -3501,6 +3504,22 @@ def test_pytorch_storage_trust_rejects_setitems_beyond_stack_limit() -> None:
     oversized_payload = b"\x80\x04}(" + (b"K\x00K\x00" * entries) + b"u."
 
     parsed = package_api._pytorch_storage_keys_from_pickle_bytes(oversized_payload)
+
+    assert parsed.parse_complete is False
+    assert parsed.referenced_keys == set()
+    assert parsed.canonical_tensor_rebuild_invocations == set()
+
+
+def test_pytorch_storage_trust_rejects_canonical_setitems_beyond_bounded_batch(tmp_path: Path) -> None:
+    archive_path = tmp_path / "oversized-canonical-batch.pt"
+    _write_large_batched_pytorch_state_dict(
+        archive_path,
+        entry_count=package_api._PYTORCH_STORAGE_TRUST_MAX_STACK_DEPTH + 1,
+    )
+    with zipfile.ZipFile(archive_path) as archive:
+        payload = archive.read("archive/data.pkl")
+
+    parsed = package_api._pytorch_storage_keys_from_pickle_bytes(payload)
 
     assert parsed.parse_complete is False
     assert parsed.referenced_keys == set()
