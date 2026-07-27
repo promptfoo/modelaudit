@@ -3432,6 +3432,80 @@ def test_scan_file_suppresses_rebuild_tensor_v2_for_real_ordered_state_dict(tmp_
     assert _torch_rebuild_tensor_v2_warning_dicts(report) == []
 
 
+def _write_large_batched_pytorch_state_dict(path: Path, *, malicious: bool = False) -> None:
+    entry_count = package_api._PYTORCH_STORAGE_TRUST_MAX_TUPLE_WIDTH // 2 + 1
+    entries: list[bytes] = []
+    for index in range(entry_count):
+        key_bytes = f"weight_{index}".encode("ascii")
+        key = b"X" + len(key_bytes).to_bytes(4, "little") + key_bytes
+        if malicious and index == entry_count - 1:
+            value = b"cos\nsystem\n(S'echo malicious-near-match'\ntR"
+        elif index == 0:
+            value = _pytorch_rebuild_tensor_v2_payload(key=str(index))[2:-1]
+        else:
+            value = _pytorch_rebuild_tensor_v2_reduce_expr(key=str(index))
+        entries.append(key + value)
+
+    payload = b"\x80\x04" + _global(b"collections", b"OrderedDict") + b")R(" + b"".join(entries) + b"u."
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("archive/data.pkl", payload)
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        for index in range(entry_count - int(malicious)):
+            archive.writestr(f"archive/data/{index}", b"\x00" * 24)
+
+
+def test_scan_file_suppresses_rebuild_tensor_v2_for_large_batched_state_dict(tmp_path: Path) -> None:
+    _require_torch_distribution()
+    archive_path = tmp_path / "large-batched-state.pt"
+    _write_large_batched_pytorch_state_dict(archive_path)
+
+    report = _scan_file_report_dict_subprocess(archive_path)
+
+    assert report["status"] == "complete"
+    assert report["verdict"] == "clean"
+    assert _torch_rebuild_tensor_v2_warning_dicts(report) == []
+    assert not any(finding["rule_code"] == "PERSISTENT_ID" for finding in report["findings"])
+
+
+def test_scan_file_preserves_malicious_call_in_large_batched_state_dict(tmp_path: Path) -> None:
+    _require_torch_distribution()
+    archive_path = tmp_path / "large-batched-malicious-state.pt"
+    _write_large_batched_pytorch_state_dict(archive_path, malicious=True)
+
+    report = _scan_file_report_dict_subprocess(archive_path)
+
+    assert report["verdict"] == "malicious"
+    assert any(
+        finding["severity"] == "critical"
+        and finding["details"].get("module") in {"os", "posix", "nt"}
+        and finding["details"].get("name") == "system"
+        for finding in report["findings"]
+    )
+
+
+def test_pytorch_storage_trust_rejects_setitems_beyond_stack_limit() -> None:
+    entries = package_api._PYTORCH_STORAGE_TRUST_MAX_STACK_DEPTH // 2 + 1
+    oversized_payload = b"\x80\x04}(" + (b"K\x00K\x00" * entries) + b"u."
+
+    parsed = package_api._pytorch_storage_keys_from_pickle_bytes(oversized_payload)
+
+    assert parsed.parse_complete is False
+    assert parsed.referenced_keys == set()
+    assert parsed.canonical_tensor_rebuild_invocations == set()
+
+
+def test_pytorch_storage_trust_preserves_tuple_width_limit() -> None:
+    tuple_items = package_api._PYTORCH_STORAGE_TRUST_MAX_TUPLE_WIDTH + 1
+    oversized_payload = b"\x80\x04(" + (b"K\x00" * tuple_items) + b"t."
+
+    parsed = package_api._pytorch_storage_keys_from_pickle_bytes(oversized_payload)
+
+    assert parsed.parse_complete is False
+    assert parsed.referenced_keys == set()
+    assert parsed.canonical_tensor_rebuild_invocations == set()
+
+
 def test_scan_bytes_keeps_rebuild_tensor_v2_warning_for_raw_data_pickle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

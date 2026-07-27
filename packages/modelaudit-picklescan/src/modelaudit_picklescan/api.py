@@ -1932,14 +1932,14 @@ def _pytorch_storage_keys_from_pickle_bytes(
         else:
             poison_stack_top()
 
-    def pop_marked_tuple() -> tuple[Any, ...] | None:
+    def pop_marked_tuple(*, max_width: int = _PYTORCH_STORAGE_TRUST_MAX_TUPLE_WIDTH) -> tuple[Any, ...] | None:
         items: list[Any] = []
         while stack:
             item = stack.pop()
             if item is marker:
                 return tuple(reversed(items))
             items.append(item)
-            if len(items) > _PYTORCH_STORAGE_TRUST_MAX_TUPLE_WIDTH:
+            if len(items) > max_width:
                 raise ValueError("PyTorch storage persistent ID tuple exceeded trust parser width")
         return None
 
@@ -2192,7 +2192,7 @@ def _pytorch_storage_keys_from_pickle_bytes(
                 key = stack.pop()
                 apply_setitems_to_target(((key, value),))
             elif opcode_name == "SETITEMS":
-                setitem_items = pop_marked_tuple()
+                setitem_items = pop_marked_tuple(max_width=_PYTORCH_STORAGE_TRUST_MAX_STACK_DEPTH)
                 if setitem_items is None or len(setitem_items) % 2 != 0 or not stack:
                     clear_stack_after_malformed_provenance()
                     continue

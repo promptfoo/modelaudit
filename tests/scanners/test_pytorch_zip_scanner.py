@@ -10003,6 +10003,21 @@ def test_pytorch_zip_scanner_suppresses_rebuild_tensor_v2_in_embedded_data_pkl(t
     assert _rebuild_tensor_v2_issue_dicts(report) == []
 
 
+def test_pytorch_zip_scanner_suppresses_rebuild_tensor_v2_in_large_batched_state_dict(tmp_path: Path) -> None:
+    _require_torch_distribution()
+    import torch
+
+    model_path = tmp_path / "large-batched-state.pt"
+    torch.save({f"weight_{index}": torch.zeros(1) for index in range(40)}, model_path)
+
+    report = _scan_pytorch_zip_report_dict_subprocess(model_path)
+
+    assert report["success"] is True
+    assert report["has_warnings"] is False
+    assert report.get("metadata", {}).get("pickle_verdict") == "clean"
+    assert _rebuild_tensor_v2_issue_dicts(report) == []
+
+
 def test_pytorch_zip_embedded_context_falls_back_with_older_picklescan_scan_stream(tmp_path: Path) -> None:
     _require_torch_distribution()
     from modelaudit_picklescan import PickleScanner as StandalonePickleScanner
