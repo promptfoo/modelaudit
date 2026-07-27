@@ -107,6 +107,7 @@ _MAX_PYTORCH_ZIP_PICKLE_TOTAL_MEMBER_BYTES = 512 * 1024 * 1024
 _MAX_PYTORCH_ZIP_STORAGE_REFERENCE_DATA_PICKLE_BYTES = 10 * 1024 * 1024
 _MAX_PYTORCH_ZIP_STORAGE_REFERENCE_TOTAL_DATA_PICKLE_BYTES = 64 * 1024 * 1024
 _PYTORCH_STORAGE_TRUST_MAX_OPCODES = 100_000
+_PYTORCH_STORAGE_TRUST_MAX_PROVENANCE_NODES = 100_000
 _PYTORCH_STORAGE_TRUST_MAX_STACK_DEPTH = 1024
 _PYTORCH_STORAGE_TRUST_MAX_MEMO_ENTRIES = 100_000
 _PYTORCH_STORAGE_TRUST_MAX_TUPLE_WIDTH = 64
@@ -378,6 +379,7 @@ class _PytorchStorageReferenceParse:
     canonical_tensor_rebuild_invocations: set[tuple[int, int]]
     parse_complete: bool
     all_persistent_ids_are_pytorch_storage: bool
+    discarded_tracked_storage_references: bool = False
 
 
 @dataclass(frozen=True)
@@ -1108,7 +1110,10 @@ def _validated_pytorch_storage_entry_ids(
             )
         validated_storage_keys = trusted_storage_keys - storage_size_mismatch_keys
         exact_trusted_storage_keys = (
-            validated_storage_keys if reference_parse.all_persistent_ids_are_pytorch_storage else set()
+            validated_storage_keys
+            if reference_parse.all_persistent_ids_are_pytorch_storage
+            and not reference_parse.discarded_tracked_storage_references
+            else set()
         )
         storage_probe_keys = trusted_storage_keys - exact_trusted_storage_keys
         if exact_trusted_storage_keys and not missing_storage_keys:
@@ -1847,6 +1852,7 @@ def _merge_pytorch_storage_reference_parses(
         canonical_tensor_rebuild_invocations=set(),
         parse_complete=True,
         all_persistent_ids_are_pytorch_storage=all(parsed.all_persistent_ids_are_pytorch_storage for parsed in parses),
+        discarded_tracked_storage_references=any(parsed.discarded_tracked_storage_references for parsed in parses),
     )
 
 
@@ -1888,6 +1894,8 @@ def _pytorch_storage_keys_from_pickle_bytes(
     tensor_rebuild_uses: set[tuple[int, int]] = set()
     tensor_rebuild_proof_valid = True
     all_persistent_ids_are_pytorch_storage = True
+    discarded_tracked_storage_references = False
+    provenance_nodes_inspected = 0
 
     def invalidate_tensor_rebuild_proof() -> None:
         nonlocal tensor_rebuild_proof_valid
@@ -1918,6 +1926,15 @@ def _pytorch_storage_keys_from_pickle_bytes(
         return True
 
     def value_contains_tracked_provenance(value: object, seen: set[int] | None = None) -> bool:
+        nonlocal provenance_nodes_inspected
+
+        provenance_nodes_inspected += 1
+        if provenance_nodes_inspected > _PYTORCH_STORAGE_TRUST_MAX_PROVENANCE_NODES:
+            raise ValueError("PyTorch storage trust parser exceeded its bounded provenance workload")
+        if deadline is not None and provenance_nodes_inspected % 1024 == 0:
+            _check_pytorch_zip_deadline(deadline)
+        if value is canonical_tensor:
+            return True
         if isinstance(value, _PytorchStorageRef | _PytorchOrderedDictState):
             return True
         if not isinstance(value, (tuple, list, dict)):
@@ -1942,12 +1959,18 @@ def _pytorch_storage_keys_from_pickle_bytes(
         )
 
     def apply_setitems_to_target(items: tuple[tuple[Any, Any], ...]) -> None:
+        nonlocal discarded_tracked_storage_references
+
         if isinstance(stack[-1], _PytorchStorageRef):
             poison_stack_top()
         elif isinstance(stack[-1], _PytorchOrderedDictState):
             mutate_tracked_ordered_dict(stack[-1])
         elif isinstance(stack[-1], dict):
-            stack[-1].update(items)
+            for key, value in items:
+                if key in stack[-1] and value_contains_tracked_provenance(stack[-1][key]):
+                    discarded_tracked_storage_references = True
+                    invalidate_tensor_rebuild_proof()
+                stack[-1][key] = value
         else:
             poison_stack_top()
 
@@ -2230,7 +2253,7 @@ def _pytorch_storage_keys_from_pickle_bytes(
                 if stack:
                     popped_value = stack.pop()
                     if value_contains_tracked_provenance(popped_value):
-                        all_persistent_ids_are_pytorch_storage = False
+                        discarded_tracked_storage_references = True
                         invalidate_tensor_rebuild_proof()
                 else:
                     invalidate_tensor_rebuild_proof()
@@ -2239,7 +2262,7 @@ def _pytorch_storage_keys_from_pickle_bytes(
                 if popped_values is None:
                     invalidate_tensor_rebuild_proof()
                 elif any(value_contains_tracked_provenance(value) for value in popped_values):
-                    all_persistent_ids_are_pytorch_storage = False
+                    discarded_tracked_storage_references = True
                     invalidate_tensor_rebuild_proof()
             elif opcode_name == "DUP":
                 if stack:
@@ -2370,6 +2393,8 @@ def _pytorch_storage_keys_from_pickle_bytes(
                 clear_stack_after_malformed_provenance()
             if not within_limits():
                 return _PytorchStorageReferenceParse(set(), {}, set(), set(), False, False)
+    except _PytorchZipDeadlineExceeded:
+        raise
     except Exception:
         return _PytorchStorageReferenceParse(set(), {}, set(), set(), False, False)
     return _PytorchStorageReferenceParse(
@@ -2383,6 +2408,7 @@ def _pytorch_storage_keys_from_pickle_bytes(
         ),
         parse_complete=True,
         all_persistent_ids_are_pytorch_storage=all_persistent_ids_are_pytorch_storage,
+        discarded_tracked_storage_references=discarded_tracked_storage_references,
     )
 
 

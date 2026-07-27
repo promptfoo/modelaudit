@@ -3516,6 +3516,43 @@ def test_pytorch_storage_trust_parses_large_metadata_after_canonical_batch(tmp_p
     assert len(parsed.canonical_tensor_rebuild_invocations) == 600
 
 
+def test_pytorch_storage_trust_checks_deadline_during_metadata_provenance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_path = tmp_path / "large-batched-metadata-deadline.pt"
+    _write_large_batched_pytorch_state_dict(archive_path, trailing_metadata_count=600)
+    with zipfile.ZipFile(archive_path) as archive:
+        payload = archive.read("archive/data.pkl")
+
+    def stop_during_metadata_inspection(_deadline: float) -> None:
+        if sys._getframe(1).f_code.co_name == "value_contains_tracked_provenance":
+            raise package_api._PytorchZipDeadlineExceeded
+
+    monkeypatch.setattr(package_api, "_check_pytorch_zip_deadline", stop_during_metadata_inspection)
+
+    with pytest.raises(package_api._PytorchZipDeadlineExceeded):
+        package_api._pytorch_storage_keys_from_pickle_bytes(payload, deadline=1.0)
+
+
+def test_pytorch_storage_trust_bounds_metadata_provenance_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_path = tmp_path / "large-batched-metadata-budget.pt"
+    _write_large_batched_pytorch_state_dict(archive_path, trailing_metadata_count=600)
+    with zipfile.ZipFile(archive_path) as archive:
+        payload = archive.read("archive/data.pkl")
+
+    monkeypatch.setattr(package_api, "_PYTORCH_STORAGE_TRUST_MAX_PROVENANCE_NODES", 32)
+
+    parsed = package_api._pytorch_storage_keys_from_pickle_bytes(payload)
+
+    assert parsed.parse_complete is False
+    assert parsed.referenced_keys == set()
+    assert parsed.canonical_tensor_rebuild_invocations == set()
+
+
 def test_scan_file_suppresses_rebuild_tensor_v2_for_large_batched_state_dict(tmp_path: Path) -> None:
     _require_torch_distribution()
     archive_path = tmp_path / "large-batched-state.pt"
@@ -3593,12 +3630,31 @@ def test_pytorch_storage_trust_preserves_noncanonical_setitems_width_limit() -> 
         (True, (b"collections", b"OrderedDict")),
         (True, "popped"),
         (True, "pop_mark"),
+        (True, "overwrite_dict"),
+        (True, "overwrite_setitems"),
+        (True, "popped_tensor"),
+        (True, "pop_mark_tensor"),
+        (True, "overwrite_tensor_dict"),
+        (True, "overwrite_tensor_setitems"),
+        (True, "nested_tensor_tuple"),
     ],
 )
 def test_scan_file_preserves_hidden_malicious_storage_after_noncanonical_setitems(
     tmp_path: Path,
     with_prior_tensor_batch: bool,
-    storage_wrapper: tuple[bytes, bytes] | Literal["popped", "pop_mark"] | None,
+    storage_wrapper: tuple[bytes, bytes]
+    | Literal[
+        "popped",
+        "pop_mark",
+        "overwrite_dict",
+        "overwrite_setitems",
+        "popped_tensor",
+        "pop_mark_tensor",
+        "overwrite_tensor_dict",
+        "overwrite_tensor_setitems",
+        "nested_tensor_tuple",
+    ]
+    | None,
 ) -> None:
     archive_path = tmp_path / f"malicious-noncanonical-state-{with_prior_tensor_batch}.pt"
     hidden_payload = b"S'" + b"A" * 5000 + b"'\n0cos\nsystem\n(S'echo malicious-near-match'\ntR."
@@ -3612,10 +3668,30 @@ def test_scan_file_preserves_hidden_malicious_storage_after_noncanonical_setitem
         storage_name="ByteStorage",
         element_count=len(hidden_payload),
     )
-    if storage_wrapper == "popped":
+    if storage_wrapper in {
+        "popped_tensor",
+        "pop_mark_tensor",
+        "overwrite_tensor_dict",
+        "overwrite_tensor_setitems",
+        "nested_tensor_tuple",
+    }:
+        storage_reference = _pytorch_rebuild_tensor_v2_reduce_expr(
+            key="0",
+            storage_name="ByteStorage",
+            element_count=len(hidden_payload),
+        )
+    if storage_wrapper in {"popped", "popped_tensor"}:
         storage_reference += b"0K\x00"
-    elif storage_wrapper == "pop_mark":
+    elif storage_wrapper in {"pop_mark", "pop_mark_tensor"}:
         storage_reference = b"(" + storage_reference + b"1K\x00"
+    elif storage_wrapper in {"overwrite_dict", "overwrite_tensor_dict"}:
+        slot = _short_binunicode(b"slot")
+        storage_reference = b"}" + slot + storage_reference + b"s" + slot + b"K\x00s"
+    elif storage_wrapper in {"overwrite_setitems", "overwrite_tensor_setitems"}:
+        slot = _short_binunicode(b"slot")
+        storage_reference = b"}(" + slot + storage_reference + b"u(" + slot + b"K\x00u"
+    elif storage_wrapper == "nested_tensor_tuple":
+        storage_reference += b"\x85"
     elif storage_wrapper is not None:
         storage_reference = _global(*storage_wrapper) + b"(" + storage_reference + b"tR"
     entries.append(b"X" + len(storage_key).to_bytes(4, "little") + storage_key + storage_reference)
