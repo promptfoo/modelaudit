@@ -1968,13 +1968,21 @@ def _pytorch_storage_keys_from_pickle_bytes(
             if pair_index + 1 >= len(stack):
                 continue
             key = stack[pair_index]
-            if not isinstance(key, str) or stack[pair_index + 1] is not canonical_tensor:
+            value = stack[pair_index + 1]
+            if not isinstance(key, str):
+                continue
+            if value is not canonical_tensor and not isinstance(value, (str, int, float, bytes, type(None))):
+                continue
+            if value is not canonical_tensor and not (
+                any(item is canonical_tensor for item in stack[pair_index + 2 :])
+                or any(entry_value is canonical_tensor for _entry_key, entry_value in canonical_batch_entries)
+            ):
                 continue
             if canonical_batch_target is None:
                 canonical_batch_target = target
                 stack.insert(marker_index + 1, canonical_batch_placeholder)
                 pair_index += 1
-            canonical_batch_entries.append((key, canonical_tensor))
+            canonical_batch_entries.append((key, value))
             del stack[pair_index : pair_index + 2]
             return True
         return False

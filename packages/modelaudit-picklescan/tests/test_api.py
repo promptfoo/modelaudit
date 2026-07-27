@@ -3432,8 +3432,17 @@ def test_scan_file_suppresses_rebuild_tensor_v2_for_real_ordered_state_dict(tmp_
     assert _torch_rebuild_tensor_v2_warning_dicts(report) == []
 
 
-def _write_large_batched_pytorch_state_dict(path: Path, *, malicious: bool = False, entry_count: int = 600) -> None:
+def _write_large_batched_pytorch_state_dict(
+    path: Path,
+    *,
+    malicious: bool = False,
+    entry_count: int = 600,
+    leading_metadata: bool = False,
+) -> None:
     entries: list[bytes] = []
+    if leading_metadata:
+        metadata_key = b"_extra_state"
+        entries.append(b"X" + len(metadata_key).to_bytes(4, "little") + metadata_key + b"K\x01")
     for index in range(entry_count):
         key_bytes = f"weight_{index}".encode("ascii")
         key = b"X" + len(key_bytes).to_bytes(4, "little") + key_bytes
@@ -3454,13 +3463,18 @@ def _write_large_batched_pytorch_state_dict(path: Path, *, malicious: bool = Fal
             archive.writestr(f"archive/data/{index}", b"\x00" * 24)
 
 
-@pytest.mark.parametrize("entry_count", [600, 1000])
+@pytest.mark.parametrize(("entry_count", "leading_metadata"), [(600, False), (1000, False), (600, True)])
 def test_pytorch_storage_trust_parses_large_batched_state_dict_without_framework(
     tmp_path: Path,
     entry_count: int,
+    leading_metadata: bool,
 ) -> None:
-    archive_path = tmp_path / f"large-batched-state-{entry_count}.pt"
-    _write_large_batched_pytorch_state_dict(archive_path, entry_count=entry_count)
+    archive_path = tmp_path / f"large-batched-state-{entry_count}-{leading_metadata}.pt"
+    _write_large_batched_pytorch_state_dict(
+        archive_path,
+        entry_count=entry_count,
+        leading_metadata=leading_metadata,
+    )
     with zipfile.ZipFile(archive_path) as archive:
         payload = archive.read("archive/data.pkl")
 
@@ -3484,9 +3498,13 @@ def test_scan_file_suppresses_rebuild_tensor_v2_for_large_batched_state_dict(tmp
     assert not any(finding["rule_code"] == "PERSISTENT_ID" for finding in report["findings"])
 
 
-def test_scan_file_preserves_malicious_call_in_large_batched_state_dict(tmp_path: Path) -> None:
-    archive_path = tmp_path / "large-batched-malicious-state.pt"
-    _write_large_batched_pytorch_state_dict(archive_path, malicious=True)
+@pytest.mark.parametrize("leading_metadata", [False, True])
+def test_scan_file_preserves_malicious_call_in_large_batched_state_dict(
+    tmp_path: Path,
+    leading_metadata: bool,
+) -> None:
+    archive_path = tmp_path / f"large-batched-malicious-state-{leading_metadata}.pt"
+    _write_large_batched_pytorch_state_dict(archive_path, malicious=True, leading_metadata=leading_metadata)
 
     report = _scan_file_report_dict_subprocess(archive_path)
 
