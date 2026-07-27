@@ -2769,6 +2769,7 @@ class TestNetworkCommDetector:
         [
             "https://huggingface.co/spaces/ds4sd/demo/resolve/main/examples/sample.png",
             "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/car.jpg?download=true",
+            "https://HuggingFace.CO/spaces/ds4sd/demo/resolve/main/examples/sample.png",
         ],
     )
     def test_readme_python_example_official_sample_image_has_no_network_false_positive(
@@ -2836,6 +2837,7 @@ class TestNetworkCommDetector:
             "requests.get(image_url, stream=True, proxies=payload)",
             "requests.get = payload\nrequests.get(image_url, stream=True)",
             "setattr(requests, 'get', payload)\nrequests.get(image_url, stream=True)",
+            "fetch = requests.get\nrequests.get(image_url, stream=True)\nfetch(input())",
         ],
     )
     def test_readme_python_example_preserves_rebound_or_unproven_requests(
@@ -2864,6 +2866,18 @@ class TestNetworkCommDetector:
 
         assert any(finding["type"] == "network_library" for finding in findings)
         assert any(finding["type"] == "network_function" for finding in findings)
+
+    def test_large_readme_keeps_bounded_official_sample_image_example(self) -> None:
+        data = (
+            (b"Documentation prose.\n" * 4000)
+            + b"```python\nimport requests\n"
+            + b"url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            + b"requests.get(url, stream=True)\n```\n"
+        )
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
 
     def test_readme_official_image_in_different_fence_does_not_suppress_network_call(self) -> None:
         data = (

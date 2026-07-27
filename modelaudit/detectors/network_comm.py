@@ -1877,17 +1877,20 @@ def _is_doc_only_network_reference(
 
 
 def _is_official_readme_sample_image_request(data: bytes, *, match_index: int, context: str) -> bool:
-    if len(data) > _MAX_README_IMAGE_EXAMPLE_BYTES:
-        return False
     filename = context.replace("\\", "/").rsplit("/", 1)[-1].lower()
     if filename != "readme.md":
         return False
 
     example: bytes | None = None
-    for opening in _PYTHON_README_FENCE_PATTERN.finditer(data):
+    window_start = max(0, match_index - _MAX_README_IMAGE_EXAMPLE_BYTES)
+    for opening in _PYTHON_README_FENCE_PATTERN.finditer(data, window_start, match_index + 1):
         if opening.end() > match_index:
             break
-        closing = _README_FENCE_END_PATTERN.search(data, opening.end())
+        closing = _README_FENCE_END_PATTERN.search(
+            data,
+            opening.end(),
+            min(len(data), opening.end() + _MAX_README_IMAGE_EXAMPLE_BYTES),
+        )
         if closing is not None and opening.end() <= match_index < closing.start():
             example = data[opening.end() : closing.start()]
             break
@@ -1901,6 +1904,7 @@ def _is_official_readme_sample_image_request(data: bytes, *, match_index: int, c
     nodes = list(ast.walk(tree))
     if len(nodes) > _MAX_README_IMAGE_EXAMPLE_AST_NODES:
         return False
+    parents = {id(child): parent for parent in nodes for child in ast.iter_child_nodes(parent)}
     imports = [
         node for node in nodes if isinstance(node, ast.Import) for alias in node.names if alias.name == "requests"
     ]
@@ -1913,7 +1917,13 @@ def _is_official_readme_sample_image_request(data: bytes, *, match_index: int, c
     for node in nodes:
         if not isinstance(node, ast.Attribute) or not isinstance(node.value, ast.Name) or node.value.id != "requests":
             continue
-        if node.attr != "get" or not isinstance(node.ctx, ast.Load):
+        parent = parents.get(id(node))
+        if (
+            node.attr != "get"
+            or not isinstance(node.ctx, ast.Load)
+            or not isinstance(parent, ast.Call)
+            or parent.func is not node
+        ):
             return False
     for node in nodes:
         if (
@@ -1993,13 +2003,17 @@ def _is_official_readme_sample_image_request(data: bytes, *, match_index: int, c
             return False
         try:
             parsed = urlsplit(url)
+            port = parsed.port
         except ValueError:
             return False
         segments = parsed.path.split("/")
         if (
             parsed.scheme != "https"
             or parsed.hostname not in _PUBLIC_MODEL_REPOSITORY_HOSTS
-            or parsed.netloc != parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or port is not None
+            or parsed.netloc.lower() != parsed.hostname
             or parsed.fragment
             or parsed.query not in {"", "download=true"}
             or "resolve" not in segments
