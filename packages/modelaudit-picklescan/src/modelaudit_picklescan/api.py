@@ -1282,6 +1282,16 @@ def _trusted_storage_zip_entry_looks_like_pickle(
     is_frame_first_candidate = prefix.startswith(_PICKLE_FRAME_OPCODE)
     if not is_binary_pickle_candidate and not is_frame_first_candidate and prefix[0] not in _PROTO0_1_START_BYTES:
         return False
+    if max_probe_bytes > _TRUSTED_STORAGE_PICKLE_PROBE_BYTES:
+        try:
+            for _opcode, _arg, _position in pickletools.genops(prefix):
+                pass
+        except ValueError as error:
+            message = str(error).lower()
+            if "opcode" in message and "unknown" in message:
+                return False
+        except Exception:
+            pass
 
     sample = prefix
     if entry.file_size > len(prefix):

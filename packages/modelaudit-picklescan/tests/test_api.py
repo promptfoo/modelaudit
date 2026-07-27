@@ -3921,6 +3921,50 @@ def test_scan_file_preserves_hidden_malicious_storage_inside_compacted_canonical
     )
 
 
+def test_scan_file_bounds_expanded_probes_for_benign_pickle_like_tensor_prefixes(tmp_path: Path) -> None:
+    archive_path = tmp_path / "large-pickle-like-storage-prefixes.pt"
+    entry_count = 600
+    storage_size = 64 * 1024
+    entries: list[bytes] = []
+    for index in range(entry_count):
+        key = _short_binunicode(f"weight_{index}".encode("ascii"))
+        if index == 0:
+            value = (
+                _pytorch_rebuild_tensor_v2_payload(
+                    key="0",
+                    storage_name="ByteStorage",
+                    element_count=storage_size,
+                )
+                .removeprefix(b"\x80\x04")
+                .removesuffix(b".")
+            )
+        else:
+            value = _pytorch_rebuild_tensor_v2_reduce_expr(
+                key=str(index),
+                storage_name="ByteStorage",
+                element_count=storage_size,
+            )
+        entries.append(key + value)
+    data_pkl = b"\x80\x04" + _pytorch_empty_ordered_dict_reduce_expr() + b"(" + b"".join(entries) + b"u."
+    storage = b"N" + b"\x00" * (storage_size - 1)
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", data_pkl)
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        for index in range(entry_count):
+            archive.writestr(f"archive/data/{index}", storage)
+
+    report = scan_file(archive_path)
+
+    assert not any(notice.code == "pytorch_zip_pickle_discovery_probe_budget" for notice in report.notices)
+    try:
+        importlib_metadata.distribution("torch")
+    except importlib_metadata.PackageNotFoundError:
+        assert report.status == ScanStatus.INCONCLUSIVE
+    else:
+        assert report.status == ScanStatus.COMPLETE
+
+
 @pytest.mark.parametrize("container_kind", ["dict-setitem", "dict-setitems", "list", "tuple", "ordered-dict"])
 def test_scan_file_preserves_retained_benign_storage_container(
     tmp_path: Path,
