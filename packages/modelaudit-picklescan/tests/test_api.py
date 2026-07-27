@@ -3439,8 +3439,10 @@ def _write_large_batched_pytorch_state_dict(
     entry_count: int = 600,
     leading_metadata: bool = False,
     leading_metadata_count: int = 0,
+    split_leading_metadata_batch: bool = False,
     metadata_value: bytes = b"K\x01",
     trailing_metadata_count: int = 0,
+    trailing_metadata_fields: int = 1,
 ) -> None:
     entries: list[bytes] = []
     if leading_metadata:
@@ -3460,14 +3462,23 @@ def _write_large_batched_pytorch_state_dict(
             value = _pytorch_rebuild_tensor_v2_reduce_expr(key=str(index))
         entries.append(key + value)
 
-    payload = b"\x80\x04" + _global(b"collections", b"OrderedDict") + b")R(" + b"".join(entries) + b"u"
+    payload = b"\x80\x04" + _global(b"collections", b"OrderedDict") + b")R("
+    if split_leading_metadata_batch:
+        prefix_count = leading_metadata_count + int(leading_metadata)
+        payload += b"".join(entries[:prefix_count]) + b"u("
+        payload += b"".join(entries[prefix_count:]) + b"u"
+    else:
+        payload += b"".join(entries) + b"u"
     if trailing_metadata_count:
         metadata_key = b"_metadata"
         metadata_entries = []
         for index in range(trailing_metadata_count):
             module_name = f"layer_{index}".encode("ascii")
-            version_key = b"version"
-            version_dict = b"}(" + b"X" + len(version_key).to_bytes(4, "little") + version_key + b"K\x01u"
+            fields = []
+            for field_index in range(trailing_metadata_fields):
+                version_key = b"version" if field_index == 0 else f"extra_{field_index}".encode("ascii")
+                fields.append(b"X" + len(version_key).to_bytes(4, "little") + version_key + b"K\x01")
+            version_dict = b"}(" + b"".join(fields) + b"u"
             metadata_entries.append(b"X" + len(module_name).to_bytes(4, "little") + module_name + version_dict)
         payload += b"(" + b"X" + len(metadata_key).to_bytes(4, "little") + metadata_key + b"}("
         payload += b"".join(metadata_entries) + b"uu"
@@ -3520,16 +3531,18 @@ def test_pytorch_storage_trust_parses_large_metadata_after_canonical_batch(tmp_p
     assert len(parsed.canonical_tensor_rebuild_invocations) == 600
 
 
-@pytest.mark.parametrize("leading_metadata_count", [510, 1000])
+@pytest.mark.parametrize(("leading_metadata_count", "split_batch"), [(510, False), (1000, False), (1000, True)])
 def test_pytorch_storage_trust_parses_large_metadata_prefix_before_canonical_tensor(
     tmp_path: Path,
     leading_metadata_count: int,
+    split_batch: bool,
 ) -> None:
     archive_path = tmp_path / f"large-metadata-prefix-{leading_metadata_count}.pt"
     _write_large_batched_pytorch_state_dict(
         archive_path,
         entry_count=1,
         leading_metadata_count=leading_metadata_count,
+        split_leading_metadata_batch=split_batch,
     )
     with zipfile.ZipFile(archive_path) as archive:
         payload = archive.read("archive/data.pkl")
@@ -3559,6 +3572,36 @@ def test_scan_file_preserves_malicious_call_after_large_metadata_prefix(tmp_path
         and finding["details"].get("name") == "system"
         for finding in report["findings"]
     )
+
+
+def test_pytorch_storage_trust_parses_nested_multifield_metadata_batch(tmp_path: Path) -> None:
+    archive_path = tmp_path / "large-multifield-metadata-state.pt"
+    _write_large_batched_pytorch_state_dict(
+        archive_path,
+        trailing_metadata_count=510,
+        trailing_metadata_fields=2,
+    )
+    with zipfile.ZipFile(archive_path) as archive:
+        payload = archive.read("archive/data.pkl")
+
+    parsed = package_api._pytorch_storage_keys_from_pickle_bytes(payload)
+
+    assert parsed.parse_complete is True
+    assert len(parsed.canonical_tensor_rebuild_invocations) == 600
+
+
+def test_scan_file_suppresses_rebuild_tensor_v2_for_real_module_state_dict(tmp_path: Path) -> None:
+    _require_torch_distribution()
+    import torch
+
+    archive_path = tmp_path / "module-state-with-metadata.pt"
+    torch.save(torch.nn.Linear(3, 2).state_dict(), archive_path)
+
+    report = _scan_file_report_dict_subprocess(archive_path)
+
+    assert report["status"] == "complete"
+    assert report["verdict"] == "clean"
+    assert _torch_rebuild_tensor_v2_warning_dicts(report) == []
 
 
 def test_pytorch_storage_trust_checks_deadline_during_metadata_provenance(
