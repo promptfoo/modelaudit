@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Avoid network false positives for bounded README examples that download sample images over HTTPS from Hugging Face.
+
 ### Bug Fixes
 
 - Prevent Windows cache identity probes from creating locked temporary files inside scanned directories.
