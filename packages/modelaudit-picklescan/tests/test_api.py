@@ -3742,6 +3742,9 @@ def test_scan_file_preserves_hidden_malicious_storage_after_noncanonical_setitem
         "list_reduce",
         "tuple_reduce",
         "ordered_reduce",
+        "ordered_storage_key",
+        "ordered_storage_value",
+        "nested_storage_key",
     ],
 )
 def test_scan_file_preserves_hidden_malicious_storage_after_duplicate_state_key(
@@ -3750,7 +3753,15 @@ def test_scan_file_preserves_hidden_malicious_storage_after_duplicate_state_key(
 ) -> None:
     archive_path = tmp_path / f"malicious-duplicate-state-{duplicate_variant}.pt"
     hidden_payload = b"S'" + b"A" * 5000 + b"'\n0cos\nsystem\n(S'echo duplicate-state-key'\ntR."
-    separate_storage = duplicate_variant in {"ordered_build", "list_reduce", "tuple_reduce", "ordered_reduce"}
+    separate_storage = duplicate_variant in {
+        "ordered_build",
+        "list_reduce",
+        "tuple_reduce",
+        "ordered_reduce",
+        "ordered_storage_key",
+        "ordered_storage_value",
+        "nested_storage_key",
+    }
 
     def encoded_key(value: str) -> bytes:
         raw = value.encode("ascii")
@@ -3794,6 +3805,18 @@ def test_scan_file_preserves_hidden_malicious_storage_after_duplicate_state_key(
         suffix = (
             b"u" + encoded_key("converted") + _global(module_name, callable_name) + b"(" + storage_reference + b"tRs."
         )
+    elif duplicate_variant in {"ordered_storage_key", "ordered_storage_value", "nested_storage_key"}:
+        storage_reference = _pytorch_storage_binpersid_expr(
+            key="0",
+            storage_name="ByteStorage",
+            element_count=len(hidden_payload),
+        )
+        if duplicate_variant == "ordered_storage_key":
+            suffix = b"u" + storage_reference + b"K\x00s."
+        elif duplicate_variant == "ordered_storage_value":
+            suffix = b"u" + encoded_key("hidden") + storage_reference + b"s."
+        else:
+            suffix = b"u" + encoded_key("hidden") + b"}" + storage_reference + b"K\x00ss."
     else:
         storage_reference = _pytorch_storage_binpersid_expr(
             key="0",

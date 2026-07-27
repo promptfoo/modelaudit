@@ -1935,7 +1935,12 @@ def _pytorch_storage_keys_from_pickle_bytes(
         value.used_as_hooks = True
         return True
 
-    def value_contains_tracked_provenance(value: object, seen: set[int] | None = None) -> bool:
+    def value_contains_tracked_provenance(
+        value: object,
+        seen: set[int] | None = None,
+        *,
+        storage_only: bool = False,
+    ) -> bool:
         nonlocal provenance_nodes_inspected
 
         provenance_nodes_inspected += 1
@@ -1945,8 +1950,10 @@ def _pytorch_storage_keys_from_pickle_bytes(
             _check_pytorch_zip_deadline(deadline)
         if value is canonical_tensor:
             return True
-        if isinstance(value, _PytorchStorageRef | _PytorchOrderedDictState):
+        if isinstance(value, _PytorchStorageRef):
             return True
+        if isinstance(value, _PytorchOrderedDictState):
+            return not storage_only
         if not isinstance(value, (tuple, list, dict)):
             return False
         if seen is None:
@@ -1956,8 +1963,10 @@ def _pytorch_storage_keys_from_pickle_bytes(
             return False
         seen.add(value_id)
         if isinstance(value, dict):
-            return any(value_contains_tracked_provenance(item, seen) for item in value.items())
-        return any(value_contains_tracked_provenance(item, seen) for item in value)
+            return any(
+                value_contains_tracked_provenance(item, seen, storage_only=storage_only) for item in value.items()
+            )
+        return any(value_contains_tracked_provenance(item, seen, storage_only=storage_only) for item in value)
 
     def setitems_entry_is_safe(key: object, value: object) -> bool:
         return isinstance(key, str) and (
@@ -1971,6 +1980,19 @@ def _pytorch_storage_keys_from_pickle_bytes(
     def apply_setitems_to_target(items: tuple[tuple[Any, Any], ...]) -> None:
         nonlocal discarded_tracked_storage_references
 
+        canonical_storage_context = (
+            trusted_canonical_batch_seen
+            or bool(canonical_batch_entries)
+            or any(value is canonical_tensor for value in stack)
+            or any(value is canonical_tensor for _key, value in items)
+        )
+        if canonical_storage_context and any(
+            value_contains_tracked_provenance(key, storage_only=True)
+            or (value is not canonical_tensor and value_contains_tracked_provenance(value, storage_only=True))
+            for key, value in items
+        ):
+            discarded_tracked_storage_references = True
+            invalidate_tensor_rebuild_proof()
         if isinstance(stack[-1], _PytorchStorageRef):
             poison_stack_top()
         elif isinstance(stack[-1], _PytorchOrderedDictState):
