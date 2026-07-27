@@ -1876,12 +1876,23 @@ def _is_doc_only_network_reference(
     return (metadata_context and word_count >= 4) or word_count >= 6
 
 
-def _is_official_readme_sample_image_request(data: bytes, *, match_index: int, context: str) -> bool:
+def _is_official_readme_sample_image_request(
+    data: bytes,
+    *,
+    match_index: int,
+    context: str,
+    fence_cache: list[tuple[int, int, bool]],
+) -> bool:
     filename = context.replace("\\", "/").rsplit("/", 1)[-1].lower()
     if filename != "readme.md":
         return False
+    for fence_start, fence_end, is_safe in reversed(fence_cache):
+        if fence_start <= match_index < fence_end:
+            return is_safe
 
     example: bytes | None = None
+    example_start = 0
+    example_end = 0
     window_start = max(0, match_index - _MAX_README_IMAGE_EXAMPLE_BYTES)
     for opening in _PYTHON_README_FENCE_PATTERN.finditer(data, window_start, match_index + 1):
         if opening.end() > match_index:
@@ -1893,8 +1904,20 @@ def _is_official_readme_sample_image_request(data: bytes, *, match_index: int, c
         )
         if closing is not None and opening.end() <= match_index < closing.start():
             example = data[opening.end() : closing.start()]
+            example_start = opening.end()
+            example_end = closing.start()
             break
     if example is None:
+        return False
+    is_safe = _is_valid_official_readme_sample_image_example(example)
+    if len(fence_cache) >= 64:
+        fence_cache.pop(0)
+    fence_cache.append((example_start, example_end, is_safe))
+    return is_safe
+
+
+def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
+    if b"import requests" not in example or b"requests.get" not in example:
         return False
     try:
         tree = ast.parse(example.decode("utf-8"))
@@ -1906,11 +1929,13 @@ def _is_official_readme_sample_image_request(data: bytes, *, match_index: int, c
         return False
     parents = {id(child): parent for parent in nodes for child in ast.iter_child_nodes(parent)}
     imports = [
-        node for node in nodes if isinstance(node, ast.Import) for alias in node.names if alias.name == "requests"
+        statement
+        for statement in tree.body
+        if isinstance(statement, ast.Import)
+        for alias in statement.names
+        if alias.name == "requests" and alias.asname is None
     ]
-    if not imports or any(
-        alias.asname is not None for node in imports for alias in node.names if alias.name == "requests"
-    ):
+    if len(imports) != 1:
         return False
 
     requests_calls: list[ast.Call] = []
@@ -1954,11 +1979,37 @@ def _is_official_readme_sample_image_request(data: bytes, *, match_index: int, c
                     (statement.lineno, value if isinstance(value, str) else None)
                 )
     for node in nodes:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.asname == "requests" or (alias.name == "requests" and node not in imports):
+                    return False
+        if isinstance(node, ast.ImportFrom) and (
+            node.module == "requests"
+            or any(alias.name == "*" or alias.name == "requests" or alias.asname == "requests" for alias in node.names)
+        ):
+            return False
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name in protected_names:
+            return False
+        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if any(not isinstance(target, ast.Name) for target in targets):
+                return False
         if (
             isinstance(node, ast.Name)
             and node.id in protected_names
             and isinstance(node.ctx, ast.Store)
             and id(node) not in allowed_targets
+        ):
+            return False
+        if (
+            isinstance(node, ast.Name)
+            and node.id == "requests"
+            and isinstance(node.ctx, ast.Load)
+            and (
+                not isinstance(parent := parents.get(id(node)), ast.Attribute)
+                or parent.value is not node
+                or parent.attr != "get"
+            )
         ):
             return False
         if isinstance(node, ast.arg) and node.arg in protected_names:
@@ -1975,6 +2026,10 @@ def _is_official_readme_sample_image_request(data: bytes, *, match_index: int, c
                 "globals",
                 "locals",
                 "setattr",
+                "getattr",
+                "delattr",
+                "vars",
+                "__import__",
             }
         ):
             return False
@@ -2009,7 +2064,7 @@ def _is_official_readme_sample_image_request(data: bytes, *, match_index: int, c
         segments = parsed.path.split("/")
         if (
             parsed.scheme != "https"
-            or parsed.hostname not in _PUBLIC_MODEL_REPOSITORY_HOSTS
+            or parsed.hostname != "huggingface.co"
             or parsed.username is not None
             or parsed.password is not None
             or port is not None
@@ -2378,6 +2433,7 @@ class NetworkCommDetector:
         self._evidence_redaction_classifications = 0
         self._evidence_redaction_limit_reached = False
         self._cloud_nested_url_findings: set[str] = set()
+        self._official_readme_image_fences: list[tuple[int, int, bool]] = []
 
         # Clone class-level patterns to avoid cross-instance leakage
         self.cc_patterns: list[bytes] = self.CC_PATTERNS.copy()
@@ -2409,6 +2465,7 @@ class NetworkCommDetector:
         self._evidence_redaction_classifications = 0
         self._evidence_redaction_limit_reached = False
         self._cloud_nested_url_findings = set()
+        self._official_readme_image_fences = []
         if self.max_findings is None:
             self._url_contexts = self._index_url_contexts(data)
             self._url_context_starts = [start for start, _end, _url in self._url_contexts]
@@ -3048,7 +3105,12 @@ class NetworkCommDetector:
                         requires_call=not pattern.startswith((b"import ", b"from ")),
                     ) or (
                         lib == b"requests"
-                        and _is_official_readme_sample_image_request(data, match_index=match_index, context=context)
+                        and _is_official_readme_sample_image_request(
+                            data,
+                            match_index=match_index,
+                            context=context,
+                            fence_cache=self._official_readme_image_fences,
+                        )
                     ):
                         continue
 
@@ -3090,7 +3152,12 @@ class NetworkCommDetector:
                     requires_call=True,
                 ) or (
                     func == b"requests.get"
-                    and _is_official_readme_sample_image_request(data, match_index=idx, context=context)
+                    and _is_official_readme_sample_image_request(
+                        data,
+                        match_index=idx,
+                        context=context,
+                        fence_cache=self._official_readme_image_fences,
+                    )
                 ):
                     continue
 

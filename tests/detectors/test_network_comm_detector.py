@@ -2793,6 +2793,7 @@ class TestNetworkCommDetector:
             "http://huggingface.co/org/model/resolve/main/sample.png",
             "https://evil.example.org/sample.png",
             "https://huggingface.co.evil.example.org/sample.png",
+            "https://hf.co/org/model/resolve/main/sample.png",
             "https://huggingface.co/org/model/resolve/main/payload.py",
             "https://huggingface.co/org/model/resolve/main/sample.png?next=https://evil.example.org/payload",
         ],
@@ -2838,6 +2839,15 @@ class TestNetworkCommDetector:
             "requests.get = payload\nrequests.get(image_url, stream=True)",
             "setattr(requests, 'get', payload)\nrequests.get(image_url, stream=True)",
             "fetch = requests.get\nrequests.get(image_url, stream=True)\nfetch(input())",
+            "from requests import post\nrequests.get(image_url, stream=True)\npost(input())",
+            "import attacker as requests\nrequests.get(image_url, stream=True)",
+            "from attacker import requests\nrequests.get(image_url, stream=True)",
+            "from attacker import *\nrequests.get(image_url, stream=True)",
+            "vars(requests)['get'] = payload\nrequests.get(image_url, stream=True)",
+            "object.__setattr__(requests, 'get', payload)\nrequests.get(image_url, stream=True)",
+            "class requests:\n    get = payload\nrequests.get(image_url, stream=True)",
+            "import sys\nsys.modules['requests'] = payload\nrequests.get(image_url, stream=True)",
+            "fetch = __import__('requests').post\nrequests.get(image_url, stream=True)\nfetch(input())",
         ],
     )
     def test_readme_python_example_preserves_rebound_or_unproven_requests(
@@ -2877,6 +2887,30 @@ class TestNetworkCommDetector:
 
         findings = NetworkCommDetector().scan(data, "README.md")
 
+        assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+
+    def test_readme_official_image_example_is_validated_once_per_fence(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        validated_examples: list[bytes] = []
+        original_validator = network_comm._is_valid_official_readme_sample_image_example
+
+        def count_validation(example: bytes) -> bool:
+            validated_examples.append(example)
+            return original_validator(example)
+
+        monkeypatch.setattr(network_comm, "_is_valid_official_readme_sample_image_example", count_validation)
+        data = (
+            b"```python\nimport requests\n"
+            b"image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            + b"# requests.get is documented here\n" * 64
+            + b"requests.get(image_url, stream=True)\n```\n"
+        )
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert len(validated_examples) == 1
         assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
 
     def test_readme_official_image_in_different_fence_does_not_suppress_network_call(self) -> None:
