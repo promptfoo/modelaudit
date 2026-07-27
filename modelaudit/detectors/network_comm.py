@@ -4,6 +4,7 @@ This module detects potential network communication capabilities in model files
 that could be used for data exfiltration or command & control operations.
 """
 
+import ast
 import ipaddress
 import math
 import re
@@ -1726,6 +1727,11 @@ _EXPLICIT_PROSE_PREFIX_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _MAX_PROSE_LINE_CONTEXT_BYTES = 512
+_MAX_README_IMAGE_EXAMPLE_BYTES = 64 * 1024
+_MAX_README_IMAGE_EXAMPLE_AST_NODES = 1024
+_PYTHON_README_FENCE_PATTERN = re.compile(rb"(?m)^[ \t]{0,3}```(?:python|py)[ \t]*\r?\n")
+_README_FENCE_END_PATTERN = re.compile(rb"(?m)^[ \t]{0,3}```[ \t]*\r?$")
+_DOCUMENTED_IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp")
 _WORD_PATTERN = re.compile(rb"[A-Za-z]{2,}")
 _CALL_SYNTAX_SUFFIX_PATTERN = re.compile(rb"(?:[\s)]|#[^\n]*\n)*\(")
 _CODE_LINE_PREFIXES: tuple[bytes, ...] = (
@@ -1868,6 +1874,102 @@ def _is_doc_only_network_reference(
     if not has_prose_marker:
         return False
     return (metadata_context and word_count >= 4) or word_count >= 6
+
+
+def _is_official_readme_sample_image_request(data: bytes, *, match_index: int, context: str) -> bool:
+    if len(data) > _MAX_README_IMAGE_EXAMPLE_BYTES:
+        return False
+    filename = context.replace("\\", "/").rsplit("/", 1)[-1].lower()
+    if filename != "readme.md":
+        return False
+
+    example: bytes | None = None
+    for opening in _PYTHON_README_FENCE_PATTERN.finditer(data):
+        if opening.end() > match_index:
+            break
+        closing = _README_FENCE_END_PATTERN.search(data, opening.end())
+        if closing is not None and opening.end() <= match_index < closing.start():
+            example = data[opening.end() : closing.start()]
+            break
+    if example is None:
+        return False
+    try:
+        tree = ast.parse(example.decode("utf-8"))
+    except (SyntaxError, UnicodeDecodeError, RecursionError, ValueError):
+        return False
+
+    nodes = list(ast.walk(tree))
+    if len(nodes) > _MAX_README_IMAGE_EXAMPLE_AST_NODES:
+        return False
+    imports = [
+        node for node in nodes if isinstance(node, ast.Import) for alias in node.names if alias.name == "requests"
+    ]
+    if not imports or any(
+        alias.asname is not None for node in imports for alias in node.names if alias.name == "requests"
+    ):
+        return False
+
+    assignments: dict[str, list[tuple[int, str | None]]] = {}
+    for node in nodes:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    value = node.value.value if isinstance(node.value, ast.Constant) else None
+                    assignments.setdefault(target.id, []).append(
+                        (node.lineno, value if isinstance(value, str) else None)
+                    )
+
+    requests_calls: list[ast.Call] = []
+    for node in nodes:
+        if not isinstance(node, ast.Attribute) or not isinstance(node.value, ast.Name) or node.value.id != "requests":
+            continue
+        if node.attr != "get":
+            return False
+    for node in nodes:
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "requests"
+            and node.func.attr == "get"
+        ):
+            requests_calls.append(node)
+    if not requests_calls:
+        return False
+
+    for call in requests_calls:
+        if len(call.args) != 1 or any(
+            keyword.arg != "stream" or not isinstance(keyword.value, ast.Constant) or keyword.value.value is not True
+            for keyword in call.keywords
+        ):
+            return False
+        argument = call.args[0]
+        if isinstance(argument, ast.Constant) and isinstance(argument.value, str):
+            url = argument.value
+        elif isinstance(argument, ast.Name):
+            bindings = [binding for binding in assignments.get(argument.id, []) if binding[0] < call.lineno]
+            if len(bindings) != 1 or bindings[0][1] is None:
+                return False
+            url = bindings[0][1]
+        else:
+            return False
+        try:
+            parsed = urlsplit(url)
+        except ValueError:
+            return False
+        segments = parsed.path.split("/")
+        if (
+            parsed.scheme != "https"
+            or parsed.hostname not in _PUBLIC_MODEL_REPOSITORY_HOSTS
+            or parsed.netloc != parsed.hostname
+            or parsed.fragment
+            or parsed.query not in {"", "download=true"}
+            or "resolve" not in segments
+            or any(segment in {".", ".."} for segment in segments)
+            or not parsed.path.lower().endswith(_DOCUMENTED_IMAGE_SUFFIXES)
+        ):
+            return False
+    return True
 
 
 class NetworkCommDetector:
@@ -2892,6 +2994,9 @@ class NetworkCommDetector:
                         token_len=len(pattern),
                         context=context,
                         requires_call=not pattern.startswith((b"import ", b"from ")),
+                    ) or (
+                        lib == b"requests"
+                        and _is_official_readme_sample_image_request(data, match_index=match_index, context=context)
                     ):
                         continue
 
@@ -2931,6 +3036,9 @@ class NetworkCommDetector:
                     token_len=len(func),
                     context=context,
                     requires_call=True,
+                ) or (
+                    func == b"requests.get"
+                    and _is_official_readme_sample_image_request(data, match_index=idx, context=context)
                 ):
                     continue
 

