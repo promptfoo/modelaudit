@@ -3404,10 +3404,14 @@ def test_scan_file_suppresses_rebuild_tensor_v2_for_multiple_canonical_memo_uses
     data_pkl = (
         b"\x80\x04"
         + _global(b"torch._utils", b"_rebuild_tensor_v2")
-        + b"q\x00"
+        + b"q\x000"
+        + _pytorch_empty_ordered_dict_reduce_expr()
+        + b"("
+        + _short_binunicode(b"first")
         + _pytorch_rebuild_tensor_v2_reduce_expr()
+        + _short_binunicode(b"second")
         + _pytorch_rebuild_tensor_v2_reduce_expr()
-        + b"."
+        + b"u."
     )
     _write_pytorch_zip_data_pickle(archive_path, data_pkl)
 
@@ -3416,6 +3420,109 @@ def test_scan_file_suppresses_rebuild_tensor_v2_for_multiple_canonical_memo_uses
     assert report["status"] == "complete"
     assert report["verdict"] == "clean"
     assert _torch_rebuild_tensor_v2_warning_dicts(report) == []
+
+
+def test_scan_file_suppresses_rebuild_tensor_v2_for_nested_canonical_tensor(tmp_path: Path) -> None:
+    _require_torch_distribution()
+    archive_path = tmp_path / "nested-canonical-state.pt"
+    data_pkl = (
+        b"\x80\x04"
+        + _global(b"torch._utils", b"_rebuild_tensor_v2")
+        + b"q\x000"
+        + _pytorch_empty_ordered_dict_reduce_expr()
+        + b"("
+        + _short_binunicode(b"weight")
+        + _pytorch_rebuild_tensor_v2_reduce_expr()
+        + _short_binunicode(b"_extra_state")
+        + b"}"
+        + _short_binunicode(b"calibration")
+        + _pytorch_rebuild_tensor_v2_reduce_expr()
+        + b"su."
+    )
+    _write_pytorch_zip_data_pickle(archive_path, data_pkl)
+
+    report = _scan_file_report_dict_subprocess(archive_path)
+
+    assert report["status"] == "complete"
+    assert report["verdict"] == "clean"
+    assert _torch_rebuild_tensor_v2_warning_dicts(report) == []
+
+
+@pytest.mark.parametrize("memoized_final_tensor", [False, True])
+def test_scan_file_preserves_hidden_malicious_storage_after_stacked_canonical_tensors(
+    tmp_path: Path,
+    memoized_final_tensor: bool,
+) -> None:
+    archive_path = tmp_path / f"malicious-stacked-canonical-{memoized_final_tensor}.pt"
+    hidden_payload = b"S'" + b"A" * 5000 + b"'\n0cos\nsystem\n(S'echo discarded-same-storage'\ntR."
+    canonical_tensor = _pytorch_rebuild_tensor_v2_reduce_expr(
+        key="0",
+        storage_name="ByteStorage",
+        element_count=len(hidden_payload),
+    )
+    final_tensor = b"q\x01h\x01" if memoized_final_tensor else canonical_tensor
+    data_pkl = (
+        b"\x80\x04"
+        + _global(b"torch._utils", b"_rebuild_tensor_v2")
+        + b"q\x00"
+        + canonical_tensor
+        + final_tensor
+        + b"."
+    )
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", data_pkl)
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", hidden_payload)
+
+    report = scan_file(archive_path)
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.severity == Severity.CRITICAL
+        and finding.details.get("module") in {"os", "posix", "nt"}
+        and finding.details.get("name") == "system"
+        for finding in report.findings
+    )
+
+
+def test_scan_file_preserves_hidden_malicious_storage_inside_enclosing_list(tmp_path: Path) -> None:
+    archive_path = tmp_path / "malicious-enclosing-list.pt"
+    hidden_payload = b"S'" + b"A" * 5000 + b"'\n0cos\nsystem\n(S'echo enclosing-list-storage'\ntR."
+    entries: list[bytes] = []
+    for index in range(600):
+        key = _short_binunicode(f"weight_{index}".encode("ascii"))
+        if index == 0:
+            value = _pytorch_rebuild_tensor_v2_payload(key=str(index + 1)).removeprefix(b"\x80\x04").removesuffix(b".")
+        else:
+            value = _pytorch_rebuild_tensor_v2_reduce_expr(key=str(index + 1))
+        entries.append(key + value)
+    data_pkl = (
+        b"\x80\x04]"
+        + _pytorch_storage_binpersid_expr(key="0", storage_name="ByteStorage", element_count=len(hidden_payload))
+        + b"a"
+        + _pytorch_empty_ordered_dict_reduce_expr()
+        + b"("
+        + b"".join(entries)
+        + b"ua."
+    )
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", data_pkl)
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", hidden_payload)
+        for index in range(600):
+            archive.writestr(f"archive/data/{index + 1}", b"\x00" * 24)
+
+    report = scan_file(archive_path)
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.severity == Severity.CRITICAL
+        and finding.details.get("module") in {"os", "posix", "nt"}
+        and finding.details.get("name") == "system"
+        for finding in report.findings
+    )
 
 
 def test_scan_file_suppresses_rebuild_tensor_v2_for_real_ordered_state_dict(tmp_path: Path) -> None:
