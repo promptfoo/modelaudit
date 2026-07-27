@@ -419,7 +419,7 @@ def test_text_scanner_documentation_urls_are_informational(tmp_path: Path) -> No
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
 
-@pytest.mark.parametrize("filename", ["README.md", "README"])
+@pytest.mark.parametrize("filename", ["README.md", "README", "README.en.md", "README.markdown"])
 def test_text_scanner_readme_official_sample_image_request_is_informational(tmp_path: Path, filename: str) -> None:
     text_path = tmp_path / filename
     text_path.write_text(

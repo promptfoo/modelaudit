@@ -1731,8 +1731,8 @@ _MAX_README_IMAGE_EXAMPLE_BYTES = 64 * 1024
 _MAX_README_IMAGE_EXAMPLE_AST_NODES = 1024
 _MAX_README_IMAGE_EXAMPLE_FENCE_OPENINGS = 64
 _MAX_README_IMAGE_EXAMPLE_FENCES = 256
-_PYTHON_README_FENCE_PATTERN = re.compile(rb"(?m)^[ \t]{0,3}```(?:python|py)[ \t]*\r?\n")
-_README_FENCE_END_PATTERN = re.compile(rb"(?m)^[ \t]{0,3}```[ \t]*\r?$")
+_PYTHON_README_FENCE_PATTERN = re.compile(rb"(?m)^[ \t]{0,3}(?P<fence>`{3,})(?:python|py)[ \t]*\r?\n")
+_README_FENCE_END_PATTERN = re.compile(rb"(?m)^[ \t]{0,3}`{3,}[ \t]*\r?$")
 _DOCUMENTED_IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp")
 _WORD_PATTERN = re.compile(rb"[A-Za-z]{2,}")
 _CALL_SYNTAX_SUFFIX_PATTERN = re.compile(rb"(?:[\s)]|#[^\n]*\n)*\(")
@@ -1886,8 +1886,7 @@ def _is_official_readme_sample_image_request(
     fence_cache: list[tuple[int, int, bool]],
     preindexed: bool = False,
 ) -> bool:
-    filename = context.replace("\\", "/").rsplit("/", 1)[-1].lower()
-    if filename not in {"readme.md", "readme"}:
+    if not _is_readme_image_example_context(context):
         return False
     if preindexed:
         fence_index = bisect_right(fence_cache, (match_index, len(data), True)) - 1
@@ -1911,8 +1910,9 @@ def _is_official_readme_sample_image_request(
     for opening in openings:
         if opening.end() > match_index:
             break
-        closing = _README_FENCE_END_PATTERN.search(
+        closing = _matching_readme_image_fence_end(
             data,
+            opening,
             opening.end(),
             min(len(data), opening.end() + _MAX_README_IMAGE_EXAMPLE_BYTES),
         )
@@ -1934,8 +1934,7 @@ def _index_official_readme_sample_image_fences(
     data: bytes,
     context: str,
 ) -> tuple[list[tuple[int, int, bool]], bool]:
-    filename = context.replace("\\", "/").rsplit("/", 1)[-1].lower()
-    if filename not in {"readme.md", "readme"} or b"requests" not in data:
+    if not _is_readme_image_example_context(context) or b"requests" not in data:
         return [], False
 
     fences: list[tuple[int, int, bool]] = []
@@ -1944,8 +1943,9 @@ def _index_official_readme_sample_image_fences(
     while opening := _PYTHON_README_FENCE_PATTERN.search(data, cursor):
         if len(fences) >= _MAX_README_IMAGE_EXAMPLE_FENCES:
             return [], True
-        closing = _README_FENCE_END_PATTERN.search(
+        closing = _matching_readme_image_fence_end(
             data,
+            opening,
             opening.end(),
             min(len(data), opening.end() + _MAX_README_IMAGE_EXAMPLE_BYTES),
         )
@@ -1964,6 +1964,29 @@ def _index_official_readme_sample_image_fences(
         fences.append((opening.end(), closing.start(), is_safe))
         cursor = closing.end()
     return fences, unvalidated_requests
+
+
+def _is_readme_image_example_context(context: str) -> bool:
+    filename = context.replace("\\", "/").rsplit("/", 1)[-1].lower()
+    return filename == "readme" or (
+        filename.startswith("readme.") and filename.rsplit(".", 1)[-1] in {"txt", "md", "markdown", "rst", "env"}
+    )
+
+
+def _matching_readme_image_fence_end(
+    data: bytes,
+    opening: re.Match[bytes],
+    start: int,
+    end: int,
+) -> re.Match[bytes] | None:
+    opening_width = len(opening.group("fence"))
+    cursor = start
+    while closing := _README_FENCE_END_PATTERN.search(data, cursor, end):
+        delimiter = data[closing.start() : closing.end()].strip(b" \t\r")
+        if len(delimiter) >= opening_width:
+            return closing
+        cursor = closing.end()
+    return None
 
 
 def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
@@ -2050,7 +2073,7 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
     known_names = (
         imported_names
         | documented_builtin_names
-        | {"Image", "torch"}
+        | {"Image", "str", "torch"}
         | {node.id for node in nodes if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)}
         | {node.arg for node in nodes if isinstance(node, ast.arg)}
         | {node.name for node in nodes if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
@@ -2070,10 +2093,13 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
     allowed_targets: set[int] = set()
     assignments: dict[str, list[tuple[int, str | None]]] = {}
     for statement in tree.body:
-        if not isinstance(statement, ast.Assign):
+        if not isinstance(statement, (ast.Assign, ast.AnnAssign)):
             continue
-        for target in statement.targets:
+        targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+        for target in targets:
             if isinstance(target, ast.Name) and target.id in protected_names and target.id != "requests":
+                if isinstance(statement, ast.AnnAssign) and not isinstance(statement.value, ast.Constant):
+                    continue
                 allowed_targets.add(id(target))
                 value = statement.value.value if isinstance(statement.value, ast.Constant) else None
                 assignments.setdefault(target.id, []).append(
@@ -2143,6 +2169,8 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
             attribute_root = node.func.value
             while isinstance(attribute_root, (ast.Attribute, ast.Subscript, ast.Call)):
+                if isinstance(attribute_root, ast.Call) and attribute_root in requests_calls:
+                    return False
                 attribute_root = attribute_root.func if isinstance(attribute_root, ast.Call) else attribute_root.value
             if isinstance(attribute_root, ast.Name) and attribute_root.id in (
                 requests_response_names | documented_builtin_names

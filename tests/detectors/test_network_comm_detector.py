@@ -2773,7 +2773,7 @@ class TestNetworkCommDetector:
             "https://HuggingFace.CO/spaces/ds4sd/demo/resolve/main/examples/sample.png",
         ],
     )
-    @pytest.mark.parametrize("context", ["README.md", "README"])
+    @pytest.mark.parametrize("context", ["README.md", "README", "README.en.md", "README.markdown", "README.rst"])
     def test_readme_python_example_official_sample_image_has_no_network_false_positive(
         self,
         image_url: str,
@@ -2789,6 +2789,42 @@ class TestNetworkCommDetector:
 
         assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
         assert any(finding["type"] == "cloud_storage_url" for finding in findings)
+
+    @pytest.mark.parametrize(("opening", "closing"), [("```", "````"), ("````", "````"), ("````", "`````")])
+    def test_readme_python_example_accepts_valid_longer_fence_closers(self, opening: str, closing: str) -> None:
+        data = (
+            f"{opening}python\nimport requests\n"
+            "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            "requests.get(image_url, stream=True)\n"
+            f"{closing}\n"
+        ).encode()
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+
+    def test_readme_python_example_rejects_shorter_fence_closers(self) -> None:
+        data = (
+            b"````python\nimport requests\n"
+            b"image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            b"requests.get(image_url, stream=True)\n```\n"
+        )
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert any(finding["type"] == "network_library" for finding in findings)
+        assert any(finding["type"] == "network_function" for finding in findings)
+
+    def test_readme_python_example_accepts_constant_annotated_url_binding(self) -> None:
+        data = (
+            b"```python\nimport requests\n"
+            b"image_url: str = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            b"requests.get(image_url, stream=True)\n```\n"
+        )
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
 
     @pytest.mark.parametrize(
         "image_url",
@@ -2874,6 +2910,10 @@ class TestNetworkCommDetector:
             "import attacker as print\nprint()\nrequests.get(image_url, stream=True)",
             "requests.get(image_url, stream=True)\nplugin.activate()",
             "response = requests.get(image_url, stream=True)\nresponse.exfiltrate()",
+            "requests.get(image_url, stream=True).raw.exfiltrate()",
+            "requests.get(image_url, stream=True).raw.connection.sock.sendall(b'secret')",
+            "requests.get(image_url, stream=True).raw.connection.request('POST', '/upload', body='secret')",
+            "requests.get(image_url, stream=True).raw[0].send(image_url)",
             "print.__self__.__dict__['ex' + 'ec']('requests.get = print')\nrequests.get(image_url, stream=True)",
             (
                 "assert print.__self__.__dict__['ex' + 'ec']('requests.get = print') is None\n"
