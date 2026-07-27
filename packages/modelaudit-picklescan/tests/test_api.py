@@ -3745,6 +3745,7 @@ def test_scan_file_preserves_hidden_malicious_storage_after_noncanonical_setitem
         "ordered_storage_key",
         "ordered_storage_value",
         "nested_storage_key",
+        "leading_nested_ordered_storage",
     ],
 )
 def test_scan_file_preserves_hidden_malicious_storage_after_duplicate_state_key(
@@ -3761,6 +3762,7 @@ def test_scan_file_preserves_hidden_malicious_storage_after_duplicate_state_key(
         "ordered_storage_key",
         "ordered_storage_value",
         "nested_storage_key",
+        "leading_nested_ordered_storage",
     }
 
     def encoded_key(value: str) -> bytes:
@@ -3805,7 +3807,12 @@ def test_scan_file_preserves_hidden_malicious_storage_after_duplicate_state_key(
         suffix = (
             b"u" + encoded_key("converted") + _global(module_name, callable_name) + b"(" + storage_reference + b"tRs."
         )
-    elif duplicate_variant in {"ordered_storage_key", "ordered_storage_value", "nested_storage_key"}:
+    elif duplicate_variant in {
+        "ordered_storage_key",
+        "ordered_storage_value",
+        "nested_storage_key",
+        "leading_nested_ordered_storage",
+    }:
         storage_reference = _pytorch_storage_binpersid_expr(
             key="0",
             storage_name="ByteStorage",
@@ -3815,7 +3822,7 @@ def test_scan_file_preserves_hidden_malicious_storage_after_duplicate_state_key(
             suffix = b"u" + storage_reference + b"K\x00s."
         elif duplicate_variant == "ordered_storage_value":
             suffix = b"u" + encoded_key("hidden") + storage_reference + b"s."
-        else:
+        elif duplicate_variant == "nested_storage_key":
             suffix = b"u" + encoded_key("hidden") + b"}" + storage_reference + b"K\x00ss."
     else:
         storage_reference = _pytorch_storage_binpersid_expr(
@@ -3827,6 +3834,19 @@ def test_scan_file_preserves_hidden_malicious_storage_after_duplicate_state_key(
         entries.append(encoded_key("nested") + nested_dict)
 
     payload = b"\x80\x04" + _global(b"collections", b"OrderedDict") + b")R(" + b"".join(entries) + suffix
+    if duplicate_variant == "leading_nested_ordered_storage":
+        ordered_dict = _global(b"collections", b"OrderedDict") + b")R"
+        payload = (
+            b"\x80\x04"
+            + ordered_dict
+            + encoded_key("pre")
+            + ordered_dict
+            + encoded_key("inside")
+            + storage_reference
+            + b"ss("
+            + b"".join(entries)
+            + b"u."
+        )
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.writestr("archive/data.pkl", payload)
         archive.writestr("archive/version", "3\n")

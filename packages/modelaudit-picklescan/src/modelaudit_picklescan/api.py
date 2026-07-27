@@ -337,6 +337,7 @@ class _PytorchStorageRef:
 class _PytorchOrderedDictState:
     mutated: bool = False
     used_as_hooks: bool = False
+    contains_untrusted_storage: bool = False
     keys_with_tracked_provenance: set[object] = field(default_factory=set)
 
 
@@ -1953,7 +1954,7 @@ def _pytorch_storage_keys_from_pickle_bytes(
         if isinstance(value, _PytorchStorageRef):
             return True
         if isinstance(value, _PytorchOrderedDictState):
-            return not storage_only
+            return value.contains_untrusted_storage if storage_only else True
         if not isinstance(value, (tuple, list, dict)):
             return False
         if seen is None:
@@ -1986,17 +1987,22 @@ def _pytorch_storage_keys_from_pickle_bytes(
             or any(value is canonical_tensor for value in stack)
             or any(value is canonical_tensor for _key, value in items)
         )
-        if canonical_storage_context and any(
+        items_contain_untrusted_storage = any(
             value_contains_tracked_provenance(key, storage_only=True)
             or (value is not canonical_tensor and value_contains_tracked_provenance(value, storage_only=True))
             for key, value in items
-        ):
+        )
+        prior_state_contains_untrusted_storage = any(
+            isinstance(value, _PytorchOrderedDictState) and value.contains_untrusted_storage for value in stack
+        )
+        if canonical_storage_context and (items_contain_untrusted_storage or prior_state_contains_untrusted_storage):
             discarded_tracked_storage_references = True
             invalidate_tensor_rebuild_proof()
         if isinstance(stack[-1], _PytorchStorageRef):
             poison_stack_top()
         elif isinstance(stack[-1], _PytorchOrderedDictState):
             target = stack[-1]
+            target.contains_untrusted_storage = target.contains_untrusted_storage or items_contain_untrusted_storage
             for key, value in items:
                 if key in target.keys_with_tracked_provenance:
                     discarded_tracked_storage_references = True
