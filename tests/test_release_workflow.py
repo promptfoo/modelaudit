@@ -110,10 +110,26 @@ def test_standalone_package_lint_uses_locked_root_ruff_version() -> None:
         (_load_release_workflow(), "build-picklescan-package"),
         (python_workflow, "picklescan-package"),
     ):
-        for step in _job_steps(workflow, job_name):
-            run = step.get("run", "")
-            if "ruff check" in run or "ruff format" in run:
-                assert expected_requirement in run
+        ruff_runs = [
+            run
+            for step in _job_steps(workflow, job_name)
+            if isinstance(run := step.get("run"), str) and ("ruff check" in run or "ruff format" in run)
+        ]
+        assert ruff_runs, f"{job_name} must run Ruff"
+        for run in ruff_runs:
+            assert f"uv run --with '{expected_requirement}' ruff" in run
+
+    expected_commands = (
+        f"uv run --with '{expected_requirement}' ruff check src tests",
+        f"uv run --with '{expected_requirement}' ruff format --check src tests",
+    )
+    for guide in (
+        root_dir / "packages/modelaudit-picklescan/AGENTS.md",
+        root_dir / "docs/agents/picklescan-package-split.md",
+    ):
+        guide_lines = guide.read_text(encoding="utf-8").splitlines()
+        for expected_command in expected_commands:
+            assert expected_command in guide_lines
 
 
 def test_release_workflow_manual_dispatch_inputs_and_guardrails() -> None:

@@ -268,6 +268,53 @@ def test_clear_cache_closes_reusable_change_clock_probes(
     assert cache.metadata_file.exists()
 
 
+def test_clear_cache_closes_remaining_probes_after_close_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    stale_clean_result = cache.cache_dir / "stale-clean-result.json"
+    stale_clean_result.write_text('{"verdict":"CLEAN","findings":[]}', encoding="utf-8")
+    close_attempts: list[str] = []
+    removed_paths: list[Path] = []
+    original_unlink = Path.unlink
+
+    class CachedProbe:
+        def __init__(self, name: str, *, fail_close: bool = False) -> None:
+            self.name = name
+            self.fail_close = fail_close
+            self.closed = False
+
+        def close(self) -> None:
+            close_attempts.append(self.name)
+            if self.fail_close:
+                raise OSError("simulated probe close failure")
+            self.closed = True
+
+    def record_unlink(path: Path, *, missing_ok: bool = False) -> None:
+        removed_paths.append(path)
+        original_unlink(path, missing_ok=missing_ok)
+
+    first_probe = CachedProbe("first", fail_close=True)
+    second_probe = CachedProbe("second")
+    cache._change_clock_probes[1] = (cast(BinaryIO, first_probe), cache.cache_dir)
+    cache._change_clock_probes[2] = (cast(BinaryIO, second_probe), cache.cache_dir)
+    monkeypatch.setattr(Path, "unlink", record_unlink)
+
+    cache.clear_cache()
+
+    assert close_attempts == ["first", "second"]
+    assert first_probe.closed is False
+    assert second_probe.closed is True
+    assert cache._change_clock_probes == {}
+    assert stale_clean_result in removed_paths
+    assert not stale_clean_result.exists()
+    assert cache.metadata_file not in removed_paths
+    assert cache.metadata_file.exists()
+    metadata = json.loads(cache.metadata_file.read_text(encoding="utf-8"))
+    assert metadata["statistics"]["total_entries"] == 0
+
+
 def test_windows_change_clock_probe_uses_existing_handle(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

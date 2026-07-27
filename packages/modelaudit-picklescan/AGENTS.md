@@ -40,8 +40,8 @@ Run from `packages/modelaudit-picklescan/`:
 
 ```bash
 uv lock --check
-uv run --with ruff ruff check src tests
-uv run --with ruff ruff format --check src tests
+uv run --with 'ruff==0.15.10' ruff check src tests
+uv run --with 'ruff==0.15.10' ruff format --check src tests
 uv run --with mypy mypy src tests
 uv run --with pytest --with pytest-xdist pytest -n auto tests --tb=short
 

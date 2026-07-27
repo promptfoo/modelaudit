@@ -2080,7 +2080,8 @@ class ScanResultsCache:
 
         with self._change_clock_probe_lock:
             for probe, _directory in self._change_clock_probes.values():
-                probe.close()
+                with suppress(OSError):
+                    probe.close()
             self._change_clock_probes.clear()
 
         # Remove all cache files except metadata
