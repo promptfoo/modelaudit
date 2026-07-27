@@ -985,12 +985,13 @@ class ScanResultsCache:
             if existing is not None:
                 return existing[0]
 
+            scanned_parent = Path(os.path.abspath(file_path)).parent
             if os.name == "nt":
                 # Windows keeps TemporaryFile names visible and locked until close.
                 candidates = [Path(tempfile.gettempdir()), self.cache_dir]
             else:
                 candidates = [self.cache_dir, Path(tempfile.gettempdir())]
-                ancestor = Path(os.path.abspath(file_path)).parent
+                ancestor = scanned_parent
                 while True:
                     candidates.append(ancestor)
                     if ancestor.parent == ancestor:
@@ -999,6 +1000,11 @@ class ScanResultsCache:
 
             checked: set[Path] = set()
             for candidate in candidates:
+                normalized_candidate = Path(os.path.abspath(candidate))
+                if os.name == "nt" and (
+                    normalized_candidate == scanned_parent or scanned_parent in normalized_candidate.parents
+                ):
+                    continue
                 if candidate in checked:
                     continue
                 checked.add(candidate)
@@ -2078,14 +2084,30 @@ class ScanResultsCache:
 
         logger.debug("Clearing entire scan results cache")
 
+        retained_probe_paths: set[Path] = set()
         with self._change_clock_probe_lock:
-            for probe, _directory in self._change_clock_probes.values():
-                with suppress(OSError):
+            for file_device, (probe, probe_directory) in tuple(self._change_clock_probes.items()):
+                try:
                     probe.close()
-            self._change_clock_probes.clear()
+                except OSError:
+                    if not probe.closed:
+                        probe_name = getattr(probe, "name", None)
+                        if isinstance(probe_name, str):
+                            probe_path = Path(os.path.abspath(probe_name))
+                            cache_path = Path(os.path.abspath(self.cache_dir))
+                            if (
+                                probe_directory == self.cache_dir
+                                and probe_path.parent == cache_path
+                                and probe_path.name.startswith(".modelaudit-cache-clock-")
+                            ):
+                                retained_probe_paths.add(probe_path)
+                        continue
+                self._change_clock_probes.pop(file_device, None)
 
         # Remove all cache files except metadata
         for item in self.cache_dir.iterdir():
+            if Path(os.path.abspath(item)) in retained_probe_paths:
+                continue
             if item.name != "cache_metadata.json":
                 if item.is_dir():
                     shutil.rmtree(item)
