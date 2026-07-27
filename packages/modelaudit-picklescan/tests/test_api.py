@@ -3583,10 +3583,20 @@ def test_pytorch_storage_trust_preserves_noncanonical_setitems_width_limit() -> 
     assert parsed.canonical_tensor_rebuild_invocations == set()
 
 
-@pytest.mark.parametrize("with_prior_tensor_batch", [False, True])
+@pytest.mark.parametrize(
+    ("with_prior_tensor_batch", "storage_wrapper"),
+    [
+        (False, None),
+        (True, None),
+        (True, (b"builtins", b"list")),
+        (True, (b"builtins", b"tuple")),
+        (True, (b"collections", b"OrderedDict")),
+    ],
+)
 def test_scan_file_preserves_hidden_malicious_storage_after_noncanonical_setitems(
     tmp_path: Path,
     with_prior_tensor_batch: bool,
+    storage_wrapper: tuple[bytes, bytes] | None,
 ) -> None:
     archive_path = tmp_path / f"malicious-noncanonical-state-{with_prior_tensor_batch}.pt"
     hidden_payload = b"S'" + b"A" * 5000 + b"'\n0cos\nsystem\n(S'echo malicious-near-match'\ntR."
@@ -3595,12 +3605,14 @@ def test_scan_file_preserves_hidden_malicious_storage_after_noncanonical_setitem
         key = f"key_{index}".encode("ascii")
         entries.append(b"X" + len(key).to_bytes(4, "little") + key + b"K\x00")
     storage_key = b"storage"
-    entries.append(
-        b"X"
-        + len(storage_key).to_bytes(4, "little")
-        + storage_key
-        + _pytorch_storage_binpersid_expr(key="0", storage_name="ByteStorage", element_count=len(hidden_payload))
+    storage_reference = _pytorch_storage_binpersid_expr(
+        key="0",
+        storage_name="ByteStorage",
+        element_count=len(hidden_payload),
     )
+    if storage_wrapper is not None:
+        storage_reference = _global(*storage_wrapper) + b"(" + storage_reference + b"tR"
+    entries.append(b"X" + len(storage_key).to_bytes(4, "little") + storage_key + storage_reference)
     if with_prior_tensor_batch:
         tensor_key = b"weight"
         tensor_value = _pytorch_rebuild_tensor_v2_payload(key="1").removeprefix(b"\x80\x04").removesuffix(b".")

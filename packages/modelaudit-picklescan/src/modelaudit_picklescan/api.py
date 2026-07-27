@@ -2295,7 +2295,8 @@ def _pytorch_storage_keys_from_pickle_bytes(
                     )
                 batch_has_canonical_tensor = any(value is canonical_tensor for _key, value in setitem_pairs)
                 if len(setitem_pairs) * 2 > _PYTORCH_STORAGE_TRUST_MAX_TUPLE_WIDTH and (
-                    not (batch_has_canonical_tensor or trusted_canonical_batch_seen)
+                    not tensor_rebuild_proof_valid
+                    or not (batch_has_canonical_tensor or trusted_canonical_batch_seen)
                     or not all(setitems_entry_is_safe(key, value) for key, value in setitem_pairs)
                 ):
                     return _PytorchStorageReferenceParse(set(), {}, set(), set(), False, False)
