@@ -2824,6 +2824,35 @@ class TestNetworkCommDetector:
         assert any(finding["type"] == "network_library" for finding in findings)
         assert any(finding["type"] == "network_function" for finding in findings)
 
+    @pytest.mark.parametrize(
+        "mutator",
+        [
+            "for image_url in [input()]:\n    requests.get(image_url, stream=True)",
+            "image_url: str = input()\nrequests.get(image_url, stream=True)",
+            "(image_url := input())\nrequests.get(image_url, stream=True)",
+            "def load(image_url):\n    requests.get(image_url, stream=True)",
+            "requests = payload\nrequests.get(image_url, stream=True)",
+            "requests.get(image_url)",
+            "requests.get(image_url, stream=True, proxies=payload)",
+            "requests.get = payload\nrequests.get(image_url, stream=True)",
+            "setattr(requests, 'get', payload)\nrequests.get(image_url, stream=True)",
+        ],
+    )
+    def test_readme_python_example_preserves_rebound_or_unproven_requests(
+        self,
+        mutator: str,
+    ) -> None:
+        data = (
+            "```python\nimport requests\n"
+            "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            f"{mutator}\n```\n"
+        ).encode()
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert any(finding["type"] == "network_library" for finding in findings)
+        assert any(finding["type"] == "network_function" for finding in findings)
+
     def test_official_sample_image_does_not_suppress_executable_python(self) -> None:
         data = (
             b"import requests\n"

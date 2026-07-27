@@ -1909,21 +1909,11 @@ def _is_official_readme_sample_image_request(data: bytes, *, match_index: int, c
     ):
         return False
 
-    assignments: dict[str, list[tuple[int, str | None]]] = {}
-    for node in nodes:
-        if isinstance(node, ast.Assign):
-            for target in node.targets:
-                if isinstance(target, ast.Name):
-                    value = node.value.value if isinstance(node.value, ast.Constant) else None
-                    assignments.setdefault(target.id, []).append(
-                        (node.lineno, value if isinstance(value, str) else None)
-                    )
-
     requests_calls: list[ast.Call] = []
     for node in nodes:
         if not isinstance(node, ast.Attribute) or not isinstance(node.value, ast.Name) or node.value.id != "requests":
             continue
-        if node.attr != "get":
+        if node.attr != "get" or not isinstance(node.ctx, ast.Load):
             return False
     for node in nodes:
         if (
@@ -1937,18 +1927,66 @@ def _is_official_readme_sample_image_request(data: bytes, *, match_index: int, c
     if not requests_calls:
         return False
 
+    protected_names = {"requests"}
+    protected_names.update(
+        call.args[0].id for call in requests_calls if len(call.args) == 1 and isinstance(call.args[0], ast.Name)
+    )
+    allowed_targets: set[int] = set()
+    assignments: dict[str, list[tuple[int, str | None]]] = {}
+    for statement in tree.body:
+        if not isinstance(statement, ast.Assign):
+            continue
+        for target in statement.targets:
+            if isinstance(target, ast.Name) and target.id in protected_names and target.id != "requests":
+                allowed_targets.add(id(target))
+                value = statement.value.value if isinstance(statement.value, ast.Constant) else None
+                assignments.setdefault(target.id, []).append(
+                    (statement.lineno, value if isinstance(value, str) else None)
+                )
+    for node in nodes:
+        if (
+            isinstance(node, ast.Name)
+            and node.id in protected_names
+            and isinstance(node.ctx, ast.Store)
+            and id(node) not in allowed_targets
+        ):
+            return False
+        if isinstance(node, ast.arg) and node.arg in protected_names:
+            return False
+        if isinstance(node, ast.ExceptHandler) and node.name in protected_names:
+            return False
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id
+            in {
+                "eval",
+                "exec",
+                "globals",
+                "locals",
+                "setattr",
+            }
+        ):
+            return False
+
     for call in requests_calls:
-        if len(call.args) != 1 or any(
-            keyword.arg != "stream" or not isinstance(keyword.value, ast.Constant) or keyword.value.value is not True
-            for keyword in call.keywords
+        if (
+            len(call.args) != 1
+            or len(call.keywords) != 1
+            or any(
+                keyword.arg != "stream"
+                or not isinstance(keyword.value, ast.Constant)
+                or keyword.value.value is not True
+                for keyword in call.keywords
+            )
         ):
             return False
         argument = call.args[0]
         if isinstance(argument, ast.Constant) and isinstance(argument.value, str):
             url = argument.value
         elif isinstance(argument, ast.Name):
-            bindings = [binding for binding in assignments.get(argument.id, []) if binding[0] < call.lineno]
-            if len(bindings) != 1 or bindings[0][1] is None:
+            bindings = assignments.get(argument.id, [])
+            if len(bindings) != 1 or bindings[0][0] >= call.lineno or bindings[0][1] is None:
                 return False
             url = bindings[0][1]
         else:
