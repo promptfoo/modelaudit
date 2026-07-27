@@ -26,6 +26,7 @@ from typing import Any, BinaryIO
 import modelaudit_picklescan.call_graph as _picklescan_call_graph
 
 from ..utils.helpers.secure_hasher import SecureFileHasher
+from ..utils.repository_context import REPOSITORY_SCAN_ROOT_CONFIG_KEY
 from .adaptive_cache_keys import AdaptiveCacheKeyGenerator
 from .optimized_config import build_cache_version_context
 
@@ -410,6 +411,9 @@ class ScanResultsCache:
         self.key_generator = AdaptiveCacheKeyGenerator()
         self._change_clock_probes: dict[int, tuple[BinaryIO, Path]] = {}
         self._change_clock_probe_lock = threading.Lock()
+        self._change_clock_probe_condition = threading.Condition(self._change_clock_probe_lock)
+        self._active_identity_captures = 0
+        self._cache_clear_in_progress = False
 
         self._ensure_metadata_exists()
 
@@ -507,10 +511,26 @@ class ScanResultsCache:
                 logger.debug("Bypassing scan-result cache lookup for symlinked path %s", file_path)
                 return None, None
 
-            if (
-                file_stat is not None
-                and getattr(self.capture_file_identity, "__func__", None) is ScanResultsCache.capture_file_identity
-            ):
+            scan_root: Path | None = None
+            scan_config = version_context.get("scan_config") if version_context is not None else None
+            if isinstance(scan_config, dict):
+                configured_root = scan_config.get(REPOSITORY_SCAN_ROOT_CONFIG_KEY)
+                if isinstance(configured_root, str):
+                    candidate_root = Path(os.path.abspath(configured_root))
+                    scanned_parent = Path(os.path.abspath(file_path)).parent
+                    if candidate_root == scanned_parent or candidate_root in scanned_parent.parents:
+                        scan_root = candidate_root
+
+            uses_default_capture = (
+                getattr(self.capture_file_identity, "__func__", None) is ScanResultsCache.capture_file_identity
+            )
+            if uses_default_capture and scan_root is not None:
+                file_identity = self._capture_file_identity(
+                    file_path,
+                    file_stat=file_stat,
+                    scan_root=scan_root,
+                )
+            elif uses_default_capture and file_stat is not None:
                 file_identity = self._capture_file_identity(file_path, file_stat=file_stat)
             else:
                 # Preserve legacy subclasses that override the established signature.
@@ -897,6 +917,33 @@ class ScanResultsCache:
         file_path: str,
         *,
         file_stat: os.stat_result | None,
+        scan_root: Path | None = None,
+    ) -> ScannedFileIdentity:
+        with self._change_clock_probe_condition:
+            while self._cache_clear_in_progress:
+                self._change_clock_probe_condition.wait()
+            self._active_identity_captures += 1
+
+        try:
+            if scan_root is None:
+                return self._capture_file_identity_leased(file_path, file_stat=file_stat)
+            return self._capture_file_identity_leased(
+                file_path,
+                file_stat=file_stat,
+                scan_root=scan_root,
+            )
+        finally:
+            with self._change_clock_probe_condition:
+                self._active_identity_captures -= 1
+                if self._active_identity_captures == 0:
+                    self._change_clock_probe_condition.notify_all()
+
+    def _capture_file_identity_leased(
+        self,
+        file_path: str,
+        *,
+        file_stat: os.stat_result | None,
+        scan_root: Path | None = None,
     ) -> ScannedFileIdentity:
         if self._path_has_symlink_component(file_path):
             raise ValueError(f"Symlinked paths are not cacheable: {file_path}")
@@ -906,7 +953,14 @@ class ScanResultsCache:
         for _capture_attempt in range(_MAX_IDENTITY_CAPTURE_ATTEMPTS):
             preliminary_stat = stat_hint if stat_hint is not None else os.stat(file_path)
             stat_hint = None
-            probe = self._get_change_clock_probe(file_path, preliminary_stat.st_dev)
+            if scan_root is None:
+                probe = self._get_change_clock_probe(file_path, preliminary_stat.st_dev)
+            else:
+                probe = self._get_change_clock_probe(
+                    file_path,
+                    preliminary_stat.st_dev,
+                    scan_root=scan_root,
+                )
             preliminary_change_token = self._get_file_change_token(file_path, preliminary_stat)
             preliminary_ancestor_identity = self._capture_ancestor_identity(file_path)
 
@@ -978,14 +1032,36 @@ class ScanResultsCache:
 
         raise ValueError(f"File kept changing while capturing cache identity: {file_path}") from last_change_error
 
-    def _get_change_clock_probe(self, file_path: str, file_device: int) -> BinaryIO:
+    def _get_change_clock_probe(
+        self,
+        file_path: str,
+        file_device: int,
+        *,
+        scan_root: Path | None = None,
+    ) -> BinaryIO:
         """Return a reusable probe whose inode lives on the scanned file's filesystem."""
         with self._change_clock_probe_lock:
+            scanned_parent = Path(os.path.abspath(file_path)).parent
+            normalized_scan_root = Path(os.path.abspath(scan_root)) if scan_root is not None else None
+            if (
+                normalized_scan_root is not None
+                and normalized_scan_root != scanned_parent
+                and normalized_scan_root not in scanned_parent.parents
+            ):
+                normalized_scan_root = None
+            protected_root = normalized_scan_root or scanned_parent
+
             existing = self._change_clock_probes.get(file_device)
             if existing is not None:
+                existing_directory = Path(os.path.abspath(existing[1]))
+                if os.name == "nt" and (
+                    existing_directory == protected_root
+                    or protected_root in existing_directory.parents
+                    or (normalized_scan_root is None and existing_directory in protected_root.parents)
+                ):
+                    raise ValueError(f"No writable cache identity probe directory for: {file_path}")
                 return existing[0]
 
-            scanned_parent = Path(os.path.abspath(file_path)).parent
             if os.name == "nt":
                 # Windows keeps TemporaryFile names visible and locked until close.
                 candidates = [Path(tempfile.gettempdir()), self.cache_dir]
@@ -1002,7 +1078,9 @@ class ScanResultsCache:
             for candidate in candidates:
                 normalized_candidate = Path(os.path.abspath(candidate))
                 if os.name == "nt" and (
-                    normalized_candidate == scanned_parent or scanned_parent in normalized_candidate.parents
+                    normalized_candidate == protected_root
+                    or protected_root in normalized_candidate.parents
+                    or (normalized_scan_root is None and normalized_candidate in protected_root.parents)
                 ):
                     continue
                 if candidate in checked:
@@ -2085,11 +2163,33 @@ class ScanResultsCache:
         logger.debug("Clearing entire scan results cache")
 
         retained_probe_paths: set[Path] = set()
-        with self._change_clock_probe_lock:
-            for file_device, (probe, probe_directory) in tuple(self._change_clock_probes.items()):
-                try:
-                    probe.close()
-                except OSError:
+        with self._change_clock_probe_condition:
+            while self._cache_clear_in_progress:
+                self._change_clock_probe_condition.wait()
+            self._cache_clear_in_progress = True
+            try:
+                while self._active_identity_captures:
+                    self._change_clock_probe_condition.wait()
+
+                for file_device, (probe, probe_directory) in tuple(self._change_clock_probes.items()):
+                    close_failed = False
+                    try:
+                        probe.close()
+                    except OSError:
+                        close_failed = True
+
+                    if not probe.closed and not close_failed:
+                        underlying_probe = getattr(probe, "file", None)
+                        wrapper_closer = getattr(probe, "_closer", None)
+                        if (
+                            underlying_probe is not None
+                            and underlying_probe is not probe
+                            and getattr(wrapper_closer, "file", None) is underlying_probe
+                            and getattr(wrapper_closer, "close_called", False)
+                        ):
+                            with suppress(OSError):
+                                underlying_probe.close()
+
                     if not probe.closed:
                         probe_name = getattr(probe, "name", None)
                         if isinstance(probe_name, str):
@@ -2102,20 +2202,24 @@ class ScanResultsCache:
                             ):
                                 retained_probe_paths.add(probe_path)
                         continue
-                self._change_clock_probes.pop(file_device, None)
 
-        # Remove all cache files except metadata
-        for item in self.cache_dir.iterdir():
-            if Path(os.path.abspath(item)) in retained_probe_paths:
-                continue
-            if item.name != "cache_metadata.json":
-                if item.is_dir():
-                    shutil.rmtree(item)
-                else:
-                    item.unlink()
+                    self._change_clock_probes.pop(file_device, None)
 
-        # Reset metadata
-        self._create_initial_metadata()
+                # Remove all cache files except metadata while excluding new probes.
+                for item in self.cache_dir.iterdir():
+                    if Path(os.path.abspath(item)) in retained_probe_paths:
+                        continue
+                    if item.name != "cache_metadata.json":
+                        if item.is_dir():
+                            shutil.rmtree(item)
+                        else:
+                            item.unlink()
+
+                self._create_initial_metadata()
+            finally:
+                self._cache_clear_in_progress = False
+                self._change_clock_probe_condition.notify_all()
+
         logger.debug("Cache cleared successfully")
 
     def _ensure_metadata_exists(self):
