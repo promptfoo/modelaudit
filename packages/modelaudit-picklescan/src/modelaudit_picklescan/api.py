@@ -2228,11 +2228,18 @@ def _pytorch_storage_keys_from_pickle_bytes(
                     stack.append(memo[key])
             elif opcode_name == "POP":
                 if stack:
-                    stack.pop()
+                    popped_value = stack.pop()
+                    if value_contains_tracked_provenance(popped_value):
+                        all_persistent_ids_are_pytorch_storage = False
+                        invalidate_tensor_rebuild_proof()
                 else:
                     invalidate_tensor_rebuild_proof()
             elif opcode_name == "POP_MARK":
-                if pop_marked_tuple() is None:
+                popped_values = pop_marked_tuple()
+                if popped_values is None:
+                    invalidate_tensor_rebuild_proof()
+                elif any(value_contains_tracked_provenance(value) for value in popped_values):
+                    all_persistent_ids_are_pytorch_storage = False
                     invalidate_tensor_rebuild_proof()
             elif opcode_name == "DUP":
                 if stack:

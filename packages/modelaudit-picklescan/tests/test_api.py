@@ -3591,12 +3591,14 @@ def test_pytorch_storage_trust_preserves_noncanonical_setitems_width_limit() -> 
         (True, (b"builtins", b"list")),
         (True, (b"builtins", b"tuple")),
         (True, (b"collections", b"OrderedDict")),
+        (True, "popped"),
+        (True, "pop_mark"),
     ],
 )
 def test_scan_file_preserves_hidden_malicious_storage_after_noncanonical_setitems(
     tmp_path: Path,
     with_prior_tensor_batch: bool,
-    storage_wrapper: tuple[bytes, bytes] | None,
+    storage_wrapper: tuple[bytes, bytes] | Literal["popped", "pop_mark"] | None,
 ) -> None:
     archive_path = tmp_path / f"malicious-noncanonical-state-{with_prior_tensor_batch}.pt"
     hidden_payload = b"S'" + b"A" * 5000 + b"'\n0cos\nsystem\n(S'echo malicious-near-match'\ntR."
@@ -3610,7 +3612,11 @@ def test_scan_file_preserves_hidden_malicious_storage_after_noncanonical_setitem
         storage_name="ByteStorage",
         element_count=len(hidden_payload),
     )
-    if storage_wrapper is not None:
+    if storage_wrapper == "popped":
+        storage_reference += b"0K\x00"
+    elif storage_wrapper == "pop_mark":
+        storage_reference = b"(" + storage_reference + b"1K\x00"
+    elif storage_wrapper is not None:
         storage_reference = _global(*storage_wrapper) + b"(" + storage_reference + b"tR"
     entries.append(b"X" + len(storage_key).to_bytes(4, "little") + storage_key + storage_reference)
     if with_prior_tensor_batch:
