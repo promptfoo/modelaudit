@@ -2032,6 +2032,14 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
             return False
         if isinstance(node, ast.ExceptHandler) and node.name in protected_names:
             return False
+        if isinstance(node, ast.Attribute) and node.attr in {"eval", "exec", "__import__"}:
+            return False
+        if (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.slice, ast.Constant)
+            and node.slice.value in {"eval", "exec", "__import__"}
+        ):
+            return False
         if (
             isinstance(node, ast.Name)
             and isinstance(node.ctx, ast.Load)

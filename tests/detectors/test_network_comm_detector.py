@@ -2857,6 +2857,8 @@ class TestNetworkCommDetector:
             "del requests\nrequests.get(image_url, stream=True)",
             "del image_url\nrequests.get(image_url, stream=True)",
             "requests.get(image_url, stream=True)\nmatch payload:\n    case image_url:\n        fetch(image_url)",
+            "builtins.exec('requests.get(input())')\nrequests.get(image_url, stream=True)",
+            "namespace['exec']('requests.get(input())')\nrequests.get(image_url, stream=True)",
         ],
     )
     def test_readme_python_example_preserves_rebound_or_unproven_requests(
