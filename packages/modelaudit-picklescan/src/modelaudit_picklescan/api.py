@@ -1878,6 +1878,7 @@ def _pytorch_storage_keys_from_pickle_bytes(
     canonical_batch_placeholder = object()
     canonical_batch_entries: list[tuple[str, object]] = []
     canonical_batch_target: object | None = None
+    trusted_canonical_batch_seen = False
     memo: dict[int, Any] = {}
     stack: list[Any] = []
     referenced_keys: set[str] = set()
@@ -1893,12 +1894,13 @@ def _pytorch_storage_keys_from_pickle_bytes(
         tensor_rebuild_proof_valid = False
 
     def clear_stack_after_malformed_provenance() -> None:
-        nonlocal canonical_batch_target
+        nonlocal canonical_batch_target, trusted_canonical_batch_seen
 
         invalidate_tensor_rebuild_proof()
         stack.clear()
         canonical_batch_entries.clear()
         canonical_batch_target = None
+        trusted_canonical_batch_seen = False
 
     def poison_stack_top() -> None:
         invalidate_tensor_rebuild_proof()
@@ -1965,7 +1967,8 @@ def _pytorch_storage_keys_from_pickle_bytes(
 
         if len(canonical_batch_entries) >= _PYTORCH_STORAGE_TRUST_MAX_STACK_DEPTH:
             return False
-        for marker_index, item in enumerate(stack):
+        for marker_index in range(len(stack) - 1, -1, -1):
+            item = stack[marker_index]
             if item is not marker or marker_index == 0:
                 continue
             target = stack[marker_index - 1]
@@ -1985,7 +1988,8 @@ def _pytorch_storage_keys_from_pickle_bytes(
             if not setitems_entry_is_safe(key, value):
                 continue
             if value is not canonical_tensor and not (
-                any(item is canonical_tensor for item in stack[pair_index + 2 :])
+                trusted_canonical_batch_seen
+                or any(item is canonical_tensor for item in stack[pair_index + 2 :])
                 or any(entry_value is canonical_tensor for _entry_key, entry_value in canonical_batch_entries)
             ):
                 continue
@@ -2289,12 +2293,15 @@ def _pytorch_storage_keys_from_pickle_bytes(
                     setitem_pairs = tuple(
                         (setitem_items[index], setitem_items[index + 1]) for index in range(0, len(setitem_items), 2)
                     )
+                batch_has_canonical_tensor = any(value is canonical_tensor for _key, value in setitem_pairs)
                 if len(setitem_pairs) * 2 > _PYTORCH_STORAGE_TRUST_MAX_TUPLE_WIDTH and (
-                    not any(value is canonical_tensor for _key, value in setitem_pairs)
+                    not (batch_has_canonical_tensor or trusted_canonical_batch_seen)
                     or not all(setitems_entry_is_safe(key, value) for key, value in setitem_pairs)
                 ):
                     return _PytorchStorageReferenceParse(set(), {}, set(), set(), False, False)
                 apply_setitems_to_target(setitem_pairs)
+                if batch_has_canonical_tensor:
+                    trusted_canonical_batch_seen = True
             elif opcode_name == "BINPERSID":
                 pid = stack.pop() if stack else None
                 storage_ref = storage_ref_from_pid(pid)

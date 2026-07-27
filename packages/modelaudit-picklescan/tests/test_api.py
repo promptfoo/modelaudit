@@ -3439,6 +3439,7 @@ def _write_large_batched_pytorch_state_dict(
     entry_count: int = 600,
     leading_metadata: bool = False,
     metadata_value: bytes = b"K\x01",
+    trailing_metadata_count: int = 0,
 ) -> None:
     entries: list[bytes] = []
     if leading_metadata:
@@ -3455,7 +3456,18 @@ def _write_large_batched_pytorch_state_dict(
             value = _pytorch_rebuild_tensor_v2_reduce_expr(key=str(index))
         entries.append(key + value)
 
-    payload = b"\x80\x04" + _global(b"collections", b"OrderedDict") + b")R(" + b"".join(entries) + b"u."
+    payload = b"\x80\x04" + _global(b"collections", b"OrderedDict") + b")R(" + b"".join(entries) + b"u"
+    if trailing_metadata_count:
+        metadata_key = b"_metadata"
+        metadata_entries = []
+        for index in range(trailing_metadata_count):
+            module_name = f"layer_{index}".encode("ascii")
+            version_key = b"version"
+            version_dict = b"}(" + b"X" + len(version_key).to_bytes(4, "little") + version_key + b"K\x01u"
+            metadata_entries.append(b"X" + len(module_name).to_bytes(4, "little") + module_name + version_dict)
+        payload += b"(" + b"X" + len(metadata_key).to_bytes(4, "little") + metadata_key + b"}("
+        payload += b"".join(metadata_entries) + b"uu"
+    payload += b"."
     with zipfile.ZipFile(path, "w") as archive:
         archive.writestr("archive/data.pkl", payload)
         archive.writestr("archive/version", "3\n")
@@ -3489,6 +3501,19 @@ def test_pytorch_storage_trust_parses_large_batched_state_dict_without_framework
     assert parsed.parse_complete is True
     assert len(parsed.referenced_keys) == entry_count
     assert len(parsed.canonical_tensor_rebuild_invocations) == len(parsed.referenced_keys)
+
+
+def test_pytorch_storage_trust_parses_large_metadata_after_canonical_batch(tmp_path: Path) -> None:
+    archive_path = tmp_path / "large-batched-metadata-state.pt"
+    _write_large_batched_pytorch_state_dict(archive_path, trailing_metadata_count=600)
+    with zipfile.ZipFile(archive_path) as archive:
+        payload = archive.read("archive/data.pkl")
+
+    parsed = package_api._pytorch_storage_keys_from_pickle_bytes(payload)
+
+    assert parsed.parse_complete is True
+    assert len(parsed.referenced_keys) == 600
+    assert len(parsed.canonical_tensor_rebuild_invocations) == 600
 
 
 def test_scan_file_suppresses_rebuild_tensor_v2_for_large_batched_state_dict(tmp_path: Path) -> None:
@@ -3558,8 +3583,12 @@ def test_pytorch_storage_trust_preserves_noncanonical_setitems_width_limit() -> 
     assert parsed.canonical_tensor_rebuild_invocations == set()
 
 
-def test_scan_file_preserves_hidden_malicious_storage_after_noncanonical_setitems(tmp_path: Path) -> None:
-    archive_path = tmp_path / "malicious-noncanonical-state.pt"
+@pytest.mark.parametrize("with_prior_tensor_batch", [False, True])
+def test_scan_file_preserves_hidden_malicious_storage_after_noncanonical_setitems(
+    tmp_path: Path,
+    with_prior_tensor_batch: bool,
+) -> None:
+    archive_path = tmp_path / f"malicious-noncanonical-state-{with_prior_tensor_batch}.pt"
     hidden_payload = b"S'" + b"A" * 5000 + b"'\n0cos\nsystem\n(S'echo malicious-near-match'\ntR."
     entries: list[bytes] = []
     for index in range(package_api._PYTORCH_STORAGE_TRUST_MAX_TUPLE_WIDTH // 2 + 1):
@@ -3572,11 +3601,31 @@ def test_scan_file_preserves_hidden_malicious_storage_after_noncanonical_setitem
         + storage_key
         + _pytorch_storage_binpersid_expr(key="0", storage_name="ByteStorage", element_count=len(hidden_payload))
     )
+    if with_prior_tensor_batch:
+        tensor_key = b"weight"
+        tensor_value = _pytorch_rebuild_tensor_v2_payload(key="1").removeprefix(b"\x80\x04").removesuffix(b".")
+        prefix = (
+            b"\x80\x04"
+            + _global(b"collections", b"OrderedDict")
+            + b")R("
+            + b"X"
+            + len(tensor_key).to_bytes(4, "little")
+            + tensor_key
+            + tensor_value
+            + b"u("
+            + b"X\x09\x00\x00\x00_metadata}("
+        )
+        suffix = b"uu."
+    else:
+        prefix = b"\x80\x04}("
+        suffix = b"u."
     with zipfile.ZipFile(archive_path, "w") as archive:
-        archive.writestr("archive/data.pkl", b"\x80\x04}(" + b"".join(entries) + b"u.")
+        archive.writestr("archive/data.pkl", prefix + b"".join(entries) + suffix)
         archive.writestr("archive/version", "3\n")
         archive.writestr("archive/byteorder", "little")
         archive.writestr("archive/data/0", hidden_payload)
+        if with_prior_tensor_batch:
+            archive.writestr("archive/data/1", b"\x00" * 24)
 
     report = scan_file(archive_path)
 
