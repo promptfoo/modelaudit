@@ -2790,7 +2790,10 @@ class TestNetworkCommDetector:
         assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
         assert any(finding["type"] == "cloud_storage_url" for finding in findings)
 
-    @pytest.mark.parametrize(("opening", "closing"), [("```", "````"), ("````", "````"), ("````", "`````")])
+    @pytest.mark.parametrize(
+        ("opening", "closing"),
+        [("```", "````"), ("````", "````"), ("````", "`````"), ("~~~", "~~~~"), ("~~~~", "~~~~")],
+    )
     def test_readme_python_example_accepts_valid_longer_fence_closers(self, opening: str, closing: str) -> None:
         data = (
             f"{opening}python\nimport requests\n"
@@ -2920,6 +2923,23 @@ class TestNetworkCommDetector:
                 + "requests.get(image_url, stream=True)"
             ),
             "torch.ops.load_library('payload.so')\nrequests.get(image_url, stream=True)",
+            "torch.load('payload.pt', weights_only=False)\nrequests.get(image_url, stream=True)",
+            "torch.distributed.init_process_group('gloo')\nrequests.get(image_url, stream=True)",
+            "Image.open('payload.tif')\nrequests.get(image_url, stream=True)",
+            (
+                "from transformers import AutoModel\n"
+                "AutoModel.from_pretrained('attacker/model', trust_remote_code=True)\n"
+                "requests.get(image_url, stream=True)"
+            ),
+            "os = 1\nos.system('payload')\nrequests.get(image_url, stream=True)",
+            (
+                "response = requests.get(image_url, stream=True)\nalias = response\n"
+                "alias.raw.connection.sock.sendall(b'x')"
+            ),
+            "raw = requests.get(image_url, stream=True).raw\nraw.connection.sock.sendall(b'x')",
+            "with requests.get(image_url, stream=True) as response:\n    response.raw.connection.sock.sendall(b'x')",
+            "(response := requests.get(image_url, stream=True)).raw.connection.sock.sendall(b'x')",
+            "responses = [requests.get(image_url, stream=True)]\nresponses[0].raw.connection.sock.sendall(b'x')",
             "(lambda: payload)()\nrequests.get(image_url, stream=True)",
         ],
     )
@@ -2937,6 +2957,41 @@ class TestNetworkCommDetector:
 
         assert any(finding["type"] == "network_library" for finding in findings)
         assert any(finding["type"] == "network_function" for finding in findings)
+
+    @pytest.mark.parametrize(
+        "additional_fence",
+        [
+            "```python\n# requests powers our image download\nprint('ok')\n```\n",
+            "```python\nprint('this example uses requests')\n```\n",
+        ],
+    )
+    def test_readme_official_image_ignores_nonexecutable_requests_mentions(self, additional_fence: str) -> None:
+        data = (
+            "```python\nimport requests\n"
+            "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            "requests.get(image_url, stream=True)\n```\n"
+            f"{additional_fence}"
+        ).encode()
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+
+    @pytest.mark.parametrize("outside_request", ["requests.patch(input())\n", "```\nrequests.patch(input())\n```\n"])
+    def test_readme_official_image_preserves_requests_outside_validated_python_fence(
+        self,
+        outside_request: str,
+    ) -> None:
+        data = (
+            "```python\nimport requests\n"
+            "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            "requests.get(image_url, stream=True)\n```\n"
+            f"{outside_request}"
+        ).encode()
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert any(finding["type"] == "network_library" for finding in findings)
 
     def test_official_sample_image_does_not_suppress_executable_python(self) -> None:
         data = (

@@ -8,12 +8,14 @@ import ast
 import ipaddress
 import math
 import re
+import tokenize
 from bisect import bisect_right
 from collections import Counter
 from collections.abc import Iterator
 from contextlib import suppress
 from functools import lru_cache
 from importlib.resources import files
+from io import BytesIO
 from typing import Any, ClassVar
 from urllib.parse import unquote, unquote_plus, urlsplit, urlunsplit
 
@@ -1731,8 +1733,9 @@ _MAX_README_IMAGE_EXAMPLE_BYTES = 64 * 1024
 _MAX_README_IMAGE_EXAMPLE_AST_NODES = 1024
 _MAX_README_IMAGE_EXAMPLE_FENCE_OPENINGS = 64
 _MAX_README_IMAGE_EXAMPLE_FENCES = 256
-_PYTHON_README_FENCE_PATTERN = re.compile(rb"(?m)^[ \t]{0,3}(?P<fence>`{3,})(?:python|py)[ \t]*\r?\n")
-_README_FENCE_END_PATTERN = re.compile(rb"(?m)^[ \t]{0,3}`{3,}[ \t]*\r?$")
+_PYTHON_README_FENCE_PATTERN = re.compile(rb"(?m)^[ \t]{0,3}(?P<fence>`{3,}|~{3,})(?:python|py)[ \t]*\r?\n")
+_README_FENCE_END_PATTERN = re.compile(rb"(?m)^[ \t]{0,3}(?:`{3,}|~{3,})[ \t]*\r?$")
+_QUALIFIED_REQUESTS_CALL_PATTERN = re.compile(rb"\brequests\s*\.\s*[A-Za-z_][A-Za-z_0-9]*\s*\(")
 _DOCUMENTED_IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp")
 _WORD_PATTERN = re.compile(rb"[A-Za-z]{2,}")
 _CALL_SYNTAX_SUFFIX_PATTERN = re.compile(rb"(?:[\s)]|#[^\n]*\n)*\(")
@@ -1959,11 +1962,50 @@ def _index_official_readme_sample_image_fences(
             and b"requests.get" in example
             and _is_valid_official_readme_sample_image_example(example)
         )
-        if b"requests" in example and not is_safe:
+        if not is_safe and _contains_executable_requests_reference(example):
             unvalidated_requests = True
         fences.append((opening.end(), closing.start(), is_safe))
         cursor = closing.end()
+    outside_start = 0
+    for fence_start, fence_end, _is_safe in fences:
+        if _contains_executable_requests_reference(data[outside_start:fence_start]):
+            unvalidated_requests = True
+            break
+        outside_start = fence_end
+    if not unvalidated_requests and _contains_executable_requests_reference(data[outside_start:]):
+        unvalidated_requests = True
     return fences, unvalidated_requests
+
+
+def _contains_executable_requests_reference(data: bytes) -> bool:
+    if b"requests" not in data:
+        return False
+    if len(data) <= _MAX_README_IMAGE_EXAMPLE_BYTES:
+        try:
+            tree = ast.parse(data.decode("utf-8"))
+        except (SyntaxError, UnicodeDecodeError, RecursionError, ValueError):
+            pass
+        else:
+            return any(
+                isinstance(node, ast.Name) and node.id == "requests" and isinstance(node.ctx, ast.Load)
+                for node in ast.walk(tree)
+            )
+
+    for checked_matches, match in enumerate(_QUALIFIED_REQUESTS_CALL_PATTERN.finditer(data)):
+        if checked_matches >= _MAX_README_IMAGE_EXAMPLE_AST_NODES:
+            return True
+        line_start = data.rfind(b"\n", 0, match.start()) + 1
+        line_end = data.find(b"\n", match.end())
+        line = data[line_start : len(data) if line_end < 0 else line_end]
+        if len(line) > _MAX_README_IMAGE_EXAMPLE_BYTES:
+            return True
+        try:
+            tokens = list(tokenize.tokenize(BytesIO(line).readline))
+        except (tokenize.TokenError, UnicodeDecodeError, SyntaxError):
+            return True
+        if any(token.type == tokenize.NAME and token.string == "requests" for token in tokens):
+            return True
+    return False
 
 
 def _is_readme_image_example_context(context: str) -> bool:
@@ -1983,7 +2025,7 @@ def _matching_readme_image_fence_end(
     cursor = start
     while closing := _README_FENCE_END_PATTERN.search(data, cursor, end):
         delimiter = data[closing.start() : closing.end()].strip(b" \t\r")
-        if len(delimiter) >= opening_width:
+        if delimiter[:1] == opening.group("fence")[:1] and len(delimiter) >= opening_width:
             return closing
         cursor = closing.end()
     return None
@@ -2078,17 +2120,57 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
         | {node.arg for node in nodes if isinstance(node, ast.arg)}
         | {node.name for node in nodes if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
     )
-    requests_response_names = {
-        target.id
-        for statement in tree.body
-        if isinstance(statement, ast.Assign)
-        and isinstance(statement.value, ast.Call)
-        and isinstance(statement.value.func, ast.Attribute)
-        and isinstance(statement.value.func.value, ast.Name)
-        and statement.value.func.value.id == "requests"
-        and statement.value.func.attr == "get"
-        for target in statement.targets
-        if isinstance(target, ast.Name)
+    requests_response_names: set[str] = set()
+    binding_nodes = sorted(
+        (node for node in nodes if isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr, ast.withitem))),
+        key=lambda node: (
+            getattr(node, "lineno", getattr(node.context_expr, "lineno", 0))
+            if isinstance(node, ast.withitem)
+            else node.lineno
+        ),
+    )
+    for node in binding_nodes:
+        response_bindings: list[tuple[ast.expr, ast.expr | None]] = []
+        if isinstance(node, ast.Assign):
+            response_bindings.extend((target, node.value) for target in node.targets)
+        elif isinstance(node, (ast.AnnAssign, ast.NamedExpr)):
+            response_bindings.append((node.target, node.value))
+        elif node.optional_vars is not None:
+            response_bindings.append((node.optional_vars, node.context_expr))
+        for target, response_value in response_bindings:
+            if not isinstance(target, ast.Name) or response_value is None:
+                continue
+            is_documented_image_open = (
+                isinstance(response_value, ast.Call)
+                and isinstance(response_value.func, ast.Attribute)
+                and isinstance(response_value.func.value, ast.Name)
+                and response_value.func.value.id == "Image"
+                and response_value.func.attr == "open"
+            )
+            if not is_documented_image_open and any(
+                child in requests_calls
+                or (
+                    isinstance(child, ast.Name)
+                    and isinstance(child.ctx, ast.Load)
+                    and child.id in requests_response_names
+                )
+                for child in ast.walk(response_value)
+            ):
+                requests_response_names.add(target.id)
+    documented_attribute_calls = {
+        "batch_decode",
+        "convert",
+        "from_pretrained",
+        "generate",
+        "is_available",
+        "item",
+        "no_grad",
+        "open",
+        "post_process_generation",
+        "post_process_object_detection",
+        "tensor",
+        "to",
+        "tolist",
     }
     allowed_targets: set[int] = set()
     assignments: dict[str, list[tuple[int, str | None]]] = {}
@@ -2167,6 +2249,15 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
         ):
             return False
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            if node not in requests_calls and node.func.attr not in documented_attribute_calls:
+                return False
+            if node.func.attr == "from_pretrained" and any(
+                keyword.arg == "trust_remote_code"
+                and isinstance(keyword.value, ast.Constant)
+                and keyword.value.value is True
+                for keyword in node.keywords
+            ):
+                return False
             attribute_root = node.func.value
             while isinstance(attribute_root, (ast.Attribute, ast.Subscript, ast.Call)):
                 if isinstance(attribute_root, ast.Call) and attribute_root in requests_calls:
@@ -2174,6 +2265,18 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
                 attribute_root = attribute_root.func if isinstance(attribute_root, ast.Call) else attribute_root.value
             if isinstance(attribute_root, ast.Name) and attribute_root.id in (
                 requests_response_names | documented_builtin_names
+            ):
+                return False
+            if (
+                node.func.attr == "open"
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "Image"
+                and not (
+                    len(node.args) == 1
+                    and isinstance(node.args[0], ast.Attribute)
+                    and node.args[0].attr == "raw"
+                    and node.args[0].value in requests_calls
+                )
             ):
                 return False
         if isinstance(node, ast.Call) and not isinstance(node.func, (ast.Attribute, ast.Name)):
