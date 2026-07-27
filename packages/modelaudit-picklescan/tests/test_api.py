@@ -3827,6 +3827,76 @@ def test_scan_file_preserves_hidden_malicious_storage_after_duplicate_state_key(
     )
 
 
+@pytest.mark.parametrize(
+    "discard_variant",
+    [
+        "stop_extra_storage",
+        "stop_extra_storage_none",
+        "stop_nested_storage",
+        "unsupported_frozenset",
+        "unsupported_additems",
+        "append_wrong_target",
+        "setitem_storage_target",
+    ],
+)
+def test_scan_file_preserves_hidden_malicious_storage_after_stack_discard(
+    tmp_path: Path,
+    discard_variant: str,
+) -> None:
+    archive_path = tmp_path / f"malicious-stack-discard-{discard_variant}.pt"
+    hidden_payload = b"S'" + b"A" * 5000 + b"'\n0cos\nsystem\n(S'echo discarded-storage'\ntR."
+
+    def encoded_key(value: str) -> bytes:
+        raw = value.encode("ascii")
+        return b"X" + len(raw).to_bytes(4, "little") + raw
+
+    tensor = _pytorch_rebuild_tensor_v2_payload(key="1").removeprefix(b"\x80\x04").removesuffix(b".")
+    entries = [encoded_key("weight") + tensor]
+    entries.extend(encoded_key(f"metadata_{index}") + b"K\x01" for index in range(40))
+    storage_reference = _pytorch_storage_binpersid_expr(
+        key="0",
+        storage_name="ByteStorage",
+        element_count=len(hidden_payload),
+    )
+    trailers = {
+        "stop_extra_storage": storage_reference + b"h\x01.",
+        "stop_extra_storage_none": storage_reference + b"N.",
+        "stop_nested_storage": b"]" + storage_reference + b"ah\x01.",
+        "unsupported_frozenset": b"(" + storage_reference + b"\x910h\x01.",
+        "unsupported_additems": b"\x8f(" + storage_reference + b"\x900h\x01.",
+        "append_wrong_target": storage_reference + b"K\x00ah\x01.",
+        "setitem_storage_target": storage_reference + b"K\x00K\x01sh\x01.",
+    }
+    payload = (
+        b"\x80\x04"
+        + _global(b"collections", b"OrderedDict")
+        + b")Rq\x01("
+        + b"".join(entries)
+        + b"u"
+        + trailers[discard_variant]
+    )
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", payload)
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", hidden_payload)
+        archive.writestr("archive/data/1", b"\x00" * 24)
+
+    report = scan_file(archive_path)
+
+    assert (
+        package_api._trusted_pytorch_data_pkl_from_storage_member_sizes(payload, {"0": len(hidden_payload), "1": 24})
+        is None
+    )
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.severity == Severity.CRITICAL
+        and finding.details.get("module") in {"os", "posix", "nt"}
+        and finding.details.get("name") == "system"
+        for finding in report.findings
+    )
+
+
 def test_pytorch_storage_trust_rejects_canonical_setitems_beyond_bounded_batch(tmp_path: Path) -> None:
     archive_path = tmp_path / "oversized-canonical-batch.pt"
     _write_large_batched_pytorch_state_dict(
