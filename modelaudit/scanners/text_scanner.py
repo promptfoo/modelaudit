@@ -44,6 +44,17 @@ DOCUMENTATION_TEXT_FILENAMES = frozenset(
         "readme.txt",
     }
 )
+HUGGINGFACE_DOCUMENTATION_IMAGE_EXAMPLE_URL_BYTES = (
+    b"https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/beignets-task-guide.png"
+)
+VERIFIED_HUGGINGFACE_DOCUMENTATION_IMAGE_READMES: frozenset[tuple[int, str]] = frozenset(
+    {
+        (4386, "3950face80991c4f91fb1ead491d787639e08a737f948fd630dd938ae8f78c18"),
+        (3707, "cbb1a81c3ce864dc6258a359e7e5a16205d269a32a91399c6c7acc92ebed8418"),
+        (15646, "8be1d036fde8dd8d279b9d0d8d886da58ba5c76e7a59d6da662b89243a51a5e3"),
+        (4515, "76528d32891b0a14087eb2240065094ff2cea9cc04a41ebe7b28311711af830d"),
+    }
+)
 PASSIVE_NETWORK_FINDING_TYPES = frozenset(
     {
         "cloud_storage_url",
@@ -2755,6 +2766,44 @@ class TextScanner(BaseScanner):
         )
 
     @classmethod
+    def _verified_huggingface_documentation_image_finding(
+        cls,
+        path: str,
+        payload: bytes,
+        finding: dict[str, Any],
+    ) -> bool:
+        filename = os.path.basename(path).lower()
+        if os.path.splitext(filename)[1] not in {".md", ".markdown"} or not (
+            cls._is_readme_documentation_filename(filename) or cls._is_model_card_documentation_filename(filename)
+        ):
+            return False
+
+        finding_type = finding.get("type")
+        if finding_type == "network_function" and finding.get("function") == "urlopen":
+            expected_token = b"urlopen"
+        elif (
+            finding_type == "network_library"
+            and finding.get("library") == "urllib"
+            and finding.get("pattern") == "from urllib"
+        ):
+            expected_token = b"from urllib"
+        else:
+            return False
+
+        payload_length = len(payload)
+        if all(payload_length != length for length, _digest in VERIFIED_HUGGINGFACE_DOCUMENTATION_IMAGE_READMES):
+            return False
+        position = finding.get("position")
+        return (
+            isinstance(position, int)
+            and position >= 0
+            and payload[position : position + len(expected_token)] == expected_token
+            and HUGGINGFACE_DOCUMENTATION_IMAGE_EXAMPLE_URL_BYTES in payload
+            and (payload_length, hashlib.sha256(payload).hexdigest())
+            in VERIFIED_HUGGINGFACE_DOCUMENTATION_IMAGE_READMES
+        )
+
+    @classmethod
     def _sidecar_network_finding_is_informational(
         cls,
         path: str,
@@ -2782,6 +2831,7 @@ class TextScanner(BaseScanner):
                 )
                 or (finding_type == "network_library" and cls._documentation_network_library_is_prose(payload, finding))
                 or (finding_type == "cc_pattern" and cls._documentation_cc_finding_is_benign_prose(payload, finding))
+                or cls._verified_huggingface_documentation_image_finding(path, payload, finding)
                 or (
                     finding_type == "suspicious_port" and not cls._documentation_finding_is_actionable(payload, finding)
                 )

