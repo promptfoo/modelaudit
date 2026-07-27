@@ -1073,12 +1073,39 @@ class ScanResultsCache:
                 if os.name == "nt" and (
                     existing_directory == protected_root or protected_root in existing_directory.parents
                 ):
-                    raise ValueError(f"No writable cache identity probe directory for: {file_path}")
-                return existing[0]
+                    if normalized_scan_root is None or self._active_identity_captures > 1:
+                        raise ValueError(f"No writable cache identity probe directory for: {file_path}")
+
+                    existing_probe = existing[0]
+                    close_failed = False
+                    try:
+                        existing_probe.close()
+                    except OSError:
+                        close_failed = True
+
+                    if not existing_probe.closed and not close_failed:
+                        underlying_probe = getattr(existing_probe, "file", None)
+                        wrapper_closer = getattr(existing_probe, "_closer", None)
+                        if (
+                            underlying_probe is not None
+                            and underlying_probe is not existing_probe
+                            and getattr(wrapper_closer, "file", None) is underlying_probe
+                            and getattr(wrapper_closer, "close_called", False)
+                        ):
+                            with suppress(OSError):
+                                underlying_probe.close()
+
+                    if not existing_probe.closed:
+                        raise ValueError(f"No writable cache identity probe directory for: {file_path}")
+                    self._change_clock_probes.pop(file_device, None)
+                else:
+                    return existing[0]
 
             if os.name == "nt":
                 # Windows keeps TemporaryFile names visible and locked until close.
                 candidates = [Path(tempfile.gettempdir()), self.cache_dir]
+                if normalized_scan_root is not None:
+                    candidates.extend(normalized_scan_root.parents)
             else:
                 candidates = [self.cache_dir, Path(tempfile.gettempdir())]
                 ancestor = scanned_parent
