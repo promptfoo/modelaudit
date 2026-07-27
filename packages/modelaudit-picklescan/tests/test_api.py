@@ -3486,8 +3486,12 @@ def test_scan_file_preserves_hidden_malicious_storage_after_stacked_canonical_te
     )
 
 
-def test_scan_file_preserves_hidden_malicious_storage_inside_enclosing_list(tmp_path: Path) -> None:
-    archive_path = tmp_path / "malicious-enclosing-list.pt"
+@pytest.mark.parametrize("raw_storage_first", [False, True])
+def test_scan_file_preserves_hidden_malicious_storage_inside_enclosing_list(
+    tmp_path: Path,
+    raw_storage_first: bool,
+) -> None:
+    archive_path = tmp_path / f"malicious-enclosing-list-{raw_storage_first}.pt"
     hidden_payload = b"S'" + b"A" * 5000 + b"'\n0cos\nsystem\n(S'echo enclosing-list-storage'\ntR."
     entries: list[bytes] = []
     for index in range(600):
@@ -3497,15 +3501,14 @@ def test_scan_file_preserves_hidden_malicious_storage_inside_enclosing_list(tmp_
         else:
             value = _pytorch_rebuild_tensor_v2_reduce_expr(key=str(index + 1))
         entries.append(key + value)
-    data_pkl = (
-        b"\x80\x04]"
-        + _pytorch_storage_binpersid_expr(key="0", storage_name="ByteStorage", element_count=len(hidden_payload))
-        + b"a"
-        + _pytorch_empty_ordered_dict_reduce_expr()
-        + b"("
-        + b"".join(entries)
-        + b"ua."
+    raw_storage = _pytorch_storage_binpersid_expr(
+        key="0",
+        storage_name="ByteStorage",
+        element_count=len(hidden_payload),
     )
+    canonical_dictionary = _pytorch_empty_ordered_dict_reduce_expr() + b"(" + b"".join(entries) + b"u"
+    ordered_entries = (raw_storage, canonical_dictionary) if raw_storage_first else (canonical_dictionary, raw_storage)
+    data_pkl = b"\x80\x04]" + b"".join(item + b"a" for item in ordered_entries) + b"."
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.writestr("archive/data.pkl", data_pkl)
         archive.writestr("archive/version", "3\n")
@@ -3596,6 +3599,7 @@ def _write_large_batched_pytorch_state_dict(
     entry_count: int = 600,
     leading_metadata: bool = False,
     leading_metadata_count: int = 0,
+    leading_canonical_container: Literal["list", "tuple", "dictionary"] | None = None,
     split_leading_metadata_batch: bool = False,
     metadata_value: bytes = b"K\x01",
     trailing_metadata_count: int = 0,
@@ -3605,6 +3609,14 @@ def _write_large_batched_pytorch_state_dict(
     if leading_metadata:
         metadata_key = b"_extra_state"
         entries.append(b"X" + len(metadata_key).to_bytes(4, "little") + metadata_key + metadata_value)
+    if leading_canonical_container is not None:
+        nested_tensor = _pytorch_rebuild_tensor_v2_payload(key="0").removeprefix(b"\x80\x04").removesuffix(b".")
+        nested_value = {
+            "list": b"]" + nested_tensor + b"a",
+            "tuple": nested_tensor + b"\x85",
+            "dictionary": b"}" + _short_binunicode(b"calibration") + nested_tensor + b"s",
+        }[leading_canonical_container]
+        entries.append(_short_binunicode(b"_extra_state") + nested_value)
     for index in range(leading_metadata_count):
         metadata_key = f"_extra_state_{index}".encode("ascii")
         entries.append(b"X" + len(metadata_key).to_bytes(4, "little") + metadata_key + metadata_value)
@@ -3613,7 +3625,7 @@ def _write_large_batched_pytorch_state_dict(
         key = b"X" + len(key_bytes).to_bytes(4, "little") + key_bytes
         if malicious and index == entry_count - 1:
             value = b"cos\nsystem\n(S'echo malicious-near-match'\ntR"
-        elif index == 0:
+        elif index == 0 and leading_canonical_container is None:
             value = _pytorch_rebuild_tensor_v2_payload(key=str(index)).removeprefix(b"\x80\x04").removesuffix(b".")
         else:
             value = _pytorch_rebuild_tensor_v2_reduce_expr(key=str(index))
@@ -3686,6 +3698,26 @@ def test_pytorch_storage_trust_parses_large_metadata_after_canonical_batch(tmp_p
     assert parsed.parse_complete is True
     assert len(parsed.referenced_keys) == 600
     assert len(parsed.canonical_tensor_rebuild_invocations) == 600
+
+
+@pytest.mark.parametrize("container_kind", ["list", "tuple", "dictionary"])
+def test_pytorch_storage_trust_parses_large_batch_with_leading_nested_canonical_tensor(
+    tmp_path: Path,
+    container_kind: Literal["list", "tuple", "dictionary"],
+) -> None:
+    archive_path = tmp_path / f"large-batched-nested-canonical-{container_kind}.pt"
+    _write_large_batched_pytorch_state_dict(
+        archive_path,
+        leading_canonical_container=container_kind,
+    )
+    with zipfile.ZipFile(archive_path) as archive:
+        payload = archive.read("archive/data.pkl")
+
+    parsed = package_api._pytorch_storage_keys_from_pickle_bytes(payload)
+
+    assert parsed.parse_complete is True
+    assert len(parsed.referenced_keys) == 600
+    assert len(parsed.canonical_tensor_rebuild_invocations) == 601
 
 
 @pytest.mark.parametrize(("leading_metadata_count", "split_batch"), [(510, False), (1000, False), (1000, True)])

@@ -1987,8 +1987,16 @@ def _pytorch_storage_keys_from_pickle_bytes(
             value is canonical_tensor
             or (
                 isinstance(value, (str, int, float, bytes, type(None), tuple, list, dict))
-                and not value_contains_tracked_provenance(value)
+                and not value_contains_tracked_provenance(value, storage_only=True)
+                and (not trusted_canonical_batch_seen or not value_contains_tracked_provenance(value))
             )
+        )
+
+    def setitems_entry_contains_canonical_tensor(value: object) -> bool:
+        return value is canonical_tensor or (
+            isinstance(value, (tuple, list, dict))
+            and not value_contains_tracked_provenance(value, storage_only=True)
+            and value_contains_tracked_provenance(value)
         )
 
     def apply_setitems_to_target(items: tuple[tuple[Any, Any], ...]) -> None:
@@ -1998,7 +2006,7 @@ def _pytorch_storage_keys_from_pickle_bytes(
             trusted_canonical_batch_seen
             or bool(canonical_batch_entries)
             or any(value is canonical_tensor for value in stack)
-            or any(value is canonical_tensor for _key, value in items)
+            or any(setitems_entry_contains_canonical_tensor(value) for _key, value in items)
         )
         items_contain_untrusted_storage = any(
             value_contains_tracked_provenance(key, storage_only=True)
@@ -2236,6 +2244,9 @@ def _pytorch_storage_keys_from_pickle_bytes(
             if opcode_name == "STOP":
                 if canonical_batch_entries or (pending_uncanonical_metadata_batch and not trusted_canonical_batch_seen):
                     return _PytorchStorageReferenceParse(set(), {}, set(), set(), False, False)
+                if stack and value_contains_tracked_provenance(stack[-1], storage_only=True):
+                    discarded_tracked_storage_references = True
+                    invalidate_tensor_rebuild_proof()
                 if any(value_contains_tracked_provenance(value) for value in stack[:-1] if value is not marker):
                     discarded_tracked_storage_references = True
                     invalidate_tensor_rebuild_proof()
@@ -2425,7 +2436,9 @@ def _pytorch_storage_keys_from_pickle_bytes(
                     setitem_pairs = tuple(
                         (setitem_items[index], setitem_items[index + 1]) for index in range(0, len(setitem_items), 2)
                     )
-                batch_has_canonical_tensor = any(value is canonical_tensor for _key, value in setitem_pairs)
+                batch_has_canonical_tensor = any(
+                    setitems_entry_contains_canonical_tensor(value) for _key, value in setitem_pairs
+                )
                 if len(setitem_pairs) * 2 > _PYTORCH_STORAGE_TRUST_MAX_TUPLE_WIDTH and (
                     not tensor_rebuild_proof_valid
                     or not all(setitems_entry_is_safe(key, value) for key, value in setitem_pairs)
