@@ -1906,7 +1906,9 @@ def _pytorch_storage_keys_from_pickle_bytes(
     def clear_stack_after_malformed_provenance() -> None:
         nonlocal canonical_batch_target, trusted_canonical_batch_seen, discarded_tracked_storage_references
 
-        if any(value_contains_tracked_provenance(value) for value in stack if value is not marker):
+        if any(value_contains_tracked_provenance(value) for value in stack if value is not marker) or any(
+            value_contains_tracked_provenance(value) for _key, value in canonical_batch_entries
+        ):
             discarded_tracked_storage_references = True
         invalidate_tensor_rebuild_proof()
         stack.clear()
