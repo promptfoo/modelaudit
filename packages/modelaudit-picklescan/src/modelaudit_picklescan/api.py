@@ -2244,7 +2244,11 @@ def _pytorch_storage_keys_from_pickle_bytes(
             if opcode_name == "STOP":
                 if canonical_batch_entries or (pending_uncanonical_metadata_batch and not trusted_canonical_batch_seen):
                     return _PytorchStorageReferenceParse(set(), {}, set(), set(), False, False)
-                if stack and value_contains_tracked_provenance(stack[-1], storage_only=True):
+                if (
+                    stack
+                    and isinstance(stack[-1], (tuple, list, dict, _PytorchOrderedDictState))
+                    and (value_contains_tracked_provenance(stack[-1], storage_only=True))
+                ):
                     discarded_tracked_storage_references = True
                     invalidate_tensor_rebuild_proof()
                 if any(value_contains_tracked_provenance(value) for value in stack[:-1] if value is not marker):
