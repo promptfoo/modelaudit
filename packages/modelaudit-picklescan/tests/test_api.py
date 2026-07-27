@@ -3732,6 +3732,62 @@ def test_scan_file_preserves_hidden_malicious_storage_after_noncanonical_setitem
     )
 
 
+@pytest.mark.parametrize("duplicate_variant", ["ordered_batch", "ordered_setitem", "nested_dict"])
+def test_scan_file_preserves_hidden_malicious_storage_after_duplicate_state_key(
+    tmp_path: Path,
+    duplicate_variant: str,
+) -> None:
+    archive_path = tmp_path / f"malicious-duplicate-state-{duplicate_variant}.pt"
+    hidden_payload = b"S'" + b"A" * 5000 + b"'\n0cos\nsystem\n(S'echo duplicate-state-key'\ntR."
+
+    def encoded_key(value: str) -> bytes:
+        raw = value.encode("ascii")
+        return b"X" + len(raw).to_bytes(4, "little") + raw
+
+    tensor_value = (
+        _pytorch_rebuild_tensor_v2_payload(
+            key="0",
+            storage_name="ByteStorage",
+            element_count=len(hidden_payload),
+        )
+        .removeprefix(b"\x80\x04")
+        .removesuffix(b".")
+    )
+    entries = [encoded_key("same") + tensor_value]
+    entries.extend(encoded_key(f"metadata_{index}") + b"K\x01" for index in range(40))
+    suffix = b"u."
+    if duplicate_variant == "ordered_batch":
+        entries.insert(1, encoded_key("same") + b"K\x00")
+    elif duplicate_variant == "ordered_setitem":
+        suffix = b"u" + encoded_key("same") + b"K\x00s."
+    else:
+        storage_reference = _pytorch_storage_binpersid_expr(
+            key="0",
+            storage_name="ByteStorage",
+            element_count=len(hidden_payload),
+        )
+        nested_dict = b"(" + encoded_key("slot") + storage_reference + encoded_key("slot") + b"K\x00d"
+        entries.append(encoded_key("nested") + nested_dict)
+
+    payload = b"\x80\x04" + _global(b"collections", b"OrderedDict") + b")R(" + b"".join(entries) + suffix
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", payload)
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", hidden_payload)
+
+    report = scan_file(archive_path)
+
+    assert package_api._trusted_pytorch_data_pkl_from_storage_member_sizes(payload, {"0": len(hidden_payload)}) is None
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.severity == Severity.CRITICAL
+        and finding.details.get("module") in {"os", "posix", "nt"}
+        and finding.details.get("name") == "system"
+        for finding in report.findings
+    )
+
+
 def test_pytorch_storage_trust_rejects_canonical_setitems_beyond_bounded_batch(tmp_path: Path) -> None:
     archive_path = tmp_path / "oversized-canonical-batch.pt"
     _write_large_batched_pytorch_state_dict(

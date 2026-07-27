@@ -12,7 +12,7 @@ import zipfile
 from _collections import OrderedDict as _CANONICAL_COLLECTIONS_ORDERED_DICT
 from collections.abc import Mapping
 from contextlib import suppress
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from importlib import import_module
 from importlib import metadata as importlib_metadata
 from pathlib import Path
@@ -337,6 +337,7 @@ class _PytorchStorageRef:
 class _PytorchOrderedDictState:
     mutated: bool = False
     used_as_hooks: bool = False
+    keys_with_tracked_provenance: set[object] = field(default_factory=set)
 
 
 @dataclass(frozen=True)
@@ -1156,6 +1157,7 @@ def _trusted_pytorch_data_pkl_from_storage_member_sizes(
         not reference_parse.parse_complete
         or not reference_parse.referenced_keys
         or not reference_parse.all_persistent_ids_are_pytorch_storage
+        or reference_parse.discarded_tracked_storage_references
     ):
         return None
     if not reference_parse.referenced_keys <= storage_member_sizes.keys():
@@ -1964,7 +1966,16 @@ def _pytorch_storage_keys_from_pickle_bytes(
         if isinstance(stack[-1], _PytorchStorageRef):
             poison_stack_top()
         elif isinstance(stack[-1], _PytorchOrderedDictState):
-            mutate_tracked_ordered_dict(stack[-1])
+            target = stack[-1]
+            for key, value in items:
+                if key in target.keys_with_tracked_provenance:
+                    discarded_tracked_storage_references = True
+                    invalidate_tensor_rebuild_proof()
+                if value_contains_tracked_provenance(value):
+                    target.keys_with_tracked_provenance.add(key)
+                else:
+                    target.keys_with_tracked_provenance.discard(key)
+            mutate_tracked_ordered_dict(target)
         elif isinstance(stack[-1], dict):
             for key, value in items:
                 if key in stack[-1] and value_contains_tracked_provenance(stack[-1][key]):
@@ -2221,7 +2232,14 @@ def _pytorch_storage_keys_from_pickle_bytes(
                 if dict_items is None or len(dict_items) % 2 != 0:
                     clear_stack_after_malformed_provenance()
                 else:
-                    stack.append({dict_items[index]: dict_items[index + 1] for index in range(0, len(dict_items), 2)})
+                    built_dict: dict[Any, Any] = {}
+                    for index in range(0, len(dict_items), 2):
+                        key = dict_items[index]
+                        if key in built_dict and value_contains_tracked_provenance(built_dict[key]):
+                            discarded_tracked_storage_references = True
+                            invalidate_tensor_rebuild_proof()
+                        built_dict[key] = dict_items[index + 1]
+                    stack.append(built_dict)
             elif opcode_name in {"BININT", "BININT1", "BININT2", "LONG", "LONG1", "LONG4", "INT", "FLOAT", "BINFLOAT"}:
                 stack.append(arg)
             elif opcode_name == "NONE":
