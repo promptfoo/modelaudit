@@ -41,6 +41,43 @@ HUGGINGFACE_DOCUMENTATION_IMAGE_EXAMPLE = (
 )
 
 
+def test_text_scanner_verified_huggingface_image_readmes_match_immutable_revisions() -> None:
+    pinned_model_cards: tuple[tuple[str, str, tuple[int, str], tuple[int, str]], ...] = (
+        (
+            "timm/mobilenetv3_small_100.lamb_in1k",
+            "1824797e7887cbec1990e4adbd6675960a36c589",
+            (4386, "3950face80991c4f91fb1ead491d787639e08a737f948fd630dd938ae8f78c18"),
+            (4531, "d15a41ee108ddfa546bc931a553f108be8e9e0c4c3ff2978dab9ee31ba5193f0"),
+        ),
+        (
+            "apple/DFN2B-CLIP-ViT-B-16",
+            "8b023e8bb8b0a27c17859af548c9fc3105d6c29c",
+            (3707, "cbb1a81c3ce864dc6258a359e7e5a16205d269a32a91399c6c7acc92ebed8418"),
+            (3818, "f9c56fcf440a540c906f88a6bfcd723eada9b2ce7719a00df6456cde29f1eef5"),
+        ),
+        (
+            "timm/convnext_femto.d1_in1k",
+            "1e0c02df687c47abf0819e1a4f858293e17e0c50",
+            (15646, "8be1d036fde8dd8d279b9d0d8d886da58ba5c76e7a59d6da662b89243a51a5e3"),
+            (15844, "5996269997efd68dfae50ababead126a2b33761510440c1355bf50854c72849d"),
+        ),
+        (
+            "timm/repvgg_a0.rvgg_in1k",
+            "e292d220aa8b811232037f8aa6d6c8c552dbd0c0",
+            (4515, "76528d32891b0a14087eb2240065094ff2cea9cc04a41ebe7b28311711af830d"),
+            (4671, "937369705c2ce5d8ef37a7b8b589a997ebdc76b05ad60cb05f1641777e4ebb69"),
+        ),
+    )
+    expected_readmes = frozenset(
+        readme for _, _, lf_readme, crlf_readme in pinned_model_cards for readme in (lf_readme, crlf_readme)
+    )
+
+    assert len(pinned_model_cards) == 4
+    assert all(len(revision) == 40 for _, revision, _, _ in pinned_model_cards)
+    assert len(expected_readmes) == 8
+    assert expected_readmes == text_scanner_module.VERIFIED_HUGGINGFACE_DOCUMENTATION_IMAGE_READMES
+
+
 def _trust_exact_huggingface_documentation_example(
     monkeypatch: pytest.MonkeyPatch,
     *,
