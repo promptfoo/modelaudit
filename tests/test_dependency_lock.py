@@ -14,7 +14,7 @@ ROOT_PYPROJECT = ROOT_DIR / "pyproject.toml"
 PICKLESCAN_PYPROJECT = ROOT_DIR / "packages" / "modelaudit-picklescan" / "pyproject.toml"
 PATCHED_GITPYTHON_FLOOR = (3, 1, 50)
 PINNED_MATURIN_BACKEND = "maturin===1.13.3"
-REQUIRED_PICKLESCAN_RELEASE = "modelaudit-picklescan>=0.1.10,<0.2.0"
+REQUIRED_PICKLESCAN_RELEASE = "modelaudit-picklescan>=0.1.11,<0.2.0"
 PATCHED_PY7ZR_REQUIREMENT = "py7zr>=1.1.3"
 PY7ZR_EXTRAS = ("sevenzip", "all-ci", "all")
 NUMPY_REQUIREMENTS = {

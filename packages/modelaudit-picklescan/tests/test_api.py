@@ -3455,6 +3455,19 @@ def _write_large_batched_pytorch_state_dict(path: Path, *, malicious: bool = Fal
             archive.writestr(f"archive/data/{index}", b"\x00" * 24)
 
 
+def test_pytorch_storage_trust_parses_large_batched_state_dict_without_framework(tmp_path: Path) -> None:
+    archive_path = tmp_path / "large-batched-state.pt"
+    _write_large_batched_pytorch_state_dict(archive_path)
+    with zipfile.ZipFile(archive_path) as archive:
+        payload = archive.read("archive/data.pkl")
+
+    parsed = package_api._pytorch_storage_keys_from_pickle_bytes(payload)
+
+    assert parsed.parse_complete is True
+    assert len(parsed.referenced_keys) == package_api._PYTORCH_STORAGE_TRUST_MAX_TUPLE_WIDTH // 2 + 1
+    assert len(parsed.canonical_tensor_rebuild_invocations) == len(parsed.referenced_keys)
+
+
 def test_scan_file_suppresses_rebuild_tensor_v2_for_large_batched_state_dict(tmp_path: Path) -> None:
     _require_torch_distribution()
     archive_path = tmp_path / "large-batched-state.pt"
@@ -3469,7 +3482,6 @@ def test_scan_file_suppresses_rebuild_tensor_v2_for_large_batched_state_dict(tmp
 
 
 def test_scan_file_preserves_malicious_call_in_large_batched_state_dict(tmp_path: Path) -> None:
-    _require_torch_distribution()
     archive_path = tmp_path / "large-batched-malicious-state.pt"
     _write_large_batched_pytorch_state_dict(archive_path, malicious=True)
 

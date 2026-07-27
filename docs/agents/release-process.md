@@ -11,7 +11,7 @@ Both packages are driven by a single [release-please](https://github.com/googlea
 
 The root release intentionally omits `package-name` and `component`. Release-please reads `project.name` from `pyproject.toml` for Python updates, while the empty branch component lets a root-only grouped Release PR match `release-please--branches--main` and keeps the existing `v{X.Y.Z}` tags. Restoring a non-empty `package-name` or `component` makes root-only releases look like a different component and silently skips publication after merge.
 
-The root `modelaudit` wheel declares a **hard dependency** on `modelaudit-picklescan>=0.1.10,<0.2.0` in `pyproject.toml`. When the sibling version crosses `0.2.0`, the constraint must be bumped in the same PR.
+The root `modelaudit` wheel declares a **hard dependency** on `modelaudit-picklescan>=0.1.11,<0.2.0` in `pyproject.toml`. When the sibling version crosses `0.2.0`, the constraint must be bumped in the same PR.
 
 ## Normal flow
 

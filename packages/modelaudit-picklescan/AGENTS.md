@@ -4,7 +4,7 @@ Scoped agent guide for work inside `packages/modelaudit-picklescan/`. The root [
 
 ## What this package is
 
-`modelaudit-picklescan` is the Rust-backed pickle scanner that ships as an independent PyPI package. The root `modelaudit` wheel depends on it at runtime via a hard `modelaudit-picklescan>=0.1.10,<0.2.0` pin in the root `pyproject.toml`.
+`modelaudit-picklescan` is the Rust-backed pickle scanner that ships as an independent PyPI package. The root `modelaudit` wheel depends on it at runtime via a hard `modelaudit-picklescan>=0.1.11,<0.2.0` pin in the root `pyproject.toml`.
 
 - **Public API** — exported from `src/modelaudit_picklescan/__init__.py`: `PickleScanner`, `ScanOptions`, `scan_file`, `scan_bytes`, `scan_stream`, `shared_source_sensitive_caches`, `PickleReport`, `Finding`, `Notice`, `ScanError`, `Severity`, `ScanStatus`, `SafetyVerdict`, `CoverageSummary`. Treat these names as a stable surface.
 - **Rust engine** — `rust/src/` compiled to `modelaudit_picklescan._rust` via maturin + PyO3. Rust 1.83+, edition 2021.
@@ -74,7 +74,7 @@ Root-level validation (`uv run ruff check modelaudit/ packages/modelaudit-pickle
 - Release tag format: `modelaudit-picklescan-v{X.Y.Z}`.
 - Bumps are driven by Conventional Commits that **touch files inside `packages/modelaudit-picklescan/`**. Commits that only touch `modelaudit/` or the repo root do not bump this package.
 
-When this package reaches `0.2.0`, the root `pyproject.toml` `modelaudit-picklescan>=0.1.10,<0.2.0` constraint must be widened in the same PR, or the next `modelaudit` release will be uninstallable.
+When this package reaches `0.2.0`, the root `pyproject.toml` `modelaudit-picklescan>=0.1.11,<0.2.0` constraint must be widened in the same PR, or the next `modelaudit` release will be uninstallable.
 
 ## Publishing
 

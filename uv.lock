@@ -2675,7 +2675,7 @@ dev = [
 
 [[package]]
 name = "modelaudit-picklescan"
-version = "0.1.10"
+version = "0.1.11"
 source = { editable = "packages/modelaudit-picklescan" }
 
 [[package]]
