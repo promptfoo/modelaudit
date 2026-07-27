@@ -1729,6 +1729,7 @@ _EXPLICIT_PROSE_PREFIX_PATTERN = re.compile(
 _MAX_PROSE_LINE_CONTEXT_BYTES = 512
 _MAX_README_IMAGE_EXAMPLE_BYTES = 64 * 1024
 _MAX_README_IMAGE_EXAMPLE_AST_NODES = 1024
+_MAX_README_IMAGE_EXAMPLE_FENCE_OPENINGS = 64
 _PYTHON_README_FENCE_PATTERN = re.compile(rb"(?m)^[ \t]{0,3}```(?:python|py)[ \t]*\r?\n")
 _README_FENCE_END_PATTERN = re.compile(rb"(?m)^[ \t]{0,3}```[ \t]*\r?$")
 _DOCUMENTED_IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp")
@@ -1884,7 +1885,7 @@ def _is_official_readme_sample_image_request(
     fence_cache: list[tuple[int, int, bool]],
 ) -> bool:
     filename = context.replace("\\", "/").rsplit("/", 1)[-1].lower()
-    if filename != "readme.md":
+    if filename not in {"readme.md", "readme"}:
         return False
     for fence_start, fence_end, is_safe in reversed(fence_cache):
         if fence_start <= match_index < fence_end:
@@ -1894,7 +1895,12 @@ def _is_official_readme_sample_image_request(
     example_start = 0
     example_end = 0
     window_start = max(0, match_index - _MAX_README_IMAGE_EXAMPLE_BYTES)
+    openings: list[re.Match[bytes]] = []
     for opening in _PYTHON_README_FENCE_PATTERN.finditer(data, window_start, match_index + 1):
+        if len(openings) >= _MAX_README_IMAGE_EXAMPLE_FENCE_OPENINGS:
+            return False
+        openings.append(opening)
+    for opening in openings:
         if opening.end() > match_index:
             break
         closing = _README_FENCE_END_PATTERN.search(
@@ -1977,6 +1983,46 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
         for target in statement.targets
         if isinstance(target, ast.Name)
     }
+    documented_builtin_names = {"enumerate", "len", "print", "range", "round", "zip"}
+    imported_names = {"requests"}
+    for node in nodes:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.asname is not None or alias.name not in {"requests", "torch"}:
+                    return False
+                imported_names.add(alias.name)
+        elif isinstance(node, ast.ImportFrom):
+            if node.level != 0 or node.module not in {"PIL", "transformers"}:
+                return False
+            for alias in node.names:
+                if (
+                    alias.asname is not None
+                    or alias.name == "*"
+                    or (node.module == "PIL" and alias.name != "Image")
+                    or (node.module == "transformers" and not alias.name[:1].isupper())
+                ):
+                    return False
+                imported_names.add(alias.name)
+    known_names = (
+        imported_names
+        | documented_builtin_names
+        | {"Image", "torch"}
+        | {node.id for node in nodes if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)}
+        | {node.arg for node in nodes if isinstance(node, ast.arg)}
+        | {node.name for node in nodes if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    )
+    requests_response_names = {
+        target.id
+        for statement in tree.body
+        if isinstance(statement, ast.Assign)
+        and isinstance(statement.value, ast.Call)
+        and isinstance(statement.value.func, ast.Attribute)
+        and isinstance(statement.value.func.value, ast.Name)
+        and statement.value.func.value.id == "requests"
+        and statement.value.func.attr == "get"
+        for target in statement.targets
+        if isinstance(target, ast.Name)
+    }
     allowed_targets: set[int] = set()
     assignments: dict[str, list[tuple[int, str | None]]] = {}
     for statement in tree.body:
@@ -2020,10 +2066,12 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
                 return False
         if (
             isinstance(node, ast.Name)
-            and node.id in protected_names
+            and node.id in protected_names | imported_names | documented_builtin_names
             and isinstance(node.ctx, (ast.Store, ast.Del))
             and id(node) not in allowed_targets
         ):
+            return False
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id not in known_names:
             return False
         if (
             isinstance(node, ast.Name)
@@ -2043,9 +2091,15 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
         if (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Name)
-            and node.func.id not in callable_assignments | {"enumerate", "len", "print", "range", "round", "zip"}
+            and node.func.id not in callable_assignments | documented_builtin_names
         ):
             return False
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            attribute_root = node.func.value
+            while isinstance(attribute_root, (ast.Attribute, ast.Subscript, ast.Call)):
+                attribute_root = attribute_root.func if isinstance(attribute_root, ast.Call) else attribute_root.value
+            if isinstance(attribute_root, ast.Name) and attribute_root.id in requests_response_names:
+                return False
         if isinstance(node, ast.Attribute) and node.attr in {"eval", "exec", "__import__"}:
             return False
         if (

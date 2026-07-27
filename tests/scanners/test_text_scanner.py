@@ -419,8 +419,9 @@ def test_text_scanner_documentation_urls_are_informational(tmp_path: Path) -> No
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
 
-def test_text_scanner_readme_official_sample_image_request_is_informational(tmp_path: Path) -> None:
-    text_path = tmp_path / "README.md"
+@pytest.mark.parametrize("filename", ["README.md", "README"])
+def test_text_scanner_readme_official_sample_image_request_is_informational(tmp_path: Path, filename: str) -> None:
+    text_path = tmp_path / filename
     text_path.write_text(
         "# Example\n```python\nimport requests\n"
         "image_url = 'https://huggingface.co/spaces/org/demo/resolve/main/image.png'\n"

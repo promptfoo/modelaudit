@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 from collections.abc import Iterator
 from pathlib import Path
 from urllib.parse import quote, urlparse
@@ -2772,9 +2773,11 @@ class TestNetworkCommDetector:
             "https://HuggingFace.CO/spaces/ds4sd/demo/resolve/main/examples/sample.png",
         ],
     )
+    @pytest.mark.parametrize("context", ["README.md", "README"])
     def test_readme_python_example_official_sample_image_has_no_network_false_positive(
         self,
         image_url: str,
+        context: str,
     ) -> None:
         data = (
             "# Model card\n\n```python\nimport requests\n"
@@ -2782,7 +2785,7 @@ class TestNetworkCommDetector:
             "image = Image.open(requests.get(image_url, stream=True).raw)\n```\n"
         ).encode()
 
-        findings = NetworkCommDetector().scan(data, "README.md")
+        findings = NetworkCommDetector().scan(data, context)
 
         assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
         assert any(finding["type"] == "cloud_storage_url" for finding in findings)
@@ -2852,8 +2855,10 @@ class TestNetworkCommDetector:
             "match payload:\n    case {'x': _, **image_url}:\n        requests.get(image_url, stream=True)",
             "@mutate\ndef placeholder():\n    pass\nrequests.get(image_url, stream=True)",
             "class Hook(metaclass=mutate):\n    pass\nrequests.get(image_url, stream=True)",
-            "import importlib\nfetch = importlib.import_module('requests').post\n"
-            "requests.get(image_url, stream=True)\nfetch(input())",
+            (
+                "import importlib\nfetch = importlib.import_module('requests').post\n"
+                + "requests.get(image_url, stream=True)\nfetch(input())"
+            ),
             "del requests\nrequests.get(image_url, stream=True)",
             "del image_url\nrequests.get(image_url, stream=True)",
             "requests.get(image_url, stream=True)\nmatch payload:\n    case image_url:\n        fetch(image_url)",
@@ -2864,6 +2869,11 @@ class TestNetworkCommDetector:
             "replace_requests_get()\nrequests.get(image_url, stream=True)",
             "from attacker import install_hook\ninstall_hook()\nrequests.get(image_url, stream=True)",
             "__builtins__['ex' + 'ec']('requests.get(input())')\nrequests.get(image_url, stream=True)",
+            "import attacker\nrequests.get(image_url, stream=True)",
+            "import attacker\nattacker.install()\nrequests.get(image_url, stream=True)",
+            "import attacker as print\nprint()\nrequests.get(image_url, stream=True)",
+            "requests.get(image_url, stream=True)\nplugin.activate()",
+            "response = requests.get(image_url, stream=True)\nresponse.exfiltrate()",
         ],
     )
     def test_readme_python_example_preserves_rebound_or_unproven_requests(
@@ -2959,6 +2969,32 @@ class TestNetworkCommDetector:
             b"import requests\nrequests.get('https://huggingface.co/org/model/resolve/main/sample.png', stream=True)\n"
         )
         assert len(visited_nodes) == network_comm._MAX_README_IMAGE_EXAMPLE_AST_NODES + 1
+
+    def test_readme_official_image_example_rejects_excessive_fence_openings(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        closing_searches: list[int] = []
+        original_pattern = network_comm._README_FENCE_END_PATTERN
+
+        class CountedClosingPattern:
+            def search(self, data: bytes, start: int, end: int) -> re.Match[bytes] | None:
+                closing_searches.append(start)
+                return original_pattern.search(data, start, end)
+
+        monkeypatch.setattr(network_comm, "_README_FENCE_END_PATTERN", CountedClosingPattern())
+        data = (
+            b"```python\n" * (network_comm._MAX_README_IMAGE_EXAMPLE_FENCE_OPENINGS + 1)
+            + b"import requests\nrequests.get(image_url, stream=True)\n"
+        )
+
+        assert not network_comm._is_official_readme_sample_image_request(
+            data,
+            match_index=data.index(b"requests.get"),
+            context="README.md",
+            fence_cache=[],
+        )
+        assert not closing_searches
 
     def test_readme_official_image_in_different_fence_does_not_suppress_network_call(self) -> None:
         data = (
