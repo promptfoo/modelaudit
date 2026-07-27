@@ -2874,6 +2874,13 @@ class TestNetworkCommDetector:
             "import attacker as print\nprint()\nrequests.get(image_url, stream=True)",
             "requests.get(image_url, stream=True)\nplugin.activate()",
             "response = requests.get(image_url, stream=True)\nresponse.exfiltrate()",
+            "print.__self__.__dict__['ex' + 'ec']('requests.get = print')\nrequests.get(image_url, stream=True)",
+            (
+                "assert print.__self__.__dict__['ex' + 'ec']('requests.get = print') is None\n"
+                + "requests.get(image_url, stream=True)"
+            ),
+            "torch.ops.load_library('payload.so')\nrequests.get(image_url, stream=True)",
+            "(lambda: payload)()\nrequests.get(image_url, stream=True)",
         ],
     )
     def test_readme_python_example_preserves_rebound_or_unproven_requests(
@@ -3006,6 +3013,42 @@ class TestNetworkCommDetector:
 
         assert any(finding["type"] == "network_library" for finding in findings)
         assert any(finding["type"] == "network_function" for finding in findings)
+
+    def test_readme_official_image_does_not_suppress_requests_in_another_fence(self) -> None:
+        data = (
+            b"```python\nimport requests\n"
+            b"image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            b"requests.get(image_url, stream=True)\n```\n"
+            b"```python\nrequests.patch(input())\n```\n"
+        )
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert any(finding["type"] == "network_library" for finding in findings)
+
+    def test_readme_official_image_fence_index_stays_bounded(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        validated_examples: list[bytes] = []
+        original_validator = network_comm._is_valid_official_readme_sample_image_example
+
+        def count_validation(example: bytes) -> bool:
+            validated_examples.append(example)
+            return original_validator(example)
+
+        monkeypatch.setattr(network_comm, "_is_valid_official_readme_sample_image_example", count_validation)
+        example = (
+            b"```python\nimport requests\n"
+            b"image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            b"requests.get(image_url, stream=True)\n```\n"
+        )
+        data = example * (network_comm._MAX_README_IMAGE_EXAMPLE_FENCES + 1)
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert len(validated_examples) == network_comm._MAX_README_IMAGE_EXAMPLE_FENCES
+        assert any(finding["type"] == "network_library" for finding in findings)
 
     def test_network_function_with_parentheses_still_flagged_in_metadata_context(self) -> None:
         """Executable-looking calls should stay detectable even when embedded in metadata files."""

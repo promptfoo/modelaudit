@@ -1730,6 +1730,7 @@ _MAX_PROSE_LINE_CONTEXT_BYTES = 512
 _MAX_README_IMAGE_EXAMPLE_BYTES = 64 * 1024
 _MAX_README_IMAGE_EXAMPLE_AST_NODES = 1024
 _MAX_README_IMAGE_EXAMPLE_FENCE_OPENINGS = 64
+_MAX_README_IMAGE_EXAMPLE_FENCES = 256
 _PYTHON_README_FENCE_PATTERN = re.compile(rb"(?m)^[ \t]{0,3}```(?:python|py)[ \t]*\r?\n")
 _README_FENCE_END_PATTERN = re.compile(rb"(?m)^[ \t]{0,3}```[ \t]*\r?$")
 _DOCUMENTED_IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp")
@@ -1883,10 +1884,17 @@ def _is_official_readme_sample_image_request(
     match_index: int,
     context: str,
     fence_cache: list[tuple[int, int, bool]],
+    preindexed: bool = False,
 ) -> bool:
     filename = context.replace("\\", "/").rsplit("/", 1)[-1].lower()
     if filename not in {"readme.md", "readme"}:
         return False
+    if preindexed:
+        fence_index = bisect_right(fence_cache, (match_index, len(data), True)) - 1
+        if fence_index < 0:
+            return False
+        fence_start, fence_end, is_safe = fence_cache[fence_index]
+        return fence_start <= match_index < fence_end and is_safe
     for fence_start, fence_end, is_safe in reversed(fence_cache):
         if fence_start <= match_index < fence_end:
             return is_safe
@@ -1920,6 +1928,42 @@ def _is_official_readme_sample_image_request(
         fence_cache.pop(0)
     fence_cache.append((example_start, example_end, is_safe))
     return is_safe
+
+
+def _index_official_readme_sample_image_fences(
+    data: bytes,
+    context: str,
+) -> tuple[list[tuple[int, int, bool]], bool]:
+    filename = context.replace("\\", "/").rsplit("/", 1)[-1].lower()
+    if filename not in {"readme.md", "readme"} or b"requests" not in data:
+        return [], False
+
+    fences: list[tuple[int, int, bool]] = []
+    unvalidated_requests = False
+    cursor = 0
+    while opening := _PYTHON_README_FENCE_PATTERN.search(data, cursor):
+        if len(fences) >= _MAX_README_IMAGE_EXAMPLE_FENCES:
+            return [], True
+        closing = _README_FENCE_END_PATTERN.search(
+            data,
+            opening.end(),
+            min(len(data), opening.end() + _MAX_README_IMAGE_EXAMPLE_BYTES),
+        )
+        if closing is None:
+            unvalidated_requests = True
+            cursor = min(len(data), opening.end() + _MAX_README_IMAGE_EXAMPLE_BYTES)
+            continue
+        example = data[opening.end() : closing.start()]
+        is_safe = (
+            b"import requests" in example
+            and b"requests.get" in example
+            and _is_valid_official_readme_sample_image_example(example)
+        )
+        if b"requests" in example and not is_safe:
+            unvalidated_requests = True
+        fences.append((opening.end(), closing.start(), is_safe))
+        cursor = closing.end()
+    return fences, unvalidated_requests
 
 
 def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
@@ -2052,6 +2096,8 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
             return False
         if isinstance(node, ast.Match):
             return False
+        if isinstance(node, (ast.Assert, ast.Lambda, ast.Raise, ast.Try)):
+            return False
         if isinstance(node, ast.ClassDef):
             return False
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and (
@@ -2098,9 +2144,21 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
             attribute_root = node.func.value
             while isinstance(attribute_root, (ast.Attribute, ast.Subscript, ast.Call)):
                 attribute_root = attribute_root.func if isinstance(attribute_root, ast.Call) else attribute_root.value
-            if isinstance(attribute_root, ast.Name) and attribute_root.id in requests_response_names:
+            if isinstance(attribute_root, ast.Name) and attribute_root.id in (
+                requests_response_names | documented_builtin_names
+            ):
                 return False
-        if isinstance(node, ast.Attribute) and node.attr in {"eval", "exec", "__import__"}:
+        if isinstance(node, ast.Call) and not isinstance(node.func, (ast.Attribute, ast.Name)):
+            return False
+        if isinstance(node, ast.Attribute) and (
+            node.attr.startswith("_")
+            or node.attr in {"eval", "exec", "load_library"}
+            or (
+                isinstance(node.value, ast.Name)
+                and node.value.id == "torch"
+                and node.attr in {"classes", "compile", "hub", "jit", "ops", "package", "serialization", "utils"}
+            )
+        ):
             return False
         if (
             isinstance(node, ast.Subscript)
@@ -2527,6 +2585,7 @@ class NetworkCommDetector:
         self._evidence_redaction_limit_reached = False
         self._cloud_nested_url_findings: set[str] = set()
         self._official_readme_image_fences: list[tuple[int, int, bool]] = []
+        self._official_readme_image_unvalidated_requests = False
 
         # Clone class-level patterns to avoid cross-instance leakage
         self.cc_patterns: list[bytes] = self.CC_PATTERNS.copy()
@@ -2558,7 +2617,10 @@ class NetworkCommDetector:
         self._evidence_redaction_classifications = 0
         self._evidence_redaction_limit_reached = False
         self._cloud_nested_url_findings = set()
-        self._official_readme_image_fences = []
+        (
+            self._official_readme_image_fences,
+            self._official_readme_image_unvalidated_requests,
+        ) = _index_official_readme_sample_image_fences(data, context)
         if self.max_findings is None:
             self._url_contexts = self._index_url_contexts(data)
             self._url_context_starts = [start for start, _end, _url in self._url_contexts]
@@ -3198,11 +3260,13 @@ class NetworkCommDetector:
                         requires_call=not pattern.startswith((b"import ", b"from ")),
                     ) or (
                         lib == b"requests"
+                        and not self._official_readme_image_unvalidated_requests
                         and _is_official_readme_sample_image_request(
                             data,
                             match_index=match_index,
                             context=context,
                             fence_cache=self._official_readme_image_fences,
+                            preindexed=True,
                         )
                     ):
                         continue
@@ -3250,6 +3314,7 @@ class NetworkCommDetector:
                         match_index=idx,
                         context=context,
                         fence_cache=self._official_readme_image_fences,
+                        preindexed=True,
                     )
                 ):
                     continue
