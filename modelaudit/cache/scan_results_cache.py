@@ -2270,12 +2270,13 @@ class ScanResultsCache:
                         if isinstance(probe_name, str):
                             probe_path = Path(os.path.abspath(probe_name))
                             cache_path = Path(os.path.abspath(self.cache_dir))
+                            normalized_cache_path = cache_path.resolve(strict=False)
                             if (
-                                probe_directory == self.cache_dir
-                                and probe_path.parent == cache_path
+                                probe_directory.resolve(strict=False) == normalized_cache_path
+                                and probe_path.parent.resolve(strict=False) == normalized_cache_path
                                 and probe_path.name.startswith(".modelaudit-cache-clock-")
                             ):
-                                retained_probe_paths.add(probe_path)
+                                retained_probe_paths.add(cache_path / probe_path.name)
                         continue
 
                     self._change_clock_probes.pop(file_device, None)
