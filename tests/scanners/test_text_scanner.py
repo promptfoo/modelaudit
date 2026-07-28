@@ -4,8 +4,10 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from click.testing import CliRunner
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
+from modelaudit.cli import cli
 from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
 from modelaudit.detectors import network_comm
 from modelaudit.scanner_results import SCAN_OUTCOME_MESSAGE_METADATA_KEY
@@ -39,6 +41,49 @@ HUGGINGFACE_DOCUMENTATION_IMAGE_EXAMPLE = (
     "))\n"
     "```\n"
 )
+
+HUGGINGFACE_DOCUMENTATION_IMAGE_README_FIXTURES = (
+    "timm_mobilenetv3_small_100.lamb_in1k_README.txt",
+    "timm_convnext_femto.d1_in1k_README.txt",
+    "timm_repvgg_a0.rvgg_in1k_README.txt",
+)
+HUGGINGFACE_WHITELIST_POLICY_MODES: tuple[tuple[bool | str | None, bool], ...] = (
+    (None, True),
+    (True, True),
+    (False, False),
+    ("false", False),
+    ("0", False),
+    ("off", False),
+)
+
+
+class _FailingSecretDetectorTextScanner(TextScanner):
+    def collect_embedded_secret_findings(
+        self,
+        *_args: Any,
+        **_kwargs: Any,
+    ) -> list[dict[str, Any]]:
+        raise RuntimeError("controlled trusted-documentation secret detector failure")
+
+
+class _FailingNetworkDetectorTextScanner(TextScanner):
+    def collect_network_communication_findings(
+        self,
+        *_args: Any,
+        **_kwargs: Any,
+    ) -> list[dict[str, Any]]:
+        raise RuntimeError("controlled trusted-documentation network detector failure")
+
+
+def _real_huggingface_image_readme_payload(fixture_name: str, *, crlf: bool) -> bytes:
+    fixture_path = Path(__file__).resolve().parents[1] / "assets" / "huggingface_model_cards" / fixture_name
+    original = fixture_path.read_bytes()
+    assert b"license: apache-2.0" in original.splitlines() or b"license: mit" in original.splitlines()
+    payload = original.replace(b"\n", b"\r\n") if crlf else original
+    assert (len(payload), hashlib.sha256(payload).hexdigest()) in (
+        text_scanner_module.VERIFIED_HUGGINGFACE_DOCUMENTATION_IMAGE_READMES
+    )
+    return payload
 
 
 def test_text_scanner_verified_huggingface_image_readmes_match_immutable_revisions() -> None:
@@ -162,6 +207,191 @@ def test_text_scanner_real_huggingface_image_readme_preserves_production_securit
         for check in _failed_network_detection_checks(malicious)
     )
     assert determine_exit_code(malicious_aggregate) == 1
+
+
+@pytest.mark.parametrize("fixture_name", HUGGINGFACE_DOCUMENTATION_IMAGE_README_FIXTURES)
+@pytest.mark.parametrize("crlf", [False, True], ids=["lf", "crlf"])
+@pytest.mark.parametrize(
+    ("whitelist_value", "whitelist_enabled"),
+    HUGGINGFACE_WHITELIST_POLICY_MODES,
+    ids=["default", "true", "false", "string-false", "string-zero", "string-off"],
+)
+def test_text_scanner_verified_huggingface_readme_respects_whitelist_policy(
+    tmp_path: Path,
+    fixture_name: str,
+    crlf: bool,
+    whitelist_value: bool | str | None,
+    whitelist_enabled: bool,
+) -> None:
+    path = tmp_path / "README.md"
+    path.write_bytes(_real_huggingface_image_readme_payload(fixture_name, crlf=crlf))
+    config: dict[str, Any] = {} if whitelist_value is None else {"use_hf_whitelist": whitelist_value}
+
+    result = TextScanner(config).scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False, **config)
+    network_checks = [
+        check
+        for check in result.checks
+        if check.name == "Network Communication Detection"
+        and (check.details.get("function") == "urlopen" or check.details.get("library") == "urllib")
+    ]
+
+    assert {check.details.get("type") for check in network_checks} == {"network_function", "network_library"}
+    if whitelist_enabled:
+        assert result.success is True
+        assert determine_exit_code(aggregate) == 0
+        assert all(check.severity == IssueSeverity.INFO for check in network_checks)
+    else:
+        assert result.success is False
+        assert determine_exit_code(aggregate) == 1
+        assert all(check.status == CheckStatus.FAILED for check in network_checks)
+        assert all(check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for check in network_checks)
+
+
+@pytest.mark.parametrize("fixture_name", HUGGINGFACE_DOCUMENTATION_IMAGE_README_FIXTURES)
+@pytest.mark.parametrize("crlf", [False, True], ids=["lf", "crlf"])
+@pytest.mark.parametrize(
+    ("whitelist_value", "_whitelist_enabled"),
+    HUGGINGFACE_WHITELIST_POLICY_MODES,
+    ids=["default", "true", "false", "string-false", "string-zero", "string-off"],
+)
+def test_text_scanner_verified_huggingface_readme_finding_limit_fails_closed(
+    tmp_path: Path,
+    fixture_name: str,
+    crlf: bool,
+    whitelist_value: bool | str | None,
+    _whitelist_enabled: bool,
+) -> None:
+    path = tmp_path / "README.md"
+    path.write_bytes(_real_huggingface_image_readme_payload(fixture_name, crlf=crlf))
+    config: dict[str, Any] = {"text_content_max_findings": 2}
+    if whitelist_value is not None:
+        config["use_hf_whitelist"] = whitelist_value
+
+    result = TextScanner(config).scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False, **config)
+    network_checks = [
+        check
+        for check in result.checks
+        if check.name == "Network Communication Detection"
+        and (check.details.get("function") == "urlopen" or check.details.get("library") == "urllib")
+    ]
+
+    assert result.success is False
+    assert result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata.get("analysis_incomplete") is True
+    assert result.metadata.get("operational_error_reason") == "text_content_security_finding_limit"
+    assert determine_exit_code(aggregate) == 2
+    assert {check.details.get("type") for check in network_checks} == {"network_function", "network_library"}
+    assert all(check.status == CheckStatus.FAILED for check in network_checks)
+    assert all(check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for check in network_checks)
+
+
+@pytest.mark.parametrize("crlf", [False, True], ids=["lf", "crlf"])
+@pytest.mark.parametrize(
+    ("whitelist_value", "_whitelist_enabled"),
+    HUGGINGFACE_WHITELIST_POLICY_MODES,
+    ids=["default", "true", "false", "string-false", "string-zero", "string-off"],
+)
+@pytest.mark.parametrize(
+    ("scanner_class", "failed_detector"),
+    [
+        pytest.param(_FailingSecretDetectorTextScanner, "secrets", id="secret-detector"),
+        pytest.param(_FailingNetworkDetectorTextScanner, "network_communication", id="network-detector"),
+    ],
+)
+def test_text_scanner_verified_huggingface_readme_detector_failure_fails_closed(
+    tmp_path: Path,
+    crlf: bool,
+    whitelist_value: bool | str | None,
+    _whitelist_enabled: bool,
+    scanner_class: type[TextScanner],
+    failed_detector: str,
+) -> None:
+    path = tmp_path / "README.md"
+    path.write_bytes(
+        _real_huggingface_image_readme_payload(HUGGINGFACE_DOCUMENTATION_IMAGE_README_FIXTURES[0], crlf=crlf)
+    )
+    config: dict[str, Any] = {} if whitelist_value is None else {"use_hf_whitelist": whitelist_value}
+
+    result = scanner_class(config).scan(str(path))
+
+    assert result.success is False
+    assert result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata.get("analysis_incomplete") is True
+    assert result.metadata.get("operational_error_reason") == "text_content_security_detector_failed"
+    assert any(
+        check.name == "Text Content Security Coverage"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("detector") == failed_detector
+        for check in result.checks
+    )
+    if failed_detector == "secrets":
+        network_checks = [
+            check
+            for check in result.checks
+            if check.name == "Network Communication Detection"
+            and (check.details.get("function") == "urlopen" or check.details.get("library") == "urllib")
+        ]
+        assert {check.details.get("type") for check in network_checks} == {"network_function", "network_library"}
+        assert all(check.status == CheckStatus.FAILED for check in network_checks)
+        assert all(check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for check in network_checks)
+
+
+@pytest.mark.parametrize("fixture_name", HUGGINGFACE_DOCUMENTATION_IMAGE_README_FIXTURES)
+@pytest.mark.parametrize("crlf", [False, True], ids=["lf", "crlf"])
+@pytest.mark.parametrize(
+    ("flags", "expected_exit_code"),
+    [
+        pytest.param((), 0, id="default"),
+        pytest.param(("--no-whitelist",), 1, id="no-whitelist"),
+        pytest.param(("--strict",), 1, id="strict"),
+    ],
+)
+def test_text_scanner_verified_huggingface_readme_click_cli_respects_whitelist_policy(
+    tmp_path: Path,
+    fixture_name: str,
+    crlf: bool,
+    flags: tuple[str, ...],
+    expected_exit_code: int,
+) -> None:
+    path = tmp_path / "README.md"
+    path.write_bytes(_real_huggingface_image_readme_payload(fixture_name, crlf=crlf))
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", str(path), "--format", "json", "--no-cache", *flags],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == expected_exit_code, result.output
+
+
+@pytest.mark.parametrize("crlf", [False, True], ids=["lf", "crlf"])
+@pytest.mark.parametrize(
+    ("whitelist_value", "_whitelist_enabled"),
+    HUGGINGFACE_WHITELIST_POLICY_MODES,
+    ids=["default", "true", "false", "string-false", "string-zero", "string-off"],
+)
+def test_text_scanner_passive_documentation_prose_is_not_whitelist_dependent(
+    tmp_path: Path,
+    crlf: bool,
+    whitelist_value: bool | str | None,
+    _whitelist_enabled: bool,
+) -> None:
+    path = tmp_path / "README.md"
+    line_ending = "\r\n" if crlf else "\n"
+    path.write_bytes(f"Documentation: https://docs.example.com/model-card{line_ending}".encode())
+    config: dict[str, Any] = {} if whitelist_value is None else {"use_hf_whitelist": whitelist_value}
+
+    result = TextScanner(config).scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False, **config)
+    network_checks = [check for check in result.checks if check.name == "Network Communication Detection"]
+
+    assert result.success is True
+    assert determine_exit_code(aggregate) == 0
+    assert network_checks
+    assert all(check.severity == IssueSeverity.INFO for check in network_checks)
 
 
 @pytest.mark.parametrize(
@@ -309,21 +539,29 @@ def test_text_scanner_verified_huggingface_image_documentation_is_informational(
 )
 @pytest.mark.parametrize("prepend", [False, True], ids=["appended", "prepended"])
 @pytest.mark.parametrize("crlf", [False, True], ids=["lf", "crlf"])
+@pytest.mark.parametrize(
+    ("whitelist_value", "_whitelist_enabled"),
+    HUGGINGFACE_WHITELIST_POLICY_MODES,
+    ids=["default", "true", "false", "string-false", "string-zero", "string-off"],
+)
 def test_text_scanner_modified_huggingface_image_documentation_fails_closed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     attack: str,
     prepend: bool,
     crlf: bool,
+    whitelist_value: bool | str | None,
+    _whitelist_enabled: bool,
 ) -> None:
     trusted_payload = _trust_exact_huggingface_documentation_example(monkeypatch, crlf=crlf)
     attack_payload = attack.replace("\n", "\r\n").encode() if crlf else attack.encode()
     payload = attack_payload + trusted_payload if prepend else trusted_payload + attack_payload
     text_path = tmp_path / "README.md"
     text_path.write_bytes(payload)
+    config: dict[str, Any] = {} if whitelist_value is None else {"use_hf_whitelist": whitelist_value}
 
-    result = TextScanner().scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+    result = TextScanner(config).scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False, **config)
 
     assert hashlib.sha256(payload).digest() != hashlib.sha256(trusted_payload).digest()
     assert result.success is False

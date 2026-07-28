@@ -2814,6 +2814,8 @@ class TextScanner(BaseScanner):
         path: str,
         payload: bytes,
         finding: dict[str, Any],
+        *,
+        allow_verified_huggingface_documentation: bool = True,
     ) -> bool:
         if cls._is_documentation_sidecar(path):
             finding_type = finding.get("type")
@@ -2836,7 +2838,10 @@ class TextScanner(BaseScanner):
                 )
                 or (finding_type == "network_library" and cls._documentation_network_library_is_prose(payload, finding))
                 or (finding_type == "cc_pattern" and cls._documentation_cc_finding_is_benign_prose(payload, finding))
-                or cls._verified_huggingface_documentation_image_finding(path, payload, finding)
+                or (
+                    allow_verified_huggingface_documentation
+                    and cls._verified_huggingface_documentation_image_finding(path, payload, finding)
+                )
                 or (
                     finding_type == "suspicious_port" and not cls._documentation_finding_is_actionable(payload, finding)
                 )
@@ -3316,6 +3321,8 @@ class TextScanner(BaseScanner):
         path: str,
         payload: bytes,
         findings: list[dict[str, Any]],
+        *,
+        allow_verified_huggingface_documentation: bool = True,
     ) -> tuple[list[dict[str, Any]], bool, set[str]]:
         classified_findings: list[dict[str, Any]] = []
         classification_incomplete = False
@@ -3352,7 +3359,12 @@ class TextScanner(BaseScanner):
                 if retargeted_finding is None:
                     continue
                 finding = retargeted_finding
-            if not retarget_incomplete and cls._sidecar_network_finding_is_informational(path, payload, finding):
+            if not retarget_incomplete and cls._sidecar_network_finding_is_informational(
+                path,
+                payload,
+                finding,
+                allow_verified_huggingface_documentation=allow_verified_huggingface_documentation,
+            ):
                 finding = {**finding, "severity": "INFO"}
             classified_findings.append(finding)
         return classified_findings, classification_incomplete, classification_limit_sources
@@ -3519,11 +3531,17 @@ class TextScanner(BaseScanner):
                     max_findings=max_findings,
                 )
                 network_findings, finding_limit = self._split_detector_finding_limit(network_findings)
+                allow_verified_huggingface_documentation = (
+                    self._get_bool_config("use_hf_whitelist", default=True)
+                    and not detector_incomplete
+                    and finding_limit is None
+                )
                 network_findings, classification_incomplete, classification_limit_sources = (
                     self._downgrade_sidecar_network_findings(
                         path,
                         inspected_payload,
                         network_findings,
+                        allow_verified_huggingface_documentation=allow_verified_huggingface_documentation,
                     )
                 )
                 network_findings = self._deduplicate_documentation_network_findings(
