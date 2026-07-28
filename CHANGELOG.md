@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - Avoid network false positives for bounded README examples that download sample images over HTTPS from Hugging Face.
+- Preserve README network detections when Transformers examples enable or dynamically configure remote code execution.
 - Prevent Windows cache identity probes from creating locked temporary files inside scanned directories.
 - Preserve locked Windows cache probes reached through directory aliases while clearing stale scan results.
 

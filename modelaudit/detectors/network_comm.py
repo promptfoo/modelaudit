@@ -2252,9 +2252,11 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
             if node not in requests_calls and node.func.attr not in documented_attribute_calls:
                 return False
             if node.func.attr == "from_pretrained" and any(
-                keyword.arg == "trust_remote_code"
-                and isinstance(keyword.value, ast.Constant)
-                and keyword.value.value is True
+                keyword.arg is None
+                or (
+                    keyword.arg == "trust_remote_code"
+                    and (not isinstance(keyword.value, ast.Constant) or keyword.value.value is not False)
+                )
                 for keyword in node.keywords
             ):
                 return False

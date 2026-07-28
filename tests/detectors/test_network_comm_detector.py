@@ -2959,6 +2959,51 @@ class TestNetworkCommDetector:
         assert any(finding["type"] == "network_function" for finding in findings)
 
     @pytest.mark.parametrize(
+        "remote_code_argument",
+        [
+            "trust_remote_code=1",
+            "trust_remote_code='true'",
+            "trust_remote_code=not False",
+            "trust_remote_code=allow_remote_code",
+            "**{'trust_remote_code': True}",
+            "**remote_options",
+        ],
+    )
+    def test_readme_python_example_rejects_truthy_or_dynamic_remote_code_trust(
+        self,
+        remote_code_argument: str,
+    ) -> None:
+        remote_code_binding = ""
+        if remote_code_argument == "trust_remote_code=allow_remote_code":
+            remote_code_binding = "allow_remote_code = True\n"
+        elif remote_code_argument == "**remote_options":
+            remote_code_binding = "remote_options = {'trust_remote_code': True}\n"
+        data = (
+            "```python\nimport requests\nfrom transformers import AutoModel\n"
+            "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            f"{remote_code_binding}"
+            f"AutoModel.from_pretrained('attacker/model', {remote_code_argument})\n"
+            "requests.get(image_url, stream=True)\n```\n"
+        ).encode()
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert any(finding["type"] == "network_library" for finding in findings)
+        assert any(finding["type"] == "network_function" for finding in findings)
+
+    def test_readme_python_example_allows_explicitly_disabled_remote_code_trust(self) -> None:
+        data = (
+            b"```python\nimport requests\nfrom transformers import AutoModel\n"
+            b"image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            b"AutoModel.from_pretrained('official/model', trust_remote_code=False)\n"
+            b"requests.get(image_url, stream=True)\n```\n"
+        )
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+
+    @pytest.mark.parametrize(
         "additional_fence",
         [
             "```python\n# requests powers our image download\nprint('ok')\n```\n",
