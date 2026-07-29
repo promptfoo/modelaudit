@@ -12531,11 +12531,28 @@ def test_scan_bytes_allows_nested_import_only_trusted_constructor() -> None:
         range(10),
     ],
 )
-@pytest.mark.parametrize("encoding", ["raw", "base64", "hex"])
+@pytest.mark.parametrize(
+    ("encoding", "source_changes"),
+    [
+        pytest.param("raw", False, id="raw"),
+        pytest.param("base64", False, id="base64"),
+        pytest.param("hex", False, id="hex"),
+        pytest.param("hex", True, id="hex-source-changed"),
+    ],
+)
 def test_scan_bytes_treats_benign_nested_constructor_pickles_as_notices(
     inner_obj: object,
     encoding: str,
+    source_changes: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    if source_changes:
+
+        def raise_source_stability_error(_report_generation: int | None) -> None:
+            raise _CallGraphAnalysisLimitError("source changed during shared call-graph analysis")
+
+        monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", raise_source_stability_error)
+
     nested_payload = pickle.dumps(inner_obj, protocol=4)
     if encoding == "raw":
         outer_value: bytes | str = nested_payload
@@ -12552,8 +12569,14 @@ def test_scan_bytes_treats_benign_nested_constructor_pickles_as_notices(
         source=f"benign-nested-{encoding}.pkl",
     )
 
-    assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.CLEAN
+    if source_changes:
+        assert report.status == ScanStatus.INCONCLUSIVE
+    if report.status == ScanStatus.INCONCLUSIVE:
+        _assert_call_graph_source_stability_error(report)
+        assert report.verdict == SafetyVerdict.UNKNOWN
+    else:
+        assert report.status == ScanStatus.COMPLETE
+        assert report.verdict == SafetyVerdict.CLEAN
     assert report.findings == ()
     assert any(
         notice.code == expected_notice
