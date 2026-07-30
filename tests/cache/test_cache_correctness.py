@@ -1195,6 +1195,57 @@ def test_clear_cache_closes_remaining_probes_after_close_failure(
     assert metadata["statistics"]["total_entries"] == 0
 
 
+def test_clear_cache_retains_locked_probe_in_aliased_cache_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    cache_alias = tmp_path / "cache-alias"
+    try:
+        cache_alias.symlink_to(cache.cache_dir, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory aliases unavailable: {exc}")
+
+    stale_result = cache.cache_dir / "stale-clean-result.json"
+    stale_result.write_text('{"verdict":"CLEAN"}', encoding="utf-8")
+    probe_path = cache.cache_dir / ".modelaudit-cache-clock-aliased"
+    probe_path.write_bytes(b"locked probe")
+    original_unlink = Path.unlink
+
+    class LockedProbe:
+        def __init__(self) -> None:
+            self.name = str(cache_alias / probe_path.name)
+            self.closed = False
+            self.fail_close = True
+
+        def close(self) -> None:
+            if self.fail_close:
+                raise OSError("simulated Windows probe close failure")
+            self.closed = True
+
+    probe = LockedProbe()
+    cache._change_clock_probes[probe_path.stat().st_dev] = (cast(BinaryIO, probe), cache_alias)
+
+    def reject_locked_probe(path: Path, *, missing_ok: bool = False) -> None:
+        if path.resolve(strict=False) == probe_path and not probe.closed:
+            raise PermissionError("Windows cannot unlink an open aliased cache clock probe")
+        original_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", reject_locked_probe)
+
+    cache.clear_cache()
+
+    assert (probe.closed, probe_path.exists()) == (False, True)
+    assert not stale_result.exists()
+    assert cache.metadata_file.exists()
+
+    probe.fail_close = False
+    cache.clear_cache()
+
+    assert (probe.closed, probe_path.exists()) == (True, False)
+    assert cache._change_clock_probes == {}
+
+
 def test_clear_cache_retries_real_temporary_file_wrapper(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
