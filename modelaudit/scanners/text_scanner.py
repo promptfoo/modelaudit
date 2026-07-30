@@ -3534,6 +3534,7 @@ class TextScanner(BaseScanner):
                 allow_verified_huggingface_documentation = (
                     self._get_bool_config("use_hf_whitelist", default=True)
                     and not detector_incomplete
+                    and not truncated
                     and finding_limit is None
                 )
                 network_findings, classification_incomplete, classification_limit_sources = (

@@ -250,6 +250,56 @@ def test_text_scanner_verified_huggingface_readme_respects_whitelist_policy(
 
 @pytest.mark.parametrize("fixture_name", HUGGINGFACE_DOCUMENTATION_IMAGE_README_FIXTURES)
 @pytest.mark.parametrize("crlf", [False, True], ids=["lf", "crlf"])
+def test_text_scanner_truncated_verified_huggingface_readme_preserves_actionable_findings(
+    tmp_path: Path,
+    fixture_name: str,
+    crlf: bool,
+) -> None:
+    trusted_payload = _real_huggingface_image_readme_payload(fixture_name, crlf=crlf)
+    path = tmp_path / "README.md"
+    path.write_bytes(trusted_payload + b"\n```python\n__import__('os').system('id')\n```\n")
+    config: dict[str, Any] = {"text_content_scan_bytes": len(trusted_payload)}
+    cache_dir = tmp_path / "cache"
+
+    result = TextScanner(config).scan(str(path))
+    reset_cache_manager()
+    try:
+        aggregates = [
+            scan_model_directory_or_file(
+                str(path),
+                cache_enabled=cache_enabled,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+                **config,
+            )
+            for cache_enabled in (False, True, True)
+        ]
+        network_checks = [
+            check
+            for check in result.checks
+            if check.name == "Network Communication Detection"
+            and (check.details.get("function") == "urlopen" or check.details.get("library") == "urllib")
+        ]
+
+        assert result.success is False
+        assert result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+        assert result.metadata.get("analysis_incomplete") is True
+        assert result.metadata.get("operational_error_reason") == "text_content_security_scan_incomplete"
+        assert {check.details.get("type") for check in network_checks} == {"network_function", "network_library"}
+        assert all(check.status == CheckStatus.FAILED for check in network_checks)
+        assert all(check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for check in network_checks)
+        assert all(determine_exit_code(aggregate) == 2 for aggregate in aggregates)
+        assert all(
+            aggregate.file_metadata[str(path)].get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+            for aggregate in aggregates
+        )
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
+@pytest.mark.parametrize("fixture_name", HUGGINGFACE_DOCUMENTATION_IMAGE_README_FIXTURES)
+@pytest.mark.parametrize("crlf", [False, True], ids=["lf", "crlf"])
 @pytest.mark.parametrize(
     ("whitelist_value", "_whitelist_enabled"),
     HUGGINGFACE_WHITELIST_POLICY_MODES,
