@@ -3491,7 +3491,7 @@ def _resolve_scan_source_for_path(
             else:
                 import tempfile
 
-                hf_cache_dir = Path(tempfile.mkdtemp(prefix="modelaudit_hf_"))
+                hf_cache_dir = Path(tempfile.mkdtemp(prefix="modelaudit_hf_")).resolve(strict=True)
                 temp_dir = str(hf_cache_dir)
 
             record_download_started("huggingface", display_path)
@@ -3528,6 +3528,7 @@ def _resolve_scan_source_for_path(
                         timeout_seconds=runtime.timeout,
                         repository_file_inventory=stream_repository_file_inventory,
                         scanner_config=runtime.config,
+                        _cache_dir_owned=temp_dir is not None,
                         _include_scan_results=True,
                         **hf_stream_kwargs,
                     )

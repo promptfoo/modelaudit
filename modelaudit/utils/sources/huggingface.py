@@ -4584,17 +4584,21 @@ def _should_cleanup_hf_streaming_context_file(
     cache_dir: Path | None,
     download_path: Path | None,
     file_path: Path,
+    *,
+    cache_dir_owned: bool,
 ) -> bool:
     """Return whether a context-only sidecar is in ModelAudit's disposable HF staging tree."""
-    if cache_dir is None or download_path is None:
+    if not cache_dir_owned or cache_dir is None or download_path is None:
         return False
     try:
-        resolved_cache_dir = cache_dir.resolve()
-    except OSError:
+        resolved_cache_dir = cache_dir.resolve(strict=True)
+        resolved_download_path = download_path.resolve(strict=True)
+        resolved_file_path = file_path.resolve(strict=True)
+        return _is_within_directory(resolved_cache_dir, resolved_download_path) and _is_within_directory(
+            resolved_download_path, resolved_file_path
+        )
+    except (OSError, RuntimeError):
         return False
-    if not resolved_cache_dir.name.startswith("modelaudit_hf_"):
-        return False
-    return _is_within_directory(download_path, file_path)
 
 
 def _huggingface_metadata_size(item: Any) -> int | None:
@@ -5350,6 +5354,7 @@ def download_model_streaming(
     include_all_files: bool = False,
     repository_file_inventory: list[str] | None = None,
     scanner_config: dict[str, Any] | None = None,
+    _cache_dir_owned: bool = False,
     _include_scan_results: Literal[False] = False,
 ) -> Iterator[tuple[Path, bool]]:
     pass
@@ -5369,6 +5374,7 @@ def download_model_streaming(
     include_all_files: bool = False,
     repository_file_inventory: list[str] | None = None,
     scanner_config: dict[str, Any] | None = None,
+    _cache_dir_owned: bool = False,
     _include_scan_results: Literal[True],
 ) -> Iterator[tuple[Path, bool] | tuple[Path, bool, Any] | tuple[Path, bool, Any | None, StreamedSourceByteAccounting]]:
     pass
@@ -5387,6 +5393,7 @@ def download_model_streaming(
     include_all_files: bool = False,
     repository_file_inventory: list[str] | None = None,
     scanner_config: dict[str, Any] | None = None,
+    _cache_dir_owned: bool = False,
     _include_scan_results: bool = False,
 ) -> Iterator[tuple[Path, bool] | tuple[Path, bool, Any] | tuple[Path, bool, Any | None, StreamedSourceByteAccounting]]:
     """Download a model from HuggingFace one file at a time (streaming mode).
@@ -5406,6 +5413,7 @@ def download_model_streaming(
         include_all_files: Include otherwise-unrecognized files under a bounded fail-closed limit
         repository_file_inventory: Optional list filled with repository member names from metadata
         scanner_config: Optional scanner configuration to preserve in remote native scans
+        _cache_dir_owned: Whether the caller created this invocation's disposable cache root
         _include_scan_results: Internal opt-in for precomputed trusted source-native scan results
 
     Yields:
@@ -5890,7 +5898,12 @@ def download_model_streaming(
                                     prefetched_selected_paths[external_filename] = external_path
                             if downloaded_selected_path is not None:
                                 downloaded_selected_paths[external_filename] = external_path
-                                if _should_cleanup_hf_streaming_context_file(cache_dir, download_path, external_path):
+                                if _should_cleanup_hf_streaming_context_file(
+                                    cache_dir,
+                                    download_path,
+                                    external_path,
+                                    cache_dir_owned=_cache_dir_owned,
+                                ):
                                     onnx_external_data_cleanup_paths.append(external_path)
                                 continue
                             if size_limit is not None and external_filename not in accounted_selected_filenames:
@@ -5937,7 +5950,12 @@ def download_model_streaming(
                                 )
                             downloaded_total_size = projected_total
                         downloaded_context_paths[external_filename] = external_path
-                        if _should_cleanup_hf_streaming_context_file(cache_dir, download_path, external_path):
+                        if _should_cleanup_hf_streaming_context_file(
+                            cache_dir,
+                            download_path,
+                            external_path,
+                            cache_dir_owned=_cache_dir_owned,
+                        ):
                             context_cleanup_paths.add(external_path)
 
             return downloaded_file, onnx_external_data_cleanup_paths

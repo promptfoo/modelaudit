@@ -15,7 +15,7 @@ import textwrap
 import time
 import zipfile
 import zlib
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator, Iterator
 from io import BytesIO
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from types import SimpleNamespace
@@ -78,6 +78,7 @@ from modelaudit.utils.sources.huggingface import (
     _run_huggingface_download_with_deadline,
     _scan_remote_huggingface_safetensors_header,
     _select_streamable_hf_files,
+    _should_cleanup_hf_streaming_context_file,
     _tensor_name_digest,
     _terminate_huggingface_download_process,
     _validate_huggingface_repo_filename,
@@ -151,6 +152,89 @@ def test_hf_acquisition_interrupt_check_honors_global_cancel_and_deadline(
     with pytest.raises(TimeoutError, match="acquisition timed out"):
         _check_hf_acquisition_interrupted("test/model", 10.0)
     assert interrupt_checks == 1
+
+
+@pytest.mark.parametrize(("cache_dir_owned", "expected"), [(False, False), (True, True)])
+def test_hf_streaming_context_cleanup_requires_explicit_owned_cache(
+    tmp_path: Path,
+    cache_dir_owned: bool,
+    expected: bool,
+) -> None:
+    """Explicit provenance, not a caller-controlled cache basename, authorizes cleanup."""
+    cache_dir = tmp_path / "caller_selected_cache"
+    download_path = cache_dir / "huggingface" / "test" / "model"
+    file_path = download_path / "model.onnx_data"
+    file_path.parent.mkdir(parents=True)
+    file_path.write_bytes(b"sidecar")
+
+    assert (
+        _should_cleanup_hf_streaming_context_file(
+            cache_dir,
+            download_path,
+            file_path,
+            cache_dir_owned=cache_dir_owned,
+        )
+        is expected
+    )
+
+
+def test_hf_streaming_context_cleanup_rejects_download_path_outside_owned_cache(tmp_path: Path) -> None:
+    """An asserted owned root cannot authorize deletion in a sibling download tree."""
+    cache_dir = tmp_path / "owned_cache"
+    cache_dir.mkdir()
+    download_path = tmp_path / "outside_cache"
+    file_path = download_path / "model.onnx_data"
+    file_path.parent.mkdir()
+    file_path.write_bytes(b"outside")
+
+    assert not _should_cleanup_hf_streaming_context_file(
+        cache_dir,
+        download_path,
+        file_path,
+        cache_dir_owned=True,
+    )
+
+
+def test_hf_streaming_context_cleanup_rejects_symlink_outside_owned_cache(
+    tmp_path: Path,
+    requires_symlinks: None,
+) -> None:
+    """A staged sidecar symlink must not turn ownership into an outside-cache unlink."""
+    cache_dir = tmp_path / "owned_cache"
+    download_path = cache_dir / "huggingface" / "test" / "model"
+    download_path.mkdir(parents=True)
+    outside_file = tmp_path / "outside.onnx_data"
+    outside_file.write_bytes(b"outside")
+    linked_sidecar = download_path / "model.onnx_data"
+    linked_sidecar.symlink_to(outside_file)
+
+    assert not _should_cleanup_hf_streaming_context_file(
+        cache_dir,
+        download_path,
+        linked_sidecar,
+        cache_dir_owned=True,
+    )
+    assert outside_file.read_bytes() == b"outside"
+
+
+@pytest.mark.parametrize("error_type", [OSError, RuntimeError])
+def test_hf_streaming_context_cleanup_fails_closed_on_resolution_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error_type: type[Exception],
+) -> None:
+    """Path-resolution failures must never fall back to an unchecked unlink."""
+
+    def fail_to_resolve(_path: Path, strict: bool = False) -> Path:
+        raise error_type("resolution failed")
+
+    monkeypatch.setattr(Path, "resolve", fail_to_resolve)
+    assert not _should_cleanup_hf_streaming_context_file(
+        tmp_path,
+        tmp_path / "download",
+        tmp_path / "download" / "model.onnx_data",
+        cache_dir_owned=True,
+    )
 
 
 def _bert_vocab_payload(min_bytes: int = 16 * 1024) -> bytes:
@@ -4201,6 +4285,7 @@ class TestModelDownloadStreaming:
             "document.bin",
         ]
 
+    @pytest.mark.parametrize("close_early", [False, True])
     @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None)
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".onnx"})
     @patch(
@@ -4217,6 +4302,7 @@ class TestModelDownloadStreaming:
         _mock_get_extensions: MagicMock,
         _mock_detect_content: MagicMock,
         tmp_path: Path,
+        close_early: bool,
     ) -> None:
         """Referenced ONNX sidecars should be present while the parent ONNX is yielded."""
         payload = _make_external_onnx_payload(tmp_path)
@@ -4241,6 +4327,7 @@ class TestModelDownloadStreaming:
             max_size=len(payload) + len(sidecar_bytes),
             scannable_extensions={".onnx"},
             scannable_scanner_ids={"onnx"},
+            _cache_dir_owned=True,
         )
         model_path, is_last = next(generator)
         sidecar_path = model_path.with_name("model.onnx_data")
@@ -4257,9 +4344,76 @@ class TestModelDownloadStreaming:
             call("test/model", ["onnx/model.onnx_data"], revision=_HF_TEST_REVISION),
         ]
 
-        with pytest.raises(StopIteration):
-            next(generator)
+        if close_early:
+            cast(Generator[tuple[Path, bool], None, None], generator).close()
+        else:
+            with pytest.raises(StopIteration):
+                next(generator)
         assert not sidecar_path.exists()
+
+    @pytest.mark.parametrize("close_early", [False, True])
+    @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None)
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".onnx"})
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["onnx/model.onnx", "onnx/model.onnx_data"], _HF_TEST_REVISION, None),
+    )
+    @patch("huggingface_hub.HfApi.get_paths_info")
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_named_persistent_cache_preserves_preexisting_onnx_sidecar(
+        self,
+        mock_hf_hub_download: MagicMock,
+        mock_get_paths_info: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+        _mock_detect_content: MagicMock,
+        tmp_path: Path,
+        close_early: bool,
+    ) -> None:
+        """A caller-owned cache is not disposable based only on its directory name."""
+        payload = _make_external_onnx_payload(tmp_path)
+        sidecar_bytes = struct.pack("f", 1.0)
+        cache_dir = tmp_path / "modelaudit_hf_persistent"
+        sidecar_path = cache_dir / "huggingface" / "test" / "model" / "onnx" / "model.onnx_data"
+        sidecar_path.parent.mkdir(parents=True)
+        sidecar_path.write_bytes(sidecar_bytes)
+
+        def download_side_effect(*, filename: str, local_dir: str | None = None, **_kwargs: object) -> str:
+            assert local_dir is not None
+            path = Path(local_dir) / filename
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if filename == "onnx/model.onnx":
+                path.write_bytes(payload)
+            else:
+                assert path == sidecar_path
+                assert path.read_bytes() == sidecar_bytes
+            return str(path)
+
+        mock_hf_hub_download.side_effect = download_side_effect
+        mock_get_paths_info.side_effect = [
+            [SimpleNamespace(path="onnx/model.onnx", size=len(payload))],
+            [SimpleNamespace(path="onnx/model.onnx_data", size=len(sidecar_bytes))],
+        ]
+
+        generator = download_model_streaming(
+            "https://huggingface.co/test/model",
+            cache_dir=cache_dir,
+            max_size=len(payload) + len(sidecar_bytes),
+            scannable_extensions={".onnx"},
+            scannable_scanner_ids={"onnx"},
+        )
+        model_path, is_last = next(generator)
+
+        assert is_last is True
+        assert model_path.name == "model.onnx"
+        assert sidecar_path.read_bytes() == sidecar_bytes
+
+        if close_early:
+            cast(Generator[tuple[Path, bool], None, None], generator).close()
+        else:
+            with pytest.raises(StopIteration):
+                next(generator)
+        assert sidecar_path.read_bytes() == sidecar_bytes
 
     @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None)
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".onnx"})
@@ -4309,6 +4463,7 @@ class TestModelDownloadStreaming:
                 max_size=(len(payload) * 2) + len(sidecar_bytes),
                 scannable_extensions={".onnx"},
                 scannable_scanner_ids={"onnx"},
+                _cache_dir_owned=True,
             )
         )
 
@@ -4323,7 +4478,9 @@ class TestModelDownloadStreaming:
             call("test/model", ["onnx/a.onnx", "onnx/b.onnx"], revision=_HF_TEST_REVISION),
             call("test/model", ["onnx/shared.onnx_data"], revision=_HF_TEST_REVISION),
         ]
-        assert not (tmp_path / "modelaudit_hf_fixture" / "test" / "model" / "onnx" / "shared.onnx_data").exists()
+        assert not (
+            tmp_path / "modelaudit_hf_fixture" / "huggingface" / "test" / "model" / "onnx" / "shared.onnx_data"
+        ).exists()
 
     @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format")
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".onnx"})
