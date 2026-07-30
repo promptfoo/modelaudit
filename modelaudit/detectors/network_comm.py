@@ -2011,7 +2011,7 @@ def _contains_executable_requests_reference(data: bytes) -> bool:
 def _is_readme_image_example_context(context: str) -> bool:
     filename = context.replace("\\", "/").rsplit("/", 1)[-1].lower()
     return filename == "readme" or (
-        filename.startswith("readme.") and filename.rsplit(".", 1)[-1] in {"txt", "md", "markdown", "rst", "env"}
+        filename.startswith("readme.") and filename.rsplit(".", 1)[-1] in {"txt", "md", "markdown", "rst"}
     )
 
 
