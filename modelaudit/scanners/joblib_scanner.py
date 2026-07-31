@@ -1530,15 +1530,8 @@ class JoblibScanner(BaseScanner):
             result.finish(success=False)
             return result
 
-        has_security_findings = any(
-            issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues
-        )
         has_trusted_incomplete_tail = result.metadata.get("trusted_incomplete_tail") is True
-        if (
-            result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
-            and not has_security_findings
-            and not has_trusted_incomplete_tail
-        ):
+        if result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME and not has_trusted_incomplete_tail:
             result.finish(success=False)
         else:
             result.finish(success=not result.has_errors)

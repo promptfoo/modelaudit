@@ -1376,6 +1376,34 @@ def test_scan_fails_closed_on_protocol1_pickle_in_numpy_wrapper_tail(tmp_path: P
     assert "trusted_incomplete_tail" not in result.metadata
 
 
+def test_scan_fails_closed_on_invalid_numpy_wrapper_with_origin_warning(tmp_path: Path) -> None:
+    path = tmp_path / "numpy_array_protocol1_origin_warning.joblib"
+    path.write_bytes(_joblib_numpy_list_payload(resumed_ops=b"\x80\x01K\x01."))
+
+    embedded_result = ScanResult("pickle")
+    embedded_result.add_check(
+        name="Standalone Pickle Finding",
+        passed=False,
+        message="Joblib NumPy wrapper requires origin verification",
+        severity=IssueSeverity.WARNING,
+        details={"import_reference": "joblib.numpy_pickle.NumpyArrayWrapper"},
+        rule_code="NON_ALLOWLISTED_GLOBAL",
+    )
+    embedded_result.finish(success=True)
+
+    scanner = JoblibScanner()
+    scanner.pickle_scanner = _StaticEmbeddedPickleScanner(embedded_result)
+    result = scanner.scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["analysis_incomplete"] is True
+    assert "joblib_numpy_array_wrapper_validation_failed" in result.metadata["scan_outcome_reasons"]
+    assert result.has_warnings is True
+    assert "trusted_incomplete_tail" not in result.metadata
+    assert should_cache_scan_result(result.to_dict(include_private_metadata=True)) is False
+
+
 def test_scan_detects_gzip_compressed_pickle_joblib(tmp_path: Path) -> None:
     path = tmp_path / "gzip_protocol4.joblib"
     path.write_bytes(gzip.compress(pickle.dumps(_Payload(), protocol=4)))
