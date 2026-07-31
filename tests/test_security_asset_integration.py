@@ -17,7 +17,25 @@ from click.testing import CliRunner
 
 from modelaudit.cli import cli
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.models import ModelAuditResultModel
 from modelaudit.scanners.base import IssueSeverity
+
+
+def describe_operational_errors(results: ModelAuditResultModel) -> str:
+    """Summarize which files carried operational errors, for assertion messages.
+
+    ``has_errors`` alone truncates to an unhelpful model repr in CI logs, which
+    hides whichever file actually failed. Naming the paths and reasons keeps a
+    recurrence diagnosable from the log without a Windows reproduction.
+    """
+    offenders = []
+    for path, metadata in results.file_metadata.items():
+        dump = getattr(metadata, "model_dump", None)
+        payload = dump() if callable(dump) else metadata
+        if not isinstance(payload, dict) or not payload.get("operational_error"):
+            continue
+        offenders.append(f"{path}: {payload.get('operational_error_reason', 'unknown reason')}")
+    return "; ".join(sorted(offenders)) or "no per-file operational_error metadata recorded"
 
 
 class TestSecurityAssetIntegration:
@@ -393,7 +411,10 @@ class TestSecurityAssetIntegration:
                     # Scan the mixed directory
                     results = scan_model_directory_or_file(str(temp_path), cache_enabled=False)
                     assert results.files_scanned >= len(copied_files)
-                    assert results.has_errors is False, "Mixed directory scan should not have operational errors"
+                    assert results.has_errors is False, (
+                        f"Mixed directory scan should not have operational errors: "
+                        f"{describe_operational_errors(results)}"
+                    )
 
     @pytest.mark.skipif(
         sys.version_info[:2] in [(3, 10), (3, 12)],
@@ -411,7 +432,9 @@ class TestSecurityAssetIntegration:
 
         # Should find various file types
         assert results.files_scanned > 0, "Should find some files to scan"
-        assert results.has_errors is False, "Assets directory scan should not have operational errors"
+        assert results.has_errors is False, (
+            f"Assets directory scan should not have operational errors: {describe_operational_errors(results)}"
+        )
         assert len(results.issues) > 0, "Assets tree contains exploits; findings expected"
 
         # Check for different file extensions in issues (indicates they were processed)
@@ -450,7 +473,9 @@ class TestSecurityAssetIntegration:
         # so success is expected to be False; assert the scan ran and produced
         # findings rather than demanding success on malicious inputs.
         assert results.files_scanned > 0, "Performance test scan should process files"
-        assert results.has_errors is False, "Performance test scan should not have operational errors"
+        assert results.has_errors is False, (
+            f"Performance test scan should not have operational errors: {describe_operational_errors(results)}"
+        )
         assert len(results.issues) > 0, "Assets tree contains exploits; findings expected"
         is_ci = bool(os.getenv("CI") or os.getenv("GITHUB_ACTIONS"))
         threshold = 120 if is_ci else 60
