@@ -2968,3 +2968,41 @@ def test_gguf_scanner_last_tensor_size(tmp_path):
     # Should not have size mismatch warnings
     size_warnings = [i for i in result.issues if "size mismatch" in i.message.lower()]
     assert len(size_warnings) == 0
+
+
+@pytest.mark.parametrize("magic", [b"GGML", b"GGMF", b"GGJT", b"GGLA", b"GGSN"])
+def test_ggml_scanner_ignores_stray_end_of_central_directory_bytes(tmp_path: Path, magic: bytes) -> None:
+    """A bare EOCD signature in tensor data is not a polyglot.
+
+    ``zipfile.is_zipfile`` returns True for any file whose trailing bytes contain ``PK\\x05\\x06``
+    followed by 18 bytes, which model tensor data hits by chance. Reporting CRITICAL S908 for an
+    archive carrying no members at all is a false positive; a hidden payload always has an entry.
+    The existing near-match regression cannot catch this because it appends ``PK\\x03\\x04``, a
+    local-file-header signature that end-of-central-directory scanning never inspects.
+    """
+    path = tmp_path / "stray-eocd.bin"
+    _write_ggml_variant_file(path, magic)
+    with path.open("ab") as handle:
+        handle.write(b"\x00" * 64 + b"PK\x05\x06" + b"\x00" * 18 + b"\x00" * 32)
+
+    assert zipfile.is_zipfile(str(path))
+
+    result = GgufScanner().scan(str(path))
+
+    assert not any("Polyglot" in check.name for check in result.checks)
+    assert not any(issue.rule_code == "S908" for issue in result.issues)
+
+
+def test_gguf_scanner_ignores_stray_end_of_central_directory_bytes(tmp_path: Path) -> None:
+    """The same false positive existed for GGUF before the member check."""
+    path = tmp_path / "stray-eocd.gguf"
+    _write_minimal_gguf(path)
+    with path.open("ab") as handle:
+        handle.write(b"\x00" * 64 + b"PK\x05\x06" + b"\x00" * 18 + b"\x00" * 32)
+
+    assert zipfile.is_zipfile(str(path))
+
+    result = GgufScanner().scan(str(path))
+
+    assert not any("Polyglot" in check.name for check in result.checks)
+    assert not any(issue.rule_code == "S908" for issue in result.issues)

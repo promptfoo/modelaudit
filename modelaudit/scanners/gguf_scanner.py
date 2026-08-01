@@ -765,6 +765,21 @@ class GgufScanner(BaseScanner):
         if not zipfile.is_zipfile(self.current_file_path):
             return False
 
+        # `is_zipfile` only proves an end-of-central-directory signature is present: it returns True
+        # for any file whose trailing bytes happen to contain b"PK\x05\x06" followed by 18 bytes.
+        # Model tensor data hits that by chance, so a cleanly-readable archive carrying no members
+        # is not a polyglot - a hidden payload always has at least one entry.
+        #
+        # A directory that fails to open is NOT treated as benign here: it falls through to the
+        # preflight below so a corrupted or truncated archive still fails closed as incomplete.
+        try:
+            with zipfile.ZipFile(self.current_file_path) as embedded_archive:
+                embedded_members: list[str] | None = embedded_archive.namelist()
+        except (OSError, zipfile.BadZipFile):
+            embedded_members = None
+        if embedded_members is not None and not embedded_members:
+            return False
+
         from .archive_dispatch import (
             _ZIP_CONTAINER_PREFLIGHT_REJECTED_PATHS_PRIVATE_METADATA_KEY,
             merge_executable_zip_container_findings,
