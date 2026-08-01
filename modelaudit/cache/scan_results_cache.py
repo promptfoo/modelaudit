@@ -1136,9 +1136,14 @@ class ScanResultsCache:
                     return existing[0]
 
             if os.name == "nt":
-                # Windows keeps TemporaryFile names visible and locked until close.
+                # Windows keeps TemporaryFile names visible and locked until close, so a
+                # probe is observable to every concurrent scan that walks the directory
+                # holding it. Ancestors are only reached when the temp and cache
+                # directories live on another volume; walk them outermost-first so the
+                # fallback settles near the volume root instead of inside a deep tree
+                # that an unrelated scan is enumerating.
                 candidates = [Path(tempfile.gettempdir()), self.cache_dir]
-                candidates.extend(protected_root.parents)
+                candidates.extend(reversed(protected_root.parents))
             else:
                 candidates = [self.cache_dir, Path(tempfile.gettempdir())]
                 ancestor = scanned_parent
