@@ -1651,11 +1651,14 @@ class _CallGraphAnalysisLimitError(RuntimeError):
         partial_findings: tuple[CallGraphFinding, ...] = (),
         partial_startup_hook_write_findings: tuple[StartupHookWriteFinding, ...] = (),
         partial_path: tuple[str, ...] | None = None,
+        stability_reason: str | None = None,
     ) -> None:
         super().__init__(message)
         self.partial_findings = partial_findings
         self.partial_startup_hook_write_findings = partial_startup_hook_write_findings
         self.partial_path = partial_path
+        # Which snapshot gate invalidated the run, reported without changing the message text.
+        self.stability_reason = stability_reason
 
 
 class _SourceReadTooLargeError(OSError):
@@ -4750,14 +4753,25 @@ def _snapshot_resolution_context_is_current(snapshot: _SharedSourceSnapshot) -> 
 
 
 def _shared_source_snapshot_is_current(snapshot: _SharedSourceSnapshot) -> bool:
-    if (
-        not snapshot.stable
-        or not snapshot.import_runtime_trusted
-        or not _interpreter_import_runtime_matches_snapshot()
-        or snapshot.search_context != _source_search_context()
-        or not _snapshot_resolution_context_is_current(snapshot)
-    ):
-        return False
+    return _shared_source_snapshot_staleness_reason(snapshot) is None
+
+
+def _shared_source_snapshot_staleness_reason(snapshot: _SharedSourceSnapshot) -> str | None:
+    """Return which gate invalidated the shared snapshot, or ``None`` when it is still current.
+
+    The gate name is attached to the resulting stability error so a recurring platform failure
+    reports its own cause instead of a bare "source changed" message.
+    """
+    if not snapshot.stable:
+        return "snapshot_marked_unstable"
+    if not snapshot.import_runtime_trusted:
+        return "import_runtime_untrusted"
+    if not _interpreter_import_runtime_matches_snapshot():
+        return "interpreter_import_runtime_changed"
+    if snapshot.search_context != _source_search_context():
+        return "source_search_context_changed"
+    if not _snapshot_resolution_context_is_current(snapshot):
+        return "resolution_context_changed"
     for path, (read_limit, require_complete, expected_read_fingerprint) in snapshot.read_fingerprints.items():
         reusable, read_fingerprint = _read_candidate_fingerprint(
             Path(path),
@@ -4765,30 +4779,30 @@ def _shared_source_snapshot_is_current(snapshot: _SharedSourceSnapshot) -> bool:
             require_complete=require_complete,
         )
         if not reusable or read_fingerprint != expected_read_fingerprint:
-            return False
+            return "read_fingerprint_changed"
     for path, expected_resolution_fingerprint in snapshot.resolution_fingerprints.items():
         reusable, resolution_fingerprint = _resolution_candidate_fingerprint(Path(path))
         if not reusable or resolution_fingerprint != expected_resolution_fingerprint:
-            return False
+            return "resolution_fingerprint_changed"
     for module_name, expected_source in snapshot.module_sources.items():
         if _current_module_source_path(module_name) != expected_source:
-            return False
+            return "module_source_path_changed"
     for module_name, expected_source in snapshot.loaded_module_sources.items():
         if _loaded_module_source_path(module_name) != expected_source:
-            return False
+            return "loaded_module_source_path_changed"
     for module_name, expected_search_path in snapshot.loaded_package_paths.items():
         is_loaded, current_search_path = _loaded_package_search_path(module_name)
         if not is_loaded or current_search_path is None or tuple(current_search_path) != expected_search_path:
-            return False
+            return "loaded_package_search_path_changed"
         expected_resolution_context = snapshot.loaded_package_resolution_contexts.get(module_name)
         if expected_resolution_context is None:
-            return False
+            return "loaded_package_resolution_context_missing"
         current_resolution_context = _current_trusted_path_importer_context(
             current_search_path,
             expected_resolution_context,
         )
         if current_resolution_context is None:
-            return False
+            return "loaded_package_resolution_context_changed"
         snapshot.loaded_package_resolution_contexts[module_name] = current_resolution_context
     for module_name, (
         expected_search_path,
@@ -4796,26 +4810,26 @@ def _shared_source_snapshot_is_current(snapshot: _SharedSourceSnapshot) -> bool:
     ) in snapshot.namespace_package_resolution_contexts.items():
         is_loaded, _loaded_search_path = _loaded_package_search_path(module_name)
         if is_loaded:
-            return False
+            return "namespace_package_became_loaded"
         current_resolution_context = _current_trusted_path_importer_context(
             expected_search_path,
             expected_resolution_context,
         )
         if current_resolution_context is None:
-            return False
+            return "namespace_package_resolution_context_changed"
         snapshot.namespace_package_resolution_contexts[module_name] = (
             expected_search_path,
             current_resolution_context,
         )
     for module_name, expected_module_state in snapshot.loaded_interpreter_modules.items():
         if not _loaded_interpreter_module_state_matches(module_name, expected_module_state):
-            return False
+            return "loaded_interpreter_module_changed"
     if snapshot.loaded_interpreter_modules and not _interpreter_import_runtime_is_trusted():
-        return False
+        return "interpreter_import_runtime_untrusted"
     for reference, expected_reference_state in snapshot.loaded_interpreter_references.items():
         if not _loaded_interpreter_reference_state_matches(reference, expected_reference_state):
-            return False
-    return True
+            return "loaded_interpreter_reference_changed"
+    return None
 
 
 def _begin_shared_source_report() -> int | None:
@@ -4837,12 +4851,19 @@ def _ensure_shared_source_snapshot_stable(report_generation: int | None) -> None
         return
     with snapshot.lock:
         if snapshot.generation != report_generation:
-            raise _CallGraphAnalysisLimitError("source changed during shared call-graph analysis")
-        if _shared_source_snapshot_is_current(snapshot):
+            raise _CallGraphAnalysisLimitError(
+                "source changed during shared call-graph analysis",
+                stability_reason="report_generation_advanced",
+            )
+        reason = _shared_source_snapshot_staleness_reason(snapshot)
+        if reason is None:
             return
         _clear_source_sensitive_caches_now()
         _reset_shared_source_snapshot(snapshot)
-    raise _CallGraphAnalysisLimitError("source changed during shared call-graph analysis")
+    raise _CallGraphAnalysisLimitError(
+        "source changed during shared call-graph analysis",
+        stability_reason=reason,
+    )
 
 
 def shared_source_fingerprint_metadata() -> dict[str, Any] | None:

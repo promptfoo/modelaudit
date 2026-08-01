@@ -4460,6 +4460,15 @@ def _abstract_value_is_inert(value: object) -> bool:
     return False
 
 
+def _call_graph_enrichment_error_details(analysis: str, error: Exception) -> dict[str, Any]:
+    """Build error details, surfacing which snapshot gate failed when one is known."""
+    details: dict[str, Any] = {"analysis": analysis, "analysis_incomplete": True}
+    stability_reason = getattr(error, "stability_reason", None)
+    if isinstance(stability_reason, str) and stability_reason:
+        details["source_stability_reason"] = stability_reason
+    return details
+
+
 def _with_call_graph_enrichment_errors(
     report: PickleReport,
     enrichment_errors: tuple[tuple[str, Exception], ...],
@@ -4472,7 +4481,7 @@ def _with_call_graph_enrichment_errors(
                 category="call_graph_analysis_error",
                 location=report.source,
                 exception_type=type(error).__name__,
-                details={"analysis": analysis, "analysis_incomplete": True},
+                details=_call_graph_enrichment_error_details(analysis, error),
             )
             for analysis, error in enrichment_errors
         ),
