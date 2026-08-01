@@ -2031,6 +2031,10 @@ def _matching_readme_image_fence_end(
     return None
 
 
+# Transformers keywords that cause Hub-hosted Python to be fetched and executed.
+_REMOTE_CODE_KEYWORDS = frozenset({"custom_generate", "trust_remote_code"})
+
+
 def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
     if b"import requests" not in example or b"requests.get" not in example:
         return False
@@ -2251,11 +2255,33 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
             if node not in requests_calls and node.func.attr not in documented_attribute_calls:
                 return False
-            if node.func.attr == "from_pretrained" and any(
-                keyword.arg is None
-                or (
+            # `trust_remote_code` and `custom_generate` both cause Transformers to fetch and execute
+            # Hub-hosted Python, and neither is exclusive to `from_pretrained`: since Transformers
+            # 4.55 `generate(custom_generate=..., trust_remote_code=True)` does it too, and
+            # `generate` is a documented call. Gate them on every call, not just `from_pretrained`.
+            if any(
+                (
                     keyword.arg == "trust_remote_code"
                     and (not isinstance(keyword.value, ast.Constant) or keyword.value.value is not False)
+                )
+                or keyword.arg == "custom_generate"
+                for keyword in node.keywords
+            ):
+                return False
+            # `**kwargs` hides the arguments above from inspection. Reject it outright only on
+            # `from_pretrained`; documented cards legitimately write `model.generate(**inputs)`, so
+            # for every other call reject just the literal-dict form that names a remote-code flag.
+            if any(
+                keyword.arg is None
+                and (
+                    node.func.attr == "from_pretrained"
+                    or (
+                        isinstance(keyword.value, ast.Dict)
+                        and any(
+                            isinstance(key, ast.Constant) and key.value in _REMOTE_CODE_KEYWORDS
+                            for key in keyword.value.keys
+                        )
+                    )
                 )
                 for keyword in node.keywords
             ):

