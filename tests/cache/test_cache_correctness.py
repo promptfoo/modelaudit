@@ -550,6 +550,59 @@ def test_windows_change_clock_probe_uses_safe_ancestor_without_scan_root(
         cache._change_clock_probes.clear()
 
 
+def test_windows_change_clock_probe_prefers_outermost_ancestor_over_scanned_tree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cross-volume probes must not land inside a tree a concurrent scan walks.
+
+    Windows CI keeps the checkout on one volume and the temp/cache directories on
+    another, so probe placement falls through to the scanned file's ancestors. The
+    nearest ancestor is normally still inside the asset tree another xdist worker is
+    enumerating, and the probe races that walk into ``file_size_check_failed``.
+    """
+    volume_root = tmp_path / "volume"
+    assets_root = volume_root / "repository" / "tests" / "assets"
+    scanned_parent = assets_root / "samples" / "pickles"
+    scanned_parent.mkdir(parents=True)
+    file_path = _make_cacheable_file(scanned_parent)
+    file_device = file_path.stat().st_dev
+    off_device_cache = tmp_path / "off-device-cache"
+    off_device_temp = tmp_path / "off-device-temp"
+    cache = ScanResultsCache(str(off_device_cache))
+    attempted_probe_dirs: list[Path] = []
+
+    with tempfile.TemporaryFile(mode="w+b", dir=volume_root) as probe:
+
+        def record_probe_directory(*_args: Any, dir: str | Path, **_kwargs: Any) -> BinaryIO:
+            attempted_probe_dirs.append(type(file_path)(dir))
+            return cast(BinaryIO, probe)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "name", "nt")
+            patch.setattr(scan_results_cache_module, "Path", type(file_path))
+            patch.setattr(tempfile, "gettempdir", lambda: str(off_device_temp))
+            # Every ancestor shares the scanned file's volume; only the off-device
+            # temp and cache directories are unreachable.
+            patch.setattr(
+                cache,
+                "_directory_is_on_device",
+                lambda directory, _device: directory not in {off_device_cache, off_device_temp},
+            )
+            patch.setattr(tempfile, "TemporaryFile", record_probe_directory)
+
+            selected_probe = cache._get_change_clock_probe(str(file_path), file_device)
+
+        assert selected_probe is probe
+        selected_directory = attempted_probe_dirs[0]
+        resolved_assets_root = assets_root.resolve()
+        # The probe must sit above the asset tree, not inside it.
+        assert selected_directory != resolved_assets_root
+        assert resolved_assets_root not in selected_directory.parents
+        assert selected_directory in scanned_parent.resolve().parents
+        cache._change_clock_probes.clear()
+
+
 def test_windows_change_clock_probe_uses_safe_ancestor_outside_scan_root(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
