@@ -35,6 +35,7 @@ from modelaudit.scanners.joblib_scanner import (
     _validated_numpy_dtype,
     np,
 )
+from modelaudit.scanners.pickle_scanner import PickleScanner
 from modelaudit.utils.file.detection import _LZ4_FRAME_MAGIC, validate_file_type_with_formats
 
 
@@ -1400,6 +1401,42 @@ def test_scan_fails_closed_on_invalid_numpy_wrapper_with_origin_warning(tmp_path
     assert result.metadata["analysis_incomplete"] is True
     assert "joblib_numpy_array_wrapper_validation_failed" in result.metadata["scan_outcome_reasons"]
     assert result.has_warnings is True
+    assert "trusted_incomplete_tail" not in result.metadata
+    assert should_cache_scan_result(result.to_dict(include_private_metadata=True)) is False
+
+
+def test_scan_fails_closed_when_embedded_pickle_reports_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Joblib must fail closed on its own wrapper validation, not on the embedded verdict.
+
+    Windows CI reaches this state through the real pickle scanner: the embedded result keeps a
+    trusted incomplete tail and finishes ``success=True`` while Joblib NumPy-wrapper validation
+    is still inconclusive. Forcing only the embedded verdict reproduces that lane deterministically
+    on every platform while leaving payload parsing and metadata composition untouched.
+    """
+    original_finish = PickleScanner._finish_after_wrapper_analysis
+
+    def finish_as_successful(self: PickleScanner, result: ScanResult, *, base_success: bool) -> None:
+        original_finish(self, result, base_success=base_success)
+        if not result.success:
+            result.success = True
+            result._merged_children_success = True
+
+    monkeypatch.setattr(PickleScanner, "_finish_after_wrapper_analysis", finish_as_successful)
+
+    result = _scan_payload(
+        tmp_path,
+        _joblib_numpy_list_payload(resumed_ops=b"\x80\x01K\x01."),
+        "numpy_array_protocol1_embedded_success.joblib",
+    )
+
+    assert result.success is False
+    assert result.has_errors is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["analysis_incomplete"] is True
+    assert "joblib_numpy_array_wrapper_validation_failed" in result.metadata["scan_outcome_reasons"]
     assert "trusted_incomplete_tail" not in result.metadata
     assert should_cache_scan_result(result.to_dict(include_private_metadata=True)) is False
 
