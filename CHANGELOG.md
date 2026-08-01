@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Security
 
 - Inspect hidden ZIP archives and malicious pickle payloads in legacy GGML model variants.
+
 ### Bug Fixes
 
 - Avoid network false positives for bounded README examples that download sample images over HTTPS from Hugging Face.
