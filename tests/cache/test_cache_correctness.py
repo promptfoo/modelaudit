@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import time
 import zipfile
 from collections.abc import Iterator
@@ -22,7 +23,7 @@ from importlib.machinery import (
 )
 from pathlib import Path
 from types import FunctionType, ModuleType
-from typing import Any
+from typing import Any, BinaryIO, cast
 from zipimport import zipimporter
 
 import pytest
@@ -37,6 +38,7 @@ from modelaudit_picklescan.call_graph import (
 from modelaudit_picklescan.call_graph import _source_resolution_context as _picklescan_source_resolution_context
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
+from modelaudit.cache import scan_results_cache as scan_results_cache_module
 from modelaudit.cache.batch_operations import BatchCacheOperations
 from modelaudit.cache.optimized_config import (
     ConfigurationExtractor,
@@ -57,6 +59,7 @@ from modelaudit.cache.scan_results_cache import (
 from modelaudit.config.rule_config import ModelAuditConfig, get_config, reset_config, set_config
 from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME, ScanResult
 from modelaudit.utils.helpers.cache_decorator import cached_scan
+from modelaudit.utils.repository_context import REPOSITORY_SCAN_ROOT_CONFIG_KEY
 
 
 @pytest.fixture(autouse=True)
@@ -176,7 +179,8 @@ def test_cache_config_hash_preserves_128_bits(tmp_path: Path) -> None:
     assert len(config_hash) == 32
 
 
-def test_capture_file_identity_uses_target_filesystem_probe(
+@pytest.mark.skipif(os.name == "nt", reason="Windows probes must remain outside scanned content")
+def test_posix_capture_file_identity_uses_target_filesystem_probe(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -200,6 +204,941 @@ def test_capture_file_identity_uses_target_filesystem_probe(
     cache._change_clock_probes.clear()
 
 
+def test_windows_change_clock_probe_avoids_scanned_ancestors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    file_path = _make_cacheable_file(tmp_path)
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    attempted_probe_dirs: list[str] = []
+
+    def record_probe_attempt(*_args: Any, dir: str | Path, **_kwargs: Any) -> BinaryIO:
+        attempted_probe_dirs.append(str(dir))
+        raise OSError("simulated probe creation failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "name", "nt")
+        patch.setattr(scan_results_cache_module, "Path", type(file_path))
+        patch.setattr(
+            cache,
+            "_directory_is_on_device",
+            lambda directory, _device: directory == file_path.parent,
+        )
+        patch.setattr(tempfile, "TemporaryFile", record_probe_attempt)
+
+        with pytest.raises(ValueError, match="No writable cache identity probe directory"):
+            cache._get_change_clock_probe(str(file_path), file_path.stat().st_dev)
+
+    assert attempted_probe_dirs == []
+
+
+@pytest.mark.parametrize(
+    "unsafe_location",
+    (
+        "cache_parent",
+        "cache_descendant",
+        "system_temp_parent",
+        "system_temp_descendant",
+    ),
+)
+def test_windows_change_clock_probe_rejects_scanned_directory_candidates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    unsafe_location: str,
+) -> None:
+    scanned_directory = tmp_path / "scanned"
+    scanned_directory.mkdir()
+    file_path = _make_cacheable_file(scanned_directory)
+    file_device = file_path.stat().st_dev
+
+    if unsafe_location.startswith("cache_"):
+        if unsafe_location == "cache_parent":
+            cache_directory = scanned_directory
+        elif unsafe_location == "cache_ancestor":
+            cache_directory = tmp_path
+        else:
+            cache_directory = scanned_directory / ".scan-cache"
+        system_temp = tmp_path / "other-device-temp"
+        unsafe_candidate = cache_directory
+    else:
+        cache_directory = tmp_path / "other-device-cache"
+        if unsafe_location == "system_temp_parent":
+            system_temp = scanned_directory
+        elif unsafe_location == "system_temp_ancestor":
+            system_temp = tmp_path
+        else:
+            system_temp = scanned_directory / ".modelaudit-temp"
+        unsafe_candidate = system_temp
+
+    cache = ScanResultsCache(str(cache_directory))
+    attempted_probe_dirs: list[Path] = []
+
+    def record_probe_attempt(*_args: Any, dir: str | Path, **_kwargs: Any) -> BinaryIO:
+        attempted_probe_dirs.append(type(file_path)(dir))
+        raise OSError("an overlapping Windows probe must never be created")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "name", "nt")
+        patch.setattr(scan_results_cache_module, "Path", type(file_path))
+        patch.setattr(tempfile, "gettempdir", lambda: str(system_temp))
+        patch.setattr(
+            cache,
+            "_directory_is_on_device",
+            lambda directory, _device: directory == unsafe_candidate,
+        )
+        patch.setattr(tempfile, "TemporaryFile", record_probe_attempt)
+
+        with pytest.raises(ValueError, match="No writable cache identity probe directory"):
+            cache._get_change_clock_probe(str(file_path), file_device)
+
+    assert attempted_probe_dirs == []
+    assert cache._change_clock_probes == {}
+
+
+@pytest.mark.parametrize(
+    "unsafe_location",
+    ("scanned_parent", "scanned_descendant"),
+)
+def test_windows_change_clock_probe_rejects_overlapping_existing_handle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    unsafe_location: str,
+) -> None:
+    scanned_directory = tmp_path / "scanned"
+    scanned_directory.mkdir()
+    file_path = _make_cacheable_file(scanned_directory)
+    file_device = file_path.stat().st_dev
+    cache = ScanResultsCache(str(tmp_path / "isolated-cache"))
+    if unsafe_location == "scanned_parent":
+        unsafe_directory = scanned_directory
+    elif unsafe_location == "scanned_ancestor":
+        unsafe_directory = tmp_path
+    else:
+        unsafe_directory = scanned_directory / ".existing-probes"
+        unsafe_directory.mkdir()
+
+    attempted_probe_dirs: list[Path] = []
+
+    def record_probe_attempt(*_args: Any, dir: str | Path, **_kwargs: Any) -> BinaryIO:
+        attempted_probe_dirs.append(type(file_path)(dir))
+        raise OSError("an overlapping Windows probe must never be replaced")
+
+    with tempfile.TemporaryFile(mode="w+b", dir=unsafe_directory) as probe:
+        tracked_probe = cast(BinaryIO, probe)
+        cache._change_clock_probes[file_device] = (tracked_probe, unsafe_directory)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "name", "nt")
+            patch.setattr(scan_results_cache_module, "Path", type(file_path))
+            patch.setattr(tempfile, "TemporaryFile", record_probe_attempt)
+
+            with pytest.raises(ValueError, match="No writable cache identity probe directory"):
+                cache._get_change_clock_probe(str(file_path), file_device)
+
+        assert attempted_probe_dirs == []
+        assert probe.closed is False
+        assert cache._change_clock_probes[file_device] == (tracked_probe, unsafe_directory)
+
+
+@pytest.mark.parametrize("unsafe_location", ("cache_sibling", "system_temp_sibling"))
+def test_windows_change_clock_probe_rejects_siblings_inside_actual_scan_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    unsafe_location: str,
+) -> None:
+    scan_root = tmp_path / "scan-root"
+    model_directory = scan_root / "models"
+    model_directory.mkdir(parents=True)
+    file_path = _make_cacheable_file(model_directory)
+    file_device = file_path.stat().st_dev
+    if unsafe_location == "cache_sibling":
+        cache_directory = scan_root / "cache"
+        system_temp = tmp_path / "outside-temp"
+        unsafe_candidate = cache_directory
+    else:
+        cache_directory = tmp_path / "outside-cache"
+        system_temp = scan_root / "temp"
+        unsafe_candidate = system_temp
+
+    unsafe_candidate.mkdir(parents=True, exist_ok=True)
+    cache = ScanResultsCache(str(cache_directory))
+    attempted_probe_dirs: list[Path] = []
+
+    def record_probe_attempt(*_args: Any, dir: str | Path, **_kwargs: Any) -> BinaryIO:
+        attempted_probe_dirs.append(type(file_path)(dir))
+        raise OSError("a probe inside the actual directory scan root must never be created")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "name", "nt")
+        patch.setattr(scan_results_cache_module, "Path", type(file_path))
+        patch.setattr(tempfile, "gettempdir", lambda: str(system_temp))
+        patch.setattr(
+            cache,
+            "_directory_is_on_device",
+            lambda directory, _device: directory == unsafe_candidate,
+        )
+        patch.setattr(tempfile, "TemporaryFile", record_probe_attempt)
+
+        with pytest.raises(ValueError, match="No writable cache identity probe directory"):
+            cache._get_change_clock_probe(str(file_path), file_device, scan_root=scan_root)
+
+    assert attempted_probe_dirs == []
+    assert cache._change_clock_probes == {}
+
+
+def test_windows_change_clock_probe_relocates_existing_handle_outside_actual_scan_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scan_root = tmp_path / "scan-root"
+    model_directory = scan_root / "models"
+    model_directory.mkdir(parents=True)
+    file_path = _make_cacheable_file(model_directory)
+    unsafe_directory = scan_root / "cache"
+    unsafe_directory.mkdir()
+    file_device = file_path.stat().st_dev
+    cache = ScanResultsCache(str(tmp_path / "isolated-cache"))
+    attempted_probe_dirs: list[Path] = []
+
+    with (
+        tempfile.TemporaryFile(mode="w+b", dir=unsafe_directory) as unsafe_probe,
+        tempfile.TemporaryFile(mode="w+b", dir=cache.cache_dir) as safe_probe,
+    ):
+
+        def create_relocated_probe(*_args: Any, dir: str | Path, **_kwargs: Any) -> BinaryIO:
+            attempted_probe_dirs.append(type(file_path)(dir))
+            return cast(BinaryIO, safe_probe)
+
+        cache._change_clock_probes[file_device] = (cast(BinaryIO, unsafe_probe), unsafe_directory)
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "name", "nt")
+            patch.setattr(scan_results_cache_module, "Path", type(file_path))
+            patch.setattr(tempfile, "gettempdir", lambda: str(scan_root))
+            patch.setattr(
+                cache,
+                "_directory_is_on_device",
+                lambda directory, _device: directory == cache.cache_dir,
+            )
+            patch.setattr(tempfile, "TemporaryFile", create_relocated_probe)
+            selected_probe = cache._get_change_clock_probe(
+                str(file_path),
+                file_device,
+                scan_root=scan_root,
+            )
+
+        assert unsafe_probe.closed is True
+        assert selected_probe is safe_probe
+        assert attempted_probe_dirs == [cache.cache_dir]
+        assert cache._change_clock_probes[file_device] == (cast(BinaryIO, safe_probe), cache.cache_dir)
+        cache._change_clock_probes.clear()
+
+
+def test_windows_cache_lookup_propagates_repository_scan_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scan_root = tmp_path / "scan-root"
+    model_directory = scan_root / "models"
+    model_directory.mkdir(parents=True)
+    file_path = _make_cacheable_file(model_directory)
+    unsafe_cache = scan_root / "cache"
+    cache = ScanResultsCache(str(unsafe_cache))
+    system_temp = tmp_path / "outside-temp"
+    attempted_probe_dirs: list[Path] = []
+
+    def record_probe_attempt(*_args: Any, dir: str | Path, **_kwargs: Any) -> BinaryIO:
+        attempted_probe_dirs.append(type(file_path)(dir))
+        raise OSError("a repository-root cache probe must never be created")
+
+    version_context = build_cache_version_context({REPOSITORY_SCAN_ROOT_CONFIG_KEY: str(scan_root)})
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "name", "nt")
+        patch.setattr(scan_results_cache_module, "Path", type(file_path))
+        patch.setattr(tempfile, "gettempdir", lambda: str(system_temp))
+        patch.setattr(
+            cache,
+            "_directory_is_on_device",
+            lambda directory, _device: directory == unsafe_cache,
+        )
+        patch.setattr(tempfile, "TemporaryFile", record_probe_attempt)
+
+        result = cache.get_cached_result_with_identity(
+            str(file_path),
+            version_context=version_context,
+        )
+
+    assert result == (None, None)
+    assert attempted_probe_dirs == []
+    assert cache._change_clock_probes == {}
+
+
+def test_windows_change_clock_probe_preserves_temporary_directory_ancestor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scanned_directory = tmp_path / "models"
+    scanned_directory.mkdir()
+    file_path = _make_cacheable_file(scanned_directory)
+    file_device = file_path.stat().st_dev
+    cache = ScanResultsCache(str(scanned_directory / "cache"))
+    attempted_probe_dirs: list[Path] = []
+
+    with tempfile.TemporaryFile(mode="w+b", dir=tmp_path) as probe:
+
+        def use_temporary_ancestor(*_args: Any, dir: str | Path, **_kwargs: Any) -> BinaryIO:
+            attempted_probe_dirs.append(type(file_path)(dir))
+            return cast(BinaryIO, probe)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "name", "nt")
+            patch.setattr(scan_results_cache_module, "Path", type(file_path))
+            patch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
+            patch.setattr(
+                cache,
+                "_directory_is_on_device",
+                lambda directory, _device: directory == tmp_path,
+            )
+            patch.setattr(tempfile, "TemporaryFile", use_temporary_ancestor)
+
+            selected_probe = cache._get_change_clock_probe(str(file_path), file_device)
+
+        assert selected_probe is probe
+        assert attempted_probe_dirs == [tmp_path]
+        assert cache._change_clock_probes[file_device][1] == tmp_path
+        cache._change_clock_probes.clear()
+
+
+def test_windows_change_clock_probe_uses_safe_ancestor_without_scan_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    volume_root = tmp_path / "model-volume"
+    scanned_parent = volume_root / "models"
+    scanned_parent.mkdir(parents=True)
+    file_path = _make_cacheable_file(scanned_parent)
+    file_device = file_path.stat().st_dev
+    off_device_cache = tmp_path / "off-device-cache"
+    off_device_temp = tmp_path / "off-device-temp"
+    cache = ScanResultsCache(str(off_device_cache))
+    safe_ancestor = scanned_parent.parent.resolve()
+    attempted_probe_dirs: list[Path] = []
+
+    with tempfile.TemporaryFile(mode="w+b", dir=safe_ancestor) as probe:
+
+        def create_safe_ancestor_probe(*_args: Any, dir: str | Path, **_kwargs: Any) -> BinaryIO:
+            attempted_probe_dirs.append(type(file_path)(dir))
+            return cast(BinaryIO, probe)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "name", "nt")
+            patch.setattr(scan_results_cache_module, "Path", type(file_path))
+            patch.setattr(tempfile, "gettempdir", lambda: str(off_device_temp))
+            patch.setattr(
+                cache,
+                "_directory_is_on_device",
+                lambda directory, _device: directory == safe_ancestor,
+            )
+            patch.setattr(tempfile, "TemporaryFile", create_safe_ancestor_probe)
+
+            selected_probe = cache._get_change_clock_probe(str(file_path), file_device)
+
+        assert selected_probe is probe
+        assert attempted_probe_dirs == [safe_ancestor]
+        assert safe_ancestor != scanned_parent
+        assert scanned_parent not in safe_ancestor.parents
+        assert cache._change_clock_probes[file_device] == (cast(BinaryIO, probe), safe_ancestor)
+        cache._change_clock_probes.clear()
+
+
+def test_windows_change_clock_probe_prefers_outermost_ancestor_over_scanned_tree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cross-volume probes must not land inside a tree a concurrent scan walks.
+
+    Windows CI keeps the checkout on one volume and the temp/cache directories on
+    another, so probe placement falls through to the scanned file's ancestors. The
+    nearest ancestor is normally still inside the asset tree another xdist worker is
+    enumerating, and the probe races that walk into ``file_size_check_failed``.
+    """
+    volume_root = tmp_path / "volume"
+    assets_root = volume_root / "repository" / "tests" / "assets"
+    scanned_parent = assets_root / "samples" / "pickles"
+    scanned_parent.mkdir(parents=True)
+    file_path = _make_cacheable_file(scanned_parent)
+    file_device = file_path.stat().st_dev
+    off_device_cache = tmp_path / "off-device-cache"
+    off_device_temp = tmp_path / "off-device-temp"
+    cache = ScanResultsCache(str(off_device_cache))
+    attempted_probe_dirs: list[Path] = []
+
+    with tempfile.TemporaryFile(mode="w+b", dir=volume_root) as probe:
+
+        def record_probe_directory(*_args: Any, dir: str | Path, **_kwargs: Any) -> BinaryIO:
+            attempted_probe_dirs.append(type(file_path)(dir))
+            return cast(BinaryIO, probe)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "name", "nt")
+            patch.setattr(scan_results_cache_module, "Path", type(file_path))
+            patch.setattr(tempfile, "gettempdir", lambda: str(off_device_temp))
+            # Every ancestor shares the scanned file's volume; only the off-device
+            # temp and cache directories are unreachable.
+            patch.setattr(
+                cache,
+                "_directory_is_on_device",
+                lambda directory, _device: directory not in {off_device_cache, off_device_temp},
+            )
+            patch.setattr(tempfile, "TemporaryFile", record_probe_directory)
+
+            selected_probe = cache._get_change_clock_probe(str(file_path), file_device)
+
+        assert selected_probe is probe
+        selected_directory = attempted_probe_dirs[0]
+        resolved_assets_root = assets_root.resolve()
+        # The probe must sit above the asset tree, not inside it.
+        assert selected_directory != resolved_assets_root
+        assert resolved_assets_root not in selected_directory.parents
+        assert selected_directory in scanned_parent.resolve().parents
+        cache._change_clock_probes.clear()
+
+
+def test_windows_change_clock_probe_uses_safe_ancestor_outside_scan_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository_root = tmp_path / "repository"
+    scan_root = repository_root / "snapshots" / "pinned-revision"
+    model_directory = scan_root / "models"
+    model_directory.mkdir(parents=True)
+    file_path = _make_cacheable_file(model_directory)
+    file_device = file_path.stat().st_dev
+    off_device_cache = tmp_path / "off-device-cache"
+    off_device_temp = tmp_path / "off-device-temp"
+    cache = ScanResultsCache(str(off_device_cache))
+    safe_ancestor = scan_root.parent.resolve()
+    attempted_probe_dirs: list[Path] = []
+
+    with tempfile.TemporaryFile(mode="w+b", dir=safe_ancestor) as probe:
+
+        def return_safe_ancestor_probe(*_args: Any, dir: str | Path, **_kwargs: Any) -> BinaryIO:
+            attempted_probe_dirs.append(type(file_path)(dir))
+            return cast(BinaryIO, probe)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "name", "nt")
+            patch.setattr(scan_results_cache_module, "Path", type(file_path))
+            patch.setattr(tempfile, "gettempdir", lambda: str(off_device_temp))
+            patch.setattr(
+                cache,
+                "_directory_is_on_device",
+                lambda directory, _device: directory == safe_ancestor,
+            )
+            patch.setattr(tempfile, "TemporaryFile", return_safe_ancestor_probe)
+
+            selected_probe = cache._get_change_clock_probe(
+                str(file_path),
+                file_device,
+                scan_root=scan_root,
+            )
+
+        assert selected_probe is probe
+        assert attempted_probe_dirs == [safe_ancestor]
+        assert safe_ancestor != scan_root
+        assert scan_root not in safe_ancestor.parents
+        assert cache._change_clock_probes[file_device][1] == safe_ancestor
+        cache._change_clock_probes.clear()
+
+
+def test_windows_probe_protects_snapshot_root_for_external_hugging_face_blob(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository_root = tmp_path / "hub" / "model"
+    scan_root = repository_root / "snapshots" / "pinned-revision"
+    blobs_directory = repository_root / "blobs"
+    scan_root.mkdir(parents=True)
+    blobs_directory.mkdir()
+    blob_path = _make_cacheable_file(blobs_directory, name="secure-blob")
+    snapshot_path = scan_root / "model.pkl"
+    try:
+        snapshot_path.symlink_to(blob_path)
+    except OSError as exc:
+        pytest.skip(f"snapshot symlinks unavailable: {exc}")
+    assert snapshot_path.resolve() == blob_path
+
+    unsafe_cache = scan_root / "cache"
+    cache = ScanResultsCache(str(unsafe_cache))
+    off_device_temp = tmp_path / "off-device-temp"
+    attempted_probe_dirs: list[Path] = []
+
+    def record_probe_attempt(*_args: Any, dir: str | Path, **_kwargs: Any) -> BinaryIO:
+        attempted_probe_dirs.append(type(blob_path)(dir))
+        raise OSError("a Hugging Face snapshot-root probe must never be created")
+
+    version_context = build_cache_version_context({REPOSITORY_SCAN_ROOT_CONFIG_KEY: str(scan_root)})
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "name", "nt")
+        patch.setattr(scan_results_cache_module, "Path", type(blob_path))
+        patch.setattr(tempfile, "gettempdir", lambda: str(off_device_temp))
+        patch.setattr(
+            cache,
+            "_directory_is_on_device",
+            lambda directory, _device: directory == unsafe_cache,
+        )
+        patch.setattr(tempfile, "TemporaryFile", record_probe_attempt)
+
+        result = cache.get_cached_result_with_identity(
+            str(blob_path),
+            version_context=version_context,
+        )
+
+    assert result == (None, None)
+    assert attempted_probe_dirs == []
+    assert cache._change_clock_probes == {}
+
+
+@pytest.mark.parametrize("unsafe_location", ("cache_alias", "system_temp_alias"))
+def test_windows_change_clock_probe_rejects_aliases_into_actual_scan_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    unsafe_location: str,
+) -> None:
+    scan_root = tmp_path / "scan-root"
+    models = scan_root / "models"
+    models.mkdir(parents=True)
+    file_path = _make_cacheable_file(models)
+    actual_probe_directory = scan_root / "internal-probes"
+    actual_probe_directory.mkdir()
+    probe_alias = tmp_path / "outside-alias"
+    try:
+        probe_alias.symlink_to(actual_probe_directory, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory aliases unavailable: {exc}")
+
+    if unsafe_location == "cache_alias":
+        cache_directory = probe_alias
+        system_temp = tmp_path / "off-device-temp"
+    else:
+        cache_directory = tmp_path / "off-device-cache"
+        system_temp = probe_alias
+    cache = ScanResultsCache(str(cache_directory))
+    attempted_probe_dirs: list[Path] = []
+
+    def record_probe_attempt(*_args: Any, dir: str | Path, **_kwargs: Any) -> BinaryIO:
+        attempted_probe_dirs.append(type(file_path)(dir))
+        raise OSError("an aliased scan-root probe must never be created")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "name", "nt")
+        patch.setattr(scan_results_cache_module, "Path", type(file_path))
+        patch.setattr(tempfile, "gettempdir", lambda: str(system_temp))
+        patch.setattr(
+            cache,
+            "_directory_is_on_device",
+            lambda directory, _device: directory == probe_alias,
+        )
+        patch.setattr(tempfile, "TemporaryFile", record_probe_attempt)
+
+        with pytest.raises(ValueError, match="No writable cache identity probe directory"):
+            cache._get_change_clock_probe(
+                str(file_path),
+                file_path.stat().st_dev,
+                scan_root=scan_root,
+            )
+
+    assert attempted_probe_dirs == []
+    assert cache._change_clock_probes == {}
+
+
+def test_windows_change_clock_probe_relocates_reused_alias_outside_scan_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scan_root = tmp_path / "scan-root"
+    models = scan_root / "models"
+    models.mkdir(parents=True)
+    file_path = _make_cacheable_file(models)
+    actual_probe_directory = scan_root / "internal-probes"
+    actual_probe_directory.mkdir()
+    probe_alias = tmp_path / "outside-alias"
+    try:
+        probe_alias.symlink_to(actual_probe_directory, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory aliases unavailable: {exc}")
+
+    cache = ScanResultsCache(str(tmp_path / "isolated-cache"))
+    file_device = file_path.stat().st_dev
+    attempted_probe_dirs: list[Path] = []
+    with (
+        tempfile.TemporaryFile(mode="w+b", dir=actual_probe_directory) as unsafe_probe,
+        tempfile.TemporaryFile(mode="w+b", dir=cache.cache_dir) as safe_probe,
+    ):
+
+        def create_relocated_probe(*_args: Any, dir: str | Path, **_kwargs: Any) -> BinaryIO:
+            attempted_probe_dirs.append(type(file_path)(dir))
+            return cast(BinaryIO, safe_probe)
+
+        cache._change_clock_probes[file_device] = (cast(BinaryIO, unsafe_probe), probe_alias)
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "name", "nt")
+            patch.setattr(scan_results_cache_module, "Path", type(file_path))
+            patch.setattr(tempfile, "gettempdir", lambda: str(actual_probe_directory))
+            patch.setattr(
+                cache,
+                "_directory_is_on_device",
+                lambda directory, _device: directory == cache.cache_dir,
+            )
+            patch.setattr(tempfile, "TemporaryFile", create_relocated_probe)
+            selected_probe = cache._get_change_clock_probe(
+                str(file_path),
+                file_device,
+                scan_root=scan_root,
+            )
+
+        assert unsafe_probe.closed is True
+        assert selected_probe is safe_probe
+        assert attempted_probe_dirs == [cache.cache_dir]
+        assert cache._change_clock_probes[file_device] == (cast(BinaryIO, safe_probe), cache.cache_dir)
+        cache._change_clock_probes.clear()
+
+
+def test_windows_change_clock_probe_retains_shared_unsafe_handle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scan_root = tmp_path / "scan-root"
+    models = scan_root / "models"
+    models.mkdir(parents=True)
+    file_path = _make_cacheable_file(models)
+    unsafe_directory = scan_root / "cache"
+    unsafe_directory.mkdir()
+    cache = ScanResultsCache(str(tmp_path / "isolated-cache"))
+    file_device = file_path.stat().st_dev
+    attempted_probe_dirs: list[Path] = []
+
+    def forbid_replacement(*_args: Any, dir: str | Path, **_kwargs: Any) -> BinaryIO:
+        attempted_probe_dirs.append(type(file_path)(dir))
+        raise OSError("an active shared probe must never be closed or replaced")
+
+    with tempfile.TemporaryFile(mode="w+b", dir=unsafe_directory) as probe:
+        tracked_probe = cast(BinaryIO, probe)
+        cache._change_clock_probes[file_device] = (tracked_probe, unsafe_directory)
+        cache._active_identity_captures = 2
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "name", "nt")
+            patch.setattr(scan_results_cache_module, "Path", type(file_path))
+            patch.setattr(tempfile, "TemporaryFile", forbid_replacement)
+            with pytest.raises(ValueError, match="No writable cache identity probe directory"):
+                cache._get_change_clock_probe(
+                    str(file_path),
+                    file_device,
+                    scan_root=scan_root,
+                )
+
+        assert probe.closed is False
+        assert attempted_probe_dirs == []
+        assert cache._change_clock_probes[file_device] == (tracked_probe, unsafe_directory)
+        cache._active_identity_captures = 0
+
+
+def test_windows_change_clock_probe_retains_handle_after_failed_relocation_close(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scan_root = tmp_path / "scan-root"
+    models = scan_root / "models"
+    models.mkdir(parents=True)
+    file_path = _make_cacheable_file(models)
+    unsafe_directory = scan_root / "cache"
+    unsafe_directory.mkdir()
+    cache = ScanResultsCache(str(tmp_path / "isolated-cache"))
+    file_device = file_path.stat().st_dev
+    close_attempts: list[str] = []
+    attempted_probe_dirs: list[Path] = []
+
+    class UnclosableProbe:
+        closed = False
+
+        def close(self) -> None:
+            close_attempts.append("close")
+            raise OSError("the underlying Windows probe is still locked")
+
+    unsafe_probe = UnclosableProbe()
+    cache._change_clock_probes[file_device] = (cast(BinaryIO, unsafe_probe), unsafe_directory)
+
+    def forbid_replacement(*_args: Any, dir: str | Path, **_kwargs: Any) -> BinaryIO:
+        attempted_probe_dirs.append(type(file_path)(dir))
+        raise OSError("an unclosed probe must never be replaced")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "name", "nt")
+        patch.setattr(scan_results_cache_module, "Path", type(file_path))
+        patch.setattr(tempfile, "TemporaryFile", forbid_replacement)
+        with pytest.raises(ValueError, match="No writable cache identity probe directory"):
+            cache._get_change_clock_probe(
+                str(file_path),
+                file_device,
+                scan_root=scan_root,
+            )
+
+    assert close_attempts == ["close"]
+    assert unsafe_probe.closed is False
+    assert attempted_probe_dirs == []
+    assert cache._change_clock_probes[file_device] == (cast(BinaryIO, unsafe_probe), unsafe_directory)
+
+
+def test_windows_batch_lookup_preserves_actual_repository_scan_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scan_root = tmp_path / "scan-root"
+    models = scan_root / "models"
+    models.mkdir(parents=True)
+    file_path = _make_cacheable_file(models)
+    unsafe_cache = scan_root / "cache"
+    cache_manager = get_cache_manager(str(unsafe_cache), enabled=True)
+    assert cache_manager.cache is not None
+    cache = cache_manager.cache
+    batch_operations = BatchCacheOperations(cache_manager)
+    version_context = build_cache_version_context({REPOSITORY_SCAN_ROOT_CONFIG_KEY: str(scan_root)})
+    expected = {
+        "checks": [],
+        "issues": [],
+        "metadata": {},
+        "scanner": "test",
+        "success": True,
+    }
+
+    assert cache_manager.store_result(
+        str(file_path),
+        expected,
+        version_context=version_context,
+        **_identity_kwargs(cache, str(file_path)),
+    )
+    cache_key = cache.generate_cache_key(str(file_path), version_context=version_context)
+    assert cache_key is not None
+    assert cache._get_cache_file_path(cache_key).exists()
+    for existing_probe, _probe_directory in tuple(cache._change_clock_probes.values()):
+        existing_probe.close()
+    cache._change_clock_probes.clear()
+
+    off_device_temp = tmp_path / "off-device-temp"
+    attempted_probe_dirs: list[Path] = []
+
+    def record_probe_attempt(*_args: Any, dir: str | Path, **_kwargs: Any) -> BinaryIO:
+        attempted_probe_dirs.append(type(file_path)(dir))
+        raise OSError("a batch repository-root probe must never be created")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "name", "nt")
+        patch.setattr(scan_results_cache_module, "Path", type(file_path))
+        patch.setattr(tempfile, "gettempdir", lambda: str(off_device_temp))
+        patch.setattr(
+            cache,
+            "_directory_is_on_device",
+            lambda directory, _device: directory == unsafe_cache,
+        )
+        patch.setattr(tempfile, "TemporaryFile", record_probe_attempt)
+
+        results = batch_operations.batch_lookup(
+            [str(file_path)],
+            version_context=version_context,
+        )
+
+    assert results[str(file_path)] is None
+    assert attempted_probe_dirs == []
+    assert cache._change_clock_probes == {}
+
+
+def test_windows_cache_lookup_propagates_repository_root_through_legacy_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scan_root = tmp_path / "scan-root"
+    models = scan_root / "models"
+    models.mkdir(parents=True)
+    file_path = _make_cacheable_file(models)
+    unsafe_cache = scan_root / "cache"
+    off_device_temp = tmp_path / "off-device-temp"
+    attempted_probe_dirs: list[Path] = []
+
+    class LegacyCaptureCache(ScanResultsCache):
+        def __init__(self, cache_dir: str) -> None:
+            super().__init__(cache_dir)
+            self.capture_called = False
+
+        def capture_file_identity(self, path: str) -> Any:
+            self.capture_called = True
+            return super().capture_file_identity(path)
+
+    cache = LegacyCaptureCache(str(unsafe_cache))
+    version_context = build_cache_version_context({REPOSITORY_SCAN_ROOT_CONFIG_KEY: str(scan_root)})
+
+    def forbid_internal_probe(*_args: Any, dir: str | Path, **_kwargs: Any) -> BinaryIO:
+        attempted_probe_dirs.append(type(file_path)(dir))
+        raise OSError("a legacy override must not create a probe in the repository")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "name", "nt")
+        patch.setattr(scan_results_cache_module, "Path", type(file_path))
+        patch.setattr(tempfile, "gettempdir", lambda: str(off_device_temp))
+        patch.setattr(
+            cache,
+            "_directory_is_on_device",
+            lambda directory, _device: directory == unsafe_cache,
+        )
+        patch.setattr(tempfile, "TemporaryFile", forbid_internal_probe)
+
+        result = cache.get_cached_result_with_identity(
+            str(file_path),
+            version_context=version_context,
+        )
+
+    assert result == (None, None)
+    assert cache.capture_called is True
+    assert attempted_probe_dirs == []
+    assert cache._change_clock_probes == {}
+    assert scan_results_cache_module._CAPTURE_REPOSITORY_SCAN_ROOT.get() is None
+
+
+def test_windows_batch_lookup_propagates_repository_root_through_legacy_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scan_root = tmp_path / "scan-root"
+    models = scan_root / "models"
+    models.mkdir(parents=True)
+    file_path = _make_cacheable_file(models)
+    unsafe_cache = scan_root / "cache"
+    off_device_temp = tmp_path / "off-device-temp"
+
+    class LegacyCaptureCache(ScanResultsCache):
+        def __init__(self, cache_dir: str) -> None:
+            super().__init__(cache_dir)
+            self.capture_called = False
+
+        def capture_file_identity(self, path: str) -> Any:
+            self.capture_called = True
+            return super().capture_file_identity(path)
+
+    cache_manager = get_cache_manager(str(unsafe_cache), enabled=True)
+    cache = LegacyCaptureCache(str(unsafe_cache))
+    cache_manager.cache = cache
+    batch_operations = BatchCacheOperations(cache_manager)
+    version_context = build_cache_version_context({REPOSITORY_SCAN_ROOT_CONFIG_KEY: str(scan_root)})
+    expected = {
+        "checks": [],
+        "issues": [],
+        "metadata": {},
+        "scanner": "test",
+        "success": True,
+    }
+
+    assert cache_manager.store_result(
+        str(file_path),
+        expected,
+        version_context=version_context,
+        **_identity_kwargs(cache, str(file_path)),
+    )
+    cache_key = cache.generate_cache_key(str(file_path), version_context=version_context)
+    assert cache_key is not None
+    assert cache._get_cache_file_path(cache_key).exists()
+    for existing_probe, _probe_directory in tuple(cache._change_clock_probes.values()):
+        existing_probe.close()
+    cache._change_clock_probes.clear()
+    cache.capture_called = False
+    attempted_probe_dirs: list[Path] = []
+
+    def forbid_internal_probe(*_args: Any, dir: str | Path, **_kwargs: Any) -> BinaryIO:
+        attempted_probe_dirs.append(type(file_path)(dir))
+        raise OSError("a legacy batch override must not create a repository-root probe")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "name", "nt")
+        patch.setattr(scan_results_cache_module, "Path", type(file_path))
+        patch.setattr(tempfile, "gettempdir", lambda: str(off_device_temp))
+        patch.setattr(
+            cache,
+            "_directory_is_on_device",
+            lambda directory, _device: directory == unsafe_cache,
+        )
+        patch.setattr(tempfile, "TemporaryFile", forbid_internal_probe)
+
+        results = batch_operations.batch_lookup(
+            [str(file_path)],
+            version_context=version_context,
+        )
+
+    assert results[str(file_path)] is None
+    assert cache.capture_called is True
+    assert attempted_probe_dirs == []
+    assert cache._change_clock_probes == {}
+    assert scan_results_cache_module._CAPTURE_REPOSITORY_SCAN_ROOT.get() is None
+
+
+def test_repository_scan_root_context_resets_after_legacy_override_failure(
+    tmp_path: Path,
+) -> None:
+    scan_root = tmp_path / "scan-root"
+    scan_root.mkdir()
+    file_path = _make_cacheable_file(scan_root)
+
+    class FailingLegacyCaptureCache(ScanResultsCache):
+        def capture_file_identity(self, _path: str) -> Any:
+            raise ValueError("legacy identity capture deliberately failed")
+
+    cache = FailingLegacyCaptureCache(str(tmp_path / "isolated-cache"))
+    version_context = build_cache_version_context({REPOSITORY_SCAN_ROOT_CONFIG_KEY: str(scan_root)})
+
+    assert cache.get_cached_result_with_identity(
+        str(file_path),
+        version_context=version_context,
+    ) == (None, None)
+    assert scan_results_cache_module._CAPTURE_REPOSITORY_SCAN_ROOT.get() is None
+
+
+@pytest.mark.parametrize("safe_location", ("cache", "system_temp"))
+def test_windows_change_clock_probe_preserves_isolated_same_device_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    safe_location: str,
+) -> None:
+    scanned_directory = tmp_path / "scanned"
+    scanned_directory.mkdir()
+    file_path = _make_cacheable_file(scanned_directory)
+    file_device = file_path.stat().st_dev
+    cache = ScanResultsCache(str(tmp_path / "isolated-cache"))
+    system_temp = tmp_path / "isolated-temp"
+    system_temp.mkdir()
+    safe_candidate = cache.cache_dir if safe_location == "cache" else system_temp
+    attempted_probe_dirs: list[Path] = []
+
+    with tempfile.TemporaryFile(mode="w+b", dir=safe_candidate) as probe:
+
+        def return_isolated_probe(*_args: Any, dir: str | Path, **_kwargs: Any) -> BinaryIO:
+            attempted_probe_dirs.append(type(file_path)(dir))
+            return cast(BinaryIO, probe)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "name", "nt")
+            patch.setattr(scan_results_cache_module, "Path", type(file_path))
+            patch.setattr(tempfile, "gettempdir", lambda: str(system_temp))
+            patch.setattr(
+                cache,
+                "_directory_is_on_device",
+                lambda directory, _device: directory == safe_candidate,
+            )
+            patch.setattr(tempfile, "TemporaryFile", return_isolated_probe)
+
+            selected_probe = cache._get_change_clock_probe(str(file_path), file_device)
+
+        assert selected_probe is probe
+        assert attempted_probe_dirs == [safe_candidate]
+        assert cache._change_clock_probes[file_device][1] == safe_candidate
+        cache._change_clock_probes.clear()
+
+
 def test_change_clock_probe_prefers_isolated_directory(tmp_path: Path) -> None:
     file_path = _make_cacheable_file(tmp_path)
     cache = ScanResultsCache(str(tmp_path / "cache"))
@@ -207,8 +1146,307 @@ def test_change_clock_probe_prefers_isolated_directory(tmp_path: Path) -> None:
     file_stat, _file_hash, _change_token, ancestor_identity = cache.capture_file_identity(str(file_path))
 
     assert ancestor_identity
-    expected_probe_dir = Path(tempfile.gettempdir()) if os.name == "nt" else cache.cache_dir
-    assert cache._change_clock_probes[file_stat.st_dev][1] == expected_probe_dir
+    expected_probe_dirs = {Path(tempfile.gettempdir()), cache.cache_dir} if os.name == "nt" else {cache.cache_dir}
+    assert cache._change_clock_probes[file_stat.st_dev][1] in expected_probe_dirs
+
+
+def test_clear_cache_closes_reusable_change_clock_probes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    original_unlink = Path.unlink
+
+    with tempfile.NamedTemporaryFile(mode="w+b", dir=cache.cache_dir, delete=False) as probe:
+        probe_path = Path(probe.name)
+        cache._change_clock_probes[probe_path.stat().st_dev] = (cast(BinaryIO, probe), cache.cache_dir)
+
+        def reject_locked_probe(path: Path, *, missing_ok: bool = False) -> None:
+            if path == probe_path and not probe.closed:
+                raise PermissionError("Windows cannot unlink an open cache clock probe")
+            original_unlink(path, missing_ok=missing_ok)
+
+        monkeypatch.setattr(Path, "unlink", reject_locked_probe)
+
+        cache.clear_cache()
+
+        assert probe.closed is True
+
+    assert cache._change_clock_probes == {}
+    assert not probe_path.exists()
+    assert cache.metadata_file.exists()
+
+
+def test_clear_cache_closes_remaining_probes_after_close_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    stale_clean_result = cache.cache_dir / "stale-clean-result.json"
+    stale_clean_result.write_text('{"verdict":"CLEAN","findings":[]}', encoding="utf-8")
+    failed_probe_path = cache.cache_dir / ".modelaudit-cache-clock-retry"
+    failed_probe_path.write_bytes(b"locked probe")
+    close_attempts: list[str] = []
+    removed_paths: list[Path] = []
+    original_unlink = Path.unlink
+
+    class CachedProbe:
+        def __init__(
+            self,
+            label: str,
+            *,
+            probe_path: Path | None = None,
+            fail_close: bool = False,
+        ) -> None:
+            self.label = label
+            self.name = str(probe_path) if probe_path is not None else label
+            self.fail_close = fail_close
+            self.closed = False
+
+        def close(self) -> None:
+            close_attempts.append(self.label)
+            if self.fail_close:
+                raise OSError("simulated probe close failure")
+            self.closed = True
+
+    first_probe = CachedProbe("first", probe_path=failed_probe_path, fail_close=True)
+    second_probe = CachedProbe("second")
+
+    def record_unlink(path: Path, *, missing_ok: bool = False) -> None:
+        removed_paths.append(path)
+        if path == failed_probe_path and not first_probe.closed:
+            raise PermissionError("Windows cannot unlink an open cache clock probe")
+        original_unlink(path, missing_ok=missing_ok)
+
+    cache._change_clock_probes[1] = (cast(BinaryIO, first_probe), cache.cache_dir)
+    cache._change_clock_probes[2] = (cast(BinaryIO, second_probe), cache.cache_dir)
+    monkeypatch.setattr(Path, "unlink", record_unlink)
+
+    cache.clear_cache()
+
+    assert close_attempts == ["first", "second"]
+    assert (first_probe.closed, second_probe.closed) == (False, True)
+    assert set(cache._change_clock_probes) == {1}
+    assert cache._change_clock_probes[1][0] is cast(BinaryIO, first_probe)
+    assert stale_clean_result in removed_paths
+    assert not stale_clean_result.exists()
+    assert failed_probe_path not in removed_paths
+    assert failed_probe_path.exists()
+    assert cache.metadata_file not in removed_paths
+    assert cache.metadata_file.exists()
+
+    first_probe.fail_close = False
+    cache.clear_cache()
+
+    assert close_attempts == ["first", "second", "first"]
+    assert first_probe.closed is True
+    assert cache._change_clock_probes == {}
+    assert failed_probe_path in removed_paths
+    assert not failed_probe_path.exists()
+    assert cache.metadata_file.exists()
+    metadata = json.loads(cache.metadata_file.read_text(encoding="utf-8"))
+    assert metadata["statistics"]["total_entries"] == 0
+
+
+def test_clear_cache_retains_locked_probe_in_aliased_cache_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    cache_alias = tmp_path / "cache-alias"
+    try:
+        cache_alias.symlink_to(cache.cache_dir, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory aliases unavailable: {exc}")
+
+    stale_result = cache.cache_dir / "stale-clean-result.json"
+    stale_result.write_text('{"verdict":"CLEAN"}', encoding="utf-8")
+    probe_path = cache.cache_dir / ".modelaudit-cache-clock-aliased"
+    probe_path.write_bytes(b"locked probe")
+    original_unlink = Path.unlink
+
+    class LockedProbe:
+        def __init__(self) -> None:
+            self.name = str(cache_alias / probe_path.name)
+            self.closed = False
+            self.fail_close = True
+
+        def close(self) -> None:
+            if self.fail_close:
+                raise OSError("simulated Windows probe close failure")
+            self.closed = True
+
+    probe = LockedProbe()
+    cache._change_clock_probes[probe_path.stat().st_dev] = (cast(BinaryIO, probe), cache_alias)
+
+    def reject_locked_probe(path: Path, *, missing_ok: bool = False) -> None:
+        if path.resolve(strict=False) == probe_path and not probe.closed:
+            raise PermissionError("Windows cannot unlink an open aliased cache clock probe")
+        original_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", reject_locked_probe)
+
+    cache.clear_cache()
+
+    assert (probe.closed, probe_path.exists()) == (False, True)
+    assert not stale_result.exists()
+    assert cache.metadata_file.exists()
+
+    probe.fail_close = False
+    cache.clear_cache()
+
+    assert (probe.closed, probe_path.exists()) == (True, False)
+    assert cache._change_clock_probes == {}
+
+
+def test_clear_cache_retries_real_temporary_file_wrapper(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    stale_result = cache.cache_dir / "stale-result.json"
+    stale_result.write_text('{"verdict":"CLEAN"}', encoding="utf-8")
+    close_attempts: list[str] = []
+    removed_paths: list[Path] = []
+    original_unlink = Path.unlink
+
+    with tempfile.NamedTemporaryFile(
+        mode="w+b",
+        dir=cache.cache_dir,
+        prefix=".modelaudit-cache-clock-",
+        delete=False,
+    ) as probe:
+        probe_path = Path(probe.name)
+        underlying_probe = probe.file
+        original_close = underlying_probe.close
+
+        def close_underlying_probe() -> None:
+            close_attempts.append("underlying")
+            if len(close_attempts) == 1:
+                raise OSError("transient underlying Windows probe close failure")
+            original_close()
+
+        def reject_locked_probe(path: Path, *, missing_ok: bool = False) -> None:
+            if path == probe_path and not underlying_probe.closed:
+                raise PermissionError("Windows cannot remove an open cache clock probe")
+            removed_paths.append(path)
+            original_unlink(path, missing_ok=missing_ok)
+
+        monkeypatch.setattr(underlying_probe, "close", close_underlying_probe)
+        monkeypatch.setattr(Path, "unlink", reject_locked_probe)
+        file_device = probe_path.stat().st_dev
+        cache._change_clock_probes[file_device] = (cast(BinaryIO, probe), cache.cache_dir)
+
+        cache.clear_cache()
+
+        assert (close_attempts, probe.closed) == (["underlying"], False)
+        assert cache._change_clock_probes[file_device][0] is cast(BinaryIO, probe)
+        assert probe_path not in removed_paths
+        assert probe_path.exists()
+        assert stale_result in removed_paths
+        assert cache.metadata_file.exists()
+
+        cache.clear_cache()
+
+        assert (close_attempts, probe.closed) == (["underlying", "underlying"], True)
+        assert cache._change_clock_probes == {}
+        assert probe_path in removed_paths
+        assert not probe_path.exists()
+        assert cache.metadata_file.exists()
+
+
+def test_clear_cache_holds_probe_lock_through_deletion_and_metadata_reset(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    stale_result = cache.cache_dir / "stale-result.json"
+    stale_result.write_text('{"verdict":"CLEAN"}', encoding="utf-8")
+    observed_phases: list[str] = []
+    original_iterdir = Path.iterdir
+    original_create_metadata = cache._create_initial_metadata
+
+    def observe_locked_directory(path: Path) -> Iterator[Path]:
+        if path == cache.cache_dir:
+            assert cache._change_clock_probe_lock.locked()
+            assert cache._change_clock_probe_lock.acquire(blocking=False) is False
+            observed_phases.append("delete")
+        return original_iterdir(path)
+
+    def observe_locked_metadata() -> None:
+        assert cache._change_clock_probe_lock.locked()
+        assert cache._change_clock_probe_lock.acquire(blocking=False) is False
+        observed_phases.append("metadata")
+        original_create_metadata()
+
+    monkeypatch.setattr(Path, "iterdir", observe_locked_directory)
+    monkeypatch.setattr(cache, "_create_initial_metadata", observe_locked_metadata)
+
+    cache.clear_cache()
+
+    assert observed_phases == ["delete", "metadata"]
+    assert not stale_result.exists()
+    assert cache.metadata_file.exists()
+    assert cache._change_clock_probe_lock.locked() is False
+
+
+def test_clear_cache_waits_for_active_identity_capture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    file_path = _make_cacheable_file(tmp_path)
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    capture_hash_entered = threading.Event()
+    allow_capture_hash = threading.Event()
+    clear_started = threading.Event()
+    clear_completed = threading.Event()
+    worker_errors: list[BaseException] = []
+    original_hash = cache.hasher.hash_file_with_stat
+
+    def block_identity_hash(path: str, file_stat: os.stat_result) -> str:
+        capture_hash_entered.set()
+        if not allow_capture_hash.wait(timeout=10):
+            raise TimeoutError("identity capture was not released")
+        return original_hash(path, file_stat)
+
+    def capture_identity() -> None:
+        try:
+            identity = cache.capture_file_identity(str(file_path))
+            cache.release_ancestor_identity(identity[-1])
+        except BaseException as exc:
+            worker_errors.append(exc)
+
+    def clear_identity_cache() -> None:
+        clear_started.set()
+        try:
+            cache.clear_cache()
+        except BaseException as exc:
+            worker_errors.append(exc)
+        finally:
+            clear_completed.set()
+
+    monkeypatch.setattr(cache.hasher, "hash_file_with_stat", block_identity_hash)
+    capture_thread = threading.Thread(target=capture_identity, daemon=True)
+    clear_thread = threading.Thread(target=clear_identity_cache, daemon=True)
+    capture_thread.start()
+
+    try:
+        assert capture_hash_entered.wait(timeout=10)
+        clear_thread.start()
+        assert clear_started.wait(timeout=10)
+        assert clear_completed.wait(timeout=0.05) is False
+    finally:
+        allow_capture_hash.set()
+        capture_thread.join(timeout=10)
+        if clear_thread.is_alive():
+            clear_thread.join(timeout=10)
+
+    assert not capture_thread.is_alive()
+    assert not clear_thread.is_alive()
+    assert worker_errors == []
+    assert clear_completed.is_set()
+    assert cache._active_identity_captures == 0
+    assert cache.metadata_file.exists()
 
 
 def test_windows_change_clock_probe_uses_existing_handle(
