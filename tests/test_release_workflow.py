@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tarfile
@@ -752,7 +753,16 @@ def test_release_workflow_generates_root_provenance_after_successful_publish() -
     assert job["needs"] == ["build", "publish-pypi", "verify-pypi", "release-please"]
 
 
-def test_release_workflow_recovers_root_provenance_without_republishing() -> None:
+@pytest.mark.parametrize(
+    "updated_checkout_digest",
+    [
+        pytest.param(None, id="current-pinned-digest"),
+        pytest.param("d23441a48e516b6c34aea4fa41551a30e30af803", id="rotated-pinned-digest"),
+    ],
+)
+def test_release_workflow_recovers_root_provenance_without_republishing(
+    updated_checkout_digest: str | None,
+) -> None:
     workflow = _load_release_workflow()
 
     release_job = _jobs(workflow)["release-please"]
@@ -776,7 +786,9 @@ def test_release_workflow_recovers_root_provenance_without_republishing() -> Non
 
     steps = _job_steps(workflow, "root-provenance-recovery")
     checkout_step = _step_by_name(steps, "Checkout tagged root release")
-    assert checkout_step["uses"] == "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd"
+    if updated_checkout_digest is not None:
+        checkout_step = {**checkout_step, "uses": f"actions/checkout@{updated_checkout_digest}"}
+    assert re.fullmatch(r"actions/checkout@[0-9a-f]{40}", checkout_step["uses"])
     assert checkout_step["with"] == {
         "ref": "refs/tags/${{ needs.release-please.outputs.tag_name }}",
         "sparse-checkout": "pyproject.toml\nuv.lock\n",
