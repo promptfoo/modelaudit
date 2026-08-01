@@ -10,6 +10,7 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - Validate bounded batched PyTorch state-dictionary entries without falsely flagging canonical tensor reconstruction.
+- Keep scanning storage members between the trusted and expanded pickle probe sizes.
 
 ## [0.1.10](https://github.com/promptfoo/modelaudit/compare/modelaudit-picklescan-v0.1.9...modelaudit-picklescan-v0.1.10) (2026-07-22)
 

@@ -10,7 +10,7 @@ import tempfile
 import time
 import zipfile
 from _collections import OrderedDict as _CANONICAL_COLLECTIONS_ORDERED_DICT
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from importlib import import_module
@@ -1303,10 +1303,35 @@ def _trusted_storage_zip_entry_looks_like_pickle(
             deadline,
         )
     if is_binary_pickle_candidate:
-        return _binary_pickle_probe_should_scan(sample, sample_is_prefix=entry.file_size > len(sample))
+        return _binary_pickle_probe_should_scan(
+            sample, sample_is_prefix=entry.file_size > len(sample)
+        ) or _expanded_probe_preserves_trusted_scan(entry, sample, max_probe_bytes, _binary_pickle_probe_should_scan)
     if is_frame_first_candidate:
         return _frame_first_trusted_storage_probe_should_scan(sample)
-    return _proto0_or_1_trusted_storage_probe_should_scan(sample, sample_is_prefix=entry.file_size > len(sample))
+    return _proto0_or_1_trusted_storage_probe_should_scan(
+        sample, sample_is_prefix=entry.file_size > len(sample)
+    ) or _expanded_probe_preserves_trusted_scan(
+        entry, sample, max_probe_bytes, _proto0_or_1_trusted_storage_probe_should_scan
+    )
+
+
+def _expanded_probe_preserves_trusted_scan(
+    entry: zipfile.ZipInfo,
+    sample: bytes,
+    max_probe_bytes: int,
+    predicate: Callable[..., bool],
+) -> bool:
+    """Return whether the shorter trusted probe would have scanned this member.
+
+    ``sample_is_prefix`` is derived from how much of the member the probe read, so widening the
+    probe can flip it from True to False and silently drop a member that the 4 KiB trusted probe
+    scanned. Members between the two probe sizes are exactly the window affected. Re-checking the
+    shorter view keeps a wider probe strictly additive for coverage.
+    """
+    if max_probe_bytes <= _TRUSTED_STORAGE_PICKLE_PROBE_BYTES:
+        return False
+    short_sample = sample[:_TRUSTED_STORAGE_PICKLE_PROBE_BYTES]
+    return predicate(short_sample, sample_is_prefix=entry.file_size > len(short_sample))
 
 
 def _binary_pickle_probe_should_scan(sample: bytes, *, sample_is_prefix: bool) -> bool:

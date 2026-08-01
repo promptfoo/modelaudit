@@ -15275,3 +15275,55 @@ def test_scan_stream_preserves_absolute_offsets_from_current_stream_position() -
     ]
     assert finding_positions
     assert all(position >= len(prefix) for position in finding_positions)
+
+
+def test_scan_file_scans_binary_storage_member_inside_expanded_probe_window(tmp_path: Path) -> None:
+    """Widening the storage probe must not drop members the 4 KiB trusted probe scanned.
+
+    ``sample_is_prefix`` is derived from how much of the member the probe read, so a member between
+    the two probe sizes flips it from True to False, and the binary-pickle predicate refuses to scan
+    a non-STOP-terminated sample once it is no longer a prefix.
+    """
+    hidden_payload = b"\x80\x04cos\nsystem\n(S'echo expanded-window'\ntR"
+    hidden_payload += b"\x00" * (5000 - len(hidden_payload))
+    assert len(hidden_payload) > package_api._TRUSTED_STORAGE_PICKLE_PROBE_BYTES
+    assert len(hidden_payload) < package_api._PICKLE_DISCOVERY_LONG_PROBE_BYTES
+
+    entry_count = 33
+    archive_path = tmp_path / "malicious-expanded-probe-window.pt"
+    entries: list[bytes] = []
+    for index in range(entry_count):
+        key = _short_binunicode(f"weight_{index}".encode("ascii"))
+        if index == 0:
+            value = (
+                _pytorch_rebuild_tensor_v2_payload(
+                    key="0",
+                    storage_name="ByteStorage",
+                    element_count=len(hidden_payload),
+                )
+                .removeprefix(b"\x80\x04")
+                .removesuffix(b".")
+            )
+        else:
+            value = _pytorch_rebuild_tensor_v2_reduce_expr(key=str(index))
+        entries.append(key + value)
+    data_pkl = b"\x80\x04" + _pytorch_empty_ordered_dict_reduce_expr() + b"(" + b"".join(entries) + b"u."
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", data_pkl)
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", hidden_payload)
+        for index in range(1, entry_count):
+            archive.writestr(f"archive/data/{index}", b"\x00" * 24)
+
+    report = scan_file(archive_path)
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.severity == Severity.CRITICAL
+        and finding.details.get("module") in {"os", "posix", "nt"}
+        and finding.details.get("name") == "system"
+        and finding.location is not None
+        and "archive/data/0" in finding.location
+        for finding in report.findings
+    )
