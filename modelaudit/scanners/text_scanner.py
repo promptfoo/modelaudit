@@ -12,7 +12,10 @@ from typing import Any, ClassVar
 from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 from modelaudit.core_results import mark_operational_scan_error
-from modelaudit.detectors.network_comm import redact_url_for_finding
+from modelaudit.detectors.network_comm import (
+    official_readme_urlopen_image_example_spans,
+    redact_url_for_finding,
+)
 from modelaudit.detectors.secrets import SecretsDetector
 from modelaudit.scanner_registry_metadata import TOKENIZER_VOCABULARY_CONTENT_FILENAMES
 from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
@@ -44,22 +47,10 @@ DOCUMENTATION_TEXT_FILENAMES = frozenset(
         "readme.txt",
     }
 )
-HUGGINGFACE_DOCUMENTATION_IMAGE_EXAMPLE_URL_BYTES = (
-    b"https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/beignets-task-guide.png"
-)
-VERIFIED_HUGGINGFACE_DOCUMENTATION_IMAGE_READMES: frozenset[tuple[int, str]] = frozenset(
-    {
-        # timm/mobilenetv3_small_100.lamb_in1k@1824797e7887cbec1990e4adbd6675960a36c589 (LF, CRLF)
-        (4386, "3950face80991c4f91fb1ead491d787639e08a737f948fd630dd938ae8f78c18"),
-        (4531, "d15a41ee108ddfa546bc931a553f108be8e9e0c4c3ff2978dab9ee31ba5193f0"),
-        # timm/convnext_femto.d1_in1k@1e0c02df687c47abf0819e1a4f858293e17e0c50 (LF, CRLF)
-        (15646, "8be1d036fde8dd8d279b9d0d8d886da58ba5c76e7a59d6da662b89243a51a5e3"),
-        (15844, "5996269997efd68dfae50ababead126a2b33761510440c1355bf50854c72849d"),
-        # timm/repvgg_a0.rvgg_in1k@e292d220aa8b811232037f8aa6d6c8c552dbd0c0 (LF, CRLF)
-        (4515, "76528d32891b0a14087eb2240065094ff2cea9cc04a41ebe7b28311711af830d"),
-        (4671, "937369705c2ce5d8ef37a7b8b589a997ebdc76b05ad60cb05f1641777e4ebb69"),
-    }
-)
+DOCUMENTATION_IMAGE_EXAMPLE_TOKENS: dict[tuple[str, str], bytes] = {
+    ("network_function", "urlopen"): b"urlopen",
+    ("network_library", "urllib"): b"from urllib",
+}
 PASSIVE_NETWORK_FINDING_TYPES = frozenset(
     {
         "cloud_storage_url",
@@ -2771,12 +2762,19 @@ class TextScanner(BaseScanner):
         )
 
     @classmethod
-    def _verified_huggingface_documentation_image_finding(
+    def _documentation_image_example_finding(
         cls,
         path: str,
         payload: bytes,
         finding: dict[str, Any],
     ) -> bool:
+        """Return whether one ``urllib``/``urlopen`` finding sits inside a documented image example.
+
+        Model-card generators emit a fixed ``Image.open(urlopen(<literal huggingface.co URL>))``
+        snippet, so the example is proven structurally by
+        :func:`official_readme_urlopen_image_example_spans`. Findings outside a proven fence, and
+        every other finding type, stay actionable.
+        """
         filename = os.path.basename(path).lower()
         if os.path.splitext(filename)[1] not in {".md", ".markdown"} or not (
             cls._is_readme_documentation_filename(filename) or cls._is_model_card_documentation_filename(filename)
@@ -2784,28 +2782,23 @@ class TextScanner(BaseScanner):
             return False
 
         finding_type = finding.get("type")
-        if finding_type == "network_function" and finding.get("function") == "urlopen":
-            expected_token = b"urlopen"
-        elif (
-            finding_type == "network_library"
-            and finding.get("library") == "urllib"
-            and finding.get("pattern") == "from urllib"
-        ):
-            expected_token = b"from urllib"
+        if finding_type == "network_function":
+            token = DOCUMENTATION_IMAGE_EXAMPLE_TOKENS.get((finding_type, str(finding.get("function"))))
+        elif finding_type == "network_library" and finding.get("pattern") == "from urllib":
+            token = DOCUMENTATION_IMAGE_EXAMPLE_TOKENS.get((finding_type, str(finding.get("library"))))
         else:
             return False
-
-        payload_length = len(payload)
-        if all(payload_length != length for length, _digest in VERIFIED_HUGGINGFACE_DOCUMENTATION_IMAGE_READMES):
+        if token is None:
             return False
+
         position = finding.get("position")
-        return (
-            isinstance(position, int)
-            and position >= 0
-            and payload[position : position + len(expected_token)] == expected_token
-            and HUGGINGFACE_DOCUMENTATION_IMAGE_EXAMPLE_URL_BYTES in payload
-            and (payload_length, hashlib.sha256(payload).hexdigest())
-            in VERIFIED_HUGGINGFACE_DOCUMENTATION_IMAGE_READMES
+        if not isinstance(position, int) or position < 0:
+            return False
+        end = position + len(token)
+        if payload[position:end] != token:
+            return False
+        return any(
+            start <= position and end <= stop for start, stop in official_readme_urlopen_image_example_spans(payload)
         )
 
     @classmethod
@@ -2815,7 +2808,7 @@ class TextScanner(BaseScanner):
         payload: bytes,
         finding: dict[str, Any],
         *,
-        allow_verified_huggingface_documentation: bool = True,
+        allow_documentation_image_examples: bool = False,
     ) -> bool:
         if cls._is_documentation_sidecar(path):
             finding_type = finding.get("type")
@@ -2839,8 +2832,8 @@ class TextScanner(BaseScanner):
                 or (finding_type == "network_library" and cls._documentation_network_library_is_prose(payload, finding))
                 or (finding_type == "cc_pattern" and cls._documentation_cc_finding_is_benign_prose(payload, finding))
                 or (
-                    allow_verified_huggingface_documentation
-                    and cls._verified_huggingface_documentation_image_finding(path, payload, finding)
+                    allow_documentation_image_examples
+                    and cls._documentation_image_example_finding(path, payload, finding)
                 )
                 or (
                     finding_type == "suspicious_port" and not cls._documentation_finding_is_actionable(payload, finding)
@@ -3322,7 +3315,7 @@ class TextScanner(BaseScanner):
         payload: bytes,
         findings: list[dict[str, Any]],
         *,
-        allow_verified_huggingface_documentation: bool = True,
+        allow_documentation_image_examples: bool = False,
     ) -> tuple[list[dict[str, Any]], bool, set[str]]:
         classified_findings: list[dict[str, Any]] = []
         classification_incomplete = False
@@ -3363,7 +3356,7 @@ class TextScanner(BaseScanner):
                 path,
                 payload,
                 finding,
-                allow_verified_huggingface_documentation=allow_verified_huggingface_documentation,
+                allow_documentation_image_examples=allow_documentation_image_examples,
             ):
                 finding = {**finding, "severity": "INFO"}
             classified_findings.append(finding)
@@ -3531,7 +3524,7 @@ class TextScanner(BaseScanner):
                     max_findings=max_findings,
                 )
                 network_findings, finding_limit = self._split_detector_finding_limit(network_findings)
-                allow_verified_huggingface_documentation = (
+                allow_documentation_image_examples = (
                     self._get_bool_config("use_hf_whitelist", default=True)
                     and not detector_incomplete
                     and not truncated
@@ -3542,7 +3535,7 @@ class TextScanner(BaseScanner):
                         path,
                         inspected_payload,
                         network_findings,
-                        allow_verified_huggingface_documentation=allow_verified_huggingface_documentation,
+                        allow_documentation_image_examples=allow_documentation_image_examples,
                     )
                 )
                 network_findings = self._deduplicate_documentation_network_findings(

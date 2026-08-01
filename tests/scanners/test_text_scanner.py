@@ -79,42 +79,7 @@ def _real_huggingface_image_readme_payload(fixture_name: str, *, crlf: bool) -> 
     fixture_path = Path(__file__).resolve().parents[1] / "assets" / "huggingface_model_cards" / fixture_name
     original = fixture_path.read_bytes()
     assert b"license: apache-2.0" in original.splitlines() or b"license: mit" in original.splitlines()
-    payload = original.replace(b"\n", b"\r\n") if crlf else original
-    assert (len(payload), hashlib.sha256(payload).hexdigest()) in (
-        text_scanner_module.VERIFIED_HUGGINGFACE_DOCUMENTATION_IMAGE_READMES
-    )
-    return payload
-
-
-def test_text_scanner_verified_huggingface_image_readmes_match_immutable_revisions() -> None:
-    pinned_model_cards: tuple[tuple[str, str, tuple[int, str], tuple[int, str]], ...] = (
-        (
-            "timm/mobilenetv3_small_100.lamb_in1k",
-            "1824797e7887cbec1990e4adbd6675960a36c589",
-            (4386, "3950face80991c4f91fb1ead491d787639e08a737f948fd630dd938ae8f78c18"),
-            (4531, "d15a41ee108ddfa546bc931a553f108be8e9e0c4c3ff2978dab9ee31ba5193f0"),
-        ),
-        (
-            "timm/convnext_femto.d1_in1k",
-            "1e0c02df687c47abf0819e1a4f858293e17e0c50",
-            (15646, "8be1d036fde8dd8d279b9d0d8d886da58ba5c76e7a59d6da662b89243a51a5e3"),
-            (15844, "5996269997efd68dfae50ababead126a2b33761510440c1355bf50854c72849d"),
-        ),
-        (
-            "timm/repvgg_a0.rvgg_in1k",
-            "e292d220aa8b811232037f8aa6d6c8c552dbd0c0",
-            (4515, "76528d32891b0a14087eb2240065094ff2cea9cc04a41ebe7b28311711af830d"),
-            (4671, "937369705c2ce5d8ef37a7b8b589a997ebdc76b05ad60cb05f1641777e4ebb69"),
-        ),
-    )
-    expected_readmes = frozenset(
-        readme for _, _, lf_readme, crlf_readme in pinned_model_cards for readme in (lf_readme, crlf_readme)
-    )
-
-    assert len(pinned_model_cards) == 3
-    assert all(len(revision) == 40 for _, revision, _, _ in pinned_model_cards)
-    assert len(expected_readmes) == 6
-    assert expected_readmes == text_scanner_module.VERIFIED_HUGGINGFACE_DOCUMENTATION_IMAGE_READMES
+    return original.replace(b"\n", b"\r\n") if crlf else original
 
 
 # Fixture SPDX: Apache-2.0; attribution: Ross Wightman and timm.
@@ -176,7 +141,6 @@ def test_text_scanner_real_huggingface_image_readme_preserves_production_securit
     digest = hashlib.sha256(payload).hexdigest()
     expected_size, expected_sha256 = (crlf_size, crlf_sha256) if crlf else (lf_size, lf_sha256)
     assert (len(payload), digest) == (expected_size, expected_sha256)
-    assert (len(payload), digest) in text_scanner_module.VERIFIED_HUGGINGFACE_DOCUMENTATION_IMAGE_READMES
 
     benign_path = tmp_path / "README.md"
     benign_path.write_bytes(payload)
@@ -193,9 +157,15 @@ def test_text_scanner_real_huggingface_image_readme_preserves_production_securit
     assert benign.success is True
     assert determine_exit_code(benign_aggregate) == 0
 
-    malicious_payload = payload.replace(b"img = Image.open", b"xmg = Image.open", 1)
+    # Repoint the sample image at attacker-controlled infrastructure. Byte length is preserved so
+    # the regression proves the URL itself is validated rather than the card's size or digest.
+    # "evilexample.co" is exactly as long as "huggingface.co".
+    malicious_payload = payload.replace(
+        b"https://huggingface.co/datasets/huggingface/documentation-images/",
+        b"https://evilexample.co/datasets/huggingface/documentation-images/",
+    )
     assert len(malicious_payload) == len(payload)
-    assert sum(left != right for left, right in zip(payload, malicious_payload, strict=True)) == 1
+    assert malicious_payload != payload
     malicious_path = tmp_path / "tampered" / "README.md"
     malicious_path.parent.mkdir()
     malicious_path.write_bytes(malicious_payload)
@@ -445,63 +415,130 @@ def test_text_scanner_passive_documentation_prose_is_not_whitelist_dependent(
 
 
 @pytest.mark.parametrize(
-    ("crlf", "excluded_size", "excluded_sha256"),
-    [
-        pytest.param(
-            False,
-            3707,
-            "cbb1a81c3ce864dc6258a359e7e5a16205d269a32a91399c6c7acc92ebed8418",
-            id="restricted-apple-lf",
-        ),
-        pytest.param(
-            True,
-            3818,
-            "f9c56fcf440a540c906f88a6bfcd723eada9b2ce7719a00df6456cde29f1eef5",
-            id="restricted-apple-crlf",
-        ),
-    ],
+    "model_name",
+    ["resnet50.a1_in1k", "vit_base_patch16_224.augreg_in21k", "efficientnet_b0.ra_in1k"],
 )
-def test_text_scanner_restricted_huggingface_model_card_remains_actionable(
+@pytest.mark.parametrize("crlf", [False, True], ids=["lf", "crlf"])
+def test_text_scanner_unpinned_model_cards_are_informational(
     tmp_path: Path,
+    model_name: str,
     crlf: bool,
-    excluded_size: int,
-    excluded_sha256: str,
 ) -> None:
-    assert (excluded_size, excluded_sha256) not in text_scanner_module.VERIFIED_HUGGINGFACE_DOCUMENTATION_IMAGE_READMES
+    """The documented example is recognised structurally, not by pinning known files.
 
-    payload = HUGGINGFACE_DOCUMENTATION_IMAGE_EXAMPLE.encode()
-    if crlf:
-        payload = payload.replace(b"\n", b"\r\n")
-    assert (len(payload), hashlib.sha256(payload).hexdigest()) not in (
-        text_scanner_module.VERIFIED_HUGGINGFACE_DOCUMENTATION_IMAGE_READMES
+    The generator that emits this snippet produces byte-identical code across every card it
+    writes, so recognition must not depend on having seen a particular card before.
+    """
+    example = (
+        "# Model card\n\n"
+        "```python\n"
+        "from urllib.request import urlopen\n"
+        "from PIL import Image\n"
+        "import timm\n\n"
+        "img = Image.open(urlopen(\n"
+        '    "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/'
+        'beignets-task-guide.png"\n'
+        "))\n"
+        f"model = timm.create_model('{model_name}', pretrained=True)\n"
+        "```\n"
     )
+    payload = example.replace("\n", "\r\n").encode() if crlf else example.encode()
     path = tmp_path / "README.md"
     path.write_bytes(payload)
 
     result = TextScanner().scan(str(path))
     aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+    network_checks = [
+        check
+        for check in result.checks
+        if check.name == "Network Communication Detection"
+        and (check.details.get("function") == "urlopen" or check.details.get("library") == "urllib")
+    ]
+
+    assert {check.details.get("type") for check in network_checks} == {"network_function", "network_library"}
+    assert all(check.severity == IssueSeverity.INFO for check in network_checks)
+    assert result.success is True
+    assert determine_exit_code(aggregate) == 0
+
+
+@pytest.mark.parametrize(
+    ("mutation", "replacement"),
+    [
+        pytest.param(
+            "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/beignets-task-guide.png",
+            "https://evil.example.com/beignets-task-guide.png",
+            id="attacker-controlled-host",
+        ),
+        pytest.param("https://huggingface.co", "http://huggingface.co", id="plain-http"),
+        pytest.param("https://huggingface.co", "https://huggingface.co@evil.example.com", id="url-userinfo"),
+        pytest.param("resolve/main/", "resolve/main/../../", id="path-traversal"),
+        pytest.param("beignets-task-guide.png", "payload.pkl", id="non-image-suffix"),
+        pytest.param("from urllib.request import urlopen", "from urllib.request import urlopen as fetch", id="alias"),
+        pytest.param("img = Image.open(urlopen(", "img = exec(urlopen(", id="response-not-into-image-open"),
+    ],
+)
+@pytest.mark.parametrize("crlf", [False, True], ids=["lf", "crlf"])
+def test_text_scanner_documentation_image_near_matches_stay_actionable(
+    tmp_path: Path,
+    mutation: str,
+    replacement: str,
+    crlf: bool,
+) -> None:
+    example = HUGGINGFACE_DOCUMENTATION_IMAGE_EXAMPLE.replace(mutation, replacement)
+    if replacement.endswith("as fetch"):
+        example = example.replace("urlopen(\n", "fetch(\n")
+    payload = example.replace("\n", "\r\n").encode() if crlf else example.encode()
+    path = tmp_path / "README.md"
+    path.write_bytes(payload)
+
+    result = TextScanner().scan(str(path))
+
     assert result.success is False
     assert any(
         check.details.get("function") == "urlopen" and check.severity == IssueSeverity.CRITICAL
         for check in _failed_network_detection_checks(result)
     )
-    assert determine_exit_code(aggregate) == 1
 
 
-def _trust_exact_huggingface_documentation_example(
-    monkeypatch: pytest.MonkeyPatch,
-    *,
-    crlf: bool = False,
-) -> bytes:
-    payload = HUGGINGFACE_DOCUMENTATION_IMAGE_EXAMPLE.encode()
-    if crlf:
-        payload = payload.replace(b"\n", b"\r\n")
-    monkeypatch.setattr(
-        text_scanner_module,
-        "VERIFIED_HUGGINGFACE_DOCUMENTATION_IMAGE_READMES",
-        frozenset({(len(payload), hashlib.sha256(payload).hexdigest())}),
+@pytest.mark.parametrize(
+    "unvalidated",
+    [
+        pytest.param(
+            "```python\nfrom urllib.request import urlopen\nurlopen('https://evil.example.com/a')\n```\n",
+            id="second-malicious-fence",
+        ),
+        pytest.param("\nAlso call urlopen('https://evil.example.com') directly.\n", id="prose-urlopen"),
+        pytest.param("\n    urlopen('http://evil.example.com')\n", id="unfenced-urlopen"),
+    ],
+)
+@pytest.mark.parametrize("prepend", [False, True], ids=["appended", "prepended"])
+def test_text_scanner_documentation_image_example_does_not_cover_other_urlopen_uses(
+    tmp_path: Path,
+    unvalidated: str,
+    prepend: bool,
+) -> None:
+    """A proven fence speaks only for itself.
+
+    Suppression keys off byte position, so an unproven ``urlopen`` elsewhere in the file must
+    disable the downgrade rather than shelter behind the documented example's finding position.
+    """
+    trusted = HUGGINGFACE_DOCUMENTATION_IMAGE_EXAMPLE
+    payload = (unvalidated + trusted if prepend else trusted + unvalidated).encode()
+    path = tmp_path / "README.md"
+    path.write_bytes(payload)
+
+    result = TextScanner().scan(str(path))
+
+    assert result.success is False
+    assert any(
+        check.details.get("function") == "urlopen" and check.severity == IssueSeverity.CRITICAL
+        for check in _failed_network_detection_checks(result)
     )
-    return payload
+
+
+def _documentation_image_example_payload(*, crlf: bool = False) -> bytes:
+    payload = HUGGINGFACE_DOCUMENTATION_IMAGE_EXAMPLE.encode()
+    return payload.replace(b"\n", b"\r\n") if crlf else payload
 
 
 @pytest.mark.parametrize(
@@ -511,11 +548,10 @@ def _trust_exact_huggingface_documentation_example(
 @pytest.mark.parametrize("crlf", [False, True], ids=["lf", "crlf"])
 def test_text_scanner_verified_huggingface_image_documentation_is_informational(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
     filename: str,
     crlf: bool,
 ) -> None:
-    payload = _trust_exact_huggingface_documentation_example(monkeypatch, crlf=crlf)
+    payload = _documentation_image_example_payload(crlf=crlf)
     text_path = tmp_path / filename
     text_path.write_bytes(payload)
 
@@ -594,65 +630,94 @@ def test_text_scanner_verified_huggingface_image_documentation_is_informational(
     HUGGINGFACE_WHITELIST_POLICY_MODES,
     ids=["default", "true", "false", "string-false", "string-zero", "string-off"],
 )
-def test_text_scanner_modified_huggingface_image_documentation_fails_closed(
+def test_text_scanner_documentation_image_example_shelters_no_appended_content(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
     attack: str,
     prepend: bool,
     crlf: bool,
     whitelist_value: bool | str | None,
     _whitelist_enabled: bool,
 ) -> None:
-    trusted_payload = _trust_exact_huggingface_documentation_example(monkeypatch, crlf=crlf)
+    """Recognising the documented example must never remove a finding the payload alone produces.
+
+    The suppression is scoped to the proven fence, so concatenating other content can only ever
+    add findings. This is the invariant that matters: an attacker cannot launder unrelated
+    content by pasting the documented snippet next to it.
+
+    Note this asserts *no sheltering*, not that every attack below is detected. Several of these
+    payloads produce no TextScanner finding on their own, which this test deliberately does not
+    paper over - see the standalone-detection assertion.
+    """
+    trusted_payload = _documentation_image_example_payload(crlf=crlf)
     attack_payload = attack.replace("\n", "\r\n").encode() if crlf else attack.encode()
     payload = attack_payload + trusted_payload if prepend else trusted_payload + attack_payload
-    text_path = tmp_path / "README.md"
-    text_path.write_bytes(payload)
     config: dict[str, Any] = {} if whitelist_value is None else {"use_hf_whitelist": whitelist_value}
 
-    result = TextScanner(config).scan(str(text_path))
-    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False, **config)
+    attack_only_path = tmp_path / "attack_only" / "README.md"
+    attack_only_path.parent.mkdir()
+    attack_only_path.write_bytes(attack_payload)
+    attack_only = TextScanner(config).scan(str(attack_only_path))
+
+    combined_path = tmp_path / "combined" / "README.md"
+    combined_path.parent.mkdir()
+    combined_path.write_bytes(payload)
+    combined = TextScanner(config).scan(str(combined_path))
+    aggregate = scan_model_directory_or_file(str(combined_path), cache_enabled=False, **config)
+
+    def actionable(result: Any) -> set[tuple[Any, Any]]:
+        return {
+            (check.details.get("type"), check.details.get("function"))
+            for check in _failed_network_detection_checks(result)
+            if check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        }
 
     assert hashlib.sha256(payload).digest() != hashlib.sha256(trusted_payload).digest()
-    assert result.success is False
-    assert any(
-        check.details.get("function") == "urlopen" and check.severity == IssueSeverity.CRITICAL
-        for check in _failed_network_detection_checks(result)
-    )
-    assert determine_exit_code(aggregate) == 1
+    assert actionable(attack_only) <= actionable(combined)
+    if actionable(attack_only):
+        assert combined.success is False
+        assert determine_exit_code(aggregate) == 1
 
 
 @pytest.mark.parametrize("crlf", [False, True], ids=["lf", "crlf"])
-def test_text_scanner_same_length_modified_huggingface_image_documentation_fails_closed(
+@pytest.mark.parametrize("rename", [b"out = Image.open", b"xmg = Image.open"])
+def test_text_scanner_documentation_image_example_survives_cosmetic_rewrites(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
     crlf: bool,
+    rename: bytes,
 ) -> None:
-    trusted_payload = _trust_exact_huggingface_documentation_example(monkeypatch, crlf=crlf)
-    payload = trusted_payload.replace(b"img = Image.open", b"out = Image.open", 1)
+    """Renaming the bound variable is not an attack.
+
+    Recognition is structural, so a card that differs from any previously observed card only by
+    a local variable name stays informational instead of alerting on a benign example.
+    """
+    trusted_payload = _documentation_image_example_payload(crlf=crlf)
+    payload = trusted_payload.replace(b"img = Image.open", rename, 1)
     text_path = tmp_path / "README.md"
     text_path.write_bytes(payload)
 
     result = TextScanner().scan(str(text_path))
+    network_checks = [
+        check
+        for check in result.checks
+        if check.name == "Network Communication Detection"
+        and (check.details.get("function") == "urlopen" or check.details.get("library") == "urllib")
+    ]
 
     assert len(payload) == len(trusted_payload)
     assert hashlib.sha256(payload).digest() != hashlib.sha256(trusted_payload).digest()
-    assert result.success is False
-    assert any(
-        check.details.get("function") == "urlopen" and check.severity == IssueSeverity.CRITICAL
-        for check in _failed_network_detection_checks(result)
-    )
+    assert network_checks
+    assert all(check.severity == IssueSeverity.INFO for check in network_checks)
+    assert result.success is True
 
 
 @pytest.mark.parametrize("filename", ["README", "README.rst", "README.txt", "model_card.rst", "vocab.txt"])
 @pytest.mark.parametrize("crlf", [False, True], ids=["lf", "crlf"])
-def test_text_scanner_verified_huggingface_image_digest_does_not_weaken_non_markdown_files(
+def test_text_scanner_documentation_image_example_does_not_weaken_non_markdown_files(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
     filename: str,
     crlf: bool,
 ) -> None:
-    payload = _trust_exact_huggingface_documentation_example(monkeypatch, crlf=crlf)
+    payload = _documentation_image_example_payload(crlf=crlf)
     text_path = tmp_path / filename
     text_path.write_bytes(payload)
 

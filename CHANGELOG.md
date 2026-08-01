@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
-- Avoid false-positive network findings for three independently verified Hugging Face image-example model cards.
+- Avoid false-positive `urllib` network findings for model cards whose only `urlopen` use is the documented `Image.open(urlopen(...))` sample-image example.
 - Avoid network false positives for bounded README examples that download sample images over HTTPS from Hugging Face.
 - Prevent Windows cache identity probes from creating locked temporary files inside scanned directories.
 - Preserve locked Windows cache probes reached through directory aliases while clearing stale scan results.
