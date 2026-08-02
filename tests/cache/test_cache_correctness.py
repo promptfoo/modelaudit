@@ -1808,6 +1808,85 @@ def test_cache_identity_allows_darwin_private_var_and_tmp_aliases(tmp_path: Path
     assert ancestor_identity
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="requires Darwin vnode monitoring")
+def test_darwin_cache_identity_ignores_unrelated_sibling_churn(tmp_path: Path) -> None:
+    file_path = _make_cacheable_file(tmp_path)
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    identity = _identity_kwargs(cache, str(file_path))
+
+    (tmp_path / "unrelated.cache").write_bytes(b"unrelated")
+
+    assert cache.store_result(str(file_path), {"success": True}, **identity) is True
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="requires Darwin vnode monitoring")
+def test_darwin_cache_identity_rejects_restored_file_replacement(tmp_path: Path) -> None:
+    file_path = _make_cacheable_file(tmp_path)
+    replacement = _make_cacheable_file(tmp_path, name="replacement.cache")
+    original_backup = tmp_path / "original.cache"
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    identity = _identity_kwargs(cache, str(file_path))
+
+    file_path.replace(original_backup)
+    replacement.replace(file_path)
+    file_path.replace(replacement)
+    original_backup.replace(file_path)
+
+    assert cache.store_result(str(file_path), {"success": True}, **identity) is False
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="requires Darwin vnode monitoring")
+def test_darwin_cache_identity_rejects_restored_ancestor_replacement(tmp_path: Path) -> None:
+    model_directory = tmp_path / "models"
+    model_directory.mkdir()
+    file_path = _make_cacheable_file(model_directory)
+    replacement_directory = tmp_path / "replacement"
+    replacement_directory.mkdir()
+    _make_cacheable_file(replacement_directory)
+    original_backup = tmp_path / "original"
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    identity = _identity_kwargs(cache, str(file_path))
+
+    model_directory.replace(original_backup)
+    replacement_directory.replace(model_directory)
+    model_directory.replace(replacement_directory)
+    original_backup.replace(model_directory)
+
+    assert cache.store_result(str(file_path), {"success": True}, **identity) is False
+
+
+def test_cache_identity_selects_darwin_path_monitor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class StubDarwinPathMonitor:
+        def __init__(self, file_path: str, ancestor_identity: tuple[Any, ...]) -> None:
+            self.file_path = file_path
+            self.ancestor_identity = ancestor_identity
+            self.closed = False
+
+        def changed(self) -> bool:
+            return False
+
+        def close(self) -> None:
+            self.closed = True
+
+    file_path = _make_cacheable_file(tmp_path)
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    monkeypatch.setattr(scan_results_cache_module.sys, "platform", "darwin")
+    monkeypatch.setattr(scan_results_cache_module, "_DarwinPathMonitor", StubDarwinPathMonitor)
+
+    identity = cache.capture_file_identity(str(file_path))[-1]
+    monitor = cast(StubDarwinPathMonitor, identity.monitor)
+    assert isinstance(monitor, StubDarwinPathMonitor)
+    assert monitor.file_path == str(file_path)
+    assert monitor.ancestor_identity == tuple(identity)
+
+    cache.release_ancestor_identity(identity)
+
+    assert monitor.closed is True
+
+
 def test_cache_path_component_rejects_windows_reparse_point(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
