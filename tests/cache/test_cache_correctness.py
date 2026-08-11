@@ -5392,6 +5392,85 @@ def test_store_result_publishes_atomically_after_final_identity_check(
     assert replace_calls[0][1].is_file()
 
 
+@pytest.mark.parametrize("lookup_kind", ["path", "key"])
+def test_cache_hit_keeps_published_entry_readable_during_access_update(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    lookup_kind: str,
+) -> None:
+    file_path = _make_cacheable_file(tmp_path, name="atomic-hit.cache")
+    cache = ScanResultsCache(str(tmp_path / "scan-cache"))
+    version_context = build_cache_version_context({"timeout": 30})
+    expected = {"checks": [], "issues": [], "metadata": {}, "scanner": "test", "success": True}
+
+    assert cache.store_result(
+        str(file_path), expected, version_context=version_context, **_identity_kwargs(cache, str(file_path))
+    )
+    cache_key = cache.generate_cache_key(str(file_path), version_context=version_context)
+    assert cache_key is not None
+    cache_file_path = cache._get_cache_file_path(cache_key)
+    observed_entries: list[dict[str, Any]] = []
+    original_dump = json.dump
+
+    def observe_published_entry(value: Any, destination: Any, *args: Any, **kwargs: Any) -> None:
+        if isinstance(value, dict) and value.get("cache_key") == cache_key:
+            observed_entries.append(json.loads(cache_file_path.read_text(encoding="utf-8")))
+        original_dump(value, destination, *args, **kwargs)
+
+    monkeypatch.setattr(scan_results_cache_module.json, "dump", observe_published_entry)
+
+    if lookup_kind == "path":
+        result = cache.get_cached_result(str(file_path), version_context=version_context)
+    else:
+        result = cache.get_cached_result_by_key(cache_key, file_path=str(file_path), version_context=version_context)
+
+    assert result == expected
+    assert len(observed_entries) == 1
+    assert observed_entries[0]["scan_result"] == expected
+    assert json.loads(cache_file_path.read_text(encoding="utf-8"))["cache_metadata"]["access_count"] == 2
+
+
+@pytest.mark.parametrize("lookup_kind", ["path", "key"])
+def test_cache_hit_preserves_published_entry_when_access_update_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    lookup_kind: str,
+) -> None:
+    file_path = _make_cacheable_file(tmp_path, name="failed-hit-update.cache")
+    cache = ScanResultsCache(str(tmp_path / "scan-cache"))
+    version_context = build_cache_version_context({"timeout": 30})
+    expected = {"checks": [], "issues": [], "metadata": {}, "scanner": "test", "success": True}
+
+    assert cache.store_result(
+        str(file_path), expected, version_context=version_context, **_identity_kwargs(cache, str(file_path))
+    )
+    cache_key = cache.generate_cache_key(str(file_path), version_context=version_context)
+    assert cache_key is not None
+    cache_file_path = cache._get_cache_file_path(cache_key)
+    original_dump = json.dump
+
+    def interrupt_entry_update(value: Any, destination: Any, *args: Any, **kwargs: Any) -> None:
+        if isinstance(value, dict) and value.get("cache_key") == cache_key:
+            raise OSError("simulated interrupted cache access update")
+        original_dump(value, destination, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(scan_results_cache_module.json, "dump", interrupt_entry_update)
+        if lookup_kind == "path":
+            result = cache.get_cached_result(str(file_path), version_context=version_context)
+        else:
+            result = cache.get_cached_result_by_key(
+                cache_key,
+                file_path=str(file_path),
+                version_context=version_context,
+            )
+
+    assert result == expected
+    assert json.loads(cache_file_path.read_text(encoding="utf-8"))["scan_result"] == expected
+    assert not list(cache_file_path.parent.glob(f".{cache_file_path.name}.*.tmp"))
+    assert cache.get_cached_result(str(file_path), version_context=version_context) == expected
+
+
 def test_store_result_discards_private_entry_when_final_identity_check_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
