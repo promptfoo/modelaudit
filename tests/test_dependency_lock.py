@@ -1,5 +1,6 @@
 """Regression tests for security-sensitive dependency lock entries."""
 
+import json
 import re
 from pathlib import Path
 
@@ -11,6 +12,7 @@ except ModuleNotFoundError:  # pragma: no cover - Python 3.10 compatibility
 ROOT_DIR = Path(__file__).resolve().parents[1]
 LOCKFILE = ROOT_DIR / "uv.lock"
 ROOT_PYPROJECT = ROOT_DIR / "pyproject.toml"
+RENOVATE_CONFIG = ROOT_DIR / "renovate.json"
 PICKLESCAN_PYPROJECT = ROOT_DIR / "packages" / "modelaudit-picklescan" / "pyproject.toml"
 PATCHED_GITPYTHON_FLOOR = (3, 1, 50)
 PINNED_MATURIN_BACKEND = "maturin===1.13.3"
@@ -104,3 +106,26 @@ def test_numpy_requirements_follow_supported_python_versions() -> None:
 
     assert root_requirements == NUMPY_REQUIREMENTS
     assert extra_requirements == NUMPY_REQUIREMENTS
+
+
+def test_renovate_keeps_xgboost_compatible_with_supported_python_versions() -> None:
+    root_config = tomllib.loads(ROOT_PYPROJECT.read_text(encoding="utf-8"))
+    project = root_config["project"]
+    optional_dependencies = project["optional-dependencies"]
+    renovate_config = json.loads(RENOVATE_CONFIG.read_text(encoding="utf-8"))
+
+    assert project["requires-python"] == ">=3.10,<3.14"
+    for extra in ("xgboost", "all-ci", "all"):
+        xgboost_requirements = [
+            requirement for requirement in optional_dependencies[extra] if requirement.startswith("xgboost")
+        ]
+        assert xgboost_requirements == ["xgboost>=3.2,<3.3"]
+
+    compatibility_rules = [
+        rule for rule in renovate_config["packageRules"] if "xgboost" in rule.get("matchPackageNames", [])
+    ]
+
+    assert len(compatibility_rules) == 1
+    assert compatibility_rules[0]["matchManagers"] == ["pep621"]
+    assert compatibility_rules[0]["matchFileNames"] == ["pyproject.toml"]
+    assert compatibility_rules[0]["allowedVersions"] == "<3.3"

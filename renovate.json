@@ -19,6 +19,13 @@
       "allowedVersions": "<2.5"
     },
     {
+      "description": "Keep XGBoost compatible with supported Python 3.10 and 3.11 runtimes.",
+      "matchFileNames": ["pyproject.toml"],
+      "matchManagers": ["pep621"],
+      "matchPackageNames": ["xgboost"],
+      "allowedVersions": "<3.3"
+    },
+    {
       "description": "Keep Python updates within the project's supported 3.10-3.13 range.",
       "matchPackageNames": ["python"],
       "allowedVersions": "<3.14"
