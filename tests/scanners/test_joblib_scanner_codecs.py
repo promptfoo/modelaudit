@@ -18,7 +18,7 @@ from unittest.mock import patch
 
 import modelaudit_picklescan.api as picklescan_api
 import pytest
-from modelaudit_picklescan.call_graph import _clear_source_sensitive_caches
+from modelaudit_picklescan.call_graph import _CallGraphAnalysisLimitError, _clear_source_sensitive_caches
 
 from modelaudit.cache.cache_policy import should_cache_scan_result
 from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
@@ -1336,14 +1336,39 @@ def test_scan_accepts_lzma_compressed_numpy_array_payload(tmp_path: Path) -> Non
 
 
 @pytest.mark.parametrize("raw_seed", [b"builtins", b"os.system", b"subprocess", b"pickle.loads"])
-def test_scan_accepts_security_like_bytes_inside_numpy_array(tmp_path: Path, raw_seed: bytes) -> None:
+@pytest.mark.parametrize("source_snapshot_changes", [False, True], ids=["stable-source", "changed-source"])
+def test_scan_accepts_security_like_bytes_inside_numpy_array(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    raw_seed: bytes,
+    source_snapshot_changes: bool,
+) -> None:
+    if source_snapshot_changes:
+
+        def raise_source_stability_error(_report_generation: int | None) -> None:
+            raise _CallGraphAnalysisLimitError("source changed during shared call-graph analysis")
+
+        monkeypatch.setattr(picklescan_api, "_ensure_shared_source_snapshot_stable", raise_source_stability_error)
+
     raw_data = raw_seed.ljust(32, b"\x00")
     payload = _joblib_numpy_list_payload(raw_data=raw_data, shape=len(raw_data), dtype="u1")
 
     result = _scan_payload(tmp_path, payload, "benign_security_like_array_bytes.joblib")
 
-    assert result.success is True
-    assert result.metadata["trusted_incomplete_tail"] is True
+    if result.success:
+        assert source_snapshot_changes is False
+        assert result.metadata["trusted_incomplete_tail"] is True
+    else:
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert result.metadata["analysis_incomplete"] is True
+        assert result.metadata["operational_error_reason"] == "call_graph_analysis_error"
+        assert "trusted_incomplete_tail" not in result.metadata
+        assert any(
+            issue.details.get("category") == "call_graph_analysis_error"
+            and issue.details.get("analysis") == "python_call_graph_source_stability"
+            and issue.details.get("analysis_incomplete") is True
+            for issue in result.issues
+        )
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
 
