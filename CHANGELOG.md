@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- Upgrade Debian util-linux packages in all Docker runtime images to remediate CVE-2026-53615.
+
 ### Bug Fixes
 
 - Avoid network false positives for bounded README examples that download sample images over HTTPS from Hugging Face.
