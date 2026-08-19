@@ -10868,20 +10868,27 @@ def test_scan_bytes_keeps_allowlisted_import_only_global_clean() -> None:
         (b"cexceptions\nWindowsError\n.", "exceptions.WindowsError"),
     ],
 )
-def test_scan_bytes_keeps_legacy_python_two_globals_clean(payload: bytes, import_reference: str) -> None:
+@pytest.mark.parametrize("source_changed", [False, True], ids=["stable-source", "changed-source"])
+def test_scan_bytes_keeps_legacy_python_two_globals_clean(
+    payload: bytes,
+    import_reference: str,
+    source_changed: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if source_changed:
+
+        def raise_source_stability_error(_report_generation: int | None) -> None:
+            raise _CallGraphAnalysisLimitError("source changed during shared call-graph analysis")
+
+        monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", raise_source_stability_error)
+
     report = scan_bytes(payload, source="legacy-python-two-global.pkl")
 
-    if import_reference == "exceptions.ValueError" and report.status == ScanStatus.INCONCLUSIVE:
-        assert report.metadata.get("analysis_incomplete") is True
-        assert any(
-            error.message
-            == "Python call-graph analysis could not complete: source changed during shared call-graph analysis"
-            and error.category == "call_graph_analysis_error"
-            and error.exception_type == "_CallGraphAnalysisLimitError"
-            and error.details.get("analysis") == "python_call_graph_source_stability"
-            and error.details.get("analysis_incomplete") is True
-            for error in report.errors
-        )
+    if source_changed:
+        assert report.status == ScanStatus.INCONCLUSIVE
+
+    if report.status == ScanStatus.INCONCLUSIVE:
+        _assert_call_graph_source_stability_error(report)
         assert report.verdict == SafetyVerdict.UNKNOWN
     else:
         assert report.status == ScanStatus.COMPLETE
