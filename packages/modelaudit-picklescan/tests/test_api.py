@@ -10875,19 +10875,16 @@ def test_scan_bytes_keeps_legacy_python_two_globals_clean(
     source_changed: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    if source_changed:
-
-        def raise_source_stability_error(_report_generation: int | None) -> None:
+    def verify_source_stability(_report_generation: int | None) -> None:
+        if source_changed:
             raise _CallGraphAnalysisLimitError("source changed during shared call-graph analysis")
 
-        monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", raise_source_stability_error)
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", verify_source_stability)
 
     report = scan_bytes(payload, source="legacy-python-two-global.pkl")
 
     if source_changed:
         assert report.status == ScanStatus.INCONCLUSIVE
-
-    if report.status == ScanStatus.INCONCLUSIVE:
         _assert_call_graph_source_stability_error(report)
         assert report.verdict == SafetyVerdict.UNKNOWN
     else:
