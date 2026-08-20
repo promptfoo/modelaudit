@@ -269,6 +269,7 @@ def test_organized_asset_scans_reject_mixed_archive_member_errors(
         "marker-only-error",
         "directory-coverage-error",
         "interrupted-scan",
+        "total-size-limit",
     ],
 )
 def test_organized_asset_scans_reject_unexpected_operational_errors(
@@ -304,7 +305,13 @@ def test_organized_asset_scans_reject_unexpected_operational_errors(
 
         monkeypatch.setattr(core_module, "scan_file", fail_secondary_file)
 
-    result = scan_model_directory_or_file(str(scan_target), cache_enabled=False)
+    if unexpected_error == "total-size-limit":
+        asset_path = tmp_path / "agpl_model.pkl"
+        scan_target = tmp_path
+        shutil.copy2(AGPL_ASSET, asset_path)
+        result = scan_model_directory_or_file(str(scan_target), cache_enabled=False, max_total_size=1)
+    else:
+        result = scan_model_directory_or_file(str(scan_target), cache_enabled=False)
     metadata = result.file_metadata[str(asset_path)]
     assert metadata.model_extra is not None
 
@@ -350,6 +357,11 @@ def test_organized_asset_scans_reject_unexpected_operational_errors(
                     "scan_outcome_reason": "directory_entry_unavailable",
                 },
             )
+        )
+    elif unexpected_error == "total-size-limit":
+        assert any(
+            issue.details.get("max_total_size") == 1 and issue.details.get("analysis_incomplete") is True
+            for issue in result.issues
         )
     else:
         result.issues.append(

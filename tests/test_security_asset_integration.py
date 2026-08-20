@@ -99,8 +99,7 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
             or details.get("interrupted") is True
             or (
                 details.get("analysis_incomplete") is True
-                and "scan_outcome_reason" in details
-                and not has_known_location
+                and ("max_total_size" in details or ("scan_outcome_reason" in details and not has_known_location))
             )
         ):
             unexpected_errors.add(location)
