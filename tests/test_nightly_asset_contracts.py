@@ -302,6 +302,46 @@ def test_organized_asset_scans_reject_mixed_archive_member_timeouts(
         "test_performance_with_organized_structure",
     ],
 )
+def test_organized_asset_scans_reject_mixed_archive_scanner_errors(
+    integration_test: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def raise_source_stability_error(_report_generation: int | None) -> None:
+        raise _CallGraphAnalysisLimitError("source changed during shared call-graph analysis")
+
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", raise_source_stability_error)
+    archive_path = tmp_path / "msgpack-limit.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("weights.msgpack", b"\x81\xa6params\x80" * 2)
+        archive.write(AGPL_ASSET, "model.pkl")
+
+    result = scan_model_directory_or_file(str(archive_path), cache_enabled=False, max_msgpack_stream_objects=1)
+    assert any(
+        issue.location == f"{archive_path}:weights.msgpack"
+        and issue.rule_code == "S902"
+        and issue.details.get("max_msgpack_stream_objects") == 1
+        for issue in result.issues
+    )
+
+    monkeypatch.setattr(
+        test_security_asset_integration,
+        "scan_model_directory_or_file",
+        lambda *_args, **_kwargs: result,
+    )
+
+    test_case = test_security_asset_integration.TestSecurityAssetIntegration()
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        getattr(test_case, integration_test)(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "integration_test",
+    [
+        "test_asset_discovery_completeness",
+        "test_performance_with_organized_structure",
+    ],
+)
 @pytest.mark.parametrize("coverage_case", ["unavailable-scanner", "nested-routing"])
 def test_organized_asset_scans_preserve_coverage_only_outcomes(
     integration_test: str,
