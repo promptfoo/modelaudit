@@ -43,22 +43,35 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
         return
 
     expected_source_changes = set()
-    unexpected_errors = set()
+    unexpected_errors = {asset.path for asset in results.assets if asset.type == "error"}
+    unexpected_errors.update(
+        issue.location or "unknown scan location"
+        for issue in results.issues
+        if issue.details.get("exception_type")
+        and not issue.details.get("pickle_source")
+        and issue.details.get("category") != "parse_error"
+    )
     for path, metadata in results.file_metadata.items():
         payload = metadata.model_dump(exclude_none=True)
         if not payload.get("operational_error"):
             continue
 
-        has_source_stability_diagnostic = any(
+        operational_diagnostics = [
+            issue
+            for issue in results.issues
+            if issue.details.get("pickle_source") == path
+            and issue.details.get("category") not in {None, "parse_error"}
+            and "exception_type" in issue.details
+        ]
+        has_only_source_stability_diagnostics = bool(operational_diagnostics) and all(
             issue.location == path
             and issue.message
             == "Python call-graph analysis could not complete: source changed during shared call-graph analysis"
-            and issue.details.get("pickle_source") == path
             and issue.details.get("category") == "call_graph_analysis_error"
             and issue.details.get("exception_type") == "_CallGraphAnalysisLimitError"
             and issue.details.get("analysis") == "python_call_graph_source_stability"
             and issue.details.get("analysis_incomplete") is True
-            for issue in results.issues
+            for issue in operational_diagnostics
         )
         if (
             payload.get("operational_error_reason") == "call_graph_analysis_error"
@@ -67,7 +80,7 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
             and "call_graph_analysis_error" in payload.get("scan_outcome_reasons", [])
             and payload.get("pickle_report_status") == "inconclusive"
             and payload.get("pickle_verdict") in {"unknown", "suspicious", "malicious"}
-            and has_source_stability_diagnostic
+            and has_only_source_stability_diagnostics
         ):
             expected_source_changes.add(path)
         else:

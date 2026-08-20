@@ -1,14 +1,18 @@
 """Coverage contracts for committed assets consumed by Nightly scans."""
 
+import shutil
 from pathlib import Path
+from typing import Any
 
 import modelaudit_picklescan.api as package_api
 import pytest
 from modelaudit_picklescan.call_graph import _CallGraphAnalysisLimitError
 
+import modelaudit.core as core_module
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.core_results import results_have_inconclusive_outcome
 from modelaudit.models import ModelAuditResultModel
+from modelaudit.scanner_results import ScanResult
 from tests import test_security_asset_integration
 
 ASSETS = Path(__file__).parent / "assets" / "samples" / "pickles"
@@ -147,7 +151,10 @@ def test_organized_asset_scans_preserve_fail_closed_source_stability(
         "test_performance_with_organized_structure",
     ],
 )
-@pytest.mark.parametrize("unexpected_error", ["different-category", "different-analysis", "clean-verdict"])
+@pytest.mark.parametrize(
+    "unexpected_error",
+    ["different-category", "different-analysis", "clean-verdict", "additional-analysis", "issue-only-error"],
+)
 def test_organized_asset_scans_reject_unexpected_operational_errors(
     integration_test: str,
     unexpected_error: str,
@@ -158,8 +165,31 @@ def test_organized_asset_scans_reject_unexpected_operational_errors(
         raise _CallGraphAnalysisLimitError("source changed during shared call-graph analysis")
 
     monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", raise_source_stability_error)
-    result = scan_model_directory_or_file(str(AGPL_ASSET), cache_enabled=False)
-    metadata = result.file_metadata[str(AGPL_ASSET)]
+
+    asset_path = AGPL_ASSET
+    scan_target = AGPL_ASSET
+    if unexpected_error == "additional-analysis":
+
+        def raise_unexpected_call_graph_error(*_args: object, **_kwargs: object) -> None:
+            raise RuntimeError("independent call-graph regression")
+
+        monkeypatch.setattr(package_api, "find_dangerous_call_graphs", raise_unexpected_call_graph_error)
+    elif unexpected_error == "issue-only-error":
+        asset_path = tmp_path / "agpl_model.pkl"
+        scan_target = tmp_path
+        shutil.copy2(AGPL_ASSET, asset_path)
+        shutil.copy2(ASSETS / "safe_data.pkl", tmp_path / "safe_data.pkl")
+        real_scan_file = core_module.scan_file
+
+        def fail_secondary_file(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+            if Path(path).name == "safe_data.pkl":
+                raise RuntimeError("independent scanner regression")
+            return real_scan_file(path, config)
+
+        monkeypatch.setattr(core_module, "scan_file", fail_secondary_file)
+
+    result = scan_model_directory_or_file(str(scan_target), cache_enabled=False)
+    metadata = result.file_metadata[str(asset_path)]
     assert metadata.model_extra is not None
 
     if unexpected_error == "different-category":
@@ -167,8 +197,17 @@ def test_organized_asset_scans_reject_unexpected_operational_errors(
     elif unexpected_error == "different-analysis":
         issue = next(issue for issue in result.issues if issue.details.get("category") == "call_graph_analysis_error")
         issue.details["analysis"] = "python_call_graph"
-    else:
+    elif unexpected_error == "clean-verdict":
         metadata.model_extra["pickle_verdict"] = "clean"
+    elif unexpected_error == "additional-analysis":
+        assert {
+            issue.details.get("analysis")
+            for issue in result.issues
+            if issue.details.get("category") == "call_graph_analysis_error"
+        } == {"python_call_graph", "python_call_graph_source_stability"}
+    else:
+        assert str(tmp_path / "safe_data.pkl") not in result.file_metadata
+        assert any(issue.message == "Error scanning file: independent scanner regression" for issue in result.issues)
 
     monkeypatch.setattr(
         test_security_asset_integration,
