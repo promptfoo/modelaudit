@@ -1,6 +1,7 @@
 """Coverage contracts for committed assets consumed by Nightly scans."""
 
 import shutil
+import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -12,7 +13,7 @@ import modelaudit.core as core_module
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.core_results import results_have_inconclusive_outcome
 from modelaudit.models import ModelAuditResultModel
-from modelaudit.scanner_results import ScanResult
+from modelaudit.scanner_results import Issue, IssueSeverity, ScanResult
 from tests import test_security_asset_integration
 
 ASSETS = Path(__file__).parent / "assets" / "samples" / "pickles"
@@ -151,9 +152,62 @@ def test_organized_asset_scans_preserve_fail_closed_source_stability(
         "test_performance_with_organized_structure",
     ],
 )
+def test_organized_asset_scans_preserve_embedded_source_stability(
+    integration_test: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def raise_source_stability_error(_report_generation: int | None) -> None:
+        raise _CallGraphAnalysisLimitError("source changed during shared call-graph analysis")
+
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", raise_source_stability_error)
+    archive_path = tmp_path / "nested.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.write(AGPL_ASSET, "model.pkl")
+
+    result = scan_model_directory_or_file(str(archive_path), cache_enabled=False)
+    metadata = result.file_metadata[str(archive_path)].model_dump(exclude_none=True)
+
+    assert result.has_errors is True
+    assert result.success is False
+    assert determine_exit_code(result) == 2
+    assert metadata["operational_error_reason"] == "call_graph_analysis_error"
+    assert metadata["pickle_source"] != str(archive_path)
+    assert any(
+        issue.location == f"{archive_path}:model.pkl"
+        and issue.details.get("pickle_source") == metadata["pickle_source"]
+        and issue.details.get("analysis") == "python_call_graph_source_stability"
+        for issue in result.issues
+    )
+
+    monkeypatch.setattr(
+        test_security_asset_integration,
+        "scan_model_directory_or_file",
+        lambda *_args, **_kwargs: result,
+    )
+
+    test_case = test_security_asset_integration.TestSecurityAssetIntegration()
+    getattr(test_case, integration_test)(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "integration_test",
+    [
+        "test_asset_discovery_completeness",
+        "test_performance_with_organized_structure",
+    ],
+)
 @pytest.mark.parametrize(
     "unexpected_error",
-    ["different-category", "different-analysis", "clean-verdict", "additional-analysis", "issue-only-error"],
+    [
+        "different-category",
+        "different-analysis",
+        "clean-verdict",
+        "additional-analysis",
+        "issue-only-error",
+        "marker-only-error",
+        "directory-coverage-error",
+    ],
 )
 def test_organized_asset_scans_reject_unexpected_operational_errors(
     integration_test: str,
@@ -205,9 +259,36 @@ def test_organized_asset_scans_reject_unexpected_operational_errors(
             for issue in result.issues
             if issue.details.get("category") == "call_graph_analysis_error"
         } == {"python_call_graph", "python_call_graph_source_stability"}
-    else:
+    elif unexpected_error == "issue-only-error":
         assert str(tmp_path / "safe_data.pkl") not in result.file_metadata
         assert any(issue.message == "Error scanning file: independent scanner regression" for issue in result.issues)
+    elif unexpected_error == "marker-only-error":
+        result.issues.append(
+            Issue(
+                message="Special directory entry could not be scanned",
+                severity=IssueSeverity.INFO,
+                location=str(tmp_path / "unscanned-special-file"),
+                details={
+                    "analysis_incomplete": True,
+                    "operational_error": True,
+                    "scan_outcome": "inconclusive",
+                    "scan_outcome_reason": "directory_special_file_unscanned",
+                },
+            )
+        )
+    else:
+        result.issues.append(
+            Issue(
+                message="Broken symlink encountered",
+                severity=IssueSeverity.INFO,
+                location=str(tmp_path / "unavailable-directory-entry"),
+                details={
+                    "analysis_incomplete": True,
+                    "scan_outcome": "inconclusive",
+                    "scan_outcome_reason": "directory_entry_unavailable",
+                },
+            )
+        )
 
     monkeypatch.setattr(
         test_security_asset_integration,

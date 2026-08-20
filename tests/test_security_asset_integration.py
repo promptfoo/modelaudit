@@ -47,24 +47,33 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
     unexpected_errors.update(
         issue.location or "unknown scan location"
         for issue in results.issues
-        if issue.details.get("exception_type")
-        and not issue.details.get("pickle_source")
+        if not issue.details.get("pickle_source")
         and issue.details.get("category") != "parse_error"
+        and (
+            issue.details.get("exception_type")
+            or issue.details.get("operational_error") is True
+            or (
+                issue.details.get("analysis_incomplete") is True
+                and issue.details.get("scan_outcome") == "inconclusive"
+                and issue.location not in results.file_metadata
+            )
+        )
     )
     for path, metadata in results.file_metadata.items():
         payload = metadata.model_dump(exclude_none=True)
         if not payload.get("operational_error"):
             continue
 
+        pickle_source = payload.get("pickle_source", path)
         operational_diagnostics = [
             issue
             for issue in results.issues
-            if issue.details.get("pickle_source") == path
+            if issue.details.get("pickle_source") == pickle_source
             and issue.details.get("category") not in {None, "parse_error"}
             and "exception_type" in issue.details
         ]
         has_only_source_stability_diagnostics = bool(operational_diagnostics) and all(
-            issue.location == path
+            (issue.location == path or bool(issue.location and issue.location.startswith(f"{path}:")))
             and issue.message
             == "Python call-graph analysis could not complete: source changed during shared call-graph analysis"
             and issue.details.get("category") == "call_graph_analysis_error"
