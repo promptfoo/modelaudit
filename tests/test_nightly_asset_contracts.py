@@ -158,7 +158,7 @@ def test_organized_asset_scans_preserve_fail_closed_source_stability(
         "test_performance_with_organized_structure",
     ],
 )
-def test_organized_asset_scans_preserve_embedded_source_stability(
+def test_organized_asset_scans_reject_embedded_source_stability(
     integration_test: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -193,7 +193,40 @@ def test_organized_asset_scans_preserve_embedded_source_stability(
     )
 
     test_case = test_security_asset_integration.TestSecurityAssetIntegration()
-    getattr(test_case, integration_test)(tmp_path)
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        getattr(test_case, integration_test)(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "integration_test",
+    [
+        "test_asset_discovery_completeness",
+        "test_performance_with_organized_structure",
+    ],
+)
+def test_organized_asset_scans_reject_source_changes_outside_agpl_fixture(
+    integration_test: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def raise_source_stability_error(_report_generation: int | None) -> None:
+        raise _CallGraphAnalysisLimitError("source changed during shared call-graph analysis")
+
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", raise_source_stability_error)
+    other_pickle = tmp_path / "other.pkl"
+    shutil.copy2(AGPL_ASSET, other_pickle)
+    result = scan_model_directory_or_file(str(other_pickle), cache_enabled=False)
+    assert any(issue.rule_code == "S204" for issue in result.issues)
+
+    monkeypatch.setattr(
+        test_security_asset_integration,
+        "scan_model_directory_or_file",
+        lambda *_args, **_kwargs: result,
+    )
+
+    test_case = test_security_asset_integration.TestSecurityAssetIntegration()
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        getattr(test_case, integration_test)(tmp_path)
 
 
 @pytest.mark.parametrize(
@@ -439,8 +472,8 @@ def test_organized_asset_scans_preserve_coverage_only_outcomes(
                 "ambiguous.txt",
                 "<?xml version='1.0'?><!--" + "x" * (1024 * 1024 + 64) + "--><PMML version='4.4'></PMML>",
             )
-            archive.write(AGPL_ASSET, "model.pkl")
-        result = scan_model_directory_or_file(str(archive_path), cache_enabled=False)
+        shutil.copy2(AGPL_ASSET, tmp_path / "agpl_model.pkl")
+        result = scan_model_directory_or_file(str(tmp_path), cache_enabled=False)
         archive_metadata = result.file_metadata[str(archive_path)].model_dump(exclude_none=True)
         assert "xml_model_routing_incomplete" in archive_metadata["scan_outcome_reasons"]
     else:

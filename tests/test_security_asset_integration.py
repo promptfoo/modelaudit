@@ -54,7 +54,8 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
             continue
 
         if (
-            payload.get("operational_error_reason") == "call_graph_analysis_error"
+            Path(path).name == "agpl_model.pkl"
+            and payload.get("operational_error_reason") == "call_graph_analysis_error"
             and payload.get("analysis_incomplete") is True
             and payload.get("scan_outcome") == "inconclusive"
             and "call_graph_analysis_error" in payload.get("scan_outcome_reasons", [])
@@ -75,9 +76,7 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
         if category == "call_graph_analysis_error" or (
             pickle_source and category not in {None, "parse_error"} and "exception_type" in details
         ):
-            matching_paths = {
-                path for path in expected_source_changes if location == path or location.startswith(f"{path}:")
-            }
+            matching_paths = {path for path in expected_source_changes if location == path}
             if (
                 matching_paths
                 and pickle_source
