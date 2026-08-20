@@ -114,6 +114,7 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
             (nested_scan_budget_failure and not coverage_only_diagnostic)
             or details.get("exception_type")
             or details.get("error_type")
+            or ("timeout" in details and "error" in details)
             or details.get("operational_error") is True
             or details.get("interrupted") is True
             or (

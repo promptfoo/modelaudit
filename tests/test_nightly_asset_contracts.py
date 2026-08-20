@@ -262,8 +262,10 @@ def test_organized_asset_scans_reject_mixed_archive_member_errors(
         "test_performance_with_organized_structure",
     ],
 )
+@pytest.mark.parametrize("timeout_source", ["manifest-scanner", "core-wrapper"])
 def test_organized_asset_scans_reject_mixed_archive_member_timeouts(
     integration_test: str,
+    timeout_source: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -274,18 +276,30 @@ def test_organized_asset_scans_reject_mixed_archive_member_timeouts(
         raise TimeoutError("independent manifest timeout")
 
     monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", raise_source_stability_error)
-    monkeypatch.setattr(ManifestScanner, "_check_timeout", raise_manifest_timeout)
+    monkeypatch.setattr(
+        ManifestScanner,
+        "_check_timeout" if timeout_source == "manifest-scanner" else "scan",
+        raise_manifest_timeout,
+    )
     archive_path = tmp_path / "manifest-timeout.zip"
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.writestr("config.json", '{"model_type":"bert"}')
         archive.write(AGPL_ASSET, "model.pkl")
 
     result = scan_model_directory_or_file(str(archive_path), cache_enabled=False)
-    assert any(
-        issue.location == f"{archive_path}:config.json"
-        and issue.details.get("scan_outcome_reason") == "manifest_scan_timeout"
-        for issue in result.issues
-    )
+    if timeout_source == "manifest-scanner":
+        assert any(
+            issue.location == f"{archive_path}:config.json"
+            and issue.details.get("scan_outcome_reason") == "manifest_scan_timeout"
+            for issue in result.issues
+        )
+    else:
+        assert any(
+            issue.location == f"{archive_path}:config.json"
+            and "timeout" in issue.details
+            and issue.details.get("error") == "independent manifest timeout"
+            for issue in result.issues
+        )
 
     monkeypatch.setattr(
         test_security_asset_integration,
