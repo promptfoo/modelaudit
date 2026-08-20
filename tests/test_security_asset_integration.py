@@ -38,6 +38,48 @@ def describe_operational_errors(results: ModelAuditResultModel) -> str:
     return "; ".join(sorted(offenders)) or "no per-file operational_error metadata recorded"
 
 
+def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_description: str) -> None:
+    if not results.has_errors:
+        return
+
+    expected_source_changes = set()
+    unexpected_errors = set()
+    for path, metadata in results.file_metadata.items():
+        payload = metadata.model_dump(exclude_none=True)
+        if not payload.get("operational_error"):
+            continue
+
+        has_source_stability_diagnostic = any(
+            issue.location == path
+            and issue.message
+            == "Python call-graph analysis could not complete: source changed during shared call-graph analysis"
+            and issue.details.get("pickle_source") == path
+            and issue.details.get("category") == "call_graph_analysis_error"
+            and issue.details.get("exception_type") == "_CallGraphAnalysisLimitError"
+            and issue.details.get("analysis") == "python_call_graph_source_stability"
+            and issue.details.get("analysis_incomplete") is True
+            for issue in results.issues
+        )
+        if (
+            payload.get("operational_error_reason") == "call_graph_analysis_error"
+            and payload.get("analysis_incomplete") is True
+            and payload.get("scan_outcome") == "inconclusive"
+            and "call_graph_analysis_error" in payload.get("scan_outcome_reasons", [])
+            and payload.get("pickle_report_status") == "inconclusive"
+            and payload.get("pickle_verdict") in {"unknown", "suspicious", "malicious"}
+            and has_source_stability_diagnostic
+        ):
+            expected_source_changes.add(path)
+        else:
+            unexpected_errors.add(path)
+
+    assert expected_source_changes and not unexpected_errors, (
+        f"{scan_description} should not have unexpected operational errors: {describe_operational_errors(results)}"
+    )
+    assert results.success is False, f"{scan_description} must fail closed when source stability changes"
+    assert determine_exit_code(results) == 2, f"{scan_description} must preserve its operational-error exit code"
+
+
 class TestSecurityAssetIntegration:
     """Integration tests for security assets using organized structure."""
 
@@ -432,9 +474,7 @@ class TestSecurityAssetIntegration:
 
         # Should find various file types
         assert results.files_scanned > 0, "Should find some files to scan"
-        assert results.has_errors is False, (
-            f"Assets directory scan should not have operational errors: {describe_operational_errors(results)}"
-        )
+        assert_no_unexpected_asset_scan_errors(results, "Assets directory scan")
         assert len(results.issues) > 0, "Assets tree contains exploits; findings expected"
 
         # Check for different file extensions in issues (indicates they were processed)
@@ -473,9 +513,7 @@ class TestSecurityAssetIntegration:
         # so success is expected to be False; assert the scan ran and produced
         # findings rather than demanding success on malicious inputs.
         assert results.files_scanned > 0, "Performance test scan should process files"
-        assert results.has_errors is False, (
-            f"Performance test scan should not have operational errors: {describe_operational_errors(results)}"
-        )
+        assert_no_unexpected_asset_scan_errors(results, "Performance test scan")
         assert len(results.issues) > 0, "Assets tree contains exploits; findings expected"
         is_ci = bool(os.getenv("CI") or os.getenv("GITHUB_ACTIONS"))
         threshold = 120 if is_ci else 60
