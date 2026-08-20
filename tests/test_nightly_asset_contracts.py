@@ -11,8 +11,8 @@ from modelaudit_picklescan.call_graph import _CallGraphAnalysisLimitError
 
 import modelaudit.core as core_module
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
-from modelaudit.core_results import results_have_inconclusive_outcome
-from modelaudit.models import ModelAuditResultModel
+from modelaudit.core_results import metadata_has_coverage_only_operational_error, results_have_inconclusive_outcome
+from modelaudit.models import FileMetadataModel, ModelAuditResultModel
 from modelaudit.scanner_results import Issue, IssueSeverity, ScanResult
 from tests import test_security_asset_integration
 
@@ -258,12 +258,66 @@ def test_organized_asset_scans_reject_mixed_archive_member_errors(
         "test_performance_with_organized_structure",
     ],
 )
+@pytest.mark.parametrize("coverage_case", ["unavailable-scanner", "nested-routing"])
+def test_organized_asset_scans_preserve_coverage_only_outcomes(
+    integration_test: str,
+    coverage_case: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def raise_source_stability_error(_report_generation: int | None) -> None:
+        raise _CallGraphAnalysisLimitError("source changed during shared call-graph analysis")
+
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", raise_source_stability_error)
+
+    if coverage_case == "nested-routing":
+        archive_path = tmp_path / "mixed-routing.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr(
+                "ambiguous.txt",
+                "<?xml version='1.0'?><!--" + "x" * (1024 * 1024 + 64) + "--><PMML version='4.4'></PMML>",
+            )
+            archive.write(AGPL_ASSET, "model.pkl")
+        result = scan_model_directory_or_file(str(archive_path), cache_enabled=False)
+        archive_metadata = result.file_metadata[str(archive_path)].model_dump(exclude_none=True)
+        assert "xml_model_routing_incomplete" in archive_metadata["scan_outcome_reasons"]
+    else:
+        result = scan_model_directory_or_file(str(AGPL_ASSET), cache_enabled=False)
+        coverage_metadata = FileMetadataModel(
+            operational_error=True,
+            operational_error_reason="recognized_format_scanner_unavailable",
+            analysis_incomplete=True,
+            scan_outcome="inconclusive",
+            scan_outcome_reasons=["recognized_format_scanner_unavailable"],
+        )
+        assert metadata_has_coverage_only_operational_error(coverage_metadata) is True
+        result.file_metadata[str(tmp_path / "missing.keras")] = coverage_metadata
+
+    monkeypatch.setattr(
+        test_security_asset_integration,
+        "scan_model_directory_or_file",
+        lambda *_args, **_kwargs: result,
+    )
+
+    test_case = test_security_asset_integration.TestSecurityAssetIntegration()
+    getattr(test_case, integration_test)(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "integration_test",
+    [
+        "test_asset_discovery_completeness",
+        "test_performance_with_organized_structure",
+    ],
+)
 @pytest.mark.parametrize(
     "unexpected_error",
     [
         "different-category",
         "different-analysis",
         "clean-verdict",
+        "unknown-verdict",
+        "missing-security-signal",
         "additional-analysis",
         "issue-only-error",
         "marker-only-error",
@@ -322,6 +376,10 @@ def test_organized_asset_scans_reject_unexpected_operational_errors(
         issue.details["analysis"] = "python_call_graph"
     elif unexpected_error == "clean-verdict":
         metadata.model_extra["pickle_verdict"] = "clean"
+    elif unexpected_error == "unknown-verdict":
+        metadata.model_extra["pickle_verdict"] = "unknown"
+    elif unexpected_error == "missing-security-signal":
+        result.issues = [issue for issue in result.issues if issue.rule_code != "S204"]
     elif unexpected_error == "additional-analysis":
         assert {
             issue.details.get("analysis")

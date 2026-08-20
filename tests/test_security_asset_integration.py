@@ -17,6 +17,7 @@ from click.testing import CliRunner
 
 from modelaudit.cli import cli
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.core_results import metadata_has_coverage_only_operational_error
 from modelaudit.models import ModelAuditResultModel
 from modelaudit.scanners.base import IssueSeverity
 
@@ -43,10 +44,13 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
         return
 
     expected_source_changes = set()
+    security_finding_locations = {
+        issue.location for issue in results.issues if issue.rule_code == "S204" and issue.location is not None
+    }
     unexpected_errors = {asset.path for asset in results.assets if asset.type == "error"}
     for path, metadata in results.file_metadata.items():
         payload = metadata.model_dump(exclude_none=True)
-        if not payload.get("operational_error"):
+        if not payload.get("operational_error") or metadata_has_coverage_only_operational_error(payload):
             continue
 
         if (
@@ -55,7 +59,7 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
             and payload.get("scan_outcome") == "inconclusive"
             and "call_graph_analysis_error" in payload.get("scan_outcome_reasons", [])
             and payload.get("pickle_report_status") == "inconclusive"
-            and payload.get("pickle_verdict") in {"unknown", "suspicious", "malicious"}
+            and payload.get("pickle_verdict") == "malicious"
         ):
             expected_source_changes.add(path)
         else:
@@ -83,6 +87,10 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
                 and details.get("exception_type") == "_CallGraphAnalysisLimitError"
                 and details.get("analysis") == "python_call_graph_source_stability"
                 and details.get("analysis_incomplete") is True
+                and any(
+                    finding_location == location or finding_location.startswith(f"{location} (")
+                    for finding_location in security_finding_locations
+                )
             ):
                 diagnosed_source_changes.update(matching_paths)
             else:
