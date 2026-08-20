@@ -44,44 +44,11 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
 
     expected_source_changes = set()
     unexpected_errors = {asset.path for asset in results.assets if asset.type == "error"}
-    unexpected_errors.update(
-        issue.location or "unknown scan location"
-        for issue in results.issues
-        if not issue.details.get("pickle_source")
-        and issue.details.get("category") != "parse_error"
-        and (
-            issue.details.get("exception_type")
-            or issue.details.get("operational_error") is True
-            or (
-                issue.details.get("analysis_incomplete") is True
-                and issue.details.get("scan_outcome") == "inconclusive"
-                and issue.location not in results.file_metadata
-            )
-        )
-    )
     for path, metadata in results.file_metadata.items():
         payload = metadata.model_dump(exclude_none=True)
         if not payload.get("operational_error"):
             continue
 
-        pickle_source = payload.get("pickle_source", path)
-        operational_diagnostics = [
-            issue
-            for issue in results.issues
-            if issue.details.get("pickle_source") == pickle_source
-            and issue.details.get("category") not in {None, "parse_error"}
-            and "exception_type" in issue.details
-        ]
-        has_only_source_stability_diagnostics = bool(operational_diagnostics) and all(
-            (issue.location == path or bool(issue.location and issue.location.startswith(f"{path}:")))
-            and issue.message
-            == "Python call-graph analysis could not complete: source changed during shared call-graph analysis"
-            and issue.details.get("category") == "call_graph_analysis_error"
-            and issue.details.get("exception_type") == "_CallGraphAnalysisLimitError"
-            and issue.details.get("analysis") == "python_call_graph_source_stability"
-            and issue.details.get("analysis_incomplete") is True
-            for issue in operational_diagnostics
-        )
         if (
             payload.get("operational_error_reason") == "call_graph_analysis_error"
             and payload.get("analysis_incomplete") is True
@@ -89,13 +56,56 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
             and "call_graph_analysis_error" in payload.get("scan_outcome_reasons", [])
             and payload.get("pickle_report_status") == "inconclusive"
             and payload.get("pickle_verdict") in {"unknown", "suspicious", "malicious"}
-            and has_only_source_stability_diagnostics
         ):
             expected_source_changes.add(path)
         else:
             unexpected_errors.add(path)
 
-    assert expected_source_changes and not unexpected_errors, (
+    diagnosed_source_changes = set()
+    for issue in results.issues:
+        details = issue.details
+        location = issue.location or "unknown scan location"
+        pickle_source = details.get("pickle_source")
+        category = details.get("category")
+
+        if category == "call_graph_analysis_error" or (
+            pickle_source and category not in {None, "parse_error"} and "exception_type" in details
+        ):
+            matching_paths = {
+                path for path in expected_source_changes if location == path or location.startswith(f"{path}:")
+            }
+            if (
+                matching_paths
+                and pickle_source
+                and issue.message
+                == "Python call-graph analysis could not complete: source changed during shared call-graph analysis"
+                and category == "call_graph_analysis_error"
+                and details.get("exception_type") == "_CallGraphAnalysisLimitError"
+                and details.get("analysis") == "python_call_graph_source_stability"
+                and details.get("analysis_incomplete") is True
+            ):
+                diagnosed_source_changes.update(matching_paths)
+            else:
+                unexpected_errors.add(location)
+            continue
+
+        if pickle_source or category == "parse_error":
+            continue
+
+        has_known_location = any(location == path or location.startswith(f"{path}:") for path in results.file_metadata)
+        if (
+            details.get("exception_type")
+            or details.get("operational_error") is True
+            or details.get("interrupted") is True
+            or (
+                details.get("analysis_incomplete") is True
+                and "scan_outcome_reason" in details
+                and not has_known_location
+            )
+        ):
+            unexpected_errors.add(location)
+
+    assert expected_source_changes and expected_source_changes == diagnosed_source_changes and not unexpected_errors, (
         f"{scan_description} should not have unexpected operational errors: {describe_operational_errors(results)}"
     )
     assert results.success is False, f"{scan_description} must fail closed when source stability changes"

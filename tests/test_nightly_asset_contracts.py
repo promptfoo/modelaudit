@@ -108,6 +108,8 @@ def test_organized_asset_scans_preserve_fail_closed_source_stability(
             raise _CallGraphAnalysisLimitError("source changed during shared call-graph analysis")
 
         monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", raise_source_stability_error)
+    else:
+        monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
 
     result = scan_model_directory_or_file(str(AGPL_ASSET), cache_enabled=False)
     metadata = result.file_metadata[str(AGPL_ASSET)].model_dump(exclude_none=True)
@@ -197,6 +199,65 @@ def test_organized_asset_scans_preserve_embedded_source_stability(
         "test_performance_with_organized_structure",
     ],
 )
+def test_organized_asset_scans_reject_mixed_archive_member_errors(
+    integration_test: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def raise_source_stability_error(_report_generation: int | None) -> None:
+        raise _CallGraphAnalysisLimitError("source changed during shared call-graph analysis")
+
+    real_find_call_graphs = package_api.find_dangerous_call_graphs
+    analyzed_members = 0
+
+    def fail_first_member(*args: Any, **kwargs: Any) -> Any:
+        nonlocal analyzed_members
+        analyzed_members += 1
+        if analyzed_members == 1:
+            raise RuntimeError("independent archive-member call-graph regression")
+        return real_find_call_graphs(*args, **kwargs)
+
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", raise_source_stability_error)
+    monkeypatch.setattr(package_api, "find_dangerous_call_graphs", fail_first_member)
+    archive_path = tmp_path / "multiple-pickles.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.write(AGPL_ASSET, "unexpected.pkl")
+        archive.write(AGPL_ASSET, "expected.pkl")
+
+    result = scan_model_directory_or_file(str(archive_path), cache_enabled=False)
+
+    assert analyzed_members == 2
+    assert result.has_errors is True
+    assert any(
+        issue.location == f"{archive_path}:unexpected.pkl"
+        and issue.details.get("analysis") == "python_call_graph"
+        and issue.details.get("exception_type") == "RuntimeError"
+        for issue in result.issues
+    )
+    assert any(
+        issue.location == f"{archive_path}:expected.pkl"
+        and issue.details.get("analysis") == "python_call_graph_source_stability"
+        for issue in result.issues
+    )
+
+    monkeypatch.setattr(
+        test_security_asset_integration,
+        "scan_model_directory_or_file",
+        lambda *_args, **_kwargs: result,
+    )
+
+    test_case = test_security_asset_integration.TestSecurityAssetIntegration()
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        getattr(test_case, integration_test)(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "integration_test",
+    [
+        "test_asset_discovery_completeness",
+        "test_performance_with_organized_structure",
+    ],
+)
 @pytest.mark.parametrize(
     "unexpected_error",
     [
@@ -207,6 +268,7 @@ def test_organized_asset_scans_preserve_embedded_source_stability(
         "issue-only-error",
         "marker-only-error",
         "directory-coverage-error",
+        "interrupted-scan",
     ],
 )
 def test_organized_asset_scans_reject_unexpected_operational_errors(
@@ -276,7 +338,7 @@ def test_organized_asset_scans_reject_unexpected_operational_errors(
                 },
             )
         )
-    else:
+    elif unexpected_error == "directory-coverage-error":
         result.issues.append(
             Issue(
                 message="Broken symlink encountered",
@@ -287,6 +349,14 @@ def test_organized_asset_scans_reject_unexpected_operational_errors(
                     "scan_outcome": "inconclusive",
                     "scan_outcome_reason": "directory_entry_unavailable",
                 },
+            )
+        )
+    else:
+        result.issues.append(
+            Issue(
+                message="Scan interrupted by user",
+                severity=IssueSeverity.INFO,
+                details={"interrupted": True},
             )
         )
 
