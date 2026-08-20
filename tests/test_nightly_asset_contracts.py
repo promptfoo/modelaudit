@@ -14,6 +14,7 @@ from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.core_results import metadata_has_coverage_only_operational_error, results_have_inconclusive_outcome
 from modelaudit.models import FileMetadataModel, ModelAuditResultModel
 from modelaudit.scanner_results import Issue, IssueSeverity, ScanResult
+from modelaudit.scanners.manifest_scanner import ManifestScanner
 from tests import test_security_asset_integration
 
 ASSETS = Path(__file__).parent / "assets" / "samples" / "pickles"
@@ -237,6 +238,49 @@ def test_organized_asset_scans_reject_mixed_archive_member_errors(
     assert any(
         issue.location == f"{archive_path}:expected.pkl"
         and issue.details.get("analysis") == "python_call_graph_source_stability"
+        for issue in result.issues
+    )
+
+    monkeypatch.setattr(
+        test_security_asset_integration,
+        "scan_model_directory_or_file",
+        lambda *_args, **_kwargs: result,
+    )
+
+    test_case = test_security_asset_integration.TestSecurityAssetIntegration()
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        getattr(test_case, integration_test)(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "integration_test",
+    [
+        "test_asset_discovery_completeness",
+        "test_performance_with_organized_structure",
+    ],
+)
+def test_organized_asset_scans_reject_mixed_archive_member_timeouts(
+    integration_test: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def raise_source_stability_error(_report_generation: int | None) -> None:
+        raise _CallGraphAnalysisLimitError("source changed during shared call-graph analysis")
+
+    def raise_manifest_timeout(_scanner: ManifestScanner, *_args: object, **_kwargs: object) -> None:
+        raise TimeoutError("independent manifest timeout")
+
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", raise_source_stability_error)
+    monkeypatch.setattr(ManifestScanner, "_check_timeout", raise_manifest_timeout)
+    archive_path = tmp_path / "manifest-timeout.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("config.json", '{"model_type":"bert"}')
+        archive.write(AGPL_ASSET, "model.pkl")
+
+    result = scan_model_directory_or_file(str(archive_path), cache_enabled=False)
+    assert any(
+        issue.location == f"{archive_path}:config.json"
+        and issue.details.get("scan_outcome_reason") == "manifest_scan_timeout"
         for issue in result.issues
     )
 

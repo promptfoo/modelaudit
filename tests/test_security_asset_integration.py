@@ -100,14 +100,19 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
         if pickle_source or category == "parse_error":
             continue
 
-        has_known_location = any(location == path or location.startswith(f"{path}:") for path in results.file_metadata)
+        coverage_only_diagnostic = metadata_has_coverage_only_operational_error(
+            {
+                "operational_error": True,
+                "operational_error_reason": details.get("scan_outcome_reason"),
+            }
+        )
         if (
             details.get("exception_type")
             or details.get("operational_error") is True
             or details.get("interrupted") is True
             or (
                 details.get("analysis_incomplete") is True
-                and ("max_total_size" in details or ("scan_outcome_reason" in details and not has_known_location))
+                and ("max_total_size" in details or ("scan_outcome_reason" in details and not coverage_only_diagnostic))
             )
         ):
             unexpected_errors.add(location)
