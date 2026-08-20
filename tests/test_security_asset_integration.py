@@ -97,7 +97,7 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
                 unexpected_errors.add(location)
             continue
 
-        if pickle_source or category == "parse_error":
+        if pickle_source or category == "parse_error" or "required_package" in details:
             continue
 
         coverage_only_diagnostic = metadata_has_coverage_only_operational_error(
@@ -106,8 +106,12 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
                 "operational_error_reason": details.get("scan_outcome_reason"),
             }
         )
+        nested_scan_budget_failure = any(location.startswith(f"{path}:") for path in expected_source_changes) and (
+            any(key.startswith("max_") for key in details)
+            or details.get("security_check") == "compression_bomb_detection"
+        )
         if (
-            (issue.rule_code == "S902" and not coverage_only_diagnostic)
+            (nested_scan_budget_failure and not coverage_only_diagnostic)
             or details.get("exception_type")
             or details.get("operational_error") is True
             or details.get("interrupted") is True

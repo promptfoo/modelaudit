@@ -10,6 +10,8 @@ import pytest
 from modelaudit_picklescan.call_graph import _CallGraphAnalysisLimitError
 
 import modelaudit.core as core_module
+import modelaudit.scanners.keras_h5_scanner as keras_h5_scanner_module
+import modelaudit.scanners.tf_metagraph_scanner as tf_metagraph_scanner_module
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.core_results import metadata_has_coverage_only_operational_error, results_have_inconclusive_outcome
 from modelaudit.models import FileMetadataModel, ModelAuditResultModel
@@ -302,8 +304,10 @@ def test_organized_asset_scans_reject_mixed_archive_member_timeouts(
         "test_performance_with_organized_structure",
     ],
 )
+@pytest.mark.parametrize("scanner_error", ["msgpack-object-limit", "metagraph-parse-budget"])
 def test_organized_asset_scans_reject_mixed_archive_scanner_errors(
     integration_test: str,
+    scanner_error: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -311,18 +315,28 @@ def test_organized_asset_scans_reject_mixed_archive_scanner_errors(
         raise _CallGraphAnalysisLimitError("source changed during shared call-graph analysis")
 
     monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", raise_source_stability_error)
-    archive_path = tmp_path / "msgpack-limit.zip"
+    archive_path = tmp_path / "scanner-limit.zip"
     with zipfile.ZipFile(archive_path, "w") as archive:
-        archive.writestr("weights.msgpack", b"\x81\xa6params\x80" * 2)
+        if scanner_error == "msgpack-object-limit":
+            archive.writestr("weights.msgpack", b"\x81\xa6params\x80" * 2)
+        else:
+            monkeypatch.setattr(tf_metagraph_scanner_module, "_MAX_PARSE_BYTES", 128)
+            archive.writestr("oversized.meta", b"A" * 129)
         archive.write(AGPL_ASSET, "model.pkl")
 
     result = scan_model_directory_or_file(str(archive_path), cache_enabled=False, max_msgpack_stream_objects=1)
-    assert any(
-        issue.location == f"{archive_path}:weights.msgpack"
-        and issue.rule_code == "S902"
-        and issue.details.get("max_msgpack_stream_objects") == 1
-        for issue in result.issues
-    )
+    if scanner_error == "msgpack-object-limit":
+        assert any(
+            issue.location == f"{archive_path}:weights.msgpack"
+            and issue.rule_code == "S902"
+            and issue.details.get("max_msgpack_stream_objects") == 1
+            for issue in result.issues
+        )
+    else:
+        assert any(
+            issue.location == f"{archive_path}:oversized.meta" and issue.details.get("max_parse_bytes") == 128
+            for issue in result.issues
+        )
 
     monkeypatch.setattr(
         test_security_asset_integration,
@@ -333,6 +347,45 @@ def test_organized_asset_scans_reject_mixed_archive_scanner_errors(
     test_case = test_security_asset_integration.TestSecurityAssetIntegration()
     with pytest.raises(AssertionError, match="unexpected operational errors"):
         getattr(test_case, integration_test)(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "integration_test",
+    [
+        "test_asset_discovery_completeness",
+        "test_performance_with_organized_structure",
+    ],
+)
+@pytest.mark.parametrize("h5_available", [False, True], ids=["windows-no-h5py", "h5py-installed"])
+def test_organized_asset_scans_preserve_existing_h5_diagnostics(
+    integration_test: str,
+    h5_available: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if h5_available and not keras_h5_scanner_module.HAS_H5PY:
+        pytest.skip("h5py is not installed in this CI profile")
+
+    def raise_source_stability_error(_report_generation: int | None) -> None:
+        raise _CallGraphAnalysisLimitError("source changed during shared call-graph analysis")
+
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", raise_source_stability_error)
+    monkeypatch.setattr(keras_h5_scanner_module, "HAS_H5PY", h5_available)
+    shutil.copy2(AGPL_ASSET, tmp_path / "agpl_model.pkl")
+    shutil.copy2(ASSETS.parent / "keras" / "malicious_lambda.h5", tmp_path / "malicious_lambda.h5")
+    result = scan_model_directory_or_file(str(tmp_path), cache_enabled=False)
+
+    expected_detail = "suspicious_term" if h5_available else "required_package"
+    assert any(issue.rule_code == "S902" and expected_detail in issue.details for issue in result.issues)
+
+    monkeypatch.setattr(
+        test_security_asset_integration,
+        "scan_model_directory_or_file",
+        lambda *_args, **_kwargs: result,
+    )
+
+    test_case = test_security_asset_integration.TestSecurityAssetIntegration()
+    getattr(test_case, integration_test)(tmp_path)
 
 
 @pytest.mark.parametrize(
