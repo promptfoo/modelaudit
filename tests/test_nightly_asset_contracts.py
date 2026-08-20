@@ -16,6 +16,7 @@ from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.core_results import metadata_has_coverage_only_operational_error, results_have_inconclusive_outcome
 from modelaudit.models import FileMetadataModel, ModelAuditResultModel
 from modelaudit.scanner_results import Issue, IssueSeverity, ScanResult
+from modelaudit.scanners.flax_msgpack_scanner import FlaxMsgpackScanner
 from modelaudit.scanners.manifest_scanner import ManifestScanner
 from tests import test_security_asset_integration
 
@@ -304,7 +305,7 @@ def test_organized_asset_scans_reject_mixed_archive_member_timeouts(
         "test_performance_with_organized_structure",
     ],
 )
-@pytest.mark.parametrize("scanner_error", ["msgpack-object-limit", "metagraph-parse-budget"])
+@pytest.mark.parametrize("scanner_error", ["msgpack-object-limit", "metagraph-parse-budget", "flax-exception"])
 def test_organized_asset_scans_reject_mixed_archive_scanner_errors(
     integration_test: str,
     scanner_error: str,
@@ -314,10 +315,15 @@ def test_organized_asset_scans_reject_mixed_archive_scanner_errors(
     def raise_source_stability_error(_report_generation: int | None) -> None:
         raise _CallGraphAnalysisLimitError("source changed during shared call-graph analysis")
 
+    def raise_flax_error(_scanner: FlaxMsgpackScanner, _path: str, _result: ScanResult) -> None:
+        raise RuntimeError("independent flax regression")
+
     monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", raise_source_stability_error)
+    if scanner_error == "flax-exception":
+        monkeypatch.setattr(FlaxMsgpackScanner, "_scan_msgpack_stream_from_path", raise_flax_error)
     archive_path = tmp_path / "scanner-limit.zip"
     with zipfile.ZipFile(archive_path, "w") as archive:
-        if scanner_error == "msgpack-object-limit":
+        if scanner_error in {"msgpack-object-limit", "flax-exception"}:
             archive.writestr("weights.msgpack", b"\x81\xa6params\x80" * 2)
         else:
             monkeypatch.setattr(tf_metagraph_scanner_module, "_MAX_PARSE_BYTES", 128)
@@ -330,6 +336,11 @@ def test_organized_asset_scans_reject_mixed_archive_scanner_errors(
             issue.location == f"{archive_path}:weights.msgpack"
             and issue.rule_code == "S902"
             and issue.details.get("max_msgpack_stream_objects") == 1
+            for issue in result.issues
+        )
+    elif scanner_error == "flax-exception":
+        assert any(
+            issue.location == f"{archive_path}:weights.msgpack" and issue.details.get("error_type") == "RuntimeError"
             for issue in result.issues
         )
     else:
