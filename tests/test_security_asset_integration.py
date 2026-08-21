@@ -19,6 +19,7 @@ from modelaudit.cli import cli
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.core_results import metadata_has_coverage_only_operational_error
 from modelaudit.models import ModelAuditResultModel
+from modelaudit.scanner_results import Check, CheckStatus, Issue
 from modelaudit.scanners.base import IssueSeverity
 
 
@@ -67,7 +68,9 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
             unexpected_errors.add(path)
 
     diagnosed_source_changes = set()
-    for issue in results.issues:
+    failed_checks = (check for check in results.checks if check.status == CheckStatus.FAILED)
+    diagnostics: list[Issue | Check] = [*results.issues, *failed_checks]
+    for issue in diagnostics:
         details = issue.details
         location = issue.location or "unknown scan location"
         pickle_source = details.get("pickle_source")
@@ -109,8 +112,9 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
                 "operational_error_reason": details.get("scan_outcome_reason"),
             }
         )
-        scan_budget_failure = any(key.startswith("max_") for key in details) or (
-            details.get("security_check") == "compression_bomb_detection"
+        scan_budget_failure = (issue.rule_code == "S902" or issue.severity == IssueSeverity.INFO) and (
+            any(key.startswith("max_") for key in details)
+            or details.get("security_check") == "compression_bomb_detection"
         )
         if (
             (scan_budget_failure and not coverage_only_diagnostic)

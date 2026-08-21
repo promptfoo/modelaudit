@@ -1,12 +1,15 @@
 """Coverage contracts for committed assets consumed by Nightly scans."""
 
+import io
 import shutil
 import sys
+import tarfile
 import zipfile
 from pathlib import Path
 from typing import Any
 
 import modelaudit_picklescan.api as package_api
+import msgpack
 import pytest
 from modelaudit_picklescan.call_graph import _CallGraphAnalysisLimitError
 
@@ -33,6 +36,7 @@ def _scan_asset(name: str) -> ModelAuditResultModel:
 def _assert_otherwise_accepted_archive_control(result: ModelAuditResultModel, failed_member: str) -> None:
     control = result.model_copy(deep=True)
     control.issues = [issue for issue in control.issues if issue.location != failed_member]
+    control.checks = [check for check in control.checks if check.location != failed_member]
     test_security_asset_integration.assert_no_unexpected_asset_scan_errors(control, "mixed archive negative control")
 
 
@@ -212,7 +216,46 @@ def test_organized_asset_scans_reject_embedded_source_stability(
         "test_performance_with_organized_structure",
     ],
 )
-@pytest.mark.parametrize("archive_failure", ["object-budget", "format-read", "file-size", "operational-dependency"])
+def test_organized_asset_scans_preserve_security_threshold_findings(
+    integration_test: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def raise_source_stability_error(_report_generation: int | None) -> None:
+        raise _CallGraphAnalysisLimitError("source changed during shared call-graph analysis")
+
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", raise_source_stability_error)
+    shutil.copy2(AGPL_ASSET, tmp_path / "agpl_model.pkl")
+    weights = tmp_path / "weights.msgpack"
+    weights.write_bytes(msgpack.packb({"params": {"shape": [1_000_000_001]}}))
+    result = scan_model_directory_or_file(str(tmp_path), cache_enabled=False)
+
+    assert result.file_metadata[str(weights)].get("operational_error") is None
+    assert any(
+        issue.rule_code == "S804" and issue.details.get("max_safe_dimension") == 10**9 for issue in result.issues
+    )
+
+    monkeypatch.setattr(
+        test_security_asset_integration,
+        "scan_model_directory_or_file",
+        lambda *_args, **_kwargs: result,
+    )
+
+    test_case = test_security_asset_integration.TestSecurityAssetIntegration()
+    getattr(test_case, integration_test)(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "integration_test",
+    [
+        "test_asset_discovery_completeness",
+        "test_performance_with_organized_structure",
+    ],
+)
+@pytest.mark.parametrize(
+    "archive_failure",
+    ["object-budget", "format-read", "file-size", "operational-dependency", "check-only-dependency"],
+)
 def test_organized_asset_scans_reject_unrelated_archive_failures(
     integration_test: str,
     archive_failure: str,
@@ -230,6 +273,17 @@ def test_organized_asset_scans_reject_unrelated_archive_failures(
             archive.writestr("weights.msgpack", b"\x81\xa6params\x80" * 2)
         elif archive_failure == "operational-dependency":
             archive.writestr("weights.tflite", b"\x00\x00\x00\x00TFL3" + bytes(100))
+        elif archive_failure == "check-only-dependency":
+            nemo_payload = io.BytesIO()
+            with tarfile.open(fileobj=nemo_payload, mode="w") as nemo_archive:
+                for member_name, member_payload in (
+                    ("model_config.yaml", b"model:\n  artifact: nemo:weights.tflite\n"),
+                    ("weights.tflite", b"\x00\x00\x00\x00TFL3" + bytes(100)),
+                ):
+                    member = tarfile.TarInfo(member_name)
+                    member.size = len(member_payload)
+                    nemo_archive.addfile(member, io.BytesIO(member_payload))
+            archive.writestr("inner.nemo", nemo_payload.getvalue())
         else:
             archive.writestr("unowned.payload", b"file format cannot be read")
         archive.writestr(
@@ -255,7 +309,7 @@ def test_organized_asset_scans_reject_unrelated_archive_failures(
             return original_getsize(path)
 
         monkeypatch.setattr(core_module.os.path, "getsize", raise_nested_size_failure)
-    elif archive_failure == "operational-dependency":
+    elif archive_failure in {"operational-dependency", "check-only-dependency"}:
         monkeypatch.setattr(tflite_scanner_module, "HAS_TFLITE", False)
 
     result = scan_model_directory_or_file(str(tmp_path), cache_enabled=False, max_msgpack_stream_objects=1)
@@ -276,11 +330,20 @@ def test_organized_asset_scans_reject_unrelated_archive_failures(
     elif archive_failure == "file-size":
         failed_member = f"{archive_path}:unowned.payload"
         assert any("independent nested file-size read failure" in issue.message for issue in result.issues)
-    else:
+    elif archive_failure == "operational-dependency":
         failed_member = f"{archive_path}:weights.tflite"
         assert any(
             issue.details.get("required_package") == "tflite" and issue.details.get("operational_error") is True
             for issue in result.issues
+        )
+    else:
+        failed_member = f"{archive_path}:inner.nemo:weights.tflite"
+        assert not any(issue.details.get("required_package") == "tflite" for issue in result.issues)
+        assert any(
+            check.location == failed_member
+            and check.details.get("required_package") == "tflite"
+            and check.details.get("operational_error") is True
+            for check in result.checks
         )
 
     _assert_otherwise_accepted_archive_control(result, failed_member)
