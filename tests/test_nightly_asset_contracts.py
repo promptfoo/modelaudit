@@ -254,7 +254,14 @@ def test_organized_asset_scans_preserve_security_threshold_findings(
 )
 @pytest.mark.parametrize(
     "archive_failure",
-    ["object-budget", "format-read", "file-size", "operational-dependency", "check-only-dependency"],
+    [
+        "object-budget",
+        "format-read",
+        "file-size",
+        "operational-dependency",
+        "check-only-dependency",
+        "consolidated-check-dependency",
+    ],
 )
 def test_organized_asset_scans_reject_unrelated_archive_failures(
     integration_test: str,
@@ -273,13 +280,18 @@ def test_organized_asset_scans_reject_unrelated_archive_failures(
             archive.writestr("weights.msgpack", b"\x81\xa6params\x80" * 2)
         elif archive_failure == "operational-dependency":
             archive.writestr("weights.tflite", b"\x00\x00\x00\x00TFL3" + bytes(100))
-        elif archive_failure == "check-only-dependency":
+        elif archive_failure in {"check-only-dependency", "consolidated-check-dependency"}:
             nemo_payload = io.BytesIO()
+            tflite_members = (
+                ("weights1.tflite", "weights2.tflite")
+                if archive_failure == "consolidated-check-dependency"
+                else ("weights.tflite",)
+            )
+            references = ", ".join(f"nemo:{name}" for name in tflite_members)
             with tarfile.open(fileobj=nemo_payload, mode="w") as nemo_archive:
-                for member_name, member_payload in (
-                    ("model_config.yaml", b"model:\n  artifact: nemo:weights.tflite\n"),
-                    ("weights.tflite", b"\x00\x00\x00\x00TFL3" + bytes(100)),
-                ):
+                members = [("model_config.yaml", f"model:\n  artifacts: [{references}]\n".encode())]
+                members.extend((name, b"\x00\x00\x00\x00TFL3" + bytes(100)) for name in tflite_members)
+                for member_name, member_payload in members:
                     member = tarfile.TarInfo(member_name)
                     member.size = len(member_payload)
                     nemo_archive.addfile(member, io.BytesIO(member_payload))
@@ -309,7 +321,7 @@ def test_organized_asset_scans_reject_unrelated_archive_failures(
             return original_getsize(path)
 
         monkeypatch.setattr(core_module.os.path, "getsize", raise_nested_size_failure)
-    elif archive_failure in {"operational-dependency", "check-only-dependency"}:
+    elif archive_failure in {"operational-dependency", "check-only-dependency", "consolidated-check-dependency"}:
         monkeypatch.setattr(tflite_scanner_module, "HAS_TFLITE", False)
 
     result = scan_model_directory_or_file(str(tmp_path), cache_enabled=False, max_msgpack_stream_objects=1)
@@ -336,13 +348,22 @@ def test_organized_asset_scans_reject_unrelated_archive_failures(
             issue.details.get("required_package") == "tflite" and issue.details.get("operational_error") is True
             for issue in result.issues
         )
-    else:
+    elif archive_failure == "check-only-dependency":
         failed_member = f"{archive_path}:inner.nemo:weights.tflite"
         assert not any(issue.details.get("required_package") == "tflite" for issue in result.issues)
         assert any(
             check.location == failed_member
             and check.details.get("required_package") == "tflite"
             and check.details.get("operational_error") is True
+            for check in result.checks
+        )
+    else:
+        failed_member = f"{archive_path}:inner.nemo:weights1.tflite"
+        assert not any(issue.details.get("required_package") == "tflite" for issue in result.issues)
+        assert any(
+            check.location == failed_member
+            and check.details.get("component_count") == 2
+            and all(finding.get("operational_error") is True for finding in check.details.get("findings", []))
             for check in result.checks
         )
 

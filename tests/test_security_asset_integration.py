@@ -72,6 +72,13 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
     diagnostics: list[Issue | Check] = [*results.issues, *failed_checks]
     for issue in diagnostics:
         details = issue.details
+        nested_findings = details.get("findings")
+        if isinstance(nested_findings, list):
+            diagnostics.extend(
+                issue.model_copy(update={"details": finding})
+                for finding in nested_findings
+                if isinstance(finding, dict)
+            )
         location = issue.location or "unknown scan location"
         pickle_source = details.get("pickle_source")
         category = details.get("category")
