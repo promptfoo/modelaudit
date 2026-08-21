@@ -204,8 +204,10 @@ def test_organized_asset_scans_reject_embedded_source_stability(
         "test_performance_with_organized_structure",
     ],
 )
-def test_organized_asset_scans_reject_unrelated_archive_budget_failures(
+@pytest.mark.parametrize("archive_failure", ["object-budget", "format-read"])
+def test_organized_asset_scans_reject_unrelated_archive_failures(
     integration_test: str,
+    archive_failure: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -214,23 +216,40 @@ def test_organized_asset_scans_reject_unrelated_archive_budget_failures(
 
     monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", raise_source_stability_error)
     shutil.copy2(AGPL_ASSET, tmp_path / "agpl_model.pkl")
-    archive_path = tmp_path / "unrelated-budget-failure.zip"
+    archive_path = tmp_path / "unrelated-archive-failure.zip"
     with zipfile.ZipFile(archive_path, "w") as archive:
-        archive.writestr("weights.msgpack", b"\x81\xa6params\x80" * 2)
+        if archive_failure == "object-budget":
+            archive.writestr("weights.msgpack", b"\x81\xa6params\x80" * 2)
+        else:
+            archive.writestr("unowned.payload", b"file format cannot be read")
         archive.writestr(
             "ambiguous.txt",
             "<?xml version='1.0'?><!--" + "x" * (1024 * 1024 + 64) + "--><PMML version='4.4'></PMML>",
         )
 
+    if archive_failure == "format-read":
+        original_detect_file_format = core_module.detect_file_format
+
+        def raise_nested_read_failure(path: str) -> str:
+            if path.endswith(".payload"):
+                raise OSError("independent nested format read failure")
+            return original_detect_file_format(path)
+
+        monkeypatch.setattr(core_module, "detect_file_format", raise_nested_read_failure)
+
     result = scan_model_directory_or_file(str(tmp_path), cache_enabled=False, max_msgpack_stream_objects=1)
     archive_metadata = result.file_metadata[str(archive_path)].model_dump(exclude_none=True)
     assert archive_metadata["operational_error_reason"] == "xml_model_routing_incomplete"
-    assert any(
-        issue.location == f"{archive_path}:weights.msgpack"
-        and issue.rule_code == "S902"
-        and issue.details.get("max_msgpack_stream_objects") == 1
-        for issue in result.issues
-    )
+    if archive_failure == "object-budget":
+        assert any(
+            issue.location == f"{archive_path}:weights.msgpack"
+            and issue.rule_code == "S902"
+            and issue.details.get("max_msgpack_stream_objects") == 1
+            for issue in result.issues
+        )
+    else:
+        assert "format_detection_read_failed" in archive_metadata["scan_outcome_reasons"]
+        assert any("independent nested format read failure" in issue.message for issue in result.issues)
 
     monkeypatch.setattr(
         test_security_asset_integration,
