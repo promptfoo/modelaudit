@@ -3,6 +3,8 @@
 import re
 from pathlib import Path
 
+import pytest
+
 try:
     import tomllib
 except ModuleNotFoundError:  # pragma: no cover - Python 3.10 compatibility
@@ -12,11 +14,13 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 LOCKFILE = ROOT_DIR / "uv.lock"
 ROOT_PYPROJECT = ROOT_DIR / "pyproject.toml"
 PICKLESCAN_PYPROJECT = ROOT_DIR / "packages" / "modelaudit-picklescan" / "pyproject.toml"
-PATCHED_GITPYTHON_FLOOR = (3, 1, 50)
+PATCHED_GITPYTHON_FLOOR = (3, 1, 58)
 PINNED_MATURIN_BACKEND = "maturin===1.13.3"
 REQUIRED_PICKLESCAN_RELEASE = "modelaudit-picklescan>=0.1.10,<0.2.0"
 PATCHED_PY7ZR_REQUIREMENT = "py7zr>=1.1.3"
 PY7ZR_EXTRAS = ("sevenzip", "all-ci", "all")
+PATCHED_MLFLOW_CLIENT_REQUIREMENT = "mlflow-skinny>=3.13.0"
+MLFLOW_EXTRAS = ("mlflow", "all-ci", "all")
 NUMPY_REQUIREMENTS = {
     "numpy>=1.19.0,<2.0; python_version == '3.10'",
     "numpy>=2.4.3,<2.5; python_version == '3.11'",
@@ -64,10 +68,34 @@ def test_gitpython_lock_stays_on_patched_release_floor() -> None:
     assert "gitpython-3.1.49" not in gitpython_block
 
 
+@pytest.mark.parametrize(
+    ("package_name", "patched_floor"),
+    [
+        ("aiohttp", (3, 14, 3)),
+        ("cryptography", (50, 0, 0)),
+        ("keras", (3, 15, 0)),
+    ],
+)
+def test_security_sensitive_dependencies_stay_on_patched_release_floors(
+    package_name: str,
+    patched_floor: tuple[int, ...],
+) -> None:
+    assert _locked_version(_lock_package_block(package_name)) >= patched_floor
+
+
 def test_mlflow_skinny_transitive_gitpython_dependency_is_guarded() -> None:
     mlflow_skinny_block = _lock_package_block("mlflow-skinny")
 
+    assert _locked_version(mlflow_skinny_block) >= (3, 13, 0)
     assert "gitpython" in _dependency_names(mlflow_skinny_block)
+
+
+def test_mlflow_extras_use_the_hardened_tracking_client() -> None:
+    root_config = tomllib.loads(ROOT_PYPROJECT.read_text(encoding="utf-8"))
+    optional_dependencies = root_config["project"]["optional-dependencies"]
+
+    for extra in MLFLOW_EXTRAS:
+        assert PATCHED_MLFLOW_CLIENT_REQUIREMENT in optional_dependencies[extra]
 
 
 def test_picklescan_build_backend_is_exactly_pinned() -> None:
