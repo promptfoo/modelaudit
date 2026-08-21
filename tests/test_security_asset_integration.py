@@ -51,7 +51,15 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
     unexpected_errors = {asset.path for asset in results.assets if asset.type == "error"}
     for path, metadata in results.file_metadata.items():
         payload = metadata.model_dump(exclude_none=True)
-        if not payload.get("operational_error") or metadata_has_coverage_only_operational_error(payload):
+        if not payload.get("operational_error"):
+            continue
+        if metadata_has_coverage_only_operational_error(payload):
+            if any(
+                isinstance(reason, str)
+                and reason.endswith(("_failed", "_error", "_exceeded", "_timeout", "_interrupted"))
+                for reason in payload.get("scan_outcome_reasons", [])
+            ):
+                unexpected_errors.add(path)
             continue
 
         if (

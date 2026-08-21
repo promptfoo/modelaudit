@@ -33,10 +33,28 @@ def _scan_asset(name: str) -> ModelAuditResultModel:
     return scan_model_directory_or_file(str(ASSETS / name), cache_enabled=False)
 
 
-def _assert_otherwise_accepted_archive_control(result: ModelAuditResultModel, failed_member: str) -> None:
+def _assert_otherwise_accepted_archive_control(
+    result: ModelAuditResultModel,
+    failed_member: str,
+    hidden_reason: str | None = None,
+) -> None:
     control = result.model_copy(deep=True)
     control.issues = [issue for issue in control.issues if issue.location != failed_member]
     control.checks = [check for check in control.checks if check.location != failed_member]
+    for archive_path, metadata in control.file_metadata.items():
+        if not failed_member.startswith(f"{archive_path}:") or metadata.model_extra is None:
+            continue
+        reasons = metadata.model_extra.get("scan_outcome_reasons")
+        if isinstance(reasons, list):
+            metadata.model_extra["scan_outcome_reasons"] = [
+                reason
+                for reason in reasons
+                if reason != hidden_reason
+                and not (
+                    isinstance(reason, str)
+                    and reason.endswith(("_failed", "_error", "_exceeded", "_timeout", "_interrupted"))
+                )
+            ]
     test_security_asset_integration.assert_no_unexpected_asset_scan_errors(control, "mixed archive negative control")
 
 
@@ -261,6 +279,7 @@ def test_organized_asset_scans_preserve_security_threshold_findings(
         "operational-dependency",
         "check-only-dependency",
         "consolidated-check-dependency",
+        "metadata-only-budget",
     ],
 )
 def test_organized_asset_scans_reject_unrelated_archive_failures(
@@ -280,17 +299,24 @@ def test_organized_asset_scans_reject_unrelated_archive_failures(
             archive.writestr("weights.msgpack", b"\x81\xa6params\x80" * 2)
         elif archive_failure == "operational-dependency":
             archive.writestr("weights.tflite", b"\x00\x00\x00\x00TFL3" + bytes(100))
-        elif archive_failure in {"check-only-dependency", "consolidated-check-dependency"}:
+        elif archive_failure in {"check-only-dependency", "consolidated-check-dependency", "metadata-only-budget"}:
             nemo_payload = io.BytesIO()
-            tflite_members = (
-                ("weights1.tflite", "weights2.tflite")
-                if archive_failure == "consolidated-check-dependency"
-                else ("weights.tflite",)
+            member_names = (
+                ("oversized.meta",)
+                if archive_failure == "metadata-only-budget"
+                else (
+                    ("weights1.tflite", "weights2.tflite")
+                    if archive_failure == "consolidated-check-dependency"
+                    else ("weights.tflite",)
+                )
             )
-            references = ", ".join(f"nemo:{name}" for name in tflite_members)
+            references = ", ".join(f"nemo:{name}" for name in member_names)
             with tarfile.open(fileobj=nemo_payload, mode="w") as nemo_archive:
                 members = [("model_config.yaml", f"model:\n  artifacts: [{references}]\n".encode())]
-                members.extend((name, b"\x00\x00\x00\x00TFL3" + bytes(100)) for name in tflite_members)
+                members.extend(
+                    (name, b"A" * 129 if name.endswith(".meta") else b"\x00\x00\x00\x00TFL3" + bytes(100))
+                    for name in member_names
+                )
                 for member_name, member_payload in members:
                     member = tarfile.TarInfo(member_name)
                     member.size = len(member_payload)
@@ -323,6 +349,8 @@ def test_organized_asset_scans_reject_unrelated_archive_failures(
         monkeypatch.setattr(core_module.os.path, "getsize", raise_nested_size_failure)
     elif archive_failure in {"operational-dependency", "check-only-dependency", "consolidated-check-dependency"}:
         monkeypatch.setattr(tflite_scanner_module, "HAS_TFLITE", False)
+    elif archive_failure == "metadata-only-budget":
+        monkeypatch.setattr(tf_metagraph_scanner_module, "_MAX_PARSE_BYTES", 128)
 
     result = scan_model_directory_or_file(str(tmp_path), cache_enabled=False, max_msgpack_stream_objects=1)
     archive_metadata = result.file_metadata[str(archive_path)].model_dump(exclude_none=True)
@@ -357,7 +385,7 @@ def test_organized_asset_scans_reject_unrelated_archive_failures(
             and check.details.get("operational_error") is True
             for check in result.checks
         )
-    else:
+    elif archive_failure == "consolidated-check-dependency":
         failed_member = f"{archive_path}:inner.nemo:weights1.tflite"
         assert not any(issue.details.get("required_package") == "tflite" for issue in result.issues)
         assert any(
@@ -366,8 +394,14 @@ def test_organized_asset_scans_reject_unrelated_archive_failures(
             and all(finding.get("operational_error") is True for finding in check.details.get("findings", []))
             for check in result.checks
         )
+    else:
+        failed_member = f"{archive_path}:inner.nemo:oversized.meta"
+        assert "metagraph_parse_budget_exceeded" in archive_metadata["scan_outcome_reasons"]
+        assert not any("max_parse_bytes" in issue.details for issue in result.issues)
+        assert not any("max_parse_bytes" in check.details for check in result.checks)
 
-    _assert_otherwise_accepted_archive_control(result, failed_member)
+    hidden_reason = "metagraph_parse_budget_exceeded" if archive_failure == "metadata-only-budget" else None
+    _assert_otherwise_accepted_archive_control(result, failed_member, hidden_reason)
     monkeypatch.setattr(
         test_security_asset_integration,
         "scan_model_directory_or_file",
