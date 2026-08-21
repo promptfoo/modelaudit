@@ -96,7 +96,11 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
                 unexpected_errors.add(location)
             continue
 
-        if pickle_source or category == "parse_error" or "required_package" in details:
+        if (
+            pickle_source
+            or category == "parse_error"
+            or ("required_package" in details and details.get("operational_error") is not True)
+        ):
             continue
 
         coverage_only_diagnostic = metadata_has_coverage_only_operational_error(
@@ -112,16 +116,12 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
             (scan_budget_failure and not coverage_only_diagnostic)
             or details.get("exception_type")
             or details.get("error_type")
-            or ("timeout" in details and "error" in details)
+            or "error" in details
             or details.get("operational_error") is True
             or details.get("interrupted") is True
             or (
                 details.get("analysis_incomplete") is True
-                and (
-                    "error" in details
-                    or "max_total_size" in details
-                    or ("scan_outcome_reason" in details and not coverage_only_diagnostic)
-                )
+                and ("max_total_size" in details or ("scan_outcome_reason" in details and not coverage_only_diagnostic))
             )
         ):
             unexpected_errors.add(location)

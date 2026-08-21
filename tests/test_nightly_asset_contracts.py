@@ -1,6 +1,7 @@
 """Coverage contracts for committed assets consumed by Nightly scans."""
 
 import shutil
+import sys
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -12,6 +13,7 @@ from modelaudit_picklescan.call_graph import _CallGraphAnalysisLimitError
 import modelaudit.core as core_module
 import modelaudit.scanners.keras_h5_scanner as keras_h5_scanner_module
 import modelaudit.scanners.tf_metagraph_scanner as tf_metagraph_scanner_module
+import modelaudit.scanners.tflite_scanner as tflite_scanner_module
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.core_results import metadata_has_coverage_only_operational_error, results_have_inconclusive_outcome
 from modelaudit.models import FileMetadataModel, ModelAuditResultModel
@@ -26,6 +28,12 @@ AGPL_ASSET = Path(__file__).parent / "assets" / "scenarios" / "license_scenarios
 
 def _scan_asset(name: str) -> ModelAuditResultModel:
     return scan_model_directory_or_file(str(ASSETS / name), cache_enabled=False)
+
+
+def _assert_otherwise_accepted_archive_control(result: ModelAuditResultModel, failed_member: str) -> None:
+    control = result.model_copy(deep=True)
+    control.issues = [issue for issue in control.issues if issue.location != failed_member]
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(control, "mixed archive negative control")
 
 
 def test_complete_benign_asset_scans_cleanly() -> None:
@@ -204,7 +212,7 @@ def test_organized_asset_scans_reject_embedded_source_stability(
         "test_performance_with_organized_structure",
     ],
 )
-@pytest.mark.parametrize("archive_failure", ["object-budget", "format-read"])
+@pytest.mark.parametrize("archive_failure", ["object-budget", "format-read", "file-size", "operational-dependency"])
 def test_organized_asset_scans_reject_unrelated_archive_failures(
     integration_test: str,
     archive_failure: str,
@@ -220,6 +228,8 @@ def test_organized_asset_scans_reject_unrelated_archive_failures(
     with zipfile.ZipFile(archive_path, "w") as archive:
         if archive_failure == "object-budget":
             archive.writestr("weights.msgpack", b"\x81\xa6params\x80" * 2)
+        elif archive_failure == "operational-dependency":
+            archive.writestr("weights.tflite", b"\x00\x00\x00\x00TFL3" + bytes(100))
         else:
             archive.writestr("unowned.payload", b"file format cannot be read")
         archive.writestr(
@@ -236,21 +246,44 @@ def test_organized_asset_scans_reject_unrelated_archive_failures(
             return original_detect_file_format(path)
 
         monkeypatch.setattr(core_module, "detect_file_format", raise_nested_read_failure)
+    elif archive_failure == "file-size":
+        original_getsize = core_module.os.path.getsize
+
+        def raise_nested_size_failure(path: str) -> int:
+            if str(path).endswith(".payload") and sys._getframe(1).f_code is core_module._scan_file_internal.__code__:
+                raise OSError("independent nested file-size read failure")
+            return original_getsize(path)
+
+        monkeypatch.setattr(core_module.os.path, "getsize", raise_nested_size_failure)
+    elif archive_failure == "operational-dependency":
+        monkeypatch.setattr(tflite_scanner_module, "HAS_TFLITE", False)
 
     result = scan_model_directory_or_file(str(tmp_path), cache_enabled=False, max_msgpack_stream_objects=1)
     archive_metadata = result.file_metadata[str(archive_path)].model_dump(exclude_none=True)
     assert archive_metadata["operational_error_reason"] == "xml_model_routing_incomplete"
     if archive_failure == "object-budget":
+        failed_member = f"{archive_path}:weights.msgpack"
         assert any(
-            issue.location == f"{archive_path}:weights.msgpack"
+            issue.location == failed_member
             and issue.rule_code == "S902"
             and issue.details.get("max_msgpack_stream_objects") == 1
             for issue in result.issues
         )
-    else:
+    elif archive_failure == "format-read":
+        failed_member = f"{archive_path}:unowned.payload"
         assert "format_detection_read_failed" in archive_metadata["scan_outcome_reasons"]
         assert any("independent nested format read failure" in issue.message for issue in result.issues)
+    elif archive_failure == "file-size":
+        failed_member = f"{archive_path}:unowned.payload"
+        assert any("independent nested file-size read failure" in issue.message for issue in result.issues)
+    else:
+        failed_member = f"{archive_path}:weights.tflite"
+        assert any(
+            issue.details.get("required_package") == "tflite" and issue.details.get("operational_error") is True
+            for issue in result.issues
+        )
 
+    _assert_otherwise_accepted_archive_control(result, failed_member)
     monkeypatch.setattr(
         test_security_asset_integration,
         "scan_model_directory_or_file",
@@ -307,26 +340,33 @@ def test_organized_asset_scans_reject_mixed_archive_member_errors(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def raise_source_stability_error(_report_generation: int | None) -> None:
-        raise _CallGraphAnalysisLimitError("source changed during shared call-graph analysis")
+        report = sys._getframe(1).f_locals["report"]
+        if Path(str(report.source)).name == "agpl_model.pkl":
+            raise _CallGraphAnalysisLimitError("source changed during shared call-graph analysis")
 
     real_find_call_graphs = package_api.find_dangerous_call_graphs
     analyzed_members = 0
 
-    def fail_first_member(*args: Any, **kwargs: Any) -> Any:
+    def fail_unexpected_member(*args: Any, **kwargs: Any) -> Any:
         nonlocal analyzed_members
         analyzed_members += 1
-        if analyzed_members == 1:
+        report = sys._getframe(1).f_locals["report"]
+        if str(report.source).endswith("unexpected.pkl"):
             raise RuntimeError("independent archive-member call-graph regression")
         return real_find_call_graphs(*args, **kwargs)
 
     monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", raise_source_stability_error)
-    monkeypatch.setattr(package_api, "find_dangerous_call_graphs", fail_first_member)
+    monkeypatch.setattr(package_api, "find_dangerous_call_graphs", fail_unexpected_member)
+    shutil.copy2(AGPL_ASSET, tmp_path / "agpl_model.pkl")
     archive_path = tmp_path / "multiple-pickles.zip"
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.write(AGPL_ASSET, "unexpected.pkl")
-        archive.write(AGPL_ASSET, "expected.pkl")
+        archive.writestr(
+            "ambiguous.txt",
+            "<?xml version='1.0'?><!--" + "x" * (1024 * 1024 + 64) + "--><PMML version='4.4'></PMML>",
+        )
 
-    result = scan_model_directory_or_file(str(archive_path), cache_enabled=False)
+    result = scan_model_directory_or_file(str(tmp_path), cache_enabled=False)
 
     assert analyzed_members == 2
     assert result.has_errors is True
@@ -337,11 +377,12 @@ def test_organized_asset_scans_reject_mixed_archive_member_errors(
         for issue in result.issues
     )
     assert any(
-        issue.location == f"{archive_path}:expected.pkl"
+        issue.location == str(tmp_path / "agpl_model.pkl")
         and issue.details.get("analysis") == "python_call_graph_source_stability"
         for issue in result.issues
     )
 
+    _assert_otherwise_accepted_archive_control(result, f"{archive_path}:unexpected.pkl")
     monkeypatch.setattr(
         test_security_asset_integration,
         "scan_model_directory_or_file",
@@ -379,12 +420,16 @@ def test_organized_asset_scans_reject_mixed_archive_member_timeouts(
         "_check_timeout" if timeout_source == "manifest-scanner" else "scan",
         raise_manifest_timeout,
     )
+    shutil.copy2(AGPL_ASSET, tmp_path / "agpl_model.pkl")
     archive_path = tmp_path / "manifest-timeout.zip"
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.writestr("config.json", '{"model_type":"bert"}')
-        archive.write(AGPL_ASSET, "model.pkl")
+        archive.writestr(
+            "ambiguous.txt",
+            "<?xml version='1.0'?><!--" + "x" * (1024 * 1024 + 64) + "--><PMML version='4.4'></PMML>",
+        )
 
-    result = scan_model_directory_or_file(str(archive_path), cache_enabled=False)
+    result = scan_model_directory_or_file(str(tmp_path), cache_enabled=False)
     if timeout_source == "manifest-scanner":
         assert any(
             issue.location == f"{archive_path}:config.json"
@@ -399,6 +444,7 @@ def test_organized_asset_scans_reject_mixed_archive_member_timeouts(
             for issue in result.issues
         )
 
+    _assert_otherwise_accepted_archive_control(result, f"{archive_path}:config.json")
     monkeypatch.setattr(
         test_security_asset_integration,
         "scan_model_directory_or_file",
@@ -433,6 +479,7 @@ def test_organized_asset_scans_reject_mixed_archive_scanner_errors(
     monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", raise_source_stability_error)
     if scanner_error == "flax-exception":
         monkeypatch.setattr(FlaxMsgpackScanner, "_scan_msgpack_stream_from_path", raise_flax_error)
+    shutil.copy2(AGPL_ASSET, tmp_path / "agpl_model.pkl")
     archive_path = tmp_path / "scanner-limit.zip"
     with zipfile.ZipFile(archive_path, "w") as archive:
         if scanner_error in {"msgpack-object-limit", "flax-exception"}:
@@ -440,9 +487,12 @@ def test_organized_asset_scans_reject_mixed_archive_scanner_errors(
         else:
             monkeypatch.setattr(tf_metagraph_scanner_module, "_MAX_PARSE_BYTES", 128)
             archive.writestr("oversized.meta", b"A" * 129)
-        archive.write(AGPL_ASSET, "model.pkl")
+        archive.writestr(
+            "ambiguous.txt",
+            "<?xml version='1.0'?><!--" + "x" * (1024 * 1024 + 64) + "--><PMML version='4.4'></PMML>",
+        )
 
-    result = scan_model_directory_or_file(str(archive_path), cache_enabled=False, max_msgpack_stream_objects=1)
+    result = scan_model_directory_or_file(str(tmp_path), cache_enabled=False, max_msgpack_stream_objects=1)
     if scanner_error == "msgpack-object-limit":
         assert any(
             issue.location == f"{archive_path}:weights.msgpack"
@@ -461,6 +511,8 @@ def test_organized_asset_scans_reject_mixed_archive_scanner_errors(
             for issue in result.issues
         )
 
+    failed_member = "oversized.meta" if scanner_error == "metagraph-parse-budget" else "weights.msgpack"
+    _assert_otherwise_accepted_archive_control(result, f"{archive_path}:{failed_member}")
     monkeypatch.setattr(
         test_security_asset_integration,
         "scan_model_directory_or_file",
