@@ -105,12 +105,11 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
                 "operational_error_reason": details.get("scan_outcome_reason"),
             }
         )
-        nested_scan_budget_failure = any(location.startswith(f"{path}:") for path in expected_source_changes) and (
-            any(key.startswith("max_") for key in details)
-            or details.get("security_check") == "compression_bomb_detection"
+        scan_budget_failure = any(key.startswith("max_") for key in details) or (
+            details.get("security_check") == "compression_bomb_detection"
         )
         if (
-            (nested_scan_budget_failure and not coverage_only_diagnostic)
+            (scan_budget_failure and not coverage_only_diagnostic)
             or details.get("exception_type")
             or details.get("error_type")
             or ("timeout" in details and "error" in details)
