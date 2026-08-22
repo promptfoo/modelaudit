@@ -163,6 +163,16 @@ def test_local_mlflow_artifact_root_rejects_remote_file_authority(tmp_path: Path
     assert _local_mlflow_artifact_root(repository) is None
 
 
+def test_sql_backed_mlflow_model_registry_is_available(tmp_path: Path) -> None:
+    mlflow = pytest.importorskip("mlflow")
+    registry_uri = f"sqlite:///{tmp_path / 'registry.db'}"
+    client = mlflow.MlflowClient(tracking_uri=registry_uri, registry_uri=registry_uri)
+
+    registered_model = client.create_registered_model("ModelAuditRegressionProbe")
+
+    assert registered_model.name == "ModelAuditRegressionProbe"
+
+
 def test_file_uri_allowlist_accepts_bracketed_ipv6_loopback() -> None:
     assert _mlflow_artifact_uri_matches_prefix(
         "file://[::1]/tmp/models/model.pkl",
