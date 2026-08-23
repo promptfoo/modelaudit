@@ -2279,6 +2279,8 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
     mapping_bindings: dict[str, list[tuple[ast.AST, ast.expr]]] = {}
     single_name_bindings: dict[str, list[tuple[ast.AST, ast.expr]]] = {}
     mapping_aliases: list[tuple[ast.AST, str, str]] = []
+    mapping_alias_groups: list[tuple[ast.AST, tuple[str, ...], str]] = []
+    mapping_alias_target_names: set[str] = set()
     name_write_nodes: dict[str, list[ast.AST]] = {}
     for node in nodes:
         if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
@@ -2316,16 +2318,13 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
             and isinstance(targets[0], ast.Name)
         ):
             mapping_bindings.setdefault(targets[0].id, []).append((binding_node, binding_node.value))
-        identity_names = [target.id for target in targets if isinstance(target, ast.Name)]
-        if isinstance(binding_node.value, ast.Name):
-            identity_names.append(binding_node.value.id)
-        if identity_names:
-            root_name = identity_names[0]
-            for alias_name in identity_names[1:]:
-                if alias_name == root_name:
-                    continue
-                mapping_aliases.append((binding_node, root_name, alias_name))
+        target_names = [target.id for target in targets if isinstance(target, ast.Name)]
+        if target_names and isinstance(binding_node.value, ast.Name):
+            mapping_alias_target_names.update(target_names)
+            mapping_alias_groups.append((binding_node, tuple(dict.fromkeys(target_names)), binding_node.value.id))
     for candidates in mapping_bindings.values():
+        candidates.sort(key=lambda item: (getattr(item[0], "lineno", 0), getattr(item[0], "col_offset", 0)))
+    for candidates in single_name_bindings.values():
         candidates.sort(key=lambda item: (getattr(item[0], "lineno", 0), getattr(item[0], "col_offset", 0)))
 
     top_level_statement_indices = {
@@ -2471,8 +2470,155 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
         reference_index = top_level_statement_indices.get(id(reference))
         return operation_index is None or reference_index is None or operation_index <= reference_index
 
+    def operation_definitely_follows_reference(operation: ast.AST, reference: ast.AST) -> bool:
+        if execution_may_be_deferred(reference):
+            return False
+        operation_line = getattr(operation, "lineno", None)
+        reference_line = getattr(reference, "lineno", None)
+        if operation_line is not None and operation_line == reference_line:
+            return False
+        operation_index = top_level_statement_indices.get(id(operation))
+        reference_index = top_level_statement_indices.get(id(reference))
+        if operation_index is None or reference_index is None:
+            return False
+        if operation_index != reference_index:
+            return operation_index > reference_index
+        operation_membership = direct_statement_membership(operation)
+        reference_membership = direct_statement_membership(reference)
+        if operation_membership is None or reference_membership is None:
+            return False
+        operation_statement = operation_membership[3]
+        reference_statement = reference_membership[3]
+        return binding_precedes_reference_in_supported_body(reference_statement, operation_statement)
+
+    def is_direct_expression_call(call: ast.Call) -> bool:
+        call_membership = direct_statement_membership(call)
+        return (
+            call_membership is not None
+            and isinstance(call_membership[3], ast.Expr)
+            and call_membership[3].value is call
+        )
+
     def mapping_operation_may_affect_call(operation: ast.AST, call: ast.Call) -> bool:
+        if is_direct_expression_call(call) and operation_definitely_follows_reference(operation, call):
+            return False
         return operation_may_affect_reference(operation, call)
+
+    def node_is_within(node: ast.AST, ancestor: ast.AST) -> bool:
+        current: ast.AST | None = node
+        while current is not None:
+            if current is ancestor:
+                return True
+            current = parents.get(id(current))
+        return False
+
+    mapping_alias_targets = {
+        id(binding_node): frozenset(target_names) for binding_node, target_names, _source_name in mapping_alias_groups
+    }
+
+    def alias_state_after_edge(
+        binding_node: ast.AST,
+        first_name: str,
+        second_name: str,
+        current_name: str,
+        reference: ast.AST,
+        version_binding: ast.AST | None,
+    ) -> tuple[str, ast.AST, ast.AST | None] | None:
+        alias_name = second_name if current_name == first_name else first_name
+        target_names = mapping_alias_targets.get(id(binding_node), frozenset())
+        if binding_node is reference:
+            return (
+                alias_name,
+                reference,
+                binding_node if alias_name in target_names else None,
+            )
+        if operation_definitely_follows_reference(binding_node, reference):
+            binding_value = binding_node.value if isinstance(binding_node, (ast.Assign, ast.AnnAssign)) else None
+            if not isinstance(binding_value, ast.Name) or binding_value.id != current_name:
+                return None
+            for write_node in name_write_nodes.get(current_name, []):
+                if node_is_within(write_node, reference) or node_is_within(write_node, binding_node):
+                    continue
+                if operation_definitely_follows_reference(
+                    write_node,
+                    reference,
+                ) and operation_definitely_follows_reference(binding_node, write_node):
+                    return None
+            return (
+                alias_name,
+                binding_node,
+                binding_node if alias_name in target_names else None,
+            )
+        reference_is_post_binding = version_binding is reference
+        for endpoint_name in (first_name, second_name):
+            for write_node in name_write_nodes.get(endpoint_name, []):
+                if node_is_within(write_node, binding_node):
+                    continue
+                if reference_is_post_binding and node_is_within(write_node, reference):
+                    return None
+                if operation_definitely_follows_reference(
+                    write_node,
+                    binding_node,
+                ) and operation_definitely_follows_reference(reference, write_node):
+                    return None
+        return (
+            alias_name,
+            reference,
+            binding_node if alias_name in target_names else None,
+        )
+
+    def alias_edge_survives_until_reference(
+        binding_node: ast.AST,
+        first_name: str,
+        second_name: str,
+        reference: ast.AST,
+    ) -> bool:
+        if not operation_definitely_follows_reference(reference, binding_node):
+            return False
+        for endpoint_name in (first_name, second_name):
+            for write_node in name_write_nodes.get(endpoint_name, []):
+                if node_is_within(write_node, binding_node):
+                    continue
+                if operation_definitely_follows_reference(
+                    write_node,
+                    binding_node,
+                ) and operation_definitely_follows_reference(reference, write_node):
+                    return False
+        return True
+
+    expanded_mapping_aliases: list[tuple[ast.AST, str, str]] = []
+    remaining_alias_expansion_steps = _MAX_README_IMAGE_EXAMPLE_AST_NODES
+    for binding_node, group_target_names, source_name in sorted(
+        mapping_alias_groups,
+        key=lambda item: (getattr(item[0], "lineno", 0), getattr(item[0], "col_offset", 0)),
+    ):
+        source_component = {source_name}
+        pending_source_names = [source_name]
+        while pending_source_names:
+            current_name = pending_source_names.pop()
+            for prior_binding, first_name, second_name in expanded_mapping_aliases:
+                if remaining_alias_expansion_steps <= 0:
+                    return False
+                remaining_alias_expansion_steps -= 1
+                if current_name not in {first_name, second_name} or not alias_edge_survives_until_reference(
+                    prior_binding,
+                    first_name,
+                    second_name,
+                    binding_node,
+                ):
+                    continue
+                alias_name = second_name if current_name == first_name else first_name
+                if alias_name in source_component:
+                    continue
+                source_component.add(alias_name)
+                pending_source_names.append(alias_name)
+        identity_names = list(dict.fromkeys((*group_target_names, *sorted(source_component))))
+        for first_index, first_name in enumerate(identity_names):
+            for second_name in identity_names[first_index + 1 :]:
+                if len(expanded_mapping_aliases) >= _MAX_README_IMAGE_EXAMPLE_AST_NODES:
+                    return False
+                expanded_mapping_aliases.append((binding_node, first_name, second_name))
+    mapping_aliases = expanded_mapping_aliases
 
     aliased_mapping_names = set(mapping_bindings)
     for _binding_node, first_name, second_name in mapping_aliases:
@@ -2567,25 +2713,48 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
             relevant_binding_counts[name] = logical_write_count
         for name, write_nodes in relevant_name_writes.items():
             relevant_binding_counts.setdefault(name, len(write_nodes))
-        relevant_aliases: dict[str, set[str]] = {}
-        for binding_node, first_name, second_name in mapping_aliases:
-            if not mapping_operation_may_affect_call(binding_node, call):
+        unsafe_names: set[str] = set()
+        remaining_alias_steps = _MAX_README_IMAGE_EXAMPLE_AST_NODES
+        for name, operation in unsafe_mapping_operations_for(proven_mapping_transfer_call_ids):
+            if not mapping_operation_may_affect_call(operation, call):
                 continue
-            relevant_aliases.setdefault(first_name, set()).add(second_name)
-            relevant_aliases.setdefault(second_name, set()).add(first_name)
-        unsafe_names = {
-            name
-            for name, operation in unsafe_mapping_operations_for(proven_mapping_transfer_call_ids)
-            if mapping_operation_may_affect_call(operation, call)
-        }
-        pending_unsafe_names = list(unsafe_names)
-        while pending_unsafe_names:
-            unsafe_name = pending_unsafe_names.pop()
-            for alias_name in relevant_aliases.get(unsafe_name, set()):
-                if alias_name in unsafe_names:
-                    continue
-                unsafe_names.add(alias_name)
-                pending_unsafe_names.append(alias_name)
+            operation_unsafe_names = {name}
+            initial_state: tuple[str, ast.AST, ast.AST | None] = (name, operation, None)
+            seen_alias_states: set[tuple[str, int, int | None]] = {(name, id(operation), None)}
+            pending_alias_states: list[tuple[str, ast.AST, ast.AST | None]] = [initial_state]
+            while pending_alias_states:
+                unsafe_name, reference, version_binding = pending_alias_states.pop()
+                for binding_node, first_name, second_name in mapping_aliases:
+                    if remaining_alias_steps <= 0:
+                        return False
+                    remaining_alias_steps -= 1
+                    if not mapping_operation_may_affect_call(binding_node, call) or unsafe_name not in {
+                        first_name,
+                        second_name,
+                    }:
+                        continue
+                    alias_state = alias_state_after_edge(
+                        binding_node,
+                        first_name,
+                        second_name,
+                        unsafe_name,
+                        reference,
+                        version_binding,
+                    )
+                    if alias_state is None:
+                        continue
+                    alias_name, alias_reference, alias_version_binding = alias_state
+                    operation_unsafe_names.add(alias_name)
+                    state_key = (
+                        alias_name,
+                        id(alias_reference),
+                        id(alias_version_binding) if alias_version_binding is not None else None,
+                    )
+                    if state_key in seen_alias_states:
+                        continue
+                    seen_alias_states.add(state_key)
+                    pending_alias_states.append(alias_state)
+            unsafe_names.update(operation_unsafe_names)
 
         return _remote_code_mapping_is_proven_safe(
             value,
@@ -2804,12 +2973,7 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
         mapping_value, transfer_calls = unwrapped_mapping
         if not transfer_calls or not isinstance(mapping_value, ast.Name):
             continue
-        prior_bindings = [
-            prior_binding
-            for prior_binding, _prior_value in mapping_bindings.get(mapping_value.id, [])
-            if top_level_statement_precedes(prior_binding, transfer_call)
-        ]
-        if not prior_bindings or id(prior_bindings[-1]) not in proven_mapping_binding_chains:
+        if not proven_mapping_binding_precedes_call(mapping_value.id, transfer_call):
             continue
         candidate_transfer_call_ids = frozenset(
             proven_mapping_transfer_call_id_set | {id(candidate) for candidate in transfer_calls}
@@ -2862,6 +3026,53 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
     proven_mapping_call_ids = frozenset(proven_mapping_call_id_set)
     proven_mapping_transfer_call_ids = frozenset(proven_mapping_transfer_call_id_set)
 
+    remote_mapping_calls_by_name: dict[str, list[ast.Call]] = {}
+    for node in nodes:
+        if (
+            not isinstance(node, ast.Call)
+            or not isinstance(node.func, ast.Attribute)
+            or node.func.attr not in {"from_pretrained", "generate"}
+        ):
+            continue
+        for keyword in node.keywords:
+            if keyword.arg is None and isinstance(keyword.value, ast.Name):
+                remote_mapping_calls_by_name.setdefault(keyword.value.id, []).append(node)
+    remote_mapping_alias_names = set(remote_mapping_calls_by_name)
+    pending_remote_mapping_alias_names = list(remote_mapping_alias_names)
+    remaining_remote_alias_steps = _MAX_README_IMAGE_EXAMPLE_AST_NODES
+    while pending_remote_mapping_alias_names:
+        mapping_name = pending_remote_mapping_alias_names.pop()
+        for _binding_node, first_name, second_name in mapping_aliases:
+            if remaining_remote_alias_steps <= 0:
+                return False
+            remaining_remote_alias_steps -= 1
+            if mapping_name not in {first_name, second_name}:
+                continue
+            alias_name = second_name if mapping_name == first_name else first_name
+            if alias_name in remote_mapping_alias_names:
+                continue
+            remote_mapping_alias_names.add(alias_name)
+            pending_remote_mapping_alias_names.append(alias_name)
+    allowed_mapping_alias_subscript_names = mapping_alias_target_names & remote_mapping_alias_names
+
+    def is_allowed_mapping_subscript_target(target: ast.expr) -> bool:
+        if not isinstance(target, ast.Subscript) or not isinstance(target.value, ast.Name):
+            return False
+        mapping_calls = remote_mapping_calls_by_name.get(target.value.id, [])
+        if mapping_calls and all(
+            is_direct_expression_call(mapping_call) and operation_definitely_follows_reference(target, mapping_call)
+            for mapping_call in mapping_calls
+        ):
+            return True
+        if target.value.id not in allowed_mapping_alias_subscript_names:
+            return False
+        prior_bindings = [
+            binding_value
+            for binding_node, binding_value in single_name_bindings.get(target.value.id, [])
+            if operation_definitely_follows_reference(target, binding_node)
+        ]
+        return bool(prior_bindings) and isinstance(prior_bindings[-1], ast.Dict)
+
     for node in nodes:
         if isinstance(node, ast.Import):
             for alias in node.names:
@@ -2891,7 +3102,10 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
             return False
         if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-            if any(not isinstance(target, ast.Name) for target in targets):
+            if any(
+                not isinstance(target, ast.Name) and not is_allowed_mapping_subscript_target(target)
+                for target in targets
+            ):
                 return False
         if (
             isinstance(node, ast.Name)
