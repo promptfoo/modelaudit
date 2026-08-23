@@ -2277,6 +2277,7 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
     }
     allowed_targets: set[int] = set()
     mapping_bindings: dict[str, list[tuple[ast.AST, ast.expr]]] = {}
+    single_name_bindings: dict[str, list[tuple[ast.AST, ast.expr]]] = {}
     mapping_aliases: list[tuple[ast.AST, str, str]] = []
     name_write_nodes: dict[str, list[ast.AST]] = {}
     for node in nodes:
@@ -2306,9 +2307,11 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
         if not isinstance(binding_node, (ast.Assign, ast.AnnAssign)):
             continue
         targets = binding_node.targets if isinstance(binding_node, ast.Assign) else [binding_node.target]
+        if binding_node.value is not None and len(targets) == 1 and isinstance(targets[0], ast.Name):
+            single_name_bindings.setdefault(targets[0].id, []).append((binding_node, binding_node.value))
         if (
             not isinstance(parents.get(id(binding_node)), ast.Module)
-            and isinstance(binding_node.value, ast.Call)
+            and isinstance(binding_node.value, (ast.Call, ast.Dict))
             and len(targets) == 1
             and isinstance(targets[0], ast.Name)
         ):
@@ -2366,8 +2369,8 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
             and Counter(write_indices) == Counter(binding_indices)
         )
 
-    def call_execution_may_be_deferred(call: ast.Call) -> bool:
-        current: ast.AST = call
+    def execution_may_be_deferred(reference: ast.AST) -> bool:
+        current = reference
         while parent := parents.get(id(current)):
             if isinstance(parent, ast.GeneratorExp):
                 return True
@@ -2408,22 +2411,24 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
             return field_name in {"body", "orelse"}
         return isinstance(container, ast.With) and field_name == "body" and is_canonical_no_grad_with(container)
 
-    def nested_mapping_binding_precedes_call(binding: ast.AST, call: ast.Call) -> bool:
-        if call_execution_may_be_deferred(call):
+    def binding_precedes_reference_in_supported_body(binding: ast.AST, reference: ast.AST) -> bool:
+        if execution_may_be_deferred(reference):
             return False
         binding_membership = direct_statement_membership(binding)
-        call_membership = direct_statement_membership(call)
-        if binding_membership is None or call_membership is None:
+        reference_membership = direct_statement_membership(reference)
+        if binding_membership is None or reference_membership is None:
             return False
         binding_container, binding_field, binding_index, binding_statement = binding_membership
-        call_container, call_field, call_index, call_statement = call_membership
+        reference_container, reference_field, reference_index, reference_statement = reference_membership
+        reference_is_direct_statement = reference_statement is reference or (
+            isinstance(reference_statement, ast.Expr) and reference_statement.value is reference
+        )
         if (
-            binding_container is not call_container
-            or binding_field != call_field
+            binding_container is not reference_container
+            or binding_field != reference_field
             or binding_statement is not binding
-            or not isinstance(call_statement, ast.Expr)
-            or call_statement.value is not call
-            or binding_index >= call_index
+            or not reference_is_direct_statement
+            or binding_index >= reference_index
             or not is_single_execution_body(binding_container, binding_field)
         ):
             return False
@@ -2443,21 +2448,31 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
             container = parent
         return True
 
-    def mapping_binding_position_at_call(binding: ast.AST, call: ast.Call) -> int:
+    def binding_position_at_reference(binding: ast.AST, reference: ast.AST) -> int:
         binding_position = top_level_statement_indices[id(binding)]
-        call_position = top_level_statement_indices[id(call)]
+        reference_position = top_level_statement_indices[id(reference)]
         if not isinstance(parents.get(id(binding)), ast.Module):
-            return call_position - 1 if nested_mapping_binding_precedes_call(binding, call) else call_position
+            if binding_precedes_reference_in_supported_body(binding, reference):
+                return reference_position - 1
+            return reference_position
         return binding_position
 
-    def mapping_operation_may_affect_call(operation: ast.AST, call: ast.Call) -> bool:
-        if call_execution_may_be_deferred(call):
+    def mapping_binding_position_at_call(binding: ast.AST, call: ast.Call) -> int:
+        return binding_position_at_reference(binding, call)
+
+    def operation_may_affect_reference(operation: ast.AST, reference: ast.AST) -> bool:
+        if execution_may_be_deferred(reference):
             return True
-        if getattr(operation, "lineno", None) == call.lineno:
+        operation_line = getattr(operation, "lineno", None)
+        reference_line = getattr(reference, "lineno", None)
+        if operation_line is not None and operation_line == reference_line:
             return True
         operation_index = top_level_statement_indices.get(id(operation))
-        call_index = top_level_statement_indices.get(id(call))
-        return operation_index is None or call_index is None or operation_index <= call_index
+        reference_index = top_level_statement_indices.get(id(reference))
+        return operation_index is None or reference_index is None or operation_index <= reference_index
+
+    def mapping_operation_may_affect_call(operation: ast.AST, call: ast.Call) -> bool:
+        return operation_may_affect_reference(operation, call)
 
     aliased_mapping_names = set(mapping_bindings)
     for _binding_node, first_name, second_name in mapping_aliases:
@@ -2599,9 +2614,9 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
         binding_node: ast.AST,
         allowed_factory_names: set[str],
     ) -> bool:
-        def operation_may_affect_reference(operation: ast.AST) -> bool:
+        def instance_operation_may_affect_reference(operation: ast.AST) -> bool:
             if isinstance(binding_node, ast.Call):
-                if call_execution_may_be_deferred(binding_node):
+                if execution_may_be_deferred(binding_node):
                     return True
                 operation_index = top_level_statement_indices.get(id(operation))
                 reference_index = top_level_statement_indices.get(id(binding_node))
@@ -2615,10 +2630,11 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
         instance_bindings = [
             (instance_binding, factory_call)
             for instance_binding, factory_call in mapping_bindings.get(instance_name, [])
-            if operation_may_affect_reference(instance_binding)
+            if instance_operation_may_affect_reference(instance_binding)
         ]
         relevant_write_count = sum(
-            operation_may_affect_reference(write_node) for write_node in name_write_nodes.get(instance_name, [])
+            instance_operation_may_affect_reference(write_node)
+            for write_node in name_write_nodes.get(instance_name, [])
         )
         if len(instance_bindings) != 1 or relevant_write_count != 1:
             return False
@@ -2654,16 +2670,23 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
             return False
         device_bindings = [
             (device_binding, device_value)
-            for device_binding, device_value in mapping_bindings.get(value.id, [])
-            if top_level_statement_precedes(device_binding, binding_node)
+            for device_binding, device_value in single_name_bindings.get(value.id, [])
+            if operation_may_affect_reference(device_binding, binding_node)
         ]
-        prior_write_count = sum(
-            top_level_statement_precedes(write_node, binding_node) for write_node in name_write_nodes.get(value.id, [])
+        relevant_write_count = sum(
+            operation_may_affect_reference(write_node, binding_node)
+            for write_node in name_write_nodes.get(value.id, [])
         )
-        if len(device_bindings) != 1 or prior_write_count != 1:
+        if len(device_bindings) != 1 or relevant_write_count != 1:
             return False
         device_binding, device_value = device_bindings[0]
-        return is_single_name_binding(device_binding, device_value, value.id) and is_allowed_local_device(device_value)
+        reference_position = top_level_statement_indices.get(id(binding_node))
+        return (
+            reference_position is not None
+            and binding_position_at_reference(device_binding, binding_node) < reference_position
+            and is_single_name_binding(device_binding, device_value, value.id)
+            and is_allowed_local_device(device_value)
+        )
 
     def unwrap_safe_mapping_device_transfers(
         value: ast.expr,
@@ -2759,12 +2782,21 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
         proven_mapping_call_id_set.add(id(binding_value))
         proven_mapping_transfer_call_id_set.update(id(transfer_call) for transfer_call in transfer_calls)
 
+    def proven_mapping_binding_precedes_call(mapping_name: str, call: ast.Call) -> bool:
+        call_position = top_level_statement_indices[id(call)]
+        prior_bindings = [
+            binding_node
+            for binding_node, _binding_value in mapping_bindings.get(mapping_name, [])
+            if mapping_binding_position_at_call(binding_node, call) < call_position
+        ]
+        return bool(prior_bindings) and id(prior_bindings[-1]) in proven_mapping_binding_chains
+
     standalone_transfer_calls = sorted(
         (node.value for node in nodes if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)),
         key=lambda call: top_level_statement_indices.get(id(call), len(tree.body)),
     )
     for transfer_call in standalone_transfer_calls:
-        if call_execution_may_be_deferred(transfer_call):
+        if execution_may_be_deferred(transfer_call):
             continue
         unwrapped_mapping = unwrap_safe_mapping_device_transfers(transfer_call, transfer_call)
         if unwrapped_mapping is None:
@@ -2797,7 +2829,7 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
             not isinstance(generate_call, ast.Call)
             or not isinstance(generate_call.func, ast.Attribute)
             or generate_call.func.attr != "generate"
-            or call_execution_may_be_deferred(generate_call)
+            or execution_may_be_deferred(generate_call)
         ):
             continue
         for keyword in generate_call.keywords:
@@ -2807,7 +2839,22 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
             if unwrapped_mapping is None:
                 continue
             mapping_value, transfer_calls = unwrapped_mapping
-            if not trusted_mapping_factory_call_is_proven_safe(generate_call, mapping_value):
+            mapping_is_proven_safe = trusted_mapping_factory_call_is_proven_safe(generate_call, mapping_value)
+            if not mapping_is_proven_safe and transfer_calls and isinstance(mapping_value, ast.Name):
+                candidate_transfer_call_ids = frozenset(
+                    proven_mapping_transfer_call_id_set | {id(candidate) for candidate in transfer_calls}
+                )
+                mapping_is_proven_safe = proven_mapping_binding_precedes_call(
+                    mapping_value.id,
+                    generate_call,
+                ) and remote_code_mapping_is_proven_safe_at_call(
+                    mapping_value,
+                    generate_call,
+                    proven_mapping_call_ids=frozenset(proven_mapping_call_id_set),
+                    proven_mapping_binding_chains=proven_mapping_binding_chains,
+                    proven_mapping_transfer_call_ids=candidate_transfer_call_ids,
+                )
+            if not mapping_is_proven_safe:
                 continue
             proven_mapping_call_id_set.add(id(keyword.value))
             proven_mapping_transfer_call_id_set.update(id(transfer_call) for transfer_call in transfer_calls)
