@@ -11,7 +11,7 @@ import re
 import tokenize
 from bisect import bisect_right
 from collections import Counter
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import suppress
 from functools import lru_cache
 from importlib.resources import files
@@ -2278,8 +2278,10 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
     allowed_targets: set[int] = set()
     mapping_bindings: dict[str, list[tuple[ast.AST, ast.expr]]] = {}
     single_name_bindings: dict[str, list[tuple[ast.AST, ast.expr]]] = {}
+    name_value_bindings: dict[str, list[tuple[ast.AST, ast.expr]]] = {}
+    modeled_name_write_ids: dict[str, set[int]] = {}
     mapping_aliases: list[tuple[ast.AST, str, str]] = []
-    mapping_alias_groups: list[tuple[ast.AST, tuple[str, ...], str]] = []
+    mapping_alias_groups: list[tuple[ast.AST, tuple[str, ...], str | None]] = []
     mapping_alias_target_names: set[str] = set()
     name_write_nodes: dict[str, list[ast.AST]] = {}
     for node in nodes:
@@ -2311,6 +2313,11 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
         targets = binding_node.targets if isinstance(binding_node, ast.Assign) else [binding_node.target]
         if binding_node.value is not None and len(targets) == 1 and isinstance(targets[0], ast.Name):
             single_name_bindings.setdefault(targets[0].id, []).append((binding_node, binding_node.value))
+        if binding_node.value is not None:
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    name_value_bindings.setdefault(target.id, []).append((binding_node, binding_node.value))
+                    modeled_name_write_ids.setdefault(target.id, set()).add(id(target))
         if (
             not isinstance(parents.get(id(binding_node)), ast.Module)
             and isinstance(binding_node.value, (ast.Call, ast.Dict))
@@ -2319,12 +2326,15 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
         ):
             mapping_bindings.setdefault(targets[0].id, []).append((binding_node, binding_node.value))
         target_names = [target.id for target in targets if isinstance(target, ast.Name)]
-        if target_names and isinstance(binding_node.value, ast.Name):
+        source_name = binding_node.value.id if isinstance(binding_node.value, ast.Name) else None
+        if target_names and (len(target_names) > 1 or source_name is not None):
             mapping_alias_target_names.update(target_names)
-            mapping_alias_groups.append((binding_node, tuple(dict.fromkeys(target_names)), binding_node.value.id))
+            mapping_alias_groups.append((binding_node, tuple(dict.fromkeys(target_names)), source_name))
     for candidates in mapping_bindings.values():
         candidates.sort(key=lambda item: (getattr(item[0], "lineno", 0), getattr(item[0], "col_offset", 0)))
     for candidates in single_name_bindings.values():
+        candidates.sort(key=lambda item: (getattr(item[0], "lineno", 0), getattr(item[0], "col_offset", 0)))
+    for candidates in name_value_bindings.values():
         candidates.sort(key=lambda item: (getattr(item[0], "lineno", 0), getattr(item[0], "col_offset", 0)))
 
     top_level_statement_indices = {
@@ -2512,6 +2522,61 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
             current = parents.get(id(current))
         return False
 
+    def node_is_statically_unreachable(node: ast.AST) -> bool:
+        membership = direct_statement_membership(node)
+        if membership is None:
+            return False
+        current_statement = membership[3]
+        while containing_membership := statement_memberships.get(id(current_statement)):
+            container, field_name, _statement_index, _statement = containing_membership
+            if (
+                isinstance(container, ast.If)
+                and isinstance(container.test, ast.Constant)
+                and isinstance(container.test.value, bool)
+                and (
+                    (field_name == "body" and not container.test.value)
+                    or (field_name == "orelse" and container.test.value)
+                )
+            ):
+                return True
+            if not isinstance(container, ast.stmt):
+                return False
+            current_statement = container
+        return False
+
+    def node_is_proven_executed_before(node: ast.AST, reference: ast.AST) -> bool:
+        if node_is_statically_unreachable(node) or not operation_definitely_follows_reference(reference, node):
+            return False
+        node_membership = direct_statement_membership(node)
+        reference_membership = direct_statement_membership(reference)
+        if node_membership is None or reference_membership is None:
+            return False
+        node_statement = node_membership[3]
+        reference_statement = reference_membership[3]
+        if binding_precedes_reference_in_supported_body(node_statement, reference_statement):
+            return True
+        current_statement = node_statement
+        while containing_membership := statement_memberships.get(id(current_statement)):
+            container, field_name, _statement_index, _statement = containing_membership
+            if isinstance(container, ast.Module):
+                return True
+            if isinstance(container, ast.With) and field_name == "body" and is_canonical_no_grad_with(container):
+                current_statement = container
+                continue
+            if (
+                isinstance(container, ast.If)
+                and isinstance(container.test, ast.Constant)
+                and isinstance(container.test.value, bool)
+                and (
+                    (field_name == "body" and container.test.value)
+                    or (field_name == "orelse" and not container.test.value)
+                )
+            ):
+                current_statement = container
+                continue
+            return False
+        return False
+
     mapping_alias_targets = {
         id(binding_node): frozenset(target_names) for binding_node, target_names, _source_name in mapping_alias_groups
     }
@@ -2539,10 +2604,17 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
             for write_node in name_write_nodes.get(current_name, []):
                 if node_is_within(write_node, reference) or node_is_within(write_node, binding_node):
                     continue
-                if operation_definitely_follows_reference(
-                    write_node,
-                    reference,
-                ) and operation_definitely_follows_reference(binding_node, write_node):
+                if (
+                    operation_definitely_follows_reference(
+                        write_node,
+                        reference,
+                    )
+                    and operation_definitely_follows_reference(
+                        binding_node,
+                        write_node,
+                    )
+                    and node_is_proven_executed_before(write_node, binding_node)
+                ):
                     return None
             return (
                 alias_name,
@@ -2556,10 +2628,17 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
                     continue
                 if reference_is_post_binding and node_is_within(write_node, reference):
                     return None
-                if operation_definitely_follows_reference(
-                    write_node,
-                    binding_node,
-                ) and operation_definitely_follows_reference(reference, write_node):
+                if (
+                    operation_definitely_follows_reference(
+                        write_node,
+                        binding_node,
+                    )
+                    and operation_definitely_follows_reference(
+                        reference,
+                        write_node,
+                    )
+                    and node_is_proven_executed_before(write_node, reference)
+                ):
                     return None
         return (
             alias_name,
@@ -2579,10 +2658,17 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
             for write_node in name_write_nodes.get(endpoint_name, []):
                 if node_is_within(write_node, binding_node):
                     continue
-                if operation_definitely_follows_reference(
-                    write_node,
-                    binding_node,
-                ) and operation_definitely_follows_reference(reference, write_node):
+                if (
+                    operation_definitely_follows_reference(
+                        write_node,
+                        binding_node,
+                    )
+                    and operation_definitely_follows_reference(
+                        reference,
+                        write_node,
+                    )
+                    and node_is_proven_executed_before(write_node, reference)
+                ):
                     return False
         return True
 
@@ -2592,8 +2678,8 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
         mapping_alias_groups,
         key=lambda item: (getattr(item[0], "lineno", 0), getattr(item[0], "col_offset", 0)),
     ):
-        source_component = {source_name}
-        pending_source_names = [source_name]
+        source_component = {source_name} if source_name is not None else set()
+        pending_source_names = [source_name] if source_name is not None else []
         while pending_source_names:
             current_name = pending_source_names.pop()
             for prior_binding, first_name, second_name in expanded_mapping_aliases:
@@ -3026,13 +3112,159 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
     proven_mapping_call_ids = frozenset(proven_mapping_call_id_set)
     proven_mapping_transfer_call_ids = frozenset(proven_mapping_transfer_call_id_set)
 
+    sensitive_callable_attributes = frozenset({"from_pretrained", "generate"})
+    benign_callable_marker = "<benign-callable>"
+    untrusted_callable_marker = "<untrusted-callable>"
+    named_callable_resolution_cache: dict[tuple[str, int], frozenset[str] | None] = {}
+
+    def binding_is_proven_after_eager_reference(binding: ast.AST, reference: ast.AST) -> bool:
+        if execution_may_be_deferred(reference):
+            return False
+        binding_position = top_level_statement_indices.get(id(binding))
+        reference_position = top_level_statement_indices.get(id(reference))
+        if binding_position is None or reference_position is None:
+            return False
+        if binding_position != reference_position:
+            return binding_position > reference_position
+        binding_membership = direct_statement_membership(binding)
+        reference_membership = direct_statement_membership(reference)
+        if binding_membership is None or reference_membership is None:
+            return False
+        return binding_precedes_reference_in_supported_body(
+            reference_membership[3],
+            binding_membership[3],
+        )
+
+    def named_sensitive_callable_resolution(
+        name: str,
+        call: ast.Call,
+    ) -> frozenset[str] | None:
+        cache_key = (name, id(call))
+        if cache_key in named_callable_resolution_cache:
+            return named_callable_resolution_cache[cache_key]
+        remaining_steps = _MAX_README_IMAGE_EXAMPLE_AST_NODES
+        memo: dict[tuple[str, int], frozenset[str]] = {}
+        resolving: set[tuple[str, int]] = set()
+
+        def merge_values(
+            values: Iterable[ast.expr],
+            reference: ast.AST,
+        ) -> frozenset[str] | None:
+            merged: set[str] = set()
+            for candidate_value in values:
+                candidate_resolution = resolve_value(candidate_value, reference)
+                if candidate_resolution is None:
+                    return None
+                merged.update(candidate_resolution)
+            return frozenset(merged or {untrusted_callable_marker})
+
+        def resolve_value(
+            value: ast.expr,
+            reference: ast.AST,
+        ) -> frozenset[str] | None:
+            if isinstance(value, ast.Attribute) and value.attr in sensitive_callable_attributes:
+                return frozenset({value.attr})
+            if isinstance(value, ast.Name):
+                return resolve_name(value.id, reference)
+            if isinstance(value, ast.IfExp):
+                if isinstance(value.test, ast.Constant) and isinstance(value.test.value, bool):
+                    return resolve_value(value.body if value.test.value else value.orelse, reference)
+                return merge_values((value.body, value.orelse), reference)
+            if isinstance(value, ast.BoolOp):
+                return merge_values(value.values, reference)
+            if isinstance(value, (ast.List, ast.Set, ast.Tuple)):
+                return merge_values(value.elts, reference)
+            if isinstance(value, ast.Dict):
+                return merge_values(value.values, reference)
+            if isinstance(value, ast.NamedExpr):
+                return resolve_value(value.value, reference)
+            if isinstance(value, ast.Subscript):
+                return resolve_value(value.value, reference)
+            if (
+                isinstance(value, ast.Call)
+                and isinstance(value.func, ast.Attribute)
+                and value.func.attr == "from_pretrained"
+                and isinstance(value.func.value, ast.Name)
+                and value.func.value.id in transformers_mapping_factory_names
+                and call_has_only_proven_safe_mapping_arguments(value)
+            ):
+                return frozenset({benign_callable_marker})
+            return frozenset({untrusted_callable_marker})
+
+        def resolve_name(
+            candidate_name: str,
+            reference: ast.AST,
+        ) -> frozenset[str] | None:
+            nonlocal remaining_steps
+            if candidate_name in documented_builtin_names:
+                return frozenset({benign_callable_marker})
+            key = (candidate_name, id(reference))
+            if key in memo:
+                return memo[key]
+            if key in resolving:
+                return None
+            resolving.add(key)
+            resolution: frozenset[str] | None = None
+            write_events: list[tuple[ast.AST, ast.expr | None]] = [
+                *name_value_bindings.get(candidate_name, []),
+                *(
+                    (write_node, None)
+                    for write_node in name_write_nodes.get(candidate_name, [])
+                    if id(write_node) not in modeled_name_write_ids.get(candidate_name, set())
+                ),
+            ]
+            write_events.sort(
+                key=lambda item: (
+                    top_level_statement_indices.get(id(item[0]), len(tree.body)),
+                    getattr(item[0], "lineno", 0),
+                    getattr(item[0], "col_offset", 0),
+                )
+            )
+            for binding_node, binding_value in write_events:
+                if binding_is_proven_after_eager_reference(
+                    binding_node,
+                    reference,
+                ) or node_is_statically_unreachable(binding_node):
+                    continue
+                if remaining_steps <= 0:
+                    resolving.remove(key)
+                    return None
+                remaining_steps -= 1
+                binding_kinds = (
+                    resolve_value(binding_value, binding_node)
+                    if binding_value is not None
+                    else frozenset({untrusted_callable_marker})
+                )
+                if binding_kinds is None:
+                    resolving.remove(key)
+                    return None
+                if node_is_proven_executed_before(binding_node, reference) or resolution is None:
+                    resolution = binding_kinds
+                else:
+                    resolution = resolution | binding_kinds
+            resolving.remove(key)
+            result = resolution if resolution is not None else frozenset({untrusted_callable_marker})
+            memo[key] = result
+            return result
+
+        result = resolve_name(name, call)
+        named_callable_resolution_cache[cache_key] = result
+        return result
+
     remote_mapping_calls_by_name: dict[str, list[ast.Call]] = {}
     for node in nodes:
-        if (
-            not isinstance(node, ast.Call)
-            or not isinstance(node.func, ast.Attribute)
-            or node.func.attr not in {"from_pretrained", "generate"}
-        ):
+        if not isinstance(node, ast.Call):
+            continue
+        if isinstance(node.func, ast.Attribute):
+            callable_kinds = frozenset({node.func.attr}) & sensitive_callable_attributes
+        elif isinstance(node.func, ast.Name):
+            callable_resolution = named_sensitive_callable_resolution(node.func.id, node)
+            if callable_resolution is None or not callable_resolution <= sensitive_callable_attributes:
+                continue
+            callable_kinds = callable_resolution
+        else:
+            continue
+        if not callable_kinds:
             continue
         for keyword in node.keywords:
             if keyword.arg is None and isinstance(keyword.value, ast.Name):
@@ -3072,6 +3304,29 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
             if operation_definitely_follows_reference(target, binding_node)
         ]
         return bool(prior_bindings) and isinstance(prior_bindings[-1], ast.Dict)
+
+    def named_sensitive_call_has_safe_options(call: ast.Call, callable_kinds: frozenset[str]) -> bool:
+        if any(
+            keyword.arg in _REMOTE_CODE_KEYWORDS and not _remote_code_option_is_disabled(keyword.arg, keyword.value)
+            for keyword in call.keywords
+        ):
+            return False
+        if "generate" in callable_kinds and (
+            any(isinstance(argument, ast.Starred) for argument in call.args)
+            or not _generate_positional_remote_code_is_disabled(call.args)
+        ):
+            return False
+        return all(
+            keyword.arg is not None
+            or remote_code_mapping_is_proven_safe_at_call(
+                keyword.value,
+                call,
+                proven_mapping_call_ids=proven_mapping_call_ids,
+                proven_mapping_binding_chains=proven_mapping_binding_chains,
+                proven_mapping_transfer_call_ids=proven_mapping_transfer_call_ids,
+            )
+            for keyword in call.keywords
+        )
 
     for node in nodes:
         if isinstance(node, ast.Import):
@@ -3131,12 +3386,17 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
             return False
         if isinstance(node, ast.ExceptHandler) and node.name in protected_names:
             return False
-        if (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id not in callable_assignments | documented_builtin_names
-        ):
-            return False
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            callable_resolution = named_sensitive_callable_resolution(node.func.id, node)
+            if callable_resolution is None or untrusted_callable_marker in callable_resolution:
+                return False
+            callable_kinds = callable_resolution & sensitive_callable_attributes
+            if callable_kinds and benign_callable_marker in callable_resolution:
+                return False
+            if node.func.id not in callable_assignments | documented_builtin_names and not callable_kinds:
+                return False
+            if callable_kinds and not named_sensitive_call_has_safe_options(node, callable_kinds):
+                return False
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
             if node not in requests_calls and node.func.attr not in documented_attribute_calls:
                 return False
