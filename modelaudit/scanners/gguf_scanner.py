@@ -762,31 +762,43 @@ class GgufScanner(BaseScanner):
 
     def _scan_zip_polyglot(self, result: ScanResult, *, format_name: str = "GGUF") -> bool:
         """Inspect ZIP members even when GGUF/GGML header parsing fails."""
-        if not zipfile.is_zipfile(self.current_file_path):
-            return False
-
-        # `is_zipfile` only proves an end-of-central-directory signature is present: it returns True
-        # for any file whose trailing bytes happen to contain b"PK\x05\x06" followed by 18 bytes.
-        # Model tensor data hits that by chance, so a cleanly-readable archive carrying no members
-        # is not a polyglot - a hidden payload always has at least one entry.
-        #
-        # A directory that fails to open is NOT treated as benign here: it falls through to the
-        # preflight below so a corrupted or truncated archive still fails closed as incomplete.
-        try:
-            with zipfile.ZipFile(self.current_file_path) as embedded_archive:
-                embedded_members: list[str] | None = embedded_archive.namelist()
-        except (OSError, zipfile.BadZipFile):
-            embedded_members = None
-        if embedded_members is not None and not embedded_members:
-            return False
-
+        from ._archive_outcomes import mark_archive_scan_incomplete
         from .archive_dispatch import (
             _ZIP_CONTAINER_PREFLIGHT_REJECTED_PATHS_PRIVATE_METADATA_KEY,
             merge_executable_zip_container_findings,
         )
+        from .zip_scanner import ZipPreflightRejected, open_preflighted_zip_handle
 
         archive_config = dict(self.config)
         archive_config.pop(_GGUF_CONTAINER_OWNED_TRAILING_CONFIG_KEY, None)
+
+        # Defer accepting an empty parse until the composed scan reconciles it with the bounded
+        # preflight count. A later EOCD inside the real EOCD comment can otherwise hide entries.
+        parsed_entry_count: int | None = None
+        preflight_accepted = False
+        try:
+            with open_preflighted_zip_handle(self.current_file_path, archive_config) as archive_handle:
+                preflight_accepted = True
+                with zipfile.ZipFile(archive_handle, "r") as embedded_archive:
+                    parsed_entry_count = len(embedded_archive.infolist())
+        except ZipPreflightRejected:
+            # The composed scan below records the fail-closed preflight diagnostics.
+            pass
+        except (OSError, zipfile.BadZipFile):
+            if not preflight_accepted:
+                return False
+            result.add_check(
+                name="ZIP File Format Validation",
+                passed=False,
+                message=f"Not a valid zip file: {self.current_file_path}",
+                severity=IssueSeverity.INFO,
+                rule_code="S902",
+                location=self.current_file_path,
+                details={"path": self.current_file_path},
+            )
+            mark_archive_scan_incomplete(result, "zip_analysis_incomplete")
+            return False
+
         merge_executable_zip_container_findings(
             self.current_file_path,
             result,
@@ -801,6 +813,8 @@ class GgufScanner(BaseScanner):
             isinstance(rejected_paths, (list, tuple, set, frozenset))
             and os.path.realpath(self.current_file_path) in rejected_paths
         ):
+            return False
+        if parsed_entry_count == 0:
             return False
 
         result.add_check(
@@ -1063,9 +1077,13 @@ class GgufScanner(BaseScanner):
         result: ScanResult,
     ) -> None:
         """Basic GGML file validation with security checks."""
+        outer_magic = magic.decode("ascii", "ignore")
         result.metadata["format"] = "ggml"
-        result.metadata["magic"] = magic.decode("ascii", "ignore")
+        result.metadata["magic"] = outer_magic
         self._scan_zip_polyglot(result, format_name="GGML")
+        result.metadata["format"] = "ggml"
+        result.metadata["magic"] = outer_magic
+        result.bytes_scanned = max(result.bytes_scanned, file_size)
 
         if file_size < 32:
             result.add_check(
@@ -1119,8 +1137,6 @@ class GgufScanner(BaseScanner):
                 details={"error": str(e), "error_type": type(e).__name__},
                 rule_code="S902",
             )
-
-        result.bytes_scanned = file_size
 
     def _read_value(
         self,
