@@ -41,7 +41,9 @@ FROM ${PYTHON_IMAGE} AS runtime
 WORKDIR /app
 
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends --only-upgrade libc-bin libc6 libcap2 libssl3t64 libsystemd0 libudev1 \
+    && apt-get install --yes --no-install-recommends --only-upgrade \
+        bsdutils libc-bin libc6 libblkid1 libcap2 liblastlog2-2 libmount1 libsmartcols1 \
+        libssl3t64 libsystemd0 libudev1 libuuid1 login mount util-linux \
     && apt-get install --yes --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
