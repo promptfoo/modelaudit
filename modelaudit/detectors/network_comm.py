@@ -2033,6 +2033,64 @@ def _matching_readme_image_fence_end(
 
 # Transformers keywords that cause Hub-hosted Python to be fetched and executed.
 _REMOTE_CODE_KEYWORDS = frozenset({"custom_generate", "trust_remote_code"})
+_GENERATE_CUSTOM_IMPLEMENTATION_POSITIONS = (10, 11)
+
+
+def _remote_code_option_is_disabled(name: str, value: ast.expr) -> bool:
+    if not isinstance(value, ast.Constant):
+        return False
+    if name == "trust_remote_code":
+        return value.value is False
+    if name == "custom_generate":
+        return value.value is None
+    return True
+
+
+def _remote_code_mapping_is_proven_safe(
+    value: ast.expr,
+    *,
+    bindings: dict[str, list[tuple[int, ast.expr]]],
+    binding_counts: Counter[str],
+    unsafe_names: frozenset[str],
+    call_lineno: int,
+    resolving: frozenset[str] = frozenset(),
+) -> bool:
+    if isinstance(value, ast.Name):
+        if value.id in resolving or value.id in unsafe_names or binding_counts[value.id] != 1:
+            return False
+        candidates = bindings.get(value.id, [])
+        if len(candidates) != 1:
+            return False
+        binding_lineno, binding_value = candidates[0]
+        if binding_lineno >= call_lineno:
+            return False
+        return _remote_code_mapping_is_proven_safe(
+            binding_value,
+            bindings=bindings,
+            binding_counts=binding_counts,
+            unsafe_names=unsafe_names,
+            call_lineno=call_lineno,
+            resolving=resolving | {value.id},
+        )
+    if not isinstance(value, ast.Dict):
+        return False
+    for key, item_value in zip(value.keys, value.values, strict=True):
+        if key is None:
+            if not _remote_code_mapping_is_proven_safe(
+                item_value,
+                bindings=bindings,
+                binding_counts=binding_counts,
+                unsafe_names=unsafe_names,
+                call_lineno=call_lineno,
+                resolving=resolving,
+            ):
+                return False
+            continue
+        if not isinstance(key, ast.Constant) or not isinstance(key.value, str):
+            return False
+        if key.value in _REMOTE_CODE_KEYWORDS and not _remote_code_option_is_disabled(key.value, item_value):
+            return False
+    return True
 
 
 def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
@@ -2177,12 +2235,22 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
         "tolist",
     }
     allowed_targets: set[int] = set()
+    mapping_bindings: dict[str, list[tuple[ast.AST, ast.expr]]] = {}
+    mapping_aliases: list[tuple[ast.AST, str, str]] = []
+    name_binding_nodes: dict[str, list[ast.AST]] = {}
+    for node in nodes:
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+            name_binding_nodes.setdefault(node.id, []).append(node)
+        elif isinstance(node, ast.arg):
+            name_binding_nodes.setdefault(node.arg, []).append(node)
     assignments: dict[str, list[tuple[int, str | None]]] = {}
     for statement in tree.body:
         if not isinstance(statement, (ast.Assign, ast.AnnAssign)):
             continue
         targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
         for target in targets:
+            if isinstance(target, ast.Name) and statement.value is not None:
+                mapping_bindings.setdefault(target.id, []).append((statement, statement.value))
             if isinstance(target, ast.Name) and target.id in protected_names and target.id != "requests":
                 if isinstance(statement, ast.AnnAssign) and not isinstance(statement.value, ast.Constant):
                     continue
@@ -2191,6 +2259,110 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
                 assignments.setdefault(target.id, []).append(
                     (statement.lineno, value if isinstance(value, str) else None)
                 )
+    for binding_node in nodes:
+        if not isinstance(binding_node, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets = binding_node.targets if isinstance(binding_node, ast.Assign) else [binding_node.target]
+        identity_names = [target.id for target in targets if isinstance(target, ast.Name)]
+        if isinstance(binding_node.value, ast.Name):
+            identity_names.append(binding_node.value.id)
+        if identity_names:
+            root_name = identity_names[0]
+            for alias_name in identity_names[1:]:
+                if alias_name == root_name:
+                    continue
+                mapping_aliases.append((binding_node, root_name, alias_name))
+
+    def is_proven_mapping_use(node: ast.Name) -> bool:
+        parent = parents.get(id(node))
+        if isinstance(parent, ast.keyword):
+            return parent.arg is None and parent.value is node
+        if isinstance(parent, ast.Dict):
+            return any(
+                key is None and item_value is node for key, item_value in zip(parent.keys, parent.values, strict=True)
+            )
+        if isinstance(parent, ast.Assign):
+            return parent.value is node and all(isinstance(target, ast.Name) for target in parent.targets)
+        return isinstance(parent, ast.AnnAssign) and parent.value is node and isinstance(parent.target, ast.Name)
+
+    aliased_mapping_names = set(mapping_bindings)
+    for _binding_node, first_name, second_name in mapping_aliases:
+        aliased_mapping_names.update((first_name, second_name))
+    unsafe_mapping_loads = [
+        node
+        for node in nodes
+        if isinstance(node, ast.Name)
+        and isinstance(node.ctx, ast.Load)
+        and node.id in aliased_mapping_names
+        and not is_proven_mapping_use(node)
+    ]
+    top_level_statement_indices = {
+        id(descendant): statement_index
+        for statement_index, statement in enumerate(tree.body)
+        for descendant in ast.walk(statement)
+    }
+
+    def call_execution_may_be_deferred(call: ast.Call) -> bool:
+        current: ast.AST = call
+        while parent := parents.get(id(current)):
+            if isinstance(parent, ast.GeneratorExp):
+                return True
+            if isinstance(parent, ast.Lambda) and current is parent.body:
+                return True
+            if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef)) and any(
+                current is statement for statement in parent.body
+            ):
+                return True
+            current = parent
+        return False
+
+    def mapping_operation_may_affect_call(operation: ast.AST, call: ast.Call) -> bool:
+        if call_execution_may_be_deferred(call):
+            return True
+        if getattr(operation, "lineno", None) == call.lineno:
+            return True
+        operation_index = top_level_statement_indices.get(id(operation))
+        call_index = top_level_statement_indices.get(id(call))
+        return operation_index is None or call_index is None or operation_index <= call_index
+
+    def remote_code_mapping_is_proven_safe_at_call(value: ast.expr, call: ast.Call) -> bool:
+        relevant_bindings = {
+            name: [
+                (getattr(binding_node, "lineno", 0), binding_value)
+                for binding_node, binding_value in candidates
+                if mapping_operation_may_affect_call(binding_node, call)
+            ]
+            for name, candidates in mapping_bindings.items()
+        }
+        relevant_binding_counts: Counter[str] = Counter(
+            {
+                name: sum(mapping_operation_may_affect_call(binding_node, call) for binding_node in binding_nodes)
+                for name, binding_nodes in name_binding_nodes.items()
+            }
+        )
+        relevant_aliases: dict[str, set[str]] = {}
+        for binding_node, first_name, second_name in mapping_aliases:
+            if not mapping_operation_may_affect_call(binding_node, call):
+                continue
+            relevant_aliases.setdefault(first_name, set()).add(second_name)
+            relevant_aliases.setdefault(second_name, set()).add(first_name)
+        unsafe_names = {node.id for node in unsafe_mapping_loads if mapping_operation_may_affect_call(node, call)}
+        pending_unsafe_names = list(unsafe_names)
+        while pending_unsafe_names:
+            unsafe_name = pending_unsafe_names.pop()
+            for alias_name in relevant_aliases.get(unsafe_name, set()):
+                if alias_name in unsafe_names:
+                    continue
+                unsafe_names.add(alias_name)
+                pending_unsafe_names.append(alias_name)
+        return _remote_code_mapping_is_proven_safe(
+            value,
+            bindings=relevant_bindings,
+            binding_counts=relevant_binding_counts,
+            unsafe_names=frozenset(unsafe_names),
+            call_lineno=call.lineno,
+        )
+
     for node in nodes:
         if isinstance(node, ast.Import):
             for alias in node.names:
@@ -2255,37 +2427,29 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
             if node not in requests_calls and node.func.attr not in documented_attribute_calls:
                 return False
-            # `trust_remote_code` and `custom_generate` both cause Transformers to fetch and execute
-            # Hub-hosted Python, and neither is exclusive to `from_pretrained`: since Transformers
-            # 4.55 `generate(custom_generate=..., trust_remote_code=True)` does it too, and
-            # `generate` is a documented call. Gate them on every call, not just `from_pretrained`.
             if any(
-                (
-                    keyword.arg == "trust_remote_code"
-                    and (not isinstance(keyword.value, ast.Constant) or keyword.value.value is not False)
-                )
-                or keyword.arg == "custom_generate"
+                keyword.arg in _REMOTE_CODE_KEYWORDS and not _remote_code_option_is_disabled(keyword.arg, keyword.value)
                 for keyword in node.keywords
             ):
                 return False
-            # `**kwargs` hides the arguments above from inspection. Reject it outright only on
-            # `from_pretrained`; documented cards legitimately write `model.generate(**inputs)`, so
-            # for every other call reject just the literal-dict form that names a remote-code flag.
-            if any(
-                keyword.arg is None
-                and (
-                    node.func.attr == "from_pretrained"
-                    or (
-                        isinstance(keyword.value, ast.Dict)
-                        and any(
-                            isinstance(key, ast.Constant) and key.value in _REMOTE_CODE_KEYWORDS
-                            for key in keyword.value.keys
-                        )
-                    )
+            if node.func.attr == "generate":
+                if any(isinstance(argument, ast.Starred) for argument in node.args):
+                    return False
+                for custom_generate_position in _GENERATE_CUSTOM_IMPLEMENTATION_POSITIONS:
+                    if len(node.args) > custom_generate_position and not _remote_code_option_is_disabled(
+                        "custom_generate",
+                        node.args[custom_generate_position],
+                    ):
+                        return False
+            for keyword in node.keywords:
+                if keyword.arg is not None:
+                    continue
+                requires_proof = node.func.attr in {"from_pretrained", "generate"} or isinstance(
+                    keyword.value,
+                    ast.Dict,
                 )
-                for keyword in node.keywords
-            ):
-                return False
+                if requires_proof and not remote_code_mapping_is_proven_safe_at_call(keyword.value, node):
+                    return False
             attribute_root = node.func.value
             while isinstance(attribute_root, (ast.Attribute, ast.Subscript, ast.Call)):
                 if isinstance(attribute_root, ast.Call) and attribute_root in requests_calls:
