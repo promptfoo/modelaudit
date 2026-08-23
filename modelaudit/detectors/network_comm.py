@@ -2864,6 +2864,19 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
             )
         )
 
+    def transformers_factory_call_is_proven_safe(
+        factory_call: ast.expr,
+        allowed_factory_names: set[str],
+    ) -> bool:
+        return (
+            isinstance(factory_call, ast.Call)
+            and call_has_only_proven_safe_mapping_arguments(factory_call)
+            and isinstance(factory_call.func, ast.Attribute)
+            and factory_call.func.attr == "from_pretrained"
+            and isinstance(factory_call.func.value, ast.Name)
+            and factory_call.func.value.id in allowed_factory_names
+        )
+
     def trusted_transformers_instance_is_proven_safe(
         instance_name: str,
         binding_node: ast.AST,
@@ -2894,14 +2907,8 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
         if len(instance_bindings) != 1 or relevant_write_count != 1:
             return False
         instance_binding, factory_call = instance_bindings[0]
-        return (
-            isinstance(factory_call, ast.Call)
-            and call_has_only_proven_safe_mapping_arguments(factory_call)
-            and is_single_name_binding(instance_binding, factory_call, instance_name)
-            and isinstance(factory_call.func, ast.Attribute)
-            and factory_call.func.attr == "from_pretrained"
-            and isinstance(factory_call.func.value, ast.Name)
-            and factory_call.func.value.id in allowed_factory_names
+        return transformers_factory_call_is_proven_safe(factory_call, allowed_factory_names) and is_single_name_binding(
+            instance_binding, factory_call, instance_name
         )
 
     def is_allowed_local_device(value: ast.expr) -> bool:
@@ -3180,14 +3187,7 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
                 return resolve_value(value.value, reference)
             if isinstance(value, ast.Subscript):
                 return resolve_value(value.value, reference)
-            if (
-                isinstance(value, ast.Call)
-                and isinstance(value.func, ast.Attribute)
-                and value.func.attr == "from_pretrained"
-                and isinstance(value.func.value, ast.Name)
-                and value.func.value.id in transformers_mapping_factory_names
-                and call_has_only_proven_safe_mapping_arguments(value)
-            ):
+            if transformers_factory_call_is_proven_safe(value, transformers_factory_names):
                 return frozenset({benign_callable_marker})
             return frozenset({untrusted_callable_marker})
 

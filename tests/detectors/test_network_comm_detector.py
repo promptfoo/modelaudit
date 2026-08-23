@@ -3287,6 +3287,149 @@ class TestNetworkCommDetector:
         assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
 
     @pytest.mark.parametrize(
+        ("factory_name", "model_setup", "model_call"),
+        [
+            (
+                "AutoModelForImageClassification",
+                "model = AutoModelForImageClassification.from_pretrained('official/model')\n",
+                "outputs = model(**inputs)\n",
+            ),
+            (
+                "T5ForConditionalGeneration",
+                "factory_options = {'revision': 'main', 'trust_remote_code': False}\n"
+                "model = T5ForConditionalGeneration.from_pretrained('official/model', **factory_options)\n",
+                "outputs = model(**inputs)\n",
+            ),
+            (
+                "AutoModelForImageClassification",
+                "model = AutoModelForImageClassification.from_pretrained('official/model')\n",
+                "with torch.no_grad():\n    outputs = model(**inputs)\n",
+            ),
+            (
+                "AutoModelForImageClassification",
+                "model = AutoModelForImageClassification.from_pretrained('official/model')\n",
+                "outputs = model(**inputs)\nmodel = evil\n",
+            ),
+            (
+                "AutoModelForImageClassification",
+                "model = AutoModelForImageClassification.from_pretrained('official/model')\n",
+                "outputs = model(**inputs); model = evil\n",
+            ),
+        ],
+        ids=["canonical", "safe-factory-options", "no-grad", "post-call-rebind", "same-line-post-call"],
+    )
+    def test_readme_python_example_allows_proven_transformers_model_call(
+        self,
+        factory_name: str,
+        model_setup: str,
+        model_call: str,
+    ) -> None:
+        data = (
+            "```python\nimport requests\nimport torch\n"
+            f"from transformers import {factory_name}\n"
+            "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            "inputs = {'pixel_values': 1}\n"
+            "def evil(**kwargs):\n"
+            "    requests.get(image_url, stream=True)\n"
+            f"{model_setup}{model_call}"
+            "requests.get(image_url, stream=True)\n```\n"
+        ).encode()
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+
+    @pytest.mark.parametrize(
+        "model_flow",
+        [
+            (
+                "model = AutoModelForImageClassification.from_pretrained("
+                "'attacker/repo', trust_remote_code=True)\n"
+                "outputs = model(**inputs)\n"
+            ),
+            (
+                "factory_options = {'trust_remote_code': True}\n"
+                "model = AutoModelForImageClassification.from_pretrained("
+                "'attacker/repo', **factory_options)\n"
+                "outputs = model(**inputs)\n"
+            ),
+            (
+                "factory_args = ['attacker/repo']\n"
+                "model = AutoModelForImageClassification.from_pretrained(*factory_args)\n"
+                "outputs = model(**inputs)\n"
+            ),
+            (
+                "factory_options = evil()\n"
+                "model = AutoModelForImageClassification.from_pretrained("
+                "'attacker/repo', **factory_options)\n"
+                "outputs = model(**inputs)\n"
+            ),
+            (
+                "model = AutoModelForImageClassification.from_pretrained('official/model')\n"
+                "model = evil\n"
+                "outputs = model(**inputs)\n"
+            ),
+            (
+                "model = AutoModelForImageClassification.from_pretrained('official/model'); "
+                "model = evil; outputs = model(**inputs)\n"
+            ),
+            (
+                "model = AutoModelForImageClassification.from_pretrained('official/model')\n"
+                "for model in [evil]:\n"
+                "    outputs = model(**inputs)\n"
+            ),
+            (
+                "model = AutoModelForImageClassification.from_pretrained('official/model')\n"
+                "selected = model if len(image_url) == 0 else evil\n"
+                "outputs = selected(**inputs)\n"
+            ),
+            (
+                "model = AutoModelForImageClassification.from_pretrained('official/model')\n"
+                "if len(image_url):\n"
+                "    model = evil\n"
+                "outputs = model(**inputs)\n"
+            ),
+            (
+                "model = AutoModelForImageClassification.from_pretrained('official/model')\n"
+                "calls = (model(**inputs) for _ in range(1))\n"
+                "model = evil\n"
+                "for output in calls:\n"
+                "    print(output)\n"
+            ),
+        ],
+        ids=[
+            "remote-code-keyword",
+            "remote-code-mapping",
+            "starred-factory-args",
+            "unknown-factory-options",
+            "model-rebind",
+            "same-line-model-rebind",
+            "model-shadow",
+            "mixed-model-alias",
+            "conditional-model-rebind",
+            "deferred-model-call",
+        ],
+    )
+    def test_readme_python_example_rejects_unproven_transformers_model_call(
+        self,
+        model_flow: str,
+    ) -> None:
+        data = (
+            "```python\nimport requests\n"
+            "from transformers import AutoModelForImageClassification\n"
+            "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            "inputs = {'pixel_values': 1}\n"
+            "def evil(**kwargs):\n"
+            "    requests.get(image_url, stream=True)\n"
+            f"{model_flow}```\n"
+        ).encode()
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert any(finding["type"] == "network_library" for finding in findings)
+        assert any(finding["type"] == "network_function" for finding in findings)
+
+    @pytest.mark.parametrize(
         ("alias_setup", "mapping_setup", "remote_call", "remote_key"),
         [
             (
