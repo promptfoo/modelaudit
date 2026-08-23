@@ -3700,6 +3700,78 @@ def test_pytorch_storage_trust_parses_large_metadata_after_canonical_batch(tmp_p
     assert len(parsed.canonical_tensor_rebuild_invocations) == 600
 
 
+def test_pytorch_storage_trust_records_canonical_tensor_inserted_with_setitem() -> None:
+    tensor = _pytorch_rebuild_tensor_v2_payload(key="0").removeprefix(b"\x80\x04").removesuffix(b".")
+    metadata_entries = b"".join(
+        _short_binunicode(f"metadata_{index}".encode("ascii")) + b"K\x01" for index in range(33)
+    )
+    payload = (
+        b"\x80\x04"
+        + _pytorch_empty_ordered_dict_reduce_expr()
+        + _short_binunicode(b"weight")
+        + tensor
+        + b"s("
+        + metadata_entries
+        + b"u."
+    )
+
+    parsed = package_api._pytorch_storage_keys_from_pickle_bytes(payload)
+
+    assert parsed.parse_complete is True
+    assert parsed.referenced_keys == {"0"}
+    assert len(parsed.canonical_tensor_rebuild_invocations) == 1
+    assert package_api._trusted_pytorch_data_pkl_from_storage_member_sizes(payload, {"0": 24}) is not None
+
+
+@pytest.mark.parametrize(
+    "malformed_opcode",
+    [b"l", b"t", b"d", b"e", b"1", b"odd-setitems"],
+    ids=["list", "tuple", "dict", "appends", "pop-mark", "odd-setitems"],
+)
+def test_pytorch_storage_trust_rejects_provenance_drained_by_malformed_opcode(
+    malformed_opcode: bytes,
+) -> None:
+    entries: list[bytes] = []
+    for index in range(33):
+        key = _short_binunicode(f"weight_{index}".encode("ascii"))
+        if index == 0:
+            value = _pytorch_rebuild_tensor_v2_payload(key="0").removeprefix(b"\x80\x04").removesuffix(b".")
+        else:
+            value = _pytorch_rebuild_tensor_v2_reduce_expr(key=str(index))
+        entries.append(key + value)
+    hidden_storage = _pytorch_storage_binpersid_expr(
+        key="hidden",
+        storage_name="ByteStorage",
+        element_count=128,
+    )
+    leading_mark = b"(" if malformed_opcode == b"odd-setitems" else b""
+    malformed_collection = (
+        hidden_storage + b"K\x00u" if malformed_opcode == b"odd-setitems" else hidden_storage + malformed_opcode
+    )
+    final_entry = _short_binunicode(b"weight_final") + _pytorch_rebuild_tensor_v2_reduce_expr(key="33")
+    payload = (
+        b"\x80\x04"
+        + leading_mark
+        + _pytorch_empty_ordered_dict_reduce_expr()
+        + b"("
+        + b"".join(entries)
+        + b"u"
+        + malformed_collection
+        + _pytorch_empty_ordered_dict_reduce_expr()
+        + b"("
+        + final_entry
+        + b"u."
+    )
+    storage_sizes = {str(index): 24 for index in range(34)}
+    storage_sizes["hidden"] = 128
+
+    parsed = package_api._pytorch_storage_keys_from_pickle_bytes(payload)
+
+    assert parsed.parse_complete is True
+    assert parsed.discarded_tracked_storage_references is True
+    assert package_api._trusted_pytorch_data_pkl_from_storage_member_sizes(payload, storage_sizes) is None
+
+
 @pytest.mark.parametrize("container_kind", ["list", "tuple", "dictionary"])
 def test_pytorch_storage_trust_parses_large_batch_with_leading_nested_canonical_tensor(
     tmp_path: Path,
@@ -15314,6 +15386,60 @@ def test_scan_file_scans_binary_storage_member_inside_expanded_probe_window(tmp_
         archive.writestr("archive/byteorder", "little")
         archive.writestr("archive/data/0", hidden_payload)
         for index in range(1, entry_count):
+            archive.writestr(f"archive/data/{index}", b"\x00" * 24)
+
+    report = scan_file(archive_path)
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.severity == Severity.CRITICAL
+        and finding.details.get("module") in {"os", "posix", "nt"}
+        and finding.details.get("name") == "system"
+        and finding.location is not None
+        and "archive/data/0" in finding.location
+        for finding in report.findings
+    )
+
+
+@pytest.mark.parametrize(
+    ("pickle_prefix", "case_name"),
+    [
+        (b"\x80\x04NNNN\x00", "generic-routing"),
+        (b"\x80\x04N\x00", "trusted-two-op-routing"),
+    ],
+)
+def test_scan_file_preserves_pickle_routing_for_expanded_storage_probe(
+    tmp_path: Path,
+    pickle_prefix: bytes,
+    case_name: str,
+) -> None:
+    hidden_payload = pickle_prefix + f"cos\nsystem\n(S'echo expanded-{case_name}'\ntR.".encode()
+    hidden_payload += b"\x00" * (5000 - len(hidden_payload))
+    assert len(hidden_payload) == 5000
+    entries: list[bytes] = []
+    for index in range(33):
+        key = _short_binunicode(f"weight_{index}".encode("ascii"))
+        if index == 0:
+            value = (
+                _pytorch_rebuild_tensor_v2_payload(
+                    key="0",
+                    storage_name="ByteStorage",
+                    element_count=len(hidden_payload),
+                )
+                .removeprefix(b"\x80\x04")
+                .removesuffix(b".")
+            )
+        else:
+            value = _pytorch_rebuild_tensor_v2_reduce_expr(key=str(index))
+        entries.append(key + value)
+    data_pkl = b"\x80\x04" + _pytorch_empty_ordered_dict_reduce_expr() + b"(" + b"".join(entries) + b"u."
+    archive_path = tmp_path / f"malicious-expanded-{case_name}.pt"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", data_pkl)
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", hidden_payload)
+        for index in range(1, 33):
             archive.writestr(f"archive/data/{index}", b"\x00" * 24)
 
     report = scan_file(archive_path)
