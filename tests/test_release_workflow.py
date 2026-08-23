@@ -753,16 +753,7 @@ def test_release_workflow_generates_root_provenance_after_successful_publish() -
     assert job["needs"] == ["build", "publish-pypi", "verify-pypi", "release-please"]
 
 
-@pytest.mark.parametrize(
-    "updated_checkout_digest",
-    [
-        pytest.param(None, id="current-pinned-digest"),
-        pytest.param("d23441a48e516b6c34aea4fa41551a30e30af803", id="rotated-pinned-digest"),
-    ],
-)
-def test_release_workflow_recovers_root_provenance_without_republishing(
-    updated_checkout_digest: str | None,
-) -> None:
+def test_release_workflow_recovers_root_provenance_without_republishing() -> None:
     workflow = _load_release_workflow()
 
     release_job = _jobs(workflow)["release-please"]
@@ -786,8 +777,6 @@ def test_release_workflow_recovers_root_provenance_without_republishing(
 
     steps = _job_steps(workflow, "root-provenance-recovery")
     checkout_step = _step_by_name(steps, "Checkout tagged root release")
-    if updated_checkout_digest is not None:
-        checkout_step = {**checkout_step, "uses": f"actions/checkout@{updated_checkout_digest}"}
     assert re.fullmatch(r"actions/checkout@[0-9a-f]{40}", checkout_step["uses"])
     assert checkout_step["with"] == {
         "ref": "refs/tags/${{ needs.release-please.outputs.tag_name }}",
