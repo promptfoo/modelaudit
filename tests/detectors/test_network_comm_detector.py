@@ -3077,6 +3077,57 @@ class TestNetworkCommDetector:
         assert any(finding["type"] == "network_library" for finding in findings)
         assert any(finding["type"] == "network_function" for finding in findings)
 
+    def test_readme_python_example_allows_v4_positional_use_model_defaults(self) -> None:
+        """Transformers v4 position 10 is `use_model_defaults`, not `custom_generate`."""
+        data = (
+            b"```python\nimport requests\nfrom transformers import AutoModel\n"
+            b"image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            b"model = AutoModel.from_pretrained('official/model')\n"
+            b"model.generate(None, None, None, None, None, None, None, None, None, None, True)\n"
+            b"requests.get(image_url, stream=True)\n```\n"
+        )
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+
+    def test_readme_python_example_bounds_repeated_mapping_expansion(self) -> None:
+        """Repeated safe mapping expansion must stay linear in the unique AST."""
+        mapping_bindings = ["options_0 = {'custom_generate': None}"]
+        mapping_bindings.extend(
+            f"options_{index} = {{**options_{index - 1}, **options_{index - 1}}}" for index in range(1, 31)
+        )
+        mapping_source = "\n".join(mapping_bindings)
+        data = (
+            "```python\nimport requests\nfrom transformers import AutoModel\n"
+            "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            "model = AutoModel.from_pretrained('official/model')\n"
+            f"{mapping_source}\n"
+            "model.generate(**options_30)\n"
+            "requests.get(image_url, stream=True)\n```\n"
+        ).encode()
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+
+    def test_readme_python_example_rejects_cyclic_generate_kwargs_mapping(self) -> None:
+        """Memoization must not turn cyclic mapping provenance into a trusted value."""
+        data = (
+            b"```python\nimport requests\nfrom transformers import AutoModel\n"
+            b"image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            b"model = AutoModel.from_pretrained('official/model')\n"
+            b"options_a = {**options_b}\n"
+            b"options_b = {**options_a}\n"
+            b"model.generate(**options_a)\n"
+            b"requests.get(image_url, stream=True)\n```\n"
+        )
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert any(finding["type"] == "network_library" for finding in findings)
+        assert any(finding["type"] == "network_function" for finding in findings)
+
     @pytest.mark.parametrize(
         "remote_call",
         [

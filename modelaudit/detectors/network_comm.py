@@ -2033,7 +2033,6 @@ def _matching_readme_image_fence_end(
 
 # Transformers keywords that cause Hub-hosted Python to be fetched and executed.
 _REMOTE_CODE_KEYWORDS = frozenset({"custom_generate", "trust_remote_code"})
-_GENERATE_CUSTOM_IMPLEMENTATION_POSITIONS = (10, 11)
 
 
 def _remote_code_option_is_disabled(name: str, value: ast.expr) -> bool:
@@ -2046,6 +2045,23 @@ def _remote_code_option_is_disabled(name: str, value: ast.expr) -> bool:
     return True
 
 
+def _generate_positional_remote_code_is_disabled(arguments: list[ast.expr]) -> bool:
+    if len(arguments) <= 10:
+        return True
+
+    position_ten = arguments[10]
+    position_ten_is_disabled_or_v4_default = isinstance(position_ten, ast.Constant) and (
+        position_ten.value is None or isinstance(position_ten.value, bool)
+    )
+    if len(arguments) == 11:
+        return position_ten_is_disabled_or_v4_default
+
+    return position_ten_is_disabled_or_v4_default and _remote_code_option_is_disabled(
+        "custom_generate",
+        arguments[11],
+    )
+
+
 def _remote_code_mapping_is_proven_safe(
     value: ast.expr,
     *,
@@ -2054,48 +2070,62 @@ def _remote_code_mapping_is_proven_safe(
     unsafe_names: frozenset[str],
     proven_mapping_call_ids: frozenset[int],
     call_position: int,
-    resolving: frozenset[str] = frozenset(),
 ) -> bool:
-    if isinstance(value, ast.Name):
-        if value.id in resolving or value.id in unsafe_names or binding_counts[value.id] != 1:
+    memo: dict[int, bool] = {}
+    remaining_steps = _MAX_README_IMAGE_EXAMPLE_AST_NODES
+
+    def visit(current: ast.expr, resolving: frozenset[str]) -> bool:
+        nonlocal remaining_steps
+
+        node_id = id(current)
+        if node_id in memo:
+            return memo[node_id]
+        if remaining_steps <= 0:
             return False
-        candidates = bindings.get(value.id, [])
-        if len(candidates) != 1:
-            return False
-        binding_position, binding_value = candidates[0]
-        if binding_position >= call_position:
-            return False
-        return _remote_code_mapping_is_proven_safe(
-            binding_value,
-            bindings=bindings,
-            binding_counts=binding_counts,
-            unsafe_names=unsafe_names,
-            proven_mapping_call_ids=proven_mapping_call_ids,
-            call_position=call_position,
-            resolving=resolving | {value.id},
-        )
-    if isinstance(value, ast.Call):
-        return id(value) in proven_mapping_call_ids
-    if not isinstance(value, ast.Dict):
+        remaining_steps -= 1
+
+        if isinstance(current, ast.Name):
+            if current.id in resolving or current.id in unsafe_names or binding_counts[current.id] != 1:
+                result = False
+            else:
+                candidates = bindings.get(current.id, [])
+                if len(candidates) != 1:
+                    result = False
+                else:
+                    binding_position, binding_value = candidates[0]
+                    result = binding_position < call_position and visit(
+                        binding_value,
+                        resolving | {current.id},
+                    )
+        elif isinstance(current, ast.Call):
+            result = node_id in proven_mapping_call_ids
+        elif isinstance(current, ast.Dict):
+            result = True
+            for key, item_value in zip(current.keys, current.values, strict=True):
+                if key is None:
+                    if not visit(item_value, resolving):
+                        result = False
+                        break
+                    continue
+                if not isinstance(key, ast.Constant) or not isinstance(key.value, str):
+                    result = False
+                    break
+                if key.value in _REMOTE_CODE_KEYWORDS and not _remote_code_option_is_disabled(
+                    key.value,
+                    item_value,
+                ):
+                    result = False
+                    break
+        else:
+            result = False
+
+        memo[node_id] = result
+        return result
+
+    try:
+        return visit(value, frozenset())
+    except RecursionError:
         return False
-    for key, item_value in zip(value.keys, value.values, strict=True):
-        if key is None:
-            if not _remote_code_mapping_is_proven_safe(
-                item_value,
-                bindings=bindings,
-                binding_counts=binding_counts,
-                unsafe_names=unsafe_names,
-                proven_mapping_call_ids=proven_mapping_call_ids,
-                call_position=call_position,
-                resolving=resolving,
-            ):
-                return False
-            continue
-        if not isinstance(key, ast.Constant) or not isinstance(key.value, str):
-            return False
-        if key.value in _REMOTE_CODE_KEYWORDS and not _remote_code_option_is_disabled(key.value, item_value):
-            return False
-    return True
 
 
 def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
@@ -2663,12 +2693,8 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
             if node.func.attr == "generate":
                 if any(isinstance(argument, ast.Starred) for argument in node.args):
                     return False
-                for custom_generate_position in _GENERATE_CUSTOM_IMPLEMENTATION_POSITIONS:
-                    if len(node.args) > custom_generate_position and not _remote_code_option_is_disabled(
-                        "custom_generate",
-                        node.args[custom_generate_position],
-                    ):
-                        return False
+                if not _generate_positional_remote_code_is_disabled(node.args):
+                    return False
             for keyword in node.keywords:
                 if keyword.arg is not None:
                     continue
