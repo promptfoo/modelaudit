@@ -4213,13 +4213,17 @@ class TestNetworkCommDetector:
             ("device = 'cpu'; inputs = processor(images=image, return_tensors='pt').to(device)\n"),
             ("inputs = processor(images=image, return_tensors='pt').to(device='cuda')\n"),
             ("inputs = processor(images=image, return_tensors='pt'); inputs = inputs.to('cpu')\n"),
+            (
+                "device = 'cuda' if torch.cuda.is_available() else 'cpu'\n"
+                "inputs = processor(images=image, return_tensors='pt').to(device)\n"
+            ),
         ],
-        ids=["named-device", "keyword-device", "mapping-rebind"],
+        ids=["named-device", "keyword-device", "mapping-rebind", "bounded-conditional-device"],
     )
     def test_readme_python_example_allows_ordered_mapping_device_transfers(self, inputs_setup: str) -> None:
-        """A unique device literal and provenance-preserving rebinding remain canonical."""
+        """A bounded local device and provenance-preserving rebinding remain canonical."""
         data = (
-            "```python\nimport requests\nfrom PIL import Image\n"
+            "```python\nimport requests\nimport torch\nfrom PIL import Image\n"
             "from transformers import AutoModel, AutoProcessor\n"
             "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
             "image = Image.open(requests.get(image_url, stream=True).raw)\n"
@@ -4451,6 +4455,12 @@ class TestNetworkCommDetector:
             "with torch.no_grad() as device:\n    model.generate(**inputs.to(device))\n",
             "if True:\n    del device\n    model.generate(**inputs.to(device))\n",
             ("if True:\n    device = image.mode\n    inputs = inputs.to(device)\n    model.generate(**inputs)\n"),
+            ("choice = 'cuda' if torch.cuda.is_available() else 'attacker'\nmodel.generate(**inputs.to(choice))\n"),
+            ("choice = 'cuda' if torch.cuda.is_available() else image.mode\nmodel.generate(**inputs.to(choice))\n"),
+            (
+                "choice = torch.device('cuda') if torch.cuda.is_available() else 'cpu'\n"
+                "model.generate(**inputs.to(choice))\n"
+            ),
         ],
         ids=[
             "nested-dynamic-rebind",
@@ -4460,6 +4470,9 @@ class TestNetworkCommDetector:
             "with-target-rebind",
             "deleted-device",
             "mapping-rebind",
+            "conditional-unsafe-branch",
+            "conditional-dynamic-branch",
+            "conditional-non-literal-branch",
         ],
     )
     def test_readme_python_example_rejects_unsafe_call_relative_named_device(

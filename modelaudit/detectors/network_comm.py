@@ -2912,12 +2912,22 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
         )
 
     def is_allowed_local_device(value: ast.expr) -> bool:
-        if not isinstance(value, ast.Constant) or not isinstance(value.value, str):
-            return False
-        device = value.value
-        return device in {"cpu", "cuda", "mps"} or (
-            device.startswith("cuda:") and device.removeprefix("cuda:").isdecimal()
-        )
+        pending_values = [value]
+        remaining_steps = _MAX_README_IMAGE_EXAMPLE_AST_NODES
+        while pending_values and remaining_steps > 0:
+            remaining_steps -= 1
+            device_value = pending_values.pop()
+            if isinstance(device_value, ast.IfExp):
+                pending_values.extend((device_value.body, device_value.orelse))
+                continue
+            if not isinstance(device_value, ast.Constant) or not isinstance(device_value.value, str):
+                return False
+            device = device_value.value
+            if device not in {"cpu", "cuda", "mps"} and not (
+                device.startswith("cuda:") and device.removeprefix("cuda:").isdecimal()
+            ):
+                return False
+        return not pending_values
 
     def mapping_device_is_proven_safe(value: ast.expr, binding_node: ast.AST) -> bool:
         if is_allowed_local_device(value):
