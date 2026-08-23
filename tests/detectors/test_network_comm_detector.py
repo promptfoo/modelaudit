@@ -3249,6 +3249,181 @@ class TestNetworkCommDetector:
         assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
 
     @pytest.mark.parametrize(
+        ("factory_name", "instance_name", "mapping_expression"),
+        [
+            ("AutoProcessor", "processor", "processor(images=image, return_tensors='pt')"),
+            (
+                "AutoProcessor",
+                "processor",
+                "processor(images=image, return_tensors='pt').to(device='cuda')",
+            ),
+            ("AutoTokenizer", "tokenizer", "tokenizer('hello', return_tensors='pt')"),
+            (
+                "AutoFeatureExtractor",
+                "feature_extractor",
+                "feature_extractor(images=image, return_tensors='pt')",
+            ),
+        ],
+        ids=["processor-output", "processor-output-device-transfer", "tokenizer-output", "feature-output"],
+    )
+    def test_readme_python_example_allows_inline_transformers_mapping_generate_kwargs(
+        self,
+        factory_name: str,
+        instance_name: str,
+        mapping_expression: str,
+    ) -> None:
+        """A canonical inline Transformers mapping is trusted model input."""
+        data = (
+            "```python\nimport requests\nfrom PIL import Image\n"
+            f"from transformers import AutoModel, {factory_name}\n"
+            "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            "image = Image.open(requests.get(image_url, stream=True).raw)\n"
+            f"{instance_name} = {factory_name}.from_pretrained('official/model')\n"
+            "model = AutoModel.from_pretrained('official/model')\n"
+            f"model.generate(**{mapping_expression})\n```\n"
+        ).encode()
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert findings
+        assert not [
+            finding
+            for finding in findings
+            if finding["type"] in {"network_library", "network_function"}
+            and finding["severity"] in {"HIGH", "CRITICAL"}
+        ]
+        assert all(finding["severity"] == "INFO" for finding in findings)
+
+    @pytest.mark.parametrize(
+        ("setup", "generate_statement"),
+        [
+            ("", "model.generate(**model(images=image, return_tensors='pt'))\n"),
+            ("", "model.generate(**processor(images=image, return_tensors='pt', trust_remote_code=True))\n"),
+            (
+                "processor_options = image\n",
+                "model.generate(**processor(**processor_options))\n",
+            ),
+            (
+                "processor_options = {'images': image, 'return_tensors': 'pt'}\n"
+                "alias = processor_options\n"
+                "alias |= {'trust_remote_code': True}\n",
+                "model.generate(**processor(**processor_options))\n",
+            ),
+            ("processor = model\n", "model.generate(**processor(images=image, return_tensors='pt'))\n"),
+            (
+                "",
+                "model.generate(**processor(images=image, return_tensors='pt').to(device=image.mode))\n",
+            ),
+            (
+                "",
+                "model.generate(**processor(images=image, return_tensors='pt').to('cpu', 'cuda'))\n",
+            ),
+            (
+                "",
+                "deferred = (model.generate(**processor(images=image, return_tensors='pt')) for _ in range(1))\n"
+                "processor = model\n",
+            ),
+        ],
+        ids=[
+            "unsafe-factory",
+            "remote-code-option",
+            "dynamic-kwargs",
+            "mutated-kwargs-alias",
+            "rebound-processor",
+            "dynamic-device",
+            "extra-device-argument",
+            "deferred-processor-rebind",
+        ],
+    )
+    def test_readme_python_example_rejects_unproven_inline_processor_generate_kwargs(
+        self,
+        setup: str,
+        generate_statement: str,
+    ) -> None:
+        data = (
+            "```python\nimport requests\nfrom PIL import Image\n"
+            "from transformers import AutoModel, AutoProcessor\n"
+            "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            "image = Image.open(requests.get(image_url, stream=True).raw)\n"
+            "processor = AutoProcessor.from_pretrained('official/model')\n"
+            "model = AutoModel.from_pretrained('official/model')\n"
+            f"{setup}"
+            f"{generate_statement}"
+            "```\n"
+        ).encode()
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert any(
+            finding["type"] == "network_library" and finding["severity"] in {"HIGH", "CRITICAL"} for finding in findings
+        )
+        assert any(
+            finding["type"] == "network_function" and finding["severity"] in {"HIGH", "CRITICAL"}
+            for finding in findings
+        )
+
+    @pytest.mark.parametrize(
+        "generate_statement",
+        [
+            ("if True:\n    processor = torch.load\n    model.generate(**processor('attacker.pkl'))\n"),
+            "for processor in [torch.load]:\n    model.generate(**processor('attacker.pkl'))\n",
+            "calls = [model.generate(**processor('attacker.pkl')) for processor in [torch.load]]\n",
+            "calls = {model.generate(**processor('attacker.pkl')) for processor in [torch.load]}\n",
+            "calls = {processor: model.generate(**processor('attacker.pkl')) for processor in [torch.load]}\n",
+        ],
+        ids=["if-assignment", "for-target", "list-comprehension", "set-comprehension", "dict-comprehension"],
+    )
+    def test_readme_python_example_rejects_inline_mapping_factory_shadowing(
+        self,
+        generate_statement: str,
+    ) -> None:
+        data = (
+            "```python\nimport requests\nimport torch\nfrom PIL import Image\n"
+            "from transformers import AutoModel, AutoProcessor\n"
+            "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            "image = Image.open(requests.get(image_url, stream=True).raw)\n"
+            "processor = AutoProcessor.from_pretrained('official/model')\n"
+            "model = AutoModel.from_pretrained('official/model')\n"
+            f"{generate_statement}"
+            "```\n"
+        ).encode()
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert any(finding["type"] == "network_library" for finding in findings)
+        assert any(finding["type"] == "network_function" for finding in findings)
+
+    @pytest.mark.parametrize(
+        "generate_statement",
+        [
+            "if True:\n    model.generate(**processor(images=image, return_tensors='pt'))\n",
+            "model.generate(**processor(images=image, return_tensors='pt'))\nprocessor = torch.load\n",
+            "model.generate(**processor(images=image, return_tensors='pt')); processor = torch.load\n",
+        ],
+        ids=["nested-without-shadow", "eager-post-call-rebind", "same-line-eager-post-call-rebind"],
+    )
+    def test_readme_python_example_allows_unshadowed_inline_mapping_factory(
+        self,
+        generate_statement: str,
+    ) -> None:
+        data = (
+            "```python\nimport requests\nimport torch\nfrom PIL import Image\n"
+            "from transformers import AutoModel, AutoProcessor\n"
+            "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            "image = Image.open(requests.get(image_url, stream=True).raw)\n"
+            "processor = AutoProcessor.from_pretrained('official/model')\n"
+            "model = AutoModel.from_pretrained('official/model')\n"
+            f"{generate_statement}"
+            "```\n"
+        ).encode()
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert findings
+        assert all(finding["severity"] == "INFO" for finding in findings)
+        assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+
+    @pytest.mark.parametrize(
         "processor_call",
         [
             (

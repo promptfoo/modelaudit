@@ -2500,16 +2500,24 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
         binding_node: ast.AST,
         allowed_factory_names: set[str],
     ) -> bool:
+        def operation_may_affect_reference(operation: ast.AST) -> bool:
+            if isinstance(binding_node, ast.Call):
+                if call_execution_may_be_deferred(binding_node):
+                    return True
+                operation_index = top_level_statement_indices.get(id(operation))
+                reference_index = top_level_statement_indices.get(id(binding_node))
+                return operation_index is None or reference_index is None or operation_index <= reference_index
+            return top_level_statement_precedes(operation, binding_node)
+
         instance_bindings = [
             (instance_binding, factory_call)
             for instance_binding, factory_call in mapping_bindings.get(instance_name, [])
-            if top_level_statement_precedes(instance_binding, binding_node)
+            if operation_may_affect_reference(instance_binding)
         ]
-        prior_write_count = sum(
-            top_level_statement_precedes(write_node, binding_node)
-            for write_node in name_write_nodes.get(instance_name, [])
+        relevant_write_count = sum(
+            operation_may_affect_reference(write_node) for write_node in name_write_nodes.get(instance_name, [])
         )
-        if len(instance_bindings) != 1 or prior_write_count != 1:
+        if len(instance_bindings) != 1 or relevant_write_count != 1:
             return False
         instance_binding, factory_call = instance_bindings[0]
         return (
@@ -2643,6 +2651,27 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
         proven_mapping_binding_chains[id(binding_node)] = binding_chain
         proven_mapping_call_id_set.add(id(binding_value))
         proven_mapping_transfer_call_id_set.update(id(transfer_call) for transfer_call in transfer_calls)
+
+    for generate_call in nodes:
+        if (
+            not isinstance(generate_call, ast.Call)
+            or not isinstance(generate_call.func, ast.Attribute)
+            or generate_call.func.attr != "generate"
+            or call_execution_may_be_deferred(generate_call)
+        ):
+            continue
+        for keyword in generate_call.keywords:
+            if keyword.arg is not None or not isinstance(keyword.value, ast.Call):
+                continue
+            unwrapped_mapping = unwrap_safe_mapping_device_transfers(keyword.value, generate_call)
+            if unwrapped_mapping is None:
+                continue
+            mapping_value, transfer_calls = unwrapped_mapping
+            if not trusted_mapping_factory_call_is_proven_safe(generate_call, mapping_value):
+                continue
+            proven_mapping_call_id_set.add(id(keyword.value))
+            proven_mapping_transfer_call_id_set.update(id(transfer_call) for transfer_call in transfer_calls)
+
     proven_mapping_call_ids = frozenset(proven_mapping_call_id_set)
     proven_mapping_transfer_call_ids = frozenset(proven_mapping_transfer_call_id_set)
 
