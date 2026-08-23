@@ -9,7 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- Upgrade vulnerable locked dependencies, use the hardened MLflow tracking client, and audit all installed CI extras.
 - Avoid network false positives for bounded README examples that download sample images over HTTPS from Hugging Face.
+- Preserve Windows source-fingerprint cache hits while continuing to reject swapped or modified files.
 - Prevent Windows cache identity probes from creating locked temporary files inside scanned directories.
 - Preserve locked Windows cache probes reached through directory aliases while clearing stale scan results.
 - Place cross-volume Windows cache identity probes near the volume root instead of the nearest ancestor of the scanned path, so a probe can no longer appear inside a directory tree that a concurrent scan is walking.
