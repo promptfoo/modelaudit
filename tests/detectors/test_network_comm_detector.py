@@ -3249,6 +3249,36 @@ class TestNetworkCommDetector:
         assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
 
     @pytest.mark.parametrize(
+        "processor_call",
+        [
+            (
+                "processor_options = {'images': image, 'return_tensors': 'pt'}\n"
+                "inputs = processor(**processor_options)\n"
+            ),
+            "inputs = processor(**{'images': image, 'return_tensors': 'pt'})\n",
+        ],
+        ids=["named-mapping", "literal-mapping"],
+    )
+    def test_readme_python_example_allows_static_processor_kwargs_unpacking(self, processor_call: str) -> None:
+        """Canonical processor options may be unpacked from a statically safe mapping."""
+        data = (
+            "```python\nimport requests\nfrom PIL import Image\n"
+            "from transformers import AutoModel, AutoProcessor\n"
+            "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            "image = Image.open(requests.get(image_url, stream=True).raw)\n"
+            "processor = AutoProcessor.from_pretrained('official/model')\n"
+            "model = AutoModel.from_pretrained('official/model')\n"
+            f"{processor_call}"
+            "model.generate(**inputs)\n```\n"
+        ).encode()
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert findings
+        assert all(finding["severity"] == "INFO" for finding in findings)
+        assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+
+    @pytest.mark.parametrize(
         ("factory_name", "instance_name", "inputs_expression"),
         [
             ("AutoTokenizer", "tokenizer", "tokenizer('hello', return_tensors='pt')"),
@@ -3294,9 +3324,10 @@ class TestNetworkCommDetector:
         "inputs_setup",
         [
             ("device = 'cpu'; inputs = processor(images=image, return_tensors='pt').to(device)\n"),
+            ("inputs = processor(images=image, return_tensors='pt').to(device='cuda')\n"),
             ("inputs = processor(images=image, return_tensors='pt'); inputs = inputs.to('cpu')\n"),
         ],
-        ids=["named-device", "mapping-rebind"],
+        ids=["named-device", "keyword-device", "mapping-rebind"],
     )
     def test_readme_python_example_allows_ordered_mapping_device_transfers(self, inputs_setup: str) -> None:
         """A unique device literal and provenance-preserving rebinding remain canonical."""
@@ -3402,6 +3433,29 @@ class TestNetworkCommDetector:
             ),
             (
                 "processor = AutoProcessor.from_pretrained('official/model')\n",
+                "processor_key = 'images'\n"
+                "processor_options = {processor_key: image, 'return_tensors': 'pt'}\n"
+                "inputs = processor(**processor_options)\n",
+            ),
+            (
+                "processor = AutoProcessor.from_pretrained('official/model')\n",
+                "processor_options = {'images': image}\n"
+                "processor_options = {'images': image, 'return_tensors': 'pt'}\n"
+                "inputs = processor(**processor_options)\n",
+            ),
+            (
+                "processor = AutoProcessor.from_pretrained('official/model')\n",
+                "processor_options = {'images': image}\n"
+                "alias = processor_options\n"
+                "alias |= {'return_tensors': 'pt'}\n"
+                "inputs = processor(**processor_options)\n",
+            ),
+            (
+                "processor = AutoProcessor.from_pretrained('official/model')\n",
+                "processor_options = image\ninputs = processor(**processor_options)\n",
+            ),
+            (
+                "processor = AutoProcessor.from_pretrained('official/model')\n",
                 "inputs = processor(images=image, return_tensors='pt')\n"
                 "alias = inputs\n"
                 "alias |= {'custom_generate': 'attacker/repo'}\n",
@@ -3424,6 +3478,18 @@ class TestNetworkCommDetector:
             ),
             (
                 "processor = AutoProcessor.from_pretrained('official/model')\n",
+                "device = image.mode\ninputs = processor(images=image, return_tensors='pt').to(device=device)\n",
+            ),
+            (
+                "processor = AutoProcessor.from_pretrained('official/model')\n",
+                "inputs = processor(images=image, return_tensors='pt').to('cpu', 'cuda')\n",
+            ),
+            (
+                "processor = AutoProcessor.from_pretrained('official/model')\n",
+                "inputs = processor(images=image, return_tensors='pt').to(device='cuda', non_blocking=True)\n",
+            ),
+            (
+                "processor = AutoProcessor.from_pretrained('official/model')\n",
                 "device = 'cpu'; device = 'cuda'; inputs = processor(images=image, return_tensors='pt').to(device)\n",
             ),
             (
@@ -3443,11 +3509,18 @@ class TestNetworkCommDetector:
         ids=[
             "non-processor-factory",
             "dynamic-processor-options",
+            "computed-processor-key",
+            "rebound-processor-options",
+            "mutated-processor-options-alias",
+            "unproven-processor-options",
             "mutated-processor-output",
             "starred-processor-arguments",
             "remote-code-processor-option",
             "arbitrary-method-chain",
             "dynamic-device-transfer",
+            "dynamic-keyword-device-transfer",
+            "extra-positional-device-transfer",
+            "extra-keyword-device-transfer",
             "rebound-device-transfer",
             "malicious-mapping-rebind",
             "function-mapping-rebind",

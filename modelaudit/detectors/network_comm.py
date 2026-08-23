@@ -2340,10 +2340,155 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
             return False
         return isinstance(target, ast.Name) and (expected_name is None or target.id == expected_name)
 
-    def call_has_only_explicit_safe_mapping_arguments(value: ast.Call) -> bool:
+    def name_writes_match_binding_chain(write_nodes: list[ast.AST], binding_chain: tuple[int, ...]) -> bool:
+        write_indices = [top_level_statement_indices.get(id(write_node)) for write_node in write_nodes]
+        binding_indices = [top_level_statement_indices.get(binding_id) for binding_id in binding_chain]
+        return (
+            None not in write_indices
+            and None not in binding_indices
+            and Counter(write_indices) == Counter(binding_indices)
+        )
+
+    def call_execution_may_be_deferred(call: ast.Call) -> bool:
+        current: ast.AST = call
+        while parent := parents.get(id(current)):
+            if isinstance(parent, ast.GeneratorExp):
+                return True
+            if isinstance(parent, ast.Lambda) and current is parent.body:
+                return True
+            if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef)) and any(
+                current is statement for statement in parent.body
+            ):
+                return True
+            current = parent
+        return False
+
+    def mapping_operation_may_affect_call(operation: ast.AST, call: ast.Call) -> bool:
+        if call_execution_may_be_deferred(call):
+            return True
+        if getattr(operation, "lineno", None) == call.lineno:
+            return True
+        operation_index = top_level_statement_indices.get(id(operation))
+        call_index = top_level_statement_indices.get(id(call))
+        return operation_index is None or call_index is None or operation_index <= call_index
+
+    aliased_mapping_names = set(mapping_bindings)
+    for _binding_node, first_name, second_name in mapping_aliases:
+        aliased_mapping_names.update((first_name, second_name))
+
+    def is_proven_mapping_use(node: ast.Name, proven_mapping_transfer_call_ids: frozenset[int]) -> bool:
+        parent = parents.get(id(node))
+        if isinstance(parent, ast.Attribute) and parent.value is node and parent.attr == "to":
+            transfer_call = parents.get(id(parent))
+            return isinstance(transfer_call, ast.Call) and id(transfer_call) in proven_mapping_transfer_call_ids
+        if isinstance(parent, ast.keyword):
+            return parent.arg is None and parent.value is node
+        if isinstance(parent, ast.Dict):
+            return any(
+                key is None and item_value is node for key, item_value in zip(parent.keys, parent.values, strict=True)
+            )
+        if isinstance(parent, ast.Assign):
+            return parent.value is node and all(isinstance(target, ast.Name) for target in parent.targets)
+        return isinstance(parent, ast.AnnAssign) and parent.value is node and isinstance(parent.target, ast.Name)
+
+    def unsafe_mapping_operations_for(
+        proven_mapping_transfer_call_ids: frozenset[int],
+    ) -> list[tuple[str, ast.AST]]:
+        operations: list[tuple[str, ast.AST]] = [
+            (node.id, node)
+            for node in nodes
+            if isinstance(node, ast.Name)
+            and isinstance(node.ctx, ast.Load)
+            and node.id in aliased_mapping_names
+            and not is_proven_mapping_use(node, proven_mapping_transfer_call_ids)
+        ]
+        operations.extend(
+            (node.target.id, node)
+            for node in nodes
+            if isinstance(node, ast.AugAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id in aliased_mapping_names
+        )
+        return operations
+
+    def remote_code_mapping_is_proven_safe_at_call(
+        value: ast.expr,
+        call: ast.Call,
+        *,
+        proven_mapping_call_ids: frozenset[int] = frozenset(),
+        proven_mapping_binding_chains: dict[int, tuple[int, ...]] | None = None,
+        proven_mapping_transfer_call_ids: frozenset[int] = frozenset(),
+    ) -> bool:
+        binding_chains = proven_mapping_binding_chains or {}
+        relevant_binding_nodes = {
+            name: [
+                (binding_node, binding_value)
+                for binding_node, binding_value in candidates
+                if mapping_operation_may_affect_call(binding_node, call)
+            ]
+            for name, candidates in mapping_bindings.items()
+        }
+        relevant_name_writes = {
+            name: [write_node for write_node in write_nodes if mapping_operation_may_affect_call(write_node, call)]
+            for name, write_nodes in name_write_nodes.items()
+        }
+        relevant_bindings: dict[str, list[tuple[int, ast.expr]]] = {}
+        relevant_binding_counts: Counter[str] = Counter()
+        for name, candidates in relevant_binding_nodes.items():
+            logical_candidates = candidates
+            logical_write_count = len(relevant_name_writes.get(name, []))
+            if candidates:
+                binding_chain = binding_chains.get(id(candidates[-1][0]))
+                if (
+                    binding_chain is not None
+                    and tuple(id(binding_node) for binding_node, _binding_value in candidates) == binding_chain
+                    and name_writes_match_binding_chain(relevant_name_writes.get(name, []), binding_chain)
+                ):
+                    logical_candidates = [candidates[-1]]
+                    logical_write_count = 1
+            relevant_bindings[name] = [
+                (top_level_statement_indices[id(binding_node)], binding_value)
+                for binding_node, binding_value in logical_candidates
+            ]
+            relevant_binding_counts[name] = logical_write_count
+        for name, write_nodes in relevant_name_writes.items():
+            relevant_binding_counts.setdefault(name, len(write_nodes))
+        relevant_aliases: dict[str, set[str]] = {}
+        for binding_node, first_name, second_name in mapping_aliases:
+            if not mapping_operation_may_affect_call(binding_node, call):
+                continue
+            relevant_aliases.setdefault(first_name, set()).add(second_name)
+            relevant_aliases.setdefault(second_name, set()).add(first_name)
+        unsafe_names = {
+            name
+            for name, operation in unsafe_mapping_operations_for(proven_mapping_transfer_call_ids)
+            if mapping_operation_may_affect_call(operation, call)
+        }
+        pending_unsafe_names = list(unsafe_names)
+        while pending_unsafe_names:
+            unsafe_name = pending_unsafe_names.pop()
+            for alias_name in relevant_aliases.get(unsafe_name, set()):
+                if alias_name in unsafe_names:
+                    continue
+                unsafe_names.add(alias_name)
+                pending_unsafe_names.append(alias_name)
+
+        return _remote_code_mapping_is_proven_safe(
+            value,
+            bindings=relevant_bindings,
+            binding_counts=relevant_binding_counts,
+            unsafe_names=frozenset(unsafe_names),
+            proven_mapping_call_ids=proven_mapping_call_ids,
+            call_position=top_level_statement_indices[id(call)],
+        )
+
+    def call_has_only_proven_safe_mapping_arguments(value: ast.Call) -> bool:
         return (
             not any(isinstance(argument, ast.Starred) for argument in value.args)
-            and not any(keyword.arg is None for keyword in value.keywords)
+            and not any(
+                keyword.arg is None and not remote_code_mapping_is_proven_safe_at_call(keyword.value, value)
+                for keyword in value.keywords
+            )
             and not any(
                 keyword.arg in _REMOTE_CODE_KEYWORDS and not _remote_code_option_is_disabled(keyword.arg, keyword.value)
                 for keyword in value.keywords
@@ -2369,7 +2514,7 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
         instance_binding, factory_call = instance_bindings[0]
         return (
             isinstance(factory_call, ast.Call)
-            and call_has_only_explicit_safe_mapping_arguments(factory_call)
+            and call_has_only_proven_safe_mapping_arguments(factory_call)
             and is_single_name_binding(instance_binding, factory_call, instance_name)
             and isinstance(factory_call.func, ast.Attribute)
             and factory_call.func.attr == "from_pretrained"
@@ -2420,30 +2565,27 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
             and isinstance(mapping_value.func, ast.Attribute)
             and mapping_value.func.attr == "to"
         ):
-            if (
-                len(mapping_value.args) != 1
-                or mapping_value.keywords
-                or not mapping_device_is_proven_safe(mapping_value.args[0], binding_node)
+            if len(mapping_value.args) == 1 and not mapping_value.keywords:
+                device_value = mapping_value.args[0]
+            elif (
+                not mapping_value.args
+                and len(mapping_value.keywords) == 1
+                and mapping_value.keywords[0].arg == "device"
             ):
+                device_value = mapping_value.keywords[0].value
+            else:
+                return None
+            if not mapping_device_is_proven_safe(device_value, binding_node):
                 return None
             transfers.append(mapping_value)
             mapping_value = mapping_value.func.value
         return mapping_value, tuple(transfers)
 
-    def name_writes_match_binding_chain(write_nodes: list[ast.AST], binding_chain: tuple[int, ...]) -> bool:
-        write_indices = [top_level_statement_indices.get(id(write_node)) for write_node in write_nodes]
-        binding_indices = [top_level_statement_indices.get(binding_id) for binding_id in binding_chain]
-        return (
-            None not in write_indices
-            and None not in binding_indices
-            and Counter(write_indices) == Counter(binding_indices)
-        )
-
     def trusted_mapping_factory_call_is_proven_safe(binding_node: ast.AST, mapping_value: ast.expr) -> bool:
         if (
             not isinstance(mapping_value, ast.Call)
             or not isinstance(mapping_value.func, ast.Name)
-            or not call_has_only_explicit_safe_mapping_arguments(mapping_value)
+            or not call_has_only_proven_safe_mapping_arguments(mapping_value)
         ):
             return False
         return trusted_transformers_instance_is_proven_safe(
@@ -2453,7 +2595,7 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
         )
 
     proven_mapping_call_id_set: set[int] = set()
-    proven_mapping_transfer_call_ids: set[int] = set()
+    proven_mapping_transfer_call_id_set: set[int] = set()
     proven_mapping_binding_chains: dict[int, tuple[int, ...]] = {}
     ordered_mapping_bindings = sorted(
         (
@@ -2500,126 +2642,9 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
             continue
         proven_mapping_binding_chains[id(binding_node)] = binding_chain
         proven_mapping_call_id_set.add(id(binding_value))
-        proven_mapping_transfer_call_ids.update(id(transfer_call) for transfer_call in transfer_calls)
+        proven_mapping_transfer_call_id_set.update(id(transfer_call) for transfer_call in transfer_calls)
     proven_mapping_call_ids = frozenset(proven_mapping_call_id_set)
-
-    def is_proven_mapping_use(node: ast.Name) -> bool:
-        parent = parents.get(id(node))
-        if isinstance(parent, ast.Attribute) and parent.value is node and parent.attr == "to":
-            transfer_call = parents.get(id(parent))
-            return isinstance(transfer_call, ast.Call) and id(transfer_call) in proven_mapping_transfer_call_ids
-        if isinstance(parent, ast.keyword):
-            return parent.arg is None and parent.value is node
-        if isinstance(parent, ast.Dict):
-            return any(
-                key is None and item_value is node for key, item_value in zip(parent.keys, parent.values, strict=True)
-            )
-        if isinstance(parent, ast.Assign):
-            return parent.value is node and all(isinstance(target, ast.Name) for target in parent.targets)
-        return isinstance(parent, ast.AnnAssign) and parent.value is node and isinstance(parent.target, ast.Name)
-
-    aliased_mapping_names = set(mapping_bindings)
-    for _binding_node, first_name, second_name in mapping_aliases:
-        aliased_mapping_names.update((first_name, second_name))
-    unsafe_mapping_operations: list[tuple[str, ast.AST]] = [
-        (node.id, node)
-        for node in nodes
-        if isinstance(node, ast.Name)
-        and isinstance(node.ctx, ast.Load)
-        and node.id in aliased_mapping_names
-        and not is_proven_mapping_use(node)
-    ]
-    unsafe_mapping_operations.extend(
-        (node.target.id, node)
-        for node in nodes
-        if isinstance(node, ast.AugAssign)
-        and isinstance(node.target, ast.Name)
-        and node.target.id in aliased_mapping_names
-    )
-
-    def call_execution_may_be_deferred(call: ast.Call) -> bool:
-        current: ast.AST = call
-        while parent := parents.get(id(current)):
-            if isinstance(parent, ast.GeneratorExp):
-                return True
-            if isinstance(parent, ast.Lambda) and current is parent.body:
-                return True
-            if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef)) and any(
-                current is statement for statement in parent.body
-            ):
-                return True
-            current = parent
-        return False
-
-    def mapping_operation_may_affect_call(operation: ast.AST, call: ast.Call) -> bool:
-        if call_execution_may_be_deferred(call):
-            return True
-        if getattr(operation, "lineno", None) == call.lineno:
-            return True
-        operation_index = top_level_statement_indices.get(id(operation))
-        call_index = top_level_statement_indices.get(id(call))
-        return operation_index is None or call_index is None or operation_index <= call_index
-
-    def remote_code_mapping_is_proven_safe_at_call(value: ast.expr, call: ast.Call) -> bool:
-        relevant_binding_nodes = {
-            name: [
-                (binding_node, binding_value)
-                for binding_node, binding_value in candidates
-                if mapping_operation_may_affect_call(binding_node, call)
-            ]
-            for name, candidates in mapping_bindings.items()
-        }
-        relevant_name_writes = {
-            name: [write_node for write_node in write_nodes if mapping_operation_may_affect_call(write_node, call)]
-            for name, write_nodes in name_write_nodes.items()
-        }
-        relevant_bindings: dict[str, list[tuple[int, ast.expr]]] = {}
-        relevant_binding_counts: Counter[str] = Counter()
-        for name, candidates in relevant_binding_nodes.items():
-            logical_candidates = candidates
-            logical_write_count = len(relevant_name_writes.get(name, []))
-            if candidates:
-                binding_chain = proven_mapping_binding_chains.get(id(candidates[-1][0]))
-                if (
-                    binding_chain is not None
-                    and tuple(id(binding_node) for binding_node, _binding_value in candidates) == binding_chain
-                    and name_writes_match_binding_chain(relevant_name_writes.get(name, []), binding_chain)
-                ):
-                    logical_candidates = [candidates[-1]]
-                    logical_write_count = 1
-            relevant_bindings[name] = [
-                (top_level_statement_indices[id(binding_node)], binding_value)
-                for binding_node, binding_value in logical_candidates
-            ]
-            relevant_binding_counts[name] = logical_write_count
-        for name, write_nodes in relevant_name_writes.items():
-            relevant_binding_counts.setdefault(name, len(write_nodes))
-        relevant_aliases: dict[str, set[str]] = {}
-        for binding_node, first_name, second_name in mapping_aliases:
-            if not mapping_operation_may_affect_call(binding_node, call):
-                continue
-            relevant_aliases.setdefault(first_name, set()).add(second_name)
-            relevant_aliases.setdefault(second_name, set()).add(first_name)
-        unsafe_names = {
-            name for name, operation in unsafe_mapping_operations if mapping_operation_may_affect_call(operation, call)
-        }
-        pending_unsafe_names = list(unsafe_names)
-        while pending_unsafe_names:
-            unsafe_name = pending_unsafe_names.pop()
-            for alias_name in relevant_aliases.get(unsafe_name, set()):
-                if alias_name in unsafe_names:
-                    continue
-                unsafe_names.add(alias_name)
-                pending_unsafe_names.append(alias_name)
-
-        return _remote_code_mapping_is_proven_safe(
-            value,
-            bindings=relevant_bindings,
-            binding_counts=relevant_binding_counts,
-            unsafe_names=frozenset(unsafe_names),
-            proven_mapping_call_ids=proven_mapping_call_ids,
-            call_position=top_level_statement_indices[id(call)],
-        )
+    proven_mapping_transfer_call_ids = frozenset(proven_mapping_transfer_call_id_set)
 
     for node in nodes:
         if isinstance(node, ast.Import):
@@ -2702,7 +2727,13 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
                     keyword.value,
                     ast.Dict,
                 )
-                if requires_proof and not remote_code_mapping_is_proven_safe_at_call(keyword.value, node):
+                if requires_proof and not remote_code_mapping_is_proven_safe_at_call(
+                    keyword.value,
+                    node,
+                    proven_mapping_call_ids=proven_mapping_call_ids,
+                    proven_mapping_binding_chains=proven_mapping_binding_chains,
+                    proven_mapping_transfer_call_ids=proven_mapping_transfer_call_ids,
+                ):
                     return False
             attribute_root = node.func.value
             while isinstance(attribute_root, (ast.Attribute, ast.Subscript, ast.Call)):
