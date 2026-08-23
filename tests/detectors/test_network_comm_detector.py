@@ -5,6 +5,7 @@ import os
 import re
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 from urllib.parse import quote, urlparse
 
 import pytest
@@ -2816,8 +2817,13 @@ class TestNetworkCommDetector:
 
         findings = NetworkCommDetector().scan(data, "README.md")
 
-        assert any(finding["type"] == "network_library" for finding in findings)
-        assert any(finding["type"] == "network_function" for finding in findings)
+        assert any(
+            finding["type"] == "network_library" and finding["severity"] in {"HIGH", "CRITICAL"} for finding in findings
+        )
+        assert any(
+            finding["type"] == "network_function" and finding["severity"] in {"HIGH", "CRITICAL"}
+            for finding in findings
+        )
 
     def test_readme_python_example_accepts_constant_annotated_url_binding(self) -> None:
         data = (
@@ -2853,8 +2859,13 @@ class TestNetworkCommDetector:
 
         findings = NetworkCommDetector().scan(data, "README.md")
 
-        assert any(finding["type"] == "network_library" for finding in findings)
-        assert any(finding["type"] == "network_function" for finding in findings)
+        assert any(
+            finding["type"] == "network_library" and finding["severity"] in {"HIGH", "CRITICAL"} for finding in findings
+        )
+        assert any(
+            finding["type"] == "network_function" and finding["severity"] in {"HIGH", "CRITICAL"}
+            for finding in findings
+        )
 
     def test_readme_python_example_preserves_mixed_untrusted_requests(self) -> None:
         data = (
@@ -3562,6 +3573,112 @@ class TestNetworkCommDetector:
         findings = NetworkCommDetector().scan(data, "README.md")
 
         assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+
+    def test_readme_python_example_bounds_scan_wide_mapping_proof_work(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Many maximal fences must share one bounded mapping-proof budget."""
+        calls = "\n".join("runner(**o)" for _ in range(139))
+        example = (
+            "import requests\n"
+            "from transformers import AutoModel\n"
+            "model = AutoModel.from_pretrained('official/model')\n"
+            "runner = model.generate\n"
+            "o = {'custom_generate': None}\n"
+            f"{calls}\n"
+            "requests.get('https://huggingface.co/org/model/resolve/main/sample.png', stream=True)\n"
+            "pass\n"
+            '""\n'
+            f"#{'x' * 750}\n"
+        )
+        node_count = sum(1 for _ in network_comm.ast.walk(network_comm.ast.parse(example)))
+        data = ((f"```python\n{example}```\n") * network_comm._MAX_README_IMAGE_EXAMPLE_FENCES).encode()
+        assert node_count == 1012
+        assert len(data) == 687_360
+
+        proof_calls = 0
+        max_proof_calls = network_comm._MAX_README_IMAGE_EXAMPLE_MAPPING_PROOF_WORK // node_count
+        assert max_proof_calls == 64
+        original_mapping_proof = network_comm._remote_code_mapping_is_proven_safe
+
+        def count_mapping_proof(*args: Any, **kwargs: Any) -> bool:
+            nonlocal proof_calls
+            proof_calls += 1
+            if proof_calls > max_proof_calls:
+                raise AssertionError("mapping proof work exceeded the scan-wide limit")
+            return original_mapping_proof(*args, **kwargs)
+
+        monkeypatch.setattr(network_comm, "_remote_code_mapping_is_proven_safe", count_mapping_proof)
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert proof_calls <= max_proof_calls
+        assert any(finding["type"] == "network_library" for finding in findings)
+        assert any(finding["type"] == "network_function" for finding in findings)
+
+    def test_readme_python_example_distinguishes_exact_mapping_proof_budget_from_overrun(self) -> None:
+        """An optional proof may consume the exact budget but must not hide an overrun."""
+        example = (
+            b"import requests\nfrom PIL import Image\n"
+            b"from transformers import AutoProcessor\n"
+            b"image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            b"image = Image.open(requests.get(image_url, stream=True).raw)\n"
+            b"processor = AutoProcessor.from_pretrained('official/model')\n"
+            b"inputs = processor(images=image, return_tensors='pt')\n"
+            b"inputs.to('cpu')\n"
+        )
+        node_count = sum(1 for _ in network_comm.ast.walk(network_comm.ast.parse(example)))
+        assert node_count == 57
+
+        exact_budget = network_comm._ReadmeImageExampleProofBudget()
+        exact_budget.remaining = node_count
+        assert network_comm._is_valid_official_readme_sample_image_example(
+            example,
+            proof_budget=exact_budget,
+        )
+        assert exact_budget.remaining == 0
+        assert not exact_budget.exceeded
+
+        overrun_budget = network_comm._ReadmeImageExampleProofBudget()
+        overrun_budget.remaining = node_count - 1
+        assert not network_comm._is_valid_official_readme_sample_image_example(
+            example,
+            proof_budget=overrun_budget,
+        )
+        assert overrun_budget.exceeded
+
+    def test_readme_python_example_fails_closed_on_optional_mapping_proof_exhaustion(self) -> None:
+        """Unused mapping transfers cannot swallow production-budget exhaustion."""
+        transfers = "\n".join("inputs.to('cpu')" for _ in range(100))
+        example = (
+            "import requests\nfrom PIL import Image\n"
+            "from transformers import AutoModel, AutoProcessor\n"
+            "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            "image = Image.open(requests.get(image_url, stream=True).raw)\n"
+            "processor = AutoProcessor.from_pretrained('official/model')\n"
+            "model = AutoModel.from_pretrained('official/model')\n"
+            "inputs = processor(images=image, return_tensors='pt')\n"
+            "model.generate(inputs)\n"
+            f"{transfers}\n"
+            '""\n'
+        )
+        node_count = sum(1 for _ in network_comm.ast.walk(network_comm.ast.parse(example)))
+        assert node_count == 770
+        detector = NetworkCommDetector()
+
+        findings = detector.scan(f"```python\n{example}```\n".encode(), "README.md")
+
+        assert any(finding["type"] == "network_library" for finding in findings)
+        assert any(finding["type"] == "network_function" for finding in findings)
+
+        safe_data = (
+            b"```python\nimport requests\n"
+            b"image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            b"requests.get(image_url, stream=True)\n```\n"
+        )
+        safe_findings = detector.scan(safe_data, "README.md")
+        assert not [finding for finding in safe_findings if finding["type"] in {"network_library", "network_function"}]
 
     def test_readme_python_example_rejects_cyclic_generate_kwargs_mapping(self) -> None:
         """Memoization must not turn cyclic mapping provenance into a trusted value."""
@@ -5194,9 +5311,9 @@ class TestNetworkCommDetector:
         validated_examples: list[bytes] = []
         original_validator = network_comm._is_valid_official_readme_sample_image_example
 
-        def count_validation(example: bytes) -> bool:
+        def count_validation(example: bytes, **kwargs: Any) -> bool:
             validated_examples.append(example)
-            return original_validator(example)
+            return original_validator(example, **kwargs)
 
         monkeypatch.setattr(network_comm, "_is_valid_official_readme_sample_image_example", count_validation)
         data = (
@@ -5285,9 +5402,9 @@ class TestNetworkCommDetector:
         validated_examples: list[bytes] = []
         original_validator = network_comm._is_valid_official_readme_sample_image_example
 
-        def count_validation(example: bytes) -> bool:
+        def count_validation(example: bytes, **kwargs: Any) -> bool:
             validated_examples.append(example)
-            return original_validator(example)
+            return original_validator(example, **kwargs)
 
         monkeypatch.setattr(network_comm, "_is_valid_official_readme_sample_image_example", count_validation)
         example = (

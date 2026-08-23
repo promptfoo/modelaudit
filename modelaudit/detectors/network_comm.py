@@ -1733,12 +1733,29 @@ _MAX_README_IMAGE_EXAMPLE_BYTES = 64 * 1024
 _MAX_README_IMAGE_EXAMPLE_AST_NODES = 1024
 _MAX_README_IMAGE_EXAMPLE_FENCE_OPENINGS = 64
 _MAX_README_IMAGE_EXAMPLE_FENCES = 256
+_MAX_README_IMAGE_EXAMPLE_MAPPING_PROOF_WORK = 64 * _MAX_README_IMAGE_EXAMPLE_AST_NODES
 _PYTHON_README_FENCE_PATTERN = re.compile(rb"(?m)^[ \t]{0,3}(?P<fence>`{3,}|~{3,})(?:python|py)[ \t]*\r?\n")
 _README_FENCE_END_PATTERN = re.compile(rb"(?m)^[ \t]{0,3}(?:`{3,}|~{3,})[ \t]*\r?$")
 _QUALIFIED_REQUESTS_CALL_PATTERN = re.compile(rb"\brequests\s*\.\s*[A-Za-z_][A-Za-z_0-9]*\s*\(")
 _DOCUMENTED_IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp")
 _WORD_PATTERN = re.compile(rb"[A-Za-z]{2,}")
 _CALL_SYNTAX_SUFFIX_PATTERN = re.compile(rb"(?:[\s)]|#[^\n]*\n)*\(")
+
+
+class _ReadmeImageExampleProofBudget:
+    def __init__(self) -> None:
+        self.remaining = _MAX_README_IMAGE_EXAMPLE_MAPPING_PROOF_WORK
+        self.exceeded = False
+
+    def consume(self, work: int) -> bool:
+        if self.exceeded or work > self.remaining:
+            self.remaining = 0
+            self.exceeded = True
+            return False
+        self.remaining -= work
+        return True
+
+
 _CODE_LINE_PREFIXES: tuple[bytes, ...] = (
     b"import ",
     b"from ",
@@ -1942,6 +1959,7 @@ def _index_official_readme_sample_image_fences(
 
     fences: list[tuple[int, int, bool]] = []
     unvalidated_requests = False
+    proof_budget = _ReadmeImageExampleProofBudget()
     cursor = 0
     while opening := _PYTHON_README_FENCE_PATTERN.search(data, cursor):
         if len(fences) >= _MAX_README_IMAGE_EXAMPLE_FENCES:
@@ -1960,7 +1978,7 @@ def _index_official_readme_sample_image_fences(
         is_safe = (
             b"import requests" in example
             and b"requests.get" in example
-            and _is_valid_official_readme_sample_image_example(example)
+            and _is_valid_official_readme_sample_image_example(example, proof_budget=proof_budget)
         )
         if not is_safe and _contains_executable_requests_reference(example):
             unvalidated_requests = True
@@ -2128,7 +2146,15 @@ def _remote_code_mapping_is_proven_safe(
         return False
 
 
-def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
+def _is_valid_official_readme_sample_image_example(
+    example: bytes,
+    *,
+    proof_budget: _ReadmeImageExampleProofBudget | None = None,
+) -> bool:
+    if proof_budget is None:
+        proof_budget = _ReadmeImageExampleProofBudget()
+    elif proof_budget.exceeded:
+        return False
     if b"import requests" not in example or b"requests.get" not in example:
         return False
     try:
@@ -2765,6 +2791,8 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
         proven_mapping_binding_chains: dict[int, tuple[int, ...]] | None = None,
         proven_mapping_transfer_call_ids: frozenset[int] = frozenset(),
     ) -> bool:
+        if not proof_budget.consume(len(nodes)):
+            return False
         binding_chains = proven_mapping_binding_chains or {}
         relevant_binding_nodes = {
             name: [
@@ -3535,7 +3563,7 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
             or not parsed.path.lower().endswith(_DOCUMENTED_IMAGE_SUFFIXES)
         ):
             return False
-    return True
+    return not proof_budget.exceeded
 
 
 class NetworkCommDetector:
