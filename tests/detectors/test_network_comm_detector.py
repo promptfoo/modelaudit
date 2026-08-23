@@ -3178,6 +3178,251 @@ class TestNetworkCommDetector:
 
         assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
 
+    def test_readme_python_example_allows_processor_generate_kwargs_unpacking(self) -> None:
+        """A canonical Transformers processor output is a trusted model-input mapping."""
+        data = (
+            b"```python\nimport requests\nfrom PIL import Image\n"
+            b"from transformers import AutoModel, AutoProcessor\n"
+            b"image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            b"image = Image.open(requests.get(image_url, stream=True).raw)\n"
+            b"processor = AutoProcessor.from_pretrained('official/model')\n"
+            b"model = AutoModel.from_pretrained('official/model')\n"
+            b"inputs = processor(images=image, return_tensors='pt')\n"
+            b"model.generate(**inputs)\n```\n"
+        )
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert findings
+        assert all(finding["severity"] == "INFO" for finding in findings)
+        assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+
+    @pytest.mark.parametrize(
+        ("factory_name", "instance_name", "inputs_expression"),
+        [
+            ("AutoTokenizer", "tokenizer", "tokenizer('hello', return_tensors='pt')"),
+            ("BertTokenizerFast", "tokenizer", "tokenizer('hello', return_tensors='pt')"),
+            (
+                "AutoFeatureExtractor",
+                "feature_extractor",
+                "feature_extractor(images=image, return_tensors='pt')",
+            ),
+            (
+                "AutoProcessor",
+                "processor",
+                "processor(images=image, return_tensors='pt').to('cpu')",
+            ),
+        ],
+        ids=["auto-tokenizer", "fast-tokenizer", "feature-extractor", "processor-to-cpu"],
+    )
+    def test_readme_python_example_allows_trusted_transformers_mapping_factories(
+        self,
+        factory_name: str,
+        instance_name: str,
+        inputs_expression: str,
+    ) -> None:
+        """Canonical Transformers input factories produce trusted model-input mappings."""
+        data = (
+            "```python\nimport requests\nfrom PIL import Image\n"
+            f"from transformers import AutoModel, {factory_name}\n"
+            "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            "image = Image.open(requests.get(image_url, stream=True).raw)\n"
+            f"{instance_name} = {factory_name}.from_pretrained('official/model')\n"
+            "model = AutoModel.from_pretrained('official/model')\n"
+            f"inputs = {inputs_expression}\n"
+            "model.generate(**inputs)\n```\n"
+        ).encode()
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert findings
+        assert all(finding["severity"] == "INFO" for finding in findings)
+        assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+
+    @pytest.mark.parametrize(
+        "inputs_setup",
+        [
+            ("device = 'cpu'; inputs = processor(images=image, return_tensors='pt').to(device)\n"),
+            ("inputs = processor(images=image, return_tensors='pt'); inputs = inputs.to('cpu')\n"),
+        ],
+        ids=["named-device", "mapping-rebind"],
+    )
+    def test_readme_python_example_allows_ordered_mapping_device_transfers(self, inputs_setup: str) -> None:
+        """A unique device literal and provenance-preserving rebinding remain canonical."""
+        data = (
+            "```python\nimport requests\nfrom PIL import Image\n"
+            "from transformers import AutoModel, AutoProcessor\n"
+            "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            "image = Image.open(requests.get(image_url, stream=True).raw)\n"
+            "processor = AutoProcessor.from_pretrained('official/model')\n"
+            "model = AutoModel.from_pretrained('official/model')\n"
+            f"{inputs_setup}"
+            "model.generate(**inputs)\n```\n"
+        ).encode()
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert findings
+        assert all(finding["severity"] == "INFO" for finding in findings)
+        assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+
+    def test_readme_python_example_allows_tokenizer_output_on_trusted_model_device(self) -> None:
+        """A uniquely bound Transformers model provides a canonical tensor device."""
+        data = (
+            b"```python\nimport requests\n"
+            b"from transformers import AutoModelForCausalLM, AutoTokenizer\n"
+            b"image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            b"tokenizer = AutoTokenizer.from_pretrained('official/model')\n"
+            b"model = AutoModelForCausalLM.from_pretrained('official/model')\n"
+            b"inputs = tokenizer('hello', return_tensors='pt').to(model.device)\n"
+            b"model.generate(**inputs)\n"
+            b"requests.get(image_url, stream=True)\n```\n"
+        )
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert findings
+        assert all(finding["severity"] == "INFO" for finding in findings)
+        assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+
+    @pytest.mark.parametrize(
+        ("provider_setup", "device_expression"),
+        [
+            ("provider = image\n", "provider.device"),
+            ("model = image; ", "model.device"),
+        ],
+        ids=["arbitrary-provider", "same-line-model-rebind"],
+    )
+    def test_readme_python_example_rejects_untrusted_model_device_provider(
+        self,
+        provider_setup: str,
+        device_expression: str,
+    ) -> None:
+        data = (
+            "```python\nimport requests\nfrom PIL import Image\n"
+            "from transformers import AutoModelForCausalLM, AutoTokenizer\n"
+            "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            "image = Image.open(requests.get(image_url, stream=True).raw)\n"
+            "tokenizer = AutoTokenizer.from_pretrained('official/model')\n"
+            "model = AutoModelForCausalLM.from_pretrained('official/model')\n"
+            f"{provider_setup}"
+            f"inputs = tokenizer('hello', return_tensors='pt').to({device_expression})\n"
+            "model.generate(**inputs)\n```\n"
+        ).encode()
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert any(finding["type"] == "network_library" for finding in findings)
+        assert any(finding["type"] == "network_function" for finding in findings)
+
+    def test_readme_python_example_rejects_same_line_mapping_factory_rebind(self) -> None:
+        """A same-line callee rebind must invalidate trusted mapping-factory provenance."""
+        data = (
+            b"```python\nimport requests\nimport torch\nfrom PIL import Image\n"
+            b"from transformers import AutoModel, AutoProcessor\n"
+            b"image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            b"image = Image.open(requests.get(image_url, stream=True).raw)\n"
+            b"processor = AutoProcessor.from_pretrained('official/model')\n"
+            b"model = AutoModel.from_pretrained('official/model')\n"
+            b"processor = torch.load; inputs = processor('attacker.pkl')\n"
+            b"model.generate(**inputs)\n```\n"
+        )
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert any(finding["type"] == "network_library" for finding in findings)
+        assert any(finding["type"] == "network_function" for finding in findings)
+
+    @pytest.mark.parametrize(
+        ("processor_binding", "inputs_binding"),
+        [
+            (
+                "processor = AutoModel.from_pretrained('official/model')\n",
+                "inputs = processor(images=image, return_tensors='pt')\n",
+            ),
+            (
+                "processor = AutoProcessor.from_pretrained('official/model')\n",
+                "processor_options = {\n"
+                "    'images': image,\n"
+                "    'return_tensors': 'pt',\n"
+                "    'custom_generate': 'attacker/repo',\n"
+                "}\n"
+                "inputs = processor(**processor_options)\n",
+            ),
+            (
+                "processor = AutoProcessor.from_pretrained('official/model')\n",
+                "inputs = processor(images=image, return_tensors='pt')\n"
+                "alias = inputs\n"
+                "alias |= {'custom_generate': 'attacker/repo'}\n",
+            ),
+            (
+                "processor = AutoProcessor.from_pretrained('official/model')\n",
+                "inputs = processor(*[image], return_tensors='pt')\n",
+            ),
+            (
+                "processor = AutoProcessor.from_pretrained('official/model')\n",
+                "inputs = processor(images=image, return_tensors='pt', trust_remote_code=True)\n",
+            ),
+            (
+                "processor = AutoProcessor.from_pretrained('official/model')\n",
+                "inputs = processor(images=image, return_tensors='pt').to('cpu').tolist()\n",
+            ),
+            (
+                "processor = AutoProcessor.from_pretrained('official/model')\n",
+                "device = image.mode\ninputs = processor(images=image, return_tensors='pt').to(device)\n",
+            ),
+            (
+                "processor = AutoProcessor.from_pretrained('official/model')\n",
+                "device = 'cpu'; device = 'cuda'; inputs = processor(images=image, return_tensors='pt').to(device)\n",
+            ),
+            (
+                "processor = AutoProcessor.from_pretrained('official/model')\n",
+                "inputs = processor(images=image, return_tensors='pt')\n"
+                "inputs = {'custom_generate': 'attacker/repo'}\n"
+                "inputs = inputs.to('cpu')\n",
+            ),
+            (
+                "processor = AutoProcessor.from_pretrained('official/model')\n",
+                "inputs = processor(images=image, return_tensors='pt')\n"
+                "def inputs():\n"
+                "    return {'custom_generate': 'attacker/repo'}\n"
+                "inputs = inputs.to('cpu')\n",
+            ),
+        ],
+        ids=[
+            "non-processor-factory",
+            "dynamic-processor-options",
+            "mutated-processor-output",
+            "starred-processor-arguments",
+            "remote-code-processor-option",
+            "arbitrary-method-chain",
+            "dynamic-device-transfer",
+            "rebound-device-transfer",
+            "malicious-mapping-rebind",
+            "function-mapping-rebind",
+        ],
+    )
+    def test_readme_python_example_rejects_unproven_processor_generate_kwargs(
+        self,
+        processor_binding: str,
+        inputs_binding: str,
+    ) -> None:
+        data = (
+            "```python\nimport requests\nfrom PIL import Image\n"
+            "from transformers import AutoModel, AutoProcessor\n"
+            "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            "image = Image.open(requests.get(image_url, stream=True).raw)\n"
+            f"{processor_binding}"
+            "model = AutoModel.from_pretrained('official/model')\n"
+            f"{inputs_binding}"
+            "model.generate(**inputs)\n```\n"
+        ).encode()
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert any(finding["type"] == "network_library" for finding in findings)
+        assert any(finding["type"] == "network_function" for finding in findings)
+
     @pytest.mark.parametrize(
         "model_call",
         [
@@ -3218,8 +3463,9 @@ class TestNetworkCommDetector:
             "copied = options['custom_generate']\n",
             "for options['custom_generate'] in ['attacker/repo']:\n    pass\n",
             "options = {'custom_generate': 'attacker/repo'}\n",
+            "alias = options\nalias |= {'custom_generate': 'attacker/repo'}\n",
         ],
-        ids=["read", "mutation", "rebind"],
+        ids=["read", "mutation", "rebind", "aliased-augmented-mutation"],
     )
     def test_readme_python_example_allows_safe_options_used_before_later_operations(
         self,
