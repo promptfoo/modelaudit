@@ -2378,6 +2378,18 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
 
     def is_proven_mapping_use(node: ast.Name, proven_mapping_transfer_call_ids: frozenset[int]) -> bool:
         parent = parents.get(id(node))
+        if (
+            isinstance(parent, ast.Call)
+            and len(parent.args) == 1
+            and parent.args[0] is node
+            and not parent.keywords
+            and isinstance(parent.func, ast.Name)
+            and parent.func.id == "len"
+            and not any(
+                mapping_operation_may_affect_call(write_node, parent) for write_node in name_write_nodes.get("len", [])
+            )
+        ):
+            return True
         if isinstance(parent, ast.Attribute) and parent.value is node and parent.attr == "to":
             transfer_call = parents.get(id(parent))
             return isinstance(transfer_call, ast.Call) and id(transfer_call) in proven_mapping_transfer_call_ids
@@ -2651,6 +2663,39 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
         proven_mapping_binding_chains[id(binding_node)] = binding_chain
         proven_mapping_call_id_set.add(id(binding_value))
         proven_mapping_transfer_call_id_set.update(id(transfer_call) for transfer_call in transfer_calls)
+
+    standalone_transfer_calls = sorted(
+        (node.value for node in nodes if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)),
+        key=lambda call: top_level_statement_indices.get(id(call), len(tree.body)),
+    )
+    for transfer_call in standalone_transfer_calls:
+        if call_execution_may_be_deferred(transfer_call):
+            continue
+        unwrapped_mapping = unwrap_safe_mapping_device_transfers(transfer_call, transfer_call)
+        if unwrapped_mapping is None:
+            continue
+        mapping_value, transfer_calls = unwrapped_mapping
+        if not transfer_calls or not isinstance(mapping_value, ast.Name):
+            continue
+        prior_bindings = [
+            prior_binding
+            for prior_binding, _prior_value in mapping_bindings.get(mapping_value.id, [])
+            if top_level_statement_precedes(prior_binding, transfer_call)
+        ]
+        if not prior_bindings or id(prior_bindings[-1]) not in proven_mapping_binding_chains:
+            continue
+        candidate_transfer_call_ids = frozenset(
+            proven_mapping_transfer_call_id_set | {id(candidate) for candidate in transfer_calls}
+        )
+        if not remote_code_mapping_is_proven_safe_at_call(
+            mapping_value,
+            transfer_call,
+            proven_mapping_call_ids=frozenset(proven_mapping_call_id_set),
+            proven_mapping_binding_chains=proven_mapping_binding_chains,
+            proven_mapping_transfer_call_ids=candidate_transfer_call_ids,
+        ):
+            continue
+        proven_mapping_transfer_call_id_set.update(id(candidate) for candidate in transfer_calls)
 
     for generate_call in nodes:
         if (

@@ -3229,6 +3229,52 @@ class TestNetworkCommDetector:
 
         assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
 
+    def test_readme_python_example_allows_non_mutating_generate_kwargs_read(self) -> None:
+        """Reading a proven mapping's length does not expose it to mutation."""
+        data = (
+            b"```python\nimport requests\nfrom transformers import AutoModel\n"
+            b"image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            b"model = AutoModel.from_pretrained('official/model')\n"
+            b"options = {'input_ids': 1}\n"
+            b"print(len(options))\n"
+            b"model.generate(**options)\n"
+            b"requests.get(image_url, stream=True)\n```\n"
+        )
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert findings
+        assert all(finding["severity"] == "INFO" for finding in findings)
+        assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+
+    @pytest.mark.parametrize(
+        "operation",
+        [
+            "print(options)\n",
+            "options['custom_generate'] = 'attacker/repo'\n",
+            "len = print\nprint(len(options))\n",
+        ],
+        ids=["leaked-mapping", "mapping-mutation", "rebound-len"],
+    )
+    def test_readme_python_example_rejects_unsafe_generate_kwargs_use_before_call(
+        self,
+        operation: str,
+    ) -> None:
+        data = (
+            "```python\nimport requests\nfrom transformers import AutoModel\n"
+            "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            "model = AutoModel.from_pretrained('official/model')\n"
+            "options = {'input_ids': 1}\n"
+            f"{operation}"
+            "model.generate(**options)\n"
+            "requests.get(image_url, stream=True)\n```\n"
+        ).encode()
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert any(finding["type"] == "network_library" for finding in findings)
+        assert any(finding["type"] == "network_function" for finding in findings)
+
     def test_readme_python_example_allows_processor_generate_kwargs_unpacking(self) -> None:
         """A canonical Transformers processor output is a trusted model-input mapping."""
         data = (
@@ -3522,6 +3568,56 @@ class TestNetworkCommDetector:
         assert findings
         assert all(finding["severity"] == "INFO" for finding in findings)
         assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+
+    def test_readme_python_example_allows_standalone_mapping_device_transfer(self) -> None:
+        """BatchEncoding.to mutates the proven mapping without replacing it."""
+        data = (
+            b"```python\nimport requests\nfrom PIL import Image\n"
+            b"from transformers import AutoModel, AutoProcessor\n"
+            b"image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            b"image = Image.open(requests.get(image_url, stream=True).raw)\n"
+            b"processor = AutoProcessor.from_pretrained('official/model')\n"
+            b"model = AutoModel.from_pretrained('official/model')\n"
+            b"inputs = processor(images=image, return_tensors='pt')\n"
+            b"inputs.to('cuda')\n"
+            b"model.generate(**inputs)\n```\n"
+        )
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert findings
+        assert all(finding["severity"] == "INFO" for finding in findings)
+        assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+
+    @pytest.mark.parametrize(
+        "transfer",
+        [
+            "inputs.to(image.mode)\n",
+            "inputs.to('cpu', 'cuda')\n",
+            "print(inputs.to('cuda'))\n",
+        ],
+        ids=["dynamic-device", "extra-device", "leaked-transfer-result"],
+    )
+    def test_readme_python_example_rejects_unsafe_standalone_mapping_device_transfer(
+        self,
+        transfer: str,
+    ) -> None:
+        data = (
+            "```python\nimport requests\nfrom PIL import Image\n"
+            "from transformers import AutoModel, AutoProcessor\n"
+            "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            "image = Image.open(requests.get(image_url, stream=True).raw)\n"
+            "processor = AutoProcessor.from_pretrained('official/model')\n"
+            "model = AutoModel.from_pretrained('official/model')\n"
+            "inputs = processor(images=image, return_tensors='pt')\n"
+            f"{transfer}"
+            "model.generate(**inputs)\n```\n"
+        ).encode()
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert any(finding["type"] == "network_library" for finding in findings)
+        assert any(finding["type"] == "network_function" for finding in findings)
 
     def test_readme_python_example_allows_tokenizer_output_on_trusted_model_device(self) -> None:
         """A uniquely bound Transformers model provides a canonical tensor device."""
