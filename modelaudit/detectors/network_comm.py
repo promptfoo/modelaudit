@@ -2306,6 +2306,13 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
         if not isinstance(binding_node, (ast.Assign, ast.AnnAssign)):
             continue
         targets = binding_node.targets if isinstance(binding_node, ast.Assign) else [binding_node.target]
+        if (
+            not isinstance(parents.get(id(binding_node)), ast.Module)
+            and isinstance(binding_node.value, ast.Call)
+            and len(targets) == 1
+            and isinstance(targets[0], ast.Name)
+        ):
+            mapping_bindings.setdefault(targets[0].id, []).append((binding_node, binding_node.value))
         identity_names = [target.id for target in targets if isinstance(target, ast.Name)]
         if isinstance(binding_node.value, ast.Name):
             identity_names.append(binding_node.value.id)
@@ -2315,11 +2322,21 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
                 if alias_name == root_name:
                     continue
                 mapping_aliases.append((binding_node, root_name, alias_name))
+    for candidates in mapping_bindings.values():
+        candidates.sort(key=lambda item: (getattr(item[0], "lineno", 0), getattr(item[0], "col_offset", 0)))
 
     top_level_statement_indices = {
         id(descendant): statement_index
         for statement_index, statement in enumerate(tree.body)
         for descendant in ast.walk(statement)
+    }
+    statement_memberships = {
+        id(statement): (parent, field_name, statement_index, statement)
+        for parent in nodes
+        for field_name, field_value in ast.iter_fields(parent)
+        if isinstance(field_value, list)
+        for statement_index, statement in enumerate(field_value)
+        if isinstance(statement, ast.stmt)
     }
 
     def top_level_statement_precedes(candidate: ast.AST, reference: ast.AST) -> bool:
@@ -2362,6 +2379,76 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
                 return True
             current = parent
         return False
+
+    def direct_statement_membership(node: ast.AST) -> tuple[ast.AST, str, int, ast.stmt] | None:
+        current = node
+        while parent := parents.get(id(current)):
+            membership = statement_memberships.get(id(current))
+            if membership is not None:
+                return membership
+            current = parent
+        return None
+
+    def is_canonical_no_grad_with(node: ast.With) -> bool:
+        if len(node.items) != 1 or node.items[0].optional_vars is not None:
+            return False
+        context = node.items[0].context_expr
+        return (
+            isinstance(context, ast.Call)
+            and not context.args
+            and not context.keywords
+            and isinstance(context.func, ast.Attribute)
+            and context.func.attr == "no_grad"
+            and isinstance(context.func.value, ast.Name)
+            and context.func.value.id == "torch"
+        )
+
+    def is_single_execution_body(container: ast.AST, field_name: str) -> bool:
+        if isinstance(container, ast.If):
+            return field_name in {"body", "orelse"}
+        return isinstance(container, ast.With) and field_name == "body" and is_canonical_no_grad_with(container)
+
+    def nested_mapping_binding_precedes_call(binding: ast.AST, call: ast.Call) -> bool:
+        if call_execution_may_be_deferred(call):
+            return False
+        binding_membership = direct_statement_membership(binding)
+        call_membership = direct_statement_membership(call)
+        if binding_membership is None or call_membership is None:
+            return False
+        binding_container, binding_field, binding_index, binding_statement = binding_membership
+        call_container, call_field, call_index, call_statement = call_membership
+        if (
+            binding_container is not call_container
+            or binding_field != call_field
+            or binding_statement is not binding
+            or not isinstance(call_statement, ast.Expr)
+            or call_statement.value is not call
+            or binding_index >= call_index
+            or not is_single_execution_body(binding_container, binding_field)
+        ):
+            return False
+
+        container = binding_container
+        while not isinstance(container, ast.Module):
+            container_membership = direct_statement_membership(container)
+            if container_membership is None:
+                return False
+            parent, field_name, _statement_index, statement = container_membership
+            if statement is not container:
+                return False
+            if isinstance(parent, ast.Module):
+                return True
+            if not is_single_execution_body(parent, field_name):
+                return False
+            container = parent
+        return True
+
+    def mapping_binding_position_at_call(binding: ast.AST, call: ast.Call) -> int:
+        binding_position = top_level_statement_indices[id(binding)]
+        call_position = top_level_statement_indices[id(call)]
+        if not isinstance(parents.get(id(binding)), ast.Module):
+            return call_position - 1 if nested_mapping_binding_precedes_call(binding, call) else call_position
+        return binding_position
 
     def mapping_operation_may_affect_call(operation: ast.AST, call: ast.Call) -> bool:
         if call_execution_may_be_deferred(call):
@@ -2459,7 +2546,7 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
                     logical_candidates = [candidates[-1]]
                     logical_write_count = 1
             relevant_bindings[name] = [
-                (top_level_statement_indices[id(binding_node)], binding_value)
+                (mapping_binding_position_at_call(binding_node, call), binding_value)
                 for binding_node, binding_value in logical_candidates
             ]
             relevant_binding_counts[name] = logical_write_count
@@ -2516,6 +2603,10 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
             if isinstance(binding_node, ast.Call):
                 if call_execution_may_be_deferred(binding_node):
                     return True
+                operation_index = top_level_statement_indices.get(id(operation))
+                reference_index = top_level_statement_indices.get(id(binding_node))
+                return operation_index is None or reference_index is None or operation_index <= reference_index
+            if not isinstance(parents.get(id(binding_node)), ast.Module):
                 operation_index = top_level_statement_indices.get(id(operation))
                 reference_index = top_level_statement_indices.get(id(binding_node))
                 return operation_index is None or reference_index is None or operation_index <= reference_index
@@ -2623,7 +2714,11 @@ def _is_valid_official_readme_sample_image_example(example: bytes) -> bool:
             for binding_name, candidates in mapping_bindings.items()
             for binding_node, binding_value in candidates
         ),
-        key=lambda item: top_level_statement_indices.get(id(item[0]), len(tree.body)),
+        key=lambda item: (
+            top_level_statement_indices.get(id(item[0]), len(tree.body)),
+            getattr(item[0], "lineno", 0),
+            getattr(item[0], "col_offset", 0),
+        ),
     )
     for binding_node, binding_name, binding_value in ordered_mapping_bindings:
         if not isinstance(binding_value, ast.Call) or not is_single_name_binding(
