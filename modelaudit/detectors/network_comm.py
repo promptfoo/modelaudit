@@ -2107,16 +2107,17 @@ def _remote_code_mapping_is_proven_safe(
                 result = False
             else:
                 candidates = bindings.get(current.id, [])
-                if len(candidates) != 1:
+                if not candidates:
                     result = False
                 else:
-                    binding_position, binding_value = candidates[0]
-                    result = binding_position < call_position and visit(
-                        binding_value,
-                        resolving | {current.id},
+                    result = all(
+                        binding_position < call_position and visit(binding_value, resolving | {current.id})
+                        for binding_position, binding_value in candidates
                     )
         elif isinstance(current, ast.Call):
             result = node_id in proven_mapping_call_ids
+        elif isinstance(current, ast.BinOp) and isinstance(current.op, ast.BitOr):
+            result = visit(current.left, resolving) and visit(current.right, resolving)
         elif isinstance(current, ast.Dict):
             result = True
             for key, item_value in zip(current.keys, current.values, strict=True):
@@ -2346,7 +2347,10 @@ def _is_valid_official_readme_sample_image_example(
                     modeled_name_write_ids.setdefault(target.id, set()).add(id(target))
         if (
             not isinstance(parents.get(id(binding_node)), ast.Module)
-            and isinstance(binding_node.value, (ast.Call, ast.Dict))
+            and (
+                isinstance(binding_node.value, (ast.Call, ast.Dict))
+                or (isinstance(binding_node.value, ast.BinOp) and isinstance(binding_node.value.op, ast.BitOr))
+            )
             and len(targets) == 1
             and isinstance(targets[0], ast.Name)
         ):
@@ -2494,6 +2498,79 @@ def _is_valid_official_readme_sample_image_example(
 
     def mapping_binding_position_at_call(binding: ast.AST, call: ast.Call) -> int:
         return binding_position_at_reference(binding, call)
+
+    def exhaustive_mapping_branch_bindings_precede_call(
+        mapping_name: str,
+        candidates: list[tuple[ast.AST, ast.expr]],
+        write_nodes: list[ast.AST],
+        call: ast.Call,
+    ) -> bool:
+        if len(candidates) != 2 or len(write_nodes) != 2 or execution_may_be_deferred(call):
+            return False
+
+        branch: ast.If | None = None
+        branch_fields: set[str] = set()
+        binding_targets: set[int] = set()
+        for binding_node, binding_value in candidates:
+            if not is_single_name_binding(binding_node, binding_value, mapping_name):
+                return False
+            if isinstance(binding_node, ast.Assign):
+                target = binding_node.targets[0]
+            elif isinstance(binding_node, ast.AnnAssign):
+                target = binding_node.target
+            else:
+                return False
+            if not isinstance(target, ast.Name):
+                return False
+            binding_targets.add(id(target))
+
+            membership = statement_memberships.get(id(binding_node))
+            if membership is None or membership[3] is not binding_node:
+                return False
+            container, field_name, _statement_index, _statement = membership
+            if not isinstance(container, ast.If) or field_name not in {"body", "orelse"}:
+                return False
+            if branch is None:
+                branch = container
+            elif branch is not container:
+                return False
+            branch_fields.add(field_name)
+
+        if branch is None or branch_fields != {"body", "orelse"}:
+            return False
+        if binding_targets != {id(write_node) for write_node in write_nodes}:
+            return False
+
+        branch_membership = statement_memberships.get(id(branch))
+        call_membership = direct_statement_membership(call)
+        if branch_membership is None or call_membership is None:
+            return False
+        branch_container, branch_field, branch_index, branch_statement = branch_membership
+        call_container, call_field, call_index, call_statement = call_membership
+        if (
+            branch_statement is not branch
+            or branch_container is not call_container
+            or branch_field != call_field
+            or branch_index >= call_index
+            or not isinstance(call_statement, ast.Expr)
+            or call_statement.value is not call
+        ):
+            return False
+        if isinstance(branch_container, ast.Module):
+            return True
+        return (
+            isinstance(branch_container, ast.With)
+            and branch_field == "body"
+            and is_canonical_no_grad_with(branch_container)
+            and isinstance(parents.get(id(branch_container)), ast.Module)
+            and any(
+                isinstance(statement, ast.Import)
+                and any(alias.name == "torch" and alias.asname is None for alias in statement.names)
+                and top_level_statement_precedes(statement, branch_container)
+                for statement in tree.body
+            )
+            and not name_write_nodes.get("torch")
+        )
 
     def operation_may_affect_reference(operation: ast.AST, reference: ast.AST) -> bool:
         if execution_may_be_deferred(reference):
@@ -2736,7 +2813,13 @@ def _is_valid_official_readme_sample_image_example(
     for _binding_node, first_name, second_name in mapping_aliases:
         aliased_mapping_names.update((first_name, second_name))
 
-    def is_proven_mapping_use(node: ast.Name, proven_mapping_transfer_call_ids: frozenset[int]) -> bool:
+    def is_proven_mapping_use(
+        node: ast.Name,
+        proven_mapping_transfer_call_ids: frozenset[int],
+        proven_union_operand_ids: frozenset[int],
+    ) -> bool:
+        if id(node) in proven_union_operand_ids:
+            return True
         parent = parents.get(id(node))
         if (
             isinstance(parent, ast.Call)
@@ -2765,6 +2848,7 @@ def _is_valid_official_readme_sample_image_example(
 
     def unsafe_mapping_operations_for(
         proven_mapping_transfer_call_ids: frozenset[int],
+        proven_union_operand_ids: frozenset[int],
     ) -> list[tuple[str, ast.AST]]:
         operations: list[tuple[str, ast.AST]] = [
             (node.id, node)
@@ -2772,7 +2856,7 @@ def _is_valid_official_readme_sample_image_example(
             if isinstance(node, ast.Name)
             and isinstance(node.ctx, ast.Load)
             and node.id in aliased_mapping_names
-            and not is_proven_mapping_use(node, proven_mapping_transfer_call_ids)
+            and not is_proven_mapping_use(node, proven_mapping_transfer_call_ids, proven_union_operand_ids)
         ]
         operations.extend(
             (node.target.id, node)
@@ -2808,12 +2892,21 @@ def _is_valid_official_readme_sample_image_example(
         }
         relevant_bindings: dict[str, list[tuple[int, ast.expr]]] = {}
         relevant_binding_counts: Counter[str] = Counter()
+        call_position = top_level_statement_indices[id(call)]
         for name, candidates in relevant_binding_nodes.items():
             logical_candidates = candidates
             logical_write_count = len(relevant_name_writes.get(name, []))
+            exhaustive_branch_join = exhaustive_mapping_branch_bindings_precede_call(
+                name,
+                candidates,
+                relevant_name_writes.get(name, []),
+                call,
+            )
             if candidates:
                 binding_chain = binding_chains.get(id(candidates[-1][0]))
-                if (
+                if exhaustive_branch_join:
+                    logical_write_count = 1
+                elif (
                     binding_chain is not None
                     and tuple(id(binding_node) for binding_node, _binding_value in candidates) == binding_chain
                     and name_writes_match_binding_chain(relevant_name_writes.get(name, []), binding_chain)
@@ -2821,15 +2914,59 @@ def _is_valid_official_readme_sample_image_example(
                     logical_candidates = [candidates[-1]]
                     logical_write_count = 1
             relevant_bindings[name] = [
-                (mapping_binding_position_at_call(binding_node, call), binding_value)
+                (
+                    call_position - 1
+                    if exhaustive_branch_join
+                    else mapping_binding_position_at_call(binding_node, call),
+                    binding_value,
+                )
                 for binding_node, binding_value in logical_candidates
             ]
             relevant_binding_counts[name] = logical_write_count
         for name, write_nodes in relevant_name_writes.items():
             relevant_binding_counts.setdefault(name, len(write_nodes))
+
+        def proven_union_operand_ids_for(mapping_value: ast.expr) -> frozenset[int]:
+            remaining_steps = _MAX_README_IMAGE_EXAMPLE_AST_NODES
+            seen: set[int] = set()
+            operand_ids: set[int] = set()
+            pending: list[ast.expr] = [mapping_value]
+            while pending:
+                if remaining_steps <= 0:
+                    return frozenset()
+                remaining_steps -= 1
+                current = pending.pop()
+                current_id = id(current)
+                if current_id in seen:
+                    continue
+                seen.add(current_id)
+                if isinstance(current, ast.Name):
+                    if relevant_binding_counts[current.id] != 1:
+                        continue
+                    pending.extend(
+                        binding_value
+                        for binding_position, binding_value in relevant_bindings.get(current.id, [])
+                        if binding_position < call_position
+                    )
+                elif isinstance(current, ast.BinOp) and isinstance(current.op, ast.BitOr):
+                    if isinstance(current.left, ast.Name):
+                        operand_ids.add(id(current.left))
+                    if isinstance(current.right, ast.Name):
+                        operand_ids.add(id(current.right))
+                    pending.extend((current.left, current.right))
+                elif isinstance(current, ast.Dict):
+                    pending.extend(
+                        item_value for key, item_value in zip(current.keys, current.values, strict=True) if key is None
+                    )
+            return frozenset(operand_ids)
+
+        proven_union_operand_ids = proven_union_operand_ids_for(value)
         unsafe_names: set[str] = set()
         remaining_alias_steps = _MAX_README_IMAGE_EXAMPLE_AST_NODES
-        for name, operation in unsafe_mapping_operations_for(proven_mapping_transfer_call_ids):
+        for name, operation in unsafe_mapping_operations_for(
+            proven_mapping_transfer_call_ids,
+            proven_union_operand_ids,
+        ):
             if not mapping_operation_may_affect_call(operation, call):
                 continue
             operation_unsafe_names = {name}
@@ -2876,7 +3013,7 @@ def _is_valid_official_readme_sample_image_example(
             binding_counts=relevant_binding_counts,
             unsafe_names=frozenset(unsafe_names),
             proven_mapping_call_ids=proven_mapping_call_ids,
-            call_position=top_level_statement_indices[id(call)],
+            call_position=call_position,
         )
 
     def call_has_only_proven_safe_mapping_arguments(value: ast.Call) -> bool:

@@ -3574,6 +3574,104 @@ class TestNetworkCommDetector:
 
         assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
 
+    @pytest.mark.parametrize(
+        "mapping_setup",
+        [
+            "inputs = {'input_ids': 1} | {'attention_mask': 1}\nmodel.generate(**inputs)\n",
+            "model.generate(**({'input_ids': 1} | {'attention_mask': 1}))\n",
+            (
+                "left = {'input_ids': 1}\n"
+                "right = {'attention_mask': 1}\n"
+                "inputs = left | right\n"
+                "model.generate(**inputs)\n"
+            ),
+            ("inputs = ({'input_ids': 1} | {'attention_mask': 1}) | {'token_type_ids': 1}\nmodel.generate(**inputs)\n"),
+            ("inputs = {'custom_generate': None} | {'trust_remote_code': False}\nmodel.generate(**inputs)\n"),
+        ],
+        ids=["named", "inline", "named-operands", "nested", "disabled-remote-options"],
+    )
+    def test_readme_python_example_allows_proven_safe_dict_union(self, mapping_setup: str) -> None:
+        data = (
+            "```python\nimport requests\nfrom transformers import AutoModel\n"
+            "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            "model = AutoModel.from_pretrained('official/model')\n"
+            f"{mapping_setup}"
+            "requests.get(image_url, stream=True)\n```\n"
+        ).encode()
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert findings
+        assert all(finding["severity"] == "INFO" for finding in findings)
+        assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+
+    @pytest.mark.parametrize(
+        "mapping_setup",
+        [
+            "inputs = {'input_ids': 1} + {'attention_mask': 1}\n",
+            "inputs = {'custom_generate': 'attacker/repo'} | {'input_ids': 1}\n",
+            "inputs = {'input_ids': 1} | {'trust_remote_code': True}\n",
+            "inputs = {'input_ids': 1} | get_options()\n",
+            ("left = {'input_ids': 1}\nunused = left | get_options()\ninputs = left\n"),
+            "key = 'input_ids'\ninputs = {key: 1} | {'attention_mask': 1}\n",
+            (
+                "left = {'input_ids': 1}\n"
+                "left['custom_generate'] = 'attacker/repo'\n"
+                "inputs = left | {'attention_mask': 1}\n"
+            ),
+            (
+                "left = {'input_ids': 1}\n"
+                "alias = left\n"
+                "alias |= {'custom_generate': 'attacker/repo'}\n"
+                "inputs = left | {'attention_mask': 1}\n"
+            ),
+            ("left = {'input_ids': 1}\nleft = get_options()\ninputs = left | {'attention_mask': 1}\n"),
+        ],
+        ids=[
+            "other-binop",
+            "unsafe-left",
+            "unsafe-right",
+            "dynamic-operand",
+            "unrelated-dynamic-union",
+            "computed-key",
+            "mutated-operand",
+            "alias-mutated-operand",
+            "rebound-operand",
+        ],
+    )
+    def test_readme_python_example_rejects_unproven_dict_union(self, mapping_setup: str) -> None:
+        data = (
+            "```python\nimport requests\nfrom transformers import AutoModel\n"
+            "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            "model = AutoModel.from_pretrained('official/model')\n"
+            "def get_options():\n"
+            "    return {'custom_generate': 'attacker/repo'}\n"
+            f"{mapping_setup}"
+            "model.generate(**inputs)\n"
+            "requests.get(image_url, stream=True)\n```\n"
+        ).encode()
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert any(finding["type"] == "network_library" for finding in findings)
+        assert any(finding["type"] == "network_function" for finding in findings)
+
+    def test_readme_python_example_rejects_excessively_nested_dict_union(self) -> None:
+        union = " | ".join("{'input_ids': 1}" for _ in range(600))
+        data = (
+            "```python\nimport requests\nfrom transformers import AutoModel\n"
+            "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            "model = AutoModel.from_pretrained('official/model')\n"
+            f"inputs = {union}\n"
+            "model.generate(**inputs)\n"
+            "requests.get(image_url, stream=True)\n```\n"
+        ).encode()
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert any(finding["type"] == "network_library" for finding in findings)
+        assert any(finding["type"] == "network_function" for finding in findings)
+
     def test_readme_python_example_bounds_scan_wide_mapping_proof_work(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -3899,6 +3997,291 @@ class TestNetworkCommDetector:
         assert findings
         assert all(finding["severity"] == "INFO" for finding in findings)
         assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+
+    @pytest.mark.parametrize(
+        "mapping_flow",
+        [
+            (
+                "if torch.cuda.is_available():\n"
+                "    inputs = processor(images=image, return_tensors='pt').to('cuda')\n"
+                "else:\n"
+                "    inputs = processor(images=image, return_tensors='pt').to('cpu')\n"
+                "model.generate(**inputs)\n"
+            ),
+            (
+                "with torch.no_grad():\n"
+                "    if torch.cuda.is_available():\n"
+                "        inputs = processor(images=image, return_tensors='pt').to('cuda')\n"
+                "    else:\n"
+                "        inputs = processor(images=image, return_tensors='pt').to('cpu')\n"
+                "    model.generate(**inputs)\n"
+            ),
+        ],
+        ids=["module", "no-grad-body"],
+    )
+    def test_readme_python_example_allows_exhaustive_safe_mapping_branch_join(
+        self,
+        mapping_flow: str,
+    ) -> None:
+        data = (
+            "```python\nimport requests\nimport torch\nfrom PIL import Image\n"
+            "from transformers import AutoModel, AutoProcessor\n"
+            "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            "image = Image.open(requests.get(image_url, stream=True).raw)\n"
+            "processor = AutoProcessor.from_pretrained('official/model')\n"
+            "model = AutoModel.from_pretrained('official/model')\n"
+            f"{mapping_flow}```\n"
+        ).encode()
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert findings
+        assert all(finding["severity"] == "INFO" for finding in findings)
+        assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+
+    def test_readme_python_example_allows_module_mapping_branch_join_without_torch_import(self) -> None:
+        data = (
+            b"```python\nimport requests\nfrom PIL import Image\n"
+            b"from transformers import AutoModel, AutoProcessor\n"
+            b"image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            b"image = Image.open(requests.get(image_url, stream=True).raw)\n"
+            b"processor = AutoProcessor.from_pretrained('official/model')\n"
+            b"model = AutoModel.from_pretrained('official/model')\n"
+            b"if image.mode:\n"
+            b"    inputs = processor(images=image, return_tensors='pt').to('cuda')\n"
+            b"else:\n"
+            b"    inputs = processor(images=image, return_tensors='pt').to('cpu')\n"
+            b"model.generate(**inputs)\n```\n"
+        )
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert findings
+        assert all(finding["severity"] == "INFO" for finding in findings)
+        assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+
+    @pytest.mark.parametrize(
+        ("before_with", "inside_with", "after_with"),
+        [
+            ("", "", ""),
+            ("", "", "import torch\n"),
+            ("", "    import torch\n", ""),
+            ("if True:\n    import torch\n", "", ""),
+            ("if False:\n    import torch\n", "", ""),
+            ("for _ in range(1):\n    import torch\n", "", ""),
+            ("try:\n    import torch\nexcept Exception:\n    pass\n", "", ""),
+            ("import torch as torch\n", "", ""),
+            ("from torch import no_grad\n", "", ""),
+            ("import torch\ntorch = model\n", "", ""),
+            ("import torch\ndel torch\n", "", ""),
+            ("import torch\nif (torch := model):\n    pass\n", "", ""),
+            ("import torch\ndef shadow(torch):\n    pass\n", "", ""),
+        ],
+        ids=[
+            "missing",
+            "late",
+            "inside-with",
+            "conditional",
+            "unreachable",
+            "loop",
+            "try",
+            "alias",
+            "from-import",
+            "rebind",
+            "delete",
+            "walrus",
+            "argument-shadow",
+        ],
+    )
+    def test_readme_python_example_rejects_unproven_torch_import_for_no_grad_branch_join(
+        self,
+        before_with: str,
+        inside_with: str,
+        after_with: str,
+    ) -> None:
+        data = (
+            "```python\nimport requests\nfrom PIL import Image\n"
+            "from transformers import AutoModel, AutoProcessor\n"
+            "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            "image = Image.open(requests.get(image_url, stream=True).raw)\n"
+            "processor = AutoProcessor.from_pretrained('official/model')\n"
+            "model = AutoModel.from_pretrained('official/model')\n"
+            f"{before_with}"
+            "with torch.no_grad():\n"
+            f"{inside_with}"
+            "    if image.mode:\n"
+            "        inputs = processor(images=image, return_tensors='pt').to('cuda')\n"
+            "    else:\n"
+            "        inputs = processor(images=image, return_tensors='pt').to('cpu')\n"
+            "    model.generate(**inputs)\n"
+            f"{after_with}```\n"
+        ).encode()
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert any(
+            finding["type"] == "network_library" and finding["severity"] in {"HIGH", "CRITICAL"} for finding in findings
+        )
+        assert any(
+            finding["type"] == "network_function" and finding["severity"] in {"HIGH", "CRITICAL"}
+            for finding in findings
+        )
+
+    @pytest.mark.parametrize(
+        "mapping_flow",
+        [
+            (
+                "if torch.cuda.is_available():\n"
+                "    inputs = processor(images=image, return_tensors='pt').to('cuda')\n"
+                "model.generate(**inputs)\n"
+            ),
+            (
+                "if torch.cuda.is_available():\n"
+                "    inputs = processor(images=image, return_tensors='pt').to('cuda')\n"
+                "else:\n"
+                "    inputs = {'custom_generate': 'attacker/repo'}\n"
+                "model.generate(**inputs)\n"
+            ),
+            (
+                "if torch.cuda.is_available():\n"
+                "    inputs = processor(images=image, return_tensors='pt').to('cuda')\n"
+                "else:\n"
+                "    inputs = get_inputs()\n"
+                "model.generate(**inputs)\n"
+            ),
+            (
+                "if torch.cuda.is_available():\n"
+                "    inputs = processor(images=image, return_tensors='pt').to('cuda')\n"
+                "else:\n"
+                "    inputs = processor(images=image, return_tensors='pt').to('cpu')\n"
+                "inputs['custom_generate'] = 'attacker/repo'\n"
+                "model.generate(**inputs)\n"
+            ),
+            (
+                "if torch.cuda.is_available():\n"
+                "    inputs = processor(images=image, return_tensors='pt').to('cuda')\n"
+                "else:\n"
+                "    inputs = processor(images=image, return_tensors='pt').to('cpu')\n"
+                "inputs = {'custom_generate': 'attacker/repo'}\n"
+                "model.generate(**inputs)\n"
+            ),
+            (
+                "if torch.cuda.is_available():\n"
+                "    inputs = processor(images=image, return_tensors='pt').to('cuda')\n"
+                "elif image.mode:\n"
+                "    inputs = processor(images=image, return_tensors='pt').to('cpu')\n"
+                "else:\n"
+                "    inputs = processor(images=image, return_tensors='pt').to('cuda')\n"
+                "model.generate(**inputs)\n"
+            ),
+            (
+                "for _ in range(1):\n"
+                "    inputs = processor(images=image, return_tensors='pt').to('cuda')\n"
+                "else:\n"
+                "    inputs = processor(images=image, return_tensors='pt').to('cpu')\n"
+                "model.generate(**inputs)\n"
+            ),
+            (
+                "try:\n"
+                "    inputs = processor(images=image, return_tensors='pt').to('cuda')\n"
+                "except Exception:\n"
+                "    inputs = processor(images=image, return_tensors='pt').to('cpu')\n"
+                "model.generate(**inputs)\n"
+            ),
+            (
+                "match image.mode:\n"
+                "    case 'RGB':\n"
+                "        inputs = processor(images=image, return_tensors='pt').to('cuda')\n"
+                "    case _:\n"
+                "        inputs = processor(images=image, return_tensors='pt').to('cpu')\n"
+                "model.generate(**inputs)\n"
+            ),
+            (
+                "if torch.cuda.is_available():\n"
+                "    inputs = processor(images=image, return_tensors='pt').to('cuda')\n"
+                "else:\n"
+                "    inputs = processor(images=image, return_tensors='pt').to('cpu')\n"
+                "def deferred():\n"
+                "    model.generate(**inputs)\n"
+            ),
+            (
+                "if image.mode:\n"
+                "    if torch.cuda.is_available():\n"
+                "        inputs = processor(images=image, return_tensors='pt').to('cuda')\n"
+                "    else:\n"
+                "        inputs = processor(images=image, return_tensors='pt').to('cpu')\n"
+                "    model.generate(**inputs)\n"
+            ),
+            (
+                "if image.mode:\n"
+                "    with torch.no_grad():\n"
+                "        if torch.cuda.is_available():\n"
+                "            inputs = processor(images=image, return_tensors='pt').to('cuda')\n"
+                "        else:\n"
+                "            inputs = processor(images=image, return_tensors='pt').to('cpu')\n"
+                "        model.generate(**inputs)\n"
+            ),
+            (
+                "def torch():\n"
+                "    pass\n"
+                "with torch.no_grad():\n"
+                "    if image.mode:\n"
+                "        inputs = processor(images=image, return_tensors='pt').to('cuda')\n"
+                "    else:\n"
+                "        inputs = processor(images=image, return_tensors='pt').to('cpu')\n"
+                "    model.generate(**inputs)\n"
+            ),
+            (
+                "if torch.cuda.is_available():\n"
+                "    inputs = processor(images=image, return_tensors='pt').to('cuda')\n"
+                "else:\n"
+                "    inputs = processor(images=image, return_tensors='pt').to('cpu')\n"
+                "if image.mode:\n"
+                "    model.generate(**inputs)\n"
+            ),
+        ],
+        ids=[
+            "missing-else",
+            "unsafe-arm",
+            "dynamic-arm",
+            "mutation-after-join",
+            "rebind-after-join",
+            "elif",
+            "loop-else",
+            "try-except",
+            "match",
+            "deferred-call",
+            "arbitrary-enclosing-if",
+            "nested-no-grad",
+            "shadowed-no-grad",
+            "cross-scope-call",
+        ],
+    )
+    def test_readme_python_example_rejects_unproven_mapping_branch_join(
+        self,
+        mapping_flow: str,
+    ) -> None:
+        data = (
+            "```python\nimport requests\nimport torch\nfrom PIL import Image\n"
+            "from transformers import AutoModel, AutoProcessor\n"
+            "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            "image = Image.open(requests.get(image_url, stream=True).raw)\n"
+            "processor = AutoProcessor.from_pretrained('official/model')\n"
+            "model = AutoModel.from_pretrained('official/model')\n"
+            "def get_inputs():\n"
+            "    return {'custom_generate': 'attacker/repo'}\n"
+            f"{mapping_flow}```\n"
+        ).encode()
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert any(
+            finding["type"] == "network_library" and finding["severity"] in {"HIGH", "CRITICAL"} for finding in findings
+        )
+        assert any(
+            finding["type"] == "network_function" and finding["severity"] in {"HIGH", "CRITICAL"}
+            for finding in findings
+        )
 
     def test_readme_python_example_allows_ordered_nested_literal_mapping(self) -> None:
         """A static mapping bound earlier in the same supported body is canonical."""
