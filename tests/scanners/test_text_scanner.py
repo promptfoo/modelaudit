@@ -440,6 +440,27 @@ def test_text_scanner_readme_official_sample_image_request_is_informational(tmp_
     )
 
 
+@pytest.mark.parametrize("filename", ["README.env", "readme.env", "README.ENV", "README.md.env"])
+def test_text_scanner_readme_environment_files_preserve_network_findings(tmp_path: Path, filename: str) -> None:
+    text_path = tmp_path / filename
+    text_path.write_text(
+        "```python\nimport requests\n"
+        "image_url = 'https://huggingface.co/spaces/org/demo/resolve/main/image.png'\n"
+        "image = Image.open(requests.get(image_url, stream=True).raw)\n```\n",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+
+    assert result.success is False
+    failed_network_checks = {
+        check.details.get("type")
+        for check in result.checks
+        if check.name == "Network Communication Detection" and check.status == CheckStatus.FAILED
+    }
+    assert {"network_library", "network_function"} <= failed_network_checks
+
+
 def test_text_scanner_readme_plain_http_sample_image_stays_actionable(tmp_path: Path) -> None:
     text_path = tmp_path / "README.md"
     text_path.write_text(

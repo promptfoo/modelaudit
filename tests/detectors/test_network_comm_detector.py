@@ -2813,6 +2813,19 @@ class TestNetworkCommDetector:
         assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
         assert any(finding["type"] == "cloud_storage_url" for finding in findings)
 
+    @pytest.mark.parametrize("context", ["README.env", "readme.env", "README.ENV", "README.md.env"])
+    def test_readme_environment_files_preserve_network_findings(self, context: str) -> None:
+        data = (
+            b"```python\nimport requests\n"
+            b"image_url = 'https://huggingface.co/spaces/org/demo/resolve/main/image.png'\n"
+            b"image = Image.open(requests.get(image_url, stream=True).raw)\n```\n"
+        )
+
+        findings = NetworkCommDetector().scan(data, context)
+
+        assert any(finding["type"] == "network_library" for finding in findings)
+        assert any(finding["type"] == "network_function" for finding in findings)
+
     @pytest.mark.parametrize(
         ("opening", "closing"),
         [("```", "````"), ("````", "````"), ("````", "`````"), ("~~~", "~~~~"), ("~~~~", "~~~~")],

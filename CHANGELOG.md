@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Upgrade vulnerable locked dependencies, use the hardened MLflow tracking client, and audit all installed CI extras.
 - Avoid network false positives for bounded README examples that download sample images over HTTPS from Hugging Face.
+- Preserve network security findings in README-named environment files.
 - Preserve README network detections when Transformers examples enable or dynamically configure remote code execution, including through `generate(custom_generate=...)`.
 - Preserve Windows source-fingerprint cache hits while continuing to reject swapped or modified files.
 - Prevent Windows cache identity probes from creating locked temporary files inside scanned directories.
