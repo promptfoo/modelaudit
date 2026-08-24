@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import os
+import select
 import stat
 import struct
 import sys
@@ -11,7 +12,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable, Iterable
-from contextlib import suppress
+from contextlib import ExitStack, suppress
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass
 from importlib.machinery import (
@@ -217,6 +218,87 @@ class _AncestorPathMonitor:
         self.close()
 
 
+class _DarwinPathMonitor:
+    """Observe vnode replacement without rejecting unrelated directory writes."""
+
+    def __init__(self, file_path: str, ancestor_identity: tuple[AncestorEntry, ...]) -> None:
+        select_module: Any = select
+        self._queue: Any = None
+        self._descriptors: list[int] = []
+        self._descriptor_stack: ExitStack | None = None
+
+        try:
+            self._queue = select_module.kqueue()
+            vnode_filter = select_module.KQ_FILTER_VNODE
+            event_flags = select_module.KQ_EV_ADD | select_module.KQ_EV_CLEAR
+            change_flags = (
+                select_module.KQ_NOTE_DELETE
+                | select_module.KQ_NOTE_RENAME
+                | select_module.KQ_NOTE_REVOKE
+                | select_module.KQ_NOTE_ATTRIB
+            )
+            descriptor_flags = getattr(os, "O_EVTONLY", os.O_RDONLY) | getattr(os, "O_CLOEXEC", 0)
+            descriptor_flags |= getattr(os, "O_NOFOLLOW", 0)
+            paths = [os.path.abspath(file_path), *(entry[0] for entry in ancestor_identity)]
+            with ExitStack() as descriptor_stack:
+                events = []
+                opened_descriptors = []
+                for path in dict.fromkeys(paths):
+                    watched_path = _DARWIN_STABLE_SYMLINK_ALIASES.get(path, path)
+                    descriptor = os.open(watched_path, descriptor_flags)
+                    try:
+                        descriptor_stack.callback(os.close, descriptor)
+                    except BaseException:
+                        with suppress(OSError):
+                            os.close(descriptor)
+                        raise
+                    opened_descriptors.append(descriptor)
+                    events.append(
+                        select_module.kevent(
+                            descriptor,
+                            filter=vnode_filter,
+                            flags=event_flags,
+                            fflags=change_flags,
+                        )
+                    )
+                self._queue.control(events, 0, 0)
+                transferred_stack = descriptor_stack.pop_all()
+            try:
+                self._descriptor_stack = transferred_stack
+                self._descriptors = opened_descriptors
+            except BaseException:
+                with suppress(OSError):
+                    transferred_stack.close()
+                raise
+        except BaseException:
+            self.close()
+            raise
+
+    def changed(self) -> bool:
+        if self._queue is None:
+            return True
+        try:
+            return bool(self._queue.control(None, max(len(self._descriptors), 1), 0))
+        except (OSError, ValueError):
+            return True
+
+    def close(self) -> None:
+        queue = getattr(self, "_queue", None)
+        self._queue = None
+        descriptor_stack = getattr(self, "_descriptor_stack", None)
+        self._descriptor_stack = None
+        if queue is not None:
+            with suppress(OSError):
+                queue.close()
+        if descriptor_stack is not None:
+            with suppress(OSError):
+                descriptor_stack.close()
+        self._descriptors = []
+
+    def __del__(self) -> None:
+        self.close()
+
+
 class _WindowsPathLockMonitor:
     """Prevent file and ancestor replacement while a Windows scan is in flight."""
 
@@ -280,12 +362,12 @@ class _WindowsPathLockMonitor:
 
 
 class AncestorIdentity(tuple[AncestorEntry, ...]):
-    monitor: _AncestorPathMonitor | _WindowsPathLockMonitor | None
+    monitor: _AncestorPathMonitor | _DarwinPathMonitor | _WindowsPathLockMonitor | None
 
     def __new__(
         cls,
         entries: tuple[AncestorEntry, ...] | list[AncestorEntry],
-        monitor: _AncestorPathMonitor | _WindowsPathLockMonitor | None = None,
+        monitor: _AncestorPathMonitor | _DarwinPathMonitor | _WindowsPathLockMonitor | None = None,
     ) -> "AncestorIdentity":
         identity = super().__new__(cls, entries)
         identity.monitor = monitor
@@ -606,6 +688,10 @@ class ScanResultsCache:
             logger.debug(f"Cache lookup failed for {file_path}: {e}")
             self._record_cache_miss("error")
             return None, file_identity
+        except BaseException:
+            if file_identity is not None:
+                self.release_ancestor_identity(file_identity[-1])
+            raise
 
     def get_cached_result_by_key(
         self,
@@ -1092,7 +1178,7 @@ class ScanResultsCache:
                     time.sleep(0.01)
                     continue
                 raise
-            except Exception:
+            except BaseException:
                 self.release_ancestor_identity(monitored_ancestor_identity)
                 raise
 
@@ -1345,13 +1431,15 @@ class ScanResultsCache:
         if not identity:
             return identity
         try:
-            monitor: _AncestorPathMonitor | _WindowsPathLockMonitor | None = None
+            monitor: _AncestorPathMonitor | _DarwinPathMonitor | _WindowsPathLockMonitor | None = None
             platform_name = getattr(sys, "platform", "")
             if platform_name.startswith("linux"):
                 monitor = _AncestorPathMonitor(
                     file_path,
                     tuple(identity),
                 )
+            elif platform_name == "darwin":
+                monitor = _DarwinPathMonitor(file_path, tuple(identity))
             elif platform_name == "win32":
                 monitor = _WindowsPathLockMonitor(file_path, tuple(identity))
             if monitor is None:
@@ -1732,6 +1820,20 @@ class ScanResultsCache:
         return f"{_CALL_GRAPH_REGULAR_FILE_FINGERPRINT}:{digest}"
 
     @staticmethod
+    def _cross_view_file_stat_identity(file_stat: os.stat_result) -> tuple[int, ...]:
+        """Compare path and descriptor views without Windows-only stat differences."""
+        identity = (
+            file_stat.st_dev,
+            file_stat.st_ino,
+            stat.S_IFMT(file_stat.st_mode),
+            file_stat.st_size,
+            file_stat.st_mtime_ns,
+        )
+        if os.name == "nt":
+            return identity
+        return (*identity, file_stat.st_ctime_ns)
+
+    @staticmethod
     def _bounded_source_fingerprint(path: Path) -> str | None:
         flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
         try:
@@ -1782,15 +1884,9 @@ class ScanResultsCache:
                 path_stat = path.stat()
             except OSError as error:
                 raise ValueError("source fingerprint candidate path changed while being read") from error
-            path_identity = (
-                path_stat.st_dev,
-                path_stat.st_ino,
-                path_stat.st_mode,
-                path_stat.st_size,
-                path_stat.st_mtime_ns,
-                path_stat.st_ctime_ns,
-            )
-            if before_identity != after_identity or after_identity != path_identity:
+            if before_identity != after_identity or ScanResultsCache._cross_view_file_stat_identity(
+                after
+            ) != ScanResultsCache._cross_view_file_stat_identity(path_stat):
                 raise ValueError("source fingerprint candidate changed while being read")
             if is_extension:
                 return ScanResultsCache._regular_file_identity_fingerprint(after)
@@ -1889,7 +1985,20 @@ class ScanResultsCache:
                 path_stat.st_mtime_ns,
                 path_stat.st_ctime_ns,
             )
-            if before_identity != after_identity or after_identity != path_identity:
+            initial_path_identity = (
+                path_before.st_dev,
+                path_before.st_ino,
+                path_before.st_mode,
+                path_before.st_size,
+                path_before.st_mtime_ns,
+                path_before.st_ctime_ns,
+            )
+            if (
+                before_identity != after_identity
+                or initial_path_identity != path_identity
+                or ScanResultsCache._cross_view_file_stat_identity(after)
+                != ScanResultsCache._cross_view_file_stat_identity(path_stat)
+            ):
                 raise ValueError("read fingerprint candidate changed while being read")
             if require_complete and len(source) > read_limit:
                 raise ValueError("read fingerprint budget exceeded")

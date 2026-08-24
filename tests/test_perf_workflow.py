@@ -389,6 +389,17 @@ def test_dependency_audit_runs_for_source_reachability_changes() -> None:
     assert "needs.changes.outputs.picklescan == 'true'" in condition
 
 
+def test_dependency_audit_covers_installed_ci_extras() -> None:
+    workflow = _load_workflow("test.yml")
+    steps = _jobs(workflow)["dependency-audit"]["steps"]
+    assert isinstance(steps, list)
+
+    audit_step = _step_by_name(steps, "Audit dependencies for vulnerabilities")
+
+    assert "uv export --extra all-ci --no-hashes --no-emit-project" in audit_step["run"]
+    assert "pip-audit --strict --no-deps --disable-pip" in audit_step["run"]
+
+
 def test_python_ci_triggers_merge_group_and_cancels_superseded_main_runs() -> None:
     workflow = _load_workflow("test.yml")
     triggers = _workflow_triggers(workflow)
