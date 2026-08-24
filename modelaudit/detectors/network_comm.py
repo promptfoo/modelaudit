@@ -2061,11 +2061,15 @@ def _matching_readme_image_fence_end(
 
 # Transformers keywords that cause Hub-hosted Python to be fetched and executed.
 _REMOTE_CODE_KEYWORDS = frozenset({"custom_generate", "trust_remote_code"})
+# `from_pretrained(weights_only=False)` also permits executable pickle payloads.
+_FROM_PRETRAINED_SAFETY_KEYWORDS = _REMOTE_CODE_KEYWORDS | {"weights_only"}
 
 
 def _remote_code_option_is_disabled(name: str, value: ast.expr) -> bool:
     if not isinstance(value, ast.Constant):
         return False
+    if name == "weights_only":
+        return value.value is True
     if name == "trust_remote_code":
         return value.value is False
     if name == "custom_generate":
@@ -2118,6 +2122,7 @@ def _remote_code_mapping_is_proven_safe(
     unsafe_names: frozenset[str],
     proven_mapping_call_ids: frozenset[int],
     call_position: int,
+    safety_keywords: frozenset[str] = _REMOTE_CODE_KEYWORDS,
 ) -> bool:
     memo: dict[int, bool] = {}
     remaining_steps = _MAX_README_IMAGE_EXAMPLE_AST_NODES
@@ -2161,7 +2166,7 @@ def _remote_code_mapping_is_proven_safe(
                 if not isinstance(key, ast.Constant) or not isinstance(key.value, str):
                     result = False
                     break
-                if key.value in _REMOTE_CODE_KEYWORDS and not _remote_code_option_is_proven_disabled(
+                if key.value in safety_keywords and not _remote_code_option_is_proven_disabled(
                     key.value,
                     item_value,
                     bindings=bindings,
@@ -2867,12 +2872,15 @@ def _is_valid_official_readme_sample_image_example(
             return False
         return False
 
-    static_mapping_proof_cache: dict[int, bool] = {}
+    static_mapping_proof_cache: dict[tuple[int, frozenset[str]], bool] = {}
 
-    def static_mapping_expression_is_proven_safe(value: ast.expr) -> bool:
-        value_id = id(value)
-        if value_id in static_mapping_proof_cache:
-            return static_mapping_proof_cache[value_id]
+    def static_mapping_expression_is_proven_safe(
+        value: ast.expr,
+        safety_keywords: frozenset[str] = _REMOTE_CODE_KEYWORDS,
+    ) -> bool:
+        cache_key = (id(value), safety_keywords)
+        if cache_key in static_mapping_proof_cache:
+            return static_mapping_proof_cache[cache_key]
         if not proof_budget.consume(sum(1 for _node in ast.walk(value))):
             return False
         result = _remote_code_mapping_is_proven_safe(
@@ -2882,12 +2890,15 @@ def _is_valid_official_readme_sample_image_example(
             unsafe_names=frozenset(),
             proven_mapping_call_ids=frozenset(),
             call_position=0,
+            safety_keywords=safety_keywords,
         )
-        static_mapping_proof_cache[value_id] = result
+        static_mapping_proof_cache[cache_key] = result
         return result
 
     proven_safe_mapping_augassign_ids: set[int] = set()
     proven_safe_mapping_augassign_target_ids: set[int] = set()
+    proven_safe_from_pretrained_mapping_augassign_ids: set[int] = set()
+    proven_safe_from_pretrained_mapping_augassign_target_ids: set[int] = set()
     proven_identity_preserving_mapping_transfer_target_ids: set[int] = set()
     for node in nodes:
         if (
@@ -2908,6 +2919,15 @@ def _is_valid_official_readme_sample_image_example(
             continue
         proven_safe_mapping_augassign_ids.add(id(node))
         proven_safe_mapping_augassign_target_ids.add(id(node.target))
+        if static_mapping_expression_is_proven_safe(
+            base_bindings[0][1],
+            _FROM_PRETRAINED_SAFETY_KEYWORDS,
+        ) and static_mapping_expression_is_proven_safe(
+            node.value,
+            _FROM_PRETRAINED_SAFETY_KEYWORDS,
+        ):
+            proven_safe_from_pretrained_mapping_augassign_ids.add(id(node))
+            proven_safe_from_pretrained_mapping_augassign_target_ids.add(id(node.target))
 
     def mapping_write_preserves_alias_identity(write_node: ast.AST) -> bool:
         write_id = id(write_node)
@@ -3105,6 +3125,7 @@ def _is_valid_official_readme_sample_image_example(
     def unsafe_mapping_operations_for(
         proven_mapping_transfer_call_ids: frozenset[int],
         proven_mapping_operand_ids: frozenset[int],
+        proven_safe_augassign_ids: set[int],
     ) -> list[tuple[str, ast.AST]]:
         operations: list[tuple[str, ast.AST]] = [
             (node.id, node)
@@ -3120,7 +3141,7 @@ def _is_valid_official_readme_sample_image_example(
             if isinstance(node, ast.AugAssign)
             and isinstance(node.target, ast.Name)
             and node.target.id in aliased_mapping_names
-            and id(node) not in proven_safe_mapping_augassign_ids
+            and id(node) not in proven_safe_augassign_ids
         )
         return operations
 
@@ -3131,9 +3152,16 @@ def _is_valid_official_readme_sample_image_example(
         proven_mapping_call_ids: frozenset[int] = frozenset(),
         proven_mapping_binding_chains: dict[int, tuple[int, ...]] | None = None,
         proven_mapping_transfer_call_ids: frozenset[int] = frozenset(),
+        safety_keywords: frozenset[str] = _REMOTE_CODE_KEYWORDS,
     ) -> bool:
         if not proof_budget.consume(len(nodes)):
             return False
+        if safety_keywords == _FROM_PRETRAINED_SAFETY_KEYWORDS:
+            proven_safe_augassign_ids = proven_safe_from_pretrained_mapping_augassign_ids
+            proven_safe_augassign_target_ids = proven_safe_from_pretrained_mapping_augassign_target_ids
+        else:
+            proven_safe_augassign_ids = proven_safe_mapping_augassign_ids
+            proven_safe_augassign_target_ids = proven_safe_mapping_augassign_target_ids
         binding_chains = proven_mapping_binding_chains or {}
         relevant_binding_nodes = {
             name: [
@@ -3155,7 +3183,7 @@ def _is_valid_official_readme_sample_image_example(
             logical_write_nodes = [
                 write_node
                 for write_node in relevant_name_writes.get(name, [])
-                if id(write_node) not in proven_safe_mapping_augassign_target_ids
+                if id(write_node) not in proven_safe_augassign_target_ids
             ]
             logical_write_count = len(logical_write_nodes)
             exhaustive_branch_join = exhaustive_mapping_branch_bindings_precede_call(
@@ -3188,7 +3216,7 @@ def _is_valid_official_readme_sample_image_example(
         for name, write_nodes in relevant_name_writes.items():
             relevant_binding_counts.setdefault(
                 name,
-                sum(id(write_node) not in proven_safe_mapping_augassign_target_ids for write_node in write_nodes),
+                sum(id(write_node) not in proven_safe_augassign_target_ids for write_node in write_nodes),
             )
 
         def proven_mapping_operand_ids_for(mapping_value: ast.expr) -> frozenset[int]:
@@ -3237,6 +3265,7 @@ def _is_valid_official_readme_sample_image_example(
         for name, operation in unsafe_mapping_operations_for(
             proven_mapping_transfer_call_ids,
             proven_mapping_operand_ids,
+            proven_safe_augassign_ids,
         ):
             if not mapping_operation_may_affect_call(operation, call):
                 continue
@@ -3285,6 +3314,7 @@ def _is_valid_official_readme_sample_image_example(
             unsafe_names=frozenset(unsafe_names),
             proven_mapping_call_ids=proven_mapping_call_ids,
             call_position=call_position,
+            safety_keywords=safety_keywords,
         )
 
     remote_code_option_proof_cache: dict[tuple[str, int, int], bool] = {}
@@ -3322,15 +3352,24 @@ def _is_valid_official_readme_sample_image_example(
         remote_code_option_proof_cache[cache_key] = result
         return result
 
-    def call_has_only_proven_safe_mapping_arguments(value: ast.Call) -> bool:
+    def call_has_only_proven_safe_mapping_arguments(
+        value: ast.Call,
+        *,
+        safety_keywords: frozenset[str] = _REMOTE_CODE_KEYWORDS,
+    ) -> bool:
         return (
             not any(isinstance(argument, ast.Starred) for argument in value.args)
             and not any(
-                keyword.arg is None and not remote_code_mapping_is_proven_safe_at_call(keyword.value, value)
+                keyword.arg is None
+                and not remote_code_mapping_is_proven_safe_at_call(
+                    keyword.value,
+                    value,
+                    safety_keywords=safety_keywords,
+                )
                 for keyword in value.keywords
             )
             and not any(
-                keyword.arg in _REMOTE_CODE_KEYWORDS
+                keyword.arg in safety_keywords
                 and not remote_code_option_is_proven_disabled_at_call(keyword.arg, keyword.value, value)
                 for keyword in value.keywords
             )
@@ -3387,7 +3426,10 @@ def _is_valid_official_readme_sample_image_example(
     ) -> bool:
         return (
             isinstance(factory_call, ast.Call)
-            and call_has_only_proven_safe_mapping_arguments(factory_call)
+            and call_has_only_proven_safe_mapping_arguments(
+                factory_call,
+                safety_keywords=_FROM_PRETRAINED_SAFETY_KEYWORDS,
+            )
             and isinstance(factory_call.func, ast.Attribute)
             and factory_call.func.attr == "from_pretrained"
             and isinstance(factory_call.func.value, ast.Name)
@@ -4116,8 +4158,11 @@ def _is_valid_official_readme_sample_image_example(
         return bool(prior_bindings) and isinstance(prior_bindings[-1], ast.Dict)
 
     def named_sensitive_call_has_safe_options(call: ast.Call, callable_kinds: frozenset[str]) -> bool:
+        safety_keywords = (
+            _FROM_PRETRAINED_SAFETY_KEYWORDS if "from_pretrained" in callable_kinds else _REMOTE_CODE_KEYWORDS
+        )
         if any(
-            keyword.arg in _REMOTE_CODE_KEYWORDS
+            keyword.arg in safety_keywords
             and not remote_code_option_is_proven_disabled_at_call(keyword.arg, keyword.value, call)
             for keyword in call.keywords
         ):
@@ -4135,6 +4180,7 @@ def _is_valid_official_readme_sample_image_example(
                 proven_mapping_call_ids=proven_mapping_call_ids,
                 proven_mapping_binding_chains=proven_mapping_binding_chains,
                 proven_mapping_transfer_call_ids=proven_mapping_transfer_call_ids,
+                safety_keywords=safety_keywords,
             )
             for keyword in call.keywords
         )
@@ -4211,8 +4257,11 @@ def _is_valid_official_readme_sample_image_example(
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
             if node not in requests_calls and node.func.attr not in documented_attribute_calls:
                 return False
+            safety_keywords = (
+                _FROM_PRETRAINED_SAFETY_KEYWORDS if node.func.attr == "from_pretrained" else _REMOTE_CODE_KEYWORDS
+            )
             if any(
-                keyword.arg in _REMOTE_CODE_KEYWORDS
+                keyword.arg in safety_keywords
                 and not remote_code_option_is_proven_disabled_at_call(keyword.arg, keyword.value, node)
                 for keyword in node.keywords
             ):
@@ -4235,6 +4284,7 @@ def _is_valid_official_readme_sample_image_example(
                     proven_mapping_call_ids=proven_mapping_call_ids,
                     proven_mapping_binding_chains=proven_mapping_binding_chains,
                     proven_mapping_transfer_call_ids=proven_mapping_transfer_call_ids,
+                    safety_keywords=safety_keywords,
                 ):
                     return False
             attribute_root = node.func.value

@@ -3027,6 +3027,156 @@ class TestNetworkCommDetector:
         assert any(finding["type"] == "network_function" for finding in findings)
 
     @pytest.mark.parametrize(
+        "model_flow",
+        [
+            ("AutoModel.from_pretrained(\n    'attacker/model', use_safetensors=False, weights_only=False\n)\n"),
+            "AutoModel.from_pretrained('attacker/model', weights_only=None)\n",
+            "AutoModel.from_pretrained('attacker/model', weights_only=1)\n",
+            "AutoModel.from_pretrained('attacker/model', weights_only=not False)\n",
+            ("weights_only = False\nAutoModel.from_pretrained('attacker/model', weights_only=weights_only)\n"),
+            "AutoModel.from_pretrained('attacker/model', **{'weights_only': False})\n",
+            ("options = {'weights_only': False}\nAutoModel.from_pretrained('attacker/model', **options)\n"),
+            ("weights_only = False\nAutoModel.from_pretrained('attacker/model', **{'weights_only': weights_only})\n"),
+            ("loader = AutoModel.from_pretrained\nloader('attacker/model', weights_only=False)\n"),
+            ("loader = AutoModel.from_pretrained\nloader('attacker/model', **{'weights_only': False})\n"),
+            (
+                "options = {}\n"
+                "options |= {'weights_only': False}\n"
+                "AutoModel.from_pretrained('attacker/model', **options)\n"
+            ),
+            (
+                "options = {}\n"
+                "options |= {'weights_only': None}\n"
+                "AutoModel.from_pretrained('attacker/model', **options)\n"
+            ),
+            (
+                "weights_only = image_url == ''\n"
+                "options = {}\n"
+                "options |= {'weights_only': weights_only}\n"
+                "AutoModel.from_pretrained('attacker/model', **options)\n"
+            ),
+            (
+                "options = {'weights_only': True}\n"
+                "options |= {'weights_only': False}\n"
+                "AutoModel.from_pretrained('attacker/model', **options)\n"
+            ),
+            (
+                "options = {}\n"
+                "options |= {'revision': 'main'}\n"
+                "options |= {'weights_only': False}\n"
+                "AutoModel.from_pretrained('attacker/model', **options)\n"
+            ),
+            (
+                "options = {}\n"
+                "options |= {'weights_only': False}\n"
+                "alias = options\n"
+                "AutoModel.from_pretrained('attacker/model', **alias)\n"
+            ),
+            (
+                "options = {}\n"
+                "options |= {'weights_only': False}\n"
+                "loader = AutoModel.from_pretrained\n"
+                "loader('attacker/model', **options)\n"
+            ),
+        ],
+        ids=[
+            "explicit-false",
+            "explicit-none",
+            "truthy-integer",
+            "dynamic-expression",
+            "named-false",
+            "inline-mapping-false",
+            "bound-mapping-false",
+            "named-inline-mapping-false",
+            "callable-alias-false",
+            "callable-alias-mapping-false",
+            "incremental-union-false",
+            "incremental-union-none",
+            "incremental-union-dynamic",
+            "incremental-union-overwrite-true",
+            "repeated-incremental-union-false",
+            "incremental-union-mapping-alias-false",
+            "callable-alias-incremental-union-false",
+        ],
+    )
+    def test_readme_python_example_rejects_unproven_safe_weights_only(
+        self,
+        model_flow: str,
+    ) -> None:
+        data = (
+            "```python\nimport requests\nfrom transformers import AutoModel\n"
+            "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            f"{model_flow}"
+            "requests.get(image_url, stream=True)\n```\n"
+        ).encode()
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert any(finding["type"] == "network_library" for finding in findings)
+        assert any(finding["type"] == "network_function" for finding in findings)
+
+    @pytest.mark.parametrize(
+        "model_flow",
+        [
+            ("AutoModel.from_pretrained(\n    'official/model', use_safetensors=False, weights_only=True\n)\n"),
+            ("weights_only = True\nAutoModel.from_pretrained('official/model', weights_only=weights_only)\n"),
+            "AutoModel.from_pretrained('official/model', **{'weights_only': True})\n",
+            ("options = {'weights_only': True}\nAutoModel.from_pretrained('official/model', **options)\n"),
+            (
+                "weights_only = True\n"
+                "AutoModel.from_pretrained('official/model', weights_only=weights_only)\n"
+                "weights_only = False\n"
+            ),
+            ("model = AutoModel.from_pretrained('official/model')\nmodel.generate(weights_only=False)\n"),
+            (
+                "options = {}\n"
+                "options |= {'weights_only': True}\n"
+                "AutoModel.from_pretrained('official/model', **options)\n"
+            ),
+            (
+                "options = {}\n"
+                "options |= {'revision': 'main'}\n"
+                "options |= {'weights_only': True}\n"
+                "loader = AutoModel.from_pretrained\n"
+                "loader('official/model', **options)\n"
+            ),
+            (
+                "options = {}\n"
+                "options |= {'weights_only': False}\n"
+                "model = AutoModel.from_pretrained('official/model')\n"
+                "model.generate(**options)\n"
+            ),
+        ],
+        ids=[
+            "explicit-true",
+            "named-true",
+            "inline-mapping-true",
+            "bound-mapping-true",
+            "post-call-rebind",
+            "generate-option-is-out-of-scope",
+            "incremental-union-true",
+            "callable-alias-repeated-incremental-union-true",
+            "generate-incremental-union-is-out-of-scope",
+        ],
+    )
+    def test_readme_python_example_allows_proven_safe_weights_only(
+        self,
+        model_flow: str,
+    ) -> None:
+        data = (
+            "```python\nimport requests\nfrom transformers import AutoModel\n"
+            "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            f"{model_flow}"
+            "requests.get(image_url, stream=True)\n```\n"
+        ).encode()
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert findings
+        assert all(finding["severity"] == "INFO" for finding in findings)
+        assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+
+    @pytest.mark.parametrize(
         "generate_argument",
         [
             "custom_generate='attacker/repo'",
