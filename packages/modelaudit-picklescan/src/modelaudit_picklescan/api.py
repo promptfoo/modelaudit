@@ -10,9 +10,9 @@ import tempfile
 import time
 import zipfile
 from _collections import OrderedDict as _CANONICAL_COLLECTIONS_ORDERED_DICT
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import suppress
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from importlib import import_module
 from importlib import metadata as importlib_metadata
 from pathlib import Path
@@ -107,6 +107,7 @@ _MAX_PYTORCH_ZIP_PICKLE_TOTAL_MEMBER_BYTES = 512 * 1024 * 1024
 _MAX_PYTORCH_ZIP_STORAGE_REFERENCE_DATA_PICKLE_BYTES = 10 * 1024 * 1024
 _MAX_PYTORCH_ZIP_STORAGE_REFERENCE_TOTAL_DATA_PICKLE_BYTES = 64 * 1024 * 1024
 _PYTORCH_STORAGE_TRUST_MAX_OPCODES = 100_000
+_PYTORCH_STORAGE_TRUST_MAX_PROVENANCE_NODES = 100_000
 _PYTORCH_STORAGE_TRUST_MAX_STACK_DEPTH = 1024
 _PYTORCH_STORAGE_TRUST_MAX_MEMO_ENTRIES = 100_000
 _PYTORCH_STORAGE_TRUST_MAX_TUPLE_WIDTH = 64
@@ -336,6 +337,16 @@ class _PytorchStorageRef:
 class _PytorchOrderedDictState:
     mutated: bool = False
     used_as_hooks: bool = False
+    contains_untrusted_storage: bool = False
+    keys_with_tracked_provenance: set[object] = field(default_factory=set)
+
+
+class _PytorchDictionaryState(dict[Any, Any]):
+    __slots__ = ("contains_untrusted_storage",)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.contains_untrusted_storage = False
 
 
 @dataclass(frozen=True)
@@ -378,6 +389,9 @@ class _PytorchStorageReferenceParse:
     canonical_tensor_rebuild_invocations: set[tuple[int, int]]
     parse_complete: bool
     all_persistent_ids_are_pytorch_storage: bool
+    discarded_tracked_storage_references: bool = False
+    used_streaming_batch_compaction: bool = False
+    accepted_oversized_state_batch: bool = False
 
 
 @dataclass(frozen=True)
@@ -389,6 +403,7 @@ class _PytorchZipDataPickleTrust:
 @dataclass(frozen=True)
 class _PytorchZipStorageEntries:
     trusted_entry_ids: set[int]
+    expanded_trust_entry_ids: set[int]
     storage_probe_entry_ids: set[int]
     trusted_data_pkl_by_name: dict[str, _PytorchZipDataPickleTrust]
 
@@ -896,6 +911,7 @@ def _discover_pytorch_zip_pickle_entries(
         if _is_data_pickle_member(lowered) or lowered.endswith(_PICKLE_MEMBER_SUFFIXES):
             add_entry(entry)
 
+    explicit_pickle_entries = tuple(pickle_entries)
     storage_entries, storage_notices = _validated_pytorch_storage_entry_ids(
         archive,
         entries,
@@ -911,6 +927,7 @@ def _discover_pytorch_zip_pickle_entries(
         candidates.append(entry)
 
     probe_bytes_remaining = [_MAX_PYTORCH_ZIP_PICKLE_DISCOVERY_PROBE_BYTES]
+    deferred_expanded_probe_entries: list[zipfile.ZipInfo] = []
     probed_member_count = 0
     for candidate_index, entry in enumerate(candidates):
         _check_pytorch_zip_deadline(deadline)
@@ -918,6 +935,8 @@ def _discover_pytorch_zip_pickle_entries(
             entry_id = id(entry)
             storage_probe_bytes = None
             if entry_id in storage_entries.trusted_entry_ids:
+                # Preserve the legacy trusted probe for every member before spending the shared
+                # discovery budget on expanded coverage.
                 storage_probe_bytes = _TRUSTED_STORAGE_PICKLE_PROBE_BYTES
             elif entry_id in storage_entries.storage_probe_entry_ids:
                 storage_probe_bytes = _PICKLE_DISCOVERY_LONG_PROBE_BYTES
@@ -933,6 +952,8 @@ def _discover_pytorch_zip_pickle_entries(
                 looks_like_pickle = _zip_entry_looks_like_pickle(archive, entry, probe_bytes_remaining, deadline)
             if looks_like_pickle:
                 add_entry(entry)
+            elif entry_id in storage_entries.expanded_trust_entry_ids:
+                deferred_expanded_probe_entries.append(entry)
             probed_member_count += 1
         except _PickleDiscoveryProbeBudgetExceeded:
             notices.append(
@@ -946,7 +967,35 @@ def _discover_pytorch_zip_pickle_entries(
             break
         except Exception as error:
             notices.append(_pytorch_zip_member_probe_notice(source=source, entry=entry, error=error))
+    else:
+        for expanded_index, entry in enumerate(deferred_expanded_probe_entries):
+            _check_pytorch_zip_deadline(deadline)
+            try:
+                if _trusted_storage_zip_entry_looks_like_pickle(
+                    archive,
+                    entry,
+                    probe_bytes_remaining,
+                    deadline,
+                    max_probe_bytes=_PICKLE_DISCOVERY_LONG_PROBE_BYTES,
+                ):
+                    add_entry(entry)
+            except _PickleDiscoveryProbeBudgetExceeded:
+                notices.append(
+                    _pytorch_zip_pickle_discovery_probe_budget_notice(
+                        source=source,
+                        probe_bytes_read=(_MAX_PYTORCH_ZIP_PICKLE_DISCOVERY_PROBE_BYTES - probe_bytes_remaining[0]),
+                        probed_member_count=probed_member_count,
+                        skipped_entries=deferred_expanded_probe_entries[expanded_index:],
+                    )
+                )
+                break
+            except Exception as error:
+                notices.append(_pytorch_zip_member_probe_notice(source=source, entry=entry, error=error))
 
+    pickle_entries = [
+        *explicit_pickle_entries,
+        *(entry for entry in candidates if id(entry) in seen_entries),
+    ]
     return pickle_entries, tuple(notices), storage_entries.trusted_data_pkl_by_name
 
 
@@ -968,6 +1017,7 @@ def _validated_pytorch_storage_entry_ids(
         entries_by_name.setdefault(name, []).append(entry)
 
     trusted_entry_ids: set[int] = set()
+    expanded_trust_entry_ids: set[int] = set()
     storage_probe_entry_ids: set[int] = set()
     trusted_data_pkl_by_name: dict[str, _PytorchZipDataPickleTrust] = {}
     notices: list[Notice] = []
@@ -1108,7 +1158,10 @@ def _validated_pytorch_storage_entry_ids(
             )
         validated_storage_keys = trusted_storage_keys - storage_size_mismatch_keys
         exact_trusted_storage_keys = (
-            validated_storage_keys if reference_parse.all_persistent_ids_are_pytorch_storage else set()
+            validated_storage_keys
+            if reference_parse.all_persistent_ids_are_pytorch_storage
+            and not reference_parse.discarded_tracked_storage_references
+            else set()
         )
         storage_probe_keys = trusted_storage_keys - exact_trusted_storage_keys
         if exact_trusted_storage_keys and not missing_storage_keys:
@@ -1119,13 +1172,17 @@ def _validated_pytorch_storage_entry_ids(
                 ),
             )
         for storage_key in exact_trusted_storage_keys:
-            trusted_entry_ids.add(id(storage_entries_by_key[storage_key]))
+            entry_id = id(storage_entries_by_key[storage_key])
+            trusted_entry_ids.add(entry_id)
+            if reference_parse.used_streaming_batch_compaction or reference_parse.accepted_oversized_state_batch:
+                expanded_trust_entry_ids.add(entry_id)
         for storage_key in storage_probe_keys:
             storage_probe_entry_ids.add(id(storage_entries_by_key[storage_key]))
 
     return (
         _PytorchZipStorageEntries(
             trusted_entry_ids=trusted_entry_ids,
+            expanded_trust_entry_ids=expanded_trust_entry_ids,
             storage_probe_entry_ids=storage_probe_entry_ids,
             trusted_data_pkl_by_name=trusted_data_pkl_by_name,
         ),
@@ -1151,6 +1208,7 @@ def _trusted_pytorch_data_pkl_from_storage_member_sizes(
         not reference_parse.parse_complete
         or not reference_parse.referenced_keys
         or not reference_parse.all_persistent_ids_are_pytorch_storage
+        or reference_parse.discarded_tracked_storage_references
     ):
         return None
     if not reference_parse.referenced_keys <= storage_member_sizes.keys():
@@ -1254,6 +1312,28 @@ def _trusted_storage_zip_entry_looks_like_pickle(
     is_frame_first_candidate = prefix.startswith(_PICKLE_FRAME_OPCODE)
     if not is_binary_pickle_candidate and not is_frame_first_candidate and prefix[0] not in _PROTO0_1_START_BYTES:
         return False
+    if max_probe_bytes > _TRUSTED_STORAGE_PICKLE_PROBE_BYTES:
+        if _has_complete_pickle_stream_without_frame_stop_overrun(prefix):
+            return True
+        try:
+            for _opcode, _arg, _position in pickletools.genops(prefix):
+                pass
+        except ValueError as error:
+            message = str(error).lower()
+            if "opcode" in message and "unknown" in message:
+                sample_is_prefix = entry.file_size > len(prefix)
+                if is_binary_pickle_candidate:
+                    return _binary_pickle_probe_should_scan(
+                        prefix, sample_is_prefix=sample_is_prefix
+                    ) or _looks_like_binary_pickle_prefix(prefix, sample_is_prefix=sample_is_prefix)
+                if not is_frame_first_candidate:
+                    return _proto0_or_1_trusted_storage_probe_should_scan(
+                        prefix, sample_is_prefix=sample_is_prefix
+                    ) or _looks_like_proto0_or_1_pickle(prefix, sample_is_prefix=sample_is_prefix)
+                return _frame_first_trusted_storage_probe_should_scan(prefix)
+        except Exception:
+            # Unexpected parser failures are not evidence that the member is safe.
+            pass
 
     sample = prefix
     if entry.file_size > len(prefix):
@@ -1265,10 +1345,48 @@ def _trusted_storage_zip_entry_looks_like_pickle(
             deadline,
         )
     if is_binary_pickle_candidate:
-        return _binary_pickle_probe_should_scan(sample, sample_is_prefix=entry.file_size > len(sample))
+        return (
+            _binary_pickle_probe_should_scan(sample, sample_is_prefix=entry.file_size > len(sample))
+            or _expanded_probe_preserves_trusted_scan(entry, sample, max_probe_bytes, _binary_pickle_probe_should_scan)
+            or (
+                max_probe_bytes > _TRUSTED_STORAGE_PICKLE_PROBE_BYTES
+                and _looks_like_binary_pickle_prefix(sample, sample_is_prefix=entry.file_size > len(sample))
+            )
+        )
     if is_frame_first_candidate:
-        return _frame_first_trusted_storage_probe_should_scan(sample)
-    return _proto0_or_1_trusted_storage_probe_should_scan(sample, sample_is_prefix=entry.file_size > len(sample))
+        return _frame_first_trusted_storage_probe_should_scan(sample) or (
+            max_probe_bytes > _TRUSTED_STORAGE_PICKLE_PROBE_BYTES
+            and _frame_first_trusted_storage_probe_should_scan(sample[:_TRUSTED_STORAGE_PICKLE_PROBE_BYTES])
+        )
+    return (
+        _proto0_or_1_trusted_storage_probe_should_scan(sample, sample_is_prefix=entry.file_size > len(sample))
+        or _expanded_probe_preserves_trusted_scan(
+            entry, sample, max_probe_bytes, _proto0_or_1_trusted_storage_probe_should_scan
+        )
+        or (
+            max_probe_bytes > _TRUSTED_STORAGE_PICKLE_PROBE_BYTES
+            and _looks_like_proto0_or_1_pickle(sample, sample_is_prefix=entry.file_size > len(sample))
+        )
+    )
+
+
+def _expanded_probe_preserves_trusted_scan(
+    entry: zipfile.ZipInfo,
+    sample: bytes,
+    max_probe_bytes: int,
+    predicate: Callable[..., bool],
+) -> bool:
+    """Return whether the shorter trusted probe would have scanned this member.
+
+    ``sample_is_prefix`` is derived from how much of the member the probe read, so widening the
+    probe can flip it from True to False and silently drop a member that the 4 KiB trusted probe
+    scanned. Members between the two probe sizes are exactly the window affected. Re-checking the
+    shorter view keeps a wider probe strictly additive for coverage.
+    """
+    if max_probe_bytes <= _TRUSTED_STORAGE_PICKLE_PROBE_BYTES:
+        return False
+    short_sample = sample[:_TRUSTED_STORAGE_PICKLE_PROBE_BYTES]
+    return predicate(short_sample, sample_is_prefix=entry.file_size > len(short_sample))
 
 
 def _binary_pickle_probe_should_scan(sample: bytes, *, sample_is_prefix: bool) -> bool:
@@ -1847,6 +1965,9 @@ def _merge_pytorch_storage_reference_parses(
         canonical_tensor_rebuild_invocations=set(),
         parse_complete=True,
         all_persistent_ids_are_pytorch_storage=all(parsed.all_persistent_ids_are_pytorch_storage for parsed in parses),
+        discarded_tracked_storage_references=any(parsed.discarded_tracked_storage_references for parsed in parses),
+        used_streaming_batch_compaction=any(parsed.used_streaming_batch_compaction for parsed in parses),
+        accepted_oversized_state_batch=any(parsed.accepted_oversized_state_batch for parsed in parses),
     )
 
 
@@ -1874,6 +1995,12 @@ def _pytorch_storage_keys_from_pickle_bytes(
         )
 
     marker = object()
+    canonical_tensor = object()
+    canonical_batch_placeholder = object()
+    canonical_batch_entries: list[tuple[str, object]] = []
+    canonical_batch_target: object | None = None
+    trusted_canonical_batch_seen = False
+    pending_uncanonical_metadata_batch = False
     memo: dict[int, Any] = {}
     stack: list[Any] = []
     referenced_keys: set[str] = set()
@@ -1883,16 +2010,35 @@ def _pytorch_storage_keys_from_pickle_bytes(
     tensor_rebuild_uses: set[tuple[int, int]] = set()
     tensor_rebuild_proof_valid = True
     all_persistent_ids_are_pytorch_storage = True
+    discarded_tracked_storage_references = False
+    used_streaming_batch_compaction = False
+    accepted_oversized_state_batch = False
+    provenance_nodes_inspected = 0
 
     def invalidate_tensor_rebuild_proof() -> None:
         nonlocal tensor_rebuild_proof_valid
         tensor_rebuild_proof_valid = False
 
-    def clear_stack_after_malformed_provenance() -> None:
+    def clear_stack_after_malformed_provenance(*discarded_values: object) -> None:
+        nonlocal canonical_batch_target, trusted_canonical_batch_seen, discarded_tracked_storage_references
+
+        if (
+            any(value_contains_tracked_provenance(value) for value in discarded_values)
+            or any(value_contains_tracked_provenance(value) for value in stack if value is not marker)
+            or any(value_contains_tracked_provenance(value) for _key, value in canonical_batch_entries)
+        ):
+            discarded_tracked_storage_references = True
         invalidate_tensor_rebuild_proof()
         stack.clear()
+        canonical_batch_entries.clear()
+        canonical_batch_target = None
+        trusted_canonical_batch_seen = False
 
     def poison_stack_top() -> None:
+        nonlocal discarded_tracked_storage_references
+
+        if value_contains_tracked_provenance(stack[-1]):
+            discarded_tracked_storage_references = True
         invalidate_tensor_rebuild_proof()
         stack[-1] = None
 
@@ -1907,9 +2053,25 @@ def _pytorch_storage_keys_from_pickle_bytes(
         value.used_as_hooks = True
         return True
 
-    def value_contains_tracked_provenance(value: object, seen: set[int] | None = None) -> bool:
-        if isinstance(value, _PytorchStorageRef | _PytorchOrderedDictState):
+    def value_contains_tracked_provenance(
+        value: object,
+        seen: set[int] | None = None,
+        *,
+        storage_only: bool = False,
+    ) -> bool:
+        nonlocal provenance_nodes_inspected
+
+        provenance_nodes_inspected += 1
+        if provenance_nodes_inspected > _PYTORCH_STORAGE_TRUST_MAX_PROVENANCE_NODES:
+            raise ValueError("PyTorch storage trust parser exceeded its bounded provenance workload")
+        if deadline is not None and provenance_nodes_inspected % 1024 == 0:
+            _check_pytorch_zip_deadline(deadline)
+        if value is canonical_tensor:
+            return not storage_only
+        if isinstance(value, _PytorchStorageRef):
             return True
+        if isinstance(value, _PytorchOrderedDictState):
+            return value.contains_untrusted_storage if storage_only else True
         if not isinstance(value, (tuple, list, dict)):
             return False
         if seen is None:
@@ -1919,34 +2081,163 @@ def _pytorch_storage_keys_from_pickle_bytes(
             return False
         seen.add(value_id)
         if isinstance(value, dict):
-            return any(value_contains_tracked_provenance(item, seen) for item in value.items())
-        return any(value_contains_tracked_provenance(item, seen) for item in value)
+            if storage_only and isinstance(value, _PytorchDictionaryState):
+                return value.contains_untrusted_storage
+            return any(
+                value_contains_tracked_provenance(key, seen, storage_only=storage_only)
+                or value_contains_tracked_provenance(item, seen, storage_only=storage_only)
+                for key, item in value.items()
+            )
+        return any(value_contains_tracked_provenance(item, seen, storage_only=storage_only) for item in value)
+
+    def setitems_entry_is_safe(key: object, value: object) -> bool:
+        return isinstance(key, str) and (
+            value is canonical_tensor
+            or (
+                isinstance(value, (str, int, float, bytes, type(None), tuple, list, dict))
+                and not value_contains_tracked_provenance(value, storage_only=True)
+                and (
+                    not trusted_canonical_batch_seen
+                    or not value_contains_tracked_provenance(value)
+                    or setitems_entry_contains_canonical_tensor(value)
+                )
+            )
+        )
+
+    def setitems_entry_contains_canonical_tensor(value: object) -> bool:
+        return value is canonical_tensor or (
+            isinstance(value, (tuple, list, dict))
+            and not value_contains_tracked_provenance(value, storage_only=True)
+            and value_contains_tracked_provenance(value)
+        )
 
     def apply_setitems_to_target(items: tuple[tuple[Any, Any], ...]) -> None:
+        nonlocal discarded_tracked_storage_references
+
+        canonical_storage_context = (
+            trusted_canonical_batch_seen
+            or bool(canonical_batch_entries)
+            or any(value is canonical_tensor for value in stack)
+            or any(setitems_entry_contains_canonical_tensor(value) for _key, value in items)
+        )
+        items_contain_untrusted_storage = any(
+            value_contains_tracked_provenance(key, storage_only=True)
+            or (value is not canonical_tensor and value_contains_tracked_provenance(value, storage_only=True))
+            for key, value in items
+        )
+        first_marker_index = next((index for index, value in enumerate(stack) if value is marker), len(stack))
+        prior_state_contains_untrusted_storage = any(
+            value_contains_tracked_provenance(value, storage_only=True)
+            for index, value in enumerate(stack)
+            if isinstance(value, (tuple, list, dict, _PytorchOrderedDictState))
+            and (
+                index < first_marker_index
+                or index == len(stack) - 1
+                or (index + 1 < len(stack) and stack[index + 1] is marker)
+            )
+        )
+        if canonical_storage_context and (items_contain_untrusted_storage or prior_state_contains_untrusted_storage):
+            discarded_tracked_storage_references = True
+            invalidate_tensor_rebuild_proof()
         if isinstance(stack[-1], _PytorchStorageRef):
             poison_stack_top()
         elif isinstance(stack[-1], _PytorchOrderedDictState):
-            mutate_tracked_ordered_dict(stack[-1])
+            target = stack[-1]
+            target.contains_untrusted_storage = target.contains_untrusted_storage or items_contain_untrusted_storage
+            for key, value in items:
+                if key in target.keys_with_tracked_provenance:
+                    discarded_tracked_storage_references = True
+                    invalidate_tensor_rebuild_proof()
+                if value_contains_tracked_provenance(value):
+                    target.keys_with_tracked_provenance.add(key)
+                else:
+                    target.keys_with_tracked_provenance.discard(key)
+            mutate_tracked_ordered_dict(target)
         elif isinstance(stack[-1], dict):
-            stack[-1].update(items)
+            if isinstance(stack[-1], _PytorchDictionaryState):
+                stack[-1].contains_untrusted_storage |= items_contain_untrusted_storage
+            for key, value in items:
+                if key in stack[-1] and value_contains_tracked_provenance(stack[-1][key]):
+                    discarded_tracked_storage_references = True
+                    invalidate_tensor_rebuild_proof()
+                stack[-1][key] = value
         else:
+            if any(
+                value_contains_tracked_provenance(key) or value_contains_tracked_provenance(value)
+                for key, value in items
+            ):
+                discarded_tracked_storage_references = True
             poison_stack_top()
 
-    def pop_marked_tuple() -> tuple[Any, ...] | None:
+    def pop_marked_tuple(
+        *,
+        max_width: int = _PYTORCH_STORAGE_TRUST_MAX_TUPLE_WIDTH,
+        unmarked_items: list[Any] | None = None,
+    ) -> tuple[Any, ...] | None:
         items: list[Any] = []
         while stack:
             item = stack.pop()
             if item is marker:
                 return tuple(reversed(items))
             items.append(item)
-            if len(items) > _PYTORCH_STORAGE_TRUST_MAX_TUPLE_WIDTH:
-                raise ValueError("PyTorch storage persistent ID tuple exceeded trust parser width")
+            if len(items) > max_width:
+                raise ValueError("PyTorch storage trust parser marked collection exceeded its width limit")
+        if unmarked_items is not None:
+            unmarked_items.extend(reversed(items))
         return None
 
+    def compact_canonical_setitems_stack() -> bool:
+        nonlocal canonical_batch_target, used_streaming_batch_compaction
+
+        if len(canonical_batch_entries) >= _PYTORCH_STORAGE_TRUST_MAX_STACK_DEPTH:
+            return False
+        for marker_index in range(len(stack)):
+            item = stack[marker_index]
+            if item is not marker or marker_index == 0:
+                continue
+            target = stack[marker_index - 1]
+            if not isinstance(target, dict | _PytorchOrderedDictState):
+                continue
+            if isinstance(target, _PytorchOrderedDictState) and target.used_as_hooks:
+                continue
+            if canonical_batch_target is not None and target is not canonical_batch_target:
+                continue
+            pair_index = marker_index + 1
+            if pair_index < len(stack) and stack[pair_index] is canonical_batch_placeholder:
+                pair_index += 1
+            if pair_index + 1 >= len(stack):
+                continue
+            key = stack[pair_index]
+            value = stack[pair_index + 1]
+            if not setitems_entry_is_safe(key, value):
+                continue
+            if pair_index + 2 < len(stack) and stack[pair_index + 2] is marker:
+                continue
+            if canonical_batch_target is None:
+                canonical_batch_target = target
+                stack.insert(marker_index + 1, canonical_batch_placeholder)
+                pair_index += 1
+            canonical_batch_entries.append((key, value))
+            del stack[pair_index : pair_index + 2]
+            used_streaming_batch_compaction = True
+            return True
+        return False
+
     def within_limits() -> bool:
+        while len(stack) > _PYTORCH_STORAGE_TRUST_MAX_STACK_DEPTH:
+            if not compact_canonical_setitems_stack():
+                return False
+        if canonical_batch_entries and not any(
+            item is marker
+            and marker_index > 0
+            and stack[marker_index - 1] is canonical_batch_target
+            and marker_index + 1 < len(stack)
+            and stack[marker_index + 1] is canonical_batch_placeholder
+            for marker_index, item in enumerate(stack)
+        ):
+            return False
         return (
-            len(stack) <= _PYTORCH_STORAGE_TRUST_MAX_STACK_DEPTH
-            and len(memo) <= _PYTORCH_STORAGE_TRUST_MAX_MEMO_ENTRIES
+            len(memo) <= _PYTORCH_STORAGE_TRUST_MAX_MEMO_ENTRIES
             and len(referenced_keys) <= _PYTORCH_STORAGE_TRUST_MAX_REFERENCED_KEYS
         )
 
@@ -2027,11 +2318,14 @@ def _pytorch_storage_keys_from_pickle_bytes(
         )
 
     def reduce_result(function: Any, args: Any, reduce_position: int) -> Any:
+        nonlocal discarded_tracked_storage_references
+
         if isinstance(function, _PickleGlobalRef) and (function.module, function.name) == (
             "collections",
             "OrderedDict",
         ):
             if args != () and value_contains_tracked_provenance(args):
+                discarded_tracked_storage_references = True
                 invalidate_tensor_rebuild_proof()
             return _PytorchOrderedDictState() if args == () else None
         if isinstance(function, _PickleGlobalRef) and (function.module, function.name) == (
@@ -2041,10 +2335,14 @@ def _pytorch_storage_keys_from_pickle_bytes(
             tensor_rebuild_uses.add((function.position, reduce_position))
             if rebuild_tensor_v2_args_are_canonical(args):
                 canonical_tensor_rebuild_invocations.add((function.position, reduce_position))
+                return canonical_tensor
             else:
+                if value_contains_tracked_provenance(args):
+                    discarded_tracked_storage_references = True
                 invalidate_tensor_rebuild_proof()
             return None
         if value_contains_tracked_provenance(function) or value_contains_tracked_provenance(args):
+            discarded_tracked_storage_references = True
             invalidate_tensor_rebuild_proof()
         return None
 
@@ -2063,6 +2361,19 @@ def _pytorch_storage_keys_from_pickle_bytes(
             if opcode_name in {"PROTO", "FRAME"}:
                 continue
             if opcode_name == "STOP":
+                if canonical_batch_entries or (pending_uncanonical_metadata_batch and not trusted_canonical_batch_seen):
+                    return _PytorchStorageReferenceParse(set(), {}, set(), set(), False, False)
+                if (
+                    stack
+                    and isinstance(stack[-1], (tuple, list, dict, _PytorchOrderedDictState))
+                    and canonical_tensor_rebuild_invocations
+                    and (value_contains_tracked_provenance(stack[-1], storage_only=True))
+                ):
+                    discarded_tracked_storage_references = True
+                    invalidate_tensor_rebuild_proof()
+                if any(value_contains_tracked_provenance(value) for value in stack[:-1] if value is not marker):
+                    discarded_tracked_storage_references = True
+                    invalidate_tensor_rebuild_proof()
                 if not isinstance(_pos, int) or _pos + 1 != len(pickle_data):
                     invalidate_tensor_rebuild_proof()
                 continue
@@ -2089,8 +2400,13 @@ def _pytorch_storage_keys_from_pickle_bytes(
                 if len(stack) < 2:
                     clear_stack_after_malformed_provenance()
                     continue
-                name = _coerce_pickle_string_arg(stack.pop())
-                module = _coerce_pickle_string_arg(stack.pop())
+                name_value = stack.pop()
+                module_value = stack.pop()
+                if value_contains_tracked_provenance(name_value) or value_contains_tracked_provenance(module_value):
+                    discarded_tracked_storage_references = True
+                    invalidate_tensor_rebuild_proof()
+                name = _coerce_pickle_string_arg(name_value)
+                module = _coerce_pickle_string_arg(module_value)
                 stack.append(
                     _PickleGlobalRef(module, name, position) if module is not None and name is not None else None
                 )
@@ -2099,11 +2415,12 @@ def _pytorch_storage_keys_from_pickle_bytes(
             elif opcode_name == "EMPTY_LIST":
                 stack.append([])
             elif opcode_name == "EMPTY_DICT":
-                stack.append({})
+                stack.append(_PytorchDictionaryState())
             elif opcode_name == "TUPLE":
-                tuple_value = pop_marked_tuple()
+                unmarked_items: list[Any] = []
+                tuple_value = pop_marked_tuple(unmarked_items=unmarked_items)
                 if tuple_value is None:
-                    clear_stack_after_malformed_provenance()
+                    clear_stack_after_malformed_provenance(*unmarked_items)
                 else:
                     stack.append(tuple_value)
             elif opcode_name in {"TUPLE1", "TUPLE2", "TUPLE3"}:
@@ -2115,17 +2432,32 @@ def _pytorch_storage_keys_from_pickle_bytes(
                 del stack[-tuple_size:]
                 stack.append(tuple(tuple_items))
             elif opcode_name == "LIST":
-                list_items = pop_marked_tuple()
+                unmarked_items = []
+                list_items = pop_marked_tuple(unmarked_items=unmarked_items)
                 if list_items is None:
-                    clear_stack_after_malformed_provenance()
+                    clear_stack_after_malformed_provenance(*unmarked_items)
                 else:
                     stack.append(list(list_items))
             elif opcode_name == "DICT":
-                dict_items = pop_marked_tuple()
+                unmarked_items = []
+                dict_items = pop_marked_tuple(unmarked_items=unmarked_items)
                 if dict_items is None or len(dict_items) % 2 != 0:
-                    clear_stack_after_malformed_provenance()
+                    clear_stack_after_malformed_provenance(*(unmarked_items if dict_items is None else dict_items))
                 else:
-                    stack.append({dict_items[index]: dict_items[index + 1] for index in range(0, len(dict_items), 2)})
+                    built_dict = _PytorchDictionaryState()
+                    for index in range(0, len(dict_items), 2):
+                        key = dict_items[index]
+                        value = dict_items[index + 1]
+                        if key in built_dict and value_contains_tracked_provenance(built_dict[key]):
+                            discarded_tracked_storage_references = True
+                            invalidate_tensor_rebuild_proof()
+                        if value_contains_tracked_provenance(key, storage_only=True) or (
+                            value is not canonical_tensor
+                            and value_contains_tracked_provenance(value, storage_only=True)
+                        ):
+                            built_dict.contains_untrusted_storage = True
+                        built_dict[key] = value
+                    stack.append(built_dict)
             elif opcode_name in {"BININT", "BININT1", "BININT2", "LONG", "LONG1", "LONG4", "INT", "FLOAT", "BINFLOAT"}:
                 stack.append(arg)
             elif opcode_name == "NONE":
@@ -2155,11 +2487,19 @@ def _pytorch_storage_keys_from_pickle_bytes(
                     stack.append(memo[key])
             elif opcode_name == "POP":
                 if stack:
-                    stack.pop()
+                    popped_value = stack.pop()
+                    if value_contains_tracked_provenance(popped_value):
+                        discarded_tracked_storage_references = True
+                        invalidate_tensor_rebuild_proof()
                 else:
                     invalidate_tensor_rebuild_proof()
             elif opcode_name == "POP_MARK":
-                if pop_marked_tuple() is None:
+                unmarked_items = []
+                popped_values = pop_marked_tuple(unmarked_items=unmarked_items)
+                if popped_values is None:
+                    clear_stack_after_malformed_provenance(*unmarked_items)
+                elif any(value_contains_tracked_provenance(value) for value in popped_values):
+                    discarded_tracked_storage_references = True
                     invalidate_tensor_rebuild_proof()
             elif opcode_name == "DUP":
                 if stack:
@@ -2174,15 +2514,22 @@ def _pytorch_storage_keys_from_pickle_bytes(
                 if isinstance(stack[-1], list):
                     stack[-1].append(value)
                 else:
+                    if value_contains_tracked_provenance(value):
+                        discarded_tracked_storage_references = True
                     poison_stack_top()
             elif opcode_name == "APPENDS":
-                appended_items = pop_marked_tuple()
+                unmarked_items = []
+                appended_items = pop_marked_tuple(unmarked_items=unmarked_items)
                 if appended_items is None or not stack:
-                    clear_stack_after_malformed_provenance()
+                    clear_stack_after_malformed_provenance(
+                        *(unmarked_items if appended_items is None else appended_items)
+                    )
                     continue
                 if isinstance(stack[-1], list):
                     stack[-1].extend(appended_items)
                 else:
+                    if any(value_contains_tracked_provenance(value) for value in appended_items):
+                        discarded_tracked_storage_references = True
                     poison_stack_top()
             elif opcode_name == "SETITEM":
                 if len(stack) < 3:
@@ -2190,15 +2537,66 @@ def _pytorch_storage_keys_from_pickle_bytes(
                     continue
                 value = stack.pop()
                 key = stack.pop()
+                setitem_has_canonical_tensor = setitems_entry_contains_canonical_tensor(value)
                 apply_setitems_to_target(((key, value),))
+                if setitem_has_canonical_tensor:
+                    trusted_canonical_batch_seen = True
+                    pending_uncanonical_metadata_batch = False
             elif opcode_name == "SETITEMS":
-                setitem_items = pop_marked_tuple()
-                if setitem_items is None or len(setitem_items) % 2 != 0 or not stack:
-                    clear_stack_after_malformed_provenance()
-                    continue
-                apply_setitems_to_target(
-                    tuple((setitem_items[index], setitem_items[index + 1]) for index in range(0, len(setitem_items), 2))
+                unmarked_items = []
+                setitem_items = pop_marked_tuple(
+                    max_width=_PYTORCH_STORAGE_TRUST_MAX_STACK_DEPTH,
+                    unmarked_items=unmarked_items,
                 )
+                if setitem_items is None or len(setitem_items) % 2 != 0 or not stack:
+                    if (
+                        setitem_items is None
+                        or not setitem_items
+                        or setitem_items[0] is not canonical_batch_placeholder
+                        or not stack
+                        or stack[-1] is not canonical_batch_target
+                        or (len(setitem_items) - 1) % 2 != 0
+                    ):
+                        clear_stack_after_malformed_provenance(
+                            *(unmarked_items if setitem_items is None else setitem_items)
+                        )
+                        continue
+                    remaining_items = setitem_items[1:]
+                    if (
+                        len(canonical_batch_entries) + len(remaining_items) // 2
+                        > _PYTORCH_STORAGE_TRUST_MAX_STACK_DEPTH
+                    ):
+                        return _PytorchStorageReferenceParse(set(), {}, set(), set(), False, False)
+                    setitem_pairs = tuple(canonical_batch_entries) + tuple(
+                        (remaining_items[index], remaining_items[index + 1])
+                        for index in range(0, len(remaining_items), 2)
+                    )
+                    canonical_batch_entries.clear()
+                    canonical_batch_target = None
+                else:
+                    setitem_pairs = tuple(
+                        (setitem_items[index], setitem_items[index + 1]) for index in range(0, len(setitem_items), 2)
+                    )
+                batch_has_canonical_tensor = any(
+                    setitems_entry_contains_canonical_tensor(value) for _key, value in setitem_pairs
+                )
+                if len(setitem_pairs) * 2 > _PYTORCH_STORAGE_TRUST_MAX_TUPLE_WIDTH:
+                    accepted_oversized_state_batch = True
+                if len(setitem_pairs) * 2 > _PYTORCH_STORAGE_TRUST_MAX_TUPLE_WIDTH and (
+                    not tensor_rebuild_proof_valid
+                    or not all(setitems_entry_is_safe(key, value) for key, value in setitem_pairs)
+                ):
+                    return _PytorchStorageReferenceParse(set(), {}, set(), set(), False, False)
+                if (
+                    len(setitem_pairs) * 2 > _PYTORCH_STORAGE_TRUST_MAX_TUPLE_WIDTH
+                    and not batch_has_canonical_tensor
+                    and not trusted_canonical_batch_seen
+                ):
+                    pending_uncanonical_metadata_batch = True
+                apply_setitems_to_target(setitem_pairs)
+                if batch_has_canonical_tensor:
+                    trusted_canonical_batch_seen = True
+                    pending_uncanonical_metadata_batch = False
             elif opcode_name == "BINPERSID":
                 pid = stack.pop() if stack else None
                 storage_ref = storage_ref_from_pid(pid)
@@ -2245,20 +2643,27 @@ def _pytorch_storage_keys_from_pickle_bytes(
                 state = stack.pop()
                 obj = stack.pop()
                 if isinstance(obj, _PytorchStorageRef):
+                    discarded_tracked_storage_references = True
                     invalidate_tensor_rebuild_proof()
                     stack.append(None)
                 elif isinstance(obj, _PytorchOrderedDictState):
                     if state is not None:
+                        if value_contains_tracked_provenance(state, storage_only=True):
+                            discarded_tracked_storage_references = True
+                            invalidate_tensor_rebuild_proof()
                         mutate_tracked_ordered_dict(obj)
                     stack.append(obj)
                 else:
                     if value_contains_tracked_provenance(obj) or value_contains_tracked_provenance(state):
+                        discarded_tracked_storage_references = True
                         invalidate_tensor_rebuild_proof()
                     stack.append(obj if state is None else None)
             else:
                 clear_stack_after_malformed_provenance()
             if not within_limits():
                 return _PytorchStorageReferenceParse(set(), {}, set(), set(), False, False)
+    except _PytorchZipDeadlineExceeded:
+        raise
     except Exception:
         return _PytorchStorageReferenceParse(set(), {}, set(), set(), False, False)
     return _PytorchStorageReferenceParse(
@@ -2272,6 +2677,9 @@ def _pytorch_storage_keys_from_pickle_bytes(
         ),
         parse_complete=True,
         all_persistent_ids_are_pytorch_storage=all_persistent_ids_are_pytorch_storage,
+        discarded_tracked_storage_references=discarded_tracked_storage_references,
+        used_streaming_batch_compaction=used_streaming_batch_compaction,
+        accepted_oversized_state_batch=accepted_oversized_state_batch,
     )
 
 
