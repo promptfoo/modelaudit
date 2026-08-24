@@ -1324,7 +1324,10 @@ def _trusted_storage_zip_entry_looks_like_pickle(
             )
         )
     if is_frame_first_candidate:
-        return _frame_first_trusted_storage_probe_should_scan(sample)
+        return _frame_first_trusted_storage_probe_should_scan(sample) or (
+            max_probe_bytes > _TRUSTED_STORAGE_PICKLE_PROBE_BYTES
+            and _frame_first_trusted_storage_probe_should_scan(sample[:_TRUSTED_STORAGE_PICKLE_PROBE_BYTES])
+        )
     return (
         _proto0_or_1_trusted_storage_probe_should_scan(sample, sample_is_prefix=entry.file_size > len(sample))
         or _expanded_probe_preserves_trusted_scan(

@@ -4084,6 +4084,48 @@ def test_expanded_trusted_storage_probe_does_not_short_circuit_partial_frame(tmp
     assert probe_bytes_remaining == [probe_budget - package_api._PICKLE_DISCOVERY_SHORT_PROBE_BYTES - storage_size]
 
 
+def test_expanded_trusted_storage_probe_preserves_short_frame_probe(tmp_path: Path) -> None:
+    frame_size = 5000
+    storage = b"\x95" + frame_size.to_bytes(8, "little") + b"N" * frame_size
+    storage += b"cos\nsystem\n(S'echo expanded-frame'\ntR"
+    assert len(storage) > package_api._TRUSTED_STORAGE_PICKLE_PROBE_BYTES
+    assert len(storage) < package_api._PICKLE_DISCOVERY_LONG_PROBE_BYTES
+    archive_path = tmp_path / "expanded-frame-storage.pt"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data/0", storage)
+
+    with zipfile.ZipFile(archive_path) as archive:
+        entry = archive.getinfo("archive/data/0")
+        short_probe_budget = [package_api._PICKLE_DISCOVERY_LONG_PROBE_BYTES]
+        short_probe_result = package_api._trusted_storage_zip_entry_looks_like_pickle(
+            archive,
+            entry,
+            short_probe_budget,
+            float("inf"),
+        )
+        expanded_probe_budget = [2 * package_api._PICKLE_DISCOVERY_LONG_PROBE_BYTES]
+        expanded_probe_result = package_api._trusted_storage_zip_entry_looks_like_pickle(
+            archive,
+            entry,
+            expanded_probe_budget,
+            float("inf"),
+            max_probe_bytes=package_api._PICKLE_DISCOVERY_LONG_PROBE_BYTES,
+        )
+
+    assert short_probe_result is True
+    assert expanded_probe_result is True
+    assert short_probe_budget == [
+        package_api._PICKLE_DISCOVERY_LONG_PROBE_BYTES
+        - package_api._PICKLE_DISCOVERY_SHORT_PROBE_BYTES
+        - package_api._TRUSTED_STORAGE_PICKLE_PROBE_BYTES
+    ]
+    assert expanded_probe_budget == [
+        2 * package_api._PICKLE_DISCOVERY_LONG_PROBE_BYTES
+        - package_api._PICKLE_DISCOVERY_SHORT_PROBE_BYTES
+        - len(storage)
+    ]
+
+
 def test_expanded_trusted_storage_probe_does_not_short_circuit_partial_proto0_string(
     tmp_path: Path,
 ) -> None:
