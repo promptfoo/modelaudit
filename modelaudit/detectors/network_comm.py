@@ -4371,7 +4371,7 @@ def _is_valid_official_readme_sample_image_example(
             return False
         if not _is_official_huggingface_documented_image_url(url):
             return False
-    return True
+    return not proof_budget.exceeded
 
 
 def _is_official_huggingface_documented_image_url(url: str) -> bool:
@@ -4633,7 +4633,7 @@ def _is_official_readme_urlopen_image_example(example: bytes) -> bool:
             or not isinstance(assignment.targets[0], ast.Name)
         ):
             return False
-    return not proof_budget.exceeded
+    return True
 
 
 class NetworkCommDetector:
