@@ -2911,7 +2911,7 @@ def _is_valid_official_readme_sample_image_example(
     mapping_alias_targets = {
         id(binding_node): frozenset(target_names) for binding_node, target_names, _source_name in mapping_alias_groups
     }
-    mapping_transfer_alias_sources: dict[int, str] = {}
+    mapping_transfer_alias_sources: dict[int, frozenset[str]] = {}
 
     def alias_state_after_edge(
         binding_node: ast.AST,
@@ -2931,12 +2931,12 @@ def _is_valid_official_readme_sample_image_example(
             )
         if operation_definitely_follows_reference(binding_node, reference):
             binding_value = binding_node.value if isinstance(binding_node, (ast.Assign, ast.AnnAssign)) else None
-            binding_source_name = (
-                binding_value.id
+            binding_source_names = (
+                frozenset({binding_value.id})
                 if isinstance(binding_value, ast.Name)
-                else mapping_transfer_alias_sources.get(id(binding_node))
+                else mapping_transfer_alias_sources.get(id(binding_node), frozenset())
             )
-            if binding_source_name != current_name:
+            if current_name not in binding_source_names:
                 return None
             for write_node in name_write_nodes.get(current_name, []):
                 if node_is_within(write_node, reference) or node_is_within(write_node, binding_node):
@@ -3015,38 +3015,46 @@ def _is_valid_official_readme_sample_image_example(
                     return False
         return True
 
-    expanded_mapping_aliases: list[tuple[ast.AST, str, str]] = []
-    remaining_alias_expansion_steps = _MAX_README_IMAGE_EXAMPLE_AST_NODES
-    for binding_node, group_target_names, source_name in sorted(
-        mapping_alias_groups,
-        key=lambda item: (getattr(item[0], "lineno", 0), getattr(item[0], "col_offset", 0)),
-    ):
-        source_component = {source_name} if source_name is not None else set()
-        pending_source_names = [source_name] if source_name is not None else []
-        while pending_source_names:
-            current_name = pending_source_names.pop()
-            for prior_binding, first_name, second_name in expanded_mapping_aliases:
-                if remaining_alias_expansion_steps <= 0:
-                    return False
-                remaining_alias_expansion_steps -= 1
-                if current_name not in {first_name, second_name} or not alias_edge_survives_until_reference(
-                    prior_binding,
-                    first_name,
-                    second_name,
-                    binding_node,
-                ):
-                    continue
-                alias_name = second_name if current_name == first_name else first_name
-                if alias_name in source_component:
-                    continue
-                source_component.add(alias_name)
-                pending_source_names.append(alias_name)
-        identity_names = list(dict.fromkeys((*group_target_names, *sorted(source_component))))
-        for first_index, first_name in enumerate(identity_names):
-            for second_name in identity_names[first_index + 1 :]:
-                if len(expanded_mapping_aliases) >= _MAX_README_IMAGE_EXAMPLE_AST_NODES:
-                    return False
-                expanded_mapping_aliases.append((binding_node, first_name, second_name))
+    def expand_mapping_alias_groups(
+        alias_groups: list[tuple[ast.AST, tuple[str, ...], str | None]],
+    ) -> list[tuple[ast.AST, str, str]] | None:
+        expanded_aliases: list[tuple[ast.AST, str, str]] = []
+        remaining_steps = _MAX_README_IMAGE_EXAMPLE_AST_NODES
+        for binding_node, group_target_names, source_name in sorted(
+            alias_groups,
+            key=lambda item: (getattr(item[0], "lineno", 0), getattr(item[0], "col_offset", 0)),
+        ):
+            source_component = {source_name} if source_name is not None else set()
+            pending_source_names = [source_name] if source_name is not None else []
+            while pending_source_names:
+                current_name = pending_source_names.pop()
+                for prior_binding, first_name, second_name in expanded_aliases:
+                    if remaining_steps <= 0:
+                        return None
+                    remaining_steps -= 1
+                    if current_name not in {first_name, second_name} or not alias_edge_survives_until_reference(
+                        prior_binding,
+                        first_name,
+                        second_name,
+                        binding_node,
+                    ):
+                        continue
+                    alias_name = second_name if current_name == first_name else first_name
+                    if alias_name in source_component:
+                        continue
+                    source_component.add(alias_name)
+                    pending_source_names.append(alias_name)
+            identity_names = list(dict.fromkeys((*group_target_names, *sorted(source_component))))
+            for first_index, first_name in enumerate(identity_names):
+                for second_name in identity_names[first_index + 1 :]:
+                    if len(expanded_aliases) >= _MAX_README_IMAGE_EXAMPLE_AST_NODES:
+                        return None
+                    expanded_aliases.append((binding_node, first_name, second_name))
+        return expanded_aliases
+
+    expanded_mapping_aliases = expand_mapping_alias_groups(mapping_alias_groups)
+    if expanded_mapping_aliases is None:
+        return False
     mapping_aliases = expanded_mapping_aliases
 
     aliased_mapping_names = set(mapping_bindings)
@@ -3640,10 +3648,27 @@ def _is_valid_official_readme_sample_image_example(
             proven_mapping_transfer_call_ids=candidate_transfer_call_ids,
         ):
             return None
-        mapping_transfer_alias_sources[id(binding_node)] = unwrapped_value.id
+
+        candidate_alias_group = (binding_node, (binding_name,), unwrapped_value.id)
+        candidate_mapping_aliases = expand_mapping_alias_groups([*mapping_alias_groups, candidate_alias_group])
+        if candidate_mapping_aliases is None:
+            return None
+        transfer_source_names = frozenset(
+            alias_name
+            for alias_binding, first_name, second_name in candidate_mapping_aliases
+            if alias_binding is binding_node
+            for alias_name in (first_name, second_name)
+            if alias_name != binding_name
+        )
+        if unwrapped_value.id not in transfer_source_names:
+            return None
+
+        mapping_transfer_alias_sources[id(binding_node)] = transfer_source_names
         mapping_alias_targets[id(binding_node)] = frozenset({binding_name})
         mapping_alias_target_names.add(binding_name)
-        mapping_aliases.append((binding_node, unwrapped_value.id, binding_name))
+        mapping_alias_groups.append(candidate_alias_group)
+        mapping_aliases[:] = candidate_mapping_aliases
+        aliased_mapping_names.update((*transfer_source_names, binding_name))
         return (id(binding_node),)
 
     def conditional_mapping_test_is_proven_inert(test: ast.expr, binding_node: ast.AST) -> bool:

