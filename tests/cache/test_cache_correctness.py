@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 import sys
 import tempfile
 import threading
@@ -22,7 +23,7 @@ from importlib.machinery import (
     SourcelessFileLoader,
 )
 from pathlib import Path
-from types import FunctionType, ModuleType
+from types import FunctionType, ModuleType, SimpleNamespace
 from typing import Any, BinaryIO, cast
 from zipimport import zipimporter
 
@@ -547,6 +548,59 @@ def test_windows_change_clock_probe_uses_safe_ancestor_without_scan_root(
         assert safe_ancestor != scanned_parent
         assert scanned_parent not in safe_ancestor.parents
         assert cache._change_clock_probes[file_device] == (cast(BinaryIO, probe), safe_ancestor)
+        cache._change_clock_probes.clear()
+
+
+def test_windows_change_clock_probe_prefers_outermost_ancestor_over_scanned_tree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cross-volume probes must not land inside a tree a concurrent scan walks.
+
+    Windows CI keeps the checkout on one volume and the temp/cache directories on
+    another, so probe placement falls through to the scanned file's ancestors. The
+    nearest ancestor is normally still inside the asset tree another xdist worker is
+    enumerating, and the probe races that walk into ``file_size_check_failed``.
+    """
+    volume_root = tmp_path / "volume"
+    assets_root = volume_root / "repository" / "tests" / "assets"
+    scanned_parent = assets_root / "samples" / "pickles"
+    scanned_parent.mkdir(parents=True)
+    file_path = _make_cacheable_file(scanned_parent)
+    file_device = file_path.stat().st_dev
+    off_device_cache = tmp_path / "off-device-cache"
+    off_device_temp = tmp_path / "off-device-temp"
+    cache = ScanResultsCache(str(off_device_cache))
+    attempted_probe_dirs: list[Path] = []
+
+    with tempfile.TemporaryFile(mode="w+b", dir=volume_root) as probe:
+
+        def record_probe_directory(*_args: Any, dir: str | Path, **_kwargs: Any) -> BinaryIO:
+            attempted_probe_dirs.append(type(file_path)(dir))
+            return cast(BinaryIO, probe)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "name", "nt")
+            patch.setattr(scan_results_cache_module, "Path", type(file_path))
+            patch.setattr(tempfile, "gettempdir", lambda: str(off_device_temp))
+            # Every ancestor shares the scanned file's volume; only the off-device
+            # temp and cache directories are unreachable.
+            patch.setattr(
+                cache,
+                "_directory_is_on_device",
+                lambda directory, _device: directory not in {off_device_cache, off_device_temp},
+            )
+            patch.setattr(tempfile, "TemporaryFile", record_probe_directory)
+
+            selected_probe = cache._get_change_clock_probe(str(file_path), file_device)
+
+        assert selected_probe is probe
+        selected_directory = attempted_probe_dirs[0]
+        resolved_assets_root = assets_root.resolve()
+        # The probe must sit above the asset tree, not inside it.
+        assert selected_directory != resolved_assets_root
+        assert resolved_assets_root not in selected_directory.parents
+        assert selected_directory in scanned_parent.resolve().parents
         cache._change_clock_probes.clear()
 
 
@@ -3694,6 +3748,112 @@ def test_scan_cache_invalidates_replaced_large_extension_candidate(tmp_path: Pat
     os.replace(replacement_path, extension_path)
 
     assert cache.get_cached_result(str(file_path), version_context=version_context) is None
+
+
+@pytest.mark.parametrize("fingerprint_kind", ["source", "read"])
+def test_source_fingerprints_accept_windows_cross_view_stat_differences(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fingerprint_kind: str,
+) -> None:
+    source_path = tmp_path / "helper.py"
+    source = b"def entrypoint():\n    return 1\n"
+    source_path.write_bytes(source)
+    original_fstat = os.fstat
+
+    def windows_descriptor_stat(file_descriptor: int) -> os.stat_result:
+        file_stat = original_fstat(file_descriptor)
+        return cast(
+            os.stat_result,
+            SimpleNamespace(
+                st_dev=file_stat.st_dev,
+                st_ino=file_stat.st_ino,
+                st_mode=file_stat.st_mode ^ 0o111,
+                st_size=file_stat.st_size,
+                st_mtime_ns=file_stat.st_mtime_ns,
+                st_ctime_ns=file_stat.st_ctime_ns + 1,
+            ),
+        )
+
+    with monkeypatch.context() as windows:
+        windows.setattr(os, "fstat", windows_descriptor_stat)
+        windows.setattr(os, "name", "nt")
+        if fingerprint_kind == "source":
+            fingerprint = ScanResultsCache._bounded_source_fingerprint(source_path)
+            expected = hashlib.sha256(source).hexdigest()
+        else:
+            fingerprint = ScanResultsCache._bounded_read_fingerprint(source_path, 64 * 1024, True)
+            expected = hashlib.sha256(b"file\0" + source).hexdigest()
+
+    assert fingerprint == expected
+
+
+@pytest.mark.parametrize("fingerprint_kind", ["source", "read"])
+def test_source_fingerprints_reject_windows_cross_view_file_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fingerprint_kind: str,
+) -> None:
+    source_path = tmp_path / "helper.py"
+    source_path.write_bytes(b"def entrypoint():\n    return 1\n")
+    original_fstat = os.fstat
+
+    def replaced_descriptor_stat(file_descriptor: int) -> os.stat_result:
+        file_stat = original_fstat(file_descriptor)
+        return cast(
+            os.stat_result,
+            SimpleNamespace(
+                st_dev=file_stat.st_dev,
+                st_ino=file_stat.st_ino + 1,
+                st_mode=stat.S_IFMT(file_stat.st_mode) | 0o666,
+                st_size=file_stat.st_size,
+                st_mtime_ns=file_stat.st_mtime_ns,
+                st_ctime_ns=file_stat.st_ctime_ns + 1,
+            ),
+        )
+
+    with monkeypatch.context() as windows:
+        windows.setattr(os, "fstat", replaced_descriptor_stat)
+        windows.setattr(os, "name", "nt")
+        with pytest.raises(ValueError, match="changed while being read"):
+            if fingerprint_kind == "source":
+                ScanResultsCache._bounded_source_fingerprint(source_path)
+            else:
+                ScanResultsCache._bounded_read_fingerprint(source_path, 64 * 1024, True)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows ctime differs across stat views")
+@pytest.mark.parametrize("fingerprint_kind", ["source", "read"])
+def test_source_fingerprints_reject_posix_cross_view_ctime_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fingerprint_kind: str,
+) -> None:
+    source_path = tmp_path / "helper.py"
+    source_path.write_bytes(b"def entrypoint():\n    return 1\n")
+    original_fstat = os.fstat
+
+    def changed_descriptor_stat(file_descriptor: int) -> os.stat_result:
+        file_stat = original_fstat(file_descriptor)
+        return cast(
+            os.stat_result,
+            SimpleNamespace(
+                st_dev=file_stat.st_dev,
+                st_ino=file_stat.st_ino,
+                st_mode=file_stat.st_mode,
+                st_size=file_stat.st_size,
+                st_mtime_ns=file_stat.st_mtime_ns,
+                st_ctime_ns=file_stat.st_ctime_ns + 1,
+            ),
+        )
+
+    monkeypatch.setattr(os, "fstat", changed_descriptor_stat)
+
+    with pytest.raises(ValueError, match="changed while being read"):
+        if fingerprint_kind == "source":
+            ScanResultsCache._bounded_source_fingerprint(source_path)
+        else:
+            ScanResultsCache._bounded_read_fingerprint(source_path, 64 * 1024, True)
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="Windows prevents replacing an open source file")

