@@ -2251,7 +2251,7 @@ def _is_valid_official_readme_sample_image_example(
         for target in statement.targets
         if isinstance(target, ast.Name)
     }
-    documented_builtin_names = {"enumerate", "len", "print", "range", "round", "zip"}
+    documented_builtin_names = {"enumerate", "len", "object", "print", "range", "round", "zip"}
     imported_names = {"requests"}
     transformers_factory_names: set[str] = set()
     transformers_mapping_factory_names: set[str] = set()
@@ -2277,6 +2277,7 @@ def _is_valid_official_readme_sample_image_example(
                     transformers_factory_names.add(alias.name)
                     if alias.name.endswith(("Processor", "Tokenizer", "TokenizerFast", "FeatureExtractor")):
                         transformers_mapping_factory_names.add(alias.name)
+    reserved_names = protected_names | imported_names | documented_builtin_names
     known_names = (
         imported_names
         | documented_builtin_names
@@ -2492,6 +2493,58 @@ def _is_valid_official_readme_sample_image_example(
             return field_name in {"body", "orelse"}
         return isinstance(container, ast.With) and field_name == "body" and is_canonical_no_grad_with(container)
 
+    def direct_eager_call_statement(call: ast.Call) -> ast.stmt | None:
+        membership = direct_statement_membership(call)
+        if membership is None:
+            return None
+        statement = membership[3]
+        if isinstance(statement, ast.Expr) and statement.value is call:
+            return statement
+        is_generate_call = isinstance(call.func, ast.Attribute) and call.func.attr == "generate"
+        if (
+            is_generate_call
+            and isinstance(statement, ast.Assign)
+            and statement.value is call
+            and len(statement.targets) == 1
+            and isinstance(statement.targets[0], ast.Name)
+        ):
+            return statement
+        if (
+            is_generate_call
+            and isinstance(statement, ast.AnnAssign)
+            and statement.value is call
+            and statement.simple == 1
+            and isinstance(statement.target, ast.Name)
+        ):
+            return statement
+        return None
+
+    def is_supported_direct_eager_call(call: ast.Call) -> bool:
+        statement = direct_eager_call_statement(call)
+        if statement is None:
+            return False
+        if isinstance(statement, ast.Expr):
+            return True
+        membership = statement_memberships.get(id(statement))
+        if membership is None:
+            return False
+        container, field_name, _statement_index, _statement = membership
+        if isinstance(container, ast.Module):
+            return True
+        return (
+            isinstance(container, ast.With)
+            and field_name == "body"
+            and is_canonical_no_grad_with(container)
+            and isinstance(parents.get(id(container)), ast.Module)
+            and any(
+                isinstance(candidate, ast.Import)
+                and any(alias.name == "torch" and alias.asname is None for alias in candidate.names)
+                and top_level_statement_precedes(candidate, container)
+                for candidate in tree.body
+            )
+            and not name_write_nodes.get("torch")
+        )
+
     def binding_precedes_reference_in_supported_body(binding: ast.AST, reference: ast.AST) -> bool:
         if execution_may_be_deferred(reference):
             return False
@@ -2501,14 +2554,20 @@ def _is_valid_official_readme_sample_image_example(
             return False
         binding_container, binding_field, binding_index, binding_statement = binding_membership
         reference_container, reference_field, reference_index, reference_statement = reference_membership
-        reference_is_direct_statement = reference_statement is reference or (
-            isinstance(reference_statement, ast.Expr) and reference_statement.value is reference
+        eager_reference_statement = direct_eager_call_statement(reference) if isinstance(reference, ast.Call) else None
+        reference_is_direct_statement = (
+            reference_statement is reference or reference_statement is eager_reference_statement
         )
         if (
             binding_container is not reference_container
             or binding_field != reference_field
             or binding_statement is not binding
             or not reference_is_direct_statement
+            or (
+                eager_reference_statement is not None
+                and isinstance(reference_statement, (ast.Assign, ast.AnnAssign))
+                and (not isinstance(reference, ast.Call) or not is_supported_direct_eager_call(reference))
+            )
             or binding_index >= reference_index
             or not is_single_execution_body(binding_container, binding_field)
         ):
@@ -2655,7 +2714,7 @@ def _is_valid_official_readme_sample_image_example(
         )
 
     def mapping_operation_may_affect_call(operation: ast.AST, call: ast.Call) -> bool:
-        if is_direct_expression_call(call) and operation_definitely_follows_reference(operation, call):
+        if is_supported_direct_eager_call(call) and operation_definitely_follows_reference(operation, call):
             return False
         return operation_may_affect_reference(operation, call)
 
@@ -2852,6 +2911,7 @@ def _is_valid_official_readme_sample_image_example(
     mapping_alias_targets = {
         id(binding_node): frozenset(target_names) for binding_node, target_names, _source_name in mapping_alias_groups
     }
+    mapping_transfer_alias_sources: dict[int, str] = {}
 
     def alias_state_after_edge(
         binding_node: ast.AST,
@@ -2871,7 +2931,12 @@ def _is_valid_official_readme_sample_image_example(
             )
         if operation_definitely_follows_reference(binding_node, reference):
             binding_value = binding_node.value if isinstance(binding_node, (ast.Assign, ast.AnnAssign)) else None
-            if not isinstance(binding_value, ast.Name) or binding_value.id != current_name:
+            binding_source_name = (
+                binding_value.id
+                if isinstance(binding_value, ast.Name)
+                else mapping_transfer_alias_sources.get(id(binding_node))
+            )
+            if binding_source_name != current_name:
                 return None
             for write_node in name_write_nodes.get(current_name, []):
                 if node_is_within(write_node, reference) or node_is_within(write_node, binding_node):
@@ -3255,6 +3320,51 @@ def _is_valid_official_readme_sample_image_example(
             )
         )
 
+    transformers_factory_alias_proof_cache: dict[tuple[str, int, int], bool] = {}
+
+    def transformers_factory_name_is_proven_safe(
+        factory_name: str,
+        reference: ast.Call,
+        allowed_factory_names: set[str],
+    ) -> bool:
+        cache_key = (factory_name, id(reference), id(allowed_factory_names))
+        if cache_key in transformers_factory_alias_proof_cache:
+            return transformers_factory_alias_proof_cache[cache_key]
+
+        current_name = factory_name
+        seen_names: set[str] = set()
+        while current_name not in allowed_factory_names:
+            if current_name in seen_names or not proof_budget.consume(1):
+                transformers_factory_alias_proof_cache[cache_key] = False
+                return False
+            seen_names.add(current_name)
+            candidates = [
+                (binding_node, binding_value)
+                for binding_node, binding_value in single_name_bindings.get(current_name, [])
+                if top_level_statement_precedes(binding_node, reference)
+            ]
+            prior_writes = [
+                write_node
+                for write_node in name_write_nodes.get(current_name, [])
+                if top_level_statement_precedes(write_node, reference)
+            ]
+            if len(candidates) != 1 or len(prior_writes) != 1:
+                transformers_factory_alias_proof_cache[cache_key] = False
+                return False
+            binding_node, binding_value = candidates[0]
+            if (
+                not isinstance(parents.get(id(binding_node)), ast.Module)
+                or not is_single_name_binding(binding_node, binding_value, current_name)
+                or not isinstance(binding_value, ast.Name)
+            ):
+                transformers_factory_alias_proof_cache[cache_key] = False
+                return False
+            current_name = binding_value.id
+
+        result = not name_write_nodes.get(current_name)
+        transformers_factory_alias_proof_cache[cache_key] = result
+        return result
+
     def transformers_factory_call_is_proven_safe(
         factory_call: ast.expr,
         allowed_factory_names: set[str],
@@ -3265,7 +3375,11 @@ def _is_valid_official_readme_sample_image_example(
             and isinstance(factory_call.func, ast.Attribute)
             and factory_call.func.attr == "from_pretrained"
             and isinstance(factory_call.func.value, ast.Name)
-            and factory_call.func.value.id in allowed_factory_names
+            and transformers_factory_name_is_proven_safe(
+                factory_call.func.value.id,
+                factory_call,
+                allowed_factory_names,
+            )
         )
 
     def trusted_transformers_instance_is_proven_safe(
@@ -3314,8 +3428,15 @@ def _is_valid_official_readme_sample_image_example(
             if not isinstance(device_value, ast.Constant) or not isinstance(device_value.value, str):
                 return False
             device = device_value.value
-            if device not in {"cpu", "cuda", "hpu", "mps", "npu", "xpu"} and not (
-                device.startswith("cuda:") and device.removeprefix("cuda:").isdecimal()
+            if device in {"cpu", "cuda", "hpu", "mps", "npu", "xpu"}:
+                continue
+            device_kind, separator, device_index = device.partition(":")
+            if (
+                not separator
+                or device_kind not in {"cuda", "hpu", "mps", "npu", "xpu"}
+                or not device_index
+                or not device_index.isascii()
+                or not device_index.isdecimal()
             ):
                 return False
         return not pending_values
@@ -3466,6 +3587,65 @@ def _is_valid_official_readme_sample_image_example(
             return None
         return (*prior_chain, id(binding_node))
 
+    def renamed_mapping_transfer_binding_chain(
+        binding_node: ast.AST,
+        binding_name: str,
+        unwrapped_value: ast.expr,
+        transfer_calls: tuple[ast.Call, ...],
+    ) -> tuple[int, ...] | None:
+        if (
+            not transfer_calls
+            or not isinstance(unwrapped_value, ast.Name)
+            or unwrapped_value.id == binding_name
+            or not isinstance(parents.get(id(binding_node)), ast.Module)
+        ):
+            return None
+
+        transfer_reference = transfer_calls[-1]
+        call_position = top_level_statement_indices.get(id(transfer_reference))
+        binding_position = top_level_statement_indices.get(id(binding_node))
+        if call_position is None or binding_position is None:
+            return None
+        source_bindings = [
+            source_binding
+            for source_binding, _source_value in mapping_bindings.get(unwrapped_value.id, [])
+            if mapping_binding_position_at_call(source_binding, transfer_reference) < call_position
+        ]
+        destination_bindings = [
+            destination_binding
+            for destination_binding, _destination_value in mapping_bindings.get(binding_name, [])
+            if top_level_statement_indices.get(id(destination_binding), len(tree.body)) <= binding_position
+        ]
+        destination_writes = [
+            write_node
+            for write_node in name_write_nodes.get(binding_name, [])
+            if top_level_statement_indices.get(id(write_node), len(tree.body)) <= binding_position
+        ]
+        if (
+            not source_bindings
+            or id(source_bindings[-1]) not in proven_mapping_binding_chains
+            or destination_bindings != [binding_node]
+            or not name_writes_match_binding_chain(destination_writes, (id(binding_node),))
+        ):
+            return None
+
+        candidate_transfer_call_ids = frozenset(
+            proven_mapping_transfer_call_id_set | {id(transfer_call) for transfer_call in transfer_calls}
+        )
+        if not remote_code_mapping_is_proven_safe_at_call(
+            unwrapped_value,
+            transfer_reference,
+            proven_mapping_call_ids=frozenset(proven_mapping_call_id_set),
+            proven_mapping_binding_chains=proven_mapping_binding_chains,
+            proven_mapping_transfer_call_ids=candidate_transfer_call_ids,
+        ):
+            return None
+        mapping_transfer_alias_sources[id(binding_node)] = unwrapped_value.id
+        mapping_alias_targets[id(binding_node)] = frozenset({binding_name})
+        mapping_alias_target_names.add(binding_name)
+        mapping_aliases.append((binding_node, unwrapped_value.id, binding_name))
+        return (id(binding_node),)
+
     def conditional_mapping_test_is_proven_inert(test: ast.expr, binding_node: ast.AST) -> bool:
         if isinstance(test, ast.Constant):
             return isinstance(test.value, bool)
@@ -3591,6 +3771,13 @@ def _is_valid_official_readme_sample_image_example(
                 transfer_calls,
                 proven_mapping_binding_chains,
             )
+            if binding_chain is None:
+                binding_chain = renamed_mapping_transfer_binding_chain(
+                    binding_node,
+                    binding_name,
+                    mapping_value,
+                    transfer_calls,
+                )
         if binding_chain is None:
             continue
         proven_mapping_binding_chains[id(binding_node)] = binding_chain
@@ -3775,7 +3962,9 @@ def _is_valid_official_readme_sample_image_example(
         ) -> frozenset[str] | None:
             nonlocal remaining_steps
             if candidate_name in documented_builtin_names:
-                return frozenset({benign_callable_marker})
+                return frozenset(
+                    {untrusted_callable_marker if name_write_nodes.get(candidate_name) else benign_callable_marker}
+                )
             key = (candidate_name, id(reference))
             if key in memo:
                 return memo[key]
@@ -3862,7 +4051,8 @@ def _is_valid_official_readme_sample_image_example(
             return False
         mapping_calls = remote_mapping_calls_by_name.get(target.value.id, [])
         if mapping_calls and all(
-            is_direct_expression_call(mapping_call) and operation_definitely_follows_reference(target, mapping_call)
+            is_supported_direct_eager_call(mapping_call)
+            and operation_definitely_follows_reference(target, mapping_call)
             for mapping_call in mapping_calls
         ):
             return True
@@ -3921,10 +4111,10 @@ def _is_valid_official_readme_sample_image_example(
         if isinstance(node, ast.ClassDef):
             return False
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and (
-            node.name in protected_names or node.decorator_list
+            node.name in reserved_names or node.decorator_list
         ):
             return False
-        if isinstance(node, (ast.Global, ast.Nonlocal)) and any(name in protected_names for name in node.names):
+        if isinstance(node, (ast.Global, ast.Nonlocal)) and any(name in reserved_names for name in node.names):
             return False
         if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
@@ -3935,7 +4125,7 @@ def _is_valid_official_readme_sample_image_example(
                 return False
         if (
             isinstance(node, ast.Name)
-            and node.id in protected_names | imported_names | documented_builtin_names
+            and node.id in reserved_names
             and isinstance(node.ctx, (ast.Store, ast.Del))
             and id(node) not in allowed_targets
         ):
@@ -3953,9 +4143,9 @@ def _is_valid_official_readme_sample_image_example(
             )
         ):
             return False
-        if isinstance(node, ast.arg) and node.arg in protected_names:
+        if isinstance(node, ast.arg) and node.arg in reserved_names:
             return False
-        if isinstance(node, ast.ExceptHandler) and node.name in protected_names:
+        if isinstance(node, ast.ExceptHandler) and node.name in reserved_names:
             return False
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             callable_resolution = named_sensitive_callable_resolution(node.func.id, node)
