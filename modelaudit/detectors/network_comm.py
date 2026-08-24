@@ -2768,6 +2768,47 @@ def _is_valid_official_readme_sample_image_example(
             return False
         return False
 
+    static_mapping_proof_cache: dict[int, bool] = {}
+
+    def static_mapping_expression_is_proven_safe(value: ast.expr) -> bool:
+        value_id = id(value)
+        if value_id in static_mapping_proof_cache:
+            return static_mapping_proof_cache[value_id]
+        if not proof_budget.consume(sum(1 for _node in ast.walk(value))):
+            return False
+        result = _remote_code_mapping_is_proven_safe(
+            value,
+            bindings={},
+            binding_counts=Counter(),
+            unsafe_names=frozenset(),
+            proven_mapping_call_ids=frozenset(),
+            call_position=0,
+        )
+        static_mapping_proof_cache[value_id] = result
+        return result
+
+    proven_safe_mapping_augassign_ids: set[int] = set()
+    proven_safe_mapping_augassign_target_ids: set[int] = set()
+    for node in nodes:
+        if (
+            not isinstance(node, ast.AugAssign)
+            or not isinstance(node.op, ast.BitOr)
+            or not isinstance(node.target, ast.Name)
+            or node.target.id not in mapping_bindings
+            or node.target.id in mapping_alias_target_names
+        ):
+            continue
+        base_bindings = mapping_bindings.get(node.target.id, [])
+        if (
+            len(base_bindings) != 1
+            or not operation_definitely_follows_reference(node, base_bindings[0][0])
+            or not static_mapping_expression_is_proven_safe(base_bindings[0][1])
+            or not static_mapping_expression_is_proven_safe(node.value)
+        ):
+            continue
+        proven_safe_mapping_augassign_ids.add(id(node))
+        proven_safe_mapping_augassign_target_ids.add(id(node.target))
+
     mapping_alias_targets = {
         id(binding_node): frozenset(target_names) for binding_node, target_names, _source_name in mapping_alias_groups
     }
@@ -2795,6 +2836,8 @@ def _is_valid_official_readme_sample_image_example(
             for write_node in name_write_nodes.get(current_name, []):
                 if node_is_within(write_node, reference) or node_is_within(write_node, binding_node):
                     continue
+                if id(write_node) in proven_safe_mapping_augassign_target_ids:
+                    continue
                 if (
                     operation_definitely_follows_reference(
                         write_node,
@@ -2816,6 +2859,8 @@ def _is_valid_official_readme_sample_image_example(
         for endpoint_name in (first_name, second_name):
             for write_node in name_write_nodes.get(endpoint_name, []):
                 if node_is_within(write_node, binding_node):
+                    continue
+                if id(write_node) in proven_safe_mapping_augassign_target_ids:
                     continue
                 if reference_is_post_binding and node_is_within(write_node, reference):
                     return None
@@ -2848,6 +2893,8 @@ def _is_valid_official_readme_sample_image_example(
         for endpoint_name in (first_name, second_name):
             for write_node in name_write_nodes.get(endpoint_name, []):
                 if node_is_within(write_node, binding_node):
+                    continue
+                if id(write_node) in proven_safe_mapping_augassign_target_ids:
                     continue
                 if (
                     operation_definitely_follows_reference(
@@ -2952,6 +2999,7 @@ def _is_valid_official_readme_sample_image_example(
             if isinstance(node, ast.AugAssign)
             and isinstance(node.target, ast.Name)
             and node.target.id in aliased_mapping_names
+            and id(node) not in proven_safe_mapping_augassign_ids
         )
         return operations
 
@@ -2983,11 +3031,16 @@ def _is_valid_official_readme_sample_image_example(
         call_position = top_level_statement_indices[id(call)]
         for name, candidates in relevant_binding_nodes.items():
             logical_candidates = candidates
-            logical_write_count = len(relevant_name_writes.get(name, []))
+            logical_write_nodes = [
+                write_node
+                for write_node in relevant_name_writes.get(name, [])
+                if id(write_node) not in proven_safe_mapping_augassign_target_ids
+            ]
+            logical_write_count = len(logical_write_nodes)
             exhaustive_branch_join = exhaustive_mapping_branch_bindings_precede_call(
                 name,
                 candidates,
-                relevant_name_writes.get(name, []),
+                logical_write_nodes,
                 call,
             )
             if candidates:
@@ -2997,7 +3050,7 @@ def _is_valid_official_readme_sample_image_example(
                 elif (
                     binding_chain is not None
                     and tuple(id(binding_node) for binding_node, _binding_value in candidates) == binding_chain
-                    and name_writes_match_binding_chain(relevant_name_writes.get(name, []), binding_chain)
+                    and name_writes_match_binding_chain(logical_write_nodes, binding_chain)
                 ):
                     logical_candidates = [candidates[-1]]
                     logical_write_count = 1
@@ -3012,7 +3065,10 @@ def _is_valid_official_readme_sample_image_example(
             ]
             relevant_binding_counts[name] = logical_write_count
         for name, write_nodes in relevant_name_writes.items():
-            relevant_binding_counts.setdefault(name, len(write_nodes))
+            relevant_binding_counts.setdefault(
+                name,
+                sum(id(write_node) not in proven_safe_mapping_augassign_target_ids for write_node in write_nodes),
+            )
 
         def proven_mapping_operand_ids_for(mapping_value: ast.expr) -> frozenset[int]:
             remaining_steps = _MAX_README_IMAGE_EXAMPLE_AST_NODES
@@ -3182,7 +3238,7 @@ def _is_valid_official_readme_sample_image_example(
             if not isinstance(device_value, ast.Constant) or not isinstance(device_value.value, str):
                 return False
             device = device_value.value
-            if device not in {"cpu", "cuda", "mps"} and not (
+            if device not in {"cpu", "cuda", "hpu", "mps", "npu", "xpu"} and not (
                 device.startswith("cuda:") and device.removeprefix("cuda:").isdecimal()
             ):
                 return False

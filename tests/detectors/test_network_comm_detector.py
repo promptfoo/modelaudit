@@ -3606,6 +3606,131 @@ class TestNetworkCommDetector:
         assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
 
     @pytest.mark.parametrize(
+        "mapping_update",
+        [
+            "options |= {'attention_mask': 1}\n",
+            "options |= {'attention_mask': 1} | {'token_type_ids': 1}\n",
+            "options |= {'custom_generate': None, 'trust_remote_code': False}\n",
+            "options |= {'attention_mask': 1}\noptions |= {'token_type_ids': 1}\n",
+        ],
+        ids=["literal", "literal-union", "disabled-remote-options", "repeated"],
+    )
+    def test_readme_python_example_allows_proven_safe_augmented_dict_union(
+        self,
+        mapping_update: str,
+    ) -> None:
+        data = (
+            "```python\nimport requests\nfrom transformers import AutoModel\n"
+            "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            "model = AutoModel.from_pretrained('official/model')\n"
+            "options = {'input_ids': 1}\n"
+            f"{mapping_update}"
+            "model.generate(**options)\n"
+            "requests.get(image_url, stream=True)\n```\n"
+        ).encode()
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert findings
+        assert all(finding["severity"] == "INFO" for finding in findings)
+        assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+
+    @pytest.mark.parametrize(
+        "mapping_update",
+        [
+            "options |= {'custom_generate': 'attacker/repo'}\n",
+            "options |= {'trust_remote_code': True}\n",
+            "options |= {'attention_mask': 1} | {'custom_generate': 'attacker/repo'}\n",
+            "key = 'custom_generate'\noptions |= {key: 'attacker/repo'}\n",
+            "options |= {'attention_mask': 1}\noptions |= {'trust_remote_code': True}\n",
+            "options |= {'attention_mask': 1}\noptions['custom_generate'] = 'attacker/repo'\n",
+        ],
+        ids=[
+            "enabled-custom-generate",
+            "enabled-trust-remote-code",
+            "nested-unsafe-union",
+            "computed-key",
+            "safe-then-unsafe-union",
+            "safe-union-then-subscript-mutation",
+        ],
+    )
+    def test_readme_python_example_rejects_unproven_augmented_dict_union(
+        self,
+        mapping_update: str,
+    ) -> None:
+        data = (
+            "```python\nimport requests\nfrom transformers import AutoModel\n"
+            "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            "model = AutoModel.from_pretrained('official/model')\n"
+            "options = {'input_ids': 1}\n"
+            f"{mapping_update}"
+            "model.generate(**options)\n"
+            "requests.get(image_url, stream=True)\n```\n"
+        ).encode()
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert any(finding["type"] == "network_library" for finding in findings)
+        assert any(finding["type"] == "network_function" for finding in findings)
+
+    @pytest.mark.parametrize(
+        "mapping_updates",
+        [
+            ("alias = options\noptions |= {'attention_mask': 1}\nalias |= {'custom_generate': 'attacker/repo'}\n"),
+            (
+                "first_alias = options\n"
+                "second_alias = first_alias\n"
+                "options |= {'attention_mask': 1}\n"
+                "second_alias |= {'trust_remote_code': True}\n"
+            ),
+            ("alias = options\nalias |= {'custom_generate': 'attacker/repo'}\noptions |= {'attention_mask': 1}\n"),
+            ("alias = options\noptions |= {'attention_mask': 1}\nalias['custom_generate'] = 'attacker/repo'\n"),
+        ],
+        ids=[
+            "source-union-before-alias-augassign",
+            "source-union-before-three-name-alias-augassign",
+            "alias-augassign-before-source-union",
+            "source-union-before-alias-subscript-mutation",
+        ],
+    )
+    def test_readme_python_example_rejects_shared_mapping_mutation_across_safe_source_union(
+        self,
+        mapping_updates: str,
+    ) -> None:
+        data = (
+            "```python\nimport requests\nfrom transformers import AutoModel\n"
+            "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            "model = AutoModel.from_pretrained('official/model')\n"
+            "options = {'input_ids': 1}\n"
+            f"{mapping_updates}"
+            "model.generate(**options)\n"
+            "requests.get(image_url, stream=True)\n```\n"
+        ).encode()
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert any(finding["type"] == "network_library" for finding in findings)
+        assert any(finding["type"] == "network_function" for finding in findings)
+
+    def test_readme_python_example_allows_safe_source_union_with_live_alias(self) -> None:
+        data = (
+            b"```python\nimport requests\nfrom transformers import AutoModel\n"
+            b"image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            b"model = AutoModel.from_pretrained('official/model')\n"
+            b"options = {'input_ids': 1}\n"
+            b"alias = options\n"
+            b"options |= {'attention_mask': 1}\n"
+            b"model.generate(**options)\n"
+            b"requests.get(image_url, stream=True)\n```\n"
+        )
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert findings
+        assert all(finding["severity"] == "INFO" for finding in findings)
+        assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+
+    @pytest.mark.parametrize(
         "mapping_setup",
         [
             "inputs = {'input_ids': 1} if condition else {'input_ids': 2}\nmodel.generate(**inputs)\n",
@@ -4831,13 +4956,24 @@ class TestNetworkCommDetector:
         [
             ("device = 'cpu'; inputs = processor(images=image, return_tensors='pt').to(device)\n"),
             ("inputs = processor(images=image, return_tensors='pt').to(device='cuda')\n"),
+            ("inputs = processor(images=image, return_tensors='pt').to('xpu')\n"),
+            ("inputs = processor(images=image, return_tensors='pt').to('npu')\n"),
+            ("inputs = processor(images=image, return_tensors='pt').to('hpu')\n"),
             ("inputs = processor(images=image, return_tensors='pt'); inputs = inputs.to('cpu')\n"),
             (
                 "device = 'cuda' if torch.cuda.is_available() else 'cpu'\n"
                 "inputs = processor(images=image, return_tensors='pt').to(device)\n"
             ),
         ],
-        ids=["named-device", "keyword-device", "mapping-rebind", "bounded-conditional-device"],
+        ids=[
+            "named-device",
+            "keyword-device",
+            "xpu-device",
+            "npu-device",
+            "hpu-device",
+            "mapping-rebind",
+            "bounded-conditional-device",
+        ],
     )
     def test_readme_python_example_allows_ordered_mapping_device_transfers(self, inputs_setup: str) -> None:
         """A bounded local device and provenance-preserving rebinding remain canonical."""
