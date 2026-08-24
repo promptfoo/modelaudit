@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- Avoid false-positive `urllib` network findings for model cards whose only `urlopen` use is the documented `Image.open(urlopen(...))` sample-image example.
 - Upgrade vulnerable locked dependencies, use the hardened MLflow tracking client, and audit all installed CI extras.
 - Avoid network false positives for bounded README examples that download sample images over HTTPS from Hugging Face.
 - Preserve network security findings in README-named environment files.
