@@ -231,7 +231,12 @@ class _DarwinPathMonitor:
             self._queue = select_module.kqueue()
             vnode_filter = select_module.KQ_FILTER_VNODE
             event_flags = select_module.KQ_EV_ADD | select_module.KQ_EV_CLEAR
-            change_flags = select_module.KQ_NOTE_DELETE | select_module.KQ_NOTE_RENAME | select_module.KQ_NOTE_REVOKE
+            change_flags = (
+                select_module.KQ_NOTE_DELETE
+                | select_module.KQ_NOTE_RENAME
+                | select_module.KQ_NOTE_REVOKE
+                | select_module.KQ_NOTE_ATTRIB
+            )
             descriptor_flags = getattr(os, "O_EVTONLY", os.O_RDONLY) | getattr(os, "O_CLOEXEC", 0)
             descriptor_flags |= getattr(os, "O_NOFOLLOW", 0)
             paths = [os.path.abspath(file_path), *(entry[0] for entry in ancestor_identity)]
