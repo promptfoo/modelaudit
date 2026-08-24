@@ -3,12 +3,13 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 import sys
 import tempfile
 import threading
 import time
 import zipfile
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from importlib.abc import MetaPathFinder
 from importlib.machinery import (
     BYTECODE_SUFFIXES,
@@ -22,7 +23,7 @@ from importlib.machinery import (
     SourcelessFileLoader,
 )
 from pathlib import Path
-from types import FunctionType, ModuleType
+from types import FunctionType, ModuleType, SimpleNamespace
 from typing import Any, BinaryIO, cast
 from zipimport import zipimporter
 
@@ -547,6 +548,59 @@ def test_windows_change_clock_probe_uses_safe_ancestor_without_scan_root(
         assert safe_ancestor != scanned_parent
         assert scanned_parent not in safe_ancestor.parents
         assert cache._change_clock_probes[file_device] == (cast(BinaryIO, probe), safe_ancestor)
+        cache._change_clock_probes.clear()
+
+
+def test_windows_change_clock_probe_prefers_outermost_ancestor_over_scanned_tree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cross-volume probes must not land inside a tree a concurrent scan walks.
+
+    Windows CI keeps the checkout on one volume and the temp/cache directories on
+    another, so probe placement falls through to the scanned file's ancestors. The
+    nearest ancestor is normally still inside the asset tree another xdist worker is
+    enumerating, and the probe races that walk into ``file_size_check_failed``.
+    """
+    volume_root = tmp_path / "volume"
+    assets_root = volume_root / "repository" / "tests" / "assets"
+    scanned_parent = assets_root / "samples" / "pickles"
+    scanned_parent.mkdir(parents=True)
+    file_path = _make_cacheable_file(scanned_parent)
+    file_device = file_path.stat().st_dev
+    off_device_cache = tmp_path / "off-device-cache"
+    off_device_temp = tmp_path / "off-device-temp"
+    cache = ScanResultsCache(str(off_device_cache))
+    attempted_probe_dirs: list[Path] = []
+
+    with tempfile.TemporaryFile(mode="w+b", dir=volume_root) as probe:
+
+        def record_probe_directory(*_args: Any, dir: str | Path, **_kwargs: Any) -> BinaryIO:
+            attempted_probe_dirs.append(type(file_path)(dir))
+            return cast(BinaryIO, probe)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "name", "nt")
+            patch.setattr(scan_results_cache_module, "Path", type(file_path))
+            patch.setattr(tempfile, "gettempdir", lambda: str(off_device_temp))
+            # Every ancestor shares the scanned file's volume; only the off-device
+            # temp and cache directories are unreachable.
+            patch.setattr(
+                cache,
+                "_directory_is_on_device",
+                lambda directory, _device: directory not in {off_device_cache, off_device_temp},
+            )
+            patch.setattr(tempfile, "TemporaryFile", record_probe_directory)
+
+            selected_probe = cache._get_change_clock_probe(str(file_path), file_device)
+
+        assert selected_probe is probe
+        selected_directory = attempted_probe_dirs[0]
+        resolved_assets_root = assets_root.resolve()
+        # The probe must sit above the asset tree, not inside it.
+        assert selected_directory != resolved_assets_root
+        assert resolved_assets_root not in selected_directory.parents
+        assert selected_directory in scanned_parent.resolve().parents
         cache._change_clock_probes.clear()
 
 
@@ -1195,6 +1249,57 @@ def test_clear_cache_closes_remaining_probes_after_close_failure(
     assert metadata["statistics"]["total_entries"] == 0
 
 
+def test_clear_cache_retains_locked_probe_in_aliased_cache_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    cache_alias = tmp_path / "cache-alias"
+    try:
+        cache_alias.symlink_to(cache.cache_dir, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory aliases unavailable: {exc}")
+
+    stale_result = cache.cache_dir / "stale-clean-result.json"
+    stale_result.write_text('{"verdict":"CLEAN"}', encoding="utf-8")
+    probe_path = cache.cache_dir / ".modelaudit-cache-clock-aliased"
+    probe_path.write_bytes(b"locked probe")
+    original_unlink = Path.unlink
+
+    class LockedProbe:
+        def __init__(self) -> None:
+            self.name = str(cache_alias / probe_path.name)
+            self.closed = False
+            self.fail_close = True
+
+        def close(self) -> None:
+            if self.fail_close:
+                raise OSError("simulated Windows probe close failure")
+            self.closed = True
+
+    probe = LockedProbe()
+    cache._change_clock_probes[probe_path.stat().st_dev] = (cast(BinaryIO, probe), cache_alias)
+
+    def reject_locked_probe(path: Path, *, missing_ok: bool = False) -> None:
+        if path.resolve(strict=False) == probe_path and not probe.closed:
+            raise PermissionError("Windows cannot unlink an open aliased cache clock probe")
+        original_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", reject_locked_probe)
+
+    cache.clear_cache()
+
+    assert (probe.closed, probe_path.exists()) == (False, True)
+    assert not stale_result.exists()
+    assert cache.metadata_file.exists()
+
+    probe.fail_close = False
+    cache.clear_cache()
+
+    assert (probe.closed, probe_path.exists()) == (True, False)
+    assert cache._change_clock_probes == {}
+
+
 def test_clear_cache_retries_real_temporary_file_wrapper(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1702,6 +1807,452 @@ def test_cache_identity_allows_darwin_private_var_and_tmp_aliases(tmp_path: Path
     file_stat, _file_hash, _change_token, ancestor_identity = cache.capture_file_identity(str(alias_path))
     assert file_stat.st_size == file_path.stat().st_size
     assert ancestor_identity
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="requires Darwin vnode monitoring")
+def test_darwin_cache_identity_ignores_unrelated_sibling_churn(tmp_path: Path) -> None:
+    file_path = _make_cacheable_file(tmp_path)
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    identity = _identity_kwargs(cache, str(file_path))
+
+    (tmp_path / "unrelated.cache").write_bytes(b"unrelated")
+
+    assert cache.store_result(str(file_path), {"success": True}, **identity) is True
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="requires Darwin vnode monitoring")
+def test_darwin_cache_identity_rejects_restored_ancestor_mode_change(tmp_path: Path) -> None:
+    model_directory = tmp_path / "models"
+    model_directory.mkdir()
+    file_path = _make_cacheable_file(model_directory)
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    identity = _identity_kwargs(cache, str(file_path))
+    original_mode = stat.S_IMODE(model_directory.stat().st_mode)
+
+    model_directory.chmod(original_mode ^ stat.S_IXUSR)
+    model_directory.chmod(original_mode)
+
+    assert cache.store_result(str(file_path), {"success": True}, **identity) is False
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="requires Darwin vnode monitoring")
+def test_darwin_cache_identity_rejects_restored_file_replacement(tmp_path: Path) -> None:
+    file_path = _make_cacheable_file(tmp_path)
+    replacement = _make_cacheable_file(tmp_path, name="replacement.cache")
+    original_backup = tmp_path / "original.cache"
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    identity = _identity_kwargs(cache, str(file_path))
+
+    file_path.replace(original_backup)
+    replacement.replace(file_path)
+    file_path.replace(replacement)
+    original_backup.replace(file_path)
+
+    assert cache.store_result(str(file_path), {"success": True}, **identity) is False
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="requires Darwin vnode monitoring")
+def test_darwin_cache_identity_rejects_restored_ancestor_replacement(tmp_path: Path) -> None:
+    model_directory = tmp_path / "models"
+    model_directory.mkdir()
+    file_path = _make_cacheable_file(model_directory)
+    replacement_directory = tmp_path / "replacement"
+    replacement_directory.mkdir()
+    _make_cacheable_file(replacement_directory)
+    original_backup = tmp_path / "original"
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    identity = _identity_kwargs(cache, str(file_path))
+
+    model_directory.replace(original_backup)
+    replacement_directory.replace(model_directory)
+    model_directory.replace(replacement_directory)
+    original_backup.replace(model_directory)
+
+    assert cache.store_result(str(file_path), {"success": True}, **identity) is False
+
+
+def test_cache_identity_selects_darwin_path_monitor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class StubDarwinPathMonitor:
+        def __init__(self, file_path: str, ancestor_identity: tuple[Any, ...]) -> None:
+            self.file_path = file_path
+            self.ancestor_identity = ancestor_identity
+            self.closed = False
+
+        def changed(self) -> bool:
+            return False
+
+        def close(self) -> None:
+            self.closed = True
+
+    file_path = _make_cacheable_file(tmp_path)
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    monkeypatch.setattr(scan_results_cache_module.sys, "platform", "darwin")
+    monkeypatch.setattr(scan_results_cache_module, "_DarwinPathMonitor", StubDarwinPathMonitor)
+
+    identity = cache.capture_file_identity(str(file_path))[-1]
+    monitor = cast(StubDarwinPathMonitor, identity.monitor)
+    assert isinstance(monitor, StubDarwinPathMonitor)
+    assert monitor.file_path == str(file_path)
+    assert monitor.ancestor_identity == tuple(identity)
+
+    cache.release_ancestor_identity(identity)
+
+    assert monitor.closed is True
+
+
+def test_identity_capture_closes_darwin_monitor_on_retained_keyboard_interrupt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created_monitors: list[Any] = []
+
+    class StubDarwinPathMonitor:
+        def __init__(self, _file_path: str, _ancestor_identity: tuple[Any, ...]) -> None:
+            self.closed = False
+            created_monitors.append(self)
+
+        def changed(self) -> bool:
+            return False
+
+        def close(self) -> None:
+            self.closed = True
+
+    def interrupt_hash(_path: str, _file_stat: os.stat_result) -> str:
+        raise KeyboardInterrupt("identity hashing interrupted")
+
+    file_path = _make_cacheable_file(tmp_path)
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    monkeypatch.setattr(scan_results_cache_module.sys, "platform", "darwin")
+    monkeypatch.setattr(scan_results_cache_module, "_DarwinPathMonitor", StubDarwinPathMonitor)
+    monkeypatch.setattr(cache.hasher, "hash_file_with_stat", interrupt_hash)
+
+    with pytest.raises(KeyboardInterrupt, match="identity hashing interrupted") as interruption:
+        cache.capture_file_identity(str(file_path))
+
+    assert interruption.traceback is not None
+    assert len(created_monitors) == 1
+    assert created_monitors[0].closed is True
+
+
+def test_cache_lookup_closes_darwin_monitor_on_retained_keyboard_interrupt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created_monitors: list[Any] = []
+
+    class StubDarwinPathMonitor:
+        def __init__(self, _file_path: str, _ancestor_identity: tuple[Any, ...]) -> None:
+            self.closed = False
+            created_monitors.append(self)
+
+        def changed(self) -> bool:
+            return False
+
+        def close(self) -> None:
+            self.closed = True
+
+    def interrupt_cache_key(*_args: Any, **_kwargs: Any) -> tuple[str, str]:
+        raise KeyboardInterrupt("cache key generation interrupted")
+
+    file_path = _make_cacheable_file(tmp_path)
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    monkeypatch.setattr(scan_results_cache_module.sys, "platform", "darwin")
+    monkeypatch.setattr(scan_results_cache_module, "_DarwinPathMonitor", StubDarwinPathMonitor)
+    monkeypatch.setattr(cache, "_generate_cache_key_material", interrupt_cache_key)
+
+    with pytest.raises(KeyboardInterrupt, match="cache key generation interrupted") as interruption:
+        cache.get_cached_result_with_identity(str(file_path))
+
+    assert interruption.traceback is not None
+    assert len(created_monitors) == 1
+    assert created_monitors[0].closed is True
+
+
+def _stub_darwin_select(queue: Any) -> type[Any]:
+    class StubDarwinSelect:
+        KQ_FILTER_VNODE = 1
+        KQ_EV_ADD = 2
+        KQ_EV_CLEAR = 4
+        KQ_NOTE_DELETE = 8
+        KQ_NOTE_RENAME = 16
+        KQ_NOTE_REVOKE = 32
+        KQ_NOTE_ATTRIB = 64
+
+        @staticmethod
+        def kqueue() -> Any:
+            return queue
+
+        @staticmethod
+        def kevent(*args: Any, **kwargs: Any) -> tuple[tuple[Any, ...], dict[str, Any]]:
+            return args, kwargs
+
+    return StubDarwinSelect
+
+
+def test_darwin_path_monitor_reports_file_and_ancestor_attribute_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class AttributeAwareQueue:
+        def __init__(self) -> None:
+            self.registered_events: list[Any] = []
+
+        def control(self, changes: Any, _max_events: int, _timeout: int) -> list[Any]:
+            if changes is not None:
+                self.registered_events.extend(changes)
+                return []
+            if any(event[1]["fflags"] & 64 for event in self.registered_events):
+                return [object()]
+            return []
+
+        def close(self) -> None:
+            return None
+
+    file_path = _make_cacheable_file(tmp_path)
+    queue = AttributeAwareQueue()
+    select_stub = _stub_darwin_select(queue)
+    opened_descriptors: list[int] = []
+    closed_descriptors: list[int] = []
+
+    def open_path(_path: str, _flags: int) -> int:
+        descriptor = 100 + len(opened_descriptors)
+        opened_descriptors.append(descriptor)
+        return descriptor
+
+    monkeypatch.setattr(scan_results_cache_module, "select", select_stub)
+    monkeypatch.setattr(scan_results_cache_module.os, "open", open_path)
+    monkeypatch.setattr(scan_results_cache_module.os, "close", closed_descriptors.append)
+
+    monitor = scan_results_cache_module._DarwinPathMonitor(
+        str(file_path),
+        ((str(tmp_path), 0, 0, 0, 0, 0),),
+    )
+
+    assert len(queue.registered_events) == 2
+    assert all(event[1]["fflags"] & select_stub.KQ_NOTE_ATTRIB for event in queue.registered_events)
+    assert monitor.changed() is True
+    monitor.close()
+    assert sorted(closed_descriptors) == opened_descriptors
+
+
+def test_darwin_path_monitor_normalizes_relative_file_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class StubQueue:
+        def control(self, _changes: Any, _max_events: int, _timeout: int) -> list[Any]:
+            return []
+
+        def close(self) -> None:
+            return None
+
+    file_path = _make_cacheable_file(tmp_path)
+    opened_paths: list[str] = []
+    closed_descriptors: list[int] = []
+
+    def open_path(path: str, _flags: int) -> int:
+        opened_paths.append(path)
+        return 100 + len(opened_paths)
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(scan_results_cache_module, "select", _stub_darwin_select(StubQueue()))
+    monkeypatch.setattr(scan_results_cache_module.os, "open", open_path)
+    monkeypatch.setattr(scan_results_cache_module.os, "close", closed_descriptors.append)
+
+    monitor = scan_results_cache_module._DarwinPathMonitor(
+        file_path.name,
+        ((str(tmp_path), 0, 0, 0, 0, 0),),
+    )
+
+    assert opened_paths[0] == str(file_path.resolve())
+    monitor.close()
+    assert sorted(closed_descriptors) == [101, 102]
+
+
+def test_darwin_path_monitor_closes_descriptors_when_registration_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FailingQueue:
+        closed = False
+
+        def control(self, _changes: Any, _max_events: int, _timeout: int) -> list[Any]:
+            raise OSError("registration failed")
+
+        def close(self) -> None:
+            self.closed = True
+
+    file_path = _make_cacheable_file(tmp_path)
+    queue = FailingQueue()
+    opened_descriptors: list[int] = []
+    closed_descriptors: list[int] = []
+
+    def open_path(_path: str, _flags: int) -> int:
+        descriptor = 100 + len(opened_descriptors)
+        opened_descriptors.append(descriptor)
+        return descriptor
+
+    monkeypatch.setattr(scan_results_cache_module, "select", _stub_darwin_select(queue))
+    monkeypatch.setattr(scan_results_cache_module.os, "open", open_path)
+    monkeypatch.setattr(scan_results_cache_module.os, "close", closed_descriptors.append)
+
+    with pytest.raises(OSError, match="registration failed"):
+        scan_results_cache_module._DarwinPathMonitor(
+            str(file_path),
+            ((str(tmp_path), 0, 0, 0, 0, 0),),
+        )
+
+    assert queue.closed is True
+    assert sorted(closed_descriptors) == opened_descriptors
+
+
+def test_darwin_path_monitor_closes_queue_when_path_setup_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class StubQueue:
+        closed = False
+
+        def control(self, _changes: Any, _max_events: int, _timeout: int) -> list[Any]:
+            return []
+
+        def close(self) -> None:
+            self.closed = True
+
+    queue = StubQueue()
+    monkeypatch.setattr(scan_results_cache_module, "select", _stub_darwin_select(queue))
+
+    def fail_abspath(_path: str) -> str:
+        raise FileNotFoundError("cwd disappeared")
+
+    monkeypatch.setattr(scan_results_cache_module.os.path, "abspath", fail_abspath)
+
+    with pytest.raises(FileNotFoundError, match="cwd disappeared"):
+        scan_results_cache_module._DarwinPathMonitor("relative.bin", ())
+
+    assert queue.closed is True
+
+
+def test_darwin_path_monitor_closes_queue_on_retained_keyboard_interrupt_during_path_setup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class StubQueue:
+        closed = False
+
+        def control(self, _changes: Any, _max_events: int, _timeout: int) -> list[Any]:
+            return []
+
+        def close(self) -> None:
+            self.closed = True
+
+    queue = StubQueue()
+    monkeypatch.setattr(scan_results_cache_module, "select", _stub_darwin_select(queue))
+
+    def interrupt_abspath(_path: str) -> str:
+        raise KeyboardInterrupt("path setup interrupted")
+
+    with monkeypatch.context() as path_patch:
+        path_patch.setattr(scan_results_cache_module.os.path, "abspath", interrupt_abspath)
+        with pytest.raises(KeyboardInterrupt, match="path setup interrupted") as interruption:
+            scan_results_cache_module._DarwinPathMonitor("relative.bin", ())
+
+    assert interruption.traceback is not None
+    assert queue.closed is True
+
+
+def test_darwin_path_monitor_closes_descriptor_when_callback_registration_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class StubQueue:
+        closed = False
+
+        def control(self, _changes: Any, _max_events: int, _timeout: int) -> list[Any]:
+            return []
+
+        def close(self) -> None:
+            self.closed = True
+
+    class FailingCallbackStack:
+        def __enter__(self) -> FailingCallbackStack:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def callback(self, _callback: Callable[[int], None], _descriptor: int) -> None:
+            raise MemoryError("callback registration failed")
+
+    file_path = _make_cacheable_file(tmp_path)
+    queue = StubQueue()
+    closed_descriptors: list[int] = []
+    monkeypatch.setattr(scan_results_cache_module, "select", _stub_darwin_select(queue))
+    monkeypatch.setattr(scan_results_cache_module, "ExitStack", FailingCallbackStack)
+    monkeypatch.setattr(scan_results_cache_module.os, "open", lambda _path, _flags: 101)
+    monkeypatch.setattr(scan_results_cache_module.os, "close", closed_descriptors.append)
+
+    with pytest.raises(MemoryError, match="callback registration failed"):
+        scan_results_cache_module._DarwinPathMonitor(str(file_path), ())
+
+    assert queue.closed is True
+    assert closed_descriptors == [101]
+
+
+def test_darwin_path_monitor_does_not_double_close_when_stack_transfer_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class StubQueue:
+        closed = False
+
+        def control(self, _changes: Any, _max_events: int, _timeout: int) -> list[Any]:
+            return []
+
+        def close(self) -> None:
+            self.closed = True
+
+    class FailingTransferStack:
+        def __init__(self) -> None:
+            self.callbacks: list[tuple[Callable[[int], None], int]] = []
+
+        def __enter__(self) -> FailingTransferStack:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            for callback, descriptor in reversed(self.callbacks):
+                callback(descriptor)
+
+        def callback(self, callback: Callable[[int], None], descriptor: int) -> None:
+            self.callbacks.append((callback, descriptor))
+
+        def pop_all(self) -> FailingTransferStack:
+            raise MemoryError("stack transfer failed")
+
+    file_path = _make_cacheable_file(tmp_path)
+    queue = StubQueue()
+    opened_descriptors: list[int] = []
+    closed_descriptors: list[int] = []
+
+    def open_path(_path: str, _flags: int) -> int:
+        descriptor = 101 + len(opened_descriptors)
+        opened_descriptors.append(descriptor)
+        return descriptor
+
+    monkeypatch.setattr(scan_results_cache_module, "select", _stub_darwin_select(queue))
+    monkeypatch.setattr(scan_results_cache_module, "ExitStack", FailingTransferStack)
+    monkeypatch.setattr(scan_results_cache_module.os, "open", open_path)
+    monkeypatch.setattr(scan_results_cache_module.os, "close", closed_descriptors.append)
+
+    with pytest.raises(MemoryError, match="stack transfer failed"):
+        scan_results_cache_module._DarwinPathMonitor(
+            str(file_path),
+            ((str(tmp_path), 0, 0, 0, 0, 0),),
+        )
+
+    assert queue.closed is True
+    assert sorted(closed_descriptors) == opened_descriptors
 
 
 def test_cache_path_component_rejects_windows_reparse_point(
@@ -3645,6 +4196,112 @@ def test_scan_cache_invalidates_replaced_large_extension_candidate(tmp_path: Pat
     assert cache.get_cached_result(str(file_path), version_context=version_context) is None
 
 
+@pytest.mark.parametrize("fingerprint_kind", ["source", "read"])
+def test_source_fingerprints_accept_windows_cross_view_stat_differences(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fingerprint_kind: str,
+) -> None:
+    source_path = tmp_path / "helper.py"
+    source = b"def entrypoint():\n    return 1\n"
+    source_path.write_bytes(source)
+    original_fstat = os.fstat
+
+    def windows_descriptor_stat(file_descriptor: int) -> os.stat_result:
+        file_stat = original_fstat(file_descriptor)
+        return cast(
+            os.stat_result,
+            SimpleNamespace(
+                st_dev=file_stat.st_dev,
+                st_ino=file_stat.st_ino,
+                st_mode=file_stat.st_mode ^ 0o111,
+                st_size=file_stat.st_size,
+                st_mtime_ns=file_stat.st_mtime_ns,
+                st_ctime_ns=file_stat.st_ctime_ns + 1,
+            ),
+        )
+
+    with monkeypatch.context() as windows:
+        windows.setattr(os, "fstat", windows_descriptor_stat)
+        windows.setattr(os, "name", "nt")
+        if fingerprint_kind == "source":
+            fingerprint = ScanResultsCache._bounded_source_fingerprint(source_path)
+            expected = hashlib.sha256(source).hexdigest()
+        else:
+            fingerprint = ScanResultsCache._bounded_read_fingerprint(source_path, 64 * 1024, True)
+            expected = hashlib.sha256(b"file\0" + source).hexdigest()
+
+    assert fingerprint == expected
+
+
+@pytest.mark.parametrize("fingerprint_kind", ["source", "read"])
+def test_source_fingerprints_reject_windows_cross_view_file_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fingerprint_kind: str,
+) -> None:
+    source_path = tmp_path / "helper.py"
+    source_path.write_bytes(b"def entrypoint():\n    return 1\n")
+    original_fstat = os.fstat
+
+    def replaced_descriptor_stat(file_descriptor: int) -> os.stat_result:
+        file_stat = original_fstat(file_descriptor)
+        return cast(
+            os.stat_result,
+            SimpleNamespace(
+                st_dev=file_stat.st_dev,
+                st_ino=file_stat.st_ino + 1,
+                st_mode=stat.S_IFMT(file_stat.st_mode) | 0o666,
+                st_size=file_stat.st_size,
+                st_mtime_ns=file_stat.st_mtime_ns,
+                st_ctime_ns=file_stat.st_ctime_ns + 1,
+            ),
+        )
+
+    with monkeypatch.context() as windows:
+        windows.setattr(os, "fstat", replaced_descriptor_stat)
+        windows.setattr(os, "name", "nt")
+        with pytest.raises(ValueError, match="changed while being read"):
+            if fingerprint_kind == "source":
+                ScanResultsCache._bounded_source_fingerprint(source_path)
+            else:
+                ScanResultsCache._bounded_read_fingerprint(source_path, 64 * 1024, True)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows ctime differs across stat views")
+@pytest.mark.parametrize("fingerprint_kind", ["source", "read"])
+def test_source_fingerprints_reject_posix_cross_view_ctime_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fingerprint_kind: str,
+) -> None:
+    source_path = tmp_path / "helper.py"
+    source_path.write_bytes(b"def entrypoint():\n    return 1\n")
+    original_fstat = os.fstat
+
+    def changed_descriptor_stat(file_descriptor: int) -> os.stat_result:
+        file_stat = original_fstat(file_descriptor)
+        return cast(
+            os.stat_result,
+            SimpleNamespace(
+                st_dev=file_stat.st_dev,
+                st_ino=file_stat.st_ino,
+                st_mode=file_stat.st_mode,
+                st_size=file_stat.st_size,
+                st_mtime_ns=file_stat.st_mtime_ns,
+                st_ctime_ns=file_stat.st_ctime_ns + 1,
+            ),
+        )
+
+    monkeypatch.setattr(os, "fstat", changed_descriptor_stat)
+
+    with pytest.raises(ValueError, match="changed while being read"):
+        if fingerprint_kind == "source":
+            ScanResultsCache._bounded_source_fingerprint(source_path)
+        else:
+            ScanResultsCache._bounded_read_fingerprint(source_path, 64 * 1024, True)
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="Windows prevents replacing an open source file")
 def test_source_fingerprint_rejects_path_replacement_during_read(
     tmp_path: Path,
@@ -5286,6 +5943,85 @@ def test_store_result_publishes_atomically_after_final_identity_check(
     assert len(replace_calls) == 1
     assert not replace_calls[0][0].exists()
     assert replace_calls[0][1].is_file()
+
+
+@pytest.mark.parametrize("lookup_kind", ["path", "key"])
+def test_cache_hit_keeps_published_entry_readable_during_access_update(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    lookup_kind: str,
+) -> None:
+    file_path = _make_cacheable_file(tmp_path, name="atomic-hit.cache")
+    cache = ScanResultsCache(str(tmp_path / "scan-cache"))
+    version_context = build_cache_version_context({"timeout": 30})
+    expected = {"checks": [], "issues": [], "metadata": {}, "scanner": "test", "success": True}
+
+    assert cache.store_result(
+        str(file_path), expected, version_context=version_context, **_identity_kwargs(cache, str(file_path))
+    )
+    cache_key = cache.generate_cache_key(str(file_path), version_context=version_context)
+    assert cache_key is not None
+    cache_file_path = cache._get_cache_file_path(cache_key)
+    observed_entries: list[dict[str, Any]] = []
+    original_dump = json.dump
+
+    def observe_published_entry(value: Any, destination: Any, *args: Any, **kwargs: Any) -> None:
+        if isinstance(value, dict) and value.get("cache_key") == cache_key:
+            observed_entries.append(json.loads(cache_file_path.read_text(encoding="utf-8")))
+        original_dump(value, destination, *args, **kwargs)
+
+    monkeypatch.setattr(scan_results_cache_module.json, "dump", observe_published_entry)
+
+    if lookup_kind == "path":
+        result = cache.get_cached_result(str(file_path), version_context=version_context)
+    else:
+        result = cache.get_cached_result_by_key(cache_key, file_path=str(file_path), version_context=version_context)
+
+    assert result == expected
+    assert len(observed_entries) == 1
+    assert observed_entries[0]["scan_result"] == expected
+    assert json.loads(cache_file_path.read_text(encoding="utf-8"))["cache_metadata"]["access_count"] == 2
+
+
+@pytest.mark.parametrize("lookup_kind", ["path", "key"])
+def test_cache_hit_preserves_published_entry_when_access_update_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    lookup_kind: str,
+) -> None:
+    file_path = _make_cacheable_file(tmp_path, name="failed-hit-update.cache")
+    cache = ScanResultsCache(str(tmp_path / "scan-cache"))
+    version_context = build_cache_version_context({"timeout": 30})
+    expected = {"checks": [], "issues": [], "metadata": {}, "scanner": "test", "success": True}
+
+    assert cache.store_result(
+        str(file_path), expected, version_context=version_context, **_identity_kwargs(cache, str(file_path))
+    )
+    cache_key = cache.generate_cache_key(str(file_path), version_context=version_context)
+    assert cache_key is not None
+    cache_file_path = cache._get_cache_file_path(cache_key)
+    original_dump = json.dump
+
+    def interrupt_entry_update(value: Any, destination: Any, *args: Any, **kwargs: Any) -> None:
+        if isinstance(value, dict) and value.get("cache_key") == cache_key:
+            raise OSError("simulated interrupted cache access update")
+        original_dump(value, destination, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(scan_results_cache_module.json, "dump", interrupt_entry_update)
+        if lookup_kind == "path":
+            result = cache.get_cached_result(str(file_path), version_context=version_context)
+        else:
+            result = cache.get_cached_result_by_key(
+                cache_key,
+                file_path=str(file_path),
+                version_context=version_context,
+            )
+
+    assert result == expected
+    assert json.loads(cache_file_path.read_text(encoding="utf-8"))["scan_result"] == expected
+    assert not list(cache_file_path.parent.glob(f".{cache_file_path.name}.*.tmp"))
+    assert cache.get_cached_result(str(file_path), version_context=version_context) == expected
 
 
 def test_store_result_discards_private_entry_when_final_identity_check_fails(

@@ -3993,9 +3993,13 @@ def test_scan_file_preserves_hidden_malicious_storage_inside_compacted_canonical
     )
 
 
-def test_scan_file_bounds_expanded_probes_for_benign_pickle_like_tensor_prefixes(tmp_path: Path) -> None:
-    archive_path = tmp_path / "large-pickle-like-storage-prefixes.pt"
-    entry_count = 600
+@pytest.mark.parametrize("malicious_last", [False, True], ids=["benign", "late-malicious"])
+def test_scan_file_bounds_expanded_probes_for_complete_proto_prefixes(
+    tmp_path: Path,
+    malicious_last: bool,
+) -> None:
+    archive_path = tmp_path / f"large-pickle-like-storage-prefixes-{malicious_last}.pt"
+    entry_count = 70
     storage_size = 64 * 1024
     entries: list[bytes] = []
     for index in range(entry_count):
@@ -4018,23 +4022,100 @@ def test_scan_file_bounds_expanded_probes_for_benign_pickle_like_tensor_prefixes
             )
         entries.append(key + value)
     data_pkl = b"\x80\x04" + _pytorch_empty_ordered_dict_reduce_expr() + b"(" + b"".join(entries) + b"u."
-    storage = b"N" + b"\x00" * (storage_size - 1)
+
+    def pad_with_protocol0_string(prefix: bytes) -> bytes:
+        padding_size = storage_size - len(prefix) - len(b"S''\n.")
+        return prefix + b"S'" + b"A" * padding_size + b"'\n."
+
+    storage = pad_with_protocol0_string(b"N.")
+    malicious_storage = pad_with_protocol0_string(b"N.cos\nsystem\n(S'echo late-expanded-proto'\ntR.")
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.writestr("archive/data.pkl", data_pkl)
         archive.writestr("archive/version", "3\n")
         archive.writestr("archive/byteorder", "little")
         for index in range(entry_count):
-            archive.writestr(f"archive/data/{index}", storage)
+            storage_payload = malicious_storage if malicious_last and index == entry_count - 1 else storage
+            archive.writestr(f"archive/data/{index}", storage_payload)
 
     report = scan_file(archive_path)
 
     assert not any(notice.code == "pytorch_zip_pickle_discovery_probe_budget" for notice in report.notices)
+    if malicious_last:
+        assert report.verdict == SafetyVerdict.MALICIOUS
+        assert any(
+            finding.severity == Severity.CRITICAL
+            and finding.details.get("module") in {"os", "posix", "nt"}
+            and finding.details.get("name") == "system"
+            and finding.location is not None
+            and f"archive/data/{entry_count - 1}" in finding.location
+            for finding in report.findings
+        )
+        return
     try:
         importlib_metadata.distribution("torch")
     except importlib_metadata.PackageNotFoundError:
         assert report.status == ScanStatus.INCONCLUSIVE
     else:
         assert report.status == ScanStatus.COMPLETE
+
+
+def test_expanded_trusted_storage_probe_does_not_short_circuit_partial_frame(tmp_path: Path) -> None:
+    frame_size = 20
+    storage_size = package_api._PICKLE_DISCOVERY_LONG_PROBE_BYTES
+    storage = b"\x95" + frame_size.to_bytes(8, "little") + b"N" * frame_size
+    storage += b"\x00" * (storage_size - len(storage))
+    archive_path = tmp_path / "partial-frame-storage.pt"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data/0", storage)
+
+    probe_budget = 2 * package_api._PICKLE_DISCOVERY_LONG_PROBE_BYTES
+    probe_bytes_remaining = [probe_budget]
+    with zipfile.ZipFile(archive_path) as archive:
+        entry = archive.getinfo("archive/data/0")
+        looks_like_pickle = package_api._trusted_storage_zip_entry_looks_like_pickle(
+            archive,
+            entry,
+            probe_bytes_remaining,
+            float("inf"),
+            max_probe_bytes=package_api._PICKLE_DISCOVERY_LONG_PROBE_BYTES,
+        )
+
+    assert looks_like_pickle is False
+    assert probe_bytes_remaining == [probe_budget - package_api._PICKLE_DISCOVERY_SHORT_PROBE_BYTES - storage_size]
+
+
+def test_expanded_trusted_storage_probe_does_not_short_circuit_partial_proto0_string(
+    tmp_path: Path,
+) -> None:
+    partial_proto_prefix = b"]NaNS'abcdefghij"
+    assert len(partial_proto_prefix) == package_api._PICKLE_DISCOVERY_SHORT_PROBE_BYTES
+    assert package_api._proto0_or_1_trusted_storage_probe_should_scan(
+        partial_proto_prefix,
+        sample_is_prefix=True,
+    )
+
+    storage_size = package_api._PICKLE_DISCOVERY_LONG_PROBE_BYTES
+    framed_suffix = b"'\n\x95" + (1).to_bytes(8, "little") + b"N"
+    storage = partial_proto_prefix + framed_suffix
+    storage += b"\x00" * (storage_size - len(storage))
+    archive_path = tmp_path / "partial-proto0-string-storage.pt"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data/0", storage)
+
+    probe_budget = 2 * package_api._PICKLE_DISCOVERY_LONG_PROBE_BYTES
+    probe_bytes_remaining = [probe_budget]
+    with zipfile.ZipFile(archive_path) as archive:
+        entry = archive.getinfo("archive/data/0")
+        looks_like_pickle = package_api._trusted_storage_zip_entry_looks_like_pickle(
+            archive,
+            entry,
+            probe_bytes_remaining,
+            float("inf"),
+            max_probe_bytes=package_api._PICKLE_DISCOVERY_LONG_PROBE_BYTES,
+        )
+
+    assert looks_like_pickle is False
+    assert probe_bytes_remaining == [probe_budget - package_api._PICKLE_DISCOVERY_SHORT_PROBE_BYTES - storage_size]
 
 
 @pytest.mark.parametrize("container_kind", ["dict-setitem", "dict-setitems", "list", "tuple", "ordered-dict"])

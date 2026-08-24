@@ -1283,6 +1283,8 @@ def _trusted_storage_zip_entry_looks_like_pickle(
     if not is_binary_pickle_candidate and not is_frame_first_candidate and prefix[0] not in _PROTO0_1_START_BYTES:
         return False
     if max_probe_bytes > _TRUSTED_STORAGE_PICKLE_PROBE_BYTES:
+        if _has_complete_pickle_stream_without_frame_stop_overrun(prefix):
+            return True
         try:
             for _opcode, _arg, _position in pickletools.genops(prefix):
                 pass
@@ -1300,6 +1302,7 @@ def _trusted_storage_zip_entry_looks_like_pickle(
                     ) or _looks_like_proto0_or_1_pickle(prefix, sample_is_prefix=sample_is_prefix)
                 return _frame_first_trusted_storage_probe_should_scan(prefix)
         except Exception:
+            # Unexpected parser failures are not evidence that the member is safe.
             pass
 
     sample = prefix

