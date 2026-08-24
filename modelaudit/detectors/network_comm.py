@@ -3466,12 +3466,104 @@ def _is_valid_official_readme_sample_image_example(
             return None
         return (*prior_chain, id(binding_node))
 
+    def conditional_mapping_test_is_proven_inert(test: ast.expr, binding_node: ast.AST) -> bool:
+        if isinstance(test, ast.Constant):
+            return isinstance(test.value, bool)
+        if (
+            not isinstance(test, ast.Compare)
+            or len(test.ops) != 1
+            or not isinstance(test.ops[0], (ast.Eq, ast.NotEq))
+            or len(test.comparators) != 1
+        ):
+            return False
+        left, right = test.left, test.comparators[0]
+        if isinstance(left, ast.Constant):
+            left, right = right, left
+        if (
+            not isinstance(left, ast.Attribute)
+            or left.attr != "mode"
+            or not isinstance(left.value, ast.Name)
+            or not isinstance(right, ast.Constant)
+            or not isinstance(right.value, str)
+        ):
+            return False
+        image_name = left.value.id
+        image_bindings = [
+            (image_binding, image_value)
+            for image_binding, image_value in single_name_bindings.get(image_name, [])
+            if operation_may_affect_reference(image_binding, binding_node)
+        ]
+        relevant_write_count = sum(
+            operation_may_affect_reference(write_node, binding_node)
+            for write_node in name_write_nodes.get(image_name, [])
+        )
+        if len(image_bindings) != 1 or relevant_write_count != 1:
+            return False
+        image_binding, image_value = image_bindings[0]
+        return (
+            binding_position_at_reference(image_binding, binding_node) < top_level_statement_indices[id(binding_node)]
+            and is_single_name_binding(image_binding, image_value, image_name)
+            and isinstance(image_value, ast.Call)
+            and isinstance(image_value.func, ast.Attribute)
+            and image_value.func.attr == "open"
+            and isinstance(image_value.func.value, ast.Name)
+            and image_value.func.value.id == "Image"
+        )
+
+    def proven_conditional_mapping_factory_calls(
+        binding_node: ast.AST,
+        mapping_value: ast.IfExp,
+    ) -> tuple[frozenset[int], frozenset[int]] | None:
+        pending: list[ast.expr] = [mapping_value]
+        mapping_call_ids: set[int] = set()
+        transfer_call_ids: set[int] = set()
+        mapping_factory_name: str | None = None
+        remaining_steps = _MAX_README_IMAGE_EXAMPLE_AST_NODES
+        while pending:
+            if remaining_steps <= 0 or not proof_budget.consume(1):
+                return None
+            remaining_steps -= 1
+            current = pending.pop()
+            if isinstance(current, ast.IfExp):
+                if not conditional_mapping_test_is_proven_inert(current.test, binding_node):
+                    return None
+                pending.extend((current.body, current.orelse))
+                continue
+            unwrapped_mapping = unwrap_safe_local_device_transfers(current, binding_node)
+            if unwrapped_mapping is None:
+                return None
+            factory_call, transfer_calls = unwrapped_mapping
+            if (
+                not isinstance(factory_call, ast.Call)
+                or not isinstance(factory_call.func, ast.Name)
+                or not trusted_mapping_factory_call_is_proven_safe(binding_node, factory_call)
+            ):
+                return None
+            if mapping_factory_name is None:
+                mapping_factory_name = factory_call.func.id
+            elif mapping_factory_name != factory_call.func.id:
+                return None
+            mapping_call_ids.add(id(current))
+            transfer_call_ids.update(id(transfer_call) for transfer_call in transfer_calls)
+        return frozenset(mapping_call_ids), frozenset(transfer_call_ids)
+
     for binding_node, binding_name, binding_value in ordered_mapping_bindings:
-        if not isinstance(binding_value, ast.Call) or not is_single_name_binding(
+        if not is_single_name_binding(
             binding_node,
             binding_value,
             binding_name,
         ):
+            continue
+        if isinstance(binding_value, ast.IfExp):
+            conditional_mapping_calls = proven_conditional_mapping_factory_calls(binding_node, binding_value)
+            if conditional_mapping_calls is None:
+                continue
+            mapping_call_ids, transfer_call_ids = conditional_mapping_calls
+            proven_mapping_binding_chains[id(binding_node)] = (id(binding_node),)
+            proven_mapping_call_id_set.update(mapping_call_ids)
+            proven_mapping_transfer_call_id_set.update(transfer_call_ids)
+            continue
+        if not isinstance(binding_value, ast.Call):
             continue
         unwrapped_mapping = unwrap_safe_local_device_transfers(binding_value, binding_node)
         if unwrapped_mapping is None:
@@ -3584,6 +3676,24 @@ def _is_valid_official_readme_sample_image_example(
     benign_callable_marker = "<benign-callable>"
     untrusted_callable_marker = "<untrusted-callable>"
     named_callable_resolution_cache: dict[tuple[str, int], frozenset[str] | None] = {}
+    named_callable_write_events: dict[str, tuple[tuple[ast.AST, ast.expr | None], ...]] = {}
+    for candidate_name in name_value_bindings.keys() | name_write_nodes.keys():
+        write_events: list[tuple[ast.AST, ast.expr | None]] = [
+            *name_value_bindings.get(candidate_name, []),
+            *(
+                (write_node, None)
+                for write_node in name_write_nodes.get(candidate_name, [])
+                if id(write_node) not in modeled_name_write_ids.get(candidate_name, set())
+            ),
+        ]
+        write_events.sort(
+            key=lambda item: (
+                top_level_statement_indices.get(id(item[0]), len(tree.body)),
+                getattr(item[0], "lineno", 0),
+                getattr(item[0], "col_offset", 0),
+            )
+        )
+        named_callable_write_events[candidate_name] = tuple(write_events)
 
     def binding_is_proven_after_eager_reference(binding: ast.AST, reference: ast.AST) -> bool:
         if execution_may_be_deferred(reference):
@@ -3630,6 +3740,8 @@ def _is_valid_official_readme_sample_image_example(
             value: ast.expr,
             reference: ast.AST,
         ) -> frozenset[str] | None:
+            if not proof_budget.consume_named_callable(1):
+                return None
             if isinstance(value, ast.Attribute) and value.attr in sensitive_callable_attributes:
                 return frozenset({value.attr})
             if isinstance(value, ast.Name):
@@ -3669,23 +3781,15 @@ def _is_valid_official_readme_sample_image_example(
                 return memo[key]
             if key in resolving:
                 return None
+            write_events = named_callable_write_events.get(candidate_name, ())
+            # Each write can require call-relative lexical and execution-order checks.
+            # Charge the full history shape before expanding it so many compact
+            # histories cannot consume unbounded CPU below the scan-wide ceiling.
+            history_work = len(nodes) * max(1, len(write_events))
+            if not proof_budget.consume_named_callable(history_work):
+                return None
             resolving.add(key)
             resolution: frozenset[str] | None = None
-            write_events: list[tuple[ast.AST, ast.expr | None]] = [
-                *name_value_bindings.get(candidate_name, []),
-                *(
-                    (write_node, None)
-                    for write_node in name_write_nodes.get(candidate_name, [])
-                    if id(write_node) not in modeled_name_write_ids.get(candidate_name, set())
-                ),
-            ]
-            write_events.sort(
-                key=lambda item: (
-                    top_level_statement_indices.get(id(item[0]), len(tree.body)),
-                    getattr(item[0], "lineno", 0),
-                    getattr(item[0], "col_offset", 0),
-                )
-            )
             for binding_node, binding_value in write_events:
                 if binding_is_proven_after_eager_reference(
                     binding_node,
@@ -4349,6 +4453,7 @@ class NetworkCommDetector:
         self._url_context_scan_complete = False
         self._evidence_redaction_classifications = 0
         self._evidence_redaction_limit_reached = False
+        self._has_sensitive_evidence_hint = False
         self._cloud_nested_url_findings: set[str] = set()
         self._official_readme_image_fences: list[tuple[int, int, bool]] = []
         self._official_readme_image_unvalidated_requests = False
@@ -4382,6 +4487,7 @@ class NetworkCommDetector:
         self.truncated_finding = None
         self._evidence_redaction_classifications = 0
         self._evidence_redaction_limit_reached = False
+        self._has_sensitive_evidence_hint = _SENSITIVE_EVIDENCE_HINT_PATTERN.search(data) is not None
         self._cloud_nested_url_findings = set()
         (
             self._official_readme_image_fences,
@@ -4496,7 +4602,8 @@ class NetworkCommDetector:
             url = _trim_matched_source_url(data, match)
             yield match.start(), match.start() + len(url.encode("utf-8")), url
 
-    def _is_redacted_url_value(self, data: bytes, match_start: int, value: str) -> bool:
+    def _url_context_redaction_decision(self, data: bytes, match_start: int, value: str) -> bool | None:
+        """Return a bounded URL-context decision or None when evidence analysis is still needed."""
         if self.max_findings is not None:
             local_uri_context = _url_text_bounds_containing_offset(data, match_start)
             if local_uri_context is None:
@@ -4512,18 +4619,22 @@ class NetworkCommDetector:
                     url_start, _url_end, url = lazy_url_context
                     if _is_match_redacted_from_url_context(url, url_start, match_start, value):
                         return True
-            return _is_split_sensitive_url_value(data, match_start) or self._is_redacted_evidence_value(
-                data, match_start, value
-            )
+            return None
         context_index = bisect_right(self._url_context_starts, match_start) - 1
         if context_index >= 0:
             url_start, url_end, url = self._url_contexts[context_index]
             if match_start < url_end:
                 return _is_match_redacted_from_url_context(url, url_start, match_start, value)
-        return (
-            _is_match_redacted_from_url(data, match_start, value)
-            or _is_split_sensitive_url_value(data, match_start)
-            or self._is_redacted_evidence_value(data, match_start, value)
+        if _is_match_redacted_from_url(data, match_start, value):
+            return True
+        return None
+
+    def _is_redacted_url_value(self, data: bytes, match_start: int, value: str) -> bool:
+        url_decision = self._url_context_redaction_decision(data, match_start, value)
+        if url_decision is not None:
+            return url_decision
+        return _is_split_sensitive_url_value(data, match_start) or self._is_redacted_evidence_value(
+            data, match_start, value
         )
 
     def _is_redacted_evidence_value(self, data: bytes, match_start: int, value: str) -> bool:
@@ -4541,6 +4652,16 @@ class NetworkCommDetector:
             return True
         self._evidence_redaction_classifications += 1
         return _is_redacted_evidence_value(data, match_start, value)
+
+    def _account_filtered_domain_redaction(self, data: bytes, match_start: int, value: str) -> None:
+        """Preserve bounded evidence accounting for domain candidates filtered before reporting."""
+        if not self._has_sensitive_evidence_hint or self._evidence_redaction_limit_reached:
+            return
+        if self._url_context_redaction_decision(data, match_start, value) is not None:
+            return
+        if _is_split_sensitive_url_value(data, match_start):
+            return
+        self._is_redacted_evidence_value(data, match_start, value)
 
     def _lazy_url_context_containing(self, match_start: int) -> tuple[int, int, str] | None:
         """Advance the bounded lazy URL index only far enough to classify one match."""
@@ -4906,29 +5027,33 @@ class NetworkCommDetector:
             # Skip common false positives
             if domain in seen_domains:
                 continue
-            if self._is_redacted_url_value(data, match.start(), domain):
-                continue
             if domain.endswith((".pkl", ".pt", ".h5", ".pb", ".onnx", ".json")):
+                self._account_filtered_domain_redaction(data, match.start(), domain)
                 continue  # File extensions
             if domain in ["numpy.org", "pytorch.org", "tensorflow.org"]:
+                self._account_filtered_domain_redaction(data, match.start(), domain)
                 continue  # ML framework domains
 
             # Skip actual layer-name grammar (e.g., layer1.weight), not any
             # attacker-controlled DNS name that happens to contain ML words.
             if _ML_LAYER_DOMAIN_PATTERN.fullmatch(domain):
+                self._account_filtered_domain_redaction(data, match.start(), domain)
                 continue
             # Bare method calls such as weight.to(device) are code tokens, not DNS names.
             if _has_call_syntax(data, match.start(), len(match.group())):
+                self._account_filtered_domain_redaction(data, match.start(), domain)
                 continue
 
             # Skip very short domain names in binary files (likely false positives)
             # e.g., "8.to", "9.cc" are probably random bytes, not real domains
             domain_parts = domain.split(".")
             if len(domain_parts) < 2:
+                self._account_filtered_domain_redaction(data, match.start(), domain)
                 continue
 
             # Skip single character subdomains with short TLDs (common false positive in binary data)
             if len(domain_parts) == 2 and len(domain_parts[0]) <= 2 and len(domain_parts[1]) <= 2:
+                self._account_filtered_domain_redaction(data, match.start(), domain)
                 continue  # Skip patterns like "8.to", "h8.cc", etc.
             tld = domain_parts[-1]
             # Common TLDs (not exhaustive, but covers most)
@@ -4971,6 +5096,9 @@ class NetworkCommDetector:
                 "xyz",
             ]
             if tld not in valid_tlds:
+                self._account_filtered_domain_redaction(data, match.start(), domain)
+                continue
+            if self._is_redacted_url_value(data, match.start(), domain):
                 continue
 
             seen_domains.add(domain)

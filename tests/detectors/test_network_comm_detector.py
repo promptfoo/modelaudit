@@ -20,6 +20,27 @@ def _is_ci_environment() -> bool:
     return bool(os.getenv("CI") or os.getenv("GITHUB_ACTIONS"))
 
 
+def _make_dense_named_callable_history_example(binding_count: int = 76) -> str:
+    bindings = "\n".join("f=model.generate" for _ in range(binding_count))
+    return (
+        "import requests\n"
+        "from transformers import AutoModel\n"
+        "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+        "model = AutoModel.from_pretrained('official/model')\n"
+        "inputs = {'input_ids': 1}\n"
+        f"{bindings}\n"
+        "f(**inputs)\n"
+        "requests.get(image_url, stream=True)\n"
+    )
+
+
+def _pad_python_fence(example: str, target_size: int) -> bytes:
+    unpadded = f"```python\n{example}```\n"
+    padding = target_size - len(unpadded.encode())
+    assert padding >= 2
+    return f"```python\n{example}#{'x' * (padding - 2)}\n```\n".encode()
+
+
 class TestNetworkCommDetector:
     """Test the NetworkCommDetector class."""
 
@@ -4076,7 +4097,11 @@ class TestNetworkCommDetector:
         )
         fence = f"```python\n{example}```\n"
         node_count = sum(1 for _ in network_comm.ast.walk(network_comm.ast.parse(example)))
-        proof_work = node_count * 4
+        call_count = 4
+        binding_count = 4
+        # Each call charges its AST-relative write history and each bound value.
+        recursive_work = call_count * (node_count * binding_count + binding_count)
+        proof_work = node_count * call_count + recursive_work
         proof_budget = network_comm._ReadmeImageExampleProofBudget()
         proof_budget.named_callable_remaining = proof_work
 
@@ -4109,6 +4134,209 @@ class TestNetworkCommDetector:
 
         assert any(finding["type"] == "network_library" for finding in exhausted_findings)
         assert any(finding["type"] == "network_function" for finding in exhausted_findings)
+        assert not [finding for finding in fresh_findings if finding["type"] in {"network_library", "network_function"}]
+
+    def test_readme_python_example_charges_dense_named_callable_history_before_expansion(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Call-relative history work must be charged before expensive expansion."""
+        binding_count = 76
+        example = _make_dense_named_callable_history_example(binding_count)
+        node_count = sum(1 for _ in network_comm.ast.walk(network_comm.ast.parse(example)))
+        proof_budget = network_comm._ReadmeImageExampleProofBudget()
+        proof_charges: list[int] = []
+        original_consume = proof_budget.consume_named_callable
+
+        def record_proof_work(work: int) -> bool:
+            proof_charges.append(work)
+            return original_consume(work)
+
+        monkeypatch.setattr(proof_budget, "consume_named_callable", record_proof_work)
+
+        assert node_count == 573
+        assert network_comm._is_valid_official_readme_sample_image_example(
+            example.encode(),
+            proof_budget=proof_budget,
+        )
+        assert proof_charges[0] == node_count
+        assert node_count * binding_count in proof_charges[1:]
+
+    @pytest.mark.parametrize("fence_count", [16, 32, 96])
+    def test_readme_python_example_bounds_dense_named_callable_histories(
+        self,
+        fence_count: int,
+    ) -> None:
+        """Compact call histories must exhaust shared work before becoming a CPU DoS."""
+        example = _make_dense_named_callable_history_example()
+        fence = _pad_python_fence(example, 1_926)
+        data = fence * fence_count
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert len(fence) == 1_926
+        assert any(
+            finding["type"] == "network_library" and finding["severity"] in {"HIGH", "CRITICAL"} for finding in findings
+        )
+        assert any(
+            finding["type"] == "network_function" and finding["severity"] in {"HIGH", "CRITICAL"}
+            for finding in findings
+        )
+
+    def test_readme_python_example_dense_named_callable_budget_fails_aggregate_closed(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        example = _make_dense_named_callable_history_example()
+        readme_path = tmp_path / "README.md"
+        readme_path.write_bytes(_pad_python_fence(example, 1_926) * 16)
+
+        aggregate = scan_model_directory_or_file(str(readme_path), cache_enabled=False)
+
+        assert determine_exit_code(aggregate) == 1
+
+    def test_readme_python_example_dense_named_callable_fallback_bounds_domain_redaction_work(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Rejected attribute histories must not trigger URL redaction for every code token."""
+        example = _make_dense_named_callable_history_example()
+        data = _pad_python_fence(example, 1_926) * 16
+        detector = NetworkCommDetector()
+        redaction_calls = 0
+        original_is_redacted = detector._is_redacted_url_value
+
+        def count_redaction_work(data: bytes, match_start: int, value: str) -> bool:
+            nonlocal redaction_calls
+            redaction_calls += 1
+            return original_is_redacted(data, match_start, value)
+
+        monkeypatch.setattr(detector, "_is_redacted_url_value", count_redaction_work)
+
+        detector.scan(data, "README.md")
+
+        assert redaction_calls < 100
+
+    def test_readme_python_example_large_padded_canonical_control_remains_safe(self) -> None:
+        example = (
+            "import requests\n"
+            "from PIL import Image\n"
+            "from transformers import AutoModel, AutoProcessor\n"
+            "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            "image = Image.open(requests.get(image_url, stream=True).raw)\n"
+            "processor = AutoProcessor.from_pretrained('official/model')\n"
+            "model = AutoModel.from_pretrained('official/model')\n"
+            "inputs = processor(images=image, return_tensors='pt')\n"
+            "model.generate(**inputs)\n"
+        )
+        data = _pad_python_fence(example, 1_915) * 96
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert len(data) == 183_840
+        assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+
+    def test_readme_python_example_charges_conditional_named_callable_resolution(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Conditional callable provenance must consume the shared proof budget."""
+        conditional_chain = "\n".join(
+            f"runner_{index + 1} = runner_{index} if image_url else runner_{index}" for index in range(24)
+        )
+        example = (
+            "import requests\n"
+            "from transformers import AutoModel\n"
+            "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            "model = AutoModel.from_pretrained('official/model')\n"
+            "inputs = {'input_ids': 1}\n"
+            "runner_0 = model.generate\n"
+            f"{conditional_chain}\n"
+            "runner_24(**inputs)\n"
+            "requests.get(image_url, stream=True)\n"
+        )
+        node_count = sum(1 for _ in network_comm.ast.walk(network_comm.ast.parse(example)))
+        proof_budget = network_comm._ReadmeImageExampleProofBudget()
+        proof_charges: list[int] = []
+        original_consume = proof_budget.consume_named_callable
+
+        def record_proof_work(work: int) -> bool:
+            proof_charges.append(work)
+            return original_consume(work)
+
+        monkeypatch.setattr(proof_budget, "consume_named_callable", record_proof_work)
+
+        assert network_comm._is_valid_official_readme_sample_image_example(
+            example.encode(),
+            proof_budget=proof_budget,
+        )
+        assert proof_charges[0] == node_count
+        assert len(proof_charges) > 1
+        assert sum(proof_charges[1:]) > 0
+
+    def test_readme_python_example_bounds_conditional_named_callable_histories_across_fences(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """Conditional histories and unique call IDs share one fail-closed budget."""
+        example = (
+            "import requests\n"
+            "from transformers import AutoModel\n"
+            "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            "model = AutoModel.from_pretrained('official/model')\n"
+            "inputs = {'input_ids': 1}\n"
+            "direct = model.generate\n"
+            "conditional = direct if image_url else direct\n"
+            "direct(**inputs)\n"
+            "conditional(**inputs)\n"
+            "requests.get(image_url, stream=True)\n"
+        )
+        fence = f"```python\n{example}```\n"
+        fence_count = 32
+        data = (fence * fence_count).encode()
+        node_count = sum(1 for _ in network_comm.ast.walk(network_comm.ast.parse(example)))
+        preflight_work = node_count * 2
+        proof_charges: list[int] = []
+        original_consume = network_comm._ReadmeImageExampleProofBudget.consume_named_callable
+
+        def record_proof_work(budget: Any, work: int) -> bool:
+            proof_charges.append(work)
+            return original_consume(budget, work)
+
+        monkeypatch.setattr(
+            network_comm,
+            "_MAX_README_IMAGE_EXAMPLE_NAMED_CALLABLE_PROOF_WORK",
+            preflight_work * fence_count + 3,
+        )
+        monkeypatch.setattr(
+            network_comm._ReadmeImageExampleProofBudget,
+            "consume_named_callable",
+            record_proof_work,
+        )
+        readme_path = tmp_path / "README.md"
+        readme_path.write_bytes(data)
+
+        exhausted_findings = NetworkCommDetector().scan(data, readme_path.name)
+        direct_proof_charges = tuple(proof_charges)
+        aggregate = scan_model_directory_or_file(str(readme_path), cache_enabled=False)
+        fresh_findings = NetworkCommDetector().scan(
+            b"```python\nimport requests\n"
+            b"image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            b"requests.get(image_url, stream=True)\n```\n",
+            "README.md",
+        )
+
+        assert any(0 < work < node_count for work in direct_proof_charges)
+        assert any(
+            finding["type"] == "network_library" and finding["severity"] in {"HIGH", "CRITICAL"}
+            for finding in exhausted_findings
+        )
+        assert any(
+            finding["type"] == "network_function" and finding["severity"] in {"HIGH", "CRITICAL"}
+            for finding in exhausted_findings
+        )
+        assert determine_exit_code(aggregate) == 1
         assert not [finding for finding in fresh_findings if finding["type"] in {"network_library", "network_function"}]
 
     def test_readme_python_example_distinguishes_exact_mapping_proof_budget_from_overrun(self) -> None:
@@ -4356,6 +4584,150 @@ class TestNetworkCommDetector:
         assert findings
         assert all(finding["severity"] == "INFO" for finding in findings)
         assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+
+    @pytest.mark.parametrize(
+        "mapping_expression",
+        [
+            (
+                "processor(images=image, return_tensors='pt') "
+                "if image.mode == 'RGB' else processor(images=image, return_tensors='pt')"
+            ),
+            (
+                "processor(images=image, return_tensors='pt') if image.mode == 'RGB' else ("
+                "processor(images=image, return_tensors='pt') if image.mode == 'RGBA' else "
+                "processor(images=image, return_tensors='pt'))"
+            ),
+        ],
+        ids=["two-safe-arms", "nested-safe-arms"],
+    )
+    def test_readme_python_example_allows_conditional_processor_mapping(
+        self,
+        mapping_expression: str,
+        tmp_path: Path,
+    ) -> None:
+        data = (
+            "```python\nimport requests\nfrom PIL import Image\n"
+            "from transformers import AutoModel, AutoProcessor\n"
+            "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            "image = Image.open(requests.get(image_url, stream=True).raw)\n"
+            "processor = AutoProcessor.from_pretrained('official/model')\n"
+            "model = AutoModel.from_pretrained('official/model')\n"
+            f"inputs = {mapping_expression}\n"
+            "model.generate(**inputs)\n```\n"
+        ).encode()
+        readme_path = tmp_path / "README.md"
+        readme_path.write_bytes(data)
+
+        findings = NetworkCommDetector().scan(data, readme_path.name)
+        aggregate = scan_model_directory_or_file(str(readme_path), cache_enabled=False)
+
+        assert findings
+        assert all(finding["severity"] == "INFO" for finding in findings)
+        assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+        assert determine_exit_code(aggregate) == 0
+
+    @pytest.mark.parametrize(
+        ("mapping_setup", "mapping_expression"),
+        [
+            (
+                "def get_inputs():\n    return {'input_ids': 1}\n",
+                "processor(images=image) if image.mode == 'RGB' else get_inputs()",
+            ),
+            (
+                "alias = processor\n",
+                "processor(images=image) if image.mode == 'RGB' else alias(images=image)",
+            ),
+            (
+                "other = AutoProcessor.from_pretrained('official/model')\nother = model\n",
+                "processor(images=image) if image.mode == 'RGB' else other(images=image)",
+            ),
+            (
+                "def get_options():\n    return {'trust_remote_code': True}\noptions = get_options()\n",
+                "processor(images=image) if image.mode == 'RGB' else processor(**options)",
+            ),
+            (
+                "tokenizer = AutoTokenizer.from_pretrained('official/model')\n",
+                "processor(images=image) if image.mode == 'RGB' else tokenizer('hello')",
+            ),
+            (
+                "if image.mode:\n    processor = AutoProcessor.from_pretrained('official/model')\n",
+                "processor(images=image) if image.mode == 'RGB' else processor(images=image)",
+            ),
+            (
+                "def prepare():\n    processor = AutoProcessor.from_pretrained('official/model')\n",
+                "processor(images=image) if image.mode == 'RGB' else processor(images=image)",
+            ),
+            (
+                "",
+                "processor(images=image) if requests.get(image_url) else processor(images=image)",
+            ),
+            (
+                "def predicate():\n    return requests.get(image_url)\n",
+                "processor(images=image) if predicate() else processor(images=image)",
+            ),
+        ],
+        ids=[
+            "unknown-arm",
+            "aliased-arm",
+            "rebound-arm",
+            "dynamic-options-arm",
+            "mixed-mapping-factories",
+            "branch-only-factory-write",
+            "deferred-factory-write",
+            "side-effecting-condition",
+            "untrusted-condition",
+        ],
+    )
+    def test_readme_python_example_rejects_unproven_conditional_processor_mapping(
+        self,
+        mapping_setup: str,
+        mapping_expression: str,
+    ) -> None:
+        data = (
+            "```python\nimport requests\nfrom PIL import Image\n"
+            "from transformers import AutoModel, AutoProcessor, AutoTokenizer\n"
+            "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            "image = Image.open(requests.get(image_url, stream=True).raw)\n"
+            "processor = AutoProcessor.from_pretrained('official/model')\n"
+            "model = AutoModel.from_pretrained('official/model')\n"
+            f"{mapping_setup}"
+            f"inputs = {mapping_expression}\n"
+            "model.generate(**inputs)\n```\n"
+        ).encode()
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert any(
+            finding["type"] == "network_library" and finding["severity"] in {"HIGH", "CRITICAL"} for finding in findings
+        )
+        assert any(
+            finding["type"] == "network_function" and finding["severity"] in {"HIGH", "CRITICAL"}
+            for finding in findings
+        )
+
+    def test_readme_python_example_bounds_nested_conditional_processor_mapping(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        mapping_expression = "processor(images=image)"
+        for _ in range(16):
+            mapping_expression = f"processor(images=image) if image.mode == 'RGB' else ({mapping_expression})"
+        data = (
+            "```python\nimport requests\nfrom PIL import Image\n"
+            "from transformers import AutoModel, AutoProcessor\n"
+            "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            "image = Image.open(requests.get(image_url, stream=True).raw)\n"
+            "processor = AutoProcessor.from_pretrained('official/model')\n"
+            "model = AutoModel.from_pretrained('official/model')\n"
+            f"inputs = {mapping_expression}\n"
+            "model.generate(**inputs)\n```\n"
+        ).encode()
+        monkeypatch.setattr(network_comm, "_MAX_README_IMAGE_EXAMPLE_MAPPING_PROOF_WORK", 8)
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert any(finding["type"] == "network_library" for finding in findings)
+        assert any(finding["type"] == "network_function" for finding in findings)
 
     @pytest.mark.parametrize(
         "compound_statement",
@@ -7737,6 +8109,64 @@ def test_sensitive_hint_prose_near_match_skips_shared_evidence_redactor(
     findings = NetworkCommDetector().scan(data, "model-card.txt")
 
     assert sum(finding.get("ip") == ip for finding in findings) == 100
+
+
+@pytest.mark.parametrize(
+    "url_template",
+    [
+        "https://example.com/download?api_key=secret{index}.invalid",
+        "https://example.com/api_key/secret{index}.invalid/download",
+    ],
+    ids=["query", "path"],
+)
+def test_filtered_url_credentials_do_not_consume_shared_evidence_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    url_template: str,
+) -> None:
+    """URL redaction must classify filtered credential-shaped domains before shared evidence."""
+    calls = 0
+    original_redactor = network_comm._redact_network_evidence
+
+    def count_shared_redaction(text: str) -> str:
+        nonlocal calls
+        calls += 1
+        return original_redactor(text)
+
+    monkeypatch.setattr(network_comm, "_redact_network_evidence", count_shared_redaction)
+    data = "\n".join(url_template.format(index=index) for index in range(40)).encode()
+    detector = NetworkCommDetector()
+
+    findings = detector.scan(data, "README.md")
+
+    assert calls == 0
+    assert detector._evidence_redaction_classifications == 0
+    assert not detector._evidence_redaction_limit_reached
+    assert not any(finding["type"] == "detector_finding_limit" for finding in findings)
+    serialized = json.dumps(findings, sort_keys=True)
+    assert all(f"secret{index}.invalid" not in serialized for index in range(40))
+
+
+def test_filtered_bare_credential_uses_shared_evidence_redaction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bare credential-shaped domain still needs shared evidence classification."""
+    calls = 0
+    original_redactor = network_comm._redact_network_evidence
+
+    def count_shared_redaction(text: str) -> str:
+        nonlocal calls
+        calls += 1
+        return original_redactor(text)
+
+    monkeypatch.setattr(network_comm, "_redact_network_evidence", count_shared_redaction)
+    detector = NetworkCommDetector()
+
+    findings = detector.scan(b"api_key=secret.invalid", "tokens.txt")
+
+    assert calls == 1
+    assert detector._evidence_redaction_classifications == 1
+    assert not detector._evidence_redaction_limit_reached
+    assert "secret.invalid" not in json.dumps(findings, sort_keys=True)
 
 
 def test_shared_evidence_redaction_classification_budget_fails_closed(
