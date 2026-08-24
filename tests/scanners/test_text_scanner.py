@@ -475,6 +475,26 @@ def test_text_scanner_unpinned_model_cards_are_informational(
         pytest.param("beignets-task-guide.png", "payload.pkl", id="non-image-suffix"),
         pytest.param("from urllib.request import urlopen", "from urllib.request import urlopen as fetch", id="alias"),
         pytest.param("img = Image.open(urlopen(", "img = exec(urlopen(", id="response-not-into-image-open"),
+        pytest.param(
+            "from PIL import Image",
+            "from PIL import Image\nimport pickle\nImage.open = pickle.load",
+            id="image-open-rebound",
+        ),
+        pytest.param(
+            "from PIL import Image",
+            "from PIL import Image\ntry:\n    raise RuntimeError()\nexcept RuntimeError as Image:\n    pass",
+            id="image-except-alias",
+        ),
+        pytest.param(
+            "from PIL import Image",
+            "from PIL import Image\nimport builtins\nbuiltins.exec('print(1)')",
+            id="builtins-exec",
+        ),
+        pytest.param(
+            "from PIL import Image",
+            "from PIL import Image\nimport pickle\nimage_module = Image\nimage_module.open = pickle.load",
+            id="image-open-rebound-through-alias",
+        ),
     ],
 )
 @pytest.mark.parametrize("crlf", [False, True], ids=["lf", "crlf"])
@@ -498,6 +518,119 @@ def test_text_scanner_documentation_image_near_matches_stay_actionable(
         check.details.get("function") == "urlopen" and check.severity == IssueSeverity.CRITICAL
         for check in _failed_network_detection_checks(result)
     )
+
+
+@pytest.mark.parametrize(
+    "injected_code",
+    [
+        pytest.param(
+            "import pickle\n"
+            "class Sink:\n"
+            "    open = staticmethod(pickle.load)\n"
+            "sink = Sink()\n"
+            "match sink:\n"
+            "    case Image:\n"
+            "        pass",
+            id="match-as-image-sink",
+        ),
+        pytest.param(
+            "sink = []\nmatch sink:\n    case [*Image]:\n        pass",
+            id="match-star-image",
+        ),
+        pytest.param(
+            "sink = {}\nmatch sink:\n    case {**Image}:\n        pass",
+            id="match-mapping-rest-image",
+        ),
+        pytest.param(
+            "from builtins import exec as run\nrun(\"print('executed')\")",
+            id="aliased-builtins-exec",
+        ),
+        pytest.param(
+            "from os import system as run\nrun('echo executed')",
+            id="aliased-os-system",
+        ),
+        pytest.param(
+            "from os import *\nsystem('echo executed')",
+            id="wildcard-execution-import",
+        ),
+        pytest.param(
+            "from attacker_helpers import Image",
+            id="protected-image-reimport",
+        ),
+        pytest.param(
+            "from attacker_helpers import urlopen",
+            id="protected-urlopen-reimport",
+        ),
+        pytest.param(
+            "import pickle\nimport PIL.Image as image_module\nimage_module.open = pickle.load",
+            id="protected-image-module-leaf-alias",
+        ),
+        pytest.param(
+            "import pickle\nfrom attacker_helpers import Image as image_module\nimage_module.open = pickle.load",
+            id="protected-image-reexport-leaf-alias",
+        ),
+        pytest.param(
+            "import pickle\nimport PIL\nPIL.Image.open = pickle.load",
+            id="pil-package-image-open-mutation",
+        ),
+        pytest.param(
+            "import pickle\nimport builtins\nimport PIL\nbuiltins.setattr(PIL.Image, 'open', pickle.load)",
+            id="builtins-setattr-image-open",
+        ),
+        pytest.param(
+            "__builtins__.eval(\"setattr(Image, 'open', lambda response: response.read())\")",
+            id="dunder-builtins-eval-image-open",
+        ),
+    ],
+)
+def test_text_scanner_documentation_image_binding_bypasses_stay_actionable(
+    tmp_path: Path,
+    injected_code: str,
+) -> None:
+    payload = HUGGINGFACE_DOCUMENTATION_IMAGE_EXAMPLE.replace(
+        "img = Image.open",
+        f"{injected_code}\nimg = Image.open",
+    ).encode()
+    path = tmp_path / "README.md"
+    path.write_bytes(payload)
+
+    result = TextScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+    assert any(
+        check.details.get("function") == "urlopen" and check.severity == IssueSeverity.CRITICAL
+        for check in _failed_network_detection_checks(result)
+    )
+    assert any(
+        issue.message == "Network function call detected: urlopen" and issue.severity == IssueSeverity.CRITICAL
+        for issue in aggregate.issues
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_urlopen_documentation_fence_validation_is_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_validate = network_comm._is_official_readme_urlopen_image_example
+    validation_calls = 0
+
+    def track_validation(example: bytes) -> bool:
+        nonlocal validation_calls
+        validation_calls += 1
+        return original_validate(example)
+
+    monkeypatch.setattr(
+        network_comm,
+        "_is_official_readme_urlopen_image_example",
+        track_validation,
+    )
+    network_comm.official_readme_urlopen_image_example_spans.cache_clear()
+    invalid_fence = b"```python\nurlopen(\n```\n"
+    payload = invalid_fence * (network_comm._MAX_README_IMAGE_EXAMPLE_FENCES + 3)
+
+    assert network_comm.official_readme_urlopen_image_example_spans(payload) == ()
+    assert validation_calls == network_comm._MAX_README_IMAGE_EXAMPLE_FENCES
+    network_comm.official_readme_urlopen_image_example_spans.cache_clear()
 
 
 @pytest.mark.parametrize(

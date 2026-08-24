@@ -2383,8 +2383,10 @@ def official_readme_urlopen_image_example_spans(data: bytes) -> tuple[tuple[int,
 
     spans: list[tuple[int, int]] = []
     cursor = 0
+    inspected_fences = 0
     while opening := _PYTHON_README_FENCE_PATTERN.search(data, cursor):
-        if len(spans) >= _MAX_README_IMAGE_EXAMPLE_FENCES:
+        inspected_fences += 1
+        if inspected_fences > _MAX_README_IMAGE_EXAMPLE_FENCES:
             return ()
         closing = _matching_readme_image_fence_end(
             data,
@@ -2432,12 +2434,14 @@ def _tokens_appear_outside_spans(
     return False
 
 
-# Bare-name execution primitives. Attribute access is checked separately and far more narrowly:
-# documented model cards legitimately call `model.eval()` (PyTorch eval mode), which has nothing to
-# do with the `eval` builtin.
+# Bare-name execution primitives. Attribute access is checked separately: documented model cards
+# legitimately call `model.eval()` and `torch.compile()`, while mutation/introspection helpers are
+# never part of the generated example.
 _DOCUMENTED_EXAMPLE_FORBIDDEN_NAMES = frozenset(
     {
+        "__builtins__",
         "__import__",
+        "builtins",
         "compile",
         "delattr",
         "eval",
@@ -2449,7 +2453,20 @@ _DOCUMENTED_EXAMPLE_FORBIDDEN_NAMES = frozenset(
         "vars",
     }
 )
-_DOCUMENTED_EXAMPLE_FORBIDDEN_ATTRIBUTES = frozenset({"popen", "system"})
+_DOCUMENTED_EXAMPLE_FORBIDDEN_ATTRIBUTES = frozenset(
+    {
+        "__import__",
+        "delattr",
+        "exec",
+        "getattr",
+        "globals",
+        "locals",
+        "popen",
+        "setattr",
+        "system",
+        "vars",
+    }
+)
 
 
 def _is_official_readme_urlopen_image_example(example: bytes) -> bool:
@@ -2475,7 +2492,8 @@ def _is_official_readme_urlopen_image_example(example: bytes) -> bool:
     ]
     if len(imports) != 1 or len(imports[0].names) != 1:
         return False
-    alias = imports[0].names[0]
+    urlopen_import = imports[0]
+    alias = urlopen_import.names[0]
     if alias.name != "urlopen" or alias.asname is not None:
         return False
 
@@ -2490,13 +2508,24 @@ def _is_official_readme_urlopen_image_example(example: bytes) -> bool:
         and node.module == "PIL"
         and any(entry.name == "Image" for entry in node.names)
     ]
-    if len(pil_image_imports) != 1 or any(
-        entry.asname is not None for entry in pil_image_imports[0].names if entry.name == "Image"
-    ):
+    if len(pil_image_imports) != 1 or len(pil_image_imports[0].names) != 1:
+        return False
+    pil_image_import = pil_image_imports[0]
+    pil_image_alias = pil_image_import.names[0]
+    if pil_image_alias.name != "Image" or pil_image_alias.asname is not None:
         return False
 
     urlopen_calls: list[ast.Call] = []
     for node in nodes:
+        # The generated cards use only these two exact imports plus an optional plain `timm`
+        # import. Keeping the import grammar positive prevents package/module aliases from
+        # reaching and mutating the protected PIL sink.
+        if isinstance(node, ast.ImportFrom) and node is not urlopen_import and node is not pil_image_import:
+            return False
+        if isinstance(node, ast.Import) and (
+            len(node.names) != 1 or node.names[0].name != "timm" or node.names[0].asname is not None
+        ):
+            return False
         # Neither `urlopen` nor `Image` may be rebound, shadowed, aliased, or reached via attribute.
         if isinstance(node, ast.Attribute) and node.attr == "urlopen":
             return False
@@ -2507,18 +2536,33 @@ def _is_official_readme_urlopen_image_example(example: bytes) -> bool:
             "Image",
         }:
             return False
-        if isinstance(node, ast.alias) and node.asname == "urlopen" and node is not alias:
+        if isinstance(node, ast.ExceptHandler) and node.name in {"urlopen", "Image"}:
             return False
-        if isinstance(node, ast.alias) and node.asname == "Image":
+        if isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name in {"urlopen", "Image"}:
             return False
-        if isinstance(node, ast.Name) and node.id == "Image" and not isinstance(node.ctx, ast.Load):
+        if isinstance(node, ast.MatchMapping) and node.rest in {"urlopen", "Image"}:
             return False
+        if isinstance(node, ast.Name) and node.id == "Image":
+            parent = parents.get(id(node))
+            if (
+                not isinstance(node.ctx, ast.Load)
+                or not isinstance(parent, ast.Attribute)
+                or parent.value is not node
+                or parent.attr != "open"
+            ):
+                return False
         # Execution primitives inside a fence we are about to call inert.
         if isinstance(node, ast.Name) and node.id in _DOCUMENTED_EXAMPLE_FORBIDDEN_NAMES:
             return False
         if isinstance(node, ast.Attribute) and (
-            node.attr in _DOCUMENTED_EXAMPLE_FORBIDDEN_ATTRIBUTES or node.attr.startswith("__")
+            node.attr in _DOCUMENTED_EXAMPLE_FORBIDDEN_ATTRIBUTES
+            or node.attr.startswith("__")
+            or not isinstance(node.ctx, ast.Load)
         ):
+            return False
+        if isinstance(node, ast.Subscript) and not isinstance(node.ctx, ast.Load):
+            return False
+        if isinstance(node, (ast.Global, ast.Nonlocal, ast.Delete)):
             return False
         if not isinstance(node, ast.Name) or node.id != "urlopen":
             continue
@@ -2548,6 +2592,14 @@ def _is_official_readme_urlopen_image_example(example: bytes) -> bool:
             or parent.func.attr != "open"
             or not isinstance(parent.func.value, ast.Name)
             or parent.func.value.id != "Image"
+        ):
+            return False
+        assignment = parents.get(id(parent))
+        if (
+            not isinstance(assignment, ast.Assign)
+            or assignment.value is not parent
+            or len(assignment.targets) != 1
+            or not isinstance(assignment.targets[0], ast.Name)
         ):
             return False
     return True
