@@ -4397,7 +4397,6 @@ def _is_official_huggingface_documented_image_url(url: str) -> bool:
     )
 
 
-@lru_cache(maxsize=1)
 def official_readme_urlopen_image_example_spans(data: bytes) -> tuple[tuple[int, int], ...]:
     """Return byte spans of Python fences whose only ``urlopen`` use fetches a documented image.
 
@@ -4406,8 +4405,6 @@ def official_readme_urlopen_image_example_spans(data: bytes) -> tuple[tuple[int,
     digests. Callers use the returned spans to decide whether an individual ``urllib``/``urlopen``
     finding sits inside a proven-inert example.
 
-    Results are memoised for the payload currently being classified, because every candidate
-    finding in one file re-checks the same spans.
     """
     if b"urlopen" not in data:
         return ()
@@ -4456,10 +4453,14 @@ def _tokens_appear_outside_spans(
 ) -> bool:
     """Return whether any token occurrence falls outside every proven span."""
     for token in tokens:
+        span_iterator = iter(spans)
+        current_span = next(span_iterator, None)
         position = data.find(token)
         while position >= 0:
             end = position + len(token)
-            if not any(start <= position and end <= stop for start, stop in spans):
+            while current_span is not None and current_span[1] <= position:
+                current_span = next(span_iterator, None)
+            if current_span is None or position < current_span[0] or end > current_span[1]:
                 return True
             position = data.find(token, end)
     return False

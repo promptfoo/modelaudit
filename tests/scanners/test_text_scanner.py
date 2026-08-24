@@ -1,5 +1,6 @@
 import hashlib
 import json
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -624,13 +625,59 @@ def test_urlopen_documentation_fence_validation_is_bounded(
         "_is_official_readme_urlopen_image_example",
         track_validation,
     )
-    network_comm.official_readme_urlopen_image_example_spans.cache_clear()
     invalid_fence = b"```python\nurlopen(\n```\n"
     payload = invalid_fence * (network_comm._MAX_README_IMAGE_EXAMPLE_FENCES + 3)
 
     assert network_comm.official_readme_urlopen_image_example_spans(payload) == ()
     assert validation_calls == network_comm._MAX_README_IMAGE_EXAMPLE_FENCES
-    network_comm.official_readme_urlopen_image_example_spans.cache_clear()
+
+
+class _CountingSpans(list[tuple[int, int]]):
+    def __init__(self, spans: list[tuple[int, int]]) -> None:
+        super().__init__(spans)
+        self.iterations = 0
+
+    def __iter__(self) -> Iterator[tuple[int, int]]:
+        for span in super().__iter__():
+            self.iterations += 1
+            yield span
+
+
+def test_urlopen_documentation_token_span_checks_are_linear() -> None:
+    tokens = (b"urllib", b"urlopen")
+    segment = b"urllib urlopen " * 16
+    span_count = network_comm._MAX_README_IMAGE_EXAMPLE_FENCES
+    payload = segment * span_count
+    spans = _CountingSpans([(index * len(segment), (index + 1) * len(segment)) for index in range(span_count)])
+
+    assert not network_comm._tokens_appear_outside_spans(payload, tokens, spans)
+    assert spans.iterations <= span_count * len(tokens)
+
+
+def test_urlopen_documentation_spans_are_not_cached_across_scans(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_validate = network_comm._is_official_readme_urlopen_image_example
+    validation_calls = 0
+
+    def track_validation(example: bytes) -> bool:
+        nonlocal validation_calls
+        validation_calls += 1
+        return original_validate(example)
+
+    monkeypatch.setattr(
+        network_comm,
+        "_is_official_readme_urlopen_image_example",
+        track_validation,
+    )
+    payload = HUGGINGFACE_DOCUMENTATION_IMAGE_EXAMPLE.encode()
+
+    first_spans = network_comm.official_readme_urlopen_image_example_spans(payload)
+    second_spans = network_comm.official_readme_urlopen_image_example_spans(payload)
+
+    assert first_spans
+    assert second_spans == first_spans
+    assert validation_calls == 2
 
 
 @pytest.mark.parametrize(

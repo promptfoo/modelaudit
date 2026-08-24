@@ -2767,6 +2767,7 @@ class TextScanner(BaseScanner):
         path: str,
         payload: bytes,
         finding: dict[str, Any],
+        documented_spans: tuple[tuple[int, int], ...],
     ) -> bool:
         """Return whether one ``urllib``/``urlopen`` finding sits inside a documented image example.
 
@@ -2797,9 +2798,7 @@ class TextScanner(BaseScanner):
         end = position + len(token)
         if payload[position:end] != token:
             return False
-        return any(
-            start <= position and end <= stop for start, stop in official_readme_urlopen_image_example_spans(payload)
-        )
+        return any(start <= position and end <= stop for start, stop in documented_spans)
 
     @classmethod
     def _sidecar_network_finding_is_informational(
@@ -2809,6 +2808,7 @@ class TextScanner(BaseScanner):
         finding: dict[str, Any],
         *,
         allow_documentation_image_examples: bool = False,
+        documentation_image_example_spans: tuple[tuple[int, int], ...] = (),
     ) -> bool:
         if cls._is_documentation_sidecar(path):
             finding_type = finding.get("type")
@@ -2833,7 +2833,12 @@ class TextScanner(BaseScanner):
                 or (finding_type == "cc_pattern" and cls._documentation_cc_finding_is_benign_prose(payload, finding))
                 or (
                     allow_documentation_image_examples
-                    and cls._documentation_image_example_finding(path, payload, finding)
+                    and cls._documentation_image_example_finding(
+                        path,
+                        payload,
+                        finding,
+                        documentation_image_example_spans,
+                    )
                 )
                 or (
                     finding_type == "suspicious_port" and not cls._documentation_finding_is_actionable(payload, finding)
@@ -3322,6 +3327,11 @@ class TextScanner(BaseScanner):
         classification_limit_sources: set[str] = set()
         remaining_occurrences = MAX_DOCUMENTATION_FINDING_RETARGET_OCCURRENCES
         documentation_sidecar = cls._is_documentation_sidecar(path)
+        documentation_image_example_spans = (
+            official_readme_urlopen_image_example_spans(payload)
+            if allow_documentation_image_examples and documentation_sidecar and findings
+            else ()
+        )
         lowered_payload = payload.lower() if documentation_sidecar else b""
         tokenizer_vocabulary_sidecar = cls._has_line_oriented_tokenizer_vocabulary_evidence(path, payload)
         last_retargetable_index = max(
@@ -3357,6 +3367,7 @@ class TextScanner(BaseScanner):
                 payload,
                 finding,
                 allow_documentation_image_examples=allow_documentation_image_examples,
+                documentation_image_example_spans=documentation_image_example_spans,
             ):
                 finding = {**finding, "severity": "INFO"}
             classified_findings.append(finding)
