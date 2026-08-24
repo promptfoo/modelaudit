@@ -2888,6 +2888,7 @@ def _is_valid_official_readme_sample_image_example(
 
     proven_safe_mapping_augassign_ids: set[int] = set()
     proven_safe_mapping_augassign_target_ids: set[int] = set()
+    proven_identity_preserving_mapping_transfer_target_ids: set[int] = set()
     for node in nodes:
         if (
             not isinstance(node, ast.AugAssign)
@@ -2907,6 +2908,13 @@ def _is_valid_official_readme_sample_image_example(
             continue
         proven_safe_mapping_augassign_ids.add(id(node))
         proven_safe_mapping_augassign_target_ids.add(id(node.target))
+
+    def mapping_write_preserves_alias_identity(write_node: ast.AST) -> bool:
+        write_id = id(write_node)
+        return (
+            write_id in proven_safe_mapping_augassign_target_ids
+            or write_id in proven_identity_preserving_mapping_transfer_target_ids
+        )
 
     mapping_alias_targets = {
         id(binding_node): frozenset(target_names) for binding_node, target_names, _source_name in mapping_alias_groups
@@ -2941,7 +2949,7 @@ def _is_valid_official_readme_sample_image_example(
             for write_node in name_write_nodes.get(current_name, []):
                 if node_is_within(write_node, reference) or node_is_within(write_node, binding_node):
                     continue
-                if id(write_node) in proven_safe_mapping_augassign_target_ids:
+                if mapping_write_preserves_alias_identity(write_node):
                     continue
                 if (
                     operation_definitely_follows_reference(
@@ -2965,7 +2973,7 @@ def _is_valid_official_readme_sample_image_example(
             for write_node in name_write_nodes.get(endpoint_name, []):
                 if node_is_within(write_node, binding_node):
                     continue
-                if id(write_node) in proven_safe_mapping_augassign_target_ids:
+                if mapping_write_preserves_alias_identity(write_node):
                     continue
                 if reference_is_post_binding and node_is_within(write_node, reference):
                     return None
@@ -2999,7 +3007,7 @@ def _is_valid_official_readme_sample_image_example(
             for write_node in name_write_nodes.get(endpoint_name, []):
                 if node_is_within(write_node, binding_node):
                     continue
-                if id(write_node) in proven_safe_mapping_augassign_target_ids:
+                if mapping_write_preserves_alias_identity(write_node):
                     continue
                 if (
                     operation_definitely_follows_reference(
@@ -3786,6 +3794,7 @@ def _is_valid_official_readme_sample_image_example(
             proven_transformers_instance_binding_chains[id(binding_node)] = instance_chain
 
         binding_chain: tuple[int, ...] | None = None
+        identity_preserving_same_name_transfer = False
         if trusted_mapping_factory_call_is_proven_safe(binding_node, mapping_value):
             binding_chain = (id(binding_node),)
         else:
@@ -3796,6 +3805,7 @@ def _is_valid_official_readme_sample_image_example(
                 transfer_calls,
                 proven_mapping_binding_chains,
             )
+            identity_preserving_same_name_transfer = binding_chain is not None
             if binding_chain is None:
                 binding_chain = renamed_mapping_transfer_binding_chain(
                     binding_node,
@@ -3805,6 +3815,21 @@ def _is_valid_official_readme_sample_image_example(
                 )
         if binding_chain is None:
             continue
+        if identity_preserving_same_name_transfer:
+            if isinstance(binding_node, ast.Assign):
+                identity_target = binding_node.targets[0]
+            elif isinstance(binding_node, ast.AnnAssign):
+                identity_target = binding_node.target
+            else:
+                return False
+            if not isinstance(identity_target, ast.Name) or identity_target.id != binding_name:
+                return False
+            # BatchEncoding.to returns self, so this proven assignment preserves every live alias edge.
+            proven_identity_preserving_mapping_transfer_target_ids.add(id(identity_target))
+            refreshed_mapping_aliases = expand_mapping_alias_groups(mapping_alias_groups)
+            if refreshed_mapping_aliases is None:
+                return False
+            mapping_aliases[:] = refreshed_mapping_aliases
         proven_mapping_binding_chains[id(binding_node)] = binding_chain
         proven_mapping_call_id_set.add(id(binding_value))
         proven_mapping_transfer_call_id_set.update(id(transfer_call) for transfer_call in transfer_calls)
