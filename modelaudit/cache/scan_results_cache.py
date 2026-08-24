@@ -1799,6 +1799,20 @@ class ScanResultsCache:
         return f"{_CALL_GRAPH_REGULAR_FILE_FINGERPRINT}:{digest}"
 
     @staticmethod
+    def _cross_view_file_stat_identity(file_stat: os.stat_result) -> tuple[int, ...]:
+        """Compare path and descriptor views without Windows-only stat differences."""
+        identity = (
+            file_stat.st_dev,
+            file_stat.st_ino,
+            stat.S_IFMT(file_stat.st_mode),
+            file_stat.st_size,
+            file_stat.st_mtime_ns,
+        )
+        if os.name == "nt":
+            return identity
+        return (*identity, file_stat.st_ctime_ns)
+
+    @staticmethod
     def _bounded_source_fingerprint(path: Path) -> str | None:
         flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
         try:
@@ -1849,15 +1863,9 @@ class ScanResultsCache:
                 path_stat = path.stat()
             except OSError as error:
                 raise ValueError("source fingerprint candidate path changed while being read") from error
-            path_identity = (
-                path_stat.st_dev,
-                path_stat.st_ino,
-                path_stat.st_mode,
-                path_stat.st_size,
-                path_stat.st_mtime_ns,
-                path_stat.st_ctime_ns,
-            )
-            if before_identity != after_identity or after_identity != path_identity:
+            if before_identity != after_identity or ScanResultsCache._cross_view_file_stat_identity(
+                after
+            ) != ScanResultsCache._cross_view_file_stat_identity(path_stat):
                 raise ValueError("source fingerprint candidate changed while being read")
             if is_extension:
                 return ScanResultsCache._regular_file_identity_fingerprint(after)
@@ -1956,7 +1964,20 @@ class ScanResultsCache:
                 path_stat.st_mtime_ns,
                 path_stat.st_ctime_ns,
             )
-            if before_identity != after_identity or after_identity != path_identity:
+            initial_path_identity = (
+                path_before.st_dev,
+                path_before.st_ino,
+                path_before.st_mode,
+                path_before.st_size,
+                path_before.st_mtime_ns,
+                path_before.st_ctime_ns,
+            )
+            if (
+                before_identity != after_identity
+                or initial_path_identity != path_identity
+                or ScanResultsCache._cross_view_file_stat_identity(after)
+                != ScanResultsCache._cross_view_file_stat_identity(path_stat)
+            ):
                 raise ValueError("read fingerprint candidate changed while being read")
             if require_complete and len(source) > read_limit:
                 raise ValueError("read fingerprint budget exceeded")
