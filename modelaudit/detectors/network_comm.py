@@ -2931,9 +2931,11 @@ def _is_valid_official_readme_sample_image_example(
 
     def mapping_write_preserves_alias_identity(write_node: ast.AST) -> bool:
         write_id = id(write_node)
+        parent = parents.get(write_id)
         return (
             write_id in proven_safe_mapping_augassign_target_ids
             or write_id in proven_identity_preserving_mapping_transfer_target_ids
+            or (isinstance(parent, ast.AnnAssign) and parent.target is write_node and parent.value is None)
         )
 
     mapping_alias_targets = {

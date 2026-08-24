@@ -7213,6 +7213,64 @@ class TestNetworkCommDetector:
 
         assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
 
+    @pytest.mark.parametrize(
+        "alias_setup",
+        [
+            ("alias = options\nalias: 'mapping'\nif False:\n    alias = {}\n"),
+            ("alias: 'mapping' = options\nif False:\n    alias = {}\n"),
+        ],
+        ids=["value-less-annotation", "annotated-active-alias"],
+    )
+    def test_readme_python_example_rejects_annotated_active_alias_mutation(
+        self,
+        alias_setup: str,
+    ) -> None:
+        data = (
+            "```python\nimport requests\nfrom transformers import AutoModel\n"
+            "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            "model = AutoModel.from_pretrained('official/model')\n"
+            "options = {'custom_generate': None}\n"
+            f"{alias_setup}"
+            "alias['custom_generate'] = 'attacker/repo'\n"
+            "model.generate(**options)\n"
+            "requests.get(image_url, stream=True)\n```\n"
+        ).encode()
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert any(finding["type"] == "network_library" for finding in findings)
+        assert any(finding["type"] == "network_function" for finding in findings)
+
+    @pytest.mark.parametrize(
+        "alias_rebind",
+        [
+            "alias: 'mapping' = {}\n",
+            "alias = {}\nalias: 'mapping'\n",
+        ],
+        ids=["annotated-rebind", "rebind-before-value-less-annotation"],
+    )
+    def test_readme_python_example_allows_annotated_detached_alias_mutation(
+        self,
+        alias_rebind: str,
+    ) -> None:
+        data = (
+            "```python\nimport requests\nfrom transformers import AutoModel\n"
+            "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            "model = AutoModel.from_pretrained('official/model')\n"
+            "options = {'custom_generate': None}\n"
+            "alias = options\n"
+            f"{alias_rebind}"
+            "alias['custom_generate'] = 'attacker/repo'\n"
+            "model.generate(**options)\n"
+            "requests.get(image_url, stream=True)\n```\n"
+        ).encode()
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert findings
+        assert all(finding["severity"] == "INFO" for finding in findings)
+        assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+
     def test_readme_python_example_allows_mutation_before_alias_binding(self) -> None:
         """An alias's old object must not taint the mapping it is later bound to."""
         data = (
