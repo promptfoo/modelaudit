@@ -671,11 +671,7 @@ class ScanResultsCache:
                 self._record_cache_miss("invalid")
                 return None, file_identity
 
-            cache_entry["cache_metadata"]["access_count"] += 1
-            cache_entry["cache_metadata"]["last_access"] = time.time()
-
-            with open(cache_file_path, "w", encoding="utf-8") as f:
-                json.dump(cache_entry, f, indent=2)
+            self._update_cached_entry_access(cache_file_path, cache_entry)
 
             if not self._file_identity_matches(file_path, file_identity):
                 self._record_cache_miss("changed")
@@ -804,13 +800,7 @@ class ScanResultsCache:
                 self._record_cache_miss("invalid")
                 return None
 
-            # Update access statistics
-            cache_entry["cache_metadata"]["access_count"] += 1
-            cache_entry["cache_metadata"]["last_access"] = time.time()
-
-            # Write back updated entry (async write would be better but adds complexity)
-            with open(cache_file_path, "w", encoding="utf-8") as f:
-                json.dump(cache_entry, f, indent=2)
+            self._update_cached_entry_access(cache_file_path, cache_entry)
 
             if (
                 file_path is not None
@@ -828,6 +818,32 @@ class ScanResultsCache:
             logger.debug(f"Cache lookup failed for key {cache_key[:8]}...: {e}")
             self._record_cache_miss("error")
             return None
+
+    @staticmethod
+    def _update_cached_entry_access(cache_file_path: Path, cache_entry: dict[str, Any]) -> None:
+        cache_entry["cache_metadata"]["access_count"] += 1
+        cache_entry["cache_metadata"]["last_access"] = time.time()
+        temporary_cache_path: Path | None = None
+
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=cache_file_path.parent,
+                prefix=f".{cache_file_path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as cache_file:
+                temporary_cache_path = Path(cache_file.name)
+                json.dump(cache_entry, cache_file, indent=2)
+            os.replace(temporary_cache_path, cache_file_path)
+            temporary_cache_path = None
+        except OSError as error:
+            logger.debug("Failed to update cache access metadata for %s: %s", cache_file_path.name, error)
+        finally:
+            if temporary_cache_path is not None:
+                with suppress(OSError):
+                    temporary_cache_path.unlink(missing_ok=True)
 
     @staticmethod
     def _result_from_cache_entry(
