@@ -1734,6 +1734,7 @@ _MAX_README_IMAGE_EXAMPLE_AST_NODES = 1024
 _MAX_README_IMAGE_EXAMPLE_FENCE_OPENINGS = 64
 _MAX_README_IMAGE_EXAMPLE_FENCES = 256
 _MAX_README_IMAGE_EXAMPLE_MAPPING_PROOF_WORK = 64 * _MAX_README_IMAGE_EXAMPLE_AST_NODES
+_MAX_README_IMAGE_EXAMPLE_NAMED_CALLABLE_PROOF_WORK = 64 * _MAX_README_IMAGE_EXAMPLE_AST_NODES
 _PYTHON_README_FENCE_PATTERN = re.compile(rb"(?m)^[ \t]{0,3}(?P<fence>`{3,}|~{3,})(?:python|py)[ \t]*\r?\n")
 _README_FENCE_END_PATTERN = re.compile(rb"(?m)^[ \t]{0,3}(?:`{3,}|~{3,})[ \t]*\r?$")
 _QUALIFIED_REQUESTS_CALL_PATTERN = re.compile(rb"\brequests\s*\.\s*[A-Za-z_][A-Za-z_0-9]*\s*\(")
@@ -1744,8 +1745,9 @@ _CALL_SYNTAX_SUFFIX_PATTERN = re.compile(rb"(?:[\s)]|#[^\n]*\n)*\(")
 
 class _ReadmeImageExampleProofBudget:
     def __init__(self) -> None:
-        self.remaining = _MAX_README_IMAGE_EXAMPLE_MAPPING_PROOF_WORK
-        self.exceeded = False
+        self.remaining: int = _MAX_README_IMAGE_EXAMPLE_MAPPING_PROOF_WORK
+        self.named_callable_remaining: int = _MAX_README_IMAGE_EXAMPLE_NAMED_CALLABLE_PROOF_WORK
+        self.exceeded: bool = False
 
     def consume(self, work: int) -> bool:
         if self.exceeded or work > self.remaining:
@@ -1753,6 +1755,14 @@ class _ReadmeImageExampleProofBudget:
             self.exceeded = True
             return False
         self.remaining -= work
+        return True
+
+    def consume_named_callable(self, work: int) -> bool:
+        if self.exceeded or work > self.named_callable_remaining:
+            self.named_callable_remaining = 0
+            self.exceeded = True
+            return False
+        self.named_callable_remaining -= work
         return True
 
 
@@ -2063,6 +2073,26 @@ def _remote_code_option_is_disabled(name: str, value: ast.expr) -> bool:
     return True
 
 
+def _remote_code_option_is_proven_disabled(
+    name: str,
+    value: ast.expr,
+    *,
+    bindings: dict[str, list[tuple[int, ast.expr]]],
+    binding_counts: Counter[str],
+    call_position: int,
+) -> bool:
+    if _remote_code_option_is_disabled(name, value):
+        return True
+    if not isinstance(value, ast.Name) or binding_counts[value.id] != 1:
+        return False
+    candidates = bindings.get(value.id, [])
+    return (
+        len(candidates) == 1
+        and candidates[0][0] < call_position
+        and _remote_code_option_is_disabled(name, candidates[0][1])
+    )
+
+
 def _generate_positional_remote_code_is_disabled(arguments: list[ast.expr]) -> bool:
     if len(arguments) <= 10:
         return True
@@ -2131,9 +2161,12 @@ def _remote_code_mapping_is_proven_safe(
                 if not isinstance(key, ast.Constant) or not isinstance(key.value, str):
                     result = False
                     break
-                if key.value in _REMOTE_CODE_KEYWORDS and not _remote_code_option_is_disabled(
+                if key.value in _REMOTE_CODE_KEYWORDS and not _remote_code_option_is_proven_disabled(
                     key.value,
                     item_value,
+                    bindings=bindings,
+                    binding_counts=binding_counts,
+                    call_position=call_position,
                 ):
                     result = False
                     break
@@ -2368,6 +2401,13 @@ def _is_valid_official_readme_sample_image_example(
         candidates.sort(key=lambda item: (getattr(item[0], "lineno", 0), getattr(item[0], "col_offset", 0)))
     for candidates in name_value_bindings.values():
         candidates.sort(key=lambda item: (getattr(item[0], "lineno", 0), getattr(item[0], "col_offset", 0)))
+
+    named_callable_call_count = sum(
+        isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id not in documented_builtin_names
+        for node in nodes
+    )
+    if not proof_budget.consume_named_callable(len(nodes) * named_callable_call_count):
+        return False
 
     top_level_statement_indices = {
         id(descendant): statement_index
@@ -3166,6 +3206,41 @@ def _is_valid_official_readme_sample_image_example(
             call_position=call_position,
         )
 
+    remote_code_option_proof_cache: dict[tuple[str, int, int], bool] = {}
+
+    def remote_code_option_is_proven_disabled_at_call(
+        name: str,
+        value: ast.expr,
+        call: ast.Call,
+    ) -> bool:
+        cache_key = (name, id(value), id(call))
+        if cache_key in remote_code_option_proof_cache:
+            return remote_code_option_proof_cache[cache_key]
+        if _remote_code_option_is_disabled(name, value):
+            result = True
+        elif isinstance(value, ast.Name):
+            candidates = [
+                (binding_node, binding_value)
+                for binding_node, binding_value in single_name_bindings.get(value.id, [])
+                if mapping_operation_may_affect_call(binding_node, call)
+            ]
+            relevant_write_count = sum(
+                mapping_operation_may_affect_call(write_node, call) for write_node in name_write_nodes.get(value.id, [])
+            )
+            call_position = top_level_statement_indices.get(id(call))
+            result = (
+                len(candidates) == 1
+                and relevant_write_count == 1
+                and call_position is not None
+                and binding_position_at_reference(candidates[0][0], call) < call_position
+                and is_single_name_binding(candidates[0][0], candidates[0][1], value.id)
+                and _remote_code_option_is_disabled(name, candidates[0][1])
+            )
+        else:
+            result = False
+        remote_code_option_proof_cache[cache_key] = result
+        return result
+
     def call_has_only_proven_safe_mapping_arguments(value: ast.Call) -> bool:
         return (
             not any(isinstance(argument, ast.Starred) for argument in value.args)
@@ -3174,7 +3249,8 @@ def _is_valid_official_readme_sample_image_example(
                 for keyword in value.keywords
             )
             and not any(
-                keyword.arg in _REMOTE_CODE_KEYWORDS and not _remote_code_option_is_disabled(keyword.arg, keyword.value)
+                keyword.arg in _REMOTE_CODE_KEYWORDS
+                and not remote_code_option_is_proven_disabled_at_call(keyword.arg, keyword.value, value)
                 for keyword in value.keywords
             )
         )
@@ -3244,6 +3320,35 @@ def _is_valid_official_readme_sample_image_example(
                 return False
         return not pending_values
 
+    proven_transformers_instance_binding_chains: dict[int, tuple[int, ...]] = {}
+
+    def proven_transformers_instance_chain_precedes_reference(
+        instance_name: str,
+        reference: ast.AST,
+    ) -> bool:
+        if execution_may_be_deferred(reference):
+            return False
+        prior_bindings = [
+            instance_binding
+            for instance_binding, _instance_value in mapping_bindings.get(instance_name, [])
+            if top_level_statement_precedes(instance_binding, reference)
+        ]
+        if not prior_bindings or any(
+            not isinstance(parents.get(id(instance_binding)), ast.Module) for instance_binding in prior_bindings
+        ):
+            return False
+        binding_chain = proven_transformers_instance_binding_chains.get(id(prior_bindings[-1]))
+        prior_writes = [
+            write_node
+            for write_node in name_write_nodes.get(instance_name, [])
+            if top_level_statement_precedes(write_node, reference)
+        ]
+        return (
+            binding_chain is not None
+            and tuple(id(instance_binding) for instance_binding in prior_bindings) == binding_chain
+            and name_writes_match_binding_chain(prior_writes, binding_chain)
+        )
+
     def mapping_device_is_proven_safe(value: ast.expr, binding_node: ast.AST) -> bool:
         if is_allowed_local_device(value):
             return True
@@ -3252,7 +3357,7 @@ def _is_valid_official_readme_sample_image_example(
                 value.value.id,
                 binding_node,
                 transformers_factory_names,
-            )
+            ) or proven_transformers_instance_chain_precedes_reference(value.value.id, binding_node)
         if not isinstance(value, ast.Name):
             return False
         device_bindings = [
@@ -3275,7 +3380,7 @@ def _is_valid_official_readme_sample_image_example(
             and is_allowed_local_device(device_value)
         )
 
-    def unwrap_safe_mapping_device_transfers(
+    def unwrap_safe_local_device_transfers(
         value: ast.expr,
         binding_node: ast.AST,
     ) -> tuple[ast.expr, tuple[ast.Call, ...]] | None:
@@ -3330,6 +3435,37 @@ def _is_valid_official_readme_sample_image_example(
             getattr(item[0], "col_offset", 0),
         ),
     )
+
+    def extended_transfer_binding_chain(
+        binding_node: ast.AST,
+        binding_name: str,
+        unwrapped_value: ast.expr,
+        transfer_calls: tuple[ast.Call, ...],
+        proven_binding_chains: dict[int, tuple[int, ...]],
+    ) -> tuple[int, ...] | None:
+        if not transfer_calls or not isinstance(unwrapped_value, ast.Name) or unwrapped_value.id != binding_name:
+            return None
+        prior_bindings = [
+            prior_binding
+            for prior_binding, _prior_value in mapping_bindings.get(binding_name, [])
+            if top_level_statement_precedes(prior_binding, binding_node)
+        ]
+        if not prior_bindings:
+            return None
+        prior_chain = proven_binding_chains.get(id(prior_bindings[-1]))
+        prior_writes = [
+            write_node
+            for write_node in name_write_nodes.get(binding_name, [])
+            if top_level_statement_precedes(write_node, binding_node)
+        ]
+        if (
+            prior_chain is None
+            or tuple(id(prior_binding) for prior_binding in prior_bindings) != prior_chain
+            or not name_writes_match_binding_chain(prior_writes, prior_chain)
+        ):
+            return None
+        return (*prior_chain, id(binding_node))
+
     for binding_node, binding_name, binding_value in ordered_mapping_bindings:
         if not isinstance(binding_value, ast.Call) or not is_single_name_binding(
             binding_node,
@@ -3337,32 +3473,32 @@ def _is_valid_official_readme_sample_image_example(
             binding_name,
         ):
             continue
-        unwrapped_mapping = unwrap_safe_mapping_device_transfers(binding_value, binding_node)
+        unwrapped_mapping = unwrap_safe_local_device_transfers(binding_value, binding_node)
         if unwrapped_mapping is None:
             continue
         mapping_value, transfer_calls = unwrapped_mapping
+        if transformers_factory_call_is_proven_safe(mapping_value, transformers_factory_names):
+            proven_transformers_instance_binding_chains[id(binding_node)] = (id(binding_node),)
+        elif instance_chain := extended_transfer_binding_chain(
+            binding_node,
+            binding_name,
+            mapping_value,
+            transfer_calls,
+            proven_transformers_instance_binding_chains,
+        ):
+            proven_transformers_instance_binding_chains[id(binding_node)] = instance_chain
+
         binding_chain: tuple[int, ...] | None = None
         if trusted_mapping_factory_call_is_proven_safe(binding_node, mapping_value):
             binding_chain = (id(binding_node),)
-        elif transfer_calls and isinstance(mapping_value, ast.Name) and mapping_value.id == binding_name:
-            prior_bindings = [
-                prior_binding
-                for prior_binding, _prior_value in mapping_bindings.get(binding_name, [])
-                if top_level_statement_precedes(prior_binding, binding_node)
-            ]
-            if prior_bindings:
-                prior_chain = proven_mapping_binding_chains.get(id(prior_bindings[-1]))
-                prior_writes = [
-                    write_node
-                    for write_node in name_write_nodes.get(binding_name, [])
-                    if top_level_statement_precedes(write_node, binding_node)
-                ]
-                if (
-                    prior_chain is not None
-                    and tuple(id(prior_binding) for prior_binding in prior_bindings) == prior_chain
-                    and name_writes_match_binding_chain(prior_writes, prior_chain)
-                ):
-                    binding_chain = (*prior_chain, id(binding_node))
+        else:
+            binding_chain = extended_transfer_binding_chain(
+                binding_node,
+                binding_name,
+                mapping_value,
+                transfer_calls,
+                proven_mapping_binding_chains,
+            )
         if binding_chain is None:
             continue
         proven_mapping_binding_chains[id(binding_node)] = binding_chain
@@ -3385,7 +3521,7 @@ def _is_valid_official_readme_sample_image_example(
     for transfer_call in standalone_transfer_calls:
         if execution_may_be_deferred(transfer_call):
             continue
-        unwrapped_mapping = unwrap_safe_mapping_device_transfers(transfer_call, transfer_call)
+        unwrapped_mapping = unwrap_safe_local_device_transfers(transfer_call, transfer_call)
         if unwrapped_mapping is None:
             continue
         mapping_value, transfer_calls = unwrapped_mapping
@@ -3417,7 +3553,7 @@ def _is_valid_official_readme_sample_image_example(
         for keyword in generate_call.keywords:
             if keyword.arg is not None or not isinstance(keyword.value, ast.Call):
                 continue
-            unwrapped_mapping = unwrap_safe_mapping_device_transfers(keyword.value, generate_call)
+            unwrapped_mapping = unwrap_safe_local_device_transfers(keyword.value, generate_call)
             if unwrapped_mapping is None:
                 continue
             mapping_value, transfer_calls = unwrapped_mapping
@@ -3512,6 +3648,11 @@ def _is_valid_official_readme_sample_image_example(
                 return resolve_value(value.value, reference)
             if isinstance(value, ast.Subscript):
                 return resolve_value(value.value, reference)
+            if id(reference) in proven_transformers_instance_binding_chains and is_single_name_binding(
+                reference,
+                value,
+            ):
+                return frozenset({benign_callable_marker})
             if transformers_factory_call_is_proven_safe(value, transformers_factory_names):
                 return frozenset({benign_callable_marker})
             return frozenset({untrusted_callable_marker})
@@ -3632,7 +3773,8 @@ def _is_valid_official_readme_sample_image_example(
 
     def named_sensitive_call_has_safe_options(call: ast.Call, callable_kinds: frozenset[str]) -> bool:
         if any(
-            keyword.arg in _REMOTE_CODE_KEYWORDS and not _remote_code_option_is_disabled(keyword.arg, keyword.value)
+            keyword.arg in _REMOTE_CODE_KEYWORDS
+            and not remote_code_option_is_proven_disabled_at_call(keyword.arg, keyword.value, call)
             for keyword in call.keywords
         ):
             return False
@@ -3726,7 +3868,8 @@ def _is_valid_official_readme_sample_image_example(
             if node not in requests_calls and node.func.attr not in documented_attribute_calls:
                 return False
             if any(
-                keyword.arg in _REMOTE_CODE_KEYWORDS and not _remote_code_option_is_disabled(keyword.arg, keyword.value)
+                keyword.arg in _REMOTE_CODE_KEYWORDS
+                and not remote_code_option_is_proven_disabled_at_call(keyword.arg, keyword.value, node)
                 for keyword in node.keywords
             ):
                 return False
