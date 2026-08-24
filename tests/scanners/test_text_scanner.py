@@ -609,6 +609,82 @@ def test_text_scanner_documentation_image_binding_bypasses_stay_actionable(
     assert determine_exit_code(aggregate) == 1
 
 
+@pytest.mark.parametrize(
+    "example",
+    [
+        pytest.param(
+            HUGGINGFACE_DOCUMENTATION_IMAGE_EXAMPLE.replace(
+                "))\n```\n",
+                "))\nattacker_urlopen = print\nattacker_urlopen('side effect')\n```\n",
+            ),
+            id="compound-urlopen-identifier",
+        ),
+        pytest.param(
+            HUGGINGFACE_DOCUMENTATION_IMAGE_EXAMPLE.replace(
+                "from urllib.request import urlopen",
+                ("open('PIL.py', 'w').write(\"Image = object\")\nfrom urllib.request import urlopen"),
+            ),
+            id="local-pil-module-before-import",
+        ),
+        pytest.param(
+            HUGGINGFACE_DOCUMENTATION_IMAGE_EXAMPLE.replace(
+                (
+                    "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/"
+                    "beignets-task-guide.png"
+                ),
+                "https://huggingface.co/attacker/backdoor/resolve/main/logo.png",
+            ),
+            id="attacker-huggingface-repository",
+        ),
+        pytest.param(
+            (
+                "```python\n"
+                "class Namespace(dict):\n"
+                "    def __setitem__(self, key, value):\n"
+                "        dict.update(self, {key: Sink if key == 'Image' else value})\n"
+                "class Meta(type):\n"
+                "    @classmethod\n"
+                "    def __prepare__(cls, name, bases):\n"
+                "        return Namespace()\n"
+                "class Sink:\n"
+                "    @staticmethod\n"
+                "    def open(response):\n"
+                "        return response.read()\n"
+                "class Example(metaclass=Meta):\n"
+                "    from urllib.request import urlopen\n"
+                "    from PIL import Image\n"
+                "    img = Image.open(urlopen(\n"
+                "        'https://huggingface.co/datasets/huggingface/documentation-images/"
+                "resolve/main/beignets-task-guide.png'\n"
+                "    ))\n"
+                "```\n"
+            ),
+            id="metaclass-namespace-replaces-image",
+        ),
+    ],
+)
+def test_text_scanner_documentation_image_trust_boundary_bypasses_stay_actionable(
+    tmp_path: Path,
+    example: str,
+) -> None:
+    path = tmp_path / "README.md"
+    path.write_text(example, encoding="utf-8")
+
+    result = TextScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+    assert result.success is False
+    assert any(
+        check.details.get("function") == "urlopen" and check.severity == IssueSeverity.CRITICAL
+        for check in _failed_network_detection_checks(result)
+    )
+    assert any(
+        issue.message == "Network function call detected: urlopen" and issue.severity == IssueSeverity.CRITICAL
+        for issue in aggregate.issues
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
 def test_urlopen_documentation_fence_validation_is_bounded(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -6110,15 +6186,15 @@ def test_text_metadata_read_failure_bypasses_stale_clean_cache(
         ),
     ],
 )
-def test_text_scanner_documentation_image_example_requires_provable_pil_sink(
+def test_text_scanner_documentation_image_example_requires_expected_pil_shape(
     tmp_path: Path,
     label: str,
     example: str,
 ) -> None:
-    """The response sink must provably be PIL's ``Image``, not merely a name spelled ``Image``.
+    """Recognition requires the expected PIL import and Image.open call shape.
 
-    Without this the fence body is unconstrained, so a card can define its own ``Image`` class whose
-    ``open`` executes the downloaded bytes and still be treated as the documented example.
+    Without these syntactic constraints, a card can define its own Image class whose open
+    executes downloaded bytes and still be treated as the documented example.
     """
     path = tmp_path / "README.md"
     path.write_text(example, encoding="utf-8")

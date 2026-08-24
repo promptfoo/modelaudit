@@ -4369,13 +4369,13 @@ def _is_valid_official_readme_sample_image_example(
             url = bindings[0][1]
         else:
             return False
-        if not _is_official_huggingface_documented_image_url(url):
+        if not _is_huggingface_image_url(url):
             return False
     return not proof_budget.exceeded
 
 
-def _is_official_huggingface_documented_image_url(url: str) -> bool:
-    """Return whether a URL is a bounded HTTPS fetch of a documented huggingface.co image."""
+def _is_huggingface_image_url(url: str) -> bool:
+    """Return whether a URL is a bounded HTTPS image fetch hosted on huggingface.co."""
     try:
         parsed = urlsplit(url)
         port = parsed.port
@@ -4397,13 +4397,23 @@ def _is_official_huggingface_documented_image_url(url: str) -> bool:
     )
 
 
+_TRUSTED_HUGGINGFACE_DOCUMENTATION_IMAGE_URLS = frozenset(
+    {("https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/beignets-task-guide.png")}
+)
+
+
+def _is_trusted_huggingface_documentation_image_url(url: str) -> bool:
+    """Return whether a URL exactly matches a reviewed documentation-image location."""
+    return url in _TRUSTED_HUGGINGFACE_DOCUMENTATION_IMAGE_URLS
+
+
 def official_readme_urlopen_image_example_spans(data: bytes) -> tuple[tuple[int, int], ...]:
     """Return byte spans of Python fences whose only ``urlopen`` use fetches a documented image.
 
     Model-card generators (notably ``timm``) emit a fixed ``Image.open(urlopen(<literal URL>))``
-    snippet, so the documented shape is proven structurally instead of by pinning whole-file
+    snippet, so this exact generated shape is recognized without pinning whole-file
     digests. Callers use the returned spans to decide whether an individual ``urllib``/``urlopen``
-    finding sits inside a proven-inert example.
+    finding sits inside a recognized generated example.
 
     """
     if b"urlopen" not in data:
@@ -4432,8 +4442,8 @@ def official_readme_urlopen_image_example_spans(data: bytes) -> tuple[tuple[int,
             spans.append((opening.end(), closing.start()))
         cursor = closing.end()
 
-    # A proven fence only speaks for itself. If any urllib reference in the file sits outside a
-    # proven fence - a second fence, prose, or trailing payload - the whole file stays actionable,
+    # A recognized fence covers only its own token positions. If any urllib reference sits outside
+    # a recognized fence - a second fence, prose, or trailing payload - the whole file stays actionable,
     # mirroring how the `requests` example tracks unvalidated references.
     #
     # Guard on the bare substrings `urllib` and `urlopen` rather than on the specific tokens the
@@ -4451,7 +4461,7 @@ def _tokens_appear_outside_spans(
     tokens: tuple[bytes, ...],
     spans: list[tuple[int, int]],
 ) -> bool:
-    """Return whether any token occurrence falls outside every proven span."""
+    """Return whether any token occurrence falls outside every recognized span."""
     for token in tokens:
         span_iterator = iter(spans)
         current_span = next(span_iterator, None)
@@ -4503,7 +4513,11 @@ _DOCUMENTED_EXAMPLE_FORBIDDEN_ATTRIBUTES = frozenset(
 
 def _is_official_readme_urlopen_image_example(example: bytes) -> bool:
     """Return whether every ``urlopen`` use in one fence is a documented sample-image fetch."""
-    if b"urlopen" not in example or len(example) > _MAX_README_IMAGE_EXAMPLE_BYTES:
+    if (
+        len(example) > _MAX_README_IMAGE_EXAMPLE_BYTES
+        or example.count(b"urllib") != 1
+        or example.count(b"urlopen") != 2
+    ):
         return False
     try:
         tree = ast.parse(example.decode("utf-8"))
@@ -4517,34 +4531,48 @@ def _is_official_readme_urlopen_image_example(example: bytes) -> bool:
         nodes.append(node)
     parents = {id(child): parent for parent in nodes for child in ast.iter_child_nodes(parent)}
 
-    imports = [
-        node
-        for node in nodes
-        if isinstance(node, ast.ImportFrom) and node.level == 0 and node.module == "urllib.request"
-    ]
-    if len(imports) != 1 or len(imports[0].names) != 1:
+    if len(tree.body) < 3:
         return False
-    urlopen_import = imports[0]
+    urlopen_import = tree.body[0]
+    if (
+        not isinstance(urlopen_import, ast.ImportFrom)
+        or urlopen_import.level != 0
+        or urlopen_import.module != "urllib.request"
+        or len(urlopen_import.names) != 1
+    ):
+        return False
     alias = urlopen_import.names[0]
     if alias.name != "urlopen" or alias.asname is not None:
         return False
 
-    # `Image` must provably be PIL's. Without this the response sink is only checked by name, so a
-    # fence can define its own `class Image` whose `open` executes the downloaded bytes and still
-    # be treated as the documented example.
-    pil_image_imports = [
-        node
-        for node in nodes
-        if isinstance(node, ast.ImportFrom)
-        and node.level == 0
-        and node.module == "PIL"
-        and any(entry.name == "Image" for entry in node.names)
-    ]
-    if len(pil_image_imports) != 1 or len(pil_image_imports[0].names) != 1:
+    pil_image_import = tree.body[1]
+    if (
+        not isinstance(pil_image_import, ast.ImportFrom)
+        or pil_image_import.level != 0
+        or pil_image_import.module != "PIL"
+        or len(pil_image_import.names) != 1
+    ):
         return False
-    pil_image_import = pil_image_imports[0]
     pil_image_alias = pil_image_import.names[0]
     if pil_image_alias.name != "Image" or pil_image_alias.asname is not None:
+        return False
+
+    image_assignment_index = 2
+    timm_import: ast.Import | None = None
+    possible_timm_import = tree.body[image_assignment_index]
+    if isinstance(possible_timm_import, ast.Import):
+        timm_import = possible_timm_import
+        if (
+            len(timm_import.names) != 1
+            or timm_import.names[0].name != "timm"
+            or timm_import.names[0].asname is not None
+        ):
+            return False
+        image_assignment_index += 1
+    if len(tree.body) <= image_assignment_index or not isinstance(
+        image_assignment := tree.body[image_assignment_index],
+        ast.Assign,
+    ):
         return False
 
     urlopen_calls: list[ast.Call] = []
@@ -4554,9 +4582,7 @@ def _is_official_readme_urlopen_image_example(example: bytes) -> bool:
         # reaching and mutating the protected PIL sink.
         if isinstance(node, ast.ImportFrom) and node is not urlopen_import and node is not pil_image_import:
             return False
-        if isinstance(node, ast.Import) and (
-            len(node.names) != 1 or node.names[0].name != "timm" or node.names[0].asname is not None
-        ):
+        if isinstance(node, ast.Import) and node is not timm_import:
             return False
         # Neither `urlopen` nor `Image` may be rebound, shadowed, aliased, or reached via attribute.
         if isinstance(node, ast.Attribute) and node.attr == "urlopen":
@@ -4583,7 +4609,7 @@ def _is_official_readme_urlopen_image_example(example: bytes) -> bool:
                 or parent.attr != "open"
             ):
                 return False
-        # Execution primitives inside a fence we are about to call inert.
+        # Execution primitives are outside the recognized generated-example grammar.
         if isinstance(node, ast.Name) and node.id in _DOCUMENTED_EXAMPLE_FORBIDDEN_NAMES:
             return False
         if isinstance(node, ast.Attribute) and (
@@ -4602,7 +4628,7 @@ def _is_official_readme_urlopen_image_example(example: bytes) -> bool:
         if not isinstance(node.ctx, ast.Load) or not isinstance(parent, ast.Call) or parent.func is not node:
             return False
         urlopen_calls.append(parent)
-    if not urlopen_calls:
+    if len(urlopen_calls) != 1:
         return False
 
     for call in urlopen_calls:
@@ -4611,7 +4637,7 @@ def _is_official_readme_urlopen_image_example(example: bytes) -> bool:
         argument = call.args[0]
         if not isinstance(argument, ast.Constant) or not isinstance(argument.value, str):
             return False
-        if not _is_official_huggingface_documented_image_url(argument.value):
+        if not _is_trusted_huggingface_documentation_image_url(argument.value):
             return False
         # The response must flow straight into `Image.open(...)` and nowhere else.
         parent = parents.get(id(call))
@@ -4629,6 +4655,7 @@ def _is_official_readme_urlopen_image_example(example: bytes) -> bool:
         assignment = parents.get(id(parent))
         if (
             not isinstance(assignment, ast.Assign)
+            or assignment is not image_assignment
             or assignment.value is not parent
             or len(assignment.targets) != 1
             or not isinstance(assignment.targets[0], ast.Name)
