@@ -2118,6 +2118,8 @@ def _remote_code_mapping_is_proven_safe(
             result = node_id in proven_mapping_call_ids
         elif isinstance(current, ast.BinOp) and isinstance(current.op, ast.BitOr):
             result = visit(current.left, resolving) and visit(current.right, resolving)
+        elif isinstance(current, ast.IfExp):
+            result = visit(current.body, resolving) and visit(current.orelse, resolving)
         elif isinstance(current, ast.Dict):
             result = True
             for key, item_value in zip(current.keys, current.values, strict=True):
@@ -2348,7 +2350,7 @@ def _is_valid_official_readme_sample_image_example(
         if (
             not isinstance(parents.get(id(binding_node)), ast.Module)
             and (
-                isinstance(binding_node.value, (ast.Call, ast.Dict))
+                isinstance(binding_node.value, (ast.Call, ast.Dict, ast.IfExp))
                 or (isinstance(binding_node.value, ast.BinOp) and isinstance(binding_node.value.op, ast.BitOr))
             )
             and len(targets) == 1
@@ -2647,8 +2649,94 @@ def _is_valid_official_readme_sample_image_example(
             current_statement = container
         return False
 
+    def name_write_is_in_supported_enclosing_scope(node: ast.AST) -> bool:
+        if isinstance(node, ast.arg):
+            return False
+
+        current = node
+        while parent := parents.get(id(current)):
+            if isinstance(parent, ast.comprehension) and node_is_within(node, parent.target):
+                return False
+            if isinstance(parent, ast.Lambda) and current is parent.body:
+                return False
+            if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and any(
+                current is statement for statement in parent.body
+            ):
+                return False
+            current = parent
+        return True
+
+    def name_write_is_definitely_evaluated(node: ast.AST) -> bool:
+        current = node
+        named_expression: ast.NamedExpr | None = None
+        while parent := parents.get(id(current)):
+            if isinstance(parent, (ast.For, ast.AsyncFor)) and node_is_within(node, parent.target):
+                return False
+            if isinstance(parent, ast.NamedExpr) and node_is_within(node, parent.target):
+                named_expression = parent
+                break
+            if isinstance(parent, ast.stmt):
+                return True
+            current = parent
+        if named_expression is None:
+            return True
+
+        current = named_expression
+        while parent := parents.get(id(current)):
+            if isinstance(parent, ast.BoolOp):
+                current_index = next(
+                    (index for index, value in enumerate(parent.values) if value is current),
+                    None,
+                )
+                if current_index is None:
+                    return False
+                required_truth = isinstance(parent.op, ast.And)
+                if any(
+                    not isinstance(value, ast.Constant)
+                    or not isinstance(value.value, bool)
+                    or value.value is not required_truth
+                    for value in parent.values[:current_index]
+                ):
+                    return False
+            elif isinstance(parent, ast.IfExp):
+                if current is parent.test:
+                    pass
+                elif current is parent.body:
+                    if not (
+                        isinstance(parent.test, ast.Constant)
+                        and isinstance(parent.test.value, bool)
+                        and parent.test.value
+                    ):
+                        return False
+                elif current is parent.orelse:
+                    if not (
+                        isinstance(parent.test, ast.Constant)
+                        and isinstance(parent.test.value, bool)
+                        and not parent.test.value
+                    ):
+                        return False
+                else:
+                    return False
+            elif isinstance(
+                parent,
+                (ast.Lambda, ast.GeneratorExp, ast.ListComp, ast.SetComp, ast.DictComp, ast.comprehension),
+            ):
+                return False
+            elif isinstance(parent, ast.Compare):
+                if current is not parent.left and (not parent.comparators or current is not parent.comparators[0]):
+                    return False
+            if isinstance(parent, ast.stmt):
+                return not (isinstance(parent, ast.Assert) and current is parent.msg)
+            current = parent
+        return True
+
     def node_is_proven_executed_before(node: ast.AST, reference: ast.AST) -> bool:
-        if node_is_statically_unreachable(node) or not operation_definitely_follows_reference(reference, node):
+        if (
+            not name_write_is_in_supported_enclosing_scope(node)
+            or not name_write_is_definitely_evaluated(node)
+            or node_is_statically_unreachable(node)
+            or not operation_definitely_follows_reference(reference, node)
+        ):
             return False
         node_membership = direct_statement_membership(node)
         reference_membership = direct_statement_membership(reference)
@@ -2816,9 +2904,9 @@ def _is_valid_official_readme_sample_image_example(
     def is_proven_mapping_use(
         node: ast.Name,
         proven_mapping_transfer_call_ids: frozenset[int],
-        proven_union_operand_ids: frozenset[int],
+        proven_mapping_operand_ids: frozenset[int],
     ) -> bool:
-        if id(node) in proven_union_operand_ids:
+        if id(node) in proven_mapping_operand_ids:
             return True
         parent = parents.get(id(node))
         if (
@@ -2848,7 +2936,7 @@ def _is_valid_official_readme_sample_image_example(
 
     def unsafe_mapping_operations_for(
         proven_mapping_transfer_call_ids: frozenset[int],
-        proven_union_operand_ids: frozenset[int],
+        proven_mapping_operand_ids: frozenset[int],
     ) -> list[tuple[str, ast.AST]]:
         operations: list[tuple[str, ast.AST]] = [
             (node.id, node)
@@ -2856,7 +2944,7 @@ def _is_valid_official_readme_sample_image_example(
             if isinstance(node, ast.Name)
             and isinstance(node.ctx, ast.Load)
             and node.id in aliased_mapping_names
-            and not is_proven_mapping_use(node, proven_mapping_transfer_call_ids, proven_union_operand_ids)
+            and not is_proven_mapping_use(node, proven_mapping_transfer_call_ids, proven_mapping_operand_ids)
         ]
         operations.extend(
             (node.target.id, node)
@@ -2926,7 +3014,7 @@ def _is_valid_official_readme_sample_image_example(
         for name, write_nodes in relevant_name_writes.items():
             relevant_binding_counts.setdefault(name, len(write_nodes))
 
-        def proven_union_operand_ids_for(mapping_value: ast.expr) -> frozenset[int]:
+        def proven_mapping_operand_ids_for(mapping_value: ast.expr) -> frozenset[int]:
             remaining_steps = _MAX_README_IMAGE_EXAMPLE_AST_NODES
             seen: set[int] = set()
             operand_ids: set[int] = set()
@@ -2954,18 +3042,24 @@ def _is_valid_official_readme_sample_image_example(
                     if isinstance(current.right, ast.Name):
                         operand_ids.add(id(current.right))
                     pending.extend((current.left, current.right))
+                elif isinstance(current, ast.IfExp):
+                    if isinstance(current.body, ast.Name):
+                        operand_ids.add(id(current.body))
+                    if isinstance(current.orelse, ast.Name):
+                        operand_ids.add(id(current.orelse))
+                    pending.extend((current.body, current.orelse))
                 elif isinstance(current, ast.Dict):
                     pending.extend(
                         item_value for key, item_value in zip(current.keys, current.values, strict=True) if key is None
                     )
             return frozenset(operand_ids)
 
-        proven_union_operand_ids = proven_union_operand_ids_for(value)
+        proven_mapping_operand_ids = proven_mapping_operand_ids_for(value)
         unsafe_names: set[str] = set()
         remaining_alias_steps = _MAX_README_IMAGE_EXAMPLE_AST_NODES
         for name, operation in unsafe_mapping_operations_for(
             proven_mapping_transfer_call_ids,
-            proven_union_operand_ids,
+            proven_mapping_operand_ids,
         ):
             if not mapping_operation_may_affect_call(operation, call):
                 continue

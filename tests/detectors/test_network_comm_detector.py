@@ -3608,6 +3608,125 @@ class TestNetworkCommDetector:
     @pytest.mark.parametrize(
         "mapping_setup",
         [
+            "inputs = {'input_ids': 1} if condition else {'input_ids': 2}\nmodel.generate(**inputs)\n",
+            "model.generate(**({'input_ids': 1} if condition else {'input_ids': 2}))\n",
+            (
+                "left = {'input_ids': 1}\n"
+                "right = {'attention_mask': 1}\n"
+                "inputs = left if condition else right\n"
+                "model.generate(**inputs)\n"
+            ),
+            (
+                "inputs = ({'input_ids': 1} if condition else {'attention_mask': 1}) "
+                "if condition else {'token_type_ids': 1}\n"
+                "model.generate(**inputs)\n"
+            ),
+            (
+                "inputs = {'custom_generate': None} if condition else {'trust_remote_code': False}\n"
+                "model.generate(**inputs)\n"
+            ),
+            (
+                "if True:\n"
+                "    inputs = {'input_ids': 1} if condition else {'input_ids': 2}\n"
+                "    model.generate(**inputs)\n"
+            ),
+        ],
+        ids=["named", "inline", "named-arms", "nested", "disabled-remote-options", "supported-body"],
+    )
+    def test_readme_python_example_allows_proven_safe_mapping_ifexp(self, mapping_setup: str) -> None:
+        data = (
+            "```python\nimport requests\nfrom transformers import AutoModel\n"
+            "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            "condition = len(image_url) > 0\n"
+            "model = AutoModel.from_pretrained('official/model')\n"
+            f"{mapping_setup}"
+            "requests.get(image_url, stream=True)\n```\n"
+        ).encode()
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert findings
+        assert all(finding["severity"] == "INFO" for finding in findings)
+        assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+
+    @pytest.mark.parametrize(
+        "mapping_setup",
+        [
+            "inputs = {'custom_generate': 'attacker/repo'} if condition else {'input_ids': 1}\n",
+            "inputs = {'input_ids': 1} if condition else {'trust_remote_code': True}\n",
+            "inputs = get_options() if condition else {'input_ids': 1}\n",
+            "inputs = {'input_ids': 1} if condition else get_options()\n",
+            "inputs = {'input_ids': 1} if True else {'custom_generate': 'attacker/repo'}\n",
+            "key = 'input_ids'\ninputs = {key: 1} if condition else {'attention_mask': 1}\n",
+            (
+                "left = {'input_ids': 1}\n"
+                "left['custom_generate'] = 'attacker/repo'\n"
+                "inputs = left if condition else {'attention_mask': 1}\n"
+            ),
+            ("left = {'input_ids': 1}\nleft = get_options()\ninputs = left if condition else {'attention_mask': 1}\n"),
+            (
+                "left = {'input_ids': 1}\n"
+                "alias = left\n"
+                "alias |= {'custom_generate': 'attacker/repo'}\n"
+                "inputs = left if condition else {'attention_mask': 1}\n"
+            ),
+            "inputs = {'input_ids': 1} if choose() else {'attention_mask': 1}\n",
+        ],
+        ids=[
+            "unsafe-body",
+            "unsafe-else",
+            "dynamic-body",
+            "dynamic-else",
+            "constant-unused-unsafe-arm",
+            "computed-key",
+            "mutated-arm",
+            "rebound-arm",
+            "alias-mutated-arm",
+            "untrusted-condition",
+        ],
+    )
+    def test_readme_python_example_rejects_unproven_mapping_ifexp(self, mapping_setup: str) -> None:
+        data = (
+            "```python\nimport requests\nfrom transformers import AutoModel\n"
+            "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            "condition = len(image_url) > 0\n"
+            "model = AutoModel.from_pretrained('official/model')\n"
+            "def get_options():\n"
+            "    return {'custom_generate': 'attacker/repo'}\n"
+            "def choose():\n"
+            "    return True\n"
+            f"{mapping_setup}"
+            "model.generate(**inputs)\n"
+            "requests.get(image_url, stream=True)\n```\n"
+        ).encode()
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert any(finding["type"] == "network_library" for finding in findings)
+        assert any(finding["type"] == "network_function" for finding in findings)
+
+    def test_readme_python_example_rejects_excessively_nested_mapping_ifexp(self) -> None:
+        mapping = "{'input_ids': 1}"
+        for index in range(400):
+            mapping = f"({mapping} if condition else {{'input_ids': {index}}})"
+        data = (
+            "```python\nimport requests\nfrom transformers import AutoModel\n"
+            "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            "condition = len(image_url) > 0\n"
+            "model = AutoModel.from_pretrained('official/model')\n"
+            f"inputs = {mapping}\n"
+            "model.generate(**inputs)\n"
+            "requests.get(image_url, stream=True)\n```\n"
+        ).encode()
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert any(finding["type"] == "network_library" for finding in findings)
+        assert any(finding["type"] == "network_function" for finding in findings)
+
+    @pytest.mark.parametrize(
+        "mapping_setup",
+        [
             "inputs = {'input_ids': 1} + {'attention_mask': 1}\n",
             "inputs = {'custom_generate': 'attacker/repo'} | {'input_ids': 1}\n",
             "inputs = {'input_ids': 1} | {'trust_remote_code': True}\n",
@@ -5426,6 +5545,249 @@ class TestNetworkCommDetector:
             b"model.generate(**options)\n"
             b"requests.get(image_url, stream=True)\n```\n"
         )
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+
+    @pytest.mark.parametrize(
+        "expression_rebind",
+        [
+            "True or (alias := {})\n",
+            "False and (alias := {})\n",
+            "(alias := {}) if False else None\n",
+            "None if True else (alias := {})\n",
+            "False or True or (alias := {})\n",
+            "True and False and (alias := {})\n",
+            "image.mode or (alias := {})\n",
+            "(alias := {}) if image.mode else None\n",
+        ],
+        ids=[
+            "true-or-rhs",
+            "false-and-rhs",
+            "ifexp-unselected-body",
+            "ifexp-unselected-else",
+            "chained-or",
+            "chained-and",
+            "runtime-boolop",
+            "runtime-ifexp",
+        ],
+    )
+    def test_readme_python_example_rejects_alias_mutation_after_unproven_expression_rebind(
+        self,
+        expression_rebind: str,
+    ) -> None:
+        data = (
+            "```python\nimport requests\nfrom PIL import Image\nfrom transformers import AutoModel\n"
+            "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            "image = Image.open(requests.get(image_url, stream=True).raw)\n"
+            "model = AutoModel.from_pretrained('official/model')\n"
+            "alias = options = {'custom_generate': None}\n"
+            f"{expression_rebind}"
+            "alias |= {'custom_generate': 'attacker/repo'}\n"
+            "model.generate(**options)\n```\n"
+        ).encode()
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert any(finding["type"] == "network_library" for finding in findings)
+        assert any(finding["type"] == "network_function" for finding in findings)
+
+    def test_readme_python_example_rejects_dead_expression_rebind_before_shared_subscript_mutation(self) -> None:
+        data = (
+            b"```python\nimport requests\nfrom transformers import AutoModel\n"
+            b"image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            b"requests.get(image_url, stream=True)\n"
+            b"model = AutoModel.from_pretrained('official/model')\n"
+            b"alias = options = {'custom_generate': None}\n"
+            b"True or (alias := {})\n"
+            b"alias['custom_generate'] = 'attacker/repo'\n"
+            b"model.generate(**options)\n```\n"
+        )
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert any(finding["type"] == "network_library" for finding in findings)
+        assert any(finding["type"] == "network_function" for finding in findings)
+
+    @pytest.mark.parametrize(
+        "function_definition",
+        [
+            "def helper(alias):\n    pass\n",
+            "def helper(alias, /):\n    pass\n",
+            "def helper(*, alias):\n    pass\n",
+            "def helper(*alias):\n    pass\n",
+            "def helper(**alias):\n    pass\n",
+            "async def helper(alias):\n    pass\n",
+            "async def helper(alias, /):\n    pass\n",
+            "async def helper(*, alias):\n    pass\n",
+            "async def helper(*alias):\n    pass\n",
+            "async def helper(**alias):\n    pass\n",
+        ],
+        ids=[
+            "positional",
+            "positional-only",
+            "keyword-only",
+            "var-positional",
+            "var-keyword",
+            "async-positional",
+            "async-positional-only",
+            "async-keyword-only",
+            "async-var-positional",
+            "async-var-keyword",
+        ],
+    )
+    def test_readme_python_example_rejects_alias_mutation_after_function_parameter_shadow(
+        self,
+        function_definition: str,
+    ) -> None:
+        data = (
+            "```python\nimport requests\nfrom transformers import AutoModel\n"
+            "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            "requests.get(image_url, stream=True)\n"
+            "model = AutoModel.from_pretrained('official/model')\n"
+            "alias = options = {'custom_generate': None}\n"
+            f"{function_definition}"
+            "alias |= {'custom_generate': 'attacker/repo'}\n"
+            "model.generate(**options)\n```\n"
+        ).encode()
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert any(finding["type"] == "network_library" for finding in findings)
+        assert any(finding["type"] == "network_function" for finding in findings)
+
+    @pytest.mark.parametrize(
+        "local_shadow",
+        [
+            "helper = lambda alias: alias\n",
+            "helper = lambda *alias: alias\n",
+            "helper = lambda **alias: alias\n",
+            "ignored = [None for alias in [{}]]\n",
+            "ignored = {None for alias in [{}]}\n",
+            "ignored = {None: None for alias in [{}]}\n",
+            "ignored = (None for alias in [{}])\n",
+            "def helper():\n    alias = {}\n",
+            "class Helper:\n    alias = {}\n",
+            "class Helper:\n    def method(self, alias):\n        pass\n",
+        ],
+        ids=[
+            "lambda-positional",
+            "lambda-var-positional",
+            "lambda-var-keyword",
+            "list-comprehension",
+            "set-comprehension",
+            "dict-comprehension",
+            "generator-expression",
+            "nested-function-local",
+            "class-local",
+            "method-parameter",
+        ],
+    )
+    def test_readme_python_example_rejects_alias_mutation_after_local_scope_shadow(
+        self,
+        local_shadow: str,
+    ) -> None:
+        data = (
+            "```python\nimport requests\nfrom transformers import AutoModel\n"
+            "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            "requests.get(image_url, stream=True)\n"
+            "model = AutoModel.from_pretrained('official/model')\n"
+            "alias = options = {'custom_generate': None}\n"
+            f"{local_shadow}"
+            "alias |= {'custom_generate': 'attacker/repo'}\n"
+            "model.generate(**options)\n```\n"
+        ).encode()
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert any(finding["type"] == "network_library" for finding in findings)
+        assert any(finding["type"] == "network_function" for finding in findings)
+
+    def test_readme_python_example_rejects_alias_mutation_after_unproven_loop_target_rebind(self) -> None:
+        data = (
+            b"```python\nimport requests\nfrom transformers import AutoModel\n"
+            b"image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            b"requests.get(image_url, stream=True)\n"
+            b"model = AutoModel.from_pretrained('official/model')\n"
+            b"alias = options = {'custom_generate': None}\n"
+            b"for alias in []:\n"
+            b"    pass\n"
+            b"alias |= {'custom_generate': 'attacker/repo'}\n"
+            b"model.generate(**options)\n```\n"
+        )
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert any(finding["type"] == "network_library" for finding in findings)
+        assert any(finding["type"] == "network_function" for finding in findings)
+
+    @pytest.mark.parametrize(
+        "definition",
+        [
+            "def helper(alias=(alias := {})):\n    pass\n",
+            "async def helper(alias=(alias := {})):\n    pass\n",
+        ],
+        ids=["function-default", "async-function-default"],
+    )
+    def test_readme_python_example_allows_alias_mutation_after_module_scope_default_rebind(
+        self,
+        definition: str,
+    ) -> None:
+        data = (
+            "```python\nimport requests\nfrom transformers import AutoModel\n"
+            "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            "model = AutoModel.from_pretrained('official/model')\n"
+            "alias = options = {'input_ids': 1}\n"
+            f"{definition}"
+            "alias |= {'custom_generate': 'attacker/repo'}\n"
+            "model.generate(**options)\n"
+            "requests.get(image_url, stream=True)\n```\n"
+        ).encode()
+
+        findings = NetworkCommDetector().scan(data, "README.md")
+
+        assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+
+    @pytest.mark.parametrize(
+        "expression_rebind",
+        [
+            "False or (alias := {})\n",
+            "True and (alias := {})\n",
+            "(alias := {}) or True\n",
+            "(alias := {}) and False\n",
+            "False or False or (alias := {})\n",
+            "True and True and (alias := {})\n",
+            "(alias := {}) if True else None\n",
+            "None if False else (alias := {})\n",
+            "True if (alias := {}) else False\n",
+        ],
+        ids=[
+            "false-or-rhs",
+            "true-and-rhs",
+            "or-first-operand",
+            "and-first-operand",
+            "chained-or",
+            "chained-and",
+            "ifexp-selected-body",
+            "ifexp-selected-else",
+            "ifexp-condition",
+        ],
+    )
+    def test_readme_python_example_allows_alias_mutation_after_proven_expression_rebind(
+        self,
+        expression_rebind: str,
+    ) -> None:
+        data = (
+            "```python\nimport requests\nfrom transformers import AutoModel\n"
+            "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+            "model = AutoModel.from_pretrained('official/model')\n"
+            "alias = options = {'input_ids': 1}\n"
+            f"{expression_rebind}"
+            "alias |= {'custom_generate': 'attacker/repo'}\n"
+            "model.generate(**options)\n"
+            "requests.get(image_url, stream=True)\n```\n"
+        ).encode()
 
         findings = NetworkCommDetector().scan(data, "README.md")
 
