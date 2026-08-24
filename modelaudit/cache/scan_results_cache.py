@@ -12,7 +12,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable, Iterable
-from contextlib import suppress
+from contextlib import ExitStack, suppress
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass
 from importlib.machinery import (
@@ -223,31 +223,49 @@ class _DarwinPathMonitor:
 
     def __init__(self, file_path: str, ancestor_identity: tuple[AncestorEntry, ...]) -> None:
         select_module: Any = select
-        self._queue: Any = select_module.kqueue()
+        self._queue: Any = None
         self._descriptors: list[int] = []
-        vnode_filter = select_module.KQ_FILTER_VNODE
-        event_flags = select_module.KQ_EV_ADD | select_module.KQ_EV_CLEAR
-        change_flags = select_module.KQ_NOTE_DELETE | select_module.KQ_NOTE_RENAME | select_module.KQ_NOTE_REVOKE
-        descriptor_flags = getattr(os, "O_EVTONLY", os.O_RDONLY) | getattr(os, "O_CLOEXEC", 0)
-        descriptor_flags |= getattr(os, "O_NOFOLLOW", 0)
-        paths = [file_path, *(entry[0] for entry in ancestor_identity)]
+        self._descriptor_stack: ExitStack | None = None
 
         try:
-            events = []
-            for path in dict.fromkeys(paths):
-                watched_path = _DARWIN_STABLE_SYMLINK_ALIASES.get(path, path)
-                descriptor = os.open(watched_path, descriptor_flags)
-                self._descriptors.append(descriptor)
-                events.append(
-                    select_module.kevent(
-                        descriptor,
-                        filter=vnode_filter,
-                        flags=event_flags,
-                        fflags=change_flags,
+            self._queue = select_module.kqueue()
+            vnode_filter = select_module.KQ_FILTER_VNODE
+            event_flags = select_module.KQ_EV_ADD | select_module.KQ_EV_CLEAR
+            change_flags = select_module.KQ_NOTE_DELETE | select_module.KQ_NOTE_RENAME | select_module.KQ_NOTE_REVOKE
+            descriptor_flags = getattr(os, "O_EVTONLY", os.O_RDONLY) | getattr(os, "O_CLOEXEC", 0)
+            descriptor_flags |= getattr(os, "O_NOFOLLOW", 0)
+            paths = [os.path.abspath(file_path), *(entry[0] for entry in ancestor_identity)]
+            with ExitStack() as descriptor_stack:
+                events = []
+                opened_descriptors = []
+                for path in dict.fromkeys(paths):
+                    watched_path = _DARWIN_STABLE_SYMLINK_ALIASES.get(path, path)
+                    descriptor = os.open(watched_path, descriptor_flags)
+                    try:
+                        descriptor_stack.callback(os.close, descriptor)
+                    except BaseException:
+                        with suppress(OSError):
+                            os.close(descriptor)
+                        raise
+                    opened_descriptors.append(descriptor)
+                    events.append(
+                        select_module.kevent(
+                            descriptor,
+                            filter=vnode_filter,
+                            flags=event_flags,
+                            fflags=change_flags,
+                        )
                     )
-                )
-            self._queue.control(events, 0, 0)
-        except Exception:
+                self._queue.control(events, 0, 0)
+                transferred_stack = descriptor_stack.pop_all()
+            try:
+                self._descriptor_stack = transferred_stack
+                self._descriptors = opened_descriptors
+            except BaseException:
+                with suppress(OSError):
+                    transferred_stack.close()
+                raise
+        except BaseException:
             self.close()
             raise
 
@@ -262,12 +280,14 @@ class _DarwinPathMonitor:
     def close(self) -> None:
         queue = getattr(self, "_queue", None)
         self._queue = None
+        descriptor_stack = getattr(self, "_descriptor_stack", None)
+        self._descriptor_stack = None
         if queue is not None:
             with suppress(OSError):
                 queue.close()
-        for descriptor in getattr(self, "_descriptors", []):
+        if descriptor_stack is not None:
             with suppress(OSError):
-                os.close(descriptor)
+                descriptor_stack.close()
         self._descriptors = []
 
     def __del__(self) -> None:
@@ -667,6 +687,10 @@ class ScanResultsCache:
             logger.debug(f"Cache lookup failed for {file_path}: {e}")
             self._record_cache_miss("error")
             return None, file_identity
+        except BaseException:
+            if file_identity is not None:
+                self.release_ancestor_identity(file_identity[-1])
+            raise
 
     def get_cached_result_by_key(
         self,
@@ -1133,7 +1157,7 @@ class ScanResultsCache:
                     time.sleep(0.01)
                     continue
                 raise
-            except Exception:
+            except BaseException:
                 self.release_ancestor_identity(monitored_ancestor_identity)
                 raise
 
