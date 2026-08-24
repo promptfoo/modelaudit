@@ -4059,6 +4059,95 @@ def test_scan_file_bounds_expanded_probes_for_complete_proto_prefixes(
         assert report.status == ScanStatus.COMPLETE
 
 
+def test_scan_file_preserves_short_probe_budget_before_expanding_trusted_storage(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    entry_count = 33
+    storage_size = 10 * 1024
+    entries: list[bytes] = []
+    for index in range(entry_count):
+        key = _short_binunicode(f"weight_{index}".encode("ascii"))
+        if index == 0:
+            value = (
+                _pytorch_rebuild_tensor_v2_payload(
+                    key="0",
+                    storage_name="ByteStorage",
+                    element_count=storage_size,
+                )
+                .removeprefix(b"\x80\x04")
+                .removesuffix(b".")
+            )
+        else:
+            value = _pytorch_rebuild_tensor_v2_reduce_expr(
+                key=str(index),
+                storage_name="ByteStorage",
+                element_count=storage_size,
+            )
+        entries.append(key + value)
+    data_pkl = b"\x80\x04" + _pytorch_empty_ordered_dict_reduce_expr() + b"(" + b"".join(entries) + b"u."
+
+    frame_size = 5000
+    frame = b"\x95" + frame_size.to_bytes(8, "little") + b"N" * frame_size
+    storage = frame + b"\x00" * (storage_size - len(frame))
+    malicious_suffix = b"cos\nsystem\n(S'echo preserved-probe-budget'\ntR"
+    malicious_storage = frame + malicious_suffix
+    malicious_storage += b"\x00" * (storage_size - len(malicious_storage))
+    probe_budget = (
+        len(b"3\n")
+        + len(b"little")
+        + entry_count
+        * (package_api._PICKLE_DISCOVERY_SHORT_PROBE_BYTES + package_api._TRUSTED_STORAGE_PICKLE_PROBE_BYTES)
+    )
+    monkeypatch.setattr(
+        package_api,
+        "_MAX_PYTORCH_ZIP_PICKLE_DISCOVERY_PROBE_BYTES",
+        probe_budget,
+        raising=False,
+    )
+    probe_bytes_remaining_at_last_read = probe_budget
+    original_read_zip_entry_probe = package_api._read_zip_entry_probe
+
+    def track_probe_budget(
+        archive: zipfile.ZipFile,
+        entry: zipfile.ZipInfo,
+        max_bytes: int,
+        probe_bytes_remaining: list[int],
+        deadline: float,
+    ) -> bytes:
+        nonlocal probe_bytes_remaining_at_last_read
+        sample = original_read_zip_entry_probe(archive, entry, max_bytes, probe_bytes_remaining, deadline)
+        probe_bytes_remaining_at_last_read = probe_bytes_remaining[0]
+        return sample
+
+    monkeypatch.setattr(package_api, "_read_zip_entry_probe", track_probe_budget)
+
+    archive_path = tmp_path / "expanded-storage-probe-budget.pt"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", data_pkl)
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        for index in range(entry_count):
+            payload = malicious_storage if index == entry_count - 1 else storage
+            archive.writestr(f"archive/data/{index}", payload)
+
+    report = scan_file(archive_path)
+
+    assert probe_bytes_remaining_at_last_read == 0
+    assert not any(notice.code == "pytorch_zip_pickle_discovery_probe_budget" for notice in report.notices)
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert f"archive/data/{entry_count - 1}" in report.metadata["pickle_files"]
+    assert any(
+        finding.severity == Severity.CRITICAL
+        and finding.details.get("module") in {"os", "posix", "nt"}
+        and finding.details.get("name") == "system"
+        and finding.location is not None
+        and f"archive/data/{entry_count - 1}" in finding.location
+        for finding in report.findings
+    )
+
+
 def test_expanded_trusted_storage_probe_does_not_short_circuit_partial_frame(tmp_path: Path) -> None:
     frame_size = 20
     storage_size = package_api._PICKLE_DISCOVERY_LONG_PROBE_BYTES

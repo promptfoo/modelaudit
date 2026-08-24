@@ -911,6 +911,7 @@ def _discover_pytorch_zip_pickle_entries(
         if _is_data_pickle_member(lowered) or lowered.endswith(_PICKLE_MEMBER_SUFFIXES):
             add_entry(entry)
 
+    explicit_pickle_entries = tuple(pickle_entries)
     storage_entries, storage_notices = _validated_pytorch_storage_entry_ids(
         archive,
         entries,
@@ -926,6 +927,7 @@ def _discover_pytorch_zip_pickle_entries(
         candidates.append(entry)
 
     probe_bytes_remaining = [_MAX_PYTORCH_ZIP_PICKLE_DISCOVERY_PROBE_BYTES]
+    deferred_expanded_probe_entries: list[zipfile.ZipInfo] = []
     probed_member_count = 0
     for candidate_index, entry in enumerate(candidates):
         _check_pytorch_zip_deadline(deadline)
@@ -933,11 +935,9 @@ def _discover_pytorch_zip_pickle_entries(
             entry_id = id(entry)
             storage_probe_bytes = None
             if entry_id in storage_entries.trusted_entry_ids:
-                storage_probe_bytes = (
-                    _PICKLE_DISCOVERY_LONG_PROBE_BYTES
-                    if entry_id in storage_entries.expanded_trust_entry_ids
-                    else _TRUSTED_STORAGE_PICKLE_PROBE_BYTES
-                )
+                # Preserve the legacy trusted probe for every member before spending the shared
+                # discovery budget on expanded coverage.
+                storage_probe_bytes = _TRUSTED_STORAGE_PICKLE_PROBE_BYTES
             elif entry_id in storage_entries.storage_probe_entry_ids:
                 storage_probe_bytes = _PICKLE_DISCOVERY_LONG_PROBE_BYTES
             if storage_probe_bytes is not None:
@@ -952,6 +952,8 @@ def _discover_pytorch_zip_pickle_entries(
                 looks_like_pickle = _zip_entry_looks_like_pickle(archive, entry, probe_bytes_remaining, deadline)
             if looks_like_pickle:
                 add_entry(entry)
+            elif entry_id in storage_entries.expanded_trust_entry_ids:
+                deferred_expanded_probe_entries.append(entry)
             probed_member_count += 1
         except _PickleDiscoveryProbeBudgetExceeded:
             notices.append(
@@ -965,7 +967,35 @@ def _discover_pytorch_zip_pickle_entries(
             break
         except Exception as error:
             notices.append(_pytorch_zip_member_probe_notice(source=source, entry=entry, error=error))
+    else:
+        for expanded_index, entry in enumerate(deferred_expanded_probe_entries):
+            _check_pytorch_zip_deadline(deadline)
+            try:
+                if _trusted_storage_zip_entry_looks_like_pickle(
+                    archive,
+                    entry,
+                    probe_bytes_remaining,
+                    deadline,
+                    max_probe_bytes=_PICKLE_DISCOVERY_LONG_PROBE_BYTES,
+                ):
+                    add_entry(entry)
+            except _PickleDiscoveryProbeBudgetExceeded:
+                notices.append(
+                    _pytorch_zip_pickle_discovery_probe_budget_notice(
+                        source=source,
+                        probe_bytes_read=(_MAX_PYTORCH_ZIP_PICKLE_DISCOVERY_PROBE_BYTES - probe_bytes_remaining[0]),
+                        probed_member_count=probed_member_count,
+                        skipped_entries=deferred_expanded_probe_entries[expanded_index:],
+                    )
+                )
+                break
+            except Exception as error:
+                notices.append(_pytorch_zip_member_probe_notice(source=source, entry=entry, error=error))
 
+    pickle_entries = [
+        *explicit_pickle_entries,
+        *(entry for entry in candidates if id(entry) in seen_entries),
+    ]
     return pickle_entries, tuple(notices), storage_entries.trusted_data_pkl_by_name
 
 
