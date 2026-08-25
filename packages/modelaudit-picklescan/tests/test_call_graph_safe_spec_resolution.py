@@ -3643,6 +3643,52 @@ def test_shared_source_snapshot_staleness_reason_names_the_failing_gate(
     assert call_graph._shared_source_snapshot_staleness_reason(snapshot) == "import_runtime_untrusted"
 
 
+def test_shared_source_tracker_preserves_specific_stability_reason_in_report_details(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tracker-detected change must survive through the public error details."""
+    search_contexts = [("original",)]
+    monkeypatch.setattr(call_graph, "_interpreter_import_runtime_matches_snapshot", lambda: True)
+    monkeypatch.setattr(call_graph, "_source_search_context", lambda: search_contexts[0])
+
+    source_path = tmp_path / "tracked_module.py"
+    source_path.write_text("value = 1\n", encoding="utf-8")
+
+    with call_graph.shared_source_sensitive_caches():
+        report_generation = call_graph._begin_shared_source_report()
+        snapshot = call_graph._SHARED_SOURCE_SENSITIVE_SNAPSHOT.get()
+        assert snapshot is not None
+        search_contexts[0] = ("changed",)
+        call_graph._track_shared_source_path("tracked_module", source_path, loaded=False)
+        call_graph._mark_shared_source_snapshot_unstable(snapshot, "resolution_context_changed")
+        with pytest.raises(
+            call_graph._CallGraphAnalysisLimitError,
+            match="source changed during shared call-graph analysis",
+        ) as exc_info:
+            call_graph._ensure_shared_source_snapshot_stable(report_generation)
+        assert snapshot.stability_reason is None
+        assert snapshot.stable is True
+        preserved_reason = snapshot.active_report_stability_reason
+        assert preserved_reason == "source_search_context_changed"
+
+        next_report_generation = call_graph._begin_shared_source_report()
+        assert next_report_generation != report_generation
+        next_report_reason = snapshot.active_report_stability_reason
+        assert next_report_reason is None
+        call_graph._ensure_shared_source_snapshot_stable(next_report_generation)
+
+    error = exc_info.value
+    details = package_api._call_graph_enrichment_error_details(
+        "python_call_graph_source_stability",
+        error,
+    )
+
+    assert error.stability_reason == "source_search_context_changed"
+    assert details["source_stability_reason"] == "source_search_context_changed"
+    assert details["analysis_incomplete"] is True
+
+
 def test_shared_source_snapshot_is_current_matches_staleness_reason() -> None:
     """The boolean wrapper must stay consistent with the reason it delegates to."""
     snapshot = call_graph._SharedSourceSnapshot(

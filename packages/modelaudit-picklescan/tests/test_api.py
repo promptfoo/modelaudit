@@ -44,6 +44,7 @@ from typing import Any, Literal, cast
 import pytest
 
 import modelaudit_picklescan.api as package_api
+import modelaudit_picklescan.call_graph as call_graph
 from modelaudit_picklescan import (
     CoverageSummary,
     Finding,
@@ -12149,6 +12150,39 @@ def _assert_call_graph_source_stability_error(report: PickleReport) -> None:
         and error.details.get("analysis_incomplete") is True
         for error in report.errors
     )
+
+
+def test_scan_bytes_preserves_tracker_stability_reason_across_call_graph_subpasses(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    search_contexts = [("original",)]
+    monkeypatch.setattr(call_graph, "_interpreter_import_runtime_matches_snapshot", lambda: True)
+    monkeypatch.setattr(call_graph, "_source_search_context", lambda: search_contexts[0])
+
+    source_path = tmp_path / "tracked_module.py"
+    source_path.write_text("value = 1\n", encoding="utf-8")
+
+    def invalidate_snapshot(
+        _import_references: object,
+        _callable_invocations: object | None = None,
+    ) -> tuple[CallGraphFinding, ...]:
+        search_contexts[0] = ("changed",)
+        call_graph._track_shared_source_path("tracked_module", source_path, loaded=False)
+        return ()
+
+    monkeypatch.setattr(package_api, "find_dangerous_call_graphs", invalidate_snapshot)
+
+    report = scan_bytes(b"cbuiltins\nlen\n.", source="source-stability-subpasses.pkl")
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    matching_errors = [
+        error for error in report.errors if error.details.get("analysis") == "python_call_graph_source_stability"
+    ]
+    assert len(matching_errors) == 1
+    assert matching_errors[0].details.get("source_stability_reason") == "source_search_context_changed"
+    assert matching_errors[0].details.get("analysis_incomplete") is True
 
 
 @pytest.mark.parametrize("module", ["_xxsubinterpreters", "dotenv.main"])

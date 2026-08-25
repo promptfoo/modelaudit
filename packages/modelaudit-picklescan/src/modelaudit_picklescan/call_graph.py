@@ -1684,7 +1684,10 @@ class _SharedSourceSnapshot:
     loaded_interpreter_references: dict[tuple[str, str], _LoadedInterpreterReferenceState] = field(default_factory=dict)
     read_fingerprints: dict[str, tuple[int, bool, bytes | None]] = field(default_factory=dict)
     generation: int = 0
+    active_report_generation: int | None = None
+    active_report_stability_reason: str | None = None
     stable: bool = True
+    stability_reason: str | None = None
     reusable: bool = True
     lock: Any = field(default_factory=threading.RLock)
 
@@ -2434,7 +2437,10 @@ def _track_loaded_interpreter_module_state(
     with snapshot.lock:
         existing = snapshot.loaded_interpreter_modules.get(module_name)
         if existing is not None and not _loaded_interpreter_states_match(existing, state):
-            snapshot.stable = False
+            _mark_shared_source_snapshot_unstable(
+                snapshot,
+                "loaded_interpreter_module_changed",
+            )
         snapshot.loaded_interpreter_modules[module_name] = state
         snapshot.reusable = False
 
@@ -2492,7 +2498,10 @@ def _track_loaded_interpreter_reference_state(
     with snapshot.lock:
         existing = snapshot.loaded_interpreter_references.get(reference)
         if existing is not None and not _loaded_interpreter_reference_states_match(existing, state):
-            snapshot.stable = False
+            _mark_shared_source_snapshot_unstable(
+                snapshot,
+                "loaded_interpreter_reference_changed",
+            )
         snapshot.loaded_interpreter_references[reference] = state
         snapshot.reusable = False
 
@@ -3114,6 +3123,17 @@ def _mark_shared_source_snapshot_unreusable() -> None:
             snapshot.reusable = False
 
 
+def _mark_shared_source_snapshot_unstable(snapshot: _SharedSourceSnapshot, reason: str) -> None:
+    """Record the first specific reason that invalidated the current report."""
+    with snapshot.lock:
+        if snapshot.stability_reason is None:
+            snapshot.stability_reason = reason
+        if snapshot.active_report_generation is not None and snapshot.active_report_stability_reason is None:
+            snapshot.active_report_stability_reason = reason
+        snapshot.stable = False
+        snapshot.reusable = False
+
+
 def _bounded_module_name_parts(module_name: str) -> tuple[str, ...] | None:
     if len(module_name) > _MAX_MODULE_NAME_CHARS:
         _mark_shared_source_snapshot_unreusable()
@@ -3534,8 +3554,10 @@ def _clear_source_sensitive_caches() -> None:
         if snapshot is None:
             return
         with snapshot.lock:
-            if _shared_source_snapshot_is_current(snapshot):
+            reason = _shared_source_snapshot_staleness_reason(snapshot)
+            if reason is None:
                 return
+            _mark_shared_source_snapshot_unstable(snapshot, reason)
             _clear_source_sensitive_caches_now()
             _reset_shared_source_snapshot(snapshot)
         return
@@ -4694,6 +4716,7 @@ def _reset_shared_source_snapshot(snapshot: _SharedSourceSnapshot) -> None:
     snapshot.loaded_interpreter_modules.clear()
     snapshot.loaded_interpreter_references.clear()
     snapshot.generation += 1
+    snapshot.stability_reason = None
     snapshot.stable = True
     snapshot.reusable = snapshot.import_runtime_trusted and _resolution_context_is_reusable(snapshot.resolution_context)
 
@@ -4763,7 +4786,7 @@ def _shared_source_snapshot_staleness_reason(snapshot: _SharedSourceSnapshot) ->
     reports its own cause instead of a bare "source changed" message.
     """
     if not snapshot.stable:
-        return "snapshot_marked_unstable"
+        return snapshot.stability_reason or "snapshot_marked_unstable"
     if not snapshot.import_runtime_trusted:
         return "import_runtime_untrusted"
     if not _interpreter_import_runtime_matches_snapshot():
@@ -4841,6 +4864,8 @@ def _begin_shared_source_report() -> int | None:
         if snapshot.report_started and (not snapshot.reusable or not _shared_source_snapshot_is_current(snapshot)):
             _clear_source_sensitive_caches_now()
             _reset_shared_source_snapshot(snapshot)
+        snapshot.active_report_generation = snapshot.generation
+        snapshot.active_report_stability_reason = snapshot.stability_reason if not snapshot.stable else None
         snapshot.report_started = True
         return snapshot.generation
 
@@ -4851,13 +4876,20 @@ def _ensure_shared_source_snapshot_stable(report_generation: int | None) -> None
         return
     with snapshot.lock:
         if snapshot.generation != report_generation:
+            reason = (
+                snapshot.active_report_stability_reason
+                if snapshot.active_report_generation == report_generation
+                else None
+            )
             raise _CallGraphAnalysisLimitError(
                 "source changed during shared call-graph analysis",
-                stability_reason="report_generation_advanced",
+                stability_reason=reason or "report_generation_advanced",
             )
         reason = _shared_source_snapshot_staleness_reason(snapshot)
         if reason is None:
             return
+        _mark_shared_source_snapshot_unstable(snapshot, reason)
+        reason = snapshot.active_report_stability_reason or reason
         _clear_source_sensitive_caches_now()
         _reset_shared_source_snapshot(snapshot)
     raise _CallGraphAnalysisLimitError(
@@ -4961,9 +4993,11 @@ def _track_resolution_candidate_paths(candidates: Iterable[Path]) -> bool:
         return True
     candidate_paths = {str(candidate): candidate for candidate in candidates}
     with snapshot.lock:
-        if snapshot.search_context != _source_search_context() or not _snapshot_resolution_context_is_current(snapshot):
-            snapshot.stable = False
-            snapshot.reusable = False
+        if snapshot.search_context != _source_search_context():
+            _mark_shared_source_snapshot_unstable(snapshot, "source_search_context_changed")
+            return False
+        if not _snapshot_resolution_context_is_current(snapshot):
+            _mark_shared_source_snapshot_unstable(snapshot, "resolution_context_changed")
             return False
         if len(snapshot.resolution_fingerprints.keys() | candidate_paths.keys()) > _MAX_SOURCE_FINGERPRINT_CANDIDATES:
             snapshot.reusable = False
@@ -4983,9 +5017,10 @@ def _track_resolution_source_candidates(parts: tuple[str, ...]) -> None:
         return
     module_name_length = sum(len(part) for part in parts) + len(parts) - 1
     if module_name_length > _MAX_SOURCE_MODULE_NAME_CHARS:
-        with snapshot.lock:
-            snapshot.stable = False
-            snapshot.reusable = False
+        _mark_shared_source_snapshot_unstable(
+            snapshot,
+            "source_module_name_limit_exceeded",
+        )
         return
 
     runtime_search_path = _runtime_search_path_without_hooks()
@@ -5008,8 +5043,10 @@ def _track_resolution_source_candidates(parts: tuple[str, ...]) -> None:
                     expected_search_path = tuple(loaded_search_path)
                     existing_search_path = snapshot.loaded_package_paths.get(qualified_name)
                     if existing_search_path is not None and existing_search_path != expected_search_path:
-                        snapshot.stable = False
-                        snapshot.reusable = False
+                        _mark_shared_source_snapshot_unstable(
+                            snapshot,
+                            "loaded_package_search_path_changed",
+                        )
                         return
                     existing_resolution_context = snapshot.loaded_package_resolution_contexts.get(qualified_name)
                     if (
@@ -5020,8 +5057,10 @@ def _track_resolution_source_candidates(parts: tuple[str, ...]) -> None:
                             loaded_resolution_context,
                         )
                     ):
-                        snapshot.stable = False
-                        snapshot.reusable = False
+                        _mark_shared_source_snapshot_unstable(
+                            snapshot,
+                            "loaded_package_resolution_context_changed",
+                        )
                         return
                     snapshot.loaded_package_paths[qualified_name] = expected_search_path
                     snapshot.loaded_package_resolution_contexts[qualified_name] = loaded_resolution_context
@@ -5073,8 +5112,15 @@ def _track_resolution_source_candidates(parts: tuple[str, ...]) -> None:
                             namespace_resolution_context,
                         )
                     ):
-                        snapshot.stable = False
-                        snapshot.reusable = False
+                        reason = (
+                            "namespace_package_search_path_changed"
+                            if existing_search_path != namespace_search_path
+                            else "namespace_package_resolution_context_changed"
+                        )
+                        _mark_shared_source_snapshot_unstable(
+                            snapshot,
+                            reason,
+                        )
                         return
                 snapshot.namespace_package_resolution_contexts[qualified_name] = namespace_context
 
@@ -5094,11 +5140,11 @@ def _track_resolution_source_candidates(parts: tuple[str, ...]) -> None:
                     resolution_candidates.add(cache_candidate)
 
         with snapshot.lock:
-            if snapshot.search_context != _source_search_context() or not _snapshot_resolution_context_is_current(
-                snapshot
-            ):
-                snapshot.stable = False
-                snapshot.reusable = False
+            if snapshot.search_context != _source_search_context():
+                _mark_shared_source_snapshot_unstable(snapshot, "source_search_context_changed")
+                return
+            if not _snapshot_resolution_context_is_current(snapshot):
+                _mark_shared_source_snapshot_unstable(snapshot, "resolution_context_changed")
                 return
             if (
                 len(snapshot.resolution_fingerprints | {str(candidate): None for candidate in resolution_candidates})
@@ -5171,22 +5217,18 @@ def _track_shared_source_path(module_name: str, path: Path, *, loaded: bool) -> 
     candidate = path.absolute()
     with snapshot.lock:
         if snapshot.search_context != _source_search_context():
-            snapshot.stable = False
-            snapshot.reusable = False
+            _mark_shared_source_snapshot_unstable(snapshot, "source_search_context_changed")
             return
         if not _snapshot_resolution_context_is_current(snapshot):
-            snapshot.stable = False
-            snapshot.reusable = False
+            _mark_shared_source_snapshot_unstable(snapshot, "resolution_context_changed")
             return
         reusable, fingerprint = _resolution_candidate_fingerprint(candidate)
         if not reusable:
-            snapshot.stable = False
-            snapshot.reusable = False
+            _mark_shared_source_snapshot_unstable(snapshot, "resolution_fingerprint_changed")
             return
         existing_source = snapshot.module_sources.get(module_name)
         if existing_source is not None and existing_source != str(candidate):
-            snapshot.stable = False
-            snapshot.reusable = False
+            _mark_shared_source_snapshot_unstable(snapshot, "module_source_path_changed")
             return
         snapshot.module_sources[module_name] = str(candidate)
         if loaded:
