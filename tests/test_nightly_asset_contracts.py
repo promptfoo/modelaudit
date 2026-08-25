@@ -976,6 +976,80 @@ def test_organized_asset_scans_preserve_existing_h5_diagnostics(
 
 
 @pytest.mark.parametrize(
+    "malformation",
+    [
+        "missing-outcome-fields",
+        "missing-analysis-incomplete",
+        "complete-outcome",
+        "missing-corresponding-reason",
+        "successful-result",
+    ],
+)
+def test_organized_asset_scans_reject_incomplete_coverage_only_contract(
+    malformation: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+    result = _scan_asset("safe_data.pkl")
+    assert result.has_errors is False
+    assert result.success is True
+
+    coverage_payload: dict[str, Any] = {
+        "operational_error": True,
+        "operational_error_reason": "recognized_format_scanner_unavailable",
+        "analysis_incomplete": True,
+        "scan_outcome": "inconclusive",
+        "scan_outcome_reasons": ["recognized_format_scanner_unavailable"],
+    }
+    result.success = False
+    if malformation == "missing-outcome-fields":
+        coverage_payload.pop("analysis_incomplete")
+        coverage_payload.pop("scan_outcome")
+        coverage_payload.pop("scan_outcome_reasons")
+        result.success = True
+    elif malformation == "missing-analysis-incomplete":
+        coverage_payload.pop("analysis_incomplete")
+    elif malformation == "complete-outcome":
+        coverage_payload["scan_outcome"] = "complete"
+    elif malformation == "missing-corresponding-reason":
+        coverage_payload["scan_outcome_reasons"] = ["xml_model_routing_incomplete"]
+    else:
+        result.success = True
+    result.file_metadata[str(tmp_path / "missing.keras")] = FileMetadataModel(**coverage_payload)
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            "malformed coverage-only outcome",
+        )
+
+
+def test_organized_asset_scans_preserve_complete_coverage_only_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+    result = _scan_asset("safe_data.pkl")
+    assert result.has_errors is False
+    result.success = False
+    result.file_metadata[str(tmp_path / "missing.keras")] = FileMetadataModel(
+        operational_error=True,
+        operational_error_reason="recognized_format_scanner_unavailable",
+        analysis_incomplete=True,
+        scan_outcome="inconclusive",
+        scan_outcome_reasons=["recognized_format_scanner_unavailable"],
+    )
+
+    assert results_have_inconclusive_outcome(result) is True
+    assert core_module.determine_exit_code(result) == 2
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+        result,
+        "complete coverage-only outcome",
+    )
+
+
+@pytest.mark.parametrize(
     "integration_test",
     [
         "test_asset_discovery_completeness",

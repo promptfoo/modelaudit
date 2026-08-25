@@ -82,6 +82,7 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
     security_finding_locations = {
         issue.location for issue in results.issues if issue.rule_code == "S204" and issue.location is not None
     }
+    coverage_only_paths = set()
     unexpected_errors = {asset.path for asset in results.assets if asset.type == "error"}
     for path, metadata in results.file_metadata.items():
         payload = metadata.model_dump(exclude_none=True)
@@ -89,11 +90,21 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
         if not payload.get("operational_error"):
             continue
         if metadata_has_coverage_only_operational_error(payload):
-            if any(
-                isinstance(reason, str)
-                and reason.endswith(("_failed", "_error", "_exceeded", "_timeout", "_interrupted"))
-                for reason in payload.get("scan_outcome_reasons", [])
-            ):
+            operational_error_reason = payload.get("operational_error_reason")
+            coverage_only_is_inconclusive = (
+                payload.get("analysis_incomplete") is True
+                and payload.get("scan_outcome") == "inconclusive"
+                and isinstance(scan_outcome_reasons, list)
+                and all(isinstance(reason, str) for reason in scan_outcome_reasons)
+                and operational_error_reason in scan_outcome_reasons
+                and not any(
+                    reason.endswith(("_failed", "_error", "_exceeded", "_timeout", "_interrupted"))
+                    for reason in scan_outcome_reasons
+                )
+            )
+            if coverage_only_is_inconclusive:
+                coverage_only_paths.add(path)
+            else:
                 unexpected_errors.add(path)
             continue
 
@@ -200,6 +211,8 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
             unexpected_errors.add(location)
             continue
 
+    if coverage_only_paths and results.success is not False:
+        unexpected_errors.update(coverage_only_paths)
     error_message = (
         f"{scan_description} should not have unexpected operational errors: {describe_operational_errors(results)}"
     )
