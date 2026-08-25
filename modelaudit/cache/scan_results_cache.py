@@ -243,7 +243,7 @@ class _DarwinPathMonitor:
             with ExitStack() as descriptor_stack:
                 events = []
                 opened_descriptors = []
-                for path in dict.fromkeys(paths):
+                for path_index, path in enumerate(dict.fromkeys(paths)):
                     watched_path = _DARWIN_STABLE_SYMLINK_ALIASES.get(path, path)
                     descriptor = os.open(watched_path, descriptor_flags)
                     try:
@@ -258,7 +258,8 @@ class _DarwinPathMonitor:
                             descriptor,
                             filter=vnode_filter,
                             flags=event_flags,
-                            fflags=change_flags,
+                            # Hashing updates the file atime; its ctime still catches real attribute changes.
+                            fflags=change_flags if path_index else change_flags & ~select_module.KQ_NOTE_ATTRIB,
                         )
                     )
                 self._queue.control(events, 0, 0)

@@ -1836,6 +1836,19 @@ def test_darwin_cache_identity_rejects_restored_ancestor_mode_change(tmp_path: P
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="requires Darwin vnode monitoring")
+def test_darwin_cache_identity_rejects_restored_file_mode_change(tmp_path: Path) -> None:
+    file_path = _make_cacheable_file(tmp_path)
+    cache = ScanResultsCache(str(tmp_path / "cache"))
+    identity = _identity_kwargs(cache, str(file_path))
+    original_mode = stat.S_IMODE(file_path.stat().st_mode)
+
+    file_path.chmod(original_mode ^ stat.S_IXUSR)
+    file_path.chmod(original_mode)
+
+    assert cache.store_result(str(file_path), {"success": True}, **identity) is False
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="requires Darwin vnode monitoring")
 def test_darwin_cache_identity_rejects_restored_file_replacement(tmp_path: Path) -> None:
     file_path = _make_cacheable_file(tmp_path)
     replacement = _make_cacheable_file(tmp_path, name="replacement.cache")
@@ -1992,7 +2005,53 @@ def _stub_darwin_select(queue: Any) -> type[Any]:
     return StubDarwinSelect
 
 
-def test_darwin_path_monitor_reports_file_and_ancestor_attribute_changes(
+def test_darwin_path_monitor_ignores_file_access_time_attribute_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FileAccessQueue:
+        def __init__(self) -> None:
+            self.registered_events: list[Any] = []
+
+        def control(self, changes: Any, _max_events: int, _timeout: int) -> list[Any]:
+            if changes is not None:
+                self.registered_events.extend(changes)
+                return []
+            file_event = self.registered_events[0]
+            if file_event[1]["fflags"] & 64:
+                return [object()]
+            return []
+
+        def close(self) -> None:
+            return None
+
+    file_path = _make_cacheable_file(tmp_path)
+    queue = FileAccessQueue()
+    select_stub = _stub_darwin_select(queue)
+    opened_descriptors: list[int] = []
+    closed_descriptors: list[int] = []
+
+    def open_path(_path: str, _flags: int) -> int:
+        descriptor = 100 + len(opened_descriptors)
+        opened_descriptors.append(descriptor)
+        return descriptor
+
+    monkeypatch.setattr(scan_results_cache_module, "select", select_stub)
+    monkeypatch.setattr(scan_results_cache_module.os, "open", open_path)
+    monkeypatch.setattr(scan_results_cache_module.os, "close", closed_descriptors.append)
+
+    monitor = scan_results_cache_module._DarwinPathMonitor(
+        str(file_path),
+        ((str(tmp_path), 0, 0, 0, 0, 0),),
+    )
+
+    assert monitor.changed() is False
+    assert queue.registered_events[1][1]["fflags"] & select_stub.KQ_NOTE_ATTRIB
+    monitor.close()
+    assert sorted(closed_descriptors) == opened_descriptors
+
+
+def test_darwin_path_monitor_reports_ancestor_attribute_changes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2032,7 +2091,8 @@ def test_darwin_path_monitor_reports_file_and_ancestor_attribute_changes(
     )
 
     assert len(queue.registered_events) == 2
-    assert all(event[1]["fflags"] & select_stub.KQ_NOTE_ATTRIB for event in queue.registered_events)
+    assert not queue.registered_events[0][1]["fflags"] & select_stub.KQ_NOTE_ATTRIB
+    assert queue.registered_events[1][1]["fflags"] & select_stub.KQ_NOTE_ATTRIB
     assert monitor.changed() is True
     monitor.close()
     assert sorted(closed_descriptors) == opened_descriptors
