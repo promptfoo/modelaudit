@@ -15,9 +15,11 @@ from modelaudit_picklescan.call_graph import _CallGraphAnalysisLimitError
 
 import modelaudit.core as core_module
 import modelaudit.scanners.keras_h5_scanner as keras_h5_scanner_module
+import modelaudit.scanners.pmml_scanner as pmml_scanner_module
 import modelaudit.scanners.sevenzip_scanner as sevenzip_scanner_module
 import modelaudit.scanners.tf_metagraph_scanner as tf_metagraph_scanner_module
 import modelaudit.scanners.tflite_scanner as tflite_scanner_module
+import modelaudit.scanners.xgboost_scanner as xgboost_scanner_module
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core_results import metadata_has_coverage_only_operational_error, results_have_inconclusive_outcome
 from modelaudit.models import FileMetadataModel, ModelAuditResultModel
@@ -271,6 +273,22 @@ def test_organized_asset_scans_reject_hidden_operational_diagnostics_without_has
             },
             id="false-operational-error-flag",
         ),
+        pytest.param(
+            {
+                "analysis_incomplete": True,
+                "scan_outcome": "inconclusive",
+                "scan_outcome_reasons": ["xml_model_routing_incomplete"],
+            },
+            id="unflagged-coverage-only-outcome-list",
+        ),
+        pytest.param(
+            {
+                "analysis_incomplete": True,
+                "scan_outcome": "inconclusive",
+                "scan_outcome_reason": "xml_model_routing_incomplete",
+            },
+            id="unflagged-coverage-only-outcome-single",
+        ),
     ],
 )
 def test_organized_asset_scans_reject_unflagged_operational_metadata(
@@ -455,6 +473,29 @@ def test_organized_asset_scans_reject_source_stability_diagnostic_without_has_er
         test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
             result,
             "source-stability diagnostic without has_errors",
+        )
+
+
+def test_organized_asset_scans_reject_passed_source_stability_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def raise_source_stability_error(_report_generation: int | None) -> None:
+        raise _source_stability_error()
+
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", raise_source_stability_error)
+    result = core_module.scan_model_directory_or_file(str(AGPL_ASSET), cache_enabled=False)
+    result.issues = [
+        issue for issue in result.issues if issue.details.get("analysis") != "python_call_graph_source_stability"
+    ]
+    source_stability_check = next(
+        check for check in result.checks if check.details.get("analysis") == "python_call_graph_source_stability"
+    )
+    source_stability_check.status = CheckStatus.PASSED
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            "passed source-stability check",
         )
 
 
@@ -1207,16 +1248,23 @@ def test_organized_asset_scans_preserve_complete_coverage_only_contract(
         pytest.param({"error": "independent scanner failure"}, id="error"),
         pytest.param({"error_type": "RuntimeError"}, id="error-type"),
         pytest.param({"exception_type": "RuntimeError"}, id="exception-type"),
+        pytest.param({"operational_error": True}, id="operational-error"),
+        pytest.param({"interrupted": True}, id="interrupted"),
     ],
 )
 def test_organized_asset_scans_reject_dependency_diagnostic_error_fields(
-    error_details: dict[str, str],
+    error_details: dict[str, Any],
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
     result = _scan_asset("safe_data.pkl")
     dependency_path = str(tmp_path / "missing.h5")
+    result.file_metadata[dependency_path] = FileMetadataModel(
+        analysis_incomplete=True,
+        scan_outcome="inconclusive",
+        scan_outcome_reasons=["keras_h5_h5py_unavailable"],
+    )
     result.checks.append(
         Check(
             name="H5PY Library Check",
@@ -1248,6 +1296,11 @@ def test_organized_asset_scans_preserve_missing_dependency_error_type(
     monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
     result = _scan_asset("safe_data.pkl")
     dependency_path = str(tmp_path / "missing.7z")
+    result.file_metadata[dependency_path] = FileMetadataModel(
+        analysis_incomplete=True,
+        scan_outcome="inconclusive",
+        scan_outcome_reasons=["sevenzip_analysis_incomplete"],
+    )
     result.checks.append(
         Check(
             name="7-Zip Dependency Check",
@@ -1271,6 +1324,69 @@ def test_organized_asset_scans_preserve_missing_dependency_error_type(
     )
 
 
+@pytest.mark.parametrize(
+    "malformation",
+    [
+        "empty-message",
+        "wrong-message",
+        "missing-incomplete-flag",
+        "missing-inconclusive-outcome",
+        "missing-outcome-reason",
+        "unknown-outcome-reason",
+    ],
+)
+def test_organized_asset_scans_reject_malformed_dependency_diagnostic(
+    malformation: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+    result = _scan_asset("safe_data.pkl")
+    dependency_path = str(tmp_path / "missing.h5")
+    message = "h5py is required for Keras H5 scanning."
+    reason = "keras_h5_h5py_unavailable"
+    metadata_kwargs: dict[str, Any] = {
+        "analysis_incomplete": True,
+        "scan_outcome": "inconclusive",
+        "scan_outcome_reasons": [reason],
+    }
+    if malformation == "empty-message":
+        message = ""
+    elif malformation == "wrong-message":
+        message = "An unrelated optional dependency is unavailable."
+    elif malformation == "missing-incomplete-flag":
+        metadata_kwargs.pop("analysis_incomplete")
+    elif malformation == "missing-inconclusive-outcome":
+        metadata_kwargs.pop("scan_outcome")
+    elif malformation == "missing-outcome-reason":
+        metadata_kwargs["scan_outcome_reasons"] = []
+    else:
+        reason = "keras_h5_unknown_incomplete"
+        metadata_kwargs["scan_outcome_reasons"] = [reason]
+    result.file_metadata[dependency_path] = FileMetadataModel(**metadata_kwargs)
+    result.checks.append(
+        Check(
+            name="H5PY Library Check",
+            status=CheckStatus.FAILED,
+            message=message,
+            severity=IssueSeverity.INFO,
+            location=dependency_path,
+            details={
+                "required_package": "h5py",
+                "analysis_incomplete": True,
+                "scan_outcome_reason": reason,
+            },
+            rule_code="S902",
+        )
+    )
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            f"malformed dependency diagnostic: {malformation}",
+        )
+
+
 def test_organized_asset_scans_preserve_real_sevenzip_missing_dependency(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1290,6 +1406,157 @@ def test_organized_asset_scans_preserve_real_sevenzip_missing_dependency(
         result,
         "real SevenZip missing dependency",
     )
+
+
+def test_organized_asset_scans_preserve_real_xgboost_ubjson_missing_dependency(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+    monkeypatch.setattr(xgboost_scanner_module, "_check_ubjson_available", lambda: False)
+    model_path = tmp_path / "missing-dependency.ubj"
+    model_path.write_bytes(b"\x7b\x55")
+
+    result = core_module.scan_model_directory_or_file(str(model_path), cache_enabled=False)
+    dependency_issue = next(issue for issue in result.issues if issue.details.get("required_package") == "ubjson")
+    assert dependency_issue.rule_code is None
+    assert "error_type" not in dependency_issue.details
+    assert dependency_issue.details["detected_format"] == "ubjson"
+
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+        result,
+        "real XGBoost UBJSON missing dependency",
+    )
+
+
+def test_organized_asset_scans_preserve_real_pmml_missing_dependency(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+    monkeypatch.setattr(pmml_scanner_module, "HAS_DEFUSEDXML", False)
+    monkeypatch.setattr(pmml_scanner_module, "DefusedET", None)
+    model_path = tmp_path / "missing-dependency.pmml"
+    model_path.write_text(
+        "<?xml version='1.0'?><PMML version='4.4'><Header/><DataDictionary numberOfFields='0'/></PMML>",
+        encoding="utf-8",
+    )
+
+    result = core_module.scan_model_directory_or_file(str(model_path), cache_enabled=False)
+    dependency_issue = next(issue for issue in result.issues if issue.details.get("required_package") == "defusedxml")
+    assert dependency_issue.rule_code is None
+    assert "error_type" not in dependency_issue.details
+    assert (
+        dependency_issue.details["scan_outcome_reason"]
+        == pmml_scanner_module.PmmlScanner.XML_PARSER_UNAVAILABLE_INCOMPLETE_REASON
+    )
+
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+        result,
+        "real PMML missing dependency",
+    )
+
+
+def test_organized_asset_scans_preserve_security_exit_with_stable_coverage_only_outcome(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+    result = core_module.scan_model_directory_or_file(str(AGPL_ASSET), cache_enabled=False)
+    coverage_path = str(tmp_path / "missing.keras")
+    result.file_metadata[coverage_path] = FileMetadataModel(
+        operational_error=True,
+        operational_error_reason="recognized_format_scanner_unavailable",
+        analysis_incomplete=True,
+        scan_outcome="inconclusive",
+        scan_outcome_reasons=["recognized_format_scanner_unavailable"],
+    )
+    result.checks.append(
+        Check(
+            name="Format Detection",
+            status=CheckStatus.FAILED,
+            message=test_security_asset_integration.EXPECTED_UNAVAILABLE_SCANNER_MESSAGE,
+            severity=IssueSeverity.INFO,
+            location=coverage_path,
+            details={"format": "keras", "path": coverage_path},
+        )
+    )
+
+    metadata = result.file_metadata[str(AGPL_ASSET)].model_dump(exclude_none=True)
+    assert result.has_errors is False
+    assert result.success is False
+    assert metadata["pickle_verdict"] == "malicious"
+    assert any(issue.rule_code == "S204" for issue in result.issues)
+    assert core_module.determine_exit_code(result) == 1
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+        result,
+        "stable source with coverage-only outcome",
+    )
+
+
+@pytest.mark.parametrize(
+    ("first_unavailable", "second_unavailable"),
+    [(False, True), (True, False)],
+    ids=["complete-to-incomplete", "incomplete-to-complete"],
+)
+def test_organized_asset_cache_preserves_missing_dependency_transitions(
+    first_unavailable: bool,
+    second_unavailable: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+    safe_parser = pmml_scanner_module.DefusedET
+    assert safe_parser is not None
+    model_path = tmp_path / "cache-transition.pmml"
+    model_path.write_text(
+        "<?xml version='1.0'?><PMML version='4.4'><Header/><DataDictionary numberOfFields='0'/></PMML>",
+        encoding="utf-8",
+    )
+    cache_dir = tmp_path / "cache"
+    scan_results: list[tuple[bool, ModelAuditResultModel]] = []
+    entry_counts: list[int] = []
+    reset_cache_manager()
+    try:
+        for unavailable in (first_unavailable, second_unavailable):
+            monkeypatch.setattr(pmml_scanner_module, "HAS_DEFUSEDXML", not unavailable)
+            monkeypatch.setattr(pmml_scanner_module, "DefusedET", None if unavailable else safe_parser)
+            result = core_module.scan_model_directory_or_file(
+                str(model_path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+            scan_results.append((unavailable, result))
+            cache_stats = get_cache_manager(str(cache_dir), enabled=True).get_stats()
+            entry_counts.append(cache_stats["total_entries"])
+        final_cache_stats = get_cache_manager(str(cache_dir), enabled=True).get_stats()
+    finally:
+        reset_cache_manager()
+
+    prior_entries = 0
+    for (unavailable, result), entry_count in zip(scan_results, entry_counts, strict=True):
+        metadata = result.file_metadata[str(model_path)].model_dump(exclude_none=True)
+        root_diagnostics: list[Issue | Check] = [*result.issues, *result.checks]
+        dependency_diagnostics = [
+            diagnostic for diagnostic in root_diagnostics if diagnostic.details.get("required_package") == "defusedxml"
+        ]
+        assert result.has_errors is False
+        assert result.success is not unavailable
+        assert core_module.determine_exit_code(result) == (2 if unavailable else 0)
+        assert bool(dependency_diagnostics) is unavailable
+        assert (metadata.get("scan_outcome") == "inconclusive") is unavailable
+        if unavailable:
+            assert entry_count == prior_entries
+        else:
+            assert entry_count > prior_entries
+        prior_entries = entry_count
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            f"PMML cache transition unavailable={unavailable}",
+        )
+    assert final_cache_stats["cache_hits"] == 0
+    assert final_cache_stats["cache_misses"] >= 4
 
 
 @pytest.mark.parametrize(

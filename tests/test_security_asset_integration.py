@@ -37,6 +37,34 @@ EXPECTED_AGPL_SOURCE_STABILITY_OUTCOME_REASONS = frozenset(
         "nested_probe_limit",
     }
 )
+EXPECTED_DEPENDENCY_OUTCOMES = {
+    "defusedxml": frozenset({"pmml_safe_xml_parser_unavailable"}),
+    "h5py": frozenset(
+        {
+            "keras_h5_h5py_unavailable",
+            "keras_zip_embedded_weights_h5py_unavailable",
+        }
+    ),
+    "onnx": frozenset(
+        {
+            "onnx_dependency_unavailable",
+            "onnx_tentative_candidate_analysis_unavailable",
+        }
+    ),
+    "py7zr": frozenset({"sevenzip_analysis_incomplete"}),
+    "tflite": frozenset({"tflite_dependency_unavailable"}),
+    "ubjson": frozenset({"xgboost_ubj_dependency_missing"}),
+    "xgboost": frozenset({"xgboost_binary_load_dependency_missing"}),
+}
+EXPECTED_DEPENDENCY_MESSAGE_MARKERS = {
+    "defusedxml": ("defusedxml is unavailable",),
+    "h5py": ("h5py is required", "h5py is unavailable"),
+    "onnx": ("onnx analysis dependency is unavailable",),
+    "py7zr": ("py7zr library not installed", "py7zr package is not installed"),
+    "tflite": ("tflite package not installed",),
+    "ubjson": ("ubjson package is not installed",),
+    "xgboost": ("xgboost library not available",),
+}
 
 
 def describe_operational_errors(results: ModelAuditResultModel) -> str:
@@ -82,20 +110,56 @@ def _nested_diagnostic_details(details: dict[str, Any]) -> list[dict[str, Any]]:
 def _is_expected_missing_dependency_diagnostic(
     diagnostic: Issue | Check,
     details: dict[str, Any],
+    metadata: dict[str, Any] | None,
 ) -> bool:
     required_package = details.get("required_package")
     error_type = details.get("error_type")
+    if not isinstance(required_package, str) or not required_package.strip():
+        return False
+    normalized_package = required_package.strip().casefold().replace("-", "_")
+    message = diagnostic.message
+    message_markers = EXPECTED_DEPENDENCY_MESSAGE_MARKERS.get(normalized_package, ())
+    if not (
+        isinstance(message, str) and message.strip() and any(marker in message.casefold() for marker in message_markers)
+    ):
+        return False
+    if not isinstance(metadata, dict):
+        return False
+    scan_outcome_reasons = metadata.get("scan_outcome_reasons")
+    if not (
+        metadata.get("analysis_incomplete") is True
+        and metadata.get("scan_outcome") == "inconclusive"
+        and isinstance(scan_outcome_reasons, list)
+        and bool(scan_outcome_reasons)
+        and all(isinstance(reason, str) and bool(reason) for reason in scan_outcome_reasons)
+    ):
+        return False
+    detail_reason = details.get("scan_outcome_reason")
+    if detail_reason is not None and (
+        not isinstance(detail_reason, str) or not detail_reason or detail_reason not in scan_outcome_reasons
+    ):
+        return False
+    expected_reasons = EXPECTED_DEPENDENCY_OUTCOMES.get(normalized_package, frozenset())
     return (
         (not isinstance(diagnostic, Check) or diagnostic.status == CheckStatus.FAILED)
-        and (diagnostic.rule_code == "S902" or (diagnostic.rule_code is None and error_type == "missing_dependency"))
-        and isinstance(required_package, str)
-        and bool(required_package)
+        and bool(expected_reasons.intersection(scan_outcome_reasons))
         and "error" not in details
         and "exception_type" not in details
         and (error_type is None or error_type == "missing_dependency")
-        and details.get("operational_error") is not True
-        and details.get("interrupted") is not True
+        and "operational_error" not in details
+        and "interrupted" not in details
     )
+
+
+def _file_metadata_for_diagnostic(
+    results: ModelAuditResultModel,
+    location: str,
+) -> dict[str, Any] | None:
+    matching_paths = [path for path in results.file_metadata if location == path or location.startswith(f"{path}:")]
+    if not matching_paths:
+        return None
+    metadata = results.file_metadata[max(matching_paths, key=len)]
+    return metadata.model_dump(exclude_none=True)
 
 
 def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_description: str) -> None:
@@ -123,10 +187,32 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
             )
         )
         if payload.get("operational_error") is not True:
+            has_unflagged_coverage_reason = (
+                isinstance(scan_outcome_reason, str)
+                and bool(scan_outcome_reason)
+                and not has_noncoverage_outcome_reason
+            ) or (
+                isinstance(scan_outcome_reasons, list)
+                and any(
+                    isinstance(reason, str)
+                    and reason
+                    and metadata_has_coverage_only_operational_error(
+                        {"operational_error": True, "operational_error_reason": reason}
+                    )
+                    for reason in scan_outcome_reasons
+                )
+            )
+            path_has_security_finding = any(
+                finding_location == path
+                or finding_location.startswith(f"{path} (")
+                or finding_location.startswith(f"{path}:")
+                for finding_location in security_finding_locations
+            )
             if (
                 (isinstance(operational_error_reason, str) and operational_error_reason)
                 or has_failed_outcome_reason
                 or has_noncoverage_outcome_reason
+                or (has_unflagged_coverage_reason and not path_has_security_finding)
             ):
                 unexpected_errors.add(path)
             continue
@@ -220,6 +306,7 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
                 and details.get("analysis") == "python_call_graph_source_stability"
                 and details.get("analysis_incomplete") is True
                 and details.get("source_stability_reason") == EXPECTED_AGPL_SOURCE_STABILITY_REASON
+                and diagnostic_is_failed
                 and any(
                     finding_location == location or finding_location.startswith(f"{location} (")
                     for finding_location in security_finding_locations
@@ -231,7 +318,8 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
             continue
 
         if "required_package" in details:
-            if _is_expected_missing_dependency_diagnostic(diagnostic, details):
+            diagnostic_metadata = _file_metadata_for_diagnostic(results, location)
+            if _is_expected_missing_dependency_diagnostic(diagnostic, details, diagnostic_metadata):
                 continue
             unexpected_errors.add(location)
             continue
