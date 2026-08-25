@@ -341,6 +341,89 @@ def test_organized_asset_scans_reject_source_stability_diagnostic_without_has_er
         )
 
 
+def test_organized_asset_scans_reject_additional_source_outcome_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def raise_source_stability_error(_report_generation: int | None) -> None:
+        raise _source_stability_error()
+
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", raise_source_stability_error)
+    result = core_module.scan_model_directory_or_file(str(AGPL_ASSET), cache_enabled=False)
+    metadata = result.file_metadata[str(AGPL_ASSET)]
+    assert metadata.model_extra is not None
+    reasons = metadata.model_extra["scan_outcome_reasons"]
+    assert isinstance(reasons, list)
+    reasons.append("scanner_read_failed")
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            "additional source outcome reason",
+        )
+
+
+@pytest.mark.parametrize(
+    "error_details",
+    [
+        pytest.param({"error": "independent scanner failure"}, id="error"),
+        pytest.param({"error_type": "RuntimeError"}, id="error-type"),
+        pytest.param({"exception_type": "RuntimeError"}, id="exception-type"),
+    ],
+)
+def test_organized_asset_scans_reject_pickle_diagnostic_error_fields(
+    error_details: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def raise_source_stability_error(_report_generation: int | None) -> None:
+        raise _source_stability_error()
+
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", raise_source_stability_error)
+    result = core_module.scan_model_directory_or_file(str(AGPL_ASSET), cache_enabled=False)
+    result.issues.append(
+        Issue(
+            message="Independent pickle scanner failure",
+            severity=IssueSeverity.INFO,
+            location=str(AGPL_ASSET),
+            details={"pickle_source": str(AGPL_ASSET), **error_details},
+        )
+    )
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            "pickle diagnostic error field",
+        )
+
+
+@pytest.mark.parametrize("source_owner", ["metadata", "diagnostic"])
+def test_organized_asset_scans_reject_mismatched_source_stability_pickle_source(
+    source_owner: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def raise_source_stability_error(_report_generation: int | None) -> None:
+        raise _source_stability_error()
+
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", raise_source_stability_error)
+    result = core_module.scan_model_directory_or_file(str(AGPL_ASSET), cache_enabled=False)
+    unrelated_source = str(tmp_path / "different.pkl")
+    if source_owner == "metadata":
+        metadata = result.file_metadata[str(AGPL_ASSET)]
+        assert metadata.model_extra is not None
+        metadata.model_extra["pickle_source"] = unrelated_source
+    else:
+        source_stability_issue = next(
+            issue for issue in result.issues if issue.details.get("analysis") == "python_call_graph_source_stability"
+        )
+        source_stability_issue.details["pickle_source"] = unrelated_source
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            f"mismatched {source_owner} pickle source",
+        )
+
+
 @pytest.mark.parametrize(
     ("first_source_changes", "second_source_changes"),
     [(False, True), (True, False)],

@@ -27,6 +27,14 @@ EXPECTED_AGPL_SOURCE_STABILITY_ASSET = (
     Path(__file__).parent / "assets" / "scenarios" / "license_scenarios" / "agpl_component" / "agpl_model.pkl"
 ).resolve()
 EXPECTED_AGPL_SOURCE_STABILITY_REASON = "source_search_context_changed"
+EXPECTED_AGPL_SOURCE_STABILITY_OUTCOME_REASONS = frozenset(
+    {
+        "call_graph_analysis_error",
+        "flax_msgpack_routing_incomplete",
+        "nested_pickle_incomplete",
+        "nested_probe_limit",
+    }
+)
 
 
 def describe_operational_errors(results: ModelAuditResultModel) -> str:
@@ -77,6 +85,7 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
     unexpected_errors = {asset.path for asset in results.assets if asset.type == "error"}
     for path, metadata in results.file_metadata.items():
         payload = metadata.model_dump(exclude_none=True)
+        scan_outcome_reasons = payload.get("scan_outcome_reasons")
         if not payload.get("operational_error"):
             continue
         if metadata_has_coverage_only_operational_error(payload):
@@ -93,9 +102,14 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
             and payload.get("operational_error_reason") == "call_graph_analysis_error"
             and payload.get("analysis_incomplete") is True
             and payload.get("scan_outcome") == "inconclusive"
-            and "call_graph_analysis_error" in payload.get("scan_outcome_reasons", [])
+            and isinstance(scan_outcome_reasons, list)
+            and all(isinstance(reason, str) for reason in scan_outcome_reasons)
+            and len(scan_outcome_reasons) == len(EXPECTED_AGPL_SOURCE_STABILITY_OUTCOME_REASONS)
+            and frozenset(scan_outcome_reasons) == EXPECTED_AGPL_SOURCE_STABILITY_OUTCOME_REASONS
             and payload.get("pickle_report_status") == "inconclusive"
             and payload.get("pickle_verdict") == "malicious"
+            and isinstance(payload.get("pickle_source"), str)
+            and Path(payload["pickle_source"]).resolve() == EXPECTED_AGPL_SOURCE_STABILITY_ASSET
         ):
             expected_source_changes.add(path)
         else:
@@ -120,7 +134,8 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
             matching_paths = {path for path in expected_source_changes if location == path}
             if (
                 matching_paths
-                and pickle_source
+                and isinstance(pickle_source, str)
+                and Path(pickle_source).resolve() == EXPECTED_AGPL_SOURCE_STABILITY_ASSET
                 and issue.message
                 == "Python call-graph analysis could not complete: source changed during shared call-graph analysis"
                 and category == "call_graph_analysis_error"
@@ -157,11 +172,13 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
             unexpected_errors.add(location)
             continue
 
-        if (
-            pickle_source
-            or category == "parse_error"
-            or ("required_package" in details and details.get("operational_error") is not True)
+        if category == "parse_error" or (
+            "required_package" in details and details.get("operational_error") is not True
         ):
+            continue
+        if pickle_source:
+            if details.get("exception_type") or details.get("error_type") or "error" in details:
+                unexpected_errors.add(location)
             continue
 
         scan_budget_failure = (issue.rule_code == "S902" or issue.severity == IssueSeverity.INFO) and (
