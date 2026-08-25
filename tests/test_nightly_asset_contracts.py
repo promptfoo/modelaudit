@@ -15,6 +15,7 @@ from modelaudit_picklescan.call_graph import _CallGraphAnalysisLimitError
 
 import modelaudit.core as core_module
 import modelaudit.scanners.keras_h5_scanner as keras_h5_scanner_module
+import modelaudit.scanners.sevenzip_scanner as sevenzip_scanner_module
 import modelaudit.scanners.tf_metagraph_scanner as tf_metagraph_scanner_module
 import modelaudit.scanners.tflite_scanner as tflite_scanner_module
 from modelaudit.cache import get_cache_manager, reset_cache_manager
@@ -259,6 +260,10 @@ def test_organized_asset_scans_reject_hidden_operational_diagnostics_without_has
             id="failed-outcome-reason",
         ),
         pytest.param(
+            {"scan_outcome_reason": "scanner_read_failed"},
+            id="single-failed-outcome-reason",
+        ),
+        pytest.param(
             {
                 "operational_error": False,
                 "operational_error_reason": "scanner_read_failed",
@@ -280,6 +285,83 @@ def test_organized_asset_scans_reject_unflagged_operational_metadata(
 
     with pytest.raises(AssertionError, match="unexpected operational errors"):
         test_security_asset_integration.assert_no_unexpected_asset_scan_errors(result, "unflagged metadata")
+
+
+@pytest.mark.parametrize("diagnostic_kind", ["issue", "failed-check"])
+def test_organized_asset_scans_reject_bare_noncoverage_outcome_reason(
+    diagnostic_kind: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+    result = _scan_asset("safe_data.pkl")
+    details = {"scan_outcome_reason": "scanner_read_failed"}
+
+    if diagnostic_kind == "failed-check":
+        result.checks.append(
+            Check(
+                name="Hidden scanner failure",
+                status=CheckStatus.FAILED,
+                message="Hidden scanner failure",
+                severity=IssueSeverity.INFO,
+                location=str(AGPL_ASSET),
+                details=details,
+            )
+        )
+    else:
+        result.issues.append(
+            Issue(
+                message="Hidden scanner failure",
+                severity=IssueSeverity.INFO,
+                location=str(AGPL_ASSET),
+                details=details,
+            )
+        )
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(result, diagnostic_kind)
+
+
+@pytest.mark.parametrize(
+    "details",
+    [
+        pytest.param({"operational_error": True}, id="operational-error"),
+        pytest.param({"interrupted": True}, id="interrupted"),
+        pytest.param({"scan_outcome_reason": "scanner_read_failed"}, id="outcome-reason"),
+    ],
+)
+def test_organized_asset_scans_reject_operational_markers_on_passed_checks(
+    details: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+    result = _scan_asset("safe_data.pkl")
+    result.checks.append(
+        Check(
+            name="Inconsistent passed check",
+            status=CheckStatus.PASSED,
+            message="Scanner claims this check passed",
+            location=str(AGPL_ASSET),
+            details=details,
+        )
+    )
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(result, "passed check")
+
+
+def test_organized_asset_scans_preserve_plain_passed_checks(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+    result = _scan_asset("safe_data.pkl")
+    result.checks.append(
+        Check(
+            name="Benign passed check",
+            status=CheckStatus.PASSED,
+            message="Scanner completed normally",
+            details={"format": "pickle"},
+        )
+    )
+
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(result, "plain passed check")
 
 
 @pytest.mark.parametrize("findings_container", ["dict", "list", "tuple"])
@@ -1186,6 +1268,27 @@ def test_organized_asset_scans_preserve_missing_dependency_error_type(
     test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
         result,
         "known missing dependency diagnostic",
+    )
+
+
+def test_organized_asset_scans_preserve_real_sevenzip_missing_dependency(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+    monkeypatch.setattr(sevenzip_scanner_module, "HAS_PY7ZR", False)
+    archive_path = tmp_path / "missing-dependency.7z"
+    archive_path.write_bytes(sevenzip_scanner_module.SevenZipScanner._SEVENZIP_MAGIC + bytes(26))
+
+    result = core_module.scan_model_directory_or_file(str(archive_path), cache_enabled=False)
+    dependency_issue = next(issue for issue in result.issues if issue.details.get("required_package") == "py7zr")
+    assert dependency_issue.rule_code is None
+    assert dependency_issue.details["error_type"] == "missing_dependency"
+    assert dependency_issue.details["scan_outcome_reason"] == "sevenzip_analysis_incomplete"
+
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+        result,
+        "real SevenZip missing dependency",
     )
 
 

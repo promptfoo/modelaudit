@@ -86,13 +86,15 @@ def _is_expected_missing_dependency_diagnostic(
     required_package = details.get("required_package")
     error_type = details.get("error_type")
     return (
-        diagnostic.rule_code == "S902"
+        (not isinstance(diagnostic, Check) or diagnostic.status == CheckStatus.FAILED)
+        and (diagnostic.rule_code == "S902" or (diagnostic.rule_code is None and error_type == "missing_dependency"))
         and isinstance(required_package, str)
         and bool(required_package)
         and "error" not in details
         and "exception_type" not in details
         and (error_type is None or error_type == "missing_dependency")
         and details.get("operational_error") is not True
+        and details.get("interrupted") is not True
     )
 
 
@@ -108,12 +110,24 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
         payload = metadata.model_dump(exclude_none=True)
         scan_outcome_reasons = payload.get("scan_outcome_reasons")
         operational_error_reason = payload.get("operational_error_reason")
+        scan_outcome_reason = payload.get("scan_outcome_reason")
         has_failed_outcome_reason = isinstance(scan_outcome_reasons, list) and any(
             isinstance(reason, str) and reason.endswith(OPERATIONAL_FAILURE_REASON_SUFFIXES)
             for reason in scan_outcome_reasons
         )
+        has_noncoverage_outcome_reason = (
+            isinstance(scan_outcome_reason, str)
+            and bool(scan_outcome_reason)
+            and not metadata_has_coverage_only_operational_error(
+                {"operational_error": True, "operational_error_reason": scan_outcome_reason}
+            )
+        )
         if payload.get("operational_error") is not True:
-            if (isinstance(operational_error_reason, str) and operational_error_reason) or has_failed_outcome_reason:
+            if (
+                (isinstance(operational_error_reason, str) and operational_error_reason)
+                or has_failed_outcome_reason
+                or has_noncoverage_outcome_reason
+            ):
                 unexpected_errors.add(path)
             continue
         if metadata_has_coverage_only_operational_error(payload):
@@ -153,21 +167,40 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
 
     diagnosed_source_changes = set()
     diagnosed_unavailable_scanners = set()
-    failed_checks = (check for check in results.checks if check.status == CheckStatus.FAILED)
-    root_diagnostics: list[Issue | Check] = [*results.issues, *failed_checks]
+    root_diagnostics: list[Issue | Check] = [*results.issues, *results.checks]
     diagnostics = [
         (diagnostic, details)
         for diagnostic in root_diagnostics
         for details in _nested_diagnostic_details(diagnostic.details)
     ]
-    for issue, details in diagnostics:
-        location = issue.location or "unknown scan location"
+    for diagnostic, details in diagnostics:
+        location = diagnostic.location or "unknown scan location"
         pickle_source = details.get("pickle_source")
         category = details.get("category")
+        scan_outcome_reason = details.get("scan_outcome_reason")
+        coverage_only_diagnostic = metadata_has_coverage_only_operational_error(
+            {
+                "operational_error": True,
+                "operational_error_reason": scan_outcome_reason,
+            }
+        )
+        has_noncoverage_outcome_reason = (
+            isinstance(scan_outcome_reason, str) and bool(scan_outcome_reason) and not coverage_only_diagnostic
+        )
+        has_operational_marker = (
+            details.get("operational_error") is True
+            or details.get("interrupted") is True
+            or (isinstance(scan_outcome_reason, str) and bool(scan_outcome_reason))
+        )
+        diagnostic_is_failed = not isinstance(diagnostic, Check) or diagnostic.status == CheckStatus.FAILED
+        if not diagnostic_is_failed and has_operational_marker:
+            unexpected_errors.add(location)
+            continue
 
         if (
             location in unavailable_scanner_paths
-            and issue.message == EXPECTED_UNAVAILABLE_SCANNER_MESSAGE
+            and diagnostic_is_failed
+            and diagnostic.message == EXPECTED_UNAVAILABLE_SCANNER_MESSAGE
             and details.get("path") == location
         ):
             diagnosed_unavailable_scanners.add(location)
@@ -180,7 +213,7 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
                 matching_paths
                 and isinstance(pickle_source, str)
                 and Path(pickle_source).resolve() == EXPECTED_AGPL_SOURCE_STABILITY_ASSET
-                and issue.message
+                and diagnostic.message
                 == "Python call-graph analysis could not complete: source changed during shared call-graph analysis"
                 and category == "call_graph_analysis_error"
                 and details.get("exception_type") == "_CallGraphAnalysisLimitError"
@@ -197,18 +230,18 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
                 unexpected_errors.add(location)
             continue
 
-        coverage_only_diagnostic = metadata_has_coverage_only_operational_error(
-            {
-                "operational_error": True,
-                "operational_error_reason": details.get("scan_outcome_reason"),
-            }
-        )
+        if "required_package" in details:
+            if _is_expected_missing_dependency_diagnostic(diagnostic, details):
+                continue
+            unexpected_errors.add(location)
+            continue
+
         explicit_operational_failure = (
             (details.get("operational_error") is True and not coverage_only_diagnostic)
             or details.get("interrupted") is True
+            or has_noncoverage_outcome_reason
             or (
                 details.get("analysis_incomplete") is True
-                and "required_package" not in details
                 and ("max_total_size" in details or ("scan_outcome_reason" in details and not coverage_only_diagnostic))
             )
         )
@@ -216,11 +249,6 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
             unexpected_errors.add(location)
             continue
 
-        if "required_package" in details:
-            if _is_expected_missing_dependency_diagnostic(issue, details):
-                continue
-            unexpected_errors.add(location)
-            continue
         if category == "parse_error":
             continue
         if pickle_source:
@@ -228,7 +256,7 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
                 unexpected_errors.add(location)
             continue
 
-        scan_budget_failure = (issue.rule_code == "S902" or issue.severity == IssueSeverity.INFO) and (
+        scan_budget_failure = (diagnostic.rule_code == "S902" or diagnostic.severity == IssueSeverity.INFO) and (
             any(key.startswith("max_") for key in details)
             or details.get("security_check") == "compression_bomb_detection"
         )
