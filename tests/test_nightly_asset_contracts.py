@@ -247,6 +247,41 @@ def test_organized_asset_scans_reject_hidden_operational_diagnostics_without_has
         test_security_asset_integration.assert_no_unexpected_asset_scan_errors(result, diagnostic_kind)
 
 
+@pytest.mark.parametrize(
+    "metadata_marker",
+    [
+        pytest.param(
+            {"operational_error_reason": "scanner_read_failed"},
+            id="operational-error-reason",
+        ),
+        pytest.param(
+            {"scan_outcome_reasons": ["scanner_read_failed"]},
+            id="failed-outcome-reason",
+        ),
+        pytest.param(
+            {
+                "operational_error": False,
+                "operational_error_reason": "scanner_read_failed",
+                "scan_outcome_reasons": ["scanner_read_failed"],
+            },
+            id="false-operational-error-flag",
+        ),
+    ],
+)
+def test_organized_asset_scans_reject_unflagged_operational_metadata(
+    metadata_marker: dict[str, Any],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+    result = _scan_asset("safe_data.pkl")
+    assert result.has_errors is False
+    result.file_metadata[str(tmp_path / "secondary.bin")] = FileMetadataModel(**metadata_marker)
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(result, "unflagged metadata")
+
+
 @pytest.mark.parametrize("findings_container", ["dict", "list", "tuple"])
 def test_organized_asset_scans_reject_nested_finding_operational_diagnostics_without_has_errors(
     findings_container: str,
@@ -975,6 +1010,30 @@ def test_organized_asset_scans_preserve_existing_h5_diagnostics(
     getattr(test_case, integration_test)(tmp_path)
 
 
+def test_organized_asset_scans_reject_coverage_only_contract_without_diagnostic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+    result = _scan_asset("safe_data.pkl")
+    assert result.has_errors is False
+    coverage_path = str(tmp_path / "missing.keras")
+    result.success = False
+    result.file_metadata[coverage_path] = FileMetadataModel(
+        operational_error=True,
+        operational_error_reason="recognized_format_scanner_unavailable",
+        analysis_incomplete=True,
+        scan_outcome="inconclusive",
+        scan_outcome_reasons=["recognized_format_scanner_unavailable"],
+    )
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            "coverage-only outcome without diagnostic",
+        )
+
+
 @pytest.mark.parametrize(
     "malformation",
     [
@@ -1033,12 +1092,23 @@ def test_organized_asset_scans_preserve_complete_coverage_only_contract(
     result = _scan_asset("safe_data.pkl")
     assert result.has_errors is False
     result.success = False
-    result.file_metadata[str(tmp_path / "missing.keras")] = FileMetadataModel(
+    coverage_path = str(tmp_path / "missing.keras")
+    result.file_metadata[coverage_path] = FileMetadataModel(
         operational_error=True,
         operational_error_reason="recognized_format_scanner_unavailable",
         analysis_incomplete=True,
         scan_outcome="inconclusive",
         scan_outcome_reasons=["recognized_format_scanner_unavailable"],
+    )
+    result.checks.append(
+        Check(
+            name="Format Detection",
+            status=CheckStatus.FAILED,
+            message=test_security_asset_integration.EXPECTED_UNAVAILABLE_SCANNER_MESSAGE,
+            severity=IssueSeverity.INFO,
+            location=coverage_path,
+            details={"format": "keras", "path": coverage_path},
+        )
     )
 
     assert results_have_inconclusive_outcome(result) is True
@@ -1046,6 +1116,76 @@ def test_organized_asset_scans_preserve_complete_coverage_only_contract(
     test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
         result,
         "complete coverage-only outcome",
+    )
+
+
+@pytest.mark.parametrize(
+    "error_details",
+    [
+        pytest.param({"error": "independent scanner failure"}, id="error"),
+        pytest.param({"error_type": "RuntimeError"}, id="error-type"),
+        pytest.param({"exception_type": "RuntimeError"}, id="exception-type"),
+    ],
+)
+def test_organized_asset_scans_reject_dependency_diagnostic_error_fields(
+    error_details: dict[str, str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+    result = _scan_asset("safe_data.pkl")
+    dependency_path = str(tmp_path / "missing.h5")
+    result.checks.append(
+        Check(
+            name="H5PY Library Check",
+            status=CheckStatus.FAILED,
+            message="h5py is required for Keras H5 scanning.",
+            severity=IssueSeverity.INFO,
+            location=dependency_path,
+            details={
+                "required_package": "h5py",
+                "analysis_incomplete": True,
+                "scan_outcome_reason": "keras_h5_h5py_unavailable",
+                **error_details,
+            },
+            rule_code="S902",
+        )
+    )
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            "dependency diagnostic with error field",
+        )
+
+
+def test_organized_asset_scans_preserve_missing_dependency_error_type(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+    result = _scan_asset("safe_data.pkl")
+    dependency_path = str(tmp_path / "missing.7z")
+    result.checks.append(
+        Check(
+            name="7-Zip Dependency Check",
+            status=CheckStatus.FAILED,
+            message="py7zr package is not installed.",
+            severity=IssueSeverity.INFO,
+            location=dependency_path,
+            details={
+                "required_package": "py7zr",
+                "error_type": "missing_dependency",
+                "analysis_incomplete": True,
+                "scan_outcome_reason": "sevenzip_analysis_incomplete",
+            },
+            rule_code="S902",
+        )
+    )
+
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+        result,
+        "known missing dependency diagnostic",
     )
 
 
@@ -1089,7 +1229,18 @@ def test_organized_asset_scans_preserve_coverage_only_outcomes(
             scan_outcome_reasons=["recognized_format_scanner_unavailable"],
         )
         assert metadata_has_coverage_only_operational_error(coverage_metadata) is True
-        result.file_metadata[str(tmp_path / "missing.keras")] = coverage_metadata
+        coverage_path = str(tmp_path / "missing.keras")
+        result.file_metadata[coverage_path] = coverage_metadata
+        result.checks.append(
+            Check(
+                name="Format Detection",
+                status=CheckStatus.FAILED,
+                message=test_security_asset_integration.EXPECTED_UNAVAILABLE_SCANNER_MESSAGE,
+                severity=IssueSeverity.INFO,
+                location=coverage_path,
+                details={"format": "keras", "path": coverage_path},
+            )
+        )
 
     monkeypatch.setattr(
         test_security_asset_integration,

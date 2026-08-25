@@ -23,6 +23,8 @@ from modelaudit.models import ModelAuditResultModel
 from modelaudit.scanner_results import Check, CheckStatus, Issue
 from modelaudit.scanners.base import IssueSeverity
 
+EXPECTED_UNAVAILABLE_SCANNER_MESSAGE = "Recognized format could not be scanned because no scanner was available"
+OPERATIONAL_FAILURE_REASON_SUFFIXES = ("_failed", "_error", "_exceeded", "_timeout", "_interrupted")
 EXPECTED_AGPL_SOURCE_STABILITY_ASSET = (
     Path(__file__).parent / "assets" / "scenarios" / "license_scenarios" / "agpl_component" / "agpl_model.pkl"
 ).resolve()
@@ -77,33 +79,56 @@ def _nested_diagnostic_details(details: dict[str, Any]) -> list[dict[str, Any]]:
     return normalized
 
 
+def _is_expected_missing_dependency_diagnostic(
+    diagnostic: Issue | Check,
+    details: dict[str, Any],
+) -> bool:
+    required_package = details.get("required_package")
+    error_type = details.get("error_type")
+    return (
+        diagnostic.rule_code == "S902"
+        and isinstance(required_package, str)
+        and bool(required_package)
+        and "error" not in details
+        and "exception_type" not in details
+        and (error_type is None or error_type == "missing_dependency")
+        and details.get("operational_error") is not True
+    )
+
+
 def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_description: str) -> None:
     expected_source_changes = set()
     security_finding_locations = {
         issue.location for issue in results.issues if issue.rule_code == "S204" and issue.location is not None
     }
     coverage_only_paths = set()
+    unavailable_scanner_paths = set()
     unexpected_errors = {asset.path for asset in results.assets if asset.type == "error"}
     for path, metadata in results.file_metadata.items():
         payload = metadata.model_dump(exclude_none=True)
         scan_outcome_reasons = payload.get("scan_outcome_reasons")
-        if not payload.get("operational_error"):
+        operational_error_reason = payload.get("operational_error_reason")
+        has_failed_outcome_reason = isinstance(scan_outcome_reasons, list) and any(
+            isinstance(reason, str) and reason.endswith(OPERATIONAL_FAILURE_REASON_SUFFIXES)
+            for reason in scan_outcome_reasons
+        )
+        if payload.get("operational_error") is not True:
+            if (isinstance(operational_error_reason, str) and operational_error_reason) or has_failed_outcome_reason:
+                unexpected_errors.add(path)
             continue
         if metadata_has_coverage_only_operational_error(payload):
-            operational_error_reason = payload.get("operational_error_reason")
             coverage_only_is_inconclusive = (
                 payload.get("analysis_incomplete") is True
                 and payload.get("scan_outcome") == "inconclusive"
                 and isinstance(scan_outcome_reasons, list)
                 and all(isinstance(reason, str) for reason in scan_outcome_reasons)
                 and operational_error_reason in scan_outcome_reasons
-                and not any(
-                    reason.endswith(("_failed", "_error", "_exceeded", "_timeout", "_interrupted"))
-                    for reason in scan_outcome_reasons
-                )
+                and not any(reason.endswith(OPERATIONAL_FAILURE_REASON_SUFFIXES) for reason in scan_outcome_reasons)
             )
             if coverage_only_is_inconclusive:
                 coverage_only_paths.add(path)
+                if operational_error_reason == "recognized_format_scanner_unavailable":
+                    unavailable_scanner_paths.add(path)
             else:
                 unexpected_errors.add(path)
             continue
@@ -127,6 +152,7 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
             unexpected_errors.add(path)
 
     diagnosed_source_changes = set()
+    diagnosed_unavailable_scanners = set()
     failed_checks = (check for check in results.checks if check.status == CheckStatus.FAILED)
     root_diagnostics: list[Issue | Check] = [*results.issues, *failed_checks]
     diagnostics = [
@@ -138,6 +164,13 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
         location = issue.location or "unknown scan location"
         pickle_source = details.get("pickle_source")
         category = details.get("category")
+
+        if (
+            location in unavailable_scanner_paths
+            and issue.message == EXPECTED_UNAVAILABLE_SCANNER_MESSAGE
+            and details.get("path") == location
+        ):
+            diagnosed_unavailable_scanners.add(location)
 
         if category == "call_graph_analysis_error" or (
             pickle_source and category not in {None, "parse_error"} and "exception_type" in details
@@ -183,9 +216,12 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
             unexpected_errors.add(location)
             continue
 
-        if category == "parse_error" or (
-            "required_package" in details and details.get("operational_error") is not True
-        ):
+        if "required_package" in details:
+            if _is_expected_missing_dependency_diagnostic(issue, details):
+                continue
+            unexpected_errors.add(location)
+            continue
+        if category == "parse_error":
             continue
         if pickle_source:
             if details.get("exception_type") or details.get("error_type") or "error" in details:
@@ -211,6 +247,7 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
             unexpected_errors.add(location)
             continue
 
+    unexpected_errors.update(unavailable_scanner_paths - diagnosed_unavailable_scanners)
     if coverage_only_paths and results.success is not False:
         unexpected_errors.update(coverage_only_paths)
     error_message = (
