@@ -3613,3 +3613,128 @@ def test_loaded_extension_export_does_not_hide_legacy_dotted_module_getattr(
     public_findings = [finding for finding in report.findings if finding.rule_code == "DANGEROUS_CALL_GRAPH"]
     assert len(public_findings) == 1
     assert public_findings[0].details["sink"] == "os.system"
+
+
+def test_shared_source_snapshot_staleness_reason_names_the_failing_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stability failure must report which gate invalidated the snapshot.
+
+    The Windows lane fails intermittently with a bare "source changed during shared call-graph
+    analysis", which is not actionable. The gate name rides in the error details so the cause is
+    visible without reproducing the failure locally.
+    """
+    monkeypatch.setattr(call_graph, "_interpreter_import_runtime_matches_snapshot", lambda: True)
+    monkeypatch.setattr(call_graph, "_source_search_context", lambda: ("current",))
+
+    snapshot = call_graph._SharedSourceSnapshot(
+        search_context=("original",),
+        resolution_context=((), (), ()),
+        import_runtime_trusted=True,
+    )
+
+    assert call_graph._shared_source_snapshot_staleness_reason(snapshot) == "source_search_context_changed"
+
+    snapshot.stable = False
+    assert call_graph._shared_source_snapshot_staleness_reason(snapshot) == "snapshot_marked_unstable"
+
+    snapshot.stable = True
+    snapshot.import_runtime_trusted = False
+    assert call_graph._shared_source_snapshot_staleness_reason(snapshot) == "import_runtime_untrusted"
+
+
+def test_shared_source_tracker_preserves_specific_stability_reason_in_report_details(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tracker-detected change must survive through the public error details."""
+    search_contexts = [("original",)]
+    monkeypatch.setattr(call_graph, "_interpreter_import_runtime_matches_snapshot", lambda: True)
+    monkeypatch.setattr(call_graph, "_source_search_context", lambda: search_contexts[0])
+
+    source_path = tmp_path / "tracked_module.py"
+    source_path.write_text("value = 1\n", encoding="utf-8")
+
+    with call_graph.shared_source_sensitive_caches():
+        report_generation = call_graph._begin_shared_source_report()
+        snapshot = call_graph._SHARED_SOURCE_SENSITIVE_SNAPSHOT.get()
+        assert snapshot is not None
+        search_contexts[0] = ("changed",)
+        call_graph._track_shared_source_path("tracked_module", source_path, loaded=False)
+        call_graph._mark_shared_source_snapshot_unstable(snapshot, "resolution_context_changed")
+        with pytest.raises(
+            call_graph._CallGraphAnalysisLimitError,
+            match="source changed during shared call-graph analysis",
+        ) as exc_info:
+            call_graph._ensure_shared_source_snapshot_stable(report_generation)
+        assert snapshot.stability_reason is None
+        assert snapshot.stable is True
+        preserved_reason = snapshot.active_report_stability_reason
+        assert preserved_reason == "source_search_context_changed"
+
+        next_report_generation = call_graph._begin_shared_source_report()
+        assert next_report_generation != report_generation
+        next_report_reason = snapshot.active_report_stability_reason
+        assert next_report_reason is None
+        call_graph._ensure_shared_source_snapshot_stable(next_report_generation)
+
+    error = exc_info.value
+    details = package_api._call_graph_enrichment_error_details(
+        "python_call_graph_source_stability",
+        error,
+    )
+
+    assert error.stability_reason == "source_search_context_changed"
+    assert details["source_stability_reason"] == "source_search_context_changed"
+    assert details["analysis_incomplete"] is True
+
+
+def test_shared_source_snapshot_is_current_matches_staleness_reason() -> None:
+    """The boolean wrapper must stay consistent with the reason it delegates to."""
+    snapshot = call_graph._SharedSourceSnapshot(
+        search_context=("original",),
+        resolution_context=((), (), ()),
+        import_runtime_trusted=True,
+    )
+
+    assert call_graph._shared_source_snapshot_is_current(snapshot) is (
+        call_graph._shared_source_snapshot_staleness_reason(snapshot) is None
+    )
+
+
+def test_call_graph_stability_error_details_carry_the_reason_without_changing_the_message() -> None:
+    """Existing assertions match the message exactly, so the reason must ride in details."""
+    error = call_graph._CallGraphAnalysisLimitError(
+        "source changed during shared call-graph analysis",
+        stability_reason="source_search_context_changed",
+    )
+
+    details = package_api._call_graph_enrichment_error_details("python_call_graph_source_stability", error)
+
+    assert str(error) == "source changed during shared call-graph analysis"
+    assert details["source_stability_reason"] == "source_search_context_changed"
+    assert details["analysis_incomplete"] is True
+    assert "source_stability_reason" not in package_api._call_graph_enrichment_error_details(
+        "python_call_graph_source_stability",
+        RuntimeError("unrelated"),
+    )
+
+
+def test_call_graph_error_details_do_not_read_arbitrary_exception_attributes() -> None:
+    class HostileError(RuntimeError):
+        def __getattribute__(self, name: str) -> object:
+            if name == "stability_reason":
+                raise RuntimeError("boom")
+            return super().__getattribute__(name)
+
+    report = package_api._with_call_graph_enrichment_errors(
+        package_api.scan_bytes(pickle.dumps(None), source="hostile-error.pkl"),
+        (("python_call_graph", HostileError("unrelated")),),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert report.errors[-1].details == {
+        "analysis": "python_call_graph",
+        "analysis_incomplete": True,
+    }
