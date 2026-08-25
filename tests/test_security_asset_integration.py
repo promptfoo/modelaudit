@@ -11,6 +11,7 @@ import shutil
 import sys
 import tempfile
 from pathlib import Path
+from typing import Any
 
 import pytest
 from click.testing import CliRunner
@@ -21,6 +22,11 @@ from modelaudit.core_results import metadata_has_coverage_only_operational_error
 from modelaudit.models import ModelAuditResultModel
 from modelaudit.scanner_results import Check, CheckStatus, Issue
 from modelaudit.scanners.base import IssueSeverity
+
+EXPECTED_AGPL_SOURCE_STABILITY_ASSET = (
+    Path(__file__).parent / "assets" / "scenarios" / "license_scenarios" / "agpl_component" / "agpl_model.pkl"
+).resolve()
+EXPECTED_AGPL_SOURCE_STABILITY_REASON = "source_search_context_changed"
 
 
 def describe_operational_errors(results: ModelAuditResultModel) -> str:
@@ -40,10 +46,30 @@ def describe_operational_errors(results: ModelAuditResultModel) -> str:
     return "; ".join(sorted(offenders)) or "no per-file operational_error metadata recorded"
 
 
-def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_description: str) -> None:
-    if not results.has_errors:
-        return
+def _nested_diagnostic_details(details: dict[str, Any]) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    pending = [details]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        current_id = id(current)
+        if current_id in seen:
+            continue
+        seen.add(current_id)
+        normalized.append(current)
 
+        nested_details = current.get("details")
+        if isinstance(nested_details, dict):
+            pending.append(nested_details)
+        nested_findings = current.get("findings")
+        if isinstance(nested_findings, dict):
+            pending.append(nested_findings)
+        elif isinstance(nested_findings, (list, tuple, set, frozenset)):
+            pending.extend(finding for finding in nested_findings if isinstance(finding, dict))
+    return normalized
+
+
+def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_description: str) -> None:
     expected_source_changes = set()
     security_finding_locations = {
         issue.location for issue in results.issues if issue.rule_code == "S204" and issue.location is not None
@@ -63,7 +89,7 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
             continue
 
         if (
-            Path(path).name == "agpl_model.pkl"
+            Path(path).resolve() == EXPECTED_AGPL_SOURCE_STABILITY_ASSET
             and payload.get("operational_error_reason") == "call_graph_analysis_error"
             and payload.get("analysis_incomplete") is True
             and payload.get("scan_outcome") == "inconclusive"
@@ -77,16 +103,13 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
 
     diagnosed_source_changes = set()
     failed_checks = (check for check in results.checks if check.status == CheckStatus.FAILED)
-    diagnostics: list[Issue | Check] = [*results.issues, *failed_checks]
-    for issue in diagnostics:
-        details = issue.details
-        nested_findings = details.get("findings")
-        if isinstance(nested_findings, list):
-            diagnostics.extend(
-                issue.model_copy(update={"details": finding})
-                for finding in nested_findings
-                if isinstance(finding, dict)
-            )
+    root_diagnostics: list[Issue | Check] = [*results.issues, *failed_checks]
+    diagnostics = [
+        (diagnostic, details)
+        for diagnostic in root_diagnostics
+        for details in _nested_diagnostic_details(diagnostic.details)
+    ]
+    for issue, details in diagnostics:
         location = issue.location or "unknown scan location"
         pickle_source = details.get("pickle_source")
         category = details.get("category")
@@ -104,6 +127,7 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
                 and details.get("exception_type") == "_CallGraphAnalysisLimitError"
                 and details.get("analysis") == "python_call_graph_source_stability"
                 and details.get("analysis_incomplete") is True
+                and details.get("source_stability_reason") == EXPECTED_AGPL_SOURCE_STABILITY_REASON
                 and any(
                     finding_location == location or finding_location.startswith(f"{location} (")
                     for finding_location in security_finding_locations
@@ -114,6 +138,25 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
                 unexpected_errors.add(location)
             continue
 
+        coverage_only_diagnostic = metadata_has_coverage_only_operational_error(
+            {
+                "operational_error": True,
+                "operational_error_reason": details.get("scan_outcome_reason"),
+            }
+        )
+        explicit_operational_failure = (
+            (details.get("operational_error") is True and not coverage_only_diagnostic)
+            or details.get("interrupted") is True
+            or (
+                details.get("analysis_incomplete") is True
+                and "required_package" not in details
+                and ("max_total_size" in details or ("scan_outcome_reason" in details and not coverage_only_diagnostic))
+            )
+        )
+        if explicit_operational_failure:
+            unexpected_errors.add(location)
+            continue
+
         if (
             pickle_source
             or category == "parse_error"
@@ -121,12 +164,6 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
         ):
             continue
 
-        coverage_only_diagnostic = metadata_has_coverage_only_operational_error(
-            {
-                "operational_error": True,
-                "operational_error_reason": details.get("scan_outcome_reason"),
-            }
-        )
         scan_budget_failure = (issue.rule_code == "S902" or issue.severity == IssueSeverity.INFO) and (
             any(key.startswith("max_") for key in details)
             or details.get("security_check") == "compression_bomb_detection"
@@ -144,12 +181,18 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
             )
         ):
             unexpected_errors.add(location)
+            continue
 
-    assert expected_source_changes and expected_source_changes == diagnosed_source_changes and not unexpected_errors, (
+    error_message = (
         f"{scan_description} should not have unexpected operational errors: {describe_operational_errors(results)}"
     )
-    assert results.success is False, f"{scan_description} must fail closed when source stability changes"
-    assert determine_exit_code(results) == 2, f"{scan_description} must preserve its operational-error exit code"
+    assert not unexpected_errors, error_message
+    if expected_source_changes:
+        assert results.has_errors and expected_source_changes == diagnosed_source_changes, error_message
+        assert results.success is False, f"{scan_description} must fail closed when source stability changes"
+        assert determine_exit_code(results) == 2, f"{scan_description} must preserve its operational-error exit code"
+        return
+    assert not results.has_errors and not diagnosed_source_changes, error_message
 
 
 class TestSecurityAssetIntegration:

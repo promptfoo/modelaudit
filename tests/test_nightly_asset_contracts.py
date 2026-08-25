@@ -17,10 +17,10 @@ import modelaudit.core as core_module
 import modelaudit.scanners.keras_h5_scanner as keras_h5_scanner_module
 import modelaudit.scanners.tf_metagraph_scanner as tf_metagraph_scanner_module
 import modelaudit.scanners.tflite_scanner as tflite_scanner_module
-from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core_results import metadata_has_coverage_only_operational_error, results_have_inconclusive_outcome
 from modelaudit.models import FileMetadataModel, ModelAuditResultModel
-from modelaudit.scanner_results import Issue, IssueSeverity, ScanResult
+from modelaudit.scanner_results import Check, CheckStatus, Issue, IssueSeverity, ScanResult
 from modelaudit.scanners.flax_msgpack_scanner import FlaxMsgpackScanner
 from modelaudit.scanners.manifest_scanner import ManifestScanner
 from tests import test_security_asset_integration
@@ -29,8 +29,21 @@ ASSETS = Path(__file__).parent / "assets" / "samples" / "pickles"
 AGPL_ASSET = Path(__file__).parent / "assets" / "scenarios" / "license_scenarios" / "agpl_component" / "agpl_model.pkl"
 
 
+def _source_stability_error() -> _CallGraphAnalysisLimitError:
+    return _CallGraphAnalysisLimitError(
+        "source changed during shared call-graph analysis",
+        stability_reason=test_security_asset_integration.EXPECTED_AGPL_SOURCE_STABILITY_REASON,
+    )
+
+
 def _scan_asset(name: str) -> ModelAuditResultModel:
-    return scan_model_directory_or_file(str(ASSETS / name), cache_enabled=False)
+    return core_module.scan_model_directory_or_file(str(ASSETS / name), cache_enabled=False)
+
+
+def _merge_with_canonical_agpl_source_change(result: ModelAuditResultModel) -> ModelAuditResultModel:
+    expected_source_change = core_module.scan_model_directory_or_file(str(AGPL_ASSET), cache_enabled=False)
+    expected_source_change.aggregate_scan_result(result)
+    return expected_source_change
 
 
 def _assert_otherwise_accepted_archive_control(
@@ -64,7 +77,7 @@ def test_complete_benign_asset_scans_cleanly() -> None:
 
     assert result.has_errors is False
     assert results_have_inconclusive_outcome(result) is False
-    assert determine_exit_code(result) == 0
+    assert core_module.determine_exit_code(result) == 0
     assert result.issues == []
 
 
@@ -98,7 +111,7 @@ def test_complete_malicious_assets_preserve_security_signal(
 
     assert result.has_errors is False
     assert results_have_inconclusive_outcome(result) is False
-    assert determine_exit_code(result) == 1
+    assert core_module.determine_exit_code(result) == 1
     assert any(issue.rule_code == rule_code and issue.message == message for issue in result.issues)
 
 
@@ -119,7 +132,7 @@ def test_intentional_incomplete_pickle_asset_preserves_security_exit() -> None:
         and issue.message == "Found REDUCE opcode invoking dangerous global: dill._dill._create_code"
         for issue in result.issues
     )
-    assert determine_exit_code(result) == 1
+    assert core_module.determine_exit_code(result) == 1
 
 
 @pytest.mark.parametrize(
@@ -139,19 +152,19 @@ def test_organized_asset_scans_preserve_fail_closed_source_stability(
     if source_changes:
 
         def raise_source_stability_error(_report_generation: int | None) -> None:
-            raise _CallGraphAnalysisLimitError("source changed during shared call-graph analysis")
+            raise _source_stability_error()
 
         monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", raise_source_stability_error)
     else:
         monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
 
-    result = scan_model_directory_or_file(str(AGPL_ASSET), cache_enabled=False)
+    result = core_module.scan_model_directory_or_file(str(AGPL_ASSET), cache_enabled=False)
     metadata = result.file_metadata[str(AGPL_ASSET)].model_dump(exclude_none=True)
 
     assert result.has_errors is source_changes
     assert result.success is False
     assert results_have_inconclusive_outcome(result) is True
-    assert determine_exit_code(result) == (2 if source_changes else 1)
+    assert core_module.determine_exit_code(result) == (2 if source_changes else 1)
     assert metadata["pickle_verdict"] == "malicious"
     assert any(issue.rule_code == "S204" for issue in result.issues)
 
@@ -168,6 +181,8 @@ def test_organized_asset_scans_preserve_fail_closed_source_stability(
             and issue.details.get("exception_type") == "_CallGraphAnalysisLimitError"
             and issue.details.get("analysis") == "python_call_graph_source_stability"
             and issue.details.get("analysis_incomplete") is True
+            and issue.details.get("source_stability_reason")
+            == test_security_asset_integration.EXPECTED_AGPL_SOURCE_STABILITY_REASON
             for issue in result.issues
         )
 
@@ -179,6 +194,201 @@ def test_organized_asset_scans_preserve_fail_closed_source_stability(
 
     test_case = test_security_asset_integration.TestSecurityAssetIntegration()
     getattr(test_case, integration_test)(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("diagnostic_kind", "include_operational_error"),
+    [
+        ("issue", True),
+        ("failed-check", True),
+        ("marker-only", False),
+    ],
+)
+def test_organized_asset_scans_reject_hidden_operational_diagnostics_without_has_errors(
+    diagnostic_kind: str,
+    include_operational_error: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+    result = core_module.scan_model_directory_or_file(str(AGPL_ASSET), cache_enabled=False)
+    assert result.has_errors is False
+
+    details = {
+        "analysis_incomplete": True,
+        "scan_outcome": "inconclusive",
+        "scan_outcome_reason": "scanner_error",
+    }
+    if include_operational_error:
+        details["operational_error"] = True
+
+    if diagnostic_kind == "failed-check":
+        result.checks.append(
+            Check(
+                name="Hidden operational failure",
+                status=CheckStatus.FAILED,
+                message="Hidden operational failure",
+                severity=IssueSeverity.INFO,
+                location=str(AGPL_ASSET),
+                details=details,
+            )
+        )
+    else:
+        result.issues.append(
+            Issue(
+                message="Hidden operational failure",
+                severity=IssueSeverity.INFO,
+                location=str(AGPL_ASSET),
+                details=details,
+            )
+        )
+
+    assert result.has_errors is False
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(result, diagnostic_kind)
+
+
+@pytest.mark.parametrize("findings_container", ["dict", "list", "tuple"])
+def test_organized_asset_scans_reject_nested_finding_operational_diagnostics_without_has_errors(
+    findings_container: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+    result = core_module.scan_model_directory_or_file(str(AGPL_ASSET), cache_enabled=False)
+    nested_finding = {
+        "details": {
+            "analysis_incomplete": True,
+            "scan_outcome": "inconclusive",
+            "scan_outcome_reason": "scanner_error",
+            "operational_error": True,
+        }
+    }
+    findings: Any = nested_finding
+    if findings_container == "list":
+        findings = [nested_finding]
+    elif findings_container == "tuple":
+        findings = (nested_finding,)
+    result.issues.append(
+        Issue(
+            message="Serialized scanner findings",
+            severity=IssueSeverity.INFO,
+            location=str(AGPL_ASSET),
+            details={"findings": findings},
+        )
+    )
+
+    assert result.has_errors is False
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(result, "nested finding")
+
+
+@pytest.mark.parametrize(
+    ("benign_detail", "nested"),
+    [
+        pytest.param({"pickle_source": str(AGPL_ASSET)}, False, id="pickle-source-top-level"),
+        pytest.param({"pickle_source": str(AGPL_ASSET)}, True, id="pickle-source-nested"),
+        pytest.param({"category": "parse_error"}, False, id="parse-error-top-level"),
+        pytest.param({"category": "parse_error"}, True, id="parse-error-nested"),
+    ],
+)
+def test_organized_asset_scans_reject_operational_markers_before_benign_detail_skip(
+    benign_detail: dict[str, Any],
+    nested: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+    result = core_module.scan_model_directory_or_file(str(AGPL_ASSET), cache_enabled=False)
+    operational_details = {
+        **benign_detail,
+        "analysis_incomplete": True,
+        "scan_outcome": "inconclusive",
+        "scan_outcome_reason": "scanner_error",
+        "operational_error": True,
+    }
+    details: dict[str, Any] = operational_details
+    if nested:
+        details = {"findings": [{"details": operational_details}]}
+    result.issues.append(
+        Issue(
+            message="Operational failure with otherwise benign details",
+            severity=IssueSeverity.INFO,
+            location=str(AGPL_ASSET),
+            details=details,
+        )
+    )
+
+    assert result.has_errors is False
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(result, "operational marker")
+
+
+def test_organized_asset_scans_reject_source_stability_diagnostic_without_has_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def raise_source_stability_error(_report_generation: int | None) -> None:
+        raise _source_stability_error()
+
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", raise_source_stability_error)
+    result = core_module.scan_model_directory_or_file(str(AGPL_ASSET), cache_enabled=False)
+
+    assert result.has_errors is True
+    assert result.success is False
+    assert core_module.determine_exit_code(result) == 2
+    result.has_errors = False
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            "source-stability diagnostic without has_errors",
+        )
+
+
+@pytest.mark.parametrize(
+    ("first_source_changes", "second_source_changes"),
+    [(False, True), (True, False)],
+    ids=["stable-to-changed", "changed-to-stable"],
+)
+def test_organized_asset_cache_preserves_source_stability_transitions(
+    first_source_changes: bool,
+    second_source_changes: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_changes = first_source_changes
+
+    def enforce_source_stability(_report_generation: int | None) -> None:
+        if source_changes:
+            raise _source_stability_error()
+
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", enforce_source_stability)
+    scan_results: list[tuple[bool, ModelAuditResultModel]] = []
+    reset_cache_manager()
+    try:
+        for source_changes in (first_source_changes, second_source_changes):
+            result = core_module.scan_model_directory_or_file(
+                str(AGPL_ASSET),
+                cache_enabled=True,
+                cache_dir=str(tmp_path / "cache"),
+                min_cache_file_size=0,
+            )
+            scan_results.append((source_changes, result))
+        cache_stats = get_cache_manager(str(tmp_path / "cache"), enabled=True).get_stats()
+    finally:
+        reset_cache_manager()
+
+    assert cache_stats["total_entries"] == 0
+    assert cache_stats["cache_hits"] == 0
+    assert cache_stats["cache_misses"] >= 2
+    for expected_source_changes, result in scan_results:
+        metadata = result.file_metadata[str(AGPL_ASSET)].model_dump(exclude_none=True)
+        assert result.has_errors is expected_source_changes
+        assert metadata["pickle_report_status"] == "inconclusive"
+        assert metadata["pickle_verdict"] == "malicious"
+        assert core_module.determine_exit_code(result) == (2 if expected_source_changes else 1)
+        assert any(issue.rule_code == "S204" for issue in result.issues)
+        assert (
+            any(issue.details.get("analysis") == "python_call_graph_source_stability" for issue in result.issues)
+            is expected_source_changes
+        )
+        assert result.success is False
 
 
 @pytest.mark.parametrize(
@@ -194,19 +404,19 @@ def test_organized_asset_scans_reject_embedded_source_stability(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def raise_source_stability_error(_report_generation: int | None) -> None:
-        raise _CallGraphAnalysisLimitError("source changed during shared call-graph analysis")
+        raise _source_stability_error()
 
     monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", raise_source_stability_error)
     archive_path = tmp_path / "nested.zip"
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.write(AGPL_ASSET, "model.pkl")
 
-    result = scan_model_directory_or_file(str(archive_path), cache_enabled=False)
+    result = core_module.scan_model_directory_or_file(str(archive_path), cache_enabled=False)
     metadata = result.file_metadata[str(archive_path)].model_dump(exclude_none=True)
 
     assert result.has_errors is True
     assert result.success is False
-    assert determine_exit_code(result) == 2
+    assert core_module.determine_exit_code(result) == 2
     assert metadata["operational_error_reason"] == "call_graph_analysis_error"
     assert metadata["pickle_source"] != str(archive_path)
     assert any(
@@ -240,13 +450,13 @@ def test_organized_asset_scans_preserve_security_threshold_findings(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def raise_source_stability_error(_report_generation: int | None) -> None:
-        raise _CallGraphAnalysisLimitError("source changed during shared call-graph analysis")
+        raise _source_stability_error()
 
     monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", raise_source_stability_error)
-    shutil.copy2(AGPL_ASSET, tmp_path / "agpl_model.pkl")
     weights = tmp_path / "weights.msgpack"
     weights.write_bytes(msgpack.packb({"params": {"shape": [1_000_000_001]}}))
-    result = scan_model_directory_or_file(str(tmp_path), cache_enabled=False)
+    result = core_module.scan_model_directory_or_file(str(tmp_path), cache_enabled=False)
+    result = _merge_with_canonical_agpl_source_change(result)
 
     assert result.file_metadata[str(weights)].get("operational_error") is None
     assert any(
@@ -289,10 +499,9 @@ def test_organized_asset_scans_reject_unrelated_archive_failures(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def raise_source_stability_error(_report_generation: int | None) -> None:
-        raise _CallGraphAnalysisLimitError("source changed during shared call-graph analysis")
+        raise _source_stability_error()
 
     monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", raise_source_stability_error)
-    shutil.copy2(AGPL_ASSET, tmp_path / "agpl_model.pkl")
     archive_path = tmp_path / "unrelated-archive-failure.zip"
     with zipfile.ZipFile(archive_path, "w") as archive:
         if archive_failure == "object-budget":
@@ -352,7 +561,8 @@ def test_organized_asset_scans_reject_unrelated_archive_failures(
     elif archive_failure == "metadata-only-budget":
         monkeypatch.setattr(tf_metagraph_scanner_module, "_MAX_PARSE_BYTES", 128)
 
-    result = scan_model_directory_or_file(str(tmp_path), cache_enabled=False, max_msgpack_stream_objects=1)
+    result = core_module.scan_model_directory_or_file(str(tmp_path), cache_enabled=False, max_msgpack_stream_objects=1)
+    result = _merge_with_canonical_agpl_source_change(result)
     archive_metadata = result.file_metadata[str(archive_path)].model_dump(exclude_none=True)
     assert archive_metadata["operational_error_reason"] == "xml_model_routing_incomplete"
     if archive_failure == "object-budget":
@@ -420,18 +630,20 @@ def test_organized_asset_scans_reject_unrelated_archive_failures(
         "test_performance_with_organized_structure",
     ],
 )
+@pytest.mark.parametrize("asset_name", ["other.pkl", "agpl_model.pkl"])
 def test_organized_asset_scans_reject_source_changes_outside_agpl_fixture(
     integration_test: str,
+    asset_name: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def raise_source_stability_error(_report_generation: int | None) -> None:
-        raise _CallGraphAnalysisLimitError("source changed during shared call-graph analysis")
+        raise _source_stability_error()
 
     monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", raise_source_stability_error)
-    other_pickle = tmp_path / "other.pkl"
+    other_pickle = tmp_path / asset_name
     shutil.copy2(AGPL_ASSET, other_pickle)
-    result = scan_model_directory_or_file(str(other_pickle), cache_enabled=False)
+    result = core_module.scan_model_directory_or_file(str(other_pickle), cache_enabled=False)
     assert any(issue.rule_code == "S204" for issue in result.issues)
 
     monkeypatch.setattr(
@@ -460,7 +672,7 @@ def test_organized_asset_scans_reject_mixed_archive_member_errors(
     def raise_source_stability_error(_report_generation: int | None) -> None:
         report = sys._getframe(1).f_locals["report"]
         if Path(str(report.source)).name == "agpl_model.pkl":
-            raise _CallGraphAnalysisLimitError("source changed during shared call-graph analysis")
+            raise _source_stability_error()
 
     real_find_call_graphs = package_api.find_dangerous_call_graphs
     analyzed_members = 0
@@ -475,7 +687,6 @@ def test_organized_asset_scans_reject_mixed_archive_member_errors(
 
     monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", raise_source_stability_error)
     monkeypatch.setattr(package_api, "find_dangerous_call_graphs", fail_unexpected_member)
-    shutil.copy2(AGPL_ASSET, tmp_path / "agpl_model.pkl")
     archive_path = tmp_path / "multiple-pickles.zip"
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.write(AGPL_ASSET, "unexpected.pkl")
@@ -484,7 +695,8 @@ def test_organized_asset_scans_reject_mixed_archive_member_errors(
             "<?xml version='1.0'?><!--" + "x" * (1024 * 1024 + 64) + "--><PMML version='4.4'></PMML>",
         )
 
-    result = scan_model_directory_or_file(str(tmp_path), cache_enabled=False)
+    result = core_module.scan_model_directory_or_file(str(tmp_path), cache_enabled=False)
+    result = _merge_with_canonical_agpl_source_change(result)
 
     assert analyzed_members == 2
     assert result.has_errors is True
@@ -495,8 +707,7 @@ def test_organized_asset_scans_reject_mixed_archive_member_errors(
         for issue in result.issues
     )
     assert any(
-        issue.location == str(tmp_path / "agpl_model.pkl")
-        and issue.details.get("analysis") == "python_call_graph_source_stability"
+        issue.location == str(AGPL_ASSET) and issue.details.get("analysis") == "python_call_graph_source_stability"
         for issue in result.issues
     )
 
@@ -527,7 +738,7 @@ def test_organized_asset_scans_reject_mixed_archive_member_timeouts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def raise_source_stability_error(_report_generation: int | None) -> None:
-        raise _CallGraphAnalysisLimitError("source changed during shared call-graph analysis")
+        raise _source_stability_error()
 
     def raise_manifest_timeout(_scanner: ManifestScanner, *_args: object, **_kwargs: object) -> None:
         raise TimeoutError("independent manifest timeout")
@@ -538,7 +749,6 @@ def test_organized_asset_scans_reject_mixed_archive_member_timeouts(
         "_check_timeout" if timeout_source == "manifest-scanner" else "scan",
         raise_manifest_timeout,
     )
-    shutil.copy2(AGPL_ASSET, tmp_path / "agpl_model.pkl")
     archive_path = tmp_path / "manifest-timeout.zip"
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.writestr("config.json", '{"model_type":"bert"}')
@@ -547,7 +757,8 @@ def test_organized_asset_scans_reject_mixed_archive_member_timeouts(
             "<?xml version='1.0'?><!--" + "x" * (1024 * 1024 + 64) + "--><PMML version='4.4'></PMML>",
         )
 
-    result = scan_model_directory_or_file(str(tmp_path), cache_enabled=False)
+    result = core_module.scan_model_directory_or_file(str(tmp_path), cache_enabled=False)
+    result = _merge_with_canonical_agpl_source_change(result)
     if timeout_source == "manifest-scanner":
         assert any(
             issue.location == f"{archive_path}:config.json"
@@ -589,7 +800,7 @@ def test_organized_asset_scans_reject_mixed_archive_scanner_errors(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def raise_source_stability_error(_report_generation: int | None) -> None:
-        raise _CallGraphAnalysisLimitError("source changed during shared call-graph analysis")
+        raise _source_stability_error()
 
     def raise_flax_error(_scanner: FlaxMsgpackScanner, _path: str, _result: ScanResult) -> None:
         raise RuntimeError("independent flax regression")
@@ -597,7 +808,6 @@ def test_organized_asset_scans_reject_mixed_archive_scanner_errors(
     monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", raise_source_stability_error)
     if scanner_error == "flax-exception":
         monkeypatch.setattr(FlaxMsgpackScanner, "_scan_msgpack_stream_from_path", raise_flax_error)
-    shutil.copy2(AGPL_ASSET, tmp_path / "agpl_model.pkl")
     archive_path = tmp_path / "scanner-limit.zip"
     with zipfile.ZipFile(archive_path, "w") as archive:
         if scanner_error in {"msgpack-object-limit", "flax-exception"}:
@@ -610,7 +820,8 @@ def test_organized_asset_scans_reject_mixed_archive_scanner_errors(
             "<?xml version='1.0'?><!--" + "x" * (1024 * 1024 + 64) + "--><PMML version='4.4'></PMML>",
         )
 
-    result = scan_model_directory_or_file(str(tmp_path), cache_enabled=False, max_msgpack_stream_objects=1)
+    result = core_module.scan_model_directory_or_file(str(tmp_path), cache_enabled=False, max_msgpack_stream_objects=1)
+    result = _merge_with_canonical_agpl_source_change(result)
     if scanner_error == "msgpack-object-limit":
         assert any(
             issue.location == f"{archive_path}:weights.msgpack"
@@ -660,13 +871,13 @@ def test_organized_asset_scans_preserve_existing_h5_diagnostics(
         pytest.skip("h5py is not installed in this CI profile")
 
     def raise_source_stability_error(_report_generation: int | None) -> None:
-        raise _CallGraphAnalysisLimitError("source changed during shared call-graph analysis")
+        raise _source_stability_error()
 
     monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", raise_source_stability_error)
     monkeypatch.setattr(keras_h5_scanner_module, "HAS_H5PY", h5_available)
-    shutil.copy2(AGPL_ASSET, tmp_path / "agpl_model.pkl")
     shutil.copy2(ASSETS.parent / "keras" / "malicious_lambda.h5", tmp_path / "malicious_lambda.h5")
-    result = scan_model_directory_or_file(str(tmp_path), cache_enabled=False)
+    result = core_module.scan_model_directory_or_file(str(tmp_path), cache_enabled=False)
+    result = _merge_with_canonical_agpl_source_change(result)
 
     expected_detail = "suspicious_term" if h5_available else "required_package"
     assert any(issue.rule_code == "S902" and expected_detail in issue.details for issue in result.issues)
@@ -696,7 +907,7 @@ def test_organized_asset_scans_preserve_coverage_only_outcomes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def raise_source_stability_error(_report_generation: int | None) -> None:
-        raise _CallGraphAnalysisLimitError("source changed during shared call-graph analysis")
+        raise _source_stability_error()
 
     monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", raise_source_stability_error)
 
@@ -707,12 +918,12 @@ def test_organized_asset_scans_preserve_coverage_only_outcomes(
                 "ambiguous.txt",
                 "<?xml version='1.0'?><!--" + "x" * (1024 * 1024 + 64) + "--><PMML version='4.4'></PMML>",
             )
-        shutil.copy2(AGPL_ASSET, tmp_path / "agpl_model.pkl")
-        result = scan_model_directory_or_file(str(tmp_path), cache_enabled=False)
+        result = core_module.scan_model_directory_or_file(str(tmp_path), cache_enabled=False)
+        result = _merge_with_canonical_agpl_source_change(result)
         archive_metadata = result.file_metadata[str(archive_path)].model_dump(exclude_none=True)
         assert "xml_model_routing_incomplete" in archive_metadata["scan_outcome_reasons"]
     else:
-        result = scan_model_directory_or_file(str(AGPL_ASSET), cache_enabled=False)
+        result = core_module.scan_model_directory_or_file(str(AGPL_ASSET), cache_enabled=False)
         coverage_metadata = FileMetadataModel(
             operational_error=True,
             operational_error_reason="recognized_format_scanner_unavailable",
@@ -763,7 +974,7 @@ def test_organized_asset_scans_reject_unexpected_operational_errors(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def raise_source_stability_error(_report_generation: int | None) -> None:
-        raise _CallGraphAnalysisLimitError("source changed during shared call-graph analysis")
+        raise _source_stability_error()
 
     monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", raise_source_stability_error)
 
@@ -776,9 +987,7 @@ def test_organized_asset_scans_reject_unexpected_operational_errors(
 
         monkeypatch.setattr(package_api, "find_dangerous_call_graphs", raise_unexpected_call_graph_error)
     elif unexpected_error == "issue-only-error":
-        asset_path = tmp_path / "agpl_model.pkl"
         scan_target = tmp_path
-        shutil.copy2(AGPL_ASSET, asset_path)
         shutil.copy2(ASSETS / "safe_data.pkl", tmp_path / "safe_data.pkl")
         real_scan_file = core_module.scan_file
 
@@ -790,12 +999,14 @@ def test_organized_asset_scans_reject_unexpected_operational_errors(
         monkeypatch.setattr(core_module, "scan_file", fail_secondary_file)
 
     if unexpected_error == "total-size-limit":
-        asset_path = tmp_path / "agpl_model.pkl"
         scan_target = tmp_path
-        shutil.copy2(AGPL_ASSET, asset_path)
-        result = scan_model_directory_or_file(str(scan_target), cache_enabled=False, max_total_size=1)
+        shutil.copy2(ASSETS / "safe_data.pkl", tmp_path / "safe_data.pkl")
+        result = core_module.scan_model_directory_or_file(str(scan_target), cache_enabled=False, max_total_size=1)
+        result = _merge_with_canonical_agpl_source_change(result)
     else:
-        result = scan_model_directory_or_file(str(scan_target), cache_enabled=False)
+        result = core_module.scan_model_directory_or_file(str(scan_target), cache_enabled=False)
+        if unexpected_error == "issue-only-error":
+            result = _merge_with_canonical_agpl_source_change(result)
     metadata = result.file_metadata[str(asset_path)]
     assert metadata.model_extra is not None
 

@@ -107,6 +107,27 @@ def test_dockerfiles_pin_python_base_images_by_digest() -> None:
     assert tensorflow_lines.count("FROM ${PYTHON_IMAGE} AS runtime") == 1
 
 
+@pytest.mark.parametrize("dockerfile", ("Dockerfile", "Dockerfile.full", "Dockerfile.tensorflow"))
+def test_docker_runtime_images_upgrade_vulnerable_util_linux_packages(dockerfile: str) -> None:
+    content = (_REPO_ROOT / dockerfile).read_text(encoding="utf-8")
+    runtime_stage = content.split("FROM ${PYTHON_IMAGE} AS runtime", maxsplit=1)[1]
+    normalized_stage = re.sub(r"\\\s*\n\s*", " ", runtime_stage)
+    upgrade_commands = re.findall(r"apt-get install[^&\n]*--only-upgrade\s+([^&\n]+)", normalized_stage)
+    upgraded_packages = {package for command in upgrade_commands for package in command.split()}
+
+    assert {
+        "bsdutils",
+        "libblkid1",
+        "liblastlog2-2",
+        "libmount1",
+        "libsmartcols1",
+        "libuuid1",
+        "login",
+        "mount",
+        "util-linux",
+    } <= upgraded_packages
+
+
 def test_docker_publish_manual_dispatch_is_guarded_before_push() -> None:
     workflow = _load_docker_publish_workflow()
 
