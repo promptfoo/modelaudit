@@ -1312,7 +1312,21 @@ def test_scan_rejects_structured_object_dtype_hiding_nested_pickle(tmp_path: Pat
     assert "trusted_incomplete_tail" not in result.metadata
 
 
-def test_scan_accepts_multiple_numpy_array_payloads_and_resumed_pickle(tmp_path: Path) -> None:
+@pytest.mark.parametrize("source_snapshot_changes", [False, True], ids=["stable-source", "changed-source"])
+def test_scan_accepts_multiple_numpy_array_payloads_and_resumed_pickle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    source_snapshot_changes: bool,
+) -> None:
+    if source_snapshot_changes:
+
+        def raise_source_stability_error(_report_generation: int | None) -> None:
+            raise _CallGraphAnalysisLimitError("source changed during shared call-graph analysis")
+
+        monkeypatch.setattr(picklescan_api, "_ensure_shared_source_snapshot_stable", raise_source_stability_error)
+    else:
+        monkeypatch.setattr(picklescan_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+
     first_prefix = b"\x80\x02](" + _joblib_numpy_wrapper_control()
     first_raw = _joblib_numpy_raw_segment(len(first_prefix), b"\x00" * 32)
     second_control = _joblib_numpy_wrapper_control(shape=3)
@@ -1322,8 +1336,39 @@ def test_scan_accepts_multiple_numpy_array_payloads_and_resumed_pickle(tmp_path:
 
     result = _scan_payload(tmp_path, payload, "multiple_arrays.joblib")
 
-    assert result.success is True
-    assert result.metadata["joblib_numpy_array_payload_count"] == 2
+    if not source_snapshot_changes:
+        assert result.success is True
+        assert result.metadata["joblib_numpy_array_payload_count"] == 2
+        assert result.metadata.get("operational_error") is not True
+    else:
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert result.metadata["analysis_incomplete"] is True
+        assert result.metadata["operational_error"] is True
+        assert result.metadata["operational_error_reason"] == "call_graph_analysis_error"
+        assert result.metadata["pickle_report_status"] == "inconclusive"
+        assert result.metadata["pickle_verdict"] == "suspicious"
+        source_stability_checks = [
+            check
+            for check in result.checks
+            if check.status == CheckStatus.FAILED
+            and check.details.get("category") == "call_graph_analysis_error"
+            and check.details.get("analysis") == "python_call_graph_source_stability"
+            and check.details.get("analysis_incomplete") is True
+        ]
+        assert len(source_stability_checks) == 1
+        assert source_stability_checks[0].severity == IssueSeverity.INFO
+        assert source_stability_checks[0].rule_code == "S902"
+        assert source_stability_checks[0].message == (
+            "Python call-graph analysis could not complete: source changed during shared call-graph analysis"
+        )
+        assert should_cache_scan_result(result.to_dict(include_private_metadata=True)) is False
+        result.metadata["file_path"] = str(tmp_path / "multiple_arrays.joblib")
+        aggregate = create_initial_audit_result()
+        merge_scan_result(aggregate, result)
+        assert aggregate.success is False
+        assert aggregate.files_scanned == 1
+        assert determine_exit_code(aggregate) == 2
     assert not _has_system_reduce_failure(result)
 
 
