@@ -61,7 +61,6 @@ _MAX_HF_SAFETENSORS_INDEX_DETAIL_ITEMS = 20
 _HF_SAFETENSORS_INDEX_RECONCILIATION_REASON = "remote_safetensors_index_reconciliation_incomplete"
 _HF_SAFETENSORS_REMOTE_OVERLAP_REASON = "remote_safetensors_overlap_coverage_incomplete"
 _MAX_HF_SAFETENSORS_RETAINED_RESULTS = 512
-_MAX_HF_SAFETENSORS_RETAINED_TENSOR_NAMES = 65_536
 _MAX_HF_SAFETENSORS_RETAINED_RESULT_BYTES = 32 * 1024 * 1024
 _HF_SAFETENSORS_RESULT_BUDGET_FAILURE_RESERVE_BYTES = 256 * 1024
 _HF_SAFETENSORS_RESULT_BUDGET_REASON = "remote_safetensors_result_budget_exceeded"
@@ -173,7 +172,6 @@ class _HuggingFaceSafeTensorsRetentionBudget:
             "projected_tensor_names": self.retained_tensor_names,
             "projected_result_bytes": self.retained_result_bytes,
             "max_retained_results": _MAX_HF_SAFETENSORS_RETAINED_RESULTS,
-            "max_retained_tensor_names": _MAX_HF_SAFETENSORS_RETAINED_TENSOR_NAMES,
             "max_retained_result_bytes": _MAX_HF_SAFETENSORS_RETAINED_RESULT_BYTES,
             "candidate_serialization_failed": False,
             "candidate_scan_preflighted": True,
@@ -208,8 +206,6 @@ class _HuggingFaceSafeTensorsRetentionBudget:
         exceeded = []
         if projected_results >= _MAX_HF_SAFETENSORS_RETAINED_RESULTS:
             exceeded.append("result_count")
-        if projected_tensor_names > _MAX_HF_SAFETENSORS_RETAINED_TENSOR_NAMES:
-            exceeded.append("tensor_name_count")
         if projected_result_bytes > result_byte_limit:
             exceeded.append("result_bytes")
         if exceeded:
@@ -224,7 +220,6 @@ class _HuggingFaceSafeTensorsRetentionBudget:
                 "projected_tensor_names": projected_tensor_names,
                 "projected_result_bytes": projected_result_bytes,
                 "max_retained_results": _MAX_HF_SAFETENSORS_RETAINED_RESULTS,
-                "max_retained_tensor_names": _MAX_HF_SAFETENSORS_RETAINED_TENSOR_NAMES,
                 "max_retained_result_bytes": _MAX_HF_SAFETENSORS_RETAINED_RESULT_BYTES,
                 "candidate_serialization_failed": serialization_failed,
             }
