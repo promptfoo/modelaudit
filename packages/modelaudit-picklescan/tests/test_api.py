@@ -44,6 +44,7 @@ from typing import Any, Literal, cast
 import pytest
 
 import modelaudit_picklescan.api as package_api
+import modelaudit_picklescan.call_graph as call_graph
 from modelaudit_picklescan import (
     CoverageSummary,
     Finding,
@@ -12151,6 +12152,39 @@ def _assert_call_graph_source_stability_error(report: PickleReport) -> None:
     )
 
 
+def test_scan_bytes_preserves_tracker_stability_reason_across_call_graph_subpasses(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    search_contexts = [("original",)]
+    monkeypatch.setattr(call_graph, "_interpreter_import_runtime_matches_snapshot", lambda: True)
+    monkeypatch.setattr(call_graph, "_source_search_context", lambda: search_contexts[0])
+
+    source_path = tmp_path / "tracked_module.py"
+    source_path.write_text("value = 1\n", encoding="utf-8")
+
+    def invalidate_snapshot(
+        _import_references: object,
+        _callable_invocations: object | None = None,
+    ) -> tuple[CallGraphFinding, ...]:
+        search_contexts[0] = ("changed",)
+        call_graph._track_shared_source_path("tracked_module", source_path, loaded=False)
+        return ()
+
+    monkeypatch.setattr(package_api, "find_dangerous_call_graphs", invalidate_snapshot)
+
+    report = scan_bytes(b"cbuiltins\nlen\n.", source="source-stability-subpasses.pkl")
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    matching_errors = [
+        error for error in report.errors if error.details.get("analysis") == "python_call_graph_source_stability"
+    ]
+    assert len(matching_errors) == 1
+    assert matching_errors[0].details.get("source_stability_reason") == "source_search_context_changed"
+    assert matching_errors[0].details.get("analysis_incomplete") is True
+
+
 @pytest.mark.parametrize("module", ["_xxsubinterpreters", "dotenv.main"])
 def test_scan_bytes_warns_on_unreviewed_name_from_module_with_dangerous_entries(module: str) -> None:
     report = scan_bytes(f"c{module}\nGadget\n.".encode(), source="dangerous-module-sibling.pkl")
@@ -13878,11 +13912,35 @@ def test_scan_bytes_allows_nested_import_only_trusted_constructor() -> None:
         range(10),
     ],
 )
-@pytest.mark.parametrize("encoding", ["raw", "base64", "hex"])
+@pytest.mark.parametrize(
+    ("encoding", "source_changes"),
+    [
+        pytest.param("raw", False, id="raw"),
+        pytest.param("base64", False, id="base64"),
+        pytest.param("hex", False, id="hex"),
+        pytest.param("hex", True, id="hex-source-changed"),
+    ],
+)
 def test_scan_bytes_treats_benign_nested_constructor_pickles_as_notices(
     inner_obj: object,
     encoding: str,
+    source_changes: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    if source_changes:
+
+        def raise_source_stability_error(_report_generation: int | None) -> None:
+            raise _CallGraphAnalysisLimitError("source changed during shared call-graph analysis")
+
+        source_stability_check = raise_source_stability_error
+    else:
+
+        def keep_source_stable(_report_generation: int | None) -> None:
+            return None
+
+        source_stability_check = keep_source_stable
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", source_stability_check)
+
     nested_payload = pickle.dumps(inner_obj, protocol=4)
     if encoding == "raw":
         outer_value: bytes | str = nested_payload
@@ -13899,8 +13957,14 @@ def test_scan_bytes_treats_benign_nested_constructor_pickles_as_notices(
         source=f"benign-nested-{encoding}.pkl",
     )
 
-    assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.CLEAN
+    if source_changes:
+        assert report.status == ScanStatus.INCONCLUSIVE
+        _assert_call_graph_source_stability_error(report)
+        assert report.verdict == SafetyVerdict.UNKNOWN
+    else:
+        assert report.status == ScanStatus.COMPLETE
+        assert report.verdict == SafetyVerdict.CLEAN
+        assert not any(error.details.get("analysis") == "python_call_graph_source_stability" for error in report.errors)
     assert report.findings == ()
     assert any(
         notice.code == expected_notice
