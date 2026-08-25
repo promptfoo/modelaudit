@@ -3615,13 +3615,18 @@ def test_loaded_extension_export_does_not_hide_legacy_dotted_module_getattr(
     assert public_findings[0].details["sink"] == "os.system"
 
 
-def test_shared_source_snapshot_staleness_reason_names_the_failing_gate() -> None:
+def test_shared_source_snapshot_staleness_reason_names_the_failing_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A stability failure must report which gate invalidated the snapshot.
 
     The Windows lane fails intermittently with a bare "source changed during shared call-graph
     analysis", which is not actionable. The gate name rides in the error details so the cause is
     visible without reproducing the failure locally.
     """
+    monkeypatch.setattr(call_graph, "_interpreter_import_runtime_matches_snapshot", lambda: True)
+    monkeypatch.setattr(call_graph, "_source_search_context", lambda: ("current",))
+
     snapshot = call_graph._SharedSourceSnapshot(
         search_context=("original",),
         resolution_context=((), (), ()),
@@ -3667,3 +3672,23 @@ def test_call_graph_stability_error_details_carry_the_reason_without_changing_th
         "python_call_graph_source_stability",
         RuntimeError("unrelated"),
     )
+
+
+def test_call_graph_error_details_do_not_read_arbitrary_exception_attributes() -> None:
+    class HostileError(RuntimeError):
+        def __getattribute__(self, name: str) -> object:
+            if name == "stability_reason":
+                raise RuntimeError("boom")
+            return super().__getattribute__(name)
+
+    report = package_api._with_call_graph_enrichment_errors(
+        package_api.scan_bytes(pickle.dumps(None), source="hostile-error.pkl"),
+        (("python_call_graph", HostileError("unrelated")),),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert report.errors[-1].details == {
+        "analysis": "python_call_graph",
+        "analysis_incomplete": True,
+    }
