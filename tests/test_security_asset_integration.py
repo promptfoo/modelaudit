@@ -228,7 +228,9 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
             )
             security_reasons = string_reasons.intersection(EXPECTED_SECURITY_FINDING_OUTCOME_REASONS)
             if security_reasons and not (
-                payload.get("pickle_report_status") == "inconclusive"
+                payload.get("analysis_incomplete") is True
+                and payload.get("scan_outcome") == "inconclusive"
+                and payload.get("pickle_report_status") == "inconclusive"
                 and payload.get("pickle_verdict") == "malicious"
                 and path_has_actionable_security_finding
             ):
@@ -432,7 +434,12 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
         if category == "parse_error":
             continue
         if pickle_source:
-            if details.get("exception_type") or details.get("error_type") or "error" in details:
+            if (
+                details.get("exception_type")
+                or details.get("error_type")
+                or "error" in details
+                or "exception" in details
+            ):
                 unexpected_errors.add(location)
             continue
 
@@ -445,6 +452,7 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
             or details.get("exception_type")
             or details.get("error_type")
             or "error" in details
+            or "exception" in details
             or details.get("operational_error") is True
             or details.get("interrupted") is True
             or (

@@ -149,6 +149,41 @@ def test_intentional_incomplete_pickle_asset_preserves_security_exit() -> None:
     )
 
 
+@pytest.mark.parametrize("outcome_state", ["missing", "contradictory"])
+def test_incomplete_pickle_security_signal_requires_aggregate_outcome_state(
+    outcome_state: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+    result = _scan_asset("dill_func.pkl")
+    path = str(ASSETS / "dill_func.pkl")
+    metadata = result.file_metadata[path]
+    assert metadata.model_extra is not None
+    assert metadata.model_extra["scan_outcome_reasons"] == ["nested_pickle_incomplete"]
+
+    if outcome_state == "missing":
+        metadata.model_extra.pop("analysis_incomplete", None)
+        metadata.model_extra.pop("scan_outcome", None)
+    else:
+        metadata.model_extra["analysis_incomplete"] = False
+        metadata.model_extra["scan_outcome"] = "complete"
+
+    assert result.has_errors is False
+    assert result.success is False
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL
+        and issue.rule_code == "S201"
+        and issue.message == "Found REDUCE opcode invoking dangerous global: dill._dill._create_code"
+        for issue in result.issues
+    )
+    assert core_module.determine_exit_code(result) == 1
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            f"incomplete pickle with {outcome_state} aggregate outcome state",
+        )
+
+
 @pytest.mark.parametrize(
     "integration_test",
     [
@@ -1937,6 +1972,45 @@ def test_organized_asset_scans_reject_missing_outcome_reasons(
         test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
             result,
             "missing outcome reasons",
+        )
+
+
+@pytest.mark.parametrize(
+    "details",
+    [
+        pytest.param({"exception": "scanner blew up"}, id="root-diagnostic"),
+        pytest.param(
+            {
+                "pickle_source": str(ASSETS / "safe_data.pkl"),
+                "exception": "scanner blew up",
+            },
+            id="pickle-source-diagnostic",
+        ),
+    ],
+)
+def test_organized_asset_scans_reject_bare_exception_diagnostics(
+    details: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+    result = _scan_asset("safe_data.pkl")
+    model_path = str(ASSETS / "safe_data.pkl")
+    result.issues.append(
+        Issue(
+            message="Scanner failed without structured error metadata",
+            severity=IssueSeverity.INFO,
+            location=model_path,
+            details=details,
+        )
+    )
+
+    assert result.has_errors is False
+    assert result.success is True
+    assert core_module.determine_exit_code(result) == 0
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            "bare exception diagnostic",
         )
 
 
