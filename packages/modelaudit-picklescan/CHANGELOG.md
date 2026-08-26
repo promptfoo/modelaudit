@@ -9,6 +9,7 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- Report which snapshot gate invalidated a shared call-graph source-stability failure.
 - Validate bounded batched PyTorch state-dictionary entries without falsely flagging canonical tensor reconstruction.
 - Keep scanning storage members between the trusted and expanded pickle probe sizes.
 
