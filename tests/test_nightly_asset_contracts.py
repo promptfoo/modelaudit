@@ -57,6 +57,8 @@ def _assert_otherwise_accepted_archive_control(
     result: ModelAuditResultModel,
     failed_member: str,
     hidden_reason: str | None = None,
+    *,
+    hidden_reasons: frozenset[str] = frozenset(),
 ) -> None:
     control = result.model_copy(deep=True)
     control.issues = [issue for issue in control.issues if issue.location != failed_member]
@@ -70,6 +72,7 @@ def _assert_otherwise_accepted_archive_control(
                 reason
                 for reason in reasons
                 if reason != hidden_reason
+                and reason not in hidden_reasons
                 and not (
                     isinstance(reason, str)
                     and reason.endswith(("_failed", "_error", "_exceeded", "_timeout", "_interrupted"))
@@ -140,6 +143,10 @@ def test_intentional_incomplete_pickle_asset_preserves_security_exit() -> None:
         for issue in result.issues
     )
     assert core_module.determine_exit_code(result) == 1
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+        result,
+        "intentional incomplete pickle asset",
+    )
 
 
 @pytest.mark.parametrize(
@@ -961,7 +968,11 @@ def test_organized_asset_scans_reject_mixed_archive_member_errors(
         for issue in result.issues
     )
 
-    _assert_otherwise_accepted_archive_control(result, f"{archive_path}:unexpected.pkl")
+    _assert_otherwise_accepted_archive_control(
+        result,
+        f"{archive_path}:unexpected.pkl",
+        hidden_reasons=test_security_asset_integration.EXPECTED_SECURITY_FINDING_OUTCOME_REASONS,
+    )
     monkeypatch.setattr(
         test_security_asset_integration,
         "scan_model_directory_or_file",
@@ -1716,6 +1727,216 @@ def test_organized_asset_scans_require_each_nested_dependency_diagnostic(
         test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
             missing_diagnostic,
             "nested missing dependency diagnostic",
+        )
+
+
+def test_organized_asset_scans_preserve_mixed_dependency_and_coverage_outcomes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+    result = _scan_asset("safe_data.pkl")
+    archive_path = str(tmp_path / "mixed-dependency-and-coverage.zip")
+    dependency_reason = "keras_h5_h5py_unavailable"
+    coverage_reason = "xml_model_routing_incomplete"
+    result.file_metadata[archive_path] = FileMetadataModel(
+        analysis_incomplete=True,
+        scan_outcome="inconclusive",
+        scan_outcome_reasons=[dependency_reason, coverage_reason],
+    )
+    result.checks.append(
+        Check(
+            name="H5PY Library Check",
+            status=CheckStatus.FAILED,
+            message="h5py is required for Keras H5 scanning.",
+            severity=IssueSeverity.INFO,
+            location=f"{archive_path}:weights.h5",
+            details={"required_package": "h5py", "scan_outcome_reason": dependency_reason},
+            rule_code="S902",
+        )
+    )
+    result.issues.append(
+        Issue(
+            message="Embedded pickle finding",
+            severity=IssueSeverity.CRITICAL,
+            location=f"{archive_path}:payload.pkl",
+            rule_code="S204",
+        )
+    )
+    result.success = False
+    assert core_module.determine_exit_code(result) == 1
+
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+        result,
+        "mixed dependency and coverage outcomes",
+    )
+
+
+def test_organized_asset_scans_reject_cross_package_dependency_reason(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+    result = _scan_asset("safe_data.pkl")
+    archive_path = str(tmp_path / "cross-package-dependency-reason.zip")
+    h5py_reason = "keras_h5_h5py_unavailable"
+    defusedxml_reason = "pmml_safe_xml_parser_unavailable"
+    result.file_metadata[archive_path] = FileMetadataModel(
+        analysis_incomplete=True,
+        scan_outcome="inconclusive",
+        scan_outcome_reasons=[h5py_reason, defusedxml_reason],
+    )
+    result.checks.extend(
+        [
+            Check(
+                name="H5PY Library Check",
+                status=CheckStatus.FAILED,
+                message="h5py is required for Keras H5 scanning.",
+                severity=IssueSeverity.INFO,
+                location=f"{archive_path}:weights.h5",
+                details={"required_package": "h5py", "scan_outcome_reason": h5py_reason},
+                rule_code="S902",
+            ),
+            Check(
+                name="XML Parser Security Check",
+                status=CheckStatus.FAILED,
+                message="PMML XML parsing skipped because defusedxml is unavailable",
+                severity=IssueSeverity.INFO,
+                location=f"{archive_path}:model.pmml",
+                details={"required_package": "defusedxml", "scan_outcome_reason": defusedxml_reason},
+                rule_code="S902",
+            ),
+            Check(
+                name="Mismatched H5PY Library Check",
+                status=CheckStatus.FAILED,
+                message="h5py is required for Keras H5 scanning.",
+                severity=IssueSeverity.INFO,
+                location=f"{archive_path}:weights.h5",
+                details={"required_package": "h5py", "scan_outcome_reason": defusedxml_reason},
+                rule_code="S902",
+            ),
+        ]
+    )
+    result.success = False
+    assert core_module.determine_exit_code(result) == 2
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            "cross-package dependency reason",
+        )
+
+
+@pytest.mark.parametrize(
+    ("scan_outcome_reasons", "operational_error_reason", "include_security_finding", "expected_exit"),
+    [
+        pytest.param(
+            ["xml_model_routing_incomplete", "unrelated_coverage_incomplete"],
+            None,
+            True,
+            1,
+            id="unflagged-coverage-with-extra",
+        ),
+        pytest.param(
+            ["unrelated_coverage_incomplete"],
+            None,
+            True,
+            1,
+            id="unknown-only",
+        ),
+        pytest.param(
+            ["xml_model_routing_incomplete", "unrelated_coverage_incomplete"],
+            "xml_model_routing_incomplete",
+            False,
+            2,
+            id="operational-coverage-with-extra",
+        ),
+        pytest.param([None], None, True, 1, id="null-reason"),
+        pytest.param([""], None, True, 1, id="empty-reason"),
+        pytest.param(
+            ["xml_model_routing_incomplete", None],
+            None,
+            True,
+            1,
+            id="coverage-with-null-reason",
+        ),
+        pytest.param(
+            ["xml_model_routing_incomplete", ""],
+            None,
+            True,
+            1,
+            id="coverage-with-empty-reason",
+        ),
+    ],
+)
+def test_organized_asset_scans_reject_unaccounted_coverage_outcomes(
+    scan_outcome_reasons: list[Any],
+    operational_error_reason: str | None,
+    include_security_finding: bool,
+    expected_exit: int,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+    result = _scan_asset("safe_data.pkl")
+    archive_path = str(tmp_path / "unaccounted-coverage-outcome.zip")
+    metadata: dict[str, Any] = {
+        "analysis_incomplete": True,
+        "scan_outcome": "inconclusive",
+        "scan_outcome_reasons": scan_outcome_reasons,
+    }
+    if operational_error_reason is not None:
+        metadata.update(
+            operational_error=True,
+            operational_error_reason=operational_error_reason,
+        )
+    result.file_metadata[archive_path] = FileMetadataModel(**metadata)
+    if include_security_finding:
+        result.issues.append(
+            Issue(
+                message="Embedded pickle finding",
+                severity=IssueSeverity.CRITICAL,
+                location=f"{archive_path}:payload.pkl",
+                rule_code="S204",
+            )
+        )
+    result.success = False
+    assert core_module.determine_exit_code(result) == expected_exit
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            "unaccounted coverage outcome",
+        )
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        pytest.param(
+            {"analysis_incomplete": True, "scan_outcome": "inconclusive"},
+            id="incomplete-and-inconclusive",
+        ),
+        pytest.param({"scan_outcome": "inconclusive"}, id="inconclusive-only"),
+        pytest.param({"analysis_incomplete": True}, id="incomplete-only"),
+    ],
+)
+def test_organized_asset_scans_reject_missing_outcome_reasons(
+    metadata: dict[str, Any],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+    result = _scan_asset("safe_data.pkl")
+    model_path = str(tmp_path / "missing-outcome-reasons.pkl")
+    result.file_metadata[model_path] = FileMetadataModel(**metadata)
+    result.success = False
+    assert core_module.determine_exit_code(result) == 2
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            "missing outcome reasons",
         )
 
 

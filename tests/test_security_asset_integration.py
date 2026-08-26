@@ -60,6 +60,8 @@ EXPECTED_DEPENDENCY_OUTCOMES = {
 EXPECTED_DEPENDENCY_OUTCOME_REASONS = frozenset(
     reason for outcomes in EXPECTED_DEPENDENCY_OUTCOMES.values() for reason in outcomes
 )
+EXPECTED_COVERAGE_AGGREGATION_OUTCOME_REASONS = frozenset({"zip_analysis_incomplete"})
+EXPECTED_SECURITY_FINDING_OUTCOME_REASONS = frozenset({"nested_pickle_incomplete", "nested_probe_limit"})
 EXPECTED_DEPENDENCY_MESSAGE_MARKERS = {
     "defusedxml": ("defusedxml is unavailable",),
     "h5py": ("h5py is required", "h5py is unavailable"),
@@ -143,12 +145,15 @@ def _is_expected_missing_dependency_diagnostic(
         and all(isinstance(reason, str) and bool(reason) for reason in scan_outcome_reasons)
     ):
         return False
+    expected_reasons = EXPECTED_DEPENDENCY_OUTCOMES.get(normalized_package, frozenset())
     detail_reason = details.get("scan_outcome_reason")
     if detail_reason is not None and (
-        not isinstance(detail_reason, str) or not detail_reason or detail_reason not in scan_outcome_reasons
+        not isinstance(detail_reason, str)
+        or not detail_reason
+        or detail_reason not in scan_outcome_reasons
+        or detail_reason not in expected_reasons
     ):
         return False
-    expected_reasons = EXPECTED_DEPENDENCY_OUTCOMES.get(normalized_package, frozenset())
     return (
         (not isinstance(diagnostic, Check) or diagnostic.status == CheckStatus.FAILED)
         and bool(expected_reasons.intersection(scan_outcome_reasons))
@@ -177,8 +182,14 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
     expected_source_changes = set()
     expected_dependency_outcomes: set[tuple[str, str]] = set()
     dependency_incomplete_paths: set[str] = set()
+    security_incomplete_paths: set[str] = set()
     security_finding_locations = {
         issue.location for issue in results.issues if issue.rule_code == "S204" and issue.location is not None
+    }
+    actionable_security_finding_locations = {
+        issue.location
+        for issue in results.issues
+        if issue.severity == IssueSeverity.CRITICAL and issue.location is not None
     }
     coverage_only_paths = set()
     unavailable_scanner_paths = set()
@@ -187,11 +198,51 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
     for path, metadata in results.file_metadata.items():
         payload = metadata.model_dump(exclude_none=True)
         scan_outcome_reasons = payload.get("scan_outcome_reasons")
-        if isinstance(scan_outcome_reasons, list):
-            string_reasons = {reason for reason in scan_outcome_reasons if isinstance(reason, str) and reason}
-            if string_reasons.intersection(EXPECTED_DEPENDENCY_OUTCOME_REASONS):
+        if scan_outcome_reasons is None:
+            if payload.get("analysis_incomplete") is True or payload.get("scan_outcome") == "inconclusive":
+                unexpected_errors.add(path)
+        else:
+            if (
+                not isinstance(scan_outcome_reasons, list)
+                or not scan_outcome_reasons
+                or not all(isinstance(reason, str) and bool(reason) for reason in scan_outcome_reasons)
+            ):
+                unexpected_errors.add(path)
+                continue
+            string_reasons = set(scan_outcome_reasons)
+            dependency_reasons = string_reasons.intersection(EXPECTED_DEPENDENCY_OUTCOME_REASONS)
+            coverage_reasons = {
+                reason
+                for reason in string_reasons
+                if metadata_has_coverage_only_operational_error(
+                    {"operational_error": True, "operational_error_reason": reason}
+                )
+            }
+            if metadata_has_coverage_only_operational_error(payload):
+                coverage_reasons.update(string_reasons.intersection(EXPECTED_COVERAGE_AGGREGATION_OUTCOME_REASONS))
+            path_has_actionable_security_finding = any(
+                finding_location == path
+                or finding_location.startswith(f"{path} (")
+                or finding_location.startswith(f"{path}:")
+                for finding_location in actionable_security_finding_locations
+            )
+            security_reasons = string_reasons.intersection(EXPECTED_SECURITY_FINDING_OUTCOME_REASONS)
+            if security_reasons and not (
+                payload.get("pickle_report_status") == "inconclusive"
+                and payload.get("pickle_verdict") == "malicious"
+                and path_has_actionable_security_finding
+            ):
+                security_reasons = set()
+            allowed_reasons = dependency_reasons | coverage_reasons | security_reasons
+            if Path(path).resolve() == EXPECTED_AGPL_SOURCE_STABILITY_ASSET:
+                allowed_reasons.update(EXPECTED_AGPL_SOURCE_STABILITY_OUTCOME_REASONS)
+            if string_reasons - allowed_reasons:
+                unexpected_errors.add(path)
+            if dependency_reasons:
                 dependency_incomplete_paths.add(path)
-                expected_dependency_outcomes.update((path, reason) for reason in string_reasons)
+                expected_dependency_outcomes.update((path, reason) for reason in dependency_reasons)
+            if security_reasons:
+                security_incomplete_paths.add(path)
         operational_error_reason = payload.get("operational_error_reason")
         scan_outcome_reason = payload.get("scan_outcome_reason")
         has_failed_outcome_reason = isinstance(scan_outcome_reasons, list) and any(
@@ -406,7 +457,7 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
 
     unexpected_errors.update(path for path, _reason in expected_dependency_outcomes - diagnosed_dependency_outcomes)
     unexpected_errors.update(unavailable_scanner_paths - diagnosed_unavailable_scanners)
-    incomplete_asset_paths = coverage_only_paths | dependency_incomplete_paths
+    incomplete_asset_paths = coverage_only_paths | dependency_incomplete_paths | security_incomplete_paths
     if incomplete_asset_paths and (results.success is not False or determine_exit_code(results) == 0):
         unexpected_errors.update(incomplete_asset_paths)
     error_message = (
