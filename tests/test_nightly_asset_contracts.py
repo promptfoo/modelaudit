@@ -2049,6 +2049,37 @@ def test_organized_asset_scans_reject_incomplete_unflagged_coverage_with_securit
         )
 
 
+def test_organized_asset_scans_reject_mismatched_unflagged_coverage_reasons(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+    result = _scan_asset("safe_data.pkl")
+    model_path = str(tmp_path / "malicious-with-mismatched-routing.pkl")
+    result.file_metadata[model_path] = FileMetadataModel(
+        analysis_incomplete=True,
+        scan_outcome="inconclusive",
+        scan_outcome_reason="xml_model_routing_incomplete",
+        scan_outcome_reasons=["flax_msgpack_routing_incomplete"],
+    )
+    result.issues.append(
+        Issue(
+            message="Embedded pickle finding",
+            severity=IssueSeverity.CRITICAL,
+            location=model_path,
+            rule_code="S204",
+        )
+    )
+    result.success = False
+
+    assert core_module.determine_exit_code(result) == 1
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            "security-positive mismatched unflagged coverage reasons",
+        )
+
+
 @pytest.mark.parametrize(
     "metadata",
     [
@@ -2119,6 +2150,39 @@ def test_organized_asset_scans_reject_bare_exception_diagnostics(
         test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
             result,
             "bare exception diagnostic",
+        )
+
+
+def test_organized_asset_scans_reject_parse_error_with_additional_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+    result = _scan_asset("safe_data.pkl")
+    model_path = str(ASSETS / "safe_data.pkl")
+    result.issues.append(
+        Issue(
+            message="Pickle parsing failed",
+            severity=IssueSeverity.INFO,
+            location=model_path,
+            rule_code="S901",
+            details={
+                "pickle_source": model_path,
+                "category": "parse_error",
+                "parse_error": "invalid pickle stream",
+                "exception_type": "ValueError",
+                "analysis_incomplete": True,
+                "error": "independent scanner failure",
+            },
+        )
+    )
+
+    assert result.has_errors is False
+    assert result.success is True
+    assert core_module.determine_exit_code(result) == 2
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            "parse-error diagnostic with an additional error",
         )
 
 

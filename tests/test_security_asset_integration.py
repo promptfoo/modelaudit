@@ -385,6 +385,11 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
                 and payload.get("scan_outcome") == "inconclusive"
                 and isinstance(scan_outcome_reasons, list)
                 and bool(scan_outcome_reasons)
+                and (
+                    not isinstance(scan_outcome_reason, str)
+                    or not scan_outcome_reason
+                    or scan_outcome_reason in scan_outcome_reasons
+                )
             )
             if (
                 (isinstance(operational_error_reason, str) and operational_error_reason)
@@ -573,6 +578,8 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
             continue
 
         if category == "parse_error":
+            if "error" in details:
+                unexpected_errors.add(location)
             continue
         if pickle_source:
             if details.get("exception_type") or details.get("error_type") or "error" in details:
