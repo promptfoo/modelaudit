@@ -184,6 +184,47 @@ def test_incomplete_pickle_security_signal_requires_aggregate_outcome_state(
         )
 
 
+@pytest.mark.parametrize("reason", ["nested_pickle_incomplete", "nested_probe_limit"])
+@pytest.mark.parametrize("malformation", ["missing-state", "contradictory-state", "missing-diagnostic"])
+def test_agpl_nested_security_outcomes_require_complete_state_and_diagnostic(
+    reason: str,
+    malformation: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+    result = core_module.scan_model_directory_or_file(str(AGPL_ASSET), cache_enabled=False)
+    path = str(AGPL_ASSET)
+    metadata = result.file_metadata[path]
+    assert metadata.model_extra is not None
+    metadata.model_extra["scan_outcome_reasons"] = [reason, "flax_msgpack_routing_incomplete"]
+
+    if malformation == "missing-state":
+        metadata.model_extra.pop("analysis_incomplete", None)
+        metadata.model_extra.pop("scan_outcome", None)
+    elif malformation == "contradictory-state":
+        metadata.model_extra["analysis_incomplete"] = False
+        metadata.model_extra["scan_outcome"] = "complete"
+    else:
+        result.issues = [issue for issue in result.issues if issue.details.get("notice_code") != reason]
+        result.checks = [check for check in result.checks if check.details.get("notice_code") != reason]
+
+    assert result.has_errors is False
+    assert result.success is False
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL
+        and issue.rule_code == "S204"
+        and issue.location is not None
+        and (issue.location == path or issue.location.startswith(f"{path} ("))
+        for issue in result.issues
+    )
+    assert core_module.determine_exit_code(result) == 1
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            f"AGPL {reason} with {malformation}",
+        )
+
+
 @pytest.mark.parametrize(
     "integration_test",
     [

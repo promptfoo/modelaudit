@@ -191,6 +191,28 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
         for issue in results.issues
         if issue.severity == IssueSeverity.CRITICAL and issue.location is not None
     }
+    root_diagnostics: list[Issue | Check] = [*results.issues, *results.checks]
+    diagnostics = [
+        (diagnostic, details)
+        for diagnostic in root_diagnostics
+        for details in _nested_diagnostic_details(diagnostic.details)
+    ]
+    security_outcome_diagnostics: set[tuple[str, str, str]] = set()
+    for diagnostic, details in diagnostics:
+        notice_code = details.get("notice_code")
+        if notice_code not in EXPECTED_SECURITY_FINDING_OUTCOME_REASONS:
+            notice_code = details.get("pickle_notice_code")
+        pickle_source = details.get("pickle_source")
+        location = diagnostic.location
+        diagnostic_is_failed = not isinstance(diagnostic, Check) or diagnostic.status == CheckStatus.FAILED
+        if (
+            diagnostic_is_failed
+            and notice_code in EXPECTED_SECURITY_FINDING_OUTCOME_REASONS
+            and details.get("analysis_incomplete") is True
+            and isinstance(pickle_source, str)
+            and isinstance(location, str)
+        ):
+            security_outcome_diagnostics.add((pickle_source, location, notice_code))
     coverage_only_paths = set()
     unavailable_scanner_paths = set()
     diagnosed_dependency_outcomes: set[tuple[str, str]] = set()
@@ -226,6 +248,20 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
                 or finding_location.startswith(f"{path}:")
                 for finding_location in actionable_security_finding_locations
             )
+            diagnosed_security_reasons = {
+                reason
+                for pickle_source, diagnostic_location, reason in security_outcome_diagnostics
+                if (
+                    pickle_source == path
+                    or pickle_source.startswith(f"{path} (")
+                    or pickle_source.startswith(f"{path}:")
+                )
+                and (
+                    diagnostic_location == path
+                    or diagnostic_location.startswith(f"{path} (")
+                    or diagnostic_location.startswith(f"{path}:")
+                )
+            }
             security_reasons = string_reasons.intersection(EXPECTED_SECURITY_FINDING_OUTCOME_REASONS)
             if security_reasons and not (
                 payload.get("analysis_incomplete") is True
@@ -233,11 +269,12 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
                 and payload.get("pickle_report_status") == "inconclusive"
                 and payload.get("pickle_verdict") == "malicious"
                 and path_has_actionable_security_finding
+                and security_reasons <= diagnosed_security_reasons
             ):
                 security_reasons = set()
             allowed_reasons = dependency_reasons | coverage_reasons | security_reasons
             if Path(path).resolve() == EXPECTED_AGPL_SOURCE_STABILITY_ASSET:
-                allowed_reasons.update(EXPECTED_AGPL_SOURCE_STABILITY_OUTCOME_REASONS)
+                allowed_reasons.update(string_reasons.intersection({"call_graph_analysis_error"}))
             if string_reasons - allowed_reasons:
                 unexpected_errors.add(path)
             if dependency_reasons:
@@ -325,12 +362,6 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
 
     diagnosed_source_changes = set()
     diagnosed_unavailable_scanners = set()
-    root_diagnostics: list[Issue | Check] = [*results.issues, *results.checks]
-    diagnostics = [
-        (diagnostic, details)
-        for diagnostic in root_diagnostics
-        for details in _nested_diagnostic_details(diagnostic.details)
-    ]
     for diagnostic, details in diagnostics:
         location = diagnostic.location or "unknown scan location"
         pickle_source = details.get("pickle_source")
