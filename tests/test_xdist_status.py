@@ -324,6 +324,14 @@ def test_nightly_runs_unsharded_performance_and_rust_once_and_fails_closed() -> 
         assert all("continue-on-error" not in step for step in job["steps"])
 
 
+def test_wall_clock_hash_generation_uses_dedicated_performance_lane() -> None:
+    from tests.test_regular_scan_hash import TestHashGenerationEdgeCases
+
+    marks = getattr(TestHashGenerationEdgeCases.test_hash_generation_performance, "pytestmark", ())
+
+    assert any(mark.name == "performance" for mark in marks)
+
+
 def test_nodeid_sharding_rejects_non_positive_count() -> None:
     root_conftest = _load_root_conftest()
 

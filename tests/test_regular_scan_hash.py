@@ -1512,7 +1512,8 @@ class TestHashGenerationEdgeCases:
         # files_scanned should include both files
         assert result.files_scanned == 2
 
-    def test_hash_generation_performance(self, tmp_path):
+    @pytest.mark.performance
+    def test_hash_generation_performance(self, tmp_path: Path) -> None:
         """Test that hash generation doesn't significantly impact performance."""
         import time
 
