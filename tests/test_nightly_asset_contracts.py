@@ -15,6 +15,8 @@ from modelaudit_picklescan.call_graph import _CallGraphAnalysisLimitError
 
 import modelaudit.core as core_module
 import modelaudit.scanners.keras_h5_scanner as keras_h5_scanner_module
+import modelaudit.scanners.keras_zip_scanner as keras_zip_scanner_module
+import modelaudit.scanners.onnx_scanner as onnx_scanner_module
 import modelaudit.scanners.pmml_scanner as pmml_scanner_module
 import modelaudit.scanners.sevenzip_scanner as sevenzip_scanner_module
 import modelaudit.scanners.tf_metagraph_scanner as tf_metagraph_scanner_module
@@ -24,8 +26,10 @@ from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core_results import metadata_has_coverage_only_operational_error, results_have_inconclusive_outcome
 from modelaudit.models import FileMetadataModel, ModelAuditResultModel
 from modelaudit.scanner_results import Check, CheckStatus, Issue, IssueSeverity, ScanResult
+from modelaudit.scanners.base import FORMAT_VALIDATION_CONFIG_KEY
 from modelaudit.scanners.flax_msgpack_scanner import FlaxMsgpackScanner
 from modelaudit.scanners.manifest_scanner import ManifestScanner
+from modelaudit.utils.file.detection import PROTOBUF_MODEL_CANDIDATE_FORMAT
 from tests import test_security_asset_integration
 
 ASSETS = Path(__file__).parent / "assets" / "samples" / "pickles"
@@ -851,7 +855,12 @@ def test_organized_asset_scans_reject_unrelated_archive_failures(
         assert not any("max_parse_bytes" in issue.details for issue in result.issues)
         assert not any("max_parse_bytes" in check.details for check in result.checks)
 
-    hidden_reason = "metagraph_parse_budget_exceeded" if archive_failure == "metadata-only-budget" else None
+    hidden_reason = {
+        "operational-dependency": "tflite_dependency_unavailable",
+        "check-only-dependency": "tflite_dependency_unavailable",
+        "consolidated-check-dependency": "tflite_dependency_unavailable",
+        "metadata-only-budget": "metagraph_parse_budget_exceeded",
+    }.get(archive_failure)
     _assert_otherwise_accepted_archive_control(result, failed_member, hidden_reason)
     monkeypatch.setattr(
         test_security_asset_integration,
@@ -1246,6 +1255,7 @@ def test_organized_asset_scans_preserve_complete_coverage_only_contract(
     "error_details",
     [
         pytest.param({"error": "independent scanner failure"}, id="error"),
+        pytest.param({"exception": "independent scanner failure"}, id="exception"),
         pytest.param({"error_type": "RuntimeError"}, id="error-type"),
         pytest.param({"exception_type": "RuntimeError"}, id="exception-type"),
         pytest.param({"operational_error": True}, id="operational-error"),
@@ -1281,6 +1291,8 @@ def test_organized_asset_scans_reject_dependency_diagnostic_error_fields(
             rule_code="S902",
         )
     )
+    result.success = False
+    assert core_module.determine_exit_code(result) == 2
 
     with pytest.raises(AssertionError, match="unexpected operational errors"):
         test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
@@ -1317,6 +1329,8 @@ def test_organized_asset_scans_preserve_missing_dependency_error_type(
             rule_code="S902",
         )
     )
+    result.success = False
+    assert core_module.determine_exit_code(result) == 2
 
     test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
         result,
@@ -1455,6 +1469,326 @@ def test_organized_asset_scans_preserve_real_pmml_missing_dependency(
         result,
         "real PMML missing dependency",
     )
+
+
+def test_organized_asset_scans_preserve_real_tentative_onnx_missing_dependency(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+    monkeypatch.setattr(onnx_scanner_module, "_check_onnx", lambda: False)
+    candidate_path = tmp_path / "tentative-protobuf.jpg"
+    candidate_path.write_bytes(b"\x42\x00" * 4097)
+    scanner = onnx_scanner_module.OnnxScanner(
+        config={FORMAT_VALIDATION_CONFIG_KEY: {"routed_format": PROTOBUF_MODEL_CANDIDATE_FORMAT}}
+    )
+
+    scan_result = scanner.scan(str(candidate_path))
+    scan_result.metadata["source_path"] = str(candidate_path)
+    result = _scan_asset("safe_data.pkl")
+    result.aggregate_scan_result_direct(scan_result)
+    metadata = result.file_metadata[str(candidate_path)].model_dump(exclude_none=True)
+    dependency_check = next(check for check in result.checks if check.details.get("required_package") == "onnx")
+    assert metadata["scan_outcome"] == "inconclusive"
+    assert "analysis_incomplete" not in metadata
+    assert metadata["scan_outcome_reasons"] == [onnx_scanner_module.ONNX_TENTATIVE_CANDIDATE_UNAVAILABLE_REASON]
+    assert dependency_check.details["analysis_incomplete"] is True
+    assert result.success is False
+    assert result.has_errors is False
+    assert core_module.determine_exit_code(result) == 2
+
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+        result,
+        "real tentative ONNX missing dependency",
+    )
+
+
+def test_organized_asset_scans_reject_real_direct_onnx_missing_dependency(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+    monkeypatch.setattr(onnx_scanner_module, "_check_onnx", lambda: False)
+    model_path = tmp_path / "direct.onnx"
+    model_path.write_bytes(b"not-a-real-onnx-model")
+
+    scan_result = onnx_scanner_module.OnnxScanner().scan(str(model_path))
+    scan_result.metadata["source_path"] = str(model_path)
+    result = _scan_asset("safe_data.pkl")
+    result.aggregate_scan_result_direct(scan_result)
+    metadata = result.file_metadata[str(model_path)].model_dump(exclude_none=True)
+    assert metadata["operational_error"] is True
+    assert metadata["operational_error_reason"] == onnx_scanner_module.ONNX_DEPENDENCY_UNAVAILABLE_REASON
+    assert result.has_errors is True
+    assert core_module.determine_exit_code(result) == 2
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            "real direct ONNX missing dependency",
+        )
+
+
+def test_organized_asset_scans_preserve_real_keras_zip_hdf5_probe_missing_dependency(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+    monkeypatch.setattr(keras_zip_scanner_module, "HAS_H5PY", False)
+    monkeypatch.setattr(keras_h5_scanner_module, "HAS_H5PY", False)
+    model_path = tmp_path / "missing-hdf5-probe-dependency.keras"
+    hdf5_signature_offset = 16 * 1024 * 1024
+    weights_payload = bytearray(hdf5_signature_offset + 8)
+    weights_payload[hdf5_signature_offset : hdf5_signature_offset + 8] = b"\x89HDF\r\n\x1a\n"
+    with zipfile.ZipFile(model_path, "w") as archive:
+        archive.writestr("config.json", '{"class_name":"Sequential","config":{"layers":[]}}')
+        archive.writestr("metadata.json", '{"keras_version":"3.12.0"}')
+        archive.writestr("model.weights.h5", bytes(weights_payload))
+
+    scan_result = keras_zip_scanner_module.KerasZipScanner().scan(str(model_path))
+    scan_result.metadata["source_path"] = str(model_path)
+    result = _scan_asset("safe_data.pkl")
+    result.aggregate_scan_result_direct(scan_result)
+    reason = "keras_zip_embedded_weights_hdf5_signature_probe_incomplete"
+    metadata = result.file_metadata[str(model_path)].model_dump(exclude_none=True)
+    dependency_check = next(check for check in result.checks if check.details.get("required_package") == "h5py")
+    assert metadata["scan_outcome_reasons"] == [reason]
+    assert dependency_check.details["scan_outcome_reason"] == reason
+    assert result.success is False
+    assert result.has_errors is False
+    assert core_module.determine_exit_code(result) == 2
+
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+        result,
+        "real Keras ZIP HDF5 probe missing dependency",
+    )
+
+
+def test_organized_asset_scans_reject_missing_dependency_metadata_without_diagnostic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+    monkeypatch.setattr(pmml_scanner_module, "HAS_DEFUSEDXML", False)
+    monkeypatch.setattr(pmml_scanner_module, "DefusedET", None)
+    model_path = tmp_path / "missing-dependency-without-diagnostic.pmml"
+    model_path.write_text(
+        "<?xml version='1.0'?><PMML version='4.4'><Header/><DataDictionary numberOfFields='0'/></PMML>",
+        encoding="utf-8",
+    )
+
+    result = core_module.scan_model_directory_or_file(str(model_path), cache_enabled=False)
+    metadata = result.file_metadata[str(model_path)].model_dump(exclude_none=True)
+    reason = pmml_scanner_module.PmmlScanner.XML_PARSER_UNAVAILABLE_INCOMPLETE_REASON
+    assert metadata["scan_outcome_reasons"] == [reason]
+    assert result.success is False
+    assert result.has_errors is False
+    assert any(diagnostic.details.get("required_package") == "defusedxml" for diagnostic in result.issues)
+    result.issues = [
+        diagnostic for diagnostic in result.issues if diagnostic.details.get("required_package") != "defusedxml"
+    ]
+    result.checks = [
+        diagnostic for diagnostic in result.checks if diagnostic.details.get("required_package") != "defusedxml"
+    ]
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            "missing dependency metadata without diagnostic",
+        )
+
+
+def test_organized_asset_scans_reject_successful_missing_dependency_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+    monkeypatch.setattr(pmml_scanner_module, "HAS_DEFUSEDXML", False)
+    monkeypatch.setattr(pmml_scanner_module, "DefusedET", None)
+    model_path = tmp_path / "successful-missing-dependency.pmml"
+    model_path.write_text(
+        "<?xml version='1.0'?><PMML version='4.4'><Header/><DataDictionary numberOfFields='0'/></PMML>",
+        encoding="utf-8",
+    )
+
+    result = core_module.scan_model_directory_or_file(str(model_path), cache_enabled=False)
+    assert result.success is False
+    assert result.has_errors is False
+    result.success = True
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            "successful missing dependency result",
+        )
+
+
+def test_organized_asset_scans_reject_unaccounted_missing_dependency_reason(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+    monkeypatch.setattr(pmml_scanner_module, "HAS_DEFUSEDXML", False)
+    monkeypatch.setattr(pmml_scanner_module, "DefusedET", None)
+    model_path = tmp_path / "unaccounted-missing-dependency-reason.pmml"
+    model_path.write_text(
+        "<?xml version='1.0'?><PMML version='4.4'><Header/><DataDictionary numberOfFields='0'/></PMML>",
+        encoding="utf-8",
+    )
+
+    result = core_module.scan_model_directory_or_file(str(model_path), cache_enabled=False)
+    metadata = result.file_metadata[str(model_path)]
+    assert metadata.model_extra is not None
+    reason = pmml_scanner_module.PmmlScanner.XML_PARSER_UNAVAILABLE_INCOMPLETE_REASON
+    assert metadata.model_extra["scan_outcome_reasons"] == [reason]
+    metadata.model_extra["scan_outcome_reasons"].append("unrelated_coverage_incomplete")
+    result.checks.append(
+        Check(
+            name="Spoofed XML Parser Security Check",
+            status=CheckStatus.FAILED,
+            message="PMML XML parsing skipped because defusedxml is unavailable",
+            severity=IssueSeverity.INFO,
+            location=str(model_path),
+            details={
+                "required_package": "defusedxml",
+                "scan_outcome_reason": "unrelated_coverage_incomplete",
+            },
+            rule_code="S902",
+        )
+    )
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            "missing dependency with unaccounted reason",
+        )
+
+
+def test_organized_asset_scans_require_each_nested_dependency_diagnostic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+    result = _scan_asset("safe_data.pkl")
+    archive_path = str(tmp_path / "multiple-missing-dependencies.zip")
+    h5py_reason = "keras_h5_h5py_unavailable"
+    defusedxml_reason = "pmml_safe_xml_parser_unavailable"
+    result.file_metadata[archive_path] = FileMetadataModel(
+        analysis_incomplete=True,
+        scan_outcome="inconclusive",
+        scan_outcome_reasons=[h5py_reason, defusedxml_reason],
+    )
+    result.checks.extend(
+        [
+            Check(
+                name="H5PY Library Check",
+                status=CheckStatus.FAILED,
+                message="h5py is required for Keras H5 scanning.",
+                severity=IssueSeverity.INFO,
+                location=f"{archive_path}:weights.h5",
+                details={"required_package": "h5py", "scan_outcome_reason": h5py_reason},
+                rule_code="S902",
+            ),
+            Check(
+                name="XML Parser Security Check",
+                status=CheckStatus.FAILED,
+                message="PMML XML parsing skipped because defusedxml is unavailable",
+                severity=IssueSeverity.INFO,
+                location=f"{archive_path}:model.pmml",
+                details={"required_package": "defusedxml", "scan_outcome_reason": defusedxml_reason},
+                rule_code="S902",
+            ),
+        ]
+    )
+    result.success = False
+    assert core_module.determine_exit_code(result) == 2
+
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+        result,
+        "nested missing dependencies",
+    )
+
+    missing_diagnostic = result.model_copy(deep=True)
+    missing_diagnostic.checks = [
+        check for check in missing_diagnostic.checks if check.details.get("required_package") != "defusedxml"
+    ]
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            missing_diagnostic,
+            "nested missing dependency diagnostic",
+        )
+
+
+def test_organized_asset_scans_do_not_share_nested_dependency_diagnostic_with_parent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+    result = _scan_asset("safe_data.pkl")
+    archive_path = str(tmp_path / "outer.zip")
+    nested_archive_path = f"{archive_path}:inner.zip"
+    reason = "keras_h5_h5py_unavailable"
+    for path in (archive_path, nested_archive_path):
+        result.file_metadata[path] = FileMetadataModel(
+            analysis_incomplete=True,
+            scan_outcome="inconclusive",
+            scan_outcome_reasons=[reason],
+        )
+    result.checks.append(
+        Check(
+            name="Nested H5PY Library Check",
+            status=CheckStatus.FAILED,
+            message="h5py is required for Keras H5 scanning.",
+            severity=IssueSeverity.INFO,
+            location=f"{nested_archive_path}:weights.h5",
+            details={"required_package": "h5py", "scan_outcome_reason": reason},
+            rule_code="S902",
+        )
+    )
+    result.success = False
+    assert core_module.determine_exit_code(result) == 2
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            "nested dependency diagnostic must not satisfy parent",
+        )
+
+
+def test_organized_asset_scans_reject_reasonless_diagnostic_for_multiple_dependency_outcomes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+    result = _scan_asset("safe_data.pkl")
+    model_path = str(tmp_path / "multiple-h5py-outcomes.keras")
+    result.file_metadata[model_path] = FileMetadataModel(
+        analysis_incomplete=True,
+        scan_outcome="inconclusive",
+        scan_outcome_reasons=[
+            "keras_zip_embedded_weights_h5py_unavailable",
+            "keras_zip_embedded_weights_hdf5_signature_probe_incomplete",
+        ],
+    )
+    result.checks.append(
+        Check(
+            name="H5PY Library Check",
+            status=CheckStatus.FAILED,
+            message="h5py is unavailable for Keras weights analysis.",
+            severity=IssueSeverity.INFO,
+            location=model_path,
+            details={"required_package": "h5py"},
+            rule_code="S902",
+        )
+    )
+    result.success = False
+    assert core_module.determine_exit_code(result) == 2
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            "reasonless diagnostic for multiple dependency outcomes",
+        )
 
 
 def test_organized_asset_scans_preserve_security_exit_with_stable_coverage_only_outcome(

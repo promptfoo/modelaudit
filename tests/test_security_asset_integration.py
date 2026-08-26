@@ -43,6 +43,7 @@ EXPECTED_DEPENDENCY_OUTCOMES = {
         {
             "keras_h5_h5py_unavailable",
             "keras_zip_embedded_weights_h5py_unavailable",
+            "keras_zip_embedded_weights_hdf5_signature_probe_incomplete",
         }
     ),
     "onnx": frozenset(
@@ -56,6 +57,9 @@ EXPECTED_DEPENDENCY_OUTCOMES = {
     "ubjson": frozenset({"xgboost_ubj_dependency_missing"}),
     "xgboost": frozenset({"xgboost_binary_load_dependency_missing"}),
 }
+EXPECTED_DEPENDENCY_OUTCOME_REASONS = frozenset(
+    reason for outcomes in EXPECTED_DEPENDENCY_OUTCOMES.values() for reason in outcomes
+)
 EXPECTED_DEPENDENCY_MESSAGE_MARKERS = {
     "defusedxml": ("defusedxml is unavailable",),
     "h5py": ("h5py is required", "h5py is unavailable"),
@@ -126,8 +130,13 @@ def _is_expected_missing_dependency_diagnostic(
     if not isinstance(metadata, dict):
         return False
     scan_outcome_reasons = metadata.get("scan_outcome_reasons")
+    tentative_onnx_candidate = (
+        normalized_package == "onnx"
+        and metadata.get("tentative_protobuf_candidate_unanalyzed") == "onnx_dependency_unavailable"
+        and scan_outcome_reasons == ["onnx_tentative_candidate_analysis_unavailable"]
+    )
     if not (
-        metadata.get("analysis_incomplete") is True
+        (metadata.get("analysis_incomplete") is True or tentative_onnx_candidate)
         and metadata.get("scan_outcome") == "inconclusive"
         and isinstance(scan_outcome_reasons, list)
         and bool(scan_outcome_reasons)
@@ -144,6 +153,7 @@ def _is_expected_missing_dependency_diagnostic(
         (not isinstance(diagnostic, Check) or diagnostic.status == CheckStatus.FAILED)
         and bool(expected_reasons.intersection(scan_outcome_reasons))
         and "error" not in details
+        and "exception" not in details
         and "exception_type" not in details
         and (error_type is None or error_type == "missing_dependency")
         and "operational_error" not in details
@@ -154,25 +164,34 @@ def _is_expected_missing_dependency_diagnostic(
 def _file_metadata_for_diagnostic(
     results: ModelAuditResultModel,
     location: str,
-) -> dict[str, Any] | None:
+) -> tuple[str, dict[str, Any]] | None:
     matching_paths = [path for path in results.file_metadata if location == path or location.startswith(f"{path}:")]
     if not matching_paths:
         return None
-    metadata = results.file_metadata[max(matching_paths, key=len)]
-    return metadata.model_dump(exclude_none=True)
+    owner_path = max(matching_paths, key=len)
+    metadata = results.file_metadata[owner_path]
+    return owner_path, metadata.model_dump(exclude_none=True)
 
 
 def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_description: str) -> None:
     expected_source_changes = set()
+    expected_dependency_outcomes: set[tuple[str, str]] = set()
+    dependency_incomplete_paths: set[str] = set()
     security_finding_locations = {
         issue.location for issue in results.issues if issue.rule_code == "S204" and issue.location is not None
     }
     coverage_only_paths = set()
     unavailable_scanner_paths = set()
+    diagnosed_dependency_outcomes: set[tuple[str, str]] = set()
     unexpected_errors = {asset.path for asset in results.assets if asset.type == "error"}
     for path, metadata in results.file_metadata.items():
         payload = metadata.model_dump(exclude_none=True)
         scan_outcome_reasons = payload.get("scan_outcome_reasons")
+        if isinstance(scan_outcome_reasons, list):
+            string_reasons = {reason for reason in scan_outcome_reasons if isinstance(reason, str) and reason}
+            if string_reasons.intersection(EXPECTED_DEPENDENCY_OUTCOME_REASONS):
+                dependency_incomplete_paths.add(path)
+                expected_dependency_outcomes.update((path, reason) for reason in string_reasons)
         operational_error_reason = payload.get("operational_error_reason")
         scan_outcome_reason = payload.get("scan_outcome_reason")
         has_failed_outcome_reason = isinstance(scan_outcome_reasons, list) and any(
@@ -318,8 +337,30 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
             continue
 
         if "required_package" in details:
-            diagnostic_metadata = _file_metadata_for_diagnostic(results, location)
-            if _is_expected_missing_dependency_diagnostic(diagnostic, details, diagnostic_metadata):
+            diagnostic_owner = _file_metadata_for_diagnostic(results, location)
+            diagnostic_metadata = diagnostic_owner[1] if diagnostic_owner is not None else None
+            if diagnostic_owner is not None and _is_expected_missing_dependency_diagnostic(
+                diagnostic, details, diagnostic_metadata
+            ):
+                owner_path = diagnostic_owner[0]
+                required_package = details.get("required_package")
+                normalized_package = (
+                    required_package.strip().casefold().replace("-", "_") if isinstance(required_package, str) else ""
+                )
+                expected_reasons = EXPECTED_DEPENDENCY_OUTCOMES.get(normalized_package, frozenset())
+                owner_expected_reasons = {
+                    reason
+                    for path, reason in expected_dependency_outcomes
+                    if path == owner_path and reason in expected_reasons
+                }
+                detail_reason = details.get("scan_outcome_reason")
+                if isinstance(detail_reason, str):
+                    diagnostic_reasons = {detail_reason} & owner_expected_reasons
+                elif len(owner_expected_reasons) == 1:
+                    diagnostic_reasons = owner_expected_reasons
+                else:
+                    diagnostic_reasons = set()
+                diagnosed_dependency_outcomes.update((owner_path, reason) for reason in diagnostic_reasons)
                 continue
             unexpected_errors.add(location)
             continue
@@ -363,9 +404,11 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
             unexpected_errors.add(location)
             continue
 
+    unexpected_errors.update(path for path, _reason in expected_dependency_outcomes - diagnosed_dependency_outcomes)
     unexpected_errors.update(unavailable_scanner_paths - diagnosed_unavailable_scanners)
-    if coverage_only_paths and results.success is not False:
-        unexpected_errors.update(coverage_only_paths)
+    incomplete_asset_paths = coverage_only_paths | dependency_incomplete_paths
+    if incomplete_asset_paths and (results.success is not False or determine_exit_code(results) == 0):
+        unexpected_errors.update(incomplete_asset_paths)
     error_message = (
         f"{scan_description} should not have unexpected operational errors: {describe_operational_errors(results)}"
     )
