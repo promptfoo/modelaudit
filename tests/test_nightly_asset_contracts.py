@@ -2009,6 +2009,46 @@ def test_organized_asset_scans_reject_unaccounted_coverage_outcomes(
         )
 
 
+@pytest.mark.parametrize("outcome_state", ["missing", "contradictory"])
+def test_organized_asset_scans_reject_incomplete_unflagged_coverage_with_security_finding(
+    outcome_state: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+    result = _scan_asset("safe_data.pkl")
+    model_path = str(tmp_path / "malicious-with-incomplete-routing.pkl")
+    result.file_metadata[model_path] = FileMetadataModel(
+        analysis_incomplete=True,
+        scan_outcome="inconclusive",
+        scan_outcome_reasons=["flax_msgpack_routing_incomplete"],
+    )
+    metadata = result.file_metadata[model_path]
+    assert metadata.model_extra is not None
+    if outcome_state == "missing":
+        metadata.model_extra.pop("analysis_incomplete")
+        metadata.model_extra.pop("scan_outcome")
+    else:
+        metadata.model_extra["analysis_incomplete"] = False
+        metadata.model_extra["scan_outcome"] = "complete"
+    result.issues.append(
+        Issue(
+            message="Embedded pickle finding",
+            severity=IssueSeverity.CRITICAL,
+            location=model_path,
+            rule_code="S204",
+        )
+    )
+    result.success = False
+
+    assert core_module.determine_exit_code(result) == 1
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            f"security-positive unflagged coverage with {outcome_state} state",
+        )
+
+
 @pytest.mark.parametrize(
     "metadata",
     [

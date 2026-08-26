@@ -380,11 +380,20 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
                 or finding_location.startswith(f"{path}:")
                 for finding_location in security_finding_locations
             )
+            unflagged_coverage_is_inconclusive = (
+                payload.get("analysis_incomplete") is True
+                and payload.get("scan_outcome") == "inconclusive"
+                and isinstance(scan_outcome_reasons, list)
+                and bool(scan_outcome_reasons)
+            )
             if (
                 (isinstance(operational_error_reason, str) and operational_error_reason)
                 or has_failed_outcome_reason
                 or has_noncoverage_outcome_reason
-                or (has_unflagged_coverage_reason and not path_has_security_finding)
+                or (
+                    has_unflagged_coverage_reason
+                    and (not path_has_security_finding or not unflagged_coverage_is_inconclusive)
+                )
             ):
                 unexpected_errors.add(path)
             continue
