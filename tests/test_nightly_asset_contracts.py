@@ -2082,6 +2082,143 @@ def test_organized_asset_scans_reject_bare_exception_diagnostics(
         )
 
 
+@pytest.mark.parametrize(
+    ("reason", "expected_message"),
+    [
+        pytest.param(
+            "nested_pickle_incomplete",
+            "Nested pickle analysis did not complete",
+            id="nested-pickle-incomplete",
+        ),
+        pytest.param(
+            "nested_probe_limit",
+            "Nested pickle probe candidate limit exceeded",
+            id="nested-probe-limit",
+        ),
+    ],
+)
+@pytest.mark.parametrize("message_state", ["missing", "corrupted"])
+def test_organized_asset_scans_reject_invalid_nested_security_messages(
+    reason: str,
+    expected_message: str,
+    message_state: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+    result = _scan_asset("dill_func.pkl")
+    model_path = str(ASSETS / "dill_func.pkl")
+    metadata = result.file_metadata[model_path]
+    assert metadata.model_extra is not None
+    metadata.model_extra["scan_outcome_reasons"] = [reason]
+
+    diagnostics: list[Issue | Check] = [*result.issues, *result.checks]
+    matching_diagnostics = [
+        diagnostic for diagnostic in diagnostics if diagnostic.details.get("notice_code") == "nested_pickle_incomplete"
+    ]
+    assert matching_diagnostics
+    for diagnostic in matching_diagnostics:
+        diagnostic.details["notice_code"] = reason
+        diagnostic.message = "" if message_state == "missing" else f"{expected_message} (message corrupted)"
+
+    assert result.success is False
+    assert core_module.determine_exit_code(result) == 1
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            f"{reason} with {message_state} user-facing message",
+        )
+
+
+@pytest.mark.parametrize("diagnostic_kind", ["issue", "failed-check", "passed-check"])
+@pytest.mark.parametrize(
+    "details",
+    [
+        pytest.param({"analysis_incomplete": True}, id="analysis-incomplete"),
+        pytest.param({"scan_outcome": "inconclusive"}, id="inconclusive-outcome"),
+    ],
+)
+def test_organized_asset_scans_reject_reasonless_incomplete_diagnostics(
+    diagnostic_kind: str,
+    details: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+    result = _scan_asset("safe_data.pkl")
+    model_path = str(ASSETS / "safe_data.pkl")
+    if diagnostic_kind != "issue":
+        result.checks.append(
+            Check(
+                name="Unexplained incomplete scan",
+                status=CheckStatus.FAILED if diagnostic_kind == "failed-check" else CheckStatus.PASSED,
+                message="Scanner analysis is incomplete",
+                severity=IssueSeverity.INFO,
+                location=model_path,
+                details=details,
+            )
+        )
+    else:
+        result.issues.append(
+            Issue(
+                message="Scanner analysis is incomplete",
+                severity=IssueSeverity.INFO,
+                location=model_path,
+                details=details,
+            )
+        )
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            f"{diagnostic_kind} with unexplained incomplete state",
+        )
+
+
+@pytest.mark.parametrize("diagnostic_kind", ["issue", "failed-check", "passed-check"])
+@pytest.mark.parametrize(
+    "details",
+    [
+        pytest.param({"category": "scanner_read_failed"}, id="failure-category"),
+        pytest.param({"category": "io_error"}, id="error-category"),
+        pytest.param({"operational_error_reason": "scanner_read_failed"}, id="operational-error-reason"),
+        pytest.param({"scan_outcome_reasons": ["scanner_read_failed"]}, id="outcome-reasons"),
+    ],
+)
+def test_organized_asset_scans_reject_diagnostic_only_operational_markers(
+    diagnostic_kind: str,
+    details: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+    result = _scan_asset("safe_data.pkl")
+    model_path = str(ASSETS / "safe_data.pkl")
+    if diagnostic_kind != "issue":
+        result.checks.append(
+            Check(
+                name="Hidden operational failure",
+                status=CheckStatus.FAILED if diagnostic_kind == "failed-check" else CheckStatus.PASSED,
+                message="Scanner operation failed",
+                severity=IssueSeverity.INFO,
+                location=model_path,
+                details=details,
+            )
+        )
+    else:
+        result.issues.append(
+            Issue(
+                message="Scanner operation failed",
+                severity=IssueSeverity.INFO,
+                location=model_path,
+                details=details,
+            )
+        )
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            f"{diagnostic_kind} with diagnostic-only operational marker",
+        )
+
+
 def test_organized_asset_scans_do_not_share_nested_dependency_diagnostic_with_parent(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

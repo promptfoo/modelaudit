@@ -62,6 +62,17 @@ EXPECTED_DEPENDENCY_OUTCOME_REASONS = frozenset(
 )
 EXPECTED_COVERAGE_AGGREGATION_OUTCOME_REASONS = frozenset({"zip_analysis_incomplete"})
 EXPECTED_SECURITY_FINDING_OUTCOME_REASONS = frozenset({"nested_pickle_incomplete", "nested_probe_limit"})
+EXPECTED_SECURITY_FINDING_OUTCOME_MESSAGES = {
+    "nested_pickle_incomplete": "Nested pickle analysis did not complete",
+    "nested_probe_limit": "Nested pickle probe candidate limit exceeded",
+}
+EXPECTED_PICKLE_INCOMPLETE_MESSAGES = frozenset(
+    {
+        "Nested pickle analysis did not complete",
+        "Nested pickle payload exceeds deep-scan byte limit",
+        "Nested pickle probe candidate limit exceeded",
+    }
+)
 EXPECTED_DEPENDENCY_MESSAGE_MARKERS = {
     "defusedxml": ("defusedxml is unavailable",),
     "h5py": ("h5py is required", "h5py is unavailable"),
@@ -178,6 +189,67 @@ def _file_metadata_for_diagnostic(
     return owner_path, metadata.model_dump(exclude_none=True)
 
 
+def _expected_security_outcome_reason(
+    diagnostic: Issue | Check,
+    details: dict[str, Any],
+) -> str | None:
+    notice_code = details.get("notice_code")
+    if notice_code not in EXPECTED_SECURITY_FINDING_OUTCOME_REASONS:
+        notice_code = details.get("pickle_notice_code")
+    if not isinstance(notice_code, str):
+        return None
+    expected_message = EXPECTED_SECURITY_FINDING_OUTCOME_MESSAGES.get(notice_code)
+    diagnostic_is_failed = not isinstance(diagnostic, Check) or diagnostic.status == CheckStatus.FAILED
+    if (
+        diagnostic_is_failed
+        and expected_message is not None
+        and diagnostic.message == expected_message
+        and details.get("analysis_incomplete") is True
+        and isinstance(details.get("pickle_source"), str)
+        and isinstance(diagnostic.location, str)
+    ):
+        return notice_code
+    return None
+
+
+def _is_expected_pickle_incomplete_diagnostic(
+    diagnostic: Issue | Check,
+    details: dict[str, Any],
+) -> bool:
+    if not (
+        (not isinstance(diagnostic, Check) or diagnostic.status == CheckStatus.FAILED)
+        and diagnostic.message in EXPECTED_PICKLE_INCOMPLETE_MESSAGES
+        and details.get("analysis_incomplete") is True
+        and isinstance(details.get("pickle_source"), str)
+    ):
+        return False
+    if diagnostic.message == "Nested pickle analysis did not complete":
+        return details.get("nested_status") == "inconclusive" and isinstance(details.get("nested_encoding"), str)
+    if diagnostic.message == "Nested pickle payload exceeds deep-scan byte limit":
+        return (
+            isinstance(details.get("encoding"), str)
+            and isinstance(details.get("max_nested_pickle_bytes"), int)
+            and details.get("nested_has_execution_opcode") is True
+        )
+    return isinstance(details.get("encoding"), str) and isinstance(details.get("max_nested_payload_probes"), int)
+
+
+def _is_expected_call_graph_source_unavailable_diagnostic(
+    diagnostic: Issue | Check,
+    details: dict[str, Any],
+) -> bool:
+    return (
+        isinstance(diagnostic, Check)
+        and diagnostic.status == CheckStatus.PASSED
+        and diagnostic.message == "Python call-graph analysis could not inspect invoked callable source"
+        and details.get("notice_code") == "call_graph_source_unavailable"
+        and details.get("pickle_notice_code") == "call_graph_source_unavailable"
+        and details.get("reason") == "source_unavailable"
+        and details.get("analysis_incomplete") is True
+        and isinstance(details.get("pickle_source"), str)
+    )
+
+
 def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_description: str) -> None:
     expected_source_changes = set()
     expected_dependency_outcomes: set[tuple[str, str]] = set()
@@ -199,19 +271,10 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
     ]
     security_outcome_diagnostics: set[tuple[str, str, str]] = set()
     for diagnostic, details in diagnostics:
-        notice_code = details.get("notice_code")
-        if notice_code not in EXPECTED_SECURITY_FINDING_OUTCOME_REASONS:
-            notice_code = details.get("pickle_notice_code")
+        notice_code = _expected_security_outcome_reason(diagnostic, details)
         pickle_source = details.get("pickle_source")
         location = diagnostic.location
-        diagnostic_is_failed = not isinstance(diagnostic, Check) or diagnostic.status == CheckStatus.FAILED
-        if (
-            diagnostic_is_failed
-            and notice_code in EXPECTED_SECURITY_FINDING_OUTCOME_REASONS
-            and details.get("analysis_incomplete") is True
-            and isinstance(pickle_source, str)
-            and isinstance(location, str)
-        ):
+        if notice_code is not None and isinstance(pickle_source, str) and isinstance(location, str):
             security_outcome_diagnostics.add((pickle_source, location, notice_code))
     coverage_only_paths = set()
     unavailable_scanner_paths = set()
@@ -367,6 +430,7 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
         pickle_source = details.get("pickle_source")
         category = details.get("category")
         scan_outcome_reason = details.get("scan_outcome_reason")
+        scan_outcome_reasons = details.get("scan_outcome_reasons")
         coverage_only_diagnostic = metadata_has_coverage_only_operational_error(
             {
                 "operational_error": True,
@@ -382,6 +446,17 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
             or (isinstance(scan_outcome_reason, str) and bool(scan_outcome_reason))
         )
         diagnostic_is_failed = not isinstance(diagnostic, Check) or diagnostic.status == CheckStatus.FAILED
+        expected_security_outcome_reason = _expected_security_outcome_reason(diagnostic, details)
+        expected_pickle_incomplete = _is_expected_pickle_incomplete_diagnostic(diagnostic, details)
+        expected_call_graph_source_unavailable = _is_expected_call_graph_source_unavailable_diagnostic(
+            diagnostic, details
+        )
+        expected_coverage_incomplete = (
+            diagnostic_is_failed
+            and details.get("analysis_incomplete") is True
+            and isinstance(scan_outcome_reason, str)
+            and coverage_only_diagnostic
+        )
         if "exception" in details:
             unexpected_errors.add(location)
             continue
@@ -450,6 +525,28 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
                     diagnostic_reasons = set()
                 diagnosed_dependency_outcomes.update((owner_path, reason) for reason in diagnostic_reasons)
                 continue
+            unexpected_errors.add(location)
+            continue
+
+        has_unexplained_operational_marker = (
+            (
+                isinstance(category, str)
+                and category != "parse_error"
+                and category.endswith(OPERATIONAL_FAILURE_REASON_SUFFIXES)
+            )
+            or "operational_error_reason" in details
+            or "scan_outcome_reasons" in details
+            or details.get("scan_outcome") == "inconclusive"
+            or (
+                details.get("analysis_incomplete") is True
+                and category != "parse_error"
+                and expected_security_outcome_reason is None
+                and not expected_pickle_incomplete
+                and not expected_call_graph_source_unavailable
+                and not expected_coverage_incomplete
+            )
+        )
+        if has_unexplained_operational_marker:
             unexpected_errors.add(location)
             continue
 
