@@ -382,6 +382,10 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
             or (isinstance(scan_outcome_reason, str) and bool(scan_outcome_reason))
         )
         diagnostic_is_failed = not isinstance(diagnostic, Check) or diagnostic.status == CheckStatus.FAILED
+        if "exception" in details:
+            unexpected_errors.add(location)
+            continue
+
         if not diagnostic_is_failed and has_operational_marker:
             unexpected_errors.add(location)
             continue
@@ -465,12 +469,7 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
         if category == "parse_error":
             continue
         if pickle_source:
-            if (
-                details.get("exception_type")
-                or details.get("error_type")
-                or "error" in details
-                or "exception" in details
-            ):
+            if details.get("exception_type") or details.get("error_type") or "error" in details:
                 unexpected_errors.add(location)
             continue
 
@@ -483,7 +482,6 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
             or details.get("exception_type")
             or details.get("error_type")
             or "error" in details
-            or "exception" in details
             or details.get("operational_error") is True
             or details.get("interrupted") is True
             or (

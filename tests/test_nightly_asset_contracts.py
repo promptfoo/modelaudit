@@ -563,6 +563,29 @@ def test_organized_asset_scans_reject_source_stability_diagnostic_without_has_er
         )
 
 
+def test_organized_asset_scans_reject_bare_exception_on_source_stability_diagnostic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def raise_source_stability_error(_report_generation: int | None) -> None:
+        raise _source_stability_error()
+
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", raise_source_stability_error)
+    result = core_module.scan_model_directory_or_file(str(AGPL_ASSET), cache_enabled=False)
+    source_stability_issue = next(
+        issue for issue in result.issues if issue.details.get("analysis") == "python_call_graph_source_stability"
+    )
+    source_stability_issue.details["exception"] = "scanner blew up"
+
+    assert result.has_errors is True
+    assert result.success is False
+    assert core_module.determine_exit_code(result) == 2
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            "source-stability diagnostic with bare exception",
+        )
+
+
 def test_organized_asset_scans_reject_passed_source_stability_check(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2026,6 +2049,10 @@ def test_organized_asset_scans_reject_missing_outcome_reasons(
                 "exception": "scanner blew up",
             },
             id="pickle-source-diagnostic",
+        ),
+        pytest.param(
+            {"category": "parse_error", "exception": "scanner blew up"},
+            id="parse-error-diagnostic",
         ),
     ],
 )
