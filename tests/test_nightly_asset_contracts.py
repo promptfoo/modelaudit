@@ -22,6 +22,7 @@ import modelaudit.scanners.sevenzip_scanner as sevenzip_scanner_module
 import modelaudit.scanners.tf_metagraph_scanner as tf_metagraph_scanner_module
 import modelaudit.scanners.tflite_scanner as tflite_scanner_module
 import modelaudit.scanners.xgboost_scanner as xgboost_scanner_module
+import modelaudit.scanners.zip_scanner as zip_scanner_module
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core_results import metadata_has_coverage_only_operational_error, results_have_inconclusive_outcome
 from modelaudit.models import FileMetadataModel, ModelAuditResultModel
@@ -34,6 +35,10 @@ from tests import test_security_asset_integration
 
 ASSETS = Path(__file__).parent / "assets" / "samples" / "pickles"
 AGPL_ASSET = Path(__file__).parent / "assets" / "scenarios" / "license_scenarios" / "agpl_component" / "agpl_model.pkl"
+AMBIGUOUS_XML_PAYLOAD = (
+    "<?xml version='1.0'?><!--" + "x" * (1024 * 1024 + 64) + "--><PMML version='4.4'></PMML>"
+).encode()
+COMPRESSION_BOMB_PAYLOAD = b"x" * (1024 * 1024 + 64)
 
 
 def _source_stability_error() -> _CallGraphAnalysisLimitError:
@@ -45,6 +50,67 @@ def _source_stability_error() -> _CallGraphAnalysisLimitError:
 
 def _scan_asset(name: str) -> ModelAuditResultModel:
     return core_module.scan_model_directory_or_file(str(ASSETS / name), cache_enabled=False)
+
+
+def _scan_ambiguous_xml_archive(
+    tmp_path: Path,
+    member_names: tuple[str, ...],
+    *,
+    unrelated_members: tuple[str, ...] = (),
+    compression: int = zipfile.ZIP_STORED,
+) -> tuple[Path, ModelAuditResultModel]:
+    archive_path = tmp_path / f"ambiguous-xml-{len(member_names)}.zip"
+    with zipfile.ZipFile(archive_path, "w", compression=compression) as archive:
+        for member_name in member_names:
+            archive.writestr(member_name, AMBIGUOUS_XML_PAYLOAD)
+        for member_name in unrelated_members:
+            archive.writestr(member_name, b"ordinary unknown archive member")
+    return archive_path, core_module.scan_model_directory_or_file(str(archive_path), cache_enabled=False)
+
+
+def _zip_payload(entries: tuple[tuple[str, bytes], ...], *, compression: int = zipfile.ZIP_STORED) -> bytes:
+    payload = io.BytesIO()
+    with zipfile.ZipFile(payload, "w", compression=compression) as archive:
+        for member_name, member_payload in entries:
+            archive.writestr(member_name, member_payload)
+    return payload.getvalue()
+
+
+def _corrupt_zip_payload() -> bytes:
+    valid_payload = _zip_payload((("ordinary.txt", b"ordinary"),))
+    eocd_offset = valid_payload.rfind(b"PK\x05\x06")
+    assert eocd_offset >= 0
+    return valid_payload[: eocd_offset + 10]
+
+
+def _scan_nested_zip_archive(
+    tmp_path: Path,
+    inner_entries: tuple[tuple[str, bytes], ...],
+    *,
+    inner_compression: int = zipfile.ZIP_STORED,
+) -> tuple[Path, ModelAuditResultModel]:
+    archive_path = tmp_path / "nested-archive.zip"
+    inner_payload = _zip_payload(inner_entries, compression=inner_compression)
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("inner.zip", inner_payload)
+    return archive_path, core_module.scan_model_directory_or_file(str(archive_path), cache_enabled=False)
+
+
+def _scan_duplicate_nested_zip_archives(
+    tmp_path: Path,
+    first_entries: tuple[tuple[str, bytes], ...],
+    second_entries: tuple[tuple[str, bytes], ...],
+    *,
+    inner_compression: int = zipfile.ZIP_STORED,
+) -> tuple[Path, ModelAuditResultModel]:
+    archive_path = tmp_path / "duplicate-nested-archives.zip"
+    first_payload = _zip_payload(first_entries, compression=inner_compression)
+    second_payload = _zip_payload(second_entries, compression=inner_compression)
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("inner.zip", first_payload)
+        with pytest.warns(UserWarning, match="Duplicate name"):
+            archive.writestr("inner.zip", second_payload)
+    return archive_path, core_module.scan_model_directory_or_file(str(archive_path), cache_enabled=False)
 
 
 def _merge_with_canonical_agpl_source_change(result: ModelAuditResultModel) -> ModelAuditResultModel:
@@ -66,9 +132,27 @@ def _assert_otherwise_accepted_archive_control(
     for archive_path, metadata in control.file_metadata.items():
         if not failed_member.startswith(f"{archive_path}:") or metadata.model_extra is None:
             continue
+        reported_coverage_reasons: set[str] = set()
+        remaining_diagnostics: list[Issue | Check] = [*control.issues, *control.checks]
+        for diagnostic in remaining_diagnostics:
+            if diagnostic.location is None or not (
+                diagnostic.location == archive_path or diagnostic.location.startswith(f"{archive_path}:")
+            ):
+                continue
+            for details in test_security_asset_integration._nested_diagnostic_details(diagnostic.details):
+                reason = details.get("scan_outcome_reason")
+                if isinstance(reason, str) and metadata_has_coverage_only_operational_error(
+                    {"operational_error": True, "operational_error_reason": reason}
+                ):
+                    reported_coverage_reasons.add(reason)
+            if diagnostic.message == (
+                "XML model routing was inconclusive because the bounded probe ended before "
+                "the first structural root element"
+            ):
+                reported_coverage_reasons.update({"xml_model_routing_incomplete", "zip_analysis_incomplete"})
         reasons = metadata.model_extra.get("scan_outcome_reasons")
         if isinstance(reasons, list):
-            metadata.model_extra["scan_outcome_reasons"] = [
+            remaining_reasons = [
                 reason
                 for reason in reasons
                 if reason != hidden_reason
@@ -77,7 +161,29 @@ def _assert_otherwise_accepted_archive_control(
                     isinstance(reason, str)
                     and reason.endswith(("_failed", "_error", "_exceeded", "_timeout", "_interrupted"))
                 )
+                and not (
+                    isinstance(reason, str)
+                    and metadata_has_coverage_only_operational_error(
+                        {"operational_error": True, "operational_error_reason": reason}
+                    )
+                    and reason not in reported_coverage_reasons
+                )
             ]
+            metadata.model_extra["scan_outcome_reasons"] = remaining_reasons
+            operational_error_reason = metadata.model_extra.get("operational_error_reason")
+            if operational_error_reason not in remaining_reasons:
+                metadata.model_extra.pop("operational_error", None)
+                metadata.model_extra.pop("operational_error_reason", None)
+            if metadata.model_extra.get("scan_outcome_reason") not in remaining_reasons:
+                metadata.model_extra.pop("scan_outcome_reason", None)
+            if not remaining_reasons:
+                for marker in (
+                    "analysis_incomplete",
+                    "scan_outcome",
+                    "scan_outcome_message",
+                    "scan_outcome_reasons",
+                ):
+                    metadata.model_extra.pop(marker, None)
     test_security_asset_integration.assert_no_unexpected_asset_scan_errors(control, "mixed archive negative control")
 
 
@@ -469,6 +575,410 @@ def test_organized_asset_scans_preserve_plain_passed_checks(monkeypatch: pytest.
     test_security_asset_integration.assert_no_unexpected_asset_scan_errors(result, "plain passed check")
 
 
+def _append_contract_diagnostic(
+    result: ModelAuditResultModel,
+    diagnostic_kind: str,
+    *,
+    message: str,
+    location: str,
+    details: dict[str, Any],
+    rule_code: str | None = None,
+) -> None:
+    root_details = details if diagnostic_kind != "nested" else {"findings": [{"details": details}]}
+    if diagnostic_kind == "failed-check":
+        result.checks.append(
+            Check(
+                name="Synthetic contract diagnostic",
+                status=CheckStatus.FAILED,
+                message=message,
+                severity=IssueSeverity.INFO,
+                location=location,
+                details=root_details,
+                rule_code=rule_code,
+            )
+        )
+        return
+    result.issues.append(
+        Issue(
+            message=message,
+            severity=IssueSeverity.INFO,
+            location=location,
+            details=root_details,
+            rule_code=rule_code,
+        )
+    )
+
+
+def test_organized_asset_scans_reject_unavailable_scanner_diagnostic_without_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+    result = _scan_asset("safe_data.pkl")
+    missing_path = str(tmp_path / "missing.keras")
+    result.checks.append(
+        Check(
+            name="Format Detection",
+            status=CheckStatus.FAILED,
+            message=test_security_asset_integration.EXPECTED_UNAVAILABLE_SCANNER_MESSAGE,
+            severity=IssueSeverity.INFO,
+            location=missing_path,
+            details={"format": "keras", "path": missing_path},
+        )
+    )
+
+    assert result.success is True
+    assert core_module.determine_exit_code(result) == 0
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            "unavailable scanner diagnostic without metadata",
+        )
+
+
+@pytest.mark.parametrize("diagnostic_kind", ["issue", "failed-check", "nested"])
+def test_organized_asset_scans_reject_coverage_diagnostic_without_metadata(
+    diagnostic_kind: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+    result = _scan_asset("safe_data.pkl")
+    model_path = str(ASSETS / "safe_data.pkl")
+    _append_contract_diagnostic(
+        result,
+        diagnostic_kind,
+        message="Recognized format scan coverage is incomplete",
+        location=model_path,
+        details={
+            "analysis_incomplete": True,
+            "scan_outcome": "inconclusive",
+            "scan_outcome_reason": "recognized_format_scanner_unavailable",
+        },
+    )
+
+    assert result.success is True
+    assert core_module.determine_exit_code(result) == 2
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            f"{diagnostic_kind} coverage diagnostic without metadata",
+        )
+
+
+@pytest.mark.parametrize("diagnostic_kind", ["issue", "failed-check", "nested"])
+def test_organized_asset_scans_reject_security_incomplete_diagnostic_without_metadata(
+    diagnostic_kind: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+    result = _scan_asset("safe_data.pkl")
+    model_path = str(ASSETS / "safe_data.pkl")
+    result.issues.append(
+        Issue(
+            message="Embedded pickle finding",
+            severity=IssueSeverity.CRITICAL,
+            location=model_path,
+            rule_code="S204",
+        )
+    )
+    _append_contract_diagnostic(
+        result,
+        diagnostic_kind,
+        message="Nested pickle analysis did not complete",
+        location=model_path,
+        details={
+            "analysis_incomplete": True,
+            "notice_code": "nested_pickle_incomplete",
+            "pickle_notice_code": "nested_pickle_incomplete",
+            "pickle_source": model_path,
+            "nested_status": "inconclusive",
+            "nested_encoding": "raw",
+        },
+        rule_code="S902",
+    )
+
+    assert result.success is True
+    assert core_module.determine_exit_code(result) == 1
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            f"{diagnostic_kind} security diagnostic without metadata",
+        )
+
+
+@pytest.mark.parametrize("contract_kind", ["source-change", "unflagged-coverage"])
+def test_organized_asset_scans_require_diagnostic_for_each_coverage_reason(
+    contract_kind: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if contract_kind == "source-change":
+
+        def raise_source_stability_error(_report_generation: int | None) -> None:
+            raise _source_stability_error()
+
+        monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", raise_source_stability_error)
+        result = core_module.scan_model_directory_or_file(str(AGPL_ASSET), cache_enabled=False)
+        model_path = str(AGPL_ASSET)
+    else:
+        monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+        result = _scan_asset("safe_data.pkl")
+        model_path = str(tmp_path / "missing-flax-diagnostic.pkl")
+        result.file_metadata[model_path] = FileMetadataModel(
+            analysis_incomplete=True,
+            scan_outcome="inconclusive",
+            scan_outcome_reasons=["flax_msgpack_routing_incomplete"],
+        )
+        result.issues.append(
+            Issue(
+                message="Embedded pickle finding",
+                severity=IssueSeverity.CRITICAL,
+                location=model_path,
+                rule_code="S204",
+            )
+        )
+        result.success = False
+
+    def reports_flax_incomplete(diagnostic: Issue | Check) -> bool:
+        return any(
+            details.get("scan_outcome_reason") == "flax_msgpack_routing_incomplete"
+            for details in test_security_asset_integration._nested_diagnostic_details(diagnostic.details)
+        )
+
+    result.issues = [diagnostic for diagnostic in result.issues if not reports_flax_incomplete(diagnostic)]
+    result.checks = [diagnostic for diagnostic in result.checks if not reports_flax_incomplete(diagnostic)]
+    remaining_diagnostics: list[Issue | Check] = [*result.issues, *result.checks]
+    assert not any(reports_flax_incomplete(diagnostic) for diagnostic in remaining_diagnostics)
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            f"{contract_kind} metadata without its coverage diagnostic",
+        )
+
+
+@pytest.mark.parametrize(
+    ("contract_kind", "field", "value"),
+    [
+        pytest.param("dependency", "analysis_incomplete", False, id="dependency-complete-flag"),
+        pytest.param("dependency", "scan_outcome", "complete", id="dependency-complete-outcome"),
+        pytest.param("security", "analysis_incomplete", False, id="security-complete-flag"),
+        pytest.param("security", "scan_outcome", "complete", id="security-complete-outcome"),
+        pytest.param("coverage", "analysis_incomplete", False, id="coverage-complete-flag"),
+        pytest.param("coverage", "scan_outcome", "complete", id="coverage-complete-outcome"),
+    ],
+)
+def test_organized_asset_scans_reject_contradictory_incomplete_diagnostic_state(
+    contract_kind: str,
+    field: str,
+    value: Any,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+    if contract_kind == "security":
+        result = _scan_asset("dill_func.pkl")
+        diagnostic: Issue | Check = next(
+            issue for issue in result.issues if issue.details.get("notice_code") == "nested_pickle_incomplete"
+        )
+    elif contract_kind == "dependency":
+        result, model_path, _reason = _synthetic_direct_h5py_dependency_profile(
+            "h5",
+            tmp_path,
+            monkeypatch,
+        )
+        monkeypatch.setattr(keras_h5_scanner_module, "HAS_H5PY", False)
+        diagnostic = next(
+            check
+            for check in result.checks
+            if check.location == model_path and check.details.get("required_package") == "h5py"
+        )
+    else:
+        result = _scan_asset("safe_data.pkl")
+        model_path = str(tmp_path / f"{contract_kind}-incomplete.model")
+        reason = "flax_msgpack_routing_incomplete"
+        result.file_metadata[model_path] = FileMetadataModel(
+            analysis_incomplete=True,
+            scan_outcome="inconclusive",
+            scan_outcome_reasons=[reason],
+        )
+        result.success = False
+        result.issues.append(
+            Issue(
+                message="Embedded pickle finding",
+                severity=IssueSeverity.CRITICAL,
+                location=model_path,
+                rule_code="S204",
+            )
+        )
+        diagnostic = Issue(
+            message="Flax MessagePack analysis incomplete because bounded routing inspection could not complete",
+            severity=IssueSeverity.INFO,
+            location=model_path,
+            details={
+                "analysis_incomplete": True,
+                "scan_outcome_reason": reason,
+            },
+            rule_code="S902",
+        )
+        result.issues.append(diagnostic)
+
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+        result,
+        f"valid {contract_kind} incomplete diagnostic control",
+    )
+    diagnostic.details[field] = value
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            f"{contract_kind} diagnostic with contradictory {field}",
+        )
+
+
+@pytest.mark.parametrize("contract_kind", ["standalone", "duplicate"])
+def test_organized_asset_scans_reject_aliasless_security_incomplete_diagnostics(
+    contract_kind: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+    if contract_kind == "duplicate":
+        result = _scan_asset("dill_func.pkl")
+        diagnostic: Issue | Check = next(
+            issue for issue in result.issues if issue.details.get("notice_code") == "nested_pickle_incomplete"
+        )
+        diagnostic.details.pop("notice_code")
+        diagnostic.details.pop("pickle_notice_code")
+    else:
+        result = _scan_asset("safe_data.pkl")
+        model_path = str(ASSETS / "safe_data.pkl")
+        result.issues.append(
+            Issue(
+                message="Embedded pickle finding",
+                severity=IssueSeverity.CRITICAL,
+                location=model_path,
+                rule_code="S204",
+            )
+        )
+        _append_contract_diagnostic(
+            result,
+            "issue",
+            message="Nested pickle analysis did not complete",
+            location=model_path,
+            details={
+                "analysis_incomplete": True,
+                "pickle_source": model_path,
+                "nested_status": "inconclusive",
+                "nested_encoding": "raw",
+            },
+            rule_code="S902",
+        )
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            f"{contract_kind} aliasless security diagnostic",
+        )
+
+
+@pytest.mark.parametrize("diagnostic_kind", ["issue", "failed-check", "nested"])
+@pytest.mark.parametrize(
+    "malformed_details",
+    [
+        pytest.param({"operational_error": "yes"}, id="non-boolean-operational-error"),
+        pytest.param({"interrupted": "yes"}, id="non-boolean-interrupted"),
+        pytest.param({"exception_type": ""}, id="empty-exception-type"),
+        pytest.param({"error_type": None}, id="null-error-type"),
+    ],
+)
+def test_organized_asset_scans_reject_malformed_diagnostic_markers(
+    diagnostic_kind: str,
+    malformed_details: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+    result = _scan_asset("safe_data.pkl")
+    model_path = str(ASSETS / "safe_data.pkl")
+    _append_contract_diagnostic(
+        result,
+        diagnostic_kind,
+        message="Malformed scanner diagnostic",
+        location=model_path,
+        details=malformed_details,
+    )
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            f"{diagnostic_kind} malformed diagnostic marker",
+        )
+
+
+@pytest.mark.parametrize(
+    ("notice_code", "pickle_notice_code"),
+    [
+        pytest.param("nested_pickle_incomplete", "nested_probe_limit", id="mismatched-pickle-alias"),
+        pytest.param("unrelated_notice", "nested_pickle_incomplete", id="fallback-from-mismatched-notice"),
+    ],
+)
+def test_organized_asset_scans_reject_mismatched_security_notice_aliases(
+    notice_code: str,
+    pickle_notice_code: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+    result = _scan_asset("dill_func.pkl")
+    diagnostic = next(
+        issue for issue in result.issues if issue.details.get("notice_code") == "nested_pickle_incomplete"
+    )
+    diagnostic.details["notice_code"] = notice_code
+    diagnostic.details["pickle_notice_code"] = pickle_notice_code
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            "mismatched nested security notice aliases",
+        )
+
+
+@pytest.mark.parametrize("removed_alias", ["notice_code", "pickle_notice_code"])
+def test_organized_asset_scans_preserve_single_security_notice_alias(
+    removed_alias: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+    result = _scan_asset("dill_func.pkl")
+    diagnostics: list[Issue | Check] = [*result.issues, *result.checks]
+    matching_diagnostics = [
+        diagnostic for diagnostic in diagnostics if diagnostic.details.get("notice_code") == "nested_pickle_incomplete"
+    ]
+    assert matching_diagnostics
+    for diagnostic in matching_diagnostics:
+        diagnostic.details.pop(removed_alias)
+
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+        result,
+        f"single nested security notice alias after removing {removed_alias}",
+    )
+
+
+def test_organized_asset_scans_reject_mismatched_security_diagnostic_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+    result = _scan_asset("dill_func.pkl")
+    diagnostic = next(
+        issue for issue in result.issues if issue.details.get("notice_code") == "nested_pickle_incomplete"
+    )
+    diagnostic.details["scan_outcome_reason"] = "recognized_format_scanner_unavailable"
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            "mismatched nested security diagnostic reason",
+        )
+
+
 @pytest.mark.parametrize("findings_container", ["dict", "list", "tuple"])
 def test_organized_asset_scans_reject_nested_finding_operational_diagnostics_without_has_errors(
     findings_container: str,
@@ -786,6 +1296,2177 @@ def test_organized_asset_scans_reject_embedded_source_stability(
     test_case = test_security_asset_integration.TestSecurityAssetIntegration()
     with pytest.raises(AssertionError, match="unexpected operational errors"):
         getattr(test_case, integration_test)(tmp_path)
+
+
+@pytest.mark.parametrize("corruption", ["truncated-eocd", "overwritten-eocd-signature"])
+def test_organized_asset_scans_require_corrupt_root_zip_evidence(
+    corruption: str,
+    tmp_path: Path,
+) -> None:
+    archive_path = tmp_path / f"{corruption}.zip"
+    valid_payload = _zip_payload((("ordinary.txt", b"ordinary"),))
+    eocd_offset = valid_payload.rfind(b"PK\x05\x06")
+    assert eocd_offset >= 0
+    if corruption == "truncated-eocd":
+        archive_path.write_bytes(valid_payload[: eocd_offset + 10])
+    else:
+        archive_path.write_bytes(valid_payload[:eocd_offset] + b"NOPE" + valid_payload[eocd_offset + 4 :])
+
+    result = core_module.scan_model_directory_or_file(str(archive_path), cache_enabled=False)
+    metadata = result.file_metadata[str(archive_path)]
+    assert metadata.model_extra is not None
+    assert metadata.model_extra["analysis_incomplete"] is True
+    assert metadata.model_extra["scan_outcome"] == "inconclusive"
+    assert metadata.model_extra["scan_outcome_reasons"] == ["zip_analysis_incomplete"]
+    assert result.success is False
+    assert core_module.determine_exit_code(result) == 2
+    assert any(issue.rule_code == "S902" for issue in result.issues)
+    assert any(check.rule_code == "S902" and check.status == CheckStatus.FAILED for check in result.checks)
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+        result,
+        f"canonical corrupt root ZIP ({corruption})",
+    )
+
+    without_hint = result.model_copy(deep=True)
+    without_hint_metadata = without_hint.file_metadata[str(archive_path)]
+    assert without_hint_metadata.model_extra is not None
+    assert "zip" in without_hint_metadata.model_extra["scanner_dependency_ids"]
+    without_hint_metadata.model_extra.pop("scanner_dependency_ids")
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+        without_hint,
+        f"canonical corrupt root ZIP without scanner hint ({corruption})",
+    )
+
+    for mutation in ("stripped", "corrupt", "duplicate"):
+        mutated = result.model_copy(deep=True)
+        mutated_metadata = mutated.file_metadata[str(archive_path)]
+        assert mutated_metadata.model_extra is not None
+        if mutation == "stripped":
+            mutated.issues = [issue for issue in mutated.issues if issue.rule_code != "S902"]
+            mutated.checks = [check for check in mutated.checks if check.rule_code != "S902"]
+            for field in ("analysis_incomplete", "scan_outcome", "scan_outcome_reasons"):
+                mutated_metadata.model_extra.pop(field, None)
+            mutated.success = True
+            assert core_module.determine_exit_code(mutated) == 0
+        elif mutation == "corrupt":
+            s902_issue = next(issue for issue in mutated.issues if issue.rule_code == "S902")
+            s902_issue.details["path"] = f"{archive_path}.forged"
+        else:
+            s902_check = next(check for check in mutated.checks if check.rule_code == "S902")
+            mutated.checks.append(s902_check.model_copy(deep=True))
+
+        with pytest.raises(AssertionError, match="unexpected operational errors"):
+            test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+                mutated,
+                f"corrupt root ZIP with {mutation} evidence ({corruption})",
+            )
+
+    for diagnostic_kind in ("issue", "check"):
+        misplaced = result.model_copy(deep=True)
+        if diagnostic_kind == "issue":
+            source_issue = next(issue for issue in misplaced.issues if issue.rule_code == "S902")
+            misplaced_issue = source_issue.model_copy(deep=True)
+            misplaced_issue.location = f"{archive_path}:fake-member"
+            misplaced.issues.append(misplaced_issue)
+        else:
+            source_check = next(check for check in misplaced.checks if check.rule_code == "S902")
+            misplaced_check = source_check.model_copy(deep=True)
+            misplaced_check.location = f"{archive_path}:fake-member"
+            misplaced.checks.append(misplaced_check)
+
+        with pytest.raises(AssertionError, match="unexpected operational errors"):
+            test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+                misplaced,
+                f"corrupt root ZIP with misplaced {diagnostic_kind} ({corruption})",
+            )
+
+    archive_path.write_bytes(b"ordinary non-ZIP source")
+    for keep_scanner_hint in (False, True):
+        replaced_source = result.model_copy(deep=True)
+        replaced_metadata = replaced_source.file_metadata[str(archive_path)]
+        assert replaced_metadata.model_extra is not None
+        if not keep_scanner_hint:
+            replaced_metadata.model_extra.pop("scanner_dependency_ids", None)
+        with pytest.raises(AssertionError, match="unexpected operational errors"):
+            test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+                replaced_source,
+                f"non-ZIP source with retained corrupt diagnostics (hint={keep_scanner_hint})",
+            )
+
+
+def test_organized_asset_scans_preserve_nested_corrupt_zip_evidence(tmp_path: Path) -> None:
+    valid_inner = _zip_payload((("ordinary.txt", b"ordinary"),))
+    eocd_offset = valid_inner.rfind(b"PK\x05\x06")
+    assert eocd_offset >= 0
+    corrupt_inner = valid_inner[: eocd_offset + 10]
+    archive_path = tmp_path / "nested-corrupt.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("inner.zip", corrupt_inner)
+
+    result = core_module.scan_model_directory_or_file(str(archive_path), cache_enabled=False)
+    assert result.success is False
+    diagnostics: list[Issue | Check] = [*result.issues, *result.checks]
+    assert any(
+        diagnostic.rule_code == "S902" and diagnostic.location == f"{archive_path}:inner.zip"
+        for diagnostic in diagnostics
+    )
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+        result,
+        "canonical nested corrupt ZIP",
+    )
+
+
+def test_organized_asset_scans_preserve_duplicate_nested_corrupt_zip_occurrences(
+    tmp_path: Path,
+) -> None:
+    archive_path = tmp_path / "duplicate-nested-corrupt.zip"
+    corrupt_inner = _corrupt_zip_payload()
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("inner.zip", corrupt_inner)
+        with pytest.warns(UserWarning, match="Duplicate name"):
+            archive.writestr("inner.zip", corrupt_inner)
+
+    result = core_module.scan_model_directory_or_file(str(archive_path), cache_enabled=False)
+    nested_location = f"{archive_path}:inner.zip"
+    issues = [issue for issue in result.issues if issue.rule_code == "S902" and issue.location == nested_location]
+    checks = [
+        check
+        for check in result.checks
+        if check.name == "ZIP File Format Validation" and check.location == nested_location
+    ]
+    assert len(issues) == 2
+    assert len(checks) == 1
+    assert checks[0].details == {
+        "component_count": 2,
+        "findings": [issue.details for issue in issues],
+    }
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+        result,
+        "canonical duplicate nested corrupt ZIP",
+    )
+
+    for mutation in (
+        "missing-issue",
+        "missing-check",
+        "corrupt-check",
+        "extra-issue",
+        "extra-check",
+        "duplicate-issue",
+        "duplicate-check",
+    ):
+        mutated = result.model_copy(deep=True)
+        nested_issues = [
+            issue for issue in mutated.issues if issue.rule_code == "S902" and issue.location == nested_location
+        ]
+        nested_check = next(
+            check
+            for check in mutated.checks
+            if check.name == "ZIP File Format Validation" and check.location == nested_location
+        )
+        if mutation == "missing-issue":
+            mutated.issues.remove(nested_issues[0])
+        elif mutation == "missing-check":
+            mutated.checks.remove(nested_check)
+        elif mutation == "corrupt-check":
+            nested_check.details["findings"][0]["zip_entry"] = "forged.zip"
+        elif mutation == "extra-issue":
+            extra_issue = nested_issues[0].model_copy(deep=True)
+            extra_issue.location = f"{nested_location}:fake"
+            mutated.issues.append(extra_issue)
+        elif mutation == "extra-check":
+            extra_check = nested_check.model_copy(deep=True)
+            extra_check.location = f"{nested_location}:fake"
+            mutated.checks.append(extra_check)
+        elif mutation == "duplicate-issue":
+            mutated.issues.append(nested_issues[0].model_copy(deep=True))
+        else:
+            mutated.checks.append(nested_check.model_copy(deep=True))
+
+        with pytest.raises(AssertionError, match="unexpected operational errors"):
+            test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+                mutated,
+                f"duplicate nested corrupt ZIP with {mutation}",
+            )
+
+
+def test_organized_asset_scans_preserve_colon_bearing_nested_corrupt_zip_siblings(
+    tmp_path: Path,
+) -> None:
+    archive_path = tmp_path / "colon-bearing-nested-corrupt.zip"
+    member_names = ("inner.zip", "inner.zip:other.zip")
+    corrupt_inner = _corrupt_zip_payload()
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        for member_name in member_names:
+            archive.writestr(member_name, corrupt_inner)
+
+    result = core_module.scan_model_directory_or_file(str(archive_path), cache_enabled=False)
+    expected_locations = {f"{archive_path}:{member_name}" for member_name in member_names}
+    issues = [issue for issue in result.issues if issue.rule_code == "S902" and issue.location in expected_locations]
+    checks = [
+        check
+        for check in result.checks
+        if check.name == "ZIP File Format Validation" and check.location in expected_locations
+    ]
+    assert {issue.location for issue in issues} == expected_locations
+    assert {check.location for check in checks} == expected_locations
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+        result,
+        "canonical colon-bearing nested corrupt ZIP siblings",
+    )
+
+    for anchor_location in expected_locations:
+        source_issue = next(issue for issue in issues if issue.location == anchor_location)
+        source_check = next(check for check in checks if check.location == anchor_location)
+        for diagnostic_kind in ("issue", "check"):
+            mutated = result.model_copy(deep=True)
+            fake_location = f"{anchor_location}:fake"
+            if diagnostic_kind == "issue":
+                fake_issue = source_issue.model_copy(deep=True)
+                fake_issue.location = fake_location
+                mutated.issues.append(fake_issue)
+            else:
+                fake_check = source_check.model_copy(deep=True)
+                fake_check.location = fake_location
+                mutated.checks.append(fake_check)
+
+            with pytest.raises(AssertionError, match="unexpected operational errors"):
+                test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+                    mutated,
+                    f"colon-bearing nested corrupt ZIP with fake {diagnostic_kind} at {fake_location}",
+                )
+
+
+@pytest.mark.parametrize("diagnostic_kind", ["issue", "check"])
+@pytest.mark.parametrize("marker_profile", ["canonical", "structural"])
+def test_organized_asset_scans_reject_unbacked_nested_corrupt_zip_diagnostics(
+    diagnostic_kind: str,
+    marker_profile: str,
+    tmp_path: Path,
+) -> None:
+    archive_path = tmp_path / "nested-corrupt-with-safe-member.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("inner.zip", _corrupt_zip_payload())
+        archive.writestr("ordinary.bin", b"ordinary")
+
+    result = core_module.scan_model_directory_or_file(str(archive_path), cache_enabled=False)
+    nested_location = f"{archive_path}:inner.zip"
+    source_issue = next(
+        issue for issue in result.issues if issue.rule_code == "S902" and issue.location == nested_location
+    )
+    source_check = next(
+        check
+        for check in result.checks
+        if check.name == "ZIP File Format Validation" and check.location == nested_location
+    )
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+        result,
+        "canonical nested corrupt ZIP with safe sibling",
+    )
+
+    invalid_locations = (
+        f"{archive_path}:ordinary.bin",
+        f"{archive_path}:fabricated.zip",
+        str(archive_path),
+        str(tmp_path / "unrelated.zip"),
+    )
+    for invalid_location in invalid_locations:
+        mutated = result.model_copy(deep=True)
+        if diagnostic_kind == "issue":
+            copied_issue = source_issue.model_copy(deep=True)
+            copied_issue.location = invalid_location
+            if marker_profile == "structural":
+                copied_issue.message = "Corrupt archive payload"
+            mutated.issues.append(copied_issue)
+        else:
+            copied_check = source_check.model_copy(deep=True)
+            copied_check.location = invalid_location
+            if marker_profile == "structural":
+                copied_check.name = "Archive Payload Validation"
+                copied_check.message = "Corrupt archive payload"
+            mutated.checks.append(copied_check)
+
+        with pytest.raises(AssertionError, match="unexpected operational errors"):
+            test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+                mutated,
+                f"nested corrupt ZIP with unbacked {marker_profile} {diagnostic_kind} at {invalid_location}",
+            )
+
+
+def test_organized_asset_scans_reject_zip_shaped_s902_on_clean_zip(
+    tmp_path: Path,
+) -> None:
+    source_archive_path = tmp_path / "source-nested-corrupt.zip"
+    with zipfile.ZipFile(source_archive_path, "w") as archive:
+        archive.writestr("inner.zip", _corrupt_zip_payload())
+    source_result = core_module.scan_model_directory_or_file(str(source_archive_path), cache_enabled=False)
+    source_issue = next(issue for issue in source_result.issues if issue.rule_code == "S902")
+
+    clean_archive_path = tmp_path / "clean.zip"
+    with zipfile.ZipFile(clean_archive_path, "w") as archive:
+        archive.writestr("ordinary.bin", b"ordinary")
+    clean_result = core_module.scan_model_directory_or_file(str(clean_archive_path), cache_enabled=False)
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+        clean_result,
+        "canonical clean ZIP",
+    )
+
+    copied_issue = source_issue.model_copy(deep=True)
+    copied_issue.location = f"{clean_archive_path}:fabricated.zip"
+    copied_issue.message = "Corrupt archive payload"
+    clean_result.issues.append(copied_issue)
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            clean_result,
+            "clean ZIP with structurally ZIP-shaped S902 issue",
+        )
+
+
+def test_zip_format_marker_does_not_classify_non_zip_s902(
+    tmp_path: Path,
+) -> None:
+    archive_path = tmp_path / "msgpack-s902.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("weights.msgpack", b"\x81\xa6params\x80" * 2)
+
+    result = core_module.scan_model_directory_or_file(
+        str(archive_path),
+        cache_enabled=False,
+        max_msgpack_stream_objects=1,
+    )
+    diagnostics: list[Issue | Check] = list(result.issues)
+    diagnostics.extend(result.checks)
+    diagnostics = [diagnostic for diagnostic in diagnostics if diagnostic.rule_code == "S902"]
+    assert len(diagnostics) == 2
+    for diagnostic in diagnostics:
+        assert not test_security_asset_integration._zip_format_diagnostic_has_explicit_marker(diagnostic)
+
+        mutated = diagnostic.model_copy(deep=True)
+        mutated.message = "Corrupt archive payload"
+        mutated.details["path_hint"] = str(tmp_path / "not-a-zip-source")
+        if isinstance(mutated, Check):
+            mutated.name = "Archive Payload Validation"
+        assert not test_security_asset_integration._zip_format_diagnostic_has_explicit_marker(mutated)
+
+
+def _plausible_hdf5_v0_payload(
+    signature_offset: int = 0,
+    *,
+    file_size: int | None = None,
+    signature: bytes = b"\x89HDF\r\n\x1a\n",
+) -> bytes:
+    payload_size = max(signature_offset + 144, file_size or 0)
+    payload = bytearray(payload_size)
+    payload[signature_offset : signature_offset + len(signature)] = signature
+    payload[signature_offset + 13] = 8
+    payload[signature_offset + 14] = 8
+    payload[signature_offset + 16 : signature_offset + 18] = (4).to_bytes(2, "little")
+    payload[signature_offset + 18 : signature_offset + 20] = (16).to_bytes(2, "little")
+    payload[signature_offset + 24 : signature_offset + 32] = signature_offset.to_bytes(8, "little")
+    payload[signature_offset + 40 : signature_offset + 48] = payload_size.to_bytes(8, "little")
+    return bytes(payload)
+
+
+def _write_sparse_plausible_hdf5_v0(
+    path: Path,
+    signature_offset: int,
+    *,
+    file_size: int | None = None,
+) -> None:
+    payload_size = max(signature_offset + 144, file_size or 0)
+    superblock = bytearray(144)
+    superblock[:8] = b"\x89HDF\r\n\x1a\n"
+    superblock[13] = 8
+    superblock[14] = 8
+    superblock[16:18] = (4).to_bytes(2, "little")
+    superblock[18:20] = (16).to_bytes(2, "little")
+    superblock[24:32] = signature_offset.to_bytes(8, "little")
+    superblock[40:48] = payload_size.to_bytes(8, "little")
+    with path.open("wb") as source:
+        source.truncate(payload_size)
+        source.seek(signature_offset)
+        source.write(superblock)
+
+
+def _scan_nested_hdf5_with_missing_h5py(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    include_ambiguous_xml: bool = False,
+    signature_offset: int = 0,
+    member_payload: bytes | None = None,
+    nested_archive_name: str | None = None,
+) -> tuple[Path, ModelAuditResultModel]:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+    monkeypatch.setattr(keras_h5_scanner_module, "HAS_H5PY", False)
+    archive_path = tmp_path / "nested-hdf5-missing-h5py.zip"
+    hdf5_payload = _plausible_hdf5_v0_payload(signature_offset) if member_payload is None else member_payload
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        if nested_archive_name is None:
+            archive.writestr("weights.h5", hdf5_payload)
+        else:
+            archive.writestr(nested_archive_name, _zip_payload((("weights.h5", hdf5_payload),)))
+        if include_ambiguous_xml:
+            archive.writestr("ambiguous.txt", AMBIGUOUS_XML_PAYLOAD)
+    return archive_path, core_module.scan_model_directory_or_file(str(archive_path), cache_enabled=False)
+
+
+def test_organized_asset_scans_preserve_nested_hdf5_missing_dependency(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_path, result = _scan_nested_hdf5_with_missing_h5py(tmp_path, monkeypatch)
+    member_location = f"{archive_path}:weights.h5"
+    metadata = result.file_metadata[str(archive_path)].model_dump(exclude_none=True)
+    dependency_issues = [
+        issue
+        for issue in result.issues
+        if issue.location == member_location
+        and issue.rule_code == "S902"
+        and issue.details.get("required_package") == "h5py"
+    ]
+    dependency_checks = [
+        check
+        for check in result.checks
+        if check.location == member_location
+        and check.name == "H5PY Library Check"
+        and check.status == CheckStatus.FAILED
+    ]
+    assert metadata["analysis_incomplete"] is True
+    assert metadata["scan_outcome"] == "inconclusive"
+    assert metadata["scan_outcome_reasons"] == ["keras_h5_h5py_unavailable", "zip_analysis_incomplete"]
+    assert len(dependency_issues) == 1
+    assert len(dependency_checks) == 1
+    assert result.success is False
+    assert core_module.determine_exit_code(result) == 2
+
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+        result,
+        "nested HDF5 with h5py unavailable",
+    )
+
+
+@pytest.mark.parametrize("signature_offset", [2 * 1024 * 1024, 8 * 1024 * 1024])
+def test_organized_asset_scans_preserve_bounded_hdf5_userblock_dependency(
+    signature_offset: int,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _archive_path, result = _scan_nested_hdf5_with_missing_h5py(
+        tmp_path,
+        monkeypatch,
+        signature_offset=signature_offset,
+    )
+    assert result.success is False
+    assert core_module.determine_exit_code(result) == 2
+
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+        result,
+        f"nested HDF5 with {signature_offset}-byte userblock",
+    )
+
+
+def test_organized_asset_scans_preserve_second_level_nested_hdf5_dependency(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_path, result = _scan_nested_hdf5_with_missing_h5py(
+        tmp_path,
+        monkeypatch,
+        nested_archive_name="inner.zip",
+    )
+    member_location = f"{archive_path}:inner.zip:weights.h5"
+    diagnostics: list[Issue | Check] = [*result.issues, *result.checks]
+    assert any(
+        diagnostic.location == member_location
+        and diagnostic.details.get("scan_outcome_reason") == "keras_h5_h5py_unavailable"
+        for diagnostic in diagnostics
+    )
+    assert result.success is False
+    assert core_module.determine_exit_code(result) == 2
+
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+        result,
+        "second-level nested HDF5 with h5py unavailable",
+    )
+
+
+def test_organized_asset_scans_preserve_bounded_hdf5_dependency_with_security_finding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_path, result = _scan_nested_hdf5_with_missing_h5py(
+        tmp_path,
+        monkeypatch,
+        signature_offset=8 * 1024 * 1024,
+    )
+    result.issues.append(
+        Issue(
+            message="Embedded executable payload",
+            severity=IssueSeverity.CRITICAL,
+            location=f"{archive_path}:payload.pkl",
+            rule_code="S204",
+        )
+    )
+    assert result.success is False
+    assert core_module.determine_exit_code(result) == 1
+
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+        result,
+        "bounded HDF5 dependency with a security finding",
+    )
+
+
+@pytest.mark.parametrize(
+    "source_shape",
+    ["beyond-bound", "non-power-offset", "near-magic", "truncated-superblock"],
+)
+def test_organized_asset_scans_reject_unproven_hdf5_dependency_sources(
+    source_shape: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if source_shape == "beyond-bound":
+        payload = _plausible_hdf5_v0_payload(16 * 1024 * 1024)
+    elif source_shape == "non-power-offset":
+        payload = _plausible_hdf5_v0_payload(3 * 1024 * 1024)
+    elif source_shape == "near-magic":
+        payload = _plausible_hdf5_v0_payload(
+            2 * 1024 * 1024,
+            signature=b"\x89HDF\r\n\x1a\x00",
+        )
+    else:
+        payload = b"\x89HDF\r\n\x1a\n\x00\x00\x00\x00"
+
+    archive_path, result = _scan_nested_hdf5_with_missing_h5py(
+        tmp_path,
+        monkeypatch,
+        member_payload=payload,
+    )
+    diagnostics: list[Issue | Check] = [*result.issues, *result.checks]
+    assert any(
+        diagnostic.location == f"{archive_path}:weights.h5" and diagnostic.details.get("required_package") == "h5py"
+        for diagnostic in diagnostics
+    )
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            f"unproven HDF5 dependency source: {source_shape}",
+        )
+
+
+@pytest.mark.parametrize("nested_archive_name", ["inner.zip", "dir:inner.zip"])
+def test_organized_asset_scans_preserve_nested_archive_hdf5_provenance(
+    nested_archive_name: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_path, result = _scan_nested_hdf5_with_missing_h5py(
+        tmp_path,
+        monkeypatch,
+        nested_archive_name=nested_archive_name,
+    )
+    member_location = f"{archive_path}:{nested_archive_name}:weights.h5"
+    diagnostics: list[Issue | Check] = [*result.issues, *result.checks]
+    assert any(
+        diagnostic.location == member_location
+        and diagnostic.details.get("zip_entry") == f"{nested_archive_name}:weights.h5"
+        for diagnostic in diagnostics
+    )
+
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+        result,
+        f"nested archive HDF5 provenance for {nested_archive_name}",
+    )
+
+
+def test_organized_asset_scans_preserve_duplicate_nested_hdf5_occurrences(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+    monkeypatch.setattr(keras_h5_scanner_module, "HAS_H5PY", False)
+    payload = _plausible_hdf5_v0_payload()
+    archive_path, result = _scan_duplicate_nested_zip_archives(
+        tmp_path,
+        (("weights.h5", payload),),
+        (("weights.h5", payload),),
+    )
+    member_location = f"{archive_path}:inner.zip:weights.h5"
+    dependency_issues = [
+        issue
+        for issue in result.issues
+        if issue.location == member_location and issue.details.get("required_package") == "h5py"
+    ]
+    dependency_checks = [
+        check for check in result.checks if check.location == member_location and check.name == "H5PY Library Check"
+    ]
+    assert len(dependency_issues) == 1
+    assert len(dependency_checks) == 1
+    assert dependency_checks[0].details.get("component_count") == 2
+
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+        result,
+        "duplicate nested HDF5 occurrences",
+    )
+
+
+def test_organized_asset_scans_preserve_independent_nested_hdf5_roots(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    results: list[ModelAuditResultModel] = []
+    for index in range(2):
+        root = tmp_path / str(index)
+        root.mkdir()
+        _archive_path, result = _scan_nested_hdf5_with_missing_h5py(
+            root,
+            monkeypatch,
+            nested_archive_name=f"inner-{index}.zip",
+        )
+        results.append(result)
+    results[0].aggregate_scan_result(results[1])
+
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+        results[0],
+        "independent nested HDF5 roots",
+    )
+
+
+@pytest.mark.parametrize(
+    "path_mutation",
+    [
+        "wrong-archive-basename",
+        "wrong-member-chain",
+        "extra-level",
+        "missing-level",
+        "arbitrary-suffix",
+        "arbitrary-temp-prefix",
+    ],
+)
+def test_organized_asset_scans_reject_unproven_nested_hdf5_metadata_paths(
+    path_mutation: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_path, result = _scan_nested_hdf5_with_missing_h5py(
+        tmp_path,
+        monkeypatch,
+        nested_archive_name="inner.zip",
+    )
+    metadata = result.file_metadata[str(archive_path)]
+    assert metadata.model_extra is not None
+    outer_contents = metadata.model_extra["contents"]
+    nested_contents = outer_contents[0]["contents"]
+    nested_path = nested_contents[0]["path"]
+    assert isinstance(nested_path, str)
+    archive_marker = "inner.zip:"
+    marker_offset = nested_path.rfind(archive_marker)
+    assert marker_offset >= 0
+    extracted_prefix = nested_path[:marker_offset]
+    if path_mutation == "wrong-archive-basename":
+        nested_contents[0]["path"] = f"{extracted_prefix}other.zip:weights.h5"
+    elif path_mutation == "wrong-member-chain":
+        nested_contents[0]["path"] = f"{extracted_prefix}{archive_marker}other.h5"
+    elif path_mutation == "extra-level":
+        nested_contents[0]["path"] = f"{extracted_prefix}{archive_marker}extra:weights.h5"
+    elif path_mutation == "missing-level":
+        nested_contents[0]["path"] = f"{extracted_prefix}weights.h5"
+    elif path_mutation == "arbitrary-suffix":
+        nested_contents[0]["path"] = f"{nested_path}:extra"
+    else:
+        nested_contents[0]["path"] = str(tmp_path / "fabricated" / "inner.zip:weights.h5")
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            f"nested HDF5 metadata path with {path_mutation}",
+        )
+
+
+def test_organized_asset_scans_reject_cross_assigned_duplicate_nested_hdf5_contents(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+    monkeypatch.setattr(keras_h5_scanner_module, "HAS_H5PY", False)
+    payload = _plausible_hdf5_v0_payload()
+    archive_path, result = _scan_duplicate_nested_zip_archives(
+        tmp_path,
+        (("first.h5", payload),),
+        (("second.h5", payload),),
+    )
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+        result,
+        "distinct duplicate nested HDF5 occurrences",
+    )
+
+    metadata = result.file_metadata[str(archive_path)]
+    assert metadata.model_extra is not None
+    outer_contents = metadata.model_extra["contents"]
+    outer_contents[0]["contents"], outer_contents[1]["contents"] = (
+        outer_contents[1]["contents"],
+        outer_contents[0]["contents"],
+    )
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            "cross-assigned duplicate nested HDF5 contents",
+        )
+
+
+def _nested_hdf5_content(
+    result: ModelAuditResultModel,
+    archive_path: Path,
+) -> dict[str, Any]:
+    metadata = result.file_metadata[str(archive_path)]
+    assert metadata.model_extra is not None
+    outer_contents = metadata.model_extra["contents"]
+    nested_contents = outer_contents[0]["contents"]
+    content = nested_contents[0]
+    assert isinstance(content, dict)
+    return content
+
+
+def _erase_nested_h5py_dependency_result(
+    result: ModelAuditResultModel,
+    archive_path: Path,
+) -> None:
+    result.issues = [issue for issue in result.issues if issue.details.get("required_package") != "h5py"]
+    result.checks = [check for check in result.checks if check.name != "H5PY Library Check"]
+    metadata = result.file_metadata[str(archive_path)]
+    assert metadata.model_extra is not None
+    for field in ("analysis_incomplete", "scan_outcome", "scan_outcome_reasons"):
+        metadata.model_extra.pop(field, None)
+    result.success = True
+
+
+@pytest.mark.parametrize("metadata_mutation", ["unknown-type", "wrong-size"])
+def test_organized_asset_scans_reject_coherent_erasure_of_source_hdf5_dependency(
+    metadata_mutation: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_path, result = _scan_nested_hdf5_with_missing_h5py(
+        tmp_path,
+        monkeypatch,
+        nested_archive_name="inner.zip",
+    )
+    content = _nested_hdf5_content(result, archive_path)
+    if metadata_mutation == "unknown-type":
+        content["type"] = "unknown"
+    else:
+        content["size"] += 1
+    _erase_nested_h5py_dependency_result(result, archive_path)
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            f"coherently erased source HDF5 dependency with {metadata_mutation}",
+        )
+
+
+def test_organized_asset_scans_require_missing_h5py_profile_for_source_hdf5(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_path, result = _scan_nested_hdf5_with_missing_h5py(
+        tmp_path,
+        monkeypatch,
+        nested_archive_name="inner.zip",
+    )
+    _erase_nested_h5py_dependency_result(result, archive_path)
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            "source HDF5 with omitted missing-h5py profile",
+        )
+
+
+@pytest.mark.parametrize(
+    "metadata_mutation",
+    [
+        "missing-type",
+        "wrong-type",
+        "missing-size",
+        "wrong-size",
+        "string-size",
+        "boolean-size",
+        "missing-item",
+        "duplicate-item",
+        "wrong-logical-path",
+    ],
+)
+def test_organized_asset_scans_reject_malformed_source_hdf5_metadata(
+    metadata_mutation: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_path, result = _scan_nested_hdf5_with_missing_h5py(
+        tmp_path,
+        monkeypatch,
+        nested_archive_name="inner.zip",
+    )
+    metadata = result.file_metadata[str(archive_path)]
+    assert metadata.model_extra is not None
+    nested_contents = metadata.model_extra["contents"][0]["contents"]
+    content = nested_contents[0]
+    original_size = content["size"]
+    if metadata_mutation == "missing-type":
+        content.pop("type")
+    elif metadata_mutation == "wrong-type":
+        content["type"] = "unknown"
+    elif metadata_mutation == "missing-size":
+        content.pop("size")
+    elif metadata_mutation == "wrong-size":
+        content["size"] = original_size + 1
+    elif metadata_mutation == "string-size":
+        content["size"] = str(original_size)
+    elif metadata_mutation == "boolean-size":
+        content["size"] = True
+    elif metadata_mutation == "missing-item":
+        nested_contents.clear()
+    elif metadata_mutation == "duplicate-item":
+        nested_contents.append(content.copy())
+    else:
+        content["path"] = content["path"].replace("weights.h5", "other.h5")
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            f"source HDF5 metadata with {metadata_mutation}",
+        )
+
+
+def test_organized_asset_scans_preserve_non_hdf5_unknown_member_near_match(
+    tmp_path: Path,
+) -> None:
+    archive_path = tmp_path / "non-hdf5-unknown-near-match.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("ordinary.txt", b"ordinary unknown archive member")
+    result = core_module.scan_model_directory_or_file(str(archive_path), cache_enabled=False)
+    metadata = result.file_metadata[str(archive_path)]
+    assert metadata.model_extra is not None
+    assert metadata.model_extra["contents"][0]["type"] == "unknown"
+
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+        result,
+        "non-HDF5 unknown archive member near match",
+    )
+
+
+def test_organized_asset_scans_reject_stale_h5py_unavailable_profile_when_available(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _archive_path, result = _scan_nested_hdf5_with_missing_h5py(
+        tmp_path,
+        monkeypatch,
+        nested_archive_name="inner.zip",
+    )
+    monkeypatch.setattr(keras_h5_scanner_module, "HAS_H5PY", True)
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            "stale h5py-unavailable profile while h5py is available",
+        )
+
+
+@pytest.mark.parametrize("stale_fragment", ["issue", "check", "reason", "incomplete"])
+def test_organized_asset_scans_reject_stale_h5py_unavailable_fragments_when_available(
+    stale_fragment: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_path, result = _scan_nested_hdf5_with_missing_h5py(
+        tmp_path,
+        monkeypatch,
+        nested_archive_name="inner.zip",
+    )
+    metadata = result.file_metadata[str(archive_path)]
+    assert metadata.model_extra is not None
+    if stale_fragment != "issue":
+        result.issues = [issue for issue in result.issues if issue.details.get("required_package") != "h5py"]
+    if stale_fragment != "check":
+        result.checks = [check for check in result.checks if check.name != "H5PY Library Check"]
+    for field in ("analysis_incomplete", "scan_outcome", "scan_outcome_reasons"):
+        metadata.model_extra.pop(field, None)
+    if stale_fragment == "reason":
+        metadata.model_extra["scan_outcome_reasons"] = ["keras_h5_h5py_unavailable"]
+    elif stale_fragment == "incomplete":
+        metadata.model_extra["analysis_incomplete"] = True
+        metadata.model_extra["scan_outcome"] = "inconclusive"
+    result.success = True
+    monkeypatch.setattr(keras_h5_scanner_module, "HAS_H5PY", True)
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            f"stale h5py-unavailable {stale_fragment} fragment while h5py is available",
+        )
+
+
+def test_organized_asset_scans_preserve_source_hdf5_without_unavailable_profile_when_h5py_available(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_path, result = _scan_nested_hdf5_with_missing_h5py(
+        tmp_path,
+        monkeypatch,
+        nested_archive_name="inner.zip",
+    )
+    _erase_nested_h5py_dependency_result(result, archive_path)
+    monkeypatch.setattr(keras_h5_scanner_module, "HAS_H5PY", True)
+    assert result.success is True
+    assert core_module.determine_exit_code(result) == 0
+
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+        result,
+        "source HDF5 without unavailable profile while h5py is available",
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing-issue",
+        "missing-check",
+        "missing-both",
+        "wrong-reason",
+        "wrong-package",
+        "wrong-path",
+        "wrong-status",
+        "owner-missing-dependency-reason",
+        "owner-missing-zip-reason",
+        "fabricated-known-dependency",
+        "fabricated-arbitrary-dependency",
+    ],
+)
+def test_organized_asset_scans_reject_malformed_nested_hdf5_dependency_profiles(
+    mutation: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_path, result = _scan_nested_hdf5_with_missing_h5py(tmp_path, monkeypatch)
+    member_location = f"{archive_path}:weights.h5"
+    dependency_issue = next(
+        issue
+        for issue in result.issues
+        if issue.location == member_location and issue.details.get("required_package") == "h5py"
+    )
+    dependency_check = next(
+        check for check in result.checks if check.location == member_location and check.name == "H5PY Library Check"
+    )
+    metadata = result.file_metadata[str(archive_path)]
+    assert metadata.model_extra is not None
+
+    if mutation == "missing-issue":
+        result.issues.remove(dependency_issue)
+    elif mutation == "missing-check":
+        result.checks.remove(dependency_check)
+    elif mutation == "missing-both":
+        result.issues.remove(dependency_issue)
+        result.checks.remove(dependency_check)
+    elif mutation == "wrong-reason":
+        dependency_issue.details["scan_outcome_reason"] = "unrelated_dependency_unavailable"
+    elif mutation == "wrong-package":
+        dependency_issue.details["required_package"] = "other"
+    elif mutation == "wrong-path":
+        dependency_issue.details["path"] = str(tmp_path / "fabricated.h5")
+    elif mutation == "wrong-status":
+        dependency_check.status = CheckStatus.PASSED
+    elif mutation == "owner-missing-dependency-reason":
+        metadata.model_extra["scan_outcome_reasons"] = ["zip_analysis_incomplete"]
+    elif mutation == "owner-missing-zip-reason":
+        metadata.model_extra["scan_outcome_reasons"] = ["keras_h5_h5py_unavailable"]
+    else:
+        fabricated = dependency_issue.model_copy(deep=True)
+        fabricated.location = f"{archive_path}:fabricated.h5"
+        fabricated.message = "Corrupt archive payload"
+        if mutation == "fabricated-arbitrary-dependency":
+            fabricated.details["required_package"] = "other"
+            fabricated.details["scan_outcome_reason"] = "other_dependency_unavailable"
+        result.issues.append(fabricated)
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            f"nested HDF5 missing-dependency profile with {mutation}",
+        )
+
+
+def test_organized_asset_scans_reject_nested_hdf5_owner_aggregate_without_source_child(
+    tmp_path: Path,
+) -> None:
+    archive_path = tmp_path / "owner-only-hdf5-dependency.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("ordinary.bin", b"ordinary")
+    result = core_module.scan_model_directory_or_file(str(archive_path), cache_enabled=False)
+    metadata = result.file_metadata[str(archive_path)]
+    assert metadata.model_extra is not None
+    metadata.model_extra.update(
+        {
+            "analysis_incomplete": True,
+            "scan_outcome": "inconclusive",
+            "scan_outcome_reasons": ["keras_h5_h5py_unavailable", "zip_analysis_incomplete"],
+        }
+    )
+    result.success = False
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            "nested HDF5 owner aggregate without a source-backed child",
+        )
+
+
+def test_organized_asset_scans_preserve_independent_nested_corrupt_zip_roots(
+    tmp_path: Path,
+) -> None:
+    results: list[ModelAuditResultModel] = []
+    for index in range(2):
+        archive_path = tmp_path / f"nested-corrupt-root-{index}.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr(f"inner-{index}.zip", _corrupt_zip_payload())
+        results.append(core_module.scan_model_directory_or_file(str(archive_path), cache_enabled=False))
+
+    results[0].aggregate_scan_result(results[1])
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+        results[0],
+        "two independent nested corrupt ZIP roots",
+    )
+
+
+@pytest.mark.parametrize("security_profile", ["s405", "s410"])
+def test_organized_asset_scans_preserve_duplicate_nested_archive_security_occurrences(
+    security_profile: str,
+    tmp_path: Path,
+) -> None:
+    if security_profile == "s405":
+        first_entries = (("../escape-one.txt", b"unsafe"),)
+        second_entries = (("../escape-two.txt", b"unsafe"),)
+        compression = zipfile.ZIP_STORED
+        check_name = "Path Traversal Protection"
+    else:
+        first_entries = (("bomb-one.txt", COMPRESSION_BOMB_PAYLOAD),)
+        second_entries = (("bomb-two.txt", COMPRESSION_BOMB_PAYLOAD),)
+        compression = zipfile.ZIP_DEFLATED
+        check_name = "Compression Ratio Check"
+    archive_path, result = _scan_duplicate_nested_zip_archives(
+        tmp_path,
+        first_entries,
+        second_entries,
+        inner_compression=compression,
+    )
+    rule_code = security_profile.upper()
+    issues = [issue for issue in result.issues if issue.rule_code == rule_code]
+    checks = [check for check in result.checks if check.name == check_name and check.status == CheckStatus.FAILED]
+    assert len(issues) == 2
+    assert len(checks) == 1
+    assert checks[0].location == f"{archive_path}:inner.zip:{first_entries[0][0]}"
+    assert checks[0].details["component_count"] == 2
+    assert len(checks[0].details["findings"]) == 2
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+        result,
+        f"duplicate nested {rule_code} baseline",
+    )
+
+    for mutation in ("missing", "corrupt", "duplicate"):
+        mutated = result.model_copy(deep=True)
+        mutated_issues = [issue for issue in mutated.issues if issue.rule_code == rule_code]
+        mutated_check = next(
+            check for check in mutated.checks if check.name == check_name and check.status == CheckStatus.FAILED
+        )
+        if mutation == "missing":
+            mutated.issues.remove(mutated_issues[0])
+        elif mutation == "corrupt":
+            mutated_check.details["findings"][0]["entry"] = "forged-member.txt"
+        else:
+            mutated.checks.append(mutated_check.model_copy(deep=True))
+        with pytest.raises(AssertionError, match="unexpected operational errors"):
+            test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+                mutated,
+                f"duplicate nested {rule_code} with {mutation} evidence",
+            )
+
+
+def test_organized_asset_scans_preserve_duplicate_nested_xml_occurrences(tmp_path: Path) -> None:
+    archive_path, result = _scan_duplicate_nested_zip_archives(
+        tmp_path,
+        (("ambiguous.txt", AMBIGUOUS_XML_PAYLOAD),),
+        (("ambiguous.txt", AMBIGUOUS_XML_PAYLOAD),),
+    )
+    checks = [
+        check for check in result.checks if check.name == "XML Model Routing" and check.status == CheckStatus.FAILED
+    ]
+    assert len(checks) == 1
+    assert checks[0].location == f"{archive_path}:inner.zip:ambiguous.txt"
+    assert checks[0].details["component_count"] == 2
+    assert len(checks[0].details["findings"]) == 2
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+        result,
+        "duplicate nested XML baseline",
+    )
+
+    result.checks.remove(checks[0])
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            "duplicate nested XML without consolidated evidence",
+        )
+
+
+@pytest.mark.parametrize(
+    ("member_name", "nested", "expected_safe_name"),
+    [
+        ("dir/ambiguous.txt", False, "ambiguous.txt"),
+        ("dir\\ambiguous.txt", False, "ambiguous.txt"),
+        ("dir:ambiguous.txt", False, "dir_ambiguous.txt"),
+        ("dir\\ambiguous.txt", True, "ambiguous.txt"),
+    ],
+)
+def test_organized_asset_scans_preserve_xml_zip_member_path_semantics(
+    member_name: str,
+    nested: bool,
+    expected_safe_name: str,
+    tmp_path: Path,
+) -> None:
+    if nested:
+        archive_path, result = _scan_nested_zip_archive(
+            tmp_path,
+            ((member_name, AMBIGUOUS_XML_PAYLOAD),),
+        )
+        expected_zip_entry = f"inner.zip:{member_name}"
+    else:
+        archive_path, result = _scan_ambiguous_xml_archive(tmp_path, (member_name,))
+        expected_zip_entry = member_name
+    diagnostics: list[Issue | Check] = [
+        *[
+            issue
+            for issue in result.issues
+            if issue.message == test_security_asset_integration.EXPECTED_XML_ARCHIVE_DIAGNOSTIC_MESSAGE
+        ],
+        *[
+            check
+            for check in result.checks
+            if check.message == test_security_asset_integration.EXPECTED_XML_ARCHIVE_DIAGNOSTIC_MESSAGE
+        ],
+    ]
+    assert diagnostics
+    assert all(diagnostic.location == f"{archive_path}:{expected_zip_entry}" for diagnostic in diagnostics)
+    assert all(diagnostic.details["zip_entry"] == expected_zip_entry for diagnostic in diagnostics)
+    assert all(Path(diagnostic.details["path"]).name.endswith(f"_{expected_safe_name}") for diagnostic in diagnostics)
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+        result,
+        f"XML member path semantics for {member_name!r} (nested={nested})",
+    )
+
+
+def test_organized_asset_scans_reject_colon_member_xml_source_with_wrong_safe_name(tmp_path: Path) -> None:
+    _archive_path, result = _scan_ambiguous_xml_archive(tmp_path, ("dir:ambiguous.txt",))
+    diagnostics: list[Issue | Check] = [
+        *[
+            issue
+            for issue in result.issues
+            if issue.message == test_security_asset_integration.EXPECTED_XML_ARCHIVE_DIAGNOSTIC_MESSAGE
+        ],
+        *[
+            check
+            for check in result.checks
+            if check.message == test_security_asset_integration.EXPECTED_XML_ARCHIVE_DIAGNOSTIC_MESSAGE
+        ],
+    ]
+    assert diagnostics
+    for diagnostic in diagnostics:
+        diagnostic.details["path"] = "/tmp/fake_ambiguous.txt"
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            "colon member XML diagnostics with the wrong safe extracted name",
+        )
+
+
+def test_organized_asset_contract_does_not_trust_zip_temp_name_helpers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        test_security_asset_integration.ZipScanner,
+        "_archive_entry_basename",
+        staticmethod(lambda _name: "forged.txt"),
+    )
+    _archive_path, result = _scan_ambiguous_xml_archive(tmp_path, ("dir:ambiguous.txt",))
+    diagnostics: list[Issue | Check] = [*result.issues, *result.checks]
+    assert any(
+        Path(diagnostic.details["path"]).name.endswith("_forged.txt")
+        for diagnostic in diagnostics
+        if diagnostic.message == test_security_asset_integration.EXPECTED_XML_ARCHIVE_DIAGNOSTIC_MESSAGE
+    )
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            "XML archive with perturbed production temp-name helper",
+        )
+
+
+@pytest.mark.parametrize("security_profile", ["s405", "s410"])
+@pytest.mark.parametrize("mutation", ["missing", "corrupt"])
+def test_organized_asset_scans_require_archive_security_evidence_without_result_opt_in(
+    security_profile: str,
+    mutation: str,
+    tmp_path: Path,
+) -> None:
+    archive_path = tmp_path / f"pure-{security_profile}.zip"
+    compression = zipfile.ZIP_DEFLATED if security_profile == "s410" else zipfile.ZIP_STORED
+    member_name = "bomb.txt" if security_profile == "s410" else "../escape.txt"
+    payload = COMPRESSION_BOMB_PAYLOAD if security_profile == "s410" else b"unsafe"
+    with zipfile.ZipFile(archive_path, "w", compression=compression) as archive:
+        archive.writestr(member_name, payload)
+    result = core_module.scan_model_directory_or_file(str(archive_path), cache_enabled=False)
+    rule_code = security_profile.upper()
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+        result,
+        f"pure {rule_code} baseline",
+    )
+
+    if security_profile == "s410":
+        metadata = result.file_metadata[str(archive_path)]
+        assert metadata.model_extra is not None
+        for field in ("analysis_incomplete", "scan_outcome", "scan_outcome_reasons"):
+            metadata.model_extra.pop(field, None)
+        result.success = True
+    matching_issues: list[Issue] = [issue for issue in result.issues if issue.rule_code == rule_code.upper()]
+    matching_checks: list[Check] = [check for check in result.checks if check.rule_code == rule_code.upper()]
+    assert matching_issues and matching_checks
+    if mutation == "missing":
+        result.issues = [issue for issue in result.issues if issue.rule_code != rule_code.upper()]
+        result.checks = [check for check in result.checks if check.rule_code != rule_code.upper()]
+    else:
+        matching_diagnostics: list[Issue | Check] = [*matching_issues, *matching_checks]
+        for diagnostic in matching_diagnostics:
+            diagnostic.details["entry"] = "forged-member.txt"
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            f"pure {rule_code} with {mutation} evidence",
+        )
+
+
+@pytest.mark.parametrize("security_profile", ["xml", "s405", "s410"])
+@pytest.mark.parametrize("mutation", ["missing", "corrupt"])
+def test_organized_asset_scans_preserve_nested_archive_security_provenance(
+    security_profile: str,
+    mutation: str,
+    tmp_path: Path,
+) -> None:
+    if security_profile == "xml":
+        entries = (("ambiguous.txt", AMBIGUOUS_XML_PAYLOAD),)
+        compression = zipfile.ZIP_STORED
+    elif security_profile == "s405":
+        entries = (("../escape.txt", b"unsafe"),)
+        compression = zipfile.ZIP_STORED
+    else:
+        entries = (("bomb.txt", COMPRESSION_BOMB_PAYLOAD),)
+        compression = zipfile.ZIP_DEFLATED
+    archive_path, result = _scan_nested_zip_archive(
+        tmp_path,
+        entries,
+        inner_compression=compression,
+    )
+    nested_location = f"{archive_path}:inner.zip:{entries[0][0]}"
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+        result,
+        f"nested {security_profile} baseline",
+    )
+
+    matching_issues: list[Issue]
+    matching_checks: list[Check]
+    if security_profile == "xml":
+        matching_issues = [
+            issue
+            for issue in result.issues
+            if issue.message == test_security_asset_integration.EXPECTED_XML_ARCHIVE_DIAGNOSTIC_MESSAGE
+        ]
+        matching_checks = [
+            check
+            for check in result.checks
+            if check.message == test_security_asset_integration.EXPECTED_XML_ARCHIVE_DIAGNOSTIC_MESSAGE
+        ]
+    else:
+        rule_code = security_profile.upper()
+        matching_issues = [issue for issue in result.issues if issue.rule_code == rule_code]
+        matching_checks = [check for check in result.checks if check.rule_code == rule_code]
+    assert matching_issues and matching_checks
+    matching_diagnostics: list[Issue | Check] = [*matching_issues, *matching_checks]
+    assert all(diagnostic.location == nested_location for diagnostic in matching_diagnostics)
+    if mutation == "missing":
+        result.issues = [issue for issue in result.issues if issue not in matching_issues]
+        result.checks = [check for check in result.checks if check not in matching_checks]
+    elif security_profile == "xml":
+        for diagnostic in matching_diagnostics:
+            diagnostic.details["zip_entry"] = "inner.zip:forged.txt"
+    else:
+        for diagnostic in matching_diagnostics:
+            diagnostic.details["entry"] = "forged.txt"
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            f"nested {security_profile} with {mutation} evidence",
+        )
+
+
+@pytest.mark.parametrize("mutation", ["missing-issue", "missing-check", "component-count", "duplicate-check"])
+def test_organized_asset_scans_preserve_mixed_compression_check_group(
+    mutation: str,
+    tmp_path: Path,
+) -> None:
+    archive_path = tmp_path / "mixed-compression.zip"
+    with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("bomb.txt", COMPRESSION_BOMB_PAYLOAD)
+        archive.writestr("safe.txt", b"ordinary")
+    result = core_module.scan_model_directory_or_file(str(archive_path), cache_enabled=False)
+    issue = next(candidate for candidate in result.issues if candidate.rule_code == "S410")
+    check = next(candidate for candidate in result.checks if candidate.name == "Compression Ratio Check")
+    assert check.details["component_count"] == 2
+    assert check.details["findings"] == [issue.details]
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+        result,
+        "mixed compression-check group baseline",
+    )
+
+    if mutation == "missing-issue":
+        result.issues = [candidate for candidate in result.issues if candidate is not issue]
+    elif mutation == "missing-check":
+        result.checks = [candidate for candidate in result.checks if candidate is not check]
+    elif mutation == "component-count":
+        check.details["component_count"] = 1
+    else:
+        result.checks.append(check.model_copy(deep=True))
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            f"mixed compression-check group with {mutation}",
+        )
+
+
+def test_organized_asset_scans_bind_xml_diagnostic_path_to_member_provenance(tmp_path: Path) -> None:
+    _archive_path, result = _scan_ambiguous_xml_archive(tmp_path, ("ambiguous.txt",))
+    diagnostics: list[Issue | Check] = [
+        *[
+            issue
+            for issue in result.issues
+            if issue.message == test_security_asset_integration.EXPECTED_XML_ARCHIVE_DIAGNOSTIC_MESSAGE
+        ],
+        *[
+            check
+            for check in result.checks
+            if check.message == test_security_asset_integration.EXPECTED_XML_ARCHIVE_DIAGNOSTIC_MESSAGE
+        ],
+    ]
+    assert len(diagnostics) == 2
+    for diagnostic in diagnostics:
+        diagnostic.details["path"] = "/tmp/coherent-but-unrelated.txt"
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            "XML diagnostics with coherent forged source path",
+        )
+
+
+def test_organized_asset_scans_reject_extra_malformed_xml_diagnostic(tmp_path: Path) -> None:
+    _archive_path, result = _scan_ambiguous_xml_archive(tmp_path, ("ambiguous.txt",))
+    issue = next(
+        candidate
+        for candidate in result.issues
+        if candidate.message == test_security_asset_integration.EXPECTED_XML_ARCHIVE_DIAGNOSTIC_MESSAGE
+    )
+    malformed = issue.model_copy(deep=True)
+    malformed.message = "XML routing coverage record was corrupted"
+    result.issues.append(malformed)
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            "XML archive with an extra malformed diagnostic",
+        )
+
+
+@pytest.mark.parametrize("diagnostic_kind", ["issue", "check"])
+def test_organized_asset_scans_reject_mutated_xml_archive_coverage_diagnostics(
+    diagnostic_kind: str,
+    tmp_path: Path,
+) -> None:
+    _archive_path, result = _scan_ambiguous_xml_archive(tmp_path, ("ambiguous.txt",))
+    message = (
+        "XML model routing was inconclusive because the bounded probe ended before the first structural root element"
+    )
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(result, "ambiguous XML archive control")
+
+    accepted_mutations = []
+    mutations: list[tuple[str, Any]] = [
+        ("analysis_incomplete", False),
+        ("scan_outcome", "complete"),
+        ("scan_outcome_reason", "scanner_read_failed"),
+        ("scan_outcome_reasons", ["scanner_read_failed"]),
+        ("operational_error", True),
+        ("interrupted", True),
+        ("error", "boom"),
+        ("error_type", "Boom"),
+        ("exception_type", "Boom"),
+    ]
+    for field, value in mutations:
+        mutated = result.model_copy(deep=True)
+        diagnostics = mutated.issues if diagnostic_kind == "issue" else mutated.checks
+        diagnostic = next(candidate for candidate in diagnostics if candidate.message == message)
+        diagnostic.details[field] = value
+        try:
+            test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+                mutated,
+                f"{diagnostic_kind} XML archive diagnostic with {field}",
+            )
+        except AssertionError:
+            pass
+        else:
+            accepted_mutations.append(field)
+
+    assert accepted_mutations == []
+
+
+def test_organized_asset_scans_require_xml_diagnostic_for_each_archive_member(tmp_path: Path) -> None:
+    archive_path, result = _scan_ambiguous_xml_archive(
+        tmp_path,
+        ("first.txt", "second.txt"),
+        unrelated_members=("unrelated.txt",),
+    )
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(result, "two-member XML archive control")
+    unrelated_location = f"{archive_path}:unrelated.txt"
+    contents = result.file_metadata[str(archive_path)].model_dump(exclude_none=True)["contents"]
+    assert any(content["path"] == unrelated_location and content["type"] == "unknown" for content in contents)
+    root_diagnostics: list[Issue | Check] = [*result.issues, *result.checks]
+    assert not any(diagnostic.location == unrelated_location for diagnostic in root_diagnostics)
+
+    accepted_missing_members = []
+    for member_name in ("first.txt", "second.txt"):
+        member_location = f"{archive_path}:{member_name}"
+        mutated = result.model_copy(deep=True)
+        mutated.issues = [issue for issue in mutated.issues if issue.location != member_location]
+        mutated.checks = [check for check in mutated.checks if check.location != member_location]
+        try:
+            test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+                mutated,
+                f"XML archive missing diagnostic for {member_name}",
+            )
+        except AssertionError:
+            pass
+        else:
+            accepted_missing_members.append(member_name)
+
+    assert accepted_missing_members == []
+
+
+def test_organized_asset_scans_count_duplicate_xml_member_occurrences(tmp_path: Path) -> None:
+    with pytest.warns(UserWarning, match="Duplicate name"):
+        archive_path, result = _scan_ambiguous_xml_archive(tmp_path, ("same.txt", "same.txt"))
+    member_location = f"{archive_path}:same.txt"
+    metadata = result.file_metadata[str(archive_path)].model_dump(exclude_none=True)
+    assert [content["path"] for content in metadata["contents"]].count(member_location) == 2
+    aggregate_check = next(
+        check
+        for check in result.checks
+        if check.message == test_security_asset_integration.EXPECTED_XML_ARCHIVE_DIAGNOSTIC_MESSAGE
+        and check.details.get("component_count") == 2
+    )
+    assert len(aggregate_check.details["findings"]) == 2
+
+    baseline_rejected = False
+    try:
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            "duplicate-name XML archive control",
+        )
+    except AssertionError:
+        baseline_rejected = True
+
+    missing_aggregate = result.model_copy(deep=True)
+    missing_aggregate.checks = [
+        check
+        for check in missing_aggregate.checks
+        if not (
+            check.message == test_security_asset_integration.EXPECTED_XML_ARCHIVE_DIAGNOSTIC_MESSAGE
+            and check.details.get("component_count") == 2
+        )
+    ]
+    missing_aggregate_accepted = True
+    try:
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            missing_aggregate,
+            "duplicate-name XML archive missing consolidated check",
+        )
+    except AssertionError:
+        missing_aggregate_accepted = False
+
+    assert {
+        "baseline_rejected": baseline_rejected,
+        "missing_aggregate_accepted": missing_aggregate_accepted,
+    } == {
+        "baseline_rejected": False,
+        "missing_aggregate_accepted": False,
+    }
+
+
+@pytest.mark.parametrize("mutation", ["missing", "extra", "duplicate"])
+def test_organized_asset_scans_reconcile_xml_archive_metadata_occurrences(
+    mutation: str,
+    tmp_path: Path,
+) -> None:
+    archive_path, result = _scan_ambiguous_xml_archive(
+        tmp_path,
+        ("ambiguous.txt",),
+        unrelated_members=("ordinary.bin",),
+    )
+    metadata = result.file_metadata[str(archive_path)]
+    assert metadata.model_extra is not None
+    contents = metadata.model_extra["contents"]
+    assert isinstance(contents, list) and len(contents) == 2
+    if mutation == "missing":
+        contents.pop()
+    elif mutation == "extra":
+        contents.append(
+            {
+                "path": f"{archive_path}:not-in-central-directory.bin",
+                "size": 1,
+                "type": "unknown",
+            }
+        )
+    else:
+        contents.append(dict(contents[0]))
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            f"XML archive metadata occurrence {mutation}",
+        )
+
+
+def test_organized_asset_scans_reject_deleted_duplicate_xml_metadata_occurrence(tmp_path: Path) -> None:
+    with pytest.warns(UserWarning, match="Duplicate name"):
+        archive_path, result = _scan_ambiguous_xml_archive(tmp_path, ("same.txt", "same.txt"))
+    metadata = result.file_metadata[str(archive_path)]
+    assert metadata.model_extra is not None
+    contents = metadata.model_extra["contents"]
+    assert isinstance(contents, list) and len(contents) == 2
+    contents.pop()
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            "duplicate-name XML archive with deleted metadata occurrence",
+        )
+
+
+def test_organized_asset_scans_reject_safe_member_sheltered_by_fake_traversal_issue(tmp_path: Path) -> None:
+    archive_path, result = _scan_ambiguous_xml_archive(
+        tmp_path,
+        ("ambiguous.txt",),
+        unrelated_members=("ordinary.bin",),
+    )
+    ordinary_location = f"{archive_path}:ordinary.bin"
+    metadata = result.file_metadata[str(archive_path)]
+    assert metadata.model_extra is not None
+    contents = metadata.model_extra["contents"]
+    assert isinstance(contents, list)
+    metadata.model_extra["contents"] = [content for content in contents if content["path"] != ordinary_location]
+    result.issues.append(
+        Issue(
+            message="Archive entry ordinary.bin attempted path traversal outside the archive",
+            severity=IssueSeverity.CRITICAL,
+            rule_code="S405",
+            location=ordinary_location,
+            details={"entry": "ordinary.bin"},
+        )
+    )
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            "safe member hidden behind fake path-traversal evidence",
+        )
+
+
+@pytest.mark.parametrize(
+    "unsafe_member",
+    [
+        "../escape.txt",
+        "dir/../../escape.txt",
+        r"..\escape.txt",
+        "/absolute.txt",
+        r"\\server\share.txt",
+        r"C:\escape.txt",
+        "C:/escape.txt",
+    ],
+)
+def test_organized_asset_scans_preserve_xml_coverage_with_rejected_unsafe_member(
+    unsafe_member: str,
+    tmp_path: Path,
+) -> None:
+    archive_path, result = _scan_ambiguous_xml_archive(
+        tmp_path,
+        ("ambiguous.txt",),
+        unrelated_members=(unsafe_member,),
+    )
+    member_location = f"{archive_path}:{unsafe_member}"
+    assert result.success is False
+    assert core_module.determine_exit_code(result) == 1
+    issue = next(issue for issue in result.issues if issue.rule_code == "S405")
+    check = next(check for check in result.checks if check.rule_code == "S405")
+    assert {
+        "issue": (issue.location, issue.details),
+        "check": (check.name, check.location, check.details),
+    } == {
+        "issue": (member_location, {"entry": unsafe_member}),
+        "check": ("Path Traversal Protection", member_location, {"entry": unsafe_member}),
+    }
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+        result,
+        f"XML archive with rejected unsafe member {unsafe_member}",
+    )
+
+
+@pytest.mark.parametrize(
+    "benign_member",
+    [
+        "dir/../safe.txt",
+        "..safe/file.txt",
+        "dir/.../safe.txt",
+        r"dir\..\safe.txt",
+    ],
+)
+def test_organized_asset_scans_preserve_benign_normalized_archive_members(
+    benign_member: str,
+    tmp_path: Path,
+) -> None:
+    _archive_path, result = _scan_ambiguous_xml_archive(
+        tmp_path,
+        ("ambiguous.txt",),
+        unrelated_members=(benign_member,),
+    )
+    assert not any(issue.rule_code == "S405" for issue in result.issues)
+    assert not any(check.rule_code == "S405" for check in result.checks)
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+        result,
+        f"XML archive with benign normalized member {benign_member}",
+    )
+
+
+def test_organized_asset_contract_does_not_trust_production_path_sanitizer(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    def permissive_sanitizer(entry_name: str, base_dir: str) -> tuple[str, bool]:
+        return str(Path(base_dir) / Path(entry_name.replace("\\", "/")).name), True
+
+    monkeypatch.setattr(zip_scanner_module, "sanitize_archive_path", permissive_sanitizer)
+    monkeypatch.setattr(
+        test_security_asset_integration,
+        "sanitize_archive_path",
+        permissive_sanitizer,
+        raising=False,
+    )
+    archive_path, result = _scan_ambiguous_xml_archive(
+        tmp_path,
+        ("ambiguous.txt",),
+        unrelated_members=("../escape.txt",),
+    )
+    assert not any(issue.rule_code == "S405" for issue in result.issues)
+    assert not any(check.rule_code == "S405" for check in result.checks)
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            f"path-sanitizer perturbation for {archive_path}",
+        )
+
+
+def test_organized_asset_scans_preserve_consolidated_path_traversal_occurrences(tmp_path: Path) -> None:
+    archive_path, result = _scan_ambiguous_xml_archive(
+        tmp_path,
+        ("ambiguous.txt",),
+        unrelated_members=("../first.txt", "/second.txt"),
+    )
+    s405_issues = [issue for issue in result.issues if issue.rule_code == "S405"]
+    aggregate_check = next(
+        check
+        for check in result.checks
+        if check.name == "Path Traversal Protection" and check.details.get("component_count") == 2
+    )
+    assert [issue.details for issue in s405_issues] == [
+        {"entry": "../first.txt"},
+        {"entry": "/second.txt"},
+    ]
+    assert aggregate_check.details["findings"] == [
+        {"entry": "../first.txt"},
+        {"entry": "/second.txt"},
+    ]
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+        result,
+        "two-member path-traversal control",
+    )
+
+    missing_second = result.model_copy(deep=True)
+    missing_second.issues = [
+        issue for issue in missing_second.issues if issue.location != f"{archive_path}:/second.txt"
+    ]
+    check = next(candidate for candidate in missing_second.checks if candidate.name == "Path Traversal Protection")
+    check.rule_code = "S405"
+    check.location = f"{archive_path}:../first.txt"
+    check.message = "Archive entry ../first.txt attempted path traversal outside the archive"
+    check.details = {"entry": "../first.txt"}
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            missing_second,
+            "two-member path traversal missing second occurrence",
+        )
+
+
+def test_organized_asset_scans_preserve_duplicate_path_traversal_occurrences(tmp_path: Path) -> None:
+    with pytest.warns(UserWarning, match="Duplicate name"):
+        _archive_path, result = _scan_ambiguous_xml_archive(
+            tmp_path,
+            ("ambiguous.txt",),
+            unrelated_members=("../same.txt", "../same.txt"),
+        )
+    assert [issue.details for issue in result.issues if issue.rule_code == "S405"] == [{"entry": "../same.txt"}]
+    aggregate_check = next(
+        check
+        for check in result.checks
+        if check.name == "Path Traversal Protection" and check.details.get("component_count") == 2
+    )
+    assert aggregate_check.details["findings"] == [
+        {"entry": "../same.txt"},
+        {"entry": "../same.txt"},
+    ]
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+        result,
+        "duplicate-name path-traversal control",
+    )
+
+    missing_aggregate = result.model_copy(deep=True)
+    missing_aggregate.checks = [
+        check for check in missing_aggregate.checks if check.name != "Path Traversal Protection"
+    ]
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            missing_aggregate,
+            "duplicate-name path traversal missing consolidated check",
+        )
+
+
+@pytest.mark.parametrize("diagnostic_kind", ["issue", "check"])
+def test_organized_asset_scans_reject_duplicate_path_traversal_representations(
+    diagnostic_kind: str,
+    tmp_path: Path,
+) -> None:
+    _archive_path, result = _scan_ambiguous_xml_archive(
+        tmp_path,
+        ("ambiguous.txt",),
+        unrelated_members=("../escape.txt",),
+    )
+    if diagnostic_kind == "issue":
+        issue = next(issue for issue in result.issues if issue.rule_code == "S405")
+        result.issues.append(issue.model_copy(deep=True))
+    else:
+        check = next(check for check in result.checks if check.rule_code == "S405")
+        result.checks.append(check.model_copy(deep=True))
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            f"duplicate path-traversal {diagnostic_kind} representation",
+        )
+
+
+def test_organized_asset_scans_preserve_exact_compression_bomb_contract(tmp_path: Path) -> None:
+    archive_path, result = _scan_ambiguous_xml_archive(
+        tmp_path,
+        ("ambiguous.txt",),
+        compression=zipfile.ZIP_DEFLATED,
+    )
+    member_location = f"{archive_path}:ambiguous.txt"
+    metadata = result.file_metadata[str(archive_path)].model_dump(exclude_none=True)
+    assert metadata["scan_outcome_reasons"] == ["zip_analysis_incomplete"]
+    assert metadata["contents"] == []
+    assert result.success is False
+    assert core_module.determine_exit_code(result) == 1
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(result, "compression bomb control")
+
+    accepted_mutations = []
+    mutations = (
+        "issue-error",
+        "check-error",
+        "issue-ratio",
+        "check-ratio",
+        "issue-severity",
+        "check-status",
+        "missing-issue",
+        "missing-check",
+        "successful-result",
+    )
+    for mutation in mutations:
+        mutated = result.model_copy(deep=True)
+        issue = next(candidate for candidate in mutated.issues if candidate.rule_code == "S410")
+        check = next(candidate for candidate in mutated.checks if candidate.rule_code == "S410")
+        if mutation == "issue-error":
+            issue.details["error"] = "boom"
+        elif mutation == "check-error":
+            check.details["error"] = "boom"
+        elif mutation == "issue-ratio":
+            issue.details["ratio"] = 1.0
+        elif mutation == "check-ratio":
+            check.details["ratio"] = 1.0
+        elif mutation == "issue-severity":
+            issue.severity = IssueSeverity.INFO
+        elif mutation == "check-status":
+            check.status = CheckStatus.PASSED
+        elif mutation == "missing-issue":
+            mutated.issues = [candidate for candidate in mutated.issues if candidate.rule_code != "S410"]
+        elif mutation == "missing-check":
+            mutated.checks = [candidate for candidate in mutated.checks if candidate.rule_code != "S410"]
+        else:
+            mutated.success = True
+        try:
+            test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+                mutated,
+                f"compression bomb with {mutation}",
+            )
+        except AssertionError:
+            pass
+        else:
+            accepted_mutations.append(mutation)
+
+    assert accepted_mutations == []
+
+
+@pytest.mark.parametrize("mutation", ["member", "metrics", "threshold", "minimum"])
+def test_organized_asset_scans_ground_compression_bomb_details_in_central_directory(
+    mutation: str,
+    tmp_path: Path,
+) -> None:
+    archive_path, result = _scan_ambiguous_xml_archive(
+        tmp_path,
+        ("ambiguous.txt",),
+        compression=zipfile.ZIP_DEFLATED,
+    )
+    diagnostics: list[Issue | Check] = [
+        *[issue for issue in result.issues if issue.rule_code == "S410"],
+        *[check for check in result.checks if check.rule_code == "S410"],
+    ]
+    assert len(diagnostics) == 2
+    for diagnostic in diagnostics:
+        if mutation == "member":
+            diagnostic.details["entry"] = "not-present.txt"
+            diagnostic.location = f"{archive_path}:not-present.txt"
+        elif mutation == "metrics":
+            diagnostic.details["compressed_size"] += 1
+            diagnostic.details["ratio"] = (
+                diagnostic.details["uncompressed_size"] / diagnostic.details["compressed_size"]
+            )
+        elif mutation == "threshold":
+            diagnostic.details["threshold"] -= 1
+        else:
+            diagnostic.details["min_uncompressed_size"] -= 1
+        details = diagnostic.details
+        diagnostic.message = (
+            f"Suspicious compression ratio ({details['ratio']:.1f}x) and uncompressed size "
+            f"({details['uncompressed_size']} bytes) in entry: {details['entry']}; skipping extraction"
+        )
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            f"compression bomb with self-consistent fake {mutation}",
+        )
+
+
+def test_organized_asset_scans_preserve_consolidated_multi_bomb_contract(tmp_path: Path) -> None:
+    archive_path, result = _scan_ambiguous_xml_archive(
+        tmp_path,
+        ("first.txt", "second.txt"),
+        compression=zipfile.ZIP_DEFLATED,
+    )
+    assert len([issue for issue in result.issues if issue.rule_code == "S410"]) == 2
+    aggregate_check = next(
+        check
+        for check in result.checks
+        if check.name == "Compression Ratio Check" and check.details.get("component_count") == 2
+    )
+    assert len(aggregate_check.details["findings"]) == 2
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+        result,
+        "two-member compression bomb control",
+    )
+
+    missing_second = result.model_copy(deep=True)
+    missing_second.issues = [issue for issue in missing_second.issues if issue.location != f"{archive_path}:second.txt"]
+    check = next(candidate for candidate in missing_second.checks if candidate.name == "Compression Ratio Check")
+    first_details = dict(check.details["findings"][0])
+    check.details = first_details
+    check.location = f"{archive_path}:first.txt"
+    check.rule_code = "S410"
+    check.message = (
+        f"Suspicious compression ratio ({first_details['ratio']:.1f}x) and uncompressed size "
+        f"({first_details['uncompressed_size']} bytes) in entry: first.txt; skipping extraction"
+    )
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            missing_second,
+            "two-member compression bomb missing second occurrence",
+        )
+
+
+def test_organized_asset_scans_preserve_duplicate_name_multi_bomb_occurrences(tmp_path: Path) -> None:
+    with pytest.warns(UserWarning, match="Duplicate name"):
+        archive_path, result = _scan_ambiguous_xml_archive(
+            tmp_path,
+            ("same.txt", "same.txt"),
+            compression=zipfile.ZIP_DEFLATED,
+        )
+    member_location = f"{archive_path}:same.txt"
+    assert len([issue for issue in result.issues if issue.rule_code == "S410"]) == 1
+    aggregate_check = next(
+        check
+        for check in result.checks
+        if check.name == "Compression Ratio Check" and check.details.get("component_count") == 2
+    )
+    assert len(aggregate_check.details["findings"]) == 2
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+        result,
+        "duplicate-name compression bomb control",
+    )
+
+    missing_aggregate = result.model_copy(deep=True)
+    missing_aggregate.checks = [check for check in missing_aggregate.checks if check.name != "Compression Ratio Check"]
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            missing_aggregate,
+            "duplicate-name compression bomb missing consolidated check",
+        )
+
+
+@pytest.mark.parametrize("profile", ["xml", "compression"])
+@pytest.mark.parametrize("diagnostic_kind", ["issue", "check"])
+def test_organized_asset_scans_reject_duplicate_archive_diagnostic_representations(
+    profile: str,
+    diagnostic_kind: str,
+    tmp_path: Path,
+) -> None:
+    compression = zipfile.ZIP_DEFLATED if profile == "compression" else zipfile.ZIP_STORED
+    _archive_path, result = _scan_ambiguous_xml_archive(
+        tmp_path,
+        ("ambiguous.txt",),
+        compression=compression,
+    )
+    if diagnostic_kind == "issue":
+        if profile == "xml":
+            issue = next(
+                candidate
+                for candidate in result.issues
+                if candidate.message == test_security_asset_integration.EXPECTED_XML_ARCHIVE_DIAGNOSTIC_MESSAGE
+            )
+        else:
+            issue = next(candidate for candidate in result.issues if candidate.rule_code == "S410")
+        result.issues.append(issue.model_copy(deep=True))
+    else:
+        if profile == "xml":
+            check = next(
+                candidate
+                for candidate in result.checks
+                if candidate.message == test_security_asset_integration.EXPECTED_XML_ARCHIVE_DIAGNOSTIC_MESSAGE
+            )
+        else:
+            check = next(candidate for candidate in result.checks if candidate.rule_code == "S410")
+        result.checks.append(check.model_copy(deep=True))
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            f"duplicate {profile} {diagnostic_kind} representation",
+        )
+
+
+def test_organized_asset_scans_reject_mutated_unavailable_scanner_diagnostic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+    result = _scan_asset("safe_data.pkl")
+    coverage_path = str(tmp_path / "missing.keras")
+    result.file_metadata[coverage_path] = FileMetadataModel(
+        operational_error=True,
+        operational_error_reason="recognized_format_scanner_unavailable",
+        analysis_incomplete=True,
+        scan_outcome="inconclusive",
+        scan_outcome_reasons=["recognized_format_scanner_unavailable"],
+    )
+    result.checks.append(
+        Check(
+            name="Format Detection",
+            status=CheckStatus.FAILED,
+            message=test_security_asset_integration.EXPECTED_UNAVAILABLE_SCANNER_MESSAGE,
+            severity=IssueSeverity.INFO,
+            location=coverage_path,
+            details={"format": "keras", "path": coverage_path},
+        )
+    )
+    result.success = False
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(result, "unavailable scanner control")
+
+    accepted_mutations = []
+    mutations: list[tuple[str, Any]] = [
+        ("analysis_incomplete", False),
+        ("scan_outcome", "complete"),
+        ("scan_outcome_reason", "scanner_read_failed"),
+        ("scan_outcome_reasons", ["scanner_read_failed"]),
+        ("operational_error", True),
+        ("interrupted", True),
+        ("error", "boom"),
+        ("error_type", "Boom"),
+        ("exception_type", "Boom"),
+    ]
+    for field, value in mutations:
+        mutated = result.model_copy(deep=True)
+        diagnostic = next(
+            check
+            for check in mutated.checks
+            if check.message == test_security_asset_integration.EXPECTED_UNAVAILABLE_SCANNER_MESSAGE
+        )
+        diagnostic.details[field] = value
+        try:
+            test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+                mutated,
+                f"unavailable scanner diagnostic with {field}",
+            )
+        except AssertionError:
+            pass
+        else:
+            accepted_mutations.append(field)
+
+    assert accepted_mutations == []
+
+
+def test_organized_asset_scans_reject_aliases_on_aliasless_pickle_findings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+    result = _scan_asset("dill_func.pkl")
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(result, "aliasless pickle control")
+    alias_mutations: list[dict[str, Any]] = [
+        {"notice_code": "bogus"},
+        {"notice_code": None},
+        {"notice_code": 123},
+        {"pickle_notice_code": "bogus"},
+        {"pickle_notice_code": None},
+        {"pickle_notice_code": 123},
+        {"notice_code": "nested_pickle_incomplete", "pickle_notice_code": "nested_probe_limit"},
+    ]
+
+    accepted_mutations = []
+    for diagnostic_kind in ("issue", "check"):
+        for mutation in alias_mutations:
+            mutated = result.model_copy(deep=True)
+            diagnostics = mutated.issues if diagnostic_kind == "issue" else mutated.checks
+            diagnostic = next(
+                candidate
+                for candidate in diagnostics
+                if candidate.rule_code == "S213" and candidate.message == "Nested pickle analysis did not complete"
+            )
+            diagnostic.details.update(mutation)
+            try:
+                test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+                    mutated,
+                    f"{diagnostic_kind} aliasless pickle finding with {mutation}",
+                )
+            except AssertionError:
+                pass
+            else:
+                accepted_mutations.append((diagnostic_kind, mutation))
+
+    assert accepted_mutations == []
+
+
+def test_organized_asset_scans_reject_duplicate_metadata_outcome_reasons(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+    result = _scan_asset("dill_func.pkl")
+    metadata = result.file_metadata[str(ASSETS / "dill_func.pkl")]
+    assert metadata.model_extra is not None
+    metadata.model_extra["scan_outcome_reasons"].append("nested_pickle_incomplete")
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            "duplicate metadata outcome reasons",
+        )
+
+
+def test_organized_asset_scans_reject_contradictory_aliasless_pickle_findings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+    cases: list[tuple[ModelAuditResultModel, str, str, list[tuple[str, Any]]]] = [
+        (
+            _scan_asset("dill_func.pkl"),
+            "S213",
+            "Nested pickle analysis did not complete",
+            [("scan_outcome", "complete")],
+        ),
+        (
+            _scan_asset("dill_func.pkl"),
+            "S213",
+            "Nested pickle payload exceeds deep-scan byte limit",
+            [("analysis_incomplete", False), ("scan_outcome", "complete")],
+        ),
+        (
+            core_module.scan_model_directory_or_file(str(AGPL_ASSET), cache_enabled=False),
+            "S601",
+            "Nested pickle probe candidate limit exceeded",
+            [("analysis_incomplete", False), ("scan_outcome", "complete")],
+        ),
+    ]
+
+    accepted_mutations = []
+    for result, rule_code, message, mutations in cases:
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            f"{rule_code} aliasless pickle finding control",
+        )
+        for diagnostic_kind in ("issue", "check"):
+            for field, value in mutations:
+                mutated = result.model_copy(deep=True)
+                diagnostics = mutated.issues if diagnostic_kind == "issue" else mutated.checks
+                diagnostic = next(
+                    candidate
+                    for candidate in diagnostics
+                    if candidate.rule_code == rule_code and candidate.message == message
+                )
+                diagnostic.details[field] = value
+                try:
+                    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+                        mutated,
+                        f"{diagnostic_kind} {rule_code} aliasless pickle finding with {field}",
+                    )
+                except AssertionError:
+                    pass
+                else:
+                    accepted_mutations.append((rule_code, message, diagnostic_kind, field))
+
+    assert accepted_mutations == []
 
 
 @pytest.mark.parametrize(
@@ -1370,6 +4051,8 @@ def test_organized_asset_scans_preserve_complete_coverage_only_contract(
         pytest.param({"exception_type": "RuntimeError"}, id="exception-type"),
         pytest.param({"operational_error": True}, id="operational-error"),
         pytest.param({"interrupted": True}, id="interrupted"),
+        pytest.param({"error_type": None}, id="explicit-null-error-type"),
+        pytest.param({"scan_outcome_reason": None}, id="explicit-null-outcome-reason"),
     ],
 )
 def test_organized_asset_scans_reject_dependency_diagnostic_error_fields(
@@ -1639,17 +4322,39 @@ def test_organized_asset_scans_reject_real_direct_onnx_missing_dependency(
         )
 
 
-def test_organized_asset_scans_preserve_real_keras_zip_hdf5_probe_missing_dependency(
+def _scan_direct_h5_with_missing_h5py(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-) -> None:
+    *,
+    signature_offset: int = 0,
+) -> tuple[ModelAuditResultModel, Path]:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+    monkeypatch.setattr(keras_h5_scanner_module, "HAS_H5PY", False)
+    model_path = tmp_path / "direct-missing-h5py.h5"
+    if signature_offset:
+        _write_sparse_plausible_hdf5_v0(model_path, signature_offset)
+    else:
+        model_path.write_bytes(_plausible_hdf5_v0_payload())
+    result = core_module.scan_model_directory_or_file(str(model_path), cache_enabled=False)
+    return result, model_path
+
+
+def _scan_keras_zip_with_missing_h5py(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    filename: str,
+    *,
+    hdf5_signature_offset: int = 16 * 1024 * 1024,
+) -> tuple[ModelAuditResultModel, Path]:
     monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
     monkeypatch.setattr(keras_zip_scanner_module, "HAS_H5PY", False)
     monkeypatch.setattr(keras_h5_scanner_module, "HAS_H5PY", False)
-    model_path = tmp_path / "missing-hdf5-probe-dependency.keras"
-    hdf5_signature_offset = 16 * 1024 * 1024
-    weights_payload = bytearray(hdf5_signature_offset + 8)
-    weights_payload[hdf5_signature_offset : hdf5_signature_offset + 8] = b"\x89HDF\r\n\x1a\n"
+    model_path = tmp_path / filename
+    if hdf5_signature_offset == 0:
+        weights_payload = bytearray(_plausible_hdf5_v0_payload())
+    else:
+        weights_payload = bytearray(hdf5_signature_offset + 8)
+        weights_payload[hdf5_signature_offset : hdf5_signature_offset + 8] = b"\x89HDF\r\n\x1a\n"
     with zipfile.ZipFile(model_path, "w") as archive:
         archive.writestr("config.json", '{"class_name":"Sequential","config":{"layers":[]}}')
         archive.writestr("metadata.json", '{"keras_version":"3.12.0"}')
@@ -1659,6 +4364,369 @@ def test_organized_asset_scans_preserve_real_keras_zip_hdf5_probe_missing_depend
     scan_result.metadata["source_path"] = str(model_path)
     result = _scan_asset("safe_data.pkl")
     result.aggregate_scan_result_direct(scan_result)
+    return result, model_path
+
+
+def _synthetic_direct_h5py_dependency_profile(
+    profile_kind: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[ModelAuditResultModel, str, str]:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+    result = _scan_asset("safe_data.pkl")
+    if profile_kind == "h5":
+        source_path = tmp_path / "missing.h5"
+        source_path.write_bytes(_plausible_hdf5_v0_payload())
+        owner_path = str(source_path)
+        location = owner_path
+        reason = "keras_h5_h5py_unavailable"
+        check_name = "H5PY Library Check"
+        message = "h5py is required for Keras H5 scanning. Install with 'pip install modelaudit[h5]'."
+        details: dict[str, Any] = {"path": owner_path}
+        metadata_extra: dict[str, Any] = {
+            "file_size": source_path.stat().st_size,
+            "scanner_dependency_ids": ["keras_h5"],
+        }
+    else:
+        assert profile_kind in {"keras", "keras-h5py"}
+        source_path = tmp_path / "missing.keras"
+        weights_payload = _plausible_hdf5_v0_payload() if profile_kind == "keras-h5py" else bytes(16 * 1024 * 1024 + 8)
+        with zipfile.ZipFile(source_path, "w") as archive:
+            archive.writestr("config.json", '{"class_name":"Sequential","config":{"layers":[]}}')
+            archive.writestr("metadata.json", '{"keras_version":"3.12.0"}')
+            archive.writestr("model.weights.h5", weights_payload)
+        owner_path = str(source_path)
+        location = f"{owner_path}:model.weights.h5"
+        details = {"entry": "model.weights.h5"}
+        metadata_extra = {
+            "file_size": source_path.stat().st_size,
+            "scanner_dependency_ids": ["keras_zip"],
+            "contents": [
+                {
+                    "path": f"{owner_path}:config.json",
+                    "type": "security_only",
+                    "size": 50,
+                },
+                {
+                    "path": f"{owner_path}:metadata.json",
+                    "type": "unknown",
+                    "size": 26,
+                },
+                {
+                    "path": location,
+                    "type": "security_only" if profile_kind == "keras-h5py" else "flax_msgpack",
+                    "size": len(weights_payload),
+                },
+            ],
+        }
+        if profile_kind == "keras-h5py":
+            reason = "keras_zip_embedded_weights_h5py_unavailable"
+            check_name = "Embedded Weights H5PY Library Check"
+            message = (
+                "Skipping embedded model.weights.h5 inspection because h5py is required for HDF5 weights "
+                "analysis. Install with 'pip install modelaudit[h5]'."
+            )
+            details["hdf5_signature_offset"] = 0
+            metadata_extra["embedded_weights_hdf5_signature_offset"] = 0
+        else:
+            reason = "keras_zip_embedded_weights_hdf5_signature_probe_incomplete"
+            check_name = "Embedded Weights HDF5 Signature Probe"
+            message = (
+                "Skipping embedded model.weights.h5 inspection because h5py is unavailable and the weights entry "
+                "is too large to rule out a valid HDF5 user-block signature within the bounded probe window. "
+                "Install with 'pip install modelaudit[h5]'."
+            )
+            details.update(
+                {
+                    "file_size": 16 * 1024 * 1024 + 8,
+                    "hdf5_signature_probe_max_bytes": 10 * 1024 * 1024,
+                }
+            )
+    details.update(
+        {
+            "required_package": "h5py",
+            "analysis_incomplete": True,
+            "scan_outcome_reason": reason,
+        }
+    )
+    result.file_metadata[owner_path] = FileMetadataModel(
+        analysis_incomplete=True,
+        scan_outcome="inconclusive",
+        scan_outcome_reasons=[reason],
+        **metadata_extra,
+    )
+    result.issues.append(
+        Issue(
+            message=message,
+            severity=IssueSeverity.INFO,
+            location=location,
+            details=details.copy(),
+            rule_code="S902",
+        )
+    )
+    result.checks.append(
+        Check(
+            name=check_name,
+            status=CheckStatus.FAILED,
+            message=message,
+            severity=IssueSeverity.INFO,
+            location=location,
+            details=details.copy(),
+            rule_code="S902",
+        )
+    )
+    result.success = False
+    return result, owner_path, reason
+
+
+def test_organized_asset_scans_preserve_real_direct_h5_missing_dependency(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result, model_path = _scan_direct_h5_with_missing_h5py(tmp_path, monkeypatch)
+    metadata = result.file_metadata[str(model_path)].model_dump(exclude_none=True)
+    assert metadata["scan_outcome_reasons"] == ["keras_h5_h5py_unavailable"]
+    assert result.success is False
+    assert result.has_errors is False
+    assert core_module.determine_exit_code(result) == 2
+
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+        result,
+        "real direct H5 missing dependency",
+    )
+
+
+@pytest.mark.parametrize(
+    "signature_offset",
+    [16 * 1024 * 1024, 32 * 1024 * 1024, 64 * 1024 * 1024],
+    ids=["16-mib", "32-mib", "64-mib"],
+)
+def test_organized_asset_scans_preserve_sparse_direct_h5_userblock_dependency(
+    signature_offset: int,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result, model_path = _scan_direct_h5_with_missing_h5py(
+        tmp_path,
+        monkeypatch,
+        signature_offset=signature_offset,
+    )
+    metadata = result.file_metadata[str(model_path)].model_dump(exclude_none=True)
+    expected_reasons = [
+        "keras_h5_h5py_unavailable",
+        "hdf5_userblock_zip_probe_incomplete",
+    ]
+    diagnostics: list[Issue | Check] = list(result.issues)
+    diagnostics.extend(result.checks)
+    assert metadata["scan_outcome_reasons"] == expected_reasons
+    probe_diagnostics: list[Issue | Check] = [
+        diagnostic
+        for diagnostic in diagnostics
+        if diagnostic.details.get("scan_outcome_reason") == "hdf5_userblock_zip_probe_incomplete"
+    ]
+    assert len(probe_diagnostics) == 2
+    assert {type(diagnostic) for diagnostic in probe_diagnostics} == {Issue, Check}
+    for diagnostic in probe_diagnostics:
+        assert diagnostic.location == str(model_path)
+        assert diagnostic.details == {
+            "analysis_incomplete": True,
+            "scan_outcome_reason": "hdf5_userblock_zip_probe_incomplete",
+            "hdf5_signature_offset": signature_offset,
+            "zip_probe_bytes_scanned": 10 * 1024 * 1024,
+            "zip_probe_max_bytes": 10 * 1024 * 1024,
+        }
+    assert result.success is False
+    assert result.has_errors is False
+    assert core_module.determine_exit_code(result) == 2
+
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+        result,
+        f"sparse direct H5 with {signature_offset}-byte userblock",
+    )
+
+
+def test_organized_asset_scans_preserve_real_h5py_direct_userblock_dependency(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h5py = pytest.importorskip("h5py")
+    model_path = tmp_path / "real-userblock.h5"
+    with h5py.File(model_path, "w", userblock_size=16 * 1024 * 1024) as model:
+        model.create_dataset("weights", data=[1.0])
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+    monkeypatch.setattr(keras_h5_scanner_module, "HAS_H5PY", False)
+    result = core_module.scan_model_directory_or_file(str(model_path), cache_enabled=False)
+
+    metadata = result.file_metadata[str(model_path)].model_dump(exclude_none=True)
+    assert metadata["scan_outcome_reasons"] == [
+        "keras_h5_h5py_unavailable",
+        "hdf5_userblock_zip_probe_incomplete",
+    ]
+    assert result.success is False
+    assert result.has_errors is False
+    assert core_module.determine_exit_code(result) == 2
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+        result,
+        "real h5py direct H5 with a 16 MiB userblock",
+    )
+
+
+def test_organized_asset_scans_preserve_direct_h5_userblock_with_fully_covered_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result, model_path = _scan_direct_h5_with_missing_h5py(
+        tmp_path,
+        monkeypatch,
+        signature_offset=8 * 1024 * 1024,
+    )
+
+    metadata = result.file_metadata[str(model_path)].model_dump(exclude_none=True)
+    assert metadata["scan_outcome_reasons"] == ["keras_h5_h5py_unavailable"]
+    diagnostics: list[Issue | Check] = list(result.issues)
+    diagnostics.extend(result.checks)
+    assert not any(
+        diagnostic.details.get("scan_outcome_reason") == "hdf5_userblock_zip_probe_incomplete"
+        for diagnostic in diagnostics
+    )
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+        result,
+        "direct H5 with a fully covered 8 MiB userblock probe",
+    )
+
+
+@pytest.mark.parametrize(
+    "source_mutation",
+    ["near-magic", "truncated", "invalid-superblock", "non-power-offset", "signature-past-eof"],
+)
+def test_direct_hdf5_sparse_signature_proof_rejects_invalid_sources(
+    source_mutation: str,
+    tmp_path: Path,
+) -> None:
+    signature_offset = 16 * 1024 * 1024
+    if source_mutation == "non-power-offset":
+        signature_offset = 3 * 1024 * 1024
+    model_path = tmp_path / f"invalid-{source_mutation}.h5"
+    _write_sparse_plausible_hdf5_v0(model_path, signature_offset)
+
+    if source_mutation == "near-magic":
+        with model_path.open("r+b") as source:
+            source.seek(signature_offset)
+            source.write(b"XHDF\r\n\x1a\n")
+    elif source_mutation == "truncated":
+        with model_path.open("r+b") as source:
+            source.truncate(signature_offset + 8)
+    elif source_mutation == "invalid-superblock":
+        with model_path.open("r+b") as source:
+            source.seek(signature_offset + 13)
+            source.write(b"\x03")
+    elif source_mutation == "signature-past-eof":
+        with model_path.open("r+b") as source:
+            source.truncate(signature_offset - 1)
+
+    assert test_security_asset_integration._direct_hdf5_signature_offset(str(model_path)) is None
+
+
+@pytest.mark.parametrize(
+    "malformation",
+    [
+        "missing-issue",
+        "missing-check",
+        "extra-profile",
+        "mutated-message",
+        "mutated-details",
+        "cross-root",
+        "duplicate-issue",
+    ],
+)
+def test_organized_asset_scans_reject_malformed_direct_hdf5_userblock_probe_profile(
+    malformation: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result, _model_path = _scan_direct_h5_with_missing_h5py(
+        tmp_path,
+        monkeypatch,
+        signature_offset=16 * 1024 * 1024,
+    )
+    probe_issues = [
+        issue
+        for issue in result.issues
+        if issue.details.get("scan_outcome_reason") == "hdf5_userblock_zip_probe_incomplete"
+    ]
+    probe_checks = [
+        check
+        for check in result.checks
+        if check.details.get("scan_outcome_reason") == "hdf5_userblock_zip_probe_incomplete"
+    ]
+    assert len(probe_issues) == len(probe_checks) == 1
+
+    if malformation == "missing-issue":
+        result.issues.remove(probe_issues[0])
+    elif malformation == "missing-check":
+        result.checks.remove(probe_checks[0])
+    elif malformation == "extra-profile":
+        extra_issue = probe_issues[0].model_copy(deep=True)
+        extra_issue.message = "Additional user-block probe record"
+        result.issues.append(extra_issue)
+    elif malformation == "mutated-message":
+        probe_issues[0].message = "User-block probe stopped"
+        probe_checks[0].message = "User-block probe stopped"
+    elif malformation == "mutated-details":
+        probe_issues[0].details["zip_probe_bytes_scanned"] = 1
+        probe_checks[0].details["zip_probe_bytes_scanned"] = 1
+    elif malformation == "cross-root":
+        other_path = tmp_path / "other.h5"
+        _write_sparse_plausible_hdf5_v0(other_path, 16 * 1024 * 1024)
+        probe_issues[0].location = str(other_path)
+        probe_checks[0].location = str(other_path)
+    else:
+        result.issues.append(probe_issues[0].model_copy(deep=True))
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            f"direct H5 user-block probe with {malformation}",
+        )
+
+
+def test_organized_asset_scans_preserve_direct_hdf5_userblock_security_precedence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result, model_path = _scan_direct_h5_with_missing_h5py(
+        tmp_path,
+        monkeypatch,
+        signature_offset=16 * 1024 * 1024,
+    )
+    result.issues.append(
+        Issue(
+            message="Detected malicious content in the HDF5 user block",
+            severity=IssueSeverity.CRITICAL,
+            location=str(model_path),
+            details={},
+            rule_code="S201",
+        )
+    )
+
+    assert result.success is False
+    assert result.has_errors is False
+    assert core_module.determine_exit_code(result) == 1
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+        result,
+        "direct H5 user-block dependency with a critical security finding",
+    )
+
+
+def test_organized_asset_scans_preserve_real_keras_zip_hdf5_probe_missing_dependency(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result, model_path = _scan_keras_zip_with_missing_h5py(
+        tmp_path,
+        monkeypatch,
+        "missing-hdf5-probe-dependency.keras",
+    )
     reason = "keras_zip_embedded_weights_hdf5_signature_probe_incomplete"
     metadata = result.file_metadata[str(model_path)].model_dump(exclude_none=True)
     dependency_check = next(check for check in result.checks if check.details.get("required_package") == "h5py")
@@ -1671,6 +4739,458 @@ def test_organized_asset_scans_preserve_real_keras_zip_hdf5_probe_missing_depend
     test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
         result,
         "real Keras ZIP HDF5 probe missing dependency",
+    )
+
+
+def test_organized_asset_scans_preserve_real_keras_zip_h5py_missing_dependency(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result, model_path = _scan_keras_zip_with_missing_h5py(
+        tmp_path,
+        monkeypatch,
+        "missing-embedded-h5py.keras",
+        hdf5_signature_offset=0,
+    )
+    reason = "keras_zip_embedded_weights_h5py_unavailable"
+    metadata = result.file_metadata[str(model_path)].model_dump(exclude_none=True)
+    dependency_check = next(check for check in result.checks if check.details.get("required_package") == "h5py")
+    assert metadata["scan_outcome_reasons"] == [reason]
+    assert metadata["scanner_dependency_ids"] == ["keras_zip"]
+    assert dependency_check.name == "Embedded Weights H5PY Library Check"
+    assert dependency_check.details["scan_outcome_reason"] == reason
+    assert result.success is False
+    assert result.has_errors is False
+    assert core_module.determine_exit_code(result) == 2
+
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+        result,
+        "real Keras ZIP embedded HDF5 missing dependency",
+    )
+
+
+@pytest.mark.parametrize("artifact_kind", ["h5", "keras"], ids=["h5-to-keras", "keras-to-h5"])
+def test_organized_asset_scans_reject_h5py_reason_artifact_owner_swaps(
+    artifact_kind: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if artifact_kind == "h5":
+        result, owner_path = _scan_direct_h5_with_missing_h5py(tmp_path, monkeypatch)
+        replacement_reason = "keras_zip_embedded_weights_h5py_unavailable"
+        monkeypatch.setattr(keras_h5_scanner_module, "HAS_H5PY", True)
+        monkeypatch.setattr(keras_zip_scanner_module, "HAS_H5PY", False)
+    else:
+        result, owner_path = _scan_keras_zip_with_missing_h5py(
+            tmp_path,
+            monkeypatch,
+            "reason-owner-swap.keras",
+        )
+        replacement_reason = "keras_h5_h5py_unavailable"
+        monkeypatch.setattr(keras_h5_scanner_module, "HAS_H5PY", False)
+        monkeypatch.setattr(keras_zip_scanner_module, "HAS_H5PY", True)
+
+    metadata = result.file_metadata[str(owner_path)].model_extra
+    assert metadata is not None
+    metadata["scan_outcome_reasons"] = [replacement_reason]
+    diagnostics: list[Issue | Check] = [*result.issues, *result.checks]
+    for diagnostic in diagnostics:
+        if diagnostic.details.get("required_package") == "h5py":
+            diagnostic.details["scan_outcome_reason"] = replacement_reason
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            f"{artifact_kind} h5py reason reassigned to another artifact owner",
+        )
+
+
+@pytest.mark.parametrize(
+    ("profile_kind", "malformation"),
+    [
+        pytest.param("h5", "wrong-scanner", id="h5-wrong-scanner"),
+        pytest.param("h5", "extra-scanner", id="h5-extra-scanner"),
+        pytest.param("h5", "wrong-check-name", id="h5-wrong-check-name"),
+        pytest.param("h5", "wrong-message", id="h5-wrong-message"),
+        pytest.param("h5", "wrong-source", id="h5-wrong-source"),
+        pytest.param("h5", "both-reasons", id="h5-both-reasons"),
+        pytest.param("h5", "metadata-diagnostic-mismatch", id="h5-metadata-diagnostic-mismatch"),
+        pytest.param("keras-h5py", "wrong-source", id="keras-h5py-wrong-source"),
+        pytest.param("keras", "wrong-scanner", id="keras-probe-wrong-scanner"),
+    ],
+)
+def test_organized_asset_scans_reject_h5py_dependency_artifact_profile_malformations(
+    profile_kind: str,
+    malformation: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result, owner_path, reason = _synthetic_direct_h5py_dependency_profile(
+        profile_kind,
+        tmp_path,
+        monkeypatch,
+    )
+    metadata = result.file_metadata[owner_path].model_extra
+    assert metadata is not None
+    h5py_issues = [issue for issue in result.issues if issue.details.get("required_package") == "h5py"]
+    h5py_checks = [check for check in result.checks if check.details.get("required_package") == "h5py"]
+    diagnostics: list[Issue | Check] = [*h5py_issues, *h5py_checks]
+    monkeypatch.setattr(keras_h5_scanner_module, "HAS_H5PY", False)
+    monkeypatch.setattr(keras_zip_scanner_module, "HAS_H5PY", False)
+
+    if malformation == "wrong-scanner":
+        metadata["scanner_dependency_ids"] = ["keras_zip" if profile_kind == "h5" else "keras_h5"]
+    elif malformation == "extra-scanner":
+        metadata["scanner_dependency_ids"] = ["keras_h5", "keras_zip"]
+    elif malformation == "wrong-check-name":
+        h5py_checks[0].name = "Unrelated Dependency Check"
+    elif malformation == "wrong-message":
+        for diagnostic in diagnostics:
+            diagnostic.message = "h5py is required for an unrelated artifact"
+    elif malformation == "wrong-source":
+        Path(owner_path).write_bytes(b"ordinary non-model payload")
+    elif malformation == "both-reasons":
+        other_reason = "keras_zip_embedded_weights_h5py_unavailable"
+        metadata["scan_outcome_reasons"] = [reason, other_reason]
+        for issue in h5py_issues:
+            duplicate_issue = issue.model_copy(deep=True)
+            duplicate_issue.details["scan_outcome_reason"] = other_reason
+            result.issues.append(duplicate_issue)
+        for check in h5py_checks:
+            duplicate_check = check.model_copy(deep=True)
+            duplicate_check.details["scan_outcome_reason"] = other_reason
+            result.checks.append(duplicate_check)
+    else:
+        replacement_reason = "keras_zip_embedded_weights_h5py_unavailable"
+        for diagnostic in diagnostics:
+            diagnostic.details["scan_outcome_reason"] = replacement_reason
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            f"{profile_kind} h5py dependency with {malformation}",
+        )
+
+
+def test_organized_asset_scans_reject_cross_assigned_h5py_dependency_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result, owner_path, _reason = _synthetic_direct_h5py_dependency_profile("h5", tmp_path, monkeypatch)
+    keras_result, keras_path = _scan_keras_zip_with_missing_h5py(
+        tmp_path,
+        monkeypatch,
+        "cross-assigned-root.keras",
+    )
+    del keras_result
+    metadata = result.file_metadata.pop(owner_path)
+    result.file_metadata[str(keras_path)] = metadata
+    diagnostics: list[Issue | Check] = [*result.issues, *result.checks]
+    for diagnostic in diagnostics:
+        if diagnostic.details.get("required_package") == "h5py":
+            diagnostic.location = str(keras_path)
+            diagnostic.details["path"] = str(keras_path)
+    monkeypatch.setattr(keras_h5_scanner_module, "HAS_H5PY", False)
+    monkeypatch.setattr(keras_zip_scanner_module, "HAS_H5PY", False)
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            "direct H5 dependency profile cross-assigned to a Keras ZIP root",
+        )
+
+
+@pytest.mark.parametrize("profile_kind", ["h5", "keras"])
+def test_organized_asset_scans_reject_stale_direct_h5py_profile_when_available(
+    profile_kind: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if profile_kind == "h5":
+        result, _model_path = _scan_direct_h5_with_missing_h5py(tmp_path, monkeypatch)
+        monkeypatch.setattr(keras_zip_scanner_module, "HAS_H5PY", False)
+        monkeypatch.setattr(keras_h5_scanner_module, "HAS_H5PY", True)
+    else:
+        result, _model_path = _scan_keras_zip_with_missing_h5py(
+            tmp_path,
+            monkeypatch,
+            "stale-direct-profile.keras",
+        )
+        monkeypatch.setattr(keras_h5_scanner_module, "HAS_H5PY", False)
+        monkeypatch.setattr(keras_zip_scanner_module, "HAS_H5PY", True)
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            f"stale direct {profile_kind} h5py-unavailable profile",
+        )
+
+
+@pytest.mark.parametrize(
+    ("profile_kind", "h5_state", "zip_state"),
+    [
+        pytest.param("h5", None, False, id="h5-none"),
+        pytest.param("h5", 1, False, id="h5-one"),
+        pytest.param("h5", "missing", False, id="h5-string"),
+        pytest.param("keras-h5py", False, None, id="keras-h5py-none"),
+        pytest.param("keras-h5py", False, 1, id="keras-h5py-one"),
+        pytest.param("keras-h5py", False, "missing", id="keras-h5py-string"),
+        pytest.param("keras", False, None, id="keras-none"),
+        pytest.param("keras", False, 1, id="keras-one"),
+        pytest.param("keras", False, "missing", id="keras-string"),
+    ],
+)
+def test_organized_asset_scans_reject_non_boolean_h5py_dependency_states(
+    profile_kind: str,
+    h5_state: object,
+    zip_state: object,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result, _owner_path, _reason = _synthetic_direct_h5py_dependency_profile(
+        profile_kind,
+        tmp_path,
+        monkeypatch,
+    )
+    monkeypatch.setattr(keras_h5_scanner_module, "HAS_H5PY", h5_state)
+    monkeypatch.setattr(keras_zip_scanner_module, "HAS_H5PY", zip_state)
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            f"{profile_kind} h5py dependency with non-boolean live state",
+        )
+
+
+@pytest.mark.parametrize(
+    ("profile_kind", "h5_state", "zip_state"),
+    [
+        pytest.param("h5", False, True, id="direct-h5"),
+        pytest.param("keras-h5py", True, False, id="keras-h5py"),
+        pytest.param("keras", True, False, id="keras-signature-probe"),
+    ],
+)
+def test_organized_asset_scans_preserve_h5py_dependency_when_owning_scanner_is_unavailable(
+    profile_kind: str,
+    h5_state: object,
+    zip_state: object,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result, _owner_path, _reason = _synthetic_direct_h5py_dependency_profile(
+        profile_kind,
+        tmp_path,
+        monkeypatch,
+    )
+    monkeypatch.setattr(keras_h5_scanner_module, "HAS_H5PY", h5_state)
+    monkeypatch.setattr(keras_zip_scanner_module, "HAS_H5PY", zip_state)
+
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+        result,
+        f"{profile_kind} h5py dependency with owning scanner unavailable",
+    )
+
+
+@pytest.mark.parametrize("profile_kind", ["h5", "keras-h5py", "keras"])
+@pytest.mark.parametrize("stale_fragment", ["issue", "check", "reason", "incomplete"])
+def test_organized_asset_scans_reject_stale_direct_h5py_fragments_when_available(
+    profile_kind: str,
+    stale_fragment: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result, owner_path, reason = _synthetic_direct_h5py_dependency_profile(
+        profile_kind,
+        tmp_path,
+        monkeypatch,
+    )
+    dependency_issue = next(issue for issue in result.issues if issue.details.get("required_package") == "h5py")
+    dependency_check = next(check for check in result.checks if check.details.get("required_package") == "h5py")
+    result.issues = [issue for issue in result.issues if issue is not dependency_issue]
+    result.checks = [check for check in result.checks if check is not dependency_check]
+    if stale_fragment == "issue":
+        result.issues.append(dependency_issue)
+        result.file_metadata[owner_path] = FileMetadataModel()
+    elif stale_fragment == "check":
+        result.checks.append(dependency_check)
+        result.file_metadata[owner_path] = FileMetadataModel()
+    elif stale_fragment == "reason":
+        result.file_metadata[owner_path] = FileMetadataModel(scan_outcome_reasons=[reason])
+    else:
+        result.file_metadata[owner_path] = FileMetadataModel(
+            analysis_incomplete=True,
+            scan_outcome="inconclusive",
+        )
+    result.success = True
+    monkeypatch.setattr(keras_h5_scanner_module, "HAS_H5PY", True)
+    monkeypatch.setattr(keras_zip_scanner_module, "HAS_H5PY", True)
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            f"stale direct {profile_kind} {stale_fragment} fragment",
+        )
+
+
+@pytest.mark.parametrize("profile_kind", ["h5", "keras"])
+def test_organized_asset_scans_preserve_direct_models_without_h5py_unavailable_profile(
+    profile_kind: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+    monkeypatch.setattr(keras_h5_scanner_module, "HAS_H5PY", True)
+    monkeypatch.setattr(keras_zip_scanner_module, "HAS_H5PY", True)
+    if profile_kind == "h5":
+        if "h5py" not in sys.modules:
+            pytest.skip("h5py is required for the direct H5 positive")
+        model_path = Path(__file__).parent / "assets" / "samples" / "keras" / "safe_model.h5"
+    else:
+        model_path = tmp_path / "normal.keras"
+        with zipfile.ZipFile(model_path, "w") as archive:
+            archive.writestr("config.json", '{"class_name":"Sequential","config":{"layers":[]}}')
+            archive.writestr("metadata.json", '{"keras_version":"3.12.0"}')
+    result = core_module.scan_model_directory_or_file(str(model_path.resolve()), cache_enabled=False)
+    assert result.success is True
+    diagnostics: list[Issue | Check] = [*result.issues, *result.checks]
+    assert not any(diagnostic.details.get("required_package") == "h5py" for diagnostic in diagnostics)
+
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+        result,
+        f"direct {profile_kind} model without h5py-unavailable profile",
+    )
+
+
+def test_organized_asset_scans_reject_duplicate_diagnostic_outcome_reasons_before_exemption(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result, _model_path = _scan_keras_zip_with_missing_h5py(
+        tmp_path,
+        monkeypatch,
+        "duplicate-diagnostic-outcome-reasons.keras",
+    )
+    dependency_check = next(check for check in result.checks if check.details.get("required_package") == "h5py")
+    reason = dependency_check.details["scan_outcome_reason"]
+    dependency_check.details["scan_outcome_reasons"] = [reason, reason]
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            "duplicate diagnostic outcome reasons",
+        )
+
+
+def test_organized_asset_scans_require_exact_member_dependency_for_nested_routing_coverage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result, model_path = _scan_keras_zip_with_missing_h5py(
+        tmp_path,
+        monkeypatch,
+        "member-routing-coverage.keras",
+    )
+    all_diagnostics: list[Issue | Check] = [*result.issues, *result.checks]
+    routing_diagnostics = [
+        diagnostic
+        for diagnostic in all_diagnostics
+        if diagnostic.details.get("scan_outcome_reason") == "flax_msgpack_routing_incomplete"
+    ]
+    assert routing_diagnostics
+    member_path = f"{model_path}:model.weights.h5"
+    assert all(diagnostic.location == member_path for diagnostic in routing_diagnostics)
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+        result,
+        "exact listed member with matching dependency diagnostic",
+    )
+
+    accepted_malformations: list[str] = []
+    for malformation in (
+        "wrong-member",
+        "unlisted-member",
+        "mismatched-location",
+        "wrong-coverage-reason",
+        "wrong-coverage-message",
+        "coherent-listed-nonweights-member",
+        "self-authorizing-nested-marker",
+        "missing-dependency-diagnostic",
+        "invalid-dependency-diagnostic",
+    ):
+        malformed = result.model_copy(deep=True)
+        malformed_diagnostics: list[Issue | Check] = [*malformed.issues, *malformed.checks]
+        malformed_routing = [
+            diagnostic
+            for diagnostic in malformed_diagnostics
+            if diagnostic.details.get("scan_outcome_reason") == "flax_msgpack_routing_incomplete"
+        ]
+        if malformation == "wrong-member":
+            for diagnostic in malformed_routing:
+                diagnostic.details["zip_entry"] = "config.json"
+        elif malformation == "unlisted-member":
+            for diagnostic in malformed_routing:
+                diagnostic.location = f"{model_path}:unlisted.weights.h5"
+                diagnostic.details["zip_entry"] = "unlisted.weights.h5"
+        elif malformation == "mismatched-location":
+            for diagnostic in malformed_routing:
+                diagnostic.location = f"{model_path}:config.json"
+        elif malformation == "wrong-coverage-reason":
+            for diagnostic in malformed_routing:
+                diagnostic.details["scan_outcome_reason"] = "xml_model_routing_incomplete"
+        elif malformation == "wrong-coverage-message":
+            for diagnostic in malformed_routing:
+                diagnostic.message = "Unrelated routing message"
+        elif malformation == "coherent-listed-nonweights-member":
+            config_path = f"{model_path}:config.json"
+            for diagnostic in malformed_routing:
+                diagnostic.location = config_path
+                diagnostic.details["zip_entry"] = "config.json"
+            for diagnostic in malformed_diagnostics:
+                if diagnostic.details.get("required_package") == "h5py":
+                    diagnostic.location = config_path
+                    if "zip_entry" in diagnostic.details:
+                        diagnostic.details["zip_entry"] = "config.json"
+        elif malformation == "self-authorizing-nested-marker":
+            malformed.issues = [
+                issue
+                for issue in malformed.issues
+                if issue.details.get("scan_outcome_reason") != "flax_msgpack_routing_incomplete"
+            ]
+            malformed.checks = [
+                check
+                for check in malformed.checks
+                if check.details.get("scan_outcome_reason") != "flax_msgpack_routing_incomplete"
+            ]
+            dependency_check = next(
+                check for check in malformed.checks if check.details.get("required_package") == "h5py"
+            )
+            dependency_check.details["findings"] = [
+                {
+                    "details": {
+                        "analysis_incomplete": True,
+                        "scan_outcome_reason": "flax_msgpack_routing_incomplete",
+                        "zip_entry": "model.weights.h5",
+                    }
+                }
+            ]
+        elif malformation == "missing-dependency-diagnostic":
+            malformed.issues = [issue for issue in malformed.issues if issue.details.get("required_package") != "h5py"]
+            malformed.checks = [check for check in malformed.checks if check.details.get("required_package") != "h5py"]
+        else:
+            for diagnostic in malformed_diagnostics:
+                if diagnostic.details.get("required_package") == "h5py":
+                    diagnostic.message = "Unrelated dependency message"
+
+        try:
+            test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+                malformed,
+                f"nested routing coverage with {malformation}",
+            )
+        except AssertionError:
+            continue
+        accepted_malformations.append(malformation)
+
+    assert accepted_malformations == [], (
+        f"nested routing coverage contract accepted malformed cases: {accepted_malformations}"
     )
 
 
@@ -1779,38 +5299,26 @@ def test_organized_asset_scans_require_each_nested_dependency_diagnostic(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
-    result = _scan_asset("safe_data.pkl")
-    archive_path = str(tmp_path / "multiple-missing-dependencies.zip")
+    monkeypatch.setattr(keras_h5_scanner_module, "HAS_H5PY", False)
+    monkeypatch.setattr(pmml_scanner_module, "HAS_DEFUSEDXML", False)
+    monkeypatch.setattr(pmml_scanner_module, "DefusedET", None)
+    archive_file = tmp_path / "multiple-missing-dependencies.zip"
+    with zipfile.ZipFile(archive_file, "w") as archive:
+        archive.writestr("weights.h5", _plausible_hdf5_v0_payload())
+        archive.writestr(
+            "model.pmml",
+            '<?xml version="1.0"?><PMML version="4.4"><Header/><DataDictionary numberOfFields="0"/></PMML>',
+        )
+    result = core_module.scan_model_directory_or_file(str(archive_file), cache_enabled=False)
+    archive_path = str(archive_file)
     h5py_reason = "keras_h5_h5py_unavailable"
     defusedxml_reason = "pmml_safe_xml_parser_unavailable"
-    result.file_metadata[archive_path] = FileMetadataModel(
-        analysis_incomplete=True,
-        scan_outcome="inconclusive",
-        scan_outcome_reasons=[h5py_reason, defusedxml_reason],
-    )
-    result.checks.extend(
-        [
-            Check(
-                name="H5PY Library Check",
-                status=CheckStatus.FAILED,
-                message="h5py is required for Keras H5 scanning.",
-                severity=IssueSeverity.INFO,
-                location=f"{archive_path}:weights.h5",
-                details={"required_package": "h5py", "scan_outcome_reason": h5py_reason},
-                rule_code="S902",
-            ),
-            Check(
-                name="XML Parser Security Check",
-                status=CheckStatus.FAILED,
-                message="PMML XML parsing skipped because defusedxml is unavailable",
-                severity=IssueSeverity.INFO,
-                location=f"{archive_path}:model.pmml",
-                details={"required_package": "defusedxml", "scan_outcome_reason": defusedxml_reason},
-                rule_code="S902",
-            ),
-        ]
-    )
-    result.success = False
+    metadata = result.file_metadata[archive_path].model_dump(exclude_none=True)
+    assert set(metadata["scan_outcome_reasons"]) == {
+        h5py_reason,
+        defusedxml_reason,
+        "zip_analysis_incomplete",
+    }
     assert core_module.determine_exit_code(result) == 2
 
     test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
@@ -1819,6 +5327,9 @@ def test_organized_asset_scans_require_each_nested_dependency_diagnostic(
     )
 
     missing_diagnostic = result.model_copy(deep=True)
+    missing_diagnostic.issues = [
+        issue for issue in missing_diagnostic.issues if issue.details.get("required_package") != "defusedxml"
+    ]
     missing_diagnostic.checks = [
         check for check in missing_diagnostic.checks if check.details.get("required_package") != "defusedxml"
     ]
@@ -1833,26 +5344,22 @@ def test_organized_asset_scans_preserve_mixed_dependency_and_coverage_outcomes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
-    result = _scan_asset("safe_data.pkl")
-    archive_path = str(tmp_path / "mixed-dependency-and-coverage.zip")
-    dependency_reason = "keras_h5_h5py_unavailable"
-    coverage_reason = "xml_model_routing_incomplete"
-    result.file_metadata[archive_path] = FileMetadataModel(
-        analysis_incomplete=True,
-        scan_outcome="inconclusive",
-        scan_outcome_reasons=[dependency_reason, coverage_reason],
+    archive_file, result = _scan_nested_hdf5_with_missing_h5py(
+        tmp_path,
+        monkeypatch,
+        include_ambiguous_xml=True,
     )
-    result.checks.append(
-        Check(
-            name="H5PY Library Check",
-            status=CheckStatus.FAILED,
-            message="h5py is required for Keras H5 scanning.",
-            severity=IssueSeverity.INFO,
-            location=f"{archive_path}:weights.h5",
-            details={"required_package": "h5py", "scan_outcome_reason": dependency_reason},
-            rule_code="S902",
-        )
+    archive_path = str(archive_file)
+    dependency_reason = "keras_h5_h5py_unavailable"
+    metadata = result.file_metadata[archive_path].model_dump(exclude_none=True)
+    assert dependency_reason in metadata["scan_outcome_reasons"]
+    assert "xml_model_routing_incomplete" in metadata["scan_outcome_reasons"]
+    assert "zip_analysis_incomplete" in metadata["scan_outcome_reasons"]
+    dependency_diagnostics: list[Issue | Check] = [*result.issues, *result.checks]
+    assert any(
+        diagnostic.location == f"{archive_path}:weights.h5"
+        and diagnostic.details.get("scan_outcome_reason") == dependency_reason
+        for diagnostic in dependency_diagnostics
     )
     result.issues.append(
         Issue(
@@ -1862,7 +5369,7 @@ def test_organized_asset_scans_preserve_mixed_dependency_and_coverage_outcomes(
             rule_code="S204",
         )
     )
-    result.success = False
+    assert result.success is False
     assert core_module.determine_exit_code(result) == 1
 
     test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
@@ -2049,7 +5556,16 @@ def test_organized_asset_scans_reject_incomplete_unflagged_coverage_with_securit
         )
 
 
+@pytest.mark.parametrize(
+    "scan_outcome_reason",
+    [
+        pytest.param("xml_model_routing_incomplete", id="mismatched-string"),
+        pytest.param(123, id="non-string"),
+        pytest.param("", id="empty-string"),
+    ],
+)
 def test_organized_asset_scans_reject_mismatched_unflagged_coverage_reasons(
+    scan_outcome_reason: Any,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2059,7 +5575,7 @@ def test_organized_asset_scans_reject_mismatched_unflagged_coverage_reasons(
     result.file_metadata[model_path] = FileMetadataModel(
         analysis_incomplete=True,
         scan_outcome="inconclusive",
-        scan_outcome_reason="xml_model_routing_incomplete",
+        scan_outcome_reason=scan_outcome_reason,
         scan_outcome_reasons=["flax_msgpack_routing_incomplete"],
     )
     result.issues.append(
@@ -2153,7 +5669,9 @@ def test_organized_asset_scans_reject_bare_exception_diagnostics(
         )
 
 
+@pytest.mark.parametrize("unexpected_field", ["error", "error_type"])
 def test_organized_asset_scans_reject_parse_error_with_additional_error(
+    unexpected_field: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
@@ -2171,7 +5689,7 @@ def test_organized_asset_scans_reject_parse_error_with_additional_error(
                 "parse_error": "invalid pickle stream",
                 "exception_type": "ValueError",
                 "analysis_incomplete": True,
-                "error": "independent scanner failure",
+                unexpected_field: "independent scanner failure",
             },
         )
     )
