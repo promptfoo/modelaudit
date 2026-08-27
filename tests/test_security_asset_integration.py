@@ -176,6 +176,23 @@ ALIASLESS_PICKLE_DISALLOWED_FIELDS = frozenset(
     }
 )
 
+COMPRESSION_DIAGNOSTIC_DISALLOWED_FIELDS = frozenset(
+    {
+        "analysis_incomplete",
+        "category",
+        "error",
+        "error_type",
+        "exception",
+        "exception_type",
+        "interrupted",
+        "operational_error",
+        "operational_error_reason",
+        "scan_outcome",
+        "scan_outcome_reason",
+        "scan_outcome_reasons",
+    }
+)
+
 CompressionBombKey = tuple[str, int, int]
 XmlArchiveSourceProfile = tuple[str, str, bool]
 _TEST_ZIP_EXTRACTION_MANIFEST_ATTRIBUTE = "_test_zip_extraction_manifest"
@@ -2171,11 +2188,17 @@ def _zip_archive_occurrence_contract(
                         member.filename if zip_entry_prefix is None else f"{zip_entry_prefix}:{member.filename}"
                     )
                     nested_archive_basename, preserve_basename = _zip_member_temp_name_profile(member.filename)
-                    with tempfile.NamedTemporaryFile(suffix=f"_{nested_archive_basename}") as nested_file:
-                        nested_file.write(nested_payload)
-                        nested_file.flush()
+                    nested_temp_path = ""
+                    try:
+                        with tempfile.NamedTemporaryFile(
+                            suffix=f"_{nested_archive_basename}",
+                            delete=False,
+                        ) as nested_file:
+                            nested_temp_path = nested_file.name
+                            nested_file.write(nested_payload)
+                            nested_file.flush()
                         inspect_archive(
-                            nested_file.name,
+                            nested_temp_path,
                             member_path,
                             nested_prefix,
                             nested_archive_basename,
@@ -2184,6 +2207,10 @@ def _zip_archive_occurrence_contract(
                             depth + 1,
                             root_archive=False,
                         )
+                    finally:
+                        if nested_temp_path:
+                            with contextlib.suppress(OSError):
+                                os.unlink(nested_temp_path)
 
                 listed_member_counts = Counter(
                     {member_name: len(member_contents) for member_name, member_contents in listed_by_member.items()}
@@ -3733,13 +3760,14 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
         else:
             unexpected_errors.add(owner_path)
 
+    corrupt_zip_expected_exit_code = 1 if aggregate_has_security_finding else 2
     for owner_path in corrupt_zip_paths:
         corrupt_coverage_pair = (owner_path, "zip_analysis_incomplete")
         if (
             owner_path in validated_corrupt_zip_paths
             and corrupt_coverage_pair in expected_coverage_outcomes
             and results.success is False
-            and determine_exit_code(results) == 2
+            and determine_exit_code(results) == corrupt_zip_expected_exit_code
         ):
             diagnosed_coverage_outcomes.add(corrupt_coverage_pair)
             diagnostic_incomplete_paths.add(owner_path)
@@ -3752,7 +3780,7 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
             owner_path in validated_nested_corrupt_zip_paths
             and nested_corrupt_coverage_pair in expected_coverage_outcomes
             and results.success is False
-            and determine_exit_code(results) == 2
+            and determine_exit_code(results) == corrupt_zip_expected_exit_code
         ):
             diagnosed_coverage_outcomes.add(nested_corrupt_coverage_pair)
             diagnostic_incomplete_paths.add(owner_path)
@@ -3787,6 +3815,8 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
         if _xml_archive_diagnostic_is_candidate(diagnostic):
             continue
         if diagnostic.rule_code == "S410" or _compression_bomb_diagnostic_is_candidate(diagnostic):
+            if COMPRESSION_DIAGNOSTIC_DISALLOWED_FIELDS.intersection(details):
+                unexpected_errors.add(location)
             continue
         if (
             isinstance(diagnostic.location, str)

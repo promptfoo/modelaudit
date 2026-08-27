@@ -1517,10 +1517,9 @@ def test_organized_asset_scans_preserve_nested_corrupt_zip_evidence(tmp_path: Pa
 
 def test_organized_asset_scans_preserve_nested_corrupt_zip_evidence_for_windows_path(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.chdir(tmp_path)
-    archive_path = Path(r"C:\models\nested-corrupt.zip")
+    archive_path = tmp_path / "nested-corrupt.zip"
+    assert archive_path.parent == tmp_path
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.writestr("inner.zip", _corrupt_zip_payload())
 
@@ -2114,6 +2113,83 @@ def test_organized_asset_scans_preserve_nested_hdf5_aggregate_security_precedenc
         aggregate,
         f"nested HDF5 aggregate with separate-root {severity.value} {record_kind}",
     )
+
+
+@pytest.mark.parametrize("archive_profile", ["root", "nested"])
+@pytest.mark.parametrize("record_kind", ["issue", "check"])
+@pytest.mark.parametrize("severity", [IssueSeverity.WARNING, IssueSeverity.CRITICAL])
+def test_organized_asset_scans_preserve_corrupt_zip_aggregate_security_precedence(
+    severity: IssueSeverity,
+    record_kind: str,
+    archive_profile: str,
+    tmp_path: Path,
+) -> None:
+    archive_path = tmp_path / f"{archive_profile}-corrupt.zip"
+    if archive_profile == "root":
+        archive_path.write_bytes(_corrupt_zip_payload())
+    else:
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("inner.zip", _corrupt_zip_payload())
+    result = core_module.scan_model_directory_or_file(str(archive_path), cache_enabled=False)
+
+    security_result = _scan_asset("safe_data.pkl")
+    finding_location = str(ASSETS / "safe_data.pkl")
+    if record_kind == "issue":
+        security_result.issues.append(
+            Issue(
+                message="Separate-root security finding",
+                severity=severity,
+                location=finding_location,
+                rule_code="S204",
+            )
+        )
+    else:
+        security_result.checks.append(
+            Check(
+                name="Separate Root Security Check",
+                status=CheckStatus.FAILED,
+                message="Separate-root security finding",
+                severity=severity,
+                location=finding_location,
+                rule_code="S204",
+            )
+        )
+    result.aggregate_scan_result(security_result)
+
+    assert result.success is False
+    assert core_module.determine_exit_code(result) == 1
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+        result,
+        f"{archive_profile} corrupt ZIP aggregate with separate-root {severity.value} {record_kind}",
+    )
+
+
+def test_zip_archive_contract_closes_nested_temp_before_recursive_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _archive_path, result = _scan_nested_zip_archive(tmp_path, (("ordinary.txt", b"ordinary"),))
+    opened_files: list[Any] = []
+    real_named_temporary_file = tempfile.NamedTemporaryFile
+    real_open_preflighted_zip = test_security_asset_integration.open_preflighted_zip
+
+    def tracked_named_temporary_file(*args: Any, **kwargs: Any) -> Any:
+        handle = real_named_temporary_file(*args, **kwargs)
+        opened_files.append(handle)
+        return handle
+
+    def guarded_open_preflighted_zip(archive_path: str, config: dict[str, int]) -> Any:
+        assert all(handle.closed for handle in opened_files if handle.name == archive_path)
+        return real_open_preflighted_zip(archive_path, config)
+
+    monkeypatch.setattr(tempfile, "NamedTemporaryFile", tracked_named_temporary_file)
+    monkeypatch.setattr(test_security_asset_integration, "open_preflighted_zip", guarded_open_preflighted_zip)
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+        result,
+        "nested archive whose temporary file must be closed before recursion",
+    )
+    assert opened_files
+    assert all(not Path(handle.name).exists() for handle in opened_files)
 
 
 @pytest.mark.parametrize("malformation", ["success", "has-errors"])
@@ -3400,9 +3476,24 @@ def test_organized_asset_scans_preserve_duplicate_nested_archive_security_occurr
         result,
         f"duplicate nested {rule_code} baseline",
     )
+    extraction_manifest = test_security_asset_integration._test_zip_extraction_manifest(result)
+    source_generations = test_security_asset_integration._test_zip_extraction_generations(result)
+    assert extraction_manifest is not None
+    assert source_generations
 
     for mutation in ("missing", "corrupt", "duplicate"):
         mutated = result.model_copy(deep=True)
+        test_security_asset_integration._set_test_zip_extraction_manifest(
+            mutated,
+            extraction_manifest,
+            source=result,
+        )
+        assert test_security_asset_integration._test_zip_extraction_manifest(mutated) is extraction_manifest, (
+            "archive mutation copy must preserve its extraction-manifest authorization"
+        )
+        assert test_security_asset_integration._test_zip_extraction_generations(mutated) == source_generations, (
+            "archive mutation copy must preserve its authorized extraction generations"
+        )
         mutated_issues = [issue for issue in mutated.issues if issue.rule_code == rule_code]
         mutated_check = next(
             check for check in mutated.checks if check.name == check_name and check.status == CheckStatus.FAILED
@@ -3418,6 +3509,45 @@ def test_organized_asset_scans_preserve_duplicate_nested_archive_security_occurr
                 mutated,
                 f"duplicate nested {rule_code} with {mutation} evidence",
             )
+
+
+@pytest.mark.parametrize(
+    "operational_details",
+    [
+        {"error": "compression scanner failed"},
+        {"error_type": "CompressionError"},
+        {"exception": "compression scanner failed"},
+        {"exception_type": "CompressionError"},
+        {"operational_error": True},
+        {"interrupted": True},
+    ],
+)
+@pytest.mark.parametrize("candidate_profile", ["rule-code", "compression-shaped"])
+def test_organized_asset_scans_reject_unvalidated_compression_diagnostic_errors(
+    candidate_profile: str,
+    operational_details: dict[str, Any],
+) -> None:
+    result = _scan_asset("safe_data.pkl")
+    details: dict[str, Any] = dict(operational_details)
+    rule_code: str | None = "S410"
+    if candidate_profile == "compression-shaped":
+        rule_code = None
+        details["ratio"] = 999.0
+    result.issues.append(
+        Issue(
+            message="Unvalidated compression diagnostic",
+            severity=IssueSeverity.INFO,
+            location=str(ASSETS / "safe_data.pkl"),
+            rule_code=rule_code,
+            details=details,
+        )
+    )
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            f"{candidate_profile} diagnostic with {next(iter(operational_details))}",
+        )
 
 
 def test_organized_asset_scans_preserve_duplicate_nested_xml_occurrences(tmp_path: Path) -> None:
