@@ -4483,6 +4483,7 @@ _DOCUMENTED_EXAMPLE_FORBIDDEN_NAMES = frozenset(
     {
         "__builtins__",
         "__import__",
+        "breakpoint",
         "builtins",
         "compile",
         "delattr",
@@ -4491,6 +4492,7 @@ _DOCUMENTED_EXAMPLE_FORBIDDEN_NAMES = frozenset(
         "getattr",
         "globals",
         "locals",
+        "open",
         "setattr",
         "vars",
     }

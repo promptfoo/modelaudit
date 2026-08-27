@@ -610,6 +610,47 @@ def test_text_scanner_documentation_image_binding_bypasses_stay_actionable(
 
 
 @pytest.mark.parametrize(
+    "injected_code",
+    [
+        pytest.param(
+            "open('sitecustomize.py', 'w').write('print(1)')",
+            id="startup-hook-direct-open",
+        ),
+        pytest.param(
+            "writer = open\nwriter('usercustomize.py', 'w').write('print(1)')",
+            id="startup-hook-aliased-open",
+        ),
+        pytest.param(
+            "(lambda writer: writer('sitecustomize.py', 'w').write('print(1)'))(open)",
+            id="startup-hook-higher-order-open",
+        ),
+        pytest.param("breakpoint()", id="interactive-debugger"),
+    ],
+)
+def test_text_scanner_documentation_image_rejects_side_effectful_builtin_calls(
+    tmp_path: Path,
+    injected_code: str,
+) -> None:
+    payload = HUGGINGFACE_DOCUMENTATION_IMAGE_EXAMPLE.replace(
+        "))\n```\n",
+        f"))\n{injected_code}\n```\n",
+    ).encode()
+    path = tmp_path / "README.md"
+    path.write_bytes(payload)
+
+    result = TextScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+    assert result.success is False
+    assert network_comm.official_readme_urlopen_image_example_spans(payload) == ()
+    assert any(
+        check.details.get("function") == "urlopen" and check.severity == IssueSeverity.CRITICAL
+        for check in _failed_network_detection_checks(result)
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+@pytest.mark.parametrize(
     "example",
     [
         pytest.param(
