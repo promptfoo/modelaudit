@@ -1,10 +1,14 @@
 """Coverage contracts for committed assets consumed by Nightly scans."""
 
+import hashlib
 import io
 import shutil
 import sys
 import tarfile
+import tempfile
 import zipfile
+import zlib
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -65,7 +69,10 @@ def _scan_ambiguous_xml_archive(
             archive.writestr(member_name, AMBIGUOUS_XML_PAYLOAD)
         for member_name in unrelated_members:
             archive.writestr(member_name, b"ordinary unknown archive member")
-    return archive_path, core_module.scan_model_directory_or_file(str(archive_path), cache_enabled=False)
+    return archive_path, test_security_asset_integration.scan_model_directory_or_file_with_extraction_manifest(
+        str(archive_path),
+        cache_enabled=False,
+    )
 
 
 def _zip_payload(entries: tuple[tuple[str, bytes], ...], *, compression: int = zipfile.ZIP_STORED) -> bytes:
@@ -93,7 +100,10 @@ def _scan_nested_zip_archive(
     inner_payload = _zip_payload(inner_entries, compression=inner_compression)
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.writestr("inner.zip", inner_payload)
-    return archive_path, core_module.scan_model_directory_or_file(str(archive_path), cache_enabled=False)
+    return archive_path, test_security_asset_integration.scan_model_directory_or_file_with_extraction_manifest(
+        str(archive_path),
+        cache_enabled=False,
+    )
 
 
 def _scan_duplicate_nested_zip_archives(
@@ -110,12 +120,16 @@ def _scan_duplicate_nested_zip_archives(
         archive.writestr("inner.zip", first_payload)
         with pytest.warns(UserWarning, match="Duplicate name"):
             archive.writestr("inner.zip", second_payload)
-    return archive_path, core_module.scan_model_directory_or_file(str(archive_path), cache_enabled=False)
+    return archive_path, test_security_asset_integration.scan_model_directory_or_file_with_extraction_manifest(
+        str(archive_path),
+        cache_enabled=False,
+    )
 
 
 def _merge_with_canonical_agpl_source_change(result: ModelAuditResultModel) -> ModelAuditResultModel:
     expected_source_change = core_module.scan_model_directory_or_file(str(AGPL_ASSET), cache_enabled=False)
     expected_source_change.aggregate_scan_result(result)
+    test_security_asset_integration._merge_test_zip_extraction_manifests(expected_source_change, result)
     return expected_source_change
 
 
@@ -127,6 +141,13 @@ def _assert_otherwise_accepted_archive_control(
     hidden_reasons: frozenset[str] = frozenset(),
 ) -> None:
     control = result.model_copy(deep=True)
+    manifest = test_security_asset_integration._test_zip_extraction_manifest(result)
+    if manifest is not None:
+        test_security_asset_integration._set_test_zip_extraction_manifest(
+            control,
+            manifest,
+            source=result,
+        )
     control.issues = [issue for issue in control.issues if issue.location != failed_member]
     control.checks = [check for check in control.checks if check.location != failed_member]
     for archive_path, metadata in control.file_metadata.items():
@@ -1096,6 +1117,84 @@ def test_organized_asset_scans_reject_bare_exception_on_source_stability_diagnos
         )
 
 
+def test_organized_asset_scans_reject_mutated_source_stability_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def raise_source_stability_error(_report_generation: int | None) -> None:
+        raise _source_stability_error()
+
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", raise_source_stability_error)
+    result = core_module.scan_model_directory_or_file(str(AGPL_ASSET), cache_enabled=False)
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+        result,
+        "canonical source-stability identity",
+    )
+
+    accepted_mutations: list[str] = []
+    for mutation in (
+        "issue-rule",
+        "issue-severity",
+        "issue-type",
+        "check-rule",
+        "check-severity",
+        "check-name",
+        "issue-as-check",
+        "check-as-issue",
+        "duplicate-issue",
+        "duplicate-check",
+        "cross-owner",
+    ):
+        mutated = result.model_copy(deep=True)
+        issue = next(
+            candidate
+            for candidate in mutated.issues
+            if candidate.details.get("analysis") == "python_call_graph_source_stability"
+        )
+        check = next(
+            candidate
+            for candidate in mutated.checks
+            if candidate.details.get("analysis") == "python_call_graph_source_stability"
+        )
+        if mutation == "issue-rule":
+            issue.rule_code = "S999"
+        elif mutation == "issue-severity":
+            issue.severity = IssueSeverity.WARNING
+        elif mutation == "issue-type":
+            issue.type = "generic"
+        elif mutation == "check-rule":
+            check.rule_code = "S999"
+        elif mutation == "check-severity":
+            check.severity = IssueSeverity.WARNING
+        elif mutation == "check-name":
+            check.name = "Generic Operational Failure"
+        elif mutation == "issue-as-check":
+            mutated.issues.remove(issue)
+            mutated.checks.append(check.model_copy(deep=True))
+        elif mutation == "check-as-issue":
+            mutated.checks.remove(check)
+            mutated.issues.append(issue.model_copy(deep=True))
+        elif mutation == "duplicate-issue":
+            mutated.issues.append(issue.model_copy(deep=True))
+        elif mutation == "duplicate-check":
+            mutated.checks.append(check.model_copy(deep=True))
+        else:
+            copied_issue = issue.model_copy(deep=True)
+            copied_issue.location = str(tmp_path / "unrelated.pkl")
+            mutated.issues.append(copied_issue)
+
+        try:
+            test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+                mutated,
+                f"source-stability diagnostic with {mutation}",
+            )
+        except AssertionError:
+            continue
+        accepted_mutations.append(mutation)
+
+    assert not accepted_mutations, f"source-stability identity mutations were accepted: {accepted_mutations}"
+
+
 def test_organized_asset_scans_reject_passed_source_stability_check(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1416,6 +1515,32 @@ def test_organized_asset_scans_preserve_nested_corrupt_zip_evidence(tmp_path: Pa
     )
 
 
+def test_organized_asset_scans_preserve_nested_corrupt_zip_evidence_for_windows_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    archive_path = Path(r"C:\models\nested-corrupt.zip")
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("inner.zip", _corrupt_zip_payload())
+
+    result = core_module.scan_model_directory_or_file(str(archive_path), cache_enabled=False)
+    nested_location = rf"{archive_path}:inner.zip"
+    issues = [issue for issue in result.issues if issue.rule_code == "S902" and issue.location == nested_location]
+    checks = [
+        check
+        for check in result.checks
+        if check.name == "ZIP File Format Validation" and check.location == nested_location
+    ]
+    assert result.success is False
+    assert len(issues) == 1
+    assert len(checks) == 1
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+        result,
+        "canonical nested corrupt ZIP with a Windows path",
+    )
+
+
 def test_organized_asset_scans_preserve_duplicate_nested_corrupt_zip_occurrences(
     tmp_path: Path,
 ) -> None:
@@ -1707,7 +1832,10 @@ def _scan_nested_hdf5_with_missing_h5py(
             archive.writestr(nested_archive_name, _zip_payload((("weights.h5", hdf5_payload),)))
         if include_ambiguous_xml:
             archive.writestr("ambiguous.txt", AMBIGUOUS_XML_PAYLOAD)
-    return archive_path, core_module.scan_model_directory_or_file(str(archive_path), cache_enabled=False)
+    return archive_path, test_security_asset_integration.scan_model_directory_or_file_with_extraction_manifest(
+        str(archive_path),
+        cache_enabled=False,
+    )
 
 
 def test_organized_asset_scans_preserve_nested_hdf5_missing_dependency(
@@ -1926,11 +2054,911 @@ def test_organized_asset_scans_preserve_independent_nested_hdf5_roots(
         )
         results.append(result)
     results[0].aggregate_scan_result(results[1])
+    test_security_asset_integration._merge_test_zip_extraction_manifests(
+        results[0],
+        *results,
+    )
 
     test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
         results[0],
         "independent nested HDF5 roots",
     )
+
+
+@pytest.mark.parametrize("record_kind", ["issue", "check"])
+@pytest.mark.parametrize("severity", [IssueSeverity.WARNING, IssueSeverity.CRITICAL])
+def test_organized_asset_scans_preserve_nested_hdf5_aggregate_security_precedence(
+    severity: IssueSeverity,
+    record_kind: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    results: list[tuple[Path, ModelAuditResultModel]] = []
+    for index in range(2):
+        root = tmp_path / str(index)
+        root.mkdir()
+        results.append(_scan_nested_hdf5_with_missing_h5py(root, monkeypatch))
+    second_archive, second_result = results[1]
+    finding_location = f"{second_archive}:payload.pkl"
+    if record_kind == "issue":
+        second_result.issues.append(
+            Issue(
+                message="Separate-root security finding",
+                severity=severity,
+                location=finding_location,
+                rule_code="S204",
+            )
+        )
+    else:
+        second_result.checks.append(
+            Check(
+                name="Separate Root Security Check",
+                status=CheckStatus.FAILED,
+                message="Separate-root security finding",
+                severity=severity,
+                location=finding_location,
+                rule_code="S204",
+            )
+        )
+    aggregate = results[0][1]
+    aggregate.aggregate_scan_result(second_result)
+    test_security_asset_integration._merge_test_zip_extraction_manifests(
+        aggregate,
+        aggregate,
+        second_result,
+    )
+
+    assert aggregate.success is False
+    assert core_module.determine_exit_code(aggregate) == 1
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+        aggregate,
+        f"nested HDF5 aggregate with separate-root {severity.value} {record_kind}",
+    )
+
+
+@pytest.mark.parametrize("malformation", ["success", "has-errors"])
+def test_organized_asset_scans_reject_malformed_nested_hdf5_aggregate_state(
+    malformation: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _archive_path, result = _scan_nested_hdf5_with_missing_h5py(tmp_path, monkeypatch)
+    assert result.success is False
+    assert core_module.determine_exit_code(result) == 2
+    if malformation == "success":
+        result.success = True
+    else:
+        result.has_errors = True
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            f"nested HDF5 aggregate with malformed {malformation} state",
+        )
+
+
+def test_organized_asset_scans_reject_forged_nested_hdf5_temp_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _archive_path, result = _scan_nested_hdf5_with_missing_h5py(tmp_path, monkeypatch)
+    temp_root = Path(tempfile.gettempdir())
+    forged_paths = {
+        "attacker-parent": tmp_path / "attacker" / "fake_weights.h5",
+        "wrong-parent": tmp_path / "tmpabcdefgh_weights.h5",
+        "wrong-generated-name": temp_root / "fake_weights.h5",
+        "correct-shape-nonexistent": temp_root / f"{tempfile.gettempprefix()}zzzzzzzz_weights.h5",
+    }
+    accepted_mutations: list[str] = []
+    for mutation, forged_path in forged_paths.items():
+        mutated = result.model_copy(deep=True)
+        diagnostics: list[Issue | Check] = [*mutated.issues, *mutated.checks]
+        for diagnostic in diagnostics:
+            if diagnostic.details.get("required_package") == "h5py":
+                diagnostic.details["path"] = str(forged_path)
+        try:
+            test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+                mutated,
+                f"nested HDF5 with {mutation} temp path",
+            )
+        except AssertionError:
+            continue
+        accepted_mutations.append(mutation)
+
+    assert not accepted_mutations, f"forged nested HDF5 temp paths were accepted: {accepted_mutations}"
+
+
+def test_organized_asset_scans_reject_cross_occurrence_nested_hdf5_temp_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+    monkeypatch.setattr(keras_h5_scanner_module, "HAS_H5PY", False)
+    archive_path = tmp_path / "distinct-hdf5-occurrences.zip"
+    payload = _plausible_hdf5_v0_payload()
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("left/weights.h5", payload)
+        archive.writestr("right/weights.h5", payload)
+    result = test_security_asset_integration.scan_model_directory_or_file_with_extraction_manifest(
+        str(archive_path),
+        cache_enabled=False,
+    )
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+        result,
+        "distinct nested HDF5 temp-path occurrences",
+    )
+
+    issues = [issue for issue in result.issues if issue.details.get("required_package") == "h5py"]
+    assert len(issues) == 2
+    first_path = issues[0].details["path"]
+    second_location = issues[1].location
+    diagnostics: list[Issue | Check] = [*result.issues, *result.checks]
+    for diagnostic in diagnostics:
+        if diagnostic.location == second_location and diagnostic.details.get("required_package") == "h5py":
+            diagnostic.details["path"] = first_path
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            "cross-occurrence nested HDF5 temp path",
+        )
+
+
+def test_organized_asset_scans_reject_distinct_nonexistent_nested_hdf5_temp_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+    monkeypatch.setattr(keras_h5_scanner_module, "HAS_H5PY", False)
+    archive_path = tmp_path / "distinct-forged-hdf5-occurrences.zip"
+    payload = _plausible_hdf5_v0_payload()
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("left/weights.h5", payload)
+        archive.writestr("right/weights.h5", payload)
+    result = test_security_asset_integration.scan_model_directory_or_file_with_extraction_manifest(
+        str(archive_path),
+        cache_enabled=False,
+    )
+    issues = [issue for issue in result.issues if issue.details.get("required_package") == "h5py"]
+    assert len(issues) == 2
+    temp_root = Path(tempfile.gettempdir())
+    forged_paths = {
+        issue.location: temp_root / f"{tempfile.gettempprefix()}zzzzzzz{index}_weights.h5"
+        for index, issue in enumerate(issues)
+    }
+    diagnostics: list[Issue | Check] = [*result.issues, *result.checks]
+    for diagnostic in diagnostics:
+        if diagnostic.location in forged_paths and diagnostic.details.get("required_package") == "h5py":
+            diagnostic.details["path"] = str(forged_paths[diagnostic.location])
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            "distinct nonexistent nested HDF5 temp paths",
+        )
+
+
+@pytest.mark.parametrize("profile", ["nested-hdf5", "xml"])
+@pytest.mark.parametrize("manifest_mutation", ["missing-event", "duplicate-event"])
+def test_organized_asset_scans_require_exact_extraction_manifest_events(
+    profile: str,
+    manifest_mutation: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if profile == "nested-hdf5":
+        _archive_path, result = _scan_nested_hdf5_with_missing_h5py(tmp_path, monkeypatch)
+        source_path = next(
+            issue.details["path"] for issue in result.issues if issue.details.get("required_package") == "h5py"
+        )
+    else:
+        _archive_path, result = _scan_ambiguous_xml_archive(tmp_path, ("ambiguous.txt",))
+        source_path = next(
+            issue.details["path"] for issue in result.issues if issue.details.get("format") == "xml_model_inconclusive"
+        )
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+        result,
+        f"{profile} with exact extraction manifest",
+    )
+    manifest = test_security_asset_integration._test_zip_extraction_manifest(result)
+    assert manifest is not None
+    event_index = next(index for index, event in enumerate(manifest.events) if event.temp_path == source_path)
+    mutated = result.model_copy(deep=True)
+    if manifest_mutation == "missing-event":
+        mutated_manifest = manifest.without_event(event_index)
+    else:
+        mutated_manifest = manifest.with_duplicate_event(event_index)
+    test_security_asset_integration._set_test_zip_extraction_manifest(
+        mutated,
+        mutated_manifest,
+        source=result,
+    )
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            mutated,
+            f"{profile} with {manifest_mutation} extraction manifest",
+        )
+
+
+@pytest.mark.parametrize(
+    "manifest_mutation",
+    [
+        "coherent-fake-path",
+        "zero-size",
+        "wrong-size",
+        "source-crc",
+        "extracted-crc",
+        "occurrence-index",
+        "wrong-member",
+    ],
+)
+def test_organized_asset_scans_reject_unverified_extraction_manifest_events(
+    manifest_mutation: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _archive_path, result = _scan_nested_hdf5_with_missing_h5py(tmp_path, monkeypatch)
+    source_path = next(
+        issue.details["path"] for issue in result.issues if issue.details.get("required_package") == "h5py"
+    )
+    manifest = test_security_asset_integration._test_zip_extraction_manifest(result)
+    assert manifest is not None
+    event_index = next(index for index, event in enumerate(manifest.events) if event.temp_path == source_path)
+    event = manifest.events[event_index]
+
+    def build_event(
+        *,
+        verified: bool = False,
+        temp_path: str | None = None,
+        entry_name: str | None = None,
+        entry_occurrence: int | None = None,
+        source_occurrence_count: int | None = None,
+        source_size: int | None = None,
+        source_crc32: int | None = None,
+        extracted_size: int | None = None,
+        extracted_crc32: int | None = None,
+    ) -> test_security_asset_integration._ZipExtractionEvent:
+        resolved_temp_path = event.temp_path if temp_path is None else temp_path
+        resolved_entry_name = event.entry_name if entry_name is None else entry_name
+        resolved_entry_occurrence = event.entry_occurrence if entry_occurrence is None else entry_occurrence
+        resolved_source_occurrence_count = (
+            event.source_occurrence_count if source_occurrence_count is None else source_occurrence_count
+        )
+        resolved_source_size = event.source_size if source_size is None else source_size
+        resolved_source_crc32 = event.source_crc32 if source_crc32 is None else source_crc32
+        resolved_extracted_size = event.extracted_size if extracted_size is None else extracted_size
+        resolved_extracted_crc32 = event.extracted_crc32 if extracted_crc32 is None else extracted_crc32
+        if verified:
+            return test_security_asset_integration._captured_zip_extraction_event(
+                generation_id=event.generation_id,
+                temp_path=resolved_temp_path,
+                archive_path=event.archive_path,
+                entry_name=resolved_entry_name,
+                entry_occurrence=resolved_entry_occurrence,
+                source_occurrence_count=resolved_source_occurrence_count,
+                source_header_offset=event.source_header_offset,
+                source_size=resolved_source_size,
+                source_crc32=resolved_source_crc32,
+                extracted_size=resolved_extracted_size,
+                extracted_crc32=resolved_extracted_crc32,
+            )
+        return test_security_asset_integration._ZipExtractionEvent(
+            generation_id=event.generation_id,
+            temp_path=resolved_temp_path,
+            archive_path=event.archive_path,
+            entry_name=resolved_entry_name,
+            entry_occurrence=resolved_entry_occurrence,
+            source_occurrence_count=resolved_source_occurrence_count,
+            source_header_offset=event.source_header_offset,
+            source_size=resolved_source_size,
+            source_crc32=resolved_source_crc32,
+            extracted_size=resolved_extracted_size,
+            extracted_crc32=resolved_extracted_crc32,
+        )
+
+    if manifest_mutation == "coherent-fake-path":
+        forged_path = str(Path(tempfile.gettempdir()) / f"{tempfile.gettempprefix()}zzzzzzzz_weights.h5")
+        diagnostics: list[Issue | Check] = [*result.issues, *result.checks]
+        for diagnostic in diagnostics:
+            if diagnostic.details.get("required_package") == "h5py":
+                diagnostic.details["path"] = forged_path
+        mutated_event = build_event(temp_path=forged_path)
+    elif manifest_mutation == "occurrence-index":
+        mutated_event = build_event(
+            entry_occurrence=event.entry_occurrence + 1,
+            source_occurrence_count=max(event.source_occurrence_count, 2),
+        )
+    elif manifest_mutation == "wrong-member":
+        mutated_event = build_event(entry_name="other/weights.h5")
+    elif manifest_mutation == "zero-size":
+        mutated_event = build_event(verified=True, extracted_size=0)
+    elif manifest_mutation == "wrong-size":
+        mutated_event = build_event(verified=True, extracted_size=event.extracted_size + 1)
+    elif manifest_mutation == "source-crc":
+        mutated_event = build_event(verified=True, source_crc32=event.source_crc32 ^ 1)
+    else:
+        mutated_event = build_event(verified=True, extracted_crc32=event.extracted_crc32 ^ 1)
+    mutated_events = list(manifest.events)
+    mutated_events[event_index] = mutated_event
+    test_security_asset_integration._set_test_zip_extraction_manifest(
+        result,
+        test_security_asset_integration._ZipExtractionManifest(tuple(mutated_events)),
+    )
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            f"nested HDF5 with {manifest_mutation} extraction event",
+        )
+
+
+def test_organized_asset_scans_reject_cross_assigned_extraction_manifest_occurrences(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+    monkeypatch.setattr(keras_h5_scanner_module, "HAS_H5PY", False)
+    archive_path = tmp_path / "cross-assigned-extraction-events.zip"
+    left_payload = bytearray(_plausible_hdf5_v0_payload(file_size=256))
+    right_payload = bytearray(left_payload)
+    right_payload[-1] = 1
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("left/weights.h5", left_payload)
+        archive.writestr("right/weights.h5", right_payload)
+    result = test_security_asset_integration.scan_model_directory_or_file_with_extraction_manifest(
+        str(archive_path),
+        cache_enabled=False,
+    )
+    manifest = test_security_asset_integration._test_zip_extraction_manifest(result)
+    assert manifest is not None
+    event_indices = {
+        event.entry_name: index
+        for index, event in enumerate(manifest.events)
+        if event.entry_name in {"left/weights.h5", "right/weights.h5"}
+    }
+    assert set(event_indices) == {"left/weights.h5", "right/weights.h5"}
+    left_event = manifest.events[event_indices["left/weights.h5"]]
+    right_event = manifest.events[event_indices["right/weights.h5"]]
+    assert left_event.source_size == right_event.source_size
+    assert left_event.source_crc32 != right_event.source_crc32
+    swapped_paths = {
+        f"{archive_path}:left/weights.h5": right_event.temp_path,
+        f"{archive_path}:right/weights.h5": left_event.temp_path,
+    }
+    diagnostics: list[Issue | Check] = [*result.issues, *result.checks]
+    for diagnostic in diagnostics:
+        if diagnostic.location in swapped_paths and diagnostic.details.get("required_package") == "h5py":
+            diagnostic.details["path"] = swapped_paths[diagnostic.location]
+    mutated_events = list(manifest.events)
+    mutated_events[event_indices["left/weights.h5"]] = test_security_asset_integration._ZipExtractionEvent(
+        generation_id=left_event.generation_id,
+        temp_path=right_event.temp_path,
+        archive_path=left_event.archive_path,
+        entry_name=left_event.entry_name,
+        entry_occurrence=left_event.entry_occurrence,
+        source_occurrence_count=left_event.source_occurrence_count,
+        source_header_offset=left_event.source_header_offset,
+        source_size=right_event.source_size,
+        source_crc32=right_event.source_crc32,
+        extracted_size=right_event.extracted_size,
+        extracted_crc32=right_event.extracted_crc32,
+    )
+    mutated_events[event_indices["right/weights.h5"]] = test_security_asset_integration._ZipExtractionEvent(
+        generation_id=right_event.generation_id,
+        temp_path=left_event.temp_path,
+        archive_path=right_event.archive_path,
+        entry_name=right_event.entry_name,
+        entry_occurrence=right_event.entry_occurrence,
+        source_occurrence_count=right_event.source_occurrence_count,
+        source_header_offset=right_event.source_header_offset,
+        source_size=left_event.source_size,
+        source_crc32=left_event.source_crc32,
+        extracted_size=left_event.extracted_size,
+        extracted_crc32=left_event.extracted_crc32,
+    )
+    test_security_asset_integration._set_test_zip_extraction_manifest(
+        result,
+        test_security_asset_integration._ZipExtractionManifest(tuple(mutated_events)),
+    )
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            "cross-assigned extraction event occurrences",
+        )
+
+
+def test_organized_asset_scans_preserve_skipped_duplicate_extraction_occurrence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+    monkeypatch.setattr(keras_h5_scanner_module, "HAS_H5PY", False)
+    archive_path = tmp_path / "skipped-duplicate-extraction.zip"
+    hdf5_payload = _plausible_hdf5_v0_payload()
+    with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("weights.h5", COMPRESSION_BOMB_PAYLOAD)
+        with pytest.warns(UserWarning, match="Duplicate name"):
+            archive.writestr("weights.h5", hdf5_payload)
+
+    result = test_security_asset_integration.scan_model_directory_or_file_with_extraction_manifest(
+        str(archive_path),
+        cache_enabled=False,
+    )
+    manifest = test_security_asset_integration._test_zip_extraction_manifest(result)
+    assert manifest is not None
+    extracted_events = [event for event in manifest.events if event.entry_name == "weights.h5"]
+    assert len(extracted_events) == 1
+    assert extracted_events[0].entry_occurrence == 1
+    assert any(issue.rule_code == "S410" for issue in result.issues)
+    assert any(issue.details.get("required_package") == "h5py" for issue in result.issues)
+    assert core_module.determine_exit_code(result) == 1
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+        result,
+        "skipped first duplicate extraction occurrence",
+    )
+
+
+def test_organized_asset_scans_bind_skipped_identical_duplicate_to_actual_source_occurrence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+    monkeypatch.setattr(keras_h5_scanner_module, "HAS_H5PY", False)
+    archive_path = tmp_path / "skipped-identical-duplicate-extraction.zip"
+    hdf5_payload = _plausible_hdf5_v0_payload(file_size=2 * 1024 * 1024)
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("weights.h5", hdf5_payload, compress_type=zipfile.ZIP_DEFLATED)
+        with pytest.warns(UserWarning, match="Duplicate name"):
+            archive.writestr("weights.h5", hdf5_payload, compress_type=zipfile.ZIP_STORED)
+    with zipfile.ZipFile(archive_path) as archive:
+        source_entries = archive.infolist()
+    assert len(source_entries) == 2
+    assert source_entries[0].CRC == source_entries[1].CRC
+    assert source_entries[0].file_size == source_entries[1].file_size
+
+    result = test_security_asset_integration.scan_model_directory_or_file_with_extraction_manifest(
+        str(archive_path),
+        cache_enabled=False,
+    )
+    manifest = test_security_asset_integration._test_zip_extraction_manifest(result)
+    assert manifest is not None
+    event = next(event for event in manifest.events if event.entry_name == "weights.h5")
+    assert event.entry_occurrence == 1
+    assert event.source_header_offset == source_entries[1].header_offset
+    assert any(issue.rule_code == "S410" for issue in result.issues)
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+        result,
+        "skipped identical duplicate extraction occurrence",
+    )
+
+    mutated = result.model_copy(deep=True)
+    mutated_event = test_security_asset_integration._captured_zip_extraction_event(
+        generation_id=event.generation_id,
+        temp_path=event.temp_path,
+        archive_path=event.archive_path,
+        entry_name=event.entry_name,
+        entry_occurrence=0,
+        source_occurrence_count=event.source_occurrence_count,
+        source_header_offset=source_entries[0].header_offset,
+        source_size=event.source_size,
+        source_crc32=event.source_crc32,
+        extracted_size=event.extracted_size,
+        extracted_crc32=event.extracted_crc32,
+    )
+    event_index = manifest.events.index(event)
+    mutated_events = list(manifest.events)
+    mutated_events[event_index] = mutated_event
+    test_security_asset_integration._set_test_zip_extraction_manifest(
+        mutated,
+        test_security_asset_integration._ZipExtractionManifest(tuple(mutated_events)),
+        source=result,
+    )
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            mutated,
+            "tampered skipped identical duplicate extraction occurrence",
+        )
+
+
+def test_organized_asset_scans_preserve_identical_duplicate_extraction_occurrences(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+    monkeypatch.setattr(keras_h5_scanner_module, "HAS_H5PY", False)
+    archive_path = tmp_path / "identical-duplicate-extraction.zip"
+    hdf5_payload = _plausible_hdf5_v0_payload()
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("weights.h5", hdf5_payload)
+        with pytest.warns(UserWarning, match="Duplicate name"):
+            archive.writestr("weights.h5", hdf5_payload)
+
+    result = test_security_asset_integration.scan_model_directory_or_file_with_extraction_manifest(
+        str(archive_path),
+        cache_enabled=False,
+    )
+    manifest = test_security_asset_integration._test_zip_extraction_manifest(result)
+    assert manifest is not None
+    extracted_events = [event for event in manifest.events if event.entry_name == "weights.h5"]
+    assert len(extracted_events) == 2
+    assert [event.entry_occurrence for event in extracted_events] == [0, 1]
+    assert len({event.source_header_offset for event in extracted_events}) == 2
+    assert len({event.source_crc32 for event in extracted_events}) == 1
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+        result,
+        "identical duplicate extraction occurrences",
+    )
+
+
+@pytest.mark.parametrize("nested_archive_name", [None, "inner.zip"])
+def test_organized_asset_scans_reject_root_zip_changed_before_manifest_freeze(
+    nested_archive_name: str | None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+    monkeypatch.setattr(keras_h5_scanner_module, "HAS_H5PY", False)
+    archive_path = tmp_path / "changed-before-manifest-freeze.zip"
+    first_payload = bytearray(_plausible_hdf5_v0_payload(file_size=256))
+    second_payload = bytearray(first_payload)
+    second_payload[-1] = 1
+
+    def write_root(member_payload: bytes) -> None:
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            if nested_archive_name is None:
+                archive.writestr("weights.h5", member_payload)
+            else:
+                archive.writestr(nested_archive_name, _zip_payload((("weights.h5", member_payload),)))
+
+    write_root(bytes(first_payload))
+    original_freeze = test_security_asset_integration._ZipExtractionRecorder.freeze
+
+    def overwrite_before_freeze(
+        recorder: test_security_asset_integration._ZipExtractionRecorder,
+    ) -> tuple[
+        test_security_asset_integration._ZipExtractionManifest,
+        test_security_asset_integration._ZipExtractionGeneration | None,
+    ]:
+        write_root(bytes(second_payload))
+        return original_freeze(recorder)
+
+    monkeypatch.setattr(
+        test_security_asset_integration._ZipExtractionRecorder,
+        "freeze",
+        overwrite_before_freeze,
+    )
+    result = test_security_asset_integration.scan_model_directory_or_file_with_extraction_manifest(
+        str(archive_path),
+        cache_enabled=False,
+    )
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            f"root ZIP changed before manifest freeze for {nested_archive_name or 'direct member'}",
+        )
+
+
+@pytest.mark.parametrize("nested_archive_name", [None, "inner.zip"])
+def test_organized_asset_scans_reject_stale_extraction_manifest_replay(
+    nested_archive_name: str | None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_payload = bytearray(_plausible_hdf5_v0_payload(file_size=256))
+    second_payload = bytearray(first_payload)
+    second_payload[-1] = 1
+    archive_path, first_result = _scan_nested_hdf5_with_missing_h5py(
+        tmp_path,
+        monkeypatch,
+        member_payload=bytes(first_payload),
+        nested_archive_name=nested_archive_name,
+    )
+    first_manifest = test_security_asset_integration._test_zip_extraction_manifest(first_result)
+    assert first_manifest is not None
+    first_source_path = next(
+        issue.details["path"] for issue in first_result.issues if issue.details.get("required_package") == "h5py"
+    )
+
+    rewritten_archive_path, second_result = _scan_nested_hdf5_with_missing_h5py(
+        tmp_path,
+        monkeypatch,
+        member_payload=bytes(second_payload),
+        nested_archive_name=nested_archive_name,
+    )
+    assert rewritten_archive_path == archive_path
+    second_manifest = test_security_asset_integration._test_zip_extraction_manifest(second_result)
+    assert second_manifest is not None
+    second_hdf_event = next(event for event in second_manifest.events if event.entry_name == "weights.h5")
+    first_hdf_event = next(event for event in first_manifest.events if event.entry_name == "weights.h5")
+    assert first_hdf_event.source_crc32 != second_hdf_event.source_crc32
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            first_result,
+            f"changed extraction source snapshot for {nested_archive_name or 'direct member'}",
+        )
+    diagnostics: list[Issue | Check] = [*second_result.issues, *second_result.checks]
+    for diagnostic in diagnostics:
+        if diagnostic.details.get("required_package") == "h5py":
+            diagnostic.details["path"] = first_source_path
+    test_security_asset_integration._set_test_zip_extraction_manifest(second_result, first_manifest)
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            second_result,
+            f"stale extraction manifest replay for {nested_archive_name or 'direct member'}",
+        )
+
+
+@pytest.mark.parametrize(
+    "rewrite_before_freeze",
+    [False, True],
+    ids=["after-freeze", "before-freeze"],
+)
+def test_organized_asset_scans_reject_root_zip_crc32_collision_rewrite(
+    rewrite_before_freeze: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+    monkeypatch.setattr(keras_h5_scanner_module, "HAS_H5PY", False)
+    archive_path = tmp_path / "crc32-collision-rewrite.zip"
+    payload_prefix = _plausible_hdf5_v0_payload(file_size=256)[:-8]
+    first_payload = payload_prefix + bytes.fromhex("fa3cfb3f1bb823aa")
+    second_payload = payload_prefix + bytes.fromhex("af84d31d6d078015")
+    assert first_payload != second_payload
+    assert len(first_payload) == len(second_payload)
+    assert zlib.crc32(first_payload) == zlib.crc32(second_payload)
+
+    def write_root(payload: bytes) -> None:
+        entry = zipfile.ZipInfo("weights.h5", date_time=(2020, 1, 1, 0, 0, 0))
+        entry.compress_type = zipfile.ZIP_STORED
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr(entry, payload)
+
+    write_root(first_payload)
+    if rewrite_before_freeze:
+        original_freeze = test_security_asset_integration._ZipExtractionRecorder.freeze
+
+        def overwrite_before_freeze(
+            recorder: test_security_asset_integration._ZipExtractionRecorder,
+        ) -> tuple[
+            test_security_asset_integration._ZipExtractionManifest,
+            test_security_asset_integration._ZipExtractionGeneration | None,
+        ]:
+            write_root(second_payload)
+            return original_freeze(recorder)
+
+        monkeypatch.setattr(
+            test_security_asset_integration._ZipExtractionRecorder,
+            "freeze",
+            overwrite_before_freeze,
+        )
+    result = test_security_asset_integration.scan_model_directory_or_file_with_extraction_manifest(
+        str(archive_path),
+        cache_enabled=False,
+    )
+    generation = next(iter(test_security_asset_integration._test_zip_extraction_generations(result).values()))
+    root_snapshot = next(
+        snapshot for snapshot in generation.root_snapshots if snapshot.archive_path == str(archive_path)
+    )
+    assert root_snapshot.unchanged_at_freeze is not rewrite_before_freeze
+
+    if not rewrite_before_freeze:
+        write_root(second_payload)
+    assert (
+        test_security_asset_integration._zip_central_directory_fingerprint(str(archive_path))
+        == root_snapshot.central_directory_fingerprint
+    )
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            "root ZIP rewritten with a distinct same-length CRC32 collision "
+            f"{'before' if rewrite_before_freeze else 'after'} manifest freeze",
+        )
+
+
+def test_zip_extraction_manifest_normalization_has_bounded_work() -> None:
+    event_count = test_security_asset_integration._TEST_ZIP_EXTRACTION_MANIFEST_MAX_EVENTS
+    manifest = test_security_asset_integration._ZipExtractionManifest(
+        tuple(
+            test_security_asset_integration._captured_zip_extraction_event(
+                temp_path=f"/not-a-real-temp-root/extracted-{index}.bin",
+                archive_path="/archives/root.zip",
+                entry_name=f"member-{index}.bin",
+                entry_occurrence=0,
+                source_occurrence_count=1,
+                source_size=1,
+                source_crc32=index & test_security_asset_integration.UINT32_MASK,
+                extracted_size=1,
+                extracted_crc32=index & test_security_asset_integration.UINT32_MASK,
+            )
+            for index in range(event_count)
+        )
+    )
+    work_counter = [0]
+
+    source_paths_by_location, errors = manifest.source_paths_by_logical_location(
+        _work_counter=work_counter,
+    )
+
+    assert not errors
+    assert len(source_paths_by_location) == event_count
+    assert work_counter[0] <= 4 * event_count
+
+
+def test_zip_extraction_source_revalidation_budget_is_shared_across_generations(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_byte_budget = 10
+    source_size = 6
+    fixed_central_directory_fingerprint = b"f" * 32
+    monkeypatch.setattr(
+        test_security_asset_integration,
+        "_TEST_ZIP_EXTRACTION_FINGERPRINT_MAX_TOTAL_BYTES",
+        source_byte_budget,
+    )
+    monkeypatch.setattr(
+        test_security_asset_integration,
+        "_zip_central_directory_fingerprint",
+        lambda _archive_path: fixed_central_directory_fingerprint,
+    )
+
+    events: list[test_security_asset_integration._ZipExtractionEvent] = []
+    generations: dict[bytes, test_security_asset_integration._ZipExtractionGeneration] = {}
+    for index in range(2):
+        archive_path = tmp_path / f"source-{index}.zip"
+        entry_name = f"member-{index}.bin"
+        payload = bytes([index]) * source_size
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr(entry_name, payload)
+        with zipfile.ZipFile(archive_path) as archive:
+            entry = archive.infolist()[0]
+
+        generation_id = index.to_bytes(32, "big")
+        event = test_security_asset_integration._captured_zip_extraction_event(
+            generation_id=generation_id,
+            temp_path=str(tmp_path / f"extracted-{index}.bin"),
+            archive_path=str(archive_path),
+            entry_name=entry_name,
+            entry_occurrence=0,
+            source_occurrence_count=1,
+            source_header_offset=entry.header_offset,
+            source_size=source_size,
+            source_crc32=entry.CRC,
+            extracted_size=source_size,
+            extracted_crc32=entry.CRC,
+            extracted_sha256=hashlib.sha256(payload).digest(),
+        )
+        events.append(event)
+        root_snapshot = test_security_asset_integration._ZipRootArchiveSnapshot(
+            archive_path=str(archive_path),
+            central_directory_fingerprint=fixed_central_directory_fingerprint,
+            source_event_fingerprint=test_security_asset_integration._zip_root_event_fingerprint((event,)),
+            unchanged_at_freeze=True,
+        )
+        generations[generation_id] = test_security_asset_integration._ZipExtractionGeneration(
+            generation_id=generation_id,
+            root_snapshots=(root_snapshot,),
+            event_proofs=(event._capture_proof,),
+        )
+
+    _source_paths, errors = test_security_asset_integration._ZipExtractionManifest(
+        tuple(events)
+    ).source_paths_by_logical_location(
+        _authorized_generations=generations,
+    )
+
+    assert any(error.startswith("ZIP extraction source content changed after capture:") for error in errors)
+
+
+def test_zip_extraction_capture_builds_each_central_directory_index_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entry_count = test_security_asset_integration._TEST_ZIP_EXTRACTION_MANIFEST_MAX_EVENTS
+    archive_payload = io.BytesIO()
+    with zipfile.ZipFile(archive_payload, "w") as archive:
+        for index in range(entry_count):
+            archive.writestr(f"member-{index}.bin", b"")
+    archive_payload.seek(0)
+    fingerprint_work = 0
+
+    def bounded_fingerprint(entries: tuple[zipfile.ZipInfo, ...]) -> bytes:
+        nonlocal fingerprint_work
+        fingerprint_work += len(entries)
+        if fingerprint_work > entry_count:
+            raise AssertionError("central directory fingerprint was rebuilt")
+        return b"f" * 32
+
+    monkeypatch.setattr(
+        test_security_asset_integration,
+        "_zip_central_directory_fingerprint_from_entries",
+        bounded_fingerprint,
+    )
+    recorder = test_security_asset_integration._ZipExtractionRecorder()
+    with zipfile.ZipFile(archive_payload) as archive:
+        entries = archive.infolist()
+        for index, entry in enumerate(entries):
+            temp_path = f"/not-a-real-temp-root/member-{index}.bin"
+            recorder.begin_temp_path(temp_path)
+            try:
+                recorder.record_source_entry(archive, entry)
+            finally:
+                recorder.end_temp_path(temp_path)
+
+    assert fingerprint_work == entry_count
+    assert recorder.capture_work_units <= 2 * entry_count
+
+
+def test_zip_extraction_manifest_preserves_windows_nested_path_provenance() -> None:
+    inner_archive_path = r"C:\Temp\tmpabcd1234\inner.zip"
+    member_temp_path = r"C:\Temp\tmpefgh5678_weights.h5"
+    manifest = test_security_asset_integration._ZipExtractionManifest(
+        (
+            test_security_asset_integration._captured_zip_extraction_event(
+                temp_path=member_temp_path,
+                archive_path=inner_archive_path,
+                entry_name=r"dir\weights.h5",
+                entry_occurrence=0,
+                source_occurrence_count=1,
+                source_size=144,
+                source_crc32=1,
+                extracted_size=144,
+                extracted_crc32=1,
+            ),
+            test_security_asset_integration._captured_zip_extraction_event(
+                temp_path=inner_archive_path,
+                archive_path=r"C:\models\outer.zip",
+                entry_name="inner.zip",
+                entry_occurrence=0,
+                source_occurrence_count=1,
+                source_size=262,
+                source_crc32=2,
+                extracted_size=262,
+                extracted_crc32=2,
+            ),
+        )
+    )
+
+    source_paths_by_location, errors = manifest.source_paths_by_logical_location()
+
+    assert not errors
+    assert source_paths_by_location[r"C:\models\outer.zip:inner.zip:dir\weights.h5"] == Counter({member_temp_path: 1})
+
+
+def test_organized_asset_scans_reject_coherent_nested_hdf5_temp_path_rewrite(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_path, result = _scan_nested_hdf5_with_missing_h5py(
+        tmp_path,
+        monkeypatch,
+        nested_archive_name="inner.zip",
+    )
+    temp_root = Path(tempfile.gettempdir())
+    forged_inner_archive = temp_root / f"{tempfile.gettempprefix()}yyyyyyyy" / "inner.zip"
+    forged_member = temp_root / f"{tempfile.gettempprefix()}zzzzzzzz_weights.h5"
+    diagnostics: list[Issue | Check] = [*result.issues, *result.checks]
+    for diagnostic in diagnostics:
+        if diagnostic.details.get("required_package") == "h5py":
+            diagnostic.details["path"] = str(forged_member)
+
+    metadata = result.file_metadata[str(archive_path)]
+    assert metadata.model_extra is not None
+    outer_contents = metadata.model_extra["contents"]
+    nested_contents = outer_contents[0]["contents"]
+    nested_contents[0]["path"] = f"{forged_inner_archive}:weights.h5"
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            "coherent nested HDF5 diagnostic and metadata temp-path rewrite",
+        )
 
 
 @pytest.mark.parametrize(
@@ -2676,6 +3704,83 @@ def test_organized_asset_scans_bind_xml_diagnostic_path_to_member_provenance(tmp
         test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
             result,
             "XML diagnostics with coherent forged source path",
+        )
+
+
+def test_organized_asset_scans_reject_forged_xml_temp_paths(tmp_path: Path) -> None:
+    _archive_path, result = _scan_ambiguous_xml_archive(tmp_path, ("ambiguous.txt",))
+    temp_root = Path(tempfile.gettempdir())
+    forged_paths = {
+        "attacker-parent": tmp_path / "attacker" / "fake_ambiguous.txt",
+        "wrong-parent": tmp_path / "tmpabcdefgh_ambiguous.txt",
+        "wrong-generated-name": temp_root / "fake_ambiguous.txt",
+        "correct-shape-nonexistent": temp_root / f"{tempfile.gettempprefix()}zzzzzzzz_ambiguous.txt",
+    }
+    accepted_mutations: list[str] = []
+    for mutation, forged_path in forged_paths.items():
+        mutated = result.model_copy(deep=True)
+        diagnostics: list[Issue | Check] = [*mutated.issues, *mutated.checks]
+        for diagnostic in diagnostics:
+            if diagnostic.details.get("format") == "xml_model_inconclusive":
+                diagnostic.details["path"] = str(forged_path)
+        try:
+            test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+                mutated,
+                f"XML diagnostic with {mutation} temp path",
+            )
+        except AssertionError:
+            continue
+        accepted_mutations.append(mutation)
+
+    assert not accepted_mutations, f"forged XML temp paths were accepted: {accepted_mutations}"
+
+
+def test_organized_asset_scans_reject_cross_occurrence_xml_temp_path(tmp_path: Path) -> None:
+    _archive_path, result = _scan_ambiguous_xml_archive(
+        tmp_path,
+        ("left/ambiguous.txt", "right/ambiguous.txt"),
+    )
+    test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+        result,
+        "distinct XML temp-path occurrences",
+    )
+    issues = [issue for issue in result.issues if issue.details.get("format") == "xml_model_inconclusive"]
+    assert len(issues) == 2
+    first_path = issues[0].details["path"]
+    second_location = issues[1].location
+    diagnostics: list[Issue | Check] = [*result.issues, *result.checks]
+    for diagnostic in diagnostics:
+        if diagnostic.location == second_location and diagnostic.details.get("format") == "xml_model_inconclusive":
+            diagnostic.details["path"] = first_path
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            "cross-occurrence XML temp path",
+        )
+
+
+def test_organized_asset_scans_reject_distinct_nonexistent_xml_temp_paths(tmp_path: Path) -> None:
+    _archive_path, result = _scan_ambiguous_xml_archive(
+        tmp_path,
+        ("left/ambiguous.txt", "right/ambiguous.txt"),
+    )
+    issues = [issue for issue in result.issues if issue.details.get("format") == "xml_model_inconclusive"]
+    assert len(issues) == 2
+    temp_root = Path(tempfile.gettempdir())
+    forged_paths = {
+        issue.location: temp_root / f"{tempfile.gettempprefix()}zzzzzzz{index}_ambiguous.txt"
+        for index, issue in enumerate(issues)
+    }
+    diagnostics: list[Issue | Check] = [*result.issues, *result.checks]
+    for diagnostic in diagnostics:
+        if diagnostic.location in forged_paths and diagnostic.details.get("format") == "xml_model_inconclusive":
+            diagnostic.details["path"] = str(forged_paths[diagnostic.location])
+
+    with pytest.raises(AssertionError, match="unexpected operational errors"):
+        test_security_asset_integration.assert_no_unexpected_asset_scan_errors(
+            result,
+            "distinct nonexistent XML temp paths",
         )
 
 
@@ -3593,7 +4698,11 @@ def test_organized_asset_scans_reject_unrelated_archive_failures(
     elif archive_failure == "metadata-only-budget":
         monkeypatch.setattr(tf_metagraph_scanner_module, "_MAX_PARSE_BYTES", 128)
 
-    result = core_module.scan_model_directory_or_file(str(tmp_path), cache_enabled=False, max_msgpack_stream_objects=1)
+    result = test_security_asset_integration.scan_model_directory_or_file_with_extraction_manifest(
+        str(tmp_path),
+        cache_enabled=False,
+        max_msgpack_stream_objects=1,
+    )
     result = _merge_with_canonical_agpl_source_change(result)
     archive_metadata = result.file_metadata[str(archive_path)].model_dump(exclude_none=True)
     assert archive_metadata["operational_error_reason"] == "xml_model_routing_incomplete"
@@ -3732,7 +4841,10 @@ def test_organized_asset_scans_reject_mixed_archive_member_errors(
             "<?xml version='1.0'?><!--" + "x" * (1024 * 1024 + 64) + "--><PMML version='4.4'></PMML>",
         )
 
-    result = core_module.scan_model_directory_or_file(str(tmp_path), cache_enabled=False)
+    result = test_security_asset_integration.scan_model_directory_or_file_with_extraction_manifest(
+        str(tmp_path),
+        cache_enabled=False,
+    )
     result = _merge_with_canonical_agpl_source_change(result)
 
     assert analyzed_members == 2
@@ -3798,7 +4910,10 @@ def test_organized_asset_scans_reject_mixed_archive_member_timeouts(
             "<?xml version='1.0'?><!--" + "x" * (1024 * 1024 + 64) + "--><PMML version='4.4'></PMML>",
         )
 
-    result = core_module.scan_model_directory_or_file(str(tmp_path), cache_enabled=False)
+    result = test_security_asset_integration.scan_model_directory_or_file_with_extraction_manifest(
+        str(tmp_path),
+        cache_enabled=False,
+    )
     result = _merge_with_canonical_agpl_source_change(result)
     if timeout_source == "manifest-scanner":
         assert any(
@@ -3861,7 +4976,11 @@ def test_organized_asset_scans_reject_mixed_archive_scanner_errors(
             "<?xml version='1.0'?><!--" + "x" * (1024 * 1024 + 64) + "--><PMML version='4.4'></PMML>",
         )
 
-    result = core_module.scan_model_directory_or_file(str(tmp_path), cache_enabled=False, max_msgpack_stream_objects=1)
+    result = test_security_asset_integration.scan_model_directory_or_file_with_extraction_manifest(
+        str(tmp_path),
+        cache_enabled=False,
+        max_msgpack_stream_objects=1,
+    )
     result = _merge_with_canonical_agpl_source_change(result)
     if scanner_error == "msgpack-object-limit":
         assert any(
@@ -5309,7 +6428,10 @@ def test_organized_asset_scans_require_each_nested_dependency_diagnostic(
             "model.pmml",
             '<?xml version="1.0"?><PMML version="4.4"><Header/><DataDictionary numberOfFields="0"/></PMML>',
         )
-    result = core_module.scan_model_directory_or_file(str(archive_file), cache_enabled=False)
+    result = test_security_asset_integration.scan_model_directory_or_file_with_extraction_manifest(
+        str(archive_file),
+        cache_enabled=False,
+    )
     archive_path = str(archive_file)
     h5py_reason = "keras_h5_h5py_unavailable"
     defusedxml_reason = "pmml_safe_xml_parser_unavailable"
@@ -6041,7 +7163,10 @@ def test_organized_asset_scans_preserve_coverage_only_outcomes(
                 "ambiguous.txt",
                 "<?xml version='1.0'?><!--" + "x" * (1024 * 1024 + 64) + "--><PMML version='4.4'></PMML>",
             )
-        result = core_module.scan_model_directory_or_file(str(tmp_path), cache_enabled=False)
+        result = test_security_asset_integration.scan_model_directory_or_file_with_extraction_manifest(
+            str(tmp_path),
+            cache_enabled=False,
+        )
         result = _merge_with_canonical_agpl_source_change(result)
         archive_metadata = result.file_metadata[str(archive_path)].model_dump(exclude_none=True)
         assert "xml_model_routing_incomplete" in archive_metadata["scan_outcome_reasons"]

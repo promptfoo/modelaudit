@@ -5,6 +5,9 @@ Tests that integrate with the organized test asset structure.
 Focuses on security-specific scanning scenarios.
 """
 
+import contextlib
+import hashlib
+import hmac
 import json
 import math
 import os
@@ -13,10 +16,16 @@ import shutil
 import stat
 import sys
 import tempfile
+import threading
+import weakref
 import zipfile
+import zlib
 from collections import Counter
+from collections.abc import Iterator
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
+from unittest import mock
 
 import pytest
 from click.testing import CliRunner
@@ -27,7 +36,7 @@ from modelaudit.cli import cli
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.core_results import metadata_has_coverage_only_operational_error
 from modelaudit.models import ModelAuditResultModel
-from modelaudit.scanner_results import Check, CheckStatus, Issue
+from modelaudit.scanner_results import Check, CheckStatus, Issue, ScanResult
 from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.zip_scanner import ZipPreflightRejected, ZipScanner, open_preflighted_zip
 from modelaudit.utils.file import detection as file_detection_module
@@ -38,6 +47,19 @@ EXPECTED_AGPL_SOURCE_STABILITY_ASSET = (
     Path(__file__).parent / "assets" / "scenarios" / "license_scenarios" / "agpl_component" / "agpl_model.pkl"
 ).resolve()
 EXPECTED_AGPL_SOURCE_STABILITY_REASON = "source_search_context_changed"
+EXPECTED_AGPL_SOURCE_STABILITY_MESSAGE = (
+    "Python call-graph analysis could not complete: source changed during shared call-graph analysis"
+)
+EXPECTED_AGPL_SOURCE_STABILITY_DETAILS = frozenset(
+    {
+        "analysis",
+        "analysis_incomplete",
+        "category",
+        "exception_type",
+        "pickle_source",
+        "source_stability_reason",
+    }
+)
 EXPECTED_AGPL_SOURCE_STABILITY_OUTCOME_REASONS = frozenset(
     {
         "call_graph_analysis_error",
@@ -156,6 +178,816 @@ ALIASLESS_PICKLE_DISALLOWED_FIELDS = frozenset(
 
 CompressionBombKey = tuple[str, int, int]
 XmlArchiveSourceProfile = tuple[str, str, bool]
+_TEST_ZIP_EXTRACTION_MANIFEST_ATTRIBUTE = "_test_zip_extraction_manifest"
+_TEST_ZIP_EXTRACTION_MANIFEST_MAX_EVENTS = ZipScanner.DEFAULT_MAX_ENTRIES
+_TEST_ZIP_EXTRACTION_FINGERPRINT_MAX_TOTAL_BYTES = HDF5_ARCHIVE_CONTRACT_MAX_TOTAL_PROBE_BYTES
+_TEST_ZIP_EXTRACTION_FINGERPRINT_CHUNK_BYTES = 64 * 1024
+_TEST_ZIP_EXTRACTION_CAPTURE_LOCK = threading.RLock()
+_TEST_ZIP_EXTRACTION_PROOF_KEY = os.urandom(32)
+_TEST_ZIP_EXTRACTION_SYNTHETIC_GENERATION = os.urandom(32)
+
+
+@dataclass(frozen=True)
+class _ZipRootArchiveSnapshot:
+    archive_path: str
+    central_directory_fingerprint: bytes
+    source_event_fingerprint: bytes
+    unchanged_at_freeze: bool
+
+
+@dataclass(frozen=True)
+class _ZipExtractionGeneration:
+    generation_id: bytes
+    root_snapshots: tuple[_ZipRootArchiveSnapshot, ...]
+    event_proofs: tuple[bytes, ...]
+
+
+@dataclass(frozen=True)
+class _ZipSourceEntryCapture:
+    archive_path: str
+    entry_name: str
+    entry_occurrence: int
+    source_occurrence_count: int
+    source_header_offset: int
+    source_size: int
+    source_crc32: int
+
+
+@dataclass(frozen=True)
+class _ZipArchiveCaptureIndex:
+    archive_path: str
+    central_directory_fingerprint: bytes | None
+    entries_by_identity: dict[tuple[str, int], tuple[zipfile.ZipInfo, int, int]]
+
+
+@dataclass(frozen=True)
+class _ZipExtractionEvent:
+    generation_id: bytes
+    temp_path: str
+    archive_path: str
+    entry_name: str
+    entry_occurrence: int
+    source_occurrence_count: int
+    source_header_offset: int
+    source_size: int
+    source_crc32: int
+    extracted_size: int
+    extracted_crc32: int
+    extracted_sha256: bytes = b""
+    _capture_proof: bytes = field(default=b"", init=False, repr=False, compare=False)
+
+
+def _zip_extraction_event_proof(event: _ZipExtractionEvent) -> bytes:
+    payload = json.dumps(
+        (
+            event.generation_id.hex(),
+            event.temp_path,
+            event.archive_path,
+            event.entry_name,
+            event.entry_occurrence,
+            event.source_occurrence_count,
+            event.source_header_offset,
+            event.source_size,
+            event.source_crc32,
+            event.extracted_size,
+            event.extracted_crc32,
+            event.extracted_sha256.hex(),
+        ),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode()
+    return hmac.new(_TEST_ZIP_EXTRACTION_PROOF_KEY, payload, hashlib.sha256).digest()
+
+
+def _captured_zip_extraction_event(
+    *,
+    generation_id: bytes = _TEST_ZIP_EXTRACTION_SYNTHETIC_GENERATION,
+    temp_path: str,
+    archive_path: str,
+    entry_name: str,
+    entry_occurrence: int,
+    source_occurrence_count: int,
+    source_header_offset: int = 0,
+    source_size: int,
+    source_crc32: int,
+    extracted_size: int,
+    extracted_crc32: int,
+    extracted_sha256: bytes | None = None,
+) -> _ZipExtractionEvent:
+    resolved_sha256 = extracted_sha256
+    if resolved_sha256 is None:
+        synthetic_identity = f"{source_size}:{source_crc32}:{extracted_size}:{extracted_crc32}".encode()
+        resolved_sha256 = hashlib.sha256(synthetic_identity).digest()
+    event = _ZipExtractionEvent(
+        generation_id=generation_id,
+        temp_path=temp_path,
+        archive_path=archive_path,
+        entry_name=entry_name,
+        entry_occurrence=entry_occurrence,
+        source_occurrence_count=source_occurrence_count,
+        source_header_offset=source_header_offset,
+        source_size=source_size,
+        source_crc32=source_crc32,
+        extracted_size=extracted_size,
+        extracted_crc32=extracted_crc32,
+        extracted_sha256=resolved_sha256,
+    )
+    object.__setattr__(event, "_capture_proof", _zip_extraction_event_proof(event))
+    return event
+
+
+def _zip_extraction_event_has_valid_proof(event: _ZipExtractionEvent) -> bool:
+    return bool(event._capture_proof) and hmac.compare_digest(
+        event._capture_proof,
+        _zip_extraction_event_proof(event),
+    )
+
+
+def _zip_central_directory_fingerprint_from_entries(
+    entries: tuple[zipfile.ZipInfo, ...],
+) -> bytes | None:
+    if len(entries) > _TEST_ZIP_EXTRACTION_MANIFEST_MAX_EVENTS:
+        return None
+
+    digest = hashlib.sha256()
+    identity_bytes = 0
+    for entry in entries:
+        entry_identity = json.dumps(
+            (
+                entry.filename,
+                entry.header_offset,
+                entry.file_size,
+                entry.compress_size,
+                entry.CRC,
+                entry.compress_type,
+                entry.flag_bits,
+                entry.external_attr,
+                entry.date_time,
+                entry.extra.hex(),
+                entry.comment.hex(),
+            ),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode()
+        identity_bytes += len(entry_identity)
+        if identity_bytes > _TEST_ZIP_EXTRACTION_FINGERPRINT_MAX_TOTAL_BYTES:
+            return None
+        digest.update(len(entry_identity).to_bytes(8, "big"))
+        digest.update(entry_identity)
+    return digest.digest()
+
+
+def _zip_central_directory_fingerprint(archive_path: str) -> bytes | None:
+    try:
+        with zipfile.ZipFile(archive_path) as archive:
+            entries = tuple(archive.infolist())
+    except (OSError, zipfile.BadZipFile, zipfile.LargeZipFile):
+        return None
+    return _zip_central_directory_fingerprint_from_entries(entries)
+
+
+def _zip_root_event_fingerprint(events: tuple[_ZipExtractionEvent, ...]) -> bytes:
+    digest = hashlib.sha256()
+    for event in events:
+        proof = event._capture_proof
+        digest.update(len(proof).to_bytes(8, "big"))
+        digest.update(proof)
+    return digest.digest()
+
+
+def _zip_root_source_events_match(
+    archive_path: str,
+    events: tuple[_ZipExtractionEvent, ...],
+    source_bytes_remaining: list[int],
+) -> bool:
+    if len(source_bytes_remaining) != 1 or not events:
+        return False
+    try:
+        with zipfile.ZipFile(archive_path) as archive:
+            entries = tuple(archive.infolist())
+            if len(entries) > _TEST_ZIP_EXTRACTION_MANIFEST_MAX_EVENTS:
+                return False
+            entry_counts = Counter(entry.filename for entry in entries)
+            entry_occurrences: Counter[str] = Counter()
+            entries_by_identity: dict[tuple[str, int], tuple[zipfile.ZipInfo, int]] = {}
+            for entry in entries:
+                identity = (entry.filename, entry.header_offset)
+                if identity in entries_by_identity:
+                    return False
+                occurrence = entry_occurrences[entry.filename]
+                entry_occurrences[entry.filename] += 1
+                entries_by_identity[identity] = (entry, occurrence)
+
+            seen_identities: set[tuple[str, int]] = set()
+            for event in events:
+                identity = (event.entry_name, event.source_header_offset)
+                source_entry = entries_by_identity.get(identity)
+                if source_entry is None or identity in seen_identities:
+                    return False
+                seen_identities.add(identity)
+                entry, occurrence = source_entry
+                if (
+                    occurrence != event.entry_occurrence
+                    or entry_counts[entry.filename] != event.source_occurrence_count
+                    or entry.file_size != event.source_size
+                    or event.source_crc32 != entry.CRC
+                    or len(event.extracted_sha256) != hashlib.sha256().digest_size
+                    or entry.file_size > source_bytes_remaining[0]
+                ):
+                    return False
+                source_bytes_remaining[0] -= entry.file_size
+                source_digest = hashlib.sha256()
+                source_size = 0
+                with archive.open(entry) as source:
+                    while True:
+                        chunk = source.read(_TEST_ZIP_EXTRACTION_FINGERPRINT_CHUNK_BYTES)
+                        if not chunk:
+                            break
+                        source_size += len(chunk)
+                        if source_size > entry.file_size:
+                            return False
+                        source_digest.update(chunk)
+                if source_size != entry.file_size or not hmac.compare_digest(
+                    source_digest.digest(), event.extracted_sha256
+                ):
+                    return False
+    except (
+        EOFError,
+        OSError,
+        RuntimeError,
+        ValueError,
+        zipfile.BadZipFile,
+        zipfile.LargeZipFile,
+        zlib.error,
+    ):
+        return False
+    return True
+
+
+_TEST_ZIP_EXTRACTION_GENERATION_REGISTRY: dict[
+    int,
+    tuple[
+        weakref.ReferenceType[ModelAuditResultModel],
+        dict[bytes, _ZipExtractionGeneration],
+    ],
+] = {}
+
+
+def _register_test_zip_extraction_generations(
+    results: ModelAuditResultModel,
+    generations: tuple[_ZipExtractionGeneration, ...],
+) -> None:
+    generations_by_id: dict[bytes, _ZipExtractionGeneration] = {}
+    for generation in generations:
+        prior = generations_by_id.setdefault(generation.generation_id, generation)
+        if prior != generation:
+            raise AssertionError("ZIP extraction generation identity was reused")
+
+    results_id = id(results)
+
+    def discard_dead_result(
+        result_reference: weakref.ReferenceType[ModelAuditResultModel],
+    ) -> None:
+        with _TEST_ZIP_EXTRACTION_CAPTURE_LOCK:
+            current = _TEST_ZIP_EXTRACTION_GENERATION_REGISTRY.get(results_id)
+            if current is not None and current[0] is result_reference:
+                _TEST_ZIP_EXTRACTION_GENERATION_REGISTRY.pop(results_id, None)
+
+    result_reference = weakref.ref(results, discard_dead_result)
+    with _TEST_ZIP_EXTRACTION_CAPTURE_LOCK:
+        _TEST_ZIP_EXTRACTION_GENERATION_REGISTRY[results_id] = (
+            result_reference,
+            generations_by_id,
+        )
+
+
+def _test_zip_extraction_generations(
+    results: ModelAuditResultModel,
+) -> dict[bytes, _ZipExtractionGeneration]:
+    results_id = id(results)
+    with _TEST_ZIP_EXTRACTION_CAPTURE_LOCK:
+        current = _TEST_ZIP_EXTRACTION_GENERATION_REGISTRY.get(results_id)
+        if current is None:
+            return {}
+        if current[0]() is not results:
+            _TEST_ZIP_EXTRACTION_GENERATION_REGISTRY.pop(results_id, None)
+            return {}
+        return dict(current[1])
+
+
+def _looks_like_unresolved_zip_temp_path(path: str) -> bool:
+    components = [component for component in path.replace("\\", "/").split("/") if component]
+    temp_prefix = tempfile.gettempprefix().casefold()
+    return any(component.casefold().startswith(temp_prefix) for component in components[-2:])
+
+
+@dataclass(frozen=True)
+class _ZipExtractionManifest:
+    events: tuple[_ZipExtractionEvent, ...]
+
+    def source_paths_by_logical_location(
+        self,
+        *,
+        _work_counter: list[int] | None = None,
+        _authorized_generations: dict[bytes, _ZipExtractionGeneration] | None = None,
+    ) -> tuple[dict[str, Counter[str]], set[str]]:
+        errors: set[str] = set()
+        if _work_counter is not None and len(_work_counter) != 1:
+            raise ValueError("ZIP extraction work counter must contain exactly one value")
+
+        def charge_work() -> None:
+            if _work_counter is not None:
+                _work_counter[0] += 1
+
+        if len(self.events) > _TEST_ZIP_EXTRACTION_MANIFEST_MAX_EVENTS:
+            return {}, {"ZIP extraction manifest exceeded the test event limit"}
+
+        event_counts = Counter(self.events)
+        temp_to_event: dict[str, _ZipExtractionEvent] = {}
+        source_occurrences: Counter[tuple[str, str, int]] = Counter()
+        for event in self.events:
+            charge_work()
+            if event_counts[event] != 1:
+                errors.add(f"duplicate ZIP extraction event for {event.temp_path}")
+            if not _zip_extraction_event_has_valid_proof(event):
+                errors.add(f"unverified ZIP extraction event for {event.temp_path}")
+            if not isinstance(event.generation_id, bytes) or len(event.generation_id) != 32:
+                errors.add(f"invalid ZIP extraction generation for {event.temp_path}")
+            prior_event = temp_to_event.setdefault(event.temp_path, event)
+            if prior_event != event:
+                errors.add(f"ZIP extraction path was reused across logical occurrences: {event.temp_path}")
+
+            source_occurrence = (event.archive_path, event.entry_name, event.entry_occurrence)
+            source_occurrences[source_occurrence] += 1
+            if source_occurrences[source_occurrence] != 1:
+                errors.add(
+                    "duplicate ZIP source occurrence for "
+                    f"{event.archive_path}:{event.entry_name}[{event.entry_occurrence}]"
+                )
+
+            integer_fields = (
+                event.entry_occurrence,
+                event.source_occurrence_count,
+                event.source_header_offset,
+                event.source_size,
+                event.source_crc32,
+                event.extracted_size,
+                event.extracted_crc32,
+            )
+            if any(not isinstance(value, int) or isinstance(value, bool) for value in integer_fields):
+                errors.add(f"invalid ZIP extraction identity fields for {event.temp_path}")
+                continue
+            if not 0 <= event.entry_occurrence < event.source_occurrence_count:
+                errors.add(f"invalid ZIP source occurrence index for {event.temp_path}")
+            if event.source_header_offset < 0:
+                errors.add(f"invalid ZIP source header offset for {event.temp_path}")
+            if event.source_size < 0 or event.extracted_size < 0:
+                errors.add(f"ZIP extraction event was not backed by a written file: {event.temp_path}")
+            if event.source_size != event.extracted_size:
+                errors.add(f"ZIP extraction size did not match its source occurrence: {event.temp_path}")
+            if not 0 <= event.source_crc32 <= UINT32_MASK or not 0 <= event.extracted_crc32 <= UINT32_MASK:
+                errors.add(f"invalid ZIP extraction content fingerprint for {event.temp_path}")
+            elif event.source_crc32 != event.extracted_crc32:
+                errors.add(f"ZIP extraction content did not match its source occurrence: {event.temp_path}")
+            if not isinstance(event.extracted_sha256, bytes) or len(event.extracted_sha256) != 32:
+                errors.add(f"invalid ZIP extraction SHA-256 for {event.temp_path}")
+
+        if _authorized_generations is not None:
+            event_generation_ids = {event.generation_id for event in self.events}
+            authorized_generation_ids = set(_authorized_generations)
+            if event_generation_ids != authorized_generation_ids:
+                errors.add("ZIP extraction manifest was not authorized for this scan result")
+            source_bytes_remaining = [_TEST_ZIP_EXTRACTION_FINGERPRINT_MAX_TOTAL_BYTES]
+            for generation_id in event_generation_ids & authorized_generation_ids:
+                generation = _authorized_generations[generation_id]
+                generation_events = tuple(event for event in self.events if event.generation_id == generation_id)
+                observed_proofs = Counter(event._capture_proof for event in generation_events)
+                if observed_proofs != Counter(generation.event_proofs):
+                    errors.add("ZIP extraction events did not match the authorized scan generation")
+                for root_snapshot in generation.root_snapshots:
+                    root_events = tuple(
+                        event for event in generation_events if event.archive_path == root_snapshot.archive_path
+                    )
+                    if _zip_root_event_fingerprint(root_events) != root_snapshot.source_event_fingerprint:
+                        errors.add(f"ZIP extraction source events changed for {root_snapshot.archive_path}")
+                    if not root_snapshot.unchanged_at_freeze:
+                        errors.add(
+                            "ZIP extraction source archive changed before manifest freeze: "
+                            f"{root_snapshot.archive_path}"
+                        )
+                    current_fingerprint = _zip_central_directory_fingerprint(root_snapshot.archive_path)
+                    if current_fingerprint is None or not hmac.compare_digest(
+                        current_fingerprint,
+                        root_snapshot.central_directory_fingerprint,
+                    ):
+                        errors.add(f"ZIP extraction source archive changed after capture: {root_snapshot.archive_path}")
+                    if not _zip_root_source_events_match(
+                        root_snapshot.archive_path,
+                        root_events,
+                        source_bytes_remaining,
+                    ):
+                        errors.add(f"ZIP extraction source content changed after capture: {root_snapshot.archive_path}")
+
+        for event in self.events:
+            if (
+                event.archive_path not in temp_to_event
+                and not os.path.exists(event.archive_path)
+                and _looks_like_unresolved_zip_temp_path(event.archive_path)
+            ):
+                errors.add(f"missing parent ZIP extraction event for {event.temp_path}")
+
+        resolved_locations: dict[str, str] = {}
+
+        def resolve_temp_path(temp_path: str) -> str:
+            resolved = resolved_locations.get(temp_path)
+            if resolved is not None:
+                return resolved
+
+            chain: list[_ZipExtractionEvent] = []
+            chain_offsets: dict[str, int] = {}
+            cursor = temp_path
+            while cursor in temp_to_event and cursor not in resolved_locations:
+                charge_work()
+                if cursor in chain_offsets:
+                    for cyclic_event in chain[chain_offsets[cursor] :]:
+                        errors.add(f"cyclic ZIP extraction provenance for {cyclic_event.temp_path}")
+                    break
+                if len(chain) >= ZIP_ARCHIVE_CONTRACT_MAX_DEPTH:
+                    errors.add(f"ZIP extraction provenance exceeded the depth bound for {temp_path}")
+                    break
+                chain_offsets[cursor] = len(chain)
+                parent_event = temp_to_event[cursor]
+                chain.append(parent_event)
+                cursor = parent_event.archive_path
+
+            location = resolved_locations.get(cursor, cursor)
+            for parent_event in reversed(chain):
+                location = f"{location}:{parent_event.entry_name}"
+                resolved_locations[parent_event.temp_path] = location
+            return resolved_locations.get(temp_path, location)
+
+        paths_by_location: dict[str, Counter[str]] = {}
+        for event in self.events:
+            charge_work()
+            archive_location = resolve_temp_path(event.archive_path)
+            location = f"{archive_location}:{event.entry_name}"
+            paths_by_location.setdefault(location, Counter())[event.temp_path] += 1
+
+        for location, source_paths in paths_by_location.items():
+            if any(count != 1 for count in source_paths.values()):
+                errors.add(f"duplicate ZIP extraction source path for {location}")
+        return paths_by_location, errors
+
+    def without_event(self, event_index: int) -> "_ZipExtractionManifest":
+        return _ZipExtractionManifest(self.events[:event_index] + self.events[event_index + 1 :])
+
+    def with_duplicate_event(self, event_index: int) -> "_ZipExtractionManifest":
+        return _ZipExtractionManifest((*self.events, self.events[event_index]))
+
+
+class _ZipExtractionRecorder:
+    def __init__(self) -> None:
+        self._generation_id = os.urandom(32)
+        self._events: list[_ZipExtractionEvent] = []
+        self._active_temp_paths: dict[int, list[str]] = {}
+        self._source_entries_by_temp_path: dict[str, _ZipSourceEntryCapture] = {}
+        self._archive_indexes: dict[zipfile.ZipFile, _ZipArchiveCaptureIndex] = {}
+        self._first_archive_fingerprints: dict[str, bytes | None] = {}
+        self._archives_changed_during_capture: set[str] = set()
+        self._fingerprint_bytes_remaining = _TEST_ZIP_EXTRACTION_FINGERPRINT_MAX_TOTAL_BYTES
+        self._capture_work_units = 0
+        self._lock = threading.Lock()
+
+    @property
+    def capture_work_units(self) -> int:
+        return self._capture_work_units
+
+    @staticmethod
+    def _archive_path(archive: zipfile.ZipFile) -> str:
+        archive_filename = archive.filename
+        if archive_filename is None:
+            return ""
+        return os.fsdecode(archive_filename)
+
+    def begin_temp_path(self, temp_path: str) -> None:
+        thread_id = threading.get_ident()
+        with self._lock:
+            active_paths = self._active_temp_paths.setdefault(thread_id, [])
+            if len(active_paths) >= ZIP_ARCHIVE_CONTRACT_MAX_DEPTH:
+                raise AssertionError("ZIP extraction capture exceeded the depth bound")
+            active_paths.append(temp_path)
+
+    def end_temp_path(self, temp_path: str) -> None:
+        thread_id = threading.get_ident()
+        with self._lock:
+            active_paths = self._active_temp_paths.get(thread_id)
+            if not active_paths or active_paths[-1] != temp_path:
+                raise AssertionError("ZIP extraction capture temp-path stack was inconsistent")
+            active_paths.pop()
+            if not active_paths:
+                self._active_temp_paths.pop(thread_id, None)
+
+    def _archive_index(self, archive: zipfile.ZipFile) -> _ZipArchiveCaptureIndex:
+        cached = self._archive_indexes.get(archive)
+        if cached is not None:
+            return cached
+        entries = tuple(archive.infolist())
+        self._capture_work_units += len(entries)
+        entries_by_name: dict[str, list[zipfile.ZipInfo]] = {}
+        for entry in entries:
+            entries_by_name.setdefault(entry.filename, []).append(entry)
+        entries_by_identity: dict[tuple[str, int], tuple[zipfile.ZipInfo, int, int]] = {}
+        for entry_name, named_entries in entries_by_name.items():
+            source_occurrence_count = len(named_entries)
+            for entry_occurrence, entry in enumerate(named_entries):
+                identity = (entry_name, entry.header_offset)
+                if identity in entries_by_identity:
+                    raise AssertionError("ZIP central directory reused a source entry identity")
+                entries_by_identity[identity] = (
+                    entry,
+                    entry_occurrence,
+                    source_occurrence_count,
+                )
+        index = _ZipArchiveCaptureIndex(
+            archive_path=self._archive_path(archive),
+            central_directory_fingerprint=_zip_central_directory_fingerprint_from_entries(entries),
+            entries_by_identity=entries_by_identity,
+        )
+        self._archive_indexes[archive] = index
+        return index
+
+    def record_source_entry(
+        self,
+        archive: zipfile.ZipFile,
+        entry_info: zipfile.ZipInfo,
+    ) -> None:
+        thread_id = threading.get_ident()
+        with self._lock:
+            active_paths = self._active_temp_paths.get(thread_id)
+            if not active_paths:
+                return
+            temp_path = active_paths[-1]
+            index = self._archive_index(archive)
+            archive_path = index.archive_path
+            fingerprint = index.central_directory_fingerprint
+            if archive_path not in self._first_archive_fingerprints:
+                self._first_archive_fingerprints[archive_path] = fingerprint
+            elif self._first_archive_fingerprints[archive_path] != fingerprint:
+                self._archives_changed_during_capture.add(archive_path)
+
+            self._capture_work_units += 1
+            source_entry = index.entries_by_identity.get((entry_info.filename, entry_info.header_offset))
+            if source_entry is None:
+                indexed_entry = entry_info
+                entry_occurrence, source_occurrence_count = 0, 0
+            else:
+                indexed_entry, entry_occurrence, source_occurrence_count = source_entry
+            capture = _ZipSourceEntryCapture(
+                archive_path=archive_path,
+                entry_name=indexed_entry.filename,
+                entry_occurrence=entry_occurrence,
+                source_occurrence_count=source_occurrence_count,
+                source_header_offset=indexed_entry.header_offset if source_entry is not None else -1,
+                source_size=indexed_entry.file_size if source_entry is not None else -1,
+                source_crc32=indexed_entry.CRC if source_entry is not None else -1,
+            )
+            prior = self._source_entries_by_temp_path.setdefault(temp_path, capture)
+            if prior != capture:
+                raise AssertionError("ZIP temp path was bound to multiple source entries")
+
+    def _fingerprint_extracted_file(self, temp_path: str) -> tuple[int, int, bytes]:
+        try:
+            extracted_size = os.path.getsize(temp_path)
+        except OSError:
+            return -1, -1, b""
+        if extracted_size < 0 or extracted_size > self._fingerprint_bytes_remaining:
+            return extracted_size, -1, b""
+
+        extracted_crc32 = 0
+        extracted_sha256 = hashlib.sha256()
+        bytes_read = 0
+        try:
+            with open(temp_path, "rb") as extracted:
+                while True:
+                    chunk = extracted.read(_TEST_ZIP_EXTRACTION_FINGERPRINT_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    bytes_read += len(chunk)
+                    if bytes_read > extracted_size:
+                        return bytes_read, -1, b""
+                    extracted_crc32 = zlib.crc32(chunk, extracted_crc32)
+                    extracted_sha256.update(chunk)
+        except OSError:
+            return -1, -1, b""
+        if bytes_read != extracted_size:
+            return bytes_read, -1, b""
+        self._fingerprint_bytes_remaining -= bytes_read
+        return extracted_size, extracted_crc32 & UINT32_MASK, extracted_sha256.digest()
+
+    def record_extraction(
+        self,
+        *,
+        temp_path: str,
+        archive_path: str,
+        entry_name: str,
+    ) -> None:
+        with self._lock:
+            if len(self._events) >= _TEST_ZIP_EXTRACTION_MANIFEST_MAX_EVENTS:
+                raise AssertionError("ZIP extraction manifest exceeded the test event limit")
+            extracted_size, extracted_crc32, extracted_sha256 = self._fingerprint_extracted_file(temp_path)
+            source_entry = self._source_entries_by_temp_path.pop(temp_path, None)
+            if (
+                source_entry is not None
+                and source_entry.archive_path == archive_path
+                and source_entry.entry_name == entry_name
+            ):
+                entry_occurrence = source_entry.entry_occurrence
+                source_occurrence_count = source_entry.source_occurrence_count
+                source_header_offset = source_entry.source_header_offset
+                source_size = source_entry.source_size
+                source_crc32 = source_entry.source_crc32
+            else:
+                entry_occurrence, source_occurrence_count, source_header_offset, source_size, source_crc32 = (
+                    0,
+                    0,
+                    -1,
+                    -1,
+                    -1,
+                )
+            self._events.append(
+                _captured_zip_extraction_event(
+                    generation_id=self._generation_id,
+                    temp_path=temp_path,
+                    archive_path=archive_path,
+                    entry_name=entry_name,
+                    entry_occurrence=entry_occurrence,
+                    source_occurrence_count=source_occurrence_count,
+                    source_header_offset=source_header_offset,
+                    source_size=source_size,
+                    source_crc32=source_crc32,
+                    extracted_size=extracted_size,
+                    extracted_crc32=extracted_crc32,
+                    extracted_sha256=extracted_sha256,
+                )
+            )
+
+    def freeze(self) -> tuple[_ZipExtractionManifest, _ZipExtractionGeneration | None]:
+        with self._lock:
+            manifest = _ZipExtractionManifest(tuple(self._events))
+            if not self._events:
+                return manifest, None
+            extracted_paths = {event.temp_path for event in self._events}
+            root_archive_paths = sorted(
+                {event.archive_path for event in self._events if event.archive_path not in extracted_paths}
+            )
+            root_snapshots: list[_ZipRootArchiveSnapshot] = []
+            source_bytes_remaining = [_TEST_ZIP_EXTRACTION_FINGERPRINT_MAX_TOTAL_BYTES]
+            for archive_path in root_archive_paths:
+                root_events = tuple(event for event in self._events if event.archive_path == archive_path)
+                captured_fingerprint = self._first_archive_fingerprints.get(archive_path)
+                current_fingerprint = _zip_central_directory_fingerprint(archive_path)
+                source_content_matches = _zip_root_source_events_match(
+                    archive_path,
+                    root_events,
+                    source_bytes_remaining,
+                )
+                unchanged_at_freeze = (
+                    captured_fingerprint is not None
+                    and current_fingerprint is not None
+                    and archive_path not in self._archives_changed_during_capture
+                    and hmac.compare_digest(captured_fingerprint, current_fingerprint)
+                    and source_content_matches
+                )
+                root_snapshots.append(
+                    _ZipRootArchiveSnapshot(
+                        archive_path=archive_path,
+                        central_directory_fingerprint=captured_fingerprint or b"",
+                        source_event_fingerprint=_zip_root_event_fingerprint(root_events),
+                        unchanged_at_freeze=unchanged_at_freeze,
+                    )
+                )
+            return manifest, _ZipExtractionGeneration(
+                generation_id=self._generation_id,
+                root_snapshots=tuple(root_snapshots),
+                event_proofs=tuple(event._capture_proof for event in self._events),
+            )
+
+
+def _set_test_zip_extraction_manifest(
+    results: ModelAuditResultModel,
+    manifest: _ZipExtractionManifest,
+    *,
+    source: ModelAuditResultModel | None = None,
+) -> None:
+    object.__setattr__(results, _TEST_ZIP_EXTRACTION_MANIFEST_ATTRIBUTE, manifest)
+    if source is not None:
+        _register_test_zip_extraction_generations(
+            results,
+            tuple(_test_zip_extraction_generations(source).values()),
+        )
+
+
+def _test_zip_extraction_manifest(results: ModelAuditResultModel) -> _ZipExtractionManifest | None:
+    manifest = getattr(results, _TEST_ZIP_EXTRACTION_MANIFEST_ATTRIBUTE, None)
+    return manifest if isinstance(manifest, _ZipExtractionManifest) else None
+
+
+def _merge_test_zip_extraction_manifests(
+    target: ModelAuditResultModel,
+    *sources: ModelAuditResultModel,
+) -> None:
+    events: list[_ZipExtractionEvent] = []
+    generations: dict[bytes, _ZipExtractionGeneration] = {}
+    for source in sources:
+        manifest = _test_zip_extraction_manifest(source)
+        if manifest is not None:
+            events.extend(manifest.events)
+        for generation_id, generation in _test_zip_extraction_generations(source).items():
+            prior = generations.setdefault(generation_id, generation)
+            if prior != generation:
+                raise AssertionError("ZIP extraction generation identity was reused")
+    if len(events) > _TEST_ZIP_EXTRACTION_MANIFEST_MAX_EVENTS:
+        raise AssertionError("merged ZIP extraction manifest exceeded the test event limit")
+    _set_test_zip_extraction_manifest(target, _ZipExtractionManifest(tuple(events)))
+    _register_test_zip_extraction_generations(target, tuple(generations.values()))
+
+
+def scan_model_directory_or_file_with_extraction_manifest(
+    path: str,
+    **scan_options: Any,
+) -> ModelAuditResultModel:
+    with _TEST_ZIP_EXTRACTION_CAPTURE_LOCK:
+        recorder = _ZipExtractionRecorder()
+        original_rewrite = ZipScanner._rewrite_nested_result_context
+        original_member_temp_file = ZipScanner._open_member_temp_file
+        original_zip_open = zipfile.ZipFile.open
+
+        def record_rewrite(
+            scanner: ZipScanner,
+            scan_result: ScanResult,
+            temp_path: str,
+            archive_path: str,
+            entry_name: str,
+        ) -> None:
+            original_rewrite(scanner, scan_result, temp_path, archive_path, entry_name)
+            recorder.record_extraction(
+                temp_path=temp_path,
+                archive_path=archive_path,
+                entry_name=entry_name,
+            )
+
+        @contextlib.contextmanager
+        def record_member_temp_file(
+            suffix: str,
+            safe_name: str | None,
+            preserve_nested_routing_basename: bool,
+        ) -> Iterator[tuple[str, BinaryIO, str | None]]:
+            with original_member_temp_file(
+                suffix,
+                safe_name,
+                preserve_nested_routing_basename,
+            ) as member_temp_file:
+                temp_path = member_temp_file[0]
+                recorder.begin_temp_path(temp_path)
+                try:
+                    yield member_temp_file
+                finally:
+                    recorder.end_temp_path(temp_path)
+
+        def record_zip_open(
+            archive: zipfile.ZipFile,
+            name: str | zipfile.ZipInfo,
+            mode: str = "r",
+            pwd: bytes | None = None,
+            *,
+            force_zip64: bool = False,
+        ) -> Any:
+            if mode == "r" and isinstance(name, zipfile.ZipInfo):
+                recorder.record_source_entry(archive, name)
+            return original_zip_open(archive, name, mode, pwd, force_zip64=force_zip64)
+
+        with (
+            mock.patch.object(ZipScanner, "_open_member_temp_file", staticmethod(record_member_temp_file)),
+            mock.patch.object(ZipScanner, "_rewrite_nested_result_context", record_rewrite),
+            mock.patch.object(zipfile.ZipFile, "open", record_zip_open),
+        ):
+            results = scan_model_directory_or_file(path, **scan_options)
+
+    captured_manifest, captured_generation = recorder.freeze()
+    existing_manifest = _test_zip_extraction_manifest(results)
+    generations = _test_zip_extraction_generations(results)
+    if existing_manifest is not None:
+        captured_manifest = _ZipExtractionManifest((*existing_manifest.events, *captured_manifest.events))
+    if captured_generation is not None:
+        generations[captured_generation.generation_id] = captured_generation
+    if len(captured_manifest.events) > _TEST_ZIP_EXTRACTION_MANIFEST_MAX_EVENTS:
+        raise AssertionError("combined ZIP extraction manifest exceeded the test event limit")
+    _set_test_zip_extraction_manifest(results, captured_manifest)
+    _register_test_zip_extraction_generations(
+        results,
+        tuple(generations.values()),
+    )
+    return results
 
 
 def _zip_member_path_is_safe(member_name: str) -> bool:
@@ -1139,23 +1971,11 @@ def _listed_archive_contents_by_member(
                 paths_are_valid = False
                 continue
             extracted_archive_path = content_path[: marker_offset + len(archive_source_basename)]
-            extracted_parent = Path(extracted_archive_path).parent
-            extracted_name = Path(extracted_archive_path).name
-            temp_root = Path(tempfile.gettempdir())
-            if archive_source_name_is_exact:
-                path_matches_profile = (
-                    extracted_name == archive_source_basename
-                    and extracted_parent.parent == temp_root
-                    and re.fullmatch(r"tmp[a-z0-9_]{8}", extracted_parent.name) is not None
-                )
-            else:
-                random_prefix = extracted_name[: -len(archive_source_basename) - 1]
-                path_matches_profile = (
-                    extracted_parent == temp_root
-                    and extracted_name.endswith(f"_{archive_source_basename}")
-                    and re.fullmatch(r"tmp[a-z0-9_]{8}", random_prefix) is not None
-                )
-            if not os.path.isabs(extracted_archive_path) or not path_matches_profile:
+            if not _source_path_matches_temp_profile(
+                extracted_archive_path,
+                archive_source_basename,
+                archive_source_name_is_exact,
+            ):
                 paths_are_valid = False
                 continue
             member_name = content_path[marker_offset + len(marker) :]
@@ -1664,11 +2484,26 @@ def _source_path_matches_temp_profile(
 ) -> bool:
     if not isinstance(source_path, str) or not os.path.isabs(source_path):
         return False
-    source_basename = Path(source_path).name
+    source = Path(source_path)
+    temp_root = Path(tempfile.gettempdir())
+    temp_prefix = tempfile.gettempprefix()
+    if source_name_is_exact:
+        random_name = source.parent.name
+        return (
+            source.name == expected_source_name
+            and source.parent.parent == temp_root
+            and random_name.startswith(temp_prefix)
+            and re.fullmatch(r"[a-z0-9_]{8}", random_name[len(temp_prefix) :]) is not None
+        )
+
+    expected_suffix = f"_{expected_source_name}"
+    if not source.name.endswith(expected_suffix):
+        return False
+    random_name = source.name[: -len(expected_suffix)]
     return (
-        source_basename == expected_source_name
-        if source_name_is_exact
-        else source_basename.endswith(f"_{expected_source_name}")
+        source.parent == temp_root
+        and random_name.startswith(temp_prefix)
+        and re.fullmatch(r"[a-z0-9_]{8}", random_name[len(temp_prefix) :]) is not None
     )
 
 
@@ -1688,6 +2523,7 @@ def _zip_format_diagnostic_has_explicit_marker(diagnostic: Issue | Check) -> boo
 def _nested_h5py_details_are_exact(
     details: dict[str, Any],
     source_profile: XmlArchiveSourceProfile,
+    expected_source_paths: Counter[str],
 ) -> bool:
     expected_zip_entry, expected_source_name, source_name_is_exact = source_profile
     return (
@@ -1698,6 +2534,8 @@ def _nested_h5py_details_are_exact(
         and details.get("scan_outcome_reason") == EXPECTED_NESTED_H5PY_REASON
         and details.get("zip_entry") == expected_zip_entry
         and _source_path_matches_temp_profile(details.get("path"), expected_source_name, source_name_is_exact)
+        and isinstance(details.get("path"), str)
+        and expected_source_paths[details["path"]] == 1
     )
 
 
@@ -1705,13 +2543,14 @@ def _nested_h5py_direct_diagnostic_is_exact(
     diagnostic: Issue | Check,
     member_location: str,
     source_profile: XmlArchiveSourceProfile,
+    expected_source_paths: Counter[str],
 ) -> bool:
     common_fields_are_exact = (
         diagnostic.location == member_location
         and diagnostic.rule_code == "S902"
         and diagnostic.severity == IssueSeverity.INFO
         and diagnostic.message == EXPECTED_NESTED_H5PY_MESSAGE
-        and _nested_h5py_details_are_exact(diagnostic.details, source_profile)
+        and _nested_h5py_details_are_exact(diagnostic.details, source_profile, expected_source_paths)
     )
     if isinstance(diagnostic, Issue):
         return common_fields_are_exact
@@ -1724,6 +2563,7 @@ def _nested_h5py_consolidated_check_is_exact(
     diagnostic: Check,
     member_location: str,
     source_profile: XmlArchiveSourceProfile,
+    expected_source_paths: Counter[str],
     occurrence_count: int,
     direct_issue: Issue,
 ) -> bool:
@@ -1740,7 +2580,7 @@ def _nested_h5py_consolidated_check_is_exact(
         and isinstance(findings, list)
         and len(findings) == occurrence_count
         and all(
-            isinstance(finding, dict) and _nested_h5py_details_are_exact(finding, source_profile)
+            isinstance(finding, dict) and _nested_h5py_details_are_exact(finding, source_profile, expected_source_paths)
             for finding in findings
         )
     ):
@@ -1766,6 +2606,7 @@ def _validate_nested_h5py_dependency_profile(
     metadata: dict[str, Any],
     contract: _ZipArchiveOccurrenceContract,
     root_diagnostics: list[Issue | Check],
+    extraction_source_paths_by_location: dict[str, Counter[str]],
 ) -> tuple[bool, bool, set[str], set[int]]:
     scan_outcome_reasons = metadata.get("scan_outcome_reasons")
     owner_claims_dependency = (
@@ -1791,6 +2632,7 @@ def _validate_nested_h5py_dependency_profile(
 
     invalid_locations: set[str] = set()
     validated_ids: set[int] = set()
+    validated_source_paths: dict[str, set[str]] = {}
     metadata_is_exact = (
         metadata.get("analysis_incomplete") is True
         and metadata.get("scan_outcome") == "inconclusive"
@@ -1808,34 +2650,77 @@ def _validate_nested_h5py_dependency_profile(
             invalid_locations.add(location)
 
     for (member_location, source_profile), occurrence_count in contract.h5py_dependency_members.items():
+        expected_source_paths = extraction_source_paths_by_location.get(member_location, Counter())
+        extraction_manifest_is_exact = (
+            sum(expected_source_paths.values()) == occurrence_count
+            and len(expected_source_paths) == occurrence_count
+            and all(count == 1 for count in expected_source_paths.values())
+        )
         member_candidates = [diagnostic for diagnostic in candidates if diagnostic.location == member_location]
         exact_issues = [
             diagnostic
             for diagnostic in member_candidates
             if isinstance(diagnostic, Issue)
-            and _nested_h5py_direct_diagnostic_is_exact(diagnostic, member_location, source_profile)
+            and _nested_h5py_direct_diagnostic_is_exact(
+                diagnostic,
+                member_location,
+                source_profile,
+                expected_source_paths,
+            )
         ]
         if len(member_candidates) != 2 or len(exact_issues) != 1:
             invalid_locations.add(member_location)
             continue
         direct_issue = exact_issues[0]
         exact_checks = [diagnostic for diagnostic in member_candidates if isinstance(diagnostic, Check)]
+        member_source_paths: set[str] = set()
         if occurrence_count == 1:
             checks_are_exact = len(exact_checks) == 1 and _nested_h5py_direct_diagnostic_is_exact(
-                exact_checks[0], member_location, source_profile
+                exact_checks[0],
+                member_location,
+                source_profile,
+                expected_source_paths,
             )
+            if checks_are_exact:
+                issue_source_path = direct_issue.details.get("path")
+                check_source_path = exact_checks[0].details.get("path")
+                if isinstance(issue_source_path, str) and issue_source_path == check_source_path:
+                    member_source_paths.add(issue_source_path)
+                else:
+                    checks_are_exact = False
         else:
             checks_are_exact = len(exact_checks) == 1 and _nested_h5py_consolidated_check_is_exact(
                 exact_checks[0],
                 member_location,
                 source_profile,
+                expected_source_paths,
                 occurrence_count,
                 direct_issue,
             )
+            if checks_are_exact:
+                findings = exact_checks[0].details.get("findings")
+                if isinstance(findings, list):
+                    member_source_paths.update(
+                        source_path
+                        for finding in findings
+                        if isinstance(finding, dict) and isinstance((source_path := finding.get("path")), str)
+                    )
+                checks_are_exact = len(member_source_paths) == occurrence_count
+        checks_are_exact = (
+            checks_are_exact and extraction_manifest_is_exact and member_source_paths == set(expected_source_paths)
+        )
         if not checks_are_exact:
             invalid_locations.add(member_location)
             continue
+        validated_source_paths[member_location] = member_source_paths
         validated_ids.update(id(diagnostic) for diagnostic in member_candidates)
+
+    source_path_owners: dict[str, str] = {}
+    for member_location, source_paths in validated_source_paths.items():
+        for source_path in source_paths:
+            previous_owner = source_path_owners.setdefault(source_path, member_location)
+            if previous_owner != member_location:
+                invalid_locations.update({previous_owner, member_location})
 
     profile_is_valid = metadata_is_exact and bool(contract.h5py_dependency_members) and not invalid_locations
     if not profile_is_valid:
@@ -2006,6 +2891,7 @@ def _validate_nested_corrupt_zip_diagnostics(
 def _xml_archive_diagnostic_details_are_exact(
     details: dict[str, Any],
     expected_source_profile: XmlArchiveSourceProfile,
+    expected_source_paths: Counter[str],
 ) -> bool:
     expected_zip_entry, expected_source_name, source_name_is_exact = expected_source_profile
     zip_entry = details.get("zip_entry")
@@ -2014,6 +2900,8 @@ def _xml_archive_diagnostic_details_are_exact(
         frozenset(details) == EXPECTED_XML_ARCHIVE_DIAGNOSTIC_FIELDS
         and details.get("format") == "xml_model_inconclusive"
         and _source_path_matches_temp_profile(source_path, expected_source_name, source_name_is_exact)
+        and isinstance(source_path, str)
+        and expected_source_paths[source_path] == 1
         and isinstance(zip_entry, str)
         and zip_entry == expected_zip_entry
     )
@@ -2032,11 +2920,15 @@ def _diagnosed_xml_archive_occurrences(
     root_diagnostics: list[Issue | Check],
     expected_occurrences: Counter[tuple[str, str]],
     expected_source_profiles: dict[tuple[str, str], XmlArchiveSourceProfile],
+    extraction_source_paths_by_location: dict[str, Counter[str]],
 ) -> tuple[Counter[tuple[str, str]], set[str]]:
     direct_issue_occurrences: Counter[tuple[str, str]] = Counter()
     direct_check_occurrences: Counter[tuple[str, str]] = Counter()
     consolidated_check_objects: Counter[tuple[str, str]] = Counter()
     consolidated_check_occurrences: Counter[tuple[str, str]] = Counter()
+    direct_issue_source_paths: dict[tuple[str, str], list[str]] = {}
+    direct_check_source_paths: dict[tuple[str, str], list[str]] = {}
+    consolidated_source_paths: dict[tuple[str, str], list[str]] = {}
     invalid_locations: set[str] = set()
 
     for diagnostic in root_diagnostics:
@@ -2052,7 +2944,14 @@ def _diagnosed_xml_archive_occurrences(
             continue
         occurrence_key = (owner[0], location)
         expected_source_profile = expected_source_profiles.get(occurrence_key)
-        if expected_occurrences[occurrence_key] == 0 or expected_source_profile is None:
+        expected_source_paths = extraction_source_paths_by_location.get(location, Counter())
+        expected_occurrence_count = expected_occurrences[occurrence_key]
+        extraction_manifest_is_exact = (
+            sum(expected_source_paths.values()) == expected_occurrence_count
+            and len(expected_source_paths) == expected_occurrence_count
+            and all(count == 1 for count in expected_source_paths.values())
+        )
+        if expected_occurrence_count == 0 or expected_source_profile is None or not extraction_manifest_is_exact:
             invalid_locations.add(location)
             continue
 
@@ -2060,9 +2959,18 @@ def _diagnosed_xml_archive_occurrences(
             if (
                 diagnostic.severity == IssueSeverity.INFO
                 and diagnostic.rule_code is None
-                and _xml_archive_diagnostic_details_are_exact(diagnostic.details, expected_source_profile)
+                and _xml_archive_diagnostic_details_are_exact(
+                    diagnostic.details,
+                    expected_source_profile,
+                    expected_source_paths,
+                )
             ):
                 direct_issue_occurrences[occurrence_key] += 1
+                source_path = diagnostic.details.get("path")
+                if isinstance(source_path, str):
+                    direct_issue_source_paths.setdefault(occurrence_key, []).append(source_path)
+                else:
+                    invalid_locations.add(location)
             else:
                 invalid_locations.add(location)
             continue
@@ -2075,8 +2983,17 @@ def _diagnosed_xml_archive_occurrences(
         ):
             invalid_locations.add(location)
             continue
-        if _xml_archive_diagnostic_details_are_exact(diagnostic.details, expected_source_profile):
+        if _xml_archive_diagnostic_details_are_exact(
+            diagnostic.details,
+            expected_source_profile,
+            expected_source_paths,
+        ):
             direct_check_occurrences[occurrence_key] += 1
+            source_path = diagnostic.details.get("path")
+            if isinstance(source_path, str):
+                direct_check_source_paths.setdefault(occurrence_key, []).append(source_path)
+            else:
+                invalid_locations.add(location)
             continue
 
         details = diagnostic.details
@@ -2091,16 +3008,30 @@ def _diagnosed_xml_archive_occurrences(
             and component_count == len(findings)
             and all(
                 isinstance(finding, dict)
-                and _xml_archive_diagnostic_details_are_exact(finding, expected_source_profile)
+                and _xml_archive_diagnostic_details_are_exact(
+                    finding,
+                    expected_source_profile,
+                    expected_source_paths,
+                )
                 for finding in findings
             )
         ):
             invalid_locations.add(location)
             continue
+        raw_source_paths = [finding.get("path") for finding in findings if isinstance(finding, dict)]
+        if not all(isinstance(source_path, str) for source_path in raw_source_paths) or len(
+            set(raw_source_paths)
+        ) != len(raw_source_paths):
+            invalid_locations.add(location)
+            continue
         consolidated_check_objects[occurrence_key] += 1
         consolidated_check_occurrences[occurrence_key] += component_count
+        consolidated_source_paths.setdefault(occurrence_key, []).extend(
+            source_path for source_path in raw_source_paths if isinstance(source_path, str)
+        )
 
     diagnosed_occurrences: Counter[tuple[str, str]] = Counter()
+    diagnosed_source_paths: dict[tuple[str, str], set[str]] = {}
     occurrence_keys = (
         expected_occurrences.keys()
         | direct_issue_occurrences.keys()
@@ -2117,20 +3048,48 @@ def _diagnosed_xml_archive_occurrences(
                 and direct_check_occurrences[occurrence_key] == 1
                 and consolidated_check_objects[occurrence_key] == 0
                 and consolidated_check_occurrences[occurrence_key] == 0
+                and direct_issue_source_paths.get(occurrence_key) == direct_check_source_paths.get(occurrence_key)
             )
         elif expected_count > 1:
+            issue_paths = direct_issue_source_paths.get(occurrence_key, [])
+            grouped_paths = consolidated_source_paths.get(occurrence_key, [])
             representation_is_exact = (
                 representation_is_exact
                 and direct_check_occurrences[occurrence_key] == 0
                 and consolidated_check_objects[occurrence_key] == 1
                 and consolidated_check_occurrences[occurrence_key] == expected_count
+                and len(grouped_paths) == expected_count
+                and len(set(grouped_paths)) == expected_count
+                and len(issue_paths) == 1
+                and issue_paths[0] in grouped_paths
             )
         else:
             representation_is_exact = False
         if representation_is_exact:
             diagnosed_occurrences[occurrence_key] = expected_count
+            diagnosed_source_paths[occurrence_key] = set(
+                direct_issue_source_paths.get(occurrence_key, [])
+                + direct_check_source_paths.get(occurrence_key, [])
+                + consolidated_source_paths.get(occurrence_key, [])
+            )
+            if diagnosed_source_paths[occurrence_key] != set(
+                extraction_source_paths_by_location.get(occurrence_key[1], Counter())
+            ):
+                diagnosed_occurrences.pop(occurrence_key, None)
+                invalid_locations.add(occurrence_key[1])
         else:
             invalid_locations.add(occurrence_key[1])
+
+    source_path_owners: dict[str, tuple[str, str]] = {}
+    conflicting_occurrences: set[tuple[str, str]] = set()
+    for occurrence_key, occurrence_source_paths in diagnosed_source_paths.items():
+        for source_path in occurrence_source_paths:
+            previous_owner = source_path_owners.setdefault(source_path, occurrence_key)
+            if previous_owner != occurrence_key:
+                conflicting_occurrences.update({previous_owner, occurrence_key})
+    for occurrence_key in conflicting_occurrences:
+        diagnosed_occurrences.pop(occurrence_key, None)
+        invalid_locations.add(occurrence_key[1])
     return diagnosed_occurrences, invalid_locations
 
 
@@ -2314,14 +3273,105 @@ def _is_expected_call_graph_source_unavailable_diagnostic(
     )
 
 
+def _source_stability_diagnostic_is_candidate(diagnostic: Issue | Check) -> bool:
+    details = diagnostic.details
+    return (
+        diagnostic.message == EXPECTED_AGPL_SOURCE_STABILITY_MESSAGE
+        or details.get("analysis") == "python_call_graph_source_stability"
+        or details.get("category") == "call_graph_analysis_error"
+    )
+
+
+def _source_stability_diagnostic_is_exact(
+    diagnostic: Issue | Check,
+    expected_path: str,
+) -> bool:
+    details = diagnostic.details
+    common_identity_is_exact = (
+        diagnostic.location == expected_path
+        and diagnostic.message == EXPECTED_AGPL_SOURCE_STABILITY_MESSAGE
+        and diagnostic.rule_code == "S902"
+        and diagnostic.severity == IssueSeverity.INFO
+        and frozenset(details) == EXPECTED_AGPL_SOURCE_STABILITY_DETAILS
+        and details.get("analysis") == "python_call_graph_source_stability"
+        and details.get("analysis_incomplete") is True
+        and details.get("category") == "call_graph_analysis_error"
+        and details.get("exception_type") == "_CallGraphAnalysisLimitError"
+        and isinstance(details.get("pickle_source"), str)
+        and Path(details["pickle_source"]).resolve() == EXPECTED_AGPL_SOURCE_STABILITY_ASSET
+        and details.get("source_stability_reason") == EXPECTED_AGPL_SOURCE_STABILITY_REASON
+    )
+    if isinstance(diagnostic, Issue):
+        return common_identity_is_exact and diagnostic.type == "pickle_check"
+    return (
+        common_identity_is_exact
+        and diagnostic.name == "Standalone Pickle Error"
+        and diagnostic.status == CheckStatus.FAILED
+    )
+
+
+def _validate_source_stability_diagnostics(
+    expected_paths: set[str],
+    root_diagnostics: list[Issue | Check],
+    security_finding_locations: set[str],
+) -> tuple[set[str], set[str], set[int]]:
+    candidates = [
+        diagnostic for diagnostic in root_diagnostics if _source_stability_diagnostic_is_candidate(diagnostic)
+    ]
+    invalid_locations = {
+        diagnostic.location or "unknown scan location"
+        for diagnostic in candidates
+        if diagnostic.location not in expected_paths
+    }
+    diagnosed_paths: set[str] = set()
+    validated_ids: set[int] = set()
+    for expected_path in expected_paths:
+        has_security_finding = any(
+            finding_location == expected_path or finding_location.startswith(f"{expected_path} (")
+            for finding_location in security_finding_locations
+        )
+        path_candidates = [diagnostic for diagnostic in candidates if diagnostic.location == expected_path]
+        exact_issues = [
+            diagnostic
+            for diagnostic in path_candidates
+            if isinstance(diagnostic, Issue) and _source_stability_diagnostic_is_exact(diagnostic, expected_path)
+        ]
+        exact_checks = [
+            diagnostic
+            for diagnostic in path_candidates
+            if isinstance(diagnostic, Check) and _source_stability_diagnostic_is_exact(diagnostic, expected_path)
+        ]
+        if not has_security_finding or len(path_candidates) != 2 or len(exact_issues) != 1 or len(exact_checks) != 1:
+            invalid_locations.add(expected_path)
+            continue
+        diagnosed_paths.add(expected_path)
+        validated_ids.update(id(diagnostic) for diagnostic in path_candidates)
+    return diagnosed_paths, invalid_locations, validated_ids
+
+
 def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_description: str) -> None:
     root_diagnostics: list[Issue | Check] = [*results.issues, *results.checks]
+    aggregate_has_security_finding = any(
+        diagnostic.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        and (not isinstance(diagnostic, Check) or diagnostic.status == CheckStatus.FAILED)
+        for diagnostic in root_diagnostics
+    )
     diagnostics = [
         (diagnostic, details)
         for diagnostic in root_diagnostics
         for details in _nested_diagnostic_details(diagnostic.details)
     ]
     unexpected_errors = {asset.path for asset in results.assets if asset.type == "error"}
+    extraction_manifest = _test_zip_extraction_manifest(results)
+    if extraction_manifest is None:
+        extraction_source_paths_by_location: dict[str, Counter[str]] = {}
+    else:
+        extraction_source_paths_by_location, extraction_manifest_errors = (
+            extraction_manifest.source_paths_by_logical_location(
+                _authorized_generations=_test_zip_extraction_generations(results),
+            )
+        )
+        unexpected_errors.update(extraction_manifest_errors)
     for diagnostic, details in diagnostics:
         if _has_malformed_diagnostic_markers(details):
             unexpected_errors.add(diagnostic.location or "unknown scan location")
@@ -2358,7 +3408,11 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
                 unexpected_errors.discard(path)
             continue
         h5py_claimed, h5py_is_valid, h5py_errors, h5py_diagnostic_ids = _validate_nested_h5py_dependency_profile(
-            path, payload, contract, root_diagnostics
+            path,
+            payload,
+            contract,
+            root_diagnostics,
+            extraction_source_paths_by_location,
         )
         unexpected_errors.update(h5py_errors)
         if h5py_claimed:
@@ -2645,6 +3699,7 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
         root_diagnostics,
         expected_xml_member_occurrences,
         expected_xml_source_profiles,
+        extraction_source_paths_by_location,
     )
     unexpected_errors.update(invalid_xml_diagnostic_locations)
     for (owner_path, member_path, reason), expected_count in expected_xml_member_coverage_outcomes.items():
@@ -2706,11 +3761,7 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
 
     for owner_path in nested_h5py_dependency_paths:
         nested_h5py_coverage_pair = (owner_path, "zip_analysis_incomplete")
-        owner_has_actionable_security_finding = any(
-            location == owner_path or location.startswith(f"{owner_path}:")
-            for location in actionable_security_finding_locations
-        )
-        expected_exit_code = 1 if owner_has_actionable_security_finding else 2
+        expected_exit_code = 1 if aggregate_has_security_finding else 2
         if (
             owner_path in validated_nested_h5py_dependency_paths
             and nested_h5py_coverage_pair in expected_coverage_outcomes
@@ -2722,7 +3773,14 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
         else:
             unexpected_errors.add(owner_path)
 
-    diagnosed_source_changes = set()
+    diagnosed_source_changes, source_stability_errors, validated_source_stability_ids = (
+        _validate_source_stability_diagnostics(
+            expected_source_changes,
+            root_diagnostics,
+            security_finding_locations,
+        )
+    )
+    unexpected_errors.update(source_stability_errors)
     diagnosed_unavailable_scanners = set()
     for diagnostic, details in diagnostics:
         location = diagnostic.location or "unknown scan location"
@@ -2913,26 +3971,7 @@ def assert_no_unexpected_asset_scan_errors(results: ModelAuditResultModel, scan_
         if category == "call_graph_analysis_error" or (
             pickle_source and category not in {None, "parse_error"} and "exception_type" in details
         ):
-            matching_paths = {path for path in expected_source_changes if location == path}
-            if (
-                matching_paths
-                and isinstance(pickle_source, str)
-                and Path(pickle_source).resolve() == EXPECTED_AGPL_SOURCE_STABILITY_ASSET
-                and diagnostic.message
-                == "Python call-graph analysis could not complete: source changed during shared call-graph analysis"
-                and category == "call_graph_analysis_error"
-                and details.get("exception_type") == "_CallGraphAnalysisLimitError"
-                and details.get("analysis") == "python_call_graph_source_stability"
-                and details.get("analysis_incomplete") is True
-                and details.get("source_stability_reason") == EXPECTED_AGPL_SOURCE_STABILITY_REASON
-                and diagnostic_is_failed
-                and any(
-                    finding_location == location or finding_location.startswith(f"{location} (")
-                    for finding_location in security_finding_locations
-                )
-            ):
-                diagnosed_source_changes.update(matching_paths)
-            else:
+            if id(diagnostic) not in validated_source_stability_ids:
                 unexpected_errors.add(location)
             continue
 
@@ -3439,7 +4478,10 @@ class TestSecurityAssetIntegration:
         # Scan the entire assets directory. The tree intentionally contains
         # exploits/ and malicious samples/, so success is expected to be False;
         # what matters for discovery is that the scan ran and processed files.
-        results = scan_model_directory_or_file(str(assets_dir), cache_enabled=False)
+        results = scan_model_directory_or_file_with_extraction_manifest(
+            str(assets_dir),
+            cache_enabled=False,
+        )
 
         # Should find various file types
         assert results.files_scanned > 0, "Should find some files to scan"
@@ -3475,7 +4517,10 @@ class TestSecurityAssetIntegration:
         import time
 
         start_time = time.perf_counter()
-        results = scan_model_directory_or_file(str(assets_dir), cache_enabled=False)
+        results = scan_model_directory_or_file_with_extraction_manifest(
+            str(assets_dir),
+            cache_enabled=False,
+        )
         duration = time.perf_counter() - start_time
 
         # Should complete in reasonable time. The assets tree contains exploits,
