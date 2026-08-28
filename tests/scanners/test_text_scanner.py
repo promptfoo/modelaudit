@@ -625,6 +625,17 @@ def test_text_scanner_documentation_image_binding_bypasses_stay_actionable(
             id="pillow-image-save-match-class-alias",
         ),
         pytest.param(
+            "class Meta(type):\n"
+            "    def __instancecheck__(cls, value):\n"
+            "        return True\n"
+            "class Matcher(metaclass=Meta):\n"
+            "    __match_args__ = ('save',)\n"
+            "match img:\n"
+            "    case Matcher(writer):\n"
+            "        writer('sitecustomize.py', format='PNG')",
+            id="pillow-image-save-positional-match-class-alias",
+        ),
+        pytest.param(
             "writer = open\nwriter('usercustomize.py', 'w').write('print(1)')",
             id="startup-hook-aliased-open",
         ),

@@ -4621,9 +4621,12 @@ def _is_official_readme_urlopen_image_example(example: bytes) -> bool:
             or not isinstance(node.ctx, ast.Load)
         ):
             return False
-        if isinstance(node, ast.MatchClass) and any(
-            attribute in _DOCUMENTED_EXAMPLE_FORBIDDEN_ATTRIBUTES or attribute.startswith("__")
-            for attribute in node.kwd_attrs
+        if isinstance(node, ast.MatchClass) and (
+            node.patterns
+            or any(
+                attribute in _DOCUMENTED_EXAMPLE_FORBIDDEN_ATTRIBUTES or attribute.startswith("__")
+                for attribute in node.kwd_attrs
+            )
         ):
             return False
         if isinstance(node, ast.Subscript) and not isinstance(node.ctx, ast.Load):
