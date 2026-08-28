@@ -3591,15 +3591,16 @@ def test_organized_asset_scans_preserve_xml_zip_member_path_semantics(
     expected_safe_name: str,
     tmp_path: Path,
 ) -> None:
+    expected_stored_member_name = zipfile.ZipInfo(member_name).filename
     if nested:
         archive_path, result = _scan_nested_zip_archive(
             tmp_path,
             ((member_name, AMBIGUOUS_XML_PAYLOAD),),
         )
-        expected_zip_entry = f"inner.zip:{member_name}"
+        expected_zip_entry = f"inner.zip:{expected_stored_member_name}"
     else:
         archive_path, result = _scan_ambiguous_xml_archive(tmp_path, (member_name,))
-        expected_zip_entry = member_name
+        expected_zip_entry = expected_stored_member_name
     diagnostics: list[Issue | Check] = [
         *[
             issue
