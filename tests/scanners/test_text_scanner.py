@@ -463,6 +463,48 @@ def test_text_scanner_unpinned_model_cards_are_informational(
 
 
 @pytest.mark.parametrize(
+    "model_name",
+    [
+        pytest.param("hf-hub:attacker/payload", id="huggingface-hub-source"),
+        pytest.param("local-dir:payload", id="local-directory-source"),
+    ],
+)
+@pytest.mark.parametrize("crlf", [False, True], ids=["lf", "crlf"])
+def test_text_scanner_documentation_image_rejects_timm_source_prefixes(
+    tmp_path: Path,
+    model_name: str,
+    crlf: bool,
+) -> None:
+    example = (
+        "# Model card\n\n"
+        "```python\n"
+        "from urllib.request import urlopen\n"
+        "from PIL import Image\n"
+        "import timm\n\n"
+        "img = Image.open(urlopen(\n"
+        '    "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/'
+        'beignets-task-guide.png"\n'
+        "))\n"
+        f"model = timm.create_model('{model_name}', pretrained=True)\n"
+        "```\n"
+    )
+    payload = example.replace("\n", "\r\n").encode() if crlf else example.encode()
+    path = tmp_path / "README.md"
+    path.write_bytes(payload)
+
+    result = TextScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+    assert result.success is False
+    assert network_comm.official_readme_urlopen_image_example_spans(payload) == ()
+    assert any(
+        check.details.get("function") == "urlopen" and check.severity == IssueSeverity.CRITICAL
+        for check in _failed_network_detection_checks(result)
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+@pytest.mark.parametrize(
     ("mutation", "replacement"),
     [
         pytest.param(
@@ -617,6 +659,14 @@ def test_text_scanner_documentation_image_binding_bypasses_stay_actionable(
             id="startup-hook-direct-open",
         ),
         pytest.param(
+            "__loader__.set_data('sitecustomize.py', b'print(1)')",
+            id="import-loader-set-data",
+        ),
+        pytest.param(
+            "help('payload')",
+            id="pydoc-help-import",
+        ),
+        pytest.param(
             "img.save('sitecustomize.py', format='PNG')",
             id="pillow-image-save",
         ),
@@ -654,7 +704,7 @@ def test_text_scanner_documentation_image_binding_bypasses_stay_actionable(
         pytest.param("breakpoint()", id="interactive-debugger"),
     ],
 )
-def test_text_scanner_documentation_image_rejects_side_effectful_builtin_calls(
+def test_text_scanner_documentation_image_rejects_side_effectful_code(
     tmp_path: Path,
     injected_code: str,
 ) -> None:
@@ -662,6 +712,33 @@ def test_text_scanner_documentation_image_rejects_side_effectful_builtin_calls(
         "))\n```\n",
         f"))\n{injected_code}\n```\n",
     ).encode()
+    path = tmp_path / "README.md"
+    path.write_bytes(payload)
+
+    result = TextScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+    assert result.success is False
+    assert network_comm.official_readme_urlopen_image_example_spans(payload) == ()
+    assert any(
+        check.details.get("function") == "urlopen" and check.severity == IssueSeverity.CRITICAL
+        for check in _failed_network_detection_checks(result)
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_text_scanner_documentation_image_rejects_timm_checkpoint_load(tmp_path: Path) -> None:
+    payload = (
+        HUGGINGFACE_DOCUMENTATION_IMAGE_EXAMPLE.replace(
+            "from PIL import Image\n",
+            "from PIL import Image\nimport timm\n",
+        )
+        .replace(
+            "))\n```\n",
+            "))\ntimm.create_model('resnet18', checkpoint_path='payload.pth')\n```\n",
+        )
+        .encode()
+    )
     path = tmp_path / "README.md"
     path.write_bytes(payload)
 
