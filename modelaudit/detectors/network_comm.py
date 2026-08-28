@@ -4499,6 +4499,7 @@ _DOCUMENTED_EXAMPLE_FORBIDDEN_NAMES = frozenset(
 )
 _DOCUMENTED_EXAMPLE_FORBIDDEN_ATTRIBUTES = frozenset(
     {
+        "_dump",
         "__import__",
         "delattr",
         "exec",
