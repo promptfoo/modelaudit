@@ -625,6 +625,10 @@ def test_text_scanner_documentation_image_binding_bypasses_stay_actionable(
             id="pillow-image-dump",
         ),
         pytest.param(
+            "img.show()",
+            id="pillow-image-show",
+        ),
+        pytest.param(
             "match img:\n    case object(save=writer):\n        writer('sitecustomize.py', format='PNG')",
             id="pillow-image-save-match-class-alias",
         ),

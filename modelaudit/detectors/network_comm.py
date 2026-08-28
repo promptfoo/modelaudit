@@ -4508,6 +4508,7 @@ _DOCUMENTED_EXAMPLE_FORBIDDEN_ATTRIBUTES = frozenset(
         "locals",
         "popen",
         "save",
+        "show",
         "setattr",
         "system",
         "vars",
