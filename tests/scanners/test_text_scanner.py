@@ -617,6 +617,14 @@ def test_text_scanner_documentation_image_binding_bypasses_stay_actionable(
             id="startup-hook-direct-open",
         ),
         pytest.param(
+            "img.save('sitecustomize.py', format='PNG')",
+            id="pillow-image-save",
+        ),
+        pytest.param(
+            "match img:\n    case object(save=writer):\n        writer('sitecustomize.py', format='PNG')",
+            id="pillow-image-save-match-class-alias",
+        ),
+        pytest.param(
             "writer = open\nwriter('usercustomize.py', 'w').write('print(1)')",
             id="startup-hook-aliased-open",
         ),

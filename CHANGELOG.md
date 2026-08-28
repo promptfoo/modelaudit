@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Security
 
 - Upgrade Debian util-linux packages in all Docker runtime images to remediate CVE-2026-53615.
-- Preserve model-card network alerts when documented image examples invoke file-writing or debugger builtins.
+- Preserve model-card network alerts when documented image examples invoke file-writing calls or debugger builtins.
 
 ### Bug Fixes
 
