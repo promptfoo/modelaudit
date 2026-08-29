@@ -26,6 +26,7 @@ from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlparse, urlspli
 
 from ..file.detection import detect_file_format_for_skip_filter
 from ..file.streaming import StreamedSourceByteAccounting
+from ..helpers.assets import asset_from_scan_result
 from ..helpers.disk_space import check_disk_space
 from ..helpers.interrupt_handler import check_interrupted
 from .huggingface_paths import (
@@ -184,9 +185,18 @@ class _HuggingFaceSafeTensorsRetentionBudget:
         tensor_name_count = sum(1 for name in raw_names if isinstance(name, str)) if isinstance(raw_names, list) else 0
         serialization_failed = False
         try:
+            # Streaming output retains metadata and a separately derived asset, so charge both representations.
+            report_path = str(metadata.get("source_path") or metadata.get("remote_source_path") or "")
+            asset = asset_from_scan_result(report_path, result, metadata=metadata)
+            asset["is_streamed"] = True
+            asset["is_remote_header_only"] = bool(metadata.get("remote_header_only"))
             result_bytes = len(
                 json.dumps(
-                    result.to_dict(),
+                    {
+                        "result": result.to_dict(),
+                        "file_metadata_path": report_path,
+                        "asset": asset,
+                    },
                     ensure_ascii=False,
                     separators=(",", ":"),
                     default=str,
