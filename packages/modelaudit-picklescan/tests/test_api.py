@@ -44,6 +44,7 @@ from typing import Any, Literal, cast
 import pytest
 
 import modelaudit_picklescan.api as package_api
+import modelaudit_picklescan.call_graph as call_graph
 from modelaudit_picklescan import (
     CoverageSummary,
     Finding,
@@ -3404,10 +3405,14 @@ def test_scan_file_suppresses_rebuild_tensor_v2_for_multiple_canonical_memo_uses
     data_pkl = (
         b"\x80\x04"
         + _global(b"torch._utils", b"_rebuild_tensor_v2")
-        + b"q\x00"
+        + b"q\x000"
+        + _pytorch_empty_ordered_dict_reduce_expr()
+        + b"("
+        + _short_binunicode(b"first")
         + _pytorch_rebuild_tensor_v2_reduce_expr()
+        + _short_binunicode(b"second")
         + _pytorch_rebuild_tensor_v2_reduce_expr()
-        + b"."
+        + b"u."
     )
     _write_pytorch_zip_data_pickle(archive_path, data_pkl)
 
@@ -3416,6 +3421,162 @@ def test_scan_file_suppresses_rebuild_tensor_v2_for_multiple_canonical_memo_uses
     assert report["status"] == "complete"
     assert report["verdict"] == "clean"
     assert _torch_rebuild_tensor_v2_warning_dicts(report) == []
+
+
+def test_scan_file_suppresses_rebuild_tensor_v2_for_nested_canonical_tensor(tmp_path: Path) -> None:
+    _require_torch_distribution()
+    archive_path = tmp_path / "nested-canonical-state.pt"
+    data_pkl = (
+        b"\x80\x04"
+        + _global(b"torch._utils", b"_rebuild_tensor_v2")
+        + b"q\x000"
+        + _pytorch_empty_ordered_dict_reduce_expr()
+        + b"("
+        + _short_binunicode(b"weight")
+        + _pytorch_rebuild_tensor_v2_reduce_expr()
+        + _short_binunicode(b"_extra_state")
+        + b"}"
+        + _short_binunicode(b"calibration")
+        + _pytorch_rebuild_tensor_v2_reduce_expr()
+        + b"su."
+    )
+    _write_pytorch_zip_data_pickle(archive_path, data_pkl)
+
+    report = _scan_file_report_dict_subprocess(archive_path)
+
+    assert report["status"] == "complete"
+    assert report["verdict"] == "clean"
+    assert _torch_rebuild_tensor_v2_warning_dicts(report) == []
+
+
+@pytest.mark.parametrize("memoized_final_tensor", [False, True])
+def test_scan_file_preserves_hidden_malicious_storage_after_stacked_canonical_tensors(
+    tmp_path: Path,
+    memoized_final_tensor: bool,
+) -> None:
+    archive_path = tmp_path / f"malicious-stacked-canonical-{memoized_final_tensor}.pt"
+    hidden_payload = b"S'" + b"A" * 5000 + b"'\n0cos\nsystem\n(S'echo discarded-same-storage'\ntR."
+    canonical_tensor = _pytorch_rebuild_tensor_v2_reduce_expr(
+        key="0",
+        storage_name="ByteStorage",
+        element_count=len(hidden_payload),
+    )
+    final_tensor = b"q\x01h\x01" if memoized_final_tensor else canonical_tensor
+    data_pkl = (
+        b"\x80\x04"
+        + _global(b"torch._utils", b"_rebuild_tensor_v2")
+        + b"q\x00"
+        + canonical_tensor
+        + final_tensor
+        + b"."
+    )
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", data_pkl)
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", hidden_payload)
+
+    report = scan_file(archive_path)
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.severity == Severity.CRITICAL
+        and finding.details.get("module") in {"os", "posix", "nt"}
+        and finding.details.get("name") == "system"
+        for finding in report.findings
+    )
+
+
+@pytest.mark.parametrize("raw_storage_first", [False, True])
+def test_scan_file_preserves_hidden_malicious_storage_inside_enclosing_list(
+    tmp_path: Path,
+    raw_storage_first: bool,
+) -> None:
+    archive_path = tmp_path / f"malicious-enclosing-list-{raw_storage_first}.pt"
+    hidden_payload = b"S'" + b"A" * 5000 + b"'\n0cos\nsystem\n(S'echo enclosing-list-storage'\ntR."
+    entries: list[bytes] = []
+    for index in range(600):
+        key = _short_binunicode(f"weight_{index}".encode("ascii"))
+        if index == 0:
+            value = _pytorch_rebuild_tensor_v2_payload(key=str(index + 1)).removeprefix(b"\x80\x04").removesuffix(b".")
+        else:
+            value = _pytorch_rebuild_tensor_v2_reduce_expr(key=str(index + 1))
+        entries.append(key + value)
+    raw_storage = _pytorch_storage_binpersid_expr(
+        key="0",
+        storage_name="ByteStorage",
+        element_count=len(hidden_payload),
+    )
+    canonical_dictionary = _pytorch_empty_ordered_dict_reduce_expr() + b"(" + b"".join(entries) + b"u"
+    ordered_entries = (raw_storage, canonical_dictionary) if raw_storage_first else (canonical_dictionary, raw_storage)
+    data_pkl = b"\x80\x04]" + b"".join(item + b"a" for item in ordered_entries) + b"."
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", data_pkl)
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", hidden_payload)
+        for index in range(600):
+            archive.writestr(f"archive/data/{index + 1}", b"\x00" * 24)
+
+    report = scan_file(archive_path)
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.severity == Severity.CRITICAL
+        and finding.details.get("module") in {"os", "posix", "nt"}
+        and finding.details.get("name") == "system"
+        for finding in report.findings
+    )
+
+
+@pytest.mark.parametrize("padding_entries", [2, 5])
+def test_scan_file_preserves_hidden_malicious_storage_after_padded_nested_dictionary_overwrite(
+    tmp_path: Path,
+    padding_entries: int,
+) -> None:
+    archive_path = tmp_path / f"malicious-padded-nested-state-{padding_entries}.pt"
+    hidden_payload = b"S'" + b"A" * 5000 + b"'\n0cos\nsystem\n(S'echo nested-dictionary-storage'\ntR."
+    hidden_tensor = (
+        _pytorch_rebuild_tensor_v2_payload(
+            key="0",
+            storage_name="ByteStorage",
+            element_count=len(hidden_payload),
+        )
+        .removeprefix(b"\x80\x04")
+        .removesuffix(b".")
+    )
+    padding = b"".join(_short_binunicode(f"pad_{index}".encode("ascii")) + b"K\x00" for index in range(padding_entries))
+    nested_dictionary = b"}(" + padding + _short_binunicode(b"hidden") + hidden_tensor + b"u"
+    entries = [
+        _short_binunicode(b"outer") + nested_dictionary,
+        _short_binunicode(b"outer") + b"K\x00",
+        _short_binunicode(b"safe") + _pytorch_rebuild_tensor_v2_reduce_expr(key="1"),
+    ]
+    entries.extend(_short_binunicode(f"metadata_{index}".encode("ascii")) + b"K\x01" for index in range(40))
+    data_pkl = b"\x80\x04" + _pytorch_empty_ordered_dict_reduce_expr() + b"(" + b"".join(entries) + b"u."
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", data_pkl)
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", hidden_payload)
+        archive.writestr("archive/data/1", b"\x00" * 24)
+
+    report = scan_file(archive_path)
+
+    assert (
+        package_api._trusted_pytorch_data_pkl_from_storage_member_sizes(
+            data_pkl,
+            {"0": len(hidden_payload), "1": 24},
+        )
+        is None
+    )
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.severity == Severity.CRITICAL
+        and finding.details.get("module") in {"os", "posix", "nt"}
+        and finding.details.get("name") == "system"
+        for finding in report.findings
+    )
 
 
 def test_scan_file_suppresses_rebuild_tensor_v2_for_real_ordered_state_dict(tmp_path: Path) -> None:
@@ -3430,6 +3591,1193 @@ def test_scan_file_suppresses_rebuild_tensor_v2_for_real_ordered_state_dict(tmp_
     assert report["status"] == "complete"
     assert report["verdict"] == "clean"
     assert _torch_rebuild_tensor_v2_warning_dicts(report) == []
+
+
+def _write_large_batched_pytorch_state_dict(
+    path: Path,
+    *,
+    malicious: bool = False,
+    entry_count: int = 600,
+    leading_metadata: bool = False,
+    leading_metadata_count: int = 0,
+    leading_canonical_container: Literal["list", "tuple", "dictionary"] | None = None,
+    split_leading_metadata_batch: bool = False,
+    metadata_value: bytes = b"K\x01",
+    trailing_metadata_count: int = 0,
+    trailing_metadata_fields: int = 1,
+) -> None:
+    entries: list[bytes] = []
+    if leading_metadata:
+        metadata_key = b"_extra_state"
+        entries.append(b"X" + len(metadata_key).to_bytes(4, "little") + metadata_key + metadata_value)
+    if leading_canonical_container is not None:
+        nested_tensor = _pytorch_rebuild_tensor_v2_payload(key="0").removeprefix(b"\x80\x04").removesuffix(b".")
+        nested_value = {
+            "list": b"]" + nested_tensor + b"a",
+            "tuple": nested_tensor + b"\x85",
+            "dictionary": b"}" + _short_binunicode(b"calibration") + nested_tensor + b"s",
+        }[leading_canonical_container]
+        entries.append(_short_binunicode(b"_extra_state") + nested_value)
+    for index in range(leading_metadata_count):
+        metadata_key = f"_extra_state_{index}".encode("ascii")
+        entries.append(b"X" + len(metadata_key).to_bytes(4, "little") + metadata_key + metadata_value)
+    for index in range(entry_count):
+        key_bytes = f"weight_{index}".encode("ascii")
+        key = b"X" + len(key_bytes).to_bytes(4, "little") + key_bytes
+        if malicious and index == entry_count - 1:
+            value = b"cos\nsystem\n(S'echo malicious-near-match'\ntR"
+        elif index == 0 and leading_canonical_container is None:
+            value = _pytorch_rebuild_tensor_v2_payload(key=str(index)).removeprefix(b"\x80\x04").removesuffix(b".")
+        else:
+            value = _pytorch_rebuild_tensor_v2_reduce_expr(key=str(index))
+        entries.append(key + value)
+
+    payload = b"\x80\x04" + _global(b"collections", b"OrderedDict") + b")R("
+    if split_leading_metadata_batch:
+        prefix_count = leading_metadata_count + int(leading_metadata)
+        payload += b"".join(entries[:prefix_count]) + b"u("
+        payload += b"".join(entries[prefix_count:]) + b"u"
+    else:
+        payload += b"".join(entries) + b"u"
+    if trailing_metadata_count:
+        metadata_key = b"_metadata"
+        metadata_entries = []
+        for index in range(trailing_metadata_count):
+            module_name = f"layer_{index}".encode("ascii")
+            fields = []
+            for field_index in range(trailing_metadata_fields):
+                version_key = b"version" if field_index == 0 else f"extra_{field_index}".encode("ascii")
+                fields.append(b"X" + len(version_key).to_bytes(4, "little") + version_key + b"K\x01")
+            version_dict = b"}(" + b"".join(fields) + b"u"
+            metadata_entries.append(b"X" + len(module_name).to_bytes(4, "little") + module_name + version_dict)
+        payload += b"(" + b"X" + len(metadata_key).to_bytes(4, "little") + metadata_key + b"}("
+        payload += b"".join(metadata_entries) + b"uu"
+    payload += b"."
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("archive/data.pkl", payload)
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        for index in range(entry_count - int(malicious)):
+            archive.writestr(f"archive/data/{index}", b"\x00" * 24)
+
+
+@pytest.mark.parametrize(
+    ("entry_count", "leading_metadata", "metadata_value"),
+    [(600, False, b"K\x01"), (1000, False, b"K\x01"), (600, True, b"K\x01"), (600, True, b"}")],
+)
+def test_pytorch_storage_trust_parses_large_batched_state_dict_without_framework(
+    tmp_path: Path,
+    entry_count: int,
+    leading_metadata: bool,
+    metadata_value: bytes,
+) -> None:
+    archive_path = tmp_path / f"large-batched-state-{entry_count}-{leading_metadata}.pt"
+    _write_large_batched_pytorch_state_dict(
+        archive_path,
+        entry_count=entry_count,
+        leading_metadata=leading_metadata,
+        metadata_value=metadata_value,
+    )
+    with zipfile.ZipFile(archive_path) as archive:
+        payload = archive.read("archive/data.pkl")
+
+    parsed = package_api._pytorch_storage_keys_from_pickle_bytes(payload)
+
+    assert parsed.parse_complete is True
+    assert len(parsed.referenced_keys) == entry_count
+    assert len(parsed.canonical_tensor_rebuild_invocations) == len(parsed.referenced_keys)
+
+
+def test_pytorch_storage_trust_parses_large_metadata_after_canonical_batch(tmp_path: Path) -> None:
+    archive_path = tmp_path / "large-batched-metadata-state.pt"
+    _write_large_batched_pytorch_state_dict(archive_path, trailing_metadata_count=600)
+    with zipfile.ZipFile(archive_path) as archive:
+        payload = archive.read("archive/data.pkl")
+
+    parsed = package_api._pytorch_storage_keys_from_pickle_bytes(payload)
+
+    assert parsed.parse_complete is True
+    assert len(parsed.referenced_keys) == 600
+    assert len(parsed.canonical_tensor_rebuild_invocations) == 600
+
+
+def test_pytorch_storage_trust_records_canonical_tensor_inserted_with_setitem() -> None:
+    tensor = _pytorch_rebuild_tensor_v2_payload(key="0").removeprefix(b"\x80\x04").removesuffix(b".")
+    metadata_entries = b"".join(
+        _short_binunicode(f"metadata_{index}".encode("ascii")) + b"K\x01" for index in range(33)
+    )
+    payload = (
+        b"\x80\x04"
+        + _pytorch_empty_ordered_dict_reduce_expr()
+        + _short_binunicode(b"weight")
+        + tensor
+        + b"s("
+        + metadata_entries
+        + b"u."
+    )
+
+    parsed = package_api._pytorch_storage_keys_from_pickle_bytes(payload)
+
+    assert parsed.parse_complete is True
+    assert parsed.referenced_keys == {"0"}
+    assert len(parsed.canonical_tensor_rebuild_invocations) == 1
+    assert package_api._trusted_pytorch_data_pkl_from_storage_member_sizes(payload, {"0": 24}) is not None
+
+
+@pytest.mark.parametrize(
+    "malformed_opcode",
+    [b"l", b"t", b"d", b"e", b"1", b"odd-setitems"],
+    ids=["list", "tuple", "dict", "appends", "pop-mark", "odd-setitems"],
+)
+def test_pytorch_storage_trust_rejects_provenance_drained_by_malformed_opcode(
+    malformed_opcode: bytes,
+) -> None:
+    entries: list[bytes] = []
+    for index in range(33):
+        key = _short_binunicode(f"weight_{index}".encode("ascii"))
+        if index == 0:
+            value = _pytorch_rebuild_tensor_v2_payload(key="0").removeprefix(b"\x80\x04").removesuffix(b".")
+        else:
+            value = _pytorch_rebuild_tensor_v2_reduce_expr(key=str(index))
+        entries.append(key + value)
+    hidden_storage = _pytorch_storage_binpersid_expr(
+        key="hidden",
+        storage_name="ByteStorage",
+        element_count=128,
+    )
+    leading_mark = b"(" if malformed_opcode == b"odd-setitems" else b""
+    malformed_collection = (
+        hidden_storage + b"K\x00u" if malformed_opcode == b"odd-setitems" else hidden_storage + malformed_opcode
+    )
+    final_entry = _short_binunicode(b"weight_final") + _pytorch_rebuild_tensor_v2_reduce_expr(key="33")
+    payload = (
+        b"\x80\x04"
+        + leading_mark
+        + _pytorch_empty_ordered_dict_reduce_expr()
+        + b"("
+        + b"".join(entries)
+        + b"u"
+        + malformed_collection
+        + _pytorch_empty_ordered_dict_reduce_expr()
+        + b"("
+        + final_entry
+        + b"u."
+    )
+    storage_sizes = {str(index): 24 for index in range(34)}
+    storage_sizes["hidden"] = 128
+
+    parsed = package_api._pytorch_storage_keys_from_pickle_bytes(payload)
+
+    assert parsed.parse_complete is True
+    assert parsed.discarded_tracked_storage_references is True
+    assert package_api._trusted_pytorch_data_pkl_from_storage_member_sizes(payload, storage_sizes) is None
+
+
+@pytest.mark.parametrize("container_kind", ["list", "tuple", "dictionary"])
+def test_pytorch_storage_trust_parses_large_batch_with_leading_nested_canonical_tensor(
+    tmp_path: Path,
+    container_kind: Literal["list", "tuple", "dictionary"],
+) -> None:
+    archive_path = tmp_path / f"large-batched-nested-canonical-{container_kind}.pt"
+    _write_large_batched_pytorch_state_dict(
+        archive_path,
+        leading_canonical_container=container_kind,
+    )
+    with zipfile.ZipFile(archive_path) as archive:
+        payload = archive.read("archive/data.pkl")
+
+    parsed = package_api._pytorch_storage_keys_from_pickle_bytes(payload)
+
+    assert parsed.parse_complete is True
+    assert len(parsed.referenced_keys) == 600
+    assert len(parsed.canonical_tensor_rebuild_invocations) == 601
+
+
+@pytest.mark.parametrize("container_kind", ["list", "tuple", "dictionary"])
+def test_pytorch_storage_trust_parses_nested_canonical_tensor_in_later_state_batch(
+    tmp_path: Path,
+    container_kind: Literal["list", "tuple", "dictionary"],
+) -> None:
+    archive_path = tmp_path / f"later-batch-nested-canonical-{container_kind}.pt"
+    _write_large_batched_pytorch_state_dict(archive_path, entry_count=1000)
+    with zipfile.ZipFile(archive_path) as archive:
+        first_batch = archive.read("archive/data.pkl")
+    nested_tensor = _pytorch_rebuild_tensor_v2_reduce_expr(key="1000")
+    nested_value = {
+        "list": b"]" + nested_tensor + b"a",
+        "tuple": nested_tensor + b"\x85",
+        "dictionary": b"}" + _short_binunicode(b"calibration") + nested_tensor + b"s",
+    }[container_kind]
+    later_entries = [_short_binunicode(b"_extra_state") + nested_value]
+    later_entries.extend(
+        _short_binunicode(f"weight_{index}".encode("ascii")) + _pytorch_rebuild_tensor_v2_reduce_expr(key=str(index))
+        for index in range(1001, 1033)
+    )
+    payload = first_batch.removesuffix(b".") + b"(" + b"".join(later_entries) + b"u."
+
+    parsed = package_api._pytorch_storage_keys_from_pickle_bytes(payload)
+
+    assert parsed.parse_complete is True
+    assert len(parsed.referenced_keys) == 1033
+    assert len(parsed.canonical_tensor_rebuild_invocations) == 1033
+
+
+@pytest.mark.parametrize(("leading_metadata_count", "split_batch"), [(510, False), (1000, False), (1000, True)])
+def test_pytorch_storage_trust_parses_large_metadata_prefix_before_canonical_tensor(
+    tmp_path: Path,
+    leading_metadata_count: int,
+    split_batch: bool,
+) -> None:
+    archive_path = tmp_path / f"large-metadata-prefix-{leading_metadata_count}.pt"
+    _write_large_batched_pytorch_state_dict(
+        archive_path,
+        entry_count=1,
+        leading_metadata_count=leading_metadata_count,
+        split_leading_metadata_batch=split_batch,
+    )
+    with zipfile.ZipFile(archive_path) as archive:
+        payload = archive.read("archive/data.pkl")
+
+    parsed = package_api._pytorch_storage_keys_from_pickle_bytes(payload)
+
+    assert parsed.parse_complete is True
+    assert parsed.referenced_keys == {"0"}
+    assert len(parsed.canonical_tensor_rebuild_invocations) == 1
+
+
+def test_scan_file_preserves_malicious_call_after_large_metadata_prefix(tmp_path: Path) -> None:
+    archive_path = tmp_path / "large-metadata-prefix-malicious.pt"
+    _write_large_batched_pytorch_state_dict(
+        archive_path,
+        entry_count=2,
+        leading_metadata_count=510,
+        malicious=True,
+    )
+
+    report = _scan_file_report_dict_subprocess(archive_path)
+
+    assert report["verdict"] == "malicious"
+    assert any(
+        finding["severity"] == "critical"
+        and finding["details"].get("module") in {"os", "posix", "nt"}
+        and finding["details"].get("name") == "system"
+        for finding in report["findings"]
+    )
+
+
+def test_pytorch_storage_trust_parses_nested_multifield_metadata_batch(tmp_path: Path) -> None:
+    archive_path = tmp_path / "large-multifield-metadata-state.pt"
+    _write_large_batched_pytorch_state_dict(
+        archive_path,
+        trailing_metadata_count=510,
+        trailing_metadata_fields=2,
+    )
+    with zipfile.ZipFile(archive_path) as archive:
+        payload = archive.read("archive/data.pkl")
+
+    parsed = package_api._pytorch_storage_keys_from_pickle_bytes(payload)
+
+    assert parsed.parse_complete is True
+    assert len(parsed.canonical_tensor_rebuild_invocations) == 600
+
+
+def test_scan_file_suppresses_rebuild_tensor_v2_for_real_module_state_dict(tmp_path: Path) -> None:
+    _require_torch_distribution()
+    import torch
+
+    archive_path = tmp_path / "module-state-with-metadata.pt"
+    torch.save(torch.nn.Linear(3, 2).state_dict(), archive_path)
+
+    report = _scan_file_report_dict_subprocess(archive_path)
+
+    assert report["status"] == "complete"
+    assert report["verdict"] == "clean"
+    assert _torch_rebuild_tensor_v2_warning_dicts(report) == []
+
+
+def test_pytorch_storage_trust_checks_deadline_during_metadata_provenance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_path = tmp_path / "large-batched-metadata-deadline.pt"
+    _write_large_batched_pytorch_state_dict(archive_path, trailing_metadata_count=600)
+    with zipfile.ZipFile(archive_path) as archive:
+        payload = archive.read("archive/data.pkl")
+
+    def stop_during_metadata_inspection(_deadline: float) -> None:
+        if sys._getframe(1).f_code.co_name == "value_contains_tracked_provenance":
+            raise package_api._PytorchZipDeadlineExceeded
+
+    monkeypatch.setattr(package_api, "_check_pytorch_zip_deadline", stop_during_metadata_inspection)
+
+    with pytest.raises(package_api._PytorchZipDeadlineExceeded):
+        package_api._pytorch_storage_keys_from_pickle_bytes(payload, deadline=1.0)
+
+
+def test_pytorch_storage_trust_bounds_metadata_provenance_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_path = tmp_path / "large-batched-metadata-budget.pt"
+    _write_large_batched_pytorch_state_dict(archive_path, trailing_metadata_count=600)
+    with zipfile.ZipFile(archive_path) as archive:
+        payload = archive.read("archive/data.pkl")
+
+    monkeypatch.setattr(package_api, "_PYTORCH_STORAGE_TRUST_MAX_PROVENANCE_NODES", 32)
+
+    parsed = package_api._pytorch_storage_keys_from_pickle_bytes(payload)
+
+    assert parsed.parse_complete is False
+    assert parsed.referenced_keys == set()
+    assert parsed.canonical_tensor_rebuild_invocations == set()
+
+
+def test_scan_file_suppresses_rebuild_tensor_v2_for_large_batched_state_dict(tmp_path: Path) -> None:
+    _require_torch_distribution()
+    archive_path = tmp_path / "large-batched-state.pt"
+    _write_large_batched_pytorch_state_dict(archive_path)
+
+    report = _scan_file_report_dict_subprocess(archive_path)
+
+    assert report["status"] == "complete"
+    assert report["verdict"] == "clean"
+    assert _torch_rebuild_tensor_v2_warning_dicts(report) == []
+    assert not any(finding["rule_code"] == "PERSISTENT_ID" for finding in report["findings"])
+
+
+@pytest.mark.parametrize(("entry_count", "padding_bytes"), [(33, 5000), (100, 5000), (600, 5000), (600, 32_000)])
+def test_scan_file_preserves_hidden_malicious_storage_inside_compacted_canonical_tensor(
+    tmp_path: Path,
+    entry_count: int,
+    padding_bytes: int,
+) -> None:
+    archive_path = tmp_path / f"malicious-compacted-canonical-{entry_count}-{padding_bytes}.pt"
+    hidden_payload = b"S'" + b"A" * padding_bytes + b"'\n0cos\nsystem\n(S'echo compacted-storage'\ntR."
+    entries: list[bytes] = []
+    for index in range(entry_count):
+        key = _short_binunicode(f"weight_{index}".encode("ascii"))
+        if index == 0:
+            value = (
+                _pytorch_rebuild_tensor_v2_payload(
+                    key="0",
+                    storage_name="ByteStorage",
+                    element_count=len(hidden_payload),
+                )
+                .removeprefix(b"\x80\x04")
+                .removesuffix(b".")
+            )
+        else:
+            value = _pytorch_rebuild_tensor_v2_reduce_expr(key=str(index))
+        entries.append(key + value)
+    data_pkl = b"\x80\x04" + _pytorch_empty_ordered_dict_reduce_expr() + b"(" + b"".join(entries) + b"u."
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", data_pkl)
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", hidden_payload)
+        for index in range(1, entry_count):
+            archive.writestr(f"archive/data/{index}", b"\x00" * 24)
+
+    parsed = package_api._pytorch_storage_keys_from_pickle_bytes(data_pkl)
+    report = scan_file(archive_path)
+
+    assert parsed.parse_complete is True
+    assert parsed.accepted_oversized_state_batch is True
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.severity == Severity.CRITICAL
+        and finding.details.get("module") in {"os", "posix", "nt"}
+        and finding.details.get("name") == "system"
+        and finding.location is not None
+        and "archive/data/0" in finding.location
+        for finding in report.findings
+    )
+
+
+@pytest.mark.parametrize("malicious_last", [False, True], ids=["benign", "late-malicious"])
+def test_scan_file_bounds_expanded_probes_for_complete_proto_prefixes(
+    tmp_path: Path,
+    malicious_last: bool,
+) -> None:
+    archive_path = tmp_path / f"large-pickle-like-storage-prefixes-{malicious_last}.pt"
+    entry_count = 70
+    storage_size = 64 * 1024
+    entries: list[bytes] = []
+    for index in range(entry_count):
+        key = _short_binunicode(f"weight_{index}".encode("ascii"))
+        if index == 0:
+            value = (
+                _pytorch_rebuild_tensor_v2_payload(
+                    key="0",
+                    storage_name="ByteStorage",
+                    element_count=storage_size,
+                )
+                .removeprefix(b"\x80\x04")
+                .removesuffix(b".")
+            )
+        else:
+            value = _pytorch_rebuild_tensor_v2_reduce_expr(
+                key=str(index),
+                storage_name="ByteStorage",
+                element_count=storage_size,
+            )
+        entries.append(key + value)
+    data_pkl = b"\x80\x04" + _pytorch_empty_ordered_dict_reduce_expr() + b"(" + b"".join(entries) + b"u."
+
+    def pad_with_protocol0_string(prefix: bytes) -> bytes:
+        padding_size = storage_size - len(prefix) - len(b"S''\n.")
+        return prefix + b"S'" + b"A" * padding_size + b"'\n."
+
+    storage = pad_with_protocol0_string(b"N.")
+    malicious_storage = pad_with_protocol0_string(b"N.cos\nsystem\n(S'echo late-expanded-proto'\ntR.")
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", data_pkl)
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        for index in range(entry_count):
+            storage_payload = malicious_storage if malicious_last and index == entry_count - 1 else storage
+            archive.writestr(f"archive/data/{index}", storage_payload)
+
+    report = scan_file(archive_path)
+
+    assert not any(notice.code == "pytorch_zip_pickle_discovery_probe_budget" for notice in report.notices)
+    if malicious_last:
+        assert report.verdict == SafetyVerdict.MALICIOUS
+        assert any(
+            finding.severity == Severity.CRITICAL
+            and finding.details.get("module") in {"os", "posix", "nt"}
+            and finding.details.get("name") == "system"
+            and finding.location is not None
+            and f"archive/data/{entry_count - 1}" in finding.location
+            for finding in report.findings
+        )
+        return
+    try:
+        importlib_metadata.distribution("torch")
+    except importlib_metadata.PackageNotFoundError:
+        assert report.status == ScanStatus.INCONCLUSIVE
+    else:
+        assert report.status == ScanStatus.COMPLETE
+
+
+def test_scan_file_preserves_short_probe_budget_before_expanding_trusted_storage(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    entry_count = 33
+    storage_size = 10 * 1024
+    entries: list[bytes] = []
+    for index in range(entry_count):
+        key = _short_binunicode(f"weight_{index}".encode("ascii"))
+        if index == 0:
+            value = (
+                _pytorch_rebuild_tensor_v2_payload(
+                    key="0",
+                    storage_name="ByteStorage",
+                    element_count=storage_size,
+                )
+                .removeprefix(b"\x80\x04")
+                .removesuffix(b".")
+            )
+        else:
+            value = _pytorch_rebuild_tensor_v2_reduce_expr(
+                key=str(index),
+                storage_name="ByteStorage",
+                element_count=storage_size,
+            )
+        entries.append(key + value)
+    data_pkl = b"\x80\x04" + _pytorch_empty_ordered_dict_reduce_expr() + b"(" + b"".join(entries) + b"u."
+
+    frame_size = 5000
+    frame = b"\x95" + frame_size.to_bytes(8, "little") + b"N" * frame_size
+    storage = frame + b"\x00" * (storage_size - len(frame))
+    malicious_suffix = b"cos\nsystem\n(S'echo preserved-probe-budget'\ntR"
+    malicious_storage = frame + malicious_suffix
+    malicious_storage += b"\x00" * (storage_size - len(malicious_storage))
+    probe_budget = (
+        len(b"3\n")
+        + len(b"little")
+        + entry_count
+        * (package_api._PICKLE_DISCOVERY_SHORT_PROBE_BYTES + package_api._TRUSTED_STORAGE_PICKLE_PROBE_BYTES)
+    )
+    monkeypatch.setattr(
+        package_api,
+        "_MAX_PYTORCH_ZIP_PICKLE_DISCOVERY_PROBE_BYTES",
+        probe_budget,
+        raising=False,
+    )
+    probe_bytes_remaining_at_last_read = probe_budget
+    original_read_zip_entry_probe = package_api._read_zip_entry_probe
+
+    def track_probe_budget(
+        archive: zipfile.ZipFile,
+        entry: zipfile.ZipInfo,
+        max_bytes: int,
+        probe_bytes_remaining: list[int],
+        deadline: float,
+    ) -> bytes:
+        nonlocal probe_bytes_remaining_at_last_read
+        sample = original_read_zip_entry_probe(archive, entry, max_bytes, probe_bytes_remaining, deadline)
+        probe_bytes_remaining_at_last_read = probe_bytes_remaining[0]
+        return sample
+
+    monkeypatch.setattr(package_api, "_read_zip_entry_probe", track_probe_budget)
+
+    archive_path = tmp_path / "expanded-storage-probe-budget.pt"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", data_pkl)
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        for index in range(entry_count):
+            payload = malicious_storage if index == entry_count - 1 else storage
+            archive.writestr(f"archive/data/{index}", payload)
+
+    report = scan_file(archive_path)
+
+    assert probe_bytes_remaining_at_last_read == 0
+    assert not any(notice.code == "pytorch_zip_pickle_discovery_probe_budget" for notice in report.notices)
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert f"archive/data/{entry_count - 1}" in report.metadata["pickle_files"]
+    assert any(
+        finding.severity == Severity.CRITICAL
+        and finding.details.get("module") in {"os", "posix", "nt"}
+        and finding.details.get("name") == "system"
+        and finding.location is not None
+        and f"archive/data/{entry_count - 1}" in finding.location
+        for finding in report.findings
+    )
+
+
+def test_expanded_trusted_storage_probe_does_not_short_circuit_partial_frame(tmp_path: Path) -> None:
+    frame_size = 20
+    storage_size = package_api._PICKLE_DISCOVERY_LONG_PROBE_BYTES
+    storage = b"\x95" + frame_size.to_bytes(8, "little") + b"N" * frame_size
+    storage += b"\x00" * (storage_size - len(storage))
+    archive_path = tmp_path / "partial-frame-storage.pt"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data/0", storage)
+
+    probe_budget = 2 * package_api._PICKLE_DISCOVERY_LONG_PROBE_BYTES
+    probe_bytes_remaining = [probe_budget]
+    with zipfile.ZipFile(archive_path) as archive:
+        entry = archive.getinfo("archive/data/0")
+        looks_like_pickle = package_api._trusted_storage_zip_entry_looks_like_pickle(
+            archive,
+            entry,
+            probe_bytes_remaining,
+            float("inf"),
+            max_probe_bytes=package_api._PICKLE_DISCOVERY_LONG_PROBE_BYTES,
+        )
+
+    assert looks_like_pickle is False
+    assert probe_bytes_remaining == [probe_budget - package_api._PICKLE_DISCOVERY_SHORT_PROBE_BYTES - storage_size]
+
+
+def test_expanded_trusted_storage_probe_preserves_short_frame_probe(tmp_path: Path) -> None:
+    frame_size = 5000
+    storage = b"\x95" + frame_size.to_bytes(8, "little") + b"N" * frame_size
+    storage += b"cos\nsystem\n(S'echo expanded-frame'\ntR"
+    assert len(storage) > package_api._TRUSTED_STORAGE_PICKLE_PROBE_BYTES
+    assert len(storage) < package_api._PICKLE_DISCOVERY_LONG_PROBE_BYTES
+    archive_path = tmp_path / "expanded-frame-storage.pt"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data/0", storage)
+
+    with zipfile.ZipFile(archive_path) as archive:
+        entry = archive.getinfo("archive/data/0")
+        short_probe_budget = [package_api._PICKLE_DISCOVERY_LONG_PROBE_BYTES]
+        short_probe_result = package_api._trusted_storage_zip_entry_looks_like_pickle(
+            archive,
+            entry,
+            short_probe_budget,
+            float("inf"),
+        )
+        expanded_probe_budget = [2 * package_api._PICKLE_DISCOVERY_LONG_PROBE_BYTES]
+        expanded_probe_result = package_api._trusted_storage_zip_entry_looks_like_pickle(
+            archive,
+            entry,
+            expanded_probe_budget,
+            float("inf"),
+            max_probe_bytes=package_api._PICKLE_DISCOVERY_LONG_PROBE_BYTES,
+        )
+
+    assert short_probe_result is True
+    assert expanded_probe_result is True
+    assert short_probe_budget == [
+        package_api._PICKLE_DISCOVERY_LONG_PROBE_BYTES
+        - package_api._PICKLE_DISCOVERY_SHORT_PROBE_BYTES
+        - package_api._TRUSTED_STORAGE_PICKLE_PROBE_BYTES
+    ]
+    assert expanded_probe_budget == [
+        2 * package_api._PICKLE_DISCOVERY_LONG_PROBE_BYTES
+        - package_api._PICKLE_DISCOVERY_SHORT_PROBE_BYTES
+        - len(storage)
+    ]
+
+
+def test_expanded_trusted_storage_probe_does_not_short_circuit_partial_proto0_string(
+    tmp_path: Path,
+) -> None:
+    partial_proto_prefix = b"]NaNS'abcdefghij"
+    assert len(partial_proto_prefix) == package_api._PICKLE_DISCOVERY_SHORT_PROBE_BYTES
+    assert package_api._proto0_or_1_trusted_storage_probe_should_scan(
+        partial_proto_prefix,
+        sample_is_prefix=True,
+    )
+
+    storage_size = package_api._PICKLE_DISCOVERY_LONG_PROBE_BYTES
+    framed_suffix = b"'\n\x95" + (1).to_bytes(8, "little") + b"N"
+    storage = partial_proto_prefix + framed_suffix
+    storage += b"\x00" * (storage_size - len(storage))
+    archive_path = tmp_path / "partial-proto0-string-storage.pt"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data/0", storage)
+
+    probe_budget = 2 * package_api._PICKLE_DISCOVERY_LONG_PROBE_BYTES
+    probe_bytes_remaining = [probe_budget]
+    with zipfile.ZipFile(archive_path) as archive:
+        entry = archive.getinfo("archive/data/0")
+        looks_like_pickle = package_api._trusted_storage_zip_entry_looks_like_pickle(
+            archive,
+            entry,
+            probe_bytes_remaining,
+            float("inf"),
+            max_probe_bytes=package_api._PICKLE_DISCOVERY_LONG_PROBE_BYTES,
+        )
+
+    assert looks_like_pickle is False
+    assert probe_bytes_remaining == [probe_budget - package_api._PICKLE_DISCOVERY_SHORT_PROBE_BYTES - storage_size]
+
+
+@pytest.mark.parametrize("container_kind", ["dict-setitem", "dict-setitems", "list", "tuple", "ordered-dict"])
+def test_scan_file_preserves_retained_benign_storage_container(
+    tmp_path: Path,
+    container_kind: str,
+) -> None:
+    archive_path = tmp_path / f"retained-storage-{container_kind}.pt"
+    storage = _pytorch_storage_binpersid_expr()
+    key = _short_binunicode(b"storage")
+    container = {
+        "dict-setitem": b"}" + key + storage + b"s",
+        "dict-setitems": b"}(" + key + storage + b"u",
+        "list": b"]" + storage + b"a",
+        "tuple": storage + b"\x85",
+        "ordered-dict": _pytorch_empty_ordered_dict_reduce_expr() + key + storage + b"s",
+    }[container_kind]
+    data_pkl = b"\x80\x04" + container + b"."
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", data_pkl)
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", b"\x00" * 24)
+
+    report = scan_file(archive_path)
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert not any(finding.rule_code == "PERSISTENT_ID" for finding in report.findings)
+
+
+@pytest.mark.parametrize(("leading_metadata", "metadata_value"), [(False, b"K\x01"), (True, b"}")])
+def test_scan_file_preserves_malicious_call_in_large_batched_state_dict(
+    tmp_path: Path,
+    leading_metadata: bool,
+    metadata_value: bytes,
+) -> None:
+    archive_path = tmp_path / f"large-batched-malicious-state-{leading_metadata}.pt"
+    _write_large_batched_pytorch_state_dict(
+        archive_path,
+        malicious=True,
+        leading_metadata=leading_metadata,
+        metadata_value=metadata_value,
+    )
+
+    report = _scan_file_report_dict_subprocess(archive_path)
+
+    assert report["verdict"] == "malicious"
+    assert any(
+        finding["severity"] == "critical"
+        and finding["details"].get("module") in {"os", "posix", "nt"}
+        and finding["details"].get("name") == "system"
+        for finding in report["findings"]
+    )
+
+
+def test_pytorch_storage_trust_rejects_setitems_beyond_stack_limit() -> None:
+    entries = package_api._PYTORCH_STORAGE_TRUST_MAX_STACK_DEPTH // 2 + 1
+    oversized_payload = b"\x80\x04}(" + (b"K\x00K\x00" * entries) + b"u."
+
+    parsed = package_api._pytorch_storage_keys_from_pickle_bytes(oversized_payload)
+
+    assert parsed.parse_complete is False
+    assert parsed.referenced_keys == set()
+    assert parsed.canonical_tensor_rebuild_invocations == set()
+
+
+def test_pytorch_storage_trust_preserves_noncanonical_setitems_width_limit() -> None:
+    entries = package_api._PYTORCH_STORAGE_TRUST_MAX_TUPLE_WIDTH // 2 + 1
+    payload = (
+        b"\x80\x04}("
+        + b"".join(
+            b"X" + len(key := f"key_{index}".encode("ascii")).to_bytes(4, "little") + key + b"K\x00"
+            for index in range(entries)
+        )
+        + b"u."
+    )
+
+    parsed = package_api._pytorch_storage_keys_from_pickle_bytes(payload)
+
+    assert parsed.parse_complete is False
+    assert parsed.referenced_keys == set()
+    assert parsed.canonical_tensor_rebuild_invocations == set()
+
+
+@pytest.mark.parametrize(
+    ("with_prior_tensor_batch", "storage_wrapper"),
+    [
+        (False, None),
+        (True, None),
+        (True, (b"builtins", b"list")),
+        (True, (b"builtins", b"tuple")),
+        (True, (b"collections", b"OrderedDict")),
+        (True, "popped"),
+        (True, "pop_mark"),
+        (True, "overwrite_dict"),
+        (True, "overwrite_setitems"),
+        (True, "popped_tensor"),
+        (True, "pop_mark_tensor"),
+        (True, "overwrite_tensor_dict"),
+        (True, "overwrite_tensor_setitems"),
+        (True, "nested_tensor_tuple"),
+    ],
+)
+def test_scan_file_preserves_hidden_malicious_storage_after_noncanonical_setitems(
+    tmp_path: Path,
+    with_prior_tensor_batch: bool,
+    storage_wrapper: tuple[bytes, bytes]
+    | Literal[
+        "popped",
+        "pop_mark",
+        "overwrite_dict",
+        "overwrite_setitems",
+        "popped_tensor",
+        "pop_mark_tensor",
+        "overwrite_tensor_dict",
+        "overwrite_tensor_setitems",
+        "nested_tensor_tuple",
+    ]
+    | None,
+) -> None:
+    archive_path = tmp_path / f"malicious-noncanonical-state-{with_prior_tensor_batch}.pt"
+    hidden_payload = b"S'" + b"A" * 5000 + b"'\n0cos\nsystem\n(S'echo malicious-near-match'\ntR."
+    entries: list[bytes] = []
+    for index in range(package_api._PYTORCH_STORAGE_TRUST_MAX_TUPLE_WIDTH // 2 + 1):
+        key = f"key_{index}".encode("ascii")
+        entries.append(b"X" + len(key).to_bytes(4, "little") + key + b"K\x00")
+    storage_key = b"storage"
+    storage_reference = _pytorch_storage_binpersid_expr(
+        key="0",
+        storage_name="ByteStorage",
+        element_count=len(hidden_payload),
+    )
+    if storage_wrapper in {
+        "popped_tensor",
+        "pop_mark_tensor",
+        "overwrite_tensor_dict",
+        "overwrite_tensor_setitems",
+        "nested_tensor_tuple",
+    }:
+        storage_reference = _pytorch_rebuild_tensor_v2_reduce_expr(
+            key="0",
+            storage_name="ByteStorage",
+            element_count=len(hidden_payload),
+        )
+    if storage_wrapper in {"popped", "popped_tensor"}:
+        storage_reference += b"0K\x00"
+    elif storage_wrapper in {"pop_mark", "pop_mark_tensor"}:
+        storage_reference = b"(" + storage_reference + b"1K\x00"
+    elif storage_wrapper in {"overwrite_dict", "overwrite_tensor_dict"}:
+        slot = _short_binunicode(b"slot")
+        storage_reference = b"}" + slot + storage_reference + b"s" + slot + b"K\x00s"
+    elif storage_wrapper in {"overwrite_setitems", "overwrite_tensor_setitems"}:
+        slot = _short_binunicode(b"slot")
+        storage_reference = b"}(" + slot + storage_reference + b"u(" + slot + b"K\x00u"
+    elif storage_wrapper == "nested_tensor_tuple":
+        storage_reference += b"\x85"
+    elif storage_wrapper is not None:
+        storage_reference = _global(*storage_wrapper) + b"(" + storage_reference + b"tR"
+    entries.append(b"X" + len(storage_key).to_bytes(4, "little") + storage_key + storage_reference)
+    if with_prior_tensor_batch:
+        tensor_key = b"weight"
+        tensor_value = _pytorch_rebuild_tensor_v2_payload(key="1").removeprefix(b"\x80\x04").removesuffix(b".")
+        prefix = (
+            b"\x80\x04"
+            + _global(b"collections", b"OrderedDict")
+            + b")R("
+            + b"X"
+            + len(tensor_key).to_bytes(4, "little")
+            + tensor_key
+            + tensor_value
+            + b"u("
+            + b"X\x09\x00\x00\x00_metadata}("
+        )
+        suffix = b"uu."
+    else:
+        prefix = b"\x80\x04}("
+        suffix = b"u."
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", prefix + b"".join(entries) + suffix)
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", hidden_payload)
+        if with_prior_tensor_batch:
+            archive.writestr("archive/data/1", b"\x00" * 24)
+
+    report = scan_file(archive_path)
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.severity == Severity.CRITICAL
+        and finding.details.get("module") in {"os", "posix", "nt"}
+        and finding.details.get("name") == "system"
+        for finding in report.findings
+    )
+
+
+@pytest.mark.parametrize(
+    "duplicate_variant",
+    [
+        "ordered_batch",
+        "ordered_setitem",
+        "nested_dict",
+        "ordered_build",
+        "list_reduce",
+        "tuple_reduce",
+        "ordered_reduce",
+        "ordered_storage_key",
+        "ordered_storage_value",
+        "nested_storage_key",
+        "leading_nested_ordered_storage",
+        "leading_plain_dict_storage_batch",
+        "leading_plain_dict_storage_setitem",
+    ],
+)
+def test_scan_file_preserves_hidden_malicious_storage_after_duplicate_state_key(
+    tmp_path: Path,
+    duplicate_variant: str,
+) -> None:
+    archive_path = tmp_path / f"malicious-duplicate-state-{duplicate_variant}.pt"
+    hidden_payload = b"S'" + b"A" * 5000 + b"'\n0cos\nsystem\n(S'echo duplicate-state-key'\ntR."
+    separate_storage = duplicate_variant in {
+        "ordered_build",
+        "list_reduce",
+        "tuple_reduce",
+        "ordered_reduce",
+        "ordered_storage_key",
+        "ordered_storage_value",
+        "nested_storage_key",
+        "leading_nested_ordered_storage",
+        "leading_plain_dict_storage_batch",
+        "leading_plain_dict_storage_setitem",
+    }
+
+    def encoded_key(value: str) -> bytes:
+        raw = value.encode("ascii")
+        return b"X" + len(raw).to_bytes(4, "little") + raw
+
+    tensor_value = (
+        _pytorch_rebuild_tensor_v2_payload(
+            key="1" if separate_storage else "0",
+            storage_name="LongStorage" if separate_storage else "ByteStorage",
+            element_count=3 if separate_storage else len(hidden_payload),
+        )
+        .removeprefix(b"\x80\x04")
+        .removesuffix(b".")
+    )
+    entries = [encoded_key("same") + tensor_value]
+    entries.extend(encoded_key(f"metadata_{index}") + b"K\x01" for index in range(40))
+    suffix = b"u."
+    if duplicate_variant == "ordered_batch":
+        entries.insert(1, encoded_key("same") + b"K\x00")
+    elif duplicate_variant == "ordered_setitem":
+        suffix = b"u" + encoded_key("same") + b"K\x00s."
+    elif duplicate_variant == "ordered_build":
+        storage_reference = _pytorch_storage_binpersid_expr(
+            key="0",
+            storage_name="ByteStorage",
+            element_count=len(hidden_payload),
+        )
+        suffix = b"u}(" + encoded_key("hidden") + storage_reference + b"ub."
+    elif duplicate_variant in {"list_reduce", "tuple_reduce", "ordered_reduce"}:
+        storage_reference = _pytorch_storage_binpersid_expr(
+            key="0",
+            storage_name="ByteStorage",
+            element_count=len(hidden_payload),
+        )
+        module_name = b"collections" if duplicate_variant == "ordered_reduce" else b"builtins"
+        callable_name = {
+            "list_reduce": b"list",
+            "tuple_reduce": b"tuple",
+            "ordered_reduce": b"OrderedDict",
+        }[duplicate_variant]
+        suffix = (
+            b"u" + encoded_key("converted") + _global(module_name, callable_name) + b"(" + storage_reference + b"tRs."
+        )
+    elif duplicate_variant in {
+        "ordered_storage_key",
+        "ordered_storage_value",
+        "nested_storage_key",
+        "leading_nested_ordered_storage",
+        "leading_plain_dict_storage_batch",
+        "leading_plain_dict_storage_setitem",
+    }:
+        storage_reference = _pytorch_storage_binpersid_expr(
+            key="0",
+            storage_name="ByteStorage",
+            element_count=len(hidden_payload),
+        )
+        if duplicate_variant == "ordered_storage_key":
+            suffix = b"u" + storage_reference + b"K\x00s."
+        elif duplicate_variant == "ordered_storage_value":
+            suffix = b"u" + encoded_key("hidden") + storage_reference + b"s."
+        elif duplicate_variant == "nested_storage_key":
+            suffix = b"u" + encoded_key("hidden") + b"}" + storage_reference + b"K\x00ss."
+    else:
+        storage_reference = _pytorch_storage_binpersid_expr(
+            key="0",
+            storage_name="ByteStorage",
+            element_count=len(hidden_payload),
+        )
+        nested_dict = b"(" + encoded_key("slot") + storage_reference + encoded_key("slot") + b"K\x00d"
+        entries.append(encoded_key("nested") + nested_dict)
+
+    payload = b"\x80\x04" + _global(b"collections", b"OrderedDict") + b")R(" + b"".join(entries) + suffix
+    if duplicate_variant == "leading_nested_ordered_storage":
+        ordered_dict = _global(b"collections", b"OrderedDict") + b")R"
+        payload = (
+            b"\x80\x04"
+            + ordered_dict
+            + encoded_key("pre")
+            + ordered_dict
+            + encoded_key("inside")
+            + storage_reference
+            + b"ss("
+            + b"".join(entries)
+            + b"u."
+        )
+    elif duplicate_variant in {"leading_plain_dict_storage_batch", "leading_plain_dict_storage_setitem"}:
+        hidden_entry = encoded_key("hidden") + storage_reference
+        initial_storage = b"(" + hidden_entry + b"u" if duplicate_variant.endswith("batch") else hidden_entry + b"s"
+        payload = b"\x80\x04}" + initial_storage + b"(" + b"".join(entries) + b"u."
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", payload)
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", hidden_payload)
+        if separate_storage:
+            archive.writestr("archive/data/1", b"\x00" * 24)
+
+    report = scan_file(archive_path)
+
+    storage_sizes = {"0": len(hidden_payload)}
+    if separate_storage:
+        storage_sizes["1"] = 24
+    assert package_api._trusted_pytorch_data_pkl_from_storage_member_sizes(payload, storage_sizes) is None
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.severity == Severity.CRITICAL
+        and finding.details.get("module") in {"os", "posix", "nt"}
+        and finding.details.get("name") == "system"
+        for finding in report.findings
+    )
+
+
+@pytest.mark.parametrize(
+    "discard_variant",
+    [
+        "stop_extra_storage",
+        "stop_extra_storage_none",
+        "stop_nested_storage",
+        "stop_extra_canonical_storage",
+        "unsupported_frozenset",
+        "unsupported_additems",
+        "append_wrong_target",
+        "setitem_storage_target",
+        "append_value",
+        "appends_value",
+        "setitem_value",
+        "setitem_key",
+        "stackglobal_name",
+        "stackglobal_module",
+    ],
+)
+def test_scan_file_preserves_hidden_malicious_storage_after_stack_discard(
+    tmp_path: Path,
+    discard_variant: str,
+) -> None:
+    archive_path = tmp_path / f"malicious-stack-discard-{discard_variant}.pt"
+    hidden_payload = b"S'" + b"A" * 5000 + b"'\n0cos\nsystem\n(S'echo discarded-storage'\ntR."
+
+    def encoded_key(value: str) -> bytes:
+        raw = value.encode("ascii")
+        return b"X" + len(raw).to_bytes(4, "little") + raw
+
+    tensor = _pytorch_rebuild_tensor_v2_payload(key="1").removeprefix(b"\x80\x04").removesuffix(b".")
+    entries = [encoded_key("weight") + tensor]
+    entries.extend(encoded_key(f"metadata_{index}") + b"K\x01" for index in range(40))
+    storage_reference = _pytorch_storage_binpersid_expr(
+        key="0",
+        storage_name="ByteStorage",
+        element_count=len(hidden_payload),
+    )
+    trailers = {
+        "stop_extra_storage": storage_reference + b"h\x01.",
+        "stop_extra_storage_none": storage_reference + b"N.",
+        "stop_nested_storage": b"]" + storage_reference + b"ah\x01.",
+        "stop_extra_canonical_storage": b".",
+        "unsupported_frozenset": b"(" + storage_reference + b"\x910h\x01.",
+        "unsupported_additems": b"\x8f(" + storage_reference + b"\x900h\x01.",
+        "append_wrong_target": storage_reference + b"K\x00ah\x01.",
+        "setitem_storage_target": storage_reference + b"K\x00K\x01sh\x01.",
+        "append_value": encoded_key("converted") + b"K\x00" + storage_reference + b"as.",
+        "appends_value": encoded_key("converted") + b"K\x00(" + storage_reference + b"es.",
+        "setitem_value": encoded_key("converted") + b"K\x00" + encoded_key("slot") + storage_reference + b"ss.",
+        "setitem_key": encoded_key("converted") + b"K\x00" + storage_reference + b"K\x00ss.",
+        "stackglobal_name": encoded_key("converted") + _short_binunicode(b"fake") + storage_reference + b"\x93s.",
+        "stackglobal_module": encoded_key("converted") + storage_reference + _short_binunicode(b"fake") + b"\x93s.",
+    }
+    payload = (
+        b"\x80\x04"
+        + _global(b"collections", b"OrderedDict")
+        + b")Rq\x01("
+        + b"".join(entries)
+        + b"u"
+        + trailers[discard_variant]
+    )
+    if discard_variant == "stop_extra_canonical_storage":
+        payload = (
+            b"\x80\x04"
+            + _global(b"torch._utils", b"_rebuild_tensor_v2")
+            + b"q\x00"
+            + _pytorch_rebuild_tensor_v2_reduce_expr(
+                key="0",
+                storage_name="ByteStorage",
+                element_count=len(hidden_payload),
+            )
+            + _pytorch_rebuild_tensor_v2_reduce_expr(key="1")
+            + b"."
+        )
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", payload)
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", hidden_payload)
+        archive.writestr("archive/data/1", b"\x00" * 24)
+
+    report = scan_file(archive_path)
+
+    assert (
+        package_api._trusted_pytorch_data_pkl_from_storage_member_sizes(payload, {"0": len(hidden_payload), "1": 24})
+        is None
+    )
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.severity == Severity.CRITICAL
+        and finding.details.get("module") in {"os", "posix", "nt"}
+        and finding.details.get("name") == "system"
+        for finding in report.findings
+    )
+
+
+@pytest.mark.parametrize("discard_opcode", [b"\x91", b"\x82\x01", b"\x90"])
+def test_scan_file_preserves_hidden_malicious_storage_after_compacted_batch_discard(
+    tmp_path: Path,
+    discard_opcode: bytes,
+) -> None:
+    archive_path = tmp_path / f"malicious-compacted-discard-{discard_opcode.hex()}.pt"
+    hidden_payload = b"S'" + b"A" * 5000 + b"'\n0cos\nsystem\n(S'echo compacted-storage'\ntR."
+
+    def encoded_key(value: str) -> bytes:
+        raw = value.encode("ascii")
+        return b"X" + len(raw).to_bytes(4, "little") + raw
+
+    tensor = (
+        _pytorch_rebuild_tensor_v2_payload(key="0", storage_name="ByteStorage", element_count=len(hidden_payload))
+        .removeprefix(b"\x80\x04")
+        .removesuffix(b".")
+    )
+    entries = [encoded_key("weight") + tensor]
+    entries.extend(encoded_key(f"metadata_{index}") + b"K\x01" for index in range(600))
+    payload = b"\x80\x04}q\x01(" + b"".join(entries) + discard_opcode + b"0h\x01."
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", payload)
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", hidden_payload)
+
+    report = scan_file(archive_path)
+
+    assert package_api._trusted_pytorch_data_pkl_from_storage_member_sizes(payload, {"0": len(hidden_payload)}) is None
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.severity == Severity.CRITICAL
+        and finding.details.get("module") in {"os", "posix", "nt"}
+        and finding.details.get("name") == "system"
+        for finding in report.findings
+    )
+
+
+def test_pytorch_storage_trust_rejects_canonical_setitems_beyond_bounded_batch(tmp_path: Path) -> None:
+    archive_path = tmp_path / "oversized-canonical-batch.pt"
+    _write_large_batched_pytorch_state_dict(
+        archive_path,
+        entry_count=package_api._PYTORCH_STORAGE_TRUST_MAX_STACK_DEPTH + 1,
+    )
+    with zipfile.ZipFile(archive_path) as archive:
+        payload = archive.read("archive/data.pkl")
+
+    parsed = package_api._pytorch_storage_keys_from_pickle_bytes(payload)
+
+    assert parsed.parse_complete is False
+    assert parsed.referenced_keys == set()
+    assert parsed.canonical_tensor_rebuild_invocations == set()
+
+
+def test_pytorch_storage_trust_invalidates_unfinished_compacted_batch(tmp_path: Path) -> None:
+    archive_path = tmp_path / "unfinished-canonical-batch.pt"
+    _write_large_batched_pytorch_state_dict(archive_path)
+    with zipfile.ZipFile(archive_path) as archive:
+        payload = archive.read("archive/data.pkl")
+
+    parsed = package_api._pytorch_storage_keys_from_pickle_bytes(payload[:-2] + b".")
+
+    assert parsed.parse_complete is False
+    assert parsed.referenced_keys == set()
+    assert parsed.canonical_tensor_rebuild_invocations == set()
+
+
+def test_pytorch_storage_trust_clears_compacted_batch_after_malformed_provenance(tmp_path: Path) -> None:
+    archive_path = tmp_path / "malformed-canonical-batch.pt"
+    _write_large_batched_pytorch_state_dict(archive_path)
+    with zipfile.ZipFile(archive_path) as archive:
+        payload = archive.read("archive/data.pkl")
+
+    parsed = package_api._pytorch_storage_keys_from_pickle_bytes(payload[:-2] + b"\x82\x01.")
+
+    assert parsed.parse_complete is True
+    assert parsed.canonical_tensor_rebuild_invocations == set()
+
+
+def test_pytorch_storage_trust_preserves_tuple_width_limit() -> None:
+    tuple_items = package_api._PYTORCH_STORAGE_TRUST_MAX_TUPLE_WIDTH + 1
+    oversized_payload = b"\x80\x04(" + (b"K\x00" * tuple_items) + b"t."
+
+    parsed = package_api._pytorch_storage_keys_from_pickle_bytes(oversized_payload)
+
+    assert parsed.parse_complete is False
+    assert parsed.referenced_keys == set()
+    assert parsed.canonical_tensor_rebuild_invocations == set()
 
 
 def test_scan_bytes_keeps_rebuild_tensor_v2_warning_for_raw_data_pickle(
@@ -10804,6 +12152,39 @@ def _assert_call_graph_source_stability_error(report: PickleReport) -> None:
     )
 
 
+def test_scan_bytes_preserves_tracker_stability_reason_across_call_graph_subpasses(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    search_contexts = [("original",)]
+    monkeypatch.setattr(call_graph, "_interpreter_import_runtime_matches_snapshot", lambda: True)
+    monkeypatch.setattr(call_graph, "_source_search_context", lambda: search_contexts[0])
+
+    source_path = tmp_path / "tracked_module.py"
+    source_path.write_text("value = 1\n", encoding="utf-8")
+
+    def invalidate_snapshot(
+        _import_references: object,
+        _callable_invocations: object | None = None,
+    ) -> tuple[CallGraphFinding, ...]:
+        search_contexts[0] = ("changed",)
+        call_graph._track_shared_source_path("tracked_module", source_path, loaded=False)
+        return ()
+
+    monkeypatch.setattr(package_api, "find_dangerous_call_graphs", invalidate_snapshot)
+
+    report = scan_bytes(b"cbuiltins\nlen\n.", source="source-stability-subpasses.pkl")
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    matching_errors = [
+        error for error in report.errors if error.details.get("analysis") == "python_call_graph_source_stability"
+    ]
+    assert len(matching_errors) == 1
+    assert matching_errors[0].details.get("source_stability_reason") == "source_search_context_changed"
+    assert matching_errors[0].details.get("analysis_incomplete") is True
+
+
 @pytest.mark.parametrize("module", ["_xxsubinterpreters", "dotenv.main"])
 def test_scan_bytes_warns_on_unreviewed_name_from_module_with_dangerous_entries(module: str) -> None:
     report = scan_bytes(f"c{module}\nGadget\n.".encode(), source="dangerous-module-sibling.pkl")
@@ -10868,20 +12249,24 @@ def test_scan_bytes_keeps_allowlisted_import_only_global_clean() -> None:
         (b"cexceptions\nWindowsError\n.", "exceptions.WindowsError"),
     ],
 )
-def test_scan_bytes_keeps_legacy_python_two_globals_clean(payload: bytes, import_reference: str) -> None:
+@pytest.mark.parametrize("source_changed", [False, True], ids=["stable-source", "changed-source"])
+def test_scan_bytes_keeps_legacy_python_two_globals_clean(
+    payload: bytes,
+    import_reference: str,
+    source_changed: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def verify_source_stability(_report_generation: int | None) -> None:
+        if source_changed:
+            raise _CallGraphAnalysisLimitError("source changed during shared call-graph analysis")
+
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", verify_source_stability)
+
     report = scan_bytes(payload, source="legacy-python-two-global.pkl")
 
-    if import_reference == "exceptions.ValueError" and report.status == ScanStatus.INCONCLUSIVE:
-        assert report.metadata.get("analysis_incomplete") is True
-        assert any(
-            error.message
-            == "Python call-graph analysis could not complete: source changed during shared call-graph analysis"
-            and error.category == "call_graph_analysis_error"
-            and error.exception_type == "_CallGraphAnalysisLimitError"
-            and error.details.get("analysis") == "python_call_graph_source_stability"
-            and error.details.get("analysis_incomplete") is True
-            for error in report.errors
-        )
+    if source_changed:
+        assert report.status == ScanStatus.INCONCLUSIVE
+        _assert_call_graph_source_stability_error(report)
         assert report.verdict == SafetyVerdict.UNKNOWN
     else:
         assert report.status == ScanStatus.COMPLETE
@@ -10889,35 +12274,6 @@ def test_scan_bytes_keeps_legacy_python_two_globals_clean(payload: bytes, import
     assert not any(finding.rule_code == "NON_ALLOWLISTED_GLOBAL" for finding in report.findings)
     assert any(
         ref["import_reference"] == import_reference and ref["is_dangerous"] is False
-        for ref in report.metadata["import_references"]
-    )
-
-
-def test_scan_bytes_fails_closed_for_legacy_python_two_global_when_source_changes(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def raise_source_stability_error(_report_generation: int | None) -> None:
-        raise _CallGraphAnalysisLimitError("source changed during shared call-graph analysis")
-
-    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", raise_source_stability_error)
-
-    report = scan_bytes(b"cexceptions\nValueError\n.", source="legacy-python-two-global-source-change.pkl")
-
-    assert report.status == ScanStatus.INCONCLUSIVE
-    assert report.verdict == SafetyVerdict.UNKNOWN
-    assert report.metadata.get("analysis_incomplete") is True
-    assert any(
-        error.message
-        == "Python call-graph analysis could not complete: source changed during shared call-graph analysis"
-        and error.category == "call_graph_analysis_error"
-        and error.exception_type == "_CallGraphAnalysisLimitError"
-        and error.details.get("analysis") == "python_call_graph_source_stability"
-        and error.details.get("analysis_incomplete") is True
-        for error in report.errors
-    )
-    assert not any(finding.rule_code == "NON_ALLOWLISTED_GLOBAL" for finding in report.findings)
-    assert any(
-        ref["import_reference"] == "exceptions.ValueError" and ref["is_dangerous"] is False
         for ref in report.metadata["import_references"]
     )
 
@@ -12531,11 +13887,35 @@ def test_scan_bytes_allows_nested_import_only_trusted_constructor() -> None:
         range(10),
     ],
 )
-@pytest.mark.parametrize("encoding", ["raw", "base64", "hex"])
+@pytest.mark.parametrize(
+    ("encoding", "source_changes"),
+    [
+        pytest.param("raw", False, id="raw"),
+        pytest.param("base64", False, id="base64"),
+        pytest.param("hex", False, id="hex"),
+        pytest.param("hex", True, id="hex-source-changed"),
+    ],
+)
 def test_scan_bytes_treats_benign_nested_constructor_pickles_as_notices(
     inner_obj: object,
     encoding: str,
+    source_changes: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    if source_changes:
+
+        def raise_source_stability_error(_report_generation: int | None) -> None:
+            raise _CallGraphAnalysisLimitError("source changed during shared call-graph analysis")
+
+        source_stability_check = raise_source_stability_error
+    else:
+
+        def keep_source_stable(_report_generation: int | None) -> None:
+            return None
+
+        source_stability_check = keep_source_stable
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", source_stability_check)
+
     nested_payload = pickle.dumps(inner_obj, protocol=4)
     if encoding == "raw":
         outer_value: bytes | str = nested_payload
@@ -12552,8 +13932,14 @@ def test_scan_bytes_treats_benign_nested_constructor_pickles_as_notices(
         source=f"benign-nested-{encoding}.pkl",
     )
 
-    assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.CLEAN
+    if source_changes:
+        assert report.status == ScanStatus.INCONCLUSIVE
+        _assert_call_graph_source_stability_error(report)
+        assert report.verdict == SafetyVerdict.UNKNOWN
+    else:
+        assert report.status == ScanStatus.COMPLETE
+        assert report.verdict == SafetyVerdict.CLEAN
+        assert not any(error.details.get("analysis") == "python_call_graph_source_stability" for error in report.errors)
     assert report.findings == ()
     assert any(
         notice.code == expected_notice
@@ -14212,3 +15598,109 @@ def test_scan_stream_preserves_absolute_offsets_from_current_stream_position() -
     ]
     assert finding_positions
     assert all(position >= len(prefix) for position in finding_positions)
+
+
+def test_scan_file_scans_binary_storage_member_inside_expanded_probe_window(tmp_path: Path) -> None:
+    """Widening the storage probe must not drop members the 4 KiB trusted probe scanned.
+
+    ``sample_is_prefix`` is derived from how much of the member the probe read, so a member between
+    the two probe sizes flips it from True to False, and the binary-pickle predicate refuses to scan
+    a non-STOP-terminated sample once it is no longer a prefix.
+    """
+    hidden_payload = b"\x80\x04cos\nsystem\n(S'echo expanded-window'\ntR"
+    hidden_payload += b"\x00" * (5000 - len(hidden_payload))
+    assert len(hidden_payload) > package_api._TRUSTED_STORAGE_PICKLE_PROBE_BYTES
+    assert len(hidden_payload) < package_api._PICKLE_DISCOVERY_LONG_PROBE_BYTES
+
+    entry_count = 33
+    archive_path = tmp_path / "malicious-expanded-probe-window.pt"
+    entries: list[bytes] = []
+    for index in range(entry_count):
+        key = _short_binunicode(f"weight_{index}".encode("ascii"))
+        if index == 0:
+            value = (
+                _pytorch_rebuild_tensor_v2_payload(
+                    key="0",
+                    storage_name="ByteStorage",
+                    element_count=len(hidden_payload),
+                )
+                .removeprefix(b"\x80\x04")
+                .removesuffix(b".")
+            )
+        else:
+            value = _pytorch_rebuild_tensor_v2_reduce_expr(key=str(index))
+        entries.append(key + value)
+    data_pkl = b"\x80\x04" + _pytorch_empty_ordered_dict_reduce_expr() + b"(" + b"".join(entries) + b"u."
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", data_pkl)
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", hidden_payload)
+        for index in range(1, entry_count):
+            archive.writestr(f"archive/data/{index}", b"\x00" * 24)
+
+    report = scan_file(archive_path)
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.severity == Severity.CRITICAL
+        and finding.details.get("module") in {"os", "posix", "nt"}
+        and finding.details.get("name") == "system"
+        and finding.location is not None
+        and "archive/data/0" in finding.location
+        for finding in report.findings
+    )
+
+
+@pytest.mark.parametrize(
+    ("pickle_prefix", "case_name"),
+    [
+        (b"\x80\x04NNNN\x00", "generic-routing"),
+        (b"\x80\x04N\x00", "trusted-two-op-routing"),
+    ],
+)
+def test_scan_file_preserves_pickle_routing_for_expanded_storage_probe(
+    tmp_path: Path,
+    pickle_prefix: bytes,
+    case_name: str,
+) -> None:
+    hidden_payload = pickle_prefix + f"cos\nsystem\n(S'echo expanded-{case_name}'\ntR.".encode()
+    hidden_payload += b"\x00" * (5000 - len(hidden_payload))
+    assert len(hidden_payload) == 5000
+    entries: list[bytes] = []
+    for index in range(33):
+        key = _short_binunicode(f"weight_{index}".encode("ascii"))
+        if index == 0:
+            value = (
+                _pytorch_rebuild_tensor_v2_payload(
+                    key="0",
+                    storage_name="ByteStorage",
+                    element_count=len(hidden_payload),
+                )
+                .removeprefix(b"\x80\x04")
+                .removesuffix(b".")
+            )
+        else:
+            value = _pytorch_rebuild_tensor_v2_reduce_expr(key=str(index))
+        entries.append(key + value)
+    data_pkl = b"\x80\x04" + _pytorch_empty_ordered_dict_reduce_expr() + b"(" + b"".join(entries) + b"u."
+    archive_path = tmp_path / f"malicious-expanded-{case_name}.pt"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", data_pkl)
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", hidden_payload)
+        for index in range(1, 33):
+            archive.writestr(f"archive/data/{index}", b"\x00" * 24)
+
+    report = scan_file(archive_path)
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.severity == Severity.CRITICAL
+        and finding.details.get("module") in {"os", "posix", "nt"}
+        and finding.details.get("name") == "system"
+        and finding.location is not None
+        and "archive/data/0" in finding.location
+        for finding in report.findings
+    )
