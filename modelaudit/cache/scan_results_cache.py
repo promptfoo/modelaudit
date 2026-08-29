@@ -226,6 +226,10 @@ class _DarwinPathMonitor:
         self._queue: Any = None
         self._descriptors: list[int] = []
         self._descriptor_stack: ExitStack | None = None
+        self._file_descriptor: int | None = None
+        self._attribute_flag = 0
+        self._event_error_flag = 0
+        self._unsafe_event_seen = False
 
         try:
             self._queue = select_module.kqueue()
@@ -237,6 +241,8 @@ class _DarwinPathMonitor:
                 | select_module.KQ_NOTE_REVOKE
                 | select_module.KQ_NOTE_ATTRIB
             )
+            self._attribute_flag = select_module.KQ_NOTE_ATTRIB
+            self._event_error_flag = getattr(select_module, "KQ_EV_ERROR", 0)
             descriptor_flags = getattr(os, "O_EVTONLY", os.O_RDONLY) | getattr(os, "O_CLOEXEC", 0)
             descriptor_flags |= getattr(os, "O_NOFOLLOW", 0)
             paths = [os.path.abspath(file_path), *(entry[0] for entry in ancestor_identity)]
@@ -266,6 +272,7 @@ class _DarwinPathMonitor:
             try:
                 self._descriptor_stack = transferred_stack
                 self._descriptors = opened_descriptors
+                self._file_descriptor = opened_descriptors[0]
             except BaseException:
                 with suppress(OSError):
                     transferred_stack.close()
@@ -274,8 +281,29 @@ class _DarwinPathMonitor:
             self.close()
             raise
 
-    def changed(self) -> bool:
+    def discard_validated_file_attribute_event(self) -> None:
+        """Discard only pending pure file attribute events after identity validation."""
         if self._queue is None:
+            self._unsafe_event_seen = True
+            return
+
+        try:
+            events = self._queue.control(None, max(len(self._descriptors), 1), 0)
+        except (OSError, ValueError):
+            self._unsafe_event_seen = True
+            return
+
+        for event in events:
+            if (
+                getattr(event, "ident", None) != self._file_descriptor
+                or getattr(event, "fflags", None) != self._attribute_flag
+                or (self._event_error_flag and getattr(event, "flags", 0) & self._event_error_flag)
+            ):
+                self._unsafe_event_seen = True
+                return
+
+    def changed(self) -> bool:
+        if self._unsafe_event_seen or self._queue is None:
             return True
         try:
             return bool(self._queue.control(None, max(len(self._descriptors), 1), 0))
@@ -285,6 +313,7 @@ class _DarwinPathMonitor:
     def close(self) -> None:
         queue = getattr(self, "_queue", None)
         self._queue = None
+        self._file_descriptor = None
         descriptor_stack = getattr(self, "_descriptor_stack", None)
         self._descriptor_stack = None
         if queue is not None:
@@ -929,14 +958,29 @@ class ScanResultsCache:
             if self._get_file_change_token(file_path, file_stat) != expected_change_token:
                 logger.debug("Skipping cache store for %s: file change token changed during scan", file_path)
                 return False
+            if not self._ancestor_identity_matches_for_store(
+                expected_ancestor_identity,
+                self._capture_ancestor_identity(file_path),
+            ):
+                logger.debug("Skipping cache store for %s: ancestor path changed during scan", file_path)
+                return False
+            self._discard_validated_file_attribute_event(expected_ancestor_identity)
+            settled_pre_hash_stat = os.stat(file_path)
+            if not self._stat_matches(settled_pre_hash_stat, expected_file_stat):
+                logger.debug("Skipping cache store for %s: file metadata changed while starting store", file_path)
+                return False
+            if self._get_file_change_token(file_path, settled_pre_hash_stat) != expected_change_token:
+                logger.debug("Skipping cache store for %s: file changed while starting store", file_path)
+                return False
             if self._ancestor_monitor_changed(
                 expected_ancestor_identity
             ) or not self._ancestor_identity_matches_for_store(
                 expected_ancestor_identity,
                 self._capture_ancestor_identity(file_path),
             ):
-                logger.debug("Skipping cache store for %s: ancestor path changed during scan", file_path)
+                logger.debug("Skipping cache store for %s: ancestor path changed while starting store", file_path)
                 return False
+            file_stat = settled_pre_hash_stat
 
             verified_current_hash = self.hasher.hash_file_with_stat(file_path, file_stat)
             if verified_current_hash != expected_file_hash:
@@ -949,15 +993,29 @@ class ScanResultsCache:
             if self._get_file_change_token(file_path, post_hash_stat) != expected_change_token:
                 logger.debug("Skipping cache store for %s: file changed during verification", file_path)
                 return False
+            if not self._ancestor_identity_matches_for_store(
+                expected_ancestor_identity,
+                self._capture_ancestor_identity(file_path),
+            ):
+                logger.debug("Skipping cache store for %s: ancestor path changed during verification", file_path)
+                return False
+            self._discard_validated_file_attribute_event(expected_ancestor_identity)
+            settled_post_hash_stat = os.stat(file_path)
+            if not self._stat_matches(settled_post_hash_stat, expected_file_stat):
+                logger.debug("Skipping cache store for %s: file metadata changed while settling monitor", file_path)
+                return False
+            if self._get_file_change_token(file_path, settled_post_hash_stat) != expected_change_token:
+                logger.debug("Skipping cache store for %s: file changed while settling monitor", file_path)
+                return False
             if self._ancestor_monitor_changed(
                 expected_ancestor_identity
             ) or not self._ancestor_identity_matches_for_store(
                 expected_ancestor_identity,
                 self._capture_ancestor_identity(file_path),
             ):
-                logger.debug("Skipping cache store for %s: ancestor path changed during verification", file_path)
+                logger.debug("Skipping cache store for %s: ancestor path changed while settling monitor", file_path)
                 return False
-            file_stat = post_hash_stat
+            file_stat = settled_post_hash_stat
 
             version_info = self._get_version_info(version_context)
             if version_info is None:
@@ -1162,7 +1220,6 @@ class ScanResultsCache:
                 if (
                     not self._stat_matches(initial_stat, verified_stat)
                     or initial_change_token != verified_change_token
-                    or self._ancestor_monitor_changed(monitored_ancestor_identity)
                     or not self._ancestor_identity_matches_for_store(
                         monitored_ancestor_identity,
                         verified_ancestor_identity,
@@ -1170,7 +1227,28 @@ class ScanResultsCache:
                 ):
                     raise ValueError(f"File changed while capturing cache identity: {file_path}")
 
-                return verified_stat, content_hash, verified_change_token, monitored_ancestor_identity
+                self._discard_validated_file_attribute_event(monitored_ancestor_identity)
+                settled_stat = os.stat(file_path)
+                settled_change_token = self._get_file_change_token(file_path, settled_stat)
+                settled_ancestor_identity = self._capture_ancestor_identity(file_path)
+
+                if (
+                    not self._stat_matches(initial_stat, settled_stat)
+                    or initial_change_token != settled_change_token
+                    or self._ancestor_monitor_changed(monitored_ancestor_identity)
+                    or not self._ancestor_identity_matches_for_store(
+                        monitored_ancestor_identity,
+                        settled_ancestor_identity,
+                    )
+                ):
+                    raise ValueError(f"File changed while settling cache identity monitor: {file_path}")
+
+                return (
+                    settled_stat,
+                    content_hash,
+                    settled_change_token,
+                    monitored_ancestor_identity,
+                )
             except ValueError as exc:
                 self.release_ancestor_identity(monitored_ancestor_identity)
                 if str(exc).startswith("File changed while"):
@@ -1404,6 +1482,12 @@ class ScanResultsCache:
     @staticmethod
     def _ancestor_monitor_changed(identity: AncestorIdentity) -> bool:
         return identity.monitor is not None and identity.monitor.changed()
+
+    @staticmethod
+    def _discard_validated_file_attribute_event(identity: AncestorIdentity) -> None:
+        discard_event = getattr(identity.monitor, "discard_validated_file_attribute_event", None)
+        if callable(discard_event):
+            discard_event()
 
     def _file_identity_matches(self, file_path: str, expected: ScannedFileIdentity) -> bool:
         expected_stat, _expected_hash, expected_change_token, expected_ancestor_identity = expected
