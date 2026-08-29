@@ -23,6 +23,8 @@ PATCHED_PY7ZR_REQUIREMENT = "py7zr>=1.1.3"
 PY7ZR_EXTRAS = ("sevenzip", "all-ci", "all")
 PATCHED_MLFLOW_CLIENT_REQUIREMENT = "mlflow-skinny>=3.13.0"
 MLFLOW_EXTRAS = ("mlflow", "all-ci", "all")
+MLFLOW_SQL_STORAGE_REQUIREMENTS = ("sqlalchemy>=2.0.49", "alembic>=1.18.4")
+PATCHED_SQLPARSE_REQUIREMENT = "sqlparse>=0.6.0"
 NUMPY_REQUIREMENTS = {
     "numpy>=1.19.0,<2.0; python_version == '3.10'",
     "numpy>=2.4.3,<2.5; python_version == '3.11'",
@@ -76,6 +78,7 @@ def test_gitpython_lock_stays_on_patched_release_floor() -> None:
         ("aiohttp", (3, 14, 3)),
         ("cryptography", (50, 0, 0)),
         ("keras", (3, 15, 0)),
+        ("sqlparse", (0, 6, 0)),
     ],
 )
 def test_security_sensitive_dependencies_stay_on_patched_release_floors(
@@ -98,6 +101,24 @@ def test_mlflow_extras_use_the_hardened_tracking_client() -> None:
 
     for extra in MLFLOW_EXTRAS:
         assert PATCHED_MLFLOW_CLIENT_REQUIREMENT in optional_dependencies[extra]
+
+
+@pytest.mark.parametrize("extra", MLFLOW_EXTRAS)
+def test_mlflow_extras_preserve_sql_backed_model_registries(extra: str) -> None:
+    root_config = tomllib.loads(ROOT_PYPROJECT.read_text(encoding="utf-8"))
+    optional_dependencies = root_config["project"]["optional-dependencies"][extra]
+
+    for requirement in MLFLOW_SQL_STORAGE_REQUIREMENTS:
+        assert requirement in optional_dependencies
+        assert _lock_package_block(requirement.split(">=", maxsplit=1)[0])
+
+
+@pytest.mark.parametrize("extra", MLFLOW_EXTRAS)
+def test_mlflow_extras_require_patched_sqlparse(extra: str) -> None:
+    root_config = tomllib.loads(ROOT_PYPROJECT.read_text(encoding="utf-8"))
+    optional_dependencies = root_config["project"]["optional-dependencies"][extra]
+
+    assert PATCHED_SQLPARSE_REQUIREMENT in optional_dependencies
 
 
 def test_picklescan_build_backend_is_exactly_pinned() -> None:

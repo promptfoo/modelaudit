@@ -535,7 +535,7 @@ def test_python_ci_windows_matrix_shards_main_and_workflow_prs() -> None:
     assert "--modelaudit-shard-index ${{ matrix.shard-index }}" in exhaustive_run
 
 
-def test_python_ci_runs_slow_suite_in_a_separate_job() -> None:
+def test_python_ci_keeps_performance_out_of_the_xdist_slow_suite() -> None:
     workflow = _load_workflow("test.yml")
     jobs = _jobs(workflow)
 
@@ -545,13 +545,9 @@ def test_python_ci_runs_slow_suite_in_a_separate_job() -> None:
         "(github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'run-slow-tests'))"
     )
     slow_steps = slow_job["steps"]
-    assert (
-        '-m "slow or integration or performance"'
-        in _step_by_name(
-            slow_steps,
-            "Run slow, integration, and performance tests",
-        )["run"]
-    )
+    slow_run = _step_by_name(slow_steps, "Run slow and integration tests")["run"]
+    assert "pytest tests -n auto" in slow_run
+    assert '-m "(slow or integration) and not performance"' in slow_run
 
     fast_steps = jobs["test"]["steps"]
     fast_step_names = {step.get("name") for step in fast_steps}

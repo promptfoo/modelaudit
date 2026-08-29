@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import os
+import select
 import stat
 import struct
 import sys
@@ -11,7 +12,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable, Iterable
-from contextlib import suppress
+from contextlib import ExitStack, suppress
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass
 from importlib.machinery import (
@@ -217,6 +218,116 @@ class _AncestorPathMonitor:
         self.close()
 
 
+class _DarwinPathMonitor:
+    """Observe vnode replacement without rejecting unrelated directory writes."""
+
+    def __init__(self, file_path: str, ancestor_identity: tuple[AncestorEntry, ...]) -> None:
+        select_module: Any = select
+        self._queue: Any = None
+        self._descriptors: list[int] = []
+        self._descriptor_stack: ExitStack | None = None
+        self._file_descriptor: int | None = None
+        self._attribute_flag = 0
+        self._event_error_flag = 0
+        self._unsafe_event_seen = False
+
+        try:
+            self._queue = select_module.kqueue()
+            vnode_filter = select_module.KQ_FILTER_VNODE
+            event_flags = select_module.KQ_EV_ADD | select_module.KQ_EV_CLEAR
+            change_flags = (
+                select_module.KQ_NOTE_DELETE
+                | select_module.KQ_NOTE_RENAME
+                | select_module.KQ_NOTE_REVOKE
+                | select_module.KQ_NOTE_ATTRIB
+            )
+            self._attribute_flag = select_module.KQ_NOTE_ATTRIB
+            self._event_error_flag = getattr(select_module, "KQ_EV_ERROR", 0)
+            descriptor_flags = getattr(os, "O_EVTONLY", os.O_RDONLY) | getattr(os, "O_CLOEXEC", 0)
+            descriptor_flags |= getattr(os, "O_NOFOLLOW", 0)
+            paths = [os.path.abspath(file_path), *(entry[0] for entry in ancestor_identity)]
+            with ExitStack() as descriptor_stack:
+                events = []
+                opened_descriptors = []
+                for path in dict.fromkeys(paths):
+                    watched_path = _DARWIN_STABLE_SYMLINK_ALIASES.get(path, path)
+                    descriptor = os.open(watched_path, descriptor_flags)
+                    try:
+                        descriptor_stack.callback(os.close, descriptor)
+                    except BaseException:
+                        with suppress(OSError):
+                            os.close(descriptor)
+                        raise
+                    opened_descriptors.append(descriptor)
+                    events.append(
+                        select_module.kevent(
+                            descriptor,
+                            filter=vnode_filter,
+                            flags=event_flags,
+                            fflags=change_flags,
+                        )
+                    )
+                self._queue.control(events, 0, 0)
+                transferred_stack = descriptor_stack.pop_all()
+            try:
+                self._descriptor_stack = transferred_stack
+                self._descriptors = opened_descriptors
+                self._file_descriptor = opened_descriptors[0]
+            except BaseException:
+                with suppress(OSError):
+                    transferred_stack.close()
+                raise
+        except BaseException:
+            self.close()
+            raise
+
+    def discard_validated_file_attribute_event(self) -> None:
+        """Discard only pending pure file attribute events after identity validation."""
+        if self._queue is None:
+            self._unsafe_event_seen = True
+            return
+
+        try:
+            events = self._queue.control(None, max(len(self._descriptors), 1), 0)
+        except (OSError, ValueError):
+            self._unsafe_event_seen = True
+            return
+
+        for event in events:
+            if (
+                getattr(event, "ident", None) != self._file_descriptor
+                or getattr(event, "fflags", None) != self._attribute_flag
+                or (self._event_error_flag and getattr(event, "flags", 0) & self._event_error_flag)
+            ):
+                self._unsafe_event_seen = True
+                return
+
+    def changed(self) -> bool:
+        if self._unsafe_event_seen or self._queue is None:
+            return True
+        try:
+            return bool(self._queue.control(None, max(len(self._descriptors), 1), 0))
+        except (OSError, ValueError):
+            return True
+
+    def close(self) -> None:
+        queue = getattr(self, "_queue", None)
+        self._queue = None
+        self._file_descriptor = None
+        descriptor_stack = getattr(self, "_descriptor_stack", None)
+        self._descriptor_stack = None
+        if queue is not None:
+            with suppress(OSError):
+                queue.close()
+        if descriptor_stack is not None:
+            with suppress(OSError):
+                descriptor_stack.close()
+        self._descriptors = []
+
+    def __del__(self) -> None:
+        self.close()
+
+
 class _WindowsPathLockMonitor:
     """Prevent file and ancestor replacement while a Windows scan is in flight."""
 
@@ -280,12 +391,12 @@ class _WindowsPathLockMonitor:
 
 
 class AncestorIdentity(tuple[AncestorEntry, ...]):
-    monitor: _AncestorPathMonitor | _WindowsPathLockMonitor | None
+    monitor: _AncestorPathMonitor | _DarwinPathMonitor | _WindowsPathLockMonitor | None
 
     def __new__(
         cls,
         entries: tuple[AncestorEntry, ...] | list[AncestorEntry],
-        monitor: _AncestorPathMonitor | _WindowsPathLockMonitor | None = None,
+        monitor: _AncestorPathMonitor | _DarwinPathMonitor | _WindowsPathLockMonitor | None = None,
     ) -> "AncestorIdentity":
         identity = super().__new__(cls, entries)
         identity.monitor = monitor
@@ -589,11 +700,7 @@ class ScanResultsCache:
                 self._record_cache_miss("invalid")
                 return None, file_identity
 
-            cache_entry["cache_metadata"]["access_count"] += 1
-            cache_entry["cache_metadata"]["last_access"] = time.time()
-
-            with open(cache_file_path, "w", encoding="utf-8") as f:
-                json.dump(cache_entry, f, indent=2)
+            self._update_cached_entry_access(cache_file_path, cache_entry)
 
             if not self._file_identity_matches(file_path, file_identity):
                 self._record_cache_miss("changed")
@@ -610,6 +717,10 @@ class ScanResultsCache:
             logger.debug(f"Cache lookup failed for {file_path}: {e}")
             self._record_cache_miss("error")
             return None, file_identity
+        except BaseException:
+            if file_identity is not None:
+                self.release_ancestor_identity(file_identity[-1])
+            raise
 
     def get_cached_result_by_key(
         self,
@@ -718,13 +829,7 @@ class ScanResultsCache:
                 self._record_cache_miss("invalid")
                 return None
 
-            # Update access statistics
-            cache_entry["cache_metadata"]["access_count"] += 1
-            cache_entry["cache_metadata"]["last_access"] = time.time()
-
-            # Write back updated entry (async write would be better but adds complexity)
-            with open(cache_file_path, "w", encoding="utf-8") as f:
-                json.dump(cache_entry, f, indent=2)
+            self._update_cached_entry_access(cache_file_path, cache_entry)
 
             if (
                 file_path is not None
@@ -742,6 +847,32 @@ class ScanResultsCache:
             logger.debug(f"Cache lookup failed for key {cache_key[:8]}...: {e}")
             self._record_cache_miss("error")
             return None
+
+    @staticmethod
+    def _update_cached_entry_access(cache_file_path: Path, cache_entry: dict[str, Any]) -> None:
+        cache_entry["cache_metadata"]["access_count"] += 1
+        cache_entry["cache_metadata"]["last_access"] = time.time()
+        temporary_cache_path: Path | None = None
+
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=cache_file_path.parent,
+                prefix=f".{cache_file_path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as cache_file:
+                temporary_cache_path = Path(cache_file.name)
+                json.dump(cache_entry, cache_file, indent=2)
+            os.replace(temporary_cache_path, cache_file_path)
+            temporary_cache_path = None
+        except OSError as error:
+            logger.debug("Failed to update cache access metadata for %s: %s", cache_file_path.name, error)
+        finally:
+            if temporary_cache_path is not None:
+                with suppress(OSError):
+                    temporary_cache_path.unlink(missing_ok=True)
 
     @staticmethod
     def _result_from_cache_entry(
@@ -827,14 +958,29 @@ class ScanResultsCache:
             if self._get_file_change_token(file_path, file_stat) != expected_change_token:
                 logger.debug("Skipping cache store for %s: file change token changed during scan", file_path)
                 return False
+            if not self._ancestor_identity_matches_for_store(
+                expected_ancestor_identity,
+                self._capture_ancestor_identity(file_path),
+            ):
+                logger.debug("Skipping cache store for %s: ancestor path changed during scan", file_path)
+                return False
+            self._discard_validated_file_attribute_event(expected_ancestor_identity)
+            settled_pre_hash_stat = os.stat(file_path)
+            if not self._stat_matches(settled_pre_hash_stat, expected_file_stat):
+                logger.debug("Skipping cache store for %s: file metadata changed while starting store", file_path)
+                return False
+            if self._get_file_change_token(file_path, settled_pre_hash_stat) != expected_change_token:
+                logger.debug("Skipping cache store for %s: file changed while starting store", file_path)
+                return False
             if self._ancestor_monitor_changed(
                 expected_ancestor_identity
             ) or not self._ancestor_identity_matches_for_store(
                 expected_ancestor_identity,
                 self._capture_ancestor_identity(file_path),
             ):
-                logger.debug("Skipping cache store for %s: ancestor path changed during scan", file_path)
+                logger.debug("Skipping cache store for %s: ancestor path changed while starting store", file_path)
                 return False
+            file_stat = settled_pre_hash_stat
 
             verified_current_hash = self.hasher.hash_file_with_stat(file_path, file_stat)
             if verified_current_hash != expected_file_hash:
@@ -847,15 +993,29 @@ class ScanResultsCache:
             if self._get_file_change_token(file_path, post_hash_stat) != expected_change_token:
                 logger.debug("Skipping cache store for %s: file changed during verification", file_path)
                 return False
+            if not self._ancestor_identity_matches_for_store(
+                expected_ancestor_identity,
+                self._capture_ancestor_identity(file_path),
+            ):
+                logger.debug("Skipping cache store for %s: ancestor path changed during verification", file_path)
+                return False
+            self._discard_validated_file_attribute_event(expected_ancestor_identity)
+            settled_post_hash_stat = os.stat(file_path)
+            if not self._stat_matches(settled_post_hash_stat, expected_file_stat):
+                logger.debug("Skipping cache store for %s: file metadata changed while settling monitor", file_path)
+                return False
+            if self._get_file_change_token(file_path, settled_post_hash_stat) != expected_change_token:
+                logger.debug("Skipping cache store for %s: file changed while settling monitor", file_path)
+                return False
             if self._ancestor_monitor_changed(
                 expected_ancestor_identity
             ) or not self._ancestor_identity_matches_for_store(
                 expected_ancestor_identity,
                 self._capture_ancestor_identity(file_path),
             ):
-                logger.debug("Skipping cache store for %s: ancestor path changed during verification", file_path)
+                logger.debug("Skipping cache store for %s: ancestor path changed while settling monitor", file_path)
                 return False
-            file_stat = post_hash_stat
+            file_stat = settled_post_hash_stat
 
             version_info = self._get_version_info(version_context)
             if version_info is None:
@@ -1060,7 +1220,6 @@ class ScanResultsCache:
                 if (
                     not self._stat_matches(initial_stat, verified_stat)
                     or initial_change_token != verified_change_token
-                    or self._ancestor_monitor_changed(monitored_ancestor_identity)
                     or not self._ancestor_identity_matches_for_store(
                         monitored_ancestor_identity,
                         verified_ancestor_identity,
@@ -1068,7 +1227,28 @@ class ScanResultsCache:
                 ):
                     raise ValueError(f"File changed while capturing cache identity: {file_path}")
 
-                return verified_stat, content_hash, verified_change_token, monitored_ancestor_identity
+                self._discard_validated_file_attribute_event(monitored_ancestor_identity)
+                settled_stat = os.stat(file_path)
+                settled_change_token = self._get_file_change_token(file_path, settled_stat)
+                settled_ancestor_identity = self._capture_ancestor_identity(file_path)
+
+                if (
+                    not self._stat_matches(initial_stat, settled_stat)
+                    or initial_change_token != settled_change_token
+                    or self._ancestor_monitor_changed(monitored_ancestor_identity)
+                    or not self._ancestor_identity_matches_for_store(
+                        monitored_ancestor_identity,
+                        settled_ancestor_identity,
+                    )
+                ):
+                    raise ValueError(f"File changed while settling cache identity monitor: {file_path}")
+
+                return (
+                    settled_stat,
+                    content_hash,
+                    settled_change_token,
+                    monitored_ancestor_identity,
+                )
             except ValueError as exc:
                 self.release_ancestor_identity(monitored_ancestor_identity)
                 if str(exc).startswith("File changed while"):
@@ -1076,7 +1256,7 @@ class ScanResultsCache:
                     time.sleep(0.01)
                     continue
                 raise
-            except Exception:
+            except BaseException:
                 self.release_ancestor_identity(monitored_ancestor_identity)
                 raise
 
@@ -1303,6 +1483,12 @@ class ScanResultsCache:
     def _ancestor_monitor_changed(identity: AncestorIdentity) -> bool:
         return identity.monitor is not None and identity.monitor.changed()
 
+    @staticmethod
+    def _discard_validated_file_attribute_event(identity: AncestorIdentity) -> None:
+        discard_event = getattr(identity.monitor, "discard_validated_file_attribute_event", None)
+        if callable(discard_event):
+            discard_event()
+
     def _file_identity_matches(self, file_path: str, expected: ScannedFileIdentity) -> bool:
         expected_stat, _expected_hash, expected_change_token, expected_ancestor_identity = expected
         try:
@@ -1329,13 +1515,15 @@ class ScanResultsCache:
         if not identity:
             return identity
         try:
-            monitor: _AncestorPathMonitor | _WindowsPathLockMonitor | None = None
+            monitor: _AncestorPathMonitor | _DarwinPathMonitor | _WindowsPathLockMonitor | None = None
             platform_name = getattr(sys, "platform", "")
             if platform_name.startswith("linux"):
                 monitor = _AncestorPathMonitor(
                     file_path,
                     tuple(identity),
                 )
+            elif platform_name == "darwin":
+                monitor = _DarwinPathMonitor(file_path, tuple(identity))
             elif platform_name == "win32":
                 monitor = _WindowsPathLockMonitor(file_path, tuple(identity))
             if monitor is None:

@@ -76,7 +76,12 @@ flax = ["msgpack>=1.2.1,<2.0"]
 tflite = ["tflite>=2.18.0"]
 tensorrt = ["tensorrt>=8.6.0; sys_platform == 'linux' or sys_platform == 'win32'"]
 xgboost = ["xgboost>=3.2,<3.3", "py-ubjson>=0.16.0"]
-mlflow = ["mlflow-skinny>=3.13.0"]
+mlflow = [
+    "mlflow-skinny>=3.13.0",
+    "sqlalchemy>=2.0.49",
+    "alembic>=1.18.4",
+    "sqlparse>=0.6.0",
+]
 sevenzip = ["py7zr>=1.1.3"]
 # Full ML framework bundle with version-appropriate NumPy
 # Note: TensorFlow is no longer required - vendored protos handle SavedModel scanning
@@ -117,6 +122,9 @@ all-ci = [
     "py-ubjson>=0.16.0",
     "py7zr>=1.1.3",
     "mlflow-skinny>=3.13.0",
+    "sqlalchemy>=2.0.49",
+    "alembic>=1.18.4",
+    "sqlparse>=0.6.0",
     "huggingface-hub>=0.23.0",
 ]
 # Lightweight Windows CI dependencies (avoids heavy ML frameworks)
@@ -144,6 +152,9 @@ all = [
     "py-ubjson>=0.16.0",
     "py7zr>=1.1.3",
     "mlflow-skinny>=3.13.0",
+    "sqlalchemy>=2.0.49",
+    "alembic>=1.18.4",
+    "sqlparse>=0.6.0",
     "huggingface-hub>=0.23.0",
 ]
 
