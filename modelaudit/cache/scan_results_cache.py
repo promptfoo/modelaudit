@@ -281,8 +281,8 @@ class _DarwinPathMonitor:
             self.close()
             raise
 
-    def discard_hash_generated_file_attribute_event(self) -> None:
-        """Discard only a pending pure file attribute event after hash validation."""
+    def discard_validated_file_attribute_event(self) -> None:
+        """Discard only pending pure file attribute events after identity validation."""
         if self._queue is None:
             self._unsafe_event_seen = True
             return
@@ -958,14 +958,29 @@ class ScanResultsCache:
             if self._get_file_change_token(file_path, file_stat) != expected_change_token:
                 logger.debug("Skipping cache store for %s: file change token changed during scan", file_path)
                 return False
+            if not self._ancestor_identity_matches_for_store(
+                expected_ancestor_identity,
+                self._capture_ancestor_identity(file_path),
+            ):
+                logger.debug("Skipping cache store for %s: ancestor path changed during scan", file_path)
+                return False
+            self._discard_validated_file_attribute_event(expected_ancestor_identity)
+            settled_pre_hash_stat = os.stat(file_path)
+            if not self._stat_matches(settled_pre_hash_stat, expected_file_stat):
+                logger.debug("Skipping cache store for %s: file metadata changed while starting store", file_path)
+                return False
+            if self._get_file_change_token(file_path, settled_pre_hash_stat) != expected_change_token:
+                logger.debug("Skipping cache store for %s: file changed while starting store", file_path)
+                return False
             if self._ancestor_monitor_changed(
                 expected_ancestor_identity
             ) or not self._ancestor_identity_matches_for_store(
                 expected_ancestor_identity,
                 self._capture_ancestor_identity(file_path),
             ):
-                logger.debug("Skipping cache store for %s: ancestor path changed during scan", file_path)
+                logger.debug("Skipping cache store for %s: ancestor path changed while starting store", file_path)
                 return False
+            file_stat = settled_pre_hash_stat
 
             verified_current_hash = self.hasher.hash_file_with_stat(file_path, file_stat)
             if verified_current_hash != expected_file_hash:
@@ -984,7 +999,7 @@ class ScanResultsCache:
             ):
                 logger.debug("Skipping cache store for %s: ancestor path changed during verification", file_path)
                 return False
-            self._discard_hash_generated_file_attribute_event(expected_ancestor_identity)
+            self._discard_validated_file_attribute_event(expected_ancestor_identity)
             settled_post_hash_stat = os.stat(file_path)
             if not self._stat_matches(settled_post_hash_stat, expected_file_stat):
                 logger.debug("Skipping cache store for %s: file metadata changed while settling monitor", file_path)
@@ -1212,7 +1227,7 @@ class ScanResultsCache:
                 ):
                     raise ValueError(f"File changed while capturing cache identity: {file_path}")
 
-                self._discard_hash_generated_file_attribute_event(monitored_ancestor_identity)
+                self._discard_validated_file_attribute_event(monitored_ancestor_identity)
                 settled_stat = os.stat(file_path)
                 settled_change_token = self._get_file_change_token(file_path, settled_stat)
                 settled_ancestor_identity = self._capture_ancestor_identity(file_path)
@@ -1469,8 +1484,8 @@ class ScanResultsCache:
         return identity.monitor is not None and identity.monitor.changed()
 
     @staticmethod
-    def _discard_hash_generated_file_attribute_event(identity: AncestorIdentity) -> None:
-        discard_event = getattr(identity.monitor, "discard_hash_generated_file_attribute_event", None)
+    def _discard_validated_file_attribute_event(identity: AncestorIdentity) -> None:
+        discard_event = getattr(identity.monitor, "discard_validated_file_attribute_event", None)
         if callable(discard_event):
             discard_event()
 
