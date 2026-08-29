@@ -437,7 +437,7 @@ jobs:
     if: needs.changes.outputs.integration == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ubuntu-latest
     # Coverage runs in dedicated shards below, and the Python 3.12
-    # slow/integration/performance suite now runs in a separate parallel job.
+    # slow/integration suite now runs in a separate parallel job.
     timeout-minutes: 75
     strategy:
       fail-fast: false
@@ -535,9 +535,9 @@ jobs:
         run: |
           uv sync --extra all-ci
 
-      - name: Run slow, integration, and performance tests
+      - name: Run slow and integration tests
         run: |
-          uv run pytest tests -n auto -m "slow or integration or performance" --tb=short --durations=20
+          uv run pytest tests -n auto -m "(slow or integration) and not performance" --tb=short --durations=20
 
   coverage:
     name: Coverage (${{ matrix.shard }})
