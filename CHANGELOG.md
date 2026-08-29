@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- Restore SQL-backed MLflow model registries and upgrade their vulnerable SQL parser.
 - Remove `tensor_name_count` as a retention budget dimension for remote SafeTensors streaming; the `result_bytes` cap already bounds aggregate serialized size, so large multi-shard models (e.g. 141 shards) no longer fail closed prematurely.
 - Avoid false-positive `urllib` network findings for model cards whose only `urlopen` use is the documented `Image.open(urlopen(...))` sample-image example.
 - Upgrade vulnerable locked dependencies, use the hardened MLflow tracking client, and audit all installed CI extras.

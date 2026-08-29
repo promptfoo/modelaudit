@@ -23,7 +23,7 @@ ModelAudit uses optional dependencies to keep the base installation lightweight:
 | `tflite`      | `tflite`                               | TensorFlow Lite parsing                                                          |
 | `tensorflow`  | `tensorflow`                           | Optional TF runtime-dependent paths on Python 3.11-3.12                          |
 | `xgboost`     | `xgboost`, `py-ubjson`                 | XGBoost UBJ/full validation paths                                                |
-| `mlflow`      | `mlflow-skinny`                        | MLflow registry source support                                                   |
+| `mlflow`      | `mlflow-skinny` + SQL dependencies     | MLflow registry source support, including SQL-backed registries                  |
 | `sevenzip`    | `py7zr`                                | 7z archive scanner                                                               |
 | `all-ci`      | most portable extras except TensorFlow | CI profile                                                                       |
 | `all`         | broad portable extras                  | Broad local scanner coverage; excludes TensorFlow and platform-specific TensorRT |
