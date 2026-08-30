@@ -49,9 +49,8 @@ RUN apt-get update \
     && apt-get install --yes --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /wheels /wheels
-RUN pip install --no-cache-dir /wheels/*.whl \
-    && rm -rf /wheels
+RUN --mount=type=bind,from=builder,source=/wheels,target=/wheels \
+    pip install --no-cache-dir /wheels/*.whl
 
 ARG UID=10001
 RUN adduser \
