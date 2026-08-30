@@ -28,6 +28,11 @@ NUMPY_REQUIREMENTS = {
     "numpy>=2.4.3,<2.5; python_version == '3.11'",
     "numpy>=2.5,<2.6; python_version >= '3.12'",
 }
+XGBOOST_REQUIREMENTS = {
+    "xgboost>=3.2,<3.3; python_version < '3.12'",
+    "xgboost>=3.4,<3.5; python_version >= '3.12'",
+}
+XGBOOST_EXTRAS = ("xgboost", "all-ci", "all")
 
 
 def _lock_package_block(name: str) -> str:
@@ -153,3 +158,13 @@ def test_numpy_requirements_follow_supported_python_versions() -> None:
 
     assert root_requirements == NUMPY_REQUIREMENTS
     assert extra_requirements == NUMPY_REQUIREMENTS
+
+
+@pytest.mark.parametrize("extra", XGBOOST_EXTRAS)
+def test_xgboost_requirements_follow_supported_python_versions(extra: str) -> None:
+    root_config = tomllib.loads(ROOT_PYPROJECT.read_text(encoding="utf-8"))
+    optional_dependencies = root_config["project"]["optional-dependencies"][extra]
+
+    requirements = {requirement for requirement in optional_dependencies if requirement.startswith("xgboost")}
+
+    assert requirements == XGBOOST_REQUIREMENTS
