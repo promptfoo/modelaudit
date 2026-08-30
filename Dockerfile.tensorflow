@@ -14,7 +14,10 @@ ARG TARGETARCH
 
 WORKDIR /build
 
+COPY pyproject.toml README.md ./
+COPY requirements-tensorflow.txt ./
 COPY packages/modelaudit-picklescan ./packages/modelaudit-picklescan
+COPY modelaudit ./modelaudit
 
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends build-essential ca-certificates curl \
@@ -32,7 +35,10 @@ RUN apt-get update \
     && /tmp/rustup-init -y --profile minimal --default-toolchain "${PICKLESCAN_RUST_TOOLCHAIN}" \
     && rm -f /tmp/rustup-init /tmp/rustup-init.sha256 \
     && PATH="/root/.cargo/bin:${PATH}" pip wheel --no-cache-dir --no-deps --wheel-dir /wheels \
-        ./packages/modelaudit-picklescan
+        ./packages/modelaudit-picklescan \
+    && pip install --no-cache-dir --prefix=/install -c requirements-tensorflow.txt \
+        /wheels/modelaudit_picklescan-*.whl \
+        ".[tensorflow]"
 
 FROM ${PYTHON_IMAGE} AS runtime
 
@@ -46,16 +52,7 @@ RUN apt-get update \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy only necessary files for installation
-COPY pyproject.toml README.md ./
-COPY requirements-tensorflow.txt ./
-COPY modelaudit ./modelaudit
-
-# Install the coordinated local picklescan wheel with TensorFlow extras.
-RUN --mount=type=bind,from=builder,source=/wheels,target=/wheels \
-    pip install --no-cache-dir -c requirements-tensorflow.txt \
-        /wheels/modelaudit_picklescan-*.whl \
-        ".[tensorflow]"
+COPY --from=builder /install /usr/local
 
 # Create a non-root user
 ARG UID=10001
