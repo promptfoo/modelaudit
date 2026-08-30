@@ -36,7 +36,8 @@ RUN apt-get update \
     && rm -f /tmp/rustup-init /tmp/rustup-init.sha256 \
     && PATH="/root/.cargo/bin:${PATH}" pip wheel --no-cache-dir --wheel-dir /wheels \
         ./packages/modelaudit-picklescan \
-        .
+        . \
+    && pip install --no-cache-dir --prefix=/install /wheels/*.whl
 
 FROM ${PYTHON_IMAGE} AS runtime
 
@@ -49,9 +50,7 @@ RUN apt-get update \
     && apt-get install --yes --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /wheels /wheels
-RUN pip install --no-cache-dir /wheels/*.whl \
-    && rm -rf /wheels
+COPY --from=builder /install /usr/local
 
 ARG UID=10001
 RUN adduser \
