@@ -458,6 +458,7 @@ def test_python_ci_fast_linux_matrix_folds_quick_feedback_into_ordinary_prs() ->
     test_job = jobs["test"]
     assert test_job["if"] == (
         "needs.changes.outputs.integration == 'true' || needs.changes.outputs.python == 'true' || "
+        "needs.changes.outputs.docker == 'true' || "
         "needs.changes.outputs.workflows == 'true'"
     )
 
@@ -583,7 +584,8 @@ def test_python_ci_requires_successful_coverage_when_scheduled() -> None:
     ci_success_steps = ci_success_job["steps"]
     gate_script = _step_by_name(ci_success_steps, "Check if all jobs succeeded")["run"]
     expected_assignments = {
-        "EXPECT_CORE_FAST": jobs["test"]["if"],
+        "EXPECT_CORE_FAST": jobs["lint"]["if"],
+        "EXPECT_TEST": jobs["test"]["if"],
         "EXPECT_SLOW": jobs["slow-tests"]["if"],
         "EXPECT_DEPENDENCY_AUDIT": jobs["dependency-audit"]["if"],
         "EXPECT_DEPENDENCY_SURFACE": jobs["license-check"]["if"],
@@ -605,7 +607,7 @@ def test_python_ci_requires_successful_coverage_when_scheduled() -> None:
         ("EXPECT_DEPENDENCY_SURFACE", "UV_LOCK_RESULT"),
         ("EXPECT_CORE_FAST", "TYPE_CHECK_RESULT"),
         ("EXPECT_CORE_FAST", "WINDOWS_RESULT"),
-        ("EXPECT_CORE_FAST", "TEST_RESULT"),
+        ("EXPECT_TEST", "TEST_RESULT"),
         ("EXPECT_SLOW", "SLOW_RESULT"),
         ("EXPECT_COVERAGE", "COVERAGE_RESULT"),
         ("EXPECT_OPTIONAL_DEPENDENCY_LANES", "NUMPY_RESULT"),

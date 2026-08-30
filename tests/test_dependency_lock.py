@@ -30,6 +30,11 @@ NUMPY_REQUIREMENTS = {
     "numpy>=2.4.3,<2.5; python_version == '3.11'",
     "numpy>=2.5,<2.6; python_version >= '3.12'",
 }
+XGBOOST_REQUIREMENTS = {
+    "xgboost>=3.2,<3.3; python_version < '3.12'",
+    "xgboost>=3.4,<3.5; python_version >= '3.12'",
+}
+XGBOOST_EXTRAS = ("xgboost", "all-ci", "all")
 
 
 def _lock_package_block(name: str) -> str:
@@ -157,24 +162,30 @@ def test_numpy_requirements_follow_supported_python_versions() -> None:
     assert extra_requirements == NUMPY_REQUIREMENTS
 
 
-def test_renovate_keeps_xgboost_compatible_with_supported_python_versions() -> None:
+@pytest.mark.parametrize("extra", XGBOOST_EXTRAS)
+def test_xgboost_requirements_follow_supported_python_versions(extra: str) -> None:
     root_config = tomllib.loads(ROOT_PYPROJECT.read_text(encoding="utf-8"))
-    project = root_config["project"]
-    optional_dependencies = project["optional-dependencies"]
+    optional_dependencies = root_config["project"]["optional-dependencies"][extra]
+
+    requirements = {requirement for requirement in optional_dependencies if requirement.startswith("xgboost")}
+
+    assert requirements == XGBOOST_REQUIREMENTS
+
+
+def test_renovate_keeps_legacy_xgboost_cohort_compatible() -> None:
     renovate_config = json.loads(RENOVATE_CONFIG.read_text(encoding="utf-8"))
-
-    assert project["requires-python"] == ">=3.10,<3.14"
-    for extra in ("xgboost", "all-ci", "all"):
-        xgboost_requirements = [
-            requirement for requirement in optional_dependencies[extra] if requirement.startswith("xgboost")
-        ]
-        assert xgboost_requirements == ["xgboost>=3.2,<3.3"]
-
     compatibility_rules = [
         rule for rule in renovate_config["packageRules"] if "xgboost" in rule.get("matchPackageNames", [])
     ]
 
     assert len(compatibility_rules) == 1
-    assert compatibility_rules[0]["matchManagers"] == ["pep621"]
-    assert compatibility_rules[0]["matchFileNames"] == ["pyproject.toml"]
-    assert compatibility_rules[0]["allowedVersions"] == "<3.3"
+    rule = compatibility_rules[0]
+    assert rule["matchManagers"] == ["pep621"]
+    assert rule["matchFileNames"] == ["pyproject.toml"]
+    assert rule["matchPackageNames"] == ["xgboost"]
+    assert rule["matchCurrentValue"] == r"/<3\.3/"
+    assert rule["allowedVersions"] == "<3.3"
+
+    current_value_pattern = re.compile(rule["matchCurrentValue"].removeprefix("/").removesuffix("/"))
+    assert current_value_pattern.search(">=3.2,<3.3") is not None
+    assert current_value_pattern.search(">=3.4,<3.5") is None

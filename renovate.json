@@ -19,10 +19,11 @@
       "allowedVersions": "<2.5"
     },
     {
-      "description": "Keep XGBoost compatible with supported Python 3.10 and 3.11 runtimes.",
+      "description": "Keep XGBoost 3.2.x constraints on Python 3.10 and 3.11 markers in pyproject.toml.",
       "matchFileNames": ["pyproject.toml"],
       "matchManagers": ["pep621"],
       "matchPackageNames": ["xgboost"],
+      "matchCurrentValue": "/<3\\.3/",
       "allowedVersions": "<3.3"
     },
     {
