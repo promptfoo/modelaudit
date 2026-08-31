@@ -3537,7 +3537,7 @@ def _resolve_scan_source_for_path(
                 stream_namespace, stream_repo_name, _stream_requested_revision = parse_huggingface_url_with_revision(
                     path
                 )
-                stream_staging_parent = Path(runtime.cache_dir) if runtime.cache_dir else None
+                stream_staging_parent = hf_cache_dir if runtime.cache_enabled else None
                 with _temporary_hf_streaming_staging_root(parent=stream_staging_parent) as stream_staging_root:
                     stream_hf_cache_root = stream_staging_root / "huggingface"
                     stream_repository_scan_root = stream_hf_cache_root / stream_namespace

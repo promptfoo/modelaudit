@@ -5994,8 +5994,8 @@ def download_model_streaming(
             if download_path is not None:
                 raise _HfStreamingStagingCleanupError("Hugging Face streaming artifact families overlapped")
 
-            with _temporary_hf_streaming_family_root(_staging_root) as family_root:
-                download_path = _build_huggingface_download_path(family_root, namespace, repo_name)
+            with _temporary_hf_streaming_family_root(_staging_root):
+                download_path = _build_huggingface_download_path(_staging_root, namespace, repo_name)
                 download_path.mkdir(parents=True, exist_ok=True)
                 try:
                     yield

@@ -4126,6 +4126,53 @@ class TestModelDownloadStreaming:
 
         assert not staging_root.exists()
 
+    @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None)
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["models/a.bin"], _HF_TEST_REVISION, None),
+    )
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_staging_matches_repository_scan_root(
+        self,
+        mock_hf_hub_download: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+        _mock_detect_content: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Staged files should be relative to the CLI's repository scan root."""
+
+        def download_side_effect(*, filename: str, local_dir: str | None = None, **_kwargs: object) -> str:
+            assert local_dir is not None
+            path = Path(local_dir) / filename
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"weights")
+            return str(path)
+
+        mock_hf_hub_download.side_effect = download_side_effect
+
+        with _temporary_hf_streaming_staging_root(parent=tmp_path / "selected-cache") as staging_root:
+            generator = download_model_streaming(
+                "https://huggingface.co/test/model",
+                cache_dir=tmp_path / "persistent-cache",
+                scannable_extensions={".bin"},
+                _staging_root=staging_root,
+            )
+
+            streamed_path, is_last = next(generator)
+            repository_scan_root = staging_root / "huggingface" / "test" / "model"
+            assert streamed_path == repository_scan_root / "models" / "a.bin"
+            assert streamed_path.relative_to(repository_scan_root).as_posix() == "models/a.bin"
+            assert mock_hf_hub_download.call_args.kwargs["local_dir"] == str(repository_scan_root)
+            assert is_last is True
+
+            cast(Generator[tuple[Path, bool], None, None], generator).close()
+            assert not streamed_path.exists()
+            assert not (staging_root / "huggingface").exists()
+
+        assert not staging_root.exists()
+
     @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format")
     @patch(
         "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",

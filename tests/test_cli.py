@@ -6980,6 +6980,49 @@ def test_scan_huggingface_streaming_passes_max_size_to_download(
     assert mock_download_streaming.call_args.kwargs["cache_dir"] == selected_cache
 
 
+@patch("modelaudit.cli.get_model_info")
+@patch("modelaudit.cli.is_huggingface_url")
+@patch("modelaudit.utils.sources.huggingface.download_model_streaming")
+@patch("modelaudit.core.scan_model_streaming")
+def test_hf_streaming_staging_default_cache_uses_cache_volume(
+    mock_scan_streaming: MagicMock,
+    mock_download_streaming: MagicMock,
+    mock_is_hf_url: MagicMock,
+    mock_get_model_info: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """Default cached streaming should stage artifacts on the cache volume."""
+    mock_is_hf_url.return_value = True
+    streamed_file = tmp_path / "model.bin"
+    streamed_file.write_bytes(b"weights")
+    mock_download_streaming.return_value = iter([(streamed_file, True)])
+    mock_scan_streaming.return_value = create_mock_scan_result(bytes_scanned=7, files_scanned=1, issues=[])
+    mock_get_model_info.return_value = {
+        "model_id": "test/model",
+        "total_size": 0,
+        "file_count": 0,
+        "inaccessible_gated_file_count": 0,
+        "unknown_size_count": 0,
+    }
+
+    home = tmp_path / "home"
+    with patch("modelaudit.cli.Path.home", return_value=home):
+        result = CliRunner().invoke(
+            cli,
+            ["scan", "--stream", "--quiet", "hf://test/model"],
+            catch_exceptions=False,
+        )
+
+    assert result.exit_code == 0, result.output
+    default_cache = home / ".modelaudit" / "cache"
+    assert mock_download_streaming.call_args.kwargs["cache_dir"] == default_cache
+    staging_root = mock_download_streaming.call_args.kwargs["_staging_root"]
+    assert isinstance(staging_root, Path)
+    assert staging_root.parent == default_cache.resolve()
+    assert not staging_root.exists()
+    assert default_cache.is_dir()
+
+
 @patch("modelaudit.cli.is_huggingface_url")
 @patch("modelaudit.utils.sources.huggingface.download_model_streaming")
 @patch("modelaudit.core.scan_model_streaming")
