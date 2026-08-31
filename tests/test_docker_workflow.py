@@ -107,6 +107,27 @@ def test_dockerfiles_pin_python_base_images_by_digest() -> None:
     assert tensorflow_lines.count("FROM ${PYTHON_IMAGE} AS runtime") == 1
 
 
+@pytest.mark.parametrize("dockerfile", ("Dockerfile", "Dockerfile.full", "Dockerfile.tensorflow"))
+def test_docker_runtime_images_upgrade_vulnerable_util_linux_packages(dockerfile: str) -> None:
+    content = (_REPO_ROOT / dockerfile).read_text(encoding="utf-8")
+    runtime_stage = content.split("FROM ${PYTHON_IMAGE} AS runtime", maxsplit=1)[1]
+    normalized_stage = re.sub(r"\\\s*\n\s*", " ", runtime_stage)
+    upgrade_commands = re.findall(r"apt-get install[^&\n]*--only-upgrade\s+([^&\n]+)", normalized_stage)
+    upgraded_packages = {package for command in upgrade_commands for package in command.split()}
+
+    assert {
+        "bsdutils",
+        "libblkid1",
+        "liblastlog2-2",
+        "libmount1",
+        "libsmartcols1",
+        "libuuid1",
+        "login",
+        "mount",
+        "util-linux",
+    } <= upgraded_packages
+
+
 def test_docker_publish_manual_dispatch_is_guarded_before_push() -> None:
     workflow = _load_docker_publish_workflow()
 
@@ -297,13 +318,28 @@ def test_dockerfiles_fallback_to_native_architecture_without_buildkit(dockerfile
     assert '*) echo "Unsupported Docker build architecture: ${TARGETARCH}" >&2; exit 1 ;;' in content
 
 
+@pytest.mark.parametrize("dockerfile", ("Dockerfile", "Dockerfile.full", "Dockerfile.tensorflow"))
+def test_dockerfiles_copy_installed_runtime_without_buildkit(dockerfile: str) -> None:
+    content = (_REPO_ROOT / dockerfile).read_text(encoding="utf-8")
+    wheel_build = content.index("pip wheel")
+    staged_install = content.index("pip install --no-cache-dir --prefix=/install")
+    runtime_stage = content.index("FROM ${PYTHON_IMAGE} AS runtime")
+    installed_copy = content.index("COPY --from=builder /install /usr/local")
+
+    assert wheel_build < staged_install < runtime_stage < installed_copy
+    assert "RUN --mount=" not in content
+    assert "COPY --from=builder /wheels /wheels" not in content
+    assert "rm -rf /wheels" not in content
+
+
 def test_tensorflow_dockerfile_builds_coordinated_picklescan_wheel() -> None:
     content = (_REPO_ROOT / "Dockerfile.tensorflow").read_text(encoding="utf-8")
 
     assert "COPY packages/modelaudit-picklescan ./packages/modelaudit-picklescan" in content
     assert "pip wheel --no-cache-dir --no-deps --wheel-dir /wheels" in content
     assert "./packages/modelaudit-picklescan" in content
-    assert "COPY --from=builder /wheels /wheels" in content
+    assert "pip install --no-cache-dir --prefix=/install -c requirements-tensorflow.txt" in content
+    assert "COPY --from=builder /install /usr/local" in content
     assert "/wheels/modelaudit_picklescan-*.whl" in content
     assert content.index("/wheels/modelaudit_picklescan-*.whl") < content.index('".[tensorflow]"')
 

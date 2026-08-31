@@ -12,7 +12,10 @@ from typing import Any, ClassVar
 from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 from modelaudit.core_results import mark_operational_scan_error
-from modelaudit.detectors.network_comm import redact_url_for_finding
+from modelaudit.detectors.network_comm import (
+    official_readme_urlopen_image_example_spans,
+    redact_url_for_finding,
+)
 from modelaudit.detectors.secrets import SecretsDetector
 from modelaudit.scanner_registry_metadata import TOKENIZER_VOCABULARY_CONTENT_FILENAMES
 from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
@@ -44,6 +47,10 @@ DOCUMENTATION_TEXT_FILENAMES = frozenset(
         "readme.txt",
     }
 )
+DOCUMENTATION_IMAGE_EXAMPLE_TOKENS: dict[tuple[str, str], bytes] = {
+    ("network_function", "urlopen"): b"urlopen",
+    ("network_library", "urllib"): b"from urllib",
+}
 PASSIVE_NETWORK_FINDING_TYPES = frozenset(
     {
         "cloud_storage_url",
@@ -2755,11 +2762,53 @@ class TextScanner(BaseScanner):
         )
 
     @classmethod
+    def _documentation_image_example_finding(
+        cls,
+        path: str,
+        payload: bytes,
+        finding: dict[str, Any],
+        documented_spans: tuple[tuple[int, int], ...],
+    ) -> bool:
+        """Return whether one ``urllib``/``urlopen`` finding sits inside a documented image example.
+
+        Model-card generators emit a fixed ``Image.open(urlopen(<literal huggingface.co URL>))``
+        snippet, so the example is proven structurally by
+        :func:`official_readme_urlopen_image_example_spans`. Findings outside a proven fence, and
+        every other finding type, stay actionable.
+        """
+        filename = os.path.basename(path).lower()
+        if os.path.splitext(filename)[1] not in {".md", ".markdown"} or not (
+            cls._is_readme_documentation_filename(filename) or cls._is_model_card_documentation_filename(filename)
+        ):
+            return False
+
+        finding_type = finding.get("type")
+        if finding_type == "network_function":
+            token = DOCUMENTATION_IMAGE_EXAMPLE_TOKENS.get((finding_type, str(finding.get("function"))))
+        elif finding_type == "network_library" and finding.get("pattern") == "from urllib":
+            token = DOCUMENTATION_IMAGE_EXAMPLE_TOKENS.get((finding_type, str(finding.get("library"))))
+        else:
+            return False
+        if token is None:
+            return False
+
+        position = finding.get("position")
+        if not isinstance(position, int) or position < 0:
+            return False
+        end = position + len(token)
+        if payload[position:end] != token:
+            return False
+        return any(start <= position and end <= stop for start, stop in documented_spans)
+
+    @classmethod
     def _sidecar_network_finding_is_informational(
         cls,
         path: str,
         payload: bytes,
         finding: dict[str, Any],
+        *,
+        allow_documentation_image_examples: bool = False,
+        documentation_image_example_spans: tuple[tuple[int, int], ...] = (),
     ) -> bool:
         if cls._is_documentation_sidecar(path):
             finding_type = finding.get("type")
@@ -2782,6 +2831,15 @@ class TextScanner(BaseScanner):
                 )
                 or (finding_type == "network_library" and cls._documentation_network_library_is_prose(payload, finding))
                 or (finding_type == "cc_pattern" and cls._documentation_cc_finding_is_benign_prose(payload, finding))
+                or (
+                    allow_documentation_image_examples
+                    and cls._documentation_image_example_finding(
+                        path,
+                        payload,
+                        finding,
+                        documentation_image_example_spans,
+                    )
+                )
                 or (
                     finding_type == "suspicious_port" and not cls._documentation_finding_is_actionable(payload, finding)
                 )
@@ -3261,12 +3319,19 @@ class TextScanner(BaseScanner):
         path: str,
         payload: bytes,
         findings: list[dict[str, Any]],
+        *,
+        allow_documentation_image_examples: bool = False,
     ) -> tuple[list[dict[str, Any]], bool, set[str]]:
         classified_findings: list[dict[str, Any]] = []
         classification_incomplete = False
         classification_limit_sources: set[str] = set()
         remaining_occurrences = MAX_DOCUMENTATION_FINDING_RETARGET_OCCURRENCES
         documentation_sidecar = cls._is_documentation_sidecar(path)
+        documentation_image_example_spans = (
+            official_readme_urlopen_image_example_spans(payload)
+            if allow_documentation_image_examples and documentation_sidecar and findings
+            else ()
+        )
         lowered_payload = payload.lower() if documentation_sidecar else b""
         tokenizer_vocabulary_sidecar = cls._has_line_oriented_tokenizer_vocabulary_evidence(path, payload)
         last_retargetable_index = max(
@@ -3297,7 +3362,13 @@ class TextScanner(BaseScanner):
                 if retargeted_finding is None:
                     continue
                 finding = retargeted_finding
-            if not retarget_incomplete and cls._sidecar_network_finding_is_informational(path, payload, finding):
+            if not retarget_incomplete and cls._sidecar_network_finding_is_informational(
+                path,
+                payload,
+                finding,
+                allow_documentation_image_examples=allow_documentation_image_examples,
+                documentation_image_example_spans=documentation_image_example_spans,
+            ):
                 finding = {**finding, "severity": "INFO"}
             classified_findings.append(finding)
         return classified_findings, classification_incomplete, classification_limit_sources
@@ -3464,11 +3535,18 @@ class TextScanner(BaseScanner):
                     max_findings=max_findings,
                 )
                 network_findings, finding_limit = self._split_detector_finding_limit(network_findings)
+                allow_documentation_image_examples = (
+                    self._get_bool_config("use_hf_whitelist", default=True)
+                    and not detector_incomplete
+                    and not truncated
+                    and finding_limit is None
+                )
                 network_findings, classification_incomplete, classification_limit_sources = (
                     self._downgrade_sidecar_network_findings(
                         path,
                         inspected_payload,
                         network_findings,
+                        allow_documentation_image_examples=allow_documentation_image_examples,
                     )
                 )
                 network_findings = self._deduplicate_documentation_network_findings(

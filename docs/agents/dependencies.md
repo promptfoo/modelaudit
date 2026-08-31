@@ -22,13 +22,15 @@ ModelAudit uses optional dependencies to keep the base installation lightweight:
 | `flax`        | no extra package (uses base `msgpack`) | Flax/JAX msgpack checkpoint support                                              |
 | `tflite`      | `tflite`                               | TensorFlow Lite parsing                                                          |
 | `tensorflow`  | `tensorflow`                           | Optional TF runtime-dependent paths on Python 3.11-3.12                          |
-| `xgboost`     | `xgboost`, `py-ubjson`                 | XGBoost UBJ/full validation paths                                                |
-| `mlflow`      | `mlflow`                               | MLflow registry source support                                                   |
+| `xgboost`     | `xgboost` 3.2/3.4, `py-ubjson`         | XGBoost UBJ/full validation paths                                                |
+| `mlflow`      | `mlflow-skinny` + SQL dependencies     | MLflow registry source support, including SQL-backed registries                  |
 | `sevenzip`    | `py7zr`                                | 7z archive scanner                                                               |
 | `all-ci`      | most portable extras except TensorFlow | CI profile                                                                       |
 | `all`         | broad portable extras                  | Broad local scanner coverage; excludes TensorFlow and platform-specific TensorRT |
 
 `pyyaml`, `msgpack`, and cloud storage dependencies (`fsspec`, `s3fs`, `gcsfs`) are core dependencies in the base install. Keep ONNX docs aligned with the `python_version < "3.13"` package marker until that gate is removed.
+
+XGBoost 3.4 requires Python 3.12+, so Python 3.10-3.11 use XGBoost 3.2 while Python 3.12-3.13 use XGBoost 3.4.
 
 ## TensorFlow SavedModel Scanning (No TensorFlow Required)
 
