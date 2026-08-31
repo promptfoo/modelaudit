@@ -2621,8 +2621,9 @@ def test_ggml_polyglot_with_empty_eocd_in_comment_fails_closed(tmp_path: Path) -
     with zipfile.ZipFile(path) as archive:
         assert archive.namelist() == []
 
-    direct = GgufScanner().scan(str(path))
-    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+    excluded_config = {"exclude_scanners": ["zip"]}
+    direct = GgufScanner(config=excluded_config).scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), config=excluded_config, cache_enabled=False)
 
     assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert "zip_analysis_incomplete" in direct.metadata["scan_outcome_reasons"]
@@ -2642,6 +2643,12 @@ def test_ggml_polyglot_with_empty_eocd_in_comment_fails_closed(tmp_path: Path) -
         }
         assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
     assert determine_exit_code(aggregate) == 2
+    _assert_uncached_rerun_preserves_inconclusive_exit2(
+        path,
+        tmp_path / "excluded-zip-cache",
+        "zip_analysis_incomplete",
+        config=excluded_config,
+    )
 
 
 def test_ggml_polyglot_with_post_preflight_bad_zip_fails_closed(tmp_path: Path) -> None:
@@ -2736,11 +2743,13 @@ def test_ggml_with_empty_zip_remains_benign(tmp_path: Path) -> None:
     with zipfile.ZipFile(path) as archive:
         assert archive.infolist() == []
 
-    direct = GgufScanner().scan(str(path))
-    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+    excluded_config = {"exclude_scanners": ["zip"]}
+    direct = GgufScanner(config=excluded_config).scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), config=excluded_config, cache_enabled=False)
 
     for result in (direct, aggregate):
         assert result.success is True
+        assert not any(check.name == "ZIP Central Directory Preflight" for check in result.checks)
         assert not any(check.name == "ZIP File Format Validation" for check in result.checks)
         assert not any(issue.rule_code == "S908" for issue in result.issues)
     assert determine_exit_code(aggregate) == 0

@@ -767,17 +767,24 @@ class GgufScanner(BaseScanner):
             _ZIP_CONTAINER_PREFLIGHT_REJECTED_PATHS_PRIVATE_METADATA_KEY,
             merge_executable_zip_container_findings,
         )
-        from .zip_scanner import ZipPreflightRejected, open_preflighted_zip_handle
+        from .zip_scanner import (
+            ZipPreflightRejected,
+            open_preflighted_zip_handle_with_entry_count,
+        )
 
         archive_config = dict(self.config)
         archive_config.pop(_GGUF_CONTAINER_OWNED_TRAILING_CONFIG_KEY, None)
 
-        # Defer accepting an empty parse until the composed scan reconciles it with the bounded
-        # preflight count. A later EOCD inside the real EOCD comment can otherwise hide entries.
+        # Retain the bounded same-handle preflight count so parser mismatches fail closed even
+        # when nested ZIP scanning is excluded.
+        preflight_entry_count: int | None = None
         parsed_entry_count: int | None = None
         preflight_accepted = False
         try:
-            with open_preflighted_zip_handle(self.current_file_path, archive_config) as archive_handle:
+            with open_preflighted_zip_handle_with_entry_count(
+                self.current_file_path,
+                archive_config,
+            ) as (archive_handle, preflight_entry_count):
                 preflight_accepted = True
                 with zipfile.ZipFile(archive_handle, "r") as embedded_archive:
                     parsed_entry_count = len(embedded_archive.infolist())
@@ -795,6 +802,31 @@ class GgufScanner(BaseScanner):
                 rule_code="S902",
                 location=self.current_file_path,
                 details={"path": self.current_file_path},
+            )
+            mark_archive_scan_incomplete(result, "zip_analysis_incomplete")
+            return False
+
+        if (
+            preflight_entry_count is not None
+            and parsed_entry_count is not None
+            and parsed_entry_count != preflight_entry_count
+        ):
+            result.add_check(
+                name="ZIP Central Directory Preflight",
+                passed=False,
+                message=(
+                    "ZIP central directory changed between preflight and parsing "
+                    f"({preflight_entry_count} != {parsed_entry_count})"
+                ),
+                severity=IssueSeverity.INFO,
+                rule_code="S902",
+                location=self.current_file_path,
+                details={
+                    "preflight_entries": preflight_entry_count,
+                    "parsed_entries": parsed_entry_count,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "zip_analysis_incomplete",
+                },
             )
             mark_archive_scan_incomplete(result, "zip_analysis_incomplete")
             return False
