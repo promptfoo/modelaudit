@@ -6679,28 +6679,32 @@ def test_scan_huggingface_cached_stream_reconciles_snapshot_alias_shards(
     tmp_path: Path,
     requires_symlinks: None,
 ) -> None:
-    """A cache-enabled HF stream should trust aliases of one logical snapshot parent."""
+    """A cache-enabled HF stream should trust staged aliases of one snapshot parent."""
     mock_is_hf_url.return_value = True
     header = b'{"__metadata__":{"format":"pt"}}'
     cache_root = tmp_path / "persistent-cache"
-    _make_trusted_shard_parent(cache_root / "huggingface", parents=True)
-    snapshot_dir = cache_root / "huggingface" / "models--test--model" / "snapshots" / _HF_TEST_REVISION
-    _make_trusted_shard_parent(snapshot_dir, parents=True)
-    alias_root = cache_root / "huggingface" / "test" / "model"
-    _make_trusted_shard_parent(alias_root, parents=True)
-    first_alias = alias_root / "cache-a"
-    second_alias = alias_root / "cache-b"
-    first_alias.symlink_to(snapshot_dir, target_is_directory=True)
-    second_alias.symlink_to(snapshot_dir, target_is_directory=True)
 
-    def file_generator() -> Iterator[tuple[Path, bool]]:
+    def file_generator(_model_url: str, **kwargs: Any) -> Iterator[tuple[Path, bool]]:
+        staging_root = cast(Path, kwargs["_staging_root"])
+        staged_cache_root = staging_root / "huggingface"
+        _make_trusted_shard_parent(staged_cache_root, parents=True)
+        snapshot_dir = staged_cache_root / "models--test--model" / "snapshots" / _HF_TEST_REVISION
+        _make_trusted_shard_parent(snapshot_dir, parents=True)
+        alias_root = staged_cache_root / "test" / "model"
+        _make_trusted_shard_parent(alias_root, parents=True)
+        first_alias = alias_root / "cache-a"
+        second_alias = alias_root / "cache-b"
+        first_alias.symlink_to(snapshot_dir, target_is_directory=True)
+        second_alias.symlink_to(snapshot_dir, target_is_directory=True)
+        streamed_shards: list[tuple[Path, bool]] = []
         for shard_index, alias_path in ((1, first_alias), (2, second_alias)):
             shard_name = f"model-{shard_index:05d}-of-00002.safetensors"
             snapshot_path = snapshot_dir / shard_name
             snapshot_path.write_bytes(struct.pack("<Q", len(header)) + header)
-            yield (alias_path / shard_name, shard_index == 2)
+            streamed_shards.append((alias_path / shard_name, shard_index == 2))
+        yield from streamed_shards
 
-    mock_download_streaming.return_value = file_generator()
+    mock_download_streaming.side_effect = file_generator
 
     result = CliRunner().invoke(
         cli,
@@ -6736,11 +6740,16 @@ def test_scan_huggingface_streaming_omits_multilingual_vocab_cc_token(
 ) -> None:
     """Streamed Hugging Face tokenizer vocabularies should retain vocabulary context."""
     mock_is_hf_url.return_value = True
-    model_dir = tmp_path / "huggingface" / "google-bert" / "bert-base-multilingual-uncased"
-    model_dir.mkdir(parents=True)
-    vocab_path = model_dir / "tokenizer-multilingual.txt"
-    vocab_path.write_bytes(_bert_like_multilingual_vocab_bytes("zombie"))
-    mock_download_streaming.return_value = iter([(vocab_path, True)])
+
+    def file_generator(_model_url: str, **kwargs: Any) -> Iterator[tuple[Path, bool]]:
+        staging_root = cast(Path, kwargs["_staging_root"])
+        model_dir = staging_root / "huggingface" / "google-bert" / "bert-base-multilingual-uncased"
+        model_dir.mkdir(parents=True)
+        vocab_path = model_dir / "tokenizer-multilingual.txt"
+        vocab_path.write_bytes(_bert_like_multilingual_vocab_bytes("zombie"))
+        yield (vocab_path, True)
+
+    mock_download_streaming.side_effect = file_generator
 
     result = CliRunner().invoke(
         cli,
