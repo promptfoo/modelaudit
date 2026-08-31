@@ -187,7 +187,7 @@ def test_hf_streaming_staging_root_replacement_fails_without_deleting_replacemen
     replacement_root: Path | None = None
 
     with (
-        pytest.raises(_HfStreamingStagingCleanupError, match="was replaced; refusing to delete"),
+        pytest.raises(_HfStreamingStagingCleanupError, match="replacement was preserved") as cleanup_error,
         _temporary_hf_streaming_staging_root(parent=staging_volume) as staging_root,
     ):
         original_identity = staging_root.stat().st_dev, staging_root.stat().st_ino
@@ -202,12 +202,110 @@ def test_hf_streaming_staging_root_replacement_fails_without_deleting_replacemen
 
     assert owned_root is not None
     assert replacement_root is not None
+    preserved_replacement = Path(str(cleanup_error.value).partition("preserved at ")[2])
     assert owned_root.is_dir()
-    assert replacement_root.is_dir()
-    assert (replacement_root / "caller.bin").read_bytes() == b"caller-owned"
+    assert not replacement_root.exists()
+    assert preserved_replacement.is_dir()
+    assert (preserved_replacement.stat().st_dev, preserved_replacement.stat().st_ino) == replacement_identity
+    assert (preserved_replacement / "caller.bin").read_bytes() == b"caller-owned"
 
     shutil.rmtree(owned_root)
-    shutil.rmtree(replacement_root)
+    shutil.rmtree(preserved_replacement)
+
+
+def test_hf_streaming_staging_fallback_quarantine_preserves_raced_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from modelaudit.utils.sources import huggingface as huggingface_module
+
+    monkeypatch.setattr(huggingface_module.os, "supports_dir_fd", set())
+    monkeypatch.setattr(huggingface_module.os, "supports_follow_symlinks", set())
+    monkeypatch.setattr(shutil, "_use_fd_functions", False)
+    original_rmtree = huggingface_module.shutil.rmtree
+    staging_volume = tmp_path / "staging-volume"
+    staging_volume.mkdir()
+    staging_root: Path | None = None
+    raced = False
+
+    def race_before_rmtree(
+        path: str | os.PathLike[str],
+        ignore_errors: bool = False,
+        onerror: Callable[..., Any] | None = None,
+    ) -> None:
+        nonlocal raced
+        candidate = Path(path)
+        if staging_root is not None and not raced:
+            raced = True
+            if candidate == staging_root:
+                staging_root.rename(staging_root.with_name(f"{staging_root.name}-owned"))
+            staging_root.mkdir()
+            (staging_root / "caller.bin").write_bytes(b"caller-owned")
+        original_rmtree(path, ignore_errors=ignore_errors, onerror=onerror)
+
+    monkeypatch.setattr(huggingface_module.shutil, "rmtree", race_before_rmtree)
+
+    with _temporary_hf_streaming_staging_root(parent=staging_volume) as active_root:
+        staging_root = active_root
+        (staging_root / "leaf.bin").write_bytes(b"owned")
+
+    assert raced
+    assert staging_root is not None
+    assert (staging_root / "caller.bin").read_bytes() == b"caller-owned"
+    assert list(staging_volume.glob(".modelaudit_hf_cleanup_*")) == []
+
+
+def test_hf_streaming_staging_descriptor_quarantine_unlinks_only_inside_owned_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from modelaudit.utils.sources import huggingface as huggingface_module
+
+    if not huggingface_module._supports_hf_staging_descriptor_cleanup():
+        pytest.skip("descriptor-relative cleanup is unavailable")
+
+    original_unlink = huggingface_module.os.unlink
+    staging_volume = tmp_path / "staging-volume"
+    staging_volume.mkdir()
+    staging_root: Path | None = None
+    raced = False
+
+    def race_before_unlink(
+        path: str | os.PathLike[str],
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        nonlocal raced
+        if path == "leaf.bin" and staging_root is not None and not raced:
+            raced = True
+            if staging_root.exists():
+                assert dir_fd is not None
+                os.rename("leaf.bin", "owned-leaf.bin", src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+                caller_fd = os.open(
+                    "leaf.bin",
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=dir_fd,
+                )
+                try:
+                    os.write(caller_fd, b"caller-owned")
+                finally:
+                    os.close(caller_fd)
+            else:
+                staging_root.mkdir()
+                (staging_root / "leaf.bin").write_bytes(b"caller-owned")
+        original_unlink(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(huggingface_module.os, "unlink", race_before_unlink)
+
+    with _temporary_hf_streaming_staging_root(parent=staging_volume) as active_root:
+        staging_root = active_root
+        (staging_root / "leaf.bin").write_bytes(b"owned")
+
+    assert raced
+    assert staging_root is not None
+    assert (staging_root / "leaf.bin").read_bytes() == b"caller-owned"
+    assert list(staging_volume.glob(".modelaudit_hf_cleanup_*")) == []
 
 
 def test_hf_streaming_staging_root_uses_selected_volume(tmp_path: Path) -> None:
@@ -4711,6 +4809,7 @@ class TestModelDownloadStreaming:
         assert outside_cache_file.read_bytes() == b"caller cache"
         assert (moved_cache / "huggingface" / "owned.bin").read_bytes() == b"owned cache"
 
+    @pytest.mark.parametrize(("sidecar_copies", "succeeds"), [(1, False), (2, True)])
     @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None)
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".onnx"})
     @patch(
@@ -4723,7 +4822,7 @@ class TestModelDownloadStreaming:
     )
     @patch("huggingface_hub.HfApi.get_paths_info")
     @patch("huggingface_hub.hf_hub_download")
-    def test_download_model_streaming_counts_shared_onnx_external_data_once(
+    def test_download_model_streaming_counts_each_shared_onnx_external_data_materialization(
         self,
         mock_hf_hub_download: MagicMock,
         mock_get_paths_info: MagicMock,
@@ -4731,8 +4830,10 @@ class TestModelDownloadStreaming:
         _mock_get_extensions: MagicMock,
         _mock_detect_content: MagicMock,
         tmp_path: Path,
+        sidecar_copies: int,
+        succeeds: bool,
     ) -> None:
-        """A shared context sidecar is budgeted once but staged with each active family."""
+        """Each separately staged shared context sidecar consumes acquisition budget."""
         payload = _make_external_onnx_payload(tmp_path, external_path="shared.onnx_data")
         sidecar_bytes = struct.pack("f", 1.0)
 
@@ -4751,30 +4852,36 @@ class TestModelDownloadStreaming:
             ],
             [SimpleNamespace(path="onnx/shared.onnx_data", size=len(sidecar_bytes))],
         ]
+        total_materialized_bytes = (len(payload) * 2) + (len(sidecar_bytes) * 2)
 
         with _temporary_hf_streaming_staging_root() as staging_root:
-            results = list(
-                download_model_streaming(
-                    "https://huggingface.co/test/model",
-                    cache_dir=tmp_path / "persistent-cache",
-                    max_size=(len(payload) * 2) + len(sidecar_bytes),
-                    scannable_extensions={".onnx"},
-                    scannable_scanner_ids={"onnx"},
-                    _staging_root=staging_root,
-                )
+            stream = download_model_streaming(
+                "https://huggingface.co/test/model",
+                cache_dir=tmp_path / "persistent-cache",
+                max_size=(len(payload) * 2) + (len(sidecar_bytes) * sidecar_copies),
+                scannable_extensions={".onnx"},
+                scannable_scanner_ids={"onnx"},
+                _staging_root=staging_root,
             )
-            assert [path.name for path, _is_last in results] == ["a.onnx", "b.onnx"]
-            assert [is_last for _path, is_last in results] == [False, True]
-            assert all(not path.exists() for path, _is_last in results)
+            if succeeds:
+                results = list(stream)
+                assert [path.name for path, _is_last in results] == ["a.onnx", "b.onnx"]
+                assert [is_last for _path, is_last in results] == [False, True]
+                assert all(not path.exists() for path, _is_last in results)
+            else:
+                with pytest.raises(Exception, match=rf"would total {total_materialized_bytes} bytes"):
+                    list(stream)
             assert not (staging_root / "huggingface").exists()
 
         assert not staging_root.exists()
-        assert [call.kwargs["filename"] for call in mock_hf_hub_download.call_args_list] == [
+        expected_downloads = [
             "onnx/a.onnx",
             "onnx/shared.onnx_data",
             "onnx/b.onnx",
-            "onnx/shared.onnx_data",
         ]
+        if succeeds:
+            expected_downloads.append("onnx/shared.onnx_data")
+        assert [call.kwargs["filename"] for call in mock_hf_hub_download.call_args_list] == expected_downloads
         assert mock_get_paths_info.call_args_list == [
             call("test/model", ["onnx/a.onnx", "onnx/b.onnx"], revision=_HF_TEST_REVISION),
             call("test/model", ["onnx/shared.onnx_data"], revision=_HF_TEST_REVISION),
@@ -5182,7 +5289,7 @@ class TestModelDownloadStreaming:
         _mock_get_extensions: MagicMock,
         tmp_path: Path,
     ) -> None:
-        """A deleted yielded sidecar should be restored as ONNX context without double-budgeting."""
+        """A deleted yielded sidecar should consume budget again when restored as ONNX context."""
         payload = _make_external_onnx_payload(tmp_path)
         sidecar_bytes = struct.pack("f", 1.0)
 
@@ -5202,7 +5309,7 @@ class TestModelDownloadStreaming:
         generator = download_model_streaming(
             "https://huggingface.co/test/model",
             cache_dir=tmp_path / "cache",
-            max_size=len(payload) + len(sidecar_bytes),
+            max_size=len(payload) + (len(sidecar_bytes) * 2),
             scannable_extensions={".onnx"},
             scannable_scanner_ids={"onnx"},
             include_all_files=True,

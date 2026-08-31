@@ -4614,7 +4614,7 @@ def _staging_identity(stat_result: os.stat_result) -> tuple[int, int, int]:
 
 
 def _supports_hf_staging_descriptor_cleanup() -> bool:
-    required_dir_fd_functions = {os.mkdir, os.open, os.rmdir, os.stat, os.unlink}
+    required_dir_fd_functions = {os.mkdir, os.open, os.rename, os.rmdir, os.stat, os.unlink}
     return (
         os.name == "posix"
         and hasattr(os, "O_DIRECTORY")
@@ -4754,21 +4754,75 @@ def _remove_hf_staging_directory_contents(directory_fd: int) -> None:
         if stat.S_ISDIR(entry_stat.st_mode):
             child_fd = os.open(name, _staging_directory_open_flags(), dir_fd=directory_fd)
             try:
-                child_identity = _staging_identity(os.fstat(child_fd))
-                if child_identity != _staging_identity(entry_stat):
-                    raise _HfStreamingStagingCleanupError(
-                        "Hugging Face streaming staging child identity changed during cleanup"
-                    )
                 _remove_hf_staging_directory_contents(child_fd)
-                if child_identity != _staging_identity(os.stat(name, dir_fd=directory_fd, follow_symlinks=False)):
-                    raise _HfStreamingStagingCleanupError(
-                        "Hugging Face streaming staging child was replaced during cleanup"
-                    )
                 os.rmdir(name, dir_fd=directory_fd)
             finally:
                 os.close(child_fd)
         else:
             os.unlink(name, dir_fd=directory_fd)
+
+
+def _quarantine_hf_staging_directory(state: _IdentityBoundStagingDirectory) -> tuple[str, Path]:
+    """Atomically detach a staging root from its caller-visible name."""
+    quarantine_name = _new_hf_staging_name(".modelaudit_hf_cleanup_")
+    quarantine_path = state.parent_path / quarantine_name
+
+    if state.parent_fd is not None and state.directory_fd is not None:
+        if state.parent_identity != _staging_identity(os.fstat(state.parent_fd)):
+            raise _HfStreamingStagingCleanupError(
+                "Hugging Face streaming staging parent identity changed during cleanup"
+            )
+        if state.identity != _staging_identity(os.fstat(state.directory_fd)):
+            raise _HfStreamingStagingCleanupError(
+                "Hugging Face streaming staging handle identity changed during cleanup"
+            )
+        try:
+            os.stat(quarantine_name, dir_fd=state.parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise _HfStreamingStagingCleanupError(
+                f"Hugging Face streaming cleanup quarantine unexpectedly exists: {quarantine_path}"
+            )
+        try:
+            os.rename(
+                state.name,
+                quarantine_name,
+                src_dir_fd=state.parent_fd,
+                dst_dir_fd=state.parent_fd,
+            )
+        except FileNotFoundError as exc:
+            raise _HfStreamingStagingCleanupError(
+                f"Hugging Face streaming staging directory disappeared before cleanup: {state.path}"
+            ) from exc
+        moved_identity = _staging_identity(os.stat(quarantine_name, dir_fd=state.parent_fd, follow_symlinks=False))
+    else:
+        if state.parent_identity != _staging_identity(os.stat(state.parent_path, follow_symlinks=False)):
+            raise _HfStreamingStagingCleanupError(
+                f"Hugging Face streaming staging parent was replaced; refusing path cleanup: {state.parent_path}"
+            )
+        try:
+            os.stat(quarantine_path, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise _HfStreamingStagingCleanupError(
+                f"Hugging Face streaming cleanup quarantine unexpectedly exists: {quarantine_path}"
+            )
+        try:
+            os.replace(state.path, quarantine_path)
+        except FileNotFoundError as exc:
+            raise _HfStreamingStagingCleanupError(
+                f"Hugging Face streaming staging directory disappeared before cleanup: {state.path}"
+            ) from exc
+        moved_identity = _staging_identity(os.stat(quarantine_path, follow_symlinks=False))
+
+    if moved_identity != state.identity:
+        raise _HfStreamingStagingCleanupError(
+            "Hugging Face streaming staging directory was replaced during cleanup; "
+            f"the replacement was preserved at {quarantine_path}"
+        )
+    return quarantine_name, quarantine_path
 
 
 def _cleanup_identity_bound_staging_directory(state: _IdentityBoundStagingDirectory) -> None:
@@ -4777,48 +4831,18 @@ def _cleanup_identity_bound_staging_directory(state: _IdentityBoundStagingDirect
             raise _HfStreamingStagingCleanupError(
                 f"Hugging Face streaming staging contains a replaced child; refusing cleanup: {state.path}"
             )
+        quarantine_name, quarantine_path = _quarantine_hf_staging_directory(state)
         if state.parent_fd is not None and state.directory_fd is not None:
-            if state.parent_identity != _staging_identity(os.fstat(state.parent_fd)):
-                raise _HfStreamingStagingCleanupError(
-                    "Hugging Face streaming staging parent identity changed during cleanup"
-                )
-            if state.identity != _staging_identity(os.fstat(state.directory_fd)):
-                raise _HfStreamingStagingCleanupError(
-                    "Hugging Face streaming staging handle identity changed during cleanup"
-                )
-            try:
-                current_identity = _staging_identity(os.stat(state.name, dir_fd=state.parent_fd, follow_symlinks=False))
-            except FileNotFoundError as exc:
-                raise _HfStreamingStagingCleanupError(
-                    f"Hugging Face streaming staging directory disappeared; refusing path cleanup: {state.path}"
-                ) from exc
-            if current_identity != state.identity:
-                raise _HfStreamingStagingCleanupError(
-                    f"Hugging Face streaming staging directory was replaced; refusing to delete it: {state.path}"
-                )
             _remove_hf_staging_directory_contents(state.directory_fd)
-            if state.identity != _staging_identity(os.stat(state.name, dir_fd=state.parent_fd, follow_symlinks=False)):
+            if state.identity != _staging_identity(
+                os.stat(quarantine_name, dir_fd=state.parent_fd, follow_symlinks=False)
+            ):
                 raise _HfStreamingStagingCleanupError(
-                    f"Hugging Face streaming staging directory was replaced during cleanup: {state.path}"
+                    f"Hugging Face streaming cleanup quarantine was replaced: {quarantine_path}"
                 )
-            os.rmdir(state.name, dir_fd=state.parent_fd)
+            os.rmdir(quarantine_name, dir_fd=state.parent_fd)
             return
-
-        if state.parent_identity != _staging_identity(os.stat(state.parent_path, follow_symlinks=False)):
-            raise _HfStreamingStagingCleanupError(
-                f"Hugging Face streaming staging parent was replaced; refusing path cleanup: {state.parent_path}"
-            )
-        try:
-            current_identity = _staging_identity(os.stat(state.path, follow_symlinks=False))
-        except FileNotFoundError as exc:
-            raise _HfStreamingStagingCleanupError(
-                f"Hugging Face streaming staging directory disappeared; refusing path cleanup: {state.path}"
-            ) from exc
-        if current_identity != state.identity:
-            raise _HfStreamingStagingCleanupError(
-                f"Hugging Face streaming staging directory was replaced; refusing to delete it: {state.path}"
-            )
-        shutil.rmtree(state.path)
+        shutil.rmtree(quarantine_path)
     except _HfStreamingStagingCleanupError:
         raise
     except OSError as exc:
@@ -5945,9 +5969,7 @@ def download_model_streaming(
         downloaded_selected_paths: dict[str, Path] = {}
         downloaded_context_paths: dict[str, Path] = {}
         context_path_sizes: dict[str, int] = {}
-        accounted_context_filenames: set[str] = set()
         acquired_index_temp_dirs: list[tempfile.TemporaryDirectory[str]] = []
-        accounted_selected_filenames = acquired_index_bytes.keys() & selected_file_set
         consumed_filenames: set[str] = set()
         pending_pretransferred_bytes = (
             content_probe_bytes_transferred + remote_index_bytes_transferred if _include_scan_results else 0
@@ -6131,31 +6153,28 @@ def download_model_streaming(
             if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
 
-            already_accounted = filename in accounted_selected_filenames
-            if size_limit is not None and not already_accounted:
-                advertised_size = selected_sizes[filename]
-                projected_total = downloaded_total_size + advertised_size
-                if projected_total > size_limit:
-                    raise ValueError(
-                        f"Cannot download {repo_id}: downloaded bytes plus selected file {filename} "
-                        f"would total {projected_total} bytes, exceeding max size {size_limit} bytes"
-                    )
-
             # Download single file
             downloaded_file = prefetched_selected_paths.pop(filename, None)
             if downloaded_file is None or not downloaded_file.is_file():
                 downloaded_file = materialize_acquired_index(filename)
             if downloaded_file is None or not downloaded_file.is_file():
+                if size_limit is not None:
+                    advertised_size = selected_sizes[filename]
+                    projected_total = downloaded_total_size + advertised_size
+                    if projected_total > size_limit:
+                        raise ValueError(
+                            f"Cannot download {repo_id}: downloaded bytes plus selected file {filename} "
+                            f"would total {projected_total} bytes, exceeding max size {size_limit} bytes"
+                        )
                 downloaded_file = download_stream_file(filename)
-            if size_limit is not None and not already_accounted:
-                downloaded_file_size = _get_downloaded_huggingface_file_size(repo_id, downloaded_file, filename)
-                downloaded_total_size += downloaded_file_size
-                accounted_selected_filenames.add(filename)
-                if downloaded_total_size > size_limit:
-                    raise ValueError(
-                        f"Cannot download {repo_id}: downloaded selected Hugging Face files total "
-                        f"{downloaded_total_size} bytes exceeds max size {size_limit} bytes"
-                    )
+                if size_limit is not None:
+                    downloaded_file_size = _get_downloaded_huggingface_file_size(repo_id, downloaded_file, filename)
+                    downloaded_total_size += downloaded_file_size
+                    if downloaded_total_size > size_limit:
+                        raise ValueError(
+                            f"Cannot download {repo_id}: downloaded selected Hugging Face files total "
+                            f"{downloaded_total_size} bytes exceeds max size {size_limit} bytes"
+                        )
             downloaded_selected_paths[filename] = downloaded_file
             return downloaded_file
 
@@ -6235,33 +6254,40 @@ def download_model_streaming(
                                 continue
                             external_path = prefetched_selected_paths.get(external_filename)
                             if external_path is None or not external_path.is_file():
+                                if size_limit is not None:
+                                    advertised_size = selected_sizes[external_filename]
+                                    projected_total = downloaded_total_size + advertised_size
+                                    if projected_total > size_limit:
+                                        raise ValueError(
+                                            f"Cannot download {repo_id}: downloaded bytes plus selected ONNX "
+                                            f"external_data file {external_filename} would total {projected_total} "
+                                            f"bytes, exceeding max size {size_limit} bytes"
+                                        )
                                 external_path = download_stream_file(external_filename)
+                                if size_limit is not None:
+                                    external_file_size = _get_downloaded_huggingface_file_size(
+                                        repo_id,
+                                        external_path,
+                                        external_filename,
+                                    )
+                                    projected_total = downloaded_total_size + external_file_size
+                                    if projected_total > size_limit:
+                                        raise ValueError(
+                                            f"Cannot download {repo_id}: downloaded bytes plus selected ONNX "
+                                            f"external_data file {external_filename} would total {projected_total} "
+                                            f"bytes, exceeding max size {size_limit} bytes"
+                                        )
+                                    downloaded_total_size = projected_total
                                 if downloaded_selected_path is None:
                                     prefetched_selected_paths[external_filename] = external_path
                             if downloaded_selected_path is not None:
                                 downloaded_selected_paths[external_filename] = external_path
                                 continue
-                            if size_limit is not None and external_filename not in accounted_selected_filenames:
-                                external_file_size = _get_downloaded_huggingface_file_size(
-                                    repo_id,
-                                    external_path,
-                                    external_filename,
-                                )
-                                projected_total = downloaded_total_size + external_file_size
-                                if projected_total > size_limit:
-                                    raise ValueError(
-                                        f"Cannot download {repo_id}: downloaded bytes plus selected ONNX "
-                                        f"external_data file {external_filename} would total {projected_total} "
-                                        f"bytes, exceeding max size {size_limit} bytes"
-                                    )
-                                downloaded_total_size = projected_total
-                                accounted_selected_filenames.add(external_filename)
                             continue
                         external_path = downloaded_context_paths.get(external_filename)
                         if external_path is not None and external_path.is_file():
                             continue
-                        context_already_accounted = external_filename in accounted_context_filenames
-                        if size_limit is not None and not context_already_accounted:
+                        if size_limit is not None:
                             advertised_size = external_data_sizes[external_filename]
                             projected_total = downloaded_total_size + advertised_size
                             if projected_total > size_limit:
@@ -6271,7 +6297,7 @@ def download_model_streaming(
                                     f"{size_limit} bytes"
                                 )
                         external_path = download_stream_file(external_filename)
-                        if size_limit is not None and not context_already_accounted:
+                        if size_limit is not None:
                             external_file_size = _get_downloaded_huggingface_file_size(
                                 repo_id,
                                 external_path,
@@ -6285,7 +6311,6 @@ def download_model_streaming(
                                     f"{size_limit} bytes"
                                 )
                             downloaded_total_size = projected_total
-                            accounted_context_filenames.add(external_filename)
                         downloaded_context_paths[external_filename] = external_path
 
             return downloaded_file
