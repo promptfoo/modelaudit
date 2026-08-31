@@ -62,6 +62,7 @@ from modelaudit.utils.sources.huggingface import (
     _discover_hf_onnx_external_data_files,
     _extract_huggingface_repo_files,
     _get_huggingface_path_sizes,
+    _HfStreamingStagingCleanupError,
     _HuggingFaceProbeBudget,
     _HuggingFaceSafeTensorsRetentionBudget,
     _list_huggingface_repo_files_at_revision,
@@ -165,6 +166,58 @@ def test_hf_streaming_staging_root_is_removed_after_normal_cleanup() -> None:
         assert artifact.read_bytes() == b"context"
 
     assert not staging_root.exists()
+
+
+@pytest.mark.parametrize("descriptor_cleanup", [True, False])
+def test_hf_streaming_staging_root_replacement_fails_without_deleting_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    descriptor_cleanup: bool,
+) -> None:
+    if not descriptor_cleanup:
+        from modelaudit.utils.sources import huggingface as huggingface_module
+
+        monkeypatch.setattr(huggingface_module.os, "supports_dir_fd", set())
+        monkeypatch.setattr(huggingface_module.os, "supports_follow_symlinks", set())
+        monkeypatch.setattr(shutil, "_use_fd_functions", False)
+
+    staging_volume = tmp_path / "staging-volume"
+    staging_volume.mkdir()
+    owned_root: Path | None = None
+    replacement_root: Path | None = None
+
+    with (
+        pytest.raises(_HfStreamingStagingCleanupError, match="was replaced; refusing to delete"),
+        _temporary_hf_streaming_staging_root(parent=staging_volume) as staging_root,
+    ):
+        original_identity = staging_root.stat().st_dev, staging_root.stat().st_ino
+        owned_root = staging_root.with_name(f"{staging_root.name}-owned")
+        staging_root.rename(owned_root)
+        staging_root.mkdir()
+        replacement_root = staging_root
+        replacement_identity = replacement_root.stat().st_dev, replacement_root.stat().st_ino
+        (replacement_root / "caller.bin").write_bytes(b"caller-owned")
+
+        assert original_identity != replacement_identity
+
+    assert owned_root is not None
+    assert replacement_root is not None
+    assert owned_root.is_dir()
+    assert replacement_root.is_dir()
+    assert (replacement_root / "caller.bin").read_bytes() == b"caller-owned"
+
+    shutil.rmtree(owned_root)
+    shutil.rmtree(replacement_root)
+
+
+def test_hf_streaming_staging_root_uses_selected_volume(tmp_path: Path) -> None:
+    staging_volume = tmp_path / "selected-cache"
+
+    with _temporary_hf_streaming_staging_root(parent=staging_volume) as staging_root:
+        assert staging_root.parent == staging_volume.resolve()
+
+    assert not staging_root.exists()
+    assert staging_volume.is_dir()
 
 
 def test_hf_streaming_staging_cleanup_does_not_follow_replaced_children(
@@ -3902,6 +3955,65 @@ class TestModelDownloadStreaming:
             local_dir=str(tmp_path / "huggingface" / "test" / "model"),
         )
 
+    @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None)
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(
+            ["models/a.bin", "models/b.bin", "models/c.bin"],
+            _HF_TEST_REVISION,
+            None,
+        ),
+    )
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_staging_keeps_only_active_artifact_family(
+        self,
+        mock_hf_hub_download: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+        _mock_detect_content: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        def download_side_effect(*, filename: str, local_dir: str | None = None, **_kwargs: object) -> str:
+            assert local_dir is not None
+            path = Path(local_dir) / filename
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(filename.encode())
+            return str(path)
+
+        mock_hf_hub_download.side_effect = download_side_effect
+
+        with _temporary_hf_streaming_staging_root(parent=tmp_path / "selected-cache") as staging_root:
+            generator = download_model_streaming(
+                "https://huggingface.co/test/model",
+                cache_dir=tmp_path / "persistent-cache",
+                scannable_extensions={".bin"},
+                _staging_root=staging_root,
+            )
+
+            first_path, first_is_last = next(generator)
+            assert first_path.read_bytes() == b"models/a.bin"
+            assert first_is_last is False
+            assert len([path for path in staging_root.rglob("*") if path.is_file()]) == 1
+
+            second_path, second_is_last = next(generator)
+            assert not first_path.exists()
+            assert second_path.read_bytes() == b"models/b.bin"
+            assert second_is_last is False
+            assert len([path for path in staging_root.rglob("*") if path.is_file()]) == 1
+
+            third_path, third_is_last = next(generator)
+            assert not second_path.exists()
+            assert third_path.read_bytes() == b"models/c.bin"
+            assert third_is_last is True
+            assert len([path for path in staging_root.rglob("*") if path.is_file()]) == 1
+
+            cast(Generator[tuple[Path, bool], None, None], generator).close()
+            assert not third_path.exists()
+            assert not (staging_root / "huggingface").exists()
+
+        assert not staging_root.exists()
+
     @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format")
     @patch(
         "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
@@ -4342,7 +4454,9 @@ class TestModelDownloadStreaming:
             else:
                 with pytest.raises(StopIteration):
                     next(generator)
-            assert sidecar_path.read_bytes() == sidecar_bytes
+            assert not model_path.exists()
+            assert not sidecar_path.exists()
+            assert not (staging_root / "huggingface").exists()
 
         assert not staging_root.exists()
 
@@ -4418,6 +4532,9 @@ class TestModelDownloadStreaming:
             else:
                 with pytest.raises(StopIteration):
                     next(generator)
+            assert not model_path.exists()
+            assert not staged_sidecar.exists()
+            assert not (staging_root / "huggingface").exists()
 
         assert not staging_root.exists()
         assert persistent_sidecar.read_bytes() == expected_persistent_bytes
@@ -4522,7 +4639,7 @@ class TestModelDownloadStreaming:
 
             with pytest.raises(Exception, match="exceeding max size"):
                 next(generator)
-            assert (staging_root / "huggingface" / "test" / "model" / "onnx" / "model.onnx_data").exists()
+            assert not (staging_root / "huggingface").exists()
 
         assert not staging_root.exists()
         assert persistent_sentinel.read_bytes() == b"caller-owned"
@@ -4615,7 +4732,7 @@ class TestModelDownloadStreaming:
         _mock_detect_content: MagicMock,
         tmp_path: Path,
     ) -> None:
-        """A shared context-only ONNX sidecar should be downloaded and budgeted once."""
+        """A shared context sidecar is budgeted once but staged with each active family."""
         payload = _make_external_onnx_payload(tmp_path, external_path="shared.onnx_data")
         sidecar_bytes = struct.pack("f", 1.0)
 
@@ -4646,16 +4763,17 @@ class TestModelDownloadStreaming:
                     _staging_root=staging_root,
                 )
             )
-            sidecar_path = staging_root / "huggingface" / "test" / "model" / "onnx" / "shared.onnx_data"
-            assert sidecar_path.read_bytes() == sidecar_bytes
             assert [path.name for path, _is_last in results] == ["a.onnx", "b.onnx"]
             assert [is_last for _path, is_last in results] == [False, True]
+            assert all(not path.exists() for path, _is_last in results)
+            assert not (staging_root / "huggingface").exists()
 
         assert not staging_root.exists()
         assert [call.kwargs["filename"] for call in mock_hf_hub_download.call_args_list] == [
             "onnx/a.onnx",
             "onnx/shared.onnx_data",
             "onnx/b.onnx",
+            "onnx/shared.onnx_data",
         ]
         assert mock_get_paths_info.call_args_list == [
             call("test/model", ["onnx/a.onnx", "onnx/b.onnx"], revision=_HF_TEST_REVISION),

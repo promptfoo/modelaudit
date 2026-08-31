@@ -3478,7 +3478,9 @@ def _resolve_scan_source_for_path(
                     )
 
                 if runtime.scan_and_delete:
-                    click.echo(style_text("   Mode: Streaming (temporary files cleaned after scan)", fg="cyan"))
+                    click.echo(
+                        style_text("   Mode: Streaming (temporary files cleaned after each artifact)", fg="cyan")
+                    )
             except Exception as exc:
                 logger.debug(
                     "Unable to display HuggingFace model metadata for %s: %s",
@@ -3523,7 +3525,8 @@ def _resolve_scan_source_for_path(
                 stream_namespace, stream_repo_name, _stream_requested_revision = parse_huggingface_url_with_revision(
                     path
                 )
-                with _temporary_hf_streaming_staging_root() as stream_staging_root:
+                stream_staging_parent = Path(runtime.cache_dir) if runtime.cache_dir else None
+                with _temporary_hf_streaming_staging_root(parent=stream_staging_parent) as stream_staging_root:
                     stream_hf_cache_root = stream_staging_root / "huggingface"
                     stream_repository_scan_root = stream_hf_cache_root / stream_namespace
                     if stream_repo_name:

@@ -6922,9 +6922,21 @@ def test_scan_huggingface_streaming_passes_max_size_to_download(
     mock_scan_streaming.return_value = create_mock_scan_result(bytes_scanned=7, files_scanned=1, has_errors=False)
 
     runner = CliRunner()
+    selected_cache = tmp_path / "selected-cache"
     result = runner.invoke(
         cli,
-        ["scan", "--stream", "--quiet", "--max-size", "2KB", "--timeout", "7", "hf://test/model"],
+        [
+            "scan",
+            "--stream",
+            "--quiet",
+            "--max-size",
+            "2KB",
+            "--timeout",
+            "7",
+            "--cache-dir",
+            str(selected_cache),
+            "hf://test/model",
+        ],
     )
 
     assert result.exit_code == 0
@@ -6935,9 +6947,11 @@ def test_scan_huggingface_streaming_passes_max_size_to_download(
     staging_root = mock_download_streaming.call_args.kwargs["_staging_root"]
     assert isinstance(staging_root, Path)
     assert staging_root.name.startswith("modelaudit_hf_stream_")
+    assert staging_root.parent == selected_cache.resolve()
     assert not staging_root.exists()
+    assert selected_cache.is_dir()
     assert mock_scan_streaming.call_args.kwargs["scan_root"] == str(staging_root / "huggingface")
-    assert mock_download_streaming.call_args.kwargs["cache_dir"] != staging_root
+    assert mock_download_streaming.call_args.kwargs["cache_dir"] == selected_cache
 
 
 @patch("modelaudit.cli.is_huggingface_url")

@@ -7,11 +7,15 @@ import ntpath
 import os
 import posixpath
 import re
+import secrets
+import shutil
 import signal
+import stat
 import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unicodedata
 from collections.abc import Callable, Collection, Iterator
@@ -4585,11 +4589,294 @@ def _get_downloaded_huggingface_file_size(repo_id: str, file_path: Path, filenam
         ) from exc
 
 
+class _HfStreamingStagingCleanupError(RuntimeError):
+    """Raised when an owned streaming directory can no longer be cleaned safely."""
+
+
+@dataclass
+class _IdentityBoundStagingDirectory:
+    path: Path
+    parent_path: Path
+    name: str
+    identity: tuple[int, int, int]
+    parent_identity: tuple[int, int, int]
+    parent_fd: int | None = None
+    directory_fd: int | None = None
+    cleanup_blocked: bool = False
+
+
+_HF_STREAMING_STAGING_ROOTS: dict[str, _IdentityBoundStagingDirectory] = {}
+_HF_STREAMING_STAGING_ROOTS_LOCK = threading.Lock()
+
+
+def _staging_identity(stat_result: os.stat_result) -> tuple[int, int, int]:
+    return (stat_result.st_dev, stat_result.st_ino, stat.S_IFMT(stat_result.st_mode))
+
+
+def _supports_hf_staging_descriptor_cleanup() -> bool:
+    required_dir_fd_functions = {os.mkdir, os.open, os.rmdir, os.stat, os.unlink}
+    return (
+        os.name == "posix"
+        and hasattr(os, "O_DIRECTORY")
+        and hasattr(os, "O_NOFOLLOW")
+        and required_dir_fd_functions <= os.supports_dir_fd
+        and os.stat in os.supports_follow_symlinks
+    )
+
+
+def _staging_directory_open_flags() -> int:
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    return flags
+
+
+def _new_hf_staging_name(prefix: str) -> str:
+    return f"{prefix}{secrets.token_hex(12)}"
+
+
+def _create_identity_bound_staging_directory(
+    *,
+    prefix: str,
+    parent: Path,
+    fixed_name: str | None = None,
+    parent_state: _IdentityBoundStagingDirectory | None = None,
+) -> _IdentityBoundStagingDirectory:
+    if parent_state is None:
+        parent.mkdir(parents=True, exist_ok=True)
+        parent_path = parent.resolve(strict=True)
+        if not parent_path.is_dir():
+            raise _HfStreamingStagingCleanupError(f"Hugging Face streaming staging parent is not a directory: {parent}")
+    else:
+        parent_path = parent_state.path
+
+    parent_fd: int | None = None
+    directory_fd: int | None = None
+    try:
+        if _supports_hf_staging_descriptor_cleanup():
+            if parent_state is not None:
+                if parent_state.directory_fd is None:
+                    raise _HfStreamingStagingCleanupError(
+                        "Hugging Face streaming staging parent lost its cleanup descriptor"
+                    )
+                parent_fd = os.dup(parent_state.directory_fd)
+                parent_identity = _staging_identity(os.fstat(parent_fd))
+                if parent_identity != parent_state.identity:
+                    raise _HfStreamingStagingCleanupError(
+                        "Hugging Face streaming staging parent identity changed before child creation"
+                    )
+            else:
+                parent_fd = os.open(parent_path, _staging_directory_open_flags())
+                parent_identity = _staging_identity(os.fstat(parent_fd))
+                if parent_identity != _staging_identity(os.stat(parent_path, follow_symlinks=False)):
+                    raise _HfStreamingStagingCleanupError(
+                        "Hugging Face streaming staging parent identity changed during setup"
+                    )
+
+            attempts = 1 if fixed_name is not None else 128
+            for _ in range(attempts):
+                name = fixed_name if fixed_name is not None else _new_hf_staging_name(prefix)
+                try:
+                    os.mkdir(name, mode=0o700, dir_fd=parent_fd)
+                except FileExistsError:
+                    if fixed_name is not None:
+                        raise _HfStreamingStagingCleanupError(
+                            f"Hugging Face streaming staging child already exists: {parent_path / name}"
+                        ) from None
+                    continue
+                break
+            else:
+                raise _HfStreamingStagingCleanupError("Unable to allocate a private Hugging Face staging directory")
+
+            directory_fd = os.open(name, _staging_directory_open_flags(), dir_fd=parent_fd)
+            identity = _staging_identity(os.fstat(directory_fd))
+            if identity != _staging_identity(os.stat(name, dir_fd=parent_fd, follow_symlinks=False)):
+                raise _HfStreamingStagingCleanupError(
+                    "Hugging Face streaming staging directory identity changed during setup"
+                )
+            path = parent_path / name
+            if identity != _staging_identity(os.stat(path, follow_symlinks=False)):
+                raise _HfStreamingStagingCleanupError("Hugging Face streaming staging path was replaced during setup")
+            return _IdentityBoundStagingDirectory(
+                path=path,
+                parent_path=parent_path,
+                name=name,
+                identity=identity,
+                parent_identity=parent_identity,
+                parent_fd=parent_fd,
+                directory_fd=directory_fd,
+            )
+
+        parent_identity = _staging_identity(os.stat(parent_path, follow_symlinks=False))
+        if parent_state is not None and parent_identity != parent_state.identity:
+            raise _HfStreamingStagingCleanupError(
+                "Hugging Face streaming staging parent identity changed before child creation"
+            )
+        if fixed_name is None:
+            path = Path(tempfile.mkdtemp(prefix=prefix, dir=parent_path))
+            name = path.name
+        else:
+            name = fixed_name
+            path = parent_path / name
+            try:
+                path.mkdir(mode=0o700)
+            except FileExistsError:
+                raise _HfStreamingStagingCleanupError(
+                    f"Hugging Face streaming staging child already exists: {path}"
+                ) from None
+        identity = _staging_identity(os.stat(path, follow_symlinks=False))
+        return _IdentityBoundStagingDirectory(
+            path=path,
+            parent_path=parent_path,
+            name=name,
+            identity=identity,
+            parent_identity=parent_identity,
+        )
+    except OSError as exc:
+        if directory_fd is not None:
+            os.close(directory_fd)
+        if parent_fd is not None:
+            os.close(parent_fd)
+        raise _HfStreamingStagingCleanupError(
+            f"Hugging Face streaming staging identity changed during setup: {parent_path}"
+        ) from exc
+    except Exception:
+        if directory_fd is not None:
+            os.close(directory_fd)
+        if parent_fd is not None:
+            os.close(parent_fd)
+        raise
+
+
+def _remove_hf_staging_directory_contents(directory_fd: int) -> None:
+    for name in os.listdir(directory_fd):
+        entry_stat = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if stat.S_ISDIR(entry_stat.st_mode):
+            child_fd = os.open(name, _staging_directory_open_flags(), dir_fd=directory_fd)
+            try:
+                child_identity = _staging_identity(os.fstat(child_fd))
+                if child_identity != _staging_identity(entry_stat):
+                    raise _HfStreamingStagingCleanupError(
+                        "Hugging Face streaming staging child identity changed during cleanup"
+                    )
+                _remove_hf_staging_directory_contents(child_fd)
+                if child_identity != _staging_identity(os.stat(name, dir_fd=directory_fd, follow_symlinks=False)):
+                    raise _HfStreamingStagingCleanupError(
+                        "Hugging Face streaming staging child was replaced during cleanup"
+                    )
+                os.rmdir(name, dir_fd=directory_fd)
+            finally:
+                os.close(child_fd)
+        else:
+            os.unlink(name, dir_fd=directory_fd)
+
+
+def _cleanup_identity_bound_staging_directory(state: _IdentityBoundStagingDirectory) -> None:
+    try:
+        if state.cleanup_blocked:
+            raise _HfStreamingStagingCleanupError(
+                f"Hugging Face streaming staging contains a replaced child; refusing cleanup: {state.path}"
+            )
+        if state.parent_fd is not None and state.directory_fd is not None:
+            if state.parent_identity != _staging_identity(os.fstat(state.parent_fd)):
+                raise _HfStreamingStagingCleanupError(
+                    "Hugging Face streaming staging parent identity changed during cleanup"
+                )
+            if state.identity != _staging_identity(os.fstat(state.directory_fd)):
+                raise _HfStreamingStagingCleanupError(
+                    "Hugging Face streaming staging handle identity changed during cleanup"
+                )
+            try:
+                current_identity = _staging_identity(os.stat(state.name, dir_fd=state.parent_fd, follow_symlinks=False))
+            except FileNotFoundError as exc:
+                raise _HfStreamingStagingCleanupError(
+                    f"Hugging Face streaming staging directory disappeared; refusing path cleanup: {state.path}"
+                ) from exc
+            if current_identity != state.identity:
+                raise _HfStreamingStagingCleanupError(
+                    f"Hugging Face streaming staging directory was replaced; refusing to delete it: {state.path}"
+                )
+            _remove_hf_staging_directory_contents(state.directory_fd)
+            if state.identity != _staging_identity(os.stat(state.name, dir_fd=state.parent_fd, follow_symlinks=False)):
+                raise _HfStreamingStagingCleanupError(
+                    f"Hugging Face streaming staging directory was replaced during cleanup: {state.path}"
+                )
+            os.rmdir(state.name, dir_fd=state.parent_fd)
+            return
+
+        if state.parent_identity != _staging_identity(os.stat(state.parent_path, follow_symlinks=False)):
+            raise _HfStreamingStagingCleanupError(
+                f"Hugging Face streaming staging parent was replaced; refusing path cleanup: {state.parent_path}"
+            )
+        try:
+            current_identity = _staging_identity(os.stat(state.path, follow_symlinks=False))
+        except FileNotFoundError as exc:
+            raise _HfStreamingStagingCleanupError(
+                f"Hugging Face streaming staging directory disappeared; refusing path cleanup: {state.path}"
+            ) from exc
+        if current_identity != state.identity:
+            raise _HfStreamingStagingCleanupError(
+                f"Hugging Face streaming staging directory was replaced; refusing to delete it: {state.path}"
+            )
+        shutil.rmtree(state.path)
+    except _HfStreamingStagingCleanupError:
+        raise
+    except OSError as exc:
+        raise _HfStreamingStagingCleanupError(
+            f"Failed to clean the owned Hugging Face streaming staging directory: {state.path}"
+        ) from exc
+    finally:
+        if state.directory_fd is not None:
+            os.close(state.directory_fd)
+        if state.parent_fd is not None:
+            os.close(state.parent_fd)
+
+
 @contextmanager
-def _temporary_hf_streaming_staging_root() -> Iterator[Path]:
-    """Yield one invocation-owned download root outside caller-controlled caches."""
-    with tempfile.TemporaryDirectory(prefix="modelaudit_hf_stream_") as temporary_directory:
-        yield Path(temporary_directory).resolve(strict=True)
+def _temporary_hf_streaming_staging_root(parent: Path | None = None) -> Iterator[Path]:
+    """Yield an identity-bound invocation root on the selected cache volume."""
+    staging_parent = Path(tempfile.gettempdir()) if parent is None else parent
+    state = _create_identity_bound_staging_directory(
+        prefix="modelaudit_hf_stream_",
+        parent=staging_parent,
+    )
+    key = _hf_download_path_for_comparison(state.path)
+    with _HF_STREAMING_STAGING_ROOTS_LOCK:
+        _HF_STREAMING_STAGING_ROOTS[key] = state
+    try:
+        yield state.path
+    finally:
+        with _HF_STREAMING_STAGING_ROOTS_LOCK:
+            _HF_STREAMING_STAGING_ROOTS.pop(key, None)
+        _cleanup_identity_bound_staging_directory(state)
+
+
+@contextmanager
+def _temporary_hf_streaming_family_root(staging_root: Path) -> Iterator[Path]:
+    """Keep one artifact family alive and clean it before advancing the stream."""
+    key = _hf_download_path_for_comparison(staging_root)
+    with _HF_STREAMING_STAGING_ROOTS_LOCK:
+        parent_state = _HF_STREAMING_STAGING_ROOTS.get(key)
+    if parent_state is None:
+        raise _HfStreamingStagingCleanupError("Hugging Face streaming staging root is not an active owned root")
+    try:
+        state = _create_identity_bound_staging_directory(
+            prefix="modelaudit_hf_family_",
+            parent=staging_root,
+            fixed_name="huggingface",
+            parent_state=parent_state,
+        )
+    except _HfStreamingStagingCleanupError:
+        parent_state.cleanup_blocked = True
+        raise
+    try:
+        yield state.path
+    finally:
+        try:
+            _cleanup_identity_bound_staging_directory(state)
+        except _HfStreamingStagingCleanupError:
+            parent_state.cleanup_blocked = True
+            raise
 
 
 def _normalize_windows_hf_download_path_for_comparison(path: str) -> str:
@@ -5634,12 +5921,9 @@ def download_model_streaming(
         # Persistent caches are only passed to Hugging Face's cache layer. A
         # trusted dispatcher can place local scan artifacts in its own staging
         # root so ModelAudit never needs to unlink a caller-owned cache path.
-        download_path = None
-        local_download_root = _staging_root if _staging_root is not None else cache_dir
-        if local_download_root is not None:
-            if _staging_root is not None:
-                local_download_root = local_download_root.resolve(strict=True)
-            download_path = _build_huggingface_download_path(local_download_root, namespace, repo_name)
+        download_path: Path | None = None
+        if _staging_root is None and cache_dir is not None:
+            download_path = _build_huggingface_download_path(cache_dir, namespace, repo_name)
             download_path.mkdir(parents=True, exist_ok=True)
 
         openvino_companion_by_xml = (
@@ -5660,12 +5944,36 @@ def download_model_streaming(
         prefetched_selected_paths: dict[str, Path] = {}
         downloaded_selected_paths: dict[str, Path] = {}
         downloaded_context_paths: dict[str, Path] = {}
+        context_path_sizes: dict[str, int] = {}
+        accounted_context_filenames: set[str] = set()
         acquired_index_temp_dirs: list[tempfile.TemporaryDirectory[str]] = []
         accounted_selected_filenames = acquired_index_bytes.keys() & selected_file_set
         consumed_filenames: set[str] = set()
         pending_pretransferred_bytes = (
             content_probe_bytes_transferred + remote_index_bytes_transferred if _include_scan_results else 0
         )
+
+        @contextmanager
+        def stage_local_artifact_family() -> Iterator[None]:
+            nonlocal download_path
+
+            if _staging_root is None:
+                yield
+                return
+
+            if download_path is not None:
+                raise _HfStreamingStagingCleanupError("Hugging Face streaming artifact families overlapped")
+
+            with _temporary_hf_streaming_family_root(_staging_root) as family_root:
+                download_path = _build_huggingface_download_path(family_root, namespace, repo_name)
+                download_path.mkdir(parents=True, exist_ok=True)
+                try:
+                    yield
+                finally:
+                    prefetched_selected_paths.clear()
+                    downloaded_selected_paths.clear()
+                    downloaded_context_paths.clear()
+                    download_path = None
 
         def make_streamed_item(
             filename: str,
@@ -5784,12 +6092,20 @@ def download_model_streaming(
             payload = acquired_index_bytes.get(filename)
             if payload is None:
                 return None
-            temp_dir = tempfile.TemporaryDirectory(
-                prefix=".modelaudit_hf_index_" if download_path is not None else "modelaudit_hf_index_",
-                dir=download_path,
-            )
-            try:
+            temp_dir: tempfile.TemporaryDirectory[str] | None = None
+            if _staging_root is not None:
+                if download_path is None:
+                    raise _HfStreamingStagingCleanupError(
+                        "Hugging Face acquired index was materialized outside an active artifact family"
+                    )
+                temp_root = Path(tempfile.mkdtemp(prefix=".modelaudit_hf_index_", dir=download_path)).resolve()
+            else:
+                temp_dir = tempfile.TemporaryDirectory(
+                    prefix=".modelaudit_hf_index_" if download_path is not None else "modelaudit_hf_index_",
+                    dir=download_path,
+                )
                 temp_root = Path(temp_dir.name).resolve()
+            try:
                 candidate = _private_huggingface_acquired_index_candidate(temp_root, repo_id, filename)
                 temp_path = Path(candidate).resolve(strict=False)
                 try:
@@ -5799,9 +6115,11 @@ def download_model_streaming(
                 temp_path.parent.mkdir(parents=True, exist_ok=True)
                 temp_path.write_bytes(payload)
             except Exception:
-                temp_dir.cleanup()
+                if temp_dir is not None:
+                    temp_dir.cleanup()
                 raise
-            acquired_index_temp_dirs.append(temp_dir)
+            if temp_dir is not None:
+                acquired_index_temp_dirs.append(temp_dir)
             return temp_path
 
         def download_selected_file(filename: str) -> Path:
@@ -5890,12 +6208,24 @@ def download_model_streaming(
                     ]
                     external_data_sizes: dict[str, int] = {}
                     if size_limit is not None and external_context_files:
-                        external_data_sizes = _get_hf_onnx_external_data_sizes(
-                            repo_id,
-                            external_context_files,
-                            revision=download_revision,
-                            deadline=deadline,
-                        )
+                        uncached_context_files = [
+                            external_filename
+                            for external_filename in external_context_files
+                            if external_filename not in context_path_sizes
+                        ]
+                        if uncached_context_files:
+                            context_path_sizes.update(
+                                _get_hf_onnx_external_data_sizes(
+                                    repo_id,
+                                    uncached_context_files,
+                                    revision=download_revision,
+                                    deadline=deadline,
+                                )
+                            )
+                        external_data_sizes = {
+                            external_filename: context_path_sizes[external_filename]
+                            for external_filename in external_context_files
+                        }
                     for external_filename in external_data_files:
                         if deadline is not None and time.monotonic() >= deadline:
                             raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
@@ -5930,7 +6260,8 @@ def download_model_streaming(
                         external_path = downloaded_context_paths.get(external_filename)
                         if external_path is not None and external_path.is_file():
                             continue
-                        if size_limit is not None:
+                        context_already_accounted = external_filename in accounted_context_filenames
+                        if size_limit is not None and not context_already_accounted:
                             advertised_size = external_data_sizes[external_filename]
                             projected_total = downloaded_total_size + advertised_size
                             if projected_total > size_limit:
@@ -5940,7 +6271,7 @@ def download_model_streaming(
                                     f"{size_limit} bytes"
                                 )
                         external_path = download_stream_file(external_filename)
-                        if size_limit is not None:
+                        if size_limit is not None and not context_already_accounted:
                             external_file_size = _get_downloaded_huggingface_file_size(
                                 repo_id,
                                 external_path,
@@ -5954,6 +6285,7 @@ def download_model_streaming(
                                     f"{size_limit} bytes"
                                 )
                             downloaded_total_size = projected_total
+                            accounted_context_filenames.add(external_filename)
                         downloaded_context_paths[external_filename] = external_path
 
             return downloaded_file
@@ -6015,26 +6347,27 @@ def download_model_streaming(
                     # before suppressing standalone analysis of the same-stem .bin.
                     continue
 
-                downloaded_file = prepare_stream_yield(filename)
-                companion = openvino_companion_by_xml.get(filename)
-                if companion is not None:
-                    from modelaudit.scanners.openvino_scanner import OpenVinoScanner
+                with stage_local_artifact_family():
+                    downloaded_file = prepare_stream_yield(filename)
+                    companion = openvino_companion_by_xml.get(filename)
+                    if companion is not None:
+                        from modelaudit.scanners.openvino_scanner import OpenVinoScanner
 
-                    if OpenVinoScanner.can_handle(str(downloaded_file)):
-                        download_selected_file(companion)
-                        consumed_filenames.add(companion)
-                    else:
-                        companion_path = prepare_stream_yield(companion)
-                        consumed_filenames.add(companion)
-                        yield from emit_file(filename, downloaded_file, False)
-                        yield from emit_file(
-                            companion,
-                            companion_path,
-                            not has_future_yield(idx),
-                        )
-                        continue
+                        if OpenVinoScanner.can_handle(str(downloaded_file)):
+                            download_selected_file(companion)
+                            consumed_filenames.add(companion)
+                        else:
+                            companion_path = prepare_stream_yield(companion)
+                            consumed_filenames.add(companion)
+                            yield from emit_file(filename, downloaded_file, False)
+                            yield from emit_file(
+                                companion,
+                                companion_path,
+                                not has_future_yield(idx),
+                            )
+                            continue
 
-                yield from emit_file(filename, downloaded_file, not has_future_yield(idx))
+                    yield from emit_file(filename, downloaded_file, not has_future_yield(idx))
             if pending_pretransferred_bytes:
                 raise ValueError("Remote pretransfer bytes were not attached to a streamed item")
         finally:
@@ -6042,6 +6375,8 @@ def download_model_streaming(
                 with suppress(OSError):
                     temp_dir.cleanup()
 
+    except _HfStreamingStagingCleanupError:
+        raise
     except Exception as e:
         raise Exception(
             f"Failed to download model from {display_url}: {redact_huggingface_urls_in_text(str(e))}"
