@@ -14,6 +14,7 @@ import sys
 import types
 import zipfile
 from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, cast
@@ -153,6 +154,22 @@ def test_track_huggingface_stream_acquisition_closes_source_on_early_close() -> 
     tracked.close()
 
     assert source_closed
+
+
+def test_track_huggingface_stream_acquisition_propagates_source_cleanup_failure() -> None:
+    from modelaudit.utils.sources.huggingface import _HfStreamingStagingCleanupError
+
+    def source() -> Iterator[tuple[Path, bool]]:
+        try:
+            yield Path("model.onnx"), True
+        finally:
+            raise _HfStreamingStagingCleanupError("deterministic family cleanup failure")
+
+    tracked = cli_module._track_huggingface_stream_acquisition(source())
+    assert next(tracked) == (Path("model.onnx"), True)
+
+    with pytest.raises(_HfStreamingStagingCleanupError, match="deterministic family cleanup failure"):
+        tracked.close()
 
 
 def _make_trusted_shard_parent(path: Path, *, parents: bool = False) -> None:
@@ -7238,6 +7255,105 @@ def test_scan_huggingface_streaming_incomplete_result_reports_failed_progress(
     assert "SCAN SUMMARY" in clean_output
     assert "SCAN COMPLETED WITH OPERATIONAL ERRORS" in clean_output
     assert "Dangerous import detected before interruption" in clean_output
+    mock_download_streaming.assert_called_once()
+    mock_scan_streaming.assert_called_once()
+
+
+@pytest.mark.parametrize("has_security_finding", [True, False], ids=["critical", "benign"])
+@patch("modelaudit.cli.is_huggingface_url")
+@patch("modelaudit.utils.sources.huggingface.download_model_streaming")
+@patch("modelaudit.core.scan_model_streaming")
+def test_scan_huggingface_streaming_cleanup_failure_preserves_completed_result(
+    mock_scan_streaming: MagicMock,
+    mock_download_streaming: MagicMock,
+    mock_is_hf_url: MagicMock,
+    tmp_path: Path,
+    has_security_finding: bool,
+) -> None:
+    """Staging cleanup failures must not erase already-produced scan evidence."""
+    from modelaudit.utils.sources.huggingface import _HfStreamingStagingCleanupError
+
+    mock_is_hf_url.return_value = True
+    mock_download_streaming.return_value = iter(())
+    finding_message = "Dangerous import detected before cleanup"
+    issues = (
+        [
+            {
+                "message": finding_message,
+                "severity": "critical",
+                "location": "malicious.pkl",
+            }
+        ]
+        if has_security_finding
+        else []
+    )
+    mock_scan_streaming.return_value = create_mock_scan_result(
+        bytes_scanned=7,
+        files_scanned=1,
+        issues=issues,
+        has_errors=False,
+        success=True,
+    )
+    selected_cache = tmp_path / "selected-cache"
+
+    @contextmanager
+    def cleanup_fails(*, parent: Path | None = None) -> Iterator[Path]:
+        assert parent == selected_cache
+        parent.mkdir(parents=True)
+        staging_root = parent / "owned-stage"
+        staging_root.mkdir()
+        try:
+            yield staging_root
+        finally:
+            raise _HfStreamingStagingCleanupError("deterministic cleanup failure")
+
+    with patch(
+        "modelaudit.utils.sources.huggingface._temporary_hf_streaming_staging_root",
+        cleanup_fails,
+    ):
+        result = CliRunner().invoke(
+            cli,
+            [
+                "scan",
+                "--stream",
+                "--quiet",
+                "--format",
+                "json",
+                "--cache-dir",
+                str(selected_cache),
+                "hf://test/model",
+            ],
+        )
+
+    parsed = parse_click_json_output(result.output)
+    assert result.exit_code == 2
+    assert parsed["bytes_scanned"] == 7
+    assert parsed["files_scanned"] == 1
+    assert parsed["has_errors"] is True
+    assert parsed["success"] is False
+
+    expected_messages = [finding_message] if has_security_finding else []
+    assert [issue["message"] for issue in parsed["issues"][:-1]] == expected_messages
+    if has_security_finding:
+        assert parsed["issues"][0]["severity"] == "critical"
+        assert parsed["issues"][0]["location"] == "malicious.pkl"
+
+    cleanup_issue = parsed["issues"][-1]
+    assert cleanup_issue["type"] == "huggingface_acquisition_error"
+    assert cleanup_issue["severity"] == "info"
+    assert cleanup_issue["message"] == (
+        "Hugging Face processing failed for hf://test/model after 1 model artifact was scanned; "
+        "scan coverage is incomplete."
+    )
+    assert cleanup_issue["details"]["partial_scan"] is True
+    assert cleanup_issue["details"]["scanned_artifact_count"] == 1
+    assert cleanup_issue["details"]["scan_outcome"] == "inconclusive"
+    assert cleanup_issue["details"]["scan_outcome_reason"] == "huggingface_acquisition_error"
+
+    source_metadata = parsed["file_metadata"]["hf://test/model"]
+    assert source_metadata["operational_error"] is True
+    assert source_metadata["scan_outcome"] == "inconclusive"
+    assert source_metadata["scan_outcome_reason"] == "huggingface_acquisition_error"
     mock_download_streaming.assert_called_once()
     mock_scan_streaming.assert_called_once()
 

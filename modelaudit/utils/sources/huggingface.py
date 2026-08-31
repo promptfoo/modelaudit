@@ -4826,6 +4826,14 @@ def _quarantine_hf_staging_directory(state: _IdentityBoundStagingDirectory) -> t
 
 
 def _cleanup_identity_bound_staging_directory(state: _IdentityBoundStagingDirectory) -> None:
+    """Clean a verified staging root without touching its persistent-cache source.
+
+    The path fallback protects the caller-visible staging name from ordinary
+    replacement and uses a random quarantine name to avoid collisions. It is
+    not an isolation boundary against a process with equivalent host privilege
+    that deliberately mutates the private quarantine after verification; that
+    actor is outside the SECURITY.md threat boundary.
+    """
     try:
         if state.cleanup_blocked:
             raise _HfStreamingStagingCleanupError(

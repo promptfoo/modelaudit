@@ -1988,8 +1988,7 @@ def _track_huggingface_stream_acquisition(
     finally:
         close_generator = getattr(file_generator, "close", None)
         if callable(close_generator):
-            with contextlib.suppress(Exception):
-                close_generator()
+            close_generator()
 
 
 def _metadata_get_bool(metadata: Any, key: str) -> bool:
@@ -2055,16 +2054,24 @@ def _record_huggingface_acquisition_error(
     *,
     path: str,
     error_msg: str,
+    scanned_artifact_count: int = 0,
 ) -> None:
-    """Record a Hugging Face source failure without claiming artifact coverage."""
+    """Record a Hugging Face source failure while preserving completed scan evidence."""
     requested_revision = _huggingface_requested_revision(path)
     source_key = _huggingface_acquisition_source_key(path, requested_revision)
     reason, blocked, category = _classify_huggingface_acquisition_error(error_msg)
-    issue_message = (
-        f"Hugging Face acquisition blocked for {source_key}; no model artifacts were scanned."
-        if blocked
-        else f"Hugging Face acquisition failed for {source_key}; no model artifacts were scanned."
-    )
+    if scanned_artifact_count:
+        artifact_label = "artifact was" if scanned_artifact_count == 1 else "artifacts were"
+        issue_message = (
+            f"Hugging Face processing failed for {source_key} after {scanned_artifact_count} model "
+            f"{artifact_label} scanned; scan coverage is incomplete."
+        )
+    else:
+        issue_message = (
+            f"Hugging Face acquisition blocked for {source_key}; no model artifacts were scanned."
+            if blocked
+            else f"Hugging Face acquisition failed for {source_key}; no model artifacts were scanned."
+        )
 
     details: dict[str, Any] = {
         "source": "huggingface",
@@ -2077,6 +2084,9 @@ def _record_huggingface_acquisition_error(
         "scan_outcome_reason": reason,
         SCAN_OUTCOME_REASONS_METADATA_KEY: [reason],
     }
+    if scanned_artifact_count:
+        details["partial_scan"] = True
+        details["scanned_artifact_count"] = scanned_artifact_count
     if requested_revision is not None:
         details["requested_revision"] = requested_revision
 
@@ -3489,6 +3499,8 @@ def _resolve_scan_source_for_path(
                 )
 
         temp_dir = None
+        streaming_result: ModelAuditResultModel | None = None
+        streaming_result_aggregated = False
         try:
             source_model_id, source_model_source = extract_model_id_from_path(path)
             if runtime.cache_enabled and runtime.cache_dir:
@@ -3583,10 +3595,10 @@ def _resolve_scan_source_for_path(
                             raise
                         except Exception as exc:
                             raise _HuggingFaceStreamInterruptedError(str(exc)) from exc
-
-                path_state.record_non_shard_result_errors(streaming_result)
-                audit_result.aggregate_scan_result(streaming_result.model_dump())
-                path_state.track_streaming_paths_for_sbom(streaming_result, path)
+                        path_state.record_non_shard_result_errors(streaming_result)
+                        audit_result.aggregate_scan_result(streaming_result.model_dump())
+                        streaming_result_aggregated = True
+                        path_state.track_streaming_paths_for_sbom(streaming_result, path)
 
                 download_duration = time.time() - download_start
                 record_download_completed("huggingface", download_duration, 0, display_path)
@@ -3681,6 +3693,11 @@ def _resolve_scan_source_for_path(
                 path_state,
                 path=path,
                 error_msg=error_msg,
+                scanned_artifact_count=(
+                    streaming_result.files_scanned
+                    if streaming_result_aggregated and streaming_result is not None
+                    else 0
+                ),
             )
             path_state.defer_temp_cleanup(
                 temp_dir,

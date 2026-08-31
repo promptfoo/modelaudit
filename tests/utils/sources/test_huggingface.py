@@ -213,10 +213,16 @@ def test_hf_streaming_staging_root_replacement_fails_without_deleting_replacemen
     shutil.rmtree(preserved_replacement)
 
 
-def test_hf_streaming_staging_fallback_quarantine_preserves_raced_replacement(
+def test_hf_streaming_staging_fallback_preserves_replacement_at_original_name(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """The fallback quarantine isolates cleanup from ordinary original-name replacement.
+
+    Deliberate mutation of the private quarantine by an equivalent OS identity
+    is outside the SECURITY.md threat boundary and is not an isolation
+    guarantee of the stdlib path fallback.
+    """
     from modelaudit.utils.sources import huggingface as huggingface_module
 
     monkeypatch.setattr(huggingface_module.os, "supports_dir_fd", set())
@@ -226,33 +232,41 @@ def test_hf_streaming_staging_fallback_quarantine_preserves_raced_replacement(
     staging_volume = tmp_path / "staging-volume"
     staging_volume.mkdir()
     staging_root: Path | None = None
-    raced = False
+    original_identity: tuple[int, int] | None = None
+    observed_quarantine: Path | None = None
 
-    def race_before_rmtree(
+    def replace_original_name_before_rmtree(
         path: str | os.PathLike[str],
         ignore_errors: bool = False,
         onerror: Callable[..., Any] | None = None,
     ) -> None:
-        nonlocal raced
+        nonlocal observed_quarantine
         candidate = Path(path)
-        if staging_root is not None and not raced:
-            raced = True
-            if candidate == staging_root:
-                staging_root.rename(staging_root.with_name(f"{staging_root.name}-owned"))
+        if observed_quarantine is None:
+            assert staging_root is not None
+            assert original_identity is not None
+            assert candidate != staging_root
+            assert candidate.name.startswith(".modelaudit_hf_cleanup_")
+            assert not staging_root.exists()
+            assert (candidate.stat().st_dev, candidate.stat().st_ino) == original_identity
+            observed_quarantine = candidate
             staging_root.mkdir()
             (staging_root / "caller.bin").write_bytes(b"caller-owned")
         original_rmtree(path, ignore_errors=ignore_errors, onerror=onerror)
 
-    monkeypatch.setattr(huggingface_module.shutil, "rmtree", race_before_rmtree)
+    monkeypatch.setattr(huggingface_module.shutil, "rmtree", replace_original_name_before_rmtree)
 
     with _temporary_hf_streaming_staging_root(parent=staging_volume) as active_root:
         staging_root = active_root
+        original_identity = staging_root.stat().st_dev, staging_root.stat().st_ino
         (staging_root / "leaf.bin").write_bytes(b"owned")
 
-    assert raced
+    assert observed_quarantine is not None
+    assert not observed_quarantine.exists()
     assert staging_root is not None
     assert (staging_root / "caller.bin").read_bytes() == b"caller-owned"
     assert list(staging_volume.glob(".modelaudit_hf_cleanup_*")) == []
+    shutil.rmtree(staging_root)
 
 
 def test_hf_streaming_staging_descriptor_quarantine_unlinks_only_inside_owned_root(
