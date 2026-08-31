@@ -6,6 +6,7 @@ import importlib
 import json
 import os
 import pickle
+import shutil
 import signal
 import struct
 import subprocess
@@ -66,6 +67,7 @@ from modelaudit.utils.sources.huggingface import (
     _list_huggingface_repo_files_at_revision,
     _list_repo_files_with_timeout,
     _loads_json_without_duplicate_keys,
+    _normalize_windows_hf_download_path_for_comparison,
     _private_huggingface_acquired_index_candidate,
     _range_response_validator,
     _read_huggingface_prefix,
@@ -77,7 +79,7 @@ from modelaudit.utils.sources.huggingface import (
     _run_huggingface_download_with_deadline,
     _scan_remote_huggingface_safetensors_header,
     _select_streamable_hf_files,
-    _should_cleanup_hf_streaming_context_file,
+    _temporary_hf_streaming_staging_root,
     _tensor_name_digest,
     _terminate_huggingface_download_process,
     _validate_huggingface_repo_filename,
@@ -153,97 +155,64 @@ def test_hf_acquisition_interrupt_check_honors_global_cancel_and_deadline(
     assert interrupt_checks == 1
 
 
-@pytest.mark.parametrize(
-    ("cache_dir_owned", "download_created", "expected"),
-    [(False, False, False), (True, False, True), (False, True, True)],
-)
-def test_hf_streaming_context_cleanup_requires_owned_cache_or_new_download(
-    tmp_path: Path,
-    cache_dir_owned: bool,
-    download_created: bool,
-    expected: bool,
-) -> None:
-    cache_dir = tmp_path / "caller_selected_cache"
-    download_path = cache_dir / "huggingface" / "test" / "model"
-    file_path = download_path / "model.onnx_data"
-    file_path.parent.mkdir(parents=True)
-    file_path.write_bytes(b"sidecar")
+def test_hf_streaming_staging_root_is_removed_after_normal_cleanup() -> None:
+    with _temporary_hf_streaming_staging_root() as staging_root:
+        artifact = staging_root / "huggingface" / "test" / "model" / "context.bin"
+        artifact.parent.mkdir(parents=True)
+        artifact.write_bytes(b"context")
 
-    assert (
-        _should_cleanup_hf_streaming_context_file(
-            cache_dir,
-            download_path,
-            file_path,
-            cache_dir_owned=cache_dir_owned,
-            download_created=download_created,
-        )
-        is expected
-    )
+        assert staging_root.name.startswith("modelaudit_hf_stream_")
+        assert artifact.read_bytes() == b"context"
+
+    assert not staging_root.exists()
 
 
-def test_hf_streaming_context_cleanup_rejects_download_path_outside_owned_cache(tmp_path: Path) -> None:
-    """An asserted owned root cannot authorize deletion in a sibling download tree."""
-    cache_dir = tmp_path / "owned_cache"
-    cache_dir.mkdir()
-    download_path = tmp_path / "outside_cache"
-    file_path = download_path / "model.onnx_data"
-    file_path.parent.mkdir()
-    file_path.write_bytes(b"outside")
-
-    assert not _should_cleanup_hf_streaming_context_file(
-        cache_dir,
-        download_path,
-        file_path,
-        cache_dir_owned=True,
-    )
-
-
-def test_hf_streaming_context_cleanup_unlinks_symlink_without_following_target(
+def test_hf_streaming_staging_cleanup_does_not_follow_replaced_children(
     tmp_path: Path,
     requires_symlinks: None,
 ) -> None:
-    cache_dir = tmp_path / "owned_cache"
-    download_path = cache_dir / "huggingface" / "test" / "model"
-    download_path.mkdir(parents=True)
-    outside_file = tmp_path / "outside.onnx_data"
-    outside_file.write_bytes(b"outside")
-    linked_sidecar = download_path / "model.onnx_data"
-    linked_sidecar.symlink_to(outside_file)
+    outside_file = tmp_path / "outside.bin"
+    outside_file.write_bytes(b"outside leaf")
+    outside_parent = tmp_path / "outside-parent"
+    outside_parent.mkdir()
+    outside_sidecar = outside_parent / "model.onnx_data"
+    outside_sidecar.write_bytes(b"outside parent")
 
-    assert _should_cleanup_hf_streaming_context_file(
-        cache_dir,
-        download_path,
-        linked_sidecar,
-        cache_dir_owned=True,
-    )
-    linked_sidecar.unlink()
-    assert not linked_sidecar.exists()
-    assert outside_file.read_bytes() == b"outside"
+    with _temporary_hf_streaming_staging_root() as staging_root:
+        leaf = staging_root / "leaf.bin"
+        leaf.write_bytes(b"owned leaf")
+        leaf.rename(staging_root / "owned-leaf.bin")
+        leaf.symlink_to(outside_file)
+
+        parent = staging_root / "onnx"
+        parent.mkdir()
+        (parent / "model.onnx_data").write_bytes(b"owned parent")
+        parent.rename(staging_root / "owned-onnx")
+        parent.symlink_to(outside_parent, target_is_directory=True)
+
+    assert not staging_root.exists()
+    assert outside_file.read_bytes() == b"outside leaf"
+    assert outside_sidecar.read_bytes() == b"outside parent"
 
 
-@pytest.mark.parametrize("error_type", [OSError, RuntimeError])
-def test_hf_streaming_context_cleanup_fails_closed_on_resolution_errors(
-    tmp_path: Path,
+def test_hf_streaming_staging_cleanup_works_without_descriptor_relative_operations(
     monkeypatch: pytest.MonkeyPatch,
-    error_type: type[Exception],
 ) -> None:
-    """Path-resolution failures must never fall back to an unchecked unlink."""
-
-    def fail_to_resolve(_path: Path, strict: bool = False) -> Path:
-        raise error_type("resolution failed")
-
-    monkeypatch.setattr(Path, "resolve", fail_to_resolve)
-    assert not _should_cleanup_hf_streaming_context_file(
-        tmp_path,
-        tmp_path / "download",
-        tmp_path / "download" / "model.onnx_data",
-        cache_dir_owned=True,
-    )
-
-
-def test_hf_streaming_context_cleanup_accepts_equivalent_windows_extended_paths() -> None:
     from modelaudit.utils.sources import huggingface as huggingface_module
 
+    monkeypatch.setattr(huggingface_module.os, "supports_dir_fd", set())
+    monkeypatch.setattr(huggingface_module.os, "supports_follow_symlinks", set())
+    monkeypatch.setattr(shutil, "_use_fd_functions", False)
+
+    with _temporary_hf_streaming_staging_root() as staging_root:
+        artifact = staging_root / "huggingface" / "test" / "model" / "context.bin"
+        artifact.parent.mkdir(parents=True)
+        artifact.write_bytes(b"context")
+
+    assert not staging_root.exists()
+
+
+def test_hf_download_path_comparison_accepts_equivalent_windows_extended_paths() -> None:
     separator = chr(92)
     drive_path = separator.join(("C:", "cache", "models", "onnx", "model.onnx_data"))
     extended_drive_path = f"{separator}{separator}?{separator}{drive_path}"
@@ -251,227 +220,13 @@ def test_hf_streaming_context_cleanup_accepts_equivalent_windows_extended_paths(
     extended_unc_path = f"{separator}{separator}?{separator}UNC{separator}" + separator.join(
         ("server", "share", "models", "onnx", "model.onnx_data")
     )
-    normalize = huggingface_module._normalize_windows_hf_download_path_for_comparison
 
-    assert normalize(extended_drive_path) == normalize(drive_path)
-    assert normalize(extended_unc_path) == normalize(unc_path)
-
-
-@pytest.mark.skipif(
-    os.stat not in os.supports_dir_fd
-    or os.unlink not in os.supports_dir_fd
-    or os.stat not in os.supports_follow_symlinks,
-    reason="descriptor-relative cleanup is unavailable",
-)
-def test_hf_streaming_context_cleanup_rejects_parent_swap_during_authorization(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    requires_symlinks: None,
-) -> None:
-    """A parent swapped after resolution cannot become the captured cleanup target."""
-    from modelaudit.utils.sources import huggingface as huggingface_module
-
-    cache_dir = tmp_path / "owned_cache"
-    download_path = cache_dir / "huggingface" / "test" / "model"
-    original_parent = download_path / "onnx"
-    original_parent.mkdir(parents=True)
-    sidecar_name = "model.onnx_data"
-    original_sidecar = original_parent / sidecar_name
-    original_sidecar.write_bytes(b"owned")
-    staged_parent = original_parent.with_name("onnx-staged")
-    outside_parent = tmp_path / "outside"
-    outside_parent.mkdir()
-    outside_sidecar = outside_parent / sidecar_name
-    outside_sidecar.write_bytes(b"outside")
-    original_resolve = Path.resolve
-    parent_swapped = False
-
-    def swap_parent_after_resolution(path: Path, strict: bool = False) -> Path:
-        nonlocal parent_swapped
-        resolved = original_resolve(path, strict=strict)
-        if path == original_parent and not parent_swapped:
-            parent_swapped = True
-            original_parent.rename(staged_parent)
-            original_parent.symlink_to(outside_parent, target_is_directory=True)
-        return resolved
-
-    monkeypatch.setattr(Path, "resolve", swap_parent_after_resolution)
-    cleanup = huggingface_module._open_hf_streaming_context_cleanup(
-        cache_dir,
-        download_path,
-        original_sidecar,
-        f"onnx/{sidecar_name}",
-        cache_dir_owned=True,
-    )
-
-    assert parent_swapped
-    assert cleanup is None
-    assert outside_sidecar.read_bytes() == b"outside"
-    assert (staged_parent / sidecar_name).read_bytes() == b"owned"
-
-
-@pytest.mark.skipif(
-    os.stat not in os.supports_dir_fd
-    or os.unlink not in os.supports_dir_fd
-    or os.stat not in os.supports_follow_symlinks,
-    reason="descriptor-relative cleanup is unavailable",
-)
-def test_hf_streaming_context_cleanup_preserves_replaced_leaf(tmp_path: Path) -> None:
-    """Cleanup must not unlink a caller replacement at the same path."""
-    from modelaudit.utils.sources import huggingface as huggingface_module
-
-    cache_dir = tmp_path / "persistent_cache"
-    download_path = cache_dir / "huggingface" / "test" / "model"
-    file_path = download_path / "model.onnx_data"
-    file_path.parent.mkdir(parents=True)
-    file_path.write_bytes(b"downloaded")
-    cleanup = huggingface_module._open_hf_streaming_context_cleanup(
-        cache_dir,
-        download_path,
-        file_path,
-        file_path.name,
-        cache_dir_owned=False,
-        download_created=True,
-    )
-    assert cleanup is not None
-
-    original_path = file_path.with_name("model.onnx_data.original")
-    file_path.rename(original_path)
-    file_path.write_bytes(b"caller replacement")
-    cleanup.cleanup()
-
-    assert file_path.read_bytes() == b"caller replacement"
-    assert original_path.read_bytes() == b"downloaded"
-
-
-def test_hf_streaming_path_preexistence_fails_closed_on_stat_error(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from modelaudit.utils.sources import huggingface as huggingface_module
-
-    missing_path = tmp_path / "missing.onnx_data"
-    assert not huggingface_module._hf_streaming_path_existed_before_download(missing_path)
-    missing_path.write_bytes(b"caller-owned")
-    assert huggingface_module._hf_streaming_path_existed_before_download(missing_path)
-
-    def fail_to_stat(_path: Path) -> os.stat_result:
-        raise PermissionError("stat denied")
-
-    monkeypatch.setattr(huggingface_module.os, "lstat", fail_to_stat)
-    assert huggingface_module._hf_streaming_path_existed_before_download(tmp_path / "unknown")
-
-
-@pytest.mark.skipif(
-    os.stat not in os.supports_dir_fd
-    or os.unlink not in os.supports_dir_fd
-    or os.stat not in os.supports_follow_symlinks,
-    reason="descriptor-relative cleanup is unavailable",
-)
-def test_hf_streaming_context_cleanup_preserves_in_place_modification(tmp_path: Path) -> None:
-    """Cleanup must preserve a file modified by its caller after download."""
-    from modelaudit.utils.sources import huggingface as huggingface_module
-
-    cache_dir = tmp_path / "persistent_cache"
-    download_path = cache_dir / "huggingface" / "test" / "model"
-    file_path = download_path / "model.onnx_data"
-    file_path.parent.mkdir(parents=True)
-    file_path.write_bytes(b"downloaded")
-    cleanup = huggingface_module._open_hf_streaming_context_cleanup(
-        cache_dir,
-        download_path,
-        file_path,
-        file_path.name,
-        cache_dir_owned=False,
-        download_created=True,
-    )
-    assert cleanup is not None
-
-    file_path.write_bytes(b"caller replacement with a different size")
-    cleanup.cleanup()
-
-    assert file_path.read_bytes() == b"caller replacement with a different size"
-
-
-@pytest.mark.skipif(
-    os.stat not in os.supports_dir_fd
-    or os.unlink not in os.supports_dir_fd
-    or os.stat not in os.supports_follow_symlinks,
-    reason="descriptor-relative cleanup is unavailable",
-)
-def test_hf_streaming_context_cleanup_does_not_retain_parent_descriptors(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from modelaudit.utils.sources import huggingface as huggingface_module
-
-    cache_dir = tmp_path / "owned_cache"
-    download_path = cache_dir / "huggingface" / "test" / "model"
-    download_path.mkdir(parents=True)
-    original_open = os.open
-    original_close = os.close
-    live_descriptors: set[int] = set()
-    max_live_descriptors = 0
-
-    def tracked_open(*args: Any, **kwargs: Any) -> int:
-        nonlocal max_live_descriptors
-        file_descriptor = original_open(*args, **kwargs)
-        live_descriptors.add(file_descriptor)
-        max_live_descriptors = max(max_live_descriptors, len(live_descriptors))
-        return file_descriptor
-
-    def tracked_close(file_descriptor: int) -> None:
-        live_descriptors.discard(file_descriptor)
-        original_close(file_descriptor)
-
-    monkeypatch.setattr(huggingface_module.os, "open", tracked_open)
-    monkeypatch.setattr(huggingface_module.os, "close", tracked_close)
-    cleanup_handles = []
-    for index in range(80):
-        file_path = download_path / f"context-{index}.bin"
-        file_path.write_bytes(b"context")
-        cleanup = huggingface_module._open_hf_streaming_context_cleanup(
-            cache_dir,
-            download_path,
-            file_path,
-            file_path.name,
-            cache_dir_owned=True,
-        )
-        assert cleanup is not None
-        cleanup_handles.append(cleanup)
-        assert not live_descriptors
-
-    assert max_live_descriptors == 1
-    for cleanup in cleanup_handles:
-        cleanup.cleanup()
-    assert not live_descriptors
-    assert not any(download_path.iterdir())
-
-
-def test_hf_streaming_context_cleanup_defers_without_descriptor_relative_unlink(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from modelaudit.utils.sources import huggingface as huggingface_module
-
-    cache_dir = tmp_path / "owned_cache"
-    download_path = cache_dir / "huggingface" / "test" / "model"
-    file_path = download_path / "model.onnx_data"
-    file_path.parent.mkdir(parents=True)
-    file_path.write_bytes(b"context")
-    monkeypatch.setattr(huggingface_module.os, "supports_dir_fd", set())
-    monkeypatch.setattr(huggingface_module.os, "supports_follow_symlinks", set())
-
-    cleanup = huggingface_module._open_hf_streaming_context_cleanup(
-        cache_dir,
-        download_path,
-        file_path,
-        file_path.name,
-        cache_dir_owned=True,
-    )
-
-    assert cleanup is None
-    assert file_path.read_bytes() == b"context"
+    assert _normalize_windows_hf_download_path_for_comparison(
+        extended_drive_path
+    ) == _normalize_windows_hf_download_path_for_comparison(drive_path)
+    assert _normalize_windows_hf_download_path_for_comparison(
+        extended_unc_path
+    ) == _normalize_windows_hf_download_path_for_comparison(unc_path)
 
 
 def _bert_vocab_payload(min_bytes: int = 16 * 1024) -> bytes:
@@ -4558,38 +4313,38 @@ class TestModelDownloadStreaming:
             [SimpleNamespace(path="onnx/model.onnx_data", size=len(sidecar_bytes))],
         ]
 
-        generator = download_model_streaming(
-            "https://huggingface.co/test/model",
-            cache_dir=tmp_path / "modelaudit_hf_fixture",
-            max_size=len(payload) + len(sidecar_bytes),
-            scannable_extensions={".onnx"},
-            scannable_scanner_ids={"onnx"},
-            _cache_dir_owned=True,
-        )
-        model_path, is_last = next(generator)
-        sidecar_path = model_path.with_name("model.onnx_data")
+        with _temporary_hf_streaming_staging_root() as staging_root:
+            generator = download_model_streaming(
+                "https://huggingface.co/test/model",
+                cache_dir=tmp_path / "persistent_cache",
+                max_size=len(payload) + len(sidecar_bytes),
+                scannable_extensions={".onnx"},
+                scannable_scanner_ids={"onnx"},
+                _staging_root=staging_root,
+            )
+            model_path, is_last = next(generator)
+            sidecar_path = model_path.with_name("model.onnx_data")
 
-        assert is_last is True
-        assert model_path.name == "model.onnx"
-        assert sidecar_path.read_bytes() == sidecar_bytes
-        assert [call.kwargs["filename"] for call in mock_hf_hub_download.call_args_list] == [
-            "onnx/model.onnx",
-            "onnx/model.onnx_data",
-        ]
-        assert mock_get_paths_info.call_args_list == [
-            call("test/model", ["onnx/model.onnx"], revision=_HF_TEST_REVISION),
-            call("test/model", ["onnx/model.onnx_data"], revision=_HF_TEST_REVISION),
-        ]
-
-        if close_early:
-            cast(Generator[tuple[Path, bool], None, None], generator).close()
-        else:
-            with pytest.raises(StopIteration):
-                next(generator)
-        if os.stat in os.supports_dir_fd and os.unlink in os.supports_dir_fd and os.stat in os.supports_follow_symlinks:
-            assert not sidecar_path.exists()
-        else:
+            assert is_last is True
+            assert model_path.name == "model.onnx"
             assert sidecar_path.read_bytes() == sidecar_bytes
+            assert [call.kwargs["filename"] for call in mock_hf_hub_download.call_args_list] == [
+                "onnx/model.onnx",
+                "onnx/model.onnx_data",
+            ]
+            assert mock_get_paths_info.call_args_list == [
+                call("test/model", ["onnx/model.onnx"], revision=_HF_TEST_REVISION),
+                call("test/model", ["onnx/model.onnx_data"], revision=_HF_TEST_REVISION),
+            ]
+
+            if close_early:
+                cast(Generator[tuple[Path, bool], None, None], generator).close()
+            else:
+                with pytest.raises(StopIteration):
+                    next(generator)
+            assert sidecar_path.read_bytes() == sidecar_bytes
+
+        assert not staging_root.exists()
 
     @pytest.mark.parametrize("close_early", [False, True])
     @pytest.mark.parametrize("sidecar_preexisted", [False, True])
@@ -4601,7 +4356,7 @@ class TestModelDownloadStreaming:
     )
     @patch("huggingface_hub.HfApi.get_paths_info")
     @patch("huggingface_hub.hf_hub_download")
-    def test_download_model_streaming_persistent_cache_tracks_onnx_sidecar_ownership(
+    def test_download_model_streaming_staging_preserves_persistent_cache_sidecars(
         self,
         mock_hf_hub_download: MagicMock,
         mock_get_paths_info: MagicMock,
@@ -4614,56 +4369,58 @@ class TestModelDownloadStreaming:
     ) -> None:
         payload = _make_external_onnx_payload(tmp_path)
         sidecar_bytes = struct.pack("f", 1.0)
-        cache_dir = tmp_path / "modelaudit_hf_persistent"
-        sidecar_path = cache_dir / "huggingface" / "test" / "model" / "onnx" / "model.onnx_data"
-        sidecar_path.parent.mkdir(parents=True)
+        persistent_cache = tmp_path / "persistent-cache"
+        persistent_sidecar = persistent_cache / "huggingface" / "test" / "model" / "onnx" / "model.onnx_data"
+        expected_persistent_bytes = b"preexisting cache" if sidecar_preexisted else b"concurrent caller"
         if sidecar_preexisted:
-            sidecar_path.write_bytes(sidecar_bytes)
+            persistent_sidecar.parent.mkdir(parents=True)
+            persistent_sidecar.write_bytes(expected_persistent_bytes)
 
-        def download_side_effect(*, filename: str, local_dir: str | None = None, **_kwargs: object) -> str:
-            assert local_dir is not None
-            path = Path(local_dir) / filename
-            path.parent.mkdir(parents=True, exist_ok=True)
-            if filename == "onnx/model.onnx":
-                path.write_bytes(payload)
-            elif sidecar_preexisted:
-                assert path == sidecar_path
-                assert path.read_bytes() == sidecar_bytes
-            else:
-                assert path == sidecar_path
-                path.write_bytes(sidecar_bytes)
-            return str(path)
-
-        mock_hf_hub_download.side_effect = download_side_effect
         mock_get_paths_info.side_effect = [
             [SimpleNamespace(path="onnx/model.onnx", size=len(payload))],
             [SimpleNamespace(path="onnx/model.onnx_data", size=len(sidecar_bytes))],
         ]
 
-        generator = download_model_streaming(
-            "https://huggingface.co/test/model",
-            cache_dir=cache_dir,
-            max_size=len(payload) + len(sidecar_bytes),
-            scannable_extensions={".onnx"},
-            scannable_scanner_ids={"onnx"},
-        )
-        model_path, is_last = next(generator)
+        with _temporary_hf_streaming_staging_root() as staging_root:
 
-        assert is_last is True
-        assert model_path.name == "model.onnx"
-        assert sidecar_path.read_bytes() == sidecar_bytes
+            def download_side_effect(*, filename: str, local_dir: str | None = None, **kwargs: object) -> str:
+                assert local_dir is not None
+                assert kwargs["cache_dir"] == str(persistent_cache / "huggingface")
+                path = Path(local_dir) / filename
+                path.parent.mkdir(parents=True, exist_ok=True)
+                if filename == "onnx/model.onnx":
+                    path.write_bytes(payload)
+                else:
+                    if not sidecar_preexisted:
+                        persistent_sidecar.parent.mkdir(parents=True)
+                        persistent_sidecar.write_bytes(expected_persistent_bytes)
+                    path.write_bytes(sidecar_bytes)
+                return str(path)
 
-        if close_early:
-            cast(Generator[tuple[Path, bool], None, None], generator).close()
-        else:
-            with pytest.raises(StopIteration):
-                next(generator)
-        cleanup_supported = (
-            os.stat in os.supports_dir_fd and os.unlink in os.supports_dir_fd and os.stat in os.supports_follow_symlinks
-        )
-        assert sidecar_path.exists() is (sidecar_preexisted or not cleanup_supported)
-        if sidecar_path.exists():
-            assert sidecar_path.read_bytes() == sidecar_bytes
+            mock_hf_hub_download.side_effect = download_side_effect
+            generator = download_model_streaming(
+                "https://huggingface.co/test/model",
+                cache_dir=persistent_cache,
+                max_size=len(payload) + len(sidecar_bytes),
+                scannable_extensions={".onnx"},
+                scannable_scanner_ids={"onnx"},
+                _staging_root=staging_root,
+            )
+            model_path, is_last = next(generator)
+            staged_sidecar = model_path.with_name("model.onnx_data")
+
+            assert is_last is True
+            assert model_path.is_relative_to(staging_root)
+            assert staged_sidecar.read_bytes() == sidecar_bytes
+
+            if close_early:
+                cast(Generator[tuple[Path, bool], None, None], generator).close()
+            else:
+                with pytest.raises(StopIteration):
+                    next(generator)
+
+        assert not staging_root.exists()
+        assert persistent_sidecar.read_bytes() == expected_persistent_bytes
 
     @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None)
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".onnx"})
@@ -4717,12 +4474,6 @@ class TestModelDownloadStreaming:
         assert preexisting_path.read_bytes() == sidecar_bytes
 
     @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None)
-    @pytest.mark.skipif(
-        os.stat not in os.supports_dir_fd
-        or os.unlink not in os.supports_dir_fd
-        or os.stat not in os.supports_follow_symlinks,
-        reason="descriptor-relative cleanup is unavailable",
-    )
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".onnx"})
     @patch(
         "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
@@ -4730,7 +4481,7 @@ class TestModelDownloadStreaming:
     )
     @patch("huggingface_hub.HfApi.get_paths_info")
     @patch("huggingface_hub.hf_hub_download")
-    def test_download_model_streaming_cleans_new_persistent_context_sidecar_after_size_failure(
+    def test_download_model_streaming_cleans_staging_after_sidecar_size_failure(
         self,
         mock_hf_hub_download: MagicMock,
         mock_get_paths_info: MagicMock,
@@ -4741,8 +4492,10 @@ class TestModelDownloadStreaming:
     ) -> None:
         payload = _make_external_onnx_payload(tmp_path)
         oversized_sidecar = b"x" * 20
-        cache_dir = tmp_path / "modelaudit_hf_persistent"
-        sidecar_path = cache_dir / "huggingface" / "test" / "model" / "onnx" / "model.onnx_data"
+        persistent_cache = tmp_path / "persistent-cache"
+        persistent_sentinel = persistent_cache / "huggingface" / "caller.bin"
+        persistent_sentinel.parent.mkdir(parents=True)
+        persistent_sentinel.write_bytes(b"caller-owned")
 
         def download_side_effect(*, filename: str, local_dir: str | None = None, **_kwargs: object) -> str:
             assert local_dir is not None
@@ -4757,33 +4510,32 @@ class TestModelDownloadStreaming:
             [SimpleNamespace(path="onnx/model.onnx_data", size=1)],
         ]
 
-        generator = download_model_streaming(
-            "https://huggingface.co/test/model",
-            cache_dir=cache_dir,
-            max_size=len(payload) + 1,
-            scannable_extensions={".onnx"},
-            scannable_scanner_ids={"onnx"},
-        )
+        with _temporary_hf_streaming_staging_root() as staging_root:
+            generator = download_model_streaming(
+                "https://huggingface.co/test/model",
+                cache_dir=persistent_cache,
+                max_size=len(payload) + 1,
+                scannable_extensions={".onnx"},
+                scannable_scanner_ids={"onnx"},
+                _staging_root=staging_root,
+            )
 
-        with pytest.raises(Exception, match="exceeding max size"):
-            next(generator)
-        assert not sidecar_path.exists()
+            with pytest.raises(Exception, match="exceeding max size"):
+                next(generator)
+            assert (staging_root / "huggingface" / "test" / "model" / "onnx" / "model.onnx_data").exists()
+
+        assert not staging_root.exists()
+        assert persistent_sentinel.read_bytes() == b"caller-owned"
 
     @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None)
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".onnx"})
-    @pytest.mark.skipif(
-        os.stat not in os.supports_dir_fd
-        or os.unlink not in os.supports_dir_fd
-        or os.stat not in os.supports_follow_symlinks,
-        reason="descriptor-relative cleanup is unavailable",
-    )
     @patch(
         "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
         return_value=(["onnx/model.onnx", "onnx/model.onnx_data"], _HF_TEST_REVISION, None),
     )
     @patch("huggingface_hub.HfApi.get_paths_info")
     @patch("huggingface_hub.hf_hub_download")
-    def test_download_model_streaming_cleanup_skips_after_parent_swap(
+    def test_download_model_streaming_cleanup_is_independent_of_cache_root_swap(
         self,
         mock_hf_hub_download: MagicMock,
         mock_get_paths_info: MagicMock,
@@ -4795,12 +4547,26 @@ class TestModelDownloadStreaming:
     ) -> None:
         payload = _make_external_onnx_payload(tmp_path)
         sidecar_bytes = struct.pack("f", 1.0)
-        cache_dir = tmp_path / "modelaudit_hf_owned"
+        persistent_cache = tmp_path / "persistent-cache"
+        moved_cache = tmp_path / "moved-cache"
+        owned_cache_file = persistent_cache / "huggingface" / "owned.bin"
+        owned_cache_file.parent.mkdir(parents=True)
+        owned_cache_file.write_bytes(b"owned cache")
+        outside_root = tmp_path / "outside"
+        outside_cache_file = outside_root / "huggingface" / "caller.bin"
+        outside_cache_file.parent.mkdir(parents=True)
+        outside_cache_file.write_bytes(b"caller cache")
+        swapped = False
 
         def download_side_effect(*, filename: str, local_dir: str | None = None, **_kwargs: object) -> str:
+            nonlocal swapped
             assert local_dir is not None
             path = Path(local_dir) / filename
             path.parent.mkdir(parents=True, exist_ok=True)
+            if filename == "onnx/model.onnx_data" and not swapped:
+                persistent_cache.rename(moved_cache)
+                persistent_cache.symlink_to(outside_root, target_is_directory=True)
+                swapped = True
             path.write_bytes(payload if filename == "onnx/model.onnx" else sidecar_bytes)
             return str(path)
 
@@ -4809,29 +4575,24 @@ class TestModelDownloadStreaming:
             [SimpleNamespace(path="onnx/model.onnx", size=len(payload))],
             [SimpleNamespace(path="onnx/model.onnx_data", size=len(sidecar_bytes))],
         ]
-        generator = download_model_streaming(
-            "https://huggingface.co/test/model",
-            cache_dir=cache_dir,
-            max_size=len(payload) + len(sidecar_bytes),
-            scannable_extensions={".onnx"},
-            scannable_scanner_ids={"onnx"},
-            _cache_dir_owned=True,
-        )
-        model_path, _is_last = next(generator)
-        sidecar_name = "model.onnx_data"
-        original_parent = model_path.parent
-        staged_parent = original_parent.with_name("onnx-staged")
-        outside_parent = tmp_path / "outside"
-        outside_parent.mkdir()
-        outside_sidecar = outside_parent / sidecar_name
-        outside_sidecar.write_bytes(b"preexisting outside")
 
-        original_parent.rename(staged_parent)
-        original_parent.symlink_to(outside_parent, target_is_directory=True)
-        cast(Generator[tuple[Path, bool], None, None], generator).close()
+        with _temporary_hf_streaming_staging_root() as staging_root:
+            generator = download_model_streaming(
+                "https://huggingface.co/test/model",
+                cache_dir=persistent_cache,
+                max_size=len(payload) + len(sidecar_bytes),
+                scannable_extensions={".onnx"},
+                scannable_scanner_ids={"onnx"},
+                _staging_root=staging_root,
+            )
+            model_path, _is_last = next(generator)
+            assert model_path.with_name("model.onnx_data").read_bytes() == sidecar_bytes
+            cast(Generator[tuple[Path, bool], None, None], generator).close()
 
-        assert outside_sidecar.read_bytes() == b"preexisting outside"
-        assert (staged_parent / sidecar_name).read_bytes() == sidecar_bytes
+        assert swapped
+        assert not staging_root.exists()
+        assert outside_cache_file.read_bytes() == b"caller cache"
+        assert (moved_cache / "huggingface" / "owned.bin").read_bytes() == b"owned cache"
 
     @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None)
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".onnx"})
@@ -4874,19 +4635,23 @@ class TestModelDownloadStreaming:
             [SimpleNamespace(path="onnx/shared.onnx_data", size=len(sidecar_bytes))],
         ]
 
-        results = list(
-            download_model_streaming(
-                "https://huggingface.co/test/model",
-                cache_dir=tmp_path / "modelaudit_hf_fixture",
-                max_size=(len(payload) * 2) + len(sidecar_bytes),
-                scannable_extensions={".onnx"},
-                scannable_scanner_ids={"onnx"},
-                _cache_dir_owned=True,
+        with _temporary_hf_streaming_staging_root() as staging_root:
+            results = list(
+                download_model_streaming(
+                    "https://huggingface.co/test/model",
+                    cache_dir=tmp_path / "persistent-cache",
+                    max_size=(len(payload) * 2) + len(sidecar_bytes),
+                    scannable_extensions={".onnx"},
+                    scannable_scanner_ids={"onnx"},
+                    _staging_root=staging_root,
+                )
             )
-        )
+            sidecar_path = staging_root / "huggingface" / "test" / "model" / "onnx" / "shared.onnx_data"
+            assert sidecar_path.read_bytes() == sidecar_bytes
+            assert [path.name for path, _is_last in results] == ["a.onnx", "b.onnx"]
+            assert [is_last for _path, is_last in results] == [False, True]
 
-        assert [path.name for path, _is_last in results] == ["a.onnx", "b.onnx"]
-        assert [is_last for _path, is_last in results] == [False, True]
+        assert not staging_root.exists()
         assert [call.kwargs["filename"] for call in mock_hf_hub_download.call_args_list] == [
             "onnx/a.onnx",
             "onnx/shared.onnx_data",
@@ -4896,13 +4661,6 @@ class TestModelDownloadStreaming:
             call("test/model", ["onnx/a.onnx", "onnx/b.onnx"], revision=_HF_TEST_REVISION),
             call("test/model", ["onnx/shared.onnx_data"], revision=_HF_TEST_REVISION),
         ]
-        sidecar_path = (
-            tmp_path / "modelaudit_hf_fixture" / "huggingface" / "test" / "model" / "onnx" / "shared.onnx_data"
-        )
-        if os.stat in os.supports_dir_fd and os.unlink in os.supports_dir_fd and os.stat in os.supports_follow_symlinks:
-            assert not sidecar_path.exists()
-        else:
-            assert sidecar_path.read_bytes() == sidecar_bytes
 
     @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format")
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".onnx"})

@@ -138,6 +138,23 @@ def test_track_huggingface_stream_acquisition_preserves_precomputed_result_tuple
     assert list(cli_module._track_huggingface_stream_acquisition(iter([streamed_item]))) == [streamed_item]
 
 
+def test_track_huggingface_stream_acquisition_closes_source_on_early_close() -> None:
+    source_closed = False
+
+    def source() -> Iterator[tuple[Path, bool]]:
+        nonlocal source_closed
+        try:
+            yield Path("model.onnx"), True
+        finally:
+            source_closed = True
+
+    tracked = cli_module._track_huggingface_stream_acquisition(source())
+    assert next(tracked) == (Path("model.onnx"), True)
+    tracked.close()
+
+    assert source_closed
+
+
 def _make_trusted_shard_parent(path: Path, *, parents: bool = False) -> None:
     """Create a shard parent without inheriting group-write test umasks."""
     path.mkdir(parents=parents)
@@ -6631,7 +6648,7 @@ def test_scan_huggingface_streaming_without_dry_run_still_reports_malicious_resu
     assert output["issues"][0]["message"] == "Dangerous pickle opcode detected"
     mock_download_streaming.assert_called_once()
     mock_scan_streaming.assert_called_once()
-    assert mock_scan_streaming.call_args.kwargs["delete_after_scan"] is True
+    assert mock_scan_streaming.call_args.kwargs["delete_after_scan"] is False
     provenance = mock_scan_streaming.call_args.kwargs["_trusted_source_provenance"]
     assert provenance.model_id == "test/malicious-model"
     assert provenance.model_source == "huggingface"
@@ -6915,14 +6932,18 @@ def test_scan_huggingface_streaming_passes_max_size_to_download(
     assert mock_download_streaming.call_args.kwargs["timeout_seconds"] == 7
     assert mock_download_streaming.call_args.kwargs["scanner_config"]["timeout"] == 7
     assert mock_download_streaming.call_args.kwargs["scanner_config"]["max_file_size"] == 2048
+    staging_root = mock_download_streaming.call_args.kwargs["_staging_root"]
+    assert isinstance(staging_root, Path)
+    assert staging_root.name.startswith("modelaudit_hf_stream_")
+    assert not staging_root.exists()
+    assert mock_scan_streaming.call_args.kwargs["scan_root"] == str(staging_root / "huggingface")
+    assert mock_download_streaming.call_args.kwargs["cache_dir"] != staging_root
 
 
 @patch("modelaudit.cli.is_huggingface_url")
 @patch("modelaudit.utils.sources.huggingface.download_model_streaming")
 @patch("modelaudit.core.scan_model_streaming")
-@patch("shutil.rmtree")
 def test_scan_huggingface_strict_streaming_uses_ephemeral_cache_dir(
-    mock_rmtree: MagicMock,
     mock_scan_streaming: MagicMock,
     mock_download_streaming: MagicMock,
     mock_is_hf_url: MagicMock,
@@ -6947,15 +6968,16 @@ def test_scan_huggingface_strict_streaming_uses_ephemeral_cache_dir(
     cache_dir = mock_download_streaming.call_args.kwargs["cache_dir"]
     assert isinstance(cache_dir, Path)
     assert cache_dir.name.startswith("modelaudit_hf_")
-    mock_rmtree.assert_called()
+    assert not cache_dir.exists()
+    staging_root = mock_download_streaming.call_args.kwargs["_staging_root"]
+    assert isinstance(staging_root, Path)
+    assert not staging_root.exists()
 
 
 @patch("modelaudit.cli.is_huggingface_url")
 @patch("modelaudit.utils.sources.huggingface.download_model_streaming")
 @patch("modelaudit.core.scan_model_streaming")
-@patch("shutil.rmtree")
 def test_scan_huggingface_no_cache_streaming_preserves_repository_scan_root(
-    mock_rmtree: MagicMock,
     mock_scan_streaming: MagicMock,
     mock_download_streaming: MagicMock,
     mock_is_hf_url: MagicMock,
@@ -6982,14 +7004,19 @@ def test_scan_huggingface_no_cache_streaming_preserves_repository_scan_root(
     assert isinstance(cache_dir, Path)
     assert cache_dir.name.startswith("modelaudit_hf_")
 
+    staging_root = mock_download_streaming.call_args.kwargs["_staging_root"]
+    assert isinstance(staging_root, Path)
+    assert staging_root.name.startswith("modelaudit_hf_stream_")
+    assert not staging_root.exists()
+
     scan_kwargs = mock_scan_streaming.call_args.kwargs
-    assert scan_kwargs["scan_root"] == str(cache_dir / "huggingface")
-    assert scan_kwargs[REPOSITORY_SCAN_ROOT_CONFIG_KEY] == str(cache_dir / "huggingface" / "test" / "model")
+    assert scan_kwargs["scan_root"] == str(staging_root / "huggingface")
+    assert scan_kwargs[REPOSITORY_SCAN_ROOT_CONFIG_KEY] == str(staging_root / "huggingface" / "test" / "model")
     assert (
         scan_kwargs[REPOSITORY_FILE_INVENTORY_CONFIG_KEY]
         is mock_download_streaming.call_args.kwargs["repository_file_inventory"]
     )
-    mock_rmtree.assert_called()
+    assert not cache_dir.exists()
 
 
 @patch("modelaudit.cli.is_huggingface_url")

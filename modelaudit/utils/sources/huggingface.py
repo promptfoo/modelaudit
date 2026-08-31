@@ -15,7 +15,7 @@ import tempfile
 import time
 import unicodedata
 from collections.abc import Callable, Collection, Iterator
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from functools import cache
 from glob import escape as escape_glob
@@ -4585,103 +4585,11 @@ def _get_downloaded_huggingface_file_size(repo_id: str, file_path: Path, filenam
         ) from exc
 
 
-def _authorized_hf_streaming_context_parent(
-    cache_dir: Path | None,
-    download_path: Path | None,
-    file_path: Path,
-    *,
-    cache_dir_owned: bool,
-    download_created: bool = False,
-) -> tuple[Path, os.stat_result] | None:
-    """Resolve and authorize a disposable sidecar parent in one operation."""
-    if not (cache_dir_owned or download_created) or cache_dir is None or download_path is None:
-        return None
-    try:
-        resolved_cache_dir = cache_dir.resolve(strict=True)
-        resolved_download_path = download_path.resolve(strict=True)
-        resolved_file_parent = file_path.parent.resolve(strict=True)
-        if not _is_within_directory(resolved_cache_dir, resolved_download_path):
-            return None
-        if not _is_within_directory(resolved_download_path, resolved_file_parent):
-            return None
-        parent_stat = os.stat(resolved_file_parent, follow_symlinks=False)
-    except (OSError, RuntimeError):
-        return None
-    return resolved_file_parent, parent_stat
-
-
-def _should_cleanup_hf_streaming_context_file(
-    cache_dir: Path | None,
-    download_path: Path | None,
-    file_path: Path,
-    *,
-    cache_dir_owned: bool,
-    download_created: bool = False,
-) -> bool:
-    """Return whether a context-only sidecar is in ModelAudit's disposable HF staging tree."""
-    return (
-        _authorized_hf_streaming_context_parent(
-            cache_dir,
-            download_path,
-            file_path,
-            cache_dir_owned=cache_dir_owned,
-            download_created=download_created,
-        )
-        is not None
-    )
-
-
-def _hf_streaming_path_existed_before_download(path: Path) -> bool:
-    """Treat uncertain or existing entries as caller-owned."""
-    try:
-        os.lstat(path)
-    except FileNotFoundError:
-        return False
-    except OSError:
-        return True
-    return True
-
-
-def _hf_streaming_path_identity(file_stat: os.stat_result) -> tuple[int, int, int]:
-    return file_stat.st_dev, file_stat.st_ino, file_stat.st_mode
-
-
-def _hf_streaming_file_identity(file_stat: os.stat_result) -> tuple[int, int, int, int, int, int]:
-    return (*_hf_streaming_path_identity(file_stat), file_stat.st_size, file_stat.st_mtime_ns, file_stat.st_ctime_ns)
-
-
-@dataclass
-class _HfStreamingContextCleanup:
-    """Unlink one staged file only while its parent and leaf identities remain stable."""
-
-    parent_path: Path
-    parent_identity: tuple[int, int, int]
-    filename: str
-    file_identity: tuple[int, int, int, int, int, int]
-    cleaned: bool = False
-
-    def cleanup(self) -> None:
-        if self.cleaned:
-            return
-        self.cleaned = True
-        descriptor_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-        descriptor_flags |= getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-        try:
-            parent_fd = os.open(self.parent_path, descriptor_flags)
-        except OSError:
-            return
-        try:
-            opened_parent_stat = os.fstat(parent_fd)
-            if _hf_streaming_path_identity(opened_parent_stat) != self.parent_identity:
-                return
-            current_stat = os.stat(self.filename, dir_fd=parent_fd, follow_symlinks=False)
-            if _hf_streaming_file_identity(current_stat) == self.file_identity:
-                os.unlink(self.filename, dir_fd=parent_fd)
-        except OSError:
-            pass
-        finally:
-            with suppress(OSError):
-                os.close(parent_fd)
+@contextmanager
+def _temporary_hf_streaming_staging_root() -> Iterator[Path]:
+    """Yield one invocation-owned download root outside caller-controlled caches."""
+    with tempfile.TemporaryDirectory(prefix="modelaudit_hf_stream_") as temporary_directory:
+        yield Path(temporary_directory).resolve(strict=True)
 
 
 def _normalize_windows_hf_download_path_for_comparison(path: str) -> str:
@@ -4697,69 +4605,10 @@ def _normalize_windows_hf_download_path_for_comparison(path: str) -> str:
 
 
 def _hf_download_path_for_comparison(path: Path) -> str:
-    """Return a lexical path key without rejecting equivalent Windows spellings."""
+    """Return a lexical path key without following cache or staging symlinks."""
     if os.name == "nt":
         return _normalize_windows_hf_download_path_for_comparison(str(path))
     return os.path.normcase(os.path.abspath(path))
-
-
-def _open_hf_streaming_context_cleanup(
-    cache_dir: Path | None,
-    download_path: Path | None,
-    file_path: Path,
-    filename: str,
-    *,
-    cache_dir_owned: bool,
-    download_created: bool = False,
-) -> _HfStreamingContextCleanup | None:
-    if download_path is None:
-        return None
-    intended_path = Path(os.path.abspath(download_path.joinpath(*PurePosixPath(filename).parts)))
-    actual_path = Path(os.path.abspath(file_path))
-    if _hf_download_path_for_comparison(actual_path) != _hf_download_path_for_comparison(intended_path):
-        raise ValueError(f"Downloaded ONNX external_data file {filename} returned an unexpected local path")
-    if (
-        os.stat not in os.supports_dir_fd
-        or os.unlink not in os.supports_dir_fd
-        or os.stat not in os.supports_follow_symlinks
-    ):
-        return None
-
-    authorized_parent = _authorized_hf_streaming_context_parent(
-        cache_dir,
-        download_path,
-        actual_path,
-        cache_dir_owned=cache_dir_owned,
-        download_created=download_created,
-    )
-    if authorized_parent is None:
-        return None
-    resolved_parent, expected_parent_stat = authorized_parent
-
-    try:
-        descriptor_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-        descriptor_flags |= getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-        parent_fd = os.open(resolved_parent, descriptor_flags)
-    except (OSError, RuntimeError):
-        return None
-
-    try:
-        opened_parent_stat = os.fstat(parent_fd)
-        if _hf_streaming_path_identity(opened_parent_stat) != _hf_streaming_path_identity(expected_parent_stat):
-            return None
-        file_stat = os.stat(actual_path.name, dir_fd=parent_fd, follow_symlinks=False)
-        cleanup = _HfStreamingContextCleanup(
-            parent_path=resolved_parent,
-            parent_identity=_hf_streaming_path_identity(opened_parent_stat),
-            filename=actual_path.name,
-            file_identity=_hf_streaming_file_identity(file_stat),
-        )
-    except OSError:
-        return None
-    finally:
-        with suppress(OSError):
-            os.close(parent_fd)
-    return cleanup
 
 
 def _huggingface_metadata_size(item: Any) -> int | None:
@@ -5515,7 +5364,7 @@ def download_model_streaming(
     include_all_files: bool = False,
     repository_file_inventory: list[str] | None = None,
     scanner_config: dict[str, Any] | None = None,
-    _cache_dir_owned: bool = False,
+    _staging_root: Path | None = None,
     _include_scan_results: Literal[False] = False,
 ) -> Iterator[tuple[Path, bool]]:
     pass
@@ -5535,7 +5384,7 @@ def download_model_streaming(
     include_all_files: bool = False,
     repository_file_inventory: list[str] | None = None,
     scanner_config: dict[str, Any] | None = None,
-    _cache_dir_owned: bool = False,
+    _staging_root: Path | None = None,
     _include_scan_results: Literal[True],
 ) -> Iterator[tuple[Path, bool] | tuple[Path, bool, Any] | tuple[Path, bool, Any | None, StreamedSourceByteAccounting]]:
     pass
@@ -5554,7 +5403,7 @@ def download_model_streaming(
     include_all_files: bool = False,
     repository_file_inventory: list[str] | None = None,
     scanner_config: dict[str, Any] | None = None,
-    _cache_dir_owned: bool = False,
+    _staging_root: Path | None = None,
     _include_scan_results: bool = False,
 ) -> Iterator[tuple[Path, bool] | tuple[Path, bool, Any] | tuple[Path, bool, Any | None, StreamedSourceByteAccounting]]:
     """Download a model from HuggingFace one file at a time (streaming mode).
@@ -5574,7 +5423,7 @@ def download_model_streaming(
         include_all_files: Include otherwise-unrecognized files under a bounded fail-closed limit
         repository_file_inventory: Optional list filled with repository member names from metadata
         scanner_config: Optional scanner configuration to preserve in remote native scans
-        _cache_dir_owned: Whether the caller created this invocation's disposable cache root
+        _staging_root: Internal invocation-owned root for ephemeral local download placement
         _include_scan_results: Internal opt-in for precomputed trusted source-native scan results
 
     Yields:
@@ -5782,10 +5631,15 @@ def download_model_streaming(
             str(scanner_id).lower() for scanner_id in scannable_scanner_ids
         }
 
-        # Setup cache directory
+        # Persistent caches are only passed to Hugging Face's cache layer. A
+        # trusted dispatcher can place local scan artifacts in its own staging
+        # root so ModelAudit never needs to unlink a caller-owned cache path.
         download_path = None
-        if cache_dir is not None:
-            download_path = _build_huggingface_download_path(cache_dir, namespace, repo_name)
+        local_download_root = _staging_root if _staging_root is not None else cache_dir
+        if local_download_root is not None:
+            if _staging_root is not None:
+                local_download_root = local_download_root.resolve(strict=True)
+            download_path = _build_huggingface_download_path(local_download_root, namespace, repo_name)
             download_path.mkdir(parents=True, exist_ok=True)
 
         openvino_companion_by_xml = (
@@ -5806,8 +5660,6 @@ def download_model_streaming(
         prefetched_selected_paths: dict[str, Path] = {}
         downloaded_selected_paths: dict[str, Path] = {}
         downloaded_context_paths: dict[str, Path] = {}
-        context_cleanup_handles: list[_HfStreamingContextCleanup] = []
-        downloaded_paths_created_by_invocation: set[str] = set()
         acquired_index_temp_dirs: list[tempfile.TemporaryDirectory[str]] = []
         accounted_selected_filenames = acquired_index_bytes.keys() & selected_file_set
         consumed_filenames: set[str] = set()
@@ -5848,16 +5700,11 @@ def download_model_streaming(
         def emit_file(
             filename: str,
             path: Path,
-            cleanup_handles: list[_HfStreamingContextCleanup],
             is_last: bool,
         ) -> Iterator[
             tuple[Path, bool] | tuple[Path, bool, Any] | tuple[Path, bool, Any | None, StreamedSourceByteAccounting]
         ]:
-            try:
-                yield make_streamed_item(filename, path, is_last)
-            finally:
-                for cleanup_handle in cleanup_handles:
-                    cleanup_handle.cleanup()
+            yield make_streamed_item(filename, path, is_last)
 
         def has_future_yield(current_index: int) -> bool:
             for future_filename in model_files[current_index + 1 :]:
@@ -5901,18 +5748,14 @@ def download_model_streaming(
             return scan_result
 
         def download_stream_file(filename: str) -> Path:
-            intended_path = None
-            intended_path_preexisted = True
             download_kwargs: dict[str, Any] = {
                 "repo_id": repo_id,
                 "filename": filename,
                 "revision": download_revision,
             }
-            if cache_dir is not None and download_path is not None:
-                # Use specific cache dir for local placement
-                intended_path = Path(os.path.abspath(download_path.joinpath(*PurePosixPath(filename).parts)))
-                intended_path_preexisted = _hf_streaming_path_existed_before_download(intended_path)
-                download_kwargs["cache_dir"] = str(cache_dir / "huggingface")
+            if download_path is not None:
+                if cache_dir is not None:
+                    download_kwargs["cache_dir"] = str(cache_dir / "huggingface")
                 download_kwargs["local_dir"] = str(download_path)
                 local_path = _run_huggingface_download_with_deadline(
                     "hf_hub_download",
@@ -5931,12 +5774,10 @@ def download_model_streaming(
                     direct_download=hf_hub_download,
                 )
             downloaded_path = Path(local_path)
-            if (
-                intended_path is not None
-                and not intended_path_preexisted
-                and _hf_download_path_for_comparison(downloaded_path) == _hf_download_path_for_comparison(intended_path)
-            ):
-                downloaded_paths_created_by_invocation.add(filename)
+            if download_path is not None:
+                intended_path = Path(os.path.abspath(download_path.joinpath(*PurePosixPath(filename).parts)))
+                if _hf_download_path_for_comparison(downloaded_path) != _hf_download_path_for_comparison(intended_path):
+                    raise ValueError(f"Downloaded Hugging Face file {filename} returned an unexpected local path")
             return downloaded_path
 
         def materialize_acquired_index(filename: str) -> Path | None:
@@ -6000,14 +5841,13 @@ def download_model_streaming(
             downloaded_selected_paths[filename] = downloaded_file
             return downloaded_file
 
-        def prepare_stream_yield(filename: str) -> tuple[Path, list[_HfStreamingContextCleanup]]:
+        def prepare_stream_yield(filename: str) -> Path:
             nonlocal downloaded_total_size
             downloaded_file = download_selected_file(filename)
 
             if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError(f"Hugging Face acquisition timed out for {repo_id}")
 
-            onnx_external_data_cleanup_handles: list[_HfStreamingContextCleanup] = []
             content_route_format = selection.content_route_formats.get(filename)
             if (
                 onnx_external_data_enabled
@@ -6070,17 +5910,6 @@ def download_model_streaming(
                                     prefetched_selected_paths[external_filename] = external_path
                             if downloaded_selected_path is not None:
                                 downloaded_selected_paths[external_filename] = external_path
-                                cleanup_handle = _open_hf_streaming_context_cleanup(
-                                    cache_dir,
-                                    download_path,
-                                    external_path,
-                                    external_filename,
-                                    cache_dir_owned=_cache_dir_owned,
-                                    download_created=external_filename in downloaded_paths_created_by_invocation,
-                                )
-                                if cleanup_handle is not None:
-                                    context_cleanup_handles.append(cleanup_handle)
-                                    onnx_external_data_cleanup_handles.append(cleanup_handle)
                                 continue
                             if size_limit is not None and external_filename not in accounted_selected_filenames:
                                 external_file_size = _get_downloaded_huggingface_file_size(
@@ -6111,16 +5940,6 @@ def download_model_streaming(
                                     f"{size_limit} bytes"
                                 )
                         external_path = download_stream_file(external_filename)
-                        cleanup_handle = _open_hf_streaming_context_cleanup(
-                            cache_dir,
-                            download_path,
-                            external_path,
-                            external_filename,
-                            cache_dir_owned=_cache_dir_owned,
-                            download_created=external_filename in downloaded_paths_created_by_invocation,
-                        )
-                        if cleanup_handle is not None:
-                            context_cleanup_handles.append(cleanup_handle)
                         if size_limit is not None:
                             external_file_size = _get_downloaded_huggingface_file_size(
                                 repo_id,
@@ -6137,7 +5956,7 @@ def download_model_streaming(
                             downloaded_total_size = projected_total
                         downloaded_context_paths[external_filename] = external_path
 
-            return downloaded_file, onnx_external_data_cleanup_handles
+            return downloaded_file
 
         try:
             for failure_index, (index_filename, failure_result) in enumerate(retained_index_failure_results):
@@ -6196,7 +6015,7 @@ def download_model_streaming(
                     # before suppressing standalone analysis of the same-stem .bin.
                     continue
 
-                downloaded_file, cleanup_paths = prepare_stream_yield(filename)
+                downloaded_file = prepare_stream_yield(filename)
                 companion = openvino_companion_by_xml.get(filename)
                 if companion is not None:
                     from modelaudit.scanners.openvino_scanner import OpenVinoScanner
@@ -6205,23 +6024,20 @@ def download_model_streaming(
                         download_selected_file(companion)
                         consumed_filenames.add(companion)
                     else:
-                        companion_path, companion_cleanup_paths = prepare_stream_yield(companion)
+                        companion_path = prepare_stream_yield(companion)
                         consumed_filenames.add(companion)
-                        yield from emit_file(filename, downloaded_file, cleanup_paths, False)
+                        yield from emit_file(filename, downloaded_file, False)
                         yield from emit_file(
                             companion,
                             companion_path,
-                            companion_cleanup_paths,
                             not has_future_yield(idx),
                         )
                         continue
 
-                yield from emit_file(filename, downloaded_file, cleanup_paths, not has_future_yield(idx))
+                yield from emit_file(filename, downloaded_file, not has_future_yield(idx))
             if pending_pretransferred_bytes:
                 raise ValueError("Remote pretransfer bytes were not attached to a streamed item")
         finally:
-            for cleanup_handle in context_cleanup_handles:
-                cleanup_handle.cleanup()
             for temp_dir in acquired_index_temp_dirs:
                 with suppress(OSError):
                     temp_dir.cleanup()
