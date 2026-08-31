@@ -10,9 +10,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Security
 
 - Upgrade Debian util-linux packages in all Docker runtime images to remediate CVE-2026-53615.
+- Preserve model-card network alerts when documented image examples contain code outside the reviewed generated forms.
 
 ### Bug Fixes
 
+- Upgrade XGBoost to 3.4 on Python 3.12+ while retaining XGBoost 3.2 on Python 3.10 and 3.11.
+- Restore SQL-backed MLflow model registries and upgrade their vulnerable SQL parser.
+- Remove `tensor_name_count` as a retention budget dimension for remote SafeTensors streaming; the `result_bytes` cap already bounds aggregate serialized size, so large multi-shard models (e.g. 141 shards) no longer fail closed prematurely.
 - Avoid false-positive `urllib` network findings for model cards whose only `urlopen` use is the documented `Image.open(urlopen(...))` sample-image example.
 - Upgrade vulnerable locked dependencies, use the hardened MLflow tracking client, and audit all installed CI extras.
 - Avoid network false positives for bounded README examples that download sample images over HTTPS from Hugging Face.
@@ -24,6 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Place cross-volume Windows cache identity probes near the volume root instead of the nearest ancestor of the scanned path, so a probe can no longer appear inside a directory tree that a concurrent scan is walking.
 - Keep published scan-result cache entries readable when concurrent or interrupted hits update access metadata.
 - Preserve macOS scan-result cache entries during unrelated temporary-file churn while rejecting replaced source files and directories.
+- Keep macOS scan-result caching enabled when hashing updates a model file's access time.
 
 ## [0.2.52](https://github.com/promptfoo/modelaudit/compare/v0.2.51...v0.2.52) (2026-07-22)
 

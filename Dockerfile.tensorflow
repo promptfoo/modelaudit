@@ -1,4 +1,4 @@
-ARG PYTHON_IMAGE=python:3.12-slim@sha256:2c941e860699f878900b0edc2403613c234d4b32eda3cc9fa7036991a2a63c4a
+ARG PYTHON_IMAGE=python:3.12-slim@sha256:09f7da3bc104798d0afb40bc08d23ab2da20a76130cec1f2ef170848f5d85217
 # Keep the major/minor version in sync with packages/modelaudit-picklescan/Cargo.toml rust-version.
 ARG PICKLESCAN_RUST_TOOLCHAIN=1.83.0
 ARG RUSTUP_VERSION=1.29.0
@@ -14,7 +14,10 @@ ARG TARGETARCH
 
 WORKDIR /build
 
+COPY pyproject.toml README.md ./
+COPY requirements-tensorflow.txt ./
 COPY packages/modelaudit-picklescan ./packages/modelaudit-picklescan
+COPY modelaudit ./modelaudit
 
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends build-essential ca-certificates curl \
@@ -32,7 +35,10 @@ RUN apt-get update \
     && /tmp/rustup-init -y --profile minimal --default-toolchain "${PICKLESCAN_RUST_TOOLCHAIN}" \
     && rm -f /tmp/rustup-init /tmp/rustup-init.sha256 \
     && PATH="/root/.cargo/bin:${PATH}" pip wheel --no-cache-dir --no-deps --wheel-dir /wheels \
-        ./packages/modelaudit-picklescan
+        ./packages/modelaudit-picklescan \
+    && pip install --no-cache-dir --prefix=/install -c requirements-tensorflow.txt \
+        /wheels/modelaudit_picklescan-*.whl \
+        ".[tensorflow]"
 
 FROM ${PYTHON_IMAGE} AS runtime
 
@@ -46,17 +52,7 @@ RUN apt-get update \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy only necessary files for installation
-COPY pyproject.toml README.md ./
-COPY requirements-tensorflow.txt ./
-COPY modelaudit ./modelaudit
-COPY --from=builder /wheels /wheels
-
-# Install the coordinated local picklescan wheel with TensorFlow extras.
-RUN pip install --no-cache-dir -c requirements-tensorflow.txt \
-        /wheels/modelaudit_picklescan-*.whl \
-        ".[tensorflow]" \
-    && rm -rf /wheels
+COPY --from=builder /install /usr/local
 
 # Create a non-root user
 ARG UID=10001

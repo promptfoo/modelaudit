@@ -318,13 +318,28 @@ def test_dockerfiles_fallback_to_native_architecture_without_buildkit(dockerfile
     assert '*) echo "Unsupported Docker build architecture: ${TARGETARCH}" >&2; exit 1 ;;' in content
 
 
+@pytest.mark.parametrize("dockerfile", ("Dockerfile", "Dockerfile.full", "Dockerfile.tensorflow"))
+def test_dockerfiles_copy_installed_runtime_without_buildkit(dockerfile: str) -> None:
+    content = (_REPO_ROOT / dockerfile).read_text(encoding="utf-8")
+    wheel_build = content.index("pip wheel")
+    staged_install = content.index("pip install --no-cache-dir --prefix=/install")
+    runtime_stage = content.index("FROM ${PYTHON_IMAGE} AS runtime")
+    installed_copy = content.index("COPY --from=builder /install /usr/local")
+
+    assert wheel_build < staged_install < runtime_stage < installed_copy
+    assert "RUN --mount=" not in content
+    assert "COPY --from=builder /wheels /wheels" not in content
+    assert "rm -rf /wheels" not in content
+
+
 def test_tensorflow_dockerfile_builds_coordinated_picklescan_wheel() -> None:
     content = (_REPO_ROOT / "Dockerfile.tensorflow").read_text(encoding="utf-8")
 
     assert "COPY packages/modelaudit-picklescan ./packages/modelaudit-picklescan" in content
     assert "pip wheel --no-cache-dir --no-deps --wheel-dir /wheels" in content
     assert "./packages/modelaudit-picklescan" in content
-    assert "COPY --from=builder /wheels /wheels" in content
+    assert "pip install --no-cache-dir --prefix=/install -c requirements-tensorflow.txt" in content
+    assert "COPY --from=builder /install /usr/local" in content
     assert "/wheels/modelaudit_picklescan-*.whl" in content
     assert content.index("/wheels/modelaudit_picklescan-*.whl") < content.index('".[tensorflow]"')
 

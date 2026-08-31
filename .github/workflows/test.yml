@@ -433,11 +433,11 @@ jobs:
   test:
     name: Fast Tests (Python ${{ matrix.python-version }}, Shard ${{ matrix.shard-name }})
     needs: changes
-    # Integration events fail closed instead of relying on changed-path data.
-    if: needs.changes.outputs.integration == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.workflows == 'true'
+    # Integration events fail closed; Docker changes run the committed Docker contract tests.
+    if: needs.changes.outputs.integration == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.docker == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ubuntu-latest
     # Coverage runs in dedicated shards below, and the Python 3.12
-    # slow/integration/performance suite now runs in a separate parallel job.
+    # slow/integration suite now runs in a separate parallel job.
     timeout-minutes: 75
     strategy:
       fail-fast: false
@@ -535,9 +535,9 @@ jobs:
         run: |
           uv sync --extra all-ci
 
-      - name: Run slow, integration, and performance tests
+      - name: Run slow and integration tests
         run: |
-          uv run pytest tests -n auto -m "slow or integration or performance" --tb=short --durations=20
+          uv run pytest tests -n auto -m "(slow or integration) and not performance" --tb=short --durations=20
 
   coverage:
     name: Coverage (${{ matrix.shard }})
@@ -1135,6 +1135,7 @@ jobs:
           # Check if conditional jobs should have run
           INTEGRATION_EVENT="${{ needs.changes.outputs.integration }}"
           EXPECT_CORE_FAST="${{ needs.changes.outputs.integration == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.workflows == 'true' }}"
+          EXPECT_TEST="${{ needs.changes.outputs.integration == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.docker == 'true' || needs.changes.outputs.workflows == 'true' }}"
           EXPECT_SLOW="${{ needs.changes.outputs.integration == 'true' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'run-slow-tests')) }}"
           EXPECT_DEPENDENCY_AUDIT="${{ github.event_name == 'merge_group' || (github.event_name == 'pull_request' && (needs.changes.outputs.dependencies == 'true' || needs.changes.outputs.workflows == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.picklescan == 'true')) }}"
           EXPECT_DEPENDENCY_SURFACE="${{ needs.changes.outputs.integration == 'true' || needs.changes.outputs.dependencies == 'true' || needs.changes.outputs.workflows == 'true' }}"
@@ -1163,6 +1164,7 @@ jobs:
           echo "Expected job groups:"
           echo "  integration-event: $INTEGRATION_EVENT"
           echo "  core-fast: $EXPECT_CORE_FAST"
+          echo "  test: $EXPECT_TEST"
           echo "  slow-tests: $EXPECT_SLOW"
           echo "  dependency-audit: $EXPECT_DEPENDENCY_AUDIT"
           echo "  dependency-surface: $EXPECT_DEPENDENCY_SURFACE"
@@ -1181,7 +1183,7 @@ jobs:
           require_success "$EXPECT_DEPENDENCY_SURFACE" "$UV_LOCK_RESULT" "uv-lock-check"
           require_success "$EXPECT_CORE_FAST" "$TYPE_CHECK_RESULT" "type-check"
           require_success "$EXPECT_CORE_FAST" "$WINDOWS_RESULT" "windows-tests"
-          require_success "$EXPECT_CORE_FAST" "$TEST_RESULT" "test"
+          require_success "$EXPECT_TEST" "$TEST_RESULT" "test"
           require_success "$EXPECT_SLOW" "$SLOW_RESULT" "slow-tests"
           require_success "$EXPECT_COVERAGE" "$COVERAGE_RESULT" "coverage"
           require_success "$EXPECT_OPTIONAL_DEPENDENCY_LANES" "$NUMPY_RESULT" "test-numpy-compatibility"
