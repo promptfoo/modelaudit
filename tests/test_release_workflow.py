@@ -5,7 +5,6 @@ import hashlib
 import io
 import json
 import os
-import re
 import subprocess
 import sys
 import tarfile
@@ -26,6 +25,18 @@ try:
     import tomllib
 except ModuleNotFoundError:  # pragma: no cover - Python 3.10 compatibility
     import tomli as tomllib  # type: ignore[no-redef]
+
+
+_TRUSTED_CHECKOUT_V6_PINS = frozenset(
+    {
+        "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd",
+        "actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803",
+    },
+)
+
+
+def _is_trusted_checkout_v6_pin(uses: object) -> bool:
+    return isinstance(uses, str) and uses in _TRUSTED_CHECKOUT_V6_PINS
 
 
 def _load_release_workflow() -> dict[str, Any]:
@@ -753,6 +764,33 @@ def test_release_workflow_generates_root_provenance_after_successful_publish() -
     assert job["needs"] == ["build", "publish-pypi", "verify-pypi", "release-please"]
 
 
+@pytest.mark.parametrize(
+    ("uses", "expected"),
+    [
+        pytest.param(
+            "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd",
+            True,
+            id="previous-v6-digest",
+        ),
+        pytest.param(
+            "actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803",
+            True,
+            id="rotated-v6-digest",
+        ),
+        pytest.param("actions/checkout@0000000000000000000000000000000000000000", False, id="arbitrary-digest"),
+        pytest.param("actions/checkout@v6", False, id="mutable-tag"),
+        pytest.param(
+            "untrusted/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd",
+            False,
+            id="different-action",
+        ),
+        pytest.param(None, False, id="non-string"),
+    ],
+)
+def test_checkout_v6_pin_validator(uses: object, expected: bool) -> None:
+    assert _is_trusted_checkout_v6_pin(uses) is expected
+
+
 def test_release_workflow_recovers_root_provenance_without_republishing() -> None:
     workflow = _load_release_workflow()
 
@@ -777,7 +815,7 @@ def test_release_workflow_recovers_root_provenance_without_republishing() -> Non
 
     steps = _job_steps(workflow, "root-provenance-recovery")
     checkout_step = _step_by_name(steps, "Checkout tagged root release")
-    assert re.fullmatch(r"actions/checkout@[0-9a-f]{40}", checkout_step["uses"])
+    assert _is_trusted_checkout_v6_pin(checkout_step["uses"])
     assert checkout_step["with"] == {
         "ref": "refs/tags/${{ needs.release-please.outputs.tag_name }}",
         "sparse-checkout": "pyproject.toml\nuv.lock\n",
