@@ -153,10 +153,14 @@ def test_hf_acquisition_interrupt_check_honors_global_cancel_and_deadline(
     assert interrupt_checks == 1
 
 
-@pytest.mark.parametrize(("cache_dir_owned", "expected"), [(False, False), (True, True)])
-def test_hf_streaming_context_cleanup_requires_explicit_owned_cache(
+@pytest.mark.parametrize(
+    ("cache_dir_owned", "download_created", "expected"),
+    [(False, False, False), (True, False, True), (False, True, True)],
+)
+def test_hf_streaming_context_cleanup_requires_owned_cache_or_new_download(
     tmp_path: Path,
     cache_dir_owned: bool,
+    download_created: bool,
     expected: bool,
 ) -> None:
     cache_dir = tmp_path / "caller_selected_cache"
@@ -171,6 +175,7 @@ def test_hf_streaming_context_cleanup_requires_explicit_owned_cache(
             download_path,
             file_path,
             cache_dir_owned=cache_dir_owned,
+            download_created=download_created,
         )
         is expected
     )
@@ -303,6 +308,89 @@ def test_hf_streaming_context_cleanup_rejects_parent_swap_during_authorization(
     assert cleanup is None
     assert outside_sidecar.read_bytes() == b"outside"
     assert (staged_parent / sidecar_name).read_bytes() == b"owned"
+
+
+@pytest.mark.skipif(
+    os.stat not in os.supports_dir_fd
+    or os.unlink not in os.supports_dir_fd
+    or os.stat not in os.supports_follow_symlinks,
+    reason="descriptor-relative cleanup is unavailable",
+)
+def test_hf_streaming_context_cleanup_preserves_replaced_leaf(tmp_path: Path) -> None:
+    """Cleanup must not unlink a caller replacement at the same path."""
+    from modelaudit.utils.sources import huggingface as huggingface_module
+
+    cache_dir = tmp_path / "persistent_cache"
+    download_path = cache_dir / "huggingface" / "test" / "model"
+    file_path = download_path / "model.onnx_data"
+    file_path.parent.mkdir(parents=True)
+    file_path.write_bytes(b"downloaded")
+    cleanup = huggingface_module._open_hf_streaming_context_cleanup(
+        cache_dir,
+        download_path,
+        file_path,
+        file_path.name,
+        cache_dir_owned=False,
+        download_created=True,
+    )
+    assert cleanup is not None
+
+    original_path = file_path.with_name("model.onnx_data.original")
+    file_path.rename(original_path)
+    file_path.write_bytes(b"caller replacement")
+    cleanup.cleanup()
+
+    assert file_path.read_bytes() == b"caller replacement"
+    assert original_path.read_bytes() == b"downloaded"
+
+
+def test_hf_streaming_path_preexistence_fails_closed_on_stat_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from modelaudit.utils.sources import huggingface as huggingface_module
+
+    missing_path = tmp_path / "missing.onnx_data"
+    assert not huggingface_module._hf_streaming_path_existed_before_download(missing_path)
+    missing_path.write_bytes(b"caller-owned")
+    assert huggingface_module._hf_streaming_path_existed_before_download(missing_path)
+
+    def fail_to_stat(_path: Path) -> os.stat_result:
+        raise PermissionError("stat denied")
+
+    monkeypatch.setattr(huggingface_module.os, "lstat", fail_to_stat)
+    assert huggingface_module._hf_streaming_path_existed_before_download(tmp_path / "unknown")
+
+
+@pytest.mark.skipif(
+    os.stat not in os.supports_dir_fd
+    or os.unlink not in os.supports_dir_fd
+    or os.stat not in os.supports_follow_symlinks,
+    reason="descriptor-relative cleanup is unavailable",
+)
+def test_hf_streaming_context_cleanup_preserves_in_place_modification(tmp_path: Path) -> None:
+    """Cleanup must preserve a file modified by its caller after download."""
+    from modelaudit.utils.sources import huggingface as huggingface_module
+
+    cache_dir = tmp_path / "persistent_cache"
+    download_path = cache_dir / "huggingface" / "test" / "model"
+    file_path = download_path / "model.onnx_data"
+    file_path.parent.mkdir(parents=True)
+    file_path.write_bytes(b"downloaded")
+    cleanup = huggingface_module._open_hf_streaming_context_cleanup(
+        cache_dir,
+        download_path,
+        file_path,
+        file_path.name,
+        cache_dir_owned=False,
+        download_created=True,
+    )
+    assert cleanup is not None
+
+    file_path.write_bytes(b"caller replacement with a different size")
+    cleanup.cleanup()
+
+    assert file_path.read_bytes() == b"caller replacement with a different size"
 
 
 @pytest.mark.skipif(
@@ -4513,7 +4601,7 @@ class TestModelDownloadStreaming:
     )
     @patch("huggingface_hub.HfApi.get_paths_info")
     @patch("huggingface_hub.hf_hub_download")
-    def test_download_model_streaming_named_persistent_cache_preserves_onnx_sidecar(
+    def test_download_model_streaming_persistent_cache_tracks_onnx_sidecar_ownership(
         self,
         mock_hf_hub_download: MagicMock,
         mock_get_paths_info: MagicMock,
@@ -4570,7 +4658,12 @@ class TestModelDownloadStreaming:
         else:
             with pytest.raises(StopIteration):
                 next(generator)
-        assert sidecar_path.read_bytes() == sidecar_bytes
+        cleanup_supported = (
+            os.stat in os.supports_dir_fd and os.unlink in os.supports_dir_fd and os.stat in os.supports_follow_symlinks
+        )
+        assert sidecar_path.exists() is (sidecar_preexisted or not cleanup_supported)
+        if sidecar_path.exists():
+            assert sidecar_path.read_bytes() == sidecar_bytes
 
     @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None)
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".onnx"})
@@ -4637,7 +4730,7 @@ class TestModelDownloadStreaming:
     )
     @patch("huggingface_hub.HfApi.get_paths_info")
     @patch("huggingface_hub.hf_hub_download")
-    def test_download_model_streaming_cleans_owned_context_sidecar_after_size_failure(
+    def test_download_model_streaming_cleans_new_persistent_context_sidecar_after_size_failure(
         self,
         mock_hf_hub_download: MagicMock,
         mock_get_paths_info: MagicMock,
@@ -4648,7 +4741,7 @@ class TestModelDownloadStreaming:
     ) -> None:
         payload = _make_external_onnx_payload(tmp_path)
         oversized_sidecar = b"x" * 20
-        cache_dir = tmp_path / "modelaudit_hf_owned"
+        cache_dir = tmp_path / "modelaudit_hf_persistent"
         sidecar_path = cache_dir / "huggingface" / "test" / "model" / "onnx" / "model.onnx_data"
 
         def download_side_effect(*, filename: str, local_dir: str | None = None, **_kwargs: object) -> str:
@@ -4670,7 +4763,6 @@ class TestModelDownloadStreaming:
             max_size=len(payload) + 1,
             scannable_extensions={".onnx"},
             scannable_scanner_ids={"onnx"},
-            _cache_dir_owned=True,
         )
 
         with pytest.raises(Exception, match="exceeding max size"):

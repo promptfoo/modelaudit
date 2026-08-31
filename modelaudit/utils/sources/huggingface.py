@@ -4591,9 +4591,10 @@ def _authorized_hf_streaming_context_parent(
     file_path: Path,
     *,
     cache_dir_owned: bool,
+    download_created: bool = False,
 ) -> tuple[Path, os.stat_result] | None:
     """Resolve and authorize a disposable sidecar parent in one operation."""
-    if not cache_dir_owned or cache_dir is None or download_path is None:
+    if not (cache_dir_owned or download_created) or cache_dir is None or download_path is None:
         return None
     try:
         resolved_cache_dir = cache_dir.resolve(strict=True)
@@ -4615,6 +4616,7 @@ def _should_cleanup_hf_streaming_context_file(
     file_path: Path,
     *,
     cache_dir_owned: bool,
+    download_created: bool = False,
 ) -> bool:
     """Return whether a context-only sidecar is in ModelAudit's disposable HF staging tree."""
     return (
@@ -4623,13 +4625,29 @@ def _should_cleanup_hf_streaming_context_file(
             download_path,
             file_path,
             cache_dir_owned=cache_dir_owned,
+            download_created=download_created,
         )
         is not None
     )
 
 
-def _hf_streaming_file_identity(file_stat: os.stat_result) -> tuple[int, int, int]:
+def _hf_streaming_path_existed_before_download(path: Path) -> bool:
+    """Treat uncertain or existing entries as caller-owned."""
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def _hf_streaming_path_identity(file_stat: os.stat_result) -> tuple[int, int, int]:
     return file_stat.st_dev, file_stat.st_ino, file_stat.st_mode
+
+
+def _hf_streaming_file_identity(file_stat: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    return (*_hf_streaming_path_identity(file_stat), file_stat.st_size, file_stat.st_mtime_ns, file_stat.st_ctime_ns)
 
 
 @dataclass
@@ -4639,7 +4657,7 @@ class _HfStreamingContextCleanup:
     parent_path: Path
     parent_identity: tuple[int, int, int]
     filename: str
-    file_identity: tuple[int, int, int]
+    file_identity: tuple[int, int, int, int, int, int]
     cleaned: bool = False
 
     def cleanup(self) -> None:
@@ -4654,7 +4672,7 @@ class _HfStreamingContextCleanup:
             return
         try:
             opened_parent_stat = os.fstat(parent_fd)
-            if _hf_streaming_file_identity(opened_parent_stat) != self.parent_identity:
+            if _hf_streaming_path_identity(opened_parent_stat) != self.parent_identity:
                 return
             current_stat = os.stat(self.filename, dir_fd=parent_fd, follow_symlinks=False)
             if _hf_streaming_file_identity(current_stat) == self.file_identity:
@@ -4692,6 +4710,7 @@ def _open_hf_streaming_context_cleanup(
     filename: str,
     *,
     cache_dir_owned: bool,
+    download_created: bool = False,
 ) -> _HfStreamingContextCleanup | None:
     if download_path is None:
         return None
@@ -4711,6 +4730,7 @@ def _open_hf_streaming_context_cleanup(
         download_path,
         actual_path,
         cache_dir_owned=cache_dir_owned,
+        download_created=download_created,
     )
     if authorized_parent is None:
         return None
@@ -4725,12 +4745,12 @@ def _open_hf_streaming_context_cleanup(
 
     try:
         opened_parent_stat = os.fstat(parent_fd)
-        if _hf_streaming_file_identity(opened_parent_stat) != _hf_streaming_file_identity(expected_parent_stat):
+        if _hf_streaming_path_identity(opened_parent_stat) != _hf_streaming_path_identity(expected_parent_stat):
             return None
         file_stat = os.stat(actual_path.name, dir_fd=parent_fd, follow_symlinks=False)
         cleanup = _HfStreamingContextCleanup(
             parent_path=resolved_parent,
-            parent_identity=_hf_streaming_file_identity(opened_parent_stat),
+            parent_identity=_hf_streaming_path_identity(opened_parent_stat),
             filename=actual_path.name,
             file_identity=_hf_streaming_file_identity(file_stat),
         )
@@ -5787,6 +5807,7 @@ def download_model_streaming(
         downloaded_selected_paths: dict[str, Path] = {}
         downloaded_context_paths: dict[str, Path] = {}
         context_cleanup_handles: list[_HfStreamingContextCleanup] = []
+        downloaded_paths_created_by_invocation: set[str] = set()
         acquired_index_temp_dirs: list[tempfile.TemporaryDirectory[str]] = []
         accounted_selected_filenames = acquired_index_bytes.keys() & selected_file_set
         consumed_filenames: set[str] = set()
@@ -5880,6 +5901,8 @@ def download_model_streaming(
             return scan_result
 
         def download_stream_file(filename: str) -> Path:
+            intended_path = None
+            intended_path_preexisted = True
             download_kwargs: dict[str, Any] = {
                 "repo_id": repo_id,
                 "filename": filename,
@@ -5887,6 +5910,8 @@ def download_model_streaming(
             }
             if cache_dir is not None and download_path is not None:
                 # Use specific cache dir for local placement
+                intended_path = Path(os.path.abspath(download_path.joinpath(*PurePosixPath(filename).parts)))
+                intended_path_preexisted = _hf_streaming_path_existed_before_download(intended_path)
                 download_kwargs["cache_dir"] = str(cache_dir / "huggingface")
                 download_kwargs["local_dir"] = str(download_path)
                 local_path = _run_huggingface_download_with_deadline(
@@ -5905,7 +5930,14 @@ def download_model_streaming(
                     repo_id,
                     direct_download=hf_hub_download,
                 )
-            return Path(local_path)
+            downloaded_path = Path(local_path)
+            if (
+                intended_path is not None
+                and not intended_path_preexisted
+                and _hf_download_path_for_comparison(downloaded_path) == _hf_download_path_for_comparison(intended_path)
+            ):
+                downloaded_paths_created_by_invocation.add(filename)
+            return downloaded_path
 
         def materialize_acquired_index(filename: str) -> Path | None:
             payload = acquired_index_bytes.get(filename)
@@ -6044,6 +6076,7 @@ def download_model_streaming(
                                     external_path,
                                     external_filename,
                                     cache_dir_owned=_cache_dir_owned,
+                                    download_created=external_filename in downloaded_paths_created_by_invocation,
                                 )
                                 if cleanup_handle is not None:
                                     context_cleanup_handles.append(cleanup_handle)
@@ -6084,6 +6117,7 @@ def download_model_streaming(
                             external_path,
                             external_filename,
                             cache_dir_owned=_cache_dir_owned,
+                            download_created=external_filename in downloaded_paths_created_by_invocation,
                         )
                         if cleanup_handle is not None:
                             context_cleanup_handles.append(cleanup_handle)
