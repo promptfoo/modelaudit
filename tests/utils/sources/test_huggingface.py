@@ -53,7 +53,6 @@ from modelaudit.utils.sources.huggingface import (
     _MAX_HF_REPOSITORY_PATH_CHARS,
     _MAX_HF_SAFETENSORS_RETAINED_RESULT_BYTES,
     _MAX_HF_SAFETENSORS_RETAINED_RESULTS,
-    _MAX_HF_SAFETENSORS_RETAINED_TENSOR_NAMES,
     _build_huggingface_model_info,
     _check_hf_acquisition_interrupted,
     _combine_remote_safetensors_shard_details,
@@ -8395,7 +8394,6 @@ class TestModelDownloadStreaming:
         ("dimension", "constant_name", "constant_value", "metadata"),
         [
             ("result_count", "_MAX_HF_SAFETENSORS_RETAINED_RESULTS", 1, {}),
-            ("tensor_name_count", "_MAX_HF_SAFETENSORS_RETAINED_TENSOR_NAMES", 1, {"tensors": ["a", "b"]}),
             (
                 "result_bytes",
                 "_MAX_HF_SAFETENSORS_RETAINED_RESULT_BYTES",
@@ -8519,7 +8517,11 @@ class TestModelDownloadStreaming:
             "_get_huggingface_path_sizes",
             lambda *_args, **_kwargs: (dict.fromkeys(filenames, 500), _HF_TEST_REVISION),
         )
-        monkeypatch.setattr(huggingface_module, "_MAX_HF_SAFETENSORS_RETAINED_TENSOR_NAMES", 3)
+        monkeypatch.setattr(
+            huggingface_module,
+            "_MAX_HF_SAFETENSORS_RETAINED_RESULT_BYTES",
+            _HF_SAFETENSORS_RESULT_BUDGET_FAILURE_RESERVE_BYTES + 1_500,
+        )
 
         def fake_scan(_repo_id: str, filename: str, _revision: str, **_kwargs: object) -> Any:
             result = _fake_remote_safetensors_scan(filename)
@@ -8560,7 +8562,7 @@ class TestModelDownloadStreaming:
         assert failure_result.success is False
         assert _HF_SAFETENSORS_RESULT_BUDGET_REASON in failure_result.metadata["scan_outcome_reasons"]
         budget = failure_result.metadata["remote_result_retention_budget"]
-        assert budget["exceeded"] == ["tensor_name_count"]
+        assert "result_bytes" in budget["exceeded"]
         assert budget["retained_tensor_names"] == 2
         assert bool(budget["candidate_security_record_count"]) is candidate_security_finding
         budget_checks = [
@@ -8592,6 +8594,77 @@ class TestModelDownloadStreaming:
         assert determine_exit_code(aggregate) == 2
         assert sum(len(asset.tensors or []) for asset in aggregate.assets) == 2
         mock_cache_store.assert_not_called()
+
+    def test_remote_safetensors_result_budget_bounds_final_stream_output(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from modelaudit.utils.sources import huggingface as huggingface_module
+
+        filenames = [f"model-{index:05d}-of-00300.safetensors" for index in range(1, 301)]
+        tensor_names = [f"tensor_{index:04d}_{'x' * 80}" for index in range(1024)]
+        monkeypatch.setattr(
+            huggingface_module,
+            "_list_repo_files_with_timeout",
+            lambda *_args, **_kwargs: (filenames, _HF_TEST_REVISION, None),
+        )
+        monkeypatch.setattr(
+            huggingface_module,
+            "_get_huggingface_path_sizes",
+            lambda *_args, **_kwargs: (dict.fromkeys(filenames, 500), _HF_TEST_REVISION),
+        )
+
+        def fake_scan(_repo_id: str, filename: str, _revision: str, **_kwargs: object) -> Any:
+            result = _fake_remote_safetensors_scan(filename)
+            result.metadata["tensors"] = tensor_names
+            result.metadata["tensor_count"] = len(tensor_names)
+            return result
+
+        with (
+            patch(
+                "modelaudit.utils.sources.huggingface._scan_remote_huggingface_safetensors_header",
+                side_effect=fake_scan,
+            ) as mock_scan,
+            patch("huggingface_hub.hf_hub_download") as mock_download,
+        ):
+            aggregate = scan_model_streaming(
+                download_model_streaming(
+                    f"hf://test/model?revision={_HF_TEST_REVISION}",
+                    scannable_extensions={".safetensors"},
+                    scannable_scanner_ids={"safetensors"},
+                    _include_scan_results=True,
+                ),
+                timeout=60,
+                delete_after_scan=False,
+                cache_enabled=False,
+                scanners=["safetensors"],
+                skip_file_types=False,
+            )
+
+        budget = next(
+            metadata["remote_result_retention_budget"]
+            for metadata in aggregate.model_dump(mode="json")["file_metadata"].values()
+            if "remote_result_retention_budget" in metadata
+        )
+        serialized_bytes = len(aggregate.model_dump_json().encode())
+        retained_results = aggregate.files_scanned - 1
+
+        assert aggregate.files_scanned == mock_scan.call_count
+        assert aggregate.files_scanned < len(filenames)
+        assert aggregate.success is False
+        assert determine_exit_code(aggregate) == 2
+        assert budget["exceeded"] == ["result_bytes"]
+        assert budget["retained_results"] == retained_results
+        assert budget["retained_result_bytes"] <= (
+            _MAX_HF_SAFETENSORS_RETAINED_RESULT_BYTES - _HF_SAFETENSORS_RESULT_BUDGET_FAILURE_RESERVE_BYTES
+        )
+        assert budget["projected_result_bytes"] > (
+            _MAX_HF_SAFETENSORS_RETAINED_RESULT_BYTES - _HF_SAFETENSORS_RESULT_BUDGET_FAILURE_RESERVE_BYTES
+        )
+        assert sum(len(asset.tensors or []) for asset in aggregate.assets) == retained_results * len(tensor_names)
+        assert serialized_bytes > _MAX_HF_SAFETENSORS_RETAINED_RESULT_BYTES - (1024 * 1024)
+        assert serialized_bytes < _MAX_HF_SAFETENSORS_RETAINED_RESULT_BYTES
+        mock_download.assert_not_called()
 
     @pytest.mark.parametrize("with_index", [False, True], ids=["huge-header-name", "huge-index-name"])
     def test_remote_safetensors_huge_tensor_names_are_source_native_and_result_bounded(
@@ -9165,7 +9238,7 @@ class TestModelDownloadStreaming:
 
     @pytest.mark.skipif(os.name == "nt", reason="resource peak RSS is unavailable on Windows")
     def test_remote_safetensors_max_cardinality_repository_retention_is_measured_and_bounded(self) -> None:
-        """One hundred maximum-cardinality headers must stop at the aggregate retention cap."""
+        """One hundred maximum-cardinality headers must complete within result_count and result_bytes caps."""
         repo_root = Path(__file__).resolve().parents[3]
         script = textwrap.dedent(
             """
@@ -9297,16 +9370,15 @@ class TestModelDownloadStreaming:
         assert completed.returncode == 0, completed.stderr
         metrics = json.loads(completed.stdout.strip().splitlines()[-1])
 
-        assert metrics["files_scanned"] == 65
+        assert metrics["files_scanned"] == 100
         assert metrics["download_calls"] == 0
-        assert metrics["success"] is False
-        assert metrics["exit_code"] == 2
-        assert metrics["retained_tensor_names"] == _MAX_HF_SAFETENSORS_RETAINED_TENSOR_NAMES
+        assert metrics["success"] is True
+        assert metrics["exit_code"] == 0
+        assert metrics["retained_tensor_names"] == 100 * 1024
         assert metrics["serialized_bytes"] < _MAX_HF_SAFETENSORS_RETAINED_RESULT_BYTES
         assert metrics["peak_delta_bytes"] < 64 * 1024 * 1024
         assert metrics["header_bytes"] > 250_000
-        assert metrics["budget"]["exceeded"] == ["tensor_name_count"]
-        assert metrics["budget"]["retained_results"] < _MAX_HF_SAFETENSORS_RETAINED_RESULTS
+        assert metrics["budget"] is None
 
     def test_remote_safetensors_zero_based_index_is_authoritative(self) -> None:
         first = "model-00000-of-00002.safetensors"
