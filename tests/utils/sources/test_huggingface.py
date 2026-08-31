@@ -6416,8 +6416,16 @@ class TestModelDownloadStreaming:
     ) -> None:
         """Exact filename routes must not widen selected scans to every extensionless file."""
         repo_files = ["README", *(f"payloads/chunk-{idx:04d}" for idx in range(129))]
-        readme_path = tmp_path / "README"
-        mock_hf_hub_download.return_value = str(readme_path)
+        readme_path = tmp_path / "huggingface" / "test" / "model" / "README"
+
+        def download_side_effect(*, filename: str, local_dir: str | None = None, **_kwargs: object) -> str:
+            assert local_dir is not None
+            downloaded_path = Path(local_dir) / filename
+            downloaded_path.parent.mkdir(parents=True, exist_ok=True)
+            downloaded_path.write_text("model card", encoding="utf-8")
+            return str(downloaded_path)
+
+        mock_hf_hub_download.side_effect = download_side_effect
 
         with patch(
             "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
