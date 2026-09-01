@@ -18,10 +18,12 @@ from unittest.mock import patch
 
 import modelaudit_picklescan.api as picklescan_api
 import pytest
-from modelaudit_picklescan.call_graph import _clear_source_sensitive_caches
+from modelaudit_picklescan.call_graph import _CallGraphAnalysisLimitError, _clear_source_sensitive_caches
 
 from modelaudit.cache.cache_policy import should_cache_scan_result
 from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
+from modelaudit.core_results import merge_scan_result
+from modelaudit.models import create_initial_audit_result
 from modelaudit.scanner_results import ACTIONABLE_FAILED_CHECKS_METADATA_KEY, INCONCLUSIVE_SCAN_OUTCOME, Issue
 from modelaudit.scanners.base import Check, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.compressed_scanner import CompressedScanner, _MissingOptionalDependencyError
@@ -1311,7 +1313,21 @@ def test_scan_rejects_structured_object_dtype_hiding_nested_pickle(tmp_path: Pat
     assert "trusted_incomplete_tail" not in result.metadata
 
 
-def test_scan_accepts_multiple_numpy_array_payloads_and_resumed_pickle(tmp_path: Path) -> None:
+@pytest.mark.parametrize("source_snapshot_changes", [False, True], ids=["stable-source", "changed-source"])
+def test_scan_accepts_multiple_numpy_array_payloads_and_resumed_pickle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    source_snapshot_changes: bool,
+) -> None:
+    if source_snapshot_changes:
+
+        def raise_source_stability_error(_report_generation: int | None) -> None:
+            raise _CallGraphAnalysisLimitError("source changed during shared call-graph analysis")
+
+        monkeypatch.setattr(picklescan_api, "_ensure_shared_source_snapshot_stable", raise_source_stability_error)
+    else:
+        monkeypatch.setattr(picklescan_api, "_ensure_shared_source_snapshot_stable", lambda _report_generation: None)
+
     first_prefix = b"\x80\x02](" + _joblib_numpy_wrapper_control()
     first_raw = _joblib_numpy_raw_segment(len(first_prefix), b"\x00" * 32)
     second_control = _joblib_numpy_wrapper_control(shape=3)
@@ -1321,8 +1337,39 @@ def test_scan_accepts_multiple_numpy_array_payloads_and_resumed_pickle(tmp_path:
 
     result = _scan_payload(tmp_path, payload, "multiple_arrays.joblib")
 
-    assert result.success is True
-    assert result.metadata["joblib_numpy_array_payload_count"] == 2
+    if not source_snapshot_changes:
+        assert result.success is True
+        assert result.metadata["joblib_numpy_array_payload_count"] == 2
+        assert result.metadata.get("operational_error") is not True
+    else:
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert result.metadata["analysis_incomplete"] is True
+        assert result.metadata["operational_error"] is True
+        assert result.metadata["operational_error_reason"] == "call_graph_analysis_error"
+        assert result.metadata["pickle_report_status"] == "inconclusive"
+        assert result.metadata["pickle_verdict"] == "suspicious"
+        source_stability_checks = [
+            check
+            for check in result.checks
+            if check.status == CheckStatus.FAILED
+            and check.details.get("category") == "call_graph_analysis_error"
+            and check.details.get("analysis") == "python_call_graph_source_stability"
+            and check.details.get("analysis_incomplete") is True
+        ]
+        assert len(source_stability_checks) == 1
+        assert source_stability_checks[0].severity == IssueSeverity.INFO
+        assert source_stability_checks[0].rule_code == "S902"
+        assert source_stability_checks[0].message == (
+            "Python call-graph analysis could not complete: source changed during shared call-graph analysis"
+        )
+        assert should_cache_scan_result(result.to_dict(include_private_metadata=True)) is False
+        result.metadata["file_path"] = str(tmp_path / "multiple_arrays.joblib")
+        aggregate = create_initial_audit_result()
+        merge_scan_result(aggregate, result)
+        assert aggregate.success is False
+        assert aggregate.files_scanned == 1
+        assert determine_exit_code(aggregate) == 2
     assert not _has_system_reduce_failure(result)
 
 
@@ -1337,15 +1384,88 @@ def test_scan_accepts_lzma_compressed_numpy_array_payload(tmp_path: Path) -> Non
 
 
 @pytest.mark.parametrize("raw_seed", [b"builtins", b"os.system", b"subprocess", b"pickle.loads"])
-def test_scan_accepts_security_like_bytes_inside_numpy_array(tmp_path: Path, raw_seed: bytes) -> None:
+@pytest.mark.parametrize("source_snapshot_changes", [False, True], ids=["stable-source", "changed-source"])
+def test_scan_accepts_security_like_bytes_inside_numpy_array(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    raw_seed: bytes,
+    source_snapshot_changes: bool,
+) -> None:
+    expected_source_stability_message = (
+        "Python call-graph analysis could not complete: source changed during shared call-graph analysis"
+    )
+    if source_snapshot_changes:
+
+        def raise_source_stability_error(_report_generation: int | None) -> None:
+            raise _CallGraphAnalysisLimitError("source changed during shared call-graph analysis")
+
+        monkeypatch.setattr(picklescan_api, "_ensure_shared_source_snapshot_stable", raise_source_stability_error)
+    else:
+        monkeypatch.setattr(
+            picklescan_api,
+            "_ensure_shared_source_snapshot_stable",
+            lambda _report_generation: None,
+        )
+
     raw_data = raw_seed.ljust(32, b"\x00")
     payload = _joblib_numpy_list_payload(raw_data=raw_data, shape=len(raw_data), dtype="u1")
+    filename = "benign_security_like_array_bytes.joblib"
 
-    result = _scan_payload(tmp_path, payload, "benign_security_like_array_bytes.joblib")
+    result = _scan_payload(tmp_path, payload, filename)
 
-    assert result.success is True
-    assert result.metadata["trusted_incomplete_tail"] is True
+    if not source_snapshot_changes:
+        assert result.success is True
+        assert result.metadata["trusted_incomplete_tail"] is True
+        assert result.metadata.get("operational_error") is not True
+    else:
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert result.metadata["analysis_incomplete"] is True
+        assert result.metadata["operational_error"] is True
+        assert result.metadata["operational_error_reason"] == "call_graph_analysis_error"
+        assert result.metadata["pickle_report_status"] == "inconclusive"
+        assert result.metadata["pickle_verdict"] == "suspicious"
+        assert "trusted_incomplete_tail" not in result.metadata
+        source_stability_checks = [
+            check
+            for check in result.checks
+            if check.status == CheckStatus.FAILED
+            and check.details.get("category") == "call_graph_analysis_error"
+            and check.details.get("analysis") == "python_call_graph_source_stability"
+            and check.details.get("analysis_incomplete") is True
+        ]
+        assert len(source_stability_checks) == 1
+        assert source_stability_checks[0].severity == IssueSeverity.INFO
+        assert source_stability_checks[0].message == expected_source_stability_message
+        assert source_stability_checks[0].rule_code == "S902"
+        source_stability_issues = [
+            issue
+            for issue in result.issues
+            if issue.details.get("category") == "call_graph_analysis_error"
+            and issue.details.get("analysis") == "python_call_graph_source_stability"
+            and issue.details.get("analysis_incomplete") is True
+        ]
+        assert len(source_stability_issues) == 1
+        assert source_stability_issues[0].severity == IssueSeverity.INFO
+        assert source_stability_issues[0].message == expected_source_stability_message
+        assert source_stability_issues[0].rule_code == "S902"
+        assert should_cache_scan_result(result.to_dict(include_private_metadata=True)) is False
+        result.metadata["file_path"] = str(tmp_path / filename)
+        aggregate = create_initial_audit_result()
+        merge_scan_result(aggregate, result)
+        assert aggregate.success is False
+        assert aggregate.files_scanned == 1
+        assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in aggregate.issues)
+        assert not any(
+            check.status == CheckStatus.FAILED and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+            for check in aggregate.checks
+        )
+        assert determine_exit_code(aggregate) == 2
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+    assert not any(
+        check.status == CheckStatus.FAILED and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in result.checks
+    )
 
 
 def test_scan_does_not_trust_joblib_tail_when_literal_coverage_is_incomplete(tmp_path: Path) -> None:
@@ -1399,10 +1519,33 @@ def test_scan_fails_closed_on_invalid_numpy_wrapper_with_origin_warning(tmp_path
     assert result.success is False
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert result.metadata["analysis_incomplete"] is True
+    assert result.metadata["operational_error"] is True
+    assert result.metadata["operational_error_reason"] == "joblib_numpy_array_wrapper_validation_failed"
     assert "joblib_numpy_array_wrapper_validation_failed" in result.metadata["scan_outcome_reasons"]
     assert result.has_warnings is True
     assert "trusted_incomplete_tail" not in result.metadata
     assert should_cache_scan_result(result.to_dict(include_private_metadata=True)) is False
+
+    result.metadata["file_path"] = str(path)
+    aggregate = create_initial_audit_result()
+    merge_scan_result(aggregate, result)
+
+    assert aggregate.success is False
+    assert aggregate.files_scanned == 1
+    assert aggregate.file_metadata[str(path)]["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "joblib_numpy_array_wrapper_validation_failed" in aggregate.file_metadata[str(path)]["scan_outcome_reasons"]
+    warning_issues = [issue for issue in aggregate.issues if issue.rule_code == "NON_ALLOWLISTED_GLOBAL"]
+    assert len(warning_issues) == 1
+    assert warning_issues[0].severity == IssueSeverity.WARNING
+    warning_checks = [check for check in aggregate.checks if check.rule_code == "NON_ALLOWLISTED_GLOBAL"]
+    assert len(warning_checks) == 1
+    assert warning_checks[0].status == CheckStatus.FAILED
+    assert warning_checks[0].severity == IssueSeverity.WARNING
+    assert any(
+        check.rule_code == "S901" and check.status == CheckStatus.FAILED and check.severity == IssueSeverity.INFO
+        for check in aggregate.checks
+    )
+    assert determine_exit_code(aggregate) == 2
 
 
 def test_scan_fails_closed_when_embedded_pickle_reports_success(
@@ -1421,8 +1564,8 @@ def test_scan_fails_closed_when_embedded_pickle_reports_success(
     def finish_as_successful(self: PickleScanner, result: ScanResult, *, base_success: bool) -> None:
         original_finish(self, result, base_success=base_success)
         if not result.success:
-            result.success = True
-            result._merged_children_success = True
+            result.trust_merged_child_failures()
+            result.finish(success=True)
 
     monkeypatch.setattr(PickleScanner, "_finish_after_wrapper_analysis", finish_as_successful)
 
