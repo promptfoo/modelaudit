@@ -7,12 +7,11 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.1.11](https://github.com/promptfoo/modelaudit/compare/modelaudit-picklescan-v0.1.10...modelaudit-picklescan-v0.1.11) (2026-09-02)
 
-
 ### Bug Fixes
 
-* **cache:** isolate Windows probes and stabilize nightly checks ([#1782](https://github.com/promptfoo/modelaudit/issues/1782)) ([47f94ee](https://github.com/promptfoo/modelaudit/commit/47f94eef3feba8e74c517114094e035c7ea837e8))
-* **picklescan:** diagnose Windows call-graph source-stability failures ([#1789](https://github.com/promptfoo/modelaudit/issues/1789)) ([89b5024](https://github.com/promptfoo/modelaudit/commit/89b50246fc9226770d46b26e8582a6d161dc0244))
-* **picklescan:** safely parse bounded PyTorch tensor batches ([#1783](https://github.com/promptfoo/modelaudit/issues/1783)) ([705059c](https://github.com/promptfoo/modelaudit/commit/705059c4280056a4b72106fbd474c00e270ecf0b))
+- **cache:** isolate Windows probes and stabilize nightly checks ([#1782](https://github.com/promptfoo/modelaudit/issues/1782)) ([47f94ee](https://github.com/promptfoo/modelaudit/commit/47f94eef3feba8e74c517114094e035c7ea837e8))
+- **picklescan:** diagnose Windows call-graph source-stability failures ([#1789](https://github.com/promptfoo/modelaudit/issues/1789)) ([89b5024](https://github.com/promptfoo/modelaudit/commit/89b50246fc9226770d46b26e8582a6d161dc0244))
+- **picklescan:** safely parse bounded PyTorch tensor batches ([#1783](https://github.com/promptfoo/modelaudit/issues/1783)) ([705059c](https://github.com/promptfoo/modelaudit/commit/705059c4280056a4b72106fbd474c00e270ecf0b))
 
 ## [Unreleased]
 
