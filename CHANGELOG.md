@@ -5,6 +5,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.53](https://github.com/promptfoo/modelaudit/compare/v0.2.52...v0.2.53) (2026-09-02)
+
+### Bug Fixes
+
+- **cache:** ignore macOS file access-time events ([#1821](https://github.com/promptfoo/modelaudit/issues/1821)) ([b5341b5](https://github.com/promptfoo/modelaudit/commit/b5341b5a35c86edba3b315af92ea2a431700156b))
+- **cache:** isolate Windows probes and stabilize nightly checks ([#1782](https://github.com/promptfoo/modelaudit/issues/1782)) ([47f94ee](https://github.com/promptfoo/modelaudit/commit/47f94eef3feba8e74c517114094e035c7ea837e8))
+- **cache:** keep Windows probes out of concurrently scanned trees ([#1795](https://github.com/promptfoo/modelaudit/issues/1795)) ([c29586b](https://github.com/promptfoo/modelaudit/commit/c29586b09a29f7cf8bbba6e9e4a0a74e006cc27f))
+- **cache:** preserve locked probes under directory aliases ([#1787](https://github.com/promptfoo/modelaudit/issues/1787)) ([caa2afe](https://github.com/promptfoo/modelaudit/commit/caa2afea1c2d961aef19d1b149f0c9b8fe20c72f))
+- **cache:** preserve macOS entries during ancestor churn ([#1800](https://github.com/promptfoo/modelaudit/issues/1800)) ([2c3512b](https://github.com/promptfoo/modelaudit/commit/2c3512b97cf01ecbce632873cf6e1e17a64b75c3))
+- **cache:** preserve Windows source fingerprint cache hits ([#1793](https://github.com/promptfoo/modelaudit/issues/1793)) ([f27ebac](https://github.com/promptfoo/modelaudit/commit/f27ebacdd4008eedf902f6ab87d9d5420a5fa66b))
+- **cache:** update scan-result entries atomically on hits ([#1809](https://github.com/promptfoo/modelaudit/issues/1809)) ([a9720c0](https://github.com/promptfoo/modelaudit/commit/a9720c0af126fd2bc3f3c2f76228320336103202))
+- **ci:** route hash timing test to performance lane ([#1824](https://github.com/promptfoo/modelaudit/issues/1824)) ([b4c10f2](https://github.com/promptfoo/modelaudit/commit/b4c10f2fe39a253c9d10f60fea3b8803c850db8d))
+- **deps:** bump gitpython from 3.1.51 to 3.1.54 ([#1786](https://github.com/promptfoo/modelaudit/issues/1786)) ([32de965](https://github.com/promptfoo/modelaudit/commit/32de965e4345b9749e6cd8bb88f5a7e01a08933b))
+- **deps:** harden audit coverage and vulnerable packages ([#1808](https://github.com/promptfoo/modelaudit/issues/1808)) ([995767e](https://github.com/promptfoo/modelaudit/commit/995767ed16bda0f6019d27b02239ed308dd669b6))
+- **deps:** update dependency xgboost to &gt;=3.4,&lt;3.5 ([#1805](https://github.com/promptfoo/modelaudit/issues/1805)) ([e84cf95](https://github.com/promptfoo/modelaudit/commit/e84cf9566c5a6da144a17ebe7a3e30812a60184b))
+- **docker:** upgrade vulnerable util-linux runtime packages ([#1813](https://github.com/promptfoo/modelaudit/issues/1813)) ([521e941](https://github.com/promptfoo/modelaudit/commit/521e94164e0e1b7ce488f0b405b7ab48404776cd))
+- **mlflow:** restore SQL-backed registry support ([#1818](https://github.com/promptfoo/modelaudit/issues/1818)) ([3e4e3c9](https://github.com/promptfoo/modelaudit/commit/3e4e3c9619c07eda82543c7c288858d25d695dd9))
+- **network:** block README remote-code trust bypasses ([#1788](https://github.com/promptfoo/modelaudit/issues/1788)) ([65111fe](https://github.com/promptfoo/modelaudit/commit/65111fe16b263a31e989ba327f1c84ff84c6f964))
+- **network:** preserve detections in README environment files ([#1790](https://github.com/promptfoo/modelaudit/issues/1790)) ([5c1b267](https://github.com/promptfoo/modelaudit/commit/5c1b2671f372655177992fda5a35039b602d67a9))
+- **network:** reject side-effectful model-card image examples ([#1825](https://github.com/promptfoo/modelaudit/issues/1825)) ([56417b8](https://github.com/promptfoo/modelaudit/commit/56417b801fc83cde10ba6d2046441af3c9636b50))
+- **picklescan:** diagnose Windows call-graph source-stability failures ([#1789](https://github.com/promptfoo/modelaudit/issues/1789)) ([89b5024](https://github.com/promptfoo/modelaudit/commit/89b50246fc9226770d46b26e8582a6d161dc0244))
+- **picklescan:** safely parse bounded PyTorch tensor batches ([#1783](https://github.com/promptfoo/modelaudit/issues/1783)) ([705059c](https://github.com/promptfoo/modelaudit/commit/705059c4280056a4b72106fbd474c00e270ecf0b))
+- recognize bounded official image downloads in model cards ([#1784](https://github.com/promptfoo/modelaudit/issues/1784)) ([64d4f52](https://github.com/promptfoo/modelaudit/commit/64d4f5238573f8d96283ebb241e6ae42258f1140))
+- remove tensor_name_count retention budget dimension for remote SafeTensors ([#1822](https://github.com/promptfoo/modelaudit/issues/1822)) ([4c24e17](https://github.com/promptfoo/modelaudit/commit/4c24e1701c456b2bd9256e4d09429fcacd1075fa))
+- safely suppress verified Hugging Face model-card image examples ([#1791](https://github.com/promptfoo/modelaudit/issues/1791)) ([6ee2b36](https://github.com/promptfoo/modelaudit/commit/6ee2b368f029d8a9858363938068cbde766b2e2e))
+- **tests:** preserve fail-closed multi-array Joblib scans ([#1819](https://github.com/promptfoo/modelaudit/issues/1819)) ([217f127](https://github.com/promptfoo/modelaudit/commit/217f1270cfa115c6409823556e5170487930fb64))
+
 ## [Unreleased]
 
 ### Security
