@@ -3251,7 +3251,10 @@ def test_scan_bytes_flags_pytorch_storage_persistent_ids_with_extra_fields() -> 
     assert report.notices == ()
 
 
-def test_scan_bytes_attributes_reduce_calls_to_the_callable_operand_not_nested_args() -> None:
+def test_scan_bytes_attributes_reduce_calls_to_the_callable_operand_not_nested_args(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _generation: None)
     payload = b"cbuiltins\nlen\n(cos\nsystem\ntR."
 
     report = scan_bytes(payload, source="reduce-args.pkl")
