@@ -37,6 +37,7 @@ from modelaudit.scanners.joblib_scanner import (
     _validated_numpy_dtype,
     np,
 )
+from modelaudit.scanners.pickle_scanner import PickleScanner
 from modelaudit.utils.file.detection import _LZ4_FRAME_MAGIC, validate_file_type_with_formats
 
 
@@ -1494,6 +1495,93 @@ def test_scan_fails_closed_on_protocol1_pickle_in_numpy_wrapper_tail(tmp_path: P
     assert result.metadata["parsing_failed"] is True
     assert result.metadata["failure_reason"] == "unknown_opcode_or_format_error"
     assert "trusted_incomplete_tail" not in result.metadata
+
+
+def test_scan_fails_closed_on_invalid_numpy_wrapper_with_origin_warning(tmp_path: Path) -> None:
+    path = tmp_path / "numpy_array_protocol1_origin_warning.joblib"
+    path.write_bytes(_joblib_numpy_list_payload(resumed_ops=b"\x80\x01K\x01."))
+
+    embedded_result = ScanResult("pickle")
+    embedded_result.add_check(
+        name="Standalone Pickle Finding",
+        passed=False,
+        message="Joblib NumPy wrapper requires origin verification",
+        severity=IssueSeverity.WARNING,
+        details={"import_reference": "joblib.numpy_pickle.NumpyArrayWrapper"},
+        rule_code="NON_ALLOWLISTED_GLOBAL",
+    )
+    embedded_result.finish(success=True)
+
+    scanner = JoblibScanner()
+    scanner.pickle_scanner = _StaticEmbeddedPickleScanner(embedded_result)
+    result = scanner.scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["analysis_incomplete"] is True
+    assert result.metadata["operational_error"] is True
+    assert result.metadata["operational_error_reason"] == "joblib_numpy_array_wrapper_validation_failed"
+    assert "joblib_numpy_array_wrapper_validation_failed" in result.metadata["scan_outcome_reasons"]
+    assert result.has_warnings is True
+    assert "trusted_incomplete_tail" not in result.metadata
+    assert should_cache_scan_result(result.to_dict(include_private_metadata=True)) is False
+
+    result.metadata["file_path"] = str(path)
+    aggregate = create_initial_audit_result()
+    merge_scan_result(aggregate, result)
+
+    assert aggregate.success is False
+    assert aggregate.files_scanned == 1
+    assert aggregate.file_metadata[str(path)]["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "joblib_numpy_array_wrapper_validation_failed" in aggregate.file_metadata[str(path)]["scan_outcome_reasons"]
+    warning_issues = [issue for issue in aggregate.issues if issue.rule_code == "NON_ALLOWLISTED_GLOBAL"]
+    assert len(warning_issues) == 1
+    assert warning_issues[0].severity == IssueSeverity.WARNING
+    warning_checks = [check for check in aggregate.checks if check.rule_code == "NON_ALLOWLISTED_GLOBAL"]
+    assert len(warning_checks) == 1
+    assert warning_checks[0].status == CheckStatus.FAILED
+    assert warning_checks[0].severity == IssueSeverity.WARNING
+    assert any(
+        check.rule_code == "S901" and check.status == CheckStatus.FAILED and check.severity == IssueSeverity.INFO
+        for check in aggregate.checks
+    )
+    assert determine_exit_code(aggregate) == 2
+
+
+def test_scan_fails_closed_when_embedded_pickle_reports_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Joblib must fail closed on its own wrapper validation, not on the embedded verdict.
+
+    Windows CI reaches this state through the real pickle scanner: the embedded result keeps a
+    trusted incomplete tail and finishes ``success=True`` while Joblib NumPy-wrapper validation
+    is still inconclusive. Forcing only the embedded verdict reproduces that lane deterministically
+    on every platform while leaving payload parsing and metadata composition untouched.
+    """
+    original_finish = PickleScanner._finish_after_wrapper_analysis
+
+    def finish_as_successful(self: PickleScanner, result: ScanResult, *, base_success: bool) -> None:
+        original_finish(self, result, base_success=base_success)
+        if not result.success:
+            result.trust_merged_child_failures()
+            result.finish(success=True)
+
+    monkeypatch.setattr(PickleScanner, "_finish_after_wrapper_analysis", finish_as_successful)
+
+    result = _scan_payload(
+        tmp_path,
+        _joblib_numpy_list_payload(resumed_ops=b"\x80\x01K\x01."),
+        "numpy_array_protocol1_embedded_success.joblib",
+    )
+
+    assert result.success is False
+    assert result.has_errors is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["analysis_incomplete"] is True
+    assert "joblib_numpy_array_wrapper_validation_failed" in result.metadata["scan_outcome_reasons"]
+    assert "trusted_incomplete_tail" not in result.metadata
+    assert should_cache_scan_result(result.to_dict(include_private_metadata=True)) is False
 
 
 def test_scan_detects_gzip_compressed_pickle_joblib(tmp_path: Path) -> None:
