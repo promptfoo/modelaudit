@@ -39,12 +39,12 @@ class TestAssetInventoryIntegration:
         model_dir = tmp_path / "complex_model"
         model_dir.mkdir()
 
-        # Create SafeTensors model with multiple tensors
+        # Fixed tensor bytes keep this metadata fixture out of pickle-overlap routing.
         safetensors_file = model_dir / "model.safetensors"
         safetensors_data = {
-            "embedding.weight": np.random.randn(1000, 768).astype(np.float32),
-            "decoder.weight": np.random.randn(768, 50257).astype(np.float32),
-            "layer_norm.bias": np.random.randn(768).astype(np.float32),
+            "embedding.weight": np.zeros((1000, 768), dtype=np.float32),
+            "decoder.weight": np.zeros((768, 50257), dtype=np.float32),
+            "layer_norm.bias": np.zeros(768, dtype=np.float32),
         }
         save_file(safetensors_data, str(safetensors_file))
 
@@ -68,17 +68,11 @@ class TestAssetInventoryIntegration:
 
             # Add another SafeTensors file inside the ZIP
             inner_safetensors_data = {
-                "optimizer.weight": np.random.randn(100, 768).astype(np.float32),
+                "optimizer.weight": np.zeros((100, 768), dtype=np.float32),
             }
-            with tempfile.NamedTemporaryFile(
-                suffix=".safetensors",
-                delete=False,
-            ) as tmp:
-                save_file(inner_safetensors_data, tmp.name)
-                tmp.close()  # Close temp file before reopening (required on Windows)
-                with open(tmp.name, "rb") as f:
-                    zf.writestr("optimizer.safetensors", f.read())
-                os.unlink(tmp.name)
+            inner_safetensors_file = tmp_path / "optimizer.safetensors"
+            save_file(inner_safetensors_data, str(inner_safetensors_file))
+            zf.writestr("optimizer.safetensors", inner_safetensors_file.read_bytes())
 
             # Add a text file
             zf.writestr("README.txt", "Model documentation")
