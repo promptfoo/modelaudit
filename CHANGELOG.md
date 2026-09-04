@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- Inspect hidden ZIP archives and malicious pickle payloads in legacy GGML model variants.
+- Stop reporting a ZIP polyglot for GGUF/GGML files whose tensor data merely contains an end-of-central-directory signature.
 - Upgrade Debian util-linux packages in all Docker runtime images to remediate CVE-2026-53615.
 - Preserve model-card network alerts when documented image examples contain code outside the reviewed generated forms.
 

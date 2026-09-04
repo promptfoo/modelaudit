@@ -760,23 +760,82 @@ class GgufScanner(BaseScanner):
         )
         result.bytes_scanned = max(result.bytes_scanned, f.tell())
 
-    def _scan_zip_polyglot(self, result: ScanResult) -> bool:
-        """Inspect ZIP members even when GGUF metadata or tensor parsing fails."""
-        if not zipfile.is_zipfile(self.current_file_path):
-            return False
-
+    def _scan_zip_polyglot(self, result: ScanResult, *, format_name: str = "GGUF") -> bool:
+        """Inspect ZIP members even when GGUF/GGML header parsing fails."""
+        from ._archive_outcomes import mark_archive_scan_incomplete
         from .archive_dispatch import (
             _ZIP_CONTAINER_PREFLIGHT_REJECTED_PATHS_PRIVATE_METADATA_KEY,
             merge_executable_zip_container_findings,
         )
+        from .zip_scanner import (
+            ZipPreflightRejected,
+            open_preflighted_zip_handle_with_entry_count,
+        )
 
         archive_config = dict(self.config)
         archive_config.pop(_GGUF_CONTAINER_OWNED_TRAILING_CONFIG_KEY, None)
+
+        # Retain the bounded same-handle preflight count so parser mismatches fail closed even
+        # when nested ZIP scanning is excluded.
+        preflight_entry_count: int | None = None
+        parsed_entry_count: int | None = None
+        preflight_accepted = False
+        try:
+            with open_preflighted_zip_handle_with_entry_count(
+                self.current_file_path,
+                archive_config,
+            ) as (archive_handle, preflight_entry_count):
+                preflight_accepted = True
+                with zipfile.ZipFile(archive_handle, "r") as embedded_archive:
+                    parsed_entry_count = len(embedded_archive.infolist())
+        except ZipPreflightRejected:
+            # The composed scan below records the fail-closed preflight diagnostics.
+            pass
+        except (OSError, zipfile.BadZipFile):
+            if not preflight_accepted:
+                return False
+            result.add_check(
+                name="ZIP File Format Validation",
+                passed=False,
+                message=f"Not a valid zip file: {self.current_file_path}",
+                severity=IssueSeverity.INFO,
+                rule_code="S902",
+                location=self.current_file_path,
+                details={"path": self.current_file_path},
+            )
+            mark_archive_scan_incomplete(result, "zip_analysis_incomplete")
+            return False
+
+        if (
+            preflight_entry_count is not None
+            and parsed_entry_count is not None
+            and parsed_entry_count != preflight_entry_count
+        ):
+            result.add_check(
+                name="ZIP Central Directory Preflight",
+                passed=False,
+                message=(
+                    "ZIP central directory changed between preflight and parsing "
+                    f"({preflight_entry_count} != {parsed_entry_count})"
+                ),
+                severity=IssueSeverity.INFO,
+                rule_code="S902",
+                location=self.current_file_path,
+                details={
+                    "preflight_entries": preflight_entry_count,
+                    "parsed_entries": parsed_entry_count,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "zip_analysis_incomplete",
+                },
+            )
+            mark_archive_scan_incomplete(result, "zip_analysis_incomplete")
+            return False
+
         merge_executable_zip_container_findings(
             self.current_file_path,
             result,
             archive_config,
-            context="GGUF trailing ZIP polyglot",
+            context=f"{format_name} trailing ZIP polyglot",
         )
         rejected_paths = result._private_metadata.get(
             _ZIP_CONTAINER_PREFLIGHT_REJECTED_PATHS_PRIVATE_METADATA_KEY,
@@ -787,11 +846,13 @@ class GgufScanner(BaseScanner):
             and os.path.realpath(self.current_file_path) in rejected_paths
         ):
             return False
+        if parsed_entry_count == 0:
+            return False
 
         result.add_check(
-            name="GGUF ZIP Polyglot Detection",
+            name=f"{format_name} ZIP Polyglot Detection",
             passed=False,
-            message="GGUF file is also a valid ZIP archive and may contain hidden archive content",
+            message=f"{format_name} file is also a valid ZIP archive and may contain hidden archive content",
             severity=IssueSeverity.CRITICAL,
             location=self.current_file_path,
             details={"embedded_format": "zip"},
@@ -1048,8 +1109,13 @@ class GgufScanner(BaseScanner):
         result: ScanResult,
     ) -> None:
         """Basic GGML file validation with security checks."""
+        outer_magic = magic.decode("ascii", "ignore")
         result.metadata["format"] = "ggml"
-        result.metadata["magic"] = magic.decode("ascii", "ignore")
+        result.metadata["magic"] = outer_magic
+        self._scan_zip_polyglot(result, format_name="GGML")
+        result.metadata["format"] = "ggml"
+        result.metadata["magic"] = outer_magic
+        result.bytes_scanned = max(result.bytes_scanned, file_size)
 
         if file_size < 32:
             result.add_check(
@@ -1103,8 +1169,6 @@ class GgufScanner(BaseScanner):
                 details={"error": str(e), "error_type": type(e).__name__},
                 rule_code="S902",
             )
-
-        result.bytes_scanned = file_size
 
     def _read_value(
         self,

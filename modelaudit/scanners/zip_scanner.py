@@ -2345,13 +2345,13 @@ class ZipScanner(BaseScanner):
 
 
 @contextlib.contextmanager
-def _open_preflighted_zip_handle(
+def _open_preflighted_zip_handle_with_entry_count(
     path: str | os.PathLike[str],
     config: dict[str, Any] | None = None,
     *,
     require_zip: bool = True,
-) -> Iterator[tuple[BinaryIO, bool]]:
-    """Open once, preflight that descriptor, and yield it with its ZIP routing state."""
+) -> Iterator[tuple[BinaryIO, bool, int | None]]:
+    """Open once and yield its descriptor, ZIP routing state, and bounded entry count."""
     scanner = ZipScanner(config=config)
     path_text = os.fspath(path)
     with open(path, "rb") as handle:
@@ -2374,7 +2374,7 @@ def _open_preflighted_zip_handle(
                     _ZIP64_EOCD_SIGNATURE,
                 }:
                     handle.seek(0)
-                    yield handle, False
+                    yield handle, False, None
                     return
             raise ZipPreflightRejected(scanner._preflight_rejection_result(path_text, error=exc)) from exc
         if preflight is None:
@@ -2394,7 +2394,35 @@ def _open_preflighted_zip_handle(
                 _ZIP64_EOCD_SIGNATURE,
             }
         handle.seek(0)
-        yield handle, preflight_is_zip
+        yield handle, preflight_is_zip, preflight[0] if preflight is not None else None
+
+
+@contextlib.contextmanager
+def _open_preflighted_zip_handle(
+    path: str | os.PathLike[str],
+    config: dict[str, Any] | None = None,
+    *,
+    require_zip: bool = True,
+) -> Iterator[tuple[BinaryIO, bool]]:
+    """Open once, preflight that descriptor, and yield it with its ZIP routing state."""
+    with _open_preflighted_zip_handle_with_entry_count(path, config, require_zip=require_zip) as (
+        handle,
+        is_zip,
+        _entry_count,
+    ):
+        yield handle, is_zip
+
+
+@contextlib.contextmanager
+def open_preflighted_zip_handle_with_entry_count(
+    path: str | os.PathLike[str],
+    config: dict[str, Any] | None = None,
+) -> Iterator[tuple[BinaryIO, int]]:
+    """Open once and yield the preflighted descriptor with its bounded entry count."""
+    with _open_preflighted_zip_handle_with_entry_count(path, config) as (handle, _is_zip, entry_count):
+        if entry_count is None:
+            raise zipfile.BadZipFile("File is not a valid ZIP archive")
+        yield handle, entry_count
 
 
 @contextlib.contextmanager
