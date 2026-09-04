@@ -13,7 +13,7 @@ import stat
 import sys
 import time
 import unicodedata
-from collections.abc import Iterator
+from collections.abc import Generator, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path, PureWindowsPath
 from typing import Any, NoReturn, cast
@@ -1974,7 +1974,7 @@ class _HuggingFaceStreamInterruptedError(RuntimeError):
 
 def _track_huggingface_stream_acquisition(
     file_generator: Iterator[tuple[Path, bool] | tuple[Path, bool, Any] | tuple[Path, bool, Any | None, Any]],
-) -> Iterator[tuple[Path, bool] | tuple[Path, bool, Any] | tuple[Path, bool, Any | None, Any]]:
+) -> Generator[tuple[Path, bool] | tuple[Path, bool, Any] | tuple[Path, bool, Any | None, Any], None, None]:
     """Distinguish pre-yield acquisition failures from interrupted streamed scans."""
     yielded_artifact = False
     try:
@@ -1985,6 +1985,10 @@ def _track_huggingface_stream_acquisition(
         if yielded_artifact:
             raise _HuggingFaceStreamInterruptedError(str(exc)) from exc
         raise _HuggingFaceAcquisitionError(str(exc)) from exc
+    finally:
+        close_generator = getattr(file_generator, "close", None)
+        if callable(close_generator):
+            close_generator()
 
 
 def _metadata_get_bool(metadata: Any, key: str) -> bool:
@@ -2050,16 +2054,24 @@ def _record_huggingface_acquisition_error(
     *,
     path: str,
     error_msg: str,
+    scanned_artifact_count: int = 0,
 ) -> None:
-    """Record a Hugging Face source failure without claiming artifact coverage."""
+    """Record a Hugging Face source failure while preserving completed scan evidence."""
     requested_revision = _huggingface_requested_revision(path)
     source_key = _huggingface_acquisition_source_key(path, requested_revision)
     reason, blocked, category = _classify_huggingface_acquisition_error(error_msg)
-    issue_message = (
-        f"Hugging Face acquisition blocked for {source_key}; no model artifacts were scanned."
-        if blocked
-        else f"Hugging Face acquisition failed for {source_key}; no model artifacts were scanned."
-    )
+    if scanned_artifact_count:
+        artifact_label = "artifact was" if scanned_artifact_count == 1 else "artifacts were"
+        issue_message = (
+            f"Hugging Face processing failed for {source_key} after {scanned_artifact_count} model "
+            f"{artifact_label} scanned; scan coverage is incomplete."
+        )
+    else:
+        issue_message = (
+            f"Hugging Face acquisition blocked for {source_key}; no model artifacts were scanned."
+            if blocked
+            else f"Hugging Face acquisition failed for {source_key}; no model artifacts were scanned."
+        )
 
     details: dict[str, Any] = {
         "source": "huggingface",
@@ -2072,6 +2084,9 @@ def _record_huggingface_acquisition_error(
         "scan_outcome_reason": reason,
         SCAN_OUTCOME_REASONS_METADATA_KEY: [reason],
     }
+    if scanned_artifact_count:
+        details["partial_scan"] = True
+        details["scanned_artifact_count"] = scanned_artifact_count
     if requested_revision is not None:
         details["requested_revision"] = requested_revision
 
@@ -3473,7 +3488,9 @@ def _resolve_scan_source_for_path(
                     )
 
                 if runtime.scan_and_delete:
-                    click.echo(style_text("   Mode: Streaming (scan and delete to save disk)", fg="cyan"))
+                    click.echo(
+                        style_text("   Mode: Streaming (temporary files cleaned after each artifact)", fg="cyan")
+                    )
             except Exception as exc:
                 logger.debug(
                     "Unable to display HuggingFace model metadata for %s: %s",
@@ -3482,6 +3499,8 @@ def _resolve_scan_source_for_path(
                 )
 
         temp_dir = None
+        streaming_result: ModelAuditResultModel | None = None
+        streaming_result_aggregated = False
         try:
             source_model_id, source_model_source = extract_model_id_from_path(path)
             if runtime.cache_enabled and runtime.cache_dir:
@@ -3491,7 +3510,7 @@ def _resolve_scan_source_for_path(
             else:
                 import tempfile
 
-                hf_cache_dir = Path(tempfile.mkdtemp(prefix="modelaudit_hf_"))
+                hf_cache_dir = Path(tempfile.mkdtemp(prefix="modelaudit_hf_")).resolve(strict=True)
                 temp_dir = str(hf_cache_dir)
 
             record_download_started("huggingface", display_path)
@@ -3506,7 +3525,10 @@ def _resolve_scan_source_for_path(
 
             if runtime.scan_and_delete:
                 from .core import scan_model_streaming
-                from .utils.sources.huggingface import download_model_streaming
+                from .utils.sources.huggingface import (
+                    _temporary_hf_streaming_staging_root,
+                    download_model_streaming,
+                )
 
                 if runtime.show_styled_output:
                     click.echo(style_text("🔄 Starting streaming scan...", fg="cyan"))
@@ -3515,61 +3537,68 @@ def _resolve_scan_source_for_path(
                 stream_namespace, stream_repo_name, _stream_requested_revision = parse_huggingface_url_with_revision(
                     path
                 )
-                stream_hf_cache_root = hf_cache_dir / "huggingface"
-                stream_repository_scan_root = stream_hf_cache_root / stream_namespace
-                if stream_repo_name:
-                    stream_repository_scan_root = stream_repository_scan_root / stream_repo_name
-                file_generator = _track_huggingface_stream_acquisition(
-                    download_model_streaming(
-                        path,
-                        cache_dir=hf_cache_dir,
-                        show_progress=runtime.show_progress,
-                        max_size=runtime.max_download_bytes,
-                        timeout_seconds=runtime.timeout,
-                        repository_file_inventory=stream_repository_file_inventory,
-                        scanner_config=runtime.config,
-                        _include_scan_results=True,
-                        **hf_stream_kwargs,
-                    )
-                )
+                stream_staging_parent = hf_cache_dir if runtime.cache_enabled else None
+                with _temporary_hf_streaming_staging_root(parent=stream_staging_parent) as stream_staging_root:
+                    stream_hf_cache_root = stream_staging_root / "huggingface"
+                    stream_repository_scan_root = stream_hf_cache_root / stream_namespace
+                    if stream_repo_name:
+                        stream_repository_scan_root = stream_repository_scan_root / stream_repo_name
+                    with contextlib.closing(
+                        _track_huggingface_stream_acquisition(
+                            download_model_streaming(
+                                path,
+                                cache_dir=hf_cache_dir,
+                                show_progress=runtime.show_progress,
+                                max_size=runtime.max_download_bytes,
+                                timeout_seconds=runtime.timeout,
+                                repository_file_inventory=stream_repository_file_inventory,
+                                scanner_config=runtime.config,
+                                _staging_root=stream_staging_root,
+                                _include_scan_results=True,
+                                **hf_stream_kwargs,
+                            )
+                        )
+                    ) as huggingface_file_generator:
+                        streaming_kwargs: dict[str, Any] = {}
+                        if trusted_source_provenance is not None:
+                            streaming_kwargs["_trusted_source_provenance"] = trusted_source_provenance
+                        streaming_kwargs[REPOSITORY_FILE_INVENTORY_CONFIG_KEY] = stream_repository_file_inventory
+                        streaming_kwargs[REPOSITORY_SCAN_ROOT_CONFIG_KEY] = str(stream_repository_scan_root)
+                        streaming_kwargs.update(_scanner_selection_overrides(runtime))
 
-                streaming_kwargs: dict[str, Any] = {}
-                if trusted_source_provenance is not None:
-                    streaming_kwargs["_trusted_source_provenance"] = trusted_source_provenance
-                streaming_kwargs[REPOSITORY_FILE_INVENTORY_CONFIG_KEY] = stream_repository_file_inventory
-                streaming_kwargs[REPOSITORY_SCAN_ROOT_CONFIG_KEY] = str(stream_repository_scan_root)
-                streaming_kwargs.update(_scanner_selection_overrides(runtime))
-
-                try:
-                    streaming_result = scan_model_streaming(
-                        file_generator=file_generator,
-                        shard_family_group=f"stream-invocation:{id(file_generator):x}",
-                        _trusted_shard_family_root=(
-                            _make_trusted_stream_shard_root(str(hf_cache_dir / "huggingface"))
-                            if runtime.cache_enabled and trusted_source_provenance is not None
-                            else None
-                        ),
-                        timeout=runtime.timeout,
-                        delete_after_scan=True,
-                        scan_root=str(stream_hf_cache_root),
-                        blacklist_patterns=list(blacklist) if blacklist else None,
-                        max_file_size=runtime.max_file_size,
-                        max_total_size=runtime.max_total_size,
-                        strict_license=runtime.strict_license,
-                        skip_file_types=runtime.skip_non_model_files,
-                        use_hf_whitelist=runtime.use_hf_whitelist,
-                        cache_enabled=runtime.cache_enabled,
-                        cache_dir=runtime.cache_dir,
-                        **streaming_kwargs,
-                    )
-                except _HuggingFaceAcquisitionError:
-                    raise
-                except Exception as exc:
-                    raise _HuggingFaceStreamInterruptedError(str(exc)) from exc
-
-                path_state.record_non_shard_result_errors(streaming_result)
-                audit_result.aggregate_scan_result(streaming_result.model_dump())
-                path_state.track_streaming_paths_for_sbom(streaming_result, path)
+                        try:
+                            streaming_result = scan_model_streaming(
+                                file_generator=huggingface_file_generator,
+                                shard_family_group=f"stream-invocation:{id(huggingface_file_generator):x}",
+                                _trusted_shard_family_root=(
+                                    _make_trusted_stream_shard_root(str(stream_hf_cache_root))
+                                    if runtime.cache_enabled and trusted_source_provenance is not None
+                                    else None
+                                ),
+                                timeout=runtime.timeout,
+                                # The invocation-owned staging context is the sole cleanup
+                                # authority. Per-file path deletion would reintroduce
+                                # ancestor-swap races against streamed path strings.
+                                delete_after_scan=False,
+                                scan_root=str(stream_hf_cache_root),
+                                blacklist_patterns=list(blacklist) if blacklist else None,
+                                max_file_size=runtime.max_file_size,
+                                max_total_size=runtime.max_total_size,
+                                strict_license=runtime.strict_license,
+                                skip_file_types=runtime.skip_non_model_files,
+                                use_hf_whitelist=runtime.use_hf_whitelist,
+                                cache_enabled=runtime.cache_enabled,
+                                cache_dir=runtime.cache_dir,
+                                **streaming_kwargs,
+                            )
+                        except _HuggingFaceAcquisitionError:
+                            raise
+                        except Exception as exc:
+                            raise _HuggingFaceStreamInterruptedError(str(exc)) from exc
+                        path_state.record_non_shard_result_errors(streaming_result)
+                        audit_result.aggregate_scan_result(streaming_result.model_dump())
+                        streaming_result_aggregated = True
+                        path_state.track_streaming_paths_for_sbom(streaming_result, path)
 
                 download_duration = time.time() - download_start
                 record_download_completed("huggingface", download_duration, 0, display_path)
@@ -3664,6 +3693,11 @@ def _resolve_scan_source_for_path(
                 path_state,
                 path=path,
                 error_msg=error_msg,
+                scanned_artifact_count=(
+                    streaming_result.files_scanned
+                    if streaming_result_aggregated and streaming_result is not None
+                    else 0
+                ),
             )
             path_state.defer_temp_cleanup(
                 temp_dir,

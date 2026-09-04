@@ -6,6 +6,7 @@ import importlib
 import json
 import os
 import pickle
+import shutil
 import signal
 import struct
 import subprocess
@@ -15,7 +16,7 @@ import textwrap
 import time
 import zipfile
 import zlib
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator, Iterator
 from io import BytesIO
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from types import SimpleNamespace
@@ -61,11 +62,13 @@ from modelaudit.utils.sources.huggingface import (
     _discover_hf_onnx_external_data_files,
     _extract_huggingface_repo_files,
     _get_huggingface_path_sizes,
+    _HfStreamingStagingCleanupError,
     _HuggingFaceProbeBudget,
     _HuggingFaceSafeTensorsRetentionBudget,
     _list_huggingface_repo_files_at_revision,
     _list_repo_files_with_timeout,
     _loads_json_without_duplicate_keys,
+    _normalize_windows_hf_download_path_for_comparison,
     _private_huggingface_acquired_index_candidate,
     _range_response_validator,
     _read_huggingface_prefix,
@@ -77,6 +80,7 @@ from modelaudit.utils.sources.huggingface import (
     _run_huggingface_download_with_deadline,
     _scan_remote_huggingface_safetensors_header,
     _select_streamable_hf_files,
+    _temporary_hf_streaming_staging_root,
     _tensor_name_digest,
     _terminate_huggingface_download_process,
     _validate_huggingface_repo_filename,
@@ -150,6 +154,244 @@ def test_hf_acquisition_interrupt_check_honors_global_cancel_and_deadline(
     with pytest.raises(TimeoutError, match="acquisition timed out"):
         _check_hf_acquisition_interrupted("test/model", 10.0)
     assert interrupt_checks == 1
+
+
+def test_hf_streaming_staging_root_is_removed_after_normal_cleanup() -> None:
+    with _temporary_hf_streaming_staging_root() as staging_root:
+        artifact = staging_root / "huggingface" / "test" / "model" / "context.bin"
+        artifact.parent.mkdir(parents=True)
+        artifact.write_bytes(b"context")
+
+        assert staging_root.name.startswith("modelaudit_hf_stream_")
+        assert artifact.read_bytes() == b"context"
+
+    assert not staging_root.exists()
+
+
+@pytest.mark.parametrize("descriptor_cleanup", [True, False])
+def test_hf_streaming_staging_root_replacement_fails_without_deleting_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    descriptor_cleanup: bool,
+) -> None:
+    if not descriptor_cleanup:
+        from modelaudit.utils.sources import huggingface as huggingface_module
+
+        monkeypatch.setattr(huggingface_module.os, "supports_dir_fd", set())
+        monkeypatch.setattr(huggingface_module.os, "supports_follow_symlinks", set())
+        monkeypatch.setattr(shutil, "_use_fd_functions", False)
+
+    staging_volume = tmp_path / "staging-volume"
+    staging_volume.mkdir()
+    owned_root: Path | None = None
+    replacement_root: Path | None = None
+
+    with (
+        pytest.raises(_HfStreamingStagingCleanupError, match="replacement was preserved") as cleanup_error,
+        _temporary_hf_streaming_staging_root(parent=staging_volume) as staging_root,
+    ):
+        original_identity = staging_root.stat().st_dev, staging_root.stat().st_ino
+        owned_root = staging_root.with_name(f"{staging_root.name}-owned")
+        staging_root.rename(owned_root)
+        staging_root.mkdir()
+        replacement_root = staging_root
+        replacement_identity = replacement_root.stat().st_dev, replacement_root.stat().st_ino
+        (replacement_root / "caller.bin").write_bytes(b"caller-owned")
+
+        assert original_identity != replacement_identity
+
+    assert owned_root is not None
+    assert replacement_root is not None
+    preserved_replacement = Path(str(cleanup_error.value).partition("preserved at ")[2])
+    assert owned_root.is_dir()
+    assert not replacement_root.exists()
+    assert preserved_replacement.is_dir()
+    assert (preserved_replacement.stat().st_dev, preserved_replacement.stat().st_ino) == replacement_identity
+    assert (preserved_replacement / "caller.bin").read_bytes() == b"caller-owned"
+
+    shutil.rmtree(owned_root)
+    shutil.rmtree(preserved_replacement)
+
+
+def test_hf_streaming_staging_fallback_preserves_replacement_at_original_name(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The fallback quarantine isolates cleanup from ordinary original-name replacement.
+
+    Deliberate mutation of the private quarantine by an equivalent OS identity
+    is outside the SECURITY.md threat boundary and is not an isolation
+    guarantee of the stdlib path fallback.
+    """
+    from modelaudit.utils.sources import huggingface as huggingface_module
+
+    monkeypatch.setattr(huggingface_module.os, "supports_dir_fd", set())
+    monkeypatch.setattr(huggingface_module.os, "supports_follow_symlinks", set())
+    monkeypatch.setattr(shutil, "_use_fd_functions", False)
+    original_rmtree = huggingface_module.shutil.rmtree
+    staging_volume = tmp_path / "staging-volume"
+    staging_volume.mkdir()
+    staging_root: Path | None = None
+    original_identity: tuple[int, int] | None = None
+    observed_quarantine: Path | None = None
+
+    def replace_original_name_before_rmtree(
+        path: str | os.PathLike[str],
+        ignore_errors: bool = False,
+        onerror: Callable[..., Any] | None = None,
+    ) -> None:
+        nonlocal observed_quarantine
+        candidate = Path(path)
+        if observed_quarantine is None:
+            assert staging_root is not None
+            assert original_identity is not None
+            assert candidate != staging_root
+            assert candidate.name.startswith(".modelaudit_hf_cleanup_")
+            assert not staging_root.exists()
+            assert (candidate.stat().st_dev, candidate.stat().st_ino) == original_identity
+            observed_quarantine = candidate
+            staging_root.mkdir()
+            (staging_root / "caller.bin").write_bytes(b"caller-owned")
+        original_rmtree(path, ignore_errors=ignore_errors, onerror=onerror)
+
+    monkeypatch.setattr(huggingface_module.shutil, "rmtree", replace_original_name_before_rmtree)
+
+    with _temporary_hf_streaming_staging_root(parent=staging_volume) as active_root:
+        staging_root = active_root
+        original_identity = staging_root.stat().st_dev, staging_root.stat().st_ino
+        (staging_root / "leaf.bin").write_bytes(b"owned")
+
+    assert observed_quarantine is not None
+    assert not observed_quarantine.exists()
+    assert staging_root is not None
+    assert (staging_root / "caller.bin").read_bytes() == b"caller-owned"
+    assert list(staging_volume.glob(".modelaudit_hf_cleanup_*")) == []
+    shutil.rmtree(staging_root)
+
+
+def test_hf_streaming_staging_descriptor_quarantine_unlinks_only_inside_owned_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from modelaudit.utils.sources import huggingface as huggingface_module
+
+    if not huggingface_module._supports_hf_staging_descriptor_cleanup():
+        pytest.skip("descriptor-relative cleanup is unavailable")
+
+    original_unlink = huggingface_module.os.unlink
+    staging_volume = tmp_path / "staging-volume"
+    staging_volume.mkdir()
+    staging_root: Path | None = None
+    raced = False
+
+    def race_before_unlink(
+        path: str | os.PathLike[str],
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        nonlocal raced
+        if path == "leaf.bin" and staging_root is not None and not raced:
+            raced = True
+            if staging_root.exists():
+                assert dir_fd is not None
+                os.rename("leaf.bin", "owned-leaf.bin", src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+                caller_fd = os.open(
+                    "leaf.bin",
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=dir_fd,
+                )
+                try:
+                    os.write(caller_fd, b"caller-owned")
+                finally:
+                    os.close(caller_fd)
+            else:
+                staging_root.mkdir()
+                (staging_root / "leaf.bin").write_bytes(b"caller-owned")
+        original_unlink(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(huggingface_module.os, "unlink", race_before_unlink)
+
+    with _temporary_hf_streaming_staging_root(parent=staging_volume) as active_root:
+        staging_root = active_root
+        (staging_root / "leaf.bin").write_bytes(b"owned")
+
+    assert raced
+    assert staging_root is not None
+    assert (staging_root / "leaf.bin").read_bytes() == b"caller-owned"
+    assert list(staging_volume.glob(".modelaudit_hf_cleanup_*")) == []
+
+
+def test_hf_streaming_staging_root_uses_selected_volume(tmp_path: Path) -> None:
+    staging_volume = tmp_path / "selected-cache"
+
+    with _temporary_hf_streaming_staging_root(parent=staging_volume) as staging_root:
+        assert staging_root.parent == staging_volume.resolve()
+
+    assert not staging_root.exists()
+    assert staging_volume.is_dir()
+
+
+def test_hf_streaming_staging_cleanup_does_not_follow_replaced_children(
+    tmp_path: Path,
+    requires_symlinks: None,
+) -> None:
+    outside_file = tmp_path / "outside.bin"
+    outside_file.write_bytes(b"outside leaf")
+    outside_parent = tmp_path / "outside-parent"
+    outside_parent.mkdir()
+    outside_sidecar = outside_parent / "model.onnx_data"
+    outside_sidecar.write_bytes(b"outside parent")
+
+    with _temporary_hf_streaming_staging_root() as staging_root:
+        leaf = staging_root / "leaf.bin"
+        leaf.write_bytes(b"owned leaf")
+        leaf.rename(staging_root / "owned-leaf.bin")
+        leaf.symlink_to(outside_file)
+
+        parent = staging_root / "onnx"
+        parent.mkdir()
+        (parent / "model.onnx_data").write_bytes(b"owned parent")
+        parent.rename(staging_root / "owned-onnx")
+        parent.symlink_to(outside_parent, target_is_directory=True)
+
+    assert not staging_root.exists()
+    assert outside_file.read_bytes() == b"outside leaf"
+    assert outside_sidecar.read_bytes() == b"outside parent"
+
+
+def test_hf_streaming_staging_cleanup_works_without_descriptor_relative_operations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from modelaudit.utils.sources import huggingface as huggingface_module
+
+    monkeypatch.setattr(huggingface_module.os, "supports_dir_fd", set())
+    monkeypatch.setattr(huggingface_module.os, "supports_follow_symlinks", set())
+    monkeypatch.setattr(shutil, "_use_fd_functions", False)
+
+    with _temporary_hf_streaming_staging_root() as staging_root:
+        artifact = staging_root / "huggingface" / "test" / "model" / "context.bin"
+        artifact.parent.mkdir(parents=True)
+        artifact.write_bytes(b"context")
+
+    assert not staging_root.exists()
+
+
+def test_hf_download_path_comparison_accepts_equivalent_windows_extended_paths() -> None:
+    separator = chr(92)
+    drive_path = separator.join(("C:", "cache", "models", "onnx", "model.onnx_data"))
+    extended_drive_path = f"{separator}{separator}?{separator}{drive_path}"
+    unc_path = f"{separator}{separator}" + separator.join(("server", "share", "models", "onnx", "model.onnx_data"))
+    extended_unc_path = f"{separator}{separator}?{separator}UNC{separator}" + separator.join(
+        ("server", "share", "models", "onnx", "model.onnx_data")
+    )
+
+    assert _normalize_windows_hf_download_path_for_comparison(
+        extended_drive_path
+    ) == _normalize_windows_hf_download_path_for_comparison(drive_path)
+    assert _normalize_windows_hf_download_path_for_comparison(
+        extended_unc_path
+    ) == _normalize_windows_hf_download_path_for_comparison(unc_path)
 
 
 def _bert_vocab_payload(min_bytes: int = 16 * 1024) -> bytes:
@@ -3825,6 +4067,112 @@ class TestModelDownloadStreaming:
             local_dir=str(tmp_path / "huggingface" / "test" / "model"),
         )
 
+    @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None)
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(
+            ["models/a.bin", "models/b.bin", "models/c.bin"],
+            _HF_TEST_REVISION,
+            None,
+        ),
+    )
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_staging_keeps_only_active_artifact_family(
+        self,
+        mock_hf_hub_download: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+        _mock_detect_content: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        def download_side_effect(*, filename: str, local_dir: str | None = None, **_kwargs: object) -> str:
+            assert local_dir is not None
+            path = Path(local_dir) / filename
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(filename.encode())
+            return str(path)
+
+        mock_hf_hub_download.side_effect = download_side_effect
+
+        with _temporary_hf_streaming_staging_root(parent=tmp_path / "selected-cache") as staging_root:
+            generator = download_model_streaming(
+                "https://huggingface.co/test/model",
+                cache_dir=tmp_path / "persistent-cache",
+                scannable_extensions={".bin"},
+                _staging_root=staging_root,
+            )
+
+            first_path, first_is_last = next(generator)
+            assert first_path.read_bytes() == b"models/a.bin"
+            assert first_is_last is False
+            assert len([path for path in staging_root.rglob("*") if path.is_file()]) == 1
+
+            second_path, second_is_last = next(generator)
+            assert not first_path.exists()
+            assert second_path.read_bytes() == b"models/b.bin"
+            assert second_is_last is False
+            assert len([path for path in staging_root.rglob("*") if path.is_file()]) == 1
+
+            third_path, third_is_last = next(generator)
+            assert not second_path.exists()
+            assert third_path.read_bytes() == b"models/c.bin"
+            assert third_is_last is True
+            assert len([path for path in staging_root.rglob("*") if path.is_file()]) == 1
+
+            cast(Generator[tuple[Path, bool], None, None], generator).close()
+            assert not third_path.exists()
+            assert not (staging_root / "huggingface").exists()
+
+        assert not staging_root.exists()
+
+    @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None)
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin"})
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["models/a.bin"], _HF_TEST_REVISION, None),
+    )
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_staging_matches_repository_scan_root(
+        self,
+        mock_hf_hub_download: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+        _mock_detect_content: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Staged files should be relative to the CLI's repository scan root."""
+
+        def download_side_effect(*, filename: str, local_dir: str | None = None, **_kwargs: object) -> str:
+            assert local_dir is not None
+            path = Path(local_dir) / filename
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"weights")
+            return str(path)
+
+        mock_hf_hub_download.side_effect = download_side_effect
+
+        with _temporary_hf_streaming_staging_root(parent=tmp_path / "selected-cache") as staging_root:
+            generator = download_model_streaming(
+                "https://huggingface.co/test/model",
+                cache_dir=tmp_path / "persistent-cache",
+                scannable_extensions={".bin"},
+                _staging_root=staging_root,
+            )
+
+            streamed_path, is_last = next(generator)
+            repository_scan_root = staging_root / "huggingface" / "test" / "model"
+            assert streamed_path == repository_scan_root / "models" / "a.bin"
+            assert streamed_path.relative_to(repository_scan_root).as_posix() == "models/a.bin"
+            assert mock_hf_hub_download.call_args.kwargs["local_dir"] == str(repository_scan_root)
+            assert is_last is True
+
+            cast(Generator[tuple[Path, bool], None, None], generator).close()
+            assert not streamed_path.exists()
+            assert not (staging_root / "huggingface").exists()
+
+        assert not staging_root.exists()
+
     @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format")
     @patch(
         "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
@@ -4200,6 +4548,7 @@ class TestModelDownloadStreaming:
             "document.bin",
         ]
 
+    @pytest.mark.parametrize("close_early", [False, True])
     @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None)
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".onnx"})
     @patch(
@@ -4216,6 +4565,7 @@ class TestModelDownloadStreaming:
         _mock_get_extensions: MagicMock,
         _mock_detect_content: MagicMock,
         tmp_path: Path,
+        close_early: bool,
     ) -> None:
         """Referenced ONNX sidecars should be present while the parent ONNX is yielded."""
         payload = _make_external_onnx_payload(tmp_path)
@@ -4234,32 +4584,293 @@ class TestModelDownloadStreaming:
             [SimpleNamespace(path="onnx/model.onnx_data", size=len(sidecar_bytes))],
         ]
 
+        with _temporary_hf_streaming_staging_root() as staging_root:
+            generator = download_model_streaming(
+                "https://huggingface.co/test/model",
+                cache_dir=tmp_path / "persistent_cache",
+                max_size=len(payload) + len(sidecar_bytes),
+                scannable_extensions={".onnx"},
+                scannable_scanner_ids={"onnx"},
+                _staging_root=staging_root,
+            )
+            model_path, is_last = next(generator)
+            sidecar_path = model_path.with_name("model.onnx_data")
+
+            assert is_last is True
+            assert model_path.name == "model.onnx"
+            assert sidecar_path.read_bytes() == sidecar_bytes
+            assert [call.kwargs["filename"] for call in mock_hf_hub_download.call_args_list] == [
+                "onnx/model.onnx",
+                "onnx/model.onnx_data",
+            ]
+            assert mock_get_paths_info.call_args_list == [
+                call("test/model", ["onnx/model.onnx"], revision=_HF_TEST_REVISION),
+                call("test/model", ["onnx/model.onnx_data"], revision=_HF_TEST_REVISION),
+            ]
+
+            if close_early:
+                cast(Generator[tuple[Path, bool], None, None], generator).close()
+            else:
+                with pytest.raises(StopIteration):
+                    next(generator)
+            assert not model_path.exists()
+            assert not sidecar_path.exists()
+            assert not (staging_root / "huggingface").exists()
+
+        assert not staging_root.exists()
+
+    @pytest.mark.parametrize("close_early", [False, True])
+    @pytest.mark.parametrize("sidecar_preexisted", [False, True])
+    @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None)
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".onnx"})
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["onnx/model.onnx", "onnx/model.onnx_data"], _HF_TEST_REVISION, None),
+    )
+    @patch("huggingface_hub.HfApi.get_paths_info")
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_staging_preserves_persistent_cache_sidecars(
+        self,
+        mock_hf_hub_download: MagicMock,
+        mock_get_paths_info: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+        _mock_detect_content: MagicMock,
+        tmp_path: Path,
+        close_early: bool,
+        sidecar_preexisted: bool,
+    ) -> None:
+        payload = _make_external_onnx_payload(tmp_path)
+        sidecar_bytes = struct.pack("f", 1.0)
+        persistent_cache = tmp_path / "persistent-cache"
+        persistent_sidecar = persistent_cache / "huggingface" / "test" / "model" / "onnx" / "model.onnx_data"
+        expected_persistent_bytes = b"preexisting cache" if sidecar_preexisted else b"concurrent caller"
+        if sidecar_preexisted:
+            persistent_sidecar.parent.mkdir(parents=True)
+            persistent_sidecar.write_bytes(expected_persistent_bytes)
+
+        mock_get_paths_info.side_effect = [
+            [SimpleNamespace(path="onnx/model.onnx", size=len(payload))],
+            [SimpleNamespace(path="onnx/model.onnx_data", size=len(sidecar_bytes))],
+        ]
+
+        with _temporary_hf_streaming_staging_root() as staging_root:
+
+            def download_side_effect(*, filename: str, local_dir: str | None = None, **kwargs: object) -> str:
+                assert local_dir is not None
+                assert kwargs["cache_dir"] == str(persistent_cache / "huggingface")
+                path = Path(local_dir) / filename
+                path.parent.mkdir(parents=True, exist_ok=True)
+                if filename == "onnx/model.onnx":
+                    path.write_bytes(payload)
+                else:
+                    if not sidecar_preexisted:
+                        persistent_sidecar.parent.mkdir(parents=True)
+                        persistent_sidecar.write_bytes(expected_persistent_bytes)
+                    path.write_bytes(sidecar_bytes)
+                return str(path)
+
+            mock_hf_hub_download.side_effect = download_side_effect
+            generator = download_model_streaming(
+                "https://huggingface.co/test/model",
+                cache_dir=persistent_cache,
+                max_size=len(payload) + len(sidecar_bytes),
+                scannable_extensions={".onnx"},
+                scannable_scanner_ids={"onnx"},
+                _staging_root=staging_root,
+            )
+            model_path, is_last = next(generator)
+            staged_sidecar = model_path.with_name("model.onnx_data")
+
+            assert is_last is True
+            assert model_path.is_relative_to(staging_root)
+            assert staged_sidecar.read_bytes() == sidecar_bytes
+
+            if close_early:
+                cast(Generator[tuple[Path, bool], None, None], generator).close()
+            else:
+                with pytest.raises(StopIteration):
+                    next(generator)
+            assert not model_path.exists()
+            assert not staged_sidecar.exists()
+            assert not (staging_root / "huggingface").exists()
+
+        assert not staging_root.exists()
+        assert persistent_sidecar.read_bytes() == expected_persistent_bytes
+
+    @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None)
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".onnx"})
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["onnx/model.onnx", "onnx/model.onnx_data"], _HF_TEST_REVISION, None),
+    )
+    @patch("huggingface_hub.HfApi.get_paths_info")
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_rejects_mismatched_context_sidecar_path(
+        self,
+        mock_hf_hub_download: MagicMock,
+        mock_get_paths_info: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+        _mock_detect_content: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        payload = _make_external_onnx_payload(tmp_path)
+        sidecar_bytes = struct.pack("f", 1.0)
+        cache_dir = tmp_path / "modelaudit_hf_persistent"
+        preexisting_path = cache_dir / "huggingface" / "test" / "model" / "onnx" / "preexisting.bin"
+        preexisting_path.parent.mkdir(parents=True)
+        preexisting_path.write_bytes(sidecar_bytes)
+
+        def download_side_effect(*, filename: str, local_dir: str | None = None, **_kwargs: object) -> str:
+            assert local_dir is not None
+            path = Path(local_dir) / filename
+            if filename == "onnx/model.onnx":
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(payload)
+                return str(path)
+            return str(preexisting_path)
+
+        mock_hf_hub_download.side_effect = download_side_effect
+        mock_get_paths_info.side_effect = [
+            [SimpleNamespace(path="onnx/model.onnx", size=len(payload))],
+            [SimpleNamespace(path="onnx/model.onnx_data", size=len(sidecar_bytes))],
+        ]
+
         generator = download_model_streaming(
             "https://huggingface.co/test/model",
-            cache_dir=tmp_path / "modelaudit_hf_fixture",
+            cache_dir=cache_dir,
             max_size=len(payload) + len(sidecar_bytes),
             scannable_extensions={".onnx"},
             scannable_scanner_ids={"onnx"},
         )
-        model_path, is_last = next(generator)
-        sidecar_path = model_path.with_name("model.onnx_data")
 
-        assert is_last is True
-        assert model_path.name == "model.onnx"
-        assert sidecar_path.read_bytes() == sidecar_bytes
-        assert [call.kwargs["filename"] for call in mock_hf_hub_download.call_args_list] == [
-            "onnx/model.onnx",
-            "onnx/model.onnx_data",
-        ]
-        assert mock_get_paths_info.call_args_list == [
-            call("test/model", ["onnx/model.onnx"], revision=_HF_TEST_REVISION),
-            call("test/model", ["onnx/model.onnx_data"], revision=_HF_TEST_REVISION),
-        ]
-
-        with pytest.raises(StopIteration):
+        with pytest.raises(Exception, match="unexpected local path"):
             next(generator)
-        assert not sidecar_path.exists()
+        assert preexisting_path.read_bytes() == sidecar_bytes
 
+    @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None)
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".onnx"})
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["onnx/model.onnx", "onnx/model.onnx_data"], _HF_TEST_REVISION, None),
+    )
+    @patch("huggingface_hub.HfApi.get_paths_info")
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_cleans_staging_after_sidecar_size_failure(
+        self,
+        mock_hf_hub_download: MagicMock,
+        mock_get_paths_info: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+        _mock_detect_content: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        payload = _make_external_onnx_payload(tmp_path)
+        oversized_sidecar = b"x" * 20
+        persistent_cache = tmp_path / "persistent-cache"
+        persistent_sentinel = persistent_cache / "huggingface" / "caller.bin"
+        persistent_sentinel.parent.mkdir(parents=True)
+        persistent_sentinel.write_bytes(b"caller-owned")
+
+        def download_side_effect(*, filename: str, local_dir: str | None = None, **_kwargs: object) -> str:
+            assert local_dir is not None
+            path = Path(local_dir) / filename
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(payload if filename == "onnx/model.onnx" else oversized_sidecar)
+            return str(path)
+
+        mock_hf_hub_download.side_effect = download_side_effect
+        mock_get_paths_info.side_effect = [
+            [SimpleNamespace(path="onnx/model.onnx", size=len(payload))],
+            [SimpleNamespace(path="onnx/model.onnx_data", size=1)],
+        ]
+
+        with _temporary_hf_streaming_staging_root() as staging_root:
+            generator = download_model_streaming(
+                "https://huggingface.co/test/model",
+                cache_dir=persistent_cache,
+                max_size=len(payload) + 1,
+                scannable_extensions={".onnx"},
+                scannable_scanner_ids={"onnx"},
+                _staging_root=staging_root,
+            )
+
+            with pytest.raises(Exception, match="exceeding max size"):
+                next(generator)
+            assert not (staging_root / "huggingface").exists()
+
+        assert not staging_root.exists()
+        assert persistent_sentinel.read_bytes() == b"caller-owned"
+
+    @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None)
+    @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".onnx"})
+    @patch(
+        "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+        return_value=(["onnx/model.onnx", "onnx/model.onnx_data"], _HF_TEST_REVISION, None),
+    )
+    @patch("huggingface_hub.HfApi.get_paths_info")
+    @patch("huggingface_hub.hf_hub_download")
+    def test_download_model_streaming_cleanup_is_independent_of_cache_root_swap(
+        self,
+        mock_hf_hub_download: MagicMock,
+        mock_get_paths_info: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_get_extensions: MagicMock,
+        _mock_detect_content: MagicMock,
+        tmp_path: Path,
+        requires_symlinks: None,
+    ) -> None:
+        payload = _make_external_onnx_payload(tmp_path)
+        sidecar_bytes = struct.pack("f", 1.0)
+        persistent_cache = tmp_path / "persistent-cache"
+        moved_cache = tmp_path / "moved-cache"
+        owned_cache_file = persistent_cache / "huggingface" / "owned.bin"
+        owned_cache_file.parent.mkdir(parents=True)
+        owned_cache_file.write_bytes(b"owned cache")
+        outside_root = tmp_path / "outside"
+        outside_cache_file = outside_root / "huggingface" / "caller.bin"
+        outside_cache_file.parent.mkdir(parents=True)
+        outside_cache_file.write_bytes(b"caller cache")
+        swapped = False
+
+        def download_side_effect(*, filename: str, local_dir: str | None = None, **_kwargs: object) -> str:
+            nonlocal swapped
+            assert local_dir is not None
+            path = Path(local_dir) / filename
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if filename == "onnx/model.onnx_data" and not swapped:
+                persistent_cache.rename(moved_cache)
+                persistent_cache.symlink_to(outside_root, target_is_directory=True)
+                swapped = True
+            path.write_bytes(payload if filename == "onnx/model.onnx" else sidecar_bytes)
+            return str(path)
+
+        mock_hf_hub_download.side_effect = download_side_effect
+        mock_get_paths_info.side_effect = [
+            [SimpleNamespace(path="onnx/model.onnx", size=len(payload))],
+            [SimpleNamespace(path="onnx/model.onnx_data", size=len(sidecar_bytes))],
+        ]
+
+        with _temporary_hf_streaming_staging_root() as staging_root:
+            generator = download_model_streaming(
+                "https://huggingface.co/test/model",
+                cache_dir=persistent_cache,
+                max_size=len(payload) + len(sidecar_bytes),
+                scannable_extensions={".onnx"},
+                scannable_scanner_ids={"onnx"},
+                _staging_root=staging_root,
+            )
+            model_path, _is_last = next(generator)
+            assert model_path.with_name("model.onnx_data").read_bytes() == sidecar_bytes
+            cast(Generator[tuple[Path, bool], None, None], generator).close()
+
+        assert swapped
+        assert not staging_root.exists()
+        assert outside_cache_file.read_bytes() == b"caller cache"
+        assert (moved_cache / "huggingface" / "owned.bin").read_bytes() == b"owned cache"
+
+    @pytest.mark.parametrize(("sidecar_copies", "succeeds"), [(1, False), (2, True)])
     @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format", return_value=None)
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".onnx"})
     @patch(
@@ -4272,7 +4883,7 @@ class TestModelDownloadStreaming:
     )
     @patch("huggingface_hub.HfApi.get_paths_info")
     @patch("huggingface_hub.hf_hub_download")
-    def test_download_model_streaming_counts_shared_onnx_external_data_once(
+    def test_download_model_streaming_counts_each_shared_onnx_external_data_materialization(
         self,
         mock_hf_hub_download: MagicMock,
         mock_get_paths_info: MagicMock,
@@ -4280,8 +4891,10 @@ class TestModelDownloadStreaming:
         _mock_get_extensions: MagicMock,
         _mock_detect_content: MagicMock,
         tmp_path: Path,
+        sidecar_copies: int,
+        succeeds: bool,
     ) -> None:
-        """A shared context-only ONNX sidecar should be downloaded and budgeted once."""
+        """Each separately staged shared context sidecar consumes acquisition budget."""
         payload = _make_external_onnx_payload(tmp_path, external_path="shared.onnx_data")
         sidecar_bytes = struct.pack("f", 1.0)
 
@@ -4300,29 +4913,40 @@ class TestModelDownloadStreaming:
             ],
             [SimpleNamespace(path="onnx/shared.onnx_data", size=len(sidecar_bytes))],
         ]
+        total_materialized_bytes = (len(payload) * 2) + (len(sidecar_bytes) * 2)
 
-        results = list(
-            download_model_streaming(
+        with _temporary_hf_streaming_staging_root() as staging_root:
+            stream = download_model_streaming(
                 "https://huggingface.co/test/model",
-                cache_dir=tmp_path / "modelaudit_hf_fixture",
-                max_size=(len(payload) * 2) + len(sidecar_bytes),
+                cache_dir=tmp_path / "persistent-cache",
+                max_size=(len(payload) * 2) + (len(sidecar_bytes) * sidecar_copies),
                 scannable_extensions={".onnx"},
                 scannable_scanner_ids={"onnx"},
+                _staging_root=staging_root,
             )
-        )
+            if succeeds:
+                results = list(stream)
+                assert [path.name for path, _is_last in results] == ["a.onnx", "b.onnx"]
+                assert [is_last for _path, is_last in results] == [False, True]
+                assert all(not path.exists() for path, _is_last in results)
+            else:
+                with pytest.raises(Exception, match=rf"would total {total_materialized_bytes} bytes"):
+                    list(stream)
+            assert not (staging_root / "huggingface").exists()
 
-        assert [path.name for path, _is_last in results] == ["a.onnx", "b.onnx"]
-        assert [is_last for _path, is_last in results] == [False, True]
-        assert [call.kwargs["filename"] for call in mock_hf_hub_download.call_args_list] == [
+        assert not staging_root.exists()
+        expected_downloads = [
             "onnx/a.onnx",
             "onnx/shared.onnx_data",
             "onnx/b.onnx",
         ]
+        if succeeds:
+            expected_downloads.append("onnx/shared.onnx_data")
+        assert [call.kwargs["filename"] for call in mock_hf_hub_download.call_args_list] == expected_downloads
         assert mock_get_paths_info.call_args_list == [
             call("test/model", ["onnx/a.onnx", "onnx/b.onnx"], revision=_HF_TEST_REVISION),
             call("test/model", ["onnx/shared.onnx_data"], revision=_HF_TEST_REVISION),
         ]
-        assert not (tmp_path / "modelaudit_hf_fixture" / "test" / "model" / "onnx" / "shared.onnx_data").exists()
 
     @patch("modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format")
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".onnx"})
@@ -4726,7 +5350,7 @@ class TestModelDownloadStreaming:
         _mock_get_extensions: MagicMock,
         tmp_path: Path,
     ) -> None:
-        """A deleted yielded sidecar should be restored as ONNX context without double-budgeting."""
+        """A deleted yielded sidecar should consume budget again when restored as ONNX context."""
         payload = _make_external_onnx_payload(tmp_path)
         sidecar_bytes = struct.pack("f", 1.0)
 
@@ -4746,7 +5370,7 @@ class TestModelDownloadStreaming:
         generator = download_model_streaming(
             "https://huggingface.co/test/model",
             cache_dir=tmp_path / "cache",
-            max_size=len(payload) + len(sidecar_bytes),
+            max_size=len(payload) + (len(sidecar_bytes) * 2),
             scannable_extensions={".onnx"},
             scannable_scanner_ids={"onnx"},
             include_all_files=True,
@@ -5792,8 +6416,16 @@ class TestModelDownloadStreaming:
     ) -> None:
         """Exact filename routes must not widen selected scans to every extensionless file."""
         repo_files = ["README", *(f"payloads/chunk-{idx:04d}" for idx in range(129))]
-        readme_path = tmp_path / "README"
-        mock_hf_hub_download.return_value = str(readme_path)
+        readme_path = tmp_path / "huggingface" / "test" / "model" / "README"
+
+        def download_side_effect(*, filename: str, local_dir: str | None = None, **_kwargs: object) -> str:
+            assert local_dir is not None
+            downloaded_path = Path(local_dir) / filename
+            downloaded_path.parent.mkdir(parents=True, exist_ok=True)
+            downloaded_path.write_text("model card", encoding="utf-8")
+            return str(downloaded_path)
+
+        mock_hf_hub_download.side_effect = download_side_effect
 
         with patch(
             "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
