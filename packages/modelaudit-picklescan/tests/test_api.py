@@ -2449,24 +2449,32 @@ def test_scan_bytes_escalates_copyreg_extension_reduce() -> None:
     )
 
 
-def test_scan_bytes_blocks_operator_setitem_copyreg_dispatch_table_poisoning() -> None:
+def test_scan_bytes_blocks_operator_setitem_copyreg_dispatch_table_poisoning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _generation: None)
     payload = b"\x80\x02coperator\nsetitem\nccopyreg\ndispatch_table\ncdecimal\nDecimal\ncbuiltins\nstr\n\x87R."
-    copyreg.dispatch_table.pop(decimal.Decimal, None)
+    original_dispatch_table = dict(copyreg.dispatch_table)
+    try:
+        copyreg.dispatch_table.pop(decimal.Decimal, None)
 
-    report = scan_bytes(payload, source="operator-setitem-copyreg-dispatch-table.pkl")
+        report = scan_bytes(payload, source="operator-setitem-copyreg-dispatch-table.pkl")
 
-    assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert decimal.Decimal not in copyreg.dispatch_table
-    assert any(
-        finding.rule_code == "DANGEROUS_CALL"
-        and finding.severity == Severity.CRITICAL
-        and finding.details.get("import_reference") == "operator.setitem"
-        for finding in report.findings
-    )
+        assert report.status == ScanStatus.COMPLETE
+        assert report.verdict == SafetyVerdict.MALICIOUS
+        assert decimal.Decimal not in copyreg.dispatch_table
+        assert any(
+            finding.rule_code == "DANGEROUS_CALL"
+            and finding.severity == Severity.CRITICAL
+            and finding.details.get("import_reference") == "operator.setitem"
+            for finding in report.findings
+        )
 
-    assert pickle.loads(payload) is None
-    assert copyreg.dispatch_table.get(decimal.Decimal) is str
+        assert pickle.loads(payload) is None
+        assert copyreg.dispatch_table.get(decimal.Decimal) is str
+    finally:
+        copyreg.dispatch_table.clear()
+        copyreg.dispatch_table.update(original_dispatch_table)
 
 
 @pytest.mark.parametrize(
@@ -3275,7 +3283,10 @@ def test_scan_bytes_attributes_reduce_calls_to_the_callable_operand_not_nested_a
         (b"cbuiltins\nlen\n}(cos\nsystem\nK\x01u\x85R.", "setitems-args.pkl"),
     ],
 )
-def test_scan_bytes_dict_mutation_operands_do_not_become_reduce_call_targets(payload: bytes, source: str) -> None:
+def test_scan_bytes_dict_mutation_operands_do_not_become_reduce_call_targets(
+    payload: bytes, source: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(package_api, "_ensure_shared_source_snapshot_stable", lambda _generation: None)
     report = scan_bytes(payload, source=source)
 
     assert report.status == ScanStatus.COMPLETE
