@@ -27,6 +27,18 @@ except ModuleNotFoundError:  # pragma: no cover - Python 3.10 compatibility
     import tomli as tomllib  # type: ignore[no-redef]
 
 
+_TRUSTED_CHECKOUT_V6_PINS = frozenset(
+    {
+        "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd",
+        "actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803",
+    },
+)
+
+
+def _is_trusted_checkout_v6_pin(uses: object) -> bool:
+    return isinstance(uses, str) and uses in _TRUSTED_CHECKOUT_V6_PINS
+
+
 def _load_release_workflow() -> dict[str, Any]:
     workflow_path = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "release-please.yml"
     workflow = yaml.safe_load(workflow_path.read_text(encoding="utf-8"))
@@ -62,6 +74,30 @@ def _jobs(workflow: dict[str, Any]) -> dict[str, Any]:
     jobs = workflow["jobs"]
     assert isinstance(jobs, dict)
     return jobs
+
+
+def _run_manual_release_step(
+    *,
+    root_version: str,
+    picklescan_version: str,
+    source_run_id: str,
+    output_path: Path,
+) -> subprocess.CompletedProcess[str]:
+    workflow = _load_release_workflow()
+    script = _step_by_name(_job_steps(workflow, "release-please"), "Resolve manual release inputs")["run"]
+    return subprocess.run(
+        ["bash", "--noprofile", "--norc", "-euo", "pipefail", "-c", script],
+        env={
+            **os.environ,
+            "GITHUB_OUTPUT": str(output_path),
+            "ROOT_VERSION": root_version,
+            "PICKLESCAN_VERSION": picklescan_version,
+            "ROOT_PROVENANCE_RUN_ID": source_run_id,
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
 
 
 def test_release_please_keeps_root_componentless_for_grouped_root_only_releases() -> None:
@@ -219,22 +255,13 @@ def test_release_workflow_resolves_provenance_only_recovery_inputs(
     expected_fragment: str,
     tmp_path: Path,
 ) -> None:
-    workflow = _load_release_workflow()
-    script = _step_by_name(_job_steps(workflow, "release-please"), "Resolve manual release inputs")["run"]
     output_path = tmp_path / "github-output"
 
-    result = subprocess.run(
-        ["bash", "--noprofile", "--norc", "-euo", "pipefail", "-c", script],
-        env={
-            **os.environ,
-            "GITHUB_OUTPUT": str(output_path),
-            "ROOT_VERSION": root_version,
-            "PICKLESCAN_VERSION": picklescan_version,
-            "ROOT_PROVENANCE_RUN_ID": source_run_id,
-        },
-        capture_output=True,
-        text=True,
-        check=False,
+    result = _run_manual_release_step(
+        root_version=root_version,
+        picklescan_version=picklescan_version,
+        source_run_id=source_run_id,
+        output_path=output_path,
     )
 
     assert result.returncode == expected_code
@@ -247,6 +274,118 @@ def test_release_workflow_resolves_provenance_only_recovery_inputs(
         assert f"root_provenance_run_id={source_run_id}" in output
         assert f"version={root_version}" in output
         assert f"tag_name=v{root_version}" in output
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Release workflow Bash execution requires POSIX filesystem semantics")
+@pytest.mark.parametrize(
+    ("root_version", "picklescan_version", "source_run_id", "expected_error"),
+    [
+        pytest.param("v0.2.52", "", "", "Invalid root_version", id="root-version-prefix"),
+        pytest.param("0.2", "", "", "Invalid root_version", id="root-version-incomplete"),
+        pytest.param("01.2.3", "", "", "Invalid root_version", id="root-version-leading-zero"),
+        pytest.param("0.02.3", "", "", "Invalid root_version", id="root-minor-leading-zero"),
+        pytest.param("0.2.03", "", "", "Invalid root_version", id="root-patch-leading-zero"),
+        pytest.param("0.2.52rc1", "", "", "Invalid root_version", id="root-prerelease"),
+        pytest.param("0.2.52;echo injected", "", "", "Invalid root_version", id="root-shell-metacharacters"),
+        pytest.param(
+            "0.2.52\nrelease_created=false",
+            "",
+            "",
+            "Invalid root_version",
+            id="root-output-injection",
+        ),
+        pytest.param("", "v0.1.10", "", "Invalid picklescan_version", id="picklescan-version-prefix"),
+        pytest.param("", "0.1", "", "Invalid picklescan_version", id="picklescan-version-incomplete"),
+        pytest.param("", "00.1.10", "", "Invalid picklescan_version", id="picklescan-version-leading-zero"),
+        pytest.param("", "0.1.10.post1", "", "Invalid picklescan_version", id="picklescan-prerelease"),
+        pytest.param(
+            "",
+            "0.1.10\nmanual_release=false",
+            "",
+            "Invalid picklescan_version",
+            id="picklescan-output-injection",
+        ),
+        pytest.param(
+            "01.2.3",
+            "",
+            "29787069929",
+            "requires root_version in X.Y.Z format",
+            id="provenance-root-leading-zero",
+        ),
+    ],
+)
+def test_release_workflow_rejects_invalid_manual_release_versions_before_writing_outputs(
+    root_version: str,
+    picklescan_version: str,
+    source_run_id: str,
+    expected_error: str,
+    tmp_path: Path,
+) -> None:
+    output_path = tmp_path / "github-output"
+
+    result = _run_manual_release_step(
+        root_version=root_version,
+        picklescan_version=picklescan_version,
+        source_run_id=source_run_id,
+        output_path=output_path,
+    )
+
+    assert result.returncode == 1
+    assert expected_error in result.stdout
+    assert not output_path.exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Release workflow Bash execution requires POSIX filesystem semantics")
+@pytest.mark.parametrize(
+    ("root_version", "picklescan_version", "expected_outputs"),
+    [
+        pytest.param(
+            "0.2.52",
+            "0.1.10",
+            (
+                "release_created=true",
+                "version=0.2.52",
+                "tag_name=v0.2.52",
+                "picklescan_release_created=true",
+                "picklescan_version=0.1.10",
+                "picklescan_tag_name=modelaudit-picklescan-v0.1.10",
+                "manual_release=true",
+            ),
+            id="both-current-release-versions",
+        ),
+        pytest.param(
+            "0.0.0",
+            "10.20.30",
+            (
+                "release_created=true",
+                "version=0.0.0",
+                "tag_name=v0.0.0",
+                "picklescan_release_created=true",
+                "picklescan_version=10.20.30",
+                "picklescan_tag_name=modelaudit-picklescan-v10.20.30",
+                "manual_release=true",
+            ),
+            id="zero-and-multidigit-components",
+        ),
+    ],
+)
+def test_release_workflow_preserves_valid_manual_release_versions(
+    root_version: str,
+    picklescan_version: str,
+    expected_outputs: tuple[str, ...],
+    tmp_path: Path,
+) -> None:
+    output_path = tmp_path / "github-output"
+
+    result = _run_manual_release_step(
+        root_version=root_version,
+        picklescan_version=picklescan_version,
+        source_run_id="",
+        output_path=output_path,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert output_path.read_text(encoding="utf-8").splitlines() == list(expected_outputs)
 
 
 def test_release_workflow_picklescan_artifacts_stay_in_package_workspace() -> None:
@@ -752,6 +891,33 @@ def test_release_workflow_generates_root_provenance_after_successful_publish() -
     assert job["needs"] == ["build", "publish-pypi", "verify-pypi", "release-please"]
 
 
+@pytest.mark.parametrize(
+    ("uses", "expected"),
+    [
+        pytest.param(
+            "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd",
+            True,
+            id="previous-v6-digest",
+        ),
+        pytest.param(
+            "actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803",
+            True,
+            id="rotated-v6-digest",
+        ),
+        pytest.param("actions/checkout@0000000000000000000000000000000000000000", False, id="arbitrary-digest"),
+        pytest.param("actions/checkout@v6", False, id="mutable-tag"),
+        pytest.param(
+            "untrusted/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd",
+            False,
+            id="different-action",
+        ),
+        pytest.param(None, False, id="non-string"),
+    ],
+)
+def test_checkout_v6_pin_validator(uses: object, expected: bool) -> None:
+    assert _is_trusted_checkout_v6_pin(uses) is expected
+
+
 def test_release_workflow_recovers_root_provenance_without_republishing() -> None:
     workflow = _load_release_workflow()
 
@@ -776,7 +942,7 @@ def test_release_workflow_recovers_root_provenance_without_republishing() -> Non
 
     steps = _job_steps(workflow, "root-provenance-recovery")
     checkout_step = _step_by_name(steps, "Checkout tagged root release")
-    assert checkout_step["uses"] == "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd"
+    assert _is_trusted_checkout_v6_pin(checkout_step["uses"])
     assert checkout_step["with"] == {
         "ref": "refs/tags/${{ needs.release-please.outputs.tag_name }}",
         "sparse-checkout": "pyproject.toml\nuv.lock\n",
