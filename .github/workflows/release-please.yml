@@ -52,6 +52,18 @@ jobs:
           PICKLESCAN_VERSION: ${{ github.event.inputs.picklescan_version || '' }}
           ROOT_PROVENANCE_RUN_ID: ${{ github.event.inputs.root_provenance_run_id || '' }}
         run: |
+          SEMVER_PATTERN='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+
+          if [[ -n "$ROOT_VERSION" && ! "$ROOT_VERSION" =~ $SEMVER_PATTERN ]]; then
+            echo "::error title=Invalid root_version::Manual release requires root_version in X.Y.Z format with no leading zeroes."
+            exit 1
+          fi
+
+          if [[ -n "$PICKLESCAN_VERSION" && ! "$PICKLESCAN_VERSION" =~ $SEMVER_PATTERN ]]; then
+            echo "::error title=Invalid picklescan_version::Manual release requires picklescan_version in X.Y.Z format with no leading zeroes."
+            exit 1
+          fi
+
           if [[ -n "$ROOT_PROVENANCE_RUN_ID" ]]; then
             if [[ ! "$ROOT_PROVENANCE_RUN_ID" =~ ^[1-9][0-9]*$ ]]; then
               echo "Root provenance recovery requires a numeric source run ID."
