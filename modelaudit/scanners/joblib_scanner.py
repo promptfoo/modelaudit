@@ -849,6 +849,7 @@ class JoblibScanner(BaseScanner):
             result.merge_member_result(sub_result, member_identity)
         if numpy_wrapper_validation_failed:
             self._record_numpy_wrapper_validation_failure(result, context)
+            self._record_joblib_operational_error(result, "joblib_numpy_array_wrapper_validation_failed")
         if has_only_validated_codec_encodes:
             self._remove_validated_dtype_codec_findings(result)
         if raw_array_count and self._numpy_array_wrapper_origin_is_trusted():
@@ -1530,15 +1531,8 @@ class JoblibScanner(BaseScanner):
             result.finish(success=False)
             return result
 
-        has_security_findings = any(
-            issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues
-        )
         has_trusted_incomplete_tail = result.metadata.get("trusted_incomplete_tail") is True
-        if (
-            result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
-            and not has_security_findings
-            and not has_trusted_incomplete_tail
-        ):
+        if result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME and not has_trusted_incomplete_tail:
             result.finish(success=False)
         else:
             result.finish(success=not result.has_errors)

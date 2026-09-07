@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- Keep incomplete Joblib NumPy-wrapper scans failed closed when embedded pickle analysis also reports warnings.
 - Upgrade XGBoost to 3.4 on Python 3.12+ while retaining XGBoost 3.2 on Python 3.10 and 3.11.
 - Restore SQL-backed MLflow model registries and upgrade their vulnerable SQL parser.
 - Remove `tensor_name_count` as a retention budget dimension for remote SafeTensors streaming; the `result_bytes` cap already bounds aggregate serialized size, so large multi-shard models (e.g. 141 shards) no longer fail closed prematurely.
