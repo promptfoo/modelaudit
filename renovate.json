@@ -19,6 +19,14 @@
       "allowedVersions": "<2.5"
     },
     {
+      "description": "Keep XGBoost 3.2.x constraints on Python 3.10 and 3.11 markers in pyproject.toml.",
+      "matchFileNames": ["pyproject.toml"],
+      "matchManagers": ["pep621"],
+      "matchPackageNames": ["xgboost"],
+      "matchCurrentValue": "/<3\\.3/",
+      "allowedVersions": "<3.3"
+    },
+    {
       "description": "Keep Python updates within the project's supported 3.10-3.13 range.",
       "matchPackageNames": ["python"],
       "allowedVersions": "<3.14"
