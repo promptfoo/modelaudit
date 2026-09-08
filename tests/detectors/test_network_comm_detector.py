@@ -2816,6 +2816,64 @@ class TestNetworkCommDetector:
         url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
         assert url_finding["severity"] == "MEDIUM"
 
+    @pytest.mark.parametrize(
+        ("data", "url"),
+        [
+            (
+                pickle.dumps({"model_url": "https://example.invalid/license.bin"}, protocol=2),
+                "https://example.invalid/license.bin",
+            ),
+            (
+                pickle.dumps({"source": "https://example.invalid/docs.pkl"}, protocol=2),
+                "https://example.invalid/docs.pkl",
+            ),
+            (
+                pickle.dumps({"license": "curl https://example.invalid/license"}, protocol=2),
+                "https://example.invalid/license",
+            ),
+            (
+                pickle.dumps({"docs": "wget https://example.invalid/docs"}, protocol=2),
+                "https://example.invalid/docs",
+            ),
+        ],
+    )
+    def test_explicit_ml_model_url_patterns_keep_unknown_and_command_urls_critical(self, data: bytes, url: str) -> None:
+        detector = NetworkCommDetector()
+
+        findings = detector.scan(data, "payload.pt")
+
+        explicit_finding = next(
+            finding
+            for finding in findings
+            if finding["type"] == "explicit_network_pattern" and finding["matched_text"] == url
+        )
+        assert explicit_finding["severity"] == "CRITICAL"
+        url_finding = next(
+            finding for finding in findings if finding["type"] == "url_detected" and finding["url"] == url
+        )
+        assert url_finding["severity"] == "MEDIUM"
+
+    def test_explicit_ml_model_url_patterns_treat_passive_onnx_source_repo_as_informational(self) -> None:
+        detector = NetworkCommDetector()
+        url = "https://github.com/RicherMans/CED"
+        data = b"model_type\x12\x03CEDr\x07version\x12\x031.0r\x0cmodel_author\x12\nRicherMansr(" + url.encode()
+
+        findings = detector.scan(data, "model.onnx")
+
+        assert not [
+            finding
+            for finding in findings
+            if finding["type"] == "explicit_network_pattern" and finding["matched_text"] == url
+        ]
+        url_finding = next(
+            finding for finding in findings if finding["type"] == "url_detected" and finding["url"] == url
+        )
+        assert url_finding["severity"] == "INFO"
+        domain_finding = next(
+            finding for finding in findings if finding["type"] == "domain" and finding["domain"] == "github.com"
+        )
+        assert domain_finding["severity"] == "INFO"
+
     def test_cc_pattern_snippet_url_expansion_is_bounded(self) -> None:
         """Long whitespace-free binary regions should not force unbounded URL scans."""
         detector = NetworkCommDetector()

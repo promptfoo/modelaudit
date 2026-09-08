@@ -106,7 +106,12 @@ _TRAILING_URL_DELIMITERS = frozenset(set(_TRAILING_URL_DELIMITER_PAIRS) | set(_T
 _URL_TEXT_BOUNDARY_BYTES = b" \t\r\n\"'<>`()"
 _MAX_PICKLE_LITERAL_BOUNDARY_PROBE_BYTES = 8192
 _PICKLE_URL_ACTIVE_CONTEXT_PATTERN = re.compile(
-    rb"api|callback|download|endpoint|fetch|from_pretrained|httpx|request|torch\.hub|urlopen|urlretrieve|urllib|webhook",
+    rb"api|callback|curl|download|endpoint|fetch|from_pretrained|git\s+clone|httpx|request|torch\.hub|urlopen|"
+    rb"urlretrieve|urllib|webhook|wget",
+    re.IGNORECASE,
+)
+_PASSIVE_METADATA_URL_CONTEXT_PATTERN = re.compile(
+    rb"author|doc(?:umentation)?s?|licen[cs]e|metadata|model_author|model_type|readme|repository|source|version",
     re.IGNORECASE,
 )
 _PROVEN_BARE_QUERY_COMPONENTS = frozenset({"_debug", "debug"})
@@ -5454,42 +5459,65 @@ class NetworkCommDetector:
             return urlsplit(url).port in self.SUSPICIOUS_PORTS
         return False
 
-    def _is_informational_url_reference(self, url: str) -> bool:
-        """Return whether a URL is passive documentation/license metadata."""
+    def _informational_url_reference_kind(self, url: str) -> str | None:
         try:
             parsed = urlsplit(url)
         except ValueError:
-            return False
+            return None
         if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
-            return False
+            return None
         if self._url_uses_suspicious_port(url):
-            return False
+            return None
 
         decoded_url = unquote_plus(url).casefold()
         if parsed.query or any(term in decoded_url for term in self.INFORMATIONAL_URL_RISK_TERMS):
-            return False
+            return None
 
         hostname = parsed.hostname.casefold().rstrip(".")
-        for segment in parsed.path.split("/"):
-            normalized_segment = unquote(segment).casefold().strip(_TRAILING_PATH_DELIMITERS)
-            stem = normalized_segment.split(".", 1)[0]
-            if (
-                normalized_segment in self.INFORMATIONAL_URL_PATH_SEGMENTS
-                or stem in self.INFORMATIONAL_URL_PATH_SEGMENTS
-            ):
-                return True
-        return hostname.startswith(self.INFORMATIONAL_URL_HOST_PREFIXES) and parsed.path in {"", "/"}
+        path_segments = [
+            unquote(segment).casefold().strip(_TRAILING_PATH_DELIMITERS)
+            for segment in parsed.path.split("/")
+            if segment
+        ]
+        if any(_looks_like_known_artifact_filename(segment) for segment in path_segments):
+            return None
+        if self._is_public_source_repository_url(hostname, path_segments):
+            return "source_repository"
+        if any(segment in self.INFORMATIONAL_URL_PATH_SEGMENTS for segment in path_segments):
+            return "documentation"
+        if hostname.startswith(self.INFORMATIONAL_URL_HOST_PREFIXES) and parsed.path in {"", "/"}:
+            return "documentation"
+        return None
+
+    @staticmethod
+    def _is_public_source_repository_url(hostname: str, path_segments: list[str]) -> bool:
+        if hostname not in {"github.com", "www.github.com"}:
+            return False
+        return len(path_segments) == 2 and all(path_segments)
 
     def _is_passive_metadata_url_reference(self, data: bytes, url_start: int, url: str) -> bool:
-        if not self._is_informational_url_reference(url):
+        kind = self._informational_url_reference_kind(url)
+        if kind is None:
             return False
         url_end = url_start + len(url.encode("utf-8"))
         bounds = _pickle_literal_payload_bounds_containing(data, url_start, url_end)
-        if bounds is None:
+        if bounds is not None:
+            context_start = max(0, bounds[0] - 128)
+            context_end = min(len(data), bounds[1] + 128)
+            context_data = data[context_start:context_end]
+            return (
+                _PICKLE_URL_ACTIVE_CONTEXT_PATTERN.search(context_data) is None
+                and _PASSIVE_METADATA_URL_CONTEXT_PATTERN.search(context_data) is not None
+            )
+        if kind != "source_repository":
             return False
-        context_start = max(0, bounds[0] - 128)
-        context_end = min(len(data), bounds[1] + 128)
-        return _PICKLE_URL_ACTIVE_CONTEXT_PATTERN.search(data[context_start:context_end]) is None
+        context_start = max(0, url_start - 256)
+        context_end = min(len(data), url_end + 64)
+        context_data = data[context_start:context_end]
+        return (
+            _PICKLE_URL_ACTIVE_CONTEXT_PATTERN.search(context_data) is None
+            and _PASSIVE_METADATA_URL_CONTEXT_PATTERN.search(context_data) is not None
+        )
 
     def _scan_cloud_storage_urls(self, data: bytes, context: str) -> None:
         """Scan for cloud storage URL patterns (S3, GCS, Azure, etc.).
