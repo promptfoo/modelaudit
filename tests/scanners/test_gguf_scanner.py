@@ -2651,6 +2651,56 @@ def test_ggml_polyglot_with_empty_eocd_in_comment_fails_closed(tmp_path: Path) -
     )
 
 
+@pytest.mark.parametrize("format_name", ["ggml", "gguf"])
+@pytest.mark.parametrize("exclude_zip", [False, True])
+@pytest.mark.parametrize("strict_zip_probe", [False, True])
+def test_malformed_zip_near_match_preserves_preflight_rejection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    format_name: str,
+    exclude_zip: bool,
+    strict_zip_probe: bool,
+) -> None:
+    path = tmp_path / f"malformed-eocd.{format_name}"
+    if format_name == "gguf":
+        _write_gguf_with_tensor_type(path, 0)
+    else:
+        _write_ggml_file(path)
+    eocd = struct.pack("<4s4H2IH", b"PK\x05\x06", 0, 0, 1, 1, 0, 0, 0)
+    with path.open("r+b") as handle:
+        handle.seek(-len(eocd), 2)
+        handle.write(eocd)
+
+    if strict_zip_probe:
+        # Newer ZIP probes reject this missing central directory before dispatch.
+        monkeypatch.setattr(zipfile, "is_zipfile", lambda _path: False)
+    config = {"exclude_scanners": ["zip"] if exclude_zip else []}
+    direct = GgufScanner(config=config).scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), config=config, cache_enabled=False)
+
+    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "zip_analysis_incomplete" in direct.metadata["scan_outcome_reasons"]
+    for result in (direct, aggregate):
+        assert result.success is False
+        preflight_checks = [
+            check
+            for check in result.checks
+            if check.name == "ZIP Central Directory Preflight" and check.status == CheckStatus.FAILED
+        ]
+        assert len(preflight_checks) == 1
+        assert "ZIP central-directory validation failed" in preflight_checks[0].message
+        assert preflight_checks[0].details["analysis_incomplete"] is True
+        assert not any(issue.rule_code == "S908" for issue in result.issues)
+        _assert_no_warning_or_critical_issues(result)
+    _assert_inconclusive_exit2(aggregate, "zip_analysis_incomplete")
+    _assert_uncached_rerun_preserves_inconclusive_exit2(
+        path,
+        tmp_path / "malformed-zip-cache",
+        "zip_analysis_incomplete",
+        config=config,
+    )
+
+
 def test_ggml_polyglot_with_post_preflight_bad_zip_fails_closed(tmp_path: Path) -> None:
     path = tmp_path / "malformed-extra.ggml"
     _write_ggml_file(path)

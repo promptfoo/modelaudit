@@ -765,6 +765,8 @@ class GgufScanner(BaseScanner):
         from ._archive_outcomes import mark_archive_scan_incomplete
         from .archive_dispatch import (
             _ZIP_CONTAINER_PREFLIGHT_REJECTED_PATHS_PRIVATE_METADATA_KEY,
+            _mark_zip_container_dispatched,
+            _mark_zip_container_preflight_rejected,
             merge_executable_zip_container_findings,
         )
         from .zip_scanner import (
@@ -788,9 +790,11 @@ class GgufScanner(BaseScanner):
                 preflight_accepted = True
                 with zipfile.ZipFile(archive_handle, "r") as embedded_archive:
                     parsed_entry_count = len(embedded_archive.infolist())
-        except ZipPreflightRejected:
-            # The composed scan below records the fail-closed preflight diagnostics.
-            pass
+        except ZipPreflightRejected as exc:
+            result.merge(exc.result)
+            _mark_zip_container_dispatched(result, self.current_file_path)
+            _mark_zip_container_preflight_rejected(result, self.current_file_path)
+            return False
         except (OSError, zipfile.BadZipFile):
             if not preflight_accepted:
                 return False
