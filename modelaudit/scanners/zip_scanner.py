@@ -1199,19 +1199,14 @@ class ZipScanner(BaseScanner):
                 candidate_errors.append((eocd_index, True))
                 continue
             except _InvalidZipDirectory as exc:
-                candidate_errors.append(
-                    (
-                        eocd_index,
-                        exc.routing_evidence
-                        or cls._candidate_has_directory_signature(
-                            handle,
-                            file_size=file_size,
-                            tail_size=tail_size,
-                            tail=tail,
-                            eocd_index=eocd_index,
-                        ),
-                    )
+                exc.routing_evidence = exc.routing_evidence or cls._candidate_has_directory_signature(
+                    handle,
+                    file_size=file_size,
+                    tail_size=tail_size,
+                    tail=tail,
+                    eocd_index=eocd_index,
                 )
+                candidate_errors.append((eocd_index, exc.routing_evidence))
                 if last_error is None or (exc.routing_evidence and not last_error.routing_evidence):
                     last_error = exc
                 continue

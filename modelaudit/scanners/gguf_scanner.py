@@ -51,6 +51,7 @@ GGUF_STRUCTURE_INCONCLUSIVE_REASON = "gguf_structure_validation_failed"
 GGUF_DUPLICATE_METADATA_INCONCLUSIVE_REASON = "gguf_duplicate_metadata_keys"
 GGUF_METADATA_LIMIT_INCONCLUSIVE_REASON = "gguf_metadata_limit_exceeded"
 GGUF_TENSOR_LIMIT_INCONCLUSIVE_REASON = "gguf_tensor_limit_exceeded"
+GGUF_SOURCE_CHANGED_REASON = "gguf_source_changed"
 _GGUF_CONTAINER_OWNED_TRAILING_CONFIG_KEY = "_modelaudit_gguf_container_owned_trailing"
 _GGUF_CONTAINER_OWNED_TRAILING_TOKEN = object()
 _GGUF_MAX_METADATA_VALUE_SECURITY_CHECKS = 64
@@ -407,6 +408,7 @@ class GgufScanner(BaseScanner):
         try:
             self.current_file_path = path
             with open(path, "rb") as f:
+                opened_stat = os.fstat(f.fileno())
                 magic = f.read(4)
                 if magic == b"GGUF":
                     self._scan_gguf(f, file_size, result)
@@ -425,6 +427,31 @@ class GgufScanner(BaseScanner):
                     self._mark_inconclusive(result, GGUF_PARSE_INCONCLUSIVE_REASON)
                     result.finish(success=False)
                     return result
+                # Nested scanners reopen the path, so coverage requires every view to match this source.
+                try:
+                    final_stats: tuple[os.stat_result, ...] = (os.fstat(f.fileno()), os.stat(path))
+                except OSError:
+                    final_stats = ()
+                if not final_stats or any(
+                    not os.path.samestat(opened_stat, final_stat)
+                    or opened_stat.st_mode != final_stat.st_mode
+                    or opened_stat.st_size != final_stat.st_size
+                    or opened_stat.st_mtime_ns != final_stat.st_mtime_ns
+                    or opened_stat.st_ctime_ns != final_stat.st_ctime_ns
+                    for final_stat in final_stats
+                ):
+                    result.add_check(
+                        name="GGUF/GGML Source Stability",
+                        passed=False,
+                        message="File changed during GGUF/GGML analysis; coverage is incomplete",
+                        severity=IssueSeverity.INFO,
+                        location=path,
+                        details={
+                            "analysis_incomplete": True,
+                            "scan_outcome_reason": GGUF_SOURCE_CHANGED_REASON,
+                        },
+                    )
+                    self._mark_inconclusive(result, GGUF_SOURCE_CHANGED_REASON)
         except Exception as e:
             result.add_check(
                 name="GGUF/GGML File Scan",
@@ -771,7 +798,7 @@ class GgufScanner(BaseScanner):
         )
         from .zip_scanner import (
             ZipPreflightRejected,
-            open_preflighted_zip_handle_with_entry_count,
+            _open_preflighted_zip_handle_with_entry_count,
         )
 
         archive_config = dict(self.config)
@@ -783,10 +810,13 @@ class GgufScanner(BaseScanner):
         parsed_entry_count: int | None = None
         preflight_accepted = False
         try:
-            with open_preflighted_zip_handle_with_entry_count(
+            with _open_preflighted_zip_handle_with_entry_count(
                 self.current_file_path,
                 archive_config,
-            ) as (archive_handle, preflight_entry_count):
+                require_zip=False,
+            ) as (archive_handle, is_zip, preflight_entry_count):
+                if not is_zip:
+                    return False
                 preflight_accepted = True
                 with zipfile.ZipFile(archive_handle, "r") as embedded_archive:
                     parsed_entry_count = len(embedded_archive.infolist())

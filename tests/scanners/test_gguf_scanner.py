@@ -2,6 +2,7 @@
 
 import io
 import json
+import os
 import struct
 import sys
 import time
@@ -24,6 +25,7 @@ from modelaudit.scanners.gguf_scanner import (
     GGUF_DUPLICATE_METADATA_INCONCLUSIVE_REASON,
     GGUF_METADATA_LIMIT_INCONCLUSIVE_REASON,
     GGUF_PARSE_INCONCLUSIVE_REASON,
+    GGUF_SOURCE_CHANGED_REASON,
     GGUF_STRUCTURE_INCONCLUSIVE_REASON,
     GGUF_TENSOR_LIMIT_INCONCLUSIVE_REASON,
     GgufScanner,
@@ -2698,6 +2700,137 @@ def test_malformed_zip_near_match_preserves_preflight_rejection(
         tmp_path / "malformed-zip-cache",
         "zip_analysis_incomplete",
         config=config,
+    )
+
+
+@pytest.mark.parametrize("format_name", ["ggml", "gguf"])
+@pytest.mark.parametrize("strict_zip_probe", [False, True])
+def test_gguf_ggml_ignores_weak_eocd_noise(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    format_name: str,
+    strict_zip_probe: bool,
+) -> None:
+    path = tmp_path / f"eocd-noise.{format_name}"
+    if format_name == "gguf":
+        _write_gguf_with_tensor_type(path, 0)
+    else:
+        _write_ggml_file(path)
+    eocd = struct.pack("<4s4H2IH", b"PK\x05\x06", 1, 0, 0, 0, 0, 0, 0)
+    with path.open("r+b") as handle:
+        handle.seek(-len(eocd), 2)
+        handle.write(eocd)
+    if strict_zip_probe:
+        monkeypatch.setattr(zipfile, "is_zipfile", lambda _path: False)
+
+    direct = GgufScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+    for result in (direct, aggregate):
+        assert result.success is True
+        assert not any(check.name == "ZIP Central Directory Preflight" for check in result.checks)
+        _assert_no_warning_or_critical_issues(result)
+    assert determine_exit_code(aggregate) == 0
+
+
+@pytest.mark.parametrize("format_name", ["ggml", "gguf"])
+def test_gguf_ggml_preserves_strong_directory_routing_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    format_name: str,
+) -> None:
+    path = tmp_path / f"unsupported-directory.{format_name}"
+    if format_name == "gguf":
+        _write_tensor_covered_gguf_zip(path, {"safe.txt": b"safe"})
+    else:
+        _write_ggml_file(path)
+        _append_gguf_zip(path, {"safe.txt": b"safe"})
+    archive_bytes = bytearray(path.read_bytes())
+    eocd_offset = archive_bytes.rfind(b"PK\x05\x06")
+    archive_bytes[eocd_offset + 4 : eocd_offset + 6] = (1).to_bytes(2, "little")
+    path.write_bytes(archive_bytes)
+    monkeypatch.setattr(zipfile, "is_zipfile", lambda _path: False)
+
+    direct = GgufScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+    for result in (direct, aggregate):
+        assert result.success is False
+        checks = [check for check in result.checks if check.name == "ZIP Central Directory Preflight"]
+        assert len(checks) == 1
+        assert checks[0].status == CheckStatus.FAILED
+        assert "multi-disk ZIP archives are unsupported" in checks[0].message
+        _assert_no_warning_or_critical_issues(result)
+    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    _assert_inconclusive_exit2(aggregate, "zip_analysis_incomplete")
+
+
+@pytest.mark.parametrize("format_name", ["ggml", "gguf"])
+@pytest.mark.parametrize("stat_source", ["descriptor", "path"])
+@pytest.mark.parametrize("change", ["identity", "metadata"])
+def test_gguf_ggml_source_stability_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    format_name: str,
+    stat_source: str,
+    change: str,
+) -> None:
+    path = tmp_path / f"source-stability.{format_name}"
+    if format_name == "gguf":
+        _write_tensor_covered_gguf_zip(path, {})
+    else:
+        _write_ggml_file(path)
+        _append_gguf_zip(path, {})
+    source_stat = path.stat()
+    changed_values = list(source_stat)
+    if change == "identity":
+        changed_values[1] += 1
+    changed_stat = os.stat_result(
+        changed_values,
+        {
+            "st_atime_ns": source_stat.st_atime_ns,
+            "st_mtime_ns": source_stat.st_mtime_ns + (1 if change == "metadata" else 0),
+            "st_ctime_ns": source_stat.st_ctime_ns,
+        },
+    )
+    original_fstat = os.fstat
+    original_stat = os.stat
+    opened = False
+
+    def simulated_fstat(fd: int) -> os.stat_result:
+        nonlocal opened
+        observed = original_fstat(fd)
+        if os.path.samestat(source_stat, observed):
+            if opened and stat_source == "descriptor":
+                return changed_stat
+            opened = True
+        return observed
+
+    def simulated_stat(*args: Any, **kwargs: Any) -> os.stat_result:
+        observed = original_stat(*args, **kwargs)
+        if opened and stat_source == "path" and os.path.samestat(source_stat, observed):
+            return changed_stat
+        return observed
+
+    monkeypatch.setattr(os, "fstat", simulated_fstat)
+    monkeypatch.setattr(os, "stat", simulated_stat)
+    direct = GgufScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+    for result in (direct, aggregate):
+        assert result.success is False
+        checks = [check for check in result.checks if check.name == "GGUF/GGML Source Stability"]
+        assert len(checks) == 1
+        assert checks[0].status == CheckStatus.FAILED
+        assert "coverage is incomplete" in checks[0].message
+        assert checks[0].details["analysis_incomplete"] is True
+        _assert_no_warning_or_critical_issues(result)
+    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    _assert_inconclusive_exit2(aggregate, GGUF_SOURCE_CHANGED_REASON)
+    _assert_uncached_rerun_preserves_inconclusive_exit2(
+        path,
+        tmp_path / "source-stability-cache",
+        GGUF_SOURCE_CHANGED_REASON,
     )
 
 
