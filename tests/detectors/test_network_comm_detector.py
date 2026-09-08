@@ -2,6 +2,7 @@
 
 import json
 import os
+import pickle
 import re
 from collections.abc import Iterator
 from pathlib import Path
@@ -2766,6 +2767,54 @@ class TestNetworkCommDetector:
         explicit_finding = next(finding for finding in findings if finding["type"] == "explicit_network_pattern")
         assert explicit_finding["matched_text"] == "https://example.com/models/checkpoint.bin"
         assert explicit_finding["message"].endswith("https://example.com/models/checkpoint.bin")
+
+    def test_explicit_ml_model_url_patterns_treat_docs_and_license_urls_as_informational(self) -> None:
+        detector = NetworkCommDetector()
+        data = pickle.dumps(
+            {
+                "license": "AGPL-3.0 License (https://ultralytics.com/license)",
+                "docs": "https://docs.ultralytics.com",
+            },
+            protocol=2,
+        )
+
+        findings = detector.scan(data, "payload.pt")
+
+        assert not [finding for finding in findings if finding["type"] == "explicit_network_pattern"]
+        url_findings = {finding["url"]: finding for finding in findings if finding["type"] == "url_detected"}
+        assert url_findings["https://ultralytics.com/license"]["severity"] == "INFO"
+        assert url_findings["https://docs.ultralytics.com"]["severity"] == "INFO"
+        domain_findings = {finding["domain"]: finding for finding in findings if finding["type"] == "domain"}
+        assert domain_findings["ultralytics.com"]["severity"] == "INFO"
+        assert domain_findings["docs.ultralytics.com"]["severity"] == "INFO"
+
+    def test_explicit_ml_model_url_patterns_keep_docs_host_execution_urls_critical(self) -> None:
+        detector = NetworkCommDetector()
+        url = "https://docs.example.invalid/checkpoint.bin"
+        data = f"httpx.get('{url}')".encode()
+
+        findings = detector.scan(data, "payload.pt")
+
+        explicit_finding = next(finding for finding in findings if finding["type"] == "explicit_network_pattern")
+        assert explicit_finding["severity"] == "CRITICAL"
+        assert explicit_finding["matched_text"] == url
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+        assert url_finding["severity"] == "MEDIUM"
+        domain_finding = next(finding for finding in findings if finding["type"] == "domain")
+        assert domain_finding["severity"] == "MEDIUM"
+
+    def test_explicit_ml_model_url_patterns_keep_pickle_callback_license_urls_critical(self) -> None:
+        detector = NetworkCommDetector()
+        url = "https://docs.example.invalid/license.bin"
+        data = pickle.dumps({"callback_url": url}, protocol=2)
+
+        findings = detector.scan(data, "payload.pt")
+
+        explicit_finding = next(finding for finding in findings if finding["type"] == "explicit_network_pattern")
+        assert explicit_finding["severity"] == "CRITICAL"
+        assert explicit_finding["matched_text"] == url
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+        assert url_finding["severity"] == "MEDIUM"
 
     def test_cc_pattern_snippet_url_expansion_is_bounded(self) -> None:
         """Long whitespace-free binary regions should not force unbounded URL scans."""
@@ -8228,6 +8277,20 @@ class TestNetworkCommDetector:
 
         assert explicit_finding["matched_text"] == "GET /download?token=<redacted> HTTP/1.1"
         assert "TOPSECRET123" not in serialized
+
+    def test_unbalanced_trailing_url_delimiter_trim_handles_long_suffix(self) -> None:
+        """Malformed trailing delimiters should trim without repeated full-string scans."""
+        import time
+
+        data = b"https://evil.example/model.pt" + (b"]" * 100_000)
+
+        start = time.perf_counter()
+        findings = NetworkCommDetector().scan(data, "model.pt")
+        duration = time.perf_counter() - start
+
+        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+        assert url_finding["url"] == "https://evil.example/model.pt"
+        assert duration < 1.0
 
     def test_suspicious_port_scan_performance(self) -> None:
         """Ensure port scanning remains performant with precompiled patterns."""

@@ -5076,6 +5076,71 @@ def test_pytorch_zip_redacts_signed_urls_in_explicit_network_findings(tmp_path: 
     assert explicit_failure.message == "Explicit network pattern in ML model: https://collector.example/upload"
 
 
+def test_pytorch_zip_treats_untrusted_pickle_docs_and_license_urls_as_informational(tmp_path: Path) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "metadata-urls.pt", with_pickle=False, prefix="archive")
+    license_url = "https://ultralytics.com/license"
+    docs_url = "https://docs.ultralytics.com"
+    payload = (
+        b"\x80\x02}q\x00("
+        + _pickle_binunicode(b"license")
+        + b"q\x01"
+        + _pickle_binunicode(f"AGPL-3.0 License ({license_url})".encode())
+        + b"q\x02"
+        + _pickle_binunicode(b"docs")
+        + b"q\x03"
+        + _pickle_binunicode(docs_url.encode())
+        + b"q\x04"
+        + _pickle_binunicode(b"model")
+        + b"q\x05"
+        + _pickle_global("ultralytics.nn.tasks", "DetectionModel")
+        + b"u."
+    )
+    with zipfile.ZipFile(model_path, "a") as zipf:
+        zipf.writestr("archive/data.pkl", payload)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    url_issues = [
+        issue for issue in result.issues if issue.rule_code == "S309" and issue.details.get("type") == "url_detected"
+    ]
+    assert {
+        issue.details["url"]: issue.severity
+        for issue in url_issues
+        if issue.details.get("url") in {license_url, docs_url}
+    } == {license_url: IssueSeverity.INFO, docs_url: IssueSeverity.INFO}
+    assert not any(
+        issue.rule_code == "S310"
+        and issue.severity == IssueSeverity.CRITICAL
+        and issue.details.get("type") == "explicit_network_pattern"
+        and issue.details.get("matched_text") in {license_url, docs_url}
+        for issue in result.issues
+    )
+
+
+def test_pytorch_zip_keeps_docs_host_execution_urls_actionable(tmp_path: Path) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "docs-host-loader.pt", with_pickle=False, prefix="archive")
+    url = "https://docs.example.invalid/checkpoint.bin"
+    payload = pickle.dumps({"loader": f"requests.get('{url}')"}, protocol=4)
+    with zipfile.ZipFile(model_path, "a") as zipf:
+        zipf.writestr("archive/data.pkl", payload)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert _has_network_evidence_for_url(result, url)
+
+
+def test_pytorch_zip_keeps_callback_license_urls_actionable(tmp_path: Path) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "callback-url.pt", with_pickle=False, prefix="archive")
+    url = "https://docs.example.invalid/license.bin"
+    payload = pickle.dumps({"callback_url": url}, protocol=4)
+    with zipfile.ZipFile(model_path, "a") as zipf:
+        zipf.writestr("archive/data.pkl", payload)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert _has_network_evidence_for_url(result, url)
+
+
 @pytest.mark.parametrize(
     "payload",
     [
