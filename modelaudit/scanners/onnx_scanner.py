@@ -1251,6 +1251,12 @@ def _onnx_activation_input_candidate(node: Any, input_index: int) -> bool:
     return node.op_type == "Gather" and input_index == 1
 
 
+def _onnx_dynamic_activation_passthrough_input_candidate(node: Any, input_index: int) -> bool:
+    if getattr(node, "domain", "") not in _STANDARD_NEURAL_NETWORK_DOMAINS:
+        return False
+    return node.op_type == "Gather" and input_index == 0
+
+
 def _onnx_opaque_activation_input_candidate(node: Any, _input_index: int) -> bool:
     """Recognize opaque-domain inputs whose schema fixes an activation-only role."""
     return getattr(node, "domain", "") == "ai.onnx.ml"
@@ -2045,6 +2051,10 @@ def _build_onnx_weight_analysis_plan(
                             or (
                                 _onnx_activation_input_candidate(node, input_index)
                                 and (opposite_resolved_weight or all_lineage_inputs_are_activation_contraction)
+                            )
+                            or (
+                                is_registered_standard_operator
+                                and _onnx_dynamic_activation_passthrough_input_candidate(node, input_index)
                             )
                         )
                         if recognized_activation_input:

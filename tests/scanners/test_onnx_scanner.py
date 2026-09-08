@@ -1389,6 +1389,33 @@ def create_activation_bookkeeping_model(tmp_path: Path, *, malicious: bool, rank
     return path
 
 
+def create_gather_activation_bookkeeping_model(tmp_path: Path, *, malicious: bool) -> Path:
+    """Create a linear stack whose prior activation is gathered before reuse."""
+    first_weight = np.zeros((100, 100), dtype=np.float32)
+    second_weight = np.zeros((100, 10), dtype=np.float32)
+    if malicious:
+        second_weight[50:55, 3] = 10.0
+    initializers = [
+        onnx.numpy_helper.from_array(first_weight, name="W1"),
+        onnx.numpy_helper.from_array(np.arange(100, dtype=np.int64), name="indices"),
+        onnx.numpy_helper.from_array(second_weight, name="W2"),
+    ]
+    X = helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 100])
+    Y = helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 10])
+    nodes = [
+        helper.make_node("MatMul", ["X", "W1"], ["hidden"], name="first_linear"),
+        helper.make_node("Gather", ["hidden", "indices"], ["selected"], name="activation_slice", axis=1),
+        helper.make_node("MatMul", ["selected", "W2"], ["Y"], name="second_linear"),
+    ]
+    graph = helper.make_graph(nodes, "gather_activation_bookkeeping_graph", [X], [Y], initializer=initializers)
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    onnx.checker.check_model(model)
+    path = tmp_path / f"{'malicious' if malicious else 'benign'}-gather-activation-bookkeeping.onnx"
+    onnx.save(model, str(path))
+    return path
+
+
 def create_einsum_weight_model(tmp_path: Path, weights: np.ndarray) -> Path:
     initializer = onnx.numpy_helper.from_array(weights, name="W")
     X = helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, weights.shape[0]])
@@ -6390,6 +6417,25 @@ class TestWeightDistributionSemantics:
         assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
         semantics = result.metadata["onnx_weight_distribution_semantics"]
         assert semantics["exclusion_counts"]["bookkeeping_constant"] == 1
+
+    @pytest.mark.parametrize("malicious", [False, True])
+    def test_gathered_activation_path_does_not_create_weight_coverage_gap(
+        self,
+        tmp_path: Path,
+        malicious: bool,
+    ) -> None:
+        model_path = create_gather_activation_bookkeeping_model(tmp_path, malicious=malicious)
+
+        result = OnnxScanner().scan(str(model_path))
+
+        assert result.success is True
+        assert len(self._extreme_checks(result)) == int(malicious)
+        assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["eligible_initializer_count"] == 2
+        assert semantics["analyzed_layer_count"] == 2
+        assert semantics["exclusion_counts"]["dynamic_activation_input"] >= 2
+        assert semantics["exclusion_counts"]["non_weight_input"] == 1
 
     @pytest.mark.parametrize("malicious", [False, True])
     def test_standard_einsum_weights_are_oriented_and_analyzed(self, tmp_path: Path, malicious: bool) -> None:
