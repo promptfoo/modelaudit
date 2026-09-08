@@ -51,6 +51,7 @@ GGUF_STRUCTURE_INCONCLUSIVE_REASON = "gguf_structure_validation_failed"
 GGUF_DUPLICATE_METADATA_INCONCLUSIVE_REASON = "gguf_duplicate_metadata_keys"
 GGUF_METADATA_LIMIT_INCONCLUSIVE_REASON = "gguf_metadata_limit_exceeded"
 GGUF_TENSOR_LIMIT_INCONCLUSIVE_REASON = "gguf_tensor_limit_exceeded"
+GGUF_SOURCE_CHANGED_REASON = "gguf_source_changed"
 _GGUF_CONTAINER_OWNED_TRAILING_CONFIG_KEY = "_modelaudit_gguf_container_owned_trailing"
 _GGUF_CONTAINER_OWNED_TRAILING_TOKEN = object()
 _GGUF_MAX_METADATA_VALUE_SECURITY_CHECKS = 64
@@ -407,6 +408,7 @@ class GgufScanner(BaseScanner):
         try:
             self.current_file_path = path
             with open(path, "rb") as f:
+                opened_stat = os.fstat(f.fileno())
                 magic = f.read(4)
                 if magic == b"GGUF":
                     self._scan_gguf(f, file_size, result)
@@ -425,6 +427,31 @@ class GgufScanner(BaseScanner):
                     self._mark_inconclusive(result, GGUF_PARSE_INCONCLUSIVE_REASON)
                     result.finish(success=False)
                     return result
+                # Nested scanners reopen the path, so coverage requires every view to match this source.
+                try:
+                    final_stats: tuple[os.stat_result, ...] = (os.fstat(f.fileno()), os.stat(path))
+                except OSError:
+                    final_stats = ()
+                if not final_stats or any(
+                    not os.path.samestat(opened_stat, final_stat)
+                    or opened_stat.st_mode != final_stat.st_mode
+                    or opened_stat.st_size != final_stat.st_size
+                    or opened_stat.st_mtime_ns != final_stat.st_mtime_ns
+                    or opened_stat.st_ctime_ns != final_stat.st_ctime_ns
+                    for final_stat in final_stats
+                ):
+                    result.add_check(
+                        name="GGUF/GGML Source Stability",
+                        passed=False,
+                        message="File changed during GGUF/GGML analysis; coverage is incomplete",
+                        severity=IssueSeverity.INFO,
+                        location=path,
+                        details={
+                            "analysis_incomplete": True,
+                            "scan_outcome_reason": GGUF_SOURCE_CHANGED_REASON,
+                        },
+                    )
+                    self._mark_inconclusive(result, GGUF_SOURCE_CHANGED_REASON)
         except Exception as e:
             result.add_check(
                 name="GGUF/GGML File Scan",
@@ -760,23 +787,83 @@ class GgufScanner(BaseScanner):
         )
         result.bytes_scanned = max(result.bytes_scanned, f.tell())
 
-    def _scan_zip_polyglot(self, result: ScanResult) -> bool:
-        """Inspect ZIP members even when GGUF metadata or tensor parsing fails."""
-        if not zipfile.is_zipfile(self.current_file_path):
-            return False
-
+    def _scan_zip_polyglot(self, result: ScanResult, *, format_name: str = "GGUF") -> bool:
+        """Inspect ZIP members even when GGUF/GGML header parsing fails."""
+        from ._archive_outcomes import mark_archive_scan_incomplete
         from .archive_dispatch import (
             _ZIP_CONTAINER_PREFLIGHT_REJECTED_PATHS_PRIVATE_METADATA_KEY,
+            _mark_zip_container_dispatched,
+            _mark_zip_container_preflight_rejected,
             merge_executable_zip_container_findings,
         )
+        from .zip_scanner import ZipPreflightRejected, _open_preflighted_zip_handle
 
         archive_config = dict(self.config)
         archive_config.pop(_GGUF_CONTAINER_OWNED_TRAILING_CONFIG_KEY, None)
+
+        preflight_accepted = False
+        try:
+            with _open_preflighted_zip_handle(
+                self.current_file_path,
+                archive_config,
+                require_zip=False,
+            ) as (archive_handle, preflight_entry_count):
+                if preflight_entry_count is None:
+                    return False
+                preflight_accepted = True
+                with zipfile.ZipFile(archive_handle, "r") as embedded_archive:
+                    parsed_entry_count = len(embedded_archive.infolist())
+        except ZipPreflightRejected as exc:
+            result.merge(exc.result)
+            _mark_zip_container_dispatched(result, self.current_file_path)
+            _mark_zip_container_preflight_rejected(result, self.current_file_path)
+            return False
+        except (OSError, zipfile.BadZipFile, UnicodeError, NotImplementedError) as exc:
+            if not preflight_accepted:
+                return False
+            result.add_check(
+                name="ZIP File Format Validation",
+                passed=False,
+                message=f"Unable to parse ZIP archive: {self.current_file_path}",
+                severity=IssueSeverity.INFO,
+                rule_code="S902",
+                location=self.current_file_path,
+                details={
+                    "path": self.current_file_path,
+                    "exception": str(exc),
+                    "exception_type": type(exc).__name__,
+                },
+            )
+            mark_archive_scan_incomplete(result, "zip_analysis_incomplete")
+            return False
+
+        # Compare counts even when nested ZIP scanning is excluded.
+        if parsed_entry_count != preflight_entry_count:
+            result.add_check(
+                name="ZIP Central Directory Preflight",
+                passed=False,
+                message=(
+                    "ZIP central directory changed between preflight and parsing "
+                    f"({preflight_entry_count} != {parsed_entry_count})"
+                ),
+                severity=IssueSeverity.INFO,
+                rule_code="S902",
+                location=self.current_file_path,
+                details={
+                    "preflight_entries": preflight_entry_count,
+                    "parsed_entries": parsed_entry_count,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "zip_analysis_incomplete",
+                },
+            )
+            mark_archive_scan_incomplete(result, "zip_analysis_incomplete")
+            return False
+
         merge_executable_zip_container_findings(
             self.current_file_path,
             result,
             archive_config,
-            context="GGUF trailing ZIP polyglot",
+            context=f"{format_name} trailing ZIP polyglot",
         )
         rejected_paths = result._private_metadata.get(
             _ZIP_CONTAINER_PREFLIGHT_REJECTED_PATHS_PRIVATE_METADATA_KEY,
@@ -787,11 +874,13 @@ class GgufScanner(BaseScanner):
             and os.path.realpath(self.current_file_path) in rejected_paths
         ):
             return False
+        if parsed_entry_count == 0:
+            return False
 
         result.add_check(
-            name="GGUF ZIP Polyglot Detection",
+            name=f"{format_name} ZIP Polyglot Detection",
             passed=False,
-            message="GGUF file is also a valid ZIP archive and may contain hidden archive content",
+            message=f"{format_name} file is also a valid ZIP archive and may contain hidden archive content",
             severity=IssueSeverity.CRITICAL,
             location=self.current_file_path,
             details={"embedded_format": "zip"},
@@ -1048,8 +1137,10 @@ class GgufScanner(BaseScanner):
         result: ScanResult,
     ) -> None:
         """Basic GGML file validation with security checks."""
+        self._scan_zip_polyglot(result, format_name="GGML")
         result.metadata["format"] = "ggml"
         result.metadata["magic"] = magic.decode("ascii", "ignore")
+        result.bytes_scanned = max(result.bytes_scanned, file_size)
 
         if file_size < 32:
             result.add_check(
@@ -1103,8 +1194,6 @@ class GgufScanner(BaseScanner):
                 details={"error": str(e), "error_type": type(e).__name__},
                 rule_code="S902",
             )
-
-        result.bytes_scanned = file_size
 
     def _read_value(
         self,
