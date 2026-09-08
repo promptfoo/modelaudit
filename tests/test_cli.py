@@ -14,6 +14,7 @@ import sys
 import types
 import zipfile
 from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, cast
@@ -136,6 +137,39 @@ def test_track_huggingface_stream_acquisition_preserves_precomputed_result_tuple
     streamed_item = (Path("model.safetensors"), True, scan_result)
 
     assert list(cli_module._track_huggingface_stream_acquisition(iter([streamed_item]))) == [streamed_item]
+
+
+def test_track_huggingface_stream_acquisition_closes_source_on_early_close() -> None:
+    source_closed = False
+
+    def source() -> Iterator[tuple[Path, bool]]:
+        nonlocal source_closed
+        try:
+            yield Path("model.onnx"), True
+        finally:
+            source_closed = True
+
+    tracked = cli_module._track_huggingface_stream_acquisition(source())
+    assert next(tracked) == (Path("model.onnx"), True)
+    tracked.close()
+
+    assert source_closed
+
+
+def test_track_huggingface_stream_acquisition_propagates_source_cleanup_failure() -> None:
+    from modelaudit.utils.sources.huggingface import _HfStreamingStagingCleanupError
+
+    def source() -> Iterator[tuple[Path, bool]]:
+        try:
+            yield Path("model.onnx"), True
+        finally:
+            raise _HfStreamingStagingCleanupError("deterministic family cleanup failure")
+
+    tracked = cli_module._track_huggingface_stream_acquisition(source())
+    assert next(tracked) == (Path("model.onnx"), True)
+
+    with pytest.raises(_HfStreamingStagingCleanupError, match="deterministic family cleanup failure"):
+        tracked.close()
 
 
 def _make_trusted_shard_parent(path: Path, *, parents: bool = False) -> None:
@@ -6631,7 +6665,7 @@ def test_scan_huggingface_streaming_without_dry_run_still_reports_malicious_resu
     assert output["issues"][0]["message"] == "Dangerous pickle opcode detected"
     mock_download_streaming.assert_called_once()
     mock_scan_streaming.assert_called_once()
-    assert mock_scan_streaming.call_args.kwargs["delete_after_scan"] is True
+    assert mock_scan_streaming.call_args.kwargs["delete_after_scan"] is False
     provenance = mock_scan_streaming.call_args.kwargs["_trusted_source_provenance"]
     assert provenance.model_id == "test/malicious-model"
     assert provenance.model_source == "huggingface"
@@ -6645,28 +6679,32 @@ def test_scan_huggingface_cached_stream_reconciles_snapshot_alias_shards(
     tmp_path: Path,
     requires_symlinks: None,
 ) -> None:
-    """A cache-enabled HF stream should trust aliases of one logical snapshot parent."""
+    """A cache-enabled HF stream should trust staged aliases of one snapshot parent."""
     mock_is_hf_url.return_value = True
     header = b'{"__metadata__":{"format":"pt"}}'
     cache_root = tmp_path / "persistent-cache"
-    _make_trusted_shard_parent(cache_root / "huggingface", parents=True)
-    snapshot_dir = cache_root / "huggingface" / "models--test--model" / "snapshots" / _HF_TEST_REVISION
-    _make_trusted_shard_parent(snapshot_dir, parents=True)
-    alias_root = cache_root / "huggingface" / "test" / "model"
-    _make_trusted_shard_parent(alias_root, parents=True)
-    first_alias = alias_root / "cache-a"
-    second_alias = alias_root / "cache-b"
-    first_alias.symlink_to(snapshot_dir, target_is_directory=True)
-    second_alias.symlink_to(snapshot_dir, target_is_directory=True)
 
-    def file_generator() -> Iterator[tuple[Path, bool]]:
+    def file_generator(_model_url: str, **kwargs: Any) -> Iterator[tuple[Path, bool]]:
+        staging_root = cast(Path, kwargs["_staging_root"])
+        staged_cache_root = staging_root / "huggingface"
+        _make_trusted_shard_parent(staged_cache_root, parents=True)
+        snapshot_dir = staged_cache_root / "models--test--model" / "snapshots" / _HF_TEST_REVISION
+        _make_trusted_shard_parent(snapshot_dir, parents=True)
+        alias_root = staged_cache_root / "test" / "model"
+        _make_trusted_shard_parent(alias_root, parents=True)
+        first_alias = alias_root / "cache-a"
+        second_alias = alias_root / "cache-b"
+        first_alias.symlink_to(snapshot_dir, target_is_directory=True)
+        second_alias.symlink_to(snapshot_dir, target_is_directory=True)
+        streamed_shards: list[tuple[Path, bool]] = []
         for shard_index, alias_path in ((1, first_alias), (2, second_alias)):
             shard_name = f"model-{shard_index:05d}-of-00002.safetensors"
             snapshot_path = snapshot_dir / shard_name
             snapshot_path.write_bytes(struct.pack("<Q", len(header)) + header)
-            yield (alias_path / shard_name, shard_index == 2)
+            streamed_shards.append((alias_path / shard_name, shard_index == 2))
+        yield from streamed_shards
 
-    mock_download_streaming.return_value = file_generator()
+    mock_download_streaming.side_effect = file_generator
 
     result = CliRunner().invoke(
         cli,
@@ -6702,11 +6740,16 @@ def test_scan_huggingface_streaming_omits_multilingual_vocab_cc_token(
 ) -> None:
     """Streamed Hugging Face tokenizer vocabularies should retain vocabulary context."""
     mock_is_hf_url.return_value = True
-    model_dir = tmp_path / "huggingface" / "google-bert" / "bert-base-multilingual-uncased"
-    model_dir.mkdir(parents=True)
-    vocab_path = model_dir / "tokenizer-multilingual.txt"
-    vocab_path.write_bytes(_bert_like_multilingual_vocab_bytes("zombie"))
-    mock_download_streaming.return_value = iter([(vocab_path, True)])
+
+    def file_generator(_model_url: str, **kwargs: Any) -> Iterator[tuple[Path, bool]]:
+        staging_root = cast(Path, kwargs["_staging_root"])
+        model_dir = staging_root / "huggingface" / "google-bert" / "bert-base-multilingual-uncased"
+        model_dir.mkdir(parents=True)
+        vocab_path = model_dir / "tokenizer-multilingual.txt"
+        vocab_path.write_bytes(_bert_like_multilingual_vocab_bytes("zombie"))
+        yield (vocab_path, True)
+
+    mock_download_streaming.side_effect = file_generator
 
     result = CliRunner().invoke(
         cli,
@@ -6905,9 +6948,21 @@ def test_scan_huggingface_streaming_passes_max_size_to_download(
     mock_scan_streaming.return_value = create_mock_scan_result(bytes_scanned=7, files_scanned=1, has_errors=False)
 
     runner = CliRunner()
+    selected_cache = tmp_path / "selected-cache"
     result = runner.invoke(
         cli,
-        ["scan", "--stream", "--quiet", "--max-size", "2KB", "--timeout", "7", "hf://test/model"],
+        [
+            "scan",
+            "--stream",
+            "--quiet",
+            "--max-size",
+            "2KB",
+            "--timeout",
+            "7",
+            "--cache-dir",
+            str(selected_cache),
+            "hf://test/model",
+        ],
     )
 
     assert result.exit_code == 0
@@ -6915,14 +6970,63 @@ def test_scan_huggingface_streaming_passes_max_size_to_download(
     assert mock_download_streaming.call_args.kwargs["timeout_seconds"] == 7
     assert mock_download_streaming.call_args.kwargs["scanner_config"]["timeout"] == 7
     assert mock_download_streaming.call_args.kwargs["scanner_config"]["max_file_size"] == 2048
+    staging_root = mock_download_streaming.call_args.kwargs["_staging_root"]
+    assert isinstance(staging_root, Path)
+    assert staging_root.name.startswith("modelaudit_hf_stream_")
+    assert staging_root.parent == selected_cache.resolve()
+    assert not staging_root.exists()
+    assert selected_cache.is_dir()
+    assert mock_scan_streaming.call_args.kwargs["scan_root"] == str(staging_root / "huggingface")
+    assert mock_download_streaming.call_args.kwargs["cache_dir"] == selected_cache
+
+
+@patch("modelaudit.cli.get_model_info")
+@patch("modelaudit.cli.is_huggingface_url")
+@patch("modelaudit.utils.sources.huggingface.download_model_streaming")
+@patch("modelaudit.core.scan_model_streaming")
+def test_hf_streaming_staging_default_cache_uses_cache_volume(
+    mock_scan_streaming: MagicMock,
+    mock_download_streaming: MagicMock,
+    mock_is_hf_url: MagicMock,
+    mock_get_model_info: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """Default cached streaming should stage artifacts on the cache volume."""
+    mock_is_hf_url.return_value = True
+    streamed_file = tmp_path / "model.bin"
+    streamed_file.write_bytes(b"weights")
+    mock_download_streaming.return_value = iter([(streamed_file, True)])
+    mock_scan_streaming.return_value = create_mock_scan_result(bytes_scanned=7, files_scanned=1, issues=[])
+    mock_get_model_info.return_value = {
+        "model_id": "test/model",
+        "total_size": 0,
+        "file_count": 0,
+        "inaccessible_gated_file_count": 0,
+        "unknown_size_count": 0,
+    }
+
+    home = tmp_path / "home"
+    with patch("modelaudit.cli.Path.home", return_value=home):
+        result = CliRunner().invoke(
+            cli,
+            ["scan", "--stream", "--quiet", "hf://test/model"],
+            catch_exceptions=False,
+        )
+
+    assert result.exit_code == 0, result.output
+    default_cache = home / ".modelaudit" / "cache"
+    assert mock_download_streaming.call_args.kwargs["cache_dir"] == default_cache
+    staging_root = mock_download_streaming.call_args.kwargs["_staging_root"]
+    assert isinstance(staging_root, Path)
+    assert staging_root.parent == default_cache.resolve()
+    assert not staging_root.exists()
+    assert default_cache.is_dir()
 
 
 @patch("modelaudit.cli.is_huggingface_url")
 @patch("modelaudit.utils.sources.huggingface.download_model_streaming")
 @patch("modelaudit.core.scan_model_streaming")
-@patch("shutil.rmtree")
 def test_scan_huggingface_strict_streaming_uses_ephemeral_cache_dir(
-    mock_rmtree: MagicMock,
     mock_scan_streaming: MagicMock,
     mock_download_streaming: MagicMock,
     mock_is_hf_url: MagicMock,
@@ -6947,15 +7051,16 @@ def test_scan_huggingface_strict_streaming_uses_ephemeral_cache_dir(
     cache_dir = mock_download_streaming.call_args.kwargs["cache_dir"]
     assert isinstance(cache_dir, Path)
     assert cache_dir.name.startswith("modelaudit_hf_")
-    mock_rmtree.assert_called()
+    assert not cache_dir.exists()
+    staging_root = mock_download_streaming.call_args.kwargs["_staging_root"]
+    assert isinstance(staging_root, Path)
+    assert not staging_root.exists()
 
 
 @patch("modelaudit.cli.is_huggingface_url")
 @patch("modelaudit.utils.sources.huggingface.download_model_streaming")
 @patch("modelaudit.core.scan_model_streaming")
-@patch("shutil.rmtree")
 def test_scan_huggingface_no_cache_streaming_preserves_repository_scan_root(
-    mock_rmtree: MagicMock,
     mock_scan_streaming: MagicMock,
     mock_download_streaming: MagicMock,
     mock_is_hf_url: MagicMock,
@@ -6982,14 +7087,19 @@ def test_scan_huggingface_no_cache_streaming_preserves_repository_scan_root(
     assert isinstance(cache_dir, Path)
     assert cache_dir.name.startswith("modelaudit_hf_")
 
+    staging_root = mock_download_streaming.call_args.kwargs["_staging_root"]
+    assert isinstance(staging_root, Path)
+    assert staging_root.name.startswith("modelaudit_hf_stream_")
+    assert not staging_root.exists()
+
     scan_kwargs = mock_scan_streaming.call_args.kwargs
-    assert scan_kwargs["scan_root"] == str(cache_dir / "huggingface")
-    assert scan_kwargs[REPOSITORY_SCAN_ROOT_CONFIG_KEY] == str(cache_dir / "huggingface" / "test" / "model")
+    assert scan_kwargs["scan_root"] == str(staging_root / "huggingface")
+    assert scan_kwargs[REPOSITORY_SCAN_ROOT_CONFIG_KEY] == str(staging_root / "huggingface" / "test" / "model")
     assert (
         scan_kwargs[REPOSITORY_FILE_INVENTORY_CONFIG_KEY]
         is mock_download_streaming.call_args.kwargs["repository_file_inventory"]
     )
-    mock_rmtree.assert_called()
+    assert not cache_dir.exists()
 
 
 @patch("modelaudit.cli.is_huggingface_url")
@@ -7197,6 +7307,105 @@ def test_scan_huggingface_streaming_incomplete_result_reports_failed_progress(
     assert "SCAN SUMMARY" in clean_output
     assert "SCAN COMPLETED WITH OPERATIONAL ERRORS" in clean_output
     assert "Dangerous import detected before interruption" in clean_output
+    mock_download_streaming.assert_called_once()
+    mock_scan_streaming.assert_called_once()
+
+
+@pytest.mark.parametrize("has_security_finding", [True, False], ids=["critical", "benign"])
+@patch("modelaudit.cli.is_huggingface_url")
+@patch("modelaudit.utils.sources.huggingface.download_model_streaming")
+@patch("modelaudit.core.scan_model_streaming")
+def test_scan_huggingface_streaming_cleanup_failure_preserves_completed_result(
+    mock_scan_streaming: MagicMock,
+    mock_download_streaming: MagicMock,
+    mock_is_hf_url: MagicMock,
+    tmp_path: Path,
+    has_security_finding: bool,
+) -> None:
+    """Staging cleanup failures must not erase already-produced scan evidence."""
+    from modelaudit.utils.sources.huggingface import _HfStreamingStagingCleanupError
+
+    mock_is_hf_url.return_value = True
+    mock_download_streaming.return_value = iter(())
+    finding_message = "Dangerous import detected before cleanup"
+    issues = (
+        [
+            {
+                "message": finding_message,
+                "severity": "critical",
+                "location": "malicious.pkl",
+            }
+        ]
+        if has_security_finding
+        else []
+    )
+    mock_scan_streaming.return_value = create_mock_scan_result(
+        bytes_scanned=7,
+        files_scanned=1,
+        issues=issues,
+        has_errors=False,
+        success=True,
+    )
+    selected_cache = tmp_path / "selected-cache"
+
+    @contextmanager
+    def cleanup_fails(*, parent: Path | None = None) -> Iterator[Path]:
+        assert parent == selected_cache
+        parent.mkdir(parents=True)
+        staging_root = parent / "owned-stage"
+        staging_root.mkdir()
+        try:
+            yield staging_root
+        finally:
+            raise _HfStreamingStagingCleanupError("deterministic cleanup failure")
+
+    with patch(
+        "modelaudit.utils.sources.huggingface._temporary_hf_streaming_staging_root",
+        cleanup_fails,
+    ):
+        result = CliRunner().invoke(
+            cli,
+            [
+                "scan",
+                "--stream",
+                "--quiet",
+                "--format",
+                "json",
+                "--cache-dir",
+                str(selected_cache),
+                "hf://test/model",
+            ],
+        )
+
+    parsed = parse_click_json_output(result.output)
+    assert result.exit_code == 2
+    assert parsed["bytes_scanned"] == 7
+    assert parsed["files_scanned"] == 1
+    assert parsed["has_errors"] is True
+    assert parsed["success"] is False
+
+    expected_messages = [finding_message] if has_security_finding else []
+    assert [issue["message"] for issue in parsed["issues"][:-1]] == expected_messages
+    if has_security_finding:
+        assert parsed["issues"][0]["severity"] == "critical"
+        assert parsed["issues"][0]["location"] == "malicious.pkl"
+
+    cleanup_issue = parsed["issues"][-1]
+    assert cleanup_issue["type"] == "huggingface_acquisition_error"
+    assert cleanup_issue["severity"] == "info"
+    assert cleanup_issue["message"] == (
+        "Hugging Face processing failed for hf://test/model after 1 model artifact was scanned; "
+        "scan coverage is incomplete."
+    )
+    assert cleanup_issue["details"]["partial_scan"] is True
+    assert cleanup_issue["details"]["scanned_artifact_count"] == 1
+    assert cleanup_issue["details"]["scan_outcome"] == "inconclusive"
+    assert cleanup_issue["details"]["scan_outcome_reason"] == "huggingface_acquisition_error"
+
+    source_metadata = parsed["file_metadata"]["hf://test/model"]
+    assert source_metadata["operational_error"] is True
+    assert source_metadata["scan_outcome"] == "inconclusive"
+    assert source_metadata["scan_outcome_reason"] == "huggingface_acquisition_error"
     mock_download_streaming.assert_called_once()
     mock_scan_streaming.assert_called_once()
 

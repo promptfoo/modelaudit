@@ -16,7 +16,7 @@ LOCKFILE = ROOT_DIR / "uv.lock"
 ROOT_PYPROJECT = ROOT_DIR / "pyproject.toml"
 RENOVATE_CONFIG = ROOT_DIR / "renovate.json"
 PICKLESCAN_PYPROJECT = ROOT_DIR / "packages" / "modelaudit-picklescan" / "pyproject.toml"
-PATCHED_GITPYTHON_FLOOR = (3, 1, 58)
+PATCHED_GITPYTHON_FLOOR = (3, 1, 59)
 PINNED_MATURIN_BACKEND = "maturin===1.13.3"
 REQUIRED_PICKLESCAN_RELEASE = "modelaudit-picklescan>=0.1.10,<0.2.0"
 PATCHED_PY7ZR_REQUIREMENT = "py7zr>=1.1.3"
