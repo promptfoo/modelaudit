@@ -2900,10 +2900,12 @@ def test_ggml_polyglot_with_rejected_zip_encoding_or_version_fails_closed(
         expected_error = NotImplementedError
     path.write_bytes(archive_bytes)
 
-    with zip_scanner_module.open_preflighted_zip_handle_with_entry_count(path) as (archive_handle, entry_count):
-        assert entry_count == 1
-        with pytest.raises(expected_error), zipfile.ZipFile(archive_handle):
-            pass
+    with (
+        zip_scanner_module.open_preflighted_zip_handle(path) as archive_handle,
+        pytest.raises(expected_error),
+        zipfile.ZipFile(archive_handle),
+    ):
+        pass
 
     direct = GgufScanner().scan(str(path))
     aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
@@ -2992,63 +2994,47 @@ def test_ggml_with_empty_zip_remains_benign(tmp_path: Path) -> None:
     assert determine_exit_code(aggregate) == 0
 
 
-def test_ggml_polyglot_entry_limit_preflights_before_zipfile_open(
+@pytest.mark.parametrize(
+    ("limit", "check_name", "expected_details"),
+    [
+        (
+            "max_zip_entries",
+            "Entry Count Limit Check",
+            {"entries": 2, "max_entries": 1, "entry_count_source": "central_directory_preflight"},
+        ),
+        (
+            "max_zip_central_directory_size",
+            "Central Directory Size Limit Check",
+            {"max_central_directory_size": 1},
+        ),
+    ],
+)
+def test_ggml_polyglot_limits_preflight_before_zipfile_open(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    limit: str,
+    check_name: str,
+    expected_details: dict[str, Any],
 ) -> None:
-    path = tmp_path / "entry-limit.ggml"
+    path = tmp_path / "limited.ggml"
     _write_ggml_file(path)
     _append_gguf_zip(path, {"one.txt": b"one", "two.txt": b"two"})
 
     def fail_zipfile_open(*_args: Any, **_kwargs: Any) -> Any:
-        raise AssertionError("entry-count preflight must run before ZipFile construction")
+        raise AssertionError("preflight must run before ZipFile construction")
 
     monkeypatch.setattr(zip_scanner_module.zipfile, "ZipFile", fail_zipfile_open)
 
-    result = GgufScanner(config={"max_zip_entries": 1}).scan(str(path))
+    result = GgufScanner(config={limit: 1}).scan(str(path))
 
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert "zip_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
-    assert any(
-        check.name == "Entry Count Limit Check"
-        and check.status == CheckStatus.FAILED
-        and check.details["entries"] == 2
-        and check.details["max_entries"] == 1
-        and check.details["entry_count_source"] == "central_directory_preflight"
-        for check in result.checks
-    )
-    assert not any(issue.rule_code == "S908" for issue in result.issues)
-
-
-def test_ggml_polyglot_directory_size_preflights_before_zipfile_open(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    path = tmp_path / "directory-size-limit.ggml"
-    _write_ggml_file(path)
-    _append_gguf_zip(path, {"safe.txt": b"safe"})
-    archive_bytes = path.read_bytes()
-    eocd_index = archive_bytes.rfind(b"PK\x05\x06")
-    assert eocd_index >= 0
-    directory_size = int.from_bytes(archive_bytes[eocd_index + 12 : eocd_index + 16], "little")
-    assert directory_size > 1
-
-    def fail_zipfile_open(*_args: Any, **_kwargs: Any) -> Any:
-        raise AssertionError("directory-size preflight must run before ZipFile construction")
-
-    monkeypatch.setattr(zip_scanner_module.zipfile, "ZipFile", fail_zipfile_open)
-
-    result = GgufScanner(config={"max_zip_central_directory_size": directory_size - 1}).scan(str(path))
-
-    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-    assert "zip_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
-    assert any(
-        check.name == "Central Directory Size Limit Check"
-        and check.status == CheckStatus.FAILED
-        and check.details["central_directory_size"] == directory_size
-        and check.details["max_central_directory_size"] == directory_size - 1
-        for check in result.checks
-    )
+    checks = [check for check in result.checks if check.name == check_name]
+    assert len(checks) == 1
+    assert checks[0].status == CheckStatus.FAILED
+    assert expected_details.items() <= checks[0].details.items()
+    if limit == "max_zip_central_directory_size":
+        assert checks[0].details["central_directory_size"] > 1
     assert not any(issue.rule_code == "S908" for issue in result.issues)
 
 
@@ -3523,33 +3509,14 @@ def test_gguf_scanner_last_tensor_size(tmp_path):
     assert len(size_warnings) == 0
 
 
-@pytest.mark.parametrize("magic", [b"GGML", b"GGMF", b"GGJT", b"GGLA", b"GGSA"])
-def test_ggml_scanner_ignores_stray_end_of_central_directory_bytes(tmp_path: Path, magic: bytes) -> None:
-    """A bare EOCD signature in tensor data is not a polyglot.
-
-    ``zipfile.is_zipfile`` returns True for any file whose trailing bytes contain ``PK\\x05\\x06``
-    followed by 18 bytes, which model tensor data hits by chance. Reporting CRITICAL S908 for an
-    archive carrying no members at all is a false positive; a hidden payload always has an entry.
-    The existing near-match regression cannot catch this because it appends ``PK\\x03\\x04``, a
-    local-file-header signature that end-of-central-directory scanning never inspects.
-    """
+@pytest.mark.parametrize("magic", [b"GGUF", b"GGML", b"GGMF", b"GGJT", b"GGLA", b"GGSA"])
+def test_gguf_ggml_ignores_stray_end_of_central_directory_bytes(tmp_path: Path, magic: bytes) -> None:
+    """A bare ZIP footer without archive members is not a polyglot."""
     path = tmp_path / "stray-eocd.bin"
-    _write_ggml_variant_file(path, magic)
-    with path.open("ab") as handle:
-        handle.write(b"\x00" * 64 + b"PK\x05\x06" + b"\x00" * 18 + b"\x00" * 32)
-
-    assert zipfile.is_zipfile(str(path))
-
-    result = GgufScanner().scan(str(path))
-
-    assert not any("Polyglot" in check.name for check in result.checks)
-    assert not any(issue.rule_code == "S908" for issue in result.issues)
-
-
-def test_gguf_scanner_ignores_stray_end_of_central_directory_bytes(tmp_path: Path) -> None:
-    """The same false positive existed for GGUF before the member check."""
-    path = tmp_path / "stray-eocd.gguf"
-    _write_minimal_gguf(path)
+    if magic == b"GGUF":
+        _write_minimal_gguf(path)
+    else:
+        _write_ggml_variant_file(path, magic)
     with path.open("ab") as handle:
         handle.write(b"\x00" * 64 + b"PK\x05\x06" + b"\x00" * 18 + b"\x00" * 32)
 

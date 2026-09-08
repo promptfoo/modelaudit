@@ -796,26 +796,19 @@ class GgufScanner(BaseScanner):
             _mark_zip_container_preflight_rejected,
             merge_executable_zip_container_findings,
         )
-        from .zip_scanner import (
-            ZipPreflightRejected,
-            _open_preflighted_zip_handle_with_entry_count,
-        )
+        from .zip_scanner import ZipPreflightRejected, _open_preflighted_zip_handle
 
         archive_config = dict(self.config)
         archive_config.pop(_GGUF_CONTAINER_OWNED_TRAILING_CONFIG_KEY, None)
 
-        # Retain the bounded same-handle preflight count so parser mismatches fail closed even
-        # when nested ZIP scanning is excluded.
-        preflight_entry_count: int | None = None
-        parsed_entry_count: int | None = None
         preflight_accepted = False
         try:
-            with _open_preflighted_zip_handle_with_entry_count(
+            with _open_preflighted_zip_handle(
                 self.current_file_path,
                 archive_config,
                 require_zip=False,
-            ) as (archive_handle, is_zip, preflight_entry_count):
-                if not is_zip:
+            ) as (archive_handle, preflight_entry_count):
+                if preflight_entry_count is None:
                     return False
                 preflight_accepted = True
                 with zipfile.ZipFile(archive_handle, "r") as embedded_archive:
@@ -844,11 +837,8 @@ class GgufScanner(BaseScanner):
             mark_archive_scan_incomplete(result, "zip_analysis_incomplete")
             return False
 
-        if (
-            preflight_entry_count is not None
-            and parsed_entry_count is not None
-            and parsed_entry_count != preflight_entry_count
-        ):
+        # Compare counts even when nested ZIP scanning is excluded.
+        if parsed_entry_count != preflight_entry_count:
             result.add_check(
                 name="ZIP Central Directory Preflight",
                 passed=False,
@@ -1147,12 +1137,9 @@ class GgufScanner(BaseScanner):
         result: ScanResult,
     ) -> None:
         """Basic GGML file validation with security checks."""
-        outer_magic = magic.decode("ascii", "ignore")
-        result.metadata["format"] = "ggml"
-        result.metadata["magic"] = outer_magic
         self._scan_zip_polyglot(result, format_name="GGML")
         result.metadata["format"] = "ggml"
-        result.metadata["magic"] = outer_magic
+        result.metadata["magic"] = magic.decode("ascii", "ignore")
         result.bytes_scanned = max(result.bytes_scanned, file_size)
 
         if file_size < 32:

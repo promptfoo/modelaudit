@@ -548,8 +548,8 @@ class WeightDistributionScanner(BaseScanner):
     def _pytorch_load_within_budget(self, path: str) -> bool:
         from .zip_scanner import _open_preflighted_zip_handle
 
-        with _open_preflighted_zip_handle(path, self.config, require_zip=False) as (archive_handle, is_zip):
-            return self._pytorch_load_handle_within_budget(path, archive_handle, is_zip=is_zip)
+        with _open_preflighted_zip_handle(path, self.config, require_zip=False) as (archive_handle, entry_count):
+            return self._pytorch_load_handle_within_budget(path, archive_handle, is_zip=entry_count is not None)
 
     def _pytorch_load_handle_within_budget(self, path: str, archive_handle: BinaryIO, *, is_zip: bool) -> bool:
         max_total_bytes = self._max_total_tensor_bytes()
@@ -973,8 +973,8 @@ class WeightDistributionScanner(BaseScanner):
             # Load model with map_location to CPU to avoid GPU requirements
             from .zip_scanner import _open_preflighted_zip_handle
 
-            with _open_preflighted_zip_handle(path, self.config, require_zip=False) as (model_handle, is_zip):
-                if not self._pytorch_load_handle_within_budget(path, model_handle, is_zip=is_zip):
+            with _open_preflighted_zip_handle(path, self.config, require_zip=False) as (model_handle, entry_count):
+                if not self._pytorch_load_handle_within_budget(path, model_handle, is_zip=entry_count is not None):
                     return {}
                 model_handle.seek(0)
                 model_data = torch.load(model_handle, **load_kwargs)

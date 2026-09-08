@@ -2340,13 +2340,13 @@ class ZipScanner(BaseScanner):
 
 
 @contextlib.contextmanager
-def _open_preflighted_zip_handle_with_entry_count(
+def _open_preflighted_zip_handle(
     path: str | os.PathLike[str],
     config: dict[str, Any] | None = None,
     *,
     require_zip: bool = True,
-) -> Iterator[tuple[BinaryIO, bool, int | None]]:
-    """Open once and yield its descriptor, ZIP routing state, and bounded entry count."""
+) -> Iterator[tuple[BinaryIO, int | None]]:
+    """Yield the descriptor and bounded ZIP entry count, or None for non-ZIP data."""
     scanner = ZipScanner(config=config)
     path_text = os.fspath(path)
     with open(path, "rb") as handle:
@@ -2369,54 +2369,29 @@ def _open_preflighted_zip_handle_with_entry_count(
                     _ZIP64_EOCD_SIGNATURE,
                 }:
                     handle.seek(0)
-                    yield handle, False, None
+                    yield handle, None
                     return
             raise ZipPreflightRejected(scanner._preflight_rejection_result(path_text, error=exc)) from exc
         if preflight is None:
             if require_zip:
                 raise zipfile.BadZipFile("File is not a valid ZIP archive")
         else:
-            entry_count, exceeds_limit = preflight
+            preflight_entries, exceeds_limit = preflight
             if exceeds_limit:
-                raise ZipPreflightRejected(scanner._preflight_rejection_result(path_text, entry_count=entry_count))
-        preflight_is_zip = preflight is not None
-        if not require_zip and preflight is not None and preflight[0] == 0:
+                raise ZipPreflightRejected(
+                    scanner._preflight_rejection_result(path_text, entry_count=preflight_entries)
+                )
+        entry_count = preflight[0] if preflight is not None else None
+        if not require_zip and entry_count == 0:
             handle.seek(0)
             leading_signature = handle.read(4)
-            preflight_is_zip = leading_signature in {
+            if leading_signature not in {
                 _ZIP_LOCAL_FILE_HEADER_SIGNATURE,
                 _ZIP_EOCD_SIGNATURE,
                 _ZIP64_EOCD_SIGNATURE,
-            }
+            }:
+                entry_count = None
         handle.seek(0)
-        yield handle, preflight_is_zip, preflight[0] if preflight is not None else None
-
-
-@contextlib.contextmanager
-def _open_preflighted_zip_handle(
-    path: str | os.PathLike[str],
-    config: dict[str, Any] | None = None,
-    *,
-    require_zip: bool = True,
-) -> Iterator[tuple[BinaryIO, bool]]:
-    """Open once, preflight that descriptor, and yield it with its ZIP routing state."""
-    with _open_preflighted_zip_handle_with_entry_count(path, config, require_zip=require_zip) as (
-        handle,
-        is_zip,
-        _entry_count,
-    ):
-        yield handle, is_zip
-
-
-@contextlib.contextmanager
-def open_preflighted_zip_handle_with_entry_count(
-    path: str | os.PathLike[str],
-    config: dict[str, Any] | None = None,
-) -> Iterator[tuple[BinaryIO, int]]:
-    """Open once and yield the preflighted descriptor with its bounded entry count."""
-    with _open_preflighted_zip_handle_with_entry_count(path, config) as (handle, _is_zip, entry_count):
-        if entry_count is None:
-            raise zipfile.BadZipFile("File is not a valid ZIP archive")
         yield handle, entry_count
 
 
@@ -2428,7 +2403,7 @@ def open_preflighted_zip_handle(
     require_zip: bool = True,
 ) -> Iterator[BinaryIO]:
     """Open once, preflight that descriptor, and yield it without a pathname race."""
-    with _open_preflighted_zip_handle(path, config, require_zip=require_zip) as (handle, _is_zip):
+    with _open_preflighted_zip_handle(path, config, require_zip=require_zip) as (handle, _entry_count):
         yield handle
 
 
