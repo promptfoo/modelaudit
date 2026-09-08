@@ -110,10 +110,11 @@ _PICKLE_URL_ACTIVE_CONTEXT_PATTERN = re.compile(
     rb"urlretrieve|urllib|webhook|wget",
     re.IGNORECASE,
 )
-_PASSIVE_METADATA_URL_CONTEXT_PATTERN = re.compile(
-    rb"author|doc(?:umentation)?s?|licen[cs]e|metadata|model_author|model_type|readme|repository|source|version",
-    re.IGNORECASE,
+_PASSIVE_PICKLE_METADATA_URL_KEYS = frozenset({"docs", "documentation", "license", "licence", "readme"})
+_PASSIVE_ONNX_METADATA_URL_KEYS = frozenset(
+    {"docs", "documentation", "license", "licence", "readme", "repository", "source", "url"}
 )
+_PASSIVE_ONNX_NUMBERED_URL_KEY_PATTERN = re.compile(r"url_\d+\Z", re.IGNORECASE)
 _PROVEN_BARE_QUERY_COMPONENTS = frozenset({"_debug", "debug"})
 _PROVEN_BARE_PROSE_COMPONENTS = frozenset({"section"})
 _PATH_TOKEN_BOUNDARY_PATTERN = re.compile(r"&amp;|[&,'\"?#\s]")
@@ -1076,11 +1077,93 @@ def _pickle_literal_payload_start_ending_at(data: bytes, literal_end: int) -> in
 def _pickle_literal_payload_bounds_containing(
     data: bytes, payload_offset_start: int, payload_offset_end: int
 ) -> tuple[int, int] | None:
+    if not 0 <= payload_offset_start <= payload_offset_end <= len(data):
+        return None
     lower_bound = max(0, payload_offset_start - _MAX_PICKLE_LITERAL_BOUNDARY_PROBE_BYTES)
     for opcode_index in range(lower_bound, payload_offset_start + 1):
         bounds = _pickle_literal_payload_bounds_at(data, opcode_index)
         if bounds is not None and bounds[0] <= payload_offset_start and payload_offset_end <= bounds[1]:
             return bounds
+    return None
+
+
+def _pickle_literal_opcode_index_for_payload_bounds(data: bytes, payload_bounds: tuple[int, int]) -> int | None:
+    lower_bound = max(0, payload_bounds[0] - _MAX_PICKLE_LITERAL_BOUNDARY_PROBE_BYTES)
+    for opcode_index in range(lower_bound, payload_bounds[0] + 1):
+        bounds = _pickle_literal_payload_bounds_at(data, opcode_index)
+        if bounds == payload_bounds:
+            return opcode_index
+    return None
+
+
+def _skip_pickle_memo_after_literal(data: bytes, cursor: int) -> int:
+    while cursor:
+        if data[cursor - 1] == 0x94:
+            cursor -= 1
+        elif cursor >= 2 and data[cursor - 2] == ord("q"):
+            cursor -= 2
+        elif cursor >= 5 and data[cursor - 5] == ord("r"):
+            cursor -= 5
+        else:
+            break
+    return cursor
+
+
+def _pickle_literal_key_before_payload(data: bytes, payload_bounds: tuple[int, int]) -> str | None:
+    value_opcode_index = _pickle_literal_opcode_index_for_payload_bounds(data, payload_bounds)
+    if value_opcode_index is None:
+        return None
+
+    key_literal_end = _skip_pickle_memo_after_literal(data, value_opcode_index)
+    key_literal_start = _pickle_literal_payload_start_ending_at(data, key_literal_end)
+    if key_literal_start is None:
+        return None
+
+    try:
+        return data[key_literal_start:key_literal_end].decode("utf-8").strip().casefold()
+    except UnicodeDecodeError:
+        return None
+
+
+def _protobuf_varint_ending_at(data: bytes, end: int) -> tuple[int, int] | None:
+    if not 0 <= end <= len(data):
+        return None
+    for start in range(max(0, end - 10), end):
+        value = 0
+        shift = 0
+        for index in range(start, end):
+            byte = data[index]
+            value |= (byte & 0x7F) << shift
+            shift += 7
+            if byte < 0x80:
+                if index == end - 1:
+                    return start, value
+                break
+    return None
+
+
+def _protobuf_length_delimited_field_at(data: bytes, payload_start: int, tag: int) -> tuple[int, int, int] | None:
+    parsed_length = _protobuf_varint_ending_at(data, payload_start)
+    if parsed_length is None:
+        return None
+    length_start, payload_len = parsed_length
+    tag_index = length_start - 1
+    payload_end = payload_start + payload_len
+    if tag_index < 0 or data[tag_index] != tag or payload_end > len(data):
+        return None
+    return tag_index, payload_start, payload_end
+
+
+def _protobuf_length_delimited_field_ending_at(data: bytes, payload_end: int, tag: int) -> bytes | None:
+    min_payload_start = max(0, payload_end - 128)
+    for payload_start in range(min_payload_start, payload_end + 1):
+        parsed_length = _protobuf_varint_ending_at(data, payload_start)
+        if parsed_length is None:
+            continue
+        length_start, payload_len = parsed_length
+        tag_index = length_start - 1
+        if tag_index >= 0 and data[tag_index] == tag and payload_start + payload_len == payload_end:
+            return data[payload_start:payload_end]
     return None
 
 
@@ -5483,7 +5566,11 @@ class NetworkCommDetector:
             return None
         if self._is_public_source_repository_url(hostname, path_segments):
             return "source_repository"
+        if self._is_public_model_repository_url(hostname, path_segments):
+            return "model_repository"
         if any(segment in self.INFORMATIONAL_URL_PATH_SEGMENTS for segment in path_segments):
+            if hostname in _PUBLIC_MODEL_REPOSITORY_HOSTS:
+                return "model_documentation"
             return "documentation"
         if hostname.startswith(self.INFORMATIONAL_URL_HOST_PREFIXES) and parsed.path in {"", "/"}:
             return "documentation"
@@ -5495,29 +5582,67 @@ class NetworkCommDetector:
             return False
         return len(path_segments) == 2 and all(path_segments)
 
-    def _is_passive_metadata_url_reference(self, data: bytes, url_start: int, url: str) -> bool:
-        kind = self._informational_url_reference_kind(url)
-        if kind is None:
+    @staticmethod
+    def _is_public_model_repository_url(hostname: str, path_segments: list[str]) -> bool:
+        if hostname not in _PUBLIC_MODEL_REPOSITORY_HOSTS:
             return False
+        if not path_segments:
+            return False
+        repo_start = 1 if path_segments[0] in _PUBLIC_MODEL_REPOSITORY_PREFIXES else 0
+        if len(path_segments) < repo_start + 2:
+            return False
+        if not all(path_segments[repo_start : repo_start + 2]):
+            return False
+        remaining = path_segments[repo_start + 2 :]
+        if not remaining:
+            return True
+        return remaining[0] == "tree" and len(remaining) >= 2
+
+    @staticmethod
+    def _is_passive_pickle_metadata_key(key: str | None) -> bool:
+        return key in _PASSIVE_PICKLE_METADATA_URL_KEYS
+
+    @staticmethod
+    def _is_passive_onnx_metadata_key(key: str) -> bool:
+        return (
+            key in _PASSIVE_ONNX_METADATA_URL_KEYS or _PASSIVE_ONNX_NUMBERED_URL_KEY_PATTERN.fullmatch(key) is not None
+        )
+
+    def _is_passive_onnx_metadata_url_reference(self, data: bytes, url_start: int, url: str) -> bool:
+        value_field = _protobuf_length_delimited_field_at(data, url_start, tag=0x12)
+        if value_field is None:
+            return False
+
+        value_tag_index, value_start, value_end = value_field
+        try:
+            value = data[value_start:value_end].decode("utf-8")
+        except UnicodeDecodeError:
+            return False
+        if not value.startswith(("http://", "https://")) or not url.startswith(value):
+            return False
+
+        kind = self._informational_url_reference_kind(value)
+        if kind not in {"documentation", "model_documentation", "model_repository", "source_repository"}:
+            return False
+
+        key_bytes = _protobuf_length_delimited_field_ending_at(data, value_tag_index, tag=0x0A)
+        if key_bytes is None:
+            return False
+        try:
+            key = key_bytes.decode("utf-8").strip().casefold()
+        except UnicodeDecodeError:
+            return False
+        return self._is_passive_onnx_metadata_key(key)
+
+    def _is_passive_metadata_url_reference(self, data: bytes, url_start: int, url: str) -> bool:
         url_end = url_start + len(url.encode("utf-8"))
         bounds = _pickle_literal_payload_bounds_containing(data, url_start, url_end)
         if bounds is not None:
-            context_start = max(0, bounds[0] - 128)
-            context_end = min(len(data), bounds[1] + 128)
-            context_data = data[context_start:context_end]
             return (
-                _PICKLE_URL_ACTIVE_CONTEXT_PATTERN.search(context_data) is None
-                and _PASSIVE_METADATA_URL_CONTEXT_PATTERN.search(context_data) is not None
+                self._is_passive_pickle_metadata_key(_pickle_literal_key_before_payload(data, bounds))
+                and _PICKLE_URL_ACTIVE_CONTEXT_PATTERN.search(data[bounds[0] : bounds[1]]) is None
             )
-        if kind != "source_repository":
-            return False
-        context_start = max(0, url_start - 256)
-        context_end = min(len(data), url_end + 64)
-        context_data = data[context_start:context_end]
-        return (
-            _PICKLE_URL_ACTIVE_CONTEXT_PATTERN.search(context_data) is None
-            and _PASSIVE_METADATA_URL_CONTEXT_PATTERN.search(context_data) is not None
-        )
+        return self._is_passive_onnx_metadata_url_reference(data, url_start, url)
 
     def _scan_cloud_storage_urls(self, data: bytes, context: str) -> None:
         """Scan for cloud storage URL patterns (S3, GCS, Azure, etc.).

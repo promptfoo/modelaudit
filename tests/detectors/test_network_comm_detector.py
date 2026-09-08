@@ -2856,7 +2856,12 @@ class TestNetworkCommDetector:
     def test_explicit_ml_model_url_patterns_treat_passive_onnx_source_repo_as_informational(self) -> None:
         detector = NetworkCommDetector()
         url = "https://github.com/RicherMans/CED"
-        data = b"model_type\x12\x03CEDr\x07version\x12\x031.0r\x0cmodel_author\x12\nRicherMansr(" + url.encode()
+        data = (
+            b"\n\nmodel_type\x12\x03CED"
+            b"\n\x07version\x12\x031.0"
+            b"\n\x0cmodel_author\x12\nRicherMans"
+            b"\n\x03url\x12" + bytes([len(url)]) + url.encode()
+        )
 
         findings = detector.scan(data, "model.onnx")
 
@@ -2873,6 +2878,117 @@ class TestNetworkCommDetector:
             finding for finding in findings if finding["type"] == "domain" and finding["domain"] == "github.com"
         )
         assert domain_finding["severity"] == "INFO"
+
+    def test_explicit_ml_model_url_patterns_treat_passive_onnx_hf_model_metadata_as_informational(
+        self,
+    ) -> None:
+        detector = NetworkCommDetector()
+        urls = [
+            "https://huggingface.co/pyannote/segmentation-3.0",
+            "https://huggingface.co/csukuangfj/pyannote-models/tree/main/segmentation-3.0",
+            "https://huggingface.co/pyannote/segmentation-3.0/blob/main/LICENSE",
+        ]
+        metadata_pairs = b"".join(
+            b"\n" + bytes([len(key)]) + key.encode() + b"\x12" + bytes([len(url)]) + url.encode()
+            for key, url in zip(("url_1", "url_2", "license"), urls, strict=True)
+        )
+        data = (
+            b"\n\nmodel_type\x12\x1apyannote-segmentation-3.0"
+            b"\n\x07version\x12\x011"
+            b"\n\x0cmodel_author\x12\x08pyannoter"
+            b"\n\nmaintainer\x12\x06k2-fsa" + metadata_pairs
+        )
+
+        findings = detector.scan(data, "model.onnx")
+
+        explicit_matches = {
+            finding["matched_text"]
+            for finding in findings
+            if finding["type"] == "explicit_network_pattern" and finding["matched_text"] in urls
+        }
+        assert explicit_matches == set()
+        url_findings = {finding["url"]: finding for finding in findings if finding["type"] == "url_detected"}
+        for url in urls:
+            assert url_findings[url]["severity"] == "INFO"
+        domain_finding = next(
+            finding for finding in findings if finding["type"] == "domain" and finding["domain"] == "huggingface.co"
+        )
+        assert domain_finding["severity"] == "INFO"
+
+    @pytest.mark.parametrize(
+        ("data", "url"),
+        [
+            (
+                b"model_author\x12\x06tester download_url\x12https://huggingface.co/owner/repo/blob/main/model.onnx",
+                "https://huggingface.co/owner/repo/blob/main/model.onnx",
+            ),
+            (
+                b"license\x12curl https://huggingface.co/owner/repo/blob/main/LICENSE",
+                "https://huggingface.co/owner/repo/blob/main/LICENSE",
+            ),
+            (
+                b"url_1\x12https://huggingface.co/owner/repo/resolve/main/payload.bin",
+                "https://huggingface.co/owner/repo/resolve/main/payload.bin",
+            ),
+        ],
+    )
+    def test_explicit_ml_model_url_patterns_keep_hf_artifact_and_command_metadata_urls_critical(
+        self, data: bytes, url: str
+    ) -> None:
+        detector = NetworkCommDetector()
+
+        findings = detector.scan(data, "model.onnx")
+
+        explicit_finding = next(
+            finding
+            for finding in findings
+            if finding["type"] == "explicit_network_pattern" and finding["matched_text"] == url
+        )
+        assert explicit_finding["severity"] == "CRITICAL"
+
+    @pytest.mark.parametrize(
+        ("data", "url", "context"),
+        [
+            (
+                pickle.dumps({"model_url": "https://example.invalid/license"}, protocol=2),
+                "https://example.invalid/license",
+                "payload.pt",
+            ),
+            (
+                pickle.dumps({"source": "https://example.invalid/docs"}, protocol=2),
+                "https://example.invalid/docs",
+                "payload.pt",
+            ),
+            (
+                pickle.dumps("https://example.invalid/license", protocol=2),
+                "https://example.invalid/license",
+                "payload.pt",
+            ),
+            (
+                b"\0https://github.com/metadata/payload\0",
+                "https://github.com/metadata/payload",
+                "model.onnx",
+            ),
+            (
+                b"\0metadata\0payload_url\0https://github.com/example/payload\0",
+                "https://github.com/example/payload",
+                "model.onnx",
+            ),
+        ],
+    )
+    def test_explicit_ml_model_url_patterns_keep_unknown_observer_controls_critical(
+        self, data: bytes, url: str, context: str
+    ) -> None:
+        detector = NetworkCommDetector()
+
+        findings = detector.scan(data, context)
+
+        explicit_finding = next(
+            finding
+            for finding in findings
+            if finding["type"] == "explicit_network_pattern" and finding["matched_text"] == url
+        )
+        assert explicit_finding["severity"] == "CRITICAL"
 
     def test_cc_pattern_snippet_url_expansion_is_bounded(self) -> None:
         """Long whitespace-free binary regions should not force unbounded URL scans."""
