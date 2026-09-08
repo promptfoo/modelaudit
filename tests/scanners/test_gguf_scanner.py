@@ -2732,13 +2732,67 @@ def test_ggml_polyglot_with_post_preflight_bad_zip_fails_closed(tmp_path: Path) 
             if check.name == "ZIP File Format Validation" and check.status == CheckStatus.FAILED
         ]
         assert len(format_checks) == 1
-        assert format_checks[0].message == f"Not a valid zip file: {path}"
+        assert format_checks[0].message == f"Unable to parse ZIP archive: {path}"
         assert not any(issue.rule_code == "S908" for issue in result.issues)
         assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
     _assert_inconclusive_exit2(aggregate, "zip_analysis_incomplete")
     _assert_uncached_rerun_preserves_inconclusive_exit2(
         path,
         tmp_path / "bad-zip-cache",
+        "zip_analysis_incomplete",
+    )
+
+
+@pytest.mark.parametrize("failure", ["invalid_utf8", "unsupported_version"])
+def test_ggml_polyglot_with_rejected_zip_encoding_or_version_fails_closed(
+    tmp_path: Path,
+    failure: str,
+) -> None:
+    path = tmp_path / f"{failure}.ggml"
+    _write_ggml_file(path)
+    _append_gguf_zip(path, {"safe.txt": b"safe"})
+    archive_bytes = bytearray(path.read_bytes())
+    local_offset = archive_bytes.index(b"PK\x03\x04")
+    directory_offset = archive_bytes.index(b"PK\x01\x02")
+    if failure == "invalid_utf8":
+        archive_bytes[local_offset + 6 : local_offset + 8] = (0x800).to_bytes(2, "little")
+        archive_bytes[directory_offset + 8 : directory_offset + 10] = (0x800).to_bytes(2, "little")
+        archive_bytes[local_offset + 30] = 0xFF
+        archive_bytes[directory_offset + 46] = 0xFF
+        expected_error: type[Exception] = UnicodeDecodeError
+    else:
+        version = (zipfile.MAX_EXTRACT_VERSION + 1).to_bytes(2, "little")
+        archive_bytes[local_offset + 4 : local_offset + 6] = version
+        archive_bytes[directory_offset + 6 : directory_offset + 8] = version
+        expected_error = NotImplementedError
+    path.write_bytes(archive_bytes)
+
+    with zip_scanner_module.open_preflighted_zip_handle_with_entry_count(path) as (archive_handle, entry_count):
+        assert entry_count == 1
+        with pytest.raises(expected_error), zipfile.ZipFile(archive_handle):
+            pass
+
+    direct = GgufScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert direct.metadata["scan_outcome_reasons"] == ["zip_analysis_incomplete"]
+    for result in (direct, aggregate):
+        assert result.success is False
+        format_checks = [
+            check
+            for check in result.checks
+            if check.name == "ZIP File Format Validation" and check.status == CheckStatus.FAILED
+        ]
+        assert len(format_checks) == 1
+        assert format_checks[0].message == f"Unable to parse ZIP archive: {path}"
+        assert format_checks[0].details["exception_type"] == expected_error.__name__
+        assert not any(issue.rule_code == "S908" for issue in result.issues)
+        _assert_no_warning_or_critical_issues(result)
+    _assert_inconclusive_exit2(aggregate, "zip_analysis_incomplete")
+    _assert_uncached_rerun_preserves_inconclusive_exit2(
+        path,
+        tmp_path / "rejected-parser-cache",
         "zip_analysis_incomplete",
     )
 
@@ -2774,7 +2828,7 @@ def test_ggml_polyglot_with_post_preflight_oserror_fails_closed(
             if check.name == "ZIP File Format Validation" and check.status == CheckStatus.FAILED
         ]
         assert len(format_checks) == 1
-        assert format_checks[0].message == f"Not a valid zip file: {path}"
+        assert format_checks[0].message == f"Unable to parse ZIP archive: {path}"
         assert not any(issue.rule_code == "S908" for issue in result.issues)
         assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
     _assert_inconclusive_exit2(aggregate, "zip_analysis_incomplete")

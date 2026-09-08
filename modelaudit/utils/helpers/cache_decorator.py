@@ -249,7 +249,7 @@ def _has_embedded_keras_hdf5_weights(file_path: str) -> bool:
                 for info in archive.infolist()
                 if info.filename and not info.is_dir()
             }
-    except (OSError, zipfile.BadZipFile, ZipPreflightRejected):
+    except (OSError, zipfile.BadZipFile, ZipPreflightRejected, UnicodeError, NotImplementedError):
         return False
     return "config.json" in member_names and "model.weights.h5" in member_names
 

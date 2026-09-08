@@ -795,17 +795,21 @@ class GgufScanner(BaseScanner):
             _mark_zip_container_dispatched(result, self.current_file_path)
             _mark_zip_container_preflight_rejected(result, self.current_file_path)
             return False
-        except (OSError, zipfile.BadZipFile):
+        except (OSError, zipfile.BadZipFile, UnicodeError, NotImplementedError) as exc:
             if not preflight_accepted:
                 return False
             result.add_check(
                 name="ZIP File Format Validation",
                 passed=False,
-                message=f"Not a valid zip file: {self.current_file_path}",
+                message=f"Unable to parse ZIP archive: {self.current_file_path}",
                 severity=IssueSeverity.INFO,
                 rule_code="S902",
                 location=self.current_file_path,
-                details={"path": self.current_file_path},
+                details={
+                    "path": self.current_file_path,
+                    "exception": str(exc),
+                    "exception_type": type(exc).__name__,
+                },
             )
             mark_archive_scan_incomplete(result, "zip_analysis_incomplete")
             return False

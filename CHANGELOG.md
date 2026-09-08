@@ -17,7 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
-- Preserve incomplete-scan diagnostics for malformed GGUF/GGML ZIP candidates.
+- Preserve incomplete-scan diagnostics for malformed or unsupported ZIP data in GGUF/GGML files, including cached scans.
 - Keep incomplete Joblib NumPy-wrapper scans failed closed when embedded pickle analysis also reports warnings.
 - Upgrade XGBoost to 3.4 on Python 3.12+ while retaining XGBoost 3.2 on Python 3.10 and 3.11.
 - Restore SQL-backed MLflow model registries and upgrade their vulnerable SQL parser.
