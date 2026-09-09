@@ -35,7 +35,13 @@ from ..scanner_results import (
 )
 from ..scanner_selection import add_scanner_selection_skip_check, embedded_pickle_scanner
 from ..utils import is_absolute_archive_path, is_critical_system_path, sanitize_archive_path
-from ..utils.file.detection import PROTO0_1_MAX_PROBE_BYTES, PROTO0_1_START_BYTES, _looks_like_proto0_or_1_pickle
+from ..utils.file.detection import (
+    PROTO0_1_IGNORABLE_TRAILING_BYTES,
+    PROTO0_1_MAX_PROBE_BYTES,
+    PROTO0_1_START_BYTES,
+    PROTO0_1_TRIVIAL_LEADING_OPCODES,
+    _looks_like_proto0_or_1_pickle,
+)
 from ..utils.repository_context import (
     RepositoryFileInventory,
     repository_file_inventory_context_from_config,
@@ -2015,6 +2021,7 @@ class PyTorchZipScanner(BaseScanner):
     def _has_complete_pickle_stream_without_frame_stop_overrun(sample: bytes) -> bool:
         active_frame_end = 0
         opcode_count = 0
+        has_non_trivial_opcode = False
         try:
             for opcode, arg, pos in pickletools.genops(sample):
                 opcode_count += 1
@@ -2025,7 +2032,14 @@ class PyTorchZipScanner(BaseScanner):
                         return False
                     active_frame_end = max(active_frame_end, pos + _PICKLE_FRAME_OPCODE_BYTES + arg)
                 elif opcode.name == "STOP":
-                    return opcode_count >= 2 and active_frame_end <= len(sample)
+                    if opcode_count < 2 or active_frame_end > len(sample):
+                        return False
+                    if has_non_trivial_opcode:
+                        return True
+                    trailing = sample[pos + 1 :].lstrip(PROTO0_1_IGNORABLE_TRAILING_BYTES)
+                    return bool(trailing) and _looks_like_proto0_or_1_pickle(trailing, sample_is_prefix=False)
+                elif opcode.name not in PROTO0_1_TRIVIAL_LEADING_OPCODES:
+                    has_non_trivial_opcode = True
         except Exception:
             return False
         return False

@@ -1484,6 +1484,7 @@ def _contains_pickle_frame_opcode(sample: bytes) -> bool:
 def _has_complete_pickle_stream_without_frame_stop_overrun(sample: bytes) -> bool:
     active_frame_end = 0
     opcode_count = 0
+    has_non_trivial_opcode = False
     try:
         for opcode, arg, pos in pickletools.genops(sample):
             opcode_count += 1
@@ -1494,7 +1495,14 @@ def _has_complete_pickle_stream_without_frame_stop_overrun(sample: bytes) -> boo
                     return False
                 active_frame_end = max(active_frame_end, pos + _PICKLE_FRAME_OPCODE_BYTES + arg)
             elif opcode.name == "STOP":
-                return opcode_count >= 2 and active_frame_end <= len(sample)
+                if opcode_count < 2 or active_frame_end > len(sample):
+                    return False
+                if has_non_trivial_opcode:
+                    return True
+                trailing = sample[pos + 1 :].lstrip(_PROTO0_1_IGNORABLE_TRAILING_BYTES)
+                return bool(trailing) and _looks_like_proto0_or_1_pickle(trailing, sample_is_prefix=False)
+            elif opcode.name not in _PROTO0_1_TRIVIAL_LEADING_OPCODES:
+                has_non_trivial_opcode = True
     except Exception:
         return False
     return False

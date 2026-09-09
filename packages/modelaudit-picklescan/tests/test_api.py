@@ -519,6 +519,15 @@ def _pickleish_tensor_storage_bytes() -> bytes:
     return bytes.fromhex("478727be61f70dbd70953cbd09b996bd5c7a2ebe") + (b"\x00" * 128)
 
 
+def _yolov5n6_tensor_storage_prefix_bytes() -> bytes:
+    # First 64 bytes of Ultralytics/YOLOv5 yolov5n6.pt archive/data/195 at
+    # revision 5bca797074771ecdfd6267d6e9be32ee201d937b.
+    return bytes.fromhex(
+        "4dae5b2ed9a78527072fd82ac529db2d822f181d76258832bd2f39a63527ad2e"
+        "ba2d3eacd9247fb0a32b1525682aa0253831dc2c4c3085296c2cbcb1f52bea31"
+    )
+
+
 def _binary_magic_tensor_storage_bytes() -> bytes:
     return b"\x80\x04\x00" + (b"\x00" * 129)
 
@@ -5492,6 +5501,45 @@ def test_scan_file_does_not_route_benign_storage_blob_as_hidden_pickle(tmp_path:
     assert report.verdict == SafetyVerdict.CLEAN
     assert list(report.metadata["pickle_files"]) == ["archive/data.pkl"]
     assert not any(finding.location is not None and "archive/data/0" in finding.location for finding in report.findings)
+
+
+def test_scan_file_does_not_route_yolov5n6_storage_prefix_as_hidden_pickle(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model.pt"
+    storage_blob = _yolov5n6_tensor_storage_prefix_bytes()
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", storage_blob)
+
+    report = scan_file(archive_path)
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert list(report.metadata["pickle_files"]) == ["archive/data.pkl"]
+    assert not any(finding.location is not None and "archive/data/0" in finding.location for finding in report.findings)
+
+
+def test_scan_file_scans_trailing_pickle_after_yolov5n6_scalar_prefix(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model.pt"
+    storage_blob = _yolov5n6_tensor_storage_prefix_bytes()[:4] + b"cposix\nsystem\n(S'echo hidden'\ntR."
+    storage_blob += b" " * (-len(storage_blob) % 4)
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", storage_blob)
+
+    report = scan_file(archive_path)
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/0"]
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.location is not None
+        and f"{archive_path}:archive/data/0" in finding.location
+        for finding in report.findings
+    )
 
 
 def test_scan_file_scans_size_mismatched_storage_blob_on_hidden_pickle_path(tmp_path: Path) -> None:

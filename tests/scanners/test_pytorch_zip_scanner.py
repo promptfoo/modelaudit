@@ -1049,6 +1049,15 @@ def _pickleish_tensor_storage_bytes() -> bytes:
     return bytes.fromhex("478727be61f70dbd70953cbd09b996bd5c7a2ebe") + (b"\x00" * 128)
 
 
+def _yolov5n6_tensor_storage_prefix_bytes() -> bytes:
+    # First 64 bytes of Ultralytics/YOLOv5 yolov5n6.pt archive/data/195 at
+    # revision 5bca797074771ecdfd6267d6e9be32ee201d937b.
+    return bytes.fromhex(
+        "4dae5b2ed9a78527072fd82ac529db2d822f181d76258832bd2f39a63527ad2e"
+        "ba2d3eacd9247fb0a32b1525682aa0253831dc2c4c3085296c2cbcb1f52bea31"
+    )
+
+
 def _binary_magic_tensor_storage_bytes() -> bytes:
     return b"\x80\x04\x00" + (b"\x00" * 129)
 
@@ -2714,6 +2723,44 @@ def test_pytorch_zip_discovery_skips_referenced_storage_blob_pickleish_bytes(tmp
     assert any(check.details.get("trusted_pytorch_archive_context") is True for check in result.checks)
     assert not any(issue.details.get("pickle_filename") == "archive/data/0" for issue in result.issues)
     assert not any(check.details.get("pickle_filename") == "archive/data/0" for check in result.checks)
+
+
+def test_pytorch_zip_discovery_skips_referenced_yolov5n6_storage_prefix(tmp_path: Path) -> None:
+    model_path = tmp_path / "referenced_yolov5n6_storage_prefix.pt"
+    storage_blob = _yolov5n6_tensor_storage_prefix_bytes()
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        zip_file.writestr("archive/data/0", storage_blob)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert result.success is True
+    assert result.metadata.get("pickle_verdict") == "clean"
+    assert result.metadata["pickle_files"] == ["archive/data.pkl"]
+    assert any(check.details.get("trusted_pytorch_archive_context") is True for check in result.checks)
+    assert not any(issue.details.get("pickle_filename") == "archive/data/0" for issue in result.issues)
+    assert not any(check.details.get("pickle_filename") == "archive/data/0" for check in result.checks)
+
+
+def test_pytorch_zip_discovery_scans_trailing_pickle_after_yolov5n6_scalar_prefix(tmp_path: Path) -> None:
+    model_path = tmp_path / "referenced_yolov5n6_prefix_trailing_pickle.pt"
+    storage_blob = _yolov5n6_tensor_storage_prefix_bytes()[:4] + _malicious_proto0_system_payload()
+    storage_blob += b" " * (-len(storage_blob) % 4)
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        zip_file.writestr("archive/data/0", storage_blob)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert "archive/data/0" in result.metadata["pickle_files"]
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
+        for issue in result.issues
+    )
 
 
 def test_pytorch_zip_discovery_does_not_route_size_mismatched_benign_storage_blob(
