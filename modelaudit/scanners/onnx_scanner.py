@@ -2004,7 +2004,10 @@ def _build_onnx_weight_analysis_plan(
                         or (
                             not is_model_local_function
                             and (
-                                (node.op_type in {"Gather", "GatherElements", "GatherND"} and input_index == 1)
+                                (
+                                    node.op_type in {"Expand", "Gather", "GatherElements", "GatherND"}
+                                    and input_index == 1
+                                )
                                 or (node.op_type in _RECURRENT_WEIGHT_OPERATORS and input_index == 4)
                             )
                         )
@@ -2072,6 +2075,17 @@ def _build_onnx_weight_analysis_plan(
                             )
                         )
                         recognized_activation_input |= recurrent_initial_state and opposite_resolved_weight
+                        recognized_activation_input |= (
+                            lineage.unresolved_reason == "runtime_shape_lineage"
+                            and is_registered_standard_operator
+                            and not is_model_local_function
+                            and _onnx_activation_input_candidate(node, input_index)
+                            and (
+                                node.op_type not in {"Einsum", "Gemm", "MatMul"}
+                                or (node.op_type in {"Gemm", "MatMul"} and input_index == 0)
+                            )
+                            and opposite_resolved_weight
+                        )
                         if recognized_activation_input:
                             if opposite_resolved_weight:
                                 activation_input_lineages.add(initializer_index)
@@ -2348,7 +2362,7 @@ def _build_onnx_weight_analysis_plan(
                     lineage.unresolved_reason == "dynamic_activation_lineage" for lineage in all_input_lineages.values()
                 )
                 # Intermediate dynamic values may contain only shape-derived constants.
-                shape_scales_activation = (
+                shape_combines_with_runtime_data = (
                     same_type_elementwise
                     and not is_model_local_function
                     and node.op_type != "Where"
@@ -2379,9 +2393,9 @@ def _build_onnx_weight_analysis_plan(
                         continue
                     unresolved_reason = lineage.unresolved_reason
                     if unresolved_reason == "shape_dimensions_lineage" and (
-                        shape_scales_activation or runtime_masks_activation
+                        shape_combines_with_runtime_data or runtime_masks_activation
                     ):
-                        unresolved_reason = "dynamic_activation_lineage"
+                        unresolved_reason = "runtime_shape_lineage"
                     if unresolved_reason is None:
                         if carries_dynamic_activation:
                             unresolved_reason = "dynamic_activation_lineage"
@@ -2518,10 +2532,20 @@ def _build_onnx_weight_analysis_plan(
                 is_registered_standard_operator
                 and not is_model_local_function
                 and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
-                and (supported_transform or node.op_type in {"Abs", "Neg", "Not", "Relu", "Sigmoid", "Tanh"})
+                and (supported_transform or node.op_type in {"Abs", "Expand", "Neg", "Not", "Relu", "Sigmoid", "Tanh"})
                 and bool(node.input)
             )
             runtime_output = preserves_runtime_data and node.input[0] in runtime_data_values
+            runtime_output |= (
+                is_registered_standard_operator
+                and not is_model_local_function
+                and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
+                and node.op_type in {"Equal", "Greater", "GreaterOrEqual", "Less", "LessOrEqual"}
+                and any(
+                    input_name in runtime_data_values or input_index in dynamic_activation_input_indexes
+                    for input_index, input_name in enumerate(node.input)
+                )
+            )
             constant_fill_output = (
                 is_registered_standard_operator
                 and not is_model_local_function

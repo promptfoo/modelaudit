@@ -6521,7 +6521,15 @@ class TestWeightDistributionSemantics:
 
     @pytest.mark.parametrize(
         "use",
-        ["Gather", "GatherElements", "GatherND", "activation_scale", "transformed_activation_scale", "weight_scale"],
+        [
+            "Expand",
+            "Gather",
+            "GatherElements",
+            "GatherND",
+            "activation_scale",
+            "transformed_activation_scale",
+            "weight_scale",
+        ],
     )
     @pytest.mark.parametrize("malicious", [False, True])
     def test_shape_dimensions_follow_their_consumer_role(self, tmp_path: Path, use: str, malicious: bool) -> None:
@@ -6534,7 +6542,13 @@ class TestWeightDistributionSemantics:
             helper.make_node("MatMul", ["Xs", "W1"], ["hidden"]),
             helper.make_node("Shape", ["hidden"], ["dimensions"]),
         ]
-        if use in {"Gather", "GatherElements", "GatherND"}:
+        if use == "Expand":
+            inputs.append(helper.make_tensor_value_info("Xd", TensorProto.FLOAT, [1, 10]))
+            initializers.append(onnx.numpy_helper.from_array(np.zeros((10, 5), dtype=np.float32), name="W2"))
+            nodes.append(helper.make_node("Expand", ["Xd", "dimensions"], ["selected"]))
+            nodes.append(helper.make_node("MatMul", ["selected", "W2"], ["Y"]))
+            output_shape = [1, 5]
+        elif use in {"Gather", "GatherElements", "GatherND"}:
             inputs.append(helper.make_tensor_value_info("Xd", TensorProto.FLOAT, [16, 100]))
             columns = 1 if use == "GatherElements" else 100
             initializers.append(onnx.numpy_helper.from_array(np.zeros((columns, 10), dtype=np.float32), name="W2"))
@@ -6594,6 +6608,43 @@ class TestWeightDistributionSemantics:
             )
         else:
             assert not coverage
+
+    @pytest.mark.parametrize("combination", ["Add", "Mul"])
+    @pytest.mark.parametrize("consumer", ["Gemm", "MatMul"])
+    def test_runtime_adjusted_dimensions_used_as_weights_retain_coverage(
+        self, tmp_path: Path, combination: str, consumer: str
+    ) -> None:
+        graph = helper.make_graph(
+            [
+                helper.make_node("Shape", ["source"], ["dimensions"]),
+                helper.make_node("Cast", ["dimensions"], ["dimensions_float"], to=TensorProto.FLOAT),
+                helper.make_node(combination, ["dimensions_float", "runtime_delta"], ["generated"]),
+                helper.make_node("Identity", ["generated"], ["weights"]),
+                helper.make_node(consumer, ["X", "weights"], ["Y"]),
+            ],
+            "runtime_adjusted_dimension_weights",
+            [helper.make_tensor_value_info("runtime_delta", TensorProto.FLOAT, [10, 2])],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [3, 2])],
+            initializer=[
+                onnx.numpy_helper.from_array(np.zeros((100, 10), dtype=np.float32), name="source"),
+                onnx.numpy_helper.from_array(np.zeros((3, 10), dtype=np.float32), name="X"),
+            ],
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / "runtime-adjusted-weights.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        assert result.success is False
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
+        assert any(
+            sample["consumer_op"] == consumer and sample["reason"] == "runtime_shape_lineage"
+            for sample in result.metadata["onnx_weight_distribution_semantics"]["unresolved_lineage_samples"]
+        )
 
     @pytest.mark.parametrize("op_type", ["LSTM", "GRU", "RNN"])
     @pytest.mark.parametrize("malicious", [False, True])
@@ -6705,8 +6756,9 @@ class TestWeightDistributionSemantics:
     @pytest.mark.parametrize("malicious", [False, True])
     @pytest.mark.parametrize("fill_first", [False, True])
     @pytest.mark.parametrize("explicit_fill", [False, True])
+    @pytest.mark.parametrize("mask_operator", ["input", "Equal", "Greater", "GreaterOrEqual", "Less", "LessOrEqual"])
     def test_runtime_masks_with_shape_derived_fills_preserve_weight_analysis(
-        self, tmp_path: Path, malicious: bool, fill_first: bool, explicit_fill: bool
+        self, tmp_path: Path, malicious: bool, fill_first: bool, explicit_fill: bool, mask_operator: str
     ) -> None:
         weights = np.zeros((100, 10), dtype=np.float32)
         if malicious:
@@ -6736,6 +6788,9 @@ class TestWeightDistributionSemantics:
                 onnx.numpy_helper.from_array(np.zeros((10, 5), dtype=np.float32), name="W2"),
             ],
         )
+        if mask_operator != "input":
+            graph.input[1].CopyFrom(helper.make_tensor_value_info("mask_values", TensorProto.FLOAT, [1, 10]))
+            graph.node.insert(3, helper.make_node(mask_operator, ["hidden", "mask_values"], ["mask"]))
         model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
         model.ir_version = 8
         onnx.checker.check_model(model)
