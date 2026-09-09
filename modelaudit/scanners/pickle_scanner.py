@@ -66,11 +66,12 @@ _HEX_TOKEN_RE = re.compile(rb"(?<![A-Fa-f0-9])[A-Fa-f0-9]{20,}(?![A-Fa-f0-9])")
 _ENCODED_TEXT_PREFIX_RE = re.compile(rb"(?i)\b(encoded|base64|hex)\s{0,32}[:=]\s{0,128}$")
 _IPV4_DOT_DIGIT_RE = re.compile(rb"\d\.\d")
 _LOCATION_POSITION_RE = re.compile(r"\(pos (?P<position>\d+)\)\s*$")
+_MAX_RAW_ENCODED_TOKENS = 4096
 _MAX_RAW_ENCODED_BYTES = 1024 * 1024
 _MAX_RAW_ENCODED_TOKEN_WITHOUT_SEED_BYTES = 4096
 _MAX_RAW_ENCODED_POST_LIMIT_BYTES = _MAX_RAW_ENCODED_BYTES
+_MAX_UNPREFIXED_SEEDLESS_ENCODED_TOKENS = 64
 _ENCODED_TEXT_SAMPLE_DECODED_BYTES = 512
-_MIN_ENCODED_TEXT_SAMPLE_PRINTABLE_RATIO = 0.85
 _ENCODED_TEXT_PREFIX_CONTEXT_BYTES = 256
 _CALL_TOKEN_SEPARATOR_SCAN_LIMIT_BYTES = 4096
 _MAX_RAW_CODE_LITERAL_VALIDATION_CHARS = 8192
@@ -147,18 +148,6 @@ def _encoded_token_decode(encoding: str, token: bytes) -> bytes | None:
     except (binascii.Error, ValueError):
         return None
     return None
-
-
-def _decoded_bytes_look_textual(data: bytes) -> bool:
-    if not data:
-        return False
-    printable = sum(byte in b"\t\n\r" or 32 <= byte < 127 for byte in data)
-    return printable / len(data) >= _MIN_ENCODED_TEXT_SAMPLE_PRINTABLE_RATIO
-
-
-def _unprefixed_seedless_encoded_token_looks_textual(encoding: str, token: bytes) -> bool:
-    decoded = _encoded_token_decode(encoding, token)
-    return decoded is not None and _decoded_bytes_look_textual(decoded)
 
 
 def _encoded_token_decoded_sample_has_execution_pattern(encoding: str, token: bytes) -> bool:
@@ -4762,6 +4751,7 @@ class PickleScanner(BaseScanner):
         *,
         skipped_decoded_bytes_accounted: int = 0,
         skipped_tokens_accounted: int = 0,
+        max_tokens: int = _MAX_RAW_ENCODED_TOKENS,
     ) -> None:
         reason = "pickle_encoded_text_scan_limit_exceeded"
         mark_inconclusive_scan_result(result, reason)
@@ -4775,6 +4765,8 @@ class PickleScanner(BaseScanner):
             "analysis_incomplete": True,
             "scan_outcome_reason": reason,
         }
+        if limit_type == "token":
+            details["max_tokens"] = max_tokens
         if skipped_tokens_accounted:
             details.update(
                 {
@@ -4814,7 +4806,11 @@ class PickleScanner(BaseScanner):
             decoded_token_count = 0
             skipped_token_count = 0
             skipped_limit_reported = False
+            unprefixed_seedless_token_count = 0
+            unprefixed_seedless_decoded_bytes = 0
             for match in token_pattern.finditer(data):
+                if skipped_limit_reported and post_limit_decoded_budget <= 0:
+                    break
                 token = match.group(0)
                 prefix_encoding = _encoded_text_prefix_encoding(data, match)
                 if (
@@ -4841,24 +4837,92 @@ class PickleScanner(BaseScanner):
                     else _hex_token_has_execution_seed(token)
                 )
                 decoded_size = _encoded_token_decoded_size(encoding, token)
+                if decoded_size is None:
+                    continue
                 seedless_budget_already_accounted = False
                 seedless_budget_overflow_reported = False
-                seedless_sample_has_execution_pattern = False
-                if len(token) > _MAX_RAW_ENCODED_TOKEN_WITHOUT_SEED_BYTES and not has_seed:
-                    if decoded_size is None:
-                        continue
-                    if prefix_encoding is None and not _unprefixed_seedless_encoded_token_looks_textual(
-                        encoding, token
+                seedless_sample_has_execution_pattern = (
+                    len(token) > _MAX_RAW_ENCODED_TOKEN_WITHOUT_SEED_BYTES
+                    and not has_seed
+                    and _encoded_token_decoded_sample_has_execution_pattern(encoding, token)
+                )
+                is_oversized_seedless_token = len(token) > _MAX_RAW_ENCODED_TOKEN_WITHOUT_SEED_BYTES and not has_seed
+                if (
+                    is_oversized_seedless_token
+                    and prefix_encoding is None
+                    and not seedless_sample_has_execution_pattern
+                ):
+                    unprefixed_seedless_token_count += 1
+                    unprefixed_seedless_decoded_bytes += decoded_size
+                    if not skipped_limit_reported and (
+                        unprefixed_seedless_token_count > _MAX_UNPREFIXED_SEEDLESS_ENCODED_TOKENS
+                        or (
+                            unprefixed_seedless_token_count + decoded_token_count
+                            > _MAX_UNPREFIXED_SEEDLESS_ENCODED_TOKENS
+                        )
                     ):
-                        continue
+                        self._mark_encoded_text_scan_limit(
+                            result,
+                            source,
+                            encoding,
+                            "token",
+                            decoded_token_count,
+                            decoded_budget,
+                            skipped_tokens_accounted=unprefixed_seedless_token_count,
+                            skipped_decoded_bytes_accounted=unprefixed_seedless_decoded_bytes,
+                            max_tokens=_MAX_UNPREFIXED_SEEDLESS_ENCODED_TOKENS,
+                        )
+                        skipped_limit_reported = True
+                    continue
+
+                if (
+                    not skipped_limit_reported
+                    and unprefixed_seedless_token_count
+                    and unprefixed_seedless_token_count + decoded_token_count + 1
+                    > _MAX_UNPREFIXED_SEEDLESS_ENCODED_TOKENS
+                ):
+                    self._mark_encoded_text_scan_limit(
+                        result,
+                        source,
+                        encoding,
+                        "token",
+                        decoded_token_count,
+                        decoded_budget,
+                        skipped_tokens_accounted=unprefixed_seedless_token_count,
+                        skipped_decoded_bytes_accounted=unprefixed_seedless_decoded_bytes,
+                        max_tokens=_MAX_UNPREFIXED_SEEDLESS_ENCODED_TOKENS,
+                    )
+                    skipped_limit_reported = True
+
+                if not skipped_limit_reported and decoded_token_count >= _MAX_RAW_ENCODED_TOKENS:
+                    self._mark_encoded_text_scan_limit(
+                        result,
+                        source,
+                        encoding,
+                        "token",
+                        decoded_token_count,
+                        decoded_budget,
+                        skipped_tokens_accounted=skipped_token_count,
+                        skipped_decoded_bytes_accounted=skipped_decoded_bytes_accounted,
+                    )
+                    skipped_limit_reported = True
+
+                if not skipped_limit_reported and accounted_decoded_budget == 0:
+                    self._mark_encoded_text_scan_limit(
+                        result,
+                        source,
+                        encoding,
+                        "decoded_byte",
+                        decoded_token_count,
+                        decoded_budget,
+                        skipped_tokens_accounted=skipped_token_count,
+                        skipped_decoded_bytes_accounted=skipped_decoded_bytes_accounted,
+                    )
+                    skipped_limit_reported = True
+
+                if is_oversized_seedless_token:
                     seedless_budget_already_accounted = token in accounted_seedless_tokens
                     seedless_budget_overflow_reported = token in over_budget_seedless_tokens
-                    if prefix_encoding is not None and (
-                        skipped_limit_reported or seedless_budget_already_accounted or seedless_budget_overflow_reported
-                    ):
-                        seedless_sample_has_execution_pattern = _encoded_token_decoded_sample_has_execution_pattern(
-                            encoding, token
-                        )
                     if skipped_limit_reported and (prefix_encoding is None or decoded_size > post_limit_decoded_budget):
                         continue
                     if (
@@ -4886,23 +4950,9 @@ class PickleScanner(BaseScanner):
                             if prefix_encoding is None or decoded_size > post_limit_decoded_budget:
                                 continue
                         else:
-                            skipped_token_count += 1
-                            skipped_decoded_bytes_accounted = attempted_skipped_decoded_bytes
                             accounted_decoded_budget -= decoded_size
                             accounted_seedless_tokens.add(token)
-                            if accounted_decoded_budget == 0:
-                                self._mark_encoded_text_scan_limit(
-                                    result,
-                                    source,
-                                    encoding,
-                                    "decoded_byte",
-                                    decoded_token_count,
-                                    decoded_budget,
-                                    skipped_tokens_accounted=skipped_token_count,
-                                    skipped_decoded_bytes_accounted=skipped_decoded_bytes_accounted,
-                                )
-                                skipped_limit_reported = True
-                            continue
+                            seedless_budget_already_accounted = True
 
                 if skipped_limit_reported:
                     if decoded_size is None or decoded_size > post_limit_decoded_budget:
