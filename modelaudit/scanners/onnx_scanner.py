@@ -133,12 +133,13 @@ _ONNX_WEIGHT_DEFAULT_MAX_ARRAY_SIZE = 100 * 1024 * 1024
 _ONNX_RAW_DETECTOR_DEFAULT_MAX_BYTES = 512 * 1024 * 1024
 _ONNX_NETWORK_TEXT_MAX_BYTES = 4 * 1024 * 1024
 _ONNX_NETWORK_TEXT_MAX_FIELDS = 100_000
-_ONNX_TENSOR_PAYLOAD_FIELD_NAMES: frozenset[str] = frozenset(
+_ONNX_RAW_OR_NUMERIC_TENSOR_PAYLOAD_FIELD_NAMES: frozenset[str] = frozenset(
     {
+        # TensorProto.string_data is semantic model data and stays in the
+        # bounded network-text path; only raw bytes and numeric payloads skip it.
         "raw_data",
         "float_data",
         "int32_data",
-        "string_data",
         "int64_data",
         "double_data",
         "uint64_data",
@@ -446,6 +447,7 @@ class _OnnxNetworkDetectorInput:
     metadata_field_count: int
     omitted_field_count: int
     truncated: bool
+    truncation_reason: str | None
 
 
 class _OnnxNetworkTextCollector:
@@ -469,6 +471,7 @@ class _OnnxNetworkTextCollector:
         self._structural_field_count = 0
         self._omitted_field_count = 0
         self._truncated = False
+        self._truncation_reason: str | None = None
 
     def is_truncated(self) -> bool:
         return self._truncated
@@ -478,8 +481,13 @@ class _OnnxNetworkTextCollector:
 
     def add(self, label: str, value: Any) -> None:
         self.check_interrupted()
+        if value is None:
+            return
+        if isinstance(value, (str, bytes)) and not value:
+            return
         if self._visited_field_count >= self._max_fields:
             self._truncated = True
+            self._truncation_reason = self._truncation_reason or "text_field_budget_exceeded"
             self._omitted_field_count += 1
             return
         self._visited_field_count += 1
@@ -489,6 +497,7 @@ class _OnnxNetworkTextCollector:
         value_bytes = _onnx_network_text_value_bytes(value, max_bytes=remaining_bytes)
         if value_bytes is None:
             self._truncated = True
+            self._truncation_reason = self._truncation_reason or "text_field_budget_exceeded"
             self._omitted_field_count += 1
             return
         if not value_bytes:
@@ -504,8 +513,9 @@ class _OnnxNetworkTextCollector:
         self._byte_count += len(entry)
         self._field_count += 1
 
-    def omit(self) -> None:
+    def omit(self, reason: str = "text_field_budget_exceeded") -> None:
         self._truncated = True
+        self._truncation_reason = self._truncation_reason or reason
         self._omitted_field_count += 1
 
     def finish(self) -> _OnnxNetworkDetectorInput:
@@ -535,6 +545,7 @@ class _OnnxNetworkTextCollector:
             metadata_field_count=self._metadata_field_count,
             omitted_field_count=self._omitted_field_count,
             truncated=self._truncated,
+            truncation_reason=self._truncation_reason,
         )
 
 
@@ -585,6 +596,27 @@ def _collect_onnx_network_detector_input(
     return collector.finish()
 
 
+def _onnx_network_detector_input_metadata(network_detector_input: _OnnxNetworkDetectorInput) -> dict[str, Any]:
+    return {
+        "source": "structured_text_fields",
+        "field_count": network_detector_input.field_count,
+        "metadata_field_count": network_detector_input.metadata_field_count,
+        "omitted_field_count": network_detector_input.omitted_field_count,
+        "truncated": network_detector_input.truncated,
+        "truncation_reason": network_detector_input.truncation_reason,
+        "max_bytes": _ONNX_NETWORK_TEXT_MAX_BYTES,
+        "max_fields": _ONNX_NETWORK_TEXT_MAX_FIELDS,
+        "sections": [
+            {
+                "name": section.name,
+                "field_count": section.field_count,
+                "metadata_owned": section.metadata_owned,
+            }
+            for section in network_detector_input.sections
+        ],
+    }
+
+
 def _collect_onnx_proto_text_fields(
     collector: _OnnxNetworkTextCollector,
     message: Any,
@@ -599,6 +631,8 @@ def _collect_onnx_proto_text_fields(
         return
     descriptor = getattr(message, "DESCRIPTOR", None)
     if descriptor is None:
+        if depth == 0:
+            collector.omit("structured_text_unavailable")
         return
     for proto_field in getattr(descriptor, "fields", []):
         collector.check_interrupted()
@@ -633,7 +667,7 @@ def _collect_onnx_proto_text_fields(
 def _is_onnx_tensor_payload_field(descriptor: Any, proto_field: Any) -> bool:
     return (
         getattr(descriptor, "full_name", "") == "onnx.TensorProto"
-        and proto_field.name in _ONNX_TENSOR_PAYLOAD_FIELD_NAMES
+        and proto_field.name in _ONNX_RAW_OR_NUMERIC_TENSOR_PAYLOAD_FIELD_NAMES
     )
 
 
@@ -4963,40 +4997,11 @@ class OnnxScanner(BaseScanner):
                         model,
                         check_interrupted=self.check_interrupted,
                     )
-                    result.metadata["onnx_network_detector_input"] = {
-                        "source": "structured_text_fields",
-                        "field_count": network_detector_input.field_count,
-                        "metadata_field_count": network_detector_input.metadata_field_count,
-                        "omitted_field_count": network_detector_input.omitted_field_count,
-                        "truncated": network_detector_input.truncated,
-                        "max_bytes": _ONNX_NETWORK_TEXT_MAX_BYTES,
-                        "max_fields": _ONNX_NETWORK_TEXT_MAX_FIELDS,
-                        "sections": [
-                            {
-                                "name": section.name,
-                                "field_count": section.field_count,
-                                "metadata_owned": section.metadata_owned,
-                            }
-                            for section in network_detector_input.sections
-                        ],
-                    }
+                    result.metadata["onnx_network_detector_input"] = _onnx_network_detector_input_metadata(
+                        network_detector_input
+                    )
                     if network_detector_input.truncated:
-                        self._mark_raw_detection_incomplete(
-                            result,
-                            path,
-                            detector="network_communication",
-                            reason="text_field_budget_exceeded",
-                            message=(
-                                "ONNX network detector text input exceeded bounded extraction budget; "
-                                "analysis incomplete"
-                            ),
-                            details={
-                                "field_count": network_detector_input.field_count,
-                                "omitted_field_count": network_detector_input.omitted_field_count,
-                                "max_bytes": _ONNX_NETWORK_TEXT_MAX_BYTES,
-                                "max_fields": _ONNX_NETWORK_TEXT_MAX_FIELDS,
-                            },
-                        )
+                        self._mark_network_text_input_incomplete(result, path, network_detector_input)
                     network_findings: list[dict[str, Any]] = []
                     max_network_findings = _network_communication_max_findings(self.config)
                     emitted_network_findings = 0
@@ -5108,6 +5113,29 @@ class OnnxScanner(BaseScanner):
                             context=path,
                         )
 
+        if model_data is None and check_net:
+            try:
+                network_detector_input = _collect_onnx_network_detector_input(
+                    model,
+                    check_interrupted=self.check_interrupted,
+                )
+                result.metadata["onnx_network_detector_input"] = _onnx_network_detector_input_metadata(
+                    network_detector_input
+                )
+                if network_detector_input.truncated:
+                    self._mark_network_text_input_incomplete(result, path, network_detector_input)
+            except Exception as e:
+                redacted_error = redact_untrusted_error_message(e)
+                logger.warning("ONNX network detector analysis failed: %s", redacted_error)
+                self._mark_raw_detection_incomplete(
+                    result,
+                    path,
+                    detector="network_communication",
+                    reason="analysis_failed",
+                    message=f"ONNX network detector analysis failed: {redacted_error}",
+                    details={"exception": redacted_error, "exception_type": type(e).__name__},
+                )
+
         self._check_custom_ops(model, path, result)
         self._check_external_data(model, path, result)
         self._check_tensor_sizes(model, path, result)
@@ -5134,6 +5162,33 @@ class OnnxScanner(BaseScanner):
 
         _finish_scan_result(result)
         return result
+
+    def _mark_network_text_input_incomplete(
+        self,
+        result: ScanResult,
+        path: str,
+        network_detector_input: _OnnxNetworkDetectorInput,
+    ) -> None:
+        truncation_reason = network_detector_input.truncation_reason or "text_field_budget_exceeded"
+        truncation_message = "ONNX network detector text input exceeded bounded extraction budget; analysis incomplete"
+        if truncation_reason == "structured_text_unavailable":
+            truncation_message = (
+                "ONNX network detector text input unavailable for bounded file-backed structure; analysis incomplete"
+            )
+        self._mark_raw_detection_incomplete(
+            result,
+            path,
+            detector="network_communication",
+            reason=truncation_reason,
+            message=truncation_message,
+            details={
+                "field_count": network_detector_input.field_count,
+                "omitted_field_count": network_detector_input.omitted_field_count,
+                "truncation_reason": truncation_reason,
+                "max_bytes": _ONNX_NETWORK_TEXT_MAX_BYTES,
+                "max_fields": _ONNX_NETWORK_TEXT_MAX_FIELDS,
+            },
+        )
 
     def _mark_raw_detection_incomplete(
         self,
