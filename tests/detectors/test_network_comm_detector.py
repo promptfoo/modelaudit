@@ -3068,24 +3068,24 @@ class TestNetworkCommDetector:
         assert not any(f["type"] == "explicit_network_pattern" for f in findings)
 
     @pytest.mark.parametrize("protocol", range(6))
-    @pytest.mark.parametrize("key", [" license ", "\tdocs", "readme\n", " metadata "])
-    def test_padded_pickle_keys_do_not_prove_metadata(self, protocol: int, key: str) -> None:
-        url = "https://example.invalid/license"
+    @pytest.mark.parametrize("key", [" license ", "\tdocs", "readme\n", " metadata ", "licen\u017fe", "doc\u017f"])
+    def test_noncanonical_pickle_keys_do_not_prove_metadata(self, protocol: int, key: str) -> None:
+        url = "https://example.invalid/license Ordinary reference text."
         value = {"license": url} if key.strip() == "metadata" else url
 
         findings = NetworkCommDetector().scan(pickle.dumps({key: value}, protocol=protocol), "checkpoint.pt")
 
         assert any(f["type"] == "explicit_network_pattern" and f["severity"] == "CRITICAL" for f in findings)
 
-    @pytest.mark.parametrize("key", [" license ", "\tdocs", "url_0\n"])
-    def test_padded_onnx_keys_do_not_prove_metadata(self, key: str) -> None:
+    @pytest.mark.parametrize("key", [" license ", "\tdocs", "url_0\n", "licen\u017fe", "doc\u017f", "url_\u0661"])
+    def test_noncanonical_onnx_keys_do_not_prove_metadata(self, key: str) -> None:
         data = _onnx_model_with_metadata({key: "https://example.invalid/license"})
 
         findings = NetworkCommDetector().scan(data, "model.onnx")
 
         assert any(f["type"] == "explicit_network_pattern" and f["severity"] == "CRITICAL" for f in findings)
 
-    @pytest.mark.parametrize("control", ["\x00", "\x0b", "\x1f", "\x7f"])
+    @pytest.mark.parametrize("control", ["\x00", "\x0b", "\x1f", "\x7f", "\x80", "\x85", "\x9f"])
     @pytest.mark.parametrize("model_format,protocol", [("pickle", p) for p in range(6)] + [("onnx", None)])
     def test_raw_controls_prevent_metadata_downgrade(
         self, control: str, model_format: str, protocol: int | None
@@ -3135,6 +3135,9 @@ class TestNetworkCommDetector:
             "https://example.invalid/license/%0dpayload",
             "https://example.invalid/license/%7fpayload",
             "https://example.invalid/license/%2500payload",
+            "https://example.invalid/license/%C2%80payload",
+            "https://example.invalid/license/%C2%85payload",
+            "https://example.invalid/license/%25C2%259Fpayload",
             "https://example.invalid/license/https%3A%2F%2Fstorage.googleapis.com%2Fbucket%2Fpayload.bin",
             "https://example.invalid/license/https%253A%252F%252Fstorage.googleapis.com%252Fbucket%252Fpayload.bin",
         ],

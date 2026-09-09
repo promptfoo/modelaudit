@@ -5448,7 +5448,7 @@ class NetworkCommDetector:
         for _ in range(3):
             decoded_url = unquote_plus(decoded_url)
         decoded_url = decoded_url.casefold()
-        if re.search(r"%[0-9a-f]{2}|[\x00-\x1f\x7f]", decoded_url) or any(
+        if re.search(r"%[0-9a-f]{2}|[\x00-\x1f\x7f-\x9f]", decoded_url) or any(
             term in decoded_url for term in self.INFORMATIONAL_URL_RISK_TERMS
         ):
             return None

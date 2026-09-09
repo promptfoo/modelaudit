@@ -40,7 +40,7 @@ def test_rust_pickle_scanner_does_not_let_ml_context_hide_dangerous_reduce(tmp_p
 
     result = PickleScanner().scan(str(path))
 
-    assert result.success is True
+    assert result.success is True, result.to_dict()
     assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
     assert any(
         issue.details.get("import_reference") in {"posix.system", "os.system", "nt.system"} for issue in result.issues
