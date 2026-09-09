@@ -49,7 +49,7 @@ def _add_items(target: _PickleValue, values: list[_PickleValue]) -> None:
             raise ValueError("Incomplete dictionary entry")
         for key, value in zip(values[::2], values[1::2], strict=True):
             _escape(key)
-            key_name = key.text.strip().casefold() if key.text is not None else None
+            key_name = key.text.casefold() if key.text is not None else None
             if key_name in _METADATA_KEYS and value.kind == "string":
                 value.metadata = True
             elif key_name != "metadata" or value.kind not in {"dict", "list", "tuple"}:

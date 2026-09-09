@@ -3067,6 +3067,16 @@ class TestNetworkCommDetector:
         assert any(f["type"] == "url_detected" and f["url"] == url and f["severity"] == "INFO" for f in findings)
         assert not any(f["type"] == "explicit_network_pattern" for f in findings)
 
+    @pytest.mark.parametrize("protocol", range(6))
+    @pytest.mark.parametrize("key", [" license ", "\tdocs", "readme\n", " metadata "])
+    def test_padded_pickle_keys_do_not_prove_metadata(self, protocol: int, key: str) -> None:
+        url = "https://example.invalid/license"
+        value = {"license": url} if key.strip() == "metadata" else url
+
+        findings = NetworkCommDetector().scan(pickle.dumps({key: value}, protocol=protocol), "checkpoint.pt")
+
+        assert any(f["type"] == "explicit_network_pattern" and f["severity"] == "CRITICAL" for f in findings)
+
     @pytest.mark.parametrize(
         "url",
         [
@@ -3096,6 +3106,13 @@ class TestNetworkCommDetector:
             "https://example.invalid/webhook/license",
             "https://example.invalid/callback/license",
             "https://example.invalid/endpoint/license",
+            "https://example.invalid/license/%00payload",
+            "https://example.invalid/license/%0apayload",
+            "https://example.invalid/license/%0dpayload",
+            "https://example.invalid/license/%7fpayload",
+            "https://example.invalid/license/%2500payload",
+            "https://example.invalid/license/https%3A%2F%2Fstorage.googleapis.com%2Fbucket%2Fpayload.bin",
+            "https://example.invalid/license/https%253A%252F%252Fstorage.googleapis.com%252Fbucket%252Fpayload.bin",
         ],
     )
     @pytest.mark.parametrize("model_format", ["pickle", "onnx"])
