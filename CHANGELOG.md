@@ -17,7 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
-- Avoid fail-closed ONNX weight analysis when Gather nodes only select from activation tensors.
+- Avoid incomplete ONNX weight analysis when Gather nodes read dimensions from Shape outputs.
 - Preserve incomplete-scan diagnostics for malformed or unsupported ZIP data in GGUF/GGML files, including cached scans.
 - Report incomplete coverage when a GGUF/GGML source changes during scanning.
 - Preserve caller-owned Hugging Face cache sidecars during streaming cleanup.

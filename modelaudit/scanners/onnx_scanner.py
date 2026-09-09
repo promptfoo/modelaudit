@@ -1251,12 +1251,6 @@ def _onnx_activation_input_candidate(node: Any, input_index: int) -> bool:
     return node.op_type == "Gather" and input_index == 1
 
 
-def _onnx_dynamic_activation_passthrough_input_candidate(node: Any, input_index: int) -> bool:
-    if getattr(node, "domain", "") not in _STANDARD_NEURAL_NETWORK_DOMAINS:
-        return False
-    return node.op_type == "Gather" and input_index == 0
-
-
 def _onnx_opaque_activation_input_candidate(node: Any, _input_index: int) -> bool:
     """Recognize opaque-domain inputs whose schema fixes an activation-only role."""
     return getattr(node, "domain", "") == "ai.onnx.ml"
@@ -2052,10 +2046,6 @@ def _build_onnx_weight_analysis_plan(
                                 _onnx_activation_input_candidate(node, input_index)
                                 and (opposite_resolved_weight or all_lineage_inputs_are_activation_contraction)
                             )
-                            or (
-                                is_registered_standard_operator
-                                and _onnx_dynamic_activation_passthrough_input_candidate(node, input_index)
-                            )
                         )
                         if recognized_activation_input:
                             if opposite_resolved_weight:
@@ -2255,6 +2245,13 @@ def _build_onnx_weight_analysis_plan(
                     ),
                 )
 
+            # Shape exposes dimensions, so input weight values cannot reach its output.
+            is_shape_query = (
+                is_registered_standard_operator
+                and not is_model_local_function
+                and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
+                and node.op_type == "Shape"
+            )
             output_lineages: dict[int, _OnnxWeightLineage] = {}
             if supported_transform:
                 data_lineages = value_lineages.get(str(node.input[0]), {}) if node.input else {}
@@ -2263,6 +2260,7 @@ def _build_onnx_weight_analysis_plan(
                     output_lineages[initializer_index] = transformed_lineage(lineage, node, constants)
             elif (
                 all_input_lineages
+                and not is_shape_query
                 and node.op_type not in _QUANTIZED_WEIGHT_OPERATORS
                 and function is None
                 and not subgraph_results

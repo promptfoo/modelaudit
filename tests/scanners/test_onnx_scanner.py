@@ -1389,29 +1389,31 @@ def create_activation_bookkeeping_model(tmp_path: Path, *, malicious: bool, rank
     return path
 
 
-def create_gather_activation_bookkeeping_model(tmp_path: Path, *, malicious: bool) -> Path:
-    """Create a linear stack whose prior activation is gathered before reuse."""
+def create_shape_gather_bookkeeping_model(tmp_path: Path, *, malicious: bool) -> Path:
+    """Create a linear stack reshaped using dimensions read through Gather."""
     first_weight = np.zeros((100, 100), dtype=np.float32)
     second_weight = np.zeros((100, 10), dtype=np.float32)
     if malicious:
         second_weight[50:55, 3] = 10.0
     initializers = [
         onnx.numpy_helper.from_array(first_weight, name="W1"),
-        onnx.numpy_helper.from_array(np.arange(100, dtype=np.int64), name="indices"),
+        onnx.numpy_helper.from_array(np.array([0, 1], dtype=np.int64), name="indices"),
         onnx.numpy_helper.from_array(second_weight, name="W2"),
     ]
     X = helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 100])
     Y = helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 10])
     nodes = [
         helper.make_node("MatMul", ["X", "W1"], ["hidden"], name="first_linear"),
-        helper.make_node("Gather", ["hidden", "indices"], ["selected"], name="activation_slice", axis=1),
-        helper.make_node("MatMul", ["selected", "W2"], ["Y"], name="second_linear"),
+        helper.make_node("Shape", ["hidden"], ["dimensions"], name="activation_shape"),
+        helper.make_node("Gather", ["dimensions", "indices"], ["selected"], name="shape_slice", axis=0),
+        helper.make_node("Reshape", ["hidden", "selected"], ["reshaped"], name="activation_reshape"),
+        helper.make_node("MatMul", ["reshaped", "W2"], ["Y"], name="second_linear"),
     ]
-    graph = helper.make_graph(nodes, "gather_activation_bookkeeping_graph", [X], [Y], initializer=initializers)
+    graph = helper.make_graph(nodes, "shape_gather_bookkeeping_graph", [X], [Y], initializer=initializers)
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 8
     onnx.checker.check_model(model)
-    path = tmp_path / f"{'malicious' if malicious else 'benign'}-gather-activation-bookkeeping.onnx"
+    path = tmp_path / f"{'malicious' if malicious else 'benign'}-shape-gather-bookkeeping.onnx"
     onnx.save(model, str(path))
     return path
 
@@ -6419,12 +6421,12 @@ class TestWeightDistributionSemantics:
         assert semantics["exclusion_counts"]["bookkeeping_constant"] == 1
 
     @pytest.mark.parametrize("malicious", [False, True])
-    def test_gathered_activation_path_does_not_create_weight_coverage_gap(
+    def test_shape_gather_path_does_not_create_weight_coverage_gap(
         self,
         tmp_path: Path,
         malicious: bool,
     ) -> None:
-        model_path = create_gather_activation_bookkeeping_model(tmp_path, malicious=malicious)
+        model_path = create_shape_gather_bookkeeping_model(tmp_path, malicious=malicious)
 
         result = OnnxScanner().scan(str(model_path))
 
@@ -6434,8 +6436,39 @@ class TestWeightDistributionSemantics:
         semantics = result.metadata["onnx_weight_distribution_semantics"]
         assert semantics["eligible_initializer_count"] == 2
         assert semantics["analyzed_layer_count"] == 2
-        assert semantics["exclusion_counts"]["dynamic_activation_input"] >= 2
-        assert semantics["exclusion_counts"]["non_weight_input"] == 1
+
+    @pytest.mark.parametrize("dynamic_indices", [False, True])
+    def test_generated_gather_tables_retain_incomplete_coverage(self, tmp_path: Path, dynamic_indices: bool) -> None:
+        inputs = [helper.make_tensor_value_info("seed", TensorProto.FLOAT, [100, 100])]
+        initializers = [onnx.numpy_helper.from_array(np.zeros((100, 100), dtype=np.float32), name="P")]
+        if dynamic_indices:
+            inputs.append(helper.make_tensor_value_info("indices", TensorProto.INT64, [1]))
+        else:
+            initializers.append(onnx.numpy_helper.from_array(np.array([0], dtype=np.int64), name="indices"))
+        nodes = [
+            helper.make_node("MatMul", ["seed", "P"], ["table"], name="generated_table"),
+            helper.make_node("Gather", ["table", "indices"], ["Y"], name="lookup", axis=0),
+        ]
+        graph = helper.make_graph(
+            nodes,
+            "generated_gather_table",
+            inputs,
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 100])],
+            initializer=initializers,
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / "generated-table.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        assert result.success is False
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        assert len(coverage) == 1
+        assert coverage[0].details["coverage_gap"] == "unresolved_initializer_lineage"
+        assert coverage[0].status == CheckStatus.FAILED
 
     @pytest.mark.parametrize("malicious", [False, True])
     def test_standard_einsum_weights_are_oriented_and_analyzed(self, tmp_path: Path, malicious: bool) -> None:
