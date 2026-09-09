@@ -1375,8 +1375,10 @@ def _build_onnx_weight_analysis_plan(
     }
 
     def lineage_could_be_weight(lineage: _OnnxWeightLineage) -> bool:
-        return (lineage.data_type is None or lineage.data_type in floating_types) and (
-            lineage.shape is None or len(lineage.shape) >= 2
+        return (
+            lineage.unresolved_reason != "shape_control_lineage"
+            and (lineage.data_type is None or lineage.data_type in floating_types)
+            and (lineage.shape is None or len(lineage.shape) >= 2)
         )
 
     def value_info_shape(value_info: Any) -> tuple[int, ...] | None:
@@ -1759,6 +1761,17 @@ def _build_onnx_weight_analysis_plan(
                 continue
             if existing == lineage:
                 continue
+            if (
+                existing.unresolved_reason == "shape_control_lineage"
+                and lineage.unresolved_reason != existing.unresolved_reason
+            ):
+                target[initializer_index] = lineage
+                continue
+            if (
+                lineage.unresolved_reason == "shape_control_lineage"
+                and existing.unresolved_reason != lineage.unresolved_reason
+            ):
+                continue
             reasons = {
                 reason for reason in (existing.unresolved_reason, lineage.unresolved_reason) if reason is not None
             }
@@ -2004,16 +2017,36 @@ def _build_onnx_weight_analysis_plan(
                         or (
                             not is_model_local_function
                             and (
-                                (
-                                    node.op_type in {"Expand", "Gather", "GatherElements", "GatherND"}
-                                    and input_index == 1
-                                )
+                                (node.op_type in {"Gather", "GatherElements", "GatherND"} and input_index == 1)
                                 or (node.op_type in _RECURRENT_WEIGHT_OPERATORS and input_index == 4)
                             )
                         )
                     )
                 )
-                if not is_array_feature_selector and not is_non_data_standard_input:
+                is_expand_shape = (
+                    is_registered_standard_operator
+                    and not is_model_local_function
+                    and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
+                    and node.op_type == "Expand"
+                    and input_index == 1
+                )
+                if is_expand_shape:
+                    # Retain shape ownership for subsequent Shape queries without inheriting data values.
+                    merge_lineages(
+                        all_input_lineages,
+                        {
+                            initializer_index: _OnnxWeightLineage(
+                                initializer_index=initializer_index,
+                                shape=None,
+                                data_type=None,
+                                transforms=lineage.transforms,
+                                unresolved_reason="shape_control_lineage",
+                            )
+                            for initializer_index, lineage in input_lineages.items()
+                        },
+                        ambiguous_reason="ambiguous_operator_input_lineage",
+                    )
+                elif not is_array_feature_selector and not is_non_data_standard_input:
                     merge_lineages(
                         all_input_lineages,
                         input_lineages,
@@ -2053,6 +2086,9 @@ def _build_onnx_weight_analysis_plan(
                     terminal_consumer_counts[initializer_index] += 1
                     total_consumer_count += 1
                     if lineage.unresolved_reason is not None:
+                        if lineage.unresolved_reason == "shape_control_lineage":
+                            record_exclusion(initializer_index, "shape_control_input", node, input_index)
+                            continue
                         opposite_resolved_weight = any(
                             resolved_index != input_index for resolved_index in resolved_weight_input_indexes
                         )
@@ -2075,17 +2111,6 @@ def _build_onnx_weight_analysis_plan(
                             )
                         )
                         recognized_activation_input |= recurrent_initial_state and opposite_resolved_weight
-                        recognized_activation_input |= (
-                            lineage.unresolved_reason == "runtime_shape_lineage"
-                            and is_registered_standard_operator
-                            and not is_model_local_function
-                            and _onnx_activation_input_candidate(node, input_index)
-                            and (
-                                node.op_type not in {"Einsum", "Gemm", "MatMul"}
-                                or (node.op_type in {"Gemm", "MatMul"} and input_index == 0)
-                            )
-                            and opposite_resolved_weight
-                        )
                         if recognized_activation_input:
                             if opposite_resolved_weight:
                                 activation_input_lineages.add(initializer_index)
@@ -2361,16 +2386,6 @@ def _build_onnx_weight_analysis_plan(
                 carries_dynamic_activation |= any(
                     lineage.unresolved_reason == "dynamic_activation_lineage" for lineage in all_input_lineages.values()
                 )
-                # Intermediate dynamic values may contain only shape-derived constants.
-                shape_combines_with_runtime_data = (
-                    same_type_elementwise
-                    and not is_model_local_function
-                    and node.op_type != "Where"
-                    and any(
-                        input_name in runtime_data_values and not value_lineages.get(input_name)
-                        for input_name in node.input
-                    )
-                )
                 runtime_masks_activation = (
                     same_type_elementwise
                     and not is_model_local_function
@@ -2392,10 +2407,9 @@ def _build_onnx_weight_analysis_plan(
                     if initializer_index in activation_input_lineages:
                         continue
                     unresolved_reason = lineage.unresolved_reason
-                    if unresolved_reason == "shape_dimensions_lineage" and (
-                        shape_combines_with_runtime_data or runtime_masks_activation
-                    ):
-                        unresolved_reason = "runtime_shape_lineage"
+                    # Arithmetic on dimension values stays unresolved in either matrix operand.
+                    if unresolved_reason == "shape_dimensions_lineage" and runtime_masks_activation:
+                        unresolved_reason = "dynamic_activation_lineage"
                     if unresolved_reason is None:
                         if carries_dynamic_activation:
                             unresolved_reason = "dynamic_activation_lineage"
