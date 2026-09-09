@@ -5443,10 +5443,13 @@ class NetworkCommDetector:
             term in decoded_url for term in self.INFORMATIONAL_URL_RISK_TERMS
         ):
             return None
-        try:
-            query = parse_qsl(parsed.query, keep_blank_values=True, strict_parsing=True)
-        except ValueError:
-            return None
+        if parsed.query:
+            try:
+                query = parse_qsl(parsed.query, keep_blank_values=True, strict_parsing=True)
+            except ValueError:
+                return None
+        else:
+            query = []
         for key, value in query:
             if (
                 key.casefold() not in {"lang", "language", "locale", "hl"}
