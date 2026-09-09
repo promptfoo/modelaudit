@@ -133,6 +133,7 @@ _ONNX_WEIGHT_DEFAULT_MAX_ARRAY_SIZE = 100 * 1024 * 1024
 _ONNX_RAW_DETECTOR_DEFAULT_MAX_BYTES = 512 * 1024 * 1024
 _ONNX_NETWORK_TEXT_MAX_BYTES = 4 * 1024 * 1024
 _ONNX_NETWORK_TEXT_MAX_FIELDS = 100_000
+_ONNX_METADATA_PROP_LABEL_PATTERN = re.compile(r"^model\.metadata_props\[(?P<index>[0-9]+)\]\.(?P<field>key|value)$")
 _ONNX_RAW_OR_NUMERIC_TENSOR_PAYLOAD_FIELD_NAMES: frozenset[str] = frozenset(
     {
         # TensorProto.string_data is semantic model data and stays in the
@@ -469,15 +470,25 @@ class _OnnxNetworkTextCollector:
         self._field_count = 0
         self._metadata_field_count = 0
         self._structural_field_count = 0
+        self._metadata_chunk_entries: list[tuple[str, bytes]] = []
         self._omitted_field_count = 0
         self._truncated = False
         self._truncation_reason: str | None = None
+        self._metadata_props: dict[int, dict[str, str]] = {}
 
     def is_truncated(self) -> bool:
         return self._truncated
 
     def check_interrupted(self) -> None:
         self._check_interrupted()
+
+    def visit_message(self) -> bool:
+        self.check_interrupted()
+        if self._visited_field_count >= self._max_fields:
+            self.omit()
+            return False
+        self._visited_field_count += 1
+        return True
 
     def add(self, label: str, value: Any) -> None:
         self.check_interrupted()
@@ -506,19 +517,43 @@ class _OnnxNetworkTextCollector:
         self._chunks.append(entry)
         if _is_onnx_metadata_text_label(label):
             self._metadata_chunks.append(entry)
+            self._metadata_chunk_entries.append((label, entry))
             self._metadata_field_count += 1
+            self._record_metadata_prop(label, value)
         else:
             self._structural_chunks.append(entry)
             self._structural_field_count += 1
         self._byte_count += len(entry)
         self._field_count += 1
 
+    def _record_metadata_prop(self, label: str, value: Any) -> None:
+        if not isinstance(value, str):
+            return
+        match = _ONNX_METADATA_PROP_LABEL_PATTERN.fullmatch(label)
+        if match is None:
+            return
+        self._metadata_props.setdefault(int(match.group("index")), {})[match.group("field")] = value
+
+    def metadata_prop_entries(self) -> list[tuple[int, str, str]]:
+        entries: list[tuple[int, str, str]] = []
+        for index in sorted(self._metadata_props):
+            fields = self._metadata_props[index]
+            key = fields.get("key")
+            value = fields.get("value")
+            if key is not None and value is not None:
+                entries.append((index, key, value))
+        return entries
+
     def omit(self, reason: str = "text_field_budget_exceeded") -> None:
         self._truncated = True
         self._truncation_reason = self._truncation_reason or reason
         self._omitted_field_count += 1
 
-    def finish(self) -> _OnnxNetworkDetectorInput:
+    def finish(
+        self,
+        *,
+        metadata_data_sections: tuple[tuple[frozenset[str], bytes], ...] = (),
+    ) -> _OnnxNetworkDetectorInput:
         sections: list[_OnnxNetworkDetectorSection] = []
         if self._structural_chunks:
             sections.append(
@@ -530,14 +565,35 @@ class _OnnxNetworkTextCollector:
                 )
             )
         if self._metadata_chunks:
-            sections.append(
-                _OnnxNetworkDetectorSection(
-                    name="metadata_props",
-                    data=b"".join(self._metadata_chunks),
-                    field_count=self._metadata_field_count,
-                    metadata_owned=True,
+            metadata_data_labels: set[str] = set()
+            for labels, metadata_data in metadata_data_sections:
+                metadata_data_labels.update(labels)
+                sections.append(
+                    _OnnxNetworkDetectorSection(
+                        name="metadata_props",
+                        data=metadata_data,
+                        field_count=len(labels),
+                        metadata_owned=True,
+                    )
                 )
-            )
+            metadata_text_chunks = [
+                entry for label, entry in self._metadata_chunk_entries if label not in metadata_data_labels
+            ]
+            if metadata_data_sections and not metadata_text_chunks:
+                metadata_text_data = b""
+            else:
+                metadata_text_data = b"".join(metadata_text_chunks or self._metadata_chunks)
+            if metadata_text_data:
+                section_name = "metadata_text_fields" if metadata_data_sections else "metadata_props"
+                field_count = len(metadata_text_chunks) if metadata_data_sections else self._metadata_field_count
+                sections.append(
+                    _OnnxNetworkDetectorSection(
+                        name=section_name,
+                        data=metadata_text_data,
+                        field_count=field_count,
+                        metadata_owned=True,
+                    )
+                )
         return _OnnxNetworkDetectorInput(
             data=b"".join(self._chunks),
             sections=tuple(sections),
@@ -578,6 +634,32 @@ def _network_communication_max_findings(config: dict[str, Any] | None) -> int | 
     return None
 
 
+def _network_finding_limit_payload(
+    section: _OnnxNetworkDetectorSection,
+    context: str,
+    *,
+    max_findings: int,
+) -> dict[str, Any]:
+    return {
+        "type": "detector_finding_limit",
+        "detector": "network_communication",
+        "severity": "INFO",
+        "message": "Network communication findings exceeded the configured reporting limit",
+        "max_findings": max_findings,
+        "truncated_finding_type": "onnx_detector_section",
+        "truncated_finding": {
+            "onnx_detector_input": section.name,
+            "onnx_metadata_owned": section.metadata_owned,
+        },
+        "analysis_incomplete": True,
+        "context": context,
+        "onnx_detector_input": section.name,
+        "onnx_detector_context": context,
+        "onnx_detector_field_count": section.field_count,
+        "onnx_metadata_owned": section.metadata_owned,
+    }
+
+
 def _is_onnx_metadata_text_label(label: str) -> bool:
     return ".metadata_props[" in label
 
@@ -593,7 +675,64 @@ def _collect_onnx_network_detector_input(
         check_interrupted=check_interrupted,
     )
     _collect_onnx_proto_text_fields(collector, model, "model")
-    return collector.finish()
+    metadata_props = collector.metadata_prop_entries()
+    metadata_data_sections = _onnx_metadata_props_detector_sections(
+        model,
+        metadata_props,
+        max_bytes=_ONNX_NETWORK_TEXT_MAX_BYTES,
+    )
+    return collector.finish(
+        metadata_data_sections=metadata_data_sections,
+    )
+
+
+def _onnx_metadata_props_detector_sections(
+    model: Any,
+    metadata_props: Iterable[tuple[int, str, str]],
+    *,
+    max_bytes: int,
+) -> tuple[tuple[frozenset[str], bytes], ...]:
+    metadata_entries = list(metadata_props)
+    if not metadata_entries:
+        return ()
+    included_entries: list[tuple[int, str, str]] = []
+    estimated_bytes = 0
+    for index, key, value in metadata_entries:
+        value_with_boundary = value + "\n"
+        entry_bytes = len(key.encode("utf-8", errors="surrogatepass")) + len(
+            value_with_boundary.encode("utf-8", errors="surrogatepass")
+        )
+        if included_entries and estimated_bytes + entry_bytes + 64 > max_bytes:
+            break
+        included_entries.append((index, key, value_with_boundary))
+        estimated_bytes += entry_bytes + 64
+    if not included_entries:
+        return ()
+    try:
+        while included_entries:
+            metadata_model = type(model)()
+            metadata_model.ir_version = int(getattr(model, "ir_version", 0) or 1)
+            metadata_model.graph.name = "modelaudit_metadata"
+            metadata_model.graph.input.add().name = "modelaudit_input"
+            metadata_model.graph.output.add().name = "modelaudit_output"
+            for _index, key, value in included_entries:
+                metadata_prop = metadata_model.metadata_props.add()
+                metadata_prop.key = key
+                metadata_prop.value = value
+            metadata_data = metadata_model.SerializeToString()
+            if len(metadata_data) <= max_bytes:
+                break
+            included_entries.pop()
+        else:
+            return ()
+        metadata_data_labels = frozenset(
+            label
+            for index, _key, _value in included_entries
+            for label in (f"model.metadata_props[{index}].key", f"model.metadata_props[{index}].value")
+        )
+        return ((metadata_data_labels, metadata_data),)
+    except Exception:  # pragma: no cover - protobuf compatibility fallback
+        return ()
 
 
 def _onnx_network_detector_input_metadata(network_detector_input: _OnnxNetworkDetectorInput) -> dict[str, Any]:
@@ -650,6 +789,8 @@ def _collect_onnx_proto_text_fields(
             for index, item in enumerate(value):
                 item_label = f"{field_label}[{index}]"
                 if proto_field.type == proto_field.TYPE_MESSAGE:
+                    if not collector.visit_message():
+                        return
                     _collect_onnx_proto_text_fields(collector, item, item_label, depth=depth + 1)
                 elif proto_field.type in {proto_field.TYPE_BYTES, proto_field.TYPE_STRING}:
                     collector.add(item_label, item)
@@ -659,6 +800,8 @@ def _collect_onnx_proto_text_fields(
         if proto_field.type == proto_field.TYPE_MESSAGE:
             if not _onnx_has_singular_field(message, proto_field.name):
                 continue
+            if not collector.visit_message():
+                return
             _collect_onnx_proto_text_fields(collector, value, field_label, depth=depth + 1)
         elif proto_field.type in {proto_field.TYPE_BYTES, proto_field.TYPE_STRING}:
             collector.add(field_label, value)
@@ -4992,6 +5135,9 @@ class OnnxScanner(BaseScanner):
                     )
 
             if check_net:
+                network_findings: list[dict[str, Any]] = []
+                network_detector_input: _OnnxNetworkDetectorInput | None = None
+                network_detector_failed = False
                 try:
                     network_detector_input = _collect_onnx_network_detector_input(
                         model,
@@ -5002,60 +5148,62 @@ class OnnxScanner(BaseScanner):
                     )
                     if network_detector_input.truncated:
                         self._mark_network_text_input_incomplete(result, path, network_detector_input)
-                    network_findings: list[dict[str, Any]] = []
                     max_network_findings = _network_communication_max_findings(self.config)
                     emitted_network_findings = 0
                     for section_index, section in enumerate(network_detector_input.sections):
                         detector_context = f"{path}/onnx_metadata/metadata" if section.metadata_owned else path
+                        limit_already_reached = (
+                            max_network_findings is not None and emitted_network_findings >= max_network_findings
+                        )
+                        remaining_findings = None
                         if max_network_findings is not None:
-                            remaining_findings = max_network_findings - emitted_network_findings
-                            if remaining_findings <= 0:
-                                self._mark_raw_detection_incomplete(
-                                    result,
-                                    path,
-                                    detector="network_communication",
-                                    reason="detector_finding_limit",
-                                    message=(
-                                        "ONNX network detector findings reached the configured reporting limit; "
-                                        "analysis incomplete"
-                                    ),
-                                    details={
-                                        "max_findings": max_network_findings,
-                                        "skipped_section": section.name,
-                                        "skipped_section_metadata_owned": section.metadata_owned,
-                                    },
-                                )
-                                network_findings.append(
-                                    {
-                                        "type": "detector_finding_limit",
-                                        "detector": "network_communication",
-                                        "severity": "INFO",
-                                        "message": (
-                                            "Network communication findings exceeded the configured reporting limit"
-                                        ),
-                                        "max_findings": max_network_findings,
-                                        "truncated_finding_type": "onnx_detector_section",
-                                        "truncated_finding": {
-                                            "onnx_detector_input": section.name,
-                                            "onnx_metadata_owned": section.metadata_owned,
-                                        },
-                                        "analysis_incomplete": True,
-                                        "context": detector_context,
-                                        "onnx_detector_input": section.name,
-                                        "onnx_detector_context": detector_context,
-                                        "onnx_detector_field_count": section.field_count,
-                                        "onnx_metadata_owned": section.metadata_owned,
-                                    }
-                                )
-                                break
-                        else:
-                            remaining_findings = None
+                            remaining_findings = (
+                                1 if limit_already_reached else max_network_findings - emitted_network_findings
+                            )
                         section_findings = self.collect_network_communication_findings(
                             section.data,
                             context=detector_context,
                             raise_on_error=True,
                             max_findings=remaining_findings,
                         )
+                        if limit_already_reached:
+                            assert max_network_findings is not None
+                            limit_findings = [
+                                finding
+                                for finding in section_findings
+                                if finding.get("type") == "detector_finding_limit"
+                            ]
+                            if limit_findings:
+                                self._mark_network_finding_limit(
+                                    result, path, section, section_index, network_detector_input
+                                )
+                                for finding in limit_findings:
+                                    annotated_finding = dict(finding)
+                                    annotated_finding.update(
+                                        {
+                                            "onnx_detector_input": section.name,
+                                            "onnx_detector_context": detector_context,
+                                            "onnx_detector_field_count": section.field_count,
+                                            "onnx_metadata_owned": section.metadata_owned,
+                                        }
+                                    )
+                                    if section.metadata_owned:
+                                        annotated_finding["context"] = f"{path}:metadata_props"
+                                    network_findings.append(annotated_finding)
+                                break
+                            if section_findings:
+                                self._mark_network_finding_limit(
+                                    result, path, section, section_index, network_detector_input
+                                )
+                                network_findings.append(
+                                    _network_finding_limit_payload(
+                                        section,
+                                        detector_context,
+                                        max_findings=max_network_findings,
+                                    )
+                                )
+                                break
+                            continue
                         section_truncated = False
                         for finding in section_findings:
                             annotated_finding = dict(finding)
@@ -5075,26 +5223,12 @@ class OnnxScanner(BaseScanner):
                                 annotated_finding["context"] = f"{path}:metadata_props"
                             network_findings.append(annotated_finding)
                         if section_truncated:
-                            remaining_sections = network_detector_input.sections[section_index + 1 :]
-                            self._mark_raw_detection_incomplete(
-                                result,
-                                path,
-                                detector="network_communication",
-                                reason="detector_finding_limit",
-                                message=(
-                                    "ONNX network detector findings reached the configured reporting limit; "
-                                    "analysis incomplete"
-                                ),
-                                details={
-                                    "max_findings": max_network_findings,
-                                    "truncated_section": section.name,
-                                    "truncated_section_metadata_owned": section.metadata_owned,
-                                    "skipped_section_count": len(remaining_sections),
-                                    "skipped_sections": [item.name for item in remaining_sections[:10]],
-                                },
+                            self._mark_network_finding_limit(
+                                result, path, section, section_index, network_detector_input
                             )
                             break
                 except Exception as e:
+                    network_detector_failed = True
                     redacted_error = redact_untrusted_error_message(e)
                     logger.warning("ONNX network detector analysis failed: %s", redacted_error)
                     self._mark_raw_detection_incomplete(
@@ -5105,13 +5239,16 @@ class OnnxScanner(BaseScanner):
                         message=f"ONNX network detector analysis failed: {redacted_error}",
                         details={"exception": redacted_error, "exception_type": type(e).__name__},
                     )
-                else:
-                    if network_findings or not network_detector_input.truncated:
-                        self.add_network_communication_findings(
-                            network_findings,
-                            result,
-                            context=path,
-                        )
+                if network_findings or (
+                    network_detector_input is not None
+                    and not network_detector_input.truncated
+                    and not network_detector_failed
+                ):
+                    self.add_network_communication_findings(
+                        network_findings,
+                        result,
+                        context=path,
+                    )
 
         if model_data is None and check_net:
             try:
@@ -5162,6 +5299,30 @@ class OnnxScanner(BaseScanner):
 
         _finish_scan_result(result)
         return result
+
+    def _mark_network_finding_limit(
+        self,
+        result: ScanResult,
+        path: str,
+        section: _OnnxNetworkDetectorSection,
+        section_index: int,
+        network_detector_input: _OnnxNetworkDetectorInput,
+    ) -> None:
+        remaining_sections = network_detector_input.sections[section_index + 1 :]
+        self._mark_raw_detection_incomplete(
+            result,
+            path,
+            detector="network_communication",
+            reason="detector_finding_limit",
+            message="ONNX network detector findings reached the configured reporting limit; analysis incomplete",
+            details={
+                "max_findings": _network_communication_max_findings(self.config),
+                "truncated_section": section.name,
+                "truncated_section_metadata_owned": section.metadata_owned,
+                "skipped_section_count": len(remaining_sections),
+                "skipped_sections": [item.name for item in remaining_sections[:10]],
+            },
+        )
 
     def _mark_network_text_input_incomplete(
         self,
