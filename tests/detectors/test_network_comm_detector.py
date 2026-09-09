@@ -3044,6 +3044,29 @@ class TestNetworkCommDetector:
 
         assert any(f["type"] == "explicit_network_pattern" and f["severity"] == "CRITICAL" for f in findings)
 
+    @pytest.mark.parametrize("protocol", range(6))
+    @pytest.mark.parametrize("active_first", [False, True])
+    @pytest.mark.parametrize("field", ["callback", "callback_config", "unknown"])
+    def test_nested_metadata_preserves_unknown_owner(self, protocol: int, active_first: bool, field: str) -> None:
+        nested = {"license": "https://example.invalid/license"}
+        entries = [("metadata", nested), (field, [nested])]
+        if active_first:
+            entries.reverse()
+
+        findings = NetworkCommDetector().scan(pickle.dumps(dict(entries), protocol=protocol), "checkpoint.pt")
+
+        assert any(f["type"] == "explicit_network_pattern" and f["severity"] == "CRITICAL" for f in findings)
+
+    @pytest.mark.parametrize("protocol", range(6))
+    def test_explicit_nested_metadata_remains_informational(self, protocol: int) -> None:
+        url = "https://example.invalid/license"
+        data = pickle.dumps({"metadata": {"license": url}}, protocol=protocol)
+
+        findings = NetworkCommDetector().scan(data, "checkpoint.pt")
+
+        assert any(f["type"] == "url_detected" and f["url"] == url and f["severity"] == "INFO" for f in findings)
+        assert not any(f["type"] == "explicit_network_pattern" for f in findings)
+
     @pytest.mark.parametrize(
         "url",
         [
@@ -3055,6 +3078,24 @@ class TestNetworkCommDetector:
             "https://example.invalid/docs/%23weights.bin",
             "https://example.invalid/docs/../callback",
             "https://docs.example.invalid/model.py",
+            "https://example.invalid/license/weights.bin;v=1",
+            "https://example.invalid/license/weights.bin%3bv=1",
+            "https://example.invalid/license/weights.bin%253bv=1",
+            "http://127.0.0.1/license",
+            "http://[::1]/license",
+            "http://10.0.0.1/license",
+            "http://169.254.169.254/license",
+            "http://192.168.1.1/license",
+            "http://8.8.8.8/license",
+            "http://2130706433/license",
+            "http://localhost/license",
+            "http://model-server/license",
+            "http://docs.localhost/license",
+            "http://docs.local/license",
+            "http://docs.internal/license",
+            "https://example.invalid/webhook/license",
+            "https://example.invalid/callback/license",
+            "https://example.invalid/endpoint/license",
         ],
     )
     @pytest.mark.parametrize("model_format", ["pickle", "onnx"])
@@ -3103,6 +3144,16 @@ class TestNetworkCommDetector:
             findings = NetworkCommDetector().scan(data, "model.onnx")
             assert any(f["type"] == "explicit_network_pattern" and f["severity"] == "CRITICAL" for f in findings)
 
+    @pytest.mark.parametrize("graph", [b"x", b"\x0a\x02\x00", b"\x08\x01"])
+    def test_invalid_onnx_graph_does_not_prove_metadata(self, graph: bytes) -> None:
+        url = b"https://example.invalid/license"
+        entry = b"\x0a\x07license\x12" + bytes([len(url)]) + url
+        data = b"\x08\x08\x3a" + bytes([len(graph)]) + graph + b"\x72" + bytes([len(entry)]) + entry
+
+        findings = NetworkCommDetector().scan(data, "model.onnx")
+
+        assert any(f["type"] == "explicit_network_pattern" and f["severity"] == "CRITICAL" for f in findings)
+
     @pytest.mark.parametrize("passive_first", [False, True])
     def test_metadata_domain_deduplication_retains_active_severity(self, passive_first: bool) -> None:
         entries = [("license", "https://example.invalid/license"), ("callback", "https://example.invalid/endpoint")]
@@ -3125,7 +3176,9 @@ class TestNetworkCommDetector:
             f["type"] == "domain" and f["domain"] == "example.invalid" and f["severity"] == "MEDIUM" for f in findings
         )
 
-    @pytest.mark.parametrize("command", ["curl", "wget", "httpx.get", "subprocess.run"])
+    @pytest.mark.parametrize(
+        "command", ["curl", "wget", "httpx.get", "subprocess.run", "GET", "POST", "OPTIONS", "download", "fetch"]
+    )
     @pytest.mark.parametrize("model_format", ["pickle", "onnx"])
     def test_commands_in_metadata_remain_actionable(self, command: str, model_format: str) -> None:
         value = f"{command} https://example.invalid/license"
@@ -3138,6 +3191,21 @@ class TestNetworkCommDetector:
         findings = NetworkCommDetector().scan(data, "checkpoint.pt" if model_format == "pickle" else "model.onnx")
 
         assert any(f["type"] == "explicit_network_pattern" and f["severity"] == "CRITICAL" for f in findings)
+
+    @pytest.mark.parametrize("model_format", ["pickle", "onnx"])
+    def test_metadata_prose_can_describe_download_instructions(self, model_format: str) -> None:
+        url = "https://docs.example.invalid/license"
+        value = f"For download instructions, see {url}"
+        data = (
+            pickle.dumps({"docs": value}, protocol=4)
+            if model_format == "pickle"
+            else _onnx_model_with_metadata({"docs": value})
+        )
+
+        findings = NetworkCommDetector().scan(data, "checkpoint.pt" if model_format == "pickle" else "model.onnx")
+
+        assert any(f["type"] == "url_detected" and f["url"] == url and f["severity"] == "INFO" for f in findings)
+        assert not any(f["type"] == "explicit_network_pattern" for f in findings)
 
     def test_pickle_object_state_is_not_passive_metadata(self) -> None:
         from types import SimpleNamespace

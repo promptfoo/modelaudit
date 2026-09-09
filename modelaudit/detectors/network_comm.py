@@ -107,9 +107,14 @@ _TRAILING_URL_DELIMITER_PAIRS = {")": "(", "]": "[", "}": "{"}
 _TRAILING_URL_DELIMITERS = frozenset(set(_TRAILING_URL_DELIMITER_PAIRS) | set(_TRAILING_URL_DELIMITER_PAIRS.values()))
 _URL_TEXT_BOUNDARY_BYTES = b" \t\r\n\"'<>`()"
 _METADATA_ACTIVE_CONTEXT_PATTERN = re.compile(
-    rb"\b(?:api|callback|curl|download|endpoint|eval|exec|fetch|from_pretrained|git\s+clone|httpx|http\.client|"
-    rb"os\.system|requests?|shell|socket|subprocess|torch\.hub|urlopen|urlretrieve|urllib|webhook|wget)\b",
+    rb"\b(?:curl|wget|git\s+clone)\b|"
+    rb"\b(?:eval|exec|fetch|from_pretrained|requests?|urlopen|urlretrieve)\s*\(|"
+    rb"\b(?:httpx|http\.client|os|requests?|socket|subprocess|torch\.hub|urllib)\s*\.|"
+    rb"\b(?:api|callback|download|endpoint|fetch|shell|webhook)\s*[:=]",
     re.IGNORECASE,
+)
+_METADATA_HTTP_REQUEST_PATTERN = re.compile(
+    rb"\b(?:GET|HEAD|POST|PUT|DELETE|CONNECT|OPTIONS|TRACE|PATCH|download|fetch)\s+https?://", re.IGNORECASE
 )
 _PROVEN_BARE_QUERY_COMPONENTS = frozenset({"_debug", "debug"})
 _PROVEN_BARE_PROSE_COMPONENTS = frozenset({"section"})
@@ -4975,8 +4980,10 @@ class NetworkCommDetector:
         }
     )
     INFORMATIONAL_URL_RISK_TERMS: ClassVar[tuple[str, ...]] = (
+        "callback",
         "cmd",
         "curl",
+        "endpoint",
         "eval",
         "exec",
         "os.system",
@@ -4985,6 +4992,7 @@ class NetworkCommDetector:
         "socket.",
         "subprocess",
         "urllib.",
+        "webhook",
         "wget",
     )
 
@@ -5056,6 +5064,7 @@ class NetworkCommDetector:
             (start, end)
             for start, end in metadata_bounds
             if _METADATA_ACTIVE_CONTEXT_PATTERN.search(_URL_IN_BYTES_PATTERN.sub(b"", data[start:end])) is None
+            and _METADATA_HTTP_REQUEST_PATTERN.search(data[start:end]) is None
         ]
         self._metadata_starts = [start for start, _end in self._metadata_bounds]
         (
@@ -5443,13 +5452,10 @@ class NetworkCommDetector:
             term in decoded_url for term in self.INFORMATIONAL_URL_RISK_TERMS
         ):
             return None
-        if parsed.query:
-            try:
-                query = parse_qsl(parsed.query, keep_blank_values=True, strict_parsing=True)
-            except ValueError:
-                return None
-        else:
-            query = []
+        try:
+            query = parse_qsl(parsed.query, keep_blank_values=True, strict_parsing=True) if parsed.query else []
+        except ValueError:
+            return None
         for key, value in query:
             if (
                 key.casefold() not in {"lang", "language", "locale", "hl"}
@@ -5458,9 +5464,15 @@ class NetworkCommDetector:
                 return None
 
         hostname = parsed.hostname.casefold().rstrip(".")
+        if _BARE_DOMAIN_PATTERN.fullmatch(hostname.encode("utf-8")) is None or hostname.endswith(
+            (".localhost", ".local", ".internal", ".lan", ".home", ".arpa")
+        ):
+            return None
         decoded_path = parsed.path
         for _ in range(3):
             decoded_path = unquote(decoded_path)
+        if ";" in decoded_path:
+            return None
         path_segments = [
             segment.casefold().strip(_TRAILING_PATH_DELIMITERS) for segment in decoded_path.split("/") if segment
         ]

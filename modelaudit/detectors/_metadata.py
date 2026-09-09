@@ -7,6 +7,7 @@ from io import BytesIO
 
 from modelaudit.utils.file.detection import (
     _ONNX_MODEL_FIELD_WIRE_TYPES,
+    _looks_like_onnx_graph_proto_stream,
     _read_proto_varint,
     _skip_proto_value,
 )
@@ -48,9 +49,10 @@ def _add_items(target: _PickleValue, values: list[_PickleValue]) -> None:
             raise ValueError("Incomplete dictionary entry")
         for key, value in zip(values[::2], values[1::2], strict=True):
             _escape(key)
-            if key.text is not None and key.text.strip().casefold() in _METADATA_KEYS and value.kind == "string":
+            key_name = key.text.strip().casefold() if key.text is not None else None
+            if key_name in _METADATA_KEYS and value.kind == "string":
                 value.metadata = True
-            elif value.kind == "string":
+            elif key_name != "metadata" or value.kind not in {"dict", "list", "tuple"}:
                 _escape(value)
     else:
         for value in values:
@@ -163,7 +165,8 @@ def _pickle_metadata(data: bytes) -> tuple[list[tuple[int, int]], list[tuple[int
                     _escape(value)
                 stack.extend(_PickleValue() for _ in opcode.stack_after)
     except (ValueError, IndexError, KeyError, UnicodeError, OverflowError):
-        pass
+        # Incomplete or invalid serialization cannot prove passive ownership.
+        return [], []
     return [], []
 
 
@@ -202,7 +205,12 @@ def _onnx_metadata(data: bytes) -> tuple[list[tuple[int, int]], list[tuple[int, 
                 version = _read_proto_varint(data, start, end)
                 has_ir_version = version is not None and 0 < version[0] <= 1000
             elif number == 7:
-                has_graph = end > start
+                _proto_fields(data, start, end, budget)
+                stream = BytesIO(data)
+                stream.seek(start)
+                if _looks_like_onnx_graph_proto_stream(stream, end, budget) is not True:
+                    return [], []
+                has_graph = True
             elif number == 14:
                 metadata_bytes += end - start
                 if metadata_bytes > _MAX_PICKLE_BYTES:
