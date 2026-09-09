@@ -8140,6 +8140,10 @@ class TestRawDetectorCoverage:
     def _coverage_checks(result: Any) -> list[Any]:
         return [c for c in result.checks if c.name == "Raw Detector Analysis Coverage"]
 
+    @staticmethod
+    def _network_detection_checks(result: Any) -> list[Any]:
+        return [c for c in result.checks if c.name == "Network Communication Detection"]
+
     def _assert_inconclusive_exit2(self, model_path: Path, direct: Any, *, detector: str) -> None:
         aggregate = scan_model_directory_or_file(str(model_path), recursive=False)
         metadata = next(iter(aggregate.file_metadata.values()))
@@ -8182,6 +8186,52 @@ class TestRawDetectorCoverage:
         assert leaked_secret not in str(coverage_check.details)
         assert leaked_secret not in caplog.text
         assert "<redacted>" in coverage_check.message
+
+    def test_network_detector_ignores_onnx_raw_tensor_bytes(self, tmp_path: Path) -> None:
+        payload = b"quantized calibration bytes 8.8.8.8 are tensor data"
+        tensor = onnx.TensorProto()
+        tensor.name = "W"
+        tensor.data_type = TensorProto.UINT8
+        tensor.dims.extend([len(payload)])
+        tensor.raw_data = payload
+        output = helper.make_tensor_value_info("output", TensorProto.UINT8, [len(payload)])
+        node = helper.make_node("Identity", ["W"], ["output"], name="identity")
+        graph = helper.make_graph([node], "raw_tensor_graph", [], [output], initializer=[tensor])
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        model_path = tmp_path / "raw-tensor-ip.onnx"
+        onnx.save(model, str(model_path))
+
+        result = OnnxScanner(config={"check_jit_script": False}).scan(str(model_path))
+
+        assert result.metadata["onnx_network_detector_input"]["source"] == "structured_text_fields"
+        failed_network_checks = [
+            check for check in self._network_detection_checks(result) if check.status == CheckStatus.FAILED
+        ]
+        assert not [
+            check
+            for check in failed_network_checks
+            if check.details.get("type") == "ipv4_address" and check.details.get("ip") == "8.8.8.8"
+        ]
+        assert any(check.status == CheckStatus.PASSED for check in self._network_detection_checks(result))
+
+    def test_network_detector_preserves_onnx_metadata_urls(self, tmp_path: Path) -> None:
+        model_path = create_onnx_model(tmp_path, include_initializer=False)
+        model = onnx.load(str(model_path))
+        metadata = model.metadata_props.add()
+        metadata.key = "callback"
+        metadata.value = "https://45.33.32.156/payload"
+        onnx.save(model, str(model_path))
+
+        result = OnnxScanner(config={"check_jit_script": False}).scan(str(model_path))
+
+        failed_network_checks = [
+            check for check in self._network_detection_checks(result) if check.status == CheckStatus.FAILED
+        ]
+        assert any(
+            check.details.get("type") == "url_detected" and "45.33.32.156" in str(check.details.get("url", ""))
+            for check in failed_network_checks
+        )
 
     def test_network_detector_failure_is_inconclusive(
         self,

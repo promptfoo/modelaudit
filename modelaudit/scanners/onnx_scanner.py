@@ -131,6 +131,8 @@ _ONNX_CUSTOM_OPERATOR_SAMPLE_LIMIT = 20
 _ONNX_CUSTOM_OPERATOR_TEXT_LIMIT = 256
 _ONNX_WEIGHT_DEFAULT_MAX_ARRAY_SIZE = 100 * 1024 * 1024
 _ONNX_RAW_DETECTOR_DEFAULT_MAX_BYTES = 512 * 1024 * 1024
+_ONNX_NETWORK_TEXT_MAX_BYTES = 4 * 1024 * 1024
+_ONNX_NETWORK_TEXT_MAX_FIELDS = 100_000
 _ONNX_STRUCTURE_STRING_MAX_BYTES = 1024 * 1024
 _ONNX_STRUCTURE_MAX_DEPTH = 128
 _ONNX_STRUCTURE_MAX_NODES = 1_000_000
@@ -407,6 +409,141 @@ def _iter_attribute_graphs(attribute: Any) -> Any:
             yield attribute.g
     except (ValueError, AttributeError):  # pragma: no cover - proto edge case
         pass
+
+
+@dataclass(frozen=True)
+class _OnnxNetworkDetectorInput:
+    data: bytes
+    field_count: int
+    omitted_field_count: int
+    truncated: bool
+
+
+class _OnnxNetworkTextCollector:
+    def __init__(
+        self,
+        *,
+        max_bytes: int,
+        max_fields: int,
+        check_interrupted: Callable[[], None],
+    ) -> None:
+        self._chunks: list[bytes] = []
+        self._max_bytes = max_bytes
+        self._max_fields = max_fields
+        self._check_interrupted = check_interrupted
+        self._byte_count = 0
+        self._field_count = 0
+        self._omitted_field_count = 0
+        self._truncated = False
+
+    def is_truncated(self) -> bool:
+        return self._truncated
+
+    def check_interrupted(self) -> None:
+        self._check_interrupted()
+
+    def add(self, label: str, value: Any) -> None:
+        self.check_interrupted()
+        value_bytes = _onnx_network_text_value_bytes(value)
+        if not value_bytes:
+            return
+        if self._field_count >= self._max_fields:
+            self._truncated = True
+            self._omitted_field_count += 1
+            return
+        entry = label.encode("utf-8", errors="surrogatepass") + b"=" + value_bytes + b"\n"
+        if self._byte_count + len(entry) > self._max_bytes:
+            self._truncated = True
+            self._omitted_field_count += 1
+            return
+        self._chunks.append(entry)
+        self._byte_count += len(entry)
+        self._field_count += 1
+
+    def omit(self) -> None:
+        self._truncated = True
+        self._omitted_field_count += 1
+
+    def finish(self) -> _OnnxNetworkDetectorInput:
+        return _OnnxNetworkDetectorInput(
+            data=b"".join(self._chunks),
+            field_count=self._field_count,
+            omitted_field_count=self._omitted_field_count,
+            truncated=self._truncated,
+        )
+
+
+def _onnx_network_text_value_bytes(value: Any) -> bytes:
+    if value is None:
+        return b""
+    if isinstance(value, bytes):
+        return value
+    if isinstance(value, str):
+        return value.encode("utf-8", errors="surrogatepass")
+    return b""
+
+
+def _collect_onnx_network_detector_input(
+    model: Any,
+    *,
+    check_interrupted: Callable[[], None],
+) -> _OnnxNetworkDetectorInput:
+    collector = _OnnxNetworkTextCollector(
+        max_bytes=_ONNX_NETWORK_TEXT_MAX_BYTES,
+        max_fields=_ONNX_NETWORK_TEXT_MAX_FIELDS,
+        check_interrupted=check_interrupted,
+    )
+    _collect_onnx_proto_text_fields(collector, model, "model")
+    return collector.finish()
+
+
+def _collect_onnx_proto_text_fields(
+    collector: _OnnxNetworkTextCollector,
+    message: Any,
+    label: str,
+    *,
+    depth: int = 0,
+) -> None:
+    if message is None or collector.is_truncated():
+        return
+    if depth > _ONNX_STRUCTURE_MAX_DEPTH:
+        collector.omit()
+        return
+    descriptor = getattr(message, "DESCRIPTOR", None)
+    if descriptor is None:
+        return
+    for proto_field in getattr(descriptor, "fields", []):
+        collector.check_interrupted()
+        field_label = f"{label}.{proto_field.name}"
+        if _is_onnx_tensor_payload_field(descriptor, proto_field):
+            continue
+        value = getattr(message, proto_field.name)
+        if proto_field.label == proto_field.LABEL_REPEATED:
+            for index, item in enumerate(value):
+                item_label = f"{field_label}[{index}]"
+                if proto_field.type == proto_field.TYPE_MESSAGE:
+                    _collect_onnx_proto_text_fields(collector, item, item_label, depth=depth + 1)
+                elif proto_field.type in {proto_field.TYPE_BYTES, proto_field.TYPE_STRING}:
+                    collector.add(item_label, item)
+                if collector.is_truncated():
+                    return
+            continue
+        if proto_field.type == proto_field.TYPE_MESSAGE:
+            try:
+                if not message.HasField(proto_field.name):
+                    continue
+            except ValueError:
+                pass
+            _collect_onnx_proto_text_fields(collector, value, field_label, depth=depth + 1)
+        elif proto_field.type in {proto_field.TYPE_BYTES, proto_field.TYPE_STRING}:
+            collector.add(field_label, value)
+
+
+def _is_onnx_tensor_payload_field(descriptor: Any, proto_field: Any) -> bool:
+    return getattr(descriptor, "full_name", "") == "onnx.TensorProto" and proto_field.name in {
+        "raw_data",
+        "string_data",
+    }
 
 
 def _iter_graph_nodes(graph: Any) -> Any:
@@ -4593,8 +4730,36 @@ class OnnxScanner(BaseScanner):
 
             if check_net:
                 try:
+                    network_detector_input = _collect_onnx_network_detector_input(
+                        model,
+                        check_interrupted=self.check_interrupted,
+                    )
+                    result.metadata["onnx_network_detector_input"] = {
+                        "source": "structured_text_fields",
+                        "field_count": network_detector_input.field_count,
+                        "omitted_field_count": network_detector_input.omitted_field_count,
+                        "max_bytes": _ONNX_NETWORK_TEXT_MAX_BYTES,
+                        "max_fields": _ONNX_NETWORK_TEXT_MAX_FIELDS,
+                    }
+                    if network_detector_input.truncated:
+                        self._mark_raw_detection_incomplete(
+                            result,
+                            path,
+                            detector="network_communication",
+                            reason="text_field_budget_exceeded",
+                            message=(
+                                "ONNX network detector text input exceeded bounded extraction budget; "
+                                "analysis incomplete"
+                            ),
+                            details={
+                                "field_count": network_detector_input.field_count,
+                                "omitted_field_count": network_detector_input.omitted_field_count,
+                                "max_bytes": _ONNX_NETWORK_TEXT_MAX_BYTES,
+                                "max_fields": _ONNX_NETWORK_TEXT_MAX_FIELDS,
+                            },
+                        )
                     network_findings = self.collect_network_communication_findings(
-                        model_data,
+                        network_detector_input.data,
                         context=path,
                         raise_on_error=True,
                     )
