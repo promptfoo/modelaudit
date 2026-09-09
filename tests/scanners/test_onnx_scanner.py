@@ -2421,9 +2421,11 @@ def test_onnx_scanner_raw_read_failure_falls_back_to_file_backed_parse(
     assert result.bytes_scanned > 0
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert result.metadata["onnx_structure_parse"]["parse_mode"] == "file_backed_structure"
-    assert len(coverage_checks) == 1
-    assert coverage_checks[0].details["detector"] == "raw_file_read"
-    assert coverage_checks[0].details["coverage_gap"] == "file_read_failed"
+    coverage_gaps = {(check.details["detector"], check.details["coverage_gap"]) for check in coverage_checks}
+    assert coverage_gaps == {
+        ("raw_file_read", "file_read_failed"),
+        ("network_communication", "structured_text_unavailable"),
+    }
 
 
 def test_directory_scan_hashes_external_data_for_content_routed_onnx_bin(tmp_path: Path) -> None:
