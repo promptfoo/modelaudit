@@ -8479,7 +8479,9 @@ class TestRawDetectorCoverage:
         docs_failures = [
             check
             for check in failed_network_checks
-            if "docs.ultralytics.com" in str(check.details) and check.details.get("onnx_metadata_owned") is True
+            if check.details.get("type") == "url_detected"
+            and check.details.get("url") == "https://docs.ultralytics.com/"
+            and check.details.get("onnx_metadata_owned") is True
         ]
         assert docs_failures
         assert all(
