@@ -1822,6 +1822,11 @@ def _is_metadata_context(context: str) -> bool:
     return any(segment in _DOC_CONTEXT_SEGMENTS for segment in context_segments[:-1])
 
 
+def _is_extracted_onnx_metadata_context(context: str) -> bool:
+    context_segments = [segment for segment in context.lower().replace("\\", "/").split("/") if segment]
+    return len(context_segments) >= 2 and context_segments[-2:] == ["onnx_metadata", "metadata"]
+
+
 def _iter_pattern_matches(data: bytes, pattern: bytes) -> Iterator[int]:
     """Yield non-overlapping match positions for a byte pattern."""
     start = 0
@@ -5470,7 +5475,10 @@ class NetworkCommDetector:
 
         # Skip domain detection in binary ML model files to avoid false positives
         # Binary weights can randomly match domain patterns
-        if context and any(ext in context.lower() for ext in [".bin", ".pt", ".pth", ".ckpt", ".h5", ".pb", ".onnx"]):
+        if context and (
+            any(ext in context.lower() for ext in [".bin", ".pt", ".pth", ".ckpt", ".h5", ".pb", ".onnx"])
+            or _is_extracted_onnx_metadata_context(context)
+        ):
             # For ML model files, only look for very explicit domain references
             # that are unlikely to occur randomly
             explicit_domain_patterns = [
@@ -5775,11 +5783,11 @@ class NetworkCommDetector:
             ".pickle",
             ".joblib",
         ]
-        is_ml_model = context and any(ext in context.lower() for ext in ml_extensions)
+        is_ml_model = bool(context) and any(ext in context.lower() for ext in ml_extensions)
 
         # For ML models, we need to be much more conservative to avoid false positives
         # Binary model weights can contain random byte sequences that match port patterns
-        if is_ml_model:
+        if is_ml_model and not _is_extracted_onnx_metadata_context(context):
             # Only scan for very explicit network patterns in ML models
             # Skip port scanning for pure binary model files to avoid false positives
             self._scan_explicit_network_patterns_in_ml_models(data, context)

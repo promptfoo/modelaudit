@@ -133,6 +133,17 @@ _ONNX_WEIGHT_DEFAULT_MAX_ARRAY_SIZE = 100 * 1024 * 1024
 _ONNX_RAW_DETECTOR_DEFAULT_MAX_BYTES = 512 * 1024 * 1024
 _ONNX_NETWORK_TEXT_MAX_BYTES = 4 * 1024 * 1024
 _ONNX_NETWORK_TEXT_MAX_FIELDS = 100_000
+_ONNX_TENSOR_PAYLOAD_FIELD_NAMES: frozenset[str] = frozenset(
+    {
+        "raw_data",
+        "float_data",
+        "int32_data",
+        "string_data",
+        "int64_data",
+        "double_data",
+        "uint64_data",
+    }
+)
 _ONNX_STRUCTURE_STRING_MAX_BYTES = 1024 * 1024
 _ONNX_STRUCTURE_MAX_DEPTH = 128
 _ONNX_STRUCTURE_MAX_NODES = 1_000_000
@@ -146,6 +157,7 @@ _ONNX_STRUCTURE_MAX_STRING_DATA_FIELDS = 100_000
 _ONNX_STRUCTURE_MAX_REPEATED_SUBMESSAGES = 100_000
 _ONNX_STRUCTURE_MAX_FIELD_NUMBER = (1 << 29) - 1
 _ONNX_STRUCTURE_MAX_PARSE_STEPS = 5_000_000
+_ONNX_STRUCTURE_MAX_UNKNOWN_FIELD_SAMPLES = 20
 _ONNX_STRUCTURE_MAX_RETAINED_OBJECTS = 1_000_000
 _ONNX_STRUCTURE_MAX_RETAINED_SEQUENCE_ENTRIES = 1_000_000
 _ONNX_STRUCTURE_MAX_RETAINED_STRING_BYTES = 64 * 1024 * 1024
@@ -404,17 +416,34 @@ def _onnx_weight_output_axes(node: Any, input_index: int, rank: int) -> tuple[tu
 def _iter_attribute_graphs(attribute: Any) -> Any:
     """Yield graph values declared by an ONNX attribute."""
     yield from attribute.graphs
-    try:
-        if attribute.HasField("g"):
-            yield attribute.g
-    except (ValueError, AttributeError):  # pragma: no cover - proto edge case
-        pass
+    if _onnx_has_singular_field(attribute, "g"):
+        yield attribute.g
+
+
+def _onnx_has_singular_field(message: Any, field_name: str) -> bool:
+    has_field = getattr(message, "HasField", None)
+    if callable(has_field):
+        try:
+            return bool(has_field(field_name))
+        except (AttributeError, ValueError):
+            pass
+    return getattr(message, field_name, None) is not None
+
+
+@dataclass(frozen=True)
+class _OnnxNetworkDetectorSection:
+    name: str
+    data: bytes
+    field_count: int
+    metadata_owned: bool
 
 
 @dataclass(frozen=True)
 class _OnnxNetworkDetectorInput:
     data: bytes
+    sections: tuple[_OnnxNetworkDetectorSection, ...]
     field_count: int
+    metadata_field_count: int
     omitted_field_count: int
     truncated: bool
 
@@ -428,11 +457,16 @@ class _OnnxNetworkTextCollector:
         check_interrupted: Callable[[], None],
     ) -> None:
         self._chunks: list[bytes] = []
+        self._metadata_chunks: list[bytes] = []
+        self._structural_chunks: list[bytes] = []
         self._max_bytes = max_bytes
         self._max_fields = max_fields
         self._check_interrupted = check_interrupted
         self._byte_count = 0
+        self._visited_field_count = 0
         self._field_count = 0
+        self._metadata_field_count = 0
+        self._structural_field_count = 0
         self._omitted_field_count = 0
         self._truncated = False
 
@@ -444,19 +478,29 @@ class _OnnxNetworkTextCollector:
 
     def add(self, label: str, value: Any) -> None:
         self.check_interrupted()
-        value_bytes = _onnx_network_text_value_bytes(value)
+        if self._visited_field_count >= self._max_fields:
+            self._truncated = True
+            self._omitted_field_count += 1
+            return
+        self._visited_field_count += 1
+        label_bytes = label.encode("utf-8", errors="surrogatepass")
+        entry_overhead = len(label_bytes) + len(b": \n")
+        remaining_bytes = self._max_bytes - self._byte_count - entry_overhead
+        value_bytes = _onnx_network_text_value_bytes(value, max_bytes=remaining_bytes)
+        if value_bytes is None:
+            self._truncated = True
+            self._omitted_field_count += 1
+            return
         if not value_bytes:
             return
-        if self._field_count >= self._max_fields:
-            self._truncated = True
-            self._omitted_field_count += 1
-            return
-        entry = label.encode("utf-8", errors="surrogatepass") + b"=" + value_bytes + b"\n"
-        if self._byte_count + len(entry) > self._max_bytes:
-            self._truncated = True
-            self._omitted_field_count += 1
-            return
+        entry = label_bytes + b": " + value_bytes + b"\n"
         self._chunks.append(entry)
+        if _is_onnx_metadata_text_label(label):
+            self._metadata_chunks.append(entry)
+            self._metadata_field_count += 1
+        else:
+            self._structural_chunks.append(entry)
+            self._structural_field_count += 1
         self._byte_count += len(entry)
         self._field_count += 1
 
@@ -465,22 +509,66 @@ class _OnnxNetworkTextCollector:
         self._omitted_field_count += 1
 
     def finish(self) -> _OnnxNetworkDetectorInput:
+        sections: list[_OnnxNetworkDetectorSection] = []
+        if self._structural_chunks:
+            sections.append(
+                _OnnxNetworkDetectorSection(
+                    name="structured_text_fields",
+                    data=b"".join(self._structural_chunks),
+                    field_count=self._structural_field_count,
+                    metadata_owned=False,
+                )
+            )
+        if self._metadata_chunks:
+            sections.append(
+                _OnnxNetworkDetectorSection(
+                    name="metadata_props",
+                    data=b"".join(self._metadata_chunks),
+                    field_count=self._metadata_field_count,
+                    metadata_owned=True,
+                )
+            )
         return _OnnxNetworkDetectorInput(
             data=b"".join(self._chunks),
+            sections=tuple(sections),
             field_count=self._field_count,
+            metadata_field_count=self._metadata_field_count,
             omitted_field_count=self._omitted_field_count,
             truncated=self._truncated,
         )
 
 
-def _onnx_network_text_value_bytes(value: Any) -> bytes:
+def _onnx_network_text_value_bytes(value: Any, *, max_bytes: int) -> bytes | None:
+    if max_bytes <= 0:
+        return None
     if value is None:
         return b""
     if isinstance(value, bytes):
+        if len(value) > max_bytes:
+            return None
         return value
     if isinstance(value, str):
-        return value.encode("utf-8", errors="surrogatepass")
+        if len(value) > max_bytes:
+            return None
+        value_bytes = value.encode("utf-8", errors="surrogatepass")
+        if len(value_bytes) > max_bytes:
+            return None
+        return value_bytes
     return b""
+
+
+def _network_communication_max_findings(config: dict[str, Any] | None) -> int | None:
+    network_config = (config or {}).get("network_comm_config")
+    if not isinstance(network_config, dict):
+        return None
+    max_findings = network_config.get("max_findings")
+    if isinstance(max_findings, int) and not isinstance(max_findings, bool) and max_findings > 0:
+        return max_findings
+    return None
+
+
+def _is_onnx_metadata_text_label(label: str) -> bool:
+    return ".metadata_props[" in label
 
 
 def _collect_onnx_network_detector_input(
@@ -517,6 +605,12 @@ def _collect_onnx_proto_text_fields(
         field_label = f"{label}.{proto_field.name}"
         if _is_onnx_tensor_payload_field(descriptor, proto_field):
             continue
+        if proto_field.label == proto_field.LABEL_REPEATED and proto_field.type not in {
+            proto_field.TYPE_MESSAGE,
+            proto_field.TYPE_BYTES,
+            proto_field.TYPE_STRING,
+        }:
+            continue
         value = getattr(message, proto_field.name)
         if proto_field.label == proto_field.LABEL_REPEATED:
             for index, item in enumerate(value):
@@ -529,21 +623,18 @@ def _collect_onnx_proto_text_fields(
                     return
             continue
         if proto_field.type == proto_field.TYPE_MESSAGE:
-            try:
-                if not message.HasField(proto_field.name):
-                    continue
-            except ValueError:
-                pass
+            if not _onnx_has_singular_field(message, proto_field.name):
+                continue
             _collect_onnx_proto_text_fields(collector, value, field_label, depth=depth + 1)
         elif proto_field.type in {proto_field.TYPE_BYTES, proto_field.TYPE_STRING}:
             collector.add(field_label, value)
 
 
 def _is_onnx_tensor_payload_field(descriptor: Any, proto_field: Any) -> bool:
-    return getattr(descriptor, "full_name", "") == "onnx.TensorProto" and proto_field.name in {
-        "raw_data",
-        "string_data",
-    }
+    return (
+        getattr(descriptor, "full_name", "") == "onnx.TensorProto"
+        and proto_field.name in _ONNX_TENSOR_PAYLOAD_FIELD_NAMES
+    )
 
 
 def _iter_graph_nodes(graph: Any) -> Any:
@@ -869,16 +960,13 @@ def _iter_attribute_external_data_tensors(
         _check_onnx_traversal_interrupted(interrupt_check)
         yield sparse_tensor.values
         yield sparse_tensor.indices
-    try:
-        if attribute.HasField("t"):
-            _check_onnx_traversal_interrupted(interrupt_check)
-            yield attribute.t
-        if attribute.HasField("sparse_tensor"):
-            _check_onnx_traversal_interrupted(interrupt_check)
-            yield attribute.sparse_tensor.values
-            yield attribute.sparse_tensor.indices
-    except (ValueError, AttributeError):  # pragma: no cover - proto edge case
-        pass
+    if _onnx_has_singular_field(attribute, "t"):
+        _check_onnx_traversal_interrupted(interrupt_check)
+        yield attribute.t
+    if _onnx_has_singular_field(attribute, "sparse_tensor"):
+        _check_onnx_traversal_interrupted(interrupt_check)
+        yield attribute.sparse_tensor.values
+        yield attribute.sparse_tensor.indices
 
 
 def _iter_graph_external_data_tensors(
@@ -979,7 +1067,7 @@ def _confirmed_onnx_operator_findings(findings: list[Any], model: Any) -> list[A
         return confirmed
 
     try:
-        if hasattr(model, "HasField") and not model.HasField("graph"):
+        if hasattr(model, "HasField") and not _onnx_has_singular_field(model, "graph"):
             return confirmed
         for graph in _iter_model_graphs(model):
             for node in _iter_graph_nodes(graph):
@@ -2480,11 +2568,8 @@ def _build_onnx_weight_analysis_plan(
                         unresolved_constant_attribute = True
                         continue
                     if attribute.name == "value":
-                        try:
-                            if resolved_attribute.HasField("t"):
-                                constant_tensor = resolved_attribute.t
-                        except (AttributeError, ValueError):
-                            constant_tensor = None
+                        if _onnx_has_singular_field(resolved_attribute, "t"):
+                            constant_tensor = resolved_attribute.t
                     elif attribute.name == "value_ints":
                         constant_tensor = onnx.helper.make_tensor(
                             "",
@@ -2513,12 +2598,11 @@ def _build_onnx_weight_analysis_plan(
                             [],
                             [resolved_attribute.f],
                         )
-                    elif attribute.name == "sparse_value":
-                        try:
-                            if resolved_attribute.HasField("sparse_tensor"):
-                                sparse_constant = resolved_attribute.sparse_tensor
-                        except (AttributeError, ValueError):
-                            sparse_constant = None
+                    elif attribute.name == "sparse_value" and _onnx_has_singular_field(
+                        resolved_attribute,
+                        "sparse_tensor",
+                    ):
+                        sparse_constant = resolved_attribute.sparse_tensor
                     if constant_tensor is not None or sparse_constant is not None:
                         constant_source_key = (
                             "constant_value",
@@ -3013,6 +3097,65 @@ class _OnnxLengthOnlySequence:
         return iter((_OnnxOmittedBytes(self._total_bytes),))
 
 
+_ONNX_MESSAGE_CLASS_BY_FULL_NAME: dict[str, str] = {
+    "onnx.StringStringEntryProto": "StringStringEntryProto",
+    "onnx.TensorProto": "TensorProto",
+    "onnx.SparseTensorProto": "SparseTensorProto",
+    "onnx.AttributeProto": "AttributeProto",
+    "onnx.NodeProto": "NodeProto",
+    "onnx.ValueInfoProto": "ValueInfoProto",
+    "onnx.GraphProto": "GraphProto",
+    "onnx.OperatorSetIdProto": "OperatorSetIdProto",
+    "onnx.FunctionProto": "FunctionProto",
+    "onnx.TrainingInfoProto": "TrainingInfoProto",
+    "onnx.ModelProto": "ModelProto",
+}
+_FALLBACK_ONNX_KNOWN_FIELD_NUMBERS: dict[str, frozenset[int]] = {
+    "onnx.StringStringEntryProto": frozenset({1, 2}),
+    "onnx.TensorProto": frozenset({1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 16}),
+    "onnx.SparseTensorProto": frozenset({1, 2, 3}),
+    "onnx.AttributeProto": frozenset({1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 14, 15, 20, 21, 22, 23}),
+    "onnx.NodeProto": frozenset({1, 2, 3, 4, 5, 6, 7, 8, 9, 10}),
+    "onnx.ValueInfoProto": frozenset({1, 2, 3, 4}),
+    "onnx.GraphProto": frozenset({1, 2, 5, 10, 11, 12, 13, 14, 15, 16}),
+    "onnx.OperatorSetIdProto": frozenset({1, 2}),
+    "onnx.FunctionProto": frozenset({1, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14}),
+    "onnx.TrainingInfoProto": frozenset({1, 2, 3, 4}),
+    "onnx.ModelProto": frozenset({1, 2, 3, 4, 5, 6, 7, 8, 14, 20, 25, 26}),
+}
+_ONNX_KNOWN_FIELD_NUMBERS: dict[str, frozenset[int]] | None = None
+
+
+def _onnx_known_field_numbers(message_name: str) -> frozenset[int]:
+    global _ONNX_KNOWN_FIELD_NUMBERS
+    if _ONNX_KNOWN_FIELD_NUMBERS is None:
+        known_fields = dict(_FALLBACK_ONNX_KNOWN_FIELD_NUMBERS)
+        try:
+            import onnx
+
+            for full_name, class_name in _ONNX_MESSAGE_CLASS_BY_FULL_NAME.items():
+                proto_type = getattr(onnx, class_name, None)
+                descriptor = getattr(proto_type, "DESCRIPTOR", None)
+                fields = getattr(descriptor, "fields", None)
+                if fields is not None:
+                    known_fields[full_name] = frozenset(int(field.number) for field in fields)
+        except Exception:
+            logger.debug("Unable to derive installed ONNX protobuf field map", exc_info=True)
+        _ONNX_KNOWN_FIELD_NUMBERS = known_fields
+    return _ONNX_KNOWN_FIELD_NUMBERS.get(message_name, frozenset())
+
+
+def _discard_onnx_unknown_field_bytes(message: Any) -> int:
+    byte_size = getattr(message, "ByteSize", None)
+    discard_unknown_fields = getattr(message, "DiscardUnknownFields", None)
+    if not callable(byte_size) or not callable(discard_unknown_fields):
+        return 0
+    before = int(byte_size())
+    discard_unknown_fields()
+    after = int(byte_size())
+    return max(0, before - after)
+
+
 @dataclass
 class _OnnxLiteStringEntry:
     key: str = ""
@@ -3150,6 +3293,8 @@ class _OnnxStructureParseState:
     retained_string_bytes: int = 0
     retained_allocation_bytes: int = 0
     string_fields_skipped: int = 0
+    unknown_field_count: int = 0
+    unknown_field_samples: list[dict[str, Any]] = field(default_factory=list)
     fields_seen: int = 0
     parse_steps: int = 0
     coverage_gaps: dict[str, int] = field(default_factory=dict)
@@ -3168,6 +3313,19 @@ class _OnnxStructureParseState:
 
     def record_gap(self, reason: str, count: int = 1) -> None:
         self.coverage_gaps[reason] = self.coverage_gaps.get(reason, 0) + count
+
+    def record_unknown_field(self, message_name: str, field_number: int, wire_type: int) -> None:
+        self.unknown_field_count += 1
+        self.record_gap("unknown_protobuf_fields")
+        if len(self.unknown_field_samples) >= _ONNX_STRUCTURE_MAX_UNKNOWN_FIELD_SAMPLES:
+            return
+        self.unknown_field_samples.append(
+            {
+                "message": message_name,
+                "field_number": field_number,
+                "wire_type": wire_type,
+            }
+        )
 
     def record_retained_allocation(self, amount: int) -> None:
         if amount < 0 or amount > _ONNX_STRUCTURE_MAX_RETAINED_ALLOCATION_BYTES - self.retained_allocation_bytes:
@@ -3234,6 +3392,9 @@ class _OnnxStructureParseState:
             "retained_string_bytes": self.retained_string_bytes,
             "retained_allocation_bytes": self.retained_allocation_bytes,
             "string_fields_skipped": self.string_fields_skipped,
+            "unknown_field_count": self.unknown_field_count,
+            "unknown_field_samples": list(self.unknown_field_samples),
+            "unknown_field_samples_truncated": (self.unknown_field_count > len(self.unknown_field_samples)),
             "fields_seen": self.fields_seen,
             "parse_steps": self.parse_steps,
             "coverage_gaps": dict(self.coverage_gaps),
@@ -3288,6 +3449,18 @@ def _read_onnx_key(handle: BinaryIO, end: int, state: _OnnxStructureParseState) 
             f"ONNX protobuf field number exceeds maximum ({_ONNX_STRUCTURE_MAX_FIELD_NUMBER})",
         )
     return field_number, key & 0x07
+
+
+def _read_onnx_message_key(
+    handle: BinaryIO,
+    end: int,
+    state: _OnnxStructureParseState,
+    message_name: str,
+) -> tuple[int, int]:
+    field_number, wire_type = _read_onnx_key(handle, end, state)
+    if field_number not in _onnx_known_field_numbers(message_name):
+        state.record_unknown_field(message_name, field_number, wire_type)
+    return field_number, wire_type
 
 
 def _read_onnx_exact(handle: BinaryIO, length: int, end: int) -> bytes:
@@ -3476,7 +3649,7 @@ def _parse_onnx_string_entry(
     state.record_retained_object()
     entry = _OnnxLiteStringEntry()
     while handle.tell() < end:
-        field_number, wire_type = _read_onnx_key(handle, end, state)
+        field_number, wire_type = _read_onnx_message_key(handle, end, state, "onnx.StringStringEntryProto")
         if field_number == 1 and wire_type == 2:
             entry.key = _read_onnx_string(handle, end, state, field_name="external_data_key")
         elif field_number == 2 and wire_type == 2:
@@ -3511,7 +3684,7 @@ def _parse_onnx_tensor(
     string_data_count = 0
     string_data_bytes = 0
     while handle.tell() < end:
-        field_number, wire_type = _read_onnx_key(handle, end, state)
+        field_number, wire_type = _read_onnx_message_key(handle, end, state, "onnx.TensorProto")
         if field_number == 1:
             if wire_type == 0:
                 _append_onnx_dimension(tensor.dims, _decode_int64_varint(_read_onnx_varint(handle, end)), state)
@@ -3631,7 +3804,7 @@ def _parse_onnx_sparse_tensor(
     seen_values = False
     seen_indices = False
     while handle.tell() < end:
-        field_number, wire_type = _read_onnx_key(handle, end, state)
+        field_number, wire_type = _read_onnx_message_key(handle, end, state, "onnx.SparseTensorProto")
         if field_number == 1 and wire_type == 2:
             if seen_values:
                 _raise_duplicate_onnx_singular_message("SparseTensorProto.values")
@@ -3672,7 +3845,7 @@ def _parse_onnx_attribute(
     state.record_retained_object()
     attribute = _OnnxLiteAttribute()
     while handle.tell() < end:
-        field_number, wire_type = _read_onnx_key(handle, end, state)
+        field_number, wire_type = _read_onnx_message_key(handle, end, state, "onnx.AttributeProto")
         if field_number == 1 and wire_type == 2:
             attribute.name = _read_onnx_string(handle, end, state, field_name="attribute_name")
         elif field_number == 21 and wire_type == 2:
@@ -3766,7 +3939,7 @@ def _parse_onnx_node(
         )
     node = _OnnxLiteNode()
     while handle.tell() < end:
-        field_number, wire_type = _read_onnx_key(handle, end, state)
+        field_number, wire_type = _read_onnx_message_key(handle, end, state, "onnx.NodeProto")
         if field_number == 1 and wire_type == 2:
             _append_onnx_string_value(
                 node.input,
@@ -3819,7 +3992,7 @@ def _parse_onnx_value_info(
     state.record_retained_object()
     value_info = _OnnxLiteValueInfo()
     while handle.tell() < end:
-        field_number, wire_type = _read_onnx_key(handle, end, state)
+        field_number, wire_type = _read_onnx_message_key(handle, end, state, "onnx.ValueInfoProto")
         if field_number == 1 and wire_type == 2:
             value_info.name = _read_onnx_string(handle, end, state, field_name="value_info_name")
         else:
@@ -3843,7 +4016,7 @@ def _parse_onnx_graph(
         )
     graph = _OnnxLiteGraph()
     while handle.tell() < end:
-        field_number, wire_type = _read_onnx_key(handle, end, state)
+        field_number, wire_type = _read_onnx_message_key(handle, end, state, "onnx.GraphProto")
         if field_number == 1 and wire_type == 2:
             _append_onnx_submessage_value(
                 graph.node,
@@ -3927,7 +4100,7 @@ def _parse_onnx_opset_import(
     state.record_retained_object()
     opset = _OnnxLiteOpsetImport()
     while handle.tell() < end:
-        field_number, wire_type = _read_onnx_key(handle, end, state)
+        field_number, wire_type = _read_onnx_message_key(handle, end, state, "onnx.OperatorSetIdProto")
         if field_number == 1 and wire_type == 2:
             opset.domain = _read_onnx_string(handle, end, state, field_name="opset_domain")
         elif field_number == 2 and wire_type == 0:
@@ -3947,7 +4120,7 @@ def _parse_onnx_function(
     state.record_retained_object()
     function = _OnnxLiteFunction()
     while handle.tell() < end:
-        field_number, wire_type = _read_onnx_key(handle, end, state)
+        field_number, wire_type = _read_onnx_message_key(handle, end, state, "onnx.FunctionProto")
         if field_number == 1 and wire_type == 2:
             function.name = _read_onnx_string(handle, end, state, field_name="function_name")
         elif field_number == 4 and wire_type == 2:
@@ -4042,7 +4215,7 @@ def _parse_onnx_training_info(
     seen_initialization = False
     seen_algorithm = False
     while handle.tell() < end:
-        field_number, wire_type = _read_onnx_key(handle, end, state)
+        field_number, wire_type = _read_onnx_message_key(handle, end, state, "onnx.TrainingInfoProto")
         if field_number == 1 and wire_type == 2:
             if seen_initialization:
                 _raise_duplicate_onnx_singular_message("TrainingInfoProto.initialization")
@@ -4090,7 +4263,7 @@ def _parse_onnx_model(
     state.record_retained_object()
     model = _OnnxLiteModel()
     while handle.tell() < end:
-        field_number, wire_type = _read_onnx_key(handle, end, state)
+        field_number, wire_type = _read_onnx_message_key(handle, end, state, "onnx.ModelProto")
         if field_number == 1 and wire_type == 0:
             model.ir_version = _decode_int64_varint(_read_onnx_varint(handle, end))
         elif field_number == 2 and wire_type == 2:
@@ -4381,13 +4554,38 @@ class OnnxScanner(BaseScanner):
         result.add_check(
             name="ONNX Structure Parse Coverage",
             passed=False,
-            message="ONNX structural parser skipped one or more oversized metadata fields",
+            message="ONNX structural parser skipped or encountered protobuf fields outside complete coverage",
             severity=IssueSeverity.INFO,
             location=path,
             rule_code="S902",
             details={
                 "scan_outcome_reason": ONNX_STRUCTURE_INCONCLUSIVE_REASON,
                 **state.metadata(),
+            },
+        )
+
+    def _mark_in_memory_unknown_fields(
+        self,
+        result: ScanResult,
+        path: str,
+        *,
+        unknown_field_bytes_discarded: int,
+    ) -> None:
+        _mark_inconclusive_scan_result(result, ONNX_STRUCTURE_INCONCLUSIVE_REASON)
+        result.add_check(
+            name="ONNX Structure Parse Coverage",
+            passed=False,
+            message="ONNX protobuf contains fields outside the installed schema; analysis incomplete",
+            severity=IssueSeverity.INFO,
+            location=path,
+            rule_code="S902",
+            details={
+                "scan_outcome_reason": ONNX_STRUCTURE_INCONCLUSIVE_REASON,
+                "parse_mode": "in_memory_model_proto",
+                "coverage_gaps": {"unknown_protobuf_fields": 1},
+                "unknown_field_count": 1,
+                "unknown_field_bytes_discarded": unknown_field_bytes_discarded,
+                "unknown_field_detection": "discard_unknown_fields_byte_size",
             },
         )
 
@@ -4541,6 +4739,20 @@ class OnnxScanner(BaseScanner):
             else:
                 model = onnx.load_model_from_string(model_data)
                 result.metadata["onnx_structure_parse"] = {"parse_mode": "in_memory_model_proto"}
+                unknown_field_bytes_discarded = _discard_onnx_unknown_field_bytes(model)
+                if unknown_field_bytes_discarded:
+                    result.metadata["onnx_structure_parse"] = {
+                        "parse_mode": "in_memory_model_proto",
+                        "coverage_gaps": {"unknown_protobuf_fields": 1},
+                        "unknown_field_count": 1,
+                        "unknown_field_bytes_discarded": unknown_field_bytes_discarded,
+                        "unknown_field_detection": "discard_unknown_fields_byte_size",
+                    }
+                    self._mark_in_memory_unknown_fields(
+                        result,
+                        path,
+                        unknown_field_bytes_discarded=unknown_field_bytes_discarded,
+                    )
             # Check for interrupts after loading completes.
             self.check_interrupted()
             result.bytes_scanned = file_size
@@ -4610,7 +4822,7 @@ class OnnxScanner(BaseScanner):
             result.finish(success=False)
             return result
 
-        has_graph = model.HasField("graph")
+        has_graph = _onnx_has_singular_field(model, "graph")
         if model.ir_version <= 0 or not has_graph:
             if self._is_tentative_protobuf_route() and not has_graph:
                 result.scanner_name = "unknown"
@@ -4642,7 +4854,7 @@ class OnnxScanner(BaseScanner):
                     message="ONNX schema checker is unavailable; analysis incomplete",
                     details={"checker_available": False},
                 )
-            elif file_backed_parse_state is not None:
+            elif model_data is None:
                 _mark_onnx_schema_incomplete(
                     result,
                     path,
@@ -4737,9 +4949,19 @@ class OnnxScanner(BaseScanner):
                     result.metadata["onnx_network_detector_input"] = {
                         "source": "structured_text_fields",
                         "field_count": network_detector_input.field_count,
+                        "metadata_field_count": network_detector_input.metadata_field_count,
                         "omitted_field_count": network_detector_input.omitted_field_count,
+                        "truncated": network_detector_input.truncated,
                         "max_bytes": _ONNX_NETWORK_TEXT_MAX_BYTES,
                         "max_fields": _ONNX_NETWORK_TEXT_MAX_FIELDS,
+                        "sections": [
+                            {
+                                "name": section.name,
+                                "field_count": section.field_count,
+                                "metadata_owned": section.metadata_owned,
+                            }
+                            for section in network_detector_input.sections
+                        ],
                     }
                     if network_detector_input.truncated:
                         self._mark_raw_detection_incomplete(
@@ -4758,11 +4980,98 @@ class OnnxScanner(BaseScanner):
                                 "max_fields": _ONNX_NETWORK_TEXT_MAX_FIELDS,
                             },
                         )
-                    network_findings = self.collect_network_communication_findings(
-                        network_detector_input.data,
-                        context=path,
-                        raise_on_error=True,
-                    )
+                    network_findings: list[dict[str, Any]] = []
+                    max_network_findings = _network_communication_max_findings(self.config)
+                    emitted_network_findings = 0
+                    for section_index, section in enumerate(network_detector_input.sections):
+                        detector_context = f"{path}/onnx_metadata/metadata" if section.metadata_owned else path
+                        if max_network_findings is not None:
+                            remaining_findings = max_network_findings - emitted_network_findings
+                            if remaining_findings <= 0:
+                                self._mark_raw_detection_incomplete(
+                                    result,
+                                    path,
+                                    detector="network_communication",
+                                    reason="detector_finding_limit",
+                                    message=(
+                                        "ONNX network detector findings reached the configured reporting limit; "
+                                        "analysis incomplete"
+                                    ),
+                                    details={
+                                        "max_findings": max_network_findings,
+                                        "skipped_section": section.name,
+                                        "skipped_section_metadata_owned": section.metadata_owned,
+                                    },
+                                )
+                                network_findings.append(
+                                    {
+                                        "type": "detector_finding_limit",
+                                        "detector": "network_communication",
+                                        "severity": "INFO",
+                                        "message": (
+                                            "Network communication findings exceeded the configured reporting limit"
+                                        ),
+                                        "max_findings": max_network_findings,
+                                        "truncated_finding_type": "onnx_detector_section",
+                                        "truncated_finding": {
+                                            "onnx_detector_input": section.name,
+                                            "onnx_metadata_owned": section.metadata_owned,
+                                        },
+                                        "analysis_incomplete": True,
+                                        "context": detector_context,
+                                        "onnx_detector_input": section.name,
+                                        "onnx_detector_context": detector_context,
+                                        "onnx_detector_field_count": section.field_count,
+                                        "onnx_metadata_owned": section.metadata_owned,
+                                    }
+                                )
+                                break
+                        else:
+                            remaining_findings = None
+                        section_findings = self.collect_network_communication_findings(
+                            section.data,
+                            context=detector_context,
+                            raise_on_error=True,
+                            max_findings=remaining_findings,
+                        )
+                        section_truncated = False
+                        for finding in section_findings:
+                            annotated_finding = dict(finding)
+                            if annotated_finding.get("type") == "detector_finding_limit":
+                                section_truncated = True
+                            else:
+                                emitted_network_findings += 1
+                            annotated_finding.update(
+                                {
+                                    "onnx_detector_input": section.name,
+                                    "onnx_detector_context": detector_context,
+                                    "onnx_detector_field_count": section.field_count,
+                                    "onnx_metadata_owned": section.metadata_owned,
+                                }
+                            )
+                            if section.metadata_owned:
+                                annotated_finding["context"] = f"{path}:metadata_props"
+                            network_findings.append(annotated_finding)
+                        if section_truncated:
+                            remaining_sections = network_detector_input.sections[section_index + 1 :]
+                            self._mark_raw_detection_incomplete(
+                                result,
+                                path,
+                                detector="network_communication",
+                                reason="detector_finding_limit",
+                                message=(
+                                    "ONNX network detector findings reached the configured reporting limit; "
+                                    "analysis incomplete"
+                                ),
+                                details={
+                                    "max_findings": max_network_findings,
+                                    "truncated_section": section.name,
+                                    "truncated_section_metadata_owned": section.metadata_owned,
+                                    "skipped_section_count": len(remaining_sections),
+                                    "skipped_sections": [item.name for item in remaining_sections[:10]],
+                                },
+                            )
+                            break
                 except Exception as e:
                     redacted_error = redact_untrusted_error_message(e)
                     logger.warning("ONNX network detector analysis failed: %s", redacted_error)
@@ -4775,11 +5084,12 @@ class OnnxScanner(BaseScanner):
                         details={"exception": redacted_error, "exception_type": type(e).__name__},
                     )
                 else:
-                    self.add_network_communication_findings(
-                        network_findings,
-                        result,
-                        context=path,
-                    )
+                    if network_findings or not network_detector_input.truncated:
+                        self.add_network_communication_findings(
+                            network_findings,
+                            result,
+                            context=path,
+                        )
 
         self._check_custom_ops(model, path, result)
         self._check_external_data(model, path, result)

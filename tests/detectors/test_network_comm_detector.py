@@ -8205,6 +8205,11 @@ class TestNetworkCommDetector:
         assert not [finding for finding in findings if finding["type"] == "suspicious_port"]
         assert "4444" not in json.dumps(findings, sort_keys=True)
 
+    def test_binary_model_under_metadata_directory_stays_on_binary_port_path(self) -> None:
+        findings = NetworkCommDetector().scan(b"raw weights port=6379", "/tmp/metadata/model.pt")
+
+        assert not [finding for finding in findings if finding["type"] == "suspicious_port"]
+
     @pytest.mark.parametrize("quote", ['"', "'"])
     def test_explicit_binary_url_findings_do_not_capture_adjacent_credentials(self, quote: str) -> None:
         """Binary-context URL matches must not retain compact adjacent arguments."""
