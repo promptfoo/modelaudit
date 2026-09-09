@@ -6471,8 +6471,9 @@ class TestWeightDistributionSemantics:
         assert coverage[0].status == CheckStatus.FAILED
 
     @pytest.mark.parametrize("gather_dimensions", [False, True])
+    @pytest.mark.parametrize("conditional_weights", [False, True])
     def test_dimensions_cast_to_weights_retain_incomplete_coverage(
-        self, tmp_path: Path, gather_dimensions: bool
+        self, tmp_path: Path, gather_dimensions: bool, conditional_weights: bool
     ) -> None:
         initializers = [onnx.numpy_helper.from_array(np.ones((2, 4), dtype=np.float32), name="source")]
         nodes = [helper.make_node("Shape", ["source"], ["dimensions"])]
@@ -6487,11 +6488,19 @@ class TestWeightDistributionSemantics:
                 helper.make_node("MatMul", ["X", "weights"], ["Y"]),
             ]
         )
+        inputs = [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 2])]
+        output_shape = [1]
+        if conditional_weights:
+            initializers.append(onnx.numpy_helper.from_array(np.zeros((4, 2), dtype=np.float32), name="X"))
+            inputs = [helper.make_tensor_value_info("condition", TensorProto.BOOL, [2])]
+            nodes.insert(-1, helper.make_node("Where", ["condition", "weights", "weights"], ["selected_weights"]))
+            nodes[-1].input[1] = "selected_weights"
+            output_shape = [4]
         graph = helper.make_graph(
             nodes,
             "dimension_weights",
-            [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 2])],
-            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1])],
+            inputs,
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, output_shape)],
             initializer=initializers,
         )
         model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
@@ -6509,6 +6518,106 @@ class TestWeightDistributionSemantics:
             sample["consumer_op"] == "MatMul" and sample["reason"] == "shape_dimensions_lineage"
             for sample in result.metadata["onnx_weight_distribution_semantics"]["unresolved_lineage_samples"]
         )
+
+    @pytest.mark.parametrize("use", ["gather_indices", "activation_scale", "weight_scale"])
+    @pytest.mark.parametrize("malicious", [False, True])
+    def test_shape_dimensions_follow_their_consumer_role(self, tmp_path: Path, use: str, malicious: bool) -> None:
+        weights = np.zeros((100, 10), dtype=np.float32)
+        if malicious:
+            weights[50:55, 3] = 10.0
+        inputs = [helper.make_tensor_value_info("Xs", TensorProto.FLOAT, [1, 100])]
+        initializers = [onnx.numpy_helper.from_array(weights, name="W1")]
+        nodes = [
+            helper.make_node("MatMul", ["Xs", "W1"], ["hidden"]),
+            helper.make_node("Shape", ["hidden"], ["dimensions"]),
+        ]
+        if use == "gather_indices":
+            inputs.append(helper.make_tensor_value_info("Xd", TensorProto.FLOAT, [16, 100]))
+            initializers.append(onnx.numpy_helper.from_array(np.zeros((100, 10), dtype=np.float32), name="W2"))
+            nodes.append(helper.make_node("Gather", ["Xd", "dimensions"], ["selected"], axis=0))
+            nodes.append(helper.make_node("MatMul", ["selected", "W2"], ["Y"]))
+            output_shape = [2, 10]
+        else:
+            nodes.append(helper.make_node("Cast", ["dimensions"], ["scale"], to=TensorProto.FLOAT))
+            if use == "activation_scale":
+                inputs.append(helper.make_tensor_value_info("Xd", TensorProto.FLOAT, [100, 2]))
+                initializers.append(onnx.numpy_helper.from_array(np.zeros((2, 10), dtype=np.float32), name="W2"))
+                nodes.append(helper.make_node("Mul", ["Xd", "scale"], ["selected"]))
+                nodes.append(helper.make_node("MatMul", ["selected", "W2"], ["Y"]))
+                output_shape = [100, 10]
+            else:
+                inputs.append(helper.make_tensor_value_info("Xd", TensorProto.FLOAT, [1, 2]))
+                initializers.append(onnx.numpy_helper.from_array(np.ones(2, dtype=np.float32), name="factor"))
+                nodes.append(helper.make_node("Mul", ["factor", "scale"], ["weights"]))
+                nodes.append(helper.make_node("MatMul", ["Xd", "weights"], ["Y"]))
+                output_shape = [1]
+        graph = helper.make_graph(
+            nodes,
+            "dimension_roles",
+            inputs,
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, output_shape)],
+            initializer=initializers,
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / "dimension-roles.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        assert result.success is (use != "weight_scale")
+        assert len(self._extreme_checks(result)) == int(malicious)
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        if use == "weight_scale":
+            assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
+            assert any(
+                sample["consumer_op"] == "MatMul" and sample["reason"] == "shape_dimensions_lineage"
+                for sample in result.metadata["onnx_weight_distribution_semantics"]["unresolved_lineage_samples"]
+            )
+        else:
+            assert not coverage
+
+    @pytest.mark.parametrize("op_type", ["LSTM", "GRU", "RNN"])
+    @pytest.mark.parametrize("malicious", [False, True])
+    def test_shape_derived_recurrent_initial_states_are_activations(
+        self, tmp_path: Path, op_type: str, malicious: bool
+    ) -> None:
+        path = create_recurrent_weight_model(
+            tmp_path, op_type=op_type, target_input_index=1, distributed_near_match=not malicious
+        )
+        model = onnx.load(str(path))
+        node = model.graph.node[0]
+        node.input.extend(["", "", "initial_state"])
+        if op_type == "LSTM":
+            node.input.append("initial_state")
+        node.output[0] = "states"
+        model.graph.initializer.extend(
+            [
+                onnx.numpy_helper.from_array(np.zeros((2, 1, 100), dtype=np.float32), name="shape_source"),
+                onnx.numpy_helper.from_array(np.array([0, 1, 2], dtype=np.int64), name="indices"),
+                onnx.numpy_helper.from_array(np.zeros((100, 10), dtype=np.float32), name="projection"),
+            ]
+        )
+        nodes = [
+            helper.make_node("Shape", ["shape_source"], ["dimensions"]),
+            helper.make_node("Gather", ["dimensions", "indices"], ["selected"], axis=0),
+            helper.make_node("ConstantOfShape", ["selected"], ["initial_state"]),
+            node,
+            helper.make_node("MatMul", ["states", "projection"], ["Y"]),
+        ]
+        del model.graph.node[:]
+        model.graph.node.extend(nodes)
+        del model.graph.output[:]
+        model.graph.output.append(helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 2, 1, 10]))
+        onnx.checker.check_model(model)
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        assert result.success is True
+        assert len(self._extreme_checks(result)) == int(malicious)
+        assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
 
     @pytest.mark.parametrize("malicious", [False, True])
     def test_standard_einsum_weights_are_oriented_and_analyzed(self, tmp_path: Path, malicious: bool) -> None:

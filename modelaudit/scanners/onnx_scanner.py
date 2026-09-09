@@ -1991,7 +1991,11 @@ def _build_onnx_weight_analysis_plan(
                 is_non_data_standard_input = (
                     is_registered_standard_operator
                     and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
-                    and ((node.op_type == "Clip" and input_index > 0) or (node.op_type == "Where" and input_index == 0))
+                    and (
+                        (node.op_type == "Clip" and input_index > 0)
+                        or (node.op_type == "Where" and input_index == 0)
+                        or (node.op_type == "Gather" and input_index == 1 and not is_model_local_function)
+                    )
                 )
                 if not is_array_feature_selector and not is_non_data_standard_input:
                     merge_lineages(
@@ -2037,6 +2041,13 @@ def _build_onnx_weight_analysis_plan(
                             resolved_index != input_index for resolved_index in resolved_weight_input_indexes
                         )
                         prior_layer_activation = lineage.unresolved_reason == "dynamic_activation_lineage"
+                        recurrent_initial_state = (
+                            is_registered_standard_operator
+                            and not is_model_local_function
+                            and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
+                            and node.op_type in _RECURRENT_WEIGHT_OPERATORS
+                            and (input_index == 5 or (node.op_type == "LSTM" and input_index == 6))
+                        )
                         recognized_activation_input = prior_layer_activation and (
                             (
                                 is_registered_standard_operator
@@ -2047,6 +2058,7 @@ def _build_onnx_weight_analysis_plan(
                                 and (opposite_resolved_weight or all_lineage_inputs_are_activation_contraction)
                             )
                         )
+                        recognized_activation_input |= recurrent_initial_state and opposite_resolved_weight
                         if recognized_activation_input:
                             if opposite_resolved_weight:
                                 activation_input_lineages.add(initializer_index)
@@ -2322,10 +2334,22 @@ def _build_onnx_weight_analysis_plan(
                 carries_dynamic_activation |= any(
                     lineage.unresolved_reason == "dynamic_activation_lineage" for lineage in all_input_lineages.values()
                 )
+                shape_scales_activation = (
+                    same_type_elementwise
+                    and not is_model_local_function
+                    and any(
+                        (input_name in dynamic_values and not value_lineages.get(input_name))
+                        or input_index in dynamic_activation_input_indexes
+                        for input_index, input_name in enumerate(node.input)
+                        if node.op_type != "Where" or input_index != 0
+                    )
+                )
                 for initializer_index, lineage in all_input_lineages.items():
                     if initializer_index in activation_input_lineages:
                         continue
                     unresolved_reason = lineage.unresolved_reason
+                    if unresolved_reason == "shape_dimensions_lineage" and shape_scales_activation:
+                        unresolved_reason = "dynamic_activation_lineage"
                     if unresolved_reason is None:
                         if carries_dynamic_activation:
                             unresolved_reason = "dynamic_activation_lineage"
