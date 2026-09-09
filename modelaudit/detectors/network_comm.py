@@ -17,7 +17,9 @@ from functools import lru_cache
 from importlib.resources import files
 from io import BytesIO
 from typing import Any, ClassVar
-from urllib.parse import unquote, unquote_plus, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, unquote, unquote_plus, urlsplit, urlunsplit
+
+from modelaudit.detectors._metadata import metadata_string_spans
 
 _REDACTED_PATH_TOKEN = "<redacted>"
 _URL_IN_TEXT_PATTERN = re.compile(
@@ -104,17 +106,11 @@ _TRAILING_PATH_DELIMITERS = ".,;:)]}'\""
 _TRAILING_URL_DELIMITER_PAIRS = {")": "(", "]": "[", "}": "{"}
 _TRAILING_URL_DELIMITERS = frozenset(set(_TRAILING_URL_DELIMITER_PAIRS) | set(_TRAILING_URL_DELIMITER_PAIRS.values()))
 _URL_TEXT_BOUNDARY_BYTES = b" \t\r\n\"'<>`()"
-_MAX_PICKLE_LITERAL_BOUNDARY_PROBE_BYTES = 8192
-_PICKLE_URL_ACTIVE_CONTEXT_PATTERN = re.compile(
-    rb"api|callback|curl|download|endpoint|fetch|from_pretrained|git\s+clone|httpx|request|torch\.hub|urlopen|"
-    rb"urlretrieve|urllib|webhook|wget",
+_METADATA_ACTIVE_CONTEXT_PATTERN = re.compile(
+    rb"\b(?:api|callback|curl|download|endpoint|eval|exec|fetch|from_pretrained|git\s+clone|httpx|http\.client|"
+    rb"os\.system|requests?|shell|socket|subprocess|torch\.hub|urlopen|urlretrieve|urllib|webhook|wget)\b",
     re.IGNORECASE,
 )
-_PASSIVE_PICKLE_METADATA_URL_KEYS = frozenset({"docs", "documentation", "license", "licence", "readme"})
-_PASSIVE_ONNX_METADATA_URL_KEYS = frozenset(
-    {"docs", "documentation", "license", "licence", "readme", "repository", "source", "url"}
-)
-_PASSIVE_ONNX_NUMBERED_URL_KEY_PATTERN = re.compile(r"url_\d+\Z", re.IGNORECASE)
 _PROVEN_BARE_QUERY_COMPONENTS = frozenset({"_debug", "debug"})
 _PROVEN_BARE_PROSE_COMPONENTS = frozenset({"section"})
 _PATH_TOKEN_BOUNDARY_PATTERN = re.compile(r"&amp;|[&,'\"?#\s]")
@@ -1046,152 +1042,17 @@ def _trim_unbalanced_trailing_url_delimiters(url: str) -> str:
     return url[:trim_end]
 
 
-def _pickle_literal_payload_bounds_at(data: bytes, opcode_index: int) -> tuple[int, int] | None:
-    opcode = data[opcode_index]
-    if opcode == ord("X") and opcode_index + 5 <= len(data):
-        payload_start = opcode_index + 5
-        payload_len = int.from_bytes(data[opcode_index + 1 : payload_start], "little")
-    elif opcode == 0x8C and opcode_index + 2 <= len(data):
-        payload_start = opcode_index + 2
-        payload_len = data[opcode_index + 1]
-    elif opcode == 0x8D and opcode_index + 9 <= len(data):
-        payload_start = opcode_index + 9
-        payload_len = int.from_bytes(data[opcode_index + 1 : payload_start], "little")
-    else:
-        return None
-    payload_end = payload_start + payload_len
-    if payload_end > len(data):
-        return None
-    return payload_start, payload_end
-
-
-def _pickle_literal_payload_start_ending_at(data: bytes, literal_end: int) -> int | None:
-    lower_bound = max(0, literal_end - _MAX_PICKLE_LITERAL_BOUNDARY_PROBE_BYTES)
-    for opcode_index in range(lower_bound, literal_end):
-        bounds = _pickle_literal_payload_bounds_at(data, opcode_index)
-        if bounds is not None and bounds[1] == literal_end:
-            return bounds[0]
-    return None
-
-
-def _pickle_literal_payload_bounds_containing(
-    data: bytes, payload_offset_start: int, payload_offset_end: int
-) -> tuple[int, int] | None:
-    if not 0 <= payload_offset_start <= payload_offset_end <= len(data):
-        return None
-    lower_bound = max(0, payload_offset_start - _MAX_PICKLE_LITERAL_BOUNDARY_PROBE_BYTES)
-    for opcode_index in range(lower_bound, payload_offset_start + 1):
-        bounds = _pickle_literal_payload_bounds_at(data, opcode_index)
-        if bounds is not None and bounds[0] <= payload_offset_start and payload_offset_end <= bounds[1]:
-            return bounds
-    return None
-
-
-def _pickle_literal_opcode_index_for_payload_bounds(data: bytes, payload_bounds: tuple[int, int]) -> int | None:
-    lower_bound = max(0, payload_bounds[0] - _MAX_PICKLE_LITERAL_BOUNDARY_PROBE_BYTES)
-    for opcode_index in range(lower_bound, payload_bounds[0] + 1):
-        bounds = _pickle_literal_payload_bounds_at(data, opcode_index)
-        if bounds == payload_bounds:
-            return opcode_index
-    return None
-
-
-def _skip_pickle_memo_after_literal(data: bytes, cursor: int) -> int:
-    while cursor:
-        if data[cursor - 1] == 0x94:
-            cursor -= 1
-        elif cursor >= 2 and data[cursor - 2] == ord("q"):
-            cursor -= 2
-        elif cursor >= 5 and data[cursor - 5] == ord("r"):
-            cursor -= 5
-        else:
-            break
-    return cursor
-
-
-def _pickle_literal_key_before_payload(data: bytes, payload_bounds: tuple[int, int]) -> str | None:
-    value_opcode_index = _pickle_literal_opcode_index_for_payload_bounds(data, payload_bounds)
-    if value_opcode_index is None:
-        return None
-
-    key_literal_end = _skip_pickle_memo_after_literal(data, value_opcode_index)
-    key_literal_start = _pickle_literal_payload_start_ending_at(data, key_literal_end)
-    if key_literal_start is None:
-        return None
-
-    try:
-        return data[key_literal_start:key_literal_end].decode("utf-8").strip().casefold()
-    except UnicodeDecodeError:
-        return None
-
-
-def _protobuf_varint_ending_at(data: bytes, end: int) -> tuple[int, int] | None:
-    if not 0 <= end <= len(data):
-        return None
-    for start in range(max(0, end - 10), end):
-        value = 0
-        shift = 0
-        for index in range(start, end):
-            byte = data[index]
-            value |= (byte & 0x7F) << shift
-            shift += 7
-            if byte < 0x80:
-                if index == end - 1:
-                    return start, value
-                break
-    return None
-
-
-def _protobuf_length_delimited_field_at(data: bytes, payload_start: int, tag: int) -> tuple[int, int, int] | None:
-    parsed_length = _protobuf_varint_ending_at(data, payload_start)
-    if parsed_length is None:
-        return None
-    length_start, payload_len = parsed_length
-    tag_index = length_start - 1
-    payload_end = payload_start + payload_len
-    if tag_index < 0 or data[tag_index] != tag or payload_end > len(data):
-        return None
-    return tag_index, payload_start, payload_end
-
-
-def _protobuf_length_delimited_field_ending_at(data: bytes, payload_end: int, tag: int) -> bytes | None:
-    min_payload_start = max(0, payload_end - 128)
-    for payload_start in range(min_payload_start, payload_end + 1):
-        parsed_length = _protobuf_varint_ending_at(data, payload_start)
-        if parsed_length is None:
-            continue
-        length_start, payload_len = parsed_length
-        tag_index = length_start - 1
-        if tag_index >= 0 and data[tag_index] == tag and payload_start + payload_len == payload_end:
-            return data[payload_start:payload_end]
-    return None
-
-
-def _trim_pickle_memo_suffix_from_url(data: bytes, match: re.Match[bytes], url: str) -> str:
-    if not url:
-        return url
-    url_end = match.start() + len(url.encode("utf-8"))
-    if url_end != match.end():
-        return url
-    if data[url_end - 1] != ord("q") or url_end >= len(data):
-        return url
-    literal_end = url_end - 1
-    payload_start = _pickle_literal_payload_start_ending_at(data, literal_end)
-    if payload_start is None or not payload_start <= match.start() < literal_end:
-        return url
-    return url[:-1]
-
-
-def _trim_matched_source_url(data: bytes, match: re.Match[bytes]) -> str:
+def _trim_matched_source_url(data: bytes, match: re.Match[bytes], literal_end: int | None = None) -> str:
     prefix = data[max(0, match.start() - _MAX_PROSE_LINE_CONTEXT_BYTES) : match.start()]
     suffix = data[match.end() : match.end() + _MAX_PROSE_LINE_CONTEXT_BYTES]
     url = _trim_source_literal_url(
-        match.group().decode("utf-8", errors="ignore"),
+        data[match.start() : min(match.end(), literal_end if literal_end is not None else match.end())].decode(
+            "utf-8", errors="ignore"
+        ),
         _source_quote_before_url(data, match.start()),
         re.split(rb"[^\t\r\n\x20-\x7e]", suffix, maxsplit=1)[0].decode("ascii"),
         re.split(rb"[^\t\x20-\x7e]", prefix)[-1].decode("ascii"),
     )
-    url = _trim_pickle_memo_suffix_from_url(data, match, url)
     return _trim_unbalanced_trailing_url_delimiters(url)
 
 
@@ -5153,6 +5014,10 @@ class NetworkCommDetector:
         self._cloud_nested_url_findings: set[str] = set()
         self._official_readme_image_fences: list[tuple[int, int, bool]] = []
         self._official_readme_image_unvalidated_requests = False
+        self._literal_bounds: list[tuple[int, int]] = []
+        self._literal_starts: list[int] = []
+        self._metadata_bounds: list[tuple[int, int]] = []
+        self._metadata_starts: list[int] = []
 
         # Clone class-level patterns to avoid cross-instance leakage
         self.cc_patterns: list[bytes] = self.CC_PATTERNS.copy()
@@ -5185,6 +5050,14 @@ class NetworkCommDetector:
         self._evidence_redaction_limit_reached = False
         self._has_sensitive_evidence_hint = _SENSITIVE_EVIDENCE_HINT_PATTERN.search(data) is not None
         self._cloud_nested_url_findings = set()
+        self._literal_bounds, metadata_bounds = metadata_string_spans(data) if b"://" in data else ([], [])
+        self._literal_starts = [start for start, _end in self._literal_bounds]
+        self._metadata_bounds = [
+            (start, end)
+            for start, end in metadata_bounds
+            if _METADATA_ACTIVE_CONTEXT_PATTERN.search(_URL_IN_BYTES_PATTERN.sub(b"", data[start:end])) is None
+        ]
+        self._metadata_starts = [start for start, _end in self._metadata_bounds]
         (
             self._official_readme_image_fences,
             self._official_readme_image_unvalidated_requests,
@@ -5282,20 +5155,25 @@ class NetworkCommDetector:
         self.findings.append(finding)
         return True
 
+    def _trim_url(self, data: bytes, match: re.Match[bytes]) -> str:
+        index = bisect_right(self._literal_starts, match.start()) - 1
+        literal_end = None
+        if index >= 0 and match.start() < self._literal_bounds[index][1]:
+            literal_end = self._literal_bounds[index][1]
+        return _trim_matched_source_url(data, match, literal_end)
+
     def _index_url_contexts(self, data: bytes) -> list[tuple[int, int, str]]:
         return list(self._iter_url_contexts(data))
 
-    @staticmethod
-    def _iter_url_contexts(data: bytes) -> Iterator[tuple[int, int, str]]:
+    def _iter_url_contexts(self, data: bytes) -> Iterator[tuple[int, int, str]]:
         for match in _URL_IN_BYTES_PATTERN.finditer(data):
-            url = _trim_matched_source_url(data, match)
+            url = self._trim_url(data, match)
             yield match.start(), match.start() + len(url.encode("utf-8")), url
 
-    @classmethod
-    def _iter_generic_url_contexts(cls, data: bytes) -> Iterator[tuple[int, int, str]]:
+    def _iter_generic_url_contexts(self, data: bytes) -> Iterator[tuple[int, int, str]]:
         """Yield only schemes handled by generic URL findings."""
-        for match in cls.URL_PATTERN.finditer(data):
-            url = _trim_matched_source_url(data, match)
+        for match in self.URL_PATTERN.finditer(data):
+            url = self._trim_url(data, match)
             yield match.start(), match.start() + len(url.encode("utf-8")), url
 
     def _url_context_redaction_decision(self, data: bytes, match_start: int, value: str) -> bool | None:
@@ -5493,7 +5371,7 @@ class NetworkCommDetector:
                 url,
                 url_start,
                 context,
-                passive_metadata_reference=self._is_passive_metadata_url_reference(data, url_start, url),
+                passive_metadata_reference=self._is_passive_metadata_url_reference(url_start, url),
             ):
                 return
             if self.max_findings is None:
@@ -5519,11 +5397,13 @@ class NetworkCommDetector:
         elif self._url_uses_suspicious_port(url):
             confidence = 0.8
             severity = "HIGH"
-        elif "://" in url and not url.startswith(("http://", "https://")):
-            confidence = 0.7
-        elif self._is_cloud_storage_url(url) or passive_metadata_reference:
+        elif passive_metadata_reference:
             severity = "INFO"
             confidence = 0.3
+        elif "://" in url and not url.startswith(("http://", "https://")):
+            confidence = 0.7
+        elif self._is_cloud_storage_url(url):
+            severity = "INFO"
 
         return self._record_finding(
             {
@@ -5545,6 +5425,7 @@ class NetworkCommDetector:
     def _informational_url_reference_kind(self, url: str) -> str | None:
         try:
             parsed = urlsplit(url)
+            port = parsed.port
         except ValueError:
             return None
         if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
@@ -5552,27 +5433,56 @@ class NetworkCommDetector:
         if self._url_uses_suspicious_port(url):
             return None
 
-        decoded_url = unquote_plus(url).casefold()
-        if parsed.query or any(term in decoded_url for term in self.INFORMATIONAL_URL_RISK_TERMS):
+        if parsed.username is not None or parsed.password is not None or port not in {None, 80, 443}:
             return None
+        decoded_url = url
+        for _ in range(3):
+            decoded_url = unquote_plus(decoded_url)
+        decoded_url = decoded_url.casefold()
+        if re.search(r"%[0-9a-f]{2}", decoded_url) or any(
+            term in decoded_url for term in self.INFORMATIONAL_URL_RISK_TERMS
+        ):
+            return None
+        try:
+            query = parse_qsl(parsed.query, keep_blank_values=True, strict_parsing=True)
+        except ValueError:
+            return None
+        for key, value in query:
+            if (
+                key.casefold() not in {"lang", "language", "locale", "hl"}
+                or re.fullmatch(r"[a-z]{2,8}(?:-[a-z0-9]{2,8})?", value.casefold()) is None
+            ):
+                return None
 
         hostname = parsed.hostname.casefold().rstrip(".")
+        decoded_path = parsed.path
+        for _ in range(3):
+            decoded_path = unquote(decoded_path)
         path_segments = [
-            unquote(segment).casefold().strip(_TRAILING_PATH_DELIMITERS)
-            for segment in parsed.path.split("/")
-            if segment
+            segment.casefold().strip(_TRAILING_PATH_DELIMITERS) for segment in decoded_path.split("/") if segment
         ]
-        if any(_looks_like_known_artifact_filename(segment) for segment in path_segments):
+        if any(segment in {".", ".."} for segment in decoded_path.split("/")):
             return None
+        for segment in path_segments:
+            extension = segment.rsplit(".", 1)[-1]
+            if extension not in {"md", "rst", "txt", "html", "htm"} and (
+                _looks_like_known_artifact_filename(segment)
+                or extension in {"py", "sh", "bash", "ps1", "exe", "dll", "so", "js"}
+            ):
+                return None
         if self._is_public_source_repository_url(hostname, path_segments):
             return "source_repository"
         if self._is_public_model_repository_url(hostname, path_segments):
             return "model_repository"
-        if any(segment in self.INFORMATIONAL_URL_PATH_SEGMENTS for segment in path_segments):
+        if any(
+            segment in self.INFORMATIONAL_URL_PATH_SEGMENTS
+            or segment.rsplit(".", 1)[0] in self.INFORMATIONAL_URL_PATH_SEGMENTS
+            for segment in path_segments
+        ):
             if hostname in _PUBLIC_MODEL_REPOSITORY_HOSTS:
                 return "model_documentation"
             return "documentation"
-        if hostname.startswith(self.INFORMATIONAL_URL_HOST_PREFIXES) and parsed.path in {"", "/"}:
+        if hostname.startswith(self.INFORMATIONAL_URL_HOST_PREFIXES):
             return "documentation"
         return None
 
@@ -5598,51 +5508,11 @@ class NetworkCommDetector:
             return True
         return remaining[0] == "tree" and len(remaining) >= 2
 
-    @staticmethod
-    def _is_passive_pickle_metadata_key(key: str | None) -> bool:
-        return key in _PASSIVE_PICKLE_METADATA_URL_KEYS
-
-    @staticmethod
-    def _is_passive_onnx_metadata_key(key: str) -> bool:
-        return (
-            key in _PASSIVE_ONNX_METADATA_URL_KEYS or _PASSIVE_ONNX_NUMBERED_URL_KEY_PATTERN.fullmatch(key) is not None
-        )
-
-    def _is_passive_onnx_metadata_url_reference(self, data: bytes, url_start: int, url: str) -> bool:
-        value_field = _protobuf_length_delimited_field_at(data, url_start, tag=0x12)
-        if value_field is None:
+    def _is_passive_metadata_url_reference(self, url_start: int, url: str) -> bool:
+        index = bisect_right(self._metadata_starts, url_start) - 1
+        if index < 0 or url_start + len(url.encode("utf-8")) > self._metadata_bounds[index][1]:
             return False
-
-        value_tag_index, value_start, value_end = value_field
-        try:
-            value = data[value_start:value_end].decode("utf-8")
-        except UnicodeDecodeError:
-            return False
-        if not value.startswith(("http://", "https://")) or not url.startswith(value):
-            return False
-
-        kind = self._informational_url_reference_kind(value)
-        if kind not in {"documentation", "model_documentation", "model_repository", "source_repository"}:
-            return False
-
-        key_bytes = _protobuf_length_delimited_field_ending_at(data, value_tag_index, tag=0x0A)
-        if key_bytes is None:
-            return False
-        try:
-            key = key_bytes.decode("utf-8").strip().casefold()
-        except UnicodeDecodeError:
-            return False
-        return self._is_passive_onnx_metadata_key(key)
-
-    def _is_passive_metadata_url_reference(self, data: bytes, url_start: int, url: str) -> bool:
-        url_end = url_start + len(url.encode("utf-8"))
-        bounds = _pickle_literal_payload_bounds_containing(data, url_start, url_end)
-        if bounds is not None:
-            return (
-                self._is_passive_pickle_metadata_key(_pickle_literal_key_before_payload(data, bounds))
-                and _PICKLE_URL_ACTIVE_CONTEXT_PATTERN.search(data[bounds[0] : bounds[1]]) is None
-            )
-        return self._is_passive_onnx_metadata_url_reference(data, url_start, url)
+        return self._informational_url_reference_kind(url) is not None
 
     def _scan_cloud_storage_urls(self, data: bytes, context: str) -> None:
         """Scan for cloud storage URL patterns (S3, GCS, Azure, etc.).
@@ -5792,60 +5662,46 @@ class NetworkCommDetector:
         if context and any(ext in context.lower() for ext in [".bin", ".pt", ".pth", ".ckpt", ".h5", ".pb", ".onnx"]):
             # For ML model files, only look for very explicit domain references
             # that are unlikely to occur randomly
-            for match in self.URL_PATTERN.finditer(data):
-                url = _trim_matched_source_url(data, match)
-                with suppress(ValueError):
-                    parsed = urlsplit(url)
-                    domain = (parsed.hostname or "").casefold().rstrip(".")
-                    if domain and domain not in seen_domains:
-                        if self._is_redacted_url_value(data, match.start(), domain):
-                            continue
-                        seen_domains.add(domain)
-                        severity = (
-                            "INFO"
-                            if self._is_passive_metadata_url_reference(data, match.start(), url)
-                            or self._is_informational_domain(domain)
-                            else "MEDIUM"
-                        )
-                        confidence = 0.3 if severity == "INFO" else 0.8
-                        if not self._record_finding(
-                            {
-                                "type": "domain",
-                                "severity": severity,
-                                "confidence": confidence,
-                                "message": f"Domain name detected: {domain}",
-                                "domain": domain,
-                                "position": match.start(),
-                                "context": context,
-                            }
-                        ):
-                            return
+            model_domains: dict[str, dict[str, Any]] = {}
 
+            def record_domain(domain: str, position: int, passive: bool = False) -> bool:
+                if not domain or self._is_redacted_url_value(data, position, domain):
+                    return True
+                severity = "INFO" if passive or self._is_informational_domain(domain) else "MEDIUM"
+                previous = model_domains.get(domain)
+                if previous is not None and (previous["severity"] == "MEDIUM" or severity == "INFO"):
+                    return True
+                finding = {
+                    "type": "domain",
+                    "severity": severity,
+                    "confidence": 0.3 if severity == "INFO" else 0.8,
+                    "message": f"Domain name detected: {domain}",
+                    "domain": domain,
+                    "position": position,
+                    "context": context,
+                }
+                if previous is not None:
+                    previous.update(finding)
+                    return True
+                model_domains[domain] = finding
+                return self._record_finding(finding)
+
+            for match in self.URL_PATTERN.finditer(data):
+                url = self._trim_url(data, match)
+                with suppress(ValueError):
+                    domain = (urlsplit(url).hostname or "").casefold().rstrip(".")
+                    if not record_domain(
+                        domain, match.start(), self._is_passive_metadata_url_reference(match.start(), url)
+                    ):
+                        return
             config_domain_pattern = re.compile(
-                rb"""["'](?:api|webhook|callback|endpoint)["']:\s*["'](?P<domain>[a-zA-Z0-9\-.]+\.[a-zA-Z]{2,})""",
+                rb"[\"'](?:api|webhook|callback|endpoint)[\"']:\s*[\"'](?P<domain>[a-zA-Z0-9\-.]+\.[a-zA-Z]{2,})",
                 re.IGNORECASE,
             )
             for match in config_domain_pattern.finditer(data):
                 domain = match.group("domain").decode("utf-8", errors="ignore").casefold()
-
-                if domain not in seen_domains:
-                    if self._is_redacted_url_value(data, match.start("domain"), domain):
-                        continue
-                    seen_domains.add(domain)
-                    severity = "INFO" if self._is_informational_domain(domain) else "MEDIUM"
-                    confidence = 0.3 if severity == "INFO" else 0.8
-                    if not self._record_finding(
-                        {
-                            "type": "domain",
-                            "severity": severity,
-                            "confidence": confidence,
-                            "message": f"Domain name detected: {domain}",
-                            "domain": domain,
-                            "position": match.start("domain"),
-                            "context": context,
-                        }
-                    ):
-                        return
+                if not record_domain(domain, match.start("domain")):
+                    return
             return
 
         for match in self.DOMAIN_PATTERN.finditer(data):
@@ -6199,13 +6055,11 @@ class NetworkCommDetector:
                 if printable_ratio <= 0.7:
                     continue
                 raw_matched_text = (
-                    _trim_matched_source_url(data, match)
+                    self._trim_url(data, match)
                     if pattern_type == "url"
                     else match.group().decode("utf-8", errors="ignore")
                 )
-                if pattern_type == "url" and self._is_passive_metadata_url_reference(
-                    data, match.start(), raw_matched_text
-                ):
+                if pattern_type == "url" and self._is_passive_metadata_url_reference(match.start(), raw_matched_text):
                     continue
                 matched_text = _redact_network_evidence(raw_matched_text)
                 if not self._record_finding(

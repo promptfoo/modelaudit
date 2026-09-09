@@ -16,6 +16,22 @@ from modelaudit.detectors import network_comm
 from modelaudit.detectors.network_comm import NetworkCommDetector, detect_network_communication
 
 
+def _onnx_model_with_metadata(entries: dict[str, str]) -> bytes:
+    onnx = pytest.importorskip("onnx")
+    helper = onnx.helper
+    tensor = helper.make_tensor_value_info("X", onnx.TensorProto.FLOAT, [1])
+    output = helper.make_tensor_value_info("Y", onnx.TensorProto.FLOAT, [1])
+    graph = helper.make_graph([helper.make_node("Identity", ["X"], ["Y"])], "metadata_control", [tensor], [output])
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    helper.set_model_props(
+        model,
+        {"description": "A small identity model used to check metadata reference handling. " * 3, **entries},
+    )
+    onnx.checker.check_model(model)
+    return bytes(model.SerializeToString())
+
+
 def _is_ci_environment() -> bool:
     """Check CI/GitHub Actions env vars to determine whether tests run in CI."""
     return bool(os.getenv("CI") or os.getenv("GITHUB_ACTIONS"))
@@ -2856,12 +2872,7 @@ class TestNetworkCommDetector:
     def test_explicit_ml_model_url_patterns_treat_passive_onnx_source_repo_as_informational(self) -> None:
         detector = NetworkCommDetector()
         url = "https://github.com/RicherMans/CED"
-        data = (
-            b"\n\nmodel_type\x12\x03CED"
-            b"\n\x07version\x12\x031.0"
-            b"\n\x0cmodel_author\x12\nRicherMans"
-            b"\n\x03url\x12" + bytes([len(url)]) + url.encode()
-        )
+        data = _onnx_model_with_metadata({"source": url})
 
         findings = detector.scan(data, "model.onnx")
 
@@ -2888,16 +2899,7 @@ class TestNetworkCommDetector:
             "https://huggingface.co/csukuangfj/pyannote-models/tree/main/segmentation-3.0",
             "https://huggingface.co/pyannote/segmentation-3.0/blob/main/LICENSE",
         ]
-        metadata_pairs = b"".join(
-            b"\n" + bytes([len(key)]) + key.encode() + b"\x12" + bytes([len(url)]) + url.encode()
-            for key, url in zip(("url_1", "url_2", "license"), urls, strict=True)
-        )
-        data = (
-            b"\n\nmodel_type\x12\x1apyannote-segmentation-3.0"
-            b"\n\x07version\x12\x011"
-            b"\n\x0cmodel_author\x12\x08pyannoter"
-            b"\n\nmaintainer\x12\x06k2-fsa" + metadata_pairs
-        )
+        data = _onnx_model_with_metadata(dict(zip(("url_1", "url_2", "license"), urls, strict=True)))
 
         findings = detector.scan(data, "model.onnx")
 
@@ -2989,6 +2991,180 @@ class TestNetworkCommDetector:
             if finding["type"] == "explicit_network_pattern" and finding["matched_text"] == url
         )
         assert explicit_finding["severity"] == "CRITICAL"
+
+    @pytest.mark.parametrize("protocol", range(6))
+    @pytest.mark.parametrize("memo_entries", [0, 32, 300])
+    def test_pickle_metadata_uses_literal_boundaries(self, protocol: int, memo_entries: int) -> None:
+        url = "https://docs.example.invalid/guide?lang=en"
+        padding = {f"key_{index}": f"value_{index}" for index in range(memo_entries)}
+        data = pickle.dumps({**padding, "docs": url}, protocol=protocol)
+
+        findings = NetworkCommDetector().scan(data, "checkpoint.pt")
+
+        assert any(
+            f["type"] == "url_detected" and f["url"] == url.partition("?")[0] and f["severity"] == "INFO"
+            for f in findings
+        )
+        assert not any(f["type"] == "explicit_network_pattern" for f in findings)
+
+    @pytest.mark.parametrize("protocol", range(6))
+    def test_pickle_metadata_resolves_reused_keys_and_long_values(self, protocol: int) -> None:
+        first = "https://api.example.invalid/license"
+        second = "https://capital.example.invalid/license"
+        data = pickle.dumps(
+            [{"license": first}, {"license": "License terms " * 1000 + f"({second})", "download_count": 1}],
+            protocol=protocol,
+        )
+
+        findings = NetworkCommDetector().scan(data, "checkpoint.pt")
+
+        urls = {f["url"]: f["severity"] for f in findings if f["type"] == "url_detected"}
+        assert urls == {first: "INFO", second: "INFO"}
+        assert not any(f["type"] == "explicit_network_pattern" for f in findings)
+
+    @pytest.mark.parametrize("container", [list, tuple])
+    @pytest.mark.parametrize("protocol", range(6))
+    def test_pickle_sequence_strings_do_not_prove_metadata(self, container: Any, protocol: int) -> None:
+        data = pickle.dumps(
+            container(["license", "https://example.invalid/license", "Ordinary descriptive text. " * 8]),
+            protocol=protocol,
+        )
+
+        findings = NetworkCommDetector().scan(data, "checkpoint.pt")
+
+        assert any(f["type"] == "explicit_network_pattern" and f["severity"] == "CRITICAL" for f in findings)
+
+    @pytest.mark.parametrize("protocol", range(6))
+    @pytest.mark.parametrize("keys", [("license", "callback"), ("callback", "license")])
+    def test_pickle_metadata_preserves_reused_endpoint(self, protocol: int, keys: tuple[str, str]) -> None:
+        url = "https://example.invalid/license"
+        data = pickle.dumps(dict.fromkeys(keys, url), protocol=protocol)
+
+        findings = NetworkCommDetector().scan(data, "checkpoint.pt")
+
+        assert any(f["type"] == "explicit_network_pattern" and f["severity"] == "CRITICAL" for f in findings)
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://example.invalid/weights.bin",
+            "https://example.invalid/license?target=weights.bin",
+            "https://example.invalid:4444/license",
+            "https://example.invalid:invalid/license",
+            "https://example.invalid/docs/weights%252ebin",
+            "https://example.invalid/docs/%23weights.bin",
+            "https://example.invalid/docs/../callback",
+            "https://docs.example.invalid/model.py",
+        ],
+    )
+    @pytest.mark.parametrize("model_format", ["pickle", "onnx"])
+    def test_metadata_preserves_active_or_uncertain_destinations(self, url: str, model_format: str) -> None:
+        data = (
+            pickle.dumps({"license": url}, protocol=2)
+            if model_format == "pickle"
+            else _onnx_model_with_metadata({"license": url})
+        )
+
+        findings = NetworkCommDetector().scan(data, "checkpoint.pt" if model_format == "pickle" else "model.onnx")
+
+        assert any(f["type"] == "explicit_network_pattern" and f["severity"] == "CRITICAL" for f in findings)
+
+    @pytest.mark.parametrize(
+        "url",
+        ["https://github.com/example/project/blob/main/README.md", "https://example.invalid/licenses/LICENSE.txt"],
+    )
+    def test_onnx_metadata_accepts_documentation_files_with_prefix_text(self, url: str) -> None:
+        data = _onnx_model_with_metadata({"license": f"License information ({url})"})
+
+        findings = NetworkCommDetector().scan(data, "model.onnx")
+
+        assert any(f["type"] == "url_detected" and f["url"] == url and f["severity"] == "INFO" for f in findings)
+        assert not any(f["type"] == "explicit_network_pattern" for f in findings)
+
+    def test_onnx_tensor_strings_do_not_prove_metadata(self) -> None:
+        onnx = pytest.importorskip("onnx")
+        url = b"https://github.com/example/project"
+        entry = b"\x0a\x06source\x12" + bytes([len(url)]) + url
+        tensor = onnx.helper.make_tensor(
+            "text", onnx.TensorProto.STRING, [1], [b"Ordinary descriptive text. " * 8 + entry]
+        )
+        graph = onnx.helper.make_graph(
+            [onnx.helper.make_node("Constant", [], ["Y"], value=tensor)],
+            "tensor_control",
+            [],
+            [onnx.helper.make_tensor_value_info("Y", onnx.TensorProto.STRING, [1])],
+        )
+        model = onnx.helper.make_model(graph, opset_imports=[onnx.helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        assert not model.metadata_props
+
+        for data in (entry, model.SerializeToString()):
+            findings = NetworkCommDetector().scan(data, "model.onnx")
+            assert any(f["type"] == "explicit_network_pattern" and f["severity"] == "CRITICAL" for f in findings)
+
+    @pytest.mark.parametrize("passive_first", [False, True])
+    def test_metadata_domain_deduplication_retains_active_severity(self, passive_first: bool) -> None:
+        entries = [("license", "https://example.invalid/license"), ("callback", "https://example.invalid/endpoint")]
+        if not passive_first:
+            entries.reverse()
+        data = pickle.dumps(dict(entries), protocol=2)
+
+        findings = NetworkCommDetector().scan(data, "checkpoint.pt")
+
+        domains = [f for f in findings if f["type"] == "domain" and f["domain"] == "example.invalid"]
+        assert len(domains) == 1
+        assert domains[0]["severity"] == "MEDIUM"
+
+    def test_metadata_domain_does_not_hide_config_endpoint(self) -> None:
+        data = pickle.dumps({"license": "https://example.invalid/license", "note": '"callback":"example.invalid"'})
+
+        findings = NetworkCommDetector().scan(data, "checkpoint.pt")
+
+        assert any(
+            f["type"] == "domain" and f["domain"] == "example.invalid" and f["severity"] == "MEDIUM" for f in findings
+        )
+
+    @pytest.mark.parametrize("command", ["curl", "wget", "httpx.get", "subprocess.run"])
+    @pytest.mark.parametrize("model_format", ["pickle", "onnx"])
+    def test_commands_in_metadata_remain_actionable(self, command: str, model_format: str) -> None:
+        value = f"{command} https://example.invalid/license"
+        data = (
+            pickle.dumps({"license": value}, protocol=2)
+            if model_format == "pickle"
+            else _onnx_model_with_metadata({"license": value})
+        )
+
+        findings = NetworkCommDetector().scan(data, "checkpoint.pt" if model_format == "pickle" else "model.onnx")
+
+        assert any(f["type"] == "explicit_network_pattern" and f["severity"] == "CRITICAL" for f in findings)
+
+    def test_pickle_object_state_is_not_passive_metadata(self) -> None:
+        from types import SimpleNamespace
+
+        data = pickle.dumps(SimpleNamespace(license="https://example.invalid/license"), protocol=2)
+
+        findings = NetworkCommDetector().scan(data, "checkpoint.pt")
+
+        assert any(f["type"] == "explicit_network_pattern" and f["severity"] == "CRITICAL" for f in findings)
+
+    @pytest.mark.parametrize("limit", ["_MAX_PICKLE_OPS", "_MAX_PICKLE_BYTES", "_MAX_METADATA_VALUE_BYTES"])
+    def test_metadata_budget_exhaustion_preserves_detection(self, monkeypatch: pytest.MonkeyPatch, limit: str) -> None:
+        from modelaudit.detectors import _metadata
+
+        monkeypatch.setattr(_metadata, limit, 1)
+        data = pickle.dumps({"license": "https://example.invalid/license"}, protocol=2)
+
+        findings = NetworkCommDetector().scan(data, "checkpoint.pt")
+
+        assert any(f["type"] == "explicit_network_pattern" and f["severity"] == "CRITICAL" for f in findings)
+
+    def test_incomplete_pickle_metadata_preserves_detection(self) -> None:
+        data = pickle.dumps({"license": "https://example.invalid/license"}, protocol=2)[:-1]
+
+        findings = NetworkCommDetector().scan(data, "checkpoint.pt")
+
+        assert any(f["type"] == "explicit_network_pattern" and f["severity"] == "CRITICAL" for f in findings)
 
     def test_cc_pattern_snippet_url_expansion_is_bounded(self) -> None:
         """Long whitespace-free binary regions should not force unbounded URL scans."""

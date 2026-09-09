@@ -17,7 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
-- Downgrade passive pickle metadata documentation and license URLs without weakening active network destination findings.
+- Treat documentation, license, and repository links in verified pickle and ONNX metadata as informational while preserving active and unknown network destinations.
 - Preserve incomplete-scan diagnostics for malformed or unsupported ZIP data in GGUF/GGML files, including cached scans.
 - Report incomplete coverage when a GGUF/GGML source changes during scanning.
 - Preserve caller-owned Hugging Face cache sidecars during streaming cleanup.
