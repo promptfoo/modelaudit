@@ -2330,6 +2330,26 @@ def test_onnx_scanner_tentative_protobuf_parse_failure_is_inconclusive(tmp_path:
     assert any(issue.severity == IssueSeverity.INFO for issue in result.issues)
 
 
+def test_onnx_scanner_tentative_missing_graph_with_unknown_field_is_rejected_cleanly(tmp_path: Path) -> None:
+    model_path = tmp_path / "ambiguous.bin"
+    model_path.write_bytes(_proto_varint(1, 8) + _proto_varint(27, 1))
+    scanner = OnnxScanner(
+        {
+            FORMAT_VALIDATION_CONFIG_KEY: {"routed_format": PROTOBUF_MODEL_CANDIDATE_FORMAT},
+            "check_jit_script": False,
+            "check_network_comm": False,
+        }
+    )
+
+    result = scanner.scan(str(model_path))
+
+    assert result.scanner_name == "unknown"
+    assert result.success is True
+    assert result.metadata["tentative_protobuf_candidate_rejected"] is True
+    assert result.metadata["onnx_structure_parse"] == {"parse_mode": "in_memory_model_proto"}
+    assert not [check for check in result.checks if check.name == "ONNX Structure Parse Coverage"]
+
+
 def test_onnx_scanner_tentative_invalid_version_still_detects_python_operator(tmp_path: Path) -> None:
     model_path = create_python_onnx_model(tmp_path)
     model = onnx.load(str(model_path))

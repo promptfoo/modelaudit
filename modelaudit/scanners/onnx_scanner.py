@@ -4726,6 +4726,7 @@ class OnnxScanner(BaseScanner):
             # Check for interrupts before starting the potentially long-running load.
             self.check_interrupted()
             file_backed_parse_state: _OnnxStructureParseState | None = None
+            in_memory_unknown_field_bytes_discarded = 0
             model: Any
             if model_data is None:
                 model, file_backed_parse_state = _load_onnx_structure_file_backed(
@@ -4735,24 +4736,10 @@ class OnnxScanner(BaseScanner):
                     expected_stat=source_stat,
                 )
                 result.metadata["onnx_structure_parse"] = file_backed_parse_state.metadata()
-                self._mark_structure_parse_coverage_gaps(result, path, state=file_backed_parse_state)
             else:
                 model = onnx.load_model_from_string(model_data)
                 result.metadata["onnx_structure_parse"] = {"parse_mode": "in_memory_model_proto"}
-                unknown_field_bytes_discarded = _discard_onnx_unknown_field_bytes(model)
-                if unknown_field_bytes_discarded:
-                    result.metadata["onnx_structure_parse"] = {
-                        "parse_mode": "in_memory_model_proto",
-                        "coverage_gaps": {"unknown_protobuf_fields": 1},
-                        "unknown_field_count": 1,
-                        "unknown_field_bytes_discarded": unknown_field_bytes_discarded,
-                        "unknown_field_detection": "discard_unknown_fields_byte_size",
-                    }
-                    self._mark_in_memory_unknown_fields(
-                        result,
-                        path,
-                        unknown_field_bytes_discarded=unknown_field_bytes_discarded,
-                    )
+                in_memory_unknown_field_bytes_discarded = _discard_onnx_unknown_field_bytes(model)
             # Check for interrupts after loading completes.
             self.check_interrupted()
             result.bytes_scanned = file_size
@@ -4829,6 +4816,21 @@ class OnnxScanner(BaseScanner):
                 result.metadata["tentative_protobuf_candidate_rejected"] = True
                 result.finish(success=True)
                 return result
+            if file_backed_parse_state is not None:
+                self._mark_structure_parse_coverage_gaps(result, path, state=file_backed_parse_state)
+            elif in_memory_unknown_field_bytes_discarded:
+                result.metadata["onnx_structure_parse"] = {
+                    "parse_mode": "in_memory_model_proto",
+                    "coverage_gaps": {"unknown_protobuf_fields": 1},
+                    "unknown_field_count": 1,
+                    "unknown_field_bytes_discarded": in_memory_unknown_field_bytes_discarded,
+                    "unknown_field_detection": "discard_unknown_fields_byte_size",
+                }
+                self._mark_in_memory_unknown_fields(
+                    result,
+                    path,
+                    unknown_field_bytes_discarded=in_memory_unknown_field_bytes_discarded,
+                )
             _mark_inconclusive_scan_result(result, ONNX_STRUCTURE_INCONCLUSIVE_REASON)
             result.add_check(
                 name="ONNX Structure Validation",
@@ -4842,6 +4844,21 @@ class OnnxScanner(BaseScanner):
                     "ir_version": model.ir_version,
                     "has_graph": has_graph,
                 },
+            )
+        elif file_backed_parse_state is not None:
+            self._mark_structure_parse_coverage_gaps(result, path, state=file_backed_parse_state)
+        elif in_memory_unknown_field_bytes_discarded:
+            result.metadata["onnx_structure_parse"] = {
+                "parse_mode": "in_memory_model_proto",
+                "coverage_gaps": {"unknown_protobuf_fields": 1},
+                "unknown_field_count": 1,
+                "unknown_field_bytes_discarded": in_memory_unknown_field_bytes_discarded,
+                "unknown_field_detection": "discard_unknown_fields_byte_size",
+            }
+            self._mark_in_memory_unknown_fields(
+                result,
+                path,
+                unknown_field_bytes_discarded=in_memory_unknown_field_bytes_discarded,
             )
 
         if model.ir_version > 0 and has_graph:
