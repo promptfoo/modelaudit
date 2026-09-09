@@ -1913,6 +1913,12 @@ def _build_onnx_weight_analysis_plan(
             if name and name not in value_lineages and name not in constants:
                 dynamic_values.add(name)
 
+        runtime_graph_inputs = (
+            {_onnx_value_name(graph_input) for graph_input in current_graph.input} & dynamic_values
+            if root_graph
+            else set()
+        )
+
         for local_node_index, node in enumerate(getattr(current_graph, "node", ())):
             current_node_index = node_counter
             node_counter += 1
@@ -1994,7 +2000,13 @@ def _build_onnx_weight_analysis_plan(
                     and (
                         (node.op_type == "Clip" and input_index > 0)
                         or (node.op_type == "Where" and input_index == 0)
-                        or (node.op_type == "Gather" and input_index == 1 and not is_model_local_function)
+                        or (
+                            not is_model_local_function
+                            and (
+                                (node.op_type in {"Gather", "GatherElements", "GatherND"} and input_index == 1)
+                                or (node.op_type in _RECURRENT_WEIGHT_OPERATORS and input_index == 4)
+                            )
+                        )
                     )
                 )
                 if not is_array_feature_selector and not is_non_data_standard_input:
@@ -2334,14 +2346,14 @@ def _build_onnx_weight_analysis_plan(
                 carries_dynamic_activation |= any(
                     lineage.unresolved_reason == "dynamic_activation_lineage" for lineage in all_input_lineages.values()
                 )
+                # Intermediate dynamic values may contain only shape-derived constants.
                 shape_scales_activation = (
                     same_type_elementwise
                     and not is_model_local_function
+                    and node.op_type != "Where"
                     and any(
-                        (input_name in dynamic_values and not value_lineages.get(input_name))
-                        or input_index in dynamic_activation_input_indexes
-                        for input_index, input_name in enumerate(node.input)
-                        if node.op_type != "Where" or input_index != 0
+                        input_name in runtime_graph_inputs and not value_lineages.get(input_name)
+                        for input_name in node.input
                     )
                 )
                 for initializer_index, lineage in all_input_lineages.items():
