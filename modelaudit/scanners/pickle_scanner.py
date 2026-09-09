@@ -63,10 +63,12 @@ _JOBLIB_NUMPY_ARRAY_WRAPPER_SPAN_PROOF_MAX_BYTES = 10 * 1024 * 1024
 _PYTORCH_CONTAINER_EXTENSIONS = frozenset({".bin", ".pt", ".pth", ".ckpt", ".pkl"})
 _BASE64_TOKEN_RE = re.compile(rb"(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{10,}={0,2}(?![A-Za-z0-9+/=])")
 _HEX_TOKEN_RE = re.compile(rb"(?<![A-Fa-f0-9])[A-Fa-f0-9]{20,}(?![A-Fa-f0-9])")
+_ENCODED_TEXT_PREFIX_RE = re.compile(rb"(?i)\b(encoded|base64|hex)\s{0,32}[:=]\s{0,128}$")
 _IPV4_DOT_DIGIT_RE = re.compile(rb"\d\.\d")
 _LOCATION_POSITION_RE = re.compile(r"\(pos (?P<position>\d+)\)\s*$")
 _MAX_RAW_ENCODED_BYTES = 1024 * 1024
 _MAX_RAW_ENCODED_TOKEN_WITHOUT_SEED_BYTES = 4096
+_ENCODED_TEXT_PREFIX_CONTEXT_BYTES = 256
 _CALL_TOKEN_SEPARATOR_SCAN_LIMIT_BYTES = 4096
 _MAX_RAW_CODE_LITERAL_VALIDATION_CHARS = 8192
 _MAX_PICKLE_LITERAL_URL_CONTEXT_CHARS = 16 * 1024
@@ -80,6 +82,37 @@ _PYTORCH_LEGACY_STREAM_COUNT = 5
 _PYTORCH_LEGACY_MAGIC_BINARY = _PYTORCH_LEGACY_MAGIC_NUMBER.to_bytes(10, "little")
 _PYTORCH_LEGACY_MAGIC_DECIMAL = str(_PYTORCH_LEGACY_MAGIC_NUMBER).encode("ascii")
 _PYTORCH_LEGACY_PREAMBLE_PROBE_BYTES = 128
+
+
+def _encoded_token_decoded_size(encoding: str, token: bytes) -> int | None:
+    if encoding == "hex":
+        return len(token) // 2 if len(token) % 2 == 0 else None
+
+    stripped = token.rstrip(b"=")
+    if b"=" in stripped:
+        return None
+    explicit_padding = len(token) - len(stripped)
+    stripped_remainder = len(stripped) % 4
+    if stripped_remainder == 1:
+        return None
+
+    if explicit_padding:
+        if len(token) % 4 != 0 or explicit_padding != 4 - stripped_remainder:
+            return None
+        padding = explicit_padding
+    else:
+        padding = (4 - stripped_remainder) % 4
+    return ((len(stripped) + padding) // 4 * 3) - padding
+
+
+def _encoded_text_prefix_encoding(data: bytes, match: re.Match[bytes]) -> str | None:
+    context_start = max(0, match.start() - _ENCODED_TEXT_PREFIX_CONTEXT_BYTES)
+    prefix_match = _ENCODED_TEXT_PREFIX_RE.search(data[context_start : match.start()])
+    if prefix_match is None:
+        return None
+    return prefix_match.group(1).decode("ascii").lower()
+
+
 _PYTORCH_LEGACY_INITIAL_LAYOUT_PROBE_BYTES = 512
 _PYTORCH_LEGACY_SYS_INFO_KEYS = frozenset({"protocol_version", "little_endian", "type_sizes"})
 _PYTORCH_LEGACY_MAX_CONTROL_BYTES = 10 * 1024 * 1024
@@ -4670,25 +4703,36 @@ class PickleScanner(BaseScanner):
         limit_type: str,
         decoded_tokens_analyzed: int,
         decoded_budget: int,
+        *,
+        skipped_decoded_bytes_accounted: int = 0,
+        skipped_tokens_accounted: int = 0,
     ) -> None:
         reason = "pickle_encoded_text_scan_limit_exceeded"
         mark_inconclusive_scan_result(result, reason)
         result.metadata[reason] = True
+        details: dict[str, Any] = {
+            "encoding": encoding,
+            "limit_type": limit_type,
+            "tokens_analyzed": decoded_tokens_analyzed,
+            "decoded_bytes_analyzed": _MAX_RAW_ENCODED_BYTES - decoded_budget,
+            "max_decoded_bytes": _MAX_RAW_ENCODED_BYTES,
+            "analysis_incomplete": True,
+            "scan_outcome_reason": reason,
+        }
+        if skipped_tokens_accounted:
+            details.update(
+                {
+                    "skipped_tokens_accounted": skipped_tokens_accounted,
+                    "skipped_decoded_bytes_accounted": skipped_decoded_bytes_accounted,
+                }
+            )
         result.add_check(
             name="Pickle Encoded Text Coverage",
             passed=False,
             message=f"{encoding} encoded-text analysis exceeded its bounded {limit_type} limit",
             severity=IssueSeverity.INFO,
             location=source,
-            details={
-                "encoding": encoding,
-                "limit_type": limit_type,
-                "tokens_analyzed": decoded_tokens_analyzed,
-                "decoded_bytes_analyzed": _MAX_RAW_ENCODED_BYTES - decoded_budget,
-                "max_decoded_bytes": _MAX_RAW_ENCODED_BYTES,
-                "analysis_incomplete": True,
-                "scan_outcome_reason": reason,
-            },
+            details=details,
             rule_code="S902",
         )
         result.finish(success=False)
@@ -4703,21 +4747,74 @@ class PickleScanner(BaseScanner):
     ) -> None:
         for encoding, token_pattern in (("base64", _BASE64_TOKEN_RE), ("hex", _HEX_TOKEN_RE)):
             seen_tokens: set[bytes] = set()
+            analyzed_tokens: set[bytes] = set()
+            seen_prefixed_tokens: set[bytes] = set()
             decoded_budget = _MAX_RAW_ENCODED_BYTES
+            skipped_decoded_budget = _MAX_RAW_ENCODED_BYTES
             decoded_token_count = 0
+            skipped_token_count = 0
+            skipped_limit_reported = False
             for match in token_pattern.finditer(data):
                 token = match.group(0)
-                if encoding == "base64" and len(token) % 2 == 0 and _HEX_TOKEN_RE.fullmatch(token) is not None:
+                prefix_encoding = _encoded_text_prefix_encoding(data, match)
+                if (
+                    encoding == "base64"
+                    and prefix_encoding != "base64"
+                    and len(token) % 2 == 0
+                    and _HEX_TOKEN_RE.fullmatch(token) is not None
+                ):
                     continue
-                if token in seen_tokens:
-                    continue
-                seen_tokens.add(token)
+                if prefix_encoding is None:
+                    if token in seen_tokens:
+                        continue
+                    seen_tokens.add(token)
+                else:
+                    if token in seen_prefixed_tokens:
+                        continue
+                    if token in analyzed_tokens:
+                        continue
+                    seen_prefixed_tokens.add(token)
+                    seen_tokens.add(token)
                 has_seed = (
                     any(seed in token for seed in _BASE64_CODE_EXECUTION_SEEDS)
                     if encoding == "base64"
                     else _hex_token_has_execution_seed(token)
                 )
                 if len(token) > _MAX_RAW_ENCODED_TOKEN_WITHOUT_SEED_BYTES and not has_seed:
+                    if prefix_encoding is None:
+                        continue
+                    decoded_size = _encoded_token_decoded_size(encoding, token)
+                    if decoded_size is not None:
+                        if decoded_size > skipped_decoded_budget:
+                            if not skipped_limit_reported:
+                                self._mark_encoded_text_scan_limit(
+                                    result,
+                                    source,
+                                    encoding,
+                                    "decoded_byte",
+                                    decoded_token_count,
+                                    decoded_budget,
+                                    skipped_tokens_accounted=skipped_token_count + 1,
+                                    skipped_decoded_bytes_accounted=(
+                                        _MAX_RAW_ENCODED_BYTES - skipped_decoded_budget + decoded_size
+                                    ),
+                                )
+                                skipped_limit_reported = True
+                            continue
+                        skipped_token_count += 1
+                        skipped_decoded_budget -= decoded_size
+                        if skipped_decoded_budget == 0 and not skipped_limit_reported:
+                            self._mark_encoded_text_scan_limit(
+                                result,
+                                source,
+                                encoding,
+                                "decoded_byte",
+                                decoded_token_count,
+                                decoded_budget,
+                                skipped_tokens_accounted=skipped_token_count,
+                                skipped_decoded_bytes_accounted=(_MAX_RAW_ENCODED_BYTES - skipped_decoded_budget),
+                            )
+                            skipped_limit_reported = True
                     continue
 
                 try:
@@ -4739,6 +4836,7 @@ class PickleScanner(BaseScanner):
                     break
                 decoded_token_count += 1
                 decoded_budget -= len(decoded)
+                analyzed_tokens.add(token)
                 decoded_scan_data = _inert_literal_url_stripped_scan_view(decoded) if allow_url_filtering else decoded
                 decoded_lower = decoded_scan_data.lower()
                 for pattern, label in _ENCODED_CODE_EXECUTION_PATTERNS:
