@@ -482,7 +482,7 @@ class _OnnxNetworkTextCollector:
     def check_interrupted(self) -> None:
         self._check_interrupted()
 
-    def visit_message(self) -> bool:
+    def visit_field(self) -> bool:
         self.check_interrupted()
         if self._visited_field_count >= self._max_fields:
             self.omit()
@@ -490,18 +490,17 @@ class _OnnxNetworkTextCollector:
         self._visited_field_count += 1
         return True
 
-    def add(self, label: str, value: Any) -> None:
+    def visit_message(self) -> bool:
+        return self.visit_field()
+
+    def add(self, label: str, value: Any, *, field_visited: bool = False) -> None:
         self.check_interrupted()
         if value is None:
             return
         if isinstance(value, (str, bytes)) and not value:
             return
-        if self._visited_field_count >= self._max_fields:
-            self._truncated = True
-            self._truncation_reason = self._truncation_reason or "text_field_budget_exceeded"
-            self._omitted_field_count += 1
+        if not field_visited and not self.visit_field():
             return
-        self._visited_field_count += 1
         label_bytes = label.encode("utf-8", errors="surrogatepass")
         entry_overhead = len(label_bytes) + len(b": \n")
         remaining_bytes = self._max_bytes - self._byte_count - entry_overhead
@@ -793,7 +792,9 @@ def _collect_onnx_proto_text_fields(
                         return
                     _collect_onnx_proto_text_fields(collector, item, item_label, depth=depth + 1)
                 elif proto_field.type in {proto_field.TYPE_BYTES, proto_field.TYPE_STRING}:
-                    collector.add(item_label, item)
+                    if not collector.visit_field():
+                        return
+                    collector.add(item_label, item, field_visited=True)
                 if collector.is_truncated():
                     return
             continue

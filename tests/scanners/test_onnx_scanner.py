@@ -8306,6 +8306,87 @@ class TestRawDetectorCoverage:
         assert detector_input.omitted_field_count == 1
         assert detector_input.field_count == 0
 
+    def test_structured_network_extraction_bounds_empty_repeated_scalar_fields(self) -> None:
+        iterations: list[int] = []
+
+        class RepeatedStringField:
+            LABEL_REPEATED = 3
+            TYPE_MESSAGE = 11
+            TYPE_BYTES = 12
+            TYPE_STRING = 9
+            name = "input"
+            label = LABEL_REPEATED
+            type = TYPE_STRING
+
+        class Descriptor:
+            fields: ClassVar[tuple[Any, ...]] = (RepeatedStringField(),)
+
+        class RepeatedValues:
+            def __iter__(self) -> Any:
+                for index in range(100):
+                    iterations.append(index)
+                    yield ""
+
+        class Message:
+            DESCRIPTOR = Descriptor()
+            input = RepeatedValues()
+
+        collector = onnx_scanner_module._OnnxNetworkTextCollector(
+            max_bytes=1024,
+            max_fields=3,
+            check_interrupted=lambda: None,
+        )
+
+        onnx_scanner_module._collect_onnx_proto_text_fields(collector, Message(), "model.graph.node[0]")
+
+        detector_input = collector.finish()
+        assert len(iterations) == 4
+        assert detector_input.truncated is True
+        assert detector_input.omitted_field_count == 1
+        assert detector_input.field_count == 0
+
+    def test_structured_network_extraction_counts_repeated_scalar_values_once(self) -> None:
+        iterations: list[int] = []
+
+        class RepeatedStringField:
+            LABEL_REPEATED = 3
+            TYPE_MESSAGE = 11
+            TYPE_BYTES = 12
+            TYPE_STRING = 9
+            name = "input"
+            label = LABEL_REPEATED
+            type = TYPE_STRING
+
+        class Descriptor:
+            fields: ClassVar[tuple[Any, ...]] = (RepeatedStringField(),)
+
+        class RepeatedValues:
+            def __iter__(self) -> Any:
+                for index, value in enumerate(("alpha", "beta", "gamma")):
+                    iterations.append(index)
+                    yield value
+
+        class Message:
+            DESCRIPTOR = Descriptor()
+            input = RepeatedValues()
+
+        collector = onnx_scanner_module._OnnxNetworkTextCollector(
+            max_bytes=1024,
+            max_fields=2,
+            check_interrupted=lambda: None,
+        )
+
+        onnx_scanner_module._collect_onnx_proto_text_fields(collector, Message(), "model.graph.node[0]")
+
+        detector_input = collector.finish()
+        assert len(iterations) == 3
+        assert detector_input.truncated is True
+        assert detector_input.omitted_field_count == 1
+        assert detector_input.field_count == 2
+        assert b"alpha" in detector_input.data
+        assert b"beta" in detector_input.data
+        assert b"gamma" not in detector_input.data
+
     def test_hasfield_value_error_falls_back_to_attribute_traversal(self) -> None:
         graph = object()
         tensor = object()
