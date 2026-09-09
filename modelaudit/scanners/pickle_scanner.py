@@ -68,6 +68,7 @@ _IPV4_DOT_DIGIT_RE = re.compile(rb"\d\.\d")
 _LOCATION_POSITION_RE = re.compile(r"\(pos (?P<position>\d+)\)\s*$")
 _MAX_RAW_ENCODED_BYTES = 1024 * 1024
 _MAX_RAW_ENCODED_TOKEN_WITHOUT_SEED_BYTES = 4096
+_MAX_RAW_ENCODED_POST_LIMIT_BYTES = _MAX_RAW_ENCODED_BYTES
 _ENCODED_TEXT_PREFIX_CONTEXT_BYTES = 256
 _CALL_TOKEN_SEPARATOR_SCAN_LIMIT_BYTES = 4096
 _MAX_RAW_CODE_LITERAL_VALIDATION_CHARS = 8192
@@ -4750,7 +4751,9 @@ class PickleScanner(BaseScanner):
             analyzed_tokens: set[bytes] = set()
             seen_prefixed_tokens: set[bytes] = set()
             decoded_budget = _MAX_RAW_ENCODED_BYTES
-            skipped_decoded_budget = _MAX_RAW_ENCODED_BYTES
+            accounted_decoded_budget = _MAX_RAW_ENCODED_BYTES
+            skipped_decoded_bytes_accounted = 0
+            post_limit_decoded_budget = _MAX_RAW_ENCODED_POST_LIMIT_BYTES
             decoded_token_count = 0
             skipped_token_count = 0
             skipped_limit_reported = False
@@ -4780,30 +4783,33 @@ class PickleScanner(BaseScanner):
                     if encoding == "base64"
                     else _hex_token_has_execution_seed(token)
                 )
+                decoded_size = _encoded_token_decoded_size(encoding, token)
                 if len(token) > _MAX_RAW_ENCODED_TOKEN_WITHOUT_SEED_BYTES and not has_seed:
-                    if prefix_encoding is None:
+                    if prefix_encoding is None or decoded_size is None:
                         continue
-                    decoded_size = _encoded_token_decoded_size(encoding, token)
-                    if decoded_size is not None:
-                        if decoded_size > skipped_decoded_budget:
-                            if not skipped_limit_reported:
-                                self._mark_encoded_text_scan_limit(
-                                    result,
-                                    source,
-                                    encoding,
-                                    "decoded_byte",
-                                    decoded_token_count,
-                                    decoded_budget,
-                                    skipped_tokens_accounted=skipped_token_count + 1,
-                                    skipped_decoded_bytes_accounted=(
-                                        _MAX_RAW_ENCODED_BYTES - skipped_decoded_budget + decoded_size
-                                    ),
-                                )
-                                skipped_limit_reported = True
+                    if skipped_limit_reported:
+                        continue
+                    attempted_skipped_decoded_bytes = skipped_decoded_bytes_accounted + decoded_size
+                    if decoded_size > accounted_decoded_budget:
+                        if not skipped_limit_reported:
+                            self._mark_encoded_text_scan_limit(
+                                result,
+                                source,
+                                encoding,
+                                "decoded_byte",
+                                decoded_token_count,
+                                decoded_budget,
+                                skipped_tokens_accounted=skipped_token_count + 1,
+                                skipped_decoded_bytes_accounted=attempted_skipped_decoded_bytes,
+                            )
+                            skipped_limit_reported = True
+                        if decoded_size > post_limit_decoded_budget:
                             continue
+                    else:
                         skipped_token_count += 1
-                        skipped_decoded_budget -= decoded_size
-                        if skipped_decoded_budget == 0 and not skipped_limit_reported:
+                        skipped_decoded_bytes_accounted = attempted_skipped_decoded_bytes
+                        accounted_decoded_budget -= decoded_size
+                        if accounted_decoded_budget == 0 and not skipped_limit_reported:
                             self._mark_encoded_text_scan_limit(
                                 result,
                                 source,
@@ -4812,10 +4818,28 @@ class PickleScanner(BaseScanner):
                                 decoded_token_count,
                                 decoded_budget,
                                 skipped_tokens_accounted=skipped_token_count,
-                                skipped_decoded_bytes_accounted=(_MAX_RAW_ENCODED_BYTES - skipped_decoded_budget),
+                                skipped_decoded_bytes_accounted=skipped_decoded_bytes_accounted,
                             )
                             skipped_limit_reported = True
-                    continue
+                        continue
+
+                if skipped_limit_reported:
+                    if decoded_size is None or decoded_size > post_limit_decoded_budget:
+                        continue
+                elif decoded_size is not None and decoded_size > accounted_decoded_budget:
+                    self._mark_encoded_text_scan_limit(
+                        result,
+                        source,
+                        encoding,
+                        "decoded_byte",
+                        decoded_token_count,
+                        decoded_budget,
+                        skipped_tokens_accounted=skipped_token_count,
+                        skipped_decoded_bytes_accounted=skipped_decoded_bytes_accounted,
+                    )
+                    skipped_limit_reported = True
+                    if decoded_size > post_limit_decoded_budget:
+                        continue
 
                 try:
                     if encoding == "base64":
@@ -4829,13 +4853,12 @@ class PickleScanner(BaseScanner):
                     continue
                 if not decoded:
                     continue
-                if len(decoded) > decoded_budget:
-                    self._mark_encoded_text_scan_limit(
-                        result, source, encoding, "decoded_byte", decoded_token_count, decoded_budget
-                    )
-                    break
-                decoded_token_count += 1
-                decoded_budget -= len(decoded)
+                if skipped_limit_reported:
+                    post_limit_decoded_budget -= len(decoded)
+                else:
+                    decoded_token_count += 1
+                    decoded_budget -= len(decoded)
+                    accounted_decoded_budget -= len(decoded)
                 analyzed_tokens.add(token)
                 decoded_scan_data = _inert_literal_url_stripped_scan_view(decoded) if allow_url_filtering else decoded
                 decoded_lower = decoded_scan_data.lower()
