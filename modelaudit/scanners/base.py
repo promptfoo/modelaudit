@@ -1065,6 +1065,7 @@ class BaseScanner(ABC):
         enable_check: bool = True,
         raise_on_error: bool = False,
         max_findings: int | None = None,
+        onnx_metadata_context: bool = False,
         result: ScanResult | None = None,
     ) -> list[dict]:
         """Collect network communication findings without creating checks.
@@ -1074,6 +1075,7 @@ class BaseScanner(ABC):
             context: Context string for reporting
             enable_check: Whether to perform the check (allows disabling)
             raise_on_error: Whether detector failures should propagate to the caller
+            onnx_metadata_context: Whether the bytes come from validated ONNX metadata
 
         Returns:
             List of findings
@@ -1090,7 +1092,10 @@ class BaseScanner(ABC):
                     raise TypeError("network_comm_config must be a mapping")
                 detector_config = {**(detector_config or {}), "max_findings": max_findings}
             detector = NetworkCommDetector(detector_config)
-            findings = detector.scan(data, context)
+            if onnx_metadata_context:
+                findings = detector.scan(data, context, onnx_metadata_context=True)
+            else:
+                findings = detector.scan(data, context)
             return [dict(finding) for finding in findings]
 
         except ImportError:

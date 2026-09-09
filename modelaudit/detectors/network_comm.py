@@ -1822,11 +1822,6 @@ def _is_metadata_context(context: str) -> bool:
     return any(segment in _DOC_CONTEXT_SEGMENTS for segment in context_segments[:-1])
 
 
-def _is_extracted_onnx_metadata_context(context: str) -> bool:
-    context_segments = [segment for segment in context.lower().replace("\\", "/").split("/") if segment]
-    return len(context_segments) >= 2 and context_segments[-2:] == ["onnx_metadata", "metadata"]
-
-
 def _iter_pattern_matches(data: bytes, pattern: bytes) -> Iterator[int]:
     """Yield non-overlapping match positions for a byte pattern."""
     start = 0
@@ -1862,6 +1857,7 @@ def _is_doc_only_network_reference(
     context: str,
     requires_call: bool,
     requires_explicit_prefix: bool = False,
+    onnx_metadata_context: bool = False,
 ) -> bool:
     """Return whether a raw network token appears in prose instead of executable code."""
     if requires_call and _has_call_syntax(data, match_index, token_len):
@@ -1885,7 +1881,7 @@ def _is_doc_only_network_reference(
     line_lower = line.lower()
     stripped = line_lower.lstrip()
     word_count = len(_WORD_PATTERN.findall(line))
-    metadata_context = _is_metadata_context(context)
+    metadata_context = onnx_metadata_context or _is_metadata_context(context)
     match_offset = match_index - source_line_start
     line_without_match = line[:match_offset] + b" " + line[match_offset + token_len :]
     prefix_before_match = line[:match_offset].strip()
@@ -4952,6 +4948,7 @@ class NetworkCommDetector:
         self._cloud_nested_url_findings: set[str] = set()
         self._official_readme_image_fences: list[tuple[int, int, bool]] = []
         self._official_readme_image_unvalidated_requests = False
+        self._onnx_metadata_context = False
 
         # Clone class-level patterns to avoid cross-instance leakage
         self.cc_patterns: list[bytes] = self.CC_PATTERNS.copy()
@@ -4966,7 +4963,13 @@ class NetworkCommDetector:
         if "custom_blacklist" in self.config:
             self.blacklisted_domains.extend(_to_lower_bytes(d) for d in self.config["custom_blacklist"])
 
-    def scan(self, data: bytes, context: str = "") -> list[dict[str, Any]]:
+    def scan(
+        self,
+        data: bytes,
+        context: str = "",
+        *,
+        onnx_metadata_context: bool = False,
+    ) -> list[dict[str, Any]]:
         """Scan data for network communication patterns.
 
         Args:
@@ -4984,6 +4987,7 @@ class NetworkCommDetector:
         self._evidence_redaction_limit_reached = False
         self._has_sensitive_evidence_hint = _SENSITIVE_EVIDENCE_HINT_PATTERN.search(data) is not None
         self._cloud_nested_url_findings = set()
+        self._onnx_metadata_context = onnx_metadata_context
         (
             self._official_readme_image_fences,
             self._official_readme_image_unvalidated_requests,
@@ -5477,7 +5481,7 @@ class NetworkCommDetector:
         # Binary weights can randomly match domain patterns
         if context and (
             any(ext in context.lower() for ext in [".bin", ".pt", ".pth", ".ckpt", ".h5", ".pb", ".onnx"])
-            or _is_extracted_onnx_metadata_context(context)
+            or self._onnx_metadata_context
         ):
             # For ML model files, only look for very explicit domain references
             # that are unlikely to occur randomly
@@ -5650,6 +5654,7 @@ class NetworkCommDetector:
                         token_len=len(pattern),
                         context=context,
                         requires_call=not pattern.startswith((b"import ", b"from ")),
+                        onnx_metadata_context=self._onnx_metadata_context,
                     ) or (
                         lib == b"requests"
                         and not self._official_readme_image_unvalidated_requests
@@ -5699,6 +5704,7 @@ class NetworkCommDetector:
                     token_len=len(func),
                     context=context,
                     requires_call=True,
+                    onnx_metadata_context=self._onnx_metadata_context,
                 ) or (
                     func == b"requests.get"
                     and _is_official_readme_sample_image_request(
@@ -5787,7 +5793,7 @@ class NetworkCommDetector:
 
         # For ML models, we need to be much more conservative to avoid false positives
         # Binary model weights can contain random byte sequences that match port patterns
-        if is_ml_model and not _is_extracted_onnx_metadata_context(context):
+        if is_ml_model and not self._onnx_metadata_context:
             # Only scan for very explicit network patterns in ML models
             # Skip port scanning for pure binary model files to avoid false positives
             self._scan_explicit_network_patterns_in_ml_models(data, context)
@@ -5848,6 +5854,7 @@ class NetworkCommDetector:
                     token_len=len(match.group()),
                     context=context,
                     requires_call=False,
+                    onnx_metadata_context=self._onnx_metadata_context,
                 ):
                     continue
 

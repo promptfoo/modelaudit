@@ -1885,6 +1885,11 @@ class TestNetworkCommDetector:
         suspicious = [f for f in domain_findings if f["confidence"] > 0.6]
         assert len(suspicious) >= 2  # .tk and .ml are suspicious
 
+    def test_metadata_shaped_path_does_not_mark_onnx_metadata(self) -> None:
+        findings = NetworkCommDetector().scan(b"callback host evil.com", "/tmp/onnx_metadata/metadata")
+
+        assert any(finding.get("type") == "domain_name" and finding.get("domain") == "evil.com" for finding in findings)
+
     @pytest.mark.parametrize(
         "command",
         [
@@ -8032,6 +8037,14 @@ class TestNetworkCommDetector:
         data = b"Model documentation includes import socket for demos and troubleshooting examples."
 
         findings = detector.scan(data, "README.txt")
+
+        assert not [finding for finding in findings if finding["type"] == "network_library"]
+
+    def test_onnx_metadata_context_preserves_short_prose_classification(self) -> None:
+        detector = NetworkCommDetector()
+        data = b"Documentation includes import socket for examples."
+
+        findings = detector.scan(data, "model.onnx", onnx_metadata_context=True)
 
         assert not [finding for finding in findings if finding["type"] == "network_library"]
 

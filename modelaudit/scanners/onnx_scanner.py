@@ -5151,7 +5151,7 @@ class OnnxScanner(BaseScanner):
                     max_network_findings = _network_communication_max_findings(self.config)
                     emitted_network_findings = 0
                     for section_index, section in enumerate(network_detector_input.sections):
-                        detector_context = f"{path}/onnx_metadata/metadata" if section.metadata_owned else path
+                        detector_context = path
                         limit_already_reached = (
                             max_network_findings is not None and emitted_network_findings >= max_network_findings
                         )
@@ -5165,6 +5165,7 @@ class OnnxScanner(BaseScanner):
                             context=detector_context,
                             raise_on_error=True,
                             max_findings=remaining_findings,
+                            onnx_metadata_context=section.metadata_owned,
                         )
                         if limit_already_reached:
                             assert max_network_findings is not None

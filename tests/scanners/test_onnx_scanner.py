@@ -8575,6 +8575,9 @@ class TestRawDetectorCoverage:
         metadata = model.metadata_props.add()
         metadata.key = "documentation"
         metadata.value = "https://docs.ultralytics.com/"
+        notes = model.metadata_props.add()
+        notes.key = "notes"
+        notes.value = "Documentation includes import socket for examples."
         onnx.save(model, str(model_path))
 
         result = OnnxScanner(config={"check_jit_script": False}).scan(str(model_path))
@@ -8582,7 +8585,7 @@ class TestRawDetectorCoverage:
         metadata_input = result.metadata["onnx_network_detector_input"]
         assert metadata_input["sections"][-1] == {
             "name": "metadata_props",
-            "field_count": 2,
+            "field_count": 4,
             "metadata_owned": True,
         }
         failed_network_checks = [
@@ -8596,10 +8599,8 @@ class TestRawDetectorCoverage:
             and check.details.get("onnx_metadata_owned") is True
         ]
         assert docs_failures
-        assert all(
-            str(check.details.get("onnx_detector_context", "")).endswith("/onnx_metadata/metadata")
-            for check in docs_failures
-        )
+        assert all(check.details.get("onnx_detector_context") == str(model_path) for check in docs_failures)
+        assert not [check for check in failed_network_checks if check.details.get("type") == "network_library"]
 
     def test_network_detector_metadata_section_uses_protobuf_owned_values(self, tmp_path: Path) -> None:
         model_path = create_onnx_model(tmp_path, include_initializer=False)
@@ -8948,9 +8949,10 @@ class TestRawDetectorCoverage:
             enable_check: bool = True,
             raise_on_error: bool = False,
             max_findings: int | None = None,
+            onnx_metadata_context: bool = False,
             result: Any | None = None,
         ) -> list[dict[str, Any]]:
-            if context.endswith("/onnx_metadata/metadata"):
+            if onnx_metadata_context:
                 return [
                     {
                         "type": "detector_finding_limit",
@@ -9009,10 +9011,16 @@ class TestRawDetectorCoverage:
         onnx.save(model, str(model_path))
         original_scan = NetworkCommDetector.scan
 
-        def fail_metadata_section(self: NetworkCommDetector, data: bytes, context: str = "") -> list[dict[str, Any]]:
-            if context.endswith("/onnx_metadata/metadata"):
+        def fail_metadata_section(
+            self: NetworkCommDetector,
+            data: bytes,
+            context: str = "",
+            *,
+            onnx_metadata_context: bool = False,
+        ) -> list[dict[str, Any]]:
+            if onnx_metadata_context:
                 raise RuntimeError("metadata detector failed")
-            return original_scan(self, data, context)
+            return original_scan(self, data, context, onnx_metadata_context=onnx_metadata_context)
 
         monkeypatch.setattr(NetworkCommDetector, "scan", fail_metadata_section)
 
