@@ -1913,11 +1913,12 @@ def _build_onnx_weight_analysis_plan(
             if name and name not in value_lineages and name not in constants:
                 dynamic_values.add(name)
 
-        runtime_graph_inputs = (
+        runtime_data_values = (
             {_onnx_value_name(graph_input) for graph_input in current_graph.input} & dynamic_values
             if root_graph
             else set()
         )
+        constant_fill_values: set[str] = set()
 
         for local_node_index, node in enumerate(getattr(current_graph, "node", ())):
             current_node_index = node_counter
@@ -2352,15 +2353,34 @@ def _build_onnx_weight_analysis_plan(
                     and not is_model_local_function
                     and node.op_type != "Where"
                     and any(
-                        input_name in runtime_graph_inputs and not value_lineages.get(input_name)
+                        input_name in runtime_data_values and not value_lineages.get(input_name)
                         for input_name in node.input
+                    )
+                )
+                runtime_masks_activation = (
+                    same_type_elementwise
+                    and not is_model_local_function
+                    and node.op_type == "Where"
+                    and len(node.input) == 3
+                    and node.input[0] in runtime_data_values
+                    and all(
+                        input_name in constant_fill_values
+                        or input_name in runtime_data_values
+                        or input_index in dynamic_activation_input_indexes
+                        for input_index, input_name in enumerate(node.input[1:], start=1)
+                    )
+                    and any(
+                        input_name in runtime_data_values or input_index in dynamic_activation_input_indexes
+                        for input_index, input_name in enumerate(node.input[1:], start=1)
                     )
                 )
                 for initializer_index, lineage in all_input_lineages.items():
                     if initializer_index in activation_input_lineages:
                         continue
                     unresolved_reason = lineage.unresolved_reason
-                    if unresolved_reason == "shape_dimensions_lineage" and shape_scales_activation:
+                    if unresolved_reason == "shape_dimensions_lineage" and (
+                        shape_scales_activation or runtime_masks_activation
+                    ):
                         unresolved_reason = "dynamic_activation_lineage"
                     if unresolved_reason is None:
                         if carries_dynamic_activation:
@@ -2494,10 +2514,32 @@ def _build_onnx_weight_analysis_plan(
                     )
                     subgraph_output_dynamic[output_index] |= graph_output_dynamic[graph_output_index]
 
+            preserves_runtime_data = (
+                is_registered_standard_operator
+                and not is_model_local_function
+                and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
+                and (supported_transform or node.op_type in {"Abs", "Neg", "Not", "Relu", "Sigmoid", "Tanh"})
+                and bool(node.input)
+            )
+            runtime_output = preserves_runtime_data and node.input[0] in runtime_data_values
+            constant_fill_output = (
+                is_registered_standard_operator
+                and not is_model_local_function
+                and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
+                and node.op_type == "ConstantOfShape"
+            ) or (preserves_runtime_data and node.input[0] in constant_fill_values)
             for output_index, output_name in enumerate(node.output):
                 if not output_name:
                     continue
                 name = str(output_name)
+                if runtime_output:
+                    runtime_data_values.add(name)
+                else:
+                    runtime_data_values.discard(name)
+                if constant_fill_output:
+                    constant_fill_values.add(name)
+                else:
+                    constant_fill_values.discard(name)
                 per_output_lineages = dict(output_lineages)
                 merge_lineages(
                     per_output_lineages,
