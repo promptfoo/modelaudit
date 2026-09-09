@@ -55,7 +55,21 @@ _PICKLE_MEMBER_SUFFIXES = (".pkl", ".pickle")
 _PICKLE_BINARY_PROTOCOL_PREFIXES = (b"\x80\x01", b"\x80\x02", b"\x80\x03", b"\x80\x04", b"\x80\x05")
 _PICKLE_OPCODE_BYTES = frozenset(ord(opcode.code) for opcode in pickletools.opcodes)
 _PICKLE_SECURITY_RELEVANT_OPCODES = frozenset(
-    {"GLOBAL", "STACK_GLOBAL", "REDUCE", "INST", "OBJ", "NEWOBJ", "NEWOBJ_EX", "BUILD"}
+    {
+        "BINPERSID",
+        "BUILD",
+        "EXT1",
+        "EXT2",
+        "EXT4",
+        "GLOBAL",
+        "INST",
+        "NEWOBJ",
+        "NEWOBJ_EX",
+        "OBJ",
+        "PERSID",
+        "REDUCE",
+        "STACK_GLOBAL",
+    }
 )
 _PICKLE_DISCOVERY_SHORT_PROBE_BYTES = 16
 _PICKLE_DISCOVERY_LONG_PROBE_BYTES = 64 * 1024
@@ -64,6 +78,8 @@ _PICKLE_FRAME_OPCODE = b"\x95"
 _PROTO0_1_START_BYTES = b"()]}cilp0FGIJKLMNSTUVX"
 _PROTO0_1_MAX_PROBE_OPCODES = _PICKLE_DISCOVERY_LONG_PROBE_BYTES
 _PROTO0_1_IGNORABLE_TRAILING_BYTES = b" \t\r\n\x00"
+_PROTO0_1_TEXT_WHITESPACE_BYTES = b" \t\r\n"
+_PICKLE_DISCOVERY_PADDING_PROBE_BYTES = 256 * 1024
 _PROTO0_1_PREFIX_TRUNCATION_ERROR_PREFIXES = (
     "pickle exhausted before seeing STOP",
     "no newline found when trying to read ",
@@ -941,18 +957,21 @@ def _discover_pytorch_zip_pickle_entries(
             elif entry_id in storage_entries.storage_probe_entry_ids:
                 storage_probe_bytes = _PICKLE_DISCOVERY_LONG_PROBE_BYTES
             if storage_probe_bytes is not None:
+                needs_deferred_expanded_probe = [False]
                 looks_like_pickle = _trusted_storage_zip_entry_looks_like_pickle(
                     archive,
                     entry,
                     probe_bytes_remaining,
                     deadline,
                     max_probe_bytes=storage_probe_bytes,
+                    defer_expanded_probe=needs_deferred_expanded_probe,
                 )
             else:
+                needs_deferred_expanded_probe = [False]
                 looks_like_pickle = _zip_entry_looks_like_pickle(archive, entry, probe_bytes_remaining, deadline)
             if looks_like_pickle:
                 add_entry(entry)
-            elif entry_id in storage_entries.expanded_trust_entry_ids:
+            elif entry_id in storage_entries.expanded_trust_entry_ids or needs_deferred_expanded_probe[0]:
                 deferred_expanded_probe_entries.append(entry)
             probed_member_count += 1
         except _PickleDiscoveryProbeBudgetExceeded:
@@ -968,17 +987,22 @@ def _discover_pytorch_zip_pickle_entries(
         except Exception as error:
             notices.append(_pytorch_zip_member_probe_notice(source=source, entry=entry, error=error))
     else:
+        deferred_padding_probe_entries: list[zipfile.ZipInfo] = []
         for expanded_index, entry in enumerate(deferred_expanded_probe_entries):
             _check_pytorch_zip_deadline(deadline)
             try:
+                needs_deferred_padding_probe = [False]
                 if _trusted_storage_zip_entry_looks_like_pickle(
                     archive,
                     entry,
                     probe_bytes_remaining,
                     deadline,
                     max_probe_bytes=_PICKLE_DISCOVERY_LONG_PROBE_BYTES,
+                    defer_padding_probe=needs_deferred_padding_probe,
                 ):
                     add_entry(entry)
+                elif needs_deferred_padding_probe[0]:
+                    deferred_padding_probe_entries.append(entry)
             except _PickleDiscoveryProbeBudgetExceeded:
                 notices.append(
                     _pytorch_zip_pickle_discovery_probe_budget_notice(
@@ -991,6 +1015,30 @@ def _discover_pytorch_zip_pickle_entries(
                 break
             except Exception as error:
                 notices.append(_pytorch_zip_member_probe_notice(source=source, entry=entry, error=error))
+        else:
+            for padding_index, entry in enumerate(deferred_padding_probe_entries):
+                _check_pytorch_zip_deadline(deadline)
+                try:
+                    if _trusted_storage_zip_entry_looks_like_pickle(
+                        archive,
+                        entry,
+                        probe_bytes_remaining,
+                        deadline,
+                        max_probe_bytes=_PICKLE_DISCOVERY_LONG_PROBE_BYTES,
+                    ):
+                        add_entry(entry)
+                except _PickleDiscoveryProbeBudgetExceeded:
+                    notices.append(
+                        _pytorch_zip_pickle_discovery_probe_budget_notice(
+                            source=source,
+                            probe_bytes_read=(_MAX_PYTORCH_ZIP_PICKLE_DISCOVERY_PROBE_BYTES - probe_bytes_remaining[0]),
+                            probed_member_count=probed_member_count,
+                            skipped_entries=deferred_padding_probe_entries[padding_index:],
+                        )
+                    )
+                    break
+                except Exception as error:
+                    notices.append(_pytorch_zip_member_probe_notice(source=source, entry=entry, error=error))
 
     pickle_entries = [
         *explicit_pickle_entries,
@@ -1298,6 +1346,8 @@ def _trusted_storage_zip_entry_looks_like_pickle(
     deadline: float,
     *,
     max_probe_bytes: int = _TRUSTED_STORAGE_PICKLE_PROBE_BYTES,
+    defer_expanded_probe: list[bool] | None = None,
+    defer_padding_probe: list[bool] | None = None,
 ) -> bool:
     prefix = _read_zip_entry_probe(
         archive,
@@ -1337,10 +1387,20 @@ def _trusted_storage_zip_entry_looks_like_pickle(
 
     sample = prefix
     if entry.file_size > len(prefix):
+        probe_bytes = max_probe_bytes
+        if (
+            max_probe_bytes > _TRUSTED_STORAGE_PICKLE_PROBE_BYTES
+            and entry.file_size > max_probe_bytes
+            and _trivial_complete_pickle_prefix_has_only_padding(prefix)
+        ):
+            if defer_padding_probe is not None:
+                defer_padding_probe[0] = True
+                return False
+            probe_bytes = min(entry.file_size, _PICKLE_DISCOVERY_PADDING_PROBE_BYTES)
         sample = _read_zip_entry_probe(
             archive,
             entry,
-            max_probe_bytes,
+            probe_bytes,
             probe_bytes_remaining,
             deadline,
         )
@@ -1358,16 +1418,51 @@ def _trusted_storage_zip_entry_looks_like_pickle(
             max_probe_bytes > _TRUSTED_STORAGE_PICKLE_PROBE_BYTES
             and _frame_first_trusted_storage_probe_should_scan(sample[:_TRUSTED_STORAGE_PICKLE_PROBE_BYTES])
         )
-    return (
-        _proto0_or_1_trusted_storage_probe_should_scan(sample, sample_is_prefix=entry.file_size > len(sample))
-        or _expanded_probe_preserves_trusted_scan(
-            entry, sample, max_probe_bytes, _proto0_or_1_trusted_storage_probe_should_scan
-        )
-        or (
-            max_probe_bytes > _TRUSTED_STORAGE_PICKLE_PROBE_BYTES
-            and _looks_like_proto0_or_1_pickle(sample, sample_is_prefix=entry.file_size > len(sample))
-        )
-    )
+    if _proto0_or_1_trusted_storage_probe_should_scan(sample, sample_is_prefix=entry.file_size > len(sample)):
+        return True
+    if (
+        defer_expanded_probe is not None
+        and max_probe_bytes == _TRUSTED_STORAGE_PICKLE_PROBE_BYTES
+        and entry.file_size > len(sample)
+        and _proto0_or_1_trusted_storage_probe_needs_expanded_sample(sample, entry_size=entry.file_size)
+    ):
+        defer_expanded_probe[0] = True
+    if _expanded_probe_preserves_trusted_scan(
+        entry, sample, max_probe_bytes, _proto0_or_1_trusted_storage_probe_should_scan
+    ):
+        return True
+    if (
+        max_probe_bytes > _TRUSTED_STORAGE_PICKLE_PROBE_BYTES
+        and _has_security_relevant_pickle_opcode(sample)
+        and _looks_like_proto0_or_1_pickle(sample, sample_is_prefix=entry.file_size > len(sample))
+    ):
+        return True
+    if (
+        entry.file_size > len(sample)
+        and len(sample) >= _PICKLE_DISCOVERY_LONG_PROBE_BYTES
+        and _trivial_complete_pickle_prefix_has_only_padding(sample)
+    ):
+        padding_probe_bytes = min(entry.file_size, _PICKLE_DISCOVERY_PADDING_PROBE_BYTES)
+        if padding_probe_bytes > len(sample):
+            sample = _read_zip_entry_probe(
+                archive,
+                entry,
+                padding_probe_bytes,
+                probe_bytes_remaining,
+                deadline,
+            )
+            if _proto0_or_1_trusted_storage_probe_should_scan(
+                sample,
+                sample_is_prefix=entry.file_size > len(sample),
+            ):
+                return True
+    if (
+        entry.file_size > len(sample)
+        and len(sample) >= _PICKLE_DISCOVERY_LONG_PROBE_BYTES
+        and _proto0_or_1_trusted_storage_probe_needs_expanded_sample(sample, entry_size=entry.file_size)
+    ):
+        raise ValueError("trusted PyTorch storage prefix exceeds pickle discovery probe")
+    return False
 
 
 def _expanded_probe_preserves_trusted_scan(
@@ -1410,11 +1505,25 @@ def _proto0_or_1_trusted_storage_probe_should_scan(sample: bytes, *, sample_is_p
         return True
     if _has_security_relevant_opcode_in_incomplete_frame(sample):
         return True
+    if _trivial_complete_pickle_prefix_trailing_should_scan(sample, sample_is_prefix=sample_is_prefix):
+        return True
+    if _trivial_complete_pickle_prefix_has_only_padding(sample):
+        return False
     if not sample_is_prefix:
         return False
     if _contains_pickle_frame_opcode(sample):
         return False
     return _looks_like_proto0_or_1_pickle(sample, sample_is_prefix=True)
+
+
+def _proto0_or_1_trusted_storage_probe_needs_expanded_sample(sample: bytes, *, entry_size: int | None = None) -> bool:
+    if _trivial_complete_pickle_prefix_needs_more_bytes(sample):
+        return entry_size is None or entry_size > len(sample)
+    if _trivial_complete_pickle_prefix_has_only_text_padding(sample):
+        return True
+    if _trivial_complete_pickle_prefix_has_only_padding(sample):
+        return entry_size is not None and entry_size > len(sample)
+    return _trivial_complete_pickle_prefix_has_ambiguous_trivial_trailing(sample)
 
 
 def _frame_first_trusted_storage_probe_should_scan(sample: bytes) -> bool:
@@ -1474,14 +1583,214 @@ def _has_security_relevant_opcode_in_incomplete_frame(sample: bytes) -> bool:
     return False
 
 
-def _contains_pickle_frame_opcode(sample: bytes) -> bool:
-    try:
-        return any(opcode.name == "FRAME" for opcode, _arg, _pos in pickletools.genops(sample))
-    except Exception:
+def _has_security_relevant_pickle_opcode(sample: bytes) -> bool:
+    remaining = sample
+    while remaining:
+        try:
+            for opcode, _arg, pos in pickletools.genops(remaining):
+                if opcode.name in _PICKLE_SECURITY_RELEVANT_OPCODES:
+                    return True
+                if opcode.name == "STOP" and pos is not None:
+                    remaining = remaining[pos + 1 :].lstrip(_PROTO0_1_IGNORABLE_TRAILING_BYTES)
+                    break
+            else:
+                return False
+        except Exception:
+            return False
+    return False
+
+
+def _trailing_pickle_probe_should_scan(trailing: bytes, *, sample_is_prefix: bool) -> bool:
+    candidate = trailing.lstrip(_PROTO0_1_IGNORABLE_TRAILING_BYTES)
+    if not candidate:
         return False
+    if candidate.startswith(b"#"):
+        return _looks_like_proto0_or_1_pickle(candidate, sample_is_prefix=sample_is_prefix)
+    if _has_security_relevant_pickle_opcode(candidate):
+        return (
+            _has_complete_pickle_stream_without_frame_stop_overrun(candidate)
+            or _looks_like_proto0_or_1_pickle(
+                candidate,
+                sample_is_prefix=False,
+            )
+            or _looks_like_binary_pickle_prefix(candidate, sample_is_prefix=False)
+            or _frame_first_trusted_storage_probe_should_scan(candidate)
+        )
+    if not sample_is_prefix:
+        return False
+    if candidate.startswith(_PICKLE_BINARY_PROTOCOL_PREFIXES):
+        return _binary_pickle_probe_should_scan(candidate, sample_is_prefix=True) or _looks_like_binary_pickle_prefix(
+            candidate,
+            sample_is_prefix=True,
+        )
+    if candidate.startswith(_PICKLE_FRAME_OPCODE):
+        return _frame_first_trusted_storage_probe_should_scan(candidate)
+    return candidate[0] in _PROTO0_1_START_BYTES and (_looks_like_proto0_or_1_pickle(candidate, sample_is_prefix=True))
 
 
-def _has_complete_pickle_stream_without_frame_stop_overrun(sample: bytes) -> bool:
+def _looks_like_truncated_proto0_or_1_operand_prefix(candidate: bytes) -> bool:
+    if candidate.startswith(b"P"):
+        return b"\n" not in candidate[1:]
+    if candidate.startswith(b"c"):
+        return candidate.count(b"\n") < 2
+    if candidate.startswith((b"S'", b'S"')):
+        return b"\n" not in candidate[2:]
+    if candidate.startswith((b"F", b"I", b"L")):
+        return b"\n" not in candidate[1:]
+    if candidate.startswith(b"V"):
+        return b"\n" not in candidate[1:]
+    if candidate.startswith((b"T", b"X")):
+        if len(candidate) < 5:
+            return True
+        declared_size = int.from_bytes(candidate[1:5], "little")
+        return len(candidate) - 5 < declared_size
+    if candidate.startswith(b"U"):
+        if len(candidate) < 2:
+            return True
+        declared_size = candidate[1]
+        return len(candidate) - 2 < declared_size
+    return False
+
+
+def _looks_like_truncated_binary_pickle_operand_prefix(candidate: bytes) -> bool:
+    if candidate.startswith((b"B", b"T", b"X", b"\x8b")):
+        if len(candidate) < 5:
+            return True
+        declared_size = int.from_bytes(candidate[1:5], "little")
+        return len(candidate) - 5 < declared_size
+    if candidate.startswith((b"C", b"U", b"\x8a", b"\x8c")):
+        if len(candidate) < 2:
+            return True
+        declared_size = candidate[1]
+        return len(candidate) - 2 < declared_size
+    if candidate.startswith((b"\x8d", b"\x8e", b"\x96")):
+        if len(candidate) < 9:
+            return True
+        declared_size = int.from_bytes(candidate[1:9], "little")
+        return len(candidate) - 9 < declared_size
+    return False
+
+
+def _looks_like_truncated_fixed_width_pickle_operand_prefix(candidate: bytes) -> bool:
+    if candidate.startswith((b"K", b"\x82")):
+        return len(candidate) < 2
+    if candidate.startswith((b"M", b"\x83")):
+        return len(candidate) < 3
+    if candidate.startswith((b"J", b"\x84")):
+        return len(candidate) < 5
+    if candidate.startswith(b"G"):
+        return len(candidate) < 9
+    return False
+
+
+def _looks_like_truncated_security_opcode_prefix(candidate: bytes) -> bool:
+    if candidate.startswith(b"\x82"):
+        return len(candidate) < 2
+    if candidate.startswith(b"\x83"):
+        return len(candidate) < 3
+    if candidate.startswith(b"\x84"):
+        return len(candidate) < 5
+    return False
+
+
+def _trivial_complete_pickle_prefix_trailing_should_scan(sample: bytes, *, sample_is_prefix: bool) -> bool:
+    trailing = _trivial_complete_pickle_prefix_trailing(sample)
+    return trailing is not None and _trailing_pickle_probe_should_scan(trailing, sample_is_prefix=sample_is_prefix)
+
+
+def _trivial_complete_pickle_prefix_has_ambiguous_trivial_trailing(sample: bytes) -> bool:
+    trailing = _trivial_complete_pickle_prefix_trailing(sample)
+    if trailing is None:
+        return False
+    candidate = trailing.lstrip(_PROTO0_1_IGNORABLE_TRAILING_BYTES)
+    if not candidate:
+        return True
+    if _looks_like_truncated_proto0_or_1_operand_prefix(candidate):
+        return True
+    while candidate:
+        active_frame_end = 0
+        opcode_count = 0
+        saw_opcode = False
+        try:
+            for opcode, arg, pos in pickletools.genops(candidate):
+                saw_opcode = True
+                opcode_count += 1
+                if pos is None:
+                    continue
+                if opcode.name == "FRAME":
+                    if not isinstance(arg, int):
+                        return False
+                    active_frame_end = max(active_frame_end, pos + _PICKLE_FRAME_OPCODE_BYTES + arg)
+                elif opcode.name == "STOP":
+                    if opcode_count < 2 or active_frame_end > len(candidate):
+                        return False
+                    candidate = candidate[pos + 1 :].lstrip(_PROTO0_1_IGNORABLE_TRAILING_BYTES)
+                    break
+                elif opcode.name not in _PROTO0_1_TRIVIAL_LEADING_OPCODES:
+                    return False
+            else:
+                return saw_opcode
+        except ValueError as exc:
+            exc_message = str(exc)
+            return saw_opcode and any(
+                exc_message.startswith(error_prefix) for error_prefix in _PROTO0_1_PREFIX_TRUNCATION_ERROR_PREFIXES
+            )
+        except Exception:
+            return False
+    return True
+
+
+def _trivial_complete_pickle_prefix_needs_more_bytes(sample: bytes) -> bool:
+    trailing = _trivial_complete_pickle_prefix_trailing(sample)
+    if trailing is None:
+        return False
+    candidate = trailing.lstrip(_PROTO0_1_IGNORABLE_TRAILING_BYTES)
+    return _trailing_pickle_candidate_needs_more_bytes(candidate)
+
+
+def _trailing_pickle_candidate_needs_more_bytes(candidate: bytes) -> bool:
+    while candidate:
+        trivial_trailing = _trivial_complete_pickle_prefix_trailing(candidate)
+        if trivial_trailing is not None and len(trivial_trailing) < len(candidate):
+            candidate = trivial_trailing.lstrip(_PROTO0_1_IGNORABLE_TRAILING_BYTES)
+            continue
+        repeated_none_trailing = _repeated_none_stream_trailing(candidate)
+        if repeated_none_trailing is not None and len(repeated_none_trailing) < len(candidate):
+            candidate = repeated_none_trailing.lstrip(_PROTO0_1_IGNORABLE_TRAILING_BYTES)
+            continue
+        if candidate.startswith(_PICKLE_FRAME_OPCODE):
+            if len(candidate) < _PICKLE_FRAME_OPCODE_BYTES:
+                return True
+            frame_payload_size = int.from_bytes(candidate[1:_PICKLE_FRAME_OPCODE_BYTES], "little")
+            return len(candidate) - _PICKLE_FRAME_OPCODE_BYTES < frame_payload_size
+        if _looks_like_truncated_proto0_or_1_operand_prefix(candidate):
+            return True
+        if _looks_like_truncated_binary_pickle_operand_prefix(candidate):
+            return True
+        if _looks_like_truncated_fixed_width_pickle_operand_prefix(candidate):
+            return True
+        if _looks_like_truncated_security_opcode_prefix(candidate):
+            return True
+        if _has_security_relevant_pickle_opcode(candidate):
+            return not _has_complete_pickle_stream_without_frame_stop_overrun(candidate)
+        return any(
+            magic.startswith(candidate) or (candidate.startswith(magic) and len(candidate) < 3)
+            for magic in _PICKLE_BINARY_PROTOCOL_PREFIXES
+        )
+    return False
+
+
+def _trivial_complete_pickle_prefix_has_only_padding(sample: bytes) -> bool:
+    trailing = _trivial_complete_pickle_prefix_trailing(sample)
+    return trailing is not None and not trailing.strip(_PROTO0_1_IGNORABLE_TRAILING_BYTES)
+
+
+def _trivial_complete_pickle_prefix_has_only_text_padding(sample: bytes) -> bool:
+    trailing = _trivial_complete_pickle_prefix_trailing(sample)
+    return trailing is not None and bool(trailing) and not trailing.strip(_PROTO0_1_TEXT_WHITESPACE_BYTES)
+
+
+def _trivial_complete_pickle_prefix_trailing(sample: bytes) -> bytes | None:
     active_frame_end = 0
     opcode_count = 0
     has_non_trivial_opcode = False
@@ -1492,20 +1801,80 @@ def _has_complete_pickle_stream_without_frame_stop_overrun(sample: bytes) -> boo
                 continue
             if opcode.name == "FRAME":
                 if not isinstance(arg, int):
-                    return False
+                    return None
                 active_frame_end = max(active_frame_end, pos + _PICKLE_FRAME_OPCODE_BYTES + arg)
             elif opcode.name == "STOP":
-                if opcode_count < 2 or active_frame_end > len(sample):
-                    return False
-                if has_non_trivial_opcode:
-                    return True
-                trailing = sample[pos + 1 :].lstrip(_PROTO0_1_IGNORABLE_TRAILING_BYTES)
-                return bool(trailing) and _looks_like_proto0_or_1_pickle(trailing, sample_is_prefix=False)
+                if opcode_count < 2 or active_frame_end > len(sample) or has_non_trivial_opcode:
+                    return None
+                return sample[pos + 1 :]
             elif opcode.name not in _PROTO0_1_TRIVIAL_LEADING_OPCODES:
                 has_non_trivial_opcode = True
     except Exception:
+        return None
+    return None
+
+
+def _contains_pickle_frame_opcode(sample: bytes) -> bool:
+    try:
+        return any(opcode.name == "FRAME" for opcode, _arg, _pos in pickletools.genops(sample))
+    except Exception:
         return False
+
+
+def _has_complete_pickle_stream_without_frame_stop_overrun(sample: bytes) -> bool:
+    repeated_none_trailing = _repeated_none_stream_trailing(sample)
+    if repeated_none_trailing is not None:
+        return _trailing_pickle_probe_should_scan(repeated_none_trailing, sample_is_prefix=False)
+    remaining = sample
+    skipped_trivial_prefix = False
+    while remaining:
+        active_frame_end = 0
+        opcode_count = 0
+        has_non_trivial_opcode = False
+        has_security_relevant_opcode = False
+        try:
+            for opcode, arg, pos in pickletools.genops(remaining):
+                opcode_count += 1
+                if pos is None:
+                    continue
+                if opcode.name == "FRAME":
+                    if not isinstance(arg, int):
+                        return False
+                    active_frame_end = max(active_frame_end, pos + _PICKLE_FRAME_OPCODE_BYTES + arg)
+                elif opcode.name == "STOP":
+                    if opcode_count < 2 or active_frame_end > len(remaining):
+                        return False
+                    if has_non_trivial_opcode:
+                        return has_security_relevant_opcode or not skipped_trivial_prefix
+                    trailing = remaining[pos + 1 :].lstrip(_PROTO0_1_IGNORABLE_TRAILING_BYTES)
+                    if not trailing:
+                        return False
+                    remaining = trailing
+                    skipped_trivial_prefix = True
+                    break
+                elif opcode.name not in _PROTO0_1_TRIVIAL_LEADING_OPCODES:
+                    has_non_trivial_opcode = True
+                    if opcode.name in _PICKLE_SECURITY_RELEVANT_OPCODES:
+                        has_security_relevant_opcode = True
+            else:
+                return False
+        except Exception:
+            return False
     return False
+
+
+def _repeated_none_stream_trailing(sample: bytes) -> bytes | None:
+    offset = 0
+    saw_stream = False
+    sample_length = len(sample)
+    while offset + 2 <= sample_length and sample[offset : offset + 2] == b"N.":
+        saw_stream = True
+        offset += 2
+        while offset < sample_length and sample[offset] in _PROTO0_1_IGNORABLE_TRAILING_BYTES:
+            offset += 1
+    if not saw_stream:
+        return None
+    return sample[offset:] if offset < sample_length else b""
 
 
 def _looks_like_binary_pickle_prefix(sample: bytes, *, sample_is_prefix: bool) -> bool:
