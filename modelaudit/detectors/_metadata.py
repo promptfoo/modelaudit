@@ -18,6 +18,7 @@ _MAX_METADATA_VALUE_BYTES = 64 * 1024
 _METADATA_KEYS = frozenset({"docs", "documentation", "license", "licence", "readme"})
 _ONNX_METADATA_KEYS = _METADATA_KEYS | {"repository", "source", "url"}
 _STRING_HEADERS = {"BINUNICODE": 5, "SHORT_BINUNICODE": 2, "BINUNICODE8": 9, "BINSTRING": 5, "SHORT_BINSTRING": 2}
+_NON_TEXT_CONTROLS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 
 @dataclass(eq=False)
@@ -51,7 +52,7 @@ def _add_items(target: _PickleValue, values: list[_PickleValue]) -> None:
             _escape(key)
             key_name = key.text.casefold() if key.text is not None else None
             if key_name in _METADATA_KEYS and value.kind == "string":
-                value.metadata = True
+                value.metadata = value.text is not None and _NON_TEXT_CONTROLS.search(value.text) is None
             elif key_name != "metadata" or value.kind not in {"dict", "list", "tuple"}:
                 _escape(value)
     else:
@@ -221,13 +222,14 @@ def _onnx_metadata(data: bytes) -> tuple[list[tuple[int, int]], list[tuple[int, 
                 key_field, value_field = sorted(fields)
                 if key_field[3] - key_field[2] > 128:
                     continue
-                key = data[key_field[2] : key_field[3]].decode("utf-8").strip().casefold()
+                key = data[key_field[2] : key_field[3]].decode("utf-8").casefold()
                 span = value_field[2], value_field[3]
                 strings.append(span)
-                if span[1] - span[0] <= _MAX_METADATA_VALUE_BYTES and (
-                    key in _ONNX_METADATA_KEYS or re.fullmatch(r"url_\d+", key)
+                if (
+                    span[1] - span[0] <= _MAX_METADATA_VALUE_BYTES
+                    and (key in _ONNX_METADATA_KEYS or re.fullmatch(r"url_\d+", key))
+                    and _NON_TEXT_CONTROLS.search(data[span[0] : span[1]].decode("utf-8")) is None
                 ):
-                    data[span[0] : span[1]].decode("utf-8")
                     metadata.append(span)
     except (ValueError, UnicodeError):
         return [], []

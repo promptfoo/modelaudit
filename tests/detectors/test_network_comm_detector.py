@@ -3077,6 +3077,30 @@ class TestNetworkCommDetector:
 
         assert any(f["type"] == "explicit_network_pattern" and f["severity"] == "CRITICAL" for f in findings)
 
+    @pytest.mark.parametrize("key", [" license ", "\tdocs", "url_0\n"])
+    def test_padded_onnx_keys_do_not_prove_metadata(self, key: str) -> None:
+        data = _onnx_model_with_metadata({key: "https://example.invalid/license"})
+
+        findings = NetworkCommDetector().scan(data, "model.onnx")
+
+        assert any(f["type"] == "explicit_network_pattern" and f["severity"] == "CRITICAL" for f in findings)
+
+    @pytest.mark.parametrize("control", ["\x00", "\x0b", "\x1f", "\x7f"])
+    @pytest.mark.parametrize("model_format,protocol", [("pickle", p) for p in range(6)] + [("onnx", None)])
+    def test_raw_controls_prevent_metadata_downgrade(
+        self, control: str, model_format: str, protocol: int | None
+    ) -> None:
+        metadata = {"license": f"https://example.invalid/license/{control}payload"}
+        data = (
+            pickle.dumps(metadata, protocol=protocol)
+            if model_format == "pickle"
+            else _onnx_model_with_metadata(metadata)
+        )
+
+        findings = NetworkCommDetector().scan(data, "checkpoint.pt" if model_format == "pickle" else "model.onnx")
+
+        assert any(f["type"] == "explicit_network_pattern" and f["severity"] == "CRITICAL" for f in findings)
+
     @pytest.mark.parametrize(
         "url",
         [
