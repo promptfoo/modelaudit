@@ -23,7 +23,9 @@ from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, Iss
 from modelaudit.scanners.joblib_scanner import JoblibScanner
 from modelaudit.scanners.pickle_scanner import (
     _BINARY_TAIL_SCAN_BYTES,
+    _ENCODED_TEXT_SAMPLE_DECODED_BYTES,
     _MAX_RAW_ENCODED_BYTES,
+    _MAX_RAW_ENCODED_POST_LIMIT_BYTES,
     _MAX_RAW_ENCODED_TOKEN_WITHOUT_SEED_BYTES,
     ALWAYS_DANGEROUS_FUNCTIONS,
     ALWAYS_DANGEROUS_MODULES,
@@ -1606,6 +1608,180 @@ def test_scan_stream_late_shifted_encoded_payload_after_seedless_budget_limit_st
     payload = pickle.dumps([*skipped_values, f"encoded:{shifted_payload}"], protocol=4)
 
     result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source="late-shifted-base64.pkl")
+
+    assert "pickle_encoded_text_scan_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.rule_code == "S604"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("encoding") == "base64"
+        and check.details.get("pattern") == "os.system"
+        for check in result.checks
+    )
+
+
+def test_scan_stream_unprefixed_seedless_oversized_tokens_share_decoded_budget() -> None:
+    decoded_size = _MAX_RAW_ENCODED_BYTES // 8
+    values = []
+    for index in range(8):
+        prefix = f"benign unprefixed token {index}:".encode()
+        values.append(base64.b64encode(prefix + (b"a" * (decoded_size - len(prefix)))).decode())
+    payload = pickle.dumps(values, protocol=4)
+
+    result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source="unprefixed-budget-base64.pkl")
+
+    assert "pickle_encoded_text_scan_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+    coverage_checks = [check for check in result.checks if check.rule_code == "S902"]
+    assert any(
+        check.details.get("encoding") == "base64"
+        and check.details.get("skipped_tokens_accounted") == 8
+        and check.details.get("skipped_decoded_bytes_accounted") == _MAX_RAW_ENCODED_BYTES
+        for check in coverage_checks
+    )
+
+
+@pytest.mark.parametrize("encoding", ["base64", "hex"])
+def test_scan_stream_unprefixed_encoded_binary_with_text_header_is_not_encoded_text(encoding: str) -> None:
+    def encode(value: bytes) -> str:
+        return base64.b64encode(value).decode("ascii") if encoding == "base64" else value.hex()
+
+    decoded_size = _MAX_RAW_ENCODED_BYTES // 8
+    values = []
+    for index in range(8):
+        prefix = f"printable-header-{index}:".encode() + (b"a" * _ENCODED_TEXT_SAMPLE_DECODED_BYTES)
+        values.append(encode(prefix + (b"\x00" * (decoded_size - len(prefix)))))
+    payload = pickle.dumps(values, protocol=4)
+
+    result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source=f"encoded-binary-{encoding}.pkl")
+
+    assert "pickle_encoded_text_scan_limit_exceeded" not in result.metadata.get("scan_outcome_reasons", [])
+
+
+def test_scan_stream_prefixed_duplicate_after_unprefixed_oversized_token_does_not_double_charge_budget() -> None:
+    decoded_size = (_MAX_RAW_ENCODED_BYTES // 2) + 1
+    encoded = base64.b64encode(b"a" * decoded_size).decode()
+    payload = pickle.dumps([encoded, f"encoded:{encoded}"], protocol=4)
+
+    result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source="prefixed-accounted-duplicate.pkl")
+
+    assert "pickle_encoded_text_scan_limit_exceeded" not in result.metadata.get("scan_outcome_reasons", [])
+
+
+def test_scan_stream_large_prefixed_shifted_payload_after_seedless_budget_limit_stays_actionable() -> None:
+    skipped_values = [
+        base64.b64encode(f"benign unprefixed token {index}:".encode() + (b"a" * (_MAX_RAW_ENCODED_BYTES // 8))).decode()
+        for index in range(8)
+    ]
+    shifted_payload_prefix = b"xos.system('id'):"
+    shifted_payload_size = _MAX_RAW_ENCODED_POST_LIMIT_BYTES
+    shifted_payload = base64.b64encode(
+        shifted_payload_prefix + (b"a" * (shifted_payload_size - len(shifted_payload_prefix)))
+    ).decode()
+    payload = pickle.dumps([*skipped_values, f"encoded:{shifted_payload}"], protocol=4)
+
+    result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source="post-limit-large-shifted.pkl")
+
+    assert "pickle_encoded_text_scan_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.rule_code == "S604"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("encoding") == "base64"
+        and check.details.get("pattern") == "os.system"
+        for check in result.checks
+    )
+
+
+def test_scan_stream_budget_crossing_prefixed_payload_scans_beyond_decoded_sample() -> None:
+    skipped_values = []
+    for index in range(7):
+        prefix = f"benign prefixed token {index}:".encode()
+        decoded = prefix + (b"a" * ((_MAX_RAW_ENCODED_BYTES // 8) - len(prefix)))
+        skipped_values.append("encoded:" + base64.b64encode(decoded).decode())
+    shifted_payload_prefix = (b"x" * (_ENCODED_TEXT_SAMPLE_DECODED_BYTES + 2)) + b"os.system('id'):"
+    shifted_payload_size = 300_000
+    shifted_payload = (
+        "encoded:"
+        + base64.b64encode(
+            shifted_payload_prefix + (b"a" * (shifted_payload_size - len(shifted_payload_prefix)))
+        ).decode()
+    )
+    payload = pickle.dumps([*skipped_values, shifted_payload], protocol=4)
+
+    result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source="budget-crossing-shifted.pkl")
+
+    assert "pickle_encoded_text_scan_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.rule_code == "S604"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("encoding") == "base64"
+        and check.details.get("pattern") == "os.system"
+        for check in result.checks
+    )
+
+
+def test_scan_stream_prefixed_duplicate_after_unprefixed_budget_limit_scans_beyond_decoded_sample() -> None:
+    decoded_size = _MAX_RAW_ENCODED_BYTES // 8
+    shifted_payload_prefix = (b"x" * (_ENCODED_TEXT_SAMPLE_DECODED_BYTES + 2)) + b"os.system('id'):"
+    shifted_decoded = shifted_payload_prefix + (b"a" * (decoded_size - len(shifted_payload_prefix)))
+    shifted_encoded = base64.b64encode(shifted_decoded).decode()
+    values = [shifted_encoded]
+    for index in range(7):
+        prefix = f"benign prefixed token {index}:".encode()
+        decoded = prefix + (b"a" * (decoded_size - len(prefix)))
+        values.append("encoded:" + base64.b64encode(decoded).decode())
+    values.append(f"encoded:{shifted_encoded}")
+    payload = pickle.dumps(values, protocol=4)
+
+    result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source="prefixed-duplicate-shifted.pkl")
+
+    assert "pickle_encoded_text_scan_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.rule_code == "S604"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("encoding") == "base64"
+        and check.details.get("pattern") == "os.system"
+        for check in result.checks
+    )
+
+
+def test_scan_stream_prefixed_duplicate_after_unprefixed_overbudget_token_scans_beyond_sample() -> None:
+    skipped_values = []
+    decoded_size = _MAX_RAW_ENCODED_BYTES // 8
+    for index in range(7):
+        prefix = f"benign prefixed token {index}:".encode()
+        decoded = prefix + (b"a" * (decoded_size - len(prefix)))
+        skipped_values.append("encoded:" + base64.b64encode(decoded).decode())
+    shifted_payload_prefix = (b"x" * (_ENCODED_TEXT_SAMPLE_DECODED_BYTES + 2)) + b"os.system('id'):"
+    shifted_payload_size = 300_000
+    shifted_encoded = base64.b64encode(
+        shifted_payload_prefix + (b"a" * (shifted_payload_size - len(shifted_payload_prefix)))
+    ).decode()
+    payload = pickle.dumps([*skipped_values, shifted_encoded, f"encoded:{shifted_encoded}"], protocol=4)
+
+    result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source="overbudget-duplicate-shifted.pkl")
+
+    assert "pickle_encoded_text_scan_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.rule_code == "S604"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("encoding") == "base64"
+        and check.details.get("pattern") == "os.system"
+        for check in result.checks
+    )
+
+
+def test_scan_stream_accounted_prefixed_duplicate_preserves_late_post_limit_budget() -> None:
+    decoded_size = _MAX_RAW_ENCODED_BYTES // 8
+    duplicate_encoded = base64.b64encode(b"b" * decoded_size).decode()
+    values = [duplicate_encoded]
+    for index in range(7):
+        prefix = f"benign prefixed token {index}:".encode()
+        decoded = prefix + (b"a" * (decoded_size - len(prefix)))
+        values.append("encoded:" + base64.b64encode(decoded).decode())
+    values.append(f"encoded:{duplicate_encoded}")
+    values.append("encoded:" + base64.b64encode(b"xos.system('id')").decode())
+    payload = pickle.dumps(values, protocol=4)
+
+    result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source="accounted-duplicate-late.pkl")
 
     assert "pickle_encoded_text_scan_limit_exceeded" in result.metadata["scan_outcome_reasons"]
     assert any(
