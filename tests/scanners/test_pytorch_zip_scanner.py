@@ -1403,6 +1403,17 @@ def test_pytorch_zip_scanner_can_handle(tmp_path):
     assert PyTorchZipScanner.can_handle(str(test_file)) is False
 
 
+def test_pytorch_zip_allows_many_small_encoded_metadata_tokens(tmp_path: Path) -> None:
+    values = [f"encoded:{base64.b64encode(f'benign-token-{index}'.encode()).decode('ascii')}" for index in range(128)]
+    model_path = create_mock_pytorch_zip(tmp_path / "many-encoded-metadata.pth", data={"metadata": values})
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert result.success is True
+    assert "pickle_encoded_text_scan_limit_exceeded" not in result.metadata.get("scan_outcome_reasons", [])
+    assert not any(check.name == "Pickle Encoded Text Coverage" for check in result.checks)
+
+
 def test_pytorch_zip_training_args_unresolved_framework_metadata_refs_warn(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

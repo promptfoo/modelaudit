@@ -24,7 +24,6 @@ from modelaudit.scanners.joblib_scanner import JoblibScanner
 from modelaudit.scanners.pickle_scanner import (
     _BINARY_TAIL_SCAN_BYTES,
     _MAX_RAW_ENCODED_BYTES,
-    _MAX_RAW_ENCODED_TOKENS,
     ALWAYS_DANGEROUS_FUNCTIONS,
     ALWAYS_DANGEROUS_MODULES,
     PickleScanner,
@@ -1353,24 +1352,23 @@ def test_scan_stream_keeps_encoded_execution_outside_url_actionable(encoding: st
 
 
 @pytest.mark.parametrize("encoding", ["base64", "hex"])
-def test_scan_stream_encoded_token_budgets_fail_closed(encoding: str) -> None:
+def test_scan_stream_keeps_scanning_many_small_encoded_tokens(encoding: str) -> None:
     def encode(value: bytes) -> str:
         return base64.b64encode(value).decode("ascii") if encoding == "base64" else value.hex()
 
-    values = [f"encoded:{encode(f'benign-token-{index}'.encode())}" for index in range(_MAX_RAW_ENCODED_TOKENS)]
+    values = [f"encoded:{encode(f'benign-token-{index}'.encode())}" for index in range(128)]
     values.append("encoded:" + encode(b"os.system('id')"))
     payload = pickle.dumps(values, protocol=4)
 
-    result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source=f"late-{encoding}.pkl")
+    result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source=f"many-{encoding}.pkl")
 
-    assert result.success is False
-    assert "pickle_encoded_text_scan_limit_exceeded" in result.metadata["scan_outcome_reasons"]
     assert any(
-        check.name == "Pickle Encoded Text Coverage"
+        check.rule_code == "S604"
         and check.details.get("encoding") == encoding
-        and check.details.get("limit_type") == "token"
+        and check.details.get("pattern") == "os.system"
         for check in result.checks
     )
+    assert "pickle_encoded_text_scan_limit_exceeded" not in result.metadata.get("scan_outcome_reasons", [])
 
 
 @pytest.mark.parametrize("encoding", ["base64", "hex"])

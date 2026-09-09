@@ -65,7 +65,6 @@ _BASE64_TOKEN_RE = re.compile(rb"(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{10,}={0,2}(?![
 _HEX_TOKEN_RE = re.compile(rb"(?<![A-Fa-f0-9])[A-Fa-f0-9]{20,}(?![A-Fa-f0-9])")
 _IPV4_DOT_DIGIT_RE = re.compile(rb"\d\.\d")
 _LOCATION_POSITION_RE = re.compile(r"\(pos (?P<position>\d+)\)\s*$")
-_MAX_RAW_ENCODED_TOKENS = 64
 _MAX_RAW_ENCODED_BYTES = 1024 * 1024
 _MAX_RAW_ENCODED_TOKEN_WITHOUT_SEED_BYTES = 4096
 _CALL_TOKEN_SEPARATOR_SCAN_LIMIT_BYTES = 4096
@@ -4669,7 +4668,7 @@ class PickleScanner(BaseScanner):
         source: str,
         encoding: str,
         limit_type: str,
-        tokens_analyzed: int,
+        decoded_tokens_analyzed: int,
         decoded_budget: int,
     ) -> None:
         reason = "pickle_encoded_text_scan_limit_exceeded"
@@ -4684,8 +4683,7 @@ class PickleScanner(BaseScanner):
             details={
                 "encoding": encoding,
                 "limit_type": limit_type,
-                "tokens_analyzed": tokens_analyzed,
-                "max_tokens": _MAX_RAW_ENCODED_TOKENS,
+                "tokens_analyzed": decoded_tokens_analyzed,
                 "decoded_bytes_analyzed": _MAX_RAW_ENCODED_BYTES - decoded_budget,
                 "max_decoded_bytes": _MAX_RAW_ENCODED_BYTES,
                 "analysis_incomplete": True,
@@ -4706,18 +4704,14 @@ class PickleScanner(BaseScanner):
         for encoding, token_pattern in (("base64", _BASE64_TOKEN_RE), ("hex", _HEX_TOKEN_RE)):
             seen_tokens: set[bytes] = set()
             decoded_budget = _MAX_RAW_ENCODED_BYTES
-            token_count = 0
+            decoded_token_count = 0
             for match in token_pattern.finditer(data):
                 token = match.group(0)
                 if encoding == "base64" and len(token) % 2 == 0 and _HEX_TOKEN_RE.fullmatch(token) is not None:
                     continue
                 if token in seen_tokens:
                     continue
-                if token_count >= _MAX_RAW_ENCODED_TOKENS:
-                    self._mark_encoded_text_scan_limit(result, source, encoding, "token", token_count, decoded_budget)
-                    break
                 seen_tokens.add(token)
-                token_count += 1
                 has_seed = (
                     any(seed in token for seed in _BASE64_CODE_EXECUTION_SEEDS)
                     if encoding == "base64"
@@ -4740,9 +4734,10 @@ class PickleScanner(BaseScanner):
                     continue
                 if len(decoded) > decoded_budget:
                     self._mark_encoded_text_scan_limit(
-                        result, source, encoding, "decoded_byte", token_count, decoded_budget
+                        result, source, encoding, "decoded_byte", decoded_token_count, decoded_budget
                     )
                     break
+                decoded_token_count += 1
                 decoded_budget -= len(decoded)
                 decoded_scan_data = _inert_literal_url_stripped_scan_view(decoded) if allow_url_filtering else decoded
                 decoded_lower = decoded_scan_data.lower()
