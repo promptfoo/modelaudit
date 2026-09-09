@@ -6470,6 +6470,46 @@ class TestWeightDistributionSemantics:
         assert coverage[0].details["coverage_gap"] == "unresolved_initializer_lineage"
         assert coverage[0].status == CheckStatus.FAILED
 
+    @pytest.mark.parametrize("gather_dimensions", [False, True])
+    def test_dimensions_cast_to_weights_retain_incomplete_coverage(
+        self, tmp_path: Path, gather_dimensions: bool
+    ) -> None:
+        initializers = [onnx.numpy_helper.from_array(np.ones((2, 4), dtype=np.float32), name="source")]
+        nodes = [helper.make_node("Shape", ["source"], ["dimensions"])]
+        cast_input = "dimensions"
+        if gather_dimensions:
+            initializers.append(onnx.numpy_helper.from_array(np.array([0, 1], dtype=np.int64), name="indices"))
+            nodes.append(helper.make_node("Gather", ["dimensions", "indices"], ["selected"], axis=0))
+            cast_input = "selected"
+        nodes.extend(
+            [
+                helper.make_node("Cast", [cast_input], ["weights"], to=TensorProto.FLOAT),
+                helper.make_node("MatMul", ["X", "weights"], ["Y"]),
+            ]
+        )
+        graph = helper.make_graph(
+            nodes,
+            "dimension_weights",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 2])],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1])],
+            initializer=initializers,
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / "dimension-weights.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        assert result.success is False
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
+        assert any(
+            sample["consumer_op"] == "MatMul" and sample["reason"] == "shape_dimensions_lineage"
+            for sample in result.metadata["onnx_weight_distribution_semantics"]["unresolved_lineage_samples"]
+        )
+
     @pytest.mark.parametrize("malicious", [False, True])
     def test_standard_einsum_weights_are_oriented_and_analyzed(self, tmp_path: Path, malicious: bool) -> None:
         weights = np.zeros((100, 10), dtype=np.float32)

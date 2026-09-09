@@ -2245,7 +2245,7 @@ def _build_onnx_weight_analysis_plan(
                     ),
                 )
 
-            # Shape exposes dimensions, so input weight values cannot reach its output.
+            # Keep dimension provenance: a later Cast can turn dimensions into weights.
             is_shape_query = (
                 is_registered_standard_operator
                 and not is_model_local_function
@@ -2258,9 +2258,17 @@ def _build_onnx_weight_analysis_plan(
                 for initializer_index, lineage in data_lineages.items():
                     transform_counts[initializer_index] += 1
                     output_lineages[initializer_index] = transformed_lineage(lineage, node, constants)
+            elif is_shape_query:
+                for initializer_index, lineage in all_input_lineages.items():
+                    output_lineages[initializer_index] = _OnnxWeightLineage(
+                        initializer_index=initializer_index,
+                        shape=None,
+                        data_type=onnx.TensorProto.INT64,
+                        transforms=lineage.transforms,
+                        unresolved_reason="shape_dimensions_lineage",
+                    )
             elif (
                 all_input_lineages
-                and not is_shape_query
                 and node.op_type not in _QUANTIZED_WEIGHT_OPERATORS
                 and function is None
                 and not subgraph_results
