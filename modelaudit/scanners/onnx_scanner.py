@@ -1926,13 +1926,6 @@ def _build_onnx_weight_analysis_plan(
             if name and name not in value_lineages and name not in constants:
                 dynamic_values.add(name)
 
-        runtime_data_values = (
-            {_onnx_value_name(graph_input) for graph_input in current_graph.input} & dynamic_values
-            if root_graph
-            else set()
-        )
-        constant_fill_values: set[str] = set()
-
         for local_node_index, node in enumerate(getattr(current_graph, "node", ())):
             current_node_index = node_counter
             node_counter += 1
@@ -2013,25 +2006,24 @@ def _build_onnx_weight_analysis_plan(
                     and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
                     and (
                         (node.op_type == "Clip" and input_index > 0)
-                        or (node.op_type == "Where" and input_index == 0)
                         or (
                             not is_model_local_function
-                            and (
-                                (node.op_type in {"Gather", "GatherElements", "GatherND"} and input_index == 1)
-                                or (node.op_type in _RECURRENT_WEIGHT_OPERATORS and input_index == 4)
-                            )
+                            and node.op_type in _RECURRENT_WEIGHT_OPERATORS
+                            and input_index == 4
                         )
                     )
                 )
-                is_expand_shape = (
+                is_shape_control_input = (
                     is_registered_standard_operator
                     and not is_model_local_function
                     and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
-                    and node.op_type == "Expand"
-                    and input_index == 1
+                    and (
+                        (node.op_type in {"Expand", "Gather", "GatherElements", "GatherND"} and input_index == 1)
+                        or (node.op_type == "Where" and input_index == 0)
+                    )
                 )
-                if is_expand_shape:
-                    # Retain shape ownership for subsequent Shape queries without inheriting data values.
+                if is_shape_control_input:
+                    # Shape and Size can later turn output dimensions into numeric data.
                     merge_lineages(
                         all_input_lineages,
                         {
@@ -2314,7 +2306,7 @@ def _build_onnx_weight_analysis_plan(
                 is_registered_standard_operator
                 and not is_model_local_function
                 and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
-                and node.op_type == "Shape"
+                and node.op_type in {"Shape", "Size"}
             )
             output_lineages: dict[int, _OnnxWeightLineage] = {}
             if supported_transform:
@@ -2386,30 +2378,28 @@ def _build_onnx_weight_analysis_plan(
                 carries_dynamic_activation |= any(
                     lineage.unresolved_reason == "dynamic_activation_lineage" for lineage in all_input_lineages.values()
                 )
-                runtime_masks_activation = (
-                    same_type_elementwise
+                preserves_shape_control = (
+                    is_registered_standard_operator
                     and not is_model_local_function
-                    and node.op_type == "Where"
-                    and len(node.input) == 3
-                    and node.input[0] in runtime_data_values
-                    and all(
-                        input_name in constant_fill_values
-                        or input_name in runtime_data_values
-                        or input_index in dynamic_activation_input_indexes
-                        for input_index, input_name in enumerate(node.input[1:], start=1)
-                    )
-                    and any(
-                        input_name in runtime_data_values or input_index in dynamic_activation_input_indexes
-                        for input_index, input_name in enumerate(node.input[1:], start=1)
+                    and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
+                    and (
+                        same_type_elementwise
+                        or (
+                            same_type_unary_elementwise
+                            and node.op_type not in {"Hardmax", "LogSoftmax", "LpNormalization", "Softmax"}
+                        )
+                        or clip_operator
+                        or pow_operator
+                        or node.op_type in {"Expand", "Gather", "GatherElements", "GatherND"}
                     )
                 )
                 for initializer_index, lineage in all_input_lineages.items():
                     if initializer_index in activation_input_lineages:
                         continue
                     unresolved_reason = lineage.unresolved_reason
-                    # Arithmetic on dimension values stays unresolved in either matrix operand.
-                    if unresolved_reason == "shape_dimensions_lineage" and runtime_masks_activation:
-                        unresolved_reason = "dynamic_activation_lineage"
+                    if unresolved_reason == "shape_control_lineage" and not preserves_shape_control:
+                        # Reductions, normalization and unknown operators can turn extents into data values.
+                        unresolved_reason = "shape_dimensions_lineage"
                     if unresolved_reason is None:
                         if carries_dynamic_activation:
                             unresolved_reason = "dynamic_activation_lineage"
@@ -2542,42 +2532,10 @@ def _build_onnx_weight_analysis_plan(
                     )
                     subgraph_output_dynamic[output_index] |= graph_output_dynamic[graph_output_index]
 
-            preserves_runtime_data = (
-                is_registered_standard_operator
-                and not is_model_local_function
-                and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
-                and (supported_transform or node.op_type in {"Abs", "Expand", "Neg", "Not", "Relu", "Sigmoid", "Tanh"})
-                and bool(node.input)
-            )
-            runtime_output = preserves_runtime_data and node.input[0] in runtime_data_values
-            runtime_output |= (
-                is_registered_standard_operator
-                and not is_model_local_function
-                and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
-                and node.op_type in {"Equal", "Greater", "GreaterOrEqual", "Less", "LessOrEqual"}
-                and any(
-                    input_name in runtime_data_values or input_index in dynamic_activation_input_indexes
-                    for input_index, input_name in enumerate(node.input)
-                )
-            )
-            constant_fill_output = (
-                is_registered_standard_operator
-                and not is_model_local_function
-                and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
-                and node.op_type == "ConstantOfShape"
-            ) or (preserves_runtime_data and node.input[0] in constant_fill_values)
             for output_index, output_name in enumerate(node.output):
                 if not output_name:
                     continue
                 name = str(output_name)
-                if runtime_output:
-                    runtime_data_values.add(name)
-                else:
-                    runtime_data_values.discard(name)
-                if constant_fill_output:
-                    constant_fill_values.add(name)
-                else:
-                    constant_fill_values.discard(name)
                 per_output_lineages = dict(output_lineages)
                 merge_lineages(
                     per_output_lineages,

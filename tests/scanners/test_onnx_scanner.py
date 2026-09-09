@@ -6619,7 +6619,7 @@ class TestWeightDistributionSemantics:
             )
         else:
             assert not coverage
-        if use == "Expand":
+        if not dimension_values_are_data:
             assert result.metadata["onnx_weight_distribution_semantics"]["exclusion_counts"]["shape_control_input"] >= 1
 
     @pytest.mark.parametrize("combination", ["Add", "Mul"])
@@ -6666,28 +6666,65 @@ class TestWeightDistributionSemantics:
         )
 
     @pytest.mark.parametrize("transform", ["Identity", "Relu"])
-    def test_expand_shape_ownership_survives_value_transforms(self, tmp_path: Path, transform: str) -> None:
-        graph = helper.make_graph(
+    @pytest.mark.parametrize("observation", ["Shape", "Size"])
+    @pytest.mark.parametrize("control", ["Expand", "Gather", "GatherElements", "GatherND", "Where"])
+    def test_shape_control_ownership_survives_value_transforms(
+        self, tmp_path: Path, transform: str, observation: str, control: str
+    ) -> None:
+        runtime_shape = {
+            "Expand": [1, 4],
+            "Gather": [4],
+            "GatherElements": [2, 4],
+            "GatherND": [4],
+            "Where": [1, 4],
+        }[control]
+        inputs = [helper.make_tensor_value_info("runtime", TensorProto.FLOAT, runtime_shape)]
+        initializers = [
+            onnx.numpy_helper.from_array(
+                np.ones((2, 4) if control == "Expand" else (2, 1), dtype=np.float32), name="source"
+            ),
+        ]
+        nodes = [helper.make_node("Shape", ["source"], ["dimensions"])]
+        if control == "Expand":
+            nodes.append(helper.make_node("Expand", ["runtime", "dimensions"], ["selected"]))
+        else:
+            initializers.append(
+                onnx.numpy_helper.from_array(
+                    np.zeros((1, 1), dtype=np.bool_ if control == "Where" else np.int64), name="seed"
+                )
+            )
+            nodes.append(helper.make_node("Expand", ["seed", "dimensions"], ["control"]))
+            if control == "Where":
+                inputs.append(helper.make_tensor_value_info("other", TensorProto.FLOAT, runtime_shape))
+                nodes.append(helper.make_node("Where", ["control", "runtime", "other"], ["selected"]))
+            else:
+                nodes.append(helper.make_node(control, ["runtime", "control"], ["selected"]))
+        nodes.extend(
             [
-                helper.make_node("Shape", ["source"], ["dimensions"]),
-                helper.make_node("Expand", ["runtime", "dimensions"], ["expanded"]),
-                helper.make_node(transform, ["expanded"], ["transformed"]),
-                helper.make_node("Shape", ["transformed"], ["output_dimensions"]),
-                helper.make_node("Cast", ["output_dimensions"], ["dimension_values"], to=TensorProto.FLOAT),
-                helper.make_node("MatMul", ["projection", "dimension_values"], ["Y"]),
-            ],
-            "expanded_shape_ownership",
-            [helper.make_tensor_value_info("runtime", TensorProto.FLOAT, [1, 4])],
+                helper.make_node(transform, ["selected"], ["transformed"]),
+                helper.make_node(observation, ["transformed"], ["measurement"]),
+                helper.make_node("Cast", ["measurement"], ["measurement_float"], to=TensorProto.FLOAT),
+            ]
+        )
+        values = "measurement_float"
+        if observation == "Size":
+            initializers.append(onnx.numpy_helper.from_array(np.array([0], dtype=np.int64), name="axes"))
+            nodes.append(helper.make_node("Unsqueeze", [values, "axes"], ["dimension_values"]))
+            values = "dimension_values"
+        columns = 1 if observation == "Size" or control == "GatherND" else 2
+        initializers.append(onnx.numpy_helper.from_array(np.ones((1, columns), dtype=np.float32), name="projection"))
+        nodes.append(helper.make_node("MatMul", ["projection", values], ["Y"]))
+        graph = helper.make_graph(
+            nodes,
+            "shape_control_ownership",
+            inputs,
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1])],
-            initializer=[
-                onnx.numpy_helper.from_array(np.ones((2, 4), dtype=np.float32), name="source"),
-                onnx.numpy_helper.from_array(np.ones((1, 2), dtype=np.float32), name="projection"),
-            ],
+            initializer=initializers,
         )
         model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
         model.ir_version = 8
         onnx.checker.check_model(model)
-        path = tmp_path / "expanded-shape-ownership.onnx"
+        path = tmp_path / "shape-control-ownership.onnx"
         onnx.save(model, str(path))
 
         result = OnnxScanner().scan(str(path))
@@ -6698,7 +6735,9 @@ class TestWeightDistributionSemantics:
             for check in result.checks
         )
         assert any(
-            sample["initializer"] == "source" and sample["reason"] == "shape_dimensions_lineage"
+            sample["initializer"] == "source"
+            and sample["consumer_op"] == "MatMul"
+            and sample["reason"] == "shape_dimensions_lineage"
             for sample in result.metadata["onnx_weight_distribution_semantics"]["unresolved_lineage_samples"]
         )
 
@@ -6732,6 +6771,60 @@ class TestWeightDistributionSemantics:
         assert any(
             check.name == "Weight Distribution Analysis Coverage" and check.status == CheckStatus.FAILED
             for check in result.checks
+        )
+
+    @pytest.mark.parametrize(
+        "operation", ["ReduceSum", "Softmax", "LogSoftmax", "LpNormalization", "Hardmax", "Custom"]
+    )
+    @pytest.mark.parametrize("generated_input_index", [0, 1])
+    def test_shape_control_data_operations_preserve_incomplete_coverage(
+        self, tmp_path: Path, operation: str, generated_input_index: int
+    ) -> None:
+        columns = 1 if operation == "ReduceSum" else 4
+        transform = helper.make_node(operation, ["expanded"], ["weights"])
+        opsets = [helper.make_opsetid("", 11)]
+        if operation == "ReduceSum":
+            transform.attribute.append(helper.make_attribute("axes", [1]))
+        elif operation == "Custom":
+            transform.domain = "test.shape"
+            opsets.append(helper.make_opsetid("test.shape", 1))
+        operands = ["weights", "projection"] if generated_input_index == 0 else ["projection", "weights"]
+        projection_shape = (columns, 3) if generated_input_index == 0 else (3, 2)
+        output_shape = [2, 3] if generated_input_index == 0 else [3, columns]
+        graph = helper.make_graph(
+            [
+                helper.make_node("Shape", ["source"], ["dimensions"]),
+                helper.make_node("Expand", ["runtime", "dimensions"], ["expanded"]),
+                transform,
+                helper.make_node("MatMul", operands, ["Y"]),
+            ],
+            "shape_control_data_operations",
+            [helper.make_tensor_value_info("runtime", TensorProto.FLOAT, [1, 4])],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, output_shape)],
+            initializer=[
+                onnx.numpy_helper.from_array(np.ones((2, 4), dtype=np.float32), name="source"),
+                onnx.numpy_helper.from_array(np.ones(projection_shape, dtype=np.float32), name="projection"),
+            ],
+        )
+        model = helper.make_model(graph, opset_imports=opsets)
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / "shape-control-data-operations.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        assert result.success is False
+        assert any(
+            check.name == "Weight Distribution Analysis Coverage" and check.status == CheckStatus.FAILED
+            for check in result.checks
+        )
+        assert any(
+            sample["initializer"] == "source"
+            and sample["consumer_op"] == "MatMul"
+            and sample["consumer_input_index"] == generated_input_index
+            and sample["reason"] == "shape_dimensions_lineage"
+            for sample in result.metadata["onnx_weight_distribution_semantics"]["unresolved_lineage_samples"]
         )
 
     @pytest.mark.parametrize("op_type", ["LSTM", "GRU", "RNN"])
@@ -6845,8 +6938,15 @@ class TestWeightDistributionSemantics:
     @pytest.mark.parametrize("fill_first", [False, True])
     @pytest.mark.parametrize("explicit_fill", [False, True])
     @pytest.mark.parametrize("mask_operator", ["input", "Equal", "Greater", "GreaterOrEqual", "Less", "LessOrEqual"])
-    def test_runtime_masks_with_shape_derived_fills_preserve_weight_analysis(
-        self, tmp_path: Path, malicious: bool, fill_first: bool, explicit_fill: bool, mask_operator: str
+    @pytest.mark.parametrize("generated_input_index", [0, 1])
+    def test_runtime_masks_with_shape_derived_fills_preserve_incomplete_coverage(
+        self,
+        tmp_path: Path,
+        malicious: bool,
+        fill_first: bool,
+        explicit_fill: bool,
+        mask_operator: str,
+        generated_input_index: int,
     ) -> None:
         weights = np.zeros((100, 10), dtype=np.float32)
         if malicious:
@@ -6863,17 +6963,19 @@ class TestWeightDistributionSemantics:
                 helper.make_node("Shape", ["hidden"], ["dimensions"]),
                 fill,
                 helper.make_node("Where", ["mask", *branches], ["masked"]),
-                helper.make_node("MatMul", ["masked", "W2"], ["Y"]),
+                helper.make_node("MatMul", ["masked", "W2"] if generated_input_index == 0 else ["W2", "masked"], ["Y"]),
             ],
             "runtime_activation_mask",
             [
                 helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 100]),
                 helper.make_tensor_value_info("mask", TensorProto.BOOL, [1, 10]),
             ],
-            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 5])],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 5] if generated_input_index == 0 else [5, 10])],
             initializer=[
                 onnx.numpy_helper.from_array(weights, name="W1"),
-                onnx.numpy_helper.from_array(np.zeros((10, 5), dtype=np.float32), name="W2"),
+                onnx.numpy_helper.from_array(
+                    np.zeros((10, 5) if generated_input_index == 0 else (5, 1), dtype=np.float32), name="W2"
+                ),
             ],
         )
         if mask_operator != "input":
@@ -6887,9 +6989,16 @@ class TestWeightDistributionSemantics:
 
         result = OnnxScanner().scan(str(path))
 
-        assert result.success is True
+        assert result.success is False
         assert len(self._extreme_checks(result)) == int(malicious)
-        assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
+        assert any(
+            check.name == "Weight Distribution Analysis Coverage" and check.status == CheckStatus.FAILED
+            for check in result.checks
+        )
+        assert any(
+            sample["consumer_op"] == "MatMul" and sample["reason"] == "shape_dimensions_lineage"
+            for sample in result.metadata["onnx_weight_distribution_semantics"]["unresolved_lineage_samples"]
+        )
 
     @pytest.mark.parametrize("malicious", [False, True])
     def test_standard_einsum_weights_are_oriented_and_analyzed(self, tmp_path: Path, malicious: bool) -> None:
