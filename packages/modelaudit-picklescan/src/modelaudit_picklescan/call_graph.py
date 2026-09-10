@@ -2121,12 +2121,6 @@ def find_startup_hook_write_call_graphs(
         if require_invocations and not invocation_references:
             continue
         seen.add((module, name))
-        if invocation_references and all(
-            _trusted_empty_mailbox_constructor_invocation_is_safe(module, name, invocation_reference)
-            for invocation_reference in invocation_references
-        ):
-            continue
-
         try:
             entrypoints = (
                 _dedupe_calls(
@@ -3450,12 +3444,43 @@ def _trusted_empty_mailbox_constructor_invocation_is_safe(
     name: str,
     reference: Mapping[str, object],
 ) -> bool:
-    if (module, name) not in _TRUSTED_EMPTY_MAILBOX_CONSTRUCTOR_INVOCATIONS:
+    return False
+
+
+def _mailbox_constructor_reference_is_canonical(module: str, name: str) -> bool:
+    if _trusted_module_origin_kind(module) != "stdlib":
         return False
-    if str(reference.get("opcode", "")) != "REDUCE":
+    loaded, module_object, spec = _loaded_module_state_without_hooks(module)
+    if not loaded:
         return False
-    positional_arg_count = reference.get("positional_arg_count")
-    return type(positional_arg_count) is int and positional_arg_count == 1
+    if type(module_object) is not ModuleType or type(spec) is not ModuleSpec:
+        return False
+    origin, loader = _module_spec_fields_without_hooks(spec)
+    if not _loaded_module_metadata_matches_spec_without_hooks(module, module_object, spec, origin, loader):
+        return False
+    reference_state = _loaded_reference_state_without_hooks(module_object, name)
+    _track_loaded_interpreter_reference_state(module, name, reference_state)
+    if not reference_state[0] or not _runtime_value_is_class(reference_state[1]):
+        return False
+    class_object = cast(type[object], reference_state[1])
+    if type.__getattribute__(class_object, "__module__") != module:
+        return False
+    if type.__getattribute__(class_object, "__name__") != name.rpartition(".")[2]:
+        return False
+    return (
+        _source_class_context(f"{module}.{name}") is not None
+        and _class_pickle_owner_matches_trusted_source(
+            class_object,
+            expected_module=module,
+            pickle_entrypoint_methods=_PICKLE_CONSTRUCTOR_ENTRYPOINT_METHODS,
+            pickle_invokes_metaclass_call=True,
+        )
+        and _class_pickle_runtime_dependencies_are_source_independent(
+            class_object,
+            pickle_entrypoint_methods=_PICKLE_CONSTRUCTOR_ENTRYPOINT_METHODS,
+            pickle_invokes_metaclass_call=True,
+        )
+    )
 
 
 def _filter_class_entrypoints(entrypoints: tuple[str, ...], methods: tuple[str, ...]) -> tuple[str, ...]:

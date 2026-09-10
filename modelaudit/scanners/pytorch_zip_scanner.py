@@ -137,12 +137,55 @@ _PROTO0_1_LITERAL_OPCODES = frozenset(
         "SHORT_BINUNICODE",
     }
 )
-_BASE64_NESTED_LITERAL_TOKEN_RE = re.compile(rb"[A-Za-z0-9+/_-]{16,}={0,2}")
-_HEX_NESTED_LITERAL_TOKEN_RE = re.compile(rb"(?<![0-9A-Fa-f])(?:[0-9A-Fa-f]{2}){8,}(?![0-9A-Fa-f])")
+_BASE64_NESTED_LITERAL_TOKEN_RE = re.compile(rb"[A-Za-z0-9+/_-][A-Za-z0-9+/_\-\s\r\n\t]{15,}={0,2}")
+_HEX_NESTED_LITERAL_TOKEN_RE = re.compile(rb"(?<![0-9A-Fa-f])(?:[0-9A-Fa-f]{2}[\s\r\n\t]*){8,}(?![0-9A-Fa-f])")
 _RAW_NESTED_SECURITY_PICKLE_START_BYTES = b"\x80(cioRbP\x82\x83\x84"
 _MAX_RAW_NESTED_PICKLE_CANDIDATES = 64
 _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES = 8 * 1024
+_MAX_PROTO0_GLOBAL_PREFIX_WITHOUT_NEWLINE_BYTES = 128
+_PROTO0_GLOBAL_PREFIX_WITHOUT_NEWLINE_RE = re.compile(rb"c[A-Za-z_][A-Za-z0-9_.]*")
+_RAW_NESTED_SECURITY_PICKLE_TEXT_MARKERS = (
+    b"builtins\neval\n",
+    b"builtins\nexec\n",
+    b"__builtin__\neval\n",
+    b"__builtin__\nexec\n",
+    b"os\npopen\n",
+    b"os\nsystem\n",
+    b"nt\npopen\n",
+    b"nt\nsystem\n",
+    b"posix\npopen\n",
+    b"posix\nsystem\n",
+    b"subprocess\nPopen\n",
+    b"subprocess\ncall\n",
+    b"subprocess\ncheck_call\n",
+    b"subprocess\ncheck_output\n",
+    b"subprocess\ngetoutput\n",
+    b"subprocess\ngetstatusoutput\n",
+    b"subprocess\nrun\n",
+    b"commands\ngetoutput\n",
+    b"commands\ngetstatusoutput\n",
+)
 _SUSPICIOUS_LITERAL_TEXT_PATTERNS = tuple(re.compile(pattern, re.IGNORECASE) for pattern in SUSPICIOUS_STRING_PATTERNS)
+_STORAGE_LITERAL_TEXT_ROUTE_PATTERNS = tuple(
+    re.compile(pattern, re.IGNORECASE | re.DOTALL)
+    for pattern in (
+        r"\b(?:eval|exec)\s*(?:\\\r?\n\s*)?\(",
+        r"__import__\s*(?:\\\r?\n\s*)?\(",
+        r"\bimportlib\s*(?:\\\r?\n\s*)?\.\s*(?:import_module|__import__)\s*\(",
+        r"\bos\s*(?:\\\r?\n\s*)?\.\s*(?:\\\r?\n\s*)?(?:system|popen|spawn[a-z]*)\s*(?:\.__call__)?\s*\(",
+        r"\bsubprocess\s*(?:\\\r?\n\s*)?\.\s*(?:Popen|call|check_output|run|check_call)\s*\(",
+        r"\bbase64\s*(?:\\\r?\n\s*)?\.\s*(?:b64decode|decode)\s*\(",
+        r"\b(?:pickle|cloudpickle|joblib)\s*(?:\\\r?\n\s*)?\.\s*(?:load|loads)\s*\(",
+        r"\bcopyreg\s*(?:\\\r?\n\s*)?\.\s*(?:add_extension|remove_extension)\s*\(",
+        r"getattr\s*\(\s*\w+\s*,\s*['\"](?:system|popen|spawn|exec|eval|call|run|Popen)['\"]",
+    )
+)
+_BASE64_LITERAL_TEXT_TOKEN_RE = re.compile(rb"[A-Za-z0-9+/_-][A-Za-z0-9+/_\-\s\r\n\t]{7,}={0,2}")
+_HEX_LITERAL_TEXT_TOKEN_RE = re.compile(rb"(?:[0-9A-Fa-f]{2}[\s\r\n\t]*){4,}")
+_MAX_STORAGE_LITERAL_TEXT_CANDIDATES = 64
+_MAX_STORAGE_LITERAL_DECODED_TEXT_BYTES = 64 * 1024
+_STORAGE_LITERAL_DECODED_TEXT_WINDOW_OVERLAP_BYTES = 1024
+_MAX_STORAGE_LITERAL_DECODED_TEXT_WINDOWS = 16
 
 
 @dataclass(frozen=True)
@@ -244,6 +287,7 @@ _PICKLE_FRAME_OPCODE = b"\x95"
 _PICKLE_FRAME_OPCODE_BYTES = 9
 _PROTO0_1_TEXT_WHITESPACE_BYTES = b" \t\r\n"
 _PICKLE_DISCOVERY_PADDING_PROBE_BYTES = 256 * 1024
+_PICKLE_DISCOVERY_NUL_PADDING_VERIFY_BYTES = 512 * 1024
 _PICKLE_DISCOVERY_PADDING_PROBE_BUDGET_BYTES = 4 * 1024 * 1024
 _PICKLE_INCOMPLETE_FRAME_MIN_PAYLOAD_OPCODES = 4
 _PYTORCH_STORAGE_TRUST_MAX_OPCODES = 100_000
@@ -1981,21 +2025,40 @@ class PyTorchZipScanner(BaseScanner):
             return False
 
         sample = data_start
+        detection_probe_budget_charge_bytes = 0
+
+        def charge_detection_probe_budget() -> None:
+            nonlocal detection_probe_budget_charge_bytes
+            if not detection_probe_budget_charge_bytes:
+                return
+            PyTorchZipScanner._charge_padding_probe_budget(
+                padding_probe_bytes_remaining,
+                detection_probe_budget_charge_bytes,
+            )
+            detection_probe_budget_charge_bytes = 0
+
         if entry.file_size > len(data_start):
             probe_bytes = max_probe_bytes
-            if (
-                max_probe_bytes > _TRUSTED_STORAGE_PICKLE_PROBE_BYTES
-                and entry.file_size > max_probe_bytes
-                and PyTorchZipScanner._trivial_complete_pickle_prefix_has_only_padding(data_start)
-                and defer_padding_probe is None
-            ):
-                padding_probe_bytes = min(entry.file_size, _PICKLE_DISCOVERY_PADDING_PROBE_BYTES)
-                if padding_probe_bytes_remaining is None or padding_probe_bytes <= padding_probe_bytes_remaining[0]:
-                    probe_bytes = padding_probe_bytes
+            probe_budget_charge_bytes = 0
             if max_probe_bytes > _TRUSTED_STORAGE_PICKLE_PROBE_BYTES:
+                if entry.file_size <= max_probe_bytes:
+                    probe_budget_charge_bytes = entry.file_size
+                elif (
+                    PyTorchZipScanner._trivial_complete_pickle_prefix_has_only_padding(data_start)
+                    and defer_padding_probe is None
+                ):
+                    padding_probe_bytes = min(entry.file_size, _PICKLE_DISCOVERY_PADDING_PROBE_BYTES)
+                    if padding_probe_bytes_remaining is None or padding_probe_bytes <= padding_probe_bytes_remaining[0]:
+                        probe_bytes = padding_probe_bytes
+                        probe_budget_charge_bytes = padding_probe_bytes
+                    else:
+                        detection_probe_budget_charge_bytes = min(entry.file_size, probe_bytes)
+                else:
+                    detection_probe_budget_charge_bytes = min(entry.file_size, probe_bytes)
+            if probe_budget_charge_bytes:
                 PyTorchZipScanner._charge_padding_probe_budget(
                     padding_probe_bytes_remaining,
-                    min(max(entry.file_size, 0), probe_bytes),
+                    probe_budget_charge_bytes,
                 )
             sample = self._read_member_prefix(
                 zip_file,
@@ -2005,14 +2068,40 @@ class PyTorchZipScanner(BaseScanner):
                 result=result,
             )
         if is_binary_pickle_candidate:
-            return self._binary_pickle_probe_should_scan(sample, sample_is_prefix=entry.file_size > len(sample))
+            should_scan = (
+                self._binary_pickle_probe_should_scan(sample, sample_is_prefix=entry.file_size > len(sample))
+                or PyTorchZipScanner._expanded_probe_preserves_trusted_scan(
+                    entry,
+                    sample,
+                    max_probe_bytes,
+                    PyTorchZipScanner._binary_pickle_probe_should_scan,
+                )
+                or (
+                    max_probe_bytes > _TRUSTED_STORAGE_PICKLE_PROBE_BYTES
+                    and PyTorchZipScanner._looks_like_binary_pickle_prefix(
+                        sample,
+                        sample_is_prefix=entry.file_size > len(sample),
+                    )
+                )
+            )
+            if should_scan:
+                charge_detection_probe_budget()
+                return True
+            return False
         if is_frame_first_candidate:
-            if self._frame_first_trusted_storage_probe_should_scan(sample):
+            if self._frame_first_trusted_storage_probe_should_scan(sample) or (
+                max_probe_bytes > _TRUSTED_STORAGE_PICKLE_PROBE_BYTES
+                and PyTorchZipScanner._frame_first_trusted_storage_probe_should_scan(
+                    sample[:_TRUSTED_STORAGE_PICKLE_PROBE_BYTES]
+                )
+            ):
+                charge_detection_probe_budget()
                 return True
         elif self._proto0_or_1_trusted_storage_probe_should_scan(
             sample,
             sample_is_prefix=entry.file_size > len(sample),
         ):
+            charge_detection_probe_budget()
             return True
         if (
             max_probe_bytes == _TRUSTED_STORAGE_PICKLE_PROBE_BYTES
@@ -2029,11 +2118,10 @@ class PyTorchZipScanner(BaseScanner):
                 defer_padding_probe[0] = True
                 return False
             expanded_probe_bytes = min(entry.file_size, _PICKLE_DISCOVERY_LONG_PROBE_BYTES)
-            if expanded_probe_bytes > len(sample):
-                PyTorchZipScanner._charge_padding_probe_budget(
-                    padding_probe_bytes_remaining,
-                    expanded_probe_bytes - len(sample),
-                )
+            PyTorchZipScanner._charge_padding_probe_budget(
+                padding_probe_bytes_remaining,
+                max(0, expanded_probe_bytes - len(sample)),
+            )
             expanded_sample = self._read_member_prefix(
                 zip_file,
                 entry,
@@ -2046,6 +2134,13 @@ class PyTorchZipScanner(BaseScanner):
             if not is_frame_first_candidate and self._proto0_or_1_trusted_storage_probe_should_scan(
                 expanded_sample,
                 sample_is_prefix=entry.file_size > len(expanded_sample),
+            ):
+                return True
+            if not is_frame_first_candidate and PyTorchZipScanner._expanded_probe_preserves_trusted_scan(
+                entry,
+                expanded_sample,
+                expanded_probe_bytes,
+                PyTorchZipScanner._proto0_or_1_trusted_storage_probe_should_scan,
             ):
                 return True
             sample = expanded_sample
@@ -2080,6 +2175,15 @@ class PyTorchZipScanner(BaseScanner):
                 sample = padding_sample
             if PyTorchZipScanner._trivial_complete_pickle_prefix_has_only_padding(sample):
                 if entry.file_size > len(sample):
+                    if PyTorchZipScanner._trivial_complete_pickle_prefix_has_only_nul_padding(sample):
+                        return self._verified_nul_padding_storage_probe_should_scan(
+                            zip_file,
+                            entry,
+                            sample,
+                            result,
+                            padding_probe_bytes_remaining,
+                            is_frame_first_candidate=is_frame_first_candidate,
+                        )
                     raise ValueError("trusted PyTorch storage padding probe limit reached")
                 return False
         if (
@@ -2091,9 +2195,65 @@ class PyTorchZipScanner(BaseScanner):
             )
         ):
             if PyTorchZipScanner._trivial_complete_pickle_prefix_has_only_padding(sample):
+                if PyTorchZipScanner._trivial_complete_pickle_prefix_has_only_nul_padding(sample):
+                    return self._verified_nul_padding_storage_probe_should_scan(
+                        zip_file,
+                        entry,
+                        sample,
+                        result,
+                        padding_probe_bytes_remaining,
+                        is_frame_first_candidate=is_frame_first_candidate,
+                    )
                 raise ValueError("trusted PyTorch storage padding probe limit reached")
             raise ValueError("trusted PyTorch storage prefix exceeds pickle discovery probe")
         return False
+
+    def _verified_nul_padding_storage_probe_should_scan(
+        self,
+        zip_file: zipfile.ZipFile,
+        entry: zipfile.ZipInfo,
+        sample: bytes,
+        result: ScanResult,
+        padding_probe_bytes_remaining: list[int] | None,
+        *,
+        is_frame_first_candidate: bool,
+    ) -> bool:
+        if entry.file_size > len(sample):
+            if entry.file_size > _PICKLE_DISCOVERY_NUL_PADDING_VERIFY_BYTES:
+                raise ValueError("trusted PyTorch storage padding probe limit reached")
+            PyTorchZipScanner._charge_padding_probe_budget(
+                padding_probe_bytes_remaining,
+                entry.file_size - len(sample),
+            )
+            sample = self._read_member_prefix(
+                zip_file,
+                entry,
+                entry.file_size,
+                phase="pickle_discovery",
+                result=result,
+            )
+        if is_frame_first_candidate and self._frame_first_trusted_storage_probe_should_scan(sample):
+            return True
+        if not is_frame_first_candidate and self._proto0_or_1_trusted_storage_probe_should_scan(
+            sample,
+            sample_is_prefix=False,
+        ):
+            return True
+        if PyTorchZipScanner._trivial_complete_pickle_prefix_has_only_padding(sample):
+            return False
+        raise ValueError("trusted PyTorch storage padding probe limit reached")
+
+    @staticmethod
+    def _expanded_probe_preserves_trusted_scan(
+        entry: zipfile.ZipInfo,
+        sample: bytes,
+        max_probe_bytes: int,
+        predicate: Callable[..., bool],
+    ) -> bool:
+        if max_probe_bytes <= _TRUSTED_STORAGE_PICKLE_PROBE_BYTES:
+            return False
+        short_sample = sample[:_TRUSTED_STORAGE_PICKLE_PROBE_BYTES]
+        return predicate(short_sample, sample_is_prefix=entry.file_size > len(short_sample))
 
     @staticmethod
     def _charge_padding_probe_budget(padding_probe_bytes_remaining: list[int] | None, probe_bytes: int) -> None:
@@ -2150,6 +2310,12 @@ class PyTorchZipScanner(BaseScanner):
         *,
         entry_size: int | None = None,
     ) -> bool:
+        if (
+            entry_size is None or entry_size > len(sample)
+        ) and PyTorchZipScanner._trailing_pickle_candidate_needs_more_bytes(
+            sample.lstrip(PROTO0_1_IGNORABLE_TRAILING_BYTES)
+        ):
+            return True
         if PyTorchZipScanner._trivial_complete_pickle_prefix_needs_more_bytes(sample):
             return entry_size is None or entry_size > len(sample)
         if PyTorchZipScanner._trivial_complete_pickle_prefix_has_only_text_padding(sample):
@@ -2162,6 +2328,8 @@ class PyTorchZipScanner(BaseScanner):
     def _frame_first_trusted_storage_probe_should_scan(sample: bytes) -> bool:
         if not sample.startswith(_PICKLE_FRAME_OPCODE):
             return False
+        if PyTorchZipScanner._complete_trivial_literal_pickle_has_nested_security_pickle(sample):
+            return True
         return PyTorchZipScanner._has_complete_pickle_stream_without_frame_stop_overrun(
             sample
         ) or PyTorchZipScanner._has_structural_pickle_evidence_in_incomplete_frame(sample)
@@ -2249,6 +2417,10 @@ class PyTorchZipScanner(BaseScanner):
                 or PyTorchZipScanner._looks_like_binary_pickle_prefix(candidate, sample_is_prefix=False)
                 or PyTorchZipScanner._frame_first_trusted_storage_probe_should_scan(candidate)
             )
+        if PyTorchZipScanner._trailing_candidate_has_raw_nested_security_pickle(candidate):
+            return True
+        if PyTorchZipScanner._malformed_separator_proto0_string_literal_has_nested_security_pickle(candidate):
+            return True
         if not sample_is_prefix:
             return False
         if candidate.startswith(_PICKLE_BINARY_PROTOCOL_PREFIXES):
@@ -2273,7 +2445,14 @@ class PyTorchZipScanner(BaseScanner):
         if candidate.startswith(b"P"):
             return b"\n" not in candidate[1:]
         if candidate.startswith(b"c"):
-            return candidate.count(b"\n") < 2
+            if len(candidate) == 1:
+                return True
+            if b"\n" in candidate:
+                return candidate.count(b"\n") < 2
+            return (
+                len(candidate) <= _MAX_PROTO0_GLOBAL_PREFIX_WITHOUT_NEWLINE_BYTES
+                and _PROTO0_GLOBAL_PREFIX_WITHOUT_NEWLINE_RE.fullmatch(candidate) is not None
+            )
         if candidate.startswith((b"F", b"I", b"L")):
             return b"\n" not in candidate[1:]
         if candidate.startswith(b"V"):
@@ -2439,9 +2618,22 @@ class PyTorchZipScanner(BaseScanner):
         return trailing is not None and not trailing.strip(PROTO0_1_IGNORABLE_TRAILING_BYTES)
 
     @staticmethod
+    def _trivial_complete_pickle_prefix_has_only_nul_padding(sample: bytes) -> bool:
+        trailing = PyTorchZipScanner._trivial_complete_pickle_prefix_trailing(sample)
+        return trailing is not None and bool(trailing) and not trailing.strip(b"\x00")
+
+    @staticmethod
     def _trivial_complete_pickle_prefix_has_only_text_padding(sample: bytes) -> bool:
         trailing = PyTorchZipScanner._trivial_complete_pickle_prefix_trailing(sample)
         return trailing is not None and bool(trailing) and not trailing.strip(_PROTO0_1_TEXT_WHITESPACE_BYTES)
+
+    @staticmethod
+    def _malformed_separator_proto0_string_literal_has_nested_security_pickle(candidate: bytes) -> bool:
+        if not candidate or candidate[0] in PROTO0_1_START_BYTES:
+            return False
+        return PyTorchZipScanner._complete_proto0_string_literal_has_nested_security_pickle(
+            candidate[1:].lstrip(PROTO0_1_IGNORABLE_TRAILING_BYTES)
+        )
 
     @staticmethod
     def _trivial_complete_pickle_prefix_trailing(sample: bytes) -> bytes | None:
@@ -2561,16 +2753,94 @@ class PyTorchZipScanner(BaseScanner):
         text = value.decode("utf-8", errors="ignore")
         if not text:
             text = value.decode("latin-1", errors="ignore")
-        return any(pattern.search(text) for pattern in _SUSPICIOUS_LITERAL_TEXT_PATTERNS)
+        return PyTorchZipScanner._literal_text_has_storage_route_signal(
+            text
+        ) or PyTorchZipScanner._literal_value_has_encoded_suspicious_text(value)
 
     @staticmethod
-    def _literal_value_has_raw_nested_security_pickle(value: bytes) -> bool:
+    def _literal_text_has_storage_route_signal(text: str) -> bool:
+        return any(pattern.search(text) for pattern in _SUSPICIOUS_LITERAL_TEXT_PATTERNS) or any(
+            pattern.search(text) for pattern in _STORAGE_LITERAL_TEXT_ROUTE_PATTERNS
+        )
+
+    @staticmethod
+    def _literal_value_has_encoded_suspicious_text(value: bytes) -> bool:
+        return PyTorchZipScanner._base64_literal_value_has_suspicious_text(
+            value
+        ) or PyTorchZipScanner._hex_literal_value_has_suspicious_text(value)
+
+    @staticmethod
+    def _decoded_literal_text_has_storage_route_signal(decoded: bytes) -> bool:
+        start = 0
+        window_count = 0
+        step = _MAX_STORAGE_LITERAL_DECODED_TEXT_BYTES - _STORAGE_LITERAL_DECODED_TEXT_WINDOW_OVERLAP_BYTES
+        while start < len(decoded):
+            window_count += 1
+            if window_count > _MAX_STORAGE_LITERAL_DECODED_TEXT_WINDOWS:
+                return True
+            window = decoded[start : start + _MAX_STORAGE_LITERAL_DECODED_TEXT_BYTES]
+            for encoding in ("utf-8", "latin-1"):
+                text = window.decode(encoding, errors="ignore")
+                if text and PyTorchZipScanner._literal_text_has_storage_route_signal(text):
+                    return True
+            if start + _MAX_STORAGE_LITERAL_DECODED_TEXT_BYTES >= len(decoded):
+                break
+            start += step
+        return False
+
+    @staticmethod
+    def _base64_literal_value_has_suspicious_text(value: bytes) -> bool:
+        candidate_count = 0
+        for match in _BASE64_LITERAL_TEXT_TOKEN_RE.finditer(value):
+            compact = re.sub(rb"\s+", b"", match.group(0)).translate(bytes.maketrans(b"-_", b"+/"))
+            if len(compact) < 8:
+                continue
+            candidate_count += 1
+            if candidate_count > _MAX_STORAGE_LITERAL_TEXT_CANDIDATES:
+                return True
+            for shift in range(min(16, len(compact))):
+                token = compact[shift:]
+                if len(token) < 8:
+                    continue
+                token += b"=" * (-len(token) % 4)
+                try:
+                    decoded = base64.b64decode(token, validate=True)
+                except (binascii.Error, ValueError):
+                    continue
+                if decoded and PyTorchZipScanner._decoded_literal_text_has_storage_route_signal(decoded):
+                    return True
+        return False
+
+    @staticmethod
+    def _hex_literal_value_has_suspicious_text(value: bytes) -> bool:
+        candidate_count = 0
+        for match in _HEX_LITERAL_TEXT_TOKEN_RE.finditer(value):
+            compact = re.sub(rb"\s+", b"", match.group(0))
+            if len(compact) < 8:
+                continue
+            candidate_count += 1
+            if candidate_count > _MAX_STORAGE_LITERAL_TEXT_CANDIDATES:
+                return True
+            try:
+                decoded = binascii.unhexlify(compact)
+            except (binascii.Error, ValueError):
+                continue
+            if decoded and PyTorchZipScanner._decoded_literal_text_has_storage_route_signal(decoded):
+                return True
+        return False
+
+    @staticmethod
+    def _literal_value_has_raw_nested_security_pickle(
+        value: bytes, *, fail_closed_on_candidate_budget: bool = True
+    ) -> bool:
         candidate_count = 0
         for offset, marker in enumerate(value):
             if marker not in _RAW_NESTED_SECURITY_PICKLE_START_BYTES:
                 continue
             candidate_count += 1
             if candidate_count > _MAX_RAW_NESTED_PICKLE_CANDIDATES:
+                if not fail_closed_on_candidate_budget:
+                    return PyTorchZipScanner._raw_nested_security_pickle_text_marker_seen(value[offset:])
                 return True
             candidate = value[offset : offset + _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES]
             candidate_is_prefix = offset + len(candidate) < len(value)
@@ -2594,9 +2864,49 @@ class PyTorchZipScanner(BaseScanner):
         return False
 
     @staticmethod
+    def _trailing_candidate_has_raw_nested_security_pickle(value: bytes) -> bool:
+        parse_attempt_count = 0
+        for offset, marker in enumerate(value):
+            if marker not in _RAW_NESTED_SECURITY_PICKLE_START_BYTES:
+                continue
+            candidate = value[offset : offset + _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES]
+            candidate_is_prefix = offset + len(candidate) < len(value)
+            parse_attempt_count += 1
+            if parse_attempt_count > _MAX_RAW_NESTED_PICKLE_CANDIDATES:
+                return PyTorchZipScanner._raw_nested_security_pickle_candidate_budget_exhausted_needs_scan(
+                    value[offset:]
+                )
+            if marker == 0x80 and PyTorchZipScanner._looks_like_binary_pickle_prefix(
+                candidate, sample_is_prefix=candidate_is_prefix
+            ):
+                if PyTorchZipScanner._has_security_relevant_pickle_opcode(candidate) or candidate_is_prefix:
+                    return True
+                continue
+            if (
+                marker in PROTO0_1_START_BYTES
+                and PyTorchZipScanner._has_security_relevant_pickle_opcode(candidate)
+                and (
+                    PyTorchZipScanner._has_complete_pickle_stream_without_frame_stop_overrun(candidate)
+                    or _looks_like_proto0_or_1_pickle(candidate, sample_is_prefix=candidate_is_prefix)
+                )
+            ):
+                return True
+        return False
+
+    @staticmethod
+    def _raw_nested_security_pickle_candidate_budget_exhausted_needs_scan(value: bytes) -> bool:
+        return PyTorchZipScanner._raw_nested_security_pickle_text_marker_seen(value) or bool(
+            value.strip(b"c \t\r\n\x00")
+        )
+
+    @staticmethod
+    def _raw_nested_security_pickle_text_marker_seen(value: bytes) -> bool:
+        return any(marker in value for marker in _RAW_NESTED_SECURITY_PICKLE_TEXT_MARKERS)
+
+    @staticmethod
     def _literal_value_has_encoded_nested_security_pickle(value: bytes) -> bool:
         for match in _BASE64_NESTED_LITERAL_TOKEN_RE.finditer(value):
-            token = match.group(0).translate(bytes.maketrans(b"-_", b"+/"))
+            token = re.sub(rb"\s+", b"", match.group(0)).translate(bytes.maketrans(b"-_", b"+/"))
             for shift in range(min(4, len(token))):
                 shifted_token = token[shift:]
                 shifted_token += b"=" * (-len(shifted_token) % 4)
@@ -2604,14 +2914,19 @@ class PyTorchZipScanner(BaseScanner):
                     decoded = base64.b64decode(shifted_token, validate=True)
                 except (binascii.Error, ValueError):
                     continue
-                if decoded and PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(decoded):
+                if decoded and PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(
+                    decoded, fail_closed_on_candidate_budget=False
+                ):
                     return True
         for match in _HEX_NESTED_LITERAL_TOKEN_RE.finditer(value):
+            compact = re.sub(rb"\s+", b"", match.group(0))
             try:
-                decoded = binascii.unhexlify(match.group(0))
+                decoded = binascii.unhexlify(compact)
             except (binascii.Error, ValueError):
                 continue
-            if decoded and PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(decoded):
+            if decoded and PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(
+                decoded, fail_closed_on_candidate_budget=False
+            ):
                 return True
         return False
 

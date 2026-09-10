@@ -53,7 +53,7 @@ from .report import CoverageSummary, Finding, Notice, PickleReport, SafetyVerdic
 
 _RUST_STREAM_READ_CHUNK_SIZE = 1024 * 1024
 _CALL_GRAPH_SOURCE_FINGERPRINTS_KEY = "call_graph_source_fingerprints"
-_SOURCE_INDEPENDENT_BUILTIN_MODULES = frozenset({"builtins", "__builtin__", "__builtins__"})
+_SOURCE_INDEPENDENT_BUILTIN_MODULES = frozenset({"builtins"})
 _SOURCE_INDEPENDENT_BUILTIN_DANGEROUS_NAMES = frozenset({"__import__", "compile", "eval", "exec", "open"})
 _NESTED_EXECUTION_FINDING_RULE_CODES = frozenset({"S213", "S601", "S602"})
 _PYTORCH_ZIP_METADATA_BASENAMES = frozenset({"version", "byteorder"})
@@ -86,7 +86,10 @@ _PROTO0_1_START_BYTES = b"()]}cilp0FGIJKLMNSTUVX"
 _PROTO0_1_MAX_PROBE_OPCODES = _PICKLE_DISCOVERY_LONG_PROBE_BYTES
 _PROTO0_1_IGNORABLE_TRAILING_BYTES = b" \t\r\n\x00"
 _PROTO0_1_TEXT_WHITESPACE_BYTES = b" \t\r\n"
+_MAX_PROTO0_GLOBAL_PREFIX_WITHOUT_NEWLINE_BYTES = 128
+_PROTO0_GLOBAL_PREFIX_WITHOUT_NEWLINE_RE = re.compile(rb"c[A-Za-z_][A-Za-z0-9_.]*")
 _PICKLE_DISCOVERY_PADDING_PROBE_BYTES = 256 * 1024
+_PICKLE_DISCOVERY_NUL_PADDING_VERIFY_BYTES = 512 * 1024
 _PROTO0_1_PREFIX_TRUNCATION_ERROR_PREFIXES = (
     "pickle exhausted before seeing STOP",
     "no newline found when trying to read ",
@@ -132,17 +135,39 @@ _PROTO0_1_LITERAL_OPCODES = frozenset(
         "SHORT_BINUNICODE",
     }
 )
-_BASE64_NESTED_LITERAL_TOKEN_RE = re.compile(rb"[A-Za-z0-9+/_-]{16,}={0,2}")
-_HEX_NESTED_LITERAL_TOKEN_RE = re.compile(rb"(?<![0-9A-Fa-f])(?:[0-9A-Fa-f]{2}){8,}(?![0-9A-Fa-f])")
+_BASE64_NESTED_LITERAL_TOKEN_RE = re.compile(rb"[A-Za-z0-9+/_-][A-Za-z0-9+/_\-\s\r\n\t]{15,}={0,2}")
+_HEX_NESTED_LITERAL_TOKEN_RE = re.compile(rb"(?<![0-9A-Fa-f])(?:[0-9A-Fa-f]{2}[\s\r\n\t]*){8,}(?![0-9A-Fa-f])")
 _RAW_NESTED_SECURITY_PICKLE_START_BYTES = b"\x80(cioRbP\x82\x83\x84"
 _MAX_RAW_NESTED_PICKLE_CANDIDATES = 64
 _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES = 8 * 1024
+_RAW_NESTED_SECURITY_PICKLE_TEXT_MARKERS = (
+    b"builtins\neval\n",
+    b"builtins\nexec\n",
+    b"__builtin__\neval\n",
+    b"__builtin__\nexec\n",
+    b"os\npopen\n",
+    b"os\nsystem\n",
+    b"nt\npopen\n",
+    b"nt\nsystem\n",
+    b"posix\npopen\n",
+    b"posix\nsystem\n",
+    b"subprocess\nPopen\n",
+    b"subprocess\ncall\n",
+    b"subprocess\ncheck_call\n",
+    b"subprocess\ncheck_output\n",
+    b"subprocess\ngetoutput\n",
+    b"subprocess\ngetstatusoutput\n",
+    b"subprocess\nrun\n",
+    b"commands\ngetoutput\n",
+    b"commands\ngetstatusoutput\n",
+)
 _SUSPICIOUS_LITERAL_TEXT_PATTERNS = tuple(
     re.compile(pattern, re.IGNORECASE)
     for pattern in (
         r"(?<!\w)__(?:reduce(?:_ex)?|setstate|getstate|getnewargs(?:_ex)?|getinitargs|new|class|"
         r"subclasses|globals|builtins|mro)__(?!\w)",
         r"base64\.b64decode",
+        r"importlib",
         r"eval\(",
         r"exec\(",
         r"os\.system",
@@ -151,9 +176,29 @@ _SUSPICIOUS_LITERAL_TEXT_PATTERNS = tuple(
         r"subprocess\.(?:Popen|call|check_output|run|check_call)",
         r"commands\.(?:getoutput|getstatusoutput)",
         r"\bimport\s+[\w\.]+",
-        r"__import__\(",
+        r"__import__",
+        r"getattr\s*\(",
     )
 )
+_STORAGE_LITERAL_TEXT_ROUTE_PATTERNS = tuple(
+    re.compile(pattern, re.IGNORECASE | re.DOTALL)
+    for pattern in (
+        r"\b(?:eval|exec)\s*(?:\\\r?\n\s*)?\(",
+        r"__import__\s*(?:\\\r?\n\s*)?\(",
+        r"\bos\s*(?:\\\r?\n\s*)?\.\s*(?:\\\r?\n\s*)?(?:system|popen|spawn[a-z]*)\s*(?:\.__call__)?\s*\(",
+        r"\bsubprocess\s*(?:\\\r?\n\s*)?\.\s*(?:Popen|call|check_output|run|check_call)\s*\(",
+        r"\bbase64\s*(?:\\\r?\n\s*)?\.\s*(?:b64decode|decode)\s*\(",
+        r"\b(?:pickle|cloudpickle|joblib)\s*(?:\\\r?\n\s*)?\.\s*(?:load|loads)\s*\(",
+        r"\bcopyreg\s*(?:\\\r?\n\s*)?\.\s*(?:add_extension|remove_extension)\s*\(",
+        r"getattr\s*\(\s*\w+\s*,\s*['\"](?:system|popen|spawn|exec|eval|call|run|Popen)['\"]",
+    )
+)
+_BASE64_LITERAL_TEXT_TOKEN_RE = re.compile(rb"[A-Za-z0-9+/_-][A-Za-z0-9+/_\-\s\r\n\t]{7,}={0,2}")
+_HEX_LITERAL_TEXT_TOKEN_RE = re.compile(rb"(?:[0-9A-Fa-f]{2}[\s\r\n\t]*){4,}")
+_MAX_STORAGE_LITERAL_TEXT_CANDIDATES = 64
+_MAX_STORAGE_LITERAL_DECODED_TEXT_BYTES = 64 * 1024
+_STORAGE_LITERAL_DECODED_TEXT_WINDOW_OVERLAP_BYTES = 1024
+_MAX_STORAGE_LITERAL_DECODED_TEXT_WINDOWS = 16
 _MAX_PYTORCH_ZIP_ENTRIES = 10_000
 _MAX_PYTORCH_ZIP_PICKLE_DISCOVERY_PROBE_BYTES = 4 * 1024 * 1024
 _MAX_PYTORCH_ZIP_PICKLE_MEMBERS = 256
@@ -1531,6 +1576,15 @@ def _trusted_storage_zip_entry_looks_like_pickle(
                 return True
             if _trivial_complete_pickle_prefix_has_only_padding(sample):
                 if entry.file_size > len(sample):
+                    if _trivial_complete_pickle_prefix_has_only_nul_padding(sample):
+                        return _verified_nul_padding_storage_probe_should_scan(
+                            archive,
+                            entry,
+                            sample,
+                            probe_bytes_remaining,
+                            deadline,
+                            is_frame_first_candidate=is_frame_first_candidate,
+                        )
                     raise ValueError("trusted PyTorch storage padding probe limit reached")
                 return False
     if (
@@ -1539,9 +1593,49 @@ def _trusted_storage_zip_entry_looks_like_pickle(
         and _proto0_or_1_trusted_storage_probe_needs_expanded_sample(sample, entry_size=entry.file_size)
     ):
         if _trivial_complete_pickle_prefix_has_only_padding(sample):
+            if _trivial_complete_pickle_prefix_has_only_nul_padding(sample):
+                return _verified_nul_padding_storage_probe_should_scan(
+                    archive,
+                    entry,
+                    sample,
+                    probe_bytes_remaining,
+                    deadline,
+                    is_frame_first_candidate=is_frame_first_candidate,
+                )
             raise ValueError("trusted PyTorch storage padding probe limit reached")
         raise ValueError("trusted PyTorch storage prefix exceeds pickle discovery probe")
     return False
+
+
+def _verified_nul_padding_storage_probe_should_scan(
+    archive: zipfile.ZipFile,
+    entry: zipfile.ZipInfo,
+    sample: bytes,
+    probe_bytes_remaining: list[int],
+    deadline: float,
+    *,
+    is_frame_first_candidate: bool,
+) -> bool:
+    if entry.file_size > len(sample):
+        if entry.file_size > _PICKLE_DISCOVERY_NUL_PADDING_VERIFY_BYTES:
+            raise ValueError("trusted PyTorch storage padding probe limit reached")
+        sample = _read_zip_entry_probe(
+            archive,
+            entry,
+            entry.file_size,
+            probe_bytes_remaining,
+            deadline,
+        )
+    if is_frame_first_candidate and _frame_first_trusted_storage_probe_should_scan(sample):
+        return True
+    if not is_frame_first_candidate and _proto0_or_1_trusted_storage_probe_should_scan(
+        sample,
+        sample_is_prefix=False,
+    ):
+        return True
+    if _trivial_complete_pickle_prefix_has_only_padding(sample):
+        return False
+    raise ValueError("trusted PyTorch storage padding probe limit reached")
 
 
 def _expanded_probe_preserves_trusted_scan(
@@ -1598,6 +1692,10 @@ def _proto0_or_1_trusted_storage_probe_should_scan(sample: bytes, *, sample_is_p
 
 
 def _proto0_or_1_trusted_storage_probe_needs_expanded_sample(sample: bytes, *, entry_size: int | None = None) -> bool:
+    if (entry_size is None or entry_size > len(sample)) and _trailing_pickle_candidate_needs_more_bytes(
+        sample.lstrip(_PROTO0_1_IGNORABLE_TRAILING_BYTES)
+    ):
+        return True
     if _trivial_complete_pickle_prefix_needs_more_bytes(sample):
         return entry_size is None or entry_size > len(sample)
     if _trivial_complete_pickle_prefix_has_only_text_padding(sample):
@@ -1610,6 +1708,8 @@ def _proto0_or_1_trusted_storage_probe_needs_expanded_sample(sample: bytes, *, e
 def _frame_first_trusted_storage_probe_should_scan(sample: bytes) -> bool:
     if not sample.startswith(_PICKLE_FRAME_OPCODE):
         return False
+    if _complete_trivial_literal_pickle_has_nested_security_pickle(sample):
+        return True
     return _has_complete_pickle_stream_without_frame_stop_overrun(
         sample
     ) or _has_structural_pickle_evidence_in_incomplete_frame(sample)
@@ -1697,6 +1797,10 @@ def _trailing_pickle_probe_should_scan(trailing: bytes, *, sample_is_prefix: boo
             or _looks_like_binary_pickle_prefix(candidate, sample_is_prefix=False)
             or _frame_first_trusted_storage_probe_should_scan(candidate)
         )
+    if _trailing_candidate_has_raw_nested_security_pickle(candidate):
+        return True
+    if _malformed_separator_proto0_string_literal_has_nested_security_pickle(candidate):
+        return True
     if not sample_is_prefix:
         return False
     if candidate.startswith(_PICKLE_BINARY_PROTOCOL_PREFIXES):
@@ -1719,7 +1823,14 @@ def _looks_like_truncated_proto0_or_1_operand_prefix(candidate: bytes) -> bool:
     if candidate.startswith(b"P"):
         return b"\n" not in candidate[1:]
     if candidate.startswith(b"c"):
-        return candidate.count(b"\n") < 2
+        if len(candidate) == 1:
+            return True
+        if b"\n" in candidate:
+            return candidate.count(b"\n") < 2
+        return (
+            len(candidate) <= _MAX_PROTO0_GLOBAL_PREFIX_WITHOUT_NEWLINE_BYTES
+            and _PROTO0_GLOBAL_PREFIX_WITHOUT_NEWLINE_RE.fullmatch(candidate) is not None
+        )
     if candidate.startswith((b"F", b"I", b"L")):
         return b"\n" not in candidate[1:]
     if candidate.startswith(b"V"):
@@ -1882,9 +1993,22 @@ def _trivial_complete_pickle_prefix_has_only_padding(sample: bytes) -> bool:
     return trailing is not None and not trailing.strip(_PROTO0_1_IGNORABLE_TRAILING_BYTES)
 
 
+def _trivial_complete_pickle_prefix_has_only_nul_padding(sample: bytes) -> bool:
+    trailing = _trivial_complete_pickle_prefix_trailing(sample)
+    return trailing is not None and bool(trailing) and not trailing.strip(b"\x00")
+
+
 def _trivial_complete_pickle_prefix_has_only_text_padding(sample: bytes) -> bool:
     trailing = _trivial_complete_pickle_prefix_trailing(sample)
     return trailing is not None and bool(trailing) and not trailing.strip(_PROTO0_1_TEXT_WHITESPACE_BYTES)
+
+
+def _malformed_separator_proto0_string_literal_has_nested_security_pickle(candidate: bytes) -> bool:
+    if not candidate or candidate[0] in _PROTO0_1_START_BYTES:
+        return False
+    return _complete_proto0_string_literal_has_nested_security_pickle(
+        candidate[1:].lstrip(_PROTO0_1_IGNORABLE_TRAILING_BYTES)
+    )
 
 
 def _trivial_complete_pickle_prefix_trailing(sample: bytes) -> bytes | None:
@@ -2000,16 +2124,90 @@ def _literal_value_has_suspicious_text(value: bytes) -> bool:
     text = value.decode("utf-8", errors="ignore")
     if not text:
         text = value.decode("latin-1", errors="ignore")
-    return any(pattern.search(text) for pattern in _SUSPICIOUS_LITERAL_TEXT_PATTERNS)
+    return _literal_text_has_storage_route_signal(text) or _literal_value_has_encoded_suspicious_text(value)
 
 
-def _literal_value_has_raw_nested_security_pickle(value: bytes) -> bool:
+def _literal_text_has_storage_route_signal(text: str) -> bool:
+    return any(pattern.search(text) for pattern in _SUSPICIOUS_LITERAL_TEXT_PATTERNS) or any(
+        pattern.search(text) for pattern in _STORAGE_LITERAL_TEXT_ROUTE_PATTERNS
+    )
+
+
+def _literal_value_has_encoded_suspicious_text(value: bytes) -> bool:
+    return _base64_literal_value_has_suspicious_text(value) or _hex_literal_value_has_suspicious_text(value)
+
+
+def _decoded_literal_text_has_storage_route_signal(decoded: bytes) -> bool:
+    start = 0
+    window_count = 0
+    step = _MAX_STORAGE_LITERAL_DECODED_TEXT_BYTES - _STORAGE_LITERAL_DECODED_TEXT_WINDOW_OVERLAP_BYTES
+    while start < len(decoded):
+        window_count += 1
+        if window_count > _MAX_STORAGE_LITERAL_DECODED_TEXT_WINDOWS:
+            return True
+        window = decoded[start : start + _MAX_STORAGE_LITERAL_DECODED_TEXT_BYTES]
+        for encoding in ("utf-8", "latin-1"):
+            text = window.decode(encoding, errors="ignore")
+            if text and _literal_text_has_storage_route_signal(text):
+                return True
+        if start + _MAX_STORAGE_LITERAL_DECODED_TEXT_BYTES >= len(decoded):
+            break
+        start += step
+    return False
+
+
+def _base64_literal_value_has_suspicious_text(value: bytes) -> bool:
+    candidate_count = 0
+    for match in _BASE64_LITERAL_TEXT_TOKEN_RE.finditer(value):
+        compact = re.sub(rb"\s+", b"", match.group(0)).translate(bytes.maketrans(b"-_", b"+/"))
+        if len(compact) < 8:
+            continue
+        candidate_count += 1
+        if candidate_count > _MAX_STORAGE_LITERAL_TEXT_CANDIDATES:
+            return True
+        for shift in range(min(16, len(compact))):
+            token = compact[shift:]
+            if len(token) < 8:
+                continue
+            token += b"=" * (-len(token) % 4)
+            try:
+                decoded = base64.b64decode(token, validate=True)
+            except (binascii.Error, ValueError):
+                continue
+            if decoded and _decoded_literal_text_has_storage_route_signal(decoded):
+                return True
+    return False
+
+
+def _hex_literal_value_has_suspicious_text(value: bytes) -> bool:
+    candidate_count = 0
+    for match in _HEX_LITERAL_TEXT_TOKEN_RE.finditer(value):
+        compact = re.sub(rb"\s+", b"", match.group(0))
+        if len(compact) < 8:
+            continue
+        candidate_count += 1
+        if candidate_count > _MAX_STORAGE_LITERAL_TEXT_CANDIDATES:
+            return True
+        try:
+            decoded = binascii.unhexlify(compact)
+        except (binascii.Error, ValueError):
+            continue
+        if decoded and _decoded_literal_text_has_storage_route_signal(decoded):
+            return True
+    return False
+
+
+def _literal_value_has_raw_nested_security_pickle(
+    value: bytes, *, fail_closed_on_candidate_budget: bool = True
+) -> bool:
     candidate_count = 0
     for offset, marker in enumerate(value):
         if marker not in _RAW_NESTED_SECURITY_PICKLE_START_BYTES:
             continue
         candidate_count += 1
         if candidate_count > _MAX_RAW_NESTED_PICKLE_CANDIDATES:
+            if not fail_closed_on_candidate_budget:
+                return _raw_nested_security_pickle_text_marker_seen(value[offset:])
             return True
         candidate = value[offset : offset + _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES]
         candidate_is_prefix = offset + len(candidate) < len(value)
@@ -2031,9 +2229,43 @@ def _literal_value_has_raw_nested_security_pickle(value: bytes) -> bool:
     return False
 
 
+def _trailing_candidate_has_raw_nested_security_pickle(value: bytes) -> bool:
+    parse_attempt_count = 0
+    for offset, marker in enumerate(value):
+        if marker not in _RAW_NESTED_SECURITY_PICKLE_START_BYTES:
+            continue
+        candidate = value[offset : offset + _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES]
+        candidate_is_prefix = offset + len(candidate) < len(value)
+        parse_attempt_count += 1
+        if parse_attempt_count > _MAX_RAW_NESTED_PICKLE_CANDIDATES:
+            return _raw_nested_security_pickle_candidate_budget_exhausted_needs_scan(value[offset:])
+        if marker == 0x80 and _looks_like_binary_pickle_prefix(candidate, sample_is_prefix=candidate_is_prefix):
+            if _has_security_relevant_pickle_opcode(candidate) or candidate_is_prefix:
+                return True
+            continue
+        if (
+            marker in _PROTO0_1_START_BYTES
+            and _has_security_relevant_pickle_opcode(candidate)
+            and (
+                _has_complete_pickle_stream_without_frame_stop_overrun(candidate)
+                or _looks_like_proto0_or_1_pickle(candidate, sample_is_prefix=candidate_is_prefix)
+            )
+        ):
+            return True
+    return False
+
+
+def _raw_nested_security_pickle_candidate_budget_exhausted_needs_scan(value: bytes) -> bool:
+    return _raw_nested_security_pickle_text_marker_seen(value) or bool(value.strip(b"c \t\r\n\x00"))
+
+
+def _raw_nested_security_pickle_text_marker_seen(value: bytes) -> bool:
+    return any(marker in value for marker in _RAW_NESTED_SECURITY_PICKLE_TEXT_MARKERS)
+
+
 def _literal_value_has_encoded_nested_security_pickle(value: bytes) -> bool:
     for match in _BASE64_NESTED_LITERAL_TOKEN_RE.finditer(value):
-        token = match.group(0).translate(bytes.maketrans(b"-_", b"+/"))
+        token = re.sub(rb"\s+", b"", match.group(0)).translate(bytes.maketrans(b"-_", b"+/"))
         for shift in range(min(4, len(token))):
             shifted_token = token[shift:]
             shifted_token += b"=" * (-len(shifted_token) % 4)
@@ -2041,14 +2273,17 @@ def _literal_value_has_encoded_nested_security_pickle(value: bytes) -> bool:
                 decoded = base64.b64decode(shifted_token, validate=True)
             except (binascii.Error, ValueError):
                 continue
-            if decoded and _literal_value_has_raw_nested_security_pickle(decoded):
+            if decoded and _literal_value_has_raw_nested_security_pickle(
+                decoded, fail_closed_on_candidate_budget=False
+            ):
                 return True
     for match in _HEX_NESTED_LITERAL_TOKEN_RE.finditer(value):
+        compact = re.sub(rb"\s+", b"", match.group(0))
         try:
-            decoded = binascii.unhexlify(match.group(0))
+            decoded = binascii.unhexlify(compact)
         except (binascii.Error, ValueError):
             continue
-        if decoded and _literal_value_has_raw_nested_security_pickle(decoded):
+        if decoded and _literal_value_has_raw_nested_security_pickle(decoded, fail_closed_on_candidate_budget=False):
             return True
     return False
 

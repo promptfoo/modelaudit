@@ -6,6 +6,7 @@ import ast
 import builtins
 import importlib
 import io
+import mailbox
 import os
 import pickle
 import py_compile
@@ -3666,6 +3667,51 @@ def test_trusted_mailbox_constructor_does_not_hide_later_unanalyzed_shape(monkey
             import_reference="mailbox.mbox",
             reason="source_unavailable",
         ),
+    )
+
+
+def test_mailbox_constructor_invocation_is_not_treated_as_empty_safe(monkeypatch: pytest.MonkeyPatch) -> None:
+    reference = {"opcode": "OBJ", "positional_arg_count": 1}
+
+    assert call_graph._trusted_empty_mailbox_constructor_invocation_is_safe("mailbox", "mbox", reference) is False
+
+    class mbox(mailbox.mbox):
+        def __init__(
+            self,
+            dirname: str | os.PathLike[str],
+            factory: Any = None,
+            create: bool = True,
+        ) -> None:
+            super().__init__(dirname, factory, create)
+
+    mbox.__module__ = "mailbox"
+    monkeypatch.setattr(mailbox, "mbox", mbox)
+
+    for opcode in ("REDUCE", "OBJ", "INST"):
+        assert (
+            call_graph._trusted_empty_mailbox_constructor_invocation_is_safe(
+                "mailbox",
+                "mbox",
+                {"opcode": opcode, "positional_arg_count": 1},
+            )
+            is False
+        )
+
+
+def test_trusted_mailbox_constructor_requires_loaded_source_backed_class(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        call_graph,
+        "_loaded_module_state_without_hooks",
+        lambda module_name: (False, None, None) if module_name == "mailbox" else (True, None, None),
+    )
+
+    assert (
+        call_graph._trusted_empty_mailbox_constructor_invocation_is_safe(
+            "mailbox",
+            "mbox",
+            {"opcode": "OBJ", "positional_arg_count": 1},
+        )
+        is False
     )
 
 
