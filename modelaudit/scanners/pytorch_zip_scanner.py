@@ -1499,17 +1499,20 @@ class PyTorchZipScanner(BaseScanner):
         # checks list with one INFO finding apiece.
         probe_failures: list[dict[str, Any]] = []
         padding_probe_bytes_remaining = [_PICKLE_DISCOVERY_PADDING_PROBE_BUDGET_BYTES]
+        deferred_padding_probe_entries: list[zipfile.ZipInfo] = []
         for entry in safe_entries:
             name = self._get_zip_member_name(entry)
             if id(entry) in seen_entries or entry.is_dir():
                 continue
             try:
+                needs_deferred_padding_probe = [False]
                 if name in trusted_storage_blob_members:
                     looks_like_pickle = self._trusted_storage_entry_looks_like_pickle(
                         zip_file,
                         entry,
                         result,
                         padding_probe_bytes_remaining=padding_probe_bytes_remaining,
+                        defer_padding_probe=needs_deferred_padding_probe,
                     )
                 elif name in storage_probe_blob_members:
                     looks_like_pickle = self._trusted_storage_entry_looks_like_pickle(
@@ -1518,10 +1521,36 @@ class PyTorchZipScanner(BaseScanner):
                         result,
                         max_probe_bytes=_PICKLE_DISCOVERY_LONG_PROBE_BYTES,
                         padding_probe_bytes_remaining=padding_probe_bytes_remaining,
+                        defer_padding_probe=needs_deferred_padding_probe,
                     )
                 else:
                     looks_like_pickle = self._entry_looks_like_pickle(zip_file, entry, result)
                 if looks_like_pickle:
+                    add_pickle_entry(entry)
+                elif needs_deferred_padding_probe[0]:
+                    deferred_padding_probe_entries.append(entry)
+            except Exception as exc:
+                logger.debug("Unable to inspect ZIP member %s as a pickle: %s", entry.filename, exc)
+                probe_failures.append(
+                    {
+                        "zip_entry": entry.filename,
+                        "exception": str(exc),
+                        "exception_type": type(exc).__name__,
+                        "location": f"{self.current_file_path}:{entry.filename}",
+                    }
+                )
+
+        for entry in deferred_padding_probe_entries:
+            if id(entry) in seen_entries or entry.is_dir():
+                continue
+            try:
+                if self._trusted_storage_entry_looks_like_pickle(
+                    zip_file,
+                    entry,
+                    result,
+                    max_probe_bytes=_PICKLE_DISCOVERY_LONG_PROBE_BYTES,
+                    padding_probe_bytes_remaining=padding_probe_bytes_remaining,
+                ):
                     add_pickle_entry(entry)
             except Exception as exc:
                 logger.debug("Unable to inspect ZIP member %s as a pickle: %s", entry.filename, exc)
@@ -1911,6 +1940,7 @@ class PyTorchZipScanner(BaseScanner):
         *,
         max_probe_bytes: int = _TRUSTED_STORAGE_PICKLE_PROBE_BYTES,
         padding_probe_bytes_remaining: list[int] | None = None,
+        defer_padding_probe: list[bool] | None = None,
     ) -> bool:
         """Return True only for parse-confirmed pickle payloads in referenced tensor storage."""
         data_start = self._read_member_prefix(
@@ -1933,18 +1963,27 @@ class PyTorchZipScanner(BaseScanner):
 
         sample = data_start
         if entry.file_size > len(data_start):
+            probe_bytes = max_probe_bytes
+            if (
+                max_probe_bytes > _TRUSTED_STORAGE_PICKLE_PROBE_BYTES
+                and entry.file_size > max_probe_bytes
+                and PyTorchZipScanner._trivial_complete_pickle_prefix_has_only_padding(data_start)
+                and defer_padding_probe is None
+            ):
+                probe_bytes = min(entry.file_size, _PICKLE_DISCOVERY_PADDING_PROBE_BYTES)
             sample = self._read_member_prefix(
                 zip_file,
                 entry,
-                max_probe_bytes,
+                probe_bytes,
                 phase="pickle_discovery",
                 result=result,
             )
         if is_binary_pickle_candidate:
             return self._binary_pickle_probe_should_scan(sample, sample_is_prefix=entry.file_size > len(sample))
         if is_frame_first_candidate:
-            return self._frame_first_trusted_storage_probe_should_scan(sample)
-        if self._proto0_or_1_trusted_storage_probe_should_scan(
+            if self._frame_first_trusted_storage_probe_should_scan(sample):
+                return True
+        elif self._proto0_or_1_trusted_storage_probe_should_scan(
             sample,
             sample_is_prefix=entry.file_size > len(sample),
         ):
@@ -1957,6 +1996,12 @@ class PyTorchZipScanner(BaseScanner):
                 entry_size=entry.file_size,
             )
         ):
+            if (
+                PyTorchZipScanner._trivial_complete_pickle_prefix_has_only_padding(sample)
+                and defer_padding_probe is not None
+            ):
+                defer_padding_probe[0] = True
+                return False
             expanded_sample = self._read_member_prefix(
                 zip_file,
                 entry,
@@ -1964,7 +2009,9 @@ class PyTorchZipScanner(BaseScanner):
                 phase="pickle_discovery",
                 result=result,
             )
-            if self._proto0_or_1_trusted_storage_probe_should_scan(
+            if is_frame_first_candidate and self._frame_first_trusted_storage_probe_should_scan(expanded_sample):
+                return True
+            if not is_frame_first_candidate and self._proto0_or_1_trusted_storage_probe_should_scan(
                 expanded_sample,
                 sample_is_prefix=entry.file_size > len(expanded_sample),
             ):
@@ -1975,6 +2022,9 @@ class PyTorchZipScanner(BaseScanner):
             and len(sample) >= _PICKLE_DISCOVERY_LONG_PROBE_BYTES
             and PyTorchZipScanner._trivial_complete_pickle_prefix_has_only_padding(sample)
         ):
+            if defer_padding_probe is not None:
+                defer_padding_probe[0] = True
+                return False
             padding_probe_bytes = min(entry.file_size, _PICKLE_DISCOVERY_PADDING_PROBE_BYTES)
             if padding_probe_bytes_remaining is not None:
                 if padding_probe_bytes_remaining[0] < padding_probe_bytes:
@@ -1987,12 +2037,18 @@ class PyTorchZipScanner(BaseScanner):
                 phase="pickle_discovery",
                 result=result,
             )
-            if self._proto0_or_1_trusted_storage_probe_should_scan(
+            if is_frame_first_candidate and self._frame_first_trusted_storage_probe_should_scan(padding_sample):
+                return True
+            if not is_frame_first_candidate and self._proto0_or_1_trusted_storage_probe_should_scan(
                 padding_sample,
                 sample_is_prefix=entry.file_size > len(padding_sample),
             ):
                 return True
             sample = padding_sample
+            if PyTorchZipScanner._trivial_complete_pickle_prefix_has_only_padding(sample):
+                if entry.file_size > len(sample):
+                    raise ValueError("trusted PyTorch storage padding probe limit reached")
+                return False
         if (
             entry.file_size > len(sample)
             and len(sample) >= _PICKLE_DISCOVERY_LONG_PROBE_BYTES
@@ -2001,6 +2057,8 @@ class PyTorchZipScanner(BaseScanner):
                 entry_size=entry.file_size,
             )
         ):
+            if PyTorchZipScanner._trivial_complete_pickle_prefix_has_only_padding(sample):
+                raise ValueError("trusted PyTorch storage padding probe limit reached")
             raise ValueError("trusted PyTorch storage prefix exceeds pickle discovery probe")
         return False
 
@@ -2116,6 +2174,7 @@ class PyTorchZipScanner(BaseScanner):
     def _has_security_relevant_pickle_opcode(sample: bytes) -> bool:
         remaining = sample
         while remaining:
+            remaining = PyTorchZipScanner._strip_optional_proto0_comment_prefix(remaining)
             try:
                 for opcode, _arg, pos in pickletools.genops(remaining):
                     if opcode.name in _PICKLE_SECURITY_RELEVANT_OPCODES:
@@ -2134,8 +2193,7 @@ class PyTorchZipScanner(BaseScanner):
         candidate = trailing.lstrip(PROTO0_1_IGNORABLE_TRAILING_BYTES)
         if not candidate:
             return False
-        if candidate.startswith(b"#"):
-            return _looks_like_proto0_or_1_pickle(candidate, sample_is_prefix=sample_is_prefix)
+        candidate = PyTorchZipScanner._strip_optional_proto0_comment_prefix(candidate)
         if PyTorchZipScanner._has_security_relevant_pickle_opcode(candidate):
             return (
                 PyTorchZipScanner._has_complete_pickle_stream_without_frame_stop_overrun(candidate)
@@ -2161,12 +2219,16 @@ class PyTorchZipScanner(BaseScanner):
 
     @staticmethod
     def _looks_like_truncated_proto0_or_1_operand_prefix(candidate: bytes) -> bool:
+        if candidate.startswith(b"S"):
+            if len(candidate) == 1:
+                return True
+            if candidate.startswith((b"S'", b'S"')):
+                return b"\n" not in candidate[2:]
+            return False
         if candidate.startswith(b"P"):
             return b"\n" not in candidate[1:]
         if candidate.startswith(b"c"):
             return candidate.count(b"\n") < 2
-        if candidate.startswith((b"S'", b'S"')):
-            return b"\n" not in candidate[2:]
         if candidate.startswith((b"F", b"I", b"L")):
             return b"\n" not in candidate[1:]
         if candidate.startswith(b"V"):
@@ -2285,6 +2347,10 @@ class PyTorchZipScanner(BaseScanner):
     @staticmethod
     def _trailing_pickle_candidate_needs_more_bytes(candidate: bytes) -> bool:
         while candidate:
+            stripped_comment_candidate = PyTorchZipScanner._strip_optional_proto0_comment_prefix(candidate)
+            if stripped_comment_candidate != candidate:
+                candidate = stripped_comment_candidate
+                continue
             trivial_trailing = PyTorchZipScanner._trivial_complete_pickle_prefix_trailing(candidate)
             if trivial_trailing is not None and len(trivial_trailing) < len(candidate):
                 candidate = trivial_trailing.lstrip(PROTO0_1_IGNORABLE_TRAILING_BYTES)
@@ -2313,6 +2379,12 @@ class PyTorchZipScanner(BaseScanner):
                 for magic in _PICKLE_BINARY_PROTOCOL_PREFIXES
             )
         return False
+
+    @staticmethod
+    def _strip_optional_proto0_comment_prefix(candidate: bytes) -> bytes:
+        if len(candidate) >= 2 and candidate[0:1] == b"#" and candidate[1] in PROTO0_1_START_BYTES:
+            return candidate[1:]
+        return candidate
 
     @staticmethod
     def _trivial_complete_pickle_prefix_has_only_padding(sample: bytes) -> bool:
@@ -2366,6 +2438,7 @@ class PyTorchZipScanner(BaseScanner):
         remaining = sample
         skipped_trivial_prefix = False
         while remaining:
+            remaining = PyTorchZipScanner._strip_optional_proto0_comment_prefix(remaining)
             active_frame_end = 0
             opcode_count = 0
             has_non_trivial_opcode = False

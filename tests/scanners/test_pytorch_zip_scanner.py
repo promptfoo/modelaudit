@@ -2963,7 +2963,7 @@ def test_pytorch_zip_discovery_skips_many_padding_only_expanded_probe_storages(
     )
 
 
-def test_pytorch_zip_discovery_marks_many_padding_only_storages_over_budget_incomplete(
+def test_pytorch_zip_discovery_skips_many_padding_only_storages_over_budget(
     tmp_path: Path,
 ) -> None:
     model_path = tmp_path / "referenced_many_padding_only_over_budget.pt"
@@ -2986,12 +2986,61 @@ def test_pytorch_zip_discovery_marks_many_padding_only_storages_over_budget_inco
 
     result = PyTorchZipScanner().scan(str(model_path))
 
-    assert result.success is False
-    assert "pytorch_zip_pickle_discovery_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert result.success is True
+    assert result.metadata.get("pickle_verdict") == "clean"
     assert result.metadata["pickle_files"] == ["archive/data.pkl"]
-    discovery_check = next(check for check in result.checks if check.name == "Pickle Discovery")
-    assert discovery_check.status == CheckStatus.FAILED
-    assert discovery_check.details["entries"][0]["exception_type"] == "ValueError"
+    assert not any(
+        str(item.location).endswith(tuple(f"archive/data/{index}" for index in range(18))) for item in result.issues
+    )
+
+
+def test_pytorch_zip_discovery_scans_late_malicious_storage_probe_before_deferred_padding_probes(
+    tmp_path: Path,
+) -> None:
+    model_path = tmp_path / "referenced_storage_probe_late_malicious_before_padding.pt"
+    padding_blob = b"N." + (b"\x00" * pytorch_zip_scanner_module._PICKLE_DISCOVERY_PADDING_PROBE_BYTES)
+    padding_blob += b"\x00" * (-len(padding_blob) % 4)
+    malicious_blob = b"N." + (b" " * 4093) + _malicious_proto0_system_payload()
+    malicious_blob += b" " * (-len(malicious_blob) % 4)
+    data_pkl_payload = (
+        b"\x80\x04]("
+        + b"".join(_pytorch_storage_binpersid_expr(str(index), storage_name="FloatStorage") for index in range(17))
+        + b"e."
+    )
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", data_pkl_payload)
+        for index in range(16):
+            zip_file.writestr(f"archive/data/{index}", padding_blob)
+        zip_file.writestr("archive/data/16", malicious_blob)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert "archive/data/16" in result.metadata["pickle_files"]
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/16"
+        for issue in result.issues
+    )
+
+
+def test_pytorch_zip_discovery_skips_padding_only_at_padding_probe_limit(
+    tmp_path: Path,
+) -> None:
+    model_path = tmp_path / "referenced_scalar_prefix_padding_only_at_probe_limit.pt"
+    storage_blob = b"N." + (b"\x00" * (pytorch_zip_scanner_module._PICKLE_DISCOVERY_PADDING_PROBE_BYTES - len(b"N.")))
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        zip_file.writestr("archive/data/0", storage_blob)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert result.success is True
+    assert result.metadata.get("pickle_verdict") == "clean"
+    assert result.metadata["pickle_files"] == ["archive/data.pkl"]
+    assert not any(issue.details.get("pickle_filename") == "archive/data/0" for issue in result.issues)
 
 
 def test_pytorch_zip_discovery_marks_padding_only_over_probe_cap_incomplete(
@@ -3090,6 +3139,29 @@ def test_pytorch_zip_discovery_scans_frame_payload_crossing_trusted_probe_bounda
     frame_body = _malicious_proto0_system_payload()
     frame = b"\x95" + len(frame_body).to_bytes(8, "little") + frame_body
     storage_blob = b"N." + (b" " * (4096 - 2 - 9)) + frame
+    storage_blob += b" " * (-len(storage_blob) % 4)
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        zip_file.writestr("archive/data/0", storage_blob)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert "archive/data/0" in result.metadata["pickle_files"]
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
+        for issue in result.issues
+    )
+
+
+def test_pytorch_zip_discovery_scans_frame_first_trivial_pickle_before_large_padding(
+    tmp_path: Path,
+) -> None:
+    model_path = tmp_path / "referenced_frame_first_trivial_before_large_padding.pt"
+    storage_blob = b"\x95" + (2).to_bytes(8, "little") + b"N."
+    storage_blob += b" " * 5000
+    storage_blob += _malicious_proto0_system_payload()
     storage_blob += b" " * (-len(storage_blob) % 4)
     with zipfile.ZipFile(model_path, "w") as zip_file:
         zip_file.writestr("archive/version", "3\n")
@@ -3377,6 +3449,60 @@ def test_pytorch_zip_discovery_scans_pickle_after_many_trivial_int_streams(
     )
 
 
+def test_pytorch_zip_discovery_scans_proto0_string_operand_split_at_trusted_probe_boundary(
+    tmp_path: Path,
+) -> None:
+    model_path = tmp_path / "referenced_scalar_prefix_split_proto0_string_pickle.pt"
+    storage_prefix = (
+        b"N."
+        + (b" " * (pytorch_zip_scanner_module._TRUSTED_STORAGE_PICKLE_PROBE_BYTES - len(b"N.") - len(b"S")))
+        + b"S"
+    )
+    assert len(storage_prefix) == pytorch_zip_scanner_module._TRUSTED_STORAGE_PICKLE_PROBE_BYTES
+    storage_blob = storage_prefix + b"'tensor-name'\n." + _malicious_proto0_system_payload()
+    storage_blob += b" " * (-len(storage_blob) % 4)
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        zip_file.writestr("archive/data/0", storage_blob)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert "archive/data/0" in result.metadata["pickle_files"]
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
+        for issue in result.issues
+    )
+
+
+def test_pytorch_zip_discovery_skips_benign_proto0_string_operand_split_at_trusted_probe_boundary(
+    tmp_path: Path,
+) -> None:
+    model_path = tmp_path / "referenced_scalar_prefix_split_proto0_string_benign.pt"
+    storage_prefix = (
+        b"N."
+        + (b" " * (pytorch_zip_scanner_module._TRUSTED_STORAGE_PICKLE_PROBE_BYTES - len(b"N.") - len(b"S")))
+        + b"S"
+    )
+    assert len(storage_prefix) == pytorch_zip_scanner_module._TRUSTED_STORAGE_PICKLE_PROBE_BYTES
+    storage_blob = storage_prefix + b"'tensor-name'\n."
+    storage_blob += b" " * (-len(storage_blob) % 4)
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        zip_file.writestr("archive/data/0", storage_blob)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert result.success is True
+    assert result.metadata.get("pickle_verdict") == "clean"
+    assert result.metadata["pickle_files"] == ["archive/data.pkl"]
+    assert not any(issue.details.get("pickle_filename") == "archive/data/0" for issue in result.issues)
+    assert not any(check.details.get("pickle_filename") == "archive/data/0" for check in result.checks)
+
+
 def test_pytorch_zip_discovery_marks_repeated_trivial_streams_filling_expanded_probe_incomplete(
     tmp_path: Path,
 ) -> None:
@@ -3405,6 +3531,48 @@ def test_pytorch_zip_discovery_scans_comment_prefixed_pickle_after_trivial_scala
 ) -> None:
     model_path = tmp_path / "referenced_scalar_prefix_comment_prefixed_pickle.pt"
     storage_blob = b"N.#" + _malicious_proto0_system_payload()
+    storage_blob += b" " * (-len(storage_blob) % 4)
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        zip_file.writestr("archive/data/0", storage_blob)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert "archive/data/0" in result.metadata["pickle_files"]
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
+        for issue in result.issues
+    )
+
+
+def test_pytorch_zip_discovery_scans_comment_prefixed_pickle_after_many_trivial_streams(
+    tmp_path: Path,
+) -> None:
+    model_path = tmp_path / "referenced_scalar_prefix_comment_many_trivial_streams_pickle.pt"
+    storage_blob = b"N.#" + (b"N." * 1200) + _malicious_proto0_system_payload()
+    storage_blob += b" " * (-len(storage_blob) % 4)
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        zip_file.writestr("archive/data/0", storage_blob)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert "archive/data/0" in result.metadata["pickle_files"]
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
+        for issue in result.issues
+    )
+
+
+def test_pytorch_zip_discovery_scans_comment_prefixed_pickle_after_many_proto0_int_streams(
+    tmp_path: Path,
+) -> None:
+    model_path = tmp_path / "referenced_scalar_prefix_comment_many_int_streams_pickle.pt"
+    storage_blob = b"N." + (b"I1\n." * 1200) + b"#" + _malicious_proto0_system_payload()
     storage_blob += b" " * (-len(storage_blob) % 4)
     with zipfile.ZipFile(model_path, "w") as zip_file:
         zip_file.writestr("archive/version", "3\n")
