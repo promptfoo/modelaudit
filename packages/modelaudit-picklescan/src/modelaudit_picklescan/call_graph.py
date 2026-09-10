@@ -2129,7 +2129,12 @@ def find_startup_hook_write_call_graphs(
             if require_invocations
             else ()
         )
-        if trusted_mailbox_constructor_invocations:
+        trusted_mailbox_constructor_openers = tuple(
+            invocation_reference
+            for invocation_reference in trusted_mailbox_constructor_invocations
+            if _trusted_mailbox_constructor_invocation_opens_path(module, name, invocation_reference)
+        )
+        if trusted_mailbox_constructor_openers:
             openers.append(
                 _ImportCallPath(
                     module=module,
@@ -3480,6 +3485,21 @@ def _trusted_empty_mailbox_constructor_invocation_is_safe(
     if _complete_keyword_arg_names(reference) != ():
         return False
     return _mailbox_constructor_reference_is_canonical(module, name)
+
+
+def _trusted_mailbox_constructor_invocation_opens_path(
+    module: str,
+    name: str,
+    reference: Mapping[str, object],
+) -> bool:
+    if not _trusted_empty_mailbox_constructor_invocation_is_safe(module, name, reference):
+        return False
+    positional_arg_count = reference.get("positional_arg_count")
+    return (
+        isinstance(positional_arg_count, int)
+        and not isinstance(positional_arg_count, bool)
+        and positional_arg_count >= 1
+    )
 
 
 def _mailbox_constructor_reference_is_canonical(module: str, name: str) -> bool:

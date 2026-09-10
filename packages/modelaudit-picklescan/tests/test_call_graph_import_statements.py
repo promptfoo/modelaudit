@@ -3774,6 +3774,61 @@ def test_trusted_mailbox_constructor_remains_startup_hook_opener(
     assert findings[0].write_sink == "handle.write"
 
 
+def test_zero_arg_trusted_mailbox_constructor_is_not_startup_hook_opener(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    module_name = "modelaudit_tp_mailbox_zero_arg_startup_writer"
+    (module_dir / f"{module_name}.py").write_text(
+        "def write_payload(handle, value):\n    return handle.write(value)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(module_dir))
+    importlib.invalidate_caches()
+    _clear_call_graph_caches()
+    invocations = (
+        {
+            "opcode": "REDUCE",
+            "module": "mailbox",
+            "name": "mbox",
+            "positional_arg_count": 0,
+            "global_position": 1,
+        },
+        {
+            "opcode": "REDUCE",
+            "module": module_name,
+            "name": "write_payload",
+            "positional_arg_count": 2,
+            "global_position": 2,
+        },
+    )
+    import_references = (
+        {
+            "opcode": "STACK_GLOBAL",
+            "module": "mailbox",
+            "name": "mbox",
+            "import_reference": "mailbox.mbox",
+            "position": 1,
+        },
+        {
+            "opcode": "STACK_GLOBAL",
+            "module": module_name,
+            "name": "write_payload",
+            "import_reference": f"{module_name}.write_payload",
+            "position": 2,
+        },
+    )
+
+    try:
+        findings = call_graph.find_startup_hook_write_call_graphs(import_references, invocations)
+    finally:
+        _clear_call_graph_caches()
+
+    assert findings == ()
+
+
 def test_pathlib_path_write_text_reexport_resolves_to_source_method() -> None:
     entrypoints = call_graph._safe_call_graph_entrypoints("pathlib.Path.write_text")
 
