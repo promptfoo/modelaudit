@@ -3684,6 +3684,26 @@ def test_pytorch_zip_discovery_scans_scalar_literal_after_trivial_stream(tmp_pat
     )
 
 
+def test_pytorch_zip_discovery_scans_scalar_literal_after_clean_nontrivial_stream(tmp_path: Path) -> None:
+    model_path = tmp_path / "referenced_scalar_literal_after_clean_nontrivial_stream.pt"
+    nested_payload = _malicious_proto0_system_payload()
+    storage_blob = b"N.]\x85.S'" + base64.b64encode(nested_payload) + b"'\n."
+    storage_blob += b" " * (-len(storage_blob) % 4)
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        zip_file.writestr("archive/data/0", storage_blob)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert "archive/data/0" in result.metadata["pickle_files"]
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
+        for issue in result.issues
+    )
+
+
 def test_pytorch_zip_discovery_preserves_suspicious_literal_after_trivial_stream(
     tmp_path: Path,
 ) -> None:
@@ -4012,6 +4032,7 @@ def test_pytorch_zip_discovery_scans_frame_first_pickle_after_trivial_scalar_pre
         pytest.param(b"N.c" + (b"\xff" * 8192), id="global-operand-noise"),
         pytest.param(b"N.P" + (b"\xff" * 8192), id="persistent-id-operand-noise"),
         pytest.param(b"N." * 600, id="repeated-empty-streams"),
+        pytest.param(b"I1\n." * 600, id="repeated-int-literal-streams"),
         pytest.param((b"N." * 2048) + (b"\x00" * 4096), id="prefix-length-repeated-empty-streams"),
     ],
 )

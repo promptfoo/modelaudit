@@ -24,9 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar
 
-from modelaudit_picklescan import scan_bytes as scan_pickle_bytes
-
-from ..detectors.suspicious_symbols import CVE_COMBINED_PATTERNS
+from ..detectors.suspicious_symbols import CVE_COMBINED_PATTERNS, SUSPICIOUS_STRING_PATTERNS
 from ..scanner_results import (
     ACTIONABLE_FAILED_CHECKS_METADATA_KEY,
     INCONCLUSIVE_SCAN_OUTCOME,
@@ -144,6 +142,7 @@ _HEX_NESTED_LITERAL_TOKEN_RE = re.compile(rb"(?<![0-9A-Fa-f])(?:[0-9A-Fa-f]{2}){
 _RAW_NESTED_SECURITY_PICKLE_START_BYTES = b"\x80(cioRbP\x82\x83\x84"
 _MAX_RAW_NESTED_PICKLE_CANDIDATES = 64
 _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES = 8 * 1024
+_SUSPICIOUS_LITERAL_TEXT_PATTERNS = tuple(re.compile(pattern, re.IGNORECASE) for pattern in SUSPICIOUS_STRING_PATTERNS)
 
 
 @dataclass(frozen=True)
@@ -2475,7 +2474,6 @@ class PyTorchZipScanner(BaseScanner):
             remaining = PyTorchZipScanner._strip_optional_proto0_comment_prefix(remaining)
             active_frame_end = 0
             opcode_count = 0
-            has_non_trivial_opcode = False
             literal_values: list[bytes] = []
             try:
                 for opcode, arg, pos in pickletools.genops(remaining):
@@ -2489,17 +2487,10 @@ class PyTorchZipScanner(BaseScanner):
                     elif opcode.name == "STOP":
                         if opcode_count < 2 or active_frame_end > len(remaining):
                             return False
-                        complete_stream = remaining[: pos + 1]
-                        if literal_values and (
-                            PyTorchZipScanner._complete_trivial_pickle_has_scanner_finding(complete_stream)
-                            or any(
-                                PyTorchZipScanner._literal_value_has_nested_security_pickle(value)
-                                for value in literal_values
-                            )
+                        if any(
+                            PyTorchZipScanner._literal_value_has_storage_scan_signal(value) for value in literal_values
                         ):
                             return True
-                        if has_non_trivial_opcode:
-                            return False
                         trailing = remaining[pos + 1 :].lstrip(PROTO0_1_IGNORABLE_TRAILING_BYTES)
                         if not trailing:
                             return False
@@ -2509,8 +2500,6 @@ class PyTorchZipScanner(BaseScanner):
                         literal_value = PyTorchZipScanner._literal_arg_bytes(opcode.name, arg)
                         if literal_value is not None:
                             literal_values.append(literal_value)
-                    elif opcode.name not in PROTO0_1_TRIVIAL_LEADING_OPCODES:
-                        has_non_trivial_opcode = True
                 else:
                     return False
             except Exception:
@@ -2540,9 +2529,7 @@ class PyTorchZipScanner(BaseScanner):
             if isinstance(decoded_literal, bytes)
             else decoded_literal.encode("latin-1", errors="surrogateescape")
         )
-        return PyTorchZipScanner._complete_trivial_pickle_has_scanner_finding(
-            sample
-        ) or PyTorchZipScanner._literal_value_has_nested_security_pickle(literal_value)
+        return PyTorchZipScanner._literal_value_has_storage_scan_signal(literal_value)
 
     @staticmethod
     def _literal_arg_bytes(opcode_name: str, value: Any) -> bytes | None:
@@ -2564,12 +2551,17 @@ class PyTorchZipScanner(BaseScanner):
         ) or PyTorchZipScanner._literal_value_has_encoded_nested_security_pickle(value)
 
     @staticmethod
-    def _complete_trivial_pickle_has_scanner_finding(sample: bytes) -> bool:
-        try:
-            report = scan_pickle_bytes(sample, source="<pytorch-storage-literal>", enrich_call_graph=False)
-        except Exception:
-            return False
-        return bool(report.findings)
+    def _literal_value_has_storage_scan_signal(value: bytes) -> bool:
+        return PyTorchZipScanner._literal_value_has_nested_security_pickle(
+            value
+        ) or PyTorchZipScanner._literal_value_has_suspicious_text(value)
+
+    @staticmethod
+    def _literal_value_has_suspicious_text(value: bytes) -> bool:
+        text = value.decode("utf-8", errors="ignore")
+        if not text:
+            text = value.decode("latin-1", errors="ignore")
+        return any(pattern.search(text) for pattern in _SUSPICIOUS_LITERAL_TEXT_PATTERNS)
 
     @staticmethod
     def _literal_value_has_raw_nested_security_pickle(value: bytes) -> bool:

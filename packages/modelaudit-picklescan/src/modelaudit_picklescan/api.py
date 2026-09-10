@@ -134,6 +134,23 @@ _HEX_NESTED_LITERAL_TOKEN_RE = re.compile(rb"(?<![0-9A-Fa-f])(?:[0-9A-Fa-f]{2}){
 _RAW_NESTED_SECURITY_PICKLE_START_BYTES = b"\x80(cioRbP\x82\x83\x84"
 _MAX_RAW_NESTED_PICKLE_CANDIDATES = 64
 _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES = 8 * 1024
+_SUSPICIOUS_LITERAL_TEXT_PATTERNS = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"(?<!\w)__(?:reduce(?:_ex)?|setstate|getstate|getnewargs(?:_ex)?|getinitargs|new|class|"
+        r"subclasses|globals|builtins|mro)__(?!\w)",
+        r"base64\.b64decode",
+        r"eval\(",
+        r"exec\(",
+        r"os\.system",
+        r"os\.popen",
+        r"os\.spawn[a-z]*",
+        r"subprocess\.(?:Popen|call|check_output|run|check_call)",
+        r"commands\.(?:getoutput|getstatusoutput)",
+        r"\bimport\s+[\w\.]+",
+        r"__import__\(",
+    )
+)
 _MAX_PYTORCH_ZIP_ENTRIES = 10_000
 _MAX_PYTORCH_ZIP_PICKLE_DISCOVERY_PROBE_BYTES = 4 * 1024 * 1024
 _MAX_PYTORCH_ZIP_PICKLE_MEMBERS = 256
@@ -1897,7 +1914,6 @@ def _complete_trivial_literal_pickle_has_nested_security_pickle(sample: bytes) -
         remaining = _strip_optional_proto0_comment_prefix(remaining)
         active_frame_end = 0
         opcode_count = 0
-        has_non_trivial_opcode = False
         literal_values: list[bytes] = []
         try:
             for opcode, arg, pos in pickletools.genops(remaining):
@@ -1911,14 +1927,8 @@ def _complete_trivial_literal_pickle_has_nested_security_pickle(sample: bytes) -
                 elif opcode.name == "STOP":
                     if opcode_count < 2 or active_frame_end > len(remaining):
                         return False
-                    complete_stream = remaining[: pos + 1]
-                    if literal_values and (
-                        _complete_trivial_pickle_has_scanner_finding(complete_stream)
-                        or any(_literal_value_has_nested_security_pickle(value) for value in literal_values)
-                    ):
+                    if any(_literal_value_has_storage_scan_signal(value) for value in literal_values):
                         return True
-                    if has_non_trivial_opcode:
-                        return False
                     trailing = remaining[pos + 1 :].lstrip(_PROTO0_1_IGNORABLE_TRAILING_BYTES)
                     if not trailing:
                         return False
@@ -1928,8 +1938,6 @@ def _complete_trivial_literal_pickle_has_nested_security_pickle(sample: bytes) -
                     literal_value = _literal_arg_bytes(opcode.name, arg)
                     if literal_value is not None:
                         literal_values.append(literal_value)
-                elif opcode.name not in _PROTO0_1_TRIVIAL_LEADING_OPCODES:
-                    has_non_trivial_opcode = True
             else:
                 return False
         except Exception:
@@ -1959,9 +1967,7 @@ def _complete_proto0_string_literal_has_nested_security_pickle(sample: bytes) ->
         if isinstance(decoded_literal, bytes)
         else decoded_literal.encode("latin-1", errors="surrogateescape")
     )
-    return _complete_trivial_pickle_has_scanner_finding(sample) or _literal_value_has_nested_security_pickle(
-        literal_value
-    )
+    return _literal_value_has_storage_scan_signal(literal_value)
 
 
 def _literal_arg_bytes(opcode_name: str, value: Any) -> bytes | None:
@@ -1983,16 +1989,15 @@ def _literal_value_has_nested_security_pickle(value: bytes) -> bool:
     )
 
 
-def _complete_trivial_pickle_has_scanner_finding(sample: bytes) -> bool:
-    try:
-        report = PickleScanner().scan_bytes(
-            sample,
-            source="<pytorch-storage-literal>",
-            enrich_call_graph=False,
-        )
-    except Exception:
-        return False
-    return bool(report.findings)
+def _literal_value_has_storage_scan_signal(value: bytes) -> bool:
+    return _literal_value_has_nested_security_pickle(value) or _literal_value_has_suspicious_text(value)
+
+
+def _literal_value_has_suspicious_text(value: bytes) -> bool:
+    text = value.decode("utf-8", errors="ignore")
+    if not text:
+        text = value.decode("latin-1", errors="ignore")
+    return any(pattern.search(text) for pattern in _SUSPICIOUS_LITERAL_TEXT_PATTERNS)
 
 
 def _literal_value_has_raw_nested_security_pickle(value: bytes) -> bool:

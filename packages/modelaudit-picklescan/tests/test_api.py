@@ -6296,14 +6296,14 @@ def test_scan_file_scans_pickle_after_many_trivial_int_streams(tmp_path: Path) -
 def test_trivial_literal_probe_skips_scanner_for_literal_free_streams(monkeypatch: pytest.MonkeyPatch) -> None:
     calls = 0
 
-    def fail_if_called(sample: bytes) -> bool:
+    def fail_if_called(*args: Any, **kwargs: Any) -> PickleReport:
         nonlocal calls
         calls += 1
-        return False
+        raise AssertionError("trivial literal probe should not recursively scan complete prefix streams")
 
-    monkeypatch.setattr(package_api, "_complete_trivial_pickle_has_scanner_finding", fail_if_called)
+    monkeypatch.setattr(package_api, "scan_bytes", fail_if_called)
 
-    assert package_api._complete_trivial_literal_pickle_has_nested_security_pickle(b"N." * 1200 + b"X") is False
+    assert package_api._complete_trivial_literal_pickle_has_nested_security_pickle(b"I1\n." * 1200 + b"X") is False
     assert calls == 0
 
 
@@ -6446,6 +6446,29 @@ def test_scan_file_scans_scalar_literal_after_trivial_stream(tmp_path: Path) -> 
     archive_path = tmp_path / "model.pt"
     nested_payload = b"cposix\nsystem\n(S'echo hidden'\ntR."
     storage_blob = b"N.S'" + base64.b64encode(nested_payload) + b"'\n."
+    storage_blob += b" " * (-len(storage_blob) % 4)
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", storage_blob)
+
+    report = scan_file(archive_path)
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/0"]
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.location is not None
+        and f"{archive_path}:archive/data/0" in finding.location
+        for finding in report.findings
+    )
+
+
+def test_scan_file_scans_scalar_literal_after_clean_nontrivial_stream(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model.pt"
+    nested_payload = b"cposix\nsystem\n(S'echo hidden'\ntR."
+    storage_blob = b"N.]\x85.S'" + base64.b64encode(nested_payload) + b"'\n."
     storage_blob += b" " * (-len(storage_blob) % 4)
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
@@ -6807,6 +6830,7 @@ def test_scan_file_scans_frame_first_pickle_after_trivial_scalar_prefix(tmp_path
         pytest.param(b"N.c" + (b"\xff" * 8192), id="global-operand-noise"),
         pytest.param(b"N.P" + (b"\xff" * 8192), id="persistent-id-operand-noise"),
         pytest.param(b"N." * 600, id="repeated-empty-streams"),
+        pytest.param(b"I1\n." * 600, id="repeated-int-literal-streams"),
         pytest.param((b"N." * 2048) + (b"\x00" * 4096), id="prefix-length-repeated-empty-streams"),
     ],
 )
