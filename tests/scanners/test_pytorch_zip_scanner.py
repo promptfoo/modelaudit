@@ -2937,6 +2937,32 @@ def test_pytorch_zip_discovery_skips_padding_only_expanded_probe(
     assert not any(issue.details.get("pickle_filename") == "archive/data/0" for issue in result.issues)
 
 
+def test_pytorch_zip_discovery_checks_long_window_before_padding_budget(tmp_path: Path) -> None:
+    model_path = tmp_path / "referenced_long_window_before_padding_budget.pt"
+    malicious_suffix = _malicious_proto0_system_payload()
+    storage_blob = b"N." + (b" " * (pytorch_zip_scanner_module._TRUSTED_STORAGE_PICKLE_PROBE_BYTES - len(b"N.")))
+    storage_blob += malicious_suffix
+    storage_blob += b"\x00" * (pytorch_zip_scanner_module._PICKLE_DISCOVERY_PADDING_PROBE_BYTES + 4 - len(storage_blob))
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/data/0", storage_blob)
+
+    scanner = PyTorchZipScanner()
+    budget = [pytorch_zip_scanner_module._PICKLE_DISCOVERY_LONG_PROBE_BYTES]
+    result = ScanResult(scanner_name="pytorch_zip")
+    with zipfile.ZipFile(model_path) as zip_file:
+        entry = zip_file.getinfo("archive/data/0")
+        looks_like_pickle = scanner._trusted_storage_entry_looks_like_pickle(
+            zip_file,
+            entry,
+            result,
+            max_probe_bytes=pytorch_zip_scanner_module._PICKLE_DISCOVERY_LONG_PROBE_BYTES,
+            padding_probe_bytes_remaining=budget,
+        )
+
+    assert looks_like_pickle is True
+    assert budget == [0]
+
+
 def test_pytorch_zip_discovery_skips_many_padding_only_expanded_probe_storages(
     tmp_path: Path,
 ) -> None:

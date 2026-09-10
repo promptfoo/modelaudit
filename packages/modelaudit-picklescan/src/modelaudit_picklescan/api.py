@@ -1444,7 +1444,9 @@ def _trusted_storage_zip_entry_looks_like_pickle(
             and _trivial_complete_pickle_prefix_has_only_padding(prefix)
             and defer_padding_probe is None
         ):
-            probe_bytes = min(entry.file_size, _PICKLE_DISCOVERY_PADDING_PROBE_BYTES)
+            padding_probe_bytes = min(entry.file_size, _PICKLE_DISCOVERY_PADDING_PROBE_BYTES)
+            if padding_probe_bytes <= probe_bytes_remaining[0]:
+                probe_bytes = padding_probe_bytes
         sample = _read_zip_entry_probe(
             archive,
             entry,

@@ -4230,6 +4230,31 @@ def test_expanded_trusted_storage_probe_preserves_short_frame_probe(tmp_path: Pa
     ]
 
 
+def test_expanded_trusted_storage_probe_checks_long_window_before_padding_budget(tmp_path: Path) -> None:
+    malicious_suffix = b"cposix\nsystem\n(S'echo long-before-padding'\ntR."
+    storage = b"N." + (b" " * (package_api._TRUSTED_STORAGE_PICKLE_PROBE_BYTES - len(b"N.")))
+    storage += malicious_suffix
+    storage += b"\x00" * (package_api._PICKLE_DISCOVERY_PADDING_PROBE_BYTES + 4 - len(storage))
+    archive_path = tmp_path / "long-window-before-padding-budget.pt"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data/0", storage)
+
+    probe_budget = package_api._PICKLE_DISCOVERY_SHORT_PROBE_BYTES + package_api._PICKLE_DISCOVERY_LONG_PROBE_BYTES
+    probe_bytes_remaining = [probe_budget]
+    with zipfile.ZipFile(archive_path) as archive:
+        entry = archive.getinfo("archive/data/0")
+        looks_like_pickle = package_api._trusted_storage_zip_entry_looks_like_pickle(
+            archive,
+            entry,
+            probe_bytes_remaining,
+            float("inf"),
+            max_probe_bytes=package_api._PICKLE_DISCOVERY_LONG_PROBE_BYTES,
+        )
+
+    assert looks_like_pickle is True
+    assert probe_bytes_remaining == [0]
+
+
 def test_expanded_trusted_storage_probe_does_not_short_circuit_partial_proto0_string(
     tmp_path: Path,
 ) -> None:
