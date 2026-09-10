@@ -2457,36 +2457,45 @@ class PyTorchZipScanner(BaseScanner):
 
     @staticmethod
     def _complete_trivial_literal_pickle_has_nested_security_pickle(sample: bytes) -> bool:
-        active_frame_end = 0
-        opcode_count = 0
-        has_non_trivial_opcode = False
-        literal_values: list[bytes] = []
-        try:
-            for opcode, arg, pos in pickletools.genops(sample):
-                opcode_count += 1
-                if pos is None:
-                    continue
-                if opcode.name == "FRAME":
-                    if not isinstance(arg, int):
-                        return False
-                    active_frame_end = max(active_frame_end, pos + _PICKLE_FRAME_OPCODE_BYTES + arg)
-                elif opcode.name == "STOP":
-                    if opcode_count < 2 or active_frame_end > len(sample) or has_non_trivial_opcode:
-                        return False
-                    trailing = sample[pos + 1 :]
-                    if trailing.strip(PROTO0_1_IGNORABLE_TRAILING_BYTES):
-                        return False
-                    return any(
-                        PyTorchZipScanner._literal_value_should_route_trivial_pickle(value) for value in literal_values
-                    )
-                elif opcode.name in _PROTO0_1_LITERAL_OPCODES:
-                    literal_value = PyTorchZipScanner._literal_arg_bytes(opcode.name, arg)
-                    if literal_value is not None:
-                        literal_values.append(literal_value)
-                elif opcode.name not in PROTO0_1_TRIVIAL_LEADING_OPCODES:
-                    has_non_trivial_opcode = True
-        except Exception:
-            return PyTorchZipScanner._complete_proto0_string_literal_has_nested_security_pickle(sample)
+        remaining = sample
+        while remaining:
+            remaining = PyTorchZipScanner._strip_optional_proto0_comment_prefix(remaining)
+            active_frame_end = 0
+            opcode_count = 0
+            has_non_trivial_opcode = False
+            literal_values: list[bytes] = []
+            try:
+                for opcode, arg, pos in pickletools.genops(remaining):
+                    opcode_count += 1
+                    if pos is None:
+                        continue
+                    if opcode.name == "FRAME":
+                        if not isinstance(arg, int):
+                            return False
+                        active_frame_end = max(active_frame_end, pos + _PICKLE_FRAME_OPCODE_BYTES + arg)
+                    elif opcode.name == "STOP":
+                        if opcode_count < 2 or active_frame_end > len(remaining) or has_non_trivial_opcode:
+                            return False
+                        if any(
+                            PyTorchZipScanner._literal_value_should_route_trivial_pickle(value)
+                            for value in literal_values
+                        ):
+                            return True
+                        trailing = remaining[pos + 1 :].lstrip(PROTO0_1_IGNORABLE_TRAILING_BYTES)
+                        if not trailing:
+                            return False
+                        remaining = trailing
+                        break
+                    elif opcode.name in _PROTO0_1_LITERAL_OPCODES:
+                        literal_value = PyTorchZipScanner._literal_arg_bytes(opcode.name, arg)
+                        if literal_value is not None:
+                            literal_values.append(literal_value)
+                    elif opcode.name not in PROTO0_1_TRIVIAL_LEADING_OPCODES:
+                        has_non_trivial_opcode = True
+                else:
+                    return False
+            except Exception:
+                return PyTorchZipScanner._complete_proto0_string_literal_has_nested_security_pickle(remaining)
         return False
 
     @staticmethod

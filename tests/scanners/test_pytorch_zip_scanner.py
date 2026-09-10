@@ -3570,6 +3570,46 @@ def test_pytorch_zip_discovery_scans_shifted_base64_scalar_literal_nested_pickle
     )
 
 
+def test_pytorch_zip_discovery_scans_scalar_literal_before_trailing_trivial_stream(tmp_path: Path) -> None:
+    model_path = tmp_path / "referenced_scalar_literal_before_trailing_trivial_stream.pt"
+    nested_payload = _malicious_proto0_system_payload()
+    storage_blob = b"S'" + base64.b64encode(nested_payload) + b"'\n.N."
+    storage_blob += b" " * (-len(storage_blob) % 4)
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        zip_file.writestr("archive/data/0", storage_blob)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert "archive/data/0" in result.metadata["pickle_files"]
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
+        for issue in result.issues
+    )
+
+
+def test_pytorch_zip_discovery_scans_scalar_literal_after_trivial_stream(tmp_path: Path) -> None:
+    model_path = tmp_path / "referenced_scalar_literal_after_trivial_stream.pt"
+    nested_payload = _malicious_proto0_system_payload()
+    storage_blob = b"N.S'" + base64.b64encode(nested_payload) + b"'\n."
+    storage_blob += b" " * (-len(storage_blob) % 4)
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        zip_file.writestr("archive/data/0", storage_blob)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert "archive/data/0" in result.metadata["pickle_files"]
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
+        for issue in result.issues
+    )
+
+
 def test_pytorch_zip_discovery_scans_scalar_literal_after_benign_binary_prefix(tmp_path: Path) -> None:
     model_path = tmp_path / "referenced_scalar_literal_after_benign_binary_prefix.pt"
     storage_blob = _proto0_string_literal(b"\x80\x04N.\xff" + _malicious_proto0_system_payload())
