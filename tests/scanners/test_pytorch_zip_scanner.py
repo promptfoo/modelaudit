@@ -3608,6 +3608,28 @@ def test_pytorch_zip_discovery_scans_scalar_literal_with_escaped_binary_nested_p
     )
 
 
+def test_pytorch_zip_discovery_scans_scalar_literal_with_suspicious_string(tmp_path: Path) -> None:
+    model_path = tmp_path / "referenced_scalar_literal_suspicious_string.pt"
+    storage_blob = b"S'eval('\n."
+    storage_blob += b" " * (-len(storage_blob) % 4)
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        zip_file.writestr("archive/data/0", storage_blob)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert "archive/data/0" in result.metadata["pickle_files"]
+    assert result.metadata["pickle_verdict"] == "suspicious"
+    assert any(
+        issue.severity == IssueSeverity.WARNING
+        and issue.details.get("pickle_rule_code") == "SUSPICIOUS_STRING"
+        and issue.details.get("pickle_filename") == "archive/data/0"
+        for issue in result.issues
+    )
+
+
 def test_pytorch_zip_discovery_raw_nested_literal_candidates_fail_closed_after_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -142,6 +142,13 @@ _HEX_NESTED_LITERAL_TOKEN_RE = re.compile(rb"(?<![0-9A-Fa-f])(?:[0-9A-Fa-f]{2}){
 _RAW_NESTED_SECURITY_PICKLE_START_BYTES = b"\x80(cioRbP\x82\x83\x84"
 _MAX_RAW_NESTED_PICKLE_CANDIDATES = 64
 _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES = 8 * 1024
+_NESTED_LITERAL_SUSPICIOUS_STRING_PATTERNS = (
+    b"eval(",
+    b"exec(",
+    b"os.system",
+    b"subprocess",
+    b"__import__",
+)
 
 
 @dataclass(frozen=True)
@@ -2470,7 +2477,7 @@ class PyTorchZipScanner(BaseScanner):
                     if trailing.strip(PROTO0_1_IGNORABLE_TRAILING_BYTES):
                         return False
                     return any(
-                        PyTorchZipScanner._literal_value_has_nested_security_pickle(value) for value in literal_values
+                        PyTorchZipScanner._literal_value_should_route_trivial_pickle(value) for value in literal_values
                     )
                 elif opcode.name in _PROTO0_1_LITERAL_OPCODES:
                     literal_value = PyTorchZipScanner._literal_arg_bytes(opcode.name, arg)
@@ -2505,7 +2512,7 @@ class PyTorchZipScanner(BaseScanner):
             if isinstance(decoded_literal, bytes)
             else decoded_literal.encode("latin-1", errors="surrogateescape")
         )
-        return PyTorchZipScanner._literal_value_has_nested_security_pickle(literal_value)
+        return PyTorchZipScanner._literal_value_should_route_trivial_pickle(literal_value)
 
     @staticmethod
     def _literal_arg_bytes(opcode_name: str, value: Any) -> bytes | None:
@@ -2525,6 +2532,17 @@ class PyTorchZipScanner(BaseScanner):
         return PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(
             value
         ) or PyTorchZipScanner._literal_value_has_encoded_nested_security_pickle(value)
+
+    @staticmethod
+    def _literal_value_should_route_trivial_pickle(value: bytes) -> bool:
+        return PyTorchZipScanner._literal_value_has_nested_security_pickle(
+            value
+        ) or PyTorchZipScanner._literal_value_has_suspicious_string(value)
+
+    @staticmethod
+    def _literal_value_has_suspicious_string(value: bytes) -> bool:
+        value_lower = value.lower()
+        return any(pattern in value_lower for pattern in _NESTED_LITERAL_SUSPICIOUS_STRING_PATTERNS)
 
     @staticmethod
     def _literal_value_has_raw_nested_security_pickle(value: bytes) -> bool:

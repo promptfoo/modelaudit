@@ -134,6 +134,13 @@ _HEX_NESTED_LITERAL_TOKEN_RE = re.compile(rb"(?<![0-9A-Fa-f])(?:[0-9A-Fa-f]{2}){
 _RAW_NESTED_SECURITY_PICKLE_START_BYTES = b"\x80(cioRbP\x82\x83\x84"
 _MAX_RAW_NESTED_PICKLE_CANDIDATES = 64
 _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES = 8 * 1024
+_NESTED_LITERAL_SUSPICIOUS_STRING_PATTERNS = (
+    b"eval(",
+    b"exec(",
+    b"os.system",
+    b"subprocess",
+    b"__import__",
+)
 _MAX_PYTORCH_ZIP_ENTRIES = 10_000
 _MAX_PYTORCH_ZIP_PICKLE_DISCOVERY_PROBE_BYTES = 4 * 1024 * 1024
 _MAX_PYTORCH_ZIP_PICKLE_MEMBERS = 256
@@ -938,6 +945,18 @@ def _discover_pytorch_zip_pickle_entries(
         pickle_entries.append(entry)
         seen_entries.add(entry_id)
 
+    def remaining_probe_entries(*entry_groups: list[zipfile.ZipInfo]) -> list[zipfile.ZipInfo]:
+        remaining: list[zipfile.ZipInfo] = []
+        remaining_ids: set[int] = set()
+        for entry_group in entry_groups:
+            for entry in entry_group:
+                entry_id = id(entry)
+                if entry_id in remaining_ids:
+                    continue
+                remaining.append(entry)
+                remaining_ids.add(entry_id)
+        return remaining
+
     for entry in entries:
         if entry.is_dir():
             continue
@@ -1005,7 +1024,11 @@ def _discover_pytorch_zip_pickle_entries(
                     source=source,
                     probe_bytes_read=(_MAX_PYTORCH_ZIP_PICKLE_DISCOVERY_PROBE_BYTES - probe_bytes_remaining[0]),
                     probed_member_count=probed_member_count,
-                    skipped_entries=candidates[candidate_index:],
+                    skipped_entries=remaining_probe_entries(
+                        candidates[candidate_index:],
+                        deferred_expanded_probe_entries,
+                        deferred_padding_probe_entries,
+                    ),
                 )
             )
             break
@@ -1033,7 +1056,10 @@ def _discover_pytorch_zip_pickle_entries(
                         source=source,
                         probe_bytes_read=(_MAX_PYTORCH_ZIP_PICKLE_DISCOVERY_PROBE_BYTES - probe_bytes_remaining[0]),
                         probed_member_count=probed_member_count,
-                        skipped_entries=deferred_expanded_probe_entries[expanded_index:],
+                        skipped_entries=remaining_probe_entries(
+                            deferred_expanded_probe_entries[expanded_index:],
+                            deferred_padding_probe_entries,
+                        ),
                     )
                 )
                 break
@@ -1890,7 +1916,7 @@ def _complete_trivial_literal_pickle_has_nested_security_pickle(sample: bytes) -
                 trailing = sample[pos + 1 :]
                 if trailing.strip(_PROTO0_1_IGNORABLE_TRAILING_BYTES):
                     return False
-                return any(_literal_value_has_nested_security_pickle(value) for value in literal_values)
+                return any(_literal_value_should_route_trivial_pickle(value) for value in literal_values)
             elif opcode.name in _PROTO0_1_LITERAL_OPCODES:
                 literal_value = _literal_arg_bytes(opcode.name, arg)
                 if literal_value is not None:
@@ -1924,7 +1950,7 @@ def _complete_proto0_string_literal_has_nested_security_pickle(sample: bytes) ->
         if isinstance(decoded_literal, bytes)
         else decoded_literal.encode("latin-1", errors="surrogateescape")
     )
-    return _literal_value_has_nested_security_pickle(literal_value)
+    return _literal_value_should_route_trivial_pickle(literal_value)
 
 
 def _literal_arg_bytes(opcode_name: str, value: Any) -> bytes | None:
@@ -1944,6 +1970,15 @@ def _literal_value_has_nested_security_pickle(value: bytes) -> bool:
     return _literal_value_has_raw_nested_security_pickle(value) or _literal_value_has_encoded_nested_security_pickle(
         value
     )
+
+
+def _literal_value_should_route_trivial_pickle(value: bytes) -> bool:
+    return _literal_value_has_nested_security_pickle(value) or _literal_value_has_suspicious_string(value)
+
+
+def _literal_value_has_suspicious_string(value: bytes) -> bool:
+    value_lower = value.lower()
+    return any(pattern in value_lower for pattern in _NESTED_LITERAL_SUSPICIOUS_STRING_PATTERNS)
 
 
 def _literal_value_has_raw_nested_security_pickle(value: bytes) -> bool:

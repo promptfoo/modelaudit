@@ -6401,6 +6401,28 @@ def test_scan_file_scans_scalar_literal_with_escaped_binary_nested_pickle(tmp_pa
     )
 
 
+def test_scan_file_scans_scalar_literal_with_suspicious_string(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model.pt"
+    storage_blob = b"S'eval('\n."
+    storage_blob += b" " * (-len(storage_blob) % 4)
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", storage_blob)
+
+    report = scan_file(archive_path)
+
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/0"]
+    assert any(
+        finding.rule_code == "SUSPICIOUS_STRING"
+        and finding.location is not None
+        and f"{archive_path}:archive/data/0" in finding.location
+        for finding in report.findings
+    )
+
+
 def test_raw_nested_literal_candidates_fail_closed_after_budget(monkeypatch: pytest.MonkeyPatch) -> None:
     calls = 0
 
@@ -7211,6 +7233,42 @@ def test_scan_file_stops_hidden_pickle_discovery_at_aggregate_probe_budget(
     assert budget_notices[0].details["probed_member_count"] == 1
     assert budget_notices[0].details["skipped_member_count"] == 3
     assert next(iter(budget_notices[0].details["skipped_members"])) == "archive/decoy-1"
+
+
+def test_scan_file_budget_notice_includes_deferred_padding_member(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    storage_blob = b"N." + (b"\x00" * package_api._PICKLE_DISCOVERY_PADDING_PROBE_BYTES)
+    storage_blob += b"\x00" * (-len(storage_blob) % 4)
+    probe_budget = (
+        len(b"3\n")
+        + len(b"little")
+        + package_api._PICKLE_DISCOVERY_SHORT_PROBE_BYTES
+        + package_api._TRUSTED_STORAGE_PICKLE_PROBE_BYTES
+    )
+    monkeypatch.setattr(
+        package_api,
+        "_MAX_PYTORCH_ZIP_PICKLE_DISCOVERY_PROBE_BYTES",
+        probe_budget,
+        raising=False,
+    )
+    archive_path = tmp_path / "deferred-padding-budget.pt"
+    with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", storage_blob)
+        archive.writestr("archive/decoy", b"I0\n0" * 20_000)
+
+    report = scan_file(archive_path)
+
+    budget_notices = [notice for notice in report.notices if notice.code == "pytorch_zip_pickle_discovery_probe_budget"]
+    assert len(budget_notices) == 1
+    skipped_members = set(budget_notices[0].details["skipped_members"])
+    assert "archive/data/0" in skipped_members
+    assert "archive/decoy" in skipped_members
+    assert budget_notices[0].details["skipped_member_count"] >= 2
 
 
 def test_scan_file_detects_hidden_pickle_at_aggregate_probe_budget_boundary(
