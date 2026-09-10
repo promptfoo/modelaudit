@@ -3901,6 +3901,26 @@ def test_pytorch_zip_discovery_scans_malformed_separator_before_security_pickle(
     )
 
 
+def test_pytorch_zip_discovery_scans_malformed_separator_after_security_opcode_prefix(tmp_path: Path) -> None:
+    model_path = tmp_path / "referenced_malformed_separator_after_security_opcode_prefix.pt"
+    storage_blob = b"N.cfoo\nbar\n\xffcposix\nsystem\n(S'echo hidden'\ntR."
+    storage_blob += b" " * (-len(storage_blob) % 4)
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        zip_file.writestr("archive/data/0", storage_blob)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert result.success is False
+    assert result.metadata["pickle_files"] == ["archive/data.pkl", "archive/data/0"]
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
+        for issue in result.issues
+    )
+
+
 def test_pytorch_zip_discovery_scans_encoded_pickle_after_malformed_separator(tmp_path: Path) -> None:
     model_path = tmp_path / "referenced_encoded_pickle_after_malformed_separator.pt"
     nested_payload = base64.b64encode(b"cposix\nsystem\n(S'echo hidden'\ntR.")
@@ -4037,6 +4057,25 @@ def test_pytorch_zip_trailing_candidate_raw_scan_fails_closed_after_candidate_bu
     )
 
     assert PyTorchZipScanner._trailing_candidate_has_raw_nested_security_pickle(value) is True
+
+
+def test_pytorch_zip_security_opcode_probe_skips_repeated_none_streams_linearly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    call_count = 0
+    original_genops = pytorch_zip_scanner_module.pickletools.genops
+
+    def counted_genops(sample: bytes) -> Iterator[Any]:
+        nonlocal call_count
+        call_count += 1
+        yield from original_genops(sample)
+
+    monkeypatch.setattr(pytorch_zip_scanner_module.pickletools, "genops", counted_genops)
+
+    assert PyTorchZipScanner._has_security_relevant_pickle_opcode(
+        b"N." * 1200 + b"cposix\nsystem\n(S'echo hidden'\ntR."
+    )
+    assert call_count <= 2
 
 
 def test_pytorch_zip_storage_probe_does_not_spend_padding_budget_on_ordinary_long_probe(tmp_path: Path) -> None:

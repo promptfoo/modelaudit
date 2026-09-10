@@ -6708,6 +6708,28 @@ def test_scan_file_scans_malformed_separator_before_security_pickle(tmp_path: Pa
     )
 
 
+def test_scan_file_scans_malformed_separator_after_security_opcode_prefix(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model.pt"
+    storage_blob = b"N.cfoo\nbar\n\xffcposix\nsystem\n(S'echo hidden'\ntR."
+    storage_blob += b" " * (-len(storage_blob) % 4)
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", storage_blob)
+
+    report = scan_file(archive_path)
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/0"]
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.location is not None
+        and f"{archive_path}:archive/data/0" in finding.location
+        for finding in report.findings
+    )
+
+
 def test_scan_file_scans_encoded_pickle_after_malformed_separator(tmp_path: Path) -> None:
     archive_path = tmp_path / "model.pt"
     nested_payload = base64.b64encode(b"cposix\nsystem\n(S'echo hidden'\ntR.")
@@ -6852,6 +6874,21 @@ def test_trailing_candidate_raw_scan_fails_closed_after_candidate_budget() -> No
     )
 
     assert package_api._trailing_candidate_has_raw_nested_security_pickle(value) is True
+
+
+def test_security_opcode_probe_skips_repeated_none_streams_linearly(monkeypatch: pytest.MonkeyPatch) -> None:
+    call_count = 0
+    original_genops = package_api.pickletools.genops
+
+    def counted_genops(sample: bytes) -> collections.abc.Iterator[Any]:
+        nonlocal call_count
+        call_count += 1
+        yield from original_genops(sample)
+
+    monkeypatch.setattr(package_api.pickletools, "genops", counted_genops)
+
+    assert package_api._has_security_relevant_pickle_opcode(b"N." * 1200 + b"cposix\nsystem\n(S'echo hidden'\ntR.")
+    assert call_count <= 2
 
 
 def test_literal_text_route_ignores_oversized_base64_compatible_noise() -> None:

@@ -2388,6 +2388,10 @@ class PyTorchZipScanner(BaseScanner):
         remaining = sample
         while remaining:
             remaining = PyTorchZipScanner._strip_optional_proto0_comment_prefix(remaining)
+            repeated_none_trailing = PyTorchZipScanner._repeated_none_stream_trailing(remaining)
+            if repeated_none_trailing is not None:
+                remaining = repeated_none_trailing
+                continue
             try:
                 for opcode, _arg, pos in pickletools.genops(remaining):
                     if opcode.name in _PICKLE_SECURITY_RELEVANT_OPCODES:
@@ -2407,16 +2411,16 @@ class PyTorchZipScanner(BaseScanner):
         if not candidate:
             return False
         candidate = PyTorchZipScanner._strip_optional_proto0_comment_prefix(candidate)
-        if PyTorchZipScanner._has_security_relevant_pickle_opcode(candidate):
-            return (
-                PyTorchZipScanner._has_complete_pickle_stream_without_frame_stop_overrun(candidate)
-                or _looks_like_proto0_or_1_pickle(
-                    candidate,
-                    sample_is_prefix=False,
-                )
-                or PyTorchZipScanner._looks_like_binary_pickle_prefix(candidate, sample_is_prefix=False)
-                or PyTorchZipScanner._frame_first_trusted_storage_probe_should_scan(candidate)
+        if PyTorchZipScanner._has_security_relevant_pickle_opcode(candidate) and (
+            PyTorchZipScanner._has_complete_pickle_stream_without_frame_stop_overrun(candidate)
+            or _looks_like_proto0_or_1_pickle(
+                candidate,
+                sample_is_prefix=False,
             )
+            or PyTorchZipScanner._looks_like_binary_pickle_prefix(candidate, sample_is_prefix=False)
+            or PyTorchZipScanner._frame_first_trusted_storage_probe_should_scan(candidate)
+        ):
+            return True
         if PyTorchZipScanner._trailing_candidate_has_raw_nested_security_pickle(candidate):
             return True
         if PyTorchZipScanner._malformed_separator_proto0_string_literal_has_nested_security_pickle(candidate):

@@ -1769,6 +1769,10 @@ def _has_security_relevant_pickle_opcode(sample: bytes) -> bool:
     remaining = sample
     while remaining:
         remaining = _strip_optional_proto0_comment_prefix(remaining)
+        repeated_none_trailing = _repeated_none_stream_trailing(remaining)
+        if repeated_none_trailing is not None:
+            remaining = repeated_none_trailing
+            continue
         try:
             for opcode, _arg, pos in pickletools.genops(remaining):
                 if opcode.name in _PICKLE_SECURITY_RELEVANT_OPCODES:
@@ -1788,16 +1792,16 @@ def _trailing_pickle_probe_should_scan(trailing: bytes, *, sample_is_prefix: boo
     if not candidate:
         return False
     candidate = _strip_optional_proto0_comment_prefix(candidate)
-    if _has_security_relevant_pickle_opcode(candidate):
-        return (
-            _has_complete_pickle_stream_without_frame_stop_overrun(candidate)
-            or _looks_like_proto0_or_1_pickle(
-                candidate,
-                sample_is_prefix=False,
-            )
-            or _looks_like_binary_pickle_prefix(candidate, sample_is_prefix=False)
-            or _frame_first_trusted_storage_probe_should_scan(candidate)
+    if _has_security_relevant_pickle_opcode(candidate) and (
+        _has_complete_pickle_stream_without_frame_stop_overrun(candidate)
+        or _looks_like_proto0_or_1_pickle(
+            candidate,
+            sample_is_prefix=False,
         )
+        or _looks_like_binary_pickle_prefix(candidate, sample_is_prefix=False)
+        or _frame_first_trusted_storage_probe_should_scan(candidate)
+    ):
+        return True
     if _trailing_candidate_has_raw_nested_security_pickle(candidate):
         return True
     if _malformed_separator_proto0_string_literal_has_nested_security_pickle(candidate):
