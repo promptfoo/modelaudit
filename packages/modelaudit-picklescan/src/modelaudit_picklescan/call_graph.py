@@ -2120,6 +2120,30 @@ def find_startup_hook_write_call_graphs(
         invocation_references = invocations_by_reference.get((module, name), ())
         if require_invocations and not invocation_references:
             continue
+        trusted_mailbox_constructor_invocations = (
+            tuple(
+                invocation_reference
+                for invocation_reference in invocation_references
+                if _trusted_empty_mailbox_constructor_invocation_is_safe(module, name, invocation_reference)
+            )
+            if require_invocations
+            else ()
+        )
+        if trusted_mailbox_constructor_invocations:
+            openers.append(
+                _ImportCallPath(
+                    module=module,
+                    name=name,
+                    import_reference=f"{module}.{name}",
+                    call_path=_trusted_mailbox_constructor_file_open_path(module, name),
+                )
+            )
+        if (
+            require_invocations
+            and invocation_references
+            and len(trusted_mailbox_constructor_invocations) == len(invocation_references)
+        ):
+            continue
         seen.add((module, name))
         try:
             entrypoints = (
@@ -3444,7 +3468,18 @@ def _trusted_empty_mailbox_constructor_invocation_is_safe(
     name: str,
     reference: Mapping[str, object],
 ) -> bool:
-    return False
+    if (module, name) not in _TRUSTED_EMPTY_MAILBOX_CONSTRUCTOR_INVOCATIONS:
+        return False
+    if str(reference.get("opcode", "")) != "REDUCE":
+        return False
+    positional_arg_count = reference.get("positional_arg_count")
+    if isinstance(positional_arg_count, bool) or not isinstance(positional_arg_count, int):
+        return False
+    if positional_arg_count not in {0, 1}:
+        return False
+    if _complete_keyword_arg_names(reference) != ():
+        return False
+    return _mailbox_constructor_reference_is_canonical(module, name)
 
 
 def _mailbox_constructor_reference_is_canonical(module: str, name: str) -> bool:
@@ -3452,7 +3487,10 @@ def _mailbox_constructor_reference_is_canonical(module: str, name: str) -> bool:
         return False
     loaded, module_object, spec = _loaded_module_state_without_hooks(module)
     if not loaded:
-        return False
+        return (
+            _resolve_class_target(f"{module}.{name}") == f"{module}.{name}"
+            and _source_class_context(f"{module}.{name}") is not None
+        )
     if type(module_object) is not ModuleType or type(spec) is not ModuleSpec:
         return False
     origin, loader = _module_spec_fields_without_hooks(spec)
@@ -3481,6 +3519,11 @@ def _mailbox_constructor_reference_is_canonical(module: str, name: str) -> bool:
             pickle_invokes_metaclass_call=True,
         )
     )
+
+
+def _trusted_mailbox_constructor_file_open_path(module: str, name: str) -> tuple[str, ...]:
+    class_target = _resolve_class_target(f"{module}.{name}") or f"{module}.{name}"
+    return (class_target, "builtins.open")
 
 
 def _filter_class_entrypoints(entrypoints: tuple[str, ...], methods: tuple[str, ...]) -> tuple[str, ...]:

@@ -177,6 +177,7 @@ _SUSPICIOUS_LITERAL_TEXT_PATTERNS = tuple(
         r"commands\.(?:getoutput|getstatusoutput)",
         r"\bimport\s+[\w\.]+",
         r"__import__",
+        r"\\x[0-9a-fA-F]{2}",
         r"getattr\s*\(",
     )
 )
@@ -2207,7 +2208,7 @@ def _literal_value_has_raw_nested_security_pickle(
         candidate_count += 1
         if candidate_count > _MAX_RAW_NESTED_PICKLE_CANDIDATES:
             if not fail_closed_on_candidate_budget:
-                return _raw_nested_security_pickle_text_marker_seen(value[offset:])
+                return _encoded_raw_nested_security_pickle_candidate_budget_exhausted_needs_scan(value[offset:])
             return True
         candidate = value[offset : offset + _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES]
         candidate_is_prefix = offset + len(candidate) < len(value)
@@ -2257,6 +2258,39 @@ def _trailing_candidate_has_raw_nested_security_pickle(value: bytes) -> bool:
 
 def _raw_nested_security_pickle_candidate_budget_exhausted_needs_scan(value: bytes) -> bool:
     return _raw_nested_security_pickle_text_marker_seen(value) or bool(value.strip(b"c \t\r\n\x00"))
+
+
+def _encoded_raw_nested_security_pickle_candidate_budget_exhausted_needs_scan(value: bytes) -> bool:
+    if _raw_nested_security_pickle_text_marker_seen(value):
+        return True
+    value = value.lstrip(b"c \t\r\n\x00")
+    candidate = value[:_MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES]
+    candidate_is_prefix = len(value) > len(candidate)
+    if not candidate:
+        return False
+    marker = candidate[0]
+    if marker == 0x80 and _looks_like_binary_pickle_prefix(candidate, sample_is_prefix=candidate_is_prefix):
+        return _has_security_relevant_pickle_opcode(candidate) or candidate_is_prefix
+    has_candidate_signal = (
+        marker in _PROTO0_1_START_BYTES
+        and _has_security_relevant_pickle_opcode(candidate)
+        and (
+            _has_complete_pickle_stream_without_frame_stop_overrun(candidate)
+            or _looks_like_proto0_or_1_pickle(candidate, sample_is_prefix=candidate_is_prefix)
+        )
+    )
+    if has_candidate_signal:
+        return True
+    return not _encoded_raw_nested_security_pickle_candidate_budget_suffix_is_noise(value)
+
+
+def _encoded_raw_nested_security_pickle_candidate_budget_suffix_is_noise(value: bytes) -> bool:
+    if not value:
+        return True
+    residue = bytes(
+        byte for byte in value if byte not in _RAW_NESTED_SECURITY_PICKLE_START_BYTES and byte not in b" \t\r\n\x00"
+    )
+    return bool(residue) and all(byte >= 0x80 for byte in residue)
 
 
 def _raw_nested_security_pickle_text_marker_seen(value: bytes) -> bool:

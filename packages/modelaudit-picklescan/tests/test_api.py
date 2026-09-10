@@ -6414,6 +6414,26 @@ def test_scan_file_scans_scalar_literal_with_encoded_nested_pickle(tmp_path: Pat
     )
 
 
+def test_scan_file_fails_closed_for_encoded_nested_pickle_after_candidate_budget(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model.pt"
+    nested_payload = b"cshutil\nrmtree\n(S'/tmp/modelaudit'\ntR."
+    encoded_payload = base64.b64encode(
+        (b"c" * (package_api._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)) + (b"Z" * 9000) + nested_payload
+    )
+    storage_blob = b"S'" + encoded_payload + b"'\n."
+    storage_blob += b" " * (-len(storage_blob) % 4)
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", storage_blob)
+
+    report = scan_file(archive_path)
+
+    assert report.verdict != SafetyVerdict.CLEAN
+    assert "archive/data/0" in report.metadata["pickle_files"]
+
+
 def test_scan_file_scans_shifted_base64_scalar_literal_nested_pickle(tmp_path: Path) -> None:
     archive_path = tmp_path / "model.pt"
     nested_payload = b"cposix\nsystem\n(S'echo hidden'\ntR."
@@ -6858,6 +6878,22 @@ def test_encoded_nested_pickle_route_scans_budget_exhausted_dangerous_global() -
     assert package_api._literal_value_has_encoded_nested_security_pickle(base64.b64encode(payload)) is True
 
 
+def test_encoded_nested_pickle_route_fails_closed_after_decoy_markers() -> None:
+    nested_pickle = b"\x80\x04\x8c\x02os\x8c\x06system\x93\x8c\x02id\x85R."
+    payload = (b"c" * (package_api._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)) + nested_pickle
+
+    assert package_api._literal_value_has_encoded_nested_security_pickle(base64.b64encode(payload)) is True
+    assert package_api._literal_value_has_encoded_nested_security_pickle(binascii.hexlify(payload)) is True
+
+
+def test_encoded_nested_pickle_route_fails_closed_after_candidate_budget_gap() -> None:
+    nested_pickle = b"cshutil\nrmtree\n(S'/tmp/modelaudit'\ntR."
+    payload = (b"c" * (package_api._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)) + (b"Z" * 9000) + nested_pickle
+
+    assert package_api._literal_value_has_encoded_nested_security_pickle(base64.b64encode(payload)) is True
+    assert package_api._literal_value_has_encoded_nested_security_pickle(binascii.hexlify(payload)) is True
+
+
 def test_base64_literal_text_route_scans_middle_windows_without_size_only_signal() -> None:
     assert package_api._base64_literal_value_has_suspicious_text(base64.b64encode(b"B" * 80_000)) is False
     value = base64.b64encode(b"B" * 40_000 + b'os.system("id")' + b"B" * 40_000)
@@ -6876,6 +6912,7 @@ def test_base64_literal_text_route_scans_middle_windows_without_size_only_signal
         (b"copyreg.add_extension(module, name, code)", SafetyVerdict.SUSPICIOUS, True),
         (b"ZX\nZh\nbC\nh4\nKQ\n==", SafetyVerdict.SUSPICIOUS, True),
         (b"A" * 100 + b"==" + base64.b64encode(b'os.system("id")'), SafetyVerdict.SUSPICIOUS, True),
+        (b"\\x6f\\x73\\x2e\\x73\\x79\\x73\\x74\\x65\\x6d", SafetyVerdict.SUSPICIOUS, True),
     ],
     ids=[
         "spaced-os-system",
@@ -6886,6 +6923,7 @@ def test_base64_literal_text_route_scans_middle_windows_without_size_only_signal
         "copyreg-extension",
         "wrapped-base64",
         "base64-after-padding",
+        "escaped-hex",
     ],
 )
 def test_scan_file_routes_scalar_literals_with_full_suspicious_string_policy(

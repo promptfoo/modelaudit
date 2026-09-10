@@ -5579,6 +5579,38 @@ def test_scan_bytes_preserves_mailbox_add_detection_when_constructor_analysis_un
     assert _has_critical_global_finding(report, "mailbox", "mbox.add")
 
 
+def test_scan_bytes_keeps_mailbox_multi_arg_constructor_gap_inconclusive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_entrypoints = call_graph._safe_call_graph_entrypoints
+
+    def flaky_entrypoints(function_name: str) -> tuple[str, ...]:
+        if function_name == "mailbox.mbox":
+            raise call_graph._CallGraphAnalysisLimitError("synthetic mailbox constructor source gap")
+        return original_entrypoints(function_name)
+
+    monkeypatch.setattr(call_graph, "_safe_call_graph_entrypoints", flaky_entrypoints)
+    pth_path = tmp_path / "mailbox_multi_arg_gap_exec.pth"
+    marker = tmp_path / "mailbox_multi_arg_gap_pth_rce_marker"
+    payload = b"".join(
+        [
+            b"\x80\x04",
+            _short_binunicode(b"mailbox"),
+            _short_binunicode(b"mbox"),
+            b"\x93",
+            _text_operand(str(pth_path)),
+            b"N\x86R.",
+        ]
+    )
+
+    report = scan_bytes(payload, source="mailbox-mbox-multi-arg-control.pkl")
+
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert not pth_path.exists()
+    assert not marker.exists()
+
+
 def test_scan_bytes_keeps_mailbox_flush_analysis_gap_fail_closed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

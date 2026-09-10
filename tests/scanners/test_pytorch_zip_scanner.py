@@ -3628,6 +3628,28 @@ def test_pytorch_zip_discovery_scans_scalar_literal_with_encoded_nested_pickle(t
     )
 
 
+def test_pytorch_zip_discovery_fails_closed_for_encoded_nested_pickle_after_candidate_budget(
+    tmp_path: Path,
+) -> None:
+    model_path = tmp_path / "referenced_scalar_literal_encoded_budget_gap.pt"
+    nested_payload = b"cshutil\nrmtree\n(S'/tmp/modelaudit'\ntR."
+    encoded_payload = base64.b64encode(
+        (b"c" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)) + (b"Z" * 9000) + nested_payload
+    )
+    storage_blob = b"S'" + encoded_payload + b"'\n."
+    storage_blob += b" " * (-len(storage_blob) % 4)
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        zip_file.writestr("archive/data/0", storage_blob)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert result.success is False
+    assert "archive/data/0" in result.metadata["pickle_files"]
+
+
 def test_pytorch_zip_discovery_scans_shifted_base64_scalar_literal_nested_pickle(tmp_path: Path) -> None:
     model_path = tmp_path / "referenced_scalar_literal_shifted_encoded_nested_pickle.pt"
     nested_payload = _malicious_proto0_system_payload()
@@ -4102,6 +4124,24 @@ def test_pytorch_zip_encoded_nested_pickle_route_ignores_base64_marker_density_n
 def test_pytorch_zip_encoded_nested_pickle_route_scans_budget_exhausted_dangerous_global() -> None:
     payload = (b"c\xff" * 100) + b"csubprocess\ngetoutput\n(S'id'\ntR."
     assert PyTorchZipScanner._literal_value_has_encoded_nested_security_pickle(base64.b64encode(payload)) is True
+
+
+def test_pytorch_zip_encoded_nested_pickle_route_fails_closed_after_decoy_markers() -> None:
+    nested_pickle = b"\x80\x04\x8c\x02os\x8c\x06system\x93\x8c\x02id\x85R."
+    payload = (b"c" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)) + nested_pickle
+
+    assert PyTorchZipScanner._literal_value_has_encoded_nested_security_pickle(base64.b64encode(payload)) is True
+    assert PyTorchZipScanner._literal_value_has_encoded_nested_security_pickle(binascii.hexlify(payload)) is True
+
+
+def test_pytorch_zip_encoded_nested_pickle_route_fails_closed_after_candidate_budget_gap() -> None:
+    nested_pickle = b"cshutil\nrmtree\n(S'/tmp/modelaudit'\ntR."
+    payload = (
+        (b"c" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)) + (b"Z" * 9000) + nested_pickle
+    )
+
+    assert PyTorchZipScanner._literal_value_has_encoded_nested_security_pickle(base64.b64encode(payload)) is True
+    assert PyTorchZipScanner._literal_value_has_encoded_nested_security_pickle(binascii.hexlify(payload)) is True
 
 
 def test_pytorch_zip_base64_literal_text_route_scans_middle_windows_without_size_only_signal() -> None:

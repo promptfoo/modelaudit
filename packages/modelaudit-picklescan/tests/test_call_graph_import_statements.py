@@ -3715,6 +3715,49 @@ def test_trusted_mailbox_constructor_requires_loaded_source_backed_class(monkeyp
     )
 
 
+def test_trusted_mailbox_constructor_remains_startup_hook_opener() -> None:
+    invocations = (
+        {
+            "opcode": "REDUCE",
+            "module": "mailbox",
+            "name": "mbox",
+            "positional_arg_count": 1,
+            "global_position": 1,
+        },
+        {
+            "opcode": "REDUCE",
+            "module": "pathlib",
+            "name": "Path.write_text",
+            "positional_arg_count": 2,
+            "global_position": 2,
+        },
+    )
+    import_references = (
+        {
+            "opcode": "STACK_GLOBAL",
+            "module": "mailbox",
+            "name": "mbox",
+            "import_reference": "mailbox.mbox",
+            "position": 1,
+        },
+        {
+            "opcode": "STACK_GLOBAL",
+            "module": "pathlib",
+            "name": "Path.write_text",
+            "import_reference": "pathlib.Path.write_text",
+            "position": 2,
+        },
+    )
+
+    findings = call_graph.find_startup_hook_write_call_graphs(import_references, invocations)
+
+    assert findings
+    assert findings[0].opener_import_reference == "mailbox.mbox"
+    assert findings[0].writer_import_reference == "pathlib.Path.write_text"
+    assert findings[0].open_sink == "builtins.open"
+    assert findings[0].write_sink == "f.write"
+
+
 def test_scan_bytes_analyzes_shadowed_torch_extension_callable_invocation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

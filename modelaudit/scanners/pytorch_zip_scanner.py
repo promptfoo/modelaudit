@@ -2840,7 +2840,9 @@ class PyTorchZipScanner(BaseScanner):
             candidate_count += 1
             if candidate_count > _MAX_RAW_NESTED_PICKLE_CANDIDATES:
                 if not fail_closed_on_candidate_budget:
-                    return PyTorchZipScanner._raw_nested_security_pickle_text_marker_seen(value[offset:])
+                    return PyTorchZipScanner._encoded_raw_nested_security_pickle_candidate_budget_exhausted_needs_scan(
+                        value[offset:]
+                    )
                 return True
             candidate = value[offset : offset + _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES]
             candidate_is_prefix = offset + len(candidate) < len(value)
@@ -2898,6 +2900,42 @@ class PyTorchZipScanner(BaseScanner):
         return PyTorchZipScanner._raw_nested_security_pickle_text_marker_seen(value) or bool(
             value.strip(b"c \t\r\n\x00")
         )
+
+    @staticmethod
+    def _encoded_raw_nested_security_pickle_candidate_budget_exhausted_needs_scan(value: bytes) -> bool:
+        if PyTorchZipScanner._raw_nested_security_pickle_text_marker_seen(value):
+            return True
+        value = value.lstrip(b"c \t\r\n\x00")
+        candidate = value[:_MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES]
+        candidate_is_prefix = len(value) > len(candidate)
+        if not candidate:
+            return False
+        marker = candidate[0]
+        if marker == 0x80 and PyTorchZipScanner._looks_like_binary_pickle_prefix(
+            candidate,
+            sample_is_prefix=candidate_is_prefix,
+        ):
+            return PyTorchZipScanner._has_security_relevant_pickle_opcode(candidate) or candidate_is_prefix
+        has_candidate_signal = (
+            marker in PROTO0_1_START_BYTES
+            and PyTorchZipScanner._has_security_relevant_pickle_opcode(candidate)
+            and (
+                PyTorchZipScanner._has_complete_pickle_stream_without_frame_stop_overrun(candidate)
+                or _looks_like_proto0_or_1_pickle(candidate, sample_is_prefix=candidate_is_prefix)
+            )
+        )
+        if has_candidate_signal:
+            return True
+        return not PyTorchZipScanner._encoded_raw_nested_security_pickle_candidate_budget_suffix_is_noise(value)
+
+    @staticmethod
+    def _encoded_raw_nested_security_pickle_candidate_budget_suffix_is_noise(value: bytes) -> bool:
+        if not value:
+            return True
+        residue = bytes(
+            byte for byte in value if byte not in _RAW_NESTED_SECURITY_PICKLE_START_BYTES and byte not in b" \t\r\n\x00"
+        )
+        return bool(residue) and all(byte >= 0x80 for byte in residue)
 
     @staticmethod
     def _raw_nested_security_pickle_text_marker_seen(value: bytes) -> bool:
