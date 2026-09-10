@@ -2963,6 +2963,31 @@ def test_pytorch_zip_discovery_checks_long_window_before_padding_budget(tmp_path
     assert budget == [0]
 
 
+def test_pytorch_zip_discovery_charges_expanded_probe_budget_for_actual_small_member(
+    tmp_path: Path,
+) -> None:
+    model_path = tmp_path / "referenced_small_member_expanded_probe_budget.pt"
+    storage_blob = b"N." + (b" " * 18)
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/data/0", storage_blob)
+
+    scanner = PyTorchZipScanner()
+    budget = [64]
+    result = ScanResult(scanner_name="pytorch_zip")
+    with zipfile.ZipFile(model_path) as zip_file:
+        entry = zip_file.getinfo("archive/data/0")
+        looks_like_pickle = scanner._trusted_storage_entry_looks_like_pickle(
+            zip_file,
+            entry,
+            result,
+            max_probe_bytes=pytorch_zip_scanner_module._PICKLE_DISCOVERY_LONG_PROBE_BYTES,
+            padding_probe_bytes_remaining=budget,
+        )
+
+    assert looks_like_pickle is False
+    assert budget == [64 - len(storage_blob)]
+
+
 def test_pytorch_zip_discovery_skips_many_padding_only_expanded_probe_storages(
     tmp_path: Path,
 ) -> None:
@@ -3692,6 +3717,31 @@ def test_pytorch_zip_discovery_scans_scalar_literal_with_suspicious_string(tmp_p
         issue.severity == IssueSeverity.WARNING
         and issue.details.get("pickle_rule_code") == "SUSPICIOUS_STRING"
         and issue.details.get("pickle_filename") == "archive/data/0"
+        for issue in result.issues
+    )
+
+
+def test_pytorch_zip_discovery_scans_scalar_literal_with_magic_method_suspicious_string(
+    tmp_path: Path,
+) -> None:
+    model_path = tmp_path / "referenced_scalar_literal_magic_method_suspicious_string.pt"
+    storage_blob = b"S'__reduce__'\n."
+    storage_blob += b" " * (-len(storage_blob) % 4)
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        zip_file.writestr("archive/data/0", storage_blob)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert "archive/data/0" in result.metadata["pickle_files"]
+    assert result.metadata["pickle_verdict"] == "suspicious"
+    assert any(
+        issue.severity == IssueSeverity.WARNING
+        and issue.details.get("pickle_rule_code") == "SUSPICIOUS_STRING"
+        and issue.details.get("pickle_filename") == "archive/data/0"
+        and issue.details.get("pattern") == "magic method"
         for issue in result.issues
     )
 

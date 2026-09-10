@@ -4255,6 +4255,29 @@ def test_expanded_trusted_storage_probe_checks_long_window_before_padding_budget
     assert probe_bytes_remaining == [0]
 
 
+def test_expanded_trusted_storage_probe_charges_actual_small_member_bytes(tmp_path: Path) -> None:
+    storage = b"N." + (b" " * 18)
+    archive_path = tmp_path / "small-member-expanded-probe-budget.pt"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data/0", storage)
+
+    probe_bytes_remaining = [64]
+    with zipfile.ZipFile(archive_path) as archive:
+        entry = archive.getinfo("archive/data/0")
+        looks_like_pickle = package_api._trusted_storage_zip_entry_looks_like_pickle(
+            archive,
+            entry,
+            probe_bytes_remaining,
+            float("inf"),
+            max_probe_bytes=package_api._PICKLE_DISCOVERY_LONG_PROBE_BYTES,
+        )
+
+    assert looks_like_pickle is False
+    assert probe_bytes_remaining == [
+        64 - package_api._PICKLE_DISCOVERY_SHORT_PROBE_BYTES - len(storage),
+    ]
+
+
 def test_expanded_trusted_storage_probe_does_not_short_circuit_partial_proto0_string(
     tmp_path: Path,
 ) -> None:
@@ -6488,6 +6511,29 @@ def test_scan_file_scans_scalar_literal_with_suspicious_string(tmp_path: Path) -
     assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/0"]
     assert any(
         finding.rule_code == "SUSPICIOUS_STRING"
+        and finding.location is not None
+        and f"{archive_path}:archive/data/0" in finding.location
+        for finding in report.findings
+    )
+
+
+def test_scan_file_scans_scalar_literal_with_magic_method_suspicious_string(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model.pt"
+    storage_blob = b"S'__reduce__'\n."
+    storage_blob += b" " * (-len(storage_blob) % 4)
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", storage_blob)
+
+    report = scan_file(archive_path)
+
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/0"]
+    assert any(
+        finding.rule_code == "SUSPICIOUS_STRING"
+        and finding.details.get("pattern") == "magic method"
         and finding.location is not None
         and f"{archive_path}:archive/data/0" in finding.location
         for finding in report.findings

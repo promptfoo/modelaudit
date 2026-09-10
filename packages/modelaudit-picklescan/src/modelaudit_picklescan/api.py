@@ -134,13 +134,6 @@ _HEX_NESTED_LITERAL_TOKEN_RE = re.compile(rb"(?<![0-9A-Fa-f])(?:[0-9A-Fa-f]{2}){
 _RAW_NESTED_SECURITY_PICKLE_START_BYTES = b"\x80(cioRbP\x82\x83\x84"
 _MAX_RAW_NESTED_PICKLE_CANDIDATES = 64
 _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES = 8 * 1024
-_NESTED_LITERAL_SUSPICIOUS_STRING_PATTERNS = (
-    b"eval(",
-    b"exec(",
-    b"os.system",
-    b"subprocess",
-    b"__import__",
-)
 _MAX_PYTORCH_ZIP_ENTRIES = 10_000
 _MAX_PYTORCH_ZIP_PICKLE_DISCOVERY_PROBE_BYTES = 4 * 1024 * 1024
 _MAX_PYTORCH_ZIP_PICKLE_MEMBERS = 256
@@ -1918,7 +1911,10 @@ def _complete_trivial_literal_pickle_has_nested_security_pickle(sample: bytes) -
                 elif opcode.name == "STOP":
                     if opcode_count < 2 or active_frame_end > len(remaining) or has_non_trivial_opcode:
                         return False
-                    if any(_literal_value_should_route_trivial_pickle(value) for value in literal_values):
+                    complete_stream = remaining[: pos + 1]
+                    if _complete_trivial_pickle_has_scanner_finding(complete_stream) or any(
+                        _literal_value_has_nested_security_pickle(value) for value in literal_values
+                    ):
                         return True
                     trailing = remaining[pos + 1 :].lstrip(_PROTO0_1_IGNORABLE_TRAILING_BYTES)
                     if not trailing:
@@ -1960,7 +1956,9 @@ def _complete_proto0_string_literal_has_nested_security_pickle(sample: bytes) ->
         if isinstance(decoded_literal, bytes)
         else decoded_literal.encode("latin-1", errors="surrogateescape")
     )
-    return _literal_value_should_route_trivial_pickle(literal_value)
+    return _complete_trivial_pickle_has_scanner_finding(sample) or _literal_value_has_nested_security_pickle(
+        literal_value
+    )
 
 
 def _literal_arg_bytes(opcode_name: str, value: Any) -> bytes | None:
@@ -1982,13 +1980,16 @@ def _literal_value_has_nested_security_pickle(value: bytes) -> bool:
     )
 
 
-def _literal_value_should_route_trivial_pickle(value: bytes) -> bool:
-    return _literal_value_has_nested_security_pickle(value) or _literal_value_has_suspicious_string(value)
-
-
-def _literal_value_has_suspicious_string(value: bytes) -> bool:
-    value_lower = value.lower()
-    return any(pattern in value_lower for pattern in _NESTED_LITERAL_SUSPICIOUS_STRING_PATTERNS)
+def _complete_trivial_pickle_has_scanner_finding(sample: bytes) -> bool:
+    try:
+        report = PickleScanner().scan_bytes(
+            sample,
+            source="<pytorch-storage-literal>",
+            enrich_call_graph=False,
+        )
+    except Exception:
+        return False
+    return bool(report.findings)
 
 
 def _literal_value_has_raw_nested_security_pickle(value: bytes) -> bool:
