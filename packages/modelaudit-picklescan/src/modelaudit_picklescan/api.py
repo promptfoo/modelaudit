@@ -53,6 +53,9 @@ from .report import CoverageSummary, Finding, Notice, PickleReport, SafetyVerdic
 
 _RUST_STREAM_READ_CHUNK_SIZE = 1024 * 1024
 _CALL_GRAPH_SOURCE_FINGERPRINTS_KEY = "call_graph_source_fingerprints"
+_SOURCE_INDEPENDENT_BUILTIN_MODULES = frozenset({"builtins", "__builtin__", "__builtins__"})
+_SOURCE_INDEPENDENT_BUILTIN_DANGEROUS_NAMES = frozenset({"__import__", "compile", "eval", "exec", "open"})
+_NESTED_EXECUTION_FINDING_RULE_CODES = frozenset({"S213", "S601", "S602"})
 _PYTORCH_ZIP_METADATA_BASENAMES = frozenset({"version", "byteorder"})
 _PYTORCH_CHECKPOINT_SUFFIXES = frozenset({".pt", ".pth", ".ckpt"})
 _PICKLE_MEMBER_SUFFIXES = (".pkl", ".pickle")
@@ -4134,7 +4137,39 @@ def _call_graph_enrichment_is_redundant(report: PickleReport) -> bool:
         for finding in report.findings
         if finding.severity == Severity.CRITICAL
     }
-    return references <= critical_references
+    return references <= critical_references or _nested_execution_finding_covers_builtin_import_references(report)
+
+
+def _nested_execution_finding_covers_builtin_import_references(report: PickleReport) -> bool:
+    if not any(
+        finding.severity == Severity.CRITICAL
+        and finding.rule_code in _NESTED_EXECUTION_FINDING_RULE_CODES
+        and finding.details.get("nested_has_execution_opcode") is True
+        for finding in report.findings
+    ):
+        return False
+
+    if any(_mapping(raw_invocation) for raw_invocation in _sequence(report.metadata.get("callable_invocations"))):
+        return False
+
+    saw_reference = False
+    for raw_reference in _sequence(report.metadata.get("import_references")):
+        reference = _mapping(raw_reference)
+        if not _source_independent_builtin_import_reference(reference):
+            return False
+        saw_reference = True
+    return saw_reference
+
+
+def _source_independent_builtin_import_reference(reference: Mapping[str, object]) -> bool:
+    module = str(reference.get("module", ""))
+    name = str(reference.get("name", ""))
+    return (
+        module in _SOURCE_INDEPENDENT_BUILTIN_MODULES
+        and bool(name)
+        and name not in _SOURCE_INDEPENDENT_BUILTIN_DANGEROUS_NAMES
+        and reference.get("is_dangerous") is not True
+    )
 
 
 def _call_graph_has_no_source_inputs(report: PickleReport) -> bool:

@@ -14539,6 +14539,38 @@ def test_scan_bytes_skips_call_graph_enrichment_for_already_critical_references(
     )
 
 
+def test_scan_bytes_skips_call_graph_enrichment_for_nested_builtin_execution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class PrintPayload:
+        def __reduce__(self) -> tuple[object, tuple[str]]:
+            return print, ("nested payload executed",)
+
+    def unexpected_enrichment(_report: PickleReport) -> PickleReport:
+        raise AssertionError("nested builtins.print payload should not enter call-graph enrichment")
+
+    monkeypatch.setattr(package_api, "_with_call_graph_findings", unexpected_enrichment)
+
+    nested_payload = pickle.dumps(PrintPayload(), protocol=4)
+    payload = pickle.dumps(
+        {
+            "raw_payload": nested_payload,
+            "encoded_payload": base64.b64encode(nested_payload).decode("ascii"),
+        },
+        protocol=4,
+    )
+    report = scan_bytes(payload, source="nested-builtin-print.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert report.errors == ()
+    assert any(finding.rule_code == "S213" for finding in report.findings)
+    assert any(finding.rule_code == "S601" for finding in report.findings)
+    assert report.private_metadata["call_graph_source_fingerprints"] == (
+        package_api._source_independent_call_graph_fingerprint_metadata(critical_references=True)
+    )
+
+
 def test_call_graph_enrichment_remains_required_for_unreviewed_sibling() -> None:
     report = PickleReport(
         source="critical-with-unreviewed-sibling.pkl",
@@ -14557,6 +14589,31 @@ def test_call_graph_enrichment_remains_required_for_unreviewed_sibling() -> None
             "import_references": (
                 {"module": "posix", "name": "system"},
                 {"module": "private_payload", "name": "Gadget"},
+            )
+        },
+    )
+
+    assert package_api._call_graph_enrichment_is_redundant(report) is False
+
+
+def test_call_graph_enrichment_remains_required_for_nested_unreviewed_sibling() -> None:
+    report = PickleReport(
+        source="nested-critical-with-unreviewed-sibling.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.MALICIOUS,
+        findings=(
+            Finding(
+                message="nested critical finding",
+                severity=Severity.CRITICAL,
+                location="nested-critical-with-unreviewed-sibling.pkl",
+                rule_code="S213",
+                details={"nested_has_execution_opcode": True},
+            ),
+        ),
+        metadata={
+            "import_references": (
+                {"module": "builtins", "name": "print", "is_dangerous": False},
+                {"module": "private_payload", "name": "Gadget", "is_dangerous": False},
             )
         },
     )
