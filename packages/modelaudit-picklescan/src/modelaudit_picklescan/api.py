@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import ast
+import base64
+import binascii
 import io
 import os
 import pickletools
+import re
 import tempfile
 import time
 import zipfile
@@ -115,6 +118,18 @@ _PROTO0_1_TRIVIAL_LEADING_OPCODES = frozenset(
         "SHORT_BINUNICODE",
     }
 )
+_PROTO0_1_LITERAL_OPCODES = frozenset(
+    {
+        "STRING",
+        "BINSTRING",
+        "SHORT_BINSTRING",
+        "UNICODE",
+        "BINUNICODE",
+        "SHORT_BINUNICODE",
+    }
+)
+_BASE64_NESTED_LITERAL_TOKEN_RE = re.compile(rb"[A-Za-z0-9+/_-]{16,}={0,2}")
+_HEX_NESTED_LITERAL_TOKEN_RE = re.compile(rb"(?<![0-9A-Fa-f])(?:[0-9A-Fa-f]{2}){8,}(?![0-9A-Fa-f])")
 _MAX_PYTORCH_ZIP_ENTRIES = 10_000
 _MAX_PYTORCH_ZIP_PICKLE_DISCOVERY_PROBE_BYTES = 4 * 1024 * 1024
 _MAX_PYTORCH_ZIP_PICKLE_MEMBERS = 256
@@ -1526,6 +1541,8 @@ def _proto0_or_1_trusted_storage_probe_should_scan(sample: bytes, *, sample_is_p
         return True
     if _trivial_complete_pickle_prefix_trailing_should_scan(sample, sample_is_prefix=sample_is_prefix):
         return True
+    if _complete_trivial_literal_pickle_has_nested_security_pickle(sample):
+        return True
     if _trivial_complete_pickle_prefix_has_only_padding(sample):
         return False
     if not sample_is_prefix:
@@ -1773,6 +1790,8 @@ def _trivial_complete_pickle_prefix_needs_more_bytes(sample: bytes) -> bool:
 
 def _trailing_pickle_candidate_needs_more_bytes(candidate: bytes) -> bool:
     while candidate:
+        if candidate == b"#":
+            return True
         stripped_comment_candidate = _strip_optional_proto0_comment_prefix(candidate)
         if stripped_comment_candidate != candidate:
             candidate = stripped_comment_candidate
@@ -1845,6 +1864,85 @@ def _trivial_complete_pickle_prefix_trailing(sample: bytes) -> bytes | None:
     except Exception:
         return None
     return None
+
+
+def _complete_trivial_literal_pickle_has_nested_security_pickle(sample: bytes) -> bool:
+    active_frame_end = 0
+    opcode_count = 0
+    has_non_trivial_opcode = False
+    literal_values: list[bytes] = []
+    try:
+        for opcode, arg, pos in pickletools.genops(sample):
+            opcode_count += 1
+            if pos is None:
+                continue
+            if opcode.name == "FRAME":
+                if not isinstance(arg, int):
+                    return False
+                active_frame_end = max(active_frame_end, pos + _PICKLE_FRAME_OPCODE_BYTES + arg)
+            elif opcode.name == "STOP":
+                if opcode_count < 2 or active_frame_end > len(sample) or has_non_trivial_opcode:
+                    return False
+                trailing = sample[pos + 1 :]
+                if trailing.strip(_PROTO0_1_IGNORABLE_TRAILING_BYTES):
+                    return False
+                return any(_literal_value_has_nested_security_pickle(value) for value in literal_values)
+            elif opcode.name in _PROTO0_1_LITERAL_OPCODES:
+                literal_value = _literal_arg_bytes(arg)
+                if literal_value is not None:
+                    literal_values.append(literal_value)
+            elif opcode.name not in _PROTO0_1_TRIVIAL_LEADING_OPCODES:
+                has_non_trivial_opcode = True
+    except Exception:
+        return False
+    return False
+
+
+def _literal_arg_bytes(value: Any) -> bytes | None:
+    if isinstance(value, bytes):
+        return value
+    if isinstance(value, str):
+        return value.encode("utf-8", errors="surrogateescape")
+    return None
+
+
+def _literal_value_has_nested_security_pickle(value: bytes) -> bool:
+    return _literal_value_has_raw_nested_security_pickle(value) or _literal_value_has_encoded_nested_security_pickle(
+        value
+    )
+
+
+def _literal_value_has_raw_nested_security_pickle(value: bytes) -> bool:
+    for offset, marker in enumerate(value):
+        candidate = value[offset:]
+        if marker == 0x80 and _looks_like_binary_pickle_prefix(candidate, sample_is_prefix=False):
+            return _has_security_relevant_pickle_opcode(candidate)
+        if marker in _PROTO0_1_START_BYTES and _has_security_relevant_pickle_opcode(candidate):
+            return _has_complete_pickle_stream_without_frame_stop_overrun(candidate) or _looks_like_proto0_or_1_pickle(
+                candidate,
+                sample_is_prefix=False,
+            )
+    return False
+
+
+def _literal_value_has_encoded_nested_security_pickle(value: bytes) -> bool:
+    for match in _BASE64_NESTED_LITERAL_TOKEN_RE.finditer(value):
+        token = match.group(0).translate(bytes.maketrans(b"-_", b"+/"))
+        token += b"=" * (-len(token) % 4)
+        try:
+            decoded = base64.b64decode(token, validate=True)
+        except (binascii.Error, ValueError):
+            continue
+        if decoded and _literal_value_has_raw_nested_security_pickle(decoded):
+            return True
+    for match in _HEX_NESTED_LITERAL_TOKEN_RE.finditer(value):
+        try:
+            decoded = binascii.unhexlify(match.group(0))
+        except (binascii.Error, ValueError):
+            continue
+        if decoded and _literal_value_has_raw_nested_security_pickle(decoded):
+            return True
+    return False
 
 
 def _contains_pickle_frame_opcode(sample: bytes) -> bool:

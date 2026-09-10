@@ -6285,6 +6285,93 @@ def test_scan_file_does_not_route_benign_proto0_string_operand_split_at_trusted_
     assert list(report.metadata["pickle_files"]) == ["archive/data.pkl"]
 
 
+def test_scan_file_scans_scalar_literal_with_raw_nested_pickle(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model.pt"
+    storage_blob = b"S'AAAAAAcos\\x0asystem\\x0a)R.BBBB'\n."
+    storage_blob += b" " * (-len(storage_blob) % 4)
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", storage_blob)
+
+    report = scan_file(archive_path)
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/0"]
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.location is not None
+        and f"{archive_path}:archive/data/0" in finding.location
+        for finding in report.findings
+    )
+
+
+def test_scan_file_scans_scalar_literal_with_encoded_nested_pickle(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model.pt"
+    storage_blob = b"S'" + base64.b64encode(b"cposix\nsystem\n(S'echo hidden'\ntR.") + b"'\n."
+    storage_blob += b" " * (-len(storage_blob) % 4)
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", storage_blob)
+
+    report = scan_file(archive_path)
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/0"]
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.location is not None
+        and f"{archive_path}:archive/data/0" in finding.location
+        for finding in report.findings
+    )
+
+
+def test_scan_file_skips_scalar_literal_raw_nested_near_match(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model.pt"
+    storage_blob = b"S'AAAAAAco\\x0asafe\\x0a)X.BBBB'\n."
+    storage_blob += b" " * (-len(storage_blob) % 4)
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", storage_blob)
+
+    report = scan_file(archive_path)
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert list(report.metadata["pickle_files"]) == ["archive/data.pkl"]
+    assert not any(f"{archive_path}:archive/data/0" in str(finding.location) for finding in report.findings)
+    assert not any(f"{archive_path}:archive/data/0" in str(notice.location) for notice in report.notices)
+
+
+def test_scan_file_scans_comment_marker_split_at_trusted_probe_boundary(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model.pt"
+    storage_prefix = b"N." + (b" " * (package_api._TRUSTED_STORAGE_PICKLE_PROBE_BYTES - len(b"N.") - len(b"#"))) + b"#"
+    assert len(storage_prefix) == package_api._TRUSTED_STORAGE_PICKLE_PROBE_BYTES
+    storage_blob = storage_prefix + b"cposix\nsystem\n(S'echo hidden'\ntR."
+    storage_blob += b" " * (-len(storage_blob) % 4)
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", storage_blob)
+
+    report = scan_file(archive_path)
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/0"]
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.location is not None
+        and f"{archive_path}:archive/data/0" in finding.location
+        for finding in report.findings
+    )
+
+
 def test_scan_file_marks_repeated_trivial_streams_filling_expanded_probe_inconclusive(
     tmp_path: Path,
 ) -> None:
