@@ -3715,7 +3715,20 @@ def test_trusted_mailbox_constructor_requires_loaded_source_backed_class(monkeyp
     )
 
 
-def test_trusted_mailbox_constructor_remains_startup_hook_opener() -> None:
+def test_trusted_mailbox_constructor_remains_startup_hook_opener(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    module_name = "modelaudit_tp_mailbox_startup_writer"
+    (module_dir / f"{module_name}.py").write_text(
+        "def write_payload(handle, value):\n    return handle.write(value)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(module_dir))
+    importlib.invalidate_caches()
+    _clear_call_graph_caches()
     invocations = (
         {
             "opcode": "REDUCE",
@@ -3726,8 +3739,8 @@ def test_trusted_mailbox_constructor_remains_startup_hook_opener() -> None:
         },
         {
             "opcode": "REDUCE",
-            "module": "pathlib",
-            "name": "Path.write_text",
+            "module": module_name,
+            "name": "write_payload",
             "positional_arg_count": 2,
             "global_position": 2,
         },
@@ -3742,20 +3755,23 @@ def test_trusted_mailbox_constructor_remains_startup_hook_opener() -> None:
         },
         {
             "opcode": "STACK_GLOBAL",
-            "module": "pathlib",
-            "name": "Path.write_text",
-            "import_reference": "pathlib.Path.write_text",
+            "module": module_name,
+            "name": "write_payload",
+            "import_reference": f"{module_name}.write_payload",
             "position": 2,
         },
     )
 
-    findings = call_graph.find_startup_hook_write_call_graphs(import_references, invocations)
+    try:
+        findings = call_graph.find_startup_hook_write_call_graphs(import_references, invocations)
+    finally:
+        _clear_call_graph_caches()
 
     assert findings
     assert findings[0].opener_import_reference == "mailbox.mbox"
-    assert findings[0].writer_import_reference == "pathlib.Path.write_text"
+    assert findings[0].writer_import_reference == f"{module_name}.write_payload"
     assert findings[0].open_sink == "builtins.open"
-    assert findings[0].write_sink == "f.write"
+    assert findings[0].write_sink == "handle.write"
 
 
 def test_scan_bytes_analyzes_shadowed_torch_extension_callable_invocation(
