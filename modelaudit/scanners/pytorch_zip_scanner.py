@@ -2029,10 +2029,16 @@ class PyTorchZipScanner(BaseScanner):
             ):
                 defer_padding_probe[0] = True
                 return False
+            expanded_probe_bytes = min(entry.file_size, _PICKLE_DISCOVERY_LONG_PROBE_BYTES)
+            if expanded_probe_bytes > len(sample):
+                PyTorchZipScanner._charge_padding_probe_budget(
+                    padding_probe_bytes_remaining,
+                    expanded_probe_bytes - len(sample),
+                )
             expanded_sample = self._read_member_prefix(
                 zip_file,
                 entry,
-                _PICKLE_DISCOVERY_LONG_PROBE_BYTES,
+                expanded_probe_bytes,
                 phase="pickle_discovery",
                 result=result,
             )
@@ -2481,14 +2487,19 @@ class PyTorchZipScanner(BaseScanner):
                             return False
                         active_frame_end = max(active_frame_end, pos + _PICKLE_FRAME_OPCODE_BYTES + arg)
                     elif opcode.name == "STOP":
-                        if opcode_count < 2 or active_frame_end > len(remaining) or has_non_trivial_opcode:
+                        if opcode_count < 2 or active_frame_end > len(remaining):
                             return False
                         complete_stream = remaining[: pos + 1]
-                        if PyTorchZipScanner._complete_trivial_pickle_has_scanner_finding(complete_stream) or any(
-                            PyTorchZipScanner._literal_value_has_nested_security_pickle(value)
-                            for value in literal_values
+                        if literal_values and (
+                            PyTorchZipScanner._complete_trivial_pickle_has_scanner_finding(complete_stream)
+                            or any(
+                                PyTorchZipScanner._literal_value_has_nested_security_pickle(value)
+                                for value in literal_values
+                            )
                         ):
                             return True
+                        if has_non_trivial_opcode:
+                            return False
                         trailing = remaining[pos + 1 :].lstrip(PROTO0_1_IGNORABLE_TRAILING_BYTES)
                         if not trailing:
                             return False

@@ -6293,6 +6293,20 @@ def test_scan_file_scans_pickle_after_many_trivial_int_streams(tmp_path: Path) -
     )
 
 
+def test_trivial_literal_probe_skips_scanner_for_literal_free_streams(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = 0
+
+    def fail_if_called(sample: bytes) -> bool:
+        nonlocal calls
+        calls += 1
+        return False
+
+    monkeypatch.setattr(package_api, "_complete_trivial_pickle_has_scanner_finding", fail_if_called)
+
+    assert package_api._complete_trivial_literal_pickle_has_nested_security_pickle(b"N." * 1200 + b"X") is False
+    assert calls == 0
+
+
 def test_scan_file_scans_proto0_string_operand_split_at_trusted_probe_boundary(tmp_path: Path) -> None:
     archive_path = tmp_path / "model.pt"
     storage_prefix = b"N." + (b" " * (package_api._TRUSTED_STORAGE_PICKLE_PROBE_BYTES - len(b"N.") - len(b"S"))) + b"S"
@@ -6445,6 +6459,28 @@ def test_scan_file_scans_scalar_literal_after_trivial_stream(tmp_path: Path) -> 
     assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/0"]
     assert any(
         finding.rule_code == "DANGEROUS_CALL"
+        and finding.location is not None
+        and f"{archive_path}:archive/data/0" in finding.location
+        for finding in report.findings
+    )
+
+
+def test_scan_file_preserves_suspicious_literal_after_trivial_stream(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model.pt"
+    storage_blob = b"N.]S'__reduce__'\na."
+    storage_blob += b" " * (-len(storage_blob) % 4)
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", storage_blob)
+
+    report = scan_file(archive_path)
+
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert "archive/data/0" in report.metadata["pickle_files"]
+    assert any(
+        finding.rule_code == "SUSPICIOUS_STRING"
         and finding.location is not None
         and f"{archive_path}:archive/data/0" in finding.location
         for finding in report.findings

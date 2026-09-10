@@ -1909,13 +1909,16 @@ def _complete_trivial_literal_pickle_has_nested_security_pickle(sample: bytes) -
                         return False
                     active_frame_end = max(active_frame_end, pos + _PICKLE_FRAME_OPCODE_BYTES + arg)
                 elif opcode.name == "STOP":
-                    if opcode_count < 2 or active_frame_end > len(remaining) or has_non_trivial_opcode:
+                    if opcode_count < 2 or active_frame_end > len(remaining):
                         return False
                     complete_stream = remaining[: pos + 1]
-                    if _complete_trivial_pickle_has_scanner_finding(complete_stream) or any(
-                        _literal_value_has_nested_security_pickle(value) for value in literal_values
+                    if literal_values and (
+                        _complete_trivial_pickle_has_scanner_finding(complete_stream)
+                        or any(_literal_value_has_nested_security_pickle(value) for value in literal_values)
                     ):
                         return True
+                    if has_non_trivial_opcode:
+                        return False
                     trailing = remaining[pos + 1 :].lstrip(_PROTO0_1_IGNORABLE_TRAILING_BYTES)
                     if not trailing:
                         return False
