@@ -2991,9 +2991,13 @@ def test_pytorch_zip_discovery_skips_many_padding_only_storages_over_budget(
 
     result = PyTorchZipScanner().scan(str(model_path))
 
-    assert result.success is True
-    assert result.metadata.get("pickle_verdict") == "clean"
+    assert result.success is False
+    assert "pytorch_zip_pickle_discovery_incomplete" in result.metadata["scan_outcome_reasons"]
     assert result.metadata["pickle_files"] == ["archive/data.pkl"]
+    discovery_check = next(check for check in result.checks if check.name == "Pickle Discovery")
+    assert discovery_check.status == CheckStatus.FAILED
+    assert discovery_check.details["entries"][0]["exception_type"] == "ValueError"
+    assert "padding probe budget exceeded" in discovery_check.details["entries"][0]["exception"]
     assert not any(
         str(item.location).endswith(tuple(f"archive/data/{index}" for index in range(18))) for item in result.issues
     )
@@ -3602,6 +3606,24 @@ def test_pytorch_zip_discovery_scans_scalar_literal_with_escaped_binary_nested_p
         issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
         for issue in result.issues
     )
+
+
+def test_pytorch_zip_discovery_raw_nested_literal_candidates_fail_closed_after_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    def no_security_opcode(_candidate: bytes) -> bool:
+        nonlocal calls
+        calls += 1
+        return False
+
+    monkeypatch.setattr(PyTorchZipScanner, "_has_security_relevant_pickle_opcode", staticmethod(no_security_opcode))
+
+    value = b"c" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)
+
+    assert PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(value) is True
+    assert calls == pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES
 
 
 def test_pytorch_zip_discovery_skips_scalar_literal_raw_nested_near_match(tmp_path: Path) -> None:

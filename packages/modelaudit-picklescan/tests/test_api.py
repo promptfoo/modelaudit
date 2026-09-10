@@ -6401,6 +6401,22 @@ def test_scan_file_scans_scalar_literal_with_escaped_binary_nested_pickle(tmp_pa
     )
 
 
+def test_raw_nested_literal_candidates_fail_closed_after_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = 0
+
+    def no_security_opcode(_candidate: bytes) -> bool:
+        nonlocal calls
+        calls += 1
+        return False
+
+    monkeypatch.setattr(package_api, "_has_security_relevant_pickle_opcode", no_security_opcode)
+
+    value = b"c" * (package_api._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)
+
+    assert package_api._literal_value_has_raw_nested_security_pickle(value) is True
+    assert calls == package_api._MAX_RAW_NESTED_PICKLE_CANDIDATES
+
+
 def test_scan_file_skips_scalar_literal_raw_nested_near_match(tmp_path: Path) -> None:
     archive_path = tmp_path / "model.pt"
     storage_blob = b"S'AAAAAAco\\x0asafe\\x0a)X.BBBB'\n."

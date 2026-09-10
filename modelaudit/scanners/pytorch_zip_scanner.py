@@ -140,6 +140,8 @@ _PROTO0_1_LITERAL_OPCODES = frozenset(
 _BASE64_NESTED_LITERAL_TOKEN_RE = re.compile(rb"[A-Za-z0-9+/_-]{16,}={0,2}")
 _HEX_NESTED_LITERAL_TOKEN_RE = re.compile(rb"(?<![0-9A-Fa-f])(?:[0-9A-Fa-f]{2}){8,}(?![0-9A-Fa-f])")
 _RAW_NESTED_SECURITY_PICKLE_START_BYTES = b"\x80(cioRbP\x82\x83\x84"
+_MAX_RAW_NESTED_PICKLE_CANDIDATES = 64
+_MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES = 8 * 1024
 
 
 @dataclass(frozen=True)
@@ -1987,6 +1989,7 @@ class PyTorchZipScanner(BaseScanner):
                 and defer_padding_probe is None
             ):
                 probe_bytes = min(entry.file_size, _PICKLE_DISCOVERY_PADDING_PROBE_BYTES)
+                PyTorchZipScanner._charge_padding_probe_budget(padding_probe_bytes_remaining, probe_bytes)
             sample = self._read_member_prefix(
                 zip_file,
                 entry,
@@ -2042,10 +2045,7 @@ class PyTorchZipScanner(BaseScanner):
                 defer_padding_probe[0] = True
                 return False
             padding_probe_bytes = min(entry.file_size, _PICKLE_DISCOVERY_PADDING_PROBE_BYTES)
-            if padding_probe_bytes_remaining is not None:
-                if padding_probe_bytes_remaining[0] < padding_probe_bytes:
-                    raise ValueError("trusted PyTorch storage padding probe budget exceeded")
-                padding_probe_bytes_remaining[0] -= padding_probe_bytes
+            PyTorchZipScanner._charge_padding_probe_budget(padding_probe_bytes_remaining, padding_probe_bytes)
             padding_sample = self._read_member_prefix(
                 zip_file,
                 entry,
@@ -2077,6 +2077,14 @@ class PyTorchZipScanner(BaseScanner):
                 raise ValueError("trusted PyTorch storage padding probe limit reached")
             raise ValueError("trusted PyTorch storage prefix exceeds pickle discovery probe")
         return False
+
+    @staticmethod
+    def _charge_padding_probe_budget(padding_probe_bytes_remaining: list[int] | None, probe_bytes: int) -> None:
+        if padding_probe_bytes_remaining is None:
+            return
+        if padding_probe_bytes_remaining[0] < probe_bytes:
+            raise ValueError("trusted PyTorch storage padding probe budget exceeded")
+        padding_probe_bytes_remaining[0] -= probe_bytes
 
     @staticmethod
     def _binary_pickle_probe_should_scan(sample: bytes, *, sample_is_prefix: bool) -> bool:
@@ -2520,12 +2528,21 @@ class PyTorchZipScanner(BaseScanner):
 
     @staticmethod
     def _literal_value_has_raw_nested_security_pickle(value: bytes) -> bool:
+        candidate_count = 0
         for offset, marker in enumerate(value):
             if marker not in _RAW_NESTED_SECURITY_PICKLE_START_BYTES:
                 continue
-            candidate = value[offset:]
-            if marker == 0x80 and PyTorchZipScanner._looks_like_binary_pickle_prefix(candidate, sample_is_prefix=False):
+            candidate_count += 1
+            if candidate_count > _MAX_RAW_NESTED_PICKLE_CANDIDATES:
+                return True
+            candidate = value[offset : offset + _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES]
+            candidate_is_prefix = offset + len(candidate) < len(value)
+            if marker == 0x80 and PyTorchZipScanner._looks_like_binary_pickle_prefix(
+                candidate, sample_is_prefix=candidate_is_prefix
+            ):
                 if PyTorchZipScanner._has_security_relevant_pickle_opcode(candidate):
+                    return True
+                if candidate_is_prefix:
                     return True
                 continue
             if (
@@ -2533,7 +2550,7 @@ class PyTorchZipScanner(BaseScanner):
                 and PyTorchZipScanner._has_security_relevant_pickle_opcode(candidate)
                 and (
                     PyTorchZipScanner._has_complete_pickle_stream_without_frame_stop_overrun(candidate)
-                    or _looks_like_proto0_or_1_pickle(candidate, sample_is_prefix=False)
+                    or _looks_like_proto0_or_1_pickle(candidate, sample_is_prefix=candidate_is_prefix)
                 )
             ):
                 return True

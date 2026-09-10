@@ -132,6 +132,8 @@ _PROTO0_1_LITERAL_OPCODES = frozenset(
 _BASE64_NESTED_LITERAL_TOKEN_RE = re.compile(rb"[A-Za-z0-9+/_-]{16,}={0,2}")
 _HEX_NESTED_LITERAL_TOKEN_RE = re.compile(rb"(?<![0-9A-Fa-f])(?:[0-9A-Fa-f]{2}){8,}(?![0-9A-Fa-f])")
 _RAW_NESTED_SECURITY_PICKLE_START_BYTES = b"\x80(cioRbP\x82\x83\x84"
+_MAX_RAW_NESTED_PICKLE_CANDIDATES = 64
+_MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES = 8 * 1024
 _MAX_PYTORCH_ZIP_ENTRIES = 10_000
 _MAX_PYTORCH_ZIP_PICKLE_DISCOVERY_PROBE_BYTES = 4 * 1024 * 1024
 _MAX_PYTORCH_ZIP_PICKLE_MEMBERS = 256
@@ -1945,12 +1947,19 @@ def _literal_value_has_nested_security_pickle(value: bytes) -> bool:
 
 
 def _literal_value_has_raw_nested_security_pickle(value: bytes) -> bool:
+    candidate_count = 0
     for offset, marker in enumerate(value):
         if marker not in _RAW_NESTED_SECURITY_PICKLE_START_BYTES:
             continue
-        candidate = value[offset:]
-        if marker == 0x80 and _looks_like_binary_pickle_prefix(candidate, sample_is_prefix=False):
+        candidate_count += 1
+        if candidate_count > _MAX_RAW_NESTED_PICKLE_CANDIDATES:
+            return True
+        candidate = value[offset : offset + _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES]
+        candidate_is_prefix = offset + len(candidate) < len(value)
+        if marker == 0x80 and _looks_like_binary_pickle_prefix(candidate, sample_is_prefix=candidate_is_prefix):
             if _has_security_relevant_pickle_opcode(candidate):
+                return True
+            if candidate_is_prefix:
                 return True
             continue
         if (
@@ -1958,7 +1967,7 @@ def _literal_value_has_raw_nested_security_pickle(value: bytes) -> bool:
             and _has_security_relevant_pickle_opcode(candidate)
             and (
                 _has_complete_pickle_stream_without_frame_stop_overrun(candidate)
-                or _looks_like_proto0_or_1_pickle(candidate, sample_is_prefix=False)
+                or _looks_like_proto0_or_1_pickle(candidate, sample_is_prefix=candidate_is_prefix)
             )
         ):
             return True
