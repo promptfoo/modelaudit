@@ -6000,10 +6000,26 @@ def _resolve_function_target(function_name: str) -> str | None:
         dotted_alias_target = _resolve_dotted_alias_prefix(module_name, qualified_name, analysis)
         if dotted_alias_target is not None:
             return _resolve_alias_function_target(dotted_alias_target)
+        explicit_method_target = _resolve_explicit_class_method_target(module_name, qualified_name)
+        if explicit_method_target is not None:
+            return explicit_method_target
         dotted_module_getattr_target = _resolve_dotted_module_getattr_target(module_name, qualified_name, analysis)
         if dotted_module_getattr_target is not None:
             return dotted_module_getattr_target
     return None
+
+
+def _resolve_explicit_class_method_target(module_name: str, qualified_name: str) -> str | None:
+    class_qualified_name, _separator, method_name = qualified_name.rpartition(".")
+    if not class_qualified_name or not method_name:
+        return None
+    class_target = _resolve_class_target(f"{module_name}.{class_qualified_name}")
+    if class_target is None:
+        return None
+    method_target = f"{class_target}.{method_name}"
+    if method_target == f"{module_name}.{qualified_name}":
+        return None
+    return _resolve_alias_function_target(method_target)
 
 
 def _resolve_dotted_alias_prefix(

@@ -3774,6 +3774,13 @@ def test_trusted_mailbox_constructor_remains_startup_hook_opener(
     assert findings[0].write_sink == "handle.write"
 
 
+def test_pathlib_path_write_text_reexport_resolves_to_source_method() -> None:
+    entrypoints = call_graph._safe_call_graph_entrypoints("pathlib.Path.write_text")
+
+    assert entrypoints
+    assert any(call_graph._find_file_write_path(entrypoint) is not None for entrypoint in entrypoints)
+
+
 def test_scan_bytes_analyzes_shadowed_torch_extension_callable_invocation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
