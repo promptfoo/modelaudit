@@ -22,6 +22,7 @@ from pathlib import Path
 
 import pytest
 
+import modelaudit_picklescan.call_graph as call_graph
 from modelaudit_picklescan import PickleReport, SafetyVerdict, ScanOptions, ScanStatus, Severity, scan_bytes
 from modelaudit_picklescan.api import _RUST_EXTENSION_MODULE, _with_call_graph_findings
 from modelaudit_picklescan.call_graph import (
@@ -5537,6 +5538,73 @@ def test_scan_bytes_blocks_mailbox_singlefile_pth_writes(
         assert marker.read_text() == marker_content
     finally:
         sys.path[:] = original_sys_path
+
+
+def test_scan_bytes_preserves_mailbox_add_detection_when_constructor_analysis_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_entrypoints = call_graph._safe_call_graph_entrypoints
+
+    def flaky_entrypoints(function_name: str) -> tuple[str, ...]:
+        if function_name == "mailbox.mbox":
+            raise call_graph._CallGraphAnalysisLimitError("synthetic mailbox constructor source gap")
+        return original_entrypoints(function_name)
+
+    monkeypatch.setattr(call_graph, "_safe_call_graph_entrypoints", flaky_entrypoints)
+    pth_path = tmp_path / "mailbox_cleanup_exec.pth"
+    marker = tmp_path / "mailbox_cleanup_pth_rce_marker"
+    control_payload = _mailbox_singlefile_pth_payload(
+        pth_path,
+        marker,
+        mailbox_class="mbox",
+        method_owner="mbox",
+        marker_content="owned-by-mailbox-mbox",
+        include_add=False,
+    )
+    payload = _mailbox_singlefile_pth_payload(
+        pth_path,
+        marker,
+        mailbox_class="mbox",
+        method_owner="mbox",
+        marker_content="owned-by-mailbox-mbox",
+        include_add=True,
+    )
+
+    control_report = scan_bytes(control_payload, source="mailbox-mbox-control.pkl")
+    assert control_report.verdict == SafetyVerdict.CLEAN
+
+    report = scan_bytes(payload, source="mailbox-mbox-pth-rce.pkl")
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_global_finding(report, "mailbox", "mbox.add")
+
+
+def test_scan_bytes_keeps_mailbox_flush_analysis_gap_fail_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_entrypoints = call_graph._safe_call_graph_entrypoints
+
+    def flaky_entrypoints(function_name: str) -> tuple[str, ...]:
+        if function_name == "mailbox.mbox.flush":
+            raise call_graph._CallGraphAnalysisLimitError("synthetic mailbox flush source gap")
+        return original_entrypoints(function_name)
+
+    monkeypatch.setattr(call_graph, "_safe_call_graph_entrypoints", flaky_entrypoints)
+    pth_path = tmp_path / "mailbox_flush_gap_exec.pth"
+    marker = tmp_path / "mailbox_flush_gap_pth_rce_marker"
+    control_payload = _mailbox_singlefile_pth_payload(
+        pth_path,
+        marker,
+        mailbox_class="mbox",
+        method_owner="mbox",
+        marker_content="owned-by-mailbox-mbox",
+        include_add=False,
+    )
+
+    control_report = scan_bytes(control_payload, source="mailbox-mbox-flush-gap-control.pkl")
+    assert control_report.verdict == SafetyVerdict.UNKNOWN
+    assert control_report.status == ScanStatus.INCONCLUSIVE
 
 
 @pytest.mark.skipif(find_spec("_tkinter") is None, reason="_tkinter is unavailable")

@@ -1600,6 +1600,13 @@ _TRUSTED_UNRESOLVED_IMPORT_ONLY_REFERENCES = frozenset(
         ("pathlib._local", "PureWindowsPath"),
     }
 )
+_TRUSTED_EMPTY_MAILBOX_CONSTRUCTOR_INVOCATIONS = frozenset(
+    {
+        ("mailbox", "Babyl"),
+        ("mailbox", "MMDF"),
+        ("mailbox", "mbox"),
+    }
+)
 # Canonical-looking specs in sys.modules are forgeable. Identity trust is
 # limited to interpreter modules already loaded when this module initializes.
 _TRUSTED_LOADED_INTERPRETER_MODULES = _capture_trusted_loaded_interpreter_modules()
@@ -1998,6 +2005,8 @@ def find_dangerous_call_graphs(
         name = str(reference.get("name", ""))
         if not module or not name:
             continue
+        if _trusted_empty_mailbox_constructor_invocation_is_safe(module, name, reference):
+            continue
 
         try:
             entrypoints = _call_graph_entrypoints_for_reference(module, name, reference)
@@ -2112,6 +2121,11 @@ def find_startup_hook_write_call_graphs(
         if require_invocations and not invocation_references:
             continue
         seen.add((module, name))
+        if invocation_references and all(
+            _trusted_empty_mailbox_constructor_invocation_is_safe(module, name, invocation_reference)
+            for invocation_reference in invocation_references
+        ):
+            continue
 
         try:
             entrypoints = (
@@ -2233,7 +2247,11 @@ def find_unanalyzed_callable_call_graph_references(
     for reference in callable_references:
         module = str(reference.get("module", ""))
         name = str(reference.get("name", ""))
-        if not module or not name or (module, name) in seen:
+        if not module or not name:
+            continue
+        if _trusted_empty_mailbox_constructor_invocation_is_safe(module, name, reference):
+            continue
+        if (module, name) in seen:
             continue
         seen.add((module, name))
         if _is_skippable_torch_extension_global_reference(module, name) or _unresolved_trusted_import_reference_is_safe(
@@ -2282,7 +2300,14 @@ def find_analyzed_callable_call_graph_global_positions(
             continue
         module = str(reference.get("module", ""))
         name = str(reference.get("name", ""))
-        if module and name and _call_graph_reference_is_analyzed(module, name, reference):
+        if (
+            module
+            and name
+            and (
+                _trusted_empty_mailbox_constructor_invocation_is_safe(module, name, reference)
+                or _call_graph_reference_is_analyzed(module, name, reference)
+            )
+        ):
             positions.add(global_position)
     return frozenset(positions)
 
@@ -3413,9 +3438,24 @@ def _call_graph_reference_is_analyzed(
     name: str,
     reference: Mapping[str, object],
 ) -> bool:
+    if _trusted_empty_mailbox_constructor_invocation_is_safe(module, name, reference):
+        return True
     if str(reference.get("opcode", "")) == "NEWOBJ_EX" and _complete_keyword_arg_names(reference) is None:
         return False
     return bool(_safe_call_graph_entrypoints(f"{module}.{name}"))
+
+
+def _trusted_empty_mailbox_constructor_invocation_is_safe(
+    module: str,
+    name: str,
+    reference: Mapping[str, object],
+) -> bool:
+    if (module, name) not in _TRUSTED_EMPTY_MAILBOX_CONSTRUCTOR_INVOCATIONS:
+        return False
+    if str(reference.get("opcode", "")) != "REDUCE":
+        return False
+    positional_arg_count = reference.get("positional_arg_count")
+    return type(positional_arg_count) is int and positional_arg_count == 1
 
 
 def _filter_class_entrypoints(entrypoints: tuple[str, ...], methods: tuple[str, ...]) -> tuple[str, ...]:

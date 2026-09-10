@@ -3620,6 +3620,55 @@ def test_incomplete_newobj_ex_invocation_is_not_hidden_by_complete_duplicate(
     )
 
 
+def test_trusted_mailbox_constructor_does_not_hide_later_unanalyzed_shape(monkeypatch: pytest.MonkeyPatch) -> None:
+    original_entrypoints_for_reference = call_graph._call_graph_entrypoints_for_reference
+    original_source_reason = call_graph._call_graph_source_unavailable_reason
+
+    def fake_entrypoints_for_reference(
+        module: str,
+        name: str,
+        reference: dict[str, object],
+    ) -> tuple[str, ...]:
+        if module == "mailbox" and name == "mbox":
+            return ()
+        return original_entrypoints_for_reference(module, name, reference)
+
+    def fake_source_reason(module_name: str) -> str | None:
+        if module_name == "mailbox":
+            return "source_unavailable"
+        return original_source_reason(module_name)
+
+    monkeypatch.setattr(call_graph, "_call_graph_entrypoints_for_reference", fake_entrypoints_for_reference)
+    monkeypatch.setattr(call_graph, "_call_graph_source_unavailable_reason", fake_source_reason)
+    invocations = (
+        {
+            "opcode": "REDUCE",
+            "module": "mailbox",
+            "name": "mbox",
+            "positional_arg_count": 1,
+            "global_position": 1,
+        },
+        {
+            "opcode": "REDUCE",
+            "module": "mailbox",
+            "name": "mbox",
+            "positional_arg_count": 2,
+            "global_position": 2,
+        },
+    )
+
+    references = call_graph.find_unanalyzed_callable_call_graph_references(invocations)
+
+    assert references == (
+        call_graph.UnanalyzedCallGraphReference(
+            module="mailbox",
+            name="mbox",
+            import_reference="mailbox.mbox",
+            reason="source_unavailable",
+        ),
+    )
+
+
 def test_scan_bytes_analyzes_shadowed_torch_extension_callable_invocation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
