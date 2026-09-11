@@ -5628,6 +5628,43 @@ def test_scan_file_does_not_route_benign_storage_blob_as_hidden_pickle(tmp_path:
     assert not any(finding.location is not None and "archive/data/0" in finding.location for finding in report.findings)
 
 
+@pytest.mark.parametrize(
+    "literal_value",
+    [
+        b"__del__",
+        b"from os import *",
+        b"from subprocess import (Popen, run)",
+        b'subprocess.\\\nrun("id")',
+        b"A" * 32 + b"os . system ('id')",
+    ],
+)
+def test_scan_file_routes_storage_literals_matching_native_suspicious_strings(
+    tmp_path: Path,
+    literal_value: bytes,
+) -> None:
+    archive_path = tmp_path / "storage-suspicious-literal.pt"
+    storage_blob = _proto0_string_literal(literal_value)
+    storage_blob += b" " * (-len(storage_blob) % 4)
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", storage_blob)
+
+    direct_report = scan_bytes(storage_blob)
+    report = scan_file(archive_path)
+
+    assert direct_report.verdict == SafetyVerdict.SUSPICIOUS
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/0"]
+    assert any(
+        finding.rule_code == "SUSPICIOUS_STRING"
+        and finding.location is not None
+        and f"{archive_path}:archive/data/0" in finding.location
+        for finding in report.findings
+    )
+
+
 def test_scan_file_skips_large_nul_padding_storage_blob(tmp_path: Path) -> None:
     archive_path = tmp_path / "large-nul-padding-storage.pt"
     storage_blob = b"N." + (b"\x00" * ((600 * 1024) - len(b"N.")))
@@ -7376,7 +7413,29 @@ def test_scan_file_scans_after_long_malformed_separator_trusted_probe_prefix(tmp
     )
 
 
-def test_scan_file_skips_large_malformed_separator_tensor_noise(tmp_path: Path) -> None:
+def test_scan_file_scans_after_expanded_malformed_separator_prefix(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model.pt"
+    storage_blob = b"N." + (b"\xff" * 65_536) + b"cposix\nsystem\n(S'echo hidden'\ntR."
+    storage_blob += b" " * (-len(storage_blob) % 4)
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", storage_blob)
+
+    report = scan_file(archive_path)
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/0"]
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.location is not None
+        and f"{archive_path}:archive/data/0" in finding.location
+        for finding in report.findings
+    )
+
+
+def test_scan_file_reports_large_malformed_separator_tensor_noise_incomplete(tmp_path: Path) -> None:
     archive_path = tmp_path / "model.pt"
     storage_blob = b"N." + (b"\xff" * 100_000)
     storage_blob += b" " * (-len(storage_blob) % 4)
@@ -7388,9 +7447,10 @@ def test_scan_file_skips_large_malformed_separator_tensor_noise(tmp_path: Path) 
 
     report = scan_file(archive_path)
 
-    assert report.status == ScanStatus.COMPLETE
-    assert report.verdict == SafetyVerdict.CLEAN
-    assert list(report.metadata["pickle_files"]) == ["archive/data.pkl"]
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/0"]
+    assert any(notice.code == "parse_incomplete" for notice in report.notices)
 
 
 def test_scan_file_skips_malformed_separator_tensor_noise_near_match(tmp_path: Path) -> None:
@@ -7408,6 +7468,29 @@ def test_scan_file_skips_malformed_separator_tensor_noise_near_match(tmp_path: P
     assert report.status == ScanStatus.COMPLETE
     assert report.verdict == SafetyVerdict.CLEAN
     assert list(report.metadata["pickle_files"]) == ["archive/data.pkl"]
+
+
+def test_scan_file_scans_malformed_separator_unicode_literal_nested_pickle(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model.pt"
+    encoded = base64.b64encode(b"cbuiltins\neval\n(S'1'\ntR.")
+    storage_blob = b"N.!V" + encoded + b"\n."
+    storage_blob += b" " * (-len(storage_blob) % 4)
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", storage_blob)
+
+    report = scan_file(archive_path)
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/0"]
+    assert any(
+        finding.rule_code == "S601"
+        and finding.location is not None
+        and f"{archive_path}:archive/data/0" in finding.location
+        for finding in report.findings
+    )
 
 
 def test_scan_file_skips_large_proto0_global_like_tensor_noise(tmp_path: Path) -> None:
@@ -7501,6 +7584,16 @@ def test_literal_text_route_ignores_oversized_base64_compatible_noise() -> None:
     assert package_api._literal_value_has_storage_scan_signal(b"A" * 100_000) is False
 
 
+def test_literal_text_route_bounds_spaced_call_near_match() -> None:
+    text = "os . system" + (" " * 60_000) + '"'
+
+    started_at = time.monotonic()
+    assert package_api._literal_text_has_storage_route_signal(text) is False
+    elapsed = time.monotonic() - started_at
+
+    assert elapsed < 1.0
+
+
 def test_encoded_nested_pickle_route_normalizes_wrapped_tokens() -> None:
     payload = b"cposix\nsystem\n)R."
     base64_token = base64.b64encode(payload)
@@ -7509,6 +7602,9 @@ def test_encoded_nested_pickle_route_normalizes_wrapped_tokens() -> None:
     wrapped_hex = hex_token[:16] + b" " + hex_token[16:]
 
     assert package_api._literal_value_has_encoded_nested_security_pickle(wrapped_base64) is True
+    for separator in (b"!", b"@"):
+        punctuated_base64 = separator.join(base64_token[index : index + 4] for index in range(0, len(base64_token), 4))
+        assert package_api._literal_value_has_encoded_nested_security_pickle(punctuated_base64) is True
     assert package_api._literal_value_has_encoded_nested_security_pickle(wrapped_hex) is True
 
 
@@ -7527,6 +7623,12 @@ def test_encoded_nested_pickle_route_fails_closed_after_decoy_markers() -> None:
 
     assert package_api._literal_value_has_encoded_nested_security_pickle(base64.b64encode(payload)) is True
     assert package_api._literal_value_has_encoded_nested_security_pickle(binascii.hexlify(payload)) is True
+
+
+def test_raw_nested_binary_route_fails_closed_for_long_headerless_prefix() -> None:
+    payload = _short_binunicode(b"os") + _short_binunicode(b"system") + (b"N0" * 5000) + b"\x93)R."
+
+    assert package_api._literal_value_has_raw_nested_security_pickle(payload) is True
 
 
 def test_encoded_nested_pickle_route_fails_closed_after_candidate_budget_gap() -> None:
@@ -7557,6 +7659,10 @@ def test_base64_literal_text_route_scans_middle_windows_without_size_only_signal
         (b'eval.__call__("1")', SafetyVerdict.SUSPICIOUS, True),
         (b"fn.__code__.co_consts", SafetyVerdict.SUSPICIOUS, True),
         (b"obj.__getattribute__('name')", SafetyVerdict.SUSPICIOUS, True),
+        (b"obj.__getattr__('name')", SafetyVerdict.SUSPICIOUS, True),
+        (b"obj.__getitem__('name')", SafetyVerdict.SUSPICIOUS, True),
+        (b"path.__fspath__()", SafetyVerdict.SUSPICIOUS, True),
+        (b"cls.__bases__", SafetyVerdict.SUSPICIOUS, True),
         (b"ZX\nZh\nbC\nh4\nKQ\n==", SafetyVerdict.SUSPICIOUS, True),
         (b"A" * 100 + b"==" + base64.b64encode(b'os.system("id")'), SafetyVerdict.SUSPICIOUS, True),
         (b"\\x6f\\x73\\x2e\\x73\\x79\\x73\\x74\\x65\\x6d", SafetyVerdict.SUSPICIOUS, True),
@@ -7572,6 +7678,10 @@ def test_base64_literal_text_route_scans_middle_windows_without_size_only_signal
         "magic-call",
         "magic-code",
         "magic-getattribute",
+        "magic-getattr",
+        "magic-getitem",
+        "magic-fspath",
+        "magic-bases",
         "wrapped-base64",
         "base64-after-padding",
         "escaped-hex",
@@ -7773,6 +7883,33 @@ def test_scan_file_routes_headerless_binary_pickle_after_budget_noise(tmp_path: 
     )
 
 
+@pytest.mark.parametrize(
+    "storage_blob",
+    [
+        pytest.param(b"\x8c\xffR\x3f" + (b"\x00\x00\x80\x3f" * 2047), id="truncated-short-binunicode"),
+        pytest.param(b"\x8c\x00N\x00" + (b"\x00\x00\x80\x3f" * 2047), id="empty-short-binunicode-none"),
+    ],
+)
+def test_scan_file_skips_headerless_binary_second_opcode_near_match(
+    tmp_path: Path,
+    storage_blob: bytes,
+) -> None:
+    archive_path = tmp_path / "model.pt"
+    storage_blob += b"\x00" * (-len(storage_blob) % 4)
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", storage_blob)
+
+    report = scan_file(archive_path)
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert list(report.metadata["pickle_files"]) == ["archive/data.pkl"]
+    assert not any(finding.details.get("pickle_filename") == "archive/data/0" for finding in report.findings)
+
+
 def test_scan_file_routes_bytearray8_literal_after_trivial_prefix(tmp_path: Path) -> None:
     archive_path = tmp_path / "model.pt"
     encoded = base64.b64encode(b"cposix\nsystem\n)R.")
@@ -7834,6 +7971,34 @@ def test_scan_file_scans_whitespace_hex_nested_pickle_literal(tmp_path: Path) ->
 
     assert report.verdict == SafetyVerdict.MALICIOUS
     assert "archive/data/0" in report.metadata["pickle_files"]
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.location is not None
+        and f"{archive_path}:archive/data/0" in finding.location
+        for finding in report.findings
+    )
+
+
+@pytest.mark.parametrize("separator", [b"!", b"@"], ids=["bang", "at"])
+def test_scan_file_scans_punctuation_base64_nested_pickle_literal(
+    tmp_path: Path,
+    separator: bytes,
+) -> None:
+    archive_path = tmp_path / "model.pt"
+    encoded = base64.b64encode(b"cposix\nsystem\n)R.")
+    punctuated = separator.join(encoded[index : index + 4] for index in range(0, len(encoded), 4))
+    storage_blob = _proto0_string_literal(punctuated)
+    storage_blob += b" " * (-len(storage_blob) % 4)
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", storage_blob)
+
+    report = scan_file(archive_path)
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/0"]
     assert any(
         finding.rule_code == "DANGEROUS_CALL"
         and finding.location is not None
@@ -7965,6 +8130,23 @@ def test_scan_file_bounds_repeated_trivial_streams_after_nul_padding(tmp_path: P
 
     assert elapsed < 2.0
     assert report.status == ScanStatus.INCONCLUSIVE
+
+
+def test_trailing_candidate_consumes_repeated_trivial_streams_before_suffix_parse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+    original = package_api._trivial_complete_pickle_prefix_trailing
+
+    def counted_trivial_prefix_trailing(sample: bytes) -> bytes | None:
+        nonlocal calls
+        calls += 1
+        return original(sample)
+
+    monkeypatch.setattr(package_api, "_trivial_complete_pickle_prefix_trailing", counted_trivial_prefix_trailing)
+
+    assert package_api._trailing_pickle_candidate_needs_more_bytes(b"N." * 32768) is False
+    assert calls == 0
 
 
 def test_scan_file_scans_comment_prefixed_pickle_after_trivial_scalar_prefix(tmp_path: Path) -> None:

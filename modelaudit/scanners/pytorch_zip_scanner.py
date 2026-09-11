@@ -140,7 +140,10 @@ _PROTO0_1_LITERAL_OPCODES = frozenset(
 )
 _PICKLE_BINARY_BYTE_LITERAL_OPCODES = frozenset({"BINBYTES", "SHORT_BINBYTES", "BINBYTES8", "BYTEARRAY8"})
 _PICKLE_LITERAL_OPCODES = _PROTO0_1_LITERAL_OPCODES | _PICKLE_BINARY_BYTE_LITERAL_OPCODES
-_BASE64_NESTED_LITERAL_TOKEN_RE = re.compile(rb"[A-Za-z0-9+/_-][A-Za-z0-9+/_\-\s\r\n\t]{7,}={0,2}")
+_BASE64_NESTED_LITERAL_TOKEN_RE = re.compile(
+    rb"[A-Za-z0-9+/_-][A-Za-z0-9+/_=\-\s\r\n\t!\"#$%&'()*.,:;<>?@\[\]\\^`{|}~]{7,}"
+)
+_BASE64_NESTED_LITERAL_SEPARATOR_RE = re.compile(rb"[^A-Za-z0-9+/_=-]+")
 _HEX_NESTED_LITERAL_TOKEN_RE = re.compile(rb"[0-9A-Fa-f][0-9A-Fa-f\s\r\n\t]{15,}")
 _RAW_NESTED_TEXT_SECURITY_PICKLE_START_BYTES = b"\x80(cioRbP\x82\x83\x84"
 _RAW_NESTED_BINARY_SECURITY_PICKLE_START_BYTES = b"\x8c\x8d\x95"
@@ -178,22 +181,25 @@ _RAW_NESTED_SECURITY_PICKLE_TEXT_MARKERS = (
     b"commands\ngetoutput\n",
     b"commands\ngetstatusoutput\n",
 )
-_PICKLE_ENGINE_MAGIC_METHOD_LITERAL_PATTERN = r"(?<!\w)__(?:call|code|getattribute)__(?!\w)"
+_PICKLE_ENGINE_MAGIC_METHOD_LITERAL_PATTERN = r"(?<!\w)__[A-Za-z][A-Za-z0-9_]*__(?!\w)"
 _SUSPICIOUS_LITERAL_TEXT_PATTERNS = tuple(
     re.compile(pattern, re.IGNORECASE)
     for pattern in (*SUSPICIOUS_STRING_PATTERNS, _PICKLE_ENGINE_MAGIC_METHOD_LITERAL_PATTERN)
 )
+_PYTHON_LINE_CONTINUATION_RE = re.compile(r"\\\r?\n[ \t\f]*")
 _STORAGE_LITERAL_TEXT_ROUTE_PATTERNS = tuple(
     re.compile(pattern, re.IGNORECASE | re.DOTALL)
     for pattern in (
-        r"\b(?:compile|eval|exec)\s*(?:\\\r?\n\s*)*\(",
-        r"__import__\s*(?:\\\r?\n\s*)*\(",
-        r"\bimportlib\s*(?:\\\r?\n\s*)*\.\s*(?:import_module|__import__)\s*\(",
-        r"\bos\s*(?:\\\r?\n\s*)*\.\s*(?:\\\r?\n\s*)*(?:system|popen|spawn[a-z]*)\s*(?:\.__call__)?\s*\(",
-        r"\bsubprocess\s*(?:\\\r?\n\s*)*\.\s*(?:Popen|call|check_output|run|check_call)\s*\(",
-        r"\bbase64\s*(?:\\\r?\n\s*)*\.\s*(?:b64decode|decode)\s*\(",
-        r"\b(?:pickle|cloudpickle|joblib)\s*(?:\\\r?\n\s*)*\.\s*(?:_pickle_load|load|loads)\s*\(",
-        r"\bcopyreg\s*(?:\\\r?\n\s*)*\.\s*(?:add_extension|remove_extension)\s*\(",
+        r"(?:compile|eval|exec)\(",
+        r"__import__\(",
+        r"import\s+[\w.]+",
+        r"from\s+[\w.]+\s+import\s*(?:\(|\*|[\w.,\s]+)",
+        r"importlib\.(?:import_module|__import__)\(",
+        r"os\.(?:system|popen|spawn[a-z]*)(?:\.__call__)?\(",
+        r"subprocess\.(?:Popen|call|check_output|run|check_call)\(",
+        r"base64\.(?:b64decode|decode)\(",
+        r"(?:pickle|cloudpickle|joblib)\.(?:_pickle_load|load|loads)\(",
+        r"copyreg\.(?:add_extension|remove_extension)\(",
         r"getattr\s*\(\s*\w+\s*,\s*['\"](?:system|popen|spawn|exec|eval|call|run|Popen)['\"]",
     )
 )
@@ -2044,11 +2050,15 @@ class PyTorchZipScanner(BaseScanner):
         if not data_start:
             return False
         is_frame_first_candidate = data_start.startswith(_PICKLE_FRAME_OPCODE)
-        is_binary_pickle_candidate = data_start.startswith(_PICKLE_BINARY_PROTOCOL_PREFIXES) or (
-            not is_frame_first_candidate and data_start[0] in _RAW_NESTED_BINARY_SECURITY_PICKLE_START_BYTES
+        is_binary_pickle_candidate = data_start.startswith(_PICKLE_BINARY_PROTOCOL_PREFIXES)
+        is_headerless_binary_pickle_candidate = (
+            not is_binary_pickle_candidate
+            and not is_frame_first_candidate
+            and data_start[0] in _RAW_NESTED_BINARY_SECURITY_PICKLE_START_BYTES
         )
         if (
             not is_binary_pickle_candidate
+            and not is_headerless_binary_pickle_candidate
             and not is_frame_first_candidate
             and data_start[0] not in PROTO0_1_START_BYTES
         ):
@@ -2136,6 +2146,20 @@ class PyTorchZipScanner(BaseScanner):
                         sample_is_prefix=entry.file_size > len(sample),
                     )
                 )
+            )
+            if should_scan:
+                charge_detection_probe_budget()
+                return True
+            charge_deferred_probe_budget_before_skip()
+            return False
+        if is_headerless_binary_pickle_candidate:
+            short_sample = sample[:_TRUSTED_STORAGE_PICKLE_PROBE_BYTES]
+            should_scan = PyTorchZipScanner._raw_nested_binary_candidate_should_scan(
+                sample,
+                candidate_is_prefix=entry.file_size > len(sample),
+            ) or PyTorchZipScanner._raw_nested_binary_candidate_should_scan(
+                short_sample,
+                candidate_is_prefix=entry.file_size > len(short_sample),
             )
             if should_scan:
                 charge_detection_probe_budget()
@@ -2424,7 +2448,7 @@ class PyTorchZipScanner(BaseScanner):
 
     @staticmethod
     def _has_known_binary_pickle_second_opcode(sample: bytes) -> bool:
-        return len(sample) >= 3 and sample[2] in _PICKLE_OPCODE_BYTES
+        return len(sample) >= 3 and sample[0] == 0x80 and sample[2] in _PICKLE_OPCODE_BYTES
 
     @staticmethod
     def _proto0_or_1_trusted_storage_probe_should_scan(sample: bytes, *, sample_is_prefix: bool) -> bool:
@@ -2432,6 +2456,11 @@ class PyTorchZipScanner(BaseScanner):
             return True
         if PyTorchZipScanner._has_security_relevant_opcode_in_incomplete_frame(sample):
             return True
+        trivial_trailing = PyTorchZipScanner._trivial_complete_pickle_prefix_trailing(sample)
+        if sample_is_prefix and trivial_trailing is not None:
+            candidate = trivial_trailing.lstrip(PROTO0_1_IGNORABLE_TRAILING_BYTES)
+            if PyTorchZipScanner._looks_like_malformed_separator_run_prefix(candidate):
+                return True
         if PyTorchZipScanner._trivial_complete_pickle_prefix_trailing_should_scan(
             sample,
             sample_is_prefix=sample_is_prefix,
@@ -2594,7 +2623,7 @@ class PyTorchZipScanner(BaseScanner):
             sample_is_prefix=sample_is_prefix,
         ):
             return True
-        if PyTorchZipScanner._malformed_separator_proto0_string_literal_has_nested_security_pickle(candidate):
+        if PyTorchZipScanner._malformed_separator_proto0_literal_has_nested_security_pickle(candidate):
             return True
         if not sample_is_prefix:
             return False
@@ -2758,13 +2787,13 @@ class PyTorchZipScanner(BaseScanner):
             if stripped_comment_candidate != candidate:
                 candidate = stripped_comment_candidate
                 continue
-            trivial_trailing = PyTorchZipScanner._trivial_complete_pickle_prefix_trailing(candidate)
-            if trivial_trailing is not None and len(trivial_trailing) < len(candidate):
-                candidate = trivial_trailing.lstrip(PROTO0_1_IGNORABLE_TRAILING_BYTES)
-                continue
             repeated_none_trailing = PyTorchZipScanner._repeated_none_stream_trailing(candidate)
             if repeated_none_trailing is not None and len(repeated_none_trailing) < len(candidate):
                 candidate = repeated_none_trailing.lstrip(PROTO0_1_IGNORABLE_TRAILING_BYTES)
+                continue
+            trivial_trailing = PyTorchZipScanner._trivial_complete_pickle_prefix_trailing(candidate)
+            if trivial_trailing is not None and len(trivial_trailing) < len(candidate):
+                candidate = trivial_trailing.lstrip(PROTO0_1_IGNORABLE_TRAILING_BYTES)
                 continue
             if PyTorchZipScanner._looks_like_malformed_separator_run_prefix(candidate):
                 return True
@@ -2826,16 +2855,16 @@ class PyTorchZipScanner(BaseScanner):
         return any(byte != first_byte and byte not in PROTO0_1_IGNORABLE_TRAILING_BYTES for byte in candidate[1:])
 
     @staticmethod
-    def _malformed_separator_proto0_string_literal_has_nested_security_pickle(candidate: bytes) -> bool:
+    def _malformed_separator_proto0_literal_has_nested_security_pickle(candidate: bytes) -> bool:
         if not candidate or candidate[0] in PROTO0_1_START_BYTES:
             return False
         offset = 0
         limit = len(candidate)
         while offset < limit and candidate[offset] not in PROTO0_1_START_BYTES:
             offset += 1
-        if offset >= limit or candidate[offset : offset + 1] != b"S":
+        if offset >= limit:
             return False
-        return PyTorchZipScanner._complete_proto0_string_literal_has_nested_security_pickle(
+        return PyTorchZipScanner._complete_trivial_literal_pickle_has_nested_security_pickle(
             candidate[offset:].lstrip(PROTO0_1_IGNORABLE_TRAILING_BYTES)
         )
 
@@ -2843,7 +2872,7 @@ class PyTorchZipScanner(BaseScanner):
     def _looks_like_malformed_separator_run_prefix(candidate: bytes) -> bool:
         if not candidate or candidate[0] in PROTO0_1_START_BYTES or candidate[0] in PROTO0_1_IGNORABLE_TRAILING_BYTES:
             return False
-        return len(candidate) <= _TRUSTED_STORAGE_PICKLE_PROBE_BYTES and not candidate.strip(bytes([candidate[0]]))
+        return not candidate.strip(bytes([candidate[0]]))
 
     @staticmethod
     def _trivial_complete_pickle_prefix_trailing(sample: bytes) -> bytes | None:
@@ -2992,9 +3021,57 @@ class PyTorchZipScanner(BaseScanner):
 
     @staticmethod
     def _literal_text_has_storage_route_signal(text: str) -> bool:
-        return any(pattern.search(text) for pattern in _SUSPICIOUS_LITERAL_TEXT_PATTERNS) or any(
-            pattern.search(text) for pattern in _STORAGE_LITERAL_TEXT_ROUTE_PATTERNS
+        for candidate in PyTorchZipScanner._storage_route_text_candidates(text):
+            if any(pattern.search(candidate) for pattern in _SUSPICIOUS_LITERAL_TEXT_PATTERNS) or any(
+                pattern.search(candidate) for pattern in _STORAGE_LITERAL_TEXT_ROUTE_PATTERNS
+            ):
+                return True
+        compacted = PyTorchZipScanner._compact_python_member_access_and_calls(
+            _PYTHON_LINE_CONTINUATION_RE.sub("", text)
         )
+        return compacted != text and any(pattern.search(compacted) for pattern in _STORAGE_LITERAL_TEXT_ROUTE_PATTERNS)
+
+    @staticmethod
+    def _storage_route_text_candidates(text: str) -> tuple[str, ...]:
+        normalized = _PYTHON_LINE_CONTINUATION_RE.sub("", text)
+        candidates = [text]
+        if normalized != text:
+            candidates.append(normalized)
+        return tuple(candidates)
+
+    @staticmethod
+    def _compact_python_member_access_and_calls(text: str) -> str:
+        output: list[str] = []
+        index = 0
+        length = len(text)
+        while index < length:
+            char = text[index]
+            if char.isspace():
+                next_index = index + 1
+                while next_index < length and text[next_index].isspace():
+                    next_index += 1
+                if next_index < length and text[next_index] in ".(":
+                    index = next_index
+                    continue
+                if output and output[-1] == ".":
+                    index = next_index
+                    continue
+                output.append(" ")
+                index = next_index
+                continue
+            if char == ".":
+                if output and output[-1] == " ":
+                    output.pop()
+                output.append(".")
+                index += 1
+                while index < length and text[index].isspace():
+                    index += 1
+                continue
+            if char == "(" and output and output[-1] == " ":
+                output.pop()
+            output.append(char)
+            index += 1
+        return "".join(output)
 
     @staticmethod
     def _literal_value_has_encoded_suspicious_text(value: bytes) -> bool:
@@ -3392,6 +3469,11 @@ class PyTorchZipScanner(BaseScanner):
 
     @staticmethod
     def _raw_nested_binary_candidate_should_scan(candidate: bytes, *, candidate_is_prefix: bool) -> bool:
+        if PyTorchZipScanner._headerless_binary_pickle_prefix_needs_more_bytes(
+            candidate,
+            candidate_is_prefix=candidate_is_prefix,
+        ):
+            return True
         if not PyTorchZipScanner._has_security_relevant_pickle_opcode(candidate):
             return False
         if PyTorchZipScanner._has_complete_pickle_stream_without_frame_stop_overrun(candidate):
@@ -3401,13 +3483,35 @@ class PyTorchZipScanner(BaseScanner):
         return candidate_is_prefix and PyTorchZipScanner._has_security_relevant_opcode_in_incomplete_frame(candidate)
 
     @staticmethod
+    def _headerless_binary_pickle_prefix_needs_more_bytes(candidate: bytes, *, candidate_is_prefix: bool) -> bool:
+        if (
+            not candidate_is_prefix
+            or not candidate
+            or candidate[0] not in _RAW_NESTED_BINARY_SECURITY_PICKLE_START_BYTES
+        ):
+            return False
+        opcode_count = 0
+        try:
+            for opcode, _arg, _pos in pickletools.genops(candidate):
+                opcode_count += 1
+                if opcode.name == "STOP":
+                    return False
+        except ValueError as exc:
+            return candidate_is_prefix and opcode_count >= 4 and "exhausted before seeing stop" in str(exc).lower()
+        except Exception:
+            return False
+        return opcode_count >= 4
+
+    @staticmethod
     def _raw_nested_security_pickle_text_marker_seen(value: bytes) -> bool:
         return any(marker in value for marker in _RAW_NESTED_SECURITY_PICKLE_TEXT_MARKERS)
 
     @staticmethod
     def _literal_value_has_encoded_nested_security_pickle(value: bytes) -> bool:
         for match in _BASE64_NESTED_LITERAL_TOKEN_RE.finditer(value):
-            token = re.sub(rb"\s+", b"", match.group(0)).translate(bytes.maketrans(b"-_", b"+/"))
+            token = _BASE64_NESTED_LITERAL_SEPARATOR_RE.sub(b"", match.group(0)).translate(
+                bytes.maketrans(b"-_", b"+/")
+            )
             for shift in range(min(4, len(token))):
                 shifted_token = token[shift:]
                 shifted_token += b"=" * (-len(shifted_token) % 4)
