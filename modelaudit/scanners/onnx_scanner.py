@@ -1748,6 +1748,21 @@ def _build_onnx_weight_analysis_plan(
         )
         return dict(sorted(lineages.items())[:_ONNX_WEIGHT_LINEAGES_PER_VALUE_LIMIT])
 
+    def merge_transform_markers(
+        left: tuple[_OnnxWeightTransform, ...],
+        right: tuple[_OnnxWeightTransform, ...],
+    ) -> tuple[_OnnxWeightTransform, ...]:
+        merged: list[_OnnxWeightTransform] = []
+        seen: set[_OnnxWeightTransform] = set()
+        for transform in (*left, *right):
+            if transform in seen:
+                continue
+            seen.add(transform)
+            merged.append(transform)
+            if len(merged) >= _ONNX_WEIGHT_TRANSFORM_DEPTH_LIMIT:
+                break
+        return tuple(merged)
+
     def merge_lineages(
         target: dict[int, _OnnxWeightLineage],
         source: dict[int, _OnnxWeightLineage],
@@ -1788,7 +1803,7 @@ def _build_onnx_weight_analysis_plan(
                 initializer_index=initializer_index,
                 shape=None,
                 data_type=existing.data_type if existing.data_type == lineage.data_type else None,
-                transforms=existing.transforms,
+                transforms=merge_transform_markers(existing.transforms, lineage.transforms),
                 unresolved_reason=unresolved_reason,
             )
 

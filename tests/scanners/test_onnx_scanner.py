@@ -7151,6 +7151,58 @@ class TestWeightDistributionSemantics:
             for sample in result.metadata["onnx_weight_distribution_semantics"]["unresolved_lineage_samples"]
         )
 
+    def test_recurrent_final_state_marker_survives_same_initializer_merge(self, tmp_path: Path) -> None:
+        hidden_size = 100
+        shape_source = TensorProto()
+        shape_source.name = "shape_source"
+        shape_source.data_type = TensorProto.FLOAT
+        shape_source.dims.extend([0] * 50 + [10] * 5 + [0] * 45)
+        graph = helper.make_graph(
+            [
+                helper.make_node("Shape", ["shape_source"], ["dimensions"]),
+                helper.make_node("Cast", ["dimensions"], ["numeric_dimensions"], to=TensorProto.FLOAT),
+                helper.make_node("Reshape", ["numeric_dimensions", "state_shape"], ["initial_h"]),
+                helper.make_node(
+                    "RNN",
+                    ["sequence", "W", "R", "", "", "initial_h"],
+                    ["sequence_output", "state"],
+                    hidden_size=hidden_size,
+                ),
+                helper.make_node("Add", ["initial_h", "state"], ["merged_state"]),
+                helper.make_node("Reshape", ["merged_state", "left_shape"], ["left_weight"]),
+                helper.make_node("MatMul", ["left_weight", "projection"], ["Y"]),
+            ],
+            "merged_recurrent_final_state_operand",
+            [helper.make_tensor_value_info("sequence", TensorProto.FLOAT, [1, 1, hidden_size])],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1])],
+            initializer=[
+                shape_source,
+                onnx.numpy_helper.from_array(np.array([1, 1, hidden_size], dtype=np.int64), name="state_shape"),
+                onnx.numpy_helper.from_array(np.array([hidden_size], dtype=np.int64), name="left_shape"),
+                onnx.numpy_helper.from_array(np.zeros((1, hidden_size, hidden_size), dtype=np.float32), name="W"),
+                onnx.numpy_helper.from_array(np.zeros((1, hidden_size, hidden_size), dtype=np.float32), name="R"),
+                onnx.numpy_helper.from_array(np.zeros((hidden_size, 1), dtype=np.float32), name="projection"),
+            ],
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 14)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / "merged-recurrent-final-state-vector-left-operand.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        assert result.success is False
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
+        assert any(
+            sample["initializer"] == "shape_source"
+            and sample["consumer_op"] == "MatMul"
+            and sample["consumer_input_index"] == 0
+            and sample["reason"] != "shape_control_lineage"
+            for sample in result.metadata["onnx_weight_distribution_semantics"]["unresolved_lineage_samples"]
+        )
+
     @pytest.mark.parametrize(
         ("generated_source", "expected_reason"),
         [
