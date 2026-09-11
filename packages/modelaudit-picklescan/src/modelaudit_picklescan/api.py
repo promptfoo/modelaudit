@@ -86,8 +86,10 @@ _PROTO0_1_START_BYTES = b"()]}cilp0FGIJKLMNPSTUVX"
 _PROTO0_1_MAX_PROBE_OPCODES = _PICKLE_DISCOVERY_LONG_PROBE_BYTES
 _PROTO0_1_IGNORABLE_TRAILING_BYTES = b" \t\r\n\x00"
 _PROTO0_1_TEXT_WHITESPACE_BYTES = b" \t\r\n"
-_MAX_MALFORMED_SEPARATOR_RUN_BYTES = 8
-_PROTO0_GLOBAL_PREFIX_WITHOUT_NEWLINE_RE = re.compile(rb"c[A-Za-z_][A-Za-z0-9_.]*")
+_PROTO0_GLOBAL_OR_INST_PREFIX_WITHOUT_NEWLINE_RE = re.compile(rb"[ci][A-Za-z_][A-Za-z0-9_.]*")
+_REPEATED_PROTO0_INT_STREAM_RE = re.compile(rb"(?:I[+-]?\d+\n\.)+")
+_PROTO0_GLOBAL_NAME_START_BYTES = frozenset(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_")
+_PROTO0_GLOBAL_NAME_BYTES = _PROTO0_GLOBAL_NAME_START_BYTES | frozenset(b"0123456789.")
 _PICKLE_DISCOVERY_PADDING_PROBE_BYTES = 256 * 1024
 _PICKLE_DISCOVERY_NUL_PADDING_VERIFY_CHUNK_BYTES = 64 * 1024
 _PICKLE_DISCOVERY_NUL_PADDING_VERIFY_BUDGET_BYTES = 64 * 1024 * 1024
@@ -134,16 +136,22 @@ _PROTO0_1_LITERAL_OPCODES = frozenset(
         "SHORT_BINSTRING",
         "UNICODE",
         "BINUNICODE",
+        "BINUNICODE8",
         "SHORT_BINUNICODE",
     }
 )
-_BASE64_NESTED_LITERAL_TOKEN_RE = re.compile(rb"[A-Za-z0-9+/_-][A-Za-z0-9+/_\-\s\r\n\t]{15,}={0,2}")
-_HEX_NESTED_LITERAL_TOKEN_RE = re.compile(rb"(?<![0-9A-Fa-f])(?:[0-9A-Fa-f]{2}[\s\r\n\t]*){8,}(?![0-9A-Fa-f])")
+_PICKLE_BINARY_BYTE_LITERAL_OPCODES = frozenset({"BINBYTES", "SHORT_BINBYTES", "BINBYTES8", "BYTEARRAY8"})
+_PICKLE_LITERAL_OPCODES = _PROTO0_1_LITERAL_OPCODES | _PICKLE_BINARY_BYTE_LITERAL_OPCODES
+_BASE64_NESTED_LITERAL_TOKEN_RE = re.compile(rb"[A-Za-z0-9+/_-][A-Za-z0-9+/_\-\s\r\n\t]{7,}={0,2}")
+_HEX_NESTED_LITERAL_TOKEN_RE = re.compile(rb"[0-9A-Fa-f][0-9A-Fa-f\s\r\n\t]{15,}")
 _RAW_NESTED_TEXT_SECURITY_PICKLE_START_BYTES = b"\x80(cioRbP\x82\x83\x84"
 _RAW_NESTED_BINARY_SECURITY_PICKLE_START_BYTES = b"\x8c\x8d\x95"
 _RAW_NESTED_SECURITY_PICKLE_START_BYTES = (
     _RAW_NESTED_TEXT_SECURITY_PICKLE_START_BYTES + _RAW_NESTED_BINARY_SECURITY_PICKLE_START_BYTES
 )
+_BINARY_EXTENSION_SECURITY_OPCODE_BYTES = b"\x82\x83\x84"
+_BINARY_EXTENSION_OPCODE_OPERAND_BYTES = {0x82: 1, 0x83: 2, 0x84: 4}
+_BINARY_EXTENSION_OPCODE_FOLLOWER_BYTES = b".)Rq\x85\x86\x87\x94\x95"
 _BINARY_SECURITY_OPCODE_REQUIRING_EXISTING_STACK_BYTES = b"\x81\x92\x93"
 _MAX_RAW_NESTED_PICKLE_CANDIDATES = 64
 _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES = 8 * 1024
@@ -172,7 +180,7 @@ _SUSPICIOUS_LITERAL_TEXT_PATTERNS = tuple(
     re.compile(pattern, re.IGNORECASE)
     for pattern in (
         r"(?<!\w)__(?:reduce(?:_ex)?|setstate|getstate|getnewargs(?:_ex)?|getinitargs|new|class|"
-        r"subclasses|globals|builtins|mro)__(?!\w)",
+        r"subclasses|globals|builtins|mro|call|code|getattribute)__(?!\w)",
         r"base64\.b64decode",
         r"compile\(",
         r"importlib",
@@ -192,14 +200,14 @@ _SUSPICIOUS_LITERAL_TEXT_PATTERNS = tuple(
 _STORAGE_LITERAL_TEXT_ROUTE_PATTERNS = tuple(
     re.compile(pattern, re.IGNORECASE | re.DOTALL)
     for pattern in (
-        r"\b(?:compile|eval|exec)\s*(?:\\\r?\n\s*)?\(",
-        r"__import__\s*(?:\\\r?\n\s*)?\(",
-        r"\bimportlib\s*(?:\\\r?\n\s*)?\.\s*(?:import_module|__import__)\s*\(",
-        r"\bos\s*(?:\\\r?\n\s*)?\.\s*(?:\\\r?\n\s*)?(?:system|popen|spawn[a-z]*)\s*(?:\.__call__)?\s*\(",
-        r"\bsubprocess\s*(?:\\\r?\n\s*)?\.\s*(?:Popen|call|check_output|run|check_call)\s*\(",
-        r"\bbase64\s*(?:\\\r?\n\s*)?\.\s*(?:b64decode|decode)\s*\(",
-        r"\b(?:pickle|cloudpickle|joblib)\s*(?:\\\r?\n\s*)?\.\s*(?:_pickle_load|load|loads)\s*\(",
-        r"\bcopyreg\s*(?:\\\r?\n\s*)?\.\s*(?:add_extension|remove_extension)\s*\(",
+        r"\b(?:compile|eval|exec)\s*(?:\\\r?\n\s*)*\(",
+        r"__import__\s*(?:\\\r?\n\s*)*\(",
+        r"\bimportlib\s*(?:\\\r?\n\s*)*\.\s*(?:import_module|__import__)\s*\(",
+        r"\bos\s*(?:\\\r?\n\s*)*\.\s*(?:\\\r?\n\s*)*(?:system|popen|spawn[a-z]*)\s*(?:\.__call__)?\s*\(",
+        r"\bsubprocess\s*(?:\\\r?\n\s*)*\.\s*(?:Popen|call|check_output|run|check_call)\s*\(",
+        r"\bbase64\s*(?:\\\r?\n\s*)*\.\s*(?:b64decode|decode)\s*\(",
+        r"\b(?:pickle|cloudpickle|joblib)\s*(?:\\\r?\n\s*)*\.\s*(?:_pickle_load|load|loads)\s*\(",
+        r"\bcopyreg\s*(?:\\\r?\n\s*)*\.\s*(?:add_extension|remove_extension)\s*\(",
         r"getattr\s*\(\s*\w+\s*,\s*['\"](?:system|popen|spawn|exec|eval|call|run|Popen)['\"]",
     )
 )
@@ -209,6 +217,11 @@ _MAX_STORAGE_LITERAL_TEXT_CANDIDATES = 64
 _MAX_STORAGE_LITERAL_DECODED_TEXT_BYTES = 64 * 1024
 _STORAGE_LITERAL_DECODED_TEXT_WINDOW_OVERLAP_BYTES = 1024
 _MAX_STORAGE_LITERAL_DECODED_TEXT_WINDOWS = 16
+_MAX_STORAGE_LITERAL_BASE64_DECODE_INPUT_BYTES = ((_MAX_STORAGE_LITERAL_DECODED_TEXT_BYTES + 2) // 3) * 4
+_STORAGE_LITERAL_BASE64_DECODE_INPUT_OVERLAP_BYTES = ((_STORAGE_LITERAL_DECODED_TEXT_WINDOW_OVERLAP_BYTES + 2) // 3) * 4
+_STORAGE_LITERAL_BASE64_DECODE_INPUT_STRIDE_BYTES = (
+    _MAX_STORAGE_LITERAL_BASE64_DECODE_INPUT_BYTES - _STORAGE_LITERAL_BASE64_DECODE_INPUT_OVERLAP_BYTES
+)
 _MAX_PYTORCH_ZIP_ENTRIES = 10_000
 _MAX_PYTORCH_ZIP_PICKLE_DISCOVERY_PROBE_BYTES = 4 * 1024 * 1024
 _MAX_PYTORCH_ZIP_PICKLE_MEMBERS = 256
@@ -1779,6 +1792,12 @@ def _proto0_or_1_trusted_storage_probe_needs_expanded_sample(sample: bytes, *, e
         return True
     if _trivial_complete_pickle_prefix_has_only_padding(sample):
         return entry_size is not None and entry_size > len(sample)
+    if (
+        entry_size is not None
+        and entry_size > len(sample)
+        and _trivial_complete_pickle_prefix_has_mixed_nonpickle_trailing(sample)
+    ):
+        return True
     return _trivial_complete_pickle_prefix_has_ambiguous_trivial_trailing(sample)
 
 
@@ -1842,19 +1861,34 @@ def _has_security_relevant_opcode_in_incomplete_frame(sample: bytes) -> bool:
 
 
 def _has_security_relevant_pickle_opcode(sample: bytes) -> bool:
-    remaining = sample
-    while remaining:
-        remaining = _strip_optional_proto0_comment_prefix(remaining)
-        repeated_none_trailing = _repeated_none_stream_trailing(remaining)
-        if repeated_none_trailing is not None:
-            remaining = repeated_none_trailing
+    stream = io.BytesIO(sample)
+    offset = 0
+    sample_length = len(sample)
+    while offset < sample_length:
+        if (
+            offset + 1 < sample_length
+            and sample[offset : offset + 1] == b"#"
+            and sample[offset + 1] in _PROTO0_1_START_BYTES
+        ):
+            offset += 1
+        trivial_offset = _repeated_trivial_stream_offset(sample, offset)
+        if trivial_offset != offset:
+            if (
+                trivial_offset < sample_length
+                and sample[trivial_offset] in _BINARY_SECURITY_OPCODE_REQUIRING_EXISTING_STACK_BYTES
+            ):
+                return False
+            offset = trivial_offset
             continue
+        stream.seek(offset)
         try:
-            for opcode, _arg, pos in pickletools.genops(remaining):
+            for opcode, _arg, pos in pickletools.genops(stream):
                 if opcode.name in _PICKLE_SECURITY_RELEVANT_OPCODES:
                     return True
                 if opcode.name == "STOP" and pos is not None:
-                    remaining = remaining[pos + 1 :].lstrip(_PROTO0_1_IGNORABLE_TRAILING_BYTES)
+                    offset = pos + 1
+                    while offset < sample_length and sample[offset] in _PROTO0_1_IGNORABLE_TRAILING_BYTES:
+                        offset += 1
                     break
             else:
                 return False
@@ -1907,14 +1941,14 @@ def _looks_like_truncated_proto0_or_1_operand_prefix(candidate: bytes) -> bool:
         return False
     if candidate.startswith(b"P"):
         return b"\n" not in candidate[1:]
-    if candidate.startswith(b"c"):
+    if candidate.startswith((b"c", b"i")):
         if len(candidate) == 1:
             return True
         if b"\n" in candidate:
             return candidate.count(b"\n") < 2
         return (
             len(candidate) <= _TRUSTED_STORAGE_PICKLE_PROBE_BYTES
-            and _PROTO0_GLOBAL_PREFIX_WITHOUT_NEWLINE_RE.fullmatch(candidate) is not None
+            and _PROTO0_GLOBAL_OR_INST_PREFIX_WITHOUT_NEWLINE_RE.fullmatch(candidate) is not None
         )
     if candidate.startswith((b"F", b"I", b"L")):
         return b"\n" not in candidate[1:]
@@ -2057,7 +2091,11 @@ def _trailing_pickle_candidate_needs_more_bytes(candidate: bytes) -> bool:
             if len(candidate) < _PICKLE_FRAME_OPCODE_BYTES:
                 return True
             frame_payload_size = int.from_bytes(candidate[1:_PICKLE_FRAME_OPCODE_BYTES], "little")
-            return len(candidate) - _PICKLE_FRAME_OPCODE_BYTES < frame_payload_size
+            frame_end = _PICKLE_FRAME_OPCODE_BYTES + frame_payload_size
+            if len(candidate) <= frame_end:
+                return True
+            candidate = candidate[frame_end:].lstrip(_PROTO0_1_IGNORABLE_TRAILING_BYTES)
+            continue
         if _looks_like_truncated_proto0_or_1_operand_prefix(candidate):
             return True
         if _looks_like_truncated_binary_pickle_operand_prefix(candidate):
@@ -2096,15 +2134,25 @@ def _trivial_complete_pickle_prefix_has_only_text_padding(sample: bytes) -> bool
     return trailing is not None and bool(trailing) and not trailing.strip(_PROTO0_1_TEXT_WHITESPACE_BYTES)
 
 
+def _trivial_complete_pickle_prefix_has_mixed_nonpickle_trailing(sample: bytes) -> bool:
+    trailing = _trivial_complete_pickle_prefix_trailing(sample)
+    if trailing is None:
+        return False
+    candidate = trailing.lstrip(_PROTO0_1_IGNORABLE_TRAILING_BYTES)
+    if len(candidate) < 2 or candidate[0] in _PROTO0_1_START_BYTES:
+        return False
+    first_byte = candidate[0]
+    return any(byte != first_byte and byte not in _PROTO0_1_IGNORABLE_TRAILING_BYTES for byte in candidate[1:])
+
+
 def _malformed_separator_proto0_string_literal_has_nested_security_pickle(candidate: bytes) -> bool:
     if not candidate or candidate[0] in _PROTO0_1_START_BYTES:
         return False
-    separator = candidate[0]
-    offset = 1
-    separator_scan_limit = min(len(candidate), _TRUSTED_STORAGE_PICKLE_PROBE_BYTES)
-    while offset < separator_scan_limit and candidate[offset] == separator:
+    offset = 0
+    limit = len(candidate)
+    while offset < limit and candidate[offset] not in _PROTO0_1_START_BYTES:
         offset += 1
-    if offset < len(candidate) and candidate[offset] == separator:
+    if offset >= limit or candidate[offset : offset + 1] != b"S":
         return False
     return _complete_proto0_string_literal_has_nested_security_pickle(
         candidate[offset:].lstrip(_PROTO0_1_IGNORABLE_TRAILING_BYTES)
@@ -2142,14 +2190,22 @@ def _trivial_complete_pickle_prefix_trailing(sample: bytes) -> bytes | None:
 
 
 def _complete_trivial_literal_pickle_has_nested_security_pickle(sample: bytes) -> bool:
-    remaining = sample
-    while remaining:
-        remaining = _strip_optional_proto0_comment_prefix(remaining)
+    cursor = 0
+    stream = io.BytesIO(sample)
+    while cursor < len(sample):
+        if (
+            cursor + 1 < len(sample)
+            and sample[cursor : cursor + 1] == b"#"
+            and sample[cursor + 1] in _PROTO0_1_START_BYTES
+        ):
+            cursor += 1
+            continue
         active_frame_end = 0
         opcode_count = 0
         literal_values: list[bytes] = []
         try:
-            for opcode, arg, pos in pickletools.genops(remaining):
+            stream.seek(cursor)
+            for opcode, arg, pos in pickletools.genops(stream):
                 opcode_count += 1
                 if pos is None:
                     continue
@@ -2158,23 +2214,24 @@ def _complete_trivial_literal_pickle_has_nested_security_pickle(sample: bytes) -
                         return False
                     active_frame_end = max(active_frame_end, pos + _PICKLE_FRAME_OPCODE_BYTES + arg)
                 elif opcode.name == "STOP":
-                    if opcode_count < 2 or active_frame_end > len(remaining):
+                    if opcode_count < 2 or active_frame_end > len(sample):
                         return False
                     if any(_literal_value_has_storage_scan_signal(value) for value in literal_values):
                         return True
-                    trailing = remaining[pos + 1 :].lstrip(_PROTO0_1_IGNORABLE_TRAILING_BYTES)
-                    if not trailing:
+                    cursor = pos + 1
+                    while cursor < len(sample) and sample[cursor] in _PROTO0_1_IGNORABLE_TRAILING_BYTES:
+                        cursor += 1
+                    if cursor >= len(sample):
                         return False
-                    remaining = trailing
                     break
-                elif opcode.name in _PROTO0_1_LITERAL_OPCODES:
+                elif opcode.name in _PICKLE_LITERAL_OPCODES:
                     literal_value = _literal_arg_bytes(opcode.name, arg)
                     if literal_value is not None:
                         literal_values.append(literal_value)
             else:
                 return False
         except Exception:
-            return _complete_proto0_string_literal_has_nested_security_pickle(remaining)
+            return _complete_proto0_string_literal_has_nested_security_pickle(sample[cursor:])
     return False
 
 
@@ -2196,9 +2253,7 @@ def _complete_proto0_string_literal_has_nested_security_pickle(sample: bytes) ->
     except Exception:
         return False
     literal_value = (
-        decoded_literal
-        if isinstance(decoded_literal, bytes)
-        else decoded_literal.encode("latin-1", errors="surrogateescape")
+        decoded_literal if isinstance(decoded_literal, bytes) else _literal_str_to_scan_bytes(decoded_literal)
     )
     return _literal_value_has_storage_scan_signal(literal_value)
 
@@ -2206,12 +2261,28 @@ def _complete_proto0_string_literal_has_nested_security_pickle(sample: bytes) ->
 def _literal_arg_bytes(opcode_name: str, value: Any) -> bytes | None:
     if isinstance(value, bytes):
         return value
+    if isinstance(value, bytearray):
+        return bytes(value)
     if isinstance(value, str) and opcode_name in _PROTO0_1_LITERAL_OPCODES:
-        try:
-            return value.encode("latin-1")
-        except UnicodeEncodeError:
-            return value.encode("utf-8", errors="surrogatepass")
+        return _literal_str_to_scan_bytes(value)
     return None
+
+
+def _literal_str_to_scan_bytes(value: str) -> bytes:
+    output = bytearray()
+    text_segment: list[str] = []
+    for char in value:
+        code_point = ord(char)
+        if code_point <= 0xFF:
+            if text_segment:
+                output.extend("".join(text_segment).encode("utf-8", errors="surrogatepass"))
+                text_segment.clear()
+            output.append(code_point)
+        else:
+            text_segment.append(char)
+    if text_segment:
+        output.extend("".join(text_segment).encode("utf-8", errors="surrogatepass"))
+    return bytes(output)
 
 
 def _literal_value_has_nested_security_pickle(value: bytes) -> bool:
@@ -2273,13 +2344,29 @@ def _base64_literal_value_has_suspicious_text(value: bytes) -> bool:
             token = compact[shift:]
             if len(token) < 8:
                 continue
-            token += b"=" * (-len(token) % 4)
-            try:
-                decoded = base64.b64decode(token, validate=True)
-            except (binascii.Error, ValueError):
-                continue
-            if decoded and _decoded_literal_text_has_storage_route_signal(decoded):
+            if _base64_token_has_storage_route_signal(token):
                 return True
+    return False
+
+
+def _base64_token_has_storage_route_signal(token: bytes) -> bool:
+    start = 0
+    window_count = 0
+    while start < len(token):
+        window_count += 1
+        if window_count > _MAX_STORAGE_LITERAL_DECODED_TEXT_WINDOWS:
+            return True
+        window = token[start : start + _MAX_STORAGE_LITERAL_BASE64_DECODE_INPUT_BYTES]
+        window += b"=" * (-len(window) % 4)
+        try:
+            decoded = base64.b64decode(window, validate=True)
+        except (binascii.Error, ValueError):
+            return False
+        if decoded and _decoded_literal_text_has_storage_route_signal(decoded):
+            return True
+        if start + _MAX_STORAGE_LITERAL_BASE64_DECODE_INPUT_BYTES >= len(token):
+            break
+        start += _STORAGE_LITERAL_BASE64_DECODE_INPUT_STRIDE_BYTES
     return False
 
 
@@ -2312,8 +2399,6 @@ def _literal_value_has_raw_nested_security_pickle(
         if candidate_count > _MAX_RAW_NESTED_PICKLE_CANDIDATES:
             if not fail_closed_on_candidate_budget:
                 return _encoded_raw_nested_security_pickle_candidate_budget_exhausted_needs_scan(value[offset:])
-            if marker in _RAW_NESTED_TEXT_SECURITY_PICKLE_START_BYTES:
-                return True
             return _raw_nested_security_pickle_candidate_budget_exhausted_needs_scan(value[offset:])
         candidate = value[offset : offset + _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES]
         candidate_is_prefix = offset + len(candidate) < len(value)
@@ -2326,6 +2411,11 @@ def _literal_value_has_raw_nested_security_pickle(
         if marker in _RAW_NESTED_BINARY_SECURITY_PICKLE_START_BYTES and _raw_nested_binary_candidate_should_scan(
             candidate,
             candidate_is_prefix=candidate_is_prefix,
+        ):
+            return True
+        if (
+            marker in _BINARY_EXTENSION_SECURITY_OPCODE_BYTES
+            and _raw_nested_extension_opcode_candidate_has_structural_signal(candidate)
         ):
             return True
         if (
@@ -2374,9 +2464,7 @@ def _trailing_candidate_has_raw_nested_security_pickle(value: bytes, *, sample_i
 def _raw_nested_security_pickle_candidate_budget_exhausted_needs_scan(value: bytes) -> bool:
     if _raw_nested_security_pickle_text_marker_seen(value):
         return True
-    if not value.strip(b"c \t\r\n\x00"):
-        return False
-    return not _raw_nested_binary_candidate_budget_suffix_is_noise(value)
+    return _raw_nested_security_pickle_candidate_has_structural_signal(value)
 
 
 def _encoded_raw_nested_security_pickle_candidate_budget_exhausted_needs_scan(value: bytes) -> bool:
@@ -2388,6 +2476,8 @@ def _encoded_raw_nested_security_pickle_candidate_budget_exhausted_needs_scan(va
     if not candidate:
         return False
     marker = candidate[0]
+    if marker in _BINARY_EXTENSION_SECURITY_OPCODE_BYTES:
+        return True
     if marker == 0x80 and _looks_like_binary_pickle_prefix(candidate, sample_is_prefix=candidate_is_prefix):
         return _has_security_relevant_pickle_opcode(candidate) or candidate_is_prefix
     if marker in _RAW_NESTED_BINARY_SECURITY_PICKLE_START_BYTES and _raw_nested_binary_candidate_should_scan(
@@ -2405,22 +2495,167 @@ def _encoded_raw_nested_security_pickle_candidate_budget_exhausted_needs_scan(va
     )
     if has_candidate_signal:
         return True
-    return not _encoded_raw_nested_security_pickle_candidate_budget_suffix_is_noise(value)
+    return _raw_nested_security_pickle_candidate_has_structural_signal(value)
 
 
-def _encoded_raw_nested_security_pickle_candidate_budget_suffix_is_noise(value: bytes) -> bool:
-    return _raw_nested_binary_candidate_budget_suffix_is_noise(value)
-
-
-def _raw_nested_binary_candidate_budget_suffix_is_noise(value: bytes) -> bool:
-    if not value:
+def _raw_nested_security_pickle_candidate_has_structural_signal(value: bytes) -> bool:
+    parse_budget_remaining = [_MAX_RAW_NESTED_PICKLE_CANDIDATES]
+    if _raw_nested_proto0_global_ref_seen(value):
         return True
-    residue = bytes(
-        byte
-        for byte in value
-        if byte not in _RAW_NESTED_TEXT_SECURITY_PICKLE_START_BYTES and byte not in b" \t\r\n\x00"
+    if _raw_nested_binary_protocol_candidate_has_structural_signal(value, parse_budget_remaining):
+        return True
+    if _raw_nested_extension_opcode_candidate_has_structural_signal(value):
+        return True
+    if _raw_nested_binary_opcode_candidate_has_structural_signal(value, parse_budget_remaining):
+        return True
+    stripped = value.lstrip(b" \t\r\n\x00")
+    candidate = stripped[:_MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES]
+    candidate_is_prefix = len(stripped) > len(candidate)
+    if not candidate:
+        return False
+    marker = candidate[0]
+    if marker in _BINARY_EXTENSION_SECURITY_OPCODE_BYTES:
+        return True
+    if not _consume_raw_nested_structural_parse_budget(parse_budget_remaining):
+        return True
+    if marker == 0x80 and _looks_like_binary_pickle_prefix(candidate, sample_is_prefix=candidate_is_prefix):
+        return _has_security_relevant_pickle_opcode(candidate) or candidate_is_prefix
+    if marker in _RAW_NESTED_BINARY_SECURITY_PICKLE_START_BYTES and _raw_nested_binary_candidate_should_scan(
+        candidate,
+        candidate_is_prefix=candidate_is_prefix,
+    ):
+        return True
+    if marker == ord("c"):
+        return False
+    return (
+        marker in _PROTO0_1_START_BYTES
+        and _has_security_relevant_pickle_opcode(candidate)
+        and (
+            _has_complete_pickle_stream_without_frame_stop_overrun(candidate)
+            or _looks_like_proto0_or_1_pickle(candidate, sample_is_prefix=candidate_is_prefix)
+        )
     )
-    return bool(residue) and all(byte >= 0x80 for byte in residue)
+
+
+def _consume_raw_nested_structural_parse_budget(parse_budget_remaining: list[int]) -> bool:
+    if parse_budget_remaining[0] <= 0:
+        return False
+    parse_budget_remaining[0] -= 1
+    return True
+
+
+def _raw_nested_proto0_global_ref_seen(value: bytes) -> bool:
+    search_limit = min(len(value), _PICKLE_DISCOVERY_LONG_PROBE_BYTES)
+    search_start = 0
+    while search_start < search_limit:
+        offset = value.find(b"c", search_start, search_limit)
+        if offset < 0:
+            return False
+        module_start = offset + 1
+        if module_start >= search_limit:
+            return False
+        if value[module_start] not in _PROTO0_GLOBAL_NAME_START_BYTES:
+            search_start = module_start
+            continue
+        module_end = module_start
+        while module_end < search_limit and value[module_end] in _PROTO0_GLOBAL_NAME_BYTES:
+            module_end += 1
+        if module_end >= search_limit:
+            return False
+        if value[module_end] != 0x0A:
+            search_start = module_end + 1
+            continue
+        name_start = module_end + 1
+        if name_start >= search_limit:
+            return False
+        if value[name_start] not in _PROTO0_GLOBAL_NAME_START_BYTES:
+            search_start = name_start + 1
+            continue
+        name_end = name_start
+        while name_end < search_limit and value[name_end] in _PROTO0_GLOBAL_NAME_BYTES:
+            name_end += 1
+        if name_end < search_limit and value[name_end] == 0x0A:
+            return True
+        search_start = name_end + 1
+    return False
+
+
+def _raw_nested_binary_protocol_candidate_has_structural_signal(
+    value: bytes, parse_budget_remaining: list[int]
+) -> bool:
+    search_limit = min(len(value), _PICKLE_DISCOVERY_LONG_PROBE_BYTES)
+    search_start = 0
+    while search_start < search_limit:
+        offset = min(
+            (
+                found
+                for prefix in _PICKLE_BINARY_PROTOCOL_PREFIXES
+                if (found := value.find(prefix, search_start, search_limit)) >= 0
+            ),
+            default=-1,
+        )
+        if offset < 0:
+            return False
+        if not _consume_raw_nested_structural_parse_budget(parse_budget_remaining):
+            return True
+        candidate = value[offset : offset + _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES]
+        candidate_is_prefix = offset + len(candidate) < len(value)
+        if _looks_like_binary_pickle_prefix(candidate, sample_is_prefix=candidate_is_prefix) and (
+            _has_security_relevant_pickle_opcode(candidate) or candidate_is_prefix
+        ):
+            return True
+        search_start = offset + 1
+    return False
+
+
+def _raw_nested_extension_opcode_candidate_has_structural_signal(value: bytes) -> bool:
+    search_limit = min(len(value), _PICKLE_DISCOVERY_LONG_PROBE_BYTES)
+    search_start = 0
+    while search_start < search_limit:
+        offset = min(
+            (
+                found
+                for marker in _BINARY_EXTENSION_SECURITY_OPCODE_BYTES
+                if (found := value.find(bytes([marker]), search_start, search_limit)) >= 0
+            ),
+            default=-1,
+        )
+        if offset < 0:
+            return False
+        operand_len = _BINARY_EXTENSION_OPCODE_OPERAND_BYTES[value[offset]]
+        follower_offset = offset + 1 + operand_len
+        if (
+            follower_offset < search_limit
+            and follower_offset < len(value)
+            and value[follower_offset] in _BINARY_EXTENSION_OPCODE_FOLLOWER_BYTES
+        ):
+            return True
+        search_start = offset + 1
+    return False
+
+
+def _raw_nested_binary_opcode_candidate_has_structural_signal(value: bytes, parse_budget_remaining: list[int]) -> bool:
+    search_limit = min(len(value), _PICKLE_DISCOVERY_LONG_PROBE_BYTES)
+    search_start = 0
+    while search_start < search_limit:
+        offset = min(
+            (
+                found
+                for marker in _RAW_NESTED_BINARY_SECURITY_PICKLE_START_BYTES
+                if (found := value.find(bytes([marker]), search_start, search_limit)) >= 0
+            ),
+            default=-1,
+        )
+        if offset < 0:
+            return False
+        if not _consume_raw_nested_structural_parse_budget(parse_budget_remaining):
+            return True
+        candidate = value[offset : offset + _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES]
+        candidate_is_prefix = offset + len(candidate) < len(value)
+        if _raw_nested_binary_candidate_should_scan(candidate, candidate_is_prefix=candidate_is_prefix):
+            return True
+        search_start = offset + 1
+    return False
 
 
 def _raw_nested_binary_candidate_should_scan(candidate: bytes, *, candidate_is_prefix: bool) -> bool:
@@ -2453,12 +2688,19 @@ def _literal_value_has_encoded_nested_security_pickle(value: bytes) -> bool:
                 return True
     for match in _HEX_NESTED_LITERAL_TOKEN_RE.finditer(value):
         compact = re.sub(rb"\s+", b"", match.group(0))
-        try:
-            decoded = binascii.unhexlify(compact)
-        except (binascii.Error, ValueError):
-            continue
-        if decoded and _literal_value_has_raw_nested_security_pickle(decoded, fail_closed_on_candidate_budget=False):
-            return True
+        for shift in range(min(2, len(compact))):
+            shifted_token = compact[shift:]
+            shifted_token = shifted_token[: len(shifted_token) - (len(shifted_token) % 2)]
+            if len(shifted_token) < 16:
+                continue
+            try:
+                decoded = binascii.unhexlify(shifted_token)
+            except (binascii.Error, ValueError):
+                continue
+            if decoded and _literal_value_has_raw_nested_security_pickle(
+                decoded, fail_closed_on_candidate_budget=False
+            ):
+                return True
     return False
 
 
@@ -2470,19 +2712,33 @@ def _contains_pickle_frame_opcode(sample: bytes) -> bool:
 
 
 def _has_complete_pickle_stream_without_frame_stop_overrun(sample: bytes) -> bool:
-    repeated_none_trailing = _repeated_none_stream_trailing(sample)
-    if repeated_none_trailing is not None:
-        return _trailing_pickle_probe_should_scan(repeated_none_trailing, sample_is_prefix=False)
-    remaining = sample
+    stream = io.BytesIO(sample)
+    offset = 0
     skipped_trivial_prefix = False
-    while remaining:
-        remaining = _strip_optional_proto0_comment_prefix(remaining)
+    sample_length = len(sample)
+    while offset < sample_length:
+        if (
+            offset + 1 < sample_length
+            and sample[offset : offset + 1] == b"#"
+            and sample[offset + 1] in _PROTO0_1_START_BYTES
+        ):
+            offset += 1
+        trivial_offset = _repeated_trivial_stream_offset(sample, offset)
+        if trivial_offset != offset:
+            if trivial_offset >= sample_length:
+                return False
+            if sample[trivial_offset] in _BINARY_SECURITY_OPCODE_REQUIRING_EXISTING_STACK_BYTES:
+                return False
+            offset = trivial_offset
+            skipped_trivial_prefix = True
+            continue
+        stream.seek(offset)
         active_frame_end = 0
         opcode_count = 0
         has_non_trivial_opcode = False
         has_security_relevant_opcode = False
         try:
-            for opcode, arg, pos in pickletools.genops(remaining):
+            for opcode, arg, pos in pickletools.genops(stream):
                 opcode_count += 1
                 if pos is None:
                     continue
@@ -2491,14 +2747,15 @@ def _has_complete_pickle_stream_without_frame_stop_overrun(sample: bytes) -> boo
                         return False
                     active_frame_end = max(active_frame_end, pos + _PICKLE_FRAME_OPCODE_BYTES + arg)
                 elif opcode.name == "STOP":
-                    if opcode_count < 2 or active_frame_end > len(remaining):
+                    if opcode_count < 2 or active_frame_end > sample_length:
                         return False
                     if has_non_trivial_opcode:
                         return has_security_relevant_opcode or not skipped_trivial_prefix
-                    trailing = remaining[pos + 1 :].lstrip(_PROTO0_1_IGNORABLE_TRAILING_BYTES)
-                    if not trailing:
+                    offset = pos + 1
+                    while offset < sample_length and sample[offset] in _PROTO0_1_IGNORABLE_TRAILING_BYTES:
+                        offset += 1
+                    if offset >= sample_length:
                         return False
-                    remaining = trailing
                     skipped_trivial_prefix = True
                     break
                 elif opcode.name not in _PROTO0_1_TRIVIAL_LEADING_OPCODES:
@@ -2510,6 +2767,24 @@ def _has_complete_pickle_stream_without_frame_stop_overrun(sample: bytes) -> boo
         except Exception:
             return False
     return False
+
+
+def _repeated_trivial_stream_offset(sample: bytes, offset: int) -> int:
+    original_offset = offset
+    sample_length = len(sample)
+    while offset < sample_length:
+        if offset + 2 <= sample_length and sample[offset : offset + 2] == b"N.":
+            offset += 2
+        elif offset < sample_length and sample[offset : offset + 1] == b"I":
+            match = _REPEATED_PROTO0_INT_STREAM_RE.match(sample, offset)
+            if match is None:
+                break
+            offset = match.end()
+        else:
+            break
+        while offset < sample_length and sample[offset] in _PROTO0_1_IGNORABLE_TRAILING_BYTES:
+            offset += 1
+    return offset if offset != original_offset else original_offset
 
 
 def _repeated_none_stream_trailing(sample: bytes) -> bytes | None:

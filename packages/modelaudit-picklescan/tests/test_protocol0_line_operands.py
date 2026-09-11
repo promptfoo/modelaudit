@@ -4,6 +4,7 @@ import base64
 import binascii
 import os
 import pickle
+import struct
 import time
 from collections.abc import Mapping
 
@@ -52,6 +53,19 @@ def _benign_long_scalar_protocol0_pickle(opcode: bytes) -> bytes:
     if prefix.endswith(b"0"):
         prefix = prefix[:-1]
     return prefix + b"."
+
+
+def _proto0_string_literal(value: bytes) -> bytes:
+    literal = value.decode("latin-1").encode("unicode_escape").replace(b"'", b"\\'")
+    return b"S'" + literal + b"'\n."
+
+
+def _binbytes_literal_pickle(value: bytes) -> bytes:
+    return b"B" + struct.pack("<I", len(value)) + value + b"."
+
+
+def _frame(payload: bytes) -> bytes:
+    return b"\x95" + struct.pack("<Q", len(payload)) + payload
 
 
 def test_scan_bytes_accepts_exact_limit_protocol0_line_operand() -> None:
@@ -137,6 +151,83 @@ def test_scan_bytes_fails_closed_for_base64_nested_overlong_protocol0_line_opera
         for finding in report.findings
     )
     assert any(notice.code == "nested_pickle_incomplete" for notice in report.notices)
+
+
+def test_trusted_storage_probe_routes_byte_literal_after_trivial_stream() -> None:
+    nested_payload = b"cos\nsystem\n)R."
+    sample = b"N." + _binbytes_literal_pickle(base64.b64encode(nested_payload))
+
+    assert picklescan_api._proto0_or_1_trusted_storage_probe_should_scan(sample, sample_is_prefix=False) is True
+
+
+def test_trusted_storage_probe_routes_nested_extension_reference_literal() -> None:
+    sample = b"U\x03\x82\x01.."
+
+    assert picklescan_api._proto0_or_1_trusted_storage_probe_should_scan(sample, sample_is_prefix=False) is True
+
+
+def test_trusted_storage_probe_scans_full_expanded_malformed_separator_run() -> None:
+    nested_payload = b"cos\nsystem\n)R."
+    sample = b"N." + (b"!" * 5000) + _proto0_string_literal(base64.b64encode(nested_payload))
+
+    assert picklescan_api._proto0_or_1_trusted_storage_probe_should_scan(sample, sample_is_prefix=False) is True
+
+
+def test_trusted_storage_probe_expands_frame_without_stop_at_boundary() -> None:
+    frame_payload = b"\x85"
+    padding = b" " * (picklescan_api._TRUSTED_STORAGE_PICKLE_PROBE_BYTES - len(b"N.") - len(_frame(frame_payload)))
+    sample = b"N." + padding + _frame(frame_payload)
+
+    assert (
+        picklescan_api._proto0_or_1_trusted_storage_probe_needs_expanded_sample(
+            sample,
+            entry_size=len(sample) + len(b"cos\nsystem\n)R."),
+        )
+        is True
+    )
+
+
+def test_trusted_storage_probe_expands_after_complete_frame_at_boundary() -> None:
+    first_frame = _frame(b"]")
+    padding = b" " * (picklescan_api._TRUSTED_STORAGE_PICKLE_PROBE_BYTES - len(b"N.") - len(first_frame) - 1)
+    sample = b"N." + padding + first_frame + b"\x95"
+
+    assert (
+        picklescan_api._proto0_or_1_trusted_storage_probe_needs_expanded_sample(
+            sample,
+            entry_size=len(sample) + 32,
+        )
+        is True
+    )
+
+
+def test_trusted_storage_probe_expands_inst_operand_at_boundary() -> None:
+    sample = b"N." + (b" " * (picklescan_api._TRUSTED_STORAGE_PICKLE_PROBE_BYTES - len(b"N.") - 1)) + b"i"
+
+    assert (
+        picklescan_api._proto0_or_1_trusted_storage_probe_needs_expanded_sample(
+            sample,
+            entry_size=len(sample) + len(b"posix\nsystem\n."),
+        )
+        is True
+    )
+
+
+def test_storage_literal_route_bounds_long_base64_without_size_only_signal(monkeypatch: pytest.MonkeyPatch) -> None:
+    decode_lengths: list[int] = []
+
+    def bounded_decode(token: bytes, *, validate: bool) -> bytes:
+        assert validate is True
+        decode_lengths.append(len(token))
+        assert len(token) <= picklescan_api._MAX_STORAGE_LITERAL_BASE64_DECODE_INPUT_BYTES
+        return b"ordinary metadata"
+
+    monkeypatch.setattr(picklescan_api.base64, "b64decode", bounded_decode)
+    token = b"A" * (picklescan_api._MAX_STORAGE_LITERAL_BASE64_DECODE_INPUT_BYTES + 1024)
+
+    assert picklescan_api._base64_literal_value_has_suspicious_text(token) is False
+    assert decode_lengths
+    assert max(decode_lengths) <= picklescan_api._MAX_STORAGE_LITERAL_BASE64_DECODE_INPUT_BYTES
 
 
 @pytest.mark.parametrize(
@@ -861,6 +952,13 @@ def test_trusted_storage_probe_routes_headerless_binary_nested_pickle_literal(li
     assert picklescan_api._proto0_or_1_trusted_storage_probe_should_scan(payload, sample_is_prefix=False)
 
 
+def test_trusted_storage_probe_preserves_embedded_bytes_in_mixed_unicode_literal() -> None:
+    nested_pickle = b"\x80\x04\x8c\x02os\x94\x8c\x06system\x94\x93\x8c\x04true\x94\x85R."
+    payload = pickle.dumps("\u2603" + nested_pickle.decode("latin-1"), protocol=0)
+
+    assert picklescan_api._proto0_or_1_trusted_storage_probe_should_scan(payload, sample_is_prefix=False)
+
+
 def test_trusted_storage_probe_routes_frame_first_headerless_binary_nested_literal() -> None:
     literal_value = base64.b64encode(_headerless_binary_nested_pickle())
     frame_payload = b"\x8c" + bytes([len(literal_value)]) + literal_value + b"."
@@ -908,6 +1006,74 @@ def test_trusted_storage_probe_skips_raw_binary_candidate_budget_noise_near_matc
     assert not picklescan_api._literal_value_has_raw_nested_security_pickle(literal)
 
 
+def test_trusted_storage_probe_skips_repeated_text_candidate_budget_near_match() -> None:
+    literal = b"abc" * (picklescan_api._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)
+    payload = _proto0_string_literal(literal)
+
+    assert not picklescan_api._proto0_or_1_trusted_storage_probe_should_scan(payload, sample_is_prefix=False)
+
+
+def test_trusted_storage_probe_bounds_repeated_global_candidate_search() -> None:
+    literal = (b"c" * (picklescan_api._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)) + (b"c" * 60_000) + b"!"
+    started_at = time.monotonic()
+
+    assert not picklescan_api._literal_value_has_raw_nested_security_pickle(literal)
+    assert time.monotonic() - started_at < 1.0
+
+
+def test_trusted_storage_probe_routes_global_after_malformed_global_candidate() -> None:
+    literal = (
+        (b"c" * (picklescan_api._MAX_RAW_NESTED_PICKLE_CANDIDATES + 6))
+        + b"foo\nbad! "
+        + b"cctypes\nCDLL\n(S'evil.so'\ntR."
+    )
+
+    assert picklescan_api._literal_value_has_raw_nested_security_pickle(literal)
+
+
+def test_trusted_storage_probe_routes_binary_pickle_after_raw_candidate_budget_gap() -> None:
+    nested_pickle = b"\x80\x04cbuiltins\neval\n(S'1+1'\ntR."
+    literal = (b"c" * (picklescan_api._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)) + b"ZZZZ" + nested_pickle
+
+    assert picklescan_api._literal_value_has_raw_nested_security_pickle(literal)
+
+
+def test_trusted_storage_probe_routes_binary_pickle_after_long_raw_candidate_budget_gap() -> None:
+    nested_pickle = b"\x80\x04\x8c\x08builtins\x94\x8c\x04eval\x94\x93\x8c\x031+1\x94\x85R."
+    literal = (b"c" * (picklescan_api._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)) + (b"!" * 9_000) + nested_pickle
+
+    assert picklescan_api._literal_value_has_raw_nested_security_pickle(literal)
+
+
+def test_trusted_storage_probe_routes_later_binary_pickle_after_benign_binary_decoy() -> None:
+    benign_decoy = pickle.dumps(None, protocol=4)
+    nested_pickle = b"\x80\x04\x8c\x08builtins\x94\x8c\x04eval\x94\x93\x8c\x031+1\x94\x85R."
+    literal = (
+        b"N." + (b"c" * (picklescan_api._MAX_RAW_NESTED_PICKLE_CANDIDATES + 6)) + benign_decoy + b"!" + nested_pickle
+    )
+
+    assert picklescan_api._literal_value_has_raw_nested_security_pickle(literal)
+
+
+def test_trusted_storage_probe_routes_headerless_binary_pickle_after_budget_noise() -> None:
+    nested_pickle = b"\x8c\x02os\x8c\x06system\x93)R."
+    literal = (b"c" * (picklescan_api._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)) + (b"!" * 100) + nested_pickle
+
+    assert picklescan_api._literal_value_has_raw_nested_security_pickle(literal)
+
+
+def test_trusted_storage_probe_routes_extension_opcode_after_budget_noise() -> None:
+    literal = (b"c" * (picklescan_api._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)) + (b"A" * 10) + b"\x82\x01."
+
+    assert picklescan_api._literal_value_has_raw_nested_security_pickle(literal)
+
+
+def test_trusted_storage_probe_skips_incomplete_extension_opcode_after_budget_noise() -> None:
+    literal = (b"c" * (picklescan_api._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)) + (b"A" * 10) + b"\x82\x01"
+
+    assert not picklescan_api._literal_value_has_raw_nested_security_pickle(literal)
+
+
 def test_trusted_storage_probe_routes_legacy_raw_candidate_budget_exhaustion() -> None:
     literal = (b"\x82" * 65) + (b"\xff" * 16)
 
@@ -917,6 +1083,13 @@ def test_trusted_storage_probe_routes_legacy_raw_candidate_budget_exhaustion() -
 def test_trusted_storage_probe_routes_encoded_pickle_after_binary_candidate_budget_noise() -> None:
     encoded = base64.b64encode((b"\x8c" * 65) + b"cbuiltins\nopen\n(S'file'\ntR.")
     payload = b"S'" + encoded + b"'\n."
+
+    assert picklescan_api._proto0_or_1_trusted_storage_probe_should_scan(payload, sample_is_prefix=False)
+
+
+def test_trusted_storage_probe_routes_bytearray8_literal_after_trivial_prefix() -> None:
+    encoded = base64.b64encode(b"cposix\nsystem\n)R.")
+    payload = b"N.\x96" + len(encoded).to_bytes(8, "little") + encoded + b"."
 
     assert picklescan_api._proto0_or_1_trusted_storage_probe_should_scan(payload, sample_is_prefix=False)
 
