@@ -93,6 +93,7 @@ _PICKLE_DISCOVERY_NUL_PADDING_VERIFY_CHUNK_BYTES = 64 * 1024
 _PROTO0_1_PREFIX_TRUNCATION_ERROR_PREFIXES = (
     "pickle exhausted before seeing STOP",
     "no newline found when trying to read ",
+    "not enough data in stream to read ",
 )
 _PICKLE_FRAME_OPCODE_BYTES = 9
 _PICKLE_INCOMPLETE_FRAME_MIN_PAYLOAD_OPCODES = 4
@@ -1907,11 +1908,11 @@ def _looks_like_truncated_binary_pickle_operand_prefix(candidate: bytes) -> bool
 
 
 def _looks_like_truncated_fixed_width_pickle_operand_prefix(candidate: bytes) -> bool:
-    if candidate.startswith((b"K", b"\x82")):
+    if candidate.startswith((b"K", b"h", b"q", b"\x82")):
         return len(candidate) < 2
     if candidate.startswith((b"M", b"\x83")):
         return len(candidate) < 3
-    if candidate.startswith((b"J", b"\x84")):
+    if candidate.startswith((b"J", b"j", b"r", b"\x84")):
         return len(candidate) < 5
     if candidate.startswith(b"G"):
         return len(candidate) < 9

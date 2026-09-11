@@ -6481,6 +6481,75 @@ def test_scan_file_does_not_route_benign_proto0_string_operand_split_at_trusted_
     assert list(report.metadata["pickle_files"]) == ["archive/data.pkl"]
 
 
+@pytest.mark.parametrize(
+    ("memo_prefix", "memo_suffix"),
+    [
+        (b"Nq", b"\x00"),
+        (b"Nr", b"\x00\x00\x00\x00"),
+    ],
+)
+def test_scan_file_scans_truncated_memo_operand_after_trivial_stream_at_trusted_probe_boundary(
+    tmp_path: Path,
+    memo_prefix: bytes,
+    memo_suffix: bytes,
+) -> None:
+    archive_path = tmp_path / "model.pt"
+    storage_prefix = (
+        b"N." + (b" " * (package_api._TRUSTED_STORAGE_PICKLE_PROBE_BYTES - len(b"N.") - len(memo_prefix))) + memo_prefix
+    )
+    assert len(storage_prefix) == package_api._TRUSTED_STORAGE_PICKLE_PROBE_BYTES
+    storage_blob = storage_prefix + memo_suffix + b"cposix\nsystem\n(S'echo hidden'\ntR."
+    storage_blob += b" " * (-len(storage_blob) % 4)
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", storage_blob)
+
+    report = scan_file(archive_path)
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/0"]
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.location is not None
+        and f"{archive_path}:archive/data/0" in finding.location
+        for finding in report.findings
+    )
+
+
+@pytest.mark.parametrize(
+    ("memo_prefix", "memo_suffix"),
+    [
+        (b"Nq", b"\x00"),
+        (b"Nr", b"\x00\x00\x00\x00"),
+    ],
+)
+def test_scan_file_does_not_route_benign_truncated_memo_operand_at_trusted_probe_boundary(
+    tmp_path: Path,
+    memo_prefix: bytes,
+    memo_suffix: bytes,
+) -> None:
+    archive_path = tmp_path / "model.pt"
+    storage_prefix = (
+        b"N." + (b" " * (package_api._TRUSTED_STORAGE_PICKLE_PROBE_BYTES - len(b"N.") - len(memo_prefix))) + memo_prefix
+    )
+    assert len(storage_prefix) == package_api._TRUSTED_STORAGE_PICKLE_PROBE_BYTES
+    storage_blob = storage_prefix + memo_suffix + b"."
+    storage_blob += b" " * (-len(storage_blob) % 4)
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", storage_blob)
+
+    report = scan_file(archive_path)
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert list(report.metadata["pickle_files"]) == ["archive/data.pkl"]
+
+
 def test_scan_file_scans_scalar_literal_with_raw_nested_pickle(tmp_path: Path) -> None:
     archive_path = tmp_path / "model.pt"
     storage_blob = b"S'AAAAAAcos\\x0asystem\\x0a)R.BBBB'\n."

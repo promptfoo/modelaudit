@@ -2525,11 +2525,11 @@ class PyTorchZipScanner(BaseScanner):
 
     @staticmethod
     def _looks_like_truncated_fixed_width_pickle_operand_prefix(candidate: bytes) -> bool:
-        if candidate.startswith((b"K", b"\x82")):
+        if candidate.startswith((b"K", b"h", b"q", b"\x82")):
             return len(candidate) < 2
         if candidate.startswith((b"M", b"\x83")):
             return len(candidate) < 3
-        if candidate.startswith((b"J", b"\x84")):
+        if candidate.startswith((b"J", b"j", b"r", b"\x84")):
             return len(candidate) < 5
         if candidate.startswith(b"G"):
             return len(candidate) < 9
