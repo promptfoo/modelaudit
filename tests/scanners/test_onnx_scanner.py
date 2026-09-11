@@ -7136,6 +7136,58 @@ class TestWeightDistributionSemantics:
         )
 
     @pytest.mark.parametrize(
+        ("generated_source", "expected_reason"),
+        [
+            ("sequence_output", "recurrent_sequence_state_lineage"),
+            ("state", "recurrent_state_lineage"),
+        ],
+    )
+    def test_direct_recurrent_initial_state_weight_lineage_fails_closed(
+        self, tmp_path: Path, generated_source: str, expected_reason: str
+    ) -> None:
+        hidden_size = 100
+        graph = helper.make_graph(
+            [
+                helper.make_node(
+                    "RNN",
+                    ["sequence", "W", "R", "", "", "initial_h"],
+                    ["sequence_output", "state"],
+                    hidden_size=hidden_size,
+                ),
+                helper.make_node("Reshape", [generated_source, "weight_shape"], ["generated_weight"]),
+                helper.make_node("MatMul", ["X", "generated_weight"], ["Y"]),
+            ],
+            "direct_recurrent_state_generated_weight",
+            [helper.make_tensor_value_info("sequence", TensorProto.FLOAT, [1, 1, hidden_size])],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 1])],
+            initializer=[
+                onnx.numpy_helper.from_array(np.ones((1, hidden_size), dtype=np.float32), name="X"),
+                onnx.numpy_helper.from_array(np.array([hidden_size, 1], dtype=np.int64), name="weight_shape"),
+                onnx.numpy_helper.from_array(np.zeros((1, hidden_size, hidden_size), dtype=np.float32), name="W"),
+                onnx.numpy_helper.from_array(np.zeros((1, hidden_size, hidden_size), dtype=np.float32), name="R"),
+                onnx.numpy_helper.from_array(np.zeros((1, 1, hidden_size), dtype=np.float32), name="initial_h"),
+            ],
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 14)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / f"direct-recurrent-{generated_source}-weight.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        assert result.success is False
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
+        assert any(
+            sample["initializer"] == "initial_h"
+            and sample["consumer_op"] == "MatMul"
+            and sample["consumer_input_index"] == 1
+            and sample["reason"] == expected_reason
+            for sample in result.metadata["onnx_weight_distribution_semantics"]["unresolved_lineage_samples"]
+        )
+
+    @pytest.mark.parametrize(
         "combination", ["where_left", "where_right", "where_runtime", "shape_zeros", "transformed_shape_zeros"]
     )
     def test_shape_only_weight_paths_retain_dimension_coverage(self, tmp_path: Path, combination: str) -> None:

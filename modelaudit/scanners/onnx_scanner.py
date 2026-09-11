@@ -2090,6 +2090,15 @@ def _build_onnx_weight_analysis_plan(
                         terminal_weight_lineages.add(initializer_index)
                     terminal_consumer_counts[initializer_index] += 1
                     total_consumer_count += 1
+                    recurrent_initial_state = (
+                        is_registered_standard_operator
+                        and not is_model_local_function
+                        and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
+                        and node.op_type in _RECURRENT_WEIGHT_OPERATORS
+                        and (input_index == 5 or (node.op_type == "LSTM" and input_index == 6))
+                    )
+                    if recurrent_initial_state:
+                        recurrent_state_lineages[initializer_index] = lineage
                     if lineage.unresolved_reason is not None:
                         if lineage.unresolved_reason == "shape_control_lineage":
                             record_exclusion(initializer_index, "shape_control_input", node, input_index)
@@ -2098,13 +2107,6 @@ def _build_onnx_weight_analysis_plan(
                             resolved_index != input_index for resolved_index in resolved_weight_input_indexes
                         )
                         prior_layer_activation = lineage.unresolved_reason == "dynamic_activation_lineage"
-                        recurrent_initial_state = (
-                            is_registered_standard_operator
-                            and not is_model_local_function
-                            and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
-                            and node.op_type in _RECURRENT_WEIGHT_OPERATORS
-                            and (input_index == 5 or (node.op_type == "LSTM" and input_index == 6))
-                        )
                         recognized_activation_input = prior_layer_activation and (
                             (
                                 is_registered_standard_operator
@@ -2566,6 +2568,8 @@ def _build_onnx_weight_analysis_plan(
                     and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
                     and node.op_type in _RECURRENT_WEIGHT_OPERATORS
                 ):
+                    for initializer_index in recurrent_state_lineages:
+                        per_output_lineages.pop(initializer_index, None)
                     state_lineages = recurrent_state_lineages
                     if output_index == 0:
                         state_lineages = {
@@ -2575,6 +2579,21 @@ def _build_onnx_weight_analysis_plan(
                                 data_type=lineage.data_type,
                                 transforms=lineage.transforms,
                                 unresolved_reason="recurrent_sequence_state_lineage",
+                            )
+                            for initializer_index, lineage in recurrent_state_lineages.items()
+                        }
+                    else:
+                        state_lineages = {
+                            initializer_index: _OnnxWeightLineage(
+                                initializer_index=initializer_index,
+                                shape=lineage.shape,
+                                data_type=lineage.data_type,
+                                transforms=lineage.transforms,
+                                unresolved_reason=(
+                                    lineage.unresolved_reason
+                                    if lineage.unresolved_reason is not None
+                                    else "recurrent_state_lineage"
+                                ),
                             )
                             for initializer_index, lineage in recurrent_state_lineages.items()
                         }
