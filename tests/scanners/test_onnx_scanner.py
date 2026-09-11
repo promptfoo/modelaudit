@@ -8905,6 +8905,25 @@ class TestRawDetectorCoverage:
             for check in failed_network_checks
         )
 
+    def test_network_detector_extensionless_metadata_callback_domain_uses_full_value(self, tmp_path: Path) -> None:
+        source_path = create_onnx_model(tmp_path, include_initializer=False)
+        model = onnx.load(str(source_path))
+        metadata = model.metadata_props.add()
+        metadata.key = "callback"
+        metadata.value = ("A" * 129) + " evil.com"
+        model_path = tmp_path / "metadata-callback-padded"
+        onnx.save(model, str(model_path))
+
+        result = OnnxScanner(config={"check_jit_script": False}).scan(str(model_path))
+
+        failed_network_checks = [
+            check for check in self._network_detection_checks(result) if check.status == CheckStatus.FAILED
+        ]
+        assert any(
+            check.details.get("domain") == "evil.com" and check.details.get("onnx_metadata_owned") is True
+            for check in failed_network_checks
+        )
+
     def test_network_detector_metadata_prose_import_requests_stays_clean(self, tmp_path: Path) -> None:
         model_path = create_onnx_model(tmp_path, include_initializer=False)
         model = onnx.load(str(model_path))
@@ -8919,6 +8938,22 @@ class TestRawDetectorCoverage:
             check for check in self._network_detection_checks(result) if check.status == CheckStatus.FAILED
         ]
         assert not failed_network_checks
+        assert any(check.status == CheckStatus.PASSED for check in self._network_detection_checks(result))
+
+    def test_network_detector_metadata_documentation_port_stays_clean(self, tmp_path: Path) -> None:
+        model_path = create_onnx_model(tmp_path, include_initializer=False)
+        model = onnx.load(str(model_path))
+        metadata = model.metadata_props.add()
+        metadata.key = "documentation"
+        metadata.value = "The local example uses localhost:8080"
+        onnx.save(model, str(model_path))
+
+        result = OnnxScanner(config={"check_jit_script": False}).scan(str(model_path))
+
+        failed_network_checks = [
+            check for check in self._network_detection_checks(result) if check.status == CheckStatus.FAILED
+        ]
+        assert not [check for check in failed_network_checks if check.details.get("type") == "suspicious_port"]
         assert any(check.status == CheckStatus.PASSED for check in self._network_detection_checks(result))
 
     def test_network_detector_pb_metadata_port_remains_actionable(self, tmp_path: Path) -> None:

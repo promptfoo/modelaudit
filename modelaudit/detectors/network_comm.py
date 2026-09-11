@@ -120,7 +120,12 @@ _ONNX_ACTIVE_METADATA_KEY_PATTERN = re.compile(
     rb"(?:^|[^A-Za-z0-9])(?:api|callback|download|endpoint|fetch|webhook)(?:[^A-Za-z0-9]|$)",
     re.IGNORECASE,
 )
-_ONNX_ACTIVE_METADATA_DOMAIN_CONTEXT_BYTES = 128
+_ONNX_METADATA_ENTRY_FIELD_NUMBER = 14
+_PROTOBUF_LENGTH_DELIMITED_WIRE_TYPE = 2
+_PROTOBUF_VARINT_WIRE_TYPE = 0
+_PROTOBUF_FIXED64_WIRE_TYPE = 1
+_PROTOBUF_FIXED32_WIRE_TYPE = 5
+_ONNX_METADATA_ENTRY_LIMIT = 1024
 _PROVEN_BARE_QUERY_COMPONENTS = frozenset({"_debug", "debug"})
 _PROVEN_BARE_PROSE_COMPONENTS = frozenset({"section"})
 _PATH_TOKEN_BOUNDARY_PATTERN = re.compile(r"&amp;|[&,'\"?#\s]")
@@ -1399,6 +1404,109 @@ def _match_starts_inside_percent_escape(data: bytes, match_start: int) -> bool:
     ):
         return False
     return int(data[match_start : match_start + 2], 16) in b"/=?&#;:@,'\" \t\r\n"
+
+
+def _read_proto_varint_bounds(data: bytes, position: int, end: int) -> tuple[int, int] | None:
+    value = 0
+    shift = 0
+    while position < end and shift < 70:
+        byte = data[position]
+        position += 1
+        value |= (byte & 0x7F) << shift
+        if byte < 0x80:
+            return value, position
+        shift += 7
+    return None
+
+
+def _read_proto_length_bounds(data: bytes, position: int, end: int) -> tuple[int, int, int] | None:
+    decoded = _read_proto_varint_bounds(data, position, end)
+    if decoded is None:
+        return None
+    length, payload_start = decoded
+    payload_end = payload_start + length
+    if payload_end > end:
+        return None
+    return payload_start, payload_end, payload_end
+
+
+def _skip_proto_field(data: bytes, position: int, end: int, wire_type: int) -> int | None:
+    if wire_type == _PROTOBUF_VARINT_WIRE_TYPE:
+        decoded = _read_proto_varint_bounds(data, position, end)
+        return None if decoded is None else decoded[1]
+    if wire_type == _PROTOBUF_FIXED64_WIRE_TYPE:
+        next_position = position + 8
+        return next_position if next_position <= end else None
+    if wire_type == _PROTOBUF_LENGTH_DELIMITED_WIRE_TYPE:
+        bounds = _read_proto_length_bounds(data, position, end)
+        return None if bounds is None else bounds[2]
+    if wire_type == _PROTOBUF_FIXED32_WIRE_TYPE:
+        next_position = position + 4
+        return next_position if next_position <= end else None
+    return None
+
+
+def _parse_onnx_metadata_entry(data: bytes, start: int, end: int) -> tuple[str, bytes, int] | None:
+    key: str | None = None
+    value: bytes | None = None
+    value_start = -1
+    position = start
+    while position < end:
+        decoded_key = _read_proto_varint_bounds(data, position, end)
+        if decoded_key is None:
+            return None
+        proto_key, position = decoded_key
+        field_number = proto_key >> 3
+        wire_type = proto_key & 0x07
+        if field_number in {1, 2} and wire_type == _PROTOBUF_LENGTH_DELIMITED_WIRE_TYPE:
+            bounds = _read_proto_length_bounds(data, position, end)
+            if bounds is None:
+                return None
+            payload_start, payload_end, position = bounds
+            if field_number == 1:
+                key = data[payload_start:payload_end].decode("utf-8", errors="ignore")
+            else:
+                value = data[payload_start:payload_end]
+                value_start = payload_start
+            continue
+        next_position = _skip_proto_field(data, position, end, wire_type)
+        if next_position is None:
+            return None
+        position = next_position
+    if key is None or value is None:
+        return None
+    return key, value, value_start
+
+
+def _iter_onnx_metadata_entries(data: bytes) -> Iterator[tuple[str, bytes, int]]:
+    position = 0
+    end = len(data)
+    yielded = 0
+    while position < end and yielded < _ONNX_METADATA_ENTRY_LIMIT:
+        decoded_key = _read_proto_varint_bounds(data, position, end)
+        if decoded_key is None:
+            return
+        proto_key, position = decoded_key
+        field_number = proto_key >> 3
+        wire_type = proto_key & 0x07
+        if field_number == _ONNX_METADATA_ENTRY_FIELD_NUMBER and wire_type == _PROTOBUF_LENGTH_DELIMITED_WIRE_TYPE:
+            bounds = _read_proto_length_bounds(data, position, end)
+            if bounds is None:
+                return
+            payload_start, payload_end, position = bounds
+            entry = _parse_onnx_metadata_entry(data, payload_start, payload_end)
+            if entry is not None:
+                yielded += 1
+                yield entry
+            continue
+        next_position = _skip_proto_field(data, position, end, wire_type)
+        if next_position is None:
+            return
+        position = next_position
+
+
+def _is_active_onnx_metadata_key(key: str) -> bool:
+    return _ONNX_ACTIVE_METADATA_KEY_PATTERN.search(key.encode("utf-8", errors="ignore")) is not None
 
 
 def _is_match_redacted_from_url(data: bytes, match_start: int, value: str) -> bool:
@@ -5735,11 +5843,23 @@ class NetworkCommDetector:
                 if not record_domain(domain, match.start("domain")):
                     return
             if self._onnx_metadata_context:
+                metadata_entries = list(_iter_onnx_metadata_entries(data))
+                for key, value, value_start in metadata_entries:
+                    if not _is_active_onnx_metadata_key(key):
+                        continue
+                    for match in self.DOMAIN_PATTERN.finditer(value):
+                        if match.start() > 0 and value[match.start() - 1 : match.start()] == b"@":
+                            continue
+                        domain = match.group().decode("utf-8", errors="ignore").casefold()
+                        if not record_domain(domain, value_start + match.start()):
+                            return
                 for match in self.DOMAIN_PATTERN.finditer(data):
                     if match.start() > 0 and data[match.start() - 1 : match.start()] == b"@":
                         continue
-                    prefix_start = max(0, match.start() - _ONNX_ACTIVE_METADATA_DOMAIN_CONTEXT_BYTES)
-                    if _ONNX_ACTIVE_METADATA_KEY_PATTERN.search(data[prefix_start : match.start()]) is None:
+                    if metadata_entries:
+                        continue
+                    line_start = data.rfind(b"\n", 0, match.start()) + 1
+                    if _ONNX_ACTIVE_METADATA_KEY_PATTERN.search(data[line_start : match.start()]) is None:
                         continue
                     domain = match.group().decode("utf-8", errors="ignore").casefold()
                     if not record_domain(domain, match.start()):
@@ -6018,6 +6138,17 @@ class NetworkCommDetector:
 
         # For ML models, we need to be much more conservative to avoid false positives
         # Binary model weights can contain random byte sequences that match port patterns
+        if is_ml_model and self._onnx_metadata_context:
+            metadata_entries = list(_iter_onnx_metadata_entries(data))
+            for key, value, _value_start in metadata_entries:
+                if _is_active_onnx_metadata_key(key):
+                    self._scan_suspicious_ports_in_active_metadata_value(value, context)
+                    if self.findings_truncated:
+                        return
+            if metadata_entries:
+                return
+            self._scan_suspicious_ports_in_active_metadata_text(data, context)
+            return
         if is_ml_model and not self._onnx_metadata_context:
             # Only scan for very explicit network patterns in ML models
             # Skip port scanning for pure binary model files to avoid false positives
@@ -6051,6 +6182,55 @@ class NetworkCommDetector:
                     }
                 ):
                     return
+
+    def _scan_suspicious_ports_in_active_metadata_text(self, data: bytes, context: str) -> None:
+        for port in self.SUSPICIOUS_PORTS:
+            port_bytes = str(port).encode()
+            matched = False
+            for pattern_bytes in self.PORT_PATTERNS[port]:
+                for pattern_start in _iter_pattern_matches(data, pattern_bytes):
+                    line_start = data.rfind(b"\n", 0, pattern_start) + 1
+                    if _ONNX_ACTIVE_METADATA_KEY_PATTERN.search(data[line_start:pattern_start]) is None:
+                        continue
+                    port_start = pattern_start + pattern_bytes.rfind(port_bytes)
+                    if self._is_redacted_url_value(data, port_start, str(port)):
+                        continue
+                    matched = True
+                    break
+                if matched:
+                    break
+            if matched and not self._record_suspicious_port(port, context):
+                return
+
+    def _scan_suspicious_ports_in_active_metadata_value(self, value: bytes, context: str) -> None:
+        for port in self.SUSPICIOUS_PORTS:
+            port_bytes = str(port).encode()
+            matched = False
+            for pattern_bytes in self.PORT_PATTERNS[port]:
+                for pattern_start in _iter_pattern_matches(value, pattern_bytes):
+                    port_start = pattern_start + pattern_bytes.rfind(port_bytes)
+                    if self._is_redacted_url_value(value, port_start, str(port)):
+                        continue
+                    matched = True
+                    break
+                if matched:
+                    break
+            if matched and not self._record_suspicious_port(port, context):
+                return
+
+    def _record_suspicious_port(self, port: int, context: str) -> bool:
+        port_name = self._get_port_name(port)
+        return self._record_finding(
+            {
+                "type": "suspicious_port",
+                "severity": "MEDIUM",
+                "confidence": 0.6,
+                "message": f"Suspicious port detected: {port} ({port_name})",
+                "port": port,
+                "service": port_name,
+                "context": context,
+            }
+        )
 
     def _scan_explicit_network_patterns_in_ml_models(self, data: bytes, context: str) -> None:
         """Scan for very explicit network patterns in ML models with high confidence."""
