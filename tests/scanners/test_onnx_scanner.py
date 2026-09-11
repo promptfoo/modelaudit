@@ -8862,7 +8862,7 @@ class TestRawDetectorCoverage:
             metadata.value = "Model Team"
         callback = model.metadata_props.add()
         callback.key = "callback"
-        callback.value = "host evil.com"
+        callback.value = "host evil.com port=6379"
         onnx.save(model, str(model_path))
 
         result = OnnxScanner(config={"check_jit_script": False}).scan(str(model_path))
@@ -8872,6 +8872,12 @@ class TestRawDetectorCoverage:
         ]
         assert any(
             check.details.get("domain") == "evil.com" and check.details.get("onnx_metadata_owned") is True
+            for check in failed_network_checks
+        )
+        assert any(
+            check.details.get("type") == "suspicious_port"
+            and check.details.get("port") == 6379
+            and check.details.get("onnx_metadata_owned") is True
             for check in failed_network_checks
         )
 

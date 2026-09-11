@@ -125,7 +125,6 @@ _PROTOBUF_LENGTH_DELIMITED_WIRE_TYPE = 2
 _PROTOBUF_VARINT_WIRE_TYPE = 0
 _PROTOBUF_FIXED64_WIRE_TYPE = 1
 _PROTOBUF_FIXED32_WIRE_TYPE = 5
-_ONNX_METADATA_ENTRY_LIMIT = 1024
 _PROVEN_BARE_QUERY_COMPONENTS = frozenset({"_debug", "debug"})
 _PROVEN_BARE_PROSE_COMPONENTS = frozenset({"section"})
 _PATH_TOKEN_BOUNDARY_PATTERN = re.compile(r"&amp;|[&,'\"?#\s]")
@@ -1481,8 +1480,7 @@ def _parse_onnx_metadata_entry(data: bytes, start: int, end: int) -> tuple[str, 
 def _iter_onnx_metadata_entries(data: bytes) -> Iterator[tuple[str, bytes, int]]:
     position = 0
     end = len(data)
-    yielded = 0
-    while position < end and yielded < _ONNX_METADATA_ENTRY_LIMIT:
+    while position < end:
         decoded_key = _read_proto_varint_bounds(data, position, end)
         if decoded_key is None:
             return
@@ -1496,7 +1494,6 @@ def _iter_onnx_metadata_entries(data: bytes) -> Iterator[tuple[str, bytes, int]]
             payload_start, payload_end, position = bounds
             entry = _parse_onnx_metadata_entry(data, payload_start, payload_end)
             if entry is not None:
-                yielded += 1
                 yield entry
             continue
         next_position = _skip_proto_field(data, position, end, wire_type)
