@@ -134,7 +134,9 @@ _ONNX_RAW_DETECTOR_DEFAULT_MAX_BYTES = 512 * 1024 * 1024
 _ONNX_NETWORK_TEXT_MAX_BYTES = 4 * 1024 * 1024
 _ONNX_NETWORK_TEXT_MAX_FIELDS = 100_000
 _ONNX_METADATA_DETECTOR_SECTION_MAX_ENTRIES = 1024
-_ONNX_METADATA_PROP_LABEL_PATTERN = re.compile(r"^model\.metadata_props\[(?P<index>[0-9]+)\]\.(?P<field>key|value)$")
+_ONNX_METADATA_PROP_LABEL_PATTERN = re.compile(
+    r"^(?P<prefix>.+\.metadata_props)\[(?P<index>[0-9]+)\]\.(?P<field>key|value)$"
+)
 _ONNX_RAW_OR_NUMERIC_TENSOR_PAYLOAD_FIELD_NAMES: frozenset[str] = frozenset(
     {
         # TensorProto.string_data is semantic model data and stays in the
@@ -475,7 +477,7 @@ class _OnnxNetworkTextCollector:
         self._omitted_field_count = 0
         self._truncated = False
         self._truncation_reason: str | None = None
-        self._metadata_props: dict[int, dict[str, str]] = {}
+        self._metadata_props: dict[tuple[str, int], dict[str, str]] = {}
 
     def is_truncated(self) -> bool:
         return self._truncated
@@ -532,16 +534,17 @@ class _OnnxNetworkTextCollector:
         match = _ONNX_METADATA_PROP_LABEL_PATTERN.fullmatch(label)
         if match is None:
             return
-        self._metadata_props.setdefault(int(match.group("index")), {})[match.group("field")] = value
+        entry_key = (match.group("prefix"), int(match.group("index")))
+        self._metadata_props.setdefault(entry_key, {})[match.group("field")] = value
 
-    def metadata_prop_entries(self) -> list[tuple[int, str, str]]:
-        entries: list[tuple[int, str, str]] = []
-        for index in sorted(self._metadata_props):
-            fields = self._metadata_props[index]
+    def metadata_prop_entries(self) -> list[tuple[str, int, str, str]]:
+        entries: list[tuple[str, int, str, str]] = []
+        for prefix, index in sorted(self._metadata_props):
+            fields = self._metadata_props[(prefix, index)]
             key = fields.get("key")
             value = fields.get("value")
             if key is not None and value is not None:
-                entries.append((index, key, value))
+                entries.append((prefix, index, key, value))
         return entries
 
     def omit(self, reason: str = "text_field_budget_exceeded") -> None:
@@ -695,23 +698,23 @@ def _collect_onnx_network_detector_input(
 
 def _onnx_metadata_props_detector_sections(
     model: Any,
-    metadata_props: Iterable[tuple[int, str, str]],
+    metadata_props: Iterable[tuple[str, int, str, str]],
     *,
     max_bytes: int,
 ) -> tuple[tuple[frozenset[str], bytes], ...]:
     metadata_entries = list(metadata_props)
     if not metadata_entries:
         return ()
-    candidate_entries: list[tuple[int, str, str]] = []
+    candidate_entries: list[tuple[str, int, str, str]] = []
     estimated_bytes = 0
-    for index, key, value in metadata_entries:
+    for prefix, index, key, value in metadata_entries:
         value_with_boundary = value + "\n"
         entry_bytes = len(key.encode("utf-8", errors="surrogatepass")) + len(
             value_with_boundary.encode("utf-8", errors="surrogatepass")
         )
         if candidate_entries and estimated_bytes + entry_bytes + 64 > max_bytes:
             break
-        candidate_entries.append((index, key, value_with_boundary))
+        candidate_entries.append((prefix, index, key, value_with_boundary))
         estimated_bytes += entry_bytes + 64
     if not candidate_entries:
         return ()
@@ -726,7 +729,7 @@ def _onnx_metadata_props_detector_sections(
                 metadata_model.graph.name = "modelaudit_metadata"
                 metadata_model.graph.input.add().name = "modelaudit_input"
                 metadata_model.graph.output.add().name = "modelaudit_output"
-                for _index, key, value in batch_entries:
+                for _prefix, _index, key, value in batch_entries:
                     metadata_prop = metadata_model.metadata_props.add()
                     metadata_prop.key = key
                     metadata_prop.value = value
@@ -738,8 +741,8 @@ def _onnx_metadata_props_detector_sections(
                 break
             metadata_data_labels = frozenset(
                 label
-                for index, _key, _value in batch_entries
-                for label in (f"model.metadata_props[{index}].key", f"model.metadata_props[{index}].value")
+                for prefix, index, _key, _value in batch_entries
+                for label in (f"{prefix}[{index}].key", f"{prefix}[{index}].value")
             )
             sections.append((metadata_data_labels, metadata_data))
             position += len(batch_entries)

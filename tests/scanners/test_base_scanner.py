@@ -132,6 +132,50 @@ def test_collect_network_communication_findings_preserves_positional_result(
     )
 
 
+def test_collect_network_communication_findings_preserves_positional_max_findings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The public positional max_findings argument must not be rebound to result."""
+    from modelaudit.detectors.network_comm import NetworkCommDetector
+
+    captured_config: dict[str, Any] = {}
+
+    def capture_init(self: NetworkCommDetector, config: dict[str, Any] | None = None) -> None:
+        captured_config.update(config or {})
+
+    def raise_controlled_failure(
+        self: NetworkCommDetector,
+        data: bytes,
+        context: str = "",
+        *,
+        onnx_metadata_context: bool = False,
+    ) -> list[dict[str, Any]]:
+        raise RuntimeError("controlled network detector failure")
+
+    monkeypatch.setattr(NetworkCommDetector, "__init__", capture_init)
+    monkeypatch.setattr(NetworkCommDetector, "scan", raise_controlled_failure)
+    scanner = MockScanner()
+    result = scanner._create_result()
+
+    findings = scanner.collect_network_communication_findings(
+        b"payload",
+        "model.test",
+        True,
+        False,
+        3,
+        result=result,
+    )
+
+    assert findings == []
+    assert captured_config["max_findings"] == 3
+    assert result.metadata["analysis_incomplete"] is True
+    assert any(
+        check.details.get("detector") == "network_communication"
+        and check.details.get("coverage_gap") == "analysis_failed"
+        for check in result.checks
+    )
+
+
 def test_base_scanner_check_path_nonexistent():
     """Test _check_path with nonexistent file."""
     scanner = MockScanner()

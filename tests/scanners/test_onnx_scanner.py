@@ -8748,7 +8748,8 @@ class TestRawDetectorCoverage:
         result = OnnxScanner(config={"check_jit_script": False}).scan(str(model_path))
 
         detector_sections = result.metadata["onnx_network_detector_input"]["sections"]
-        assert any(section["name"] == "metadata_text_fields" for section in detector_sections)
+        assert any(section["name"] == "metadata_props" for section in detector_sections)
+        assert not any(section["name"] == "metadata_text_fields" for section in detector_sections)
         assert any(
             check.details.get("type") == "url_detected"
             and check.details.get("url") == url
@@ -8863,6 +8864,39 @@ class TestRawDetectorCoverage:
         callback = model.metadata_props.add()
         callback.key = "callback"
         callback.value = "host evil.com port=6379"
+        onnx.save(model, str(model_path))
+
+        result = OnnxScanner(config={"check_jit_script": False}).scan(str(model_path))
+
+        failed_network_checks = [
+            check for check in self._network_detection_checks(result) if check.status == CheckStatus.FAILED
+        ]
+        assert any(
+            check.details.get("domain") == "evil.com" and check.details.get("onnx_metadata_owned") is True
+            for check in failed_network_checks
+        )
+        assert any(
+            check.details.get("type") == "suspicious_port"
+            and check.details.get("port") == 6379
+            and check.details.get("onnx_metadata_owned") is True
+            for check in failed_network_checks
+        )
+
+    def test_network_detector_preserves_nested_onnx_metadata_props(self, tmp_path: Path) -> None:
+        model_path = create_onnx_model(tmp_path, include_initializer=False)
+        model = onnx.load(str(model_path))
+        function = helper.make_function(
+            "modelaudit.test",
+            "CallbackFunction",
+            ["function_input"],
+            ["function_output"],
+            [helper.make_node("Identity", ["function_input"], ["function_output"])],
+            [helper.make_opsetid("", 13)],
+        )
+        callback = function.metadata_props.add()
+        callback.key = "callback"
+        callback.value = "host evil.com port=6379"
+        model.functions.extend([function])
         onnx.save(model, str(model_path))
 
         result = OnnxScanner(config={"check_jit_script": False}).scan(str(model_path))
