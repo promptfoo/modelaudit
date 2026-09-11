@@ -4057,6 +4057,30 @@ def test_pytorch_zip_discovery_scans_scalar_literal_with_suspicious_string(tmp_p
     )
 
 
+def test_pytorch_zip_discovery_continues_literal_inspection_after_surrogate_unicode(tmp_path: Path) -> None:
+    model_path = tmp_path / "referenced_surrogate_unicode_suspicious_string.pt"
+    storage_blob = b"V\\ud800\nS'os.system'\n."
+    storage_blob += b" " * (-len(storage_blob) % 4)
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        zip_file.writestr("archive/data/0", storage_blob)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert "archive/data/0" in result.metadata["pickle_files"]
+    assert result.success is False
+    assert result.metadata["pickle_verdict"] == "unknown"
+    assert "pickle_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL
+        and issue.details.get("source") == "bounded_raw_pickle_window"
+        and issue.details.get("pickle_filename") == "archive/data/0"
+        for issue in result.issues
+    )
+
+
 def test_pytorch_zip_discovery_scans_scalar_literal_with_magic_method_suspicious_string(
     tmp_path: Path,
 ) -> None:
@@ -4255,6 +4279,45 @@ def test_pytorch_zip_discovery_scans_malformed_separator_after_benign_binary_can
         issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
         for issue in result.issues
     )
+
+
+def test_pytorch_zip_discovery_scans_after_long_malformed_separator_trusted_probe_prefix(
+    tmp_path: Path,
+) -> None:
+    model_path = tmp_path / "referenced_long_malformed_separator_prefix_pickle.pt"
+    storage_blob = b"N." + (b"\xff" * 4094) + _malicious_proto0_system_payload()
+    storage_blob += b" " * (-len(storage_blob) % 4)
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        zip_file.writestr("archive/data/0", storage_blob)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert "archive/data/0" in result.metadata["pickle_files"]
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
+        for issue in result.issues
+    )
+
+
+def test_pytorch_zip_discovery_skips_large_malformed_separator_tensor_noise(tmp_path: Path) -> None:
+    model_path = tmp_path / "referenced_large_malformed_separator_tensor_noise.pt"
+    storage_blob = b"N." + (b"\xff" * 100_000)
+    storage_blob += b" " * (-len(storage_blob) % 4)
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        zip_file.writestr("archive/data/0", storage_blob)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert result.success is True
+    assert result.metadata.get("pickle_verdict") == "clean"
+    assert result.metadata["pickle_files"] == ["archive/data.pkl"]
+    assert not any(issue.details.get("pickle_filename") == "archive/data/0" for issue in result.issues)
 
 
 def test_pytorch_zip_discovery_skips_malformed_separator_tensor_noise_near_match(tmp_path: Path) -> None:

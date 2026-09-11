@@ -2667,6 +2667,8 @@ class PyTorchZipScanner(BaseScanner):
             if repeated_none_trailing is not None and len(repeated_none_trailing) < len(candidate):
                 candidate = repeated_none_trailing.lstrip(PROTO0_1_IGNORABLE_TRAILING_BYTES)
                 continue
+            if PyTorchZipScanner._looks_like_malformed_separator_run_prefix(candidate):
+                return True
             if candidate.startswith(_PICKLE_FRAME_OPCODE):
                 if len(candidate) < _PICKLE_FRAME_OPCODE_BYTES:
                     return True
@@ -2724,6 +2726,12 @@ class PyTorchZipScanner(BaseScanner):
         return PyTorchZipScanner._complete_proto0_string_literal_has_nested_security_pickle(
             candidate[offset:].lstrip(PROTO0_1_IGNORABLE_TRAILING_BYTES)
         )
+
+    @staticmethod
+    def _looks_like_malformed_separator_run_prefix(candidate: bytes) -> bool:
+        if not candidate or candidate[0] in PROTO0_1_START_BYTES or candidate[0] in PROTO0_1_IGNORABLE_TRAILING_BYTES:
+            return False
+        return len(candidate) <= _TRUSTED_STORAGE_PICKLE_PROBE_BYTES and not candidate.strip(bytes([candidate[0]]))
 
     @staticmethod
     def _trivial_complete_pickle_prefix_trailing(sample: bytes) -> bytes | None:
@@ -2822,8 +2830,8 @@ class PyTorchZipScanner(BaseScanner):
                 try:
                     return value.encode("latin-1")
                 except UnicodeEncodeError:
-                    return value.encode("utf-8", errors="surrogateescape")
-            return value.encode("utf-8", errors="surrogateescape")
+                    return value.encode("utf-8", errors="surrogatepass")
+            return value.encode("utf-8", errors="surrogatepass")
         return None
 
     @staticmethod
