@@ -17,7 +17,9 @@ from functools import lru_cache
 from importlib.resources import files
 from io import BytesIO
 from typing import Any, ClassVar
-from urllib.parse import unquote, unquote_plus, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, unquote, unquote_plus, urlsplit, urlunsplit
+
+from modelaudit.detectors._metadata import metadata_string_spans
 
 _REDACTED_PATH_TOKEN = "<redacted>"
 _URL_IN_TEXT_PATTERN = re.compile(
@@ -101,7 +103,19 @@ _KNOWN_ARTIFACT_FILENAME_EXTENSIONS = frozenset(
     }
 )
 _TRAILING_PATH_DELIMITERS = ".,;:)]}'\""
+_TRAILING_URL_DELIMITER_PAIRS = {")": "(", "]": "[", "}": "{"}
+_TRAILING_URL_DELIMITERS = frozenset(set(_TRAILING_URL_DELIMITER_PAIRS) | set(_TRAILING_URL_DELIMITER_PAIRS.values()))
 _URL_TEXT_BOUNDARY_BYTES = b" \t\r\n\"'<>`()"
+_METADATA_ACTIVE_CONTEXT_PATTERN = re.compile(
+    rb"\b(?:curl|wget|git\s+clone)\b|"
+    rb"\b(?:eval|exec|fetch|from_pretrained|requests?|urlopen|urlretrieve)\s*\(|"
+    rb"\b(?:httpx|http\.client|os|requests?|socket|subprocess|torch\.hub|urllib)\s*\.|"
+    rb"\b(?:api|callback|download|endpoint|fetch|shell|webhook)\s*[:=]",
+    re.IGNORECASE,
+)
+_METADATA_HTTP_REQUEST_PATTERN = re.compile(
+    rb"\b(?:GET|HEAD|POST|PUT|DELETE|CONNECT|OPTIONS|TRACE|PATCH|download|fetch)\s+https?://", re.IGNORECASE
+)
 _PROVEN_BARE_QUERY_COMPONENTS = frozenset({"_debug", "debug"})
 _PROVEN_BARE_PROSE_COMPONENTS = frozenset({"section"})
 _PATH_TOKEN_BOUNDARY_PATTERN = re.compile(r"&amp;|[&,'\"?#\s]")
@@ -1014,15 +1028,37 @@ def _trim_source_literal_url(
     return url.rstrip("'")
 
 
-def _trim_matched_source_url(data: bytes, match: re.Match[bytes]) -> str:
+def _trim_unbalanced_trailing_url_delimiters(url: str) -> str:
+    if not url:
+        return url
+
+    delimiter_counts: Counter[str] = Counter()
+    for character in url:
+        if character in _TRAILING_URL_DELIMITERS:
+            delimiter_counts[character] += 1
+    trim_end = len(url)
+    while trim_end:
+        closer = url[trim_end - 1]
+        opener = _TRAILING_URL_DELIMITER_PAIRS.get(closer)
+        if opener is None or delimiter_counts[closer] <= delimiter_counts[opener]:
+            break
+        delimiter_counts[closer] -= 1
+        trim_end -= 1
+    return url[:trim_end]
+
+
+def _trim_matched_source_url(data: bytes, match: re.Match[bytes], literal_end: int | None = None) -> str:
     prefix = data[max(0, match.start() - _MAX_PROSE_LINE_CONTEXT_BYTES) : match.start()]
     suffix = data[match.end() : match.end() + _MAX_PROSE_LINE_CONTEXT_BYTES]
-    return _trim_source_literal_url(
-        match.group().decode("utf-8", errors="ignore"),
+    url = _trim_source_literal_url(
+        data[match.start() : min(match.end(), literal_end if literal_end is not None else match.end())].decode(
+            "utf-8", errors="ignore"
+        ),
         _source_quote_before_url(data, match.start()),
         re.split(rb"[^\t\r\n\x20-\x7e]", suffix, maxsplit=1)[0].decode("ascii"),
         re.split(rb"[^\t\x20-\x7e]", prefix)[-1].decode("ascii"),
     )
+    return _trim_unbalanced_trailing_url_delimiters(url)
 
 
 def redact_url_for_finding(url: str) -> str:
@@ -4920,6 +4956,45 @@ class NetworkCommDetector:
         "blob.core.windows.net",
         "dfs.core.windows.net",
     )
+    INFORMATIONAL_URL_HOST_PREFIXES: ClassVar[tuple[str, ...]] = (
+        "docs.",
+        "documentation.",
+        "help.",
+        "support.",
+    )
+    INFORMATIONAL_URL_PATH_SEGMENTS: ClassVar[frozenset[str]] = frozenset(
+        {
+            "doc",
+            "docs",
+            "documentation",
+            "legal",
+            "licence",
+            "licences",
+            "license",
+            "licenses",
+            "privacy",
+            "readme",
+            "reference",
+            "references",
+            "terms",
+        }
+    )
+    INFORMATIONAL_URL_RISK_TERMS: ClassVar[tuple[str, ...]] = (
+        "callback",
+        "cmd",
+        "curl",
+        "endpoint",
+        "eval",
+        "exec",
+        "os.system",
+        "requests.",
+        "shell",
+        "socket.",
+        "subprocess",
+        "urllib.",
+        "webhook",
+        "wget",
+    )
 
     def __init__(self, config: dict[str, Any] | None = None):
         """Initialize the detector with optional configuration."""
@@ -4947,6 +5022,10 @@ class NetworkCommDetector:
         self._cloud_nested_url_findings: set[str] = set()
         self._official_readme_image_fences: list[tuple[int, int, bool]] = []
         self._official_readme_image_unvalidated_requests = False
+        self._literal_bounds: list[tuple[int, int]] = []
+        self._literal_starts: list[int] = []
+        self._metadata_bounds: list[tuple[int, int]] = []
+        self._metadata_starts: list[int] = []
 
         # Clone class-level patterns to avoid cross-instance leakage
         self.cc_patterns: list[bytes] = self.CC_PATTERNS.copy()
@@ -4979,6 +5058,15 @@ class NetworkCommDetector:
         self._evidence_redaction_limit_reached = False
         self._has_sensitive_evidence_hint = _SENSITIVE_EVIDENCE_HINT_PATTERN.search(data) is not None
         self._cloud_nested_url_findings = set()
+        self._literal_bounds, metadata_bounds = metadata_string_spans(data) if b"://" in data else ([], [])
+        self._literal_starts = [start for start, _end in self._literal_bounds]
+        self._metadata_bounds = [
+            (start, end)
+            for start, end in metadata_bounds
+            if _METADATA_ACTIVE_CONTEXT_PATTERN.search(_URL_IN_BYTES_PATTERN.sub(b"", data[start:end])) is None
+            and _METADATA_HTTP_REQUEST_PATTERN.search(data[start:end]) is None
+        ]
+        self._metadata_starts = [start for start, _end in self._metadata_bounds]
         (
             self._official_readme_image_fences,
             self._official_readme_image_unvalidated_requests,
@@ -5076,20 +5164,25 @@ class NetworkCommDetector:
         self.findings.append(finding)
         return True
 
+    def _trim_url(self, data: bytes, match: re.Match[bytes]) -> str:
+        index = bisect_right(self._literal_starts, match.start()) - 1
+        literal_end = None
+        if index >= 0 and match.start() < self._literal_bounds[index][1]:
+            literal_end = self._literal_bounds[index][1]
+        return _trim_matched_source_url(data, match, literal_end)
+
     def _index_url_contexts(self, data: bytes) -> list[tuple[int, int, str]]:
         return list(self._iter_url_contexts(data))
 
-    @staticmethod
-    def _iter_url_contexts(data: bytes) -> Iterator[tuple[int, int, str]]:
+    def _iter_url_contexts(self, data: bytes) -> Iterator[tuple[int, int, str]]:
         for match in _URL_IN_BYTES_PATTERN.finditer(data):
-            url = _trim_matched_source_url(data, match)
+            url = self._trim_url(data, match)
             yield match.start(), match.start() + len(url.encode("utf-8")), url
 
-    @classmethod
-    def _iter_generic_url_contexts(cls, data: bytes) -> Iterator[tuple[int, int, str]]:
+    def _iter_generic_url_contexts(self, data: bytes) -> Iterator[tuple[int, int, str]]:
         """Yield only schemes handled by generic URL findings."""
-        for match in cls.URL_PATTERN.finditer(data):
-            url = _trim_matched_source_url(data, match)
+        for match in self.URL_PATTERN.finditer(data):
+            url = self._trim_url(data, match)
             yield match.start(), match.start() + len(url.encode("utf-8")), url
 
     def _url_context_redaction_decision(self, data: bytes, match_start: int, value: str) -> bool | None:
@@ -5284,7 +5377,10 @@ class NetworkCommDetector:
                         return
                     self._cloud_nested_url_findings.add(nested_url)
             if self.URL_PATTERN.fullmatch(url.encode("utf-8")) is not None and not self._record_url_finding(
-                url, url_start, context
+                url,
+                url_start,
+                context,
+                passive_metadata_reference=self._is_passive_metadata_url_reference(url_start, url),
             ):
                 return
             if self.max_findings is None:
@@ -5292,7 +5388,14 @@ class NetworkCommDetector:
                     if not self._record_url_finding(nested_url, url_start, context):
                         return
 
-    def _record_url_finding(self, url: str, position: int, context: str) -> bool:
+    def _record_url_finding(
+        self,
+        url: str,
+        position: int,
+        context: str,
+        *,
+        passive_metadata_reference: bool = False,
+    ) -> bool:
         safe_url = redact_url_for_finding(url)
 
         confidence = 0.5
@@ -5303,6 +5406,9 @@ class NetworkCommDetector:
         elif self._url_uses_suspicious_port(url):
             confidence = 0.8
             severity = "HIGH"
+        elif passive_metadata_reference:
+            severity = "INFO"
+            confidence = 0.3
         elif "://" in url and not url.startswith(("http://", "https://")):
             confidence = 0.7
         elif self._is_cloud_storage_url(url):
@@ -5324,6 +5430,104 @@ class NetworkCommDetector:
         with suppress(ValueError):
             return urlsplit(url).port in self.SUSPICIOUS_PORTS
         return False
+
+    def _informational_url_reference_kind(self, url: str) -> str | None:
+        try:
+            parsed = urlsplit(url)
+            port = parsed.port
+        except ValueError:
+            return None
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+            return None
+        if self._url_uses_suspicious_port(url):
+            return None
+
+        if parsed.username is not None or parsed.password is not None or port not in {None, 80, 443}:
+            return None
+        decoded_url = url
+        for _ in range(3):
+            decoded_url = unquote_plus(decoded_url)
+        decoded_url = decoded_url.casefold()
+        if re.search(r"%[0-9a-f]{2}|[\x00-\x1f\x7f-\x9f]", decoded_url) or any(
+            term in decoded_url for term in self.INFORMATIONAL_URL_RISK_TERMS
+        ):
+            return None
+        try:
+            query = parse_qsl(parsed.query, keep_blank_values=True, strict_parsing=True) if parsed.query else []
+        except ValueError:
+            return None
+        for key, value in query:
+            if (
+                key.casefold() not in {"lang", "language", "locale", "hl"}
+                or re.fullmatch(r"[a-z]{2,8}(?:-[a-z0-9]{2,8})?", value.casefold()) is None
+            ):
+                return None
+
+        hostname = parsed.hostname.casefold().rstrip(".")
+        if _BARE_DOMAIN_PATTERN.fullmatch(hostname.encode("utf-8")) is None or hostname.endswith(
+            (".localhost", ".local", ".internal", ".lan", ".home", ".arpa")
+        ):
+            return None
+        decoded_path = parsed.path
+        for _ in range(3):
+            decoded_path = unquote(decoded_path)
+        if ";" in decoded_path:
+            return None
+        path_segments = [
+            segment.casefold().strip(_TRAILING_PATH_DELIMITERS) for segment in decoded_path.split("/") if segment
+        ]
+        if any(segment in {".", ".."} for segment in decoded_path.split("/")):
+            return None
+        for segment in path_segments:
+            extension = segment.rsplit(".", 1)[-1]
+            if extension not in {"md", "rst", "txt", "html", "htm"} and (
+                _looks_like_known_artifact_filename(segment)
+                or extension in {"py", "sh", "bash", "ps1", "exe", "dll", "so", "js"}
+            ):
+                return None
+        if self._is_public_source_repository_url(hostname, path_segments):
+            return "source_repository"
+        if self._is_public_model_repository_url(hostname, path_segments):
+            return "model_repository"
+        if any(
+            segment in self.INFORMATIONAL_URL_PATH_SEGMENTS
+            or segment.rsplit(".", 1)[0] in self.INFORMATIONAL_URL_PATH_SEGMENTS
+            for segment in path_segments
+        ):
+            if hostname in _PUBLIC_MODEL_REPOSITORY_HOSTS:
+                return "model_documentation"
+            return "documentation"
+        if hostname.startswith(self.INFORMATIONAL_URL_HOST_PREFIXES):
+            return "documentation"
+        return None
+
+    @staticmethod
+    def _is_public_source_repository_url(hostname: str, path_segments: list[str]) -> bool:
+        if hostname not in {"github.com", "www.github.com"}:
+            return False
+        return len(path_segments) == 2 and all(path_segments)
+
+    @staticmethod
+    def _is_public_model_repository_url(hostname: str, path_segments: list[str]) -> bool:
+        if hostname not in _PUBLIC_MODEL_REPOSITORY_HOSTS:
+            return False
+        if not path_segments:
+            return False
+        repo_start = 1 if path_segments[0] in _PUBLIC_MODEL_REPOSITORY_PREFIXES else 0
+        if len(path_segments) < repo_start + 2:
+            return False
+        if not all(path_segments[repo_start : repo_start + 2]):
+            return False
+        remaining = path_segments[repo_start + 2 :]
+        if not remaining:
+            return True
+        return remaining[0] == "tree" and len(remaining) >= 2
+
+    def _is_passive_metadata_url_reference(self, url_start: int, url: str) -> bool:
+        index = bisect_right(self._metadata_starts, url_start) - 1
+        if index < 0 or url_start + len(url.encode("utf-8")) > self._metadata_bounds[index][1]:
+            return False
+        return self._informational_url_reference_kind(url) is not None
 
     def _scan_cloud_storage_urls(self, data: bytes, context: str) -> None:
         """Scan for cloud storage URL patterns (S3, GCS, Azure, etc.).
@@ -5473,40 +5677,46 @@ class NetworkCommDetector:
         if context and any(ext in context.lower() for ext in [".bin", ".pt", ".pth", ".ckpt", ".h5", ".pb", ".onnx"]):
             # For ML model files, only look for very explicit domain references
             # that are unlikely to occur randomly
-            explicit_domain_patterns = [
-                rb"https?://[a-zA-Z0-9\-\.]+\.[a-zA-Z]{2,}",  # Full URLs only
-                # Config-like patterns
-                rb'["\'](?:api|webhook|callback|endpoint)["\']:\s*["\'][a-zA-Z0-9\-\.]+\.[a-zA-Z]{2,}',
-            ]
+            model_domains: dict[str, dict[str, Any]] = {}
 
-            for pattern in explicit_domain_patterns:
-                for match in re.finditer(pattern, data, re.IGNORECASE):
-                    domain_match = match.group()
-                    if b"://" in domain_match:
-                        # Extract domain from URL
-                        parts = domain_match.split(b"://", 1)[1].split(b"/")[0]
-                        domain = parts.decode("utf-8", errors="ignore").lower()
-                    else:
-                        domain = match.group().decode("utf-8", errors="ignore").lower()
+            def record_domain(domain: str, position: int, passive: bool = False) -> bool:
+                if not domain or self._is_redacted_url_value(data, position, domain):
+                    return True
+                severity = "INFO" if passive or self._is_informational_domain(domain) else "MEDIUM"
+                previous = model_domains.get(domain)
+                if previous is not None and (previous["severity"] == "MEDIUM" or severity == "INFO"):
+                    return True
+                finding = {
+                    "type": "domain",
+                    "severity": severity,
+                    "confidence": 0.3 if severity == "INFO" else 0.8,
+                    "message": f"Domain name detected: {domain}",
+                    "domain": domain,
+                    "position": position,
+                    "context": context,
+                }
+                if previous is not None:
+                    previous.update(finding)
+                    return True
+                model_domains[domain] = finding
+                return self._record_finding(finding)
 
-                    if domain not in seen_domains:
-                        if self._is_redacted_url_value(data, match.start(), domain):
-                            continue
-                        seen_domains.add(domain)
-                        severity = "INFO" if self._is_informational_domain(domain) else "MEDIUM"
-                        confidence = 0.3 if severity == "INFO" else 0.8
-                        if not self._record_finding(
-                            {
-                                "type": "domain",
-                                "severity": severity,
-                                "confidence": confidence,
-                                "message": f"Domain name detected: {domain}",
-                                "domain": domain,
-                                "position": match.start(),
-                                "context": context,
-                            }
-                        ):
-                            return
+            for match in self.URL_PATTERN.finditer(data):
+                url = self._trim_url(data, match)
+                with suppress(ValueError):
+                    domain = (urlsplit(url).hostname or "").casefold().rstrip(".")
+                    if not record_domain(
+                        domain, match.start(), self._is_passive_metadata_url_reference(match.start(), url)
+                    ):
+                        return
+            config_domain_pattern = re.compile(
+                rb"[\"'](?:api|webhook|callback|endpoint)[\"']:\s*[\"'](?P<domain>[a-zA-Z0-9\-.]+\.[a-zA-Z]{2,})",
+                re.IGNORECASE,
+            )
+            for match in config_domain_pattern.finditer(data):
+                domain = match.group("domain").decode("utf-8", errors="ignore").casefold()
+                if not record_domain(domain, match.start("domain")):
+                    return
             return
 
         for match in self.DOMAIN_PATTERN.finditer(data):
@@ -5860,10 +6070,12 @@ class NetworkCommDetector:
                 if printable_ratio <= 0.7:
                     continue
                 raw_matched_text = (
-                    _trim_matched_source_url(data, match)
+                    self._trim_url(data, match)
                     if pattern_type == "url"
                     else match.group().decode("utf-8", errors="ignore")
                 )
+                if pattern_type == "url" and self._is_passive_metadata_url_reference(match.start(), raw_matched_text):
+                    continue
                 matched_text = _redact_network_evidence(raw_matched_text)
                 if not self._record_finding(
                     {
