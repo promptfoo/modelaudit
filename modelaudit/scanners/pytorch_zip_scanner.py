@@ -2026,6 +2026,7 @@ class PyTorchZipScanner(BaseScanner):
 
         sample = data_start
         detection_probe_budget_charge_bytes = 0
+        charge_deferred_probe_budget_on_skip = False
 
         def charge_detection_probe_budget() -> None:
             nonlocal detection_probe_budget_charge_bytes
@@ -2044,12 +2045,27 @@ class PyTorchZipScanner(BaseScanner):
             )
             detection_probe_budget_charge_bytes = 0
 
+        def charge_deferred_probe_budget_before_skip() -> None:
+            nonlocal charge_deferred_probe_budget_on_skip, detection_probe_budget_charge_bytes
+            if not charge_deferred_probe_budget_on_skip or not detection_probe_budget_charge_bytes:
+                return
+            PyTorchZipScanner._charge_padding_probe_budget(
+                padding_probe_bytes_remaining,
+                detection_probe_budget_charge_bytes,
+            )
+            charge_deferred_probe_budget_on_skip = False
+            detection_probe_budget_charge_bytes = 0
+
         if entry.file_size > len(data_start):
             probe_bytes = max_probe_bytes
             probe_budget_charge_bytes = 0
             if max_probe_bytes > _TRUSTED_STORAGE_PICKLE_PROBE_BYTES:
                 if entry.file_size <= max_probe_bytes:
-                    probe_budget_charge_bytes = entry.file_size
+                    if padding_probe_bytes_remaining is None or entry.file_size <= padding_probe_bytes_remaining[0]:
+                        probe_budget_charge_bytes = entry.file_size
+                    else:
+                        charge_deferred_probe_budget_on_skip = True
+                        detection_probe_budget_charge_bytes = entry.file_size
                 elif (
                     PyTorchZipScanner._trivial_complete_pickle_prefix_has_only_padding(data_start)
                     and defer_padding_probe is None
@@ -2094,6 +2110,7 @@ class PyTorchZipScanner(BaseScanner):
             if should_scan:
                 charge_detection_probe_budget()
                 return True
+            charge_deferred_probe_budget_before_skip()
             return False
         if is_frame_first_candidate:
             if self._frame_first_trusted_storage_probe_should_scan(sample) or (
@@ -2123,6 +2140,7 @@ class PyTorchZipScanner(BaseScanner):
                 and defer_padding_probe is not None
             ):
                 defer_padding_probe[0] = True
+                charge_deferred_probe_budget_before_skip()
                 return False
             expanded_probe_bytes = min(entry.file_size, _PICKLE_DISCOVERY_LONG_PROBE_BYTES)
             PyTorchZipScanner._charge_padding_probe_budget(
@@ -2158,6 +2176,7 @@ class PyTorchZipScanner(BaseScanner):
         ):
             if defer_padding_probe is not None:
                 defer_padding_probe[0] = True
+                charge_deferred_probe_budget_before_skip()
                 return False
             padding_probe_bytes = min(entry.file_size, _PICKLE_DISCOVERY_PADDING_PROBE_BYTES)
             if padding_probe_bytes > len(sample):
@@ -2191,6 +2210,7 @@ class PyTorchZipScanner(BaseScanner):
                             is_frame_first_candidate=is_frame_first_candidate,
                         )
                     raise ValueError("trusted PyTorch storage padding probe limit reached")
+                charge_deferred_probe_budget_before_skip()
                 return False
         if (
             entry.file_size > len(sample)
@@ -2211,6 +2231,7 @@ class PyTorchZipScanner(BaseScanner):
                     )
                 raise ValueError("trusted PyTorch storage padding probe limit reached")
             raise ValueError("trusted PyTorch storage prefix exceeds pickle discovery probe")
+        charge_deferred_probe_budget_before_skip()
         return False
 
     def _verified_nul_padding_storage_probe_should_scan(

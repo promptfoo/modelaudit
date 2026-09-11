@@ -3023,6 +3023,29 @@ def test_pytorch_zip_discovery_keeps_detected_probe_after_budget_exhaustion(tmp_
     assert budget == [0]
 
 
+def test_pytorch_zip_discovery_rejects_undetected_probe_after_budget_exhaustion(tmp_path: Path) -> None:
+    model_path = tmp_path / "referenced_undetected_expanded_probe_after_budget.pt"
+    storage_blob = b"S" + (b"x" * 5000)
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/data/0", storage_blob)
+
+    scanner = PyTorchZipScanner()
+    budget = [0]
+    result = ScanResult(scanner_name="pytorch_zip")
+    with zipfile.ZipFile(model_path) as zip_file:
+        entry = zip_file.getinfo("archive/data/0")
+        with pytest.raises(ValueError, match="trusted PyTorch storage padding probe budget exceeded"):
+            scanner._trusted_storage_entry_looks_like_pickle(
+                zip_file,
+                entry,
+                result,
+                max_probe_bytes=pytorch_zip_scanner_module._PICKLE_DISCOVERY_LONG_PROBE_BYTES,
+                padding_probe_bytes_remaining=budget,
+            )
+
+    assert budget == [0]
+
+
 def test_pytorch_zip_discovery_charges_expanded_probe_budget_for_actual_small_member(
     tmp_path: Path,
 ) -> None:
