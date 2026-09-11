@@ -37,6 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Keep published scan-result cache entries readable when concurrent or interrupted hits update access metadata.
 - Preserve macOS scan-result cache entries during unrelated temporary-file churn while rejecting replaced source files and directories.
 - Keep macOS scan-result caching enabled when hashing updates a model file's access time.
+- Scan all bounded encoded pickle metadata that fits the decoded-byte budget, avoiding incomplete PyTorch ZIP coverage on harmless small encoded tokens.
 
 ## [0.2.52](https://github.com/promptfoo/modelaudit/compare/v0.2.51...v0.2.52) (2026-07-22)
 
