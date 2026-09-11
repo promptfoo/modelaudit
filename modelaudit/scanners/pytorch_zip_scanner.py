@@ -2608,6 +2608,8 @@ class PyTorchZipScanner(BaseScanner):
         while candidate:
             if candidate == b"#":
                 return True
+            if len(candidate) == 1 and candidate[0] not in PROTO0_1_START_BYTES:
+                return True
             stripped_comment_candidate = PyTorchZipScanner._strip_optional_proto0_comment_prefix(candidate)
             if stripped_comment_candidate != candidate:
                 candidate = stripped_comment_candidate

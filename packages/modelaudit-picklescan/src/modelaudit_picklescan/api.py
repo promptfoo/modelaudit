@@ -179,7 +179,6 @@ _SUSPICIOUS_LITERAL_TEXT_PATTERNS = tuple(
         r"\bimport\s+[\w\.]+",
         r"__import__",
         r"\\x[0-9a-fA-F]{2}",
-        r"getattr\s*\(",
     )
 )
 _STORAGE_LITERAL_TEXT_ROUTE_PATTERNS = tuple(
@@ -1987,6 +1986,8 @@ def _trivial_complete_pickle_prefix_needs_more_bytes(sample: bytes) -> bool:
 def _trailing_pickle_candidate_needs_more_bytes(candidate: bytes) -> bool:
     while candidate:
         if candidate == b"#":
+            return True
+        if len(candidate) == 1 and candidate[0] not in _PROTO0_1_START_BYTES:
             return True
         stripped_comment_candidate = _strip_optional_proto0_comment_prefix(candidate)
         if stripped_comment_candidate != candidate:
