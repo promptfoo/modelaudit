@@ -6919,7 +6919,10 @@ class TestWeightDistributionSemantics:
         assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
 
     @pytest.mark.parametrize("op_type", ["RNN", "GRU", "LSTM"])
-    def test_shape_derived_recurrent_state_generated_weights_fail_closed(self, tmp_path: Path, op_type: str) -> None:
+    @pytest.mark.parametrize("output_slot", ["sequence", "state"])
+    def test_shape_derived_recurrent_state_generated_weights_fail_closed(
+        self, tmp_path: Path, op_type: str, output_slot: str
+    ) -> None:
         hidden_size = 100
         gate_multiplier = {"RNN": 1, "GRU": 3, "LSTM": 4}[op_type]
         shape_source = TensorProto()
@@ -6927,17 +6930,18 @@ class TestWeightDistributionSemantics:
         shape_source.data_type = TensorProto.FLOAT
         shape_source.dims.extend([0] * 50 + [10] * 5 + [0] * 45)
         recurrent_inputs = ["sequence", "W", "R", "", "", "initial_h"]
-        recurrent_outputs = ["", "state"]
+        recurrent_outputs = ["sequence_output", "state"]
         if op_type == "LSTM":
             recurrent_inputs.append("initial_h")
-            recurrent_outputs.append("")
+            recurrent_outputs.append("cell_state")
+        generated_source = "sequence_output" if output_slot == "sequence" else "state"
         graph = helper.make_graph(
             [
                 helper.make_node("Shape", ["shape_source"], ["dimensions"]),
                 helper.make_node("Cast", ["dimensions"], ["numeric_dimensions"], to=TensorProto.FLOAT),
                 helper.make_node("Reshape", ["numeric_dimensions", "state_shape"], ["initial_h"]),
                 helper.make_node(op_type, recurrent_inputs, recurrent_outputs, hidden_size=hidden_size),
-                helper.make_node("Reshape", ["state", "weight_shape"], ["generated_weight"]),
+                helper.make_node("Reshape", [generated_source, "weight_shape"], ["generated_weight"]),
                 helper.make_node("MatMul", ["X", "generated_weight"], ["Y"]),
             ],
             f"{op_type.lower()}_state_generated_weight",
@@ -6967,11 +6971,14 @@ class TestWeightDistributionSemantics:
         assert result.success is False
         coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
         assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
+        expected_reason = (
+            "recurrent_sequence_state_lineage" if output_slot == "sequence" else "shape_dimensions_lineage"
+        )
         assert any(
             sample["initializer"] == "shape_source"
             and sample["consumer_op"] == "MatMul"
             and sample["consumer_input_index"] == 1
-            and sample["reason"] == "shape_dimensions_lineage"
+            and sample["reason"] == expected_reason
             for sample in result.metadata["onnx_weight_distribution_semantics"]["unresolved_lineage_samples"]
         )
 

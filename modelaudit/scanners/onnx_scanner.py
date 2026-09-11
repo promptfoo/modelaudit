@@ -2105,6 +2105,12 @@ def _build_onnx_weight_analysis_plan(
                             )
                         )
                         recognized_activation_input |= recurrent_initial_state and opposite_resolved_weight
+                        recognized_activation_input |= (
+                            lineage.unresolved_reason == "recurrent_sequence_state_lineage"
+                            and _onnx_activation_input_candidate(node, input_index)
+                            and input_index == 0
+                            and opposite_resolved_weight
+                        )
                         if recognized_activation_input:
                             if recurrent_initial_state and lineage.unresolved_reason == "shape_dimensions_lineage":
                                 recurrent_state_lineages[initializer_index] = lineage
@@ -2543,15 +2549,26 @@ def _build_onnx_weight_analysis_plan(
                 per_output_lineages = dict(output_lineages)
                 if (
                     recurrent_state_lineages
-                    and output_index > 0
                     and is_registered_standard_operator
                     and not is_model_local_function
                     and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
                     and node.op_type in _RECURRENT_WEIGHT_OPERATORS
                 ):
+                    state_lineages = recurrent_state_lineages
+                    if output_index == 0:
+                        state_lineages = {
+                            initializer_index: _OnnxWeightLineage(
+                                initializer_index=initializer_index,
+                                shape=lineage.shape,
+                                data_type=lineage.data_type,
+                                transforms=lineage.transforms,
+                                unresolved_reason="recurrent_sequence_state_lineage",
+                            )
+                            for initializer_index, lineage in recurrent_state_lineages.items()
+                        }
                     merge_lineages(
                         per_output_lineages,
-                        recurrent_state_lineages,
+                        state_lineages,
                         ambiguous_reason="ambiguous_operator_input_lineage",
                     )
                 merge_lineages(
