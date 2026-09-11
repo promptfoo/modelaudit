@@ -1506,8 +1506,10 @@ def _trusted_storage_zip_entry_looks_like_pickle(
     )
     if not prefix:
         return False
-    is_binary_pickle_candidate = prefix.startswith(_PICKLE_BINARY_PROTOCOL_PREFIXES)
     is_frame_first_candidate = prefix.startswith(_PICKLE_FRAME_OPCODE)
+    is_binary_pickle_candidate = prefix.startswith(_PICKLE_BINARY_PROTOCOL_PREFIXES) or (
+        not is_frame_first_candidate and prefix[0] in _RAW_NESTED_BINARY_SECURITY_PICKLE_START_BYTES
+    )
     if not is_binary_pickle_candidate and not is_frame_first_candidate and prefix[0] not in _PROTO0_1_START_BYTES:
         return False
     if max_probe_bytes > _TRUSTED_STORAGE_PICKLE_PROBE_BYTES:

@@ -2043,8 +2043,10 @@ class PyTorchZipScanner(BaseScanner):
         )
         if not data_start:
             return False
-        is_binary_pickle_candidate = data_start.startswith(_PICKLE_BINARY_PROTOCOL_PREFIXES)
         is_frame_first_candidate = data_start.startswith(_PICKLE_FRAME_OPCODE)
+        is_binary_pickle_candidate = data_start.startswith(_PICKLE_BINARY_PROTOCOL_PREFIXES) or (
+            not is_frame_first_candidate and data_start[0] in _RAW_NESTED_BINARY_SECURITY_PICKLE_START_BYTES
+        )
         if (
             not is_binary_pickle_candidate
             and not is_frame_first_candidate

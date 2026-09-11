@@ -4298,6 +4298,24 @@ def test_expanded_trusted_storage_probe_preserves_short_frame_probe(tmp_path: Pa
     ]
 
 
+def test_trusted_storage_probe_routes_headerless_binary_stream_at_entry_gate(tmp_path: Path) -> None:
+    storage = _short_binunicode(b"os") + _short_binunicode(b"system") + b"\x93)R."
+    archive_path = tmp_path / "headerless-binary-storage.pt"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data/0", storage)
+
+    with zipfile.ZipFile(archive_path) as archive:
+        entry = archive.getinfo("archive/data/0")
+        looks_like_pickle = package_api._trusted_storage_zip_entry_looks_like_pickle(
+            archive,
+            entry,
+            [package_api._PICKLE_DISCOVERY_LONG_PROBE_BYTES],
+            float("inf"),
+        )
+
+    assert looks_like_pickle is True
+
+
 def test_expanded_trusted_storage_probe_checks_long_window_before_padding_budget(tmp_path: Path) -> None:
     malicious_suffix = b"cposix\nsystem\n(S'echo long-before-padding'\ntR."
     storage = b"N." + (b" " * (package_api._TRUSTED_STORAGE_PICKLE_PROBE_BYTES - len(b"N.")))

@@ -5116,6 +5116,27 @@ def test_pytorch_zip_storage_probe_does_not_spend_padding_budget_on_ordinary_lon
     assert padding_probe_bytes_remaining == [1]
 
 
+def test_pytorch_zip_trusted_storage_routes_headerless_binary_stream_at_entry_gate(tmp_path: Path) -> None:
+    archive_path = tmp_path / "headerless_binary_storage_gate.pt"
+    storage_blob = _pickle_short_binunicode(b"os") + _pickle_short_binunicode(b"system") + b"\x93)R."
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data/0", storage_blob)
+
+    result = ScanResult(scanner_name="pytorch_zip")
+    scanner = PyTorchZipScanner()
+
+    with zipfile.ZipFile(archive_path, "r") as archive:
+        entry = archive.getinfo("archive/data/0")
+        looks_like_pickle = scanner._trusted_storage_entry_looks_like_pickle(
+            archive,
+            entry,
+            result,
+            padding_probe_bytes_remaining=[pytorch_zip_scanner_module._PICKLE_DISCOVERY_LONG_PROBE_BYTES],
+        )
+
+    assert looks_like_pickle is True
+
+
 def test_pytorch_zip_discovery_skips_oversized_nul_padding_storage_near_match(tmp_path: Path) -> None:
     model_path = tmp_path / "referenced_oversized_nul_padding_tensor_noise.pt"
     storage_blob = b"N." + (b"\x00" * 300_002)
