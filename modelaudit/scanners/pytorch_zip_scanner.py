@@ -142,6 +142,7 @@ _HEX_NESTED_LITERAL_TOKEN_RE = re.compile(rb"(?<![0-9A-Fa-f])(?:[0-9A-Fa-f]{2}[\
 _RAW_NESTED_SECURITY_PICKLE_START_BYTES = b"\x80(cioRbP\x82\x83\x84"
 _MAX_RAW_NESTED_PICKLE_CANDIDATES = 64
 _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES = 8 * 1024
+_MAX_MALFORMED_SEPARATOR_RUN_BYTES = 8
 _PROTO0_GLOBAL_PREFIX_WITHOUT_NEWLINE_RE = re.compile(rb"c[A-Za-z_][A-Za-z0-9_.]*")
 _RAW_NESTED_SECURITY_PICKLE_TEXT_MARKERS = (
     b"builtins\neval\n",
@@ -2712,8 +2713,16 @@ class PyTorchZipScanner(BaseScanner):
     def _malformed_separator_proto0_string_literal_has_nested_security_pickle(candidate: bytes) -> bool:
         if not candidate or candidate[0] in PROTO0_1_START_BYTES:
             return False
+        separator = candidate[0]
+        offset = 1
+        while (
+            offset < len(candidate) and candidate[offset] == separator and offset < _MAX_MALFORMED_SEPARATOR_RUN_BYTES
+        ):
+            offset += 1
+        if offset < len(candidate) and candidate[offset] == separator:
+            return False
         return PyTorchZipScanner._complete_proto0_string_literal_has_nested_security_pickle(
-            candidate[1:].lstrip(PROTO0_1_IGNORABLE_TRAILING_BYTES)
+            candidate[offset:].lstrip(PROTO0_1_IGNORABLE_TRAILING_BYTES)
         )
 
     @staticmethod

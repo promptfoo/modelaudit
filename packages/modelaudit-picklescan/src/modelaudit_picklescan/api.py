@@ -86,6 +86,7 @@ _PROTO0_1_START_BYTES = b"()]}cilp0FGIJKLMNPSTUVX"
 _PROTO0_1_MAX_PROBE_OPCODES = _PICKLE_DISCOVERY_LONG_PROBE_BYTES
 _PROTO0_1_IGNORABLE_TRAILING_BYTES = b" \t\r\n\x00"
 _PROTO0_1_TEXT_WHITESPACE_BYTES = b" \t\r\n"
+_MAX_MALFORMED_SEPARATOR_RUN_BYTES = 8
 _PROTO0_GLOBAL_PREFIX_WITHOUT_NEWLINE_RE = re.compile(rb"c[A-Za-z_][A-Za-z0-9_.]*")
 _PICKLE_DISCOVERY_PADDING_PROBE_BYTES = 256 * 1024
 _PICKLE_DISCOVERY_NUL_PADDING_VERIFY_CHUNK_BYTES = 64 * 1024
@@ -2062,8 +2063,14 @@ def _trivial_complete_pickle_prefix_has_only_text_padding(sample: bytes) -> bool
 def _malformed_separator_proto0_string_literal_has_nested_security_pickle(candidate: bytes) -> bool:
     if not candidate or candidate[0] in _PROTO0_1_START_BYTES:
         return False
+    separator = candidate[0]
+    offset = 1
+    while offset < len(candidate) and candidate[offset] == separator and offset < _MAX_MALFORMED_SEPARATOR_RUN_BYTES:
+        offset += 1
+    if offset < len(candidate) and candidate[offset] == separator:
+        return False
     return _complete_proto0_string_literal_has_nested_security_pickle(
-        candidate[1:].lstrip(_PROTO0_1_IGNORABLE_TRAILING_BYTES)
+        candidate[offset:].lstrip(_PROTO0_1_IGNORABLE_TRAILING_BYTES)
     )
 
 
