@@ -1679,8 +1679,8 @@ def _verified_nul_padding_storage_probe_sample(
         return sample
 
     nul_padding_verify_bytes_remaining[0] -= remaining_bytes
-    chunks: list[bytes] = []
-    saw_non_nul = False
+    retained_chunks: list[bytes] = []
+    verified_nul_tail_bytes = 0
     with archive.open(entry, "r") as member:
         member.seek(verified_prefix_bytes)
         bytes_left = remaining_bytes
@@ -1690,15 +1690,21 @@ def _verified_nul_padding_storage_probe_sample(
             _check_pytorch_zip_deadline(deadline)
             if not chunk:
                 raise ValueError("trusted PyTorch storage padding probe limit reached")
-            chunks.append(chunk)
-            if chunk.rstrip(b"\x00"):
-                saw_non_nul = True
+            if retained_chunks:
+                retained_chunks.append(chunk)
+            elif chunk.rstrip(b"\x00"):
+                if remaining_bytes > probe_bytes_remaining[0]:
+                    raise _PickleDiscoveryProbeBudgetExceeded
+                probe_bytes_remaining[0] -= remaining_bytes
+                if verified_nul_tail_bytes:
+                    retained_chunks.append(b"\x00" * verified_nul_tail_bytes)
+                    verified_nul_tail_bytes = 0
+                retained_chunks.append(chunk)
+            else:
+                verified_nul_tail_bytes += len(chunk)
             bytes_left -= len(chunk)
-    if saw_non_nul:
-        if remaining_bytes > probe_bytes_remaining[0]:
-            raise _PickleDiscoveryProbeBudgetExceeded
-        probe_bytes_remaining[0] -= remaining_bytes
-        return sample + b"".join(chunks)
+    if retained_chunks:
+        return sample + b"".join(retained_chunks)
     return sample
 
 

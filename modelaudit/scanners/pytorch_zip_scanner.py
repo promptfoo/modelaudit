@@ -2295,26 +2295,72 @@ class PyTorchZipScanner(BaseScanner):
         if remaining_bytes == 0:
             return sample
 
+        member_name = self._get_zip_member_name(entry)
+        archive_path = self.current_file_path or member_name
+
+        def read_verified_tail(*, relaxed_crc: bool, record_relaxed_usage: bool) -> bytes:
+            if relaxed_crc and record_relaxed_usage:
+                self._relaxed_crc_tracker.record_usage(
+                    member_name,
+                    "trusted_storage_padding_probe",
+                    result,
+                    archive_path=archive_path,
+                )
+            with zip_file.open(entry, "r") as member:
+                if relaxed_crc and hasattr(member, "_expected_crc"):
+                    member._expected_crc = None
+
+                prefix_bytes_left = verified_prefix_bytes
+                while prefix_bytes_left > 0:
+                    chunk = member.read(min(_PICKLE_DISCOVERY_NUL_PADDING_VERIFY_CHUNK_BYTES, prefix_bytes_left))
+                    if not chunk:
+                        raise ValueError("trusted PyTorch storage padding probe limit reached")
+                    prefix_bytes_left -= len(chunk)
+
+                retained_chunks: list[bytes] = []
+                verified_nul_tail_bytes = 0
+                bytes_left = remaining_bytes
+                while bytes_left > 0:
+                    chunk = member.read(min(_PICKLE_DISCOVERY_NUL_PADDING_VERIFY_CHUNK_BYTES, bytes_left))
+                    if not chunk:
+                        raise ValueError("trusted PyTorch storage padding probe limit reached")
+                    if retained_chunks:
+                        retained_chunks.append(chunk)
+                    elif chunk.rstrip(b"\x00"):
+                        PyTorchZipScanner._charge_padding_probe_budget(
+                            padding_probe_bytes_remaining,
+                            remaining_bytes,
+                        )
+                        if verified_nul_tail_bytes:
+                            retained_chunks.append(b"\x00" * verified_nul_tail_bytes)
+                            verified_nul_tail_bytes = 0
+                        retained_chunks.append(chunk)
+                    else:
+                        verified_nul_tail_bytes += len(chunk)
+                    bytes_left -= len(chunk)
+            if retained_chunks:
+                return sample + b"".join(retained_chunks)
+            return sample
+
+        relaxed_crc = self._relaxed_crc_tracker.has_member(member_name)
         try:
-            expanded_sample = self._read_member_prefix(
-                zip_file,
-                entry,
-                verified_prefix_bytes + remaining_bytes,
-                phase="trusted_storage_padding_probe",
-                result=result,
+            return read_verified_tail(relaxed_crc=relaxed_crc, record_relaxed_usage=True)
+        except zipfile.BadZipFile as exc:
+            if relaxed_crc or "Bad CRC-32" not in str(exc):
+                raise ValueError("trusted PyTorch storage padding probe limit reached") from exc
+            self._relaxed_crc_tracker.record_usage(
+                member_name,
+                "trusted_storage_padding_probe",
+                result,
+                archive_path=archive_path,
+                error=exc,
             )
+            try:
+                return read_verified_tail(relaxed_crc=True, record_relaxed_usage=False)
+            except Exception as retry_exc:
+                raise ValueError("trusted PyTorch storage padding probe limit reached") from retry_exc
         except Exception as exc:
             raise ValueError("trusted PyTorch storage padding probe limit reached") from exc
-        tail = expanded_sample[verified_prefix_bytes:]
-        if len(tail) < remaining_bytes:
-            raise ValueError("trusted PyTorch storage padding probe limit reached")
-        if tail.rstrip(b"\x00"):
-            PyTorchZipScanner._charge_padding_probe_budget(
-                padding_probe_bytes_remaining,
-                remaining_bytes,
-            )
-            return sample + tail
-        return sample
 
     @staticmethod
     def _expanded_probe_preserves_trusted_scan(
