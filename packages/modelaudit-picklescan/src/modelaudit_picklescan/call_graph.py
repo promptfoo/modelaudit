@@ -2120,15 +2120,24 @@ def find_startup_hook_write_call_graphs(
         invocation_references = invocations_by_reference.get((module, name), ())
         if require_invocations and not invocation_references:
             continue
-        trusted_mailbox_constructor_invocations = (
-            tuple(
-                invocation_reference
-                for invocation_reference in invocation_references
-                if _trusted_empty_mailbox_constructor_invocation_is_safe(module, name, invocation_reference)
-            )
-            if require_invocations
-            else ()
-        )
+        trusted_mailbox_constructor_invocations: tuple[dict[str, object], ...] = ()
+        if require_invocations:
+            trusted_constructor_references: list[dict[str, object]] = []
+            for invocation_reference in invocation_references:
+                try:
+                    trusted_constructor = _trusted_empty_mailbox_constructor_invocation_is_safe(
+                        module,
+                        name,
+                        invocation_reference,
+                        require_entrypoint_analysis=True,
+                    )
+                except _CallGraphAnalysisLimitError as error:
+                    if analysis_limit_error is None:
+                        analysis_limit_error = error
+                    continue
+                if trusted_constructor:
+                    trusted_constructor_references.append(invocation_reference)
+            trusted_mailbox_constructor_invocations = tuple(trusted_constructor_references)
         trusted_mailbox_constructor_openers = tuple(
             invocation_reference
             for invocation_reference in trusted_mailbox_constructor_invocations
@@ -3472,6 +3481,8 @@ def _trusted_empty_mailbox_constructor_invocation_is_safe(
     module: str,
     name: str,
     reference: Mapping[str, object],
+    *,
+    require_entrypoint_analysis: bool = False,
 ) -> bool:
     if (module, name) not in _TRUSTED_EMPTY_MAILBOX_CONSTRUCTOR_INVOCATIONS:
         return False
@@ -3484,7 +3495,9 @@ def _trusted_empty_mailbox_constructor_invocation_is_safe(
         return False
     if _complete_keyword_arg_names(reference) != ():
         return False
-    return _mailbox_constructor_reference_is_canonical(module, name)
+    if not _mailbox_constructor_reference_is_canonical(module, name):
+        return False
+    return not require_entrypoint_analysis or bool(_safe_call_graph_entrypoints(f"{module}.{name}"))
 
 
 def _trusted_mailbox_constructor_invocation_opens_path(
