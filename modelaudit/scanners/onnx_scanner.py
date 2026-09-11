@@ -2110,9 +2110,10 @@ def _build_onnx_weight_analysis_plan(
                             and _onnx_activation_input_candidate(node, input_index)
                             and input_index == 0
                             and opposite_resolved_weight
+                            and not potential_weight_input
                         )
                         if recognized_activation_input:
-                            if recurrent_initial_state and lineage.unresolved_reason == "shape_dimensions_lineage":
+                            if recurrent_initial_state:
                                 recurrent_state_lineages[initializer_index] = lineage
                             if opposite_resolved_weight:
                                 activation_input_lineages.add(initializer_index)
@@ -2400,7 +2401,7 @@ def _build_onnx_weight_analysis_plan(
                         )
                         or clip_operator
                         or pow_operator
-                        or node.op_type in {"Expand", "Gather", "GatherElements", "GatherND"}
+                        or node.op_type in {"Expand", "Gather", "GatherElements", "GatherND", "Slice"}
                     )
                 )
                 for initializer_index, lineage in all_input_lineages.items():

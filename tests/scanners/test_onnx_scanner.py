@@ -6437,23 +6437,31 @@ class TestWeightDistributionSemantics:
         assert semantics["eligible_initializer_count"] == 2
         assert semantics["analyzed_layer_count"] == 2
 
+    @pytest.mark.parametrize("separate_slice_data", [False, True])
     @pytest.mark.parametrize("malicious", [False, True])
-    def test_slice_bounds_from_shape_remain_control_lineage(self, tmp_path: Path, malicious: bool) -> None:
+    def test_slice_bounds_from_shape_remain_control_lineage(
+        self, tmp_path: Path, malicious: bool, separate_slice_data: bool
+    ) -> None:
         weights = np.zeros((100, 10), dtype=np.float32)
         if malicious:
             weights[50:55, 3] = 10.0
+        inputs = [
+            helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 100]),
+            helper.make_tensor_value_info("starts", TensorProto.INT64, [2]),
+        ]
+        slice_data = "hidden"
+        if separate_slice_data:
+            inputs.append(helper.make_tensor_value_info("Xd", TensorProto.FLOAT, [1, 10]))
+            slice_data = "Xd"
         graph = helper.make_graph(
             [
                 helper.make_node("MatMul", ["X", "W1"], ["hidden"]),
                 helper.make_node("Shape", ["hidden"], ["ends"]),
-                helper.make_node("Slice", ["hidden", "starts", "ends"], ["cropped"]),
+                helper.make_node("Slice", [slice_data, "starts", "ends"], ["cropped"]),
                 helper.make_node("MatMul", ["cropped", "W2"], ["Y"]),
             ],
             "slice_bounds_control_lineage",
-            [
-                helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 100]),
-                helper.make_tensor_value_info("starts", TensorProto.INT64, [2]),
-            ],
+            inputs,
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [None, 5])],
             initializer=[
                 onnx.numpy_helper.from_array(weights, name="W1"),
@@ -6914,51 +6922,84 @@ class TestWeightDistributionSemantics:
 
         result = OnnxScanner().scan(str(path))
 
-        assert result.success is True
         assert len(self._extreme_checks(result)) == int(malicious)
-        assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        if control_input == "sequence_lens":
+            assert result.success is True
+            assert not coverage
+        else:
+            assert result.success is False
+            assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
+            assert any(
+                sample["consumer_op"] == "MatMul"
+                and sample["consumer_input_index"] == 0
+                and sample["reason"] == "recurrent_sequence_state_lineage"
+                for sample in result.metadata["onnx_weight_distribution_semantics"]["unresolved_lineage_samples"]
+            )
 
     @pytest.mark.parametrize("op_type", ["RNN", "GRU", "LSTM"])
+    @pytest.mark.parametrize("initial_state_lineage", ["shape_dimensions", "unsupported_operator"])
     @pytest.mark.parametrize("output_slot", ["sequence", "state"])
     def test_shape_derived_recurrent_state_generated_weights_fail_closed(
-        self, tmp_path: Path, op_type: str, output_slot: str
+        self, tmp_path: Path, op_type: str, initial_state_lineage: str, output_slot: str
     ) -> None:
         hidden_size = 100
         gate_multiplier = {"RNN": 1, "GRU": 3, "LSTM": 4}[op_type]
-        shape_source = TensorProto()
-        shape_source.name = "shape_source"
-        shape_source.data_type = TensorProto.FLOAT
-        shape_source.dims.extend([0] * 50 + [10] * 5 + [0] * 45)
         recurrent_inputs = ["sequence", "W", "R", "", "", "initial_h"]
         recurrent_outputs = ["sequence_output", "state"]
         if op_type == "LSTM":
             recurrent_inputs.append("initial_h")
             recurrent_outputs.append("cell_state")
         generated_source = "sequence_output" if output_slot == "sequence" else "state"
-        graph = helper.make_graph(
-            [
+        initializers = [
+            onnx.numpy_helper.from_array(np.ones((1, hidden_size), dtype=np.float32), name="X"),
+            onnx.numpy_helper.from_array(np.array([1, 1, hidden_size], dtype=np.int64), name="state_shape"),
+            onnx.numpy_helper.from_array(np.array([hidden_size, 1], dtype=np.int64), name="weight_shape"),
+            onnx.numpy_helper.from_array(
+                np.zeros((1, gate_multiplier * hidden_size, hidden_size), dtype=np.float32), name="W"
+            ),
+            onnx.numpy_helper.from_array(
+                np.zeros((1, gate_multiplier * hidden_size, hidden_size), dtype=np.float32), name="R"
+            ),
+        ]
+        if initial_state_lineage == "shape_dimensions":
+            shape_source = TensorProto()
+            shape_source.name = "shape_source"
+            shape_source.data_type = TensorProto.FLOAT
+            shape_source.dims.extend([0] * 50 + [10] * 5 + [0] * 45)
+            initializers.insert(0, shape_source)
+            nodes = [
                 helper.make_node("Shape", ["shape_source"], ["dimensions"]),
                 helper.make_node("Cast", ["dimensions"], ["numeric_dimensions"], to=TensorProto.FLOAT),
                 helper.make_node("Reshape", ["numeric_dimensions", "state_shape"], ["initial_h"]),
+            ]
+            expected_initializer = "shape_source"
+            state_reason = "shape_dimensions_lineage"
+        else:
+            initializers.extend(
+                [
+                    onnx.numpy_helper.from_array(np.ones((1, 1, hidden_size), dtype=np.float32), name="state_seed"),
+                    onnx.numpy_helper.from_array(np.array([0], dtype=np.int64), name="reduce_axes"),
+                ]
+            )
+            nodes = [
+                helper.make_node("ReduceSum", ["state_seed", "reduce_axes"], ["initial_h"], keepdims=1),
+            ]
+            expected_initializer = "state_seed"
+            state_reason = "unsupported_lineage_operator"
+        nodes.extend(
+            [
                 helper.make_node(op_type, recurrent_inputs, recurrent_outputs, hidden_size=hidden_size),
                 helper.make_node("Reshape", [generated_source, "weight_shape"], ["generated_weight"]),
                 helper.make_node("MatMul", ["X", "generated_weight"], ["Y"]),
-            ],
+            ]
+        )
+        graph = helper.make_graph(
+            nodes,
             f"{op_type.lower()}_state_generated_weight",
             [helper.make_tensor_value_info("sequence", TensorProto.FLOAT, [1, 1, hidden_size])],
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 1])],
-            initializer=[
-                shape_source,
-                onnx.numpy_helper.from_array(np.ones((1, hidden_size), dtype=np.float32), name="X"),
-                onnx.numpy_helper.from_array(np.array([1, 1, hidden_size], dtype=np.int64), name="state_shape"),
-                onnx.numpy_helper.from_array(np.array([hidden_size, 1], dtype=np.int64), name="weight_shape"),
-                onnx.numpy_helper.from_array(
-                    np.zeros((1, gate_multiplier * hidden_size, hidden_size), dtype=np.float32), name="W"
-                ),
-                onnx.numpy_helper.from_array(
-                    np.zeros((1, gate_multiplier * hidden_size, hidden_size), dtype=np.float32), name="R"
-                ),
-            ],
+            initializer=initializers,
         )
         model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 14)])
         model.ir_version = 8
@@ -6971,14 +7012,64 @@ class TestWeightDistributionSemantics:
         assert result.success is False
         coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
         assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
-        expected_reason = (
-            "recurrent_sequence_state_lineage" if output_slot == "sequence" else "shape_dimensions_lineage"
-        )
+        expected_reason = "recurrent_sequence_state_lineage" if output_slot == "sequence" else state_reason
         assert any(
-            sample["initializer"] == "shape_source"
+            sample["initializer"] == expected_initializer
             and sample["consumer_op"] == "MatMul"
             and sample["consumer_input_index"] == 1
             and sample["reason"] == expected_reason
+            for sample in result.metadata["onnx_weight_distribution_semantics"]["unresolved_lineage_samples"]
+        )
+
+    @pytest.mark.parametrize("consumer", ["Gemm", "MatMul"])
+    def test_recurrent_sequence_lineage_left_operand_fails_closed(self, tmp_path: Path, consumer: str) -> None:
+        hidden_size = 100
+        shape_source = TensorProto()
+        shape_source.name = "shape_source"
+        shape_source.data_type = TensorProto.FLOAT
+        shape_source.dims.extend([0] * 50 + [10] * 5 + [0] * 45)
+        graph = helper.make_graph(
+            [
+                helper.make_node("Shape", ["shape_source"], ["dimensions"]),
+                helper.make_node("Cast", ["dimensions"], ["numeric_dimensions"], to=TensorProto.FLOAT),
+                helper.make_node("Reshape", ["numeric_dimensions", "state_shape"], ["initial_h"]),
+                helper.make_node(
+                    "RNN",
+                    ["sequence", "W", "R", "", "", "initial_h"],
+                    ["sequence_output", "state"],
+                    hidden_size=hidden_size,
+                ),
+                helper.make_node("Reshape", ["sequence_output", "left_shape"], ["left_weight"]),
+                helper.make_node(consumer, ["left_weight", "projection"], ["Y"]),
+            ],
+            "recurrent_sequence_left_operand",
+            [helper.make_tensor_value_info("sequence", TensorProto.FLOAT, [1, 1, hidden_size])],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 1])],
+            initializer=[
+                shape_source,
+                onnx.numpy_helper.from_array(np.array([1, 1, hidden_size], dtype=np.int64), name="state_shape"),
+                onnx.numpy_helper.from_array(np.array([1, hidden_size], dtype=np.int64), name="left_shape"),
+                onnx.numpy_helper.from_array(np.zeros((1, hidden_size, hidden_size), dtype=np.float32), name="W"),
+                onnx.numpy_helper.from_array(np.zeros((1, hidden_size, hidden_size), dtype=np.float32), name="R"),
+                onnx.numpy_helper.from_array(np.zeros((hidden_size, 1), dtype=np.float32), name="projection"),
+            ],
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 14)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / "recurrent-sequence-left-operand.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        assert result.success is False
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
+        assert any(
+            sample["initializer"] == "shape_source"
+            and sample["consumer_op"] == consumer
+            and sample["consumer_input_index"] == 0
+            and sample["reason"] == "recurrent_sequence_state_lineage"
             for sample in result.metadata["onnx_weight_distribution_semantics"]["unresolved_lineage_samples"]
         )
 
