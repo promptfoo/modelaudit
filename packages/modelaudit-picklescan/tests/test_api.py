@@ -5978,6 +5978,56 @@ def test_scan_file_scans_late_malicious_storage_probe_before_deferred_padding_pr
     )
 
 
+def test_scan_file_continues_deferred_padding_after_nul_verification_budget_gap(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    archive_path = tmp_path / "deferred-nul-budget-gap.pt"
+    padding_blob = b"N." + (b"\x00" * (package_api._PICKLE_DISCOVERY_PADDING_PROBE_BYTES + 128))
+    padding_blob += b"\x00" * (-len(padding_blob) % 4)
+    malicious_blob = b"N." + (b"\x00" * 4094) + b"cposix\nsystem\n(S'echo hidden'\ntR."
+    malicious_blob += b"\x00" * (-len(malicious_blob) % 4)
+    data_pkl_payload = (
+        b"\x80\x04]("
+        + _pytorch_storage_binpersid_expr(
+            "0",
+            storage_name="FloatStorage",
+            element_count=_float_storage_element_count_for_bytes(padding_blob),
+        )
+        + _pytorch_storage_binpersid_expr(
+            "1",
+            storage_name="FloatStorage",
+            element_count=_float_storage_element_count_for_bytes(malicious_blob),
+        )
+        + b"e."
+    )
+    monkeypatch.setattr(package_api, "_PICKLE_DISCOVERY_NUL_PADDING_VERIFY_BUDGET_BYTES", 64)
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", data_pkl_payload)
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", padding_blob)
+        archive.writestr("archive/data/1", malicious_blob)
+
+    report = scan_file(archive_path)
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert "archive/data/1" in report.metadata["pickle_files"]
+    assert any(
+        notice.code == "pytorch_zip_member_probe_failed"
+        and notice.details["member_name"] == "archive/data/0"
+        and notice.details["exception_type"] == "_PytorchZipNulPaddingVerificationBudgetExceeded"
+        for notice in report.notices
+    )
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.location is not None
+        and f"{archive_path}:archive/data/1" in finding.location
+        for finding in report.findings
+    )
+
+
 def test_scan_file_skips_padding_only_at_padding_probe_limit(tmp_path: Path) -> None:
     archive_path = tmp_path / "model.pt"
     storage_blob = b"N." + (b"\x00" * (package_api._PICKLE_DISCOVERY_PADDING_PROBE_BYTES - len(b"N.")))

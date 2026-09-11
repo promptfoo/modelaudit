@@ -3190,6 +3190,51 @@ def test_pytorch_zip_discovery_scans_late_malicious_storage_probe_before_deferre
     )
 
 
+def test_pytorch_zip_discovery_continues_deferred_padding_after_nul_verification_budget_gap(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    model_path = tmp_path / "referenced_deferred_nul_budget_gap.pt"
+    padding_blob = b"N." + (b"\x00" * (pytorch_zip_scanner_module._PICKLE_DISCOVERY_PADDING_PROBE_BYTES + 128))
+    padding_blob += b"\x00" * (-len(padding_blob) % 4)
+    malicious_blob = b"N." + (b"\x00" * 4094) + _malicious_proto0_system_payload()
+    malicious_blob += b"\x00" * (-len(malicious_blob) % 4)
+    data_pkl_payload = (
+        b"\x80\x04]("
+        + _pytorch_storage_binpersid_expr(
+            "0",
+            storage_name="FloatStorage",
+            element_count=_float_storage_element_count_for_bytes(padding_blob),
+        )
+        + _pytorch_storage_binpersid_expr(
+            "1",
+            storage_name="FloatStorage",
+            element_count=_float_storage_element_count_for_bytes(malicious_blob),
+        )
+        + b"e."
+    )
+    monkeypatch.setattr(pytorch_zip_scanner_module, "_PICKLE_DISCOVERY_NUL_PADDING_VERIFY_BUDGET_BYTES", 64)
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", data_pkl_payload)
+        zip_file.writestr("archive/data/0", padding_blob)
+        zip_file.writestr("archive/data/1", malicious_blob)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert result.success is False
+    assert result.metadata["pickle_verdict"] == "malicious"
+    assert "archive/data/1" in result.metadata["pickle_files"]
+    discovery_check = next(check for check in result.checks if check.name == "Pickle Discovery")
+    assert discovery_check.status == CheckStatus.FAILED
+    assert any(entry["zip_entry"] == "archive/data/0" for entry in discovery_check.details["entries"])
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/1"
+        for issue in result.issues
+    )
+
+
 def test_pytorch_zip_discovery_skips_padding_only_at_padding_probe_limit(
     tmp_path: Path,
 ) -> None:

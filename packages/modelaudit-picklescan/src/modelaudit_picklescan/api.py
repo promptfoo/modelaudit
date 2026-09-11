@@ -415,6 +415,10 @@ class _PickleDiscoveryProbeBudgetExceeded(ValueError):
     """Raised when another hidden ZIP-member probe would exceed the byte budget."""
 
 
+class _PytorchZipNulPaddingVerificationBudgetExceeded(_PickleDiscoveryProbeBudgetExceeded):
+    """Raised when validating one all-NUL storage member exceeds its allowance."""
+
+
 class _PytorchZipDeadlineExceeded(TimeoutError):
     """Raised when Python-side PyTorch ZIP analysis exceeds ScanOptions.timeout_s."""
 
@@ -1081,6 +1085,8 @@ def _discover_pytorch_zip_pickle_entries(
             elif needs_deferred_padding_probe[0]:
                 deferred_padding_probe_entries.append(entry)
             probed_member_count += 1
+        except _PytorchZipNulPaddingVerificationBudgetExceeded as error:
+            notices.append(_pytorch_zip_member_probe_notice(source=source, entry=entry, error=error))
         except _PickleDiscoveryProbeBudgetExceeded:
             notices.append(
                 _pytorch_zip_pickle_discovery_probe_budget_notice(
@@ -1114,6 +1120,8 @@ def _discover_pytorch_zip_pickle_entries(
                     add_entry(entry)
                 elif needs_deferred_padding_probe[0]:
                     deferred_padding_probe_entries.append(entry)
+            except _PytorchZipNulPaddingVerificationBudgetExceeded as error:
+                notices.append(_pytorch_zip_member_probe_notice(source=source, entry=entry, error=error))
             except _PickleDiscoveryProbeBudgetExceeded:
                 notices.append(
                     _pytorch_zip_pickle_discovery_probe_budget_notice(
@@ -1142,6 +1150,8 @@ def _discover_pytorch_zip_pickle_entries(
                         max_probe_bytes=_PICKLE_DISCOVERY_LONG_PROBE_BYTES,
                     ):
                         add_entry(entry)
+                except _PytorchZipNulPaddingVerificationBudgetExceeded as error:
+                    notices.append(_pytorch_zip_member_probe_notice(source=source, entry=entry, error=error))
                 except _PickleDiscoveryProbeBudgetExceeded:
                     notices.append(
                         _pytorch_zip_pickle_discovery_probe_budget_notice(
@@ -1662,7 +1672,9 @@ def _verified_nul_padding_storage_probe_sample(
 ) -> bytes:
     remaining_bytes = max(entry.file_size - verified_prefix_bytes, 0)
     if remaining_bytes > nul_padding_verify_bytes_remaining[0]:
-        raise _PickleDiscoveryProbeBudgetExceeded
+        raise _PytorchZipNulPaddingVerificationBudgetExceeded(
+            "trusted PyTorch storage NUL padding verification budget exceeded"
+        )
     if remaining_bytes == 0:
         return sample
 
