@@ -2031,6 +2031,13 @@ class PyTorchZipScanner(BaseScanner):
             nonlocal detection_probe_budget_charge_bytes
             if not detection_probe_budget_charge_bytes:
                 return
+            if (
+                padding_probe_bytes_remaining is not None
+                and padding_probe_bytes_remaining[0] < detection_probe_budget_charge_bytes
+            ):
+                padding_probe_bytes_remaining[0] = 0
+                detection_probe_budget_charge_bytes = 0
+                return
             PyTorchZipScanner._charge_padding_probe_budget(
                 padding_probe_bytes_remaining,
                 detection_probe_budget_charge_bytes,
