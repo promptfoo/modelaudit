@@ -5995,6 +5995,31 @@ def test_scan_file_skips_padding_only_at_padding_probe_limit(tmp_path: Path) -> 
     assert not any(finding.location is not None and "archive/data/0" in finding.location for finding in report.findings)
 
 
+def test_scan_file_scans_raw_nested_binary_prefix_at_padding_probe_boundary(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model.pt"
+    boundary_prefix = b"!\x80\x04N"
+    padding_len = package_api._PICKLE_DISCOVERY_PADDING_PROBE_BYTES - len(b"N.") - len(boundary_prefix)
+    storage_blob = b"N." + (b"\x00" * padding_len) + boundary_prefix + b"cposix\nsystem\n(S'echo hidden'\ntR."
+    storage_blob += b"\x00" * (-len(storage_blob) % 4)
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", storage_blob)
+
+    report = scan_file(archive_path)
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/0"]
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.location is not None
+        and f"{archive_path}:archive/data/0" in finding.location
+        for finding in report.findings
+    )
+
+
 def test_scan_file_scans_length_operand_crossing_trusted_probe_boundary(tmp_path: Path) -> None:
     archive_path = tmp_path / "model.pt"
     storage_blob = (
@@ -6948,7 +6973,9 @@ def test_trailing_candidate_raw_scan_bounds_invalid_marker_attempts(monkeypatch:
         counted_has_security_relevant_pickle_opcode,
     )
 
-    assert package_api._trailing_candidate_has_raw_nested_security_pickle(b"c" * 100_000) is False
+    assert (
+        package_api._trailing_candidate_has_raw_nested_security_pickle(b"c" * 100_000, sample_is_prefix=False) is False
+    )
     assert call_count <= package_api._MAX_RAW_NESTED_PICKLE_CANDIDATES
 
 
@@ -6959,7 +6986,14 @@ def test_trailing_candidate_raw_scan_fails_closed_after_candidate_budget() -> No
         + b"cos\nremove\n(S'/tmp/test'\ntR."
     )
 
-    assert package_api._trailing_candidate_has_raw_nested_security_pickle(value) is True
+    assert package_api._trailing_candidate_has_raw_nested_security_pickle(value, sample_is_prefix=False) is True
+
+
+def test_trailing_candidate_raw_scan_preserves_outer_prefix_state() -> None:
+    assert package_api._trailing_candidate_has_raw_nested_security_pickle(b"!\x80\x04N", sample_is_prefix=True) is True
+    assert (
+        package_api._trailing_candidate_has_raw_nested_security_pickle(b"!\x80\x04N", sample_is_prefix=False) is False
+    )
 
 
 def test_security_opcode_probe_skips_repeated_none_streams_linearly(monkeypatch: pytest.MonkeyPatch) -> None:

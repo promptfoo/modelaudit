@@ -3162,6 +3162,28 @@ def test_pytorch_zip_discovery_skips_padding_only_at_padding_probe_limit(
     assert not any(issue.details.get("pickle_filename") == "archive/data/0" for issue in result.issues)
 
 
+def test_pytorch_zip_discovery_scans_raw_nested_binary_prefix_at_padding_probe_boundary(
+    tmp_path: Path,
+) -> None:
+    model_path = tmp_path / "referenced_raw_nested_at_probe_boundary.pt"
+    boundary_prefix = b"!\x80\x04N"
+    padding_len = pytorch_zip_scanner_module._PICKLE_DISCOVERY_PADDING_PROBE_BYTES - len(b"N.") - len(boundary_prefix)
+    storage_blob = b"N." + (b"\x00" * padding_len) + boundary_prefix + _malicious_proto0_system_payload()
+    storage_blob += b"\x00" * (-len(storage_blob) % 4)
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        zip_file.writestr("archive/data/0", storage_blob)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert result.success is False
+    assert result.metadata.get("pickle_verdict") == "malicious"
+    assert result.metadata["pickle_files"] == ["archive/data.pkl", "archive/data/0"]
+    assert any(issue.details.get("pickle_filename") == "archive/data/0" for issue in result.issues)
+
+
 def test_pytorch_zip_discovery_scans_length_operand_crossing_trusted_probe_boundary(
     tmp_path: Path,
 ) -> None:
@@ -4056,7 +4078,13 @@ def test_pytorch_zip_trailing_candidate_raw_scan_bounds_invalid_marker_attempts(
         staticmethod(counted_has_security_relevant_pickle_opcode),
     )
 
-    assert PyTorchZipScanner._trailing_candidate_has_raw_nested_security_pickle(b"c" * 100_000) is False
+    assert (
+        PyTorchZipScanner._trailing_candidate_has_raw_nested_security_pickle(
+            b"c" * 100_000,
+            sample_is_prefix=False,
+        )
+        is False
+    )
     assert call_count <= pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES
 
 
@@ -4067,7 +4095,24 @@ def test_pytorch_zip_trailing_candidate_raw_scan_fails_closed_after_candidate_bu
         + b"cos\nremove\n(S'/tmp/test'\ntR."
     )
 
-    assert PyTorchZipScanner._trailing_candidate_has_raw_nested_security_pickle(value) is True
+    assert PyTorchZipScanner._trailing_candidate_has_raw_nested_security_pickle(value, sample_is_prefix=False) is True
+
+
+def test_pytorch_zip_trailing_candidate_raw_scan_preserves_outer_prefix_state() -> None:
+    assert (
+        PyTorchZipScanner._trailing_candidate_has_raw_nested_security_pickle(
+            b"!\x80\x04N",
+            sample_is_prefix=True,
+        )
+        is True
+    )
+    assert (
+        PyTorchZipScanner._trailing_candidate_has_raw_nested_security_pickle(
+            b"!\x80\x04N",
+            sample_is_prefix=False,
+        )
+        is False
+    )
 
 
 def test_pytorch_zip_security_opcode_probe_skips_repeated_none_streams_linearly(

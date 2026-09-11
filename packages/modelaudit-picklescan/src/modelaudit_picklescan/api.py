@@ -1836,7 +1836,7 @@ def _trailing_pickle_probe_should_scan(trailing: bytes, *, sample_is_prefix: boo
         or _frame_first_trusted_storage_probe_should_scan(candidate)
     ):
         return True
-    if _trailing_candidate_has_raw_nested_security_pickle(candidate):
+    if _trailing_candidate_has_raw_nested_security_pickle(candidate, sample_is_prefix=sample_is_prefix):
         return True
     if _malformed_separator_proto0_string_literal_has_nested_security_pickle(candidate):
         return True
@@ -2268,13 +2268,13 @@ def _literal_value_has_raw_nested_security_pickle(
     return False
 
 
-def _trailing_candidate_has_raw_nested_security_pickle(value: bytes) -> bool:
+def _trailing_candidate_has_raw_nested_security_pickle(value: bytes, *, sample_is_prefix: bool) -> bool:
     parse_attempt_count = 0
     for offset, marker in enumerate(value):
         if marker not in _RAW_NESTED_SECURITY_PICKLE_START_BYTES:
             continue
         candidate = value[offset : offset + _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES]
-        candidate_is_prefix = offset + len(candidate) < len(value)
+        candidate_is_prefix = offset + len(candidate) < len(value) or sample_is_prefix
         parse_attempt_count += 1
         if parse_attempt_count > _MAX_RAW_NESTED_PICKLE_CANDIDATES:
             return _raw_nested_security_pickle_candidate_budget_exhausted_needs_scan(value[offset:])
