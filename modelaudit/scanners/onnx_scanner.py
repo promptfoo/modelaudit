@@ -2107,6 +2107,9 @@ def _build_onnx_weight_analysis_plan(
                             resolved_index != input_index for resolved_index in resolved_weight_input_indexes
                         )
                         prior_layer_activation = lineage.unresolved_reason == "dynamic_activation_lineage"
+                        recurrent_final_state_output = any(
+                            transform.kind == "recurrent_state_output" for transform in lineage.transforms
+                        )
                         recognized_activation_input = prior_layer_activation and (
                             (
                                 is_registered_standard_operator
@@ -2125,7 +2128,16 @@ def _build_onnx_weight_analysis_plan(
                                 activation_input_lineages.add(initializer_index)
                             record_exclusion(initializer_index, "dynamic_activation_input", node, input_index)
                         elif potential_weight_input or (
-                            potential_weight_role and lineage.unresolved_reason == "recurrent_sequence_state_lineage"
+                            (
+                                potential_weight_role
+                                and lineage.unresolved_reason
+                                in {"recurrent_sequence_state_lineage", "recurrent_state_lineage"}
+                            )
+                            or (
+                                potential_weight_role
+                                and recurrent_final_state_output
+                                and lineage.unresolved_reason != "shape_control_lineage"
+                            )
                         ):
                             record_unresolved_lineage(lineage, node, current_node_index, input_index)
                         else:
@@ -2570,7 +2582,6 @@ def _build_onnx_weight_analysis_plan(
                 ):
                     for initializer_index in recurrent_state_lineages:
                         per_output_lineages.pop(initializer_index, None)
-                    state_lineages = recurrent_state_lineages
                     if output_index == 0:
                         state_lineages = {
                             initializer_index: _OnnxWeightLineage(
@@ -2588,7 +2599,7 @@ def _build_onnx_weight_analysis_plan(
                                 initializer_index=initializer_index,
                                 shape=lineage.shape,
                                 data_type=lineage.data_type,
-                                transforms=lineage.transforms,
+                                transforms=(*lineage.transforms, _OnnxWeightTransform("recurrent_state_output")),
                                 unresolved_reason=(
                                     lineage.unresolved_reason
                                     if lineage.unresolved_reason is not None
