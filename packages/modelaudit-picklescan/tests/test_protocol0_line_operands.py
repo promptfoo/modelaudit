@@ -9,6 +9,7 @@ from collections.abc import Mapping
 import pytest
 
 from modelaudit_picklescan import SafetyVerdict, ScanOptions, ScanStatus, scan_bytes
+from modelaudit_picklescan import api as picklescan_api
 
 MAX_PROTOCOL0_LINE_OPERAND_BYTES = 8 * 1024 * 1024
 SCAN_LIMIT_OVERHEAD_BYTES = 16
@@ -822,6 +823,23 @@ def test_scan_bytes_detects_sparse_lenient_base64_pickle_after_long_protocol0_sc
     assert report.status == ScanStatus.COMPLETE
     assert report.verdict == SafetyVerdict.MALICIOUS
     assert any(finding.rule_code == "DANGEROUS_CALL" for finding in report.findings)
+
+
+@pytest.mark.parametrize("separator_count", [9, 16])
+def test_trusted_storage_probe_routes_encoded_pickle_after_long_malformed_separator(
+    separator_count: int,
+) -> None:
+    nested_payload = b"cposix\nsystem\n(S'echo hidden'\ntR."
+    encoded = base64.b64encode(nested_payload)
+    payload = b"N." + (b"Z" * separator_count) + b"S'" + encoded + b"'\n."
+
+    assert picklescan_api._proto0_or_1_trusted_storage_probe_should_scan(payload, sample_is_prefix=False)
+
+
+def test_trusted_storage_probe_skips_long_malformed_separator_literal_near_match() -> None:
+    payload = b"N." + (b"Z" * 16) + b"S'benign-token'\n."
+
+    assert not picklescan_api._proto0_or_1_trusted_storage_probe_should_scan(payload, sample_is_prefix=False)
 
 
 def test_scan_bytes_ignores_sparse_unterminated_protocol0_base64_scalar() -> None:

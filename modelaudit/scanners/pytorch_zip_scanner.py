@@ -2763,9 +2763,8 @@ class PyTorchZipScanner(BaseScanner):
             return False
         separator = candidate[0]
         offset = 1
-        while (
-            offset < len(candidate) and candidate[offset] == separator and offset < _MAX_MALFORMED_SEPARATOR_RUN_BYTES
-        ):
+        separator_scan_limit = min(len(candidate), _TRUSTED_STORAGE_PICKLE_PROBE_BYTES)
+        while offset < separator_scan_limit and candidate[offset] == separator:
             offset += 1
         if offset < len(candidate) and candidate[offset] == separator:
             return False
