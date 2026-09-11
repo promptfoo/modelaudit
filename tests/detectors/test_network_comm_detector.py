@@ -1902,6 +1902,11 @@ class TestNetworkCommDetector:
         suspicious = [f for f in domain_findings if f["confidence"] > 0.6]
         assert len(suspicious) >= 2  # .tk and .ml are suspicious
 
+    def test_metadata_shaped_path_does_not_mark_onnx_metadata(self) -> None:
+        findings = NetworkCommDetector().scan(b"callback host evil.com", "/tmp/onnx_metadata/metadata")
+
+        assert any(finding.get("type") == "domain_name" and finding.get("domain") == "evil.com" for finding in findings)
+
     @pytest.mark.parametrize(
         "command",
         [
@@ -8546,6 +8551,14 @@ class TestNetworkCommDetector:
 
         assert not [finding for finding in findings if finding["type"] == "network_library"]
 
+    def test_onnx_metadata_context_preserves_short_prose_classification(self) -> None:
+        detector = NetworkCommDetector()
+        data = b"Documentation includes import socket for examples."
+
+        findings = detector.scan(data, "model.onnx", onnx_metadata_context=True)
+
+        assert not [finding for finding in findings if finding["type"] == "network_library"]
+
     def test_executable_metadata_named_path_still_flags_network_import(self) -> None:
         """Executable paths containing metadata-like words should not be treated as prose."""
         detector = NetworkCommDetector()
@@ -8715,6 +8728,11 @@ class TestNetworkCommDetector:
 
         assert not [finding for finding in findings if finding["type"] == "suspicious_port"]
         assert "4444" not in json.dumps(findings, sort_keys=True)
+
+    def test_binary_model_under_metadata_directory_stays_on_binary_port_path(self) -> None:
+        findings = NetworkCommDetector().scan(b"raw weights port=6379", "/tmp/metadata/model.pt")
+
+        assert not [finding for finding in findings if finding["type"] == "suspicious_port"]
 
     @pytest.mark.parametrize("quote", ['"', "'"])
     def test_explicit_binary_url_findings_do_not_capture_adjacent_credentials(self, quote: str) -> None:
