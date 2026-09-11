@@ -7654,6 +7654,46 @@ def test_scan_file_keeps_large_all_nul_storage_padding_clean(tmp_path: Path) -> 
     assert not any(finding.location is not None and "archive/data/0" in finding.location for finding in report.findings)
 
 
+def test_scan_file_large_all_nul_storage_padding_does_not_starve_later_storage(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model.pt"
+    padding_blob = b"N." + (b"\x00" * ((5 * 1024 * 1024) + 2))
+    persid_blob = b"Pkey01\n."
+    data_pkl_payload = (
+        b"\x80\x04]("
+        + _pytorch_storage_binpersid_expr(
+            "0",
+            storage_name="FloatStorage",
+            element_count=_float_storage_element_count_for_bytes(padding_blob),
+        )
+        + _pytorch_storage_binpersid_expr(
+            "1",
+            storage_name="FloatStorage",
+            element_count=_float_storage_element_count_for_bytes(persid_blob),
+        )
+        + b"e."
+    )
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", data_pkl_payload)
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", padding_blob)
+        archive.writestr("archive/data/1", persid_blob)
+
+    report = scan_file(archive_path)
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert "archive/data/1" in report.metadata["pickle_files"]
+    assert not any(finding.location is not None and "archive/data/0" in finding.location for finding in report.findings)
+    assert any(
+        finding.rule_code == "PERSISTENT_ID"
+        and finding.details.get("opcode") == "PERSID"
+        and finding.location is not None
+        and "archive/data/1" in finding.location
+        for finding in report.findings
+    )
+
+
 def test_scan_file_trusts_protocol0_storage_persid_in_data_pkl(tmp_path: Path) -> None:
     archive_path = tmp_path / "model.pt"
     with zipfile.ZipFile(archive_path, "w") as archive:

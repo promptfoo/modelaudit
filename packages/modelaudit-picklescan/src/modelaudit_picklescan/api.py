@@ -1675,7 +1675,6 @@ def _verified_nul_padding_storage_probe_sample(
             _check_pytorch_zip_deadline(deadline)
             chunk = member.read(min(_PICKLE_DISCOVERY_NUL_PADDING_VERIFY_CHUNK_BYTES, bytes_left))
             _check_pytorch_zip_deadline(deadline)
-            probe_bytes_remaining[0] -= len(chunk)
             if not chunk:
                 raise ValueError("trusted PyTorch storage padding probe limit reached")
             chunks.append(chunk)
