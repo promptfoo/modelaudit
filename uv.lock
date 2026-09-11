@@ -1921,6 +1921,7 @@ dependencies = [
     { name = "s3fs" },
     { name = "scipy", version = "1.15.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "tomli", marker = "python_full_version < '3.11'" },
     { name = "yaspin" },
 ]
 
@@ -2140,6 +2141,7 @@ requires-dist = [
     { name = "sqlparse", marker = "extra == 'mlflow'", specifier = ">=0.6.0" },
     { name = "tensorflow", marker = "python_full_version >= '3.11' and python_full_version < '3.13' and extra == 'tensorflow'", specifier = ">=2.21,<2.22" },
     { name = "tensorrt", marker = "(sys_platform == 'linux' and extra == 'tensorrt') or (sys_platform == 'win32' and extra == 'tensorrt')", specifier = ">=8.6.0" },
+    { name = "tomli", marker = "python_full_version < '3.11'", specifier = ">=2.0.0" },
     { name = "tflite", marker = "extra == 'all'", specifier = ">=2.18.0" },
     { name = "tflite", marker = "extra == 'all-ci'", specifier = ">=2.18.0" },
     { name = "tflite", marker = "extra == 'numpy1'", specifier = ">=2.18.0" },
