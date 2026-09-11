@@ -3728,6 +3728,7 @@ def test_trusted_mailbox_constructor_remains_startup_hook_opener(
     )
     monkeypatch.syspath_prepend(str(module_dir))
     importlib.invalidate_caches()
+    importlib.import_module(module_name)
     _clear_call_graph_caches()
     invocations = (
         {

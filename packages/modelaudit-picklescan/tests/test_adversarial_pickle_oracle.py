@@ -7,6 +7,7 @@ import dataclasses
 import gc
 import json
 import logging
+import mailbox
 import pickle
 import shlex
 import shutil
@@ -5485,6 +5486,7 @@ def test_scan_bytes_blocks_mailbox_singlefile_pth_writes(
     marker_content: str,
     expected_global: str,
 ) -> None:
+    assert mailbox.mbox is not None
     pth_path = tmp_path / f"mailbox_{case_name}_exec.pth"
     marker = tmp_path / f"mailbox_{case_name}_pth_rce_marker"
     control_payload = _mailbox_singlefile_pth_payload(
@@ -5572,7 +5574,8 @@ def test_scan_bytes_preserves_mailbox_add_detection_when_constructor_analysis_un
     )
 
     control_report = scan_bytes(control_payload, source="mailbox-mbox-control.pkl")
-    assert control_report.verdict == SafetyVerdict.CLEAN
+    assert control_report.status == ScanStatus.INCONCLUSIVE
+    assert control_report.verdict == SafetyVerdict.UNKNOWN
 
     report = scan_bytes(payload, source="mailbox-mbox-pth-rce.pkl")
     assert report.verdict == SafetyVerdict.MALICIOUS
