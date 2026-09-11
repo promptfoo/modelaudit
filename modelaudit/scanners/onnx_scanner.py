@@ -1803,8 +1803,10 @@ def _build_onnx_weight_analysis_plan(
     }
 
     def lineage_could_be_weight(lineage: _OnnxWeightLineage) -> bool:
-        return (lineage.data_type is None or lineage.data_type in floating_types) and (
-            lineage.shape is None or len(lineage.shape) >= 2
+        return (
+            lineage.unresolved_reason != "shape_control_lineage"
+            and (lineage.data_type is None or lineage.data_type in floating_types)
+            and (lineage.shape is None or len(lineage.shape) >= 2)
         )
 
     def value_info_shape(value_info: Any) -> tuple[int, ...] | None:
@@ -2174,6 +2176,29 @@ def _build_onnx_weight_analysis_plan(
         )
         return dict(sorted(lineages.items())[:_ONNX_WEIGHT_LINEAGES_PER_VALUE_LIMIT])
 
+    def merge_transform_markers(
+        left: tuple[_OnnxWeightTransform, ...],
+        right: tuple[_OnnxWeightTransform, ...],
+    ) -> tuple[_OnnxWeightTransform, ...]:
+        merged: list[_OnnxWeightTransform] = []
+        seen: set[_OnnxWeightTransform] = set()
+        for transform in (*left, *right):
+            if transform in seen:
+                continue
+            seen.add(transform)
+            merged.append(transform)
+            if len(merged) >= _ONNX_WEIGHT_TRANSFORM_DEPTH_LIMIT:
+                break
+        return tuple(merged)
+
+    def append_transform_marker(
+        transforms: tuple[_OnnxWeightTransform, ...],
+        marker: _OnnxWeightTransform,
+    ) -> tuple[_OnnxWeightTransform, ...]:
+        if marker in transforms or len(transforms) >= _ONNX_WEIGHT_TRANSFORM_DEPTH_LIMIT:
+            return transforms
+        return (*transforms, marker)
+
     def merge_lineages(
         target: dict[int, _OnnxWeightLineage],
         source: dict[int, _OnnxWeightLineage],
@@ -2186,6 +2211,17 @@ def _build_onnx_weight_analysis_plan(
                 target[initializer_index] = lineage
                 continue
             if existing == lineage:
+                continue
+            if (
+                existing.unresolved_reason == "shape_control_lineage"
+                and lineage.unresolved_reason != existing.unresolved_reason
+            ):
+                target[initializer_index] = lineage
+                continue
+            if (
+                lineage.unresolved_reason == "shape_control_lineage"
+                and existing.unresolved_reason != lineage.unresolved_reason
+            ):
                 continue
             reasons = {
                 reason for reason in (existing.unresolved_reason, lineage.unresolved_reason) if reason is not None
@@ -2203,7 +2239,7 @@ def _build_onnx_weight_analysis_plan(
                 initializer_index=initializer_index,
                 shape=None,
                 data_type=existing.data_type if existing.data_type == lineage.data_type else None,
-                transforms=existing.transforms,
+                transforms=merge_transform_markers(existing.transforms, lineage.transforms),
                 unresolved_reason=unresolved_reason,
             )
 
@@ -2364,8 +2400,10 @@ def _build_onnx_weight_analysis_plan(
                 "Unsqueeze",
             }
             all_input_lineages: dict[int, _OnnxWeightLineage] = {}
+            shape_control_input_lineages: dict[int, _OnnxWeightLineage] = {}
             terminal_weight_lineages: set[int] = set()
             activation_input_lineages: set[int] = set()
+            recurrent_state_lineages: dict[int, _OnnxWeightLineage] = {}
             input_names = [str(input_name) for input_name in node.input if input_name]
             if fail_on_unbound_inputs:
                 for input_name in input_names:
@@ -2419,20 +2457,69 @@ def _build_onnx_weight_analysis_plan(
                 is_non_data_standard_input = (
                     is_registered_standard_operator
                     and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
-                    and ((node.op_type == "Clip" and input_index > 0) or (node.op_type == "Where" and input_index == 0))
+                    and (
+                        (node.op_type == "Clip" and input_index > 0)
+                        or (
+                            not is_model_local_function
+                            and node.op_type in _RECURRENT_WEIGHT_OPERATORS
+                            and input_index == 4
+                        )
+                    )
                 )
-                if not is_array_feature_selector and not is_non_data_standard_input:
+                is_shape_control_input = (
+                    is_registered_standard_operator
+                    and not is_model_local_function
+                    and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
+                    and (
+                        (node.op_type in {"Expand", "Gather", "GatherElements", "GatherND"} and input_index == 1)
+                        or (node.op_type == "Reshape" and input_index == 1)
+                        or (node.op_type == "Slice" and input_index > 0)
+                        or (node.op_type in {"Squeeze", "Unsqueeze"} and input_index == 1)
+                        or (node.op_type == "Tile" and input_index == 1)
+                        or (node.op_type == "Where" and input_index == 0)
+                    )
+                )
+                if is_shape_control_input:
+                    # Shape and Size can later turn output dimensions into numeric data.
+                    shape_control_lineages = {
+                        initializer_index: _OnnxWeightLineage(
+                            initializer_index=initializer_index,
+                            shape=None,
+                            data_type=None,
+                            transforms=lineage.transforms,
+                            unresolved_reason="shape_control_lineage",
+                        )
+                        for initializer_index, lineage in input_lineages.items()
+                    }
+                    merge_lineages(
+                        all_input_lineages,
+                        shape_control_lineages,
+                        ambiguous_reason="ambiguous_operator_input_lineage",
+                    )
+                    merge_lineages(
+                        shape_control_input_lineages,
+                        shape_control_lineages,
+                        ambiguous_reason="ambiguous_operator_input_lineage",
+                    )
+                elif not is_array_feature_selector and not is_non_data_standard_input:
                     merge_lineages(
                         all_input_lineages,
                         input_lineages,
                         ambiguous_reason="ambiguous_operator_input_lineage",
                     )
                 for initializer_index, lineage in input_lineages.items():
+                    potential_weight_role = _onnx_potential_weight_input(
+                        node,
+                        input_index,
+                        is_model_local_function=is_model_local_function,
+                        is_registered_standard_operator=is_registered_standard_operator,
+                    )
                     invalid_clip_bound = (
                         is_registered_standard_operator
                         and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
                         and node.op_type == "Clip"
                         and input_index > 0
+                        and lineage.unresolved_reason != "shape_control_lineage"
                         and lineage.shape != ()
                     )
                     if invalid_clip_bound:
@@ -2448,23 +2535,33 @@ def _build_onnx_weight_analysis_plan(
                             current_node_index,
                             input_index,
                         )
-                    potential_weight_input = _onnx_potential_weight_input(
-                        node,
-                        input_index,
-                        is_model_local_function=is_model_local_function,
-                        is_registered_standard_operator=is_registered_standard_operator,
-                    ) and lineage_could_be_weight(lineage)
+                    potential_weight_input = potential_weight_role and lineage_could_be_weight(lineage)
                     if supported_transform and input_index == 0:
                         continue
                     if potential_weight_input:
                         terminal_weight_lineages.add(initializer_index)
                     terminal_consumer_counts[initializer_index] += 1
                     total_consumer_count += 1
+                    recurrent_initial_state = (
+                        is_registered_standard_operator
+                        and not is_model_local_function
+                        and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
+                        and node.op_type in _RECURRENT_WEIGHT_OPERATORS
+                        and (input_index == 5 or (node.op_type == "LSTM" and input_index == 6))
+                    )
+                    if recurrent_initial_state:
+                        recurrent_state_lineages[initializer_index] = lineage
                     if lineage.unresolved_reason is not None:
+                        if lineage.unresolved_reason == "shape_control_lineage":
+                            record_exclusion(initializer_index, "shape_control_input", node, input_index)
+                            continue
                         opposite_resolved_weight = any(
                             resolved_index != input_index for resolved_index in resolved_weight_input_indexes
                         )
                         prior_layer_activation = lineage.unresolved_reason == "dynamic_activation_lineage"
+                        recurrent_final_state_output = any(
+                            transform.kind == "recurrent_state_output" for transform in lineage.transforms
+                        )
                         recognized_activation_input = prior_layer_activation and (
                             (
                                 is_registered_standard_operator
@@ -2475,11 +2572,25 @@ def _build_onnx_weight_analysis_plan(
                                 and (opposite_resolved_weight or all_lineage_inputs_are_activation_contraction)
                             )
                         )
+                        recognized_activation_input |= recurrent_initial_state and opposite_resolved_weight
                         if recognized_activation_input:
+                            if recurrent_initial_state:
+                                recurrent_state_lineages[initializer_index] = lineage
                             if opposite_resolved_weight:
                                 activation_input_lineages.add(initializer_index)
                             record_exclusion(initializer_index, "dynamic_activation_input", node, input_index)
-                        elif potential_weight_input:
+                        elif potential_weight_input or (
+                            (
+                                potential_weight_role
+                                and lineage.unresolved_reason
+                                in {"recurrent_sequence_state_lineage", "recurrent_state_lineage"}
+                            )
+                            or (
+                                potential_weight_role
+                                and recurrent_final_state_output
+                                and lineage.unresolved_reason != "shape_control_lineage"
+                            )
+                        ):
                             record_unresolved_lineage(lineage, node, current_node_index, input_index)
                         else:
                             record_exclusion(initializer_index, "unresolved_lineage_consumer", node, input_index)
@@ -2673,12 +2784,33 @@ def _build_onnx_weight_analysis_plan(
                     ),
                 )
 
+            # Keep dimension provenance: a later Cast can turn dimensions into weights.
+            is_shape_query = (
+                is_registered_standard_operator
+                and not is_model_local_function
+                and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
+                and node.op_type in {"Shape", "Size"}
+            )
             output_lineages: dict[int, _OnnxWeightLineage] = {}
             if supported_transform:
                 data_lineages = value_lineages.get(str(node.input[0]), {}) if node.input else {}
                 for initializer_index, lineage in data_lineages.items():
                     transform_counts[initializer_index] += 1
                     output_lineages[initializer_index] = transformed_lineage(lineage, node, constants)
+                merge_lineages(
+                    output_lineages,
+                    shape_control_input_lineages,
+                    ambiguous_reason="ambiguous_operator_input_lineage",
+                )
+            elif is_shape_query:
+                for initializer_index, lineage in all_input_lineages.items():
+                    output_lineages[initializer_index] = _OnnxWeightLineage(
+                        initializer_index=initializer_index,
+                        shape=None,
+                        data_type=onnx.TensorProto.INT64,
+                        transforms=lineage.transforms,
+                        unresolved_reason="shape_dimensions_lineage",
+                    )
             elif (
                 all_input_lineages
                 and node.op_type not in _QUANTIZED_WEIGHT_OPERATORS
@@ -2734,10 +2866,28 @@ def _build_onnx_weight_analysis_plan(
                 carries_dynamic_activation |= any(
                     lineage.unresolved_reason == "dynamic_activation_lineage" for lineage in all_input_lineages.values()
                 )
+                preserves_shape_control = (
+                    is_registered_standard_operator
+                    and not is_model_local_function
+                    and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
+                    and (
+                        same_type_elementwise
+                        or (
+                            same_type_unary_elementwise
+                            and node.op_type not in {"Hardmax", "LogSoftmax", "LpNormalization", "Softmax"}
+                        )
+                        or clip_operator
+                        or pow_operator
+                        or node.op_type in {"Expand", "Gather", "GatherElements", "GatherND", "Slice", "Tile"}
+                    )
+                )
                 for initializer_index, lineage in all_input_lineages.items():
                     if initializer_index in activation_input_lineages:
                         continue
                     unresolved_reason = lineage.unresolved_reason
+                    if unresolved_reason == "shape_control_lineage" and not preserves_shape_control:
+                        # Reductions, normalization and unknown operators can turn extents into data values.
+                        unresolved_reason = "shape_dimensions_lineage"
                     if unresolved_reason is None:
                         if carries_dynamic_activation:
                             unresolved_reason = "dynamic_activation_lineage"
@@ -2871,6 +3021,49 @@ def _build_onnx_weight_analysis_plan(
                     continue
                 name = str(output_name)
                 per_output_lineages = dict(output_lineages)
+                if (
+                    recurrent_state_lineages
+                    and is_registered_standard_operator
+                    and not is_model_local_function
+                    and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
+                    and node.op_type in _RECURRENT_WEIGHT_OPERATORS
+                ):
+                    for initializer_index in recurrent_state_lineages:
+                        per_output_lineages.pop(initializer_index, None)
+                    if output_index == 0:
+                        state_lineages = {
+                            initializer_index: _OnnxWeightLineage(
+                                initializer_index=initializer_index,
+                                shape=lineage.shape,
+                                data_type=lineage.data_type,
+                                transforms=lineage.transforms,
+                                unresolved_reason="recurrent_sequence_state_lineage",
+                            )
+                            for initializer_index, lineage in recurrent_state_lineages.items()
+                        }
+                    else:
+                        state_lineages = {
+                            initializer_index: _OnnxWeightLineage(
+                                initializer_index=initializer_index,
+                                shape=lineage.shape,
+                                data_type=lineage.data_type,
+                                transforms=append_transform_marker(
+                                    lineage.transforms,
+                                    _OnnxWeightTransform("recurrent_state_output"),
+                                ),
+                                unresolved_reason=(
+                                    lineage.unresolved_reason
+                                    if lineage.unresolved_reason is not None
+                                    else "recurrent_state_lineage"
+                                ),
+                            )
+                            for initializer_index, lineage in recurrent_state_lineages.items()
+                        }
+                    merge_lineages(
+                        per_output_lineages,
+                        state_lineages,
+                        ambiguous_reason="ambiguous_operator_input_lineage",
+                    )
                 merge_lineages(
                     per_output_lineages,
                     constant_output_lineages.get(name, {}),
