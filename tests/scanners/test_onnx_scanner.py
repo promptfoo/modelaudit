@@ -3783,6 +3783,7 @@ def test_onnx_scanner_transformed_non_scalar_clip_bound_fails_closed(tmp_path: P
     assert len(coverage_checks) == 1
     assert coverage_checks[0].details["coverage_gaps"] == {"unresolved_initializer_lineage": 1}
     samples = result.metadata["onnx_weight_distribution_semantics"]["unresolved_lineage_samples"]
+    assert {sample["initializer"] for sample in samples} == {"minimum_matrix"}
     assert {sample["reason"] for sample in samples} == {"invalid_clip_bound_shape"}
 
 

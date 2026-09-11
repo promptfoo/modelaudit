@@ -2083,6 +2083,7 @@ def _build_onnx_weight_analysis_plan(
                         and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
                         and node.op_type == "Clip"
                         and input_index > 0
+                        and lineage.unresolved_reason != "shape_control_lineage"
                         and lineage.shape != ()
                     )
                     if invalid_clip_bound:
