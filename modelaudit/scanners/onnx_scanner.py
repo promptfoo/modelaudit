@@ -1951,6 +1951,7 @@ def _build_onnx_weight_analysis_plan(
             all_input_lineages: dict[int, _OnnxWeightLineage] = {}
             terminal_weight_lineages: set[int] = set()
             activation_input_lineages: set[int] = set()
+            recurrent_state_lineages: dict[int, _OnnxWeightLineage] = {}
             input_names = [str(input_name) for input_name in node.input if input_name]
             if fail_on_unbound_inputs:
                 for input_name in input_names:
@@ -2019,6 +2020,7 @@ def _build_onnx_weight_analysis_plan(
                     and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
                     and (
                         (node.op_type in {"Expand", "Gather", "GatherElements", "GatherND"} and input_index == 1)
+                        or (node.op_type == "Slice" and input_index > 0)
                         or (node.op_type == "Where" and input_index == 0)
                     )
                 )
@@ -2104,6 +2106,8 @@ def _build_onnx_weight_analysis_plan(
                         )
                         recognized_activation_input |= recurrent_initial_state and opposite_resolved_weight
                         if recognized_activation_input:
+                            if recurrent_initial_state and lineage.unresolved_reason == "shape_dimensions_lineage":
+                                recurrent_state_lineages[initializer_index] = lineage
                             if opposite_resolved_weight:
                                 activation_input_lineages.add(initializer_index)
                             record_exclusion(initializer_index, "dynamic_activation_input", node, input_index)
@@ -2537,6 +2541,19 @@ def _build_onnx_weight_analysis_plan(
                     continue
                 name = str(output_name)
                 per_output_lineages = dict(output_lineages)
+                if (
+                    recurrent_state_lineages
+                    and output_index > 0
+                    and is_registered_standard_operator
+                    and not is_model_local_function
+                    and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
+                    and node.op_type in _RECURRENT_WEIGHT_OPERATORS
+                ):
+                    merge_lineages(
+                        per_output_lineages,
+                        recurrent_state_lineages,
+                        ambiguous_reason="ambiguous_operator_input_lineage",
+                    )
                 merge_lineages(
                     per_output_lineages,
                     constant_output_lineages.get(name, {}),
