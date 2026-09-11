@@ -2023,6 +2023,7 @@ def _build_onnx_weight_analysis_plan(
                         (node.op_type in {"Expand", "Gather", "GatherElements", "GatherND"} and input_index == 1)
                         or (node.op_type == "Reshape" and input_index == 1)
                         or (node.op_type == "Slice" and input_index > 0)
+                        or (node.op_type in {"Squeeze", "Unsqueeze"} and input_index == 1)
                         or (node.op_type == "Tile" and input_index == 1)
                         or (node.op_type == "Where" and input_index == 0)
                     )

@@ -6721,7 +6721,10 @@ class TestWeightDistributionSemantics:
 
     @pytest.mark.parametrize("transform", ["Identity", "Relu"])
     @pytest.mark.parametrize("observation", ["Shape", "Size"])
-    @pytest.mark.parametrize("control", ["Expand", "Gather", "GatherElements", "GatherND", "Reshape", "Where"])
+    @pytest.mark.parametrize(
+        "control",
+        ["Expand", "Gather", "GatherElements", "GatherND", "Reshape", "Squeeze", "Unsqueeze", "Where"],
+    )
     def test_shape_control_ownership_survives_value_transforms(
         self, tmp_path: Path, transform: str, observation: str, control: str
     ) -> None:
@@ -6731,19 +6734,24 @@ class TestWeightDistributionSemantics:
             "GatherElements": [2, 4],
             "GatherND": [4],
             "Reshape": [2, 4],
+            "Squeeze": [1, 4],
+            "Unsqueeze": [4],
             "Where": [1, 4],
         }[control]
         inputs = [helper.make_tensor_value_info("runtime", TensorProto.FLOAT, runtime_shape)]
+        source_shape = (
+            (0,) if control in {"Squeeze", "Unsqueeze"} else (2, 4) if control in {"Expand", "Reshape"} else (2, 1)
+        )
         initializers = [
-            onnx.numpy_helper.from_array(
-                np.ones((2, 4) if control in {"Expand", "Reshape"} else (2, 1), dtype=np.float32), name="source"
-            ),
+            onnx.numpy_helper.from_array(np.ones(source_shape, dtype=np.float32), name="source"),
         ]
         nodes = [helper.make_node("Shape", ["source"], ["dimensions"])]
         if control == "Expand":
             nodes.append(helper.make_node("Expand", ["runtime", "dimensions"], ["selected"]))
         elif control == "Reshape":
             nodes.append(helper.make_node("Reshape", ["runtime", "dimensions"], ["selected"]))
+        elif control in {"Squeeze", "Unsqueeze"}:
+            nodes.append(helper.make_node(control, ["runtime", "dimensions"], ["selected"]))
         else:
             initializers.append(
                 onnx.numpy_helper.from_array(
@@ -6768,7 +6776,7 @@ class TestWeightDistributionSemantics:
             initializers.append(onnx.numpy_helper.from_array(np.array([0], dtype=np.int64), name="axes"))
             nodes.append(helper.make_node("Unsqueeze", [values, "axes"], ["dimension_values"]))
             values = "dimension_values"
-        columns = 1 if observation == "Size" or control == "GatherND" else 2
+        columns = 1 if observation == "Size" or control in {"GatherND", "Squeeze"} else 2
         initializers.append(onnx.numpy_helper.from_array(np.ones((1, columns), dtype=np.float32), name="projection"))
         nodes.append(helper.make_node("MatMul", ["projection", values], ["Y"]))
         graph = helper.make_graph(
