@@ -90,6 +90,7 @@ _MAX_PROTO0_GLOBAL_PREFIX_WITHOUT_NEWLINE_BYTES = 128
 _PROTO0_GLOBAL_PREFIX_WITHOUT_NEWLINE_RE = re.compile(rb"c[A-Za-z_][A-Za-z0-9_.]*")
 _PICKLE_DISCOVERY_PADDING_PROBE_BYTES = 256 * 1024
 _PICKLE_DISCOVERY_NUL_PADDING_VERIFY_CHUNK_BYTES = 64 * 1024
+_PICKLE_DISCOVERY_NUL_PADDING_VERIFY_BUDGET_BYTES = 64 * 1024 * 1024
 _PROTO0_1_PREFIX_TRUNCATION_ERROR_PREFIXES = (
     "pickle exhausted before seeing STOP",
     "no newline found when trying to read ",
@@ -1040,6 +1041,7 @@ def _discover_pytorch_zip_pickle_entries(
         candidates.append(entry)
 
     probe_bytes_remaining = [_MAX_PYTORCH_ZIP_PICKLE_DISCOVERY_PROBE_BYTES]
+    nul_padding_verify_bytes_remaining = [_PICKLE_DISCOVERY_NUL_PADDING_VERIFY_BUDGET_BYTES]
     deferred_expanded_probe_entries: list[zipfile.ZipInfo] = []
     deferred_padding_probe_entries: list[zipfile.ZipInfo] = []
     probed_member_count = 0
@@ -1062,6 +1064,7 @@ def _discover_pytorch_zip_pickle_entries(
                     entry,
                     probe_bytes_remaining,
                     deadline,
+                    nul_padding_verify_bytes_remaining=nul_padding_verify_bytes_remaining,
                     max_probe_bytes=storage_probe_bytes,
                     defer_expanded_probe=needs_deferred_expanded_probe,
                     defer_padding_probe=needs_deferred_padding_probe,
@@ -1103,6 +1106,7 @@ def _discover_pytorch_zip_pickle_entries(
                     entry,
                     probe_bytes_remaining,
                     deadline,
+                    nul_padding_verify_bytes_remaining=nul_padding_verify_bytes_remaining,
                     max_probe_bytes=_PICKLE_DISCOVERY_LONG_PROBE_BYTES,
                     defer_padding_probe=needs_deferred_padding_probe,
                 ):
@@ -1133,6 +1137,7 @@ def _discover_pytorch_zip_pickle_entries(
                         entry,
                         probe_bytes_remaining,
                         deadline,
+                        nul_padding_verify_bytes_remaining=nul_padding_verify_bytes_remaining,
                         max_probe_bytes=_PICKLE_DISCOVERY_LONG_PROBE_BYTES,
                     ):
                         add_entry(entry)
@@ -1454,10 +1459,13 @@ def _trusted_storage_zip_entry_looks_like_pickle(
     probe_bytes_remaining: list[int],
     deadline: float,
     *,
+    nul_padding_verify_bytes_remaining: list[int] | None = None,
     max_probe_bytes: int = _TRUSTED_STORAGE_PICKLE_PROBE_BYTES,
     defer_expanded_probe: list[bool] | None = None,
     defer_padding_probe: list[bool] | None = None,
 ) -> bool:
+    if nul_padding_verify_bytes_remaining is None:
+        nul_padding_verify_bytes_remaining = [_PICKLE_DISCOVERY_NUL_PADDING_VERIFY_BUDGET_BYTES]
     prefix = _read_zip_entry_probe(
         archive,
         entry,
@@ -1583,6 +1591,7 @@ def _trusted_storage_zip_entry_looks_like_pickle(
                             entry,
                             sample,
                             probe_bytes_remaining,
+                            nul_padding_verify_bytes_remaining,
                             deadline,
                             is_frame_first_candidate=is_frame_first_candidate,
                         )
@@ -1600,6 +1609,7 @@ def _trusted_storage_zip_entry_looks_like_pickle(
                     entry,
                     sample,
                     probe_bytes_remaining,
+                    nul_padding_verify_bytes_remaining,
                     deadline,
                     is_frame_first_candidate=is_frame_first_candidate,
                 )
@@ -1613,6 +1623,7 @@ def _verified_nul_padding_storage_probe_should_scan(
     entry: zipfile.ZipInfo,
     sample: bytes,
     probe_bytes_remaining: list[int],
+    nul_padding_verify_bytes_remaining: list[int],
     deadline: float,
     *,
     is_frame_first_candidate: bool,
@@ -1624,6 +1635,7 @@ def _verified_nul_padding_storage_probe_should_scan(
             sample,
             len(sample),
             probe_bytes_remaining,
+            nul_padding_verify_bytes_remaining,
             deadline,
         )
     if is_frame_first_candidate and _frame_first_trusted_storage_probe_should_scan(sample):
@@ -1644,14 +1656,16 @@ def _verified_nul_padding_storage_probe_sample(
     sample: bytes,
     verified_prefix_bytes: int,
     probe_bytes_remaining: list[int],
+    nul_padding_verify_bytes_remaining: list[int],
     deadline: float,
 ) -> bytes:
     remaining_bytes = max(entry.file_size - verified_prefix_bytes, 0)
-    if remaining_bytes > probe_bytes_remaining[0]:
+    if remaining_bytes > nul_padding_verify_bytes_remaining[0]:
         raise _PickleDiscoveryProbeBudgetExceeded
     if remaining_bytes == 0:
         return sample
 
+    nul_padding_verify_bytes_remaining[0] -= remaining_bytes
     chunks: list[bytes] = []
     saw_non_nul = False
     with archive.open(entry, "r") as member:
@@ -1669,6 +1683,9 @@ def _verified_nul_padding_storage_probe_sample(
                 saw_non_nul = True
             bytes_left -= len(chunk)
     if saw_non_nul:
+        if remaining_bytes > probe_bytes_remaining[0]:
+            raise _PickleDiscoveryProbeBudgetExceeded
+        probe_bytes_remaining[0] -= remaining_bytes
         return sample + b"".join(chunks)
     return sample
 

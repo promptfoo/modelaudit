@@ -4425,6 +4425,23 @@ def test_pytorch_zip_discovery_skips_protocol0_persid_near_match_storage_blob(tm
     assert not any(issue.details.get("pickle_filename") == "archive/data/0" for issue in result.issues)
 
 
+def test_pytorch_zip_discovery_keeps_large_all_nul_storage_padding_clean(tmp_path: Path) -> None:
+    model_path = tmp_path / "referenced_large_nul_padding_storage.pt"
+    storage_blob = b"N." + (b"\x00" * ((5 * 1024 * 1024) + 2))
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        zip_file.writestr("archive/data/0", storage_blob)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert result.success is True
+    assert result.metadata.get("pickle_verdict") == "clean"
+    assert result.metadata["pickle_files"] == ["archive/data.pkl"]
+    assert not any(issue.details.get("pickle_filename") == "archive/data/0" for issue in result.issues)
+
+
 def test_pytorch_zip_literal_text_route_ignores_oversized_base64_compatible_noise() -> None:
     assert PyTorchZipScanner._literal_value_has_storage_scan_signal(b"A" * 100_000) is False
 

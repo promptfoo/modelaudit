@@ -289,6 +289,7 @@ _PROTO0_1_TEXT_WHITESPACE_BYTES = b" \t\r\n"
 _PICKLE_DISCOVERY_PADDING_PROBE_BYTES = 256 * 1024
 _PICKLE_DISCOVERY_NUL_PADDING_VERIFY_CHUNK_BYTES = 64 * 1024
 _PICKLE_DISCOVERY_PADDING_PROBE_BUDGET_BYTES = 4 * 1024 * 1024
+_PICKLE_DISCOVERY_NUL_PADDING_VERIFY_BUDGET_BYTES = 64 * 1024 * 1024
 _PICKLE_INCOMPLETE_FRAME_MIN_PAYLOAD_OPCODES = 4
 _PYTORCH_STORAGE_TRUST_MAX_OPCODES = 100_000
 _PYTORCH_STORAGE_TRUST_MAX_STACK_DEPTH = 1024
@@ -1562,6 +1563,7 @@ class PyTorchZipScanner(BaseScanner):
         # checks list with one INFO finding apiece.
         probe_failures: list[dict[str, Any]] = []
         padding_probe_bytes_remaining = [_PICKLE_DISCOVERY_PADDING_PROBE_BUDGET_BYTES]
+        nul_padding_verify_bytes_remaining = [_PICKLE_DISCOVERY_NUL_PADDING_VERIFY_BUDGET_BYTES]
         deferred_padding_probe_entries: list[zipfile.ZipInfo] = []
         for entry in safe_entries:
             name = self._get_zip_member_name(entry)
@@ -1575,6 +1577,7 @@ class PyTorchZipScanner(BaseScanner):
                         entry,
                         result,
                         padding_probe_bytes_remaining=padding_probe_bytes_remaining,
+                        nul_padding_verify_bytes_remaining=nul_padding_verify_bytes_remaining,
                         defer_padding_probe=needs_deferred_padding_probe,
                     )
                 elif name in storage_probe_blob_members:
@@ -1584,6 +1587,7 @@ class PyTorchZipScanner(BaseScanner):
                         result,
                         max_probe_bytes=_PICKLE_DISCOVERY_LONG_PROBE_BYTES,
                         padding_probe_bytes_remaining=padding_probe_bytes_remaining,
+                        nul_padding_verify_bytes_remaining=nul_padding_verify_bytes_remaining,
                         defer_padding_probe=needs_deferred_padding_probe,
                     )
                 else:
@@ -1613,6 +1617,7 @@ class PyTorchZipScanner(BaseScanner):
                     result,
                     max_probe_bytes=_PICKLE_DISCOVERY_LONG_PROBE_BYTES,
                     padding_probe_bytes_remaining=padding_probe_bytes_remaining,
+                    nul_padding_verify_bytes_remaining=nul_padding_verify_bytes_remaining,
                 ):
                     add_pickle_entry(entry)
             except Exception as exc:
@@ -2003,6 +2008,7 @@ class PyTorchZipScanner(BaseScanner):
         *,
         max_probe_bytes: int = _TRUSTED_STORAGE_PICKLE_PROBE_BYTES,
         padding_probe_bytes_remaining: list[int] | None = None,
+        nul_padding_verify_bytes_remaining: list[int] | None = None,
         defer_padding_probe: list[bool] | None = None,
     ) -> bool:
         """Return True only for parse-confirmed pickle payloads in referenced tensor storage."""
@@ -2208,6 +2214,7 @@ class PyTorchZipScanner(BaseScanner):
                             sample,
                             result,
                             padding_probe_bytes_remaining,
+                            nul_padding_verify_bytes_remaining,
                             is_frame_first_candidate=is_frame_first_candidate,
                         )
                     raise ValueError("trusted PyTorch storage padding probe limit reached")
@@ -2229,6 +2236,7 @@ class PyTorchZipScanner(BaseScanner):
                         sample,
                         result,
                         padding_probe_bytes_remaining,
+                        nul_padding_verify_bytes_remaining,
                         is_frame_first_candidate=is_frame_first_candidate,
                     )
                 raise ValueError("trusted PyTorch storage padding probe limit reached")
@@ -2243,6 +2251,7 @@ class PyTorchZipScanner(BaseScanner):
         sample: bytes,
         result: ScanResult,
         padding_probe_bytes_remaining: list[int] | None,
+        nul_padding_verify_bytes_remaining: list[int] | None,
         *,
         is_frame_first_candidate: bool,
     ) -> bool:
@@ -2254,6 +2263,7 @@ class PyTorchZipScanner(BaseScanner):
                 verified_prefix_bytes=len(sample),
                 result=result,
                 padding_probe_bytes_remaining=padding_probe_bytes_remaining,
+                nul_padding_verify_bytes_remaining=nul_padding_verify_bytes_remaining,
             )
         if is_frame_first_candidate and self._frame_first_trusted_storage_probe_should_scan(sample):
             return True
@@ -2275,10 +2285,11 @@ class PyTorchZipScanner(BaseScanner):
         verified_prefix_bytes: int,
         result: ScanResult,
         padding_probe_bytes_remaining: list[int] | None,
+        nul_padding_verify_bytes_remaining: list[int] | None,
     ) -> bytes:
         remaining_bytes = max(entry.file_size - verified_prefix_bytes, 0)
         PyTorchZipScanner._charge_padding_probe_budget(
-            padding_probe_bytes_remaining,
+            nul_padding_verify_bytes_remaining,
             remaining_bytes,
         )
         if remaining_bytes == 0:
@@ -2298,6 +2309,10 @@ class PyTorchZipScanner(BaseScanner):
         if len(tail) < remaining_bytes:
             raise ValueError("trusted PyTorch storage padding probe limit reached")
         if tail.rstrip(b"\x00"):
+            PyTorchZipScanner._charge_padding_probe_budget(
+                padding_probe_bytes_remaining,
+                remaining_bytes,
+            )
             return sample + tail
         return sample
 
