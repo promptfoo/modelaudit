@@ -1763,6 +1763,14 @@ def _build_onnx_weight_analysis_plan(
                 break
         return tuple(merged)
 
+    def append_transform_marker(
+        transforms: tuple[_OnnxWeightTransform, ...],
+        marker: _OnnxWeightTransform,
+    ) -> tuple[_OnnxWeightTransform, ...]:
+        if marker in transforms or len(transforms) >= _ONNX_WEIGHT_TRANSFORM_DEPTH_LIMIT:
+            return transforms
+        return (*transforms, marker)
+
     def merge_lineages(
         target: dict[int, _OnnxWeightLineage],
         source: dict[int, _OnnxWeightLineage],
@@ -2615,7 +2623,10 @@ def _build_onnx_weight_analysis_plan(
                                 initializer_index=initializer_index,
                                 shape=lineage.shape,
                                 data_type=lineage.data_type,
-                                transforms=(*lineage.transforms, _OnnxWeightTransform("recurrent_state_output")),
+                                transforms=append_transform_marker(
+                                    lineage.transforms,
+                                    _OnnxWeightTransform("recurrent_state_output"),
+                                ),
                                 unresolved_reason=(
                                     lineage.unresolved_reason
                                     if lineage.unresolved_reason is not None

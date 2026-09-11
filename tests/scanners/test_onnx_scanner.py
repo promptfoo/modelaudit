@@ -7204,6 +7204,65 @@ class TestWeightDistributionSemantics:
             for sample in result.metadata["onnx_weight_distribution_semantics"]["unresolved_lineage_samples"]
         )
 
+    def test_recurrent_final_state_marker_does_not_grow_through_state_chain(self, tmp_path: Path) -> None:
+        hidden_size = 4
+        recurrent_nodes = []
+        recurrent_initializers = [
+            onnx.numpy_helper.from_array(np.zeros((1, 1, hidden_size), dtype=np.float32), name="initial_h")
+        ]
+        previous_state = "initial_h"
+        for index in range(6):
+            state_name = f"state_{index}"
+            recurrent_nodes.append(
+                helper.make_node(
+                    "RNN",
+                    ["sequence", f"W_{index}", f"R_{index}", "", "", previous_state],
+                    [f"sequence_output_{index}", state_name],
+                    hidden_size=hidden_size,
+                )
+            )
+            recurrent_initializers.extend(
+                [
+                    onnx.numpy_helper.from_array(
+                        np.zeros((1, hidden_size, hidden_size), dtype=np.float32), name=f"W_{index}"
+                    ),
+                    onnx.numpy_helper.from_array(
+                        np.zeros((1, hidden_size, hidden_size), dtype=np.float32), name=f"R_{index}"
+                    ),
+                ]
+            )
+            previous_state = state_name
+        graph = helper.make_graph(
+            [
+                *recurrent_nodes,
+                helper.make_node("Reshape", [previous_state, "weight_shape"], ["generated_weight"]),
+                helper.make_node("MatMul", ["X", "generated_weight"], ["Y"]),
+            ],
+            "chained_recurrent_final_state_marker",
+            [helper.make_tensor_value_info("sequence", TensorProto.FLOAT, [1, 1, hidden_size])],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 1])],
+            initializer=[
+                *recurrent_initializers,
+                onnx.numpy_helper.from_array(np.ones((1, hidden_size), dtype=np.float32), name="X"),
+                onnx.numpy_helper.from_array(np.array([hidden_size, 1], dtype=np.int64), name="weight_shape"),
+            ],
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 14)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / "chained-recurrent-final-state-marker.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        assert result.success is False
+        samples = result.metadata["onnx_weight_distribution_semantics"]["unresolved_lineage_samples"]
+        sample = next(
+            sample for sample in samples if sample["initializer"] == "initial_h" and sample["consumer_op"] == "MatMul"
+        )
+        assert sample["reason"] == "recurrent_state_lineage"
+        assert sample["lineage_transform_count"] == 2
+
     @pytest.mark.parametrize(
         ("generated_source", "expected_reason"),
         [
