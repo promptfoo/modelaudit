@@ -8498,7 +8498,7 @@ class TestRawDetectorCoverage:
     def test_structured_network_extraction_skips_repeated_numeric_fields_before_iteration(self) -> None:
         class RepeatedNumericField:
             name = "ints"
-            label = 3
+            is_repeated = True
             type = 3
             LABEL_REPEATED = 3
             TYPE_MESSAGE = 11
@@ -8526,6 +8526,34 @@ class TestRawDetectorCoverage:
         onnx_scanner_module._collect_onnx_proto_text_fields(collector, AttributeMessage(), "attribute")
 
         assert collector.finish().sections == ()
+
+    def test_structured_network_extraction_accepts_repeated_field_without_label(self) -> None:
+        class RepeatedStringField:
+            name = "input"
+            is_repeated = True
+            type = 9
+            TYPE_MESSAGE = 11
+            TYPE_BYTES = 12
+            TYPE_STRING = 9
+
+        class Descriptor:
+            fields: ClassVar[tuple[Any, ...]] = (RepeatedStringField(),)
+
+        class Message:
+            DESCRIPTOR = Descriptor()
+            input = ("https://docs.ultralytics.com/",)
+
+        collector = onnx_scanner_module._OnnxNetworkTextCollector(
+            max_bytes=1024,
+            max_fields=10,
+            check_interrupted=lambda: None,
+        )
+
+        onnx_scanner_module._collect_onnx_proto_text_fields(collector, Message(), "model.graph.node[0]")
+
+        detector_input = collector.finish()
+        assert detector_input.field_count == 1
+        assert b"model.graph.node[0].input[0]: https://docs.ultralytics.com/" in detector_input.data
 
     def test_network_detector_ignores_onnx_raw_tensor_bytes(self, tmp_path: Path) -> None:
         payload = b"quantized calibration bytes 8.8.8.8 are tensor data"

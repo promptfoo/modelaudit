@@ -674,6 +674,13 @@ def _is_onnx_metadata_text_label(label: str) -> bool:
     return ".metadata_props[" in label
 
 
+def _onnx_proto_field_is_repeated(proto_field: Any) -> bool:
+    is_repeated = getattr(proto_field, "is_repeated", None)
+    if is_repeated is not None:
+        return bool(is_repeated() if callable(is_repeated) else is_repeated)
+    return getattr(proto_field, "label", None) == getattr(proto_field, "LABEL_REPEATED", 3)
+
+
 def _collect_onnx_network_detector_input(
     model: Any,
     *,
@@ -794,14 +801,15 @@ def _collect_onnx_proto_text_fields(
         field_label = f"{label}.{proto_field.name}"
         if _is_onnx_tensor_payload_field(descriptor, proto_field):
             continue
-        if proto_field.label == proto_field.LABEL_REPEATED and proto_field.type not in {
+        repeated_field = _onnx_proto_field_is_repeated(proto_field)
+        if repeated_field and proto_field.type not in {
             proto_field.TYPE_MESSAGE,
             proto_field.TYPE_BYTES,
             proto_field.TYPE_STRING,
         }:
             continue
         value = getattr(message, proto_field.name)
-        if proto_field.label == proto_field.LABEL_REPEATED:
+        if repeated_field:
             for index, item in enumerate(value):
                 item_label = f"{field_label}[{index}]"
                 if proto_field.type == proto_field.TYPE_MESSAGE:
