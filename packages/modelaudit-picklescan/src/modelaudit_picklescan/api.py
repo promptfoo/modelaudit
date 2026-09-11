@@ -180,6 +180,7 @@ _SUSPICIOUS_LITERAL_TEXT_PATTERNS = tuple(
         r"\bimport\s+[\w\.]+",
         r"__import__",
         r"\\x[0-9a-fA-F]{2}",
+        r"getattr\s*\(\s*getattr\s*\(",
     )
 )
 _STORAGE_LITERAL_TEXT_ROUTE_PATTERNS = tuple(
