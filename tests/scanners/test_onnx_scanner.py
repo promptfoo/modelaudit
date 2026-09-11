@@ -8886,6 +8886,25 @@ class TestRawDetectorCoverage:
         assert not failed_network_checks
         assert any(check.status == CheckStatus.PASSED for check in self._network_detection_checks(result))
 
+    def test_network_detector_extensionless_metadata_callback_domain_remains_actionable(self, tmp_path: Path) -> None:
+        source_path = create_onnx_model(tmp_path, include_initializer=False)
+        model = onnx.load(str(source_path))
+        metadata = model.metadata_props.add()
+        metadata.key = "callback"
+        metadata.value = "host evil.com"
+        model_path = tmp_path / "metadata-callback"
+        onnx.save(model, str(model_path))
+
+        result = OnnxScanner(config={"check_jit_script": False}).scan(str(model_path))
+
+        failed_network_checks = [
+            check for check in self._network_detection_checks(result) if check.status == CheckStatus.FAILED
+        ]
+        assert any(
+            check.details.get("domain") == "evil.com" and check.details.get("onnx_metadata_owned") is True
+            for check in failed_network_checks
+        )
+
     def test_network_detector_metadata_prose_import_requests_stays_clean(self, tmp_path: Path) -> None:
         model_path = create_onnx_model(tmp_path, include_initializer=False)
         model = onnx.load(str(model_path))
@@ -9075,6 +9094,39 @@ class TestRawDetectorCoverage:
         assert any(
             check.details.get("coverage_gap") == "detector_finding_limit"
             and check.details.get("detector") == "network_communication"
+            for check in self._coverage_checks(result)
+        )
+
+    def test_network_detector_redaction_work_limit_continues_to_later_metadata(self, tmp_path: Path) -> None:
+        model_path = create_onnx_model(tmp_path, include_initializer=False)
+        model = onnx.load(str(model_path))
+        model.doc_string = "".join("api_key=value endpoint=45.33.32.156\n" for _ in range(100))
+        metadata = model.metadata_props.add()
+        metadata.key = "callback"
+        metadata.value = "https://45.33.32.157/payload"
+        onnx.save(model, str(model_path))
+
+        result = OnnxScanner(config={"check_jit_script": False}).scan(str(model_path))
+
+        failed_network_checks = [
+            check for check in self._network_detection_checks(result) if check.status == CheckStatus.FAILED
+        ]
+        assert any(
+            check.details.get("type") == "detector_finding_limit"
+            and check.details.get("truncated_finding_type") == "endpoint_redaction_classification"
+            and check.details.get("onnx_metadata_owned") is False
+            for check in failed_network_checks
+        )
+        assert any(
+            check.details.get("type") == "url_detected"
+            and "45.33.32.157" in str(check.details.get("url", ""))
+            and check.details.get("onnx_metadata_owned") is True
+            for check in failed_network_checks
+        )
+        assert any(
+            check.details.get("coverage_gap") == "detector_finding_limit"
+            and check.details.get("truncated_section") == "structured_text_fields"
+            and "skipped_sections" not in check.details
             for check in self._coverage_checks(result)
         )
 

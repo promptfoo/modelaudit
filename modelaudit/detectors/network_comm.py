@@ -116,6 +116,11 @@ _METADATA_ACTIVE_CONTEXT_PATTERN = re.compile(
 _METADATA_HTTP_REQUEST_PATTERN = re.compile(
     rb"\b(?:GET|HEAD|POST|PUT|DELETE|CONNECT|OPTIONS|TRACE|PATCH|download|fetch)\s+https?://", re.IGNORECASE
 )
+_ONNX_ACTIVE_METADATA_KEY_PATTERN = re.compile(
+    rb"(?:^|[^A-Za-z0-9])(?:api|callback|download|endpoint|fetch|webhook)(?:[^A-Za-z0-9]|$)",
+    re.IGNORECASE,
+)
+_ONNX_ACTIVE_METADATA_DOMAIN_CONTEXT_BYTES = 128
 _PROVEN_BARE_QUERY_COMPONENTS = frozenset({"_debug", "debug"})
 _PROVEN_BARE_PROSE_COMPONENTS = frozenset({"section"})
 _PATH_TOKEN_BOUNDARY_PATTERN = re.compile(r"&amp;|[&,'\"?#\s]")
@@ -5729,6 +5734,16 @@ class NetworkCommDetector:
                 domain = match.group("domain").decode("utf-8", errors="ignore").casefold()
                 if not record_domain(domain, match.start("domain")):
                     return
+            if self._onnx_metadata_context:
+                for match in self.DOMAIN_PATTERN.finditer(data):
+                    if match.start() > 0 and data[match.start() - 1 : match.start()] == b"@":
+                        continue
+                    prefix_start = max(0, match.start() - _ONNX_ACTIVE_METADATA_DOMAIN_CONTEXT_BYTES)
+                    if _ONNX_ACTIVE_METADATA_KEY_PATTERN.search(data[prefix_start : match.start()]) is None:
+                        continue
+                    domain = match.group().decode("utf-8", errors="ignore").casefold()
+                    if not record_domain(domain, match.start()):
+                        return
             return
 
         for match in self.DOMAIN_PATTERN.finditer(data):

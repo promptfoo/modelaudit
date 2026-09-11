@@ -633,6 +633,13 @@ def _network_communication_max_findings(config: dict[str, Any] | None) -> int | 
     return None
 
 
+def _is_network_redaction_work_limit(finding: dict[str, Any]) -> bool:
+    return finding.get("type") == "detector_finding_limit" and finding.get("truncated_finding_type") in {
+        "endpoint_redaction_classification",
+        "evidence_redaction",
+    }
+
+
 def _network_finding_limit_payload(
     section: _OnnxNetworkDetectorSection,
     context: str,
@@ -5207,10 +5214,18 @@ class OnnxScanner(BaseScanner):
                                 break
                             continue
                         section_truncated = False
+                        section_redaction_work_limited = False
+                        section_finding_limited = False
+                        section_redaction_work_limit: dict[str, Any] | None = None
                         for finding in section_findings:
                             annotated_finding = dict(finding)
                             if annotated_finding.get("type") == "detector_finding_limit":
                                 section_truncated = True
+                                if _is_network_redaction_work_limit(annotated_finding):
+                                    section_redaction_work_limited = True
+                                    section_redaction_work_limit = annotated_finding
+                                else:
+                                    section_finding_limited = True
                             else:
                                 emitted_network_findings += 1
                             annotated_finding.update(
@@ -5225,10 +5240,18 @@ class OnnxScanner(BaseScanner):
                                 annotated_finding["context"] = f"{path}:metadata_props"
                             network_findings.append(annotated_finding)
                         if section_truncated:
-                            self._mark_network_finding_limit(
-                                result, path, section, section_index, network_detector_input
-                            )
-                            break
+                            if section_redaction_work_limited:
+                                self._mark_network_redaction_work_limit(
+                                    result,
+                                    path,
+                                    section,
+                                    section_redaction_work_limit,
+                                )
+                            if section_finding_limited:
+                                self._mark_network_finding_limit(
+                                    result, path, section, section_index, network_detector_input
+                                )
+                                break
                 except Exception as e:
                     network_detector_failed = True
                     redacted_error = redact_untrusted_error_message(e)
@@ -5301,6 +5324,26 @@ class OnnxScanner(BaseScanner):
 
         _finish_scan_result(result)
         return result
+
+    def _mark_network_redaction_work_limit(
+        self,
+        result: ScanResult,
+        path: str,
+        section: _OnnxNetworkDetectorSection,
+        finding: dict[str, Any] | None,
+    ) -> None:
+        self._mark_raw_detection_incomplete(
+            result,
+            path,
+            detector="network_communication",
+            reason="detector_finding_limit",
+            message="ONNX network detector redaction work limit reached; analysis incomplete",
+            details={
+                "max_classifications": (finding or {}).get("max_classifications"),
+                "truncated_section": section.name,
+                "truncated_section_metadata_owned": section.metadata_owned,
+            },
+        )
 
     def _mark_network_finding_limit(
         self,
