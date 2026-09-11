@@ -142,7 +142,6 @@ _HEX_NESTED_LITERAL_TOKEN_RE = re.compile(rb"(?<![0-9A-Fa-f])(?:[0-9A-Fa-f]{2}[\
 _RAW_NESTED_SECURITY_PICKLE_START_BYTES = b"\x80(cioRbP\x82\x83\x84"
 _MAX_RAW_NESTED_PICKLE_CANDIDATES = 64
 _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES = 8 * 1024
-_MAX_PROTO0_GLOBAL_PREFIX_WITHOUT_NEWLINE_BYTES = 128
 _PROTO0_GLOBAL_PREFIX_WITHOUT_NEWLINE_RE = re.compile(rb"c[A-Za-z_][A-Za-z0-9_.]*")
 _RAW_NESTED_SECURITY_PICKLE_TEXT_MARKERS = (
     b"builtins\neval\n",
@@ -2530,7 +2529,7 @@ class PyTorchZipScanner(BaseScanner):
             if b"\n" in candidate:
                 return candidate.count(b"\n") < 2
             return (
-                len(candidate) <= _MAX_PROTO0_GLOBAL_PREFIX_WITHOUT_NEWLINE_BYTES
+                len(candidate) <= _TRUSTED_STORAGE_PICKLE_PROBE_BYTES
                 and _PROTO0_GLOBAL_PREFIX_WITHOUT_NEWLINE_RE.fullmatch(candidate) is not None
             )
         if candidate.startswith((b"F", b"I", b"L")):

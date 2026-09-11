@@ -86,7 +86,6 @@ _PROTO0_1_START_BYTES = b"()]}cilp0FGIJKLMNPSTUVX"
 _PROTO0_1_MAX_PROBE_OPCODES = _PICKLE_DISCOVERY_LONG_PROBE_BYTES
 _PROTO0_1_IGNORABLE_TRAILING_BYTES = b" \t\r\n\x00"
 _PROTO0_1_TEXT_WHITESPACE_BYTES = b" \t\r\n"
-_MAX_PROTO0_GLOBAL_PREFIX_WITHOUT_NEWLINE_BYTES = 128
 _PROTO0_GLOBAL_PREFIX_WITHOUT_NEWLINE_RE = re.compile(rb"c[A-Za-z_][A-Za-z0-9_.]*")
 _PICKLE_DISCOVERY_PADDING_PROBE_BYTES = 256 * 1024
 _PICKLE_DISCOVERY_NUL_PADDING_VERIFY_CHUNK_BYTES = 64 * 1024
@@ -1883,7 +1882,7 @@ def _looks_like_truncated_proto0_or_1_operand_prefix(candidate: bytes) -> bool:
         if b"\n" in candidate:
             return candidate.count(b"\n") < 2
         return (
-            len(candidate) <= _MAX_PROTO0_GLOBAL_PREFIX_WITHOUT_NEWLINE_BYTES
+            len(candidate) <= _TRUSTED_STORAGE_PICKLE_PROBE_BYTES
             and _PROTO0_GLOBAL_PREFIX_WITHOUT_NEWLINE_RE.fullmatch(candidate) is not None
         )
     if candidate.startswith((b"F", b"I", b"L")):

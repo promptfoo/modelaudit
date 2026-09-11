@@ -3431,6 +3431,27 @@ def test_pytorch_zip_discovery_scans_long_string_trailing_pickle_after_trivial_s
     )
 
 
+def test_pytorch_zip_discovery_scans_long_global_operand_crossing_trusted_probe_boundary(
+    tmp_path: Path,
+) -> None:
+    model_path = tmp_path / "referenced_scalar_prefix_long_global_operand_pickle.pt"
+    storage_blob = b"N." + (b"c" * 4094) + b"\nignored\n." + _malicious_proto0_system_payload()
+    storage_blob += b" " * (-len(storage_blob) % 4)
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        zip_file.writestr("archive/data/0", storage_blob)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert "archive/data/0" in result.metadata["pickle_files"]
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
+        for issue in result.issues
+    )
+
+
 def test_pytorch_zip_discovery_scans_pickle_after_padding_at_trusted_probe_boundary(
     tmp_path: Path,
 ) -> None:
