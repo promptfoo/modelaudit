@@ -3386,6 +3386,7 @@ def _with_canonical_pytorch_storage_persistent_id_metadata(
         and bool(trusted_storage_keys)
     )
     rust_canonical_storage_ids = _rust_pytorch_storage_persistent_id_flags_are_canonical(report)
+    storage_global_positions = storage_reference_parse.storage_global_positions
     single_storage_key = next(iter(trusted_storage_keys)) if len(trusted_storage_keys) == 1 else None
 
     findings = tuple(
@@ -3407,7 +3408,8 @@ def _with_canonical_pytorch_storage_persistent_id_metadata(
             _canonical_pytorch_storage_import_reference(
                 _mapping(reference),
                 proven_canonical_storage_ids=proven_canonical_storage_ids,
-                storage_global_positions=storage_reference_parse.storage_global_positions,
+                rust_canonical_storage_ids=rust_canonical_storage_ids,
+                storage_global_positions=storage_global_positions,
             )
             for reference in import_references
         ]
@@ -3443,12 +3445,15 @@ def _canonical_pytorch_storage_import_reference(
     reference: Mapping[str, Any],
     *,
     proven_canonical_storage_ids: bool,
+    rust_canonical_storage_ids: bool,
     storage_global_positions: set[int],
 ) -> dict[str, Any]:
     normalized = dict(reference)
     module = normalized.get("module")
     name = normalized.get("name")
     if type(module) is str and type(name) is str and (module, name) in _PYTORCH_STORAGE_GLOBALS:
+        if rust_canonical_storage_ids and normalized.get("pytorch_storage_persistent_id") is True:
+            return normalized
         if proven_canonical_storage_ids and _optional_int(normalized.get("position")) in storage_global_positions:
             normalized["pytorch_storage_persistent_id"] = True
         else:

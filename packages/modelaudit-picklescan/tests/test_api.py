@@ -3002,6 +3002,7 @@ def test_scan_bytes_marks_only_pytorch_storage_global_used_by_persistent_id() ->
             "pytorch_storage_persistent_id": True,
         },
         proven_canonical_storage_ids=True,
+        rust_canonical_storage_ids=False,
         storage_global_positions={10},
     )
 
@@ -3174,6 +3175,72 @@ def test_scan_bytes_marks_only_matched_pytorch_storage_persistent_id_import_refe
     assert flagged_positions == [first_storage_position]
     assert storage_flags_by_position[first_storage_position] is True
     assert storage_flags_by_position.get(extra_storage_position) is not True
+
+
+def test_scan_bytes_preserves_native_storage_pid_flags_when_trust_parser_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _require_torch_distribution()
+    payload = _pytorch_storage_persistent_id_payload("0")
+
+    def fail_trust_parse(*_args: object, **_kwargs: object) -> package_api._PytorchStorageReferenceParse:
+        return package_api._PytorchStorageReferenceParse(set(), {}, set(), set(), False, False)
+
+    monkeypatch.setattr(package_api, "_pytorch_storage_keys_from_pickle_bytes", fail_trust_parse)
+    _clear_source_sensitive_caches()
+    try:
+        report = scan_bytes(payload, source="parser-failed-pytorch-storage.pkl")
+    finally:
+        _clear_source_sensitive_caches()
+
+    assert report.status == ScanStatus.COMPLETE
+    assert not any(
+        finding.rule_code == "DANGEROUS_CALL_GRAPH" and finding.details.get("import_reference") == "torch.FloatStorage"
+        for finding in report.findings
+    )
+    assert not any(
+        finding.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and finding.details.get("import_reference") == "torch.FloatStorage"
+        for finding in report.findings
+    )
+    storage_references = [
+        reference
+        for reference in report.metadata["import_references"]
+        if reference.get("import_reference") == "torch.FloatStorage"
+    ]
+    assert storage_references
+    assert all(reference.get("pytorch_storage_persistent_id") is True for reference in storage_references)
+
+
+def test_scan_bytes_preserves_unmatched_storage_global_call_graph_when_trust_parser_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _require_torch_distribution()
+    payload = _pytorch_storage_persistent_id_payload("0")
+    payload = payload[:-1] + b"0" + _short_binunicode(b"torch") + _short_binunicode(b"FloatStorage") + b"\x93."
+
+    def fail_trust_parse(*_args: object, **_kwargs: object) -> package_api._PytorchStorageReferenceParse:
+        return package_api._PytorchStorageReferenceParse(set(), {}, set(), set(), False, False)
+
+    monkeypatch.setattr(package_api, "_pytorch_storage_keys_from_pickle_bytes", fail_trust_parse)
+    _clear_source_sensitive_caches()
+    try:
+        report = scan_bytes(payload, source="parser-failed-mixed-pytorch-storage.pkl")
+    finally:
+        _clear_source_sensitive_caches()
+
+    assert report.status == ScanStatus.COMPLETE
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL_GRAPH" and finding.details.get("import_reference") == "torch.FloatStorage"
+        for finding in report.findings
+    )
+    storage_references = [
+        reference
+        for reference in report.metadata["import_references"]
+        if reference.get("import_reference") == "torch.FloatStorage"
+    ]
+    assert len(storage_references) == 2
+    assert [reference.get("pytorch_storage_persistent_id") for reference in storage_references].count(True) == 1
 
 
 def test_scan_bytes_does_not_mark_synthetic_torch_storage_name_as_storage_persistent_id() -> None:
