@@ -89,7 +89,7 @@ _PROTO0_1_TEXT_WHITESPACE_BYTES = b" \t\r\n"
 _MAX_PROTO0_GLOBAL_PREFIX_WITHOUT_NEWLINE_BYTES = 128
 _PROTO0_GLOBAL_PREFIX_WITHOUT_NEWLINE_RE = re.compile(rb"c[A-Za-z_][A-Za-z0-9_.]*")
 _PICKLE_DISCOVERY_PADDING_PROBE_BYTES = 256 * 1024
-_PICKLE_DISCOVERY_NUL_PADDING_VERIFY_BYTES = 512 * 1024
+_PICKLE_DISCOVERY_NUL_PADDING_VERIFY_CHUNK_BYTES = 64 * 1024
 _PROTO0_1_PREFIX_TRUNCATION_ERROR_PREFIXES = (
     "pickle exhausted before seeing STOP",
     "no newline found when trying to read ",
@@ -1618,12 +1618,11 @@ def _verified_nul_padding_storage_probe_should_scan(
     is_frame_first_candidate: bool,
 ) -> bool:
     if entry.file_size > len(sample):
-        if entry.file_size > _PICKLE_DISCOVERY_NUL_PADDING_VERIFY_BYTES:
-            raise ValueError("trusted PyTorch storage padding probe limit reached")
-        sample = _read_zip_entry_probe(
+        sample = _verified_nul_padding_storage_probe_sample(
             archive,
             entry,
-            entry.file_size,
+            sample,
+            len(sample),
             probe_bytes_remaining,
             deadline,
         )
@@ -1637,6 +1636,41 @@ def _verified_nul_padding_storage_probe_should_scan(
     if _trivial_complete_pickle_prefix_has_only_padding(sample):
         return False
     raise ValueError("trusted PyTorch storage padding probe limit reached")
+
+
+def _verified_nul_padding_storage_probe_sample(
+    archive: zipfile.ZipFile,
+    entry: zipfile.ZipInfo,
+    sample: bytes,
+    verified_prefix_bytes: int,
+    probe_bytes_remaining: list[int],
+    deadline: float,
+) -> bytes:
+    remaining_bytes = max(entry.file_size - verified_prefix_bytes, 0)
+    if remaining_bytes > probe_bytes_remaining[0]:
+        raise _PickleDiscoveryProbeBudgetExceeded
+    if remaining_bytes == 0:
+        return sample
+
+    chunks: list[bytes] = []
+    saw_non_nul = False
+    with archive.open(entry, "r") as member:
+        member.seek(verified_prefix_bytes)
+        bytes_left = remaining_bytes
+        while bytes_left > 0:
+            _check_pytorch_zip_deadline(deadline)
+            chunk = member.read(min(_PICKLE_DISCOVERY_NUL_PADDING_VERIFY_CHUNK_BYTES, bytes_left))
+            _check_pytorch_zip_deadline(deadline)
+            probe_bytes_remaining[0] -= len(chunk)
+            if not chunk:
+                raise ValueError("trusted PyTorch storage padding probe limit reached")
+            chunks.append(chunk)
+            if chunk.rstrip(b"\x00"):
+                saw_non_nul = True
+            bytes_left -= len(chunk)
+    if saw_non_nul:
+        return sample + b"".join(chunks)
+    return sample
 
 
 def _expanded_probe_preserves_trusted_scan(

@@ -287,7 +287,7 @@ _PICKLE_FRAME_OPCODE = b"\x95"
 _PICKLE_FRAME_OPCODE_BYTES = 9
 _PROTO0_1_TEXT_WHITESPACE_BYTES = b" \t\r\n"
 _PICKLE_DISCOVERY_PADDING_PROBE_BYTES = 256 * 1024
-_PICKLE_DISCOVERY_NUL_PADDING_VERIFY_BYTES = 512 * 1024
+_PICKLE_DISCOVERY_NUL_PADDING_VERIFY_CHUNK_BYTES = 64 * 1024
 _PICKLE_DISCOVERY_PADDING_PROBE_BUDGET_BYTES = 4 * 1024 * 1024
 _PICKLE_INCOMPLETE_FRAME_MIN_PAYLOAD_OPCODES = 4
 _PYTORCH_STORAGE_TRUST_MAX_OPCODES = 100_000
@@ -2180,7 +2180,6 @@ class PyTorchZipScanner(BaseScanner):
                             zip_file,
                             entry,
                             sample,
-                            result,
                             padding_probe_bytes_remaining,
                             is_frame_first_candidate=is_frame_first_candidate,
                         )
@@ -2200,7 +2199,6 @@ class PyTorchZipScanner(BaseScanner):
                         zip_file,
                         entry,
                         sample,
-                        result,
                         padding_probe_bytes_remaining,
                         is_frame_first_candidate=is_frame_first_candidate,
                     )
@@ -2213,24 +2211,17 @@ class PyTorchZipScanner(BaseScanner):
         zip_file: zipfile.ZipFile,
         entry: zipfile.ZipInfo,
         sample: bytes,
-        result: ScanResult,
         padding_probe_bytes_remaining: list[int] | None,
         *,
         is_frame_first_candidate: bool,
     ) -> bool:
         if entry.file_size > len(sample):
-            if entry.file_size > _PICKLE_DISCOVERY_NUL_PADDING_VERIFY_BYTES:
-                raise ValueError("trusted PyTorch storage padding probe limit reached")
-            PyTorchZipScanner._charge_padding_probe_budget(
-                padding_probe_bytes_remaining,
-                entry.file_size - len(sample),
-            )
-            sample = self._read_member_prefix(
+            sample = self._verified_nul_padding_storage_probe_sample(
                 zip_file,
                 entry,
-                entry.file_size,
-                phase="pickle_discovery",
-                result=result,
+                sample,
+                verified_prefix_bytes=len(sample),
+                padding_probe_bytes_remaining=padding_probe_bytes_remaining,
             )
         if is_frame_first_candidate and self._frame_first_trusted_storage_probe_should_scan(sample):
             return True
@@ -2242,6 +2233,43 @@ class PyTorchZipScanner(BaseScanner):
         if PyTorchZipScanner._trivial_complete_pickle_prefix_has_only_padding(sample):
             return False
         raise ValueError("trusted PyTorch storage padding probe limit reached")
+
+    def _verified_nul_padding_storage_probe_sample(
+        self,
+        zip_file: zipfile.ZipFile,
+        entry: zipfile.ZipInfo,
+        sample: bytes,
+        *,
+        verified_prefix_bytes: int,
+        padding_probe_bytes_remaining: list[int] | None,
+    ) -> bytes:
+        remaining_bytes = max(entry.file_size - verified_prefix_bytes, 0)
+        PyTorchZipScanner._charge_padding_probe_budget(
+            padding_probe_bytes_remaining,
+            remaining_bytes,
+        )
+        if remaining_bytes == 0:
+            return sample
+
+        chunks: list[bytes] = []
+        saw_non_nul = False
+        try:
+            with zip_file.open(entry) as source:
+                source.seek(verified_prefix_bytes)
+                bytes_left = remaining_bytes
+                while bytes_left > 0:
+                    chunk = source.read(min(_PICKLE_DISCOVERY_NUL_PADDING_VERIFY_CHUNK_BYTES, bytes_left))
+                    if not chunk:
+                        raise ValueError("trusted PyTorch storage padding probe limit reached")
+                    chunks.append(chunk)
+                    if chunk.rstrip(b"\x00"):
+                        saw_non_nul = True
+                    bytes_left -= len(chunk)
+        except Exception as exc:
+            raise ValueError("trusted PyTorch storage padding probe limit reached") from exc
+        if saw_non_nul:
+            return sample + b"".join(chunks)
+        return sample
 
     @staticmethod
     def _expanded_probe_preserves_trusted_scan(

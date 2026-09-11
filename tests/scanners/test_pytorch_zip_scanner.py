@@ -4506,6 +4506,25 @@ def test_pytorch_zip_discovery_skips_trivial_prefix_tensor_noise(
     assert not any(check.details.get("pickle_filename") == "archive/data/0" for check in result.checks)
 
 
+def test_pytorch_zip_discovery_skips_large_nul_padding_storage_blob(tmp_path: Path) -> None:
+    model_path = tmp_path / "referenced_large_nul_padding_storage.pt"
+    storage_blob = b"N." + (b"\x00" * ((600 * 1024) - len(b"N.")))
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        zip_file.writestr("archive/data/0", storage_blob)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert result.success is True
+    assert result.metadata.get("pickle_verdict") == "clean"
+    assert result.metadata["pickle_files"] == ["archive/data.pkl"]
+    assert "pytorch_zip_pickle_discovery_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
+    assert not any(issue.details.get("pickle_filename") == "archive/data/0" for issue in result.issues)
+    assert not any(check.details.get("pickle_filename") == "archive/data/0" for check in result.checks)
+
+
 def test_pytorch_zip_discovery_does_not_route_size_mismatched_benign_storage_blob(
     tmp_path: Path,
 ) -> None:

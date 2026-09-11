@@ -5542,6 +5542,25 @@ def test_scan_file_does_not_route_benign_storage_blob_as_hidden_pickle(tmp_path:
     assert not any(finding.location is not None and "archive/data/0" in finding.location for finding in report.findings)
 
 
+def test_scan_file_skips_large_nul_padding_storage_blob(tmp_path: Path) -> None:
+    archive_path = tmp_path / "large-nul-padding-storage.pt"
+    storage_blob = b"N." + (b"\x00" * ((600 * 1024) - len(b"N.")))
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", storage_blob)
+
+    report = scan_file(archive_path)
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert list(report.metadata["pickle_files"]) == ["archive/data.pkl"]
+    assert report.metadata.get("analysis_incomplete") is not True
+    assert not any(finding.location is not None and "archive/data/0" in finding.location for finding in report.findings)
+    assert report.errors == ()
+
+
 def test_scan_file_does_not_route_yolov5n6_storage_prefix_as_hidden_pickle(tmp_path: Path) -> None:
     archive_path = tmp_path / "model.pt"
     storage_blob = _yolov5n6_tensor_storage_prefix_bytes()
