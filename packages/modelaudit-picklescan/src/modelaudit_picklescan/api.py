@@ -139,7 +139,12 @@ _PROTO0_1_LITERAL_OPCODES = frozenset(
 )
 _BASE64_NESTED_LITERAL_TOKEN_RE = re.compile(rb"[A-Za-z0-9+/_-][A-Za-z0-9+/_\-\s\r\n\t]{15,}={0,2}")
 _HEX_NESTED_LITERAL_TOKEN_RE = re.compile(rb"(?<![0-9A-Fa-f])(?:[0-9A-Fa-f]{2}[\s\r\n\t]*){8,}(?![0-9A-Fa-f])")
-_RAW_NESTED_SECURITY_PICKLE_START_BYTES = b"\x80(cioRbP\x82\x83\x84"
+_RAW_NESTED_TEXT_SECURITY_PICKLE_START_BYTES = b"\x80(cioRbP\x82\x83\x84"
+_RAW_NESTED_BINARY_SECURITY_PICKLE_START_BYTES = b"\x8c\x8d\x95"
+_RAW_NESTED_SECURITY_PICKLE_START_BYTES = (
+    _RAW_NESTED_TEXT_SECURITY_PICKLE_START_BYTES + _RAW_NESTED_BINARY_SECURITY_PICKLE_START_BYTES
+)
+_BINARY_SECURITY_OPCODE_REQUIRING_EXISTING_STACK_BYTES = b"\x81\x92\x93"
 _MAX_RAW_NESTED_PICKLE_CANDIDATES = 64
 _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES = 8 * 1024
 _RAW_NESTED_SECURITY_PICKLE_TEXT_MARKERS = (
@@ -169,6 +174,7 @@ _SUSPICIOUS_LITERAL_TEXT_PATTERNS = tuple(
         r"(?<!\w)__(?:reduce(?:_ex)?|setstate|getstate|getnewargs(?:_ex)?|getinitargs|new|class|"
         r"subclasses|globals|builtins|mro)__(?!\w)",
         r"base64\.b64decode",
+        r"compile\(",
         r"importlib",
         r"eval\(",
         r"exec\(",
@@ -186,12 +192,13 @@ _SUSPICIOUS_LITERAL_TEXT_PATTERNS = tuple(
 _STORAGE_LITERAL_TEXT_ROUTE_PATTERNS = tuple(
     re.compile(pattern, re.IGNORECASE | re.DOTALL)
     for pattern in (
-        r"\b(?:eval|exec)\s*(?:\\\r?\n\s*)?\(",
+        r"\b(?:compile|eval|exec)\s*(?:\\\r?\n\s*)?\(",
         r"__import__\s*(?:\\\r?\n\s*)?\(",
+        r"\bimportlib\s*(?:\\\r?\n\s*)?\.\s*(?:import_module|__import__)\s*\(",
         r"\bos\s*(?:\\\r?\n\s*)?\.\s*(?:\\\r?\n\s*)?(?:system|popen|spawn[a-z]*)\s*(?:\.__call__)?\s*\(",
         r"\bsubprocess\s*(?:\\\r?\n\s*)?\.\s*(?:Popen|call|check_output|run|check_call)\s*\(",
         r"\bbase64\s*(?:\\\r?\n\s*)?\.\s*(?:b64decode|decode)\s*\(",
-        r"\b(?:pickle|cloudpickle|joblib)\s*(?:\\\r?\n\s*)?\.\s*(?:load|loads)\s*\(",
+        r"\b(?:pickle|cloudpickle|joblib)\s*(?:\\\r?\n\s*)?\.\s*(?:_pickle_load|load|loads)\s*\(",
         r"\bcopyreg\s*(?:\\\r?\n\s*)?\.\s*(?:add_extension|remove_extension)\s*\(",
         r"getattr\s*\(\s*\w+\s*,\s*['\"](?:system|popen|spawn|exec|eval|call|run|Popen)['\"]",
     )
@@ -1861,14 +1868,18 @@ def _trailing_pickle_probe_should_scan(trailing: bytes, *, sample_is_prefix: boo
     if not candidate:
         return False
     candidate = _strip_optional_proto0_comment_prefix(candidate)
-    if _has_security_relevant_pickle_opcode(candidate) and (
-        _has_complete_pickle_stream_without_frame_stop_overrun(candidate)
-        or _looks_like_proto0_or_1_pickle(
-            candidate,
-            sample_is_prefix=False,
+    if (
+        not _candidate_starts_with_binary_security_opcode_requiring_existing_stack(candidate)
+        and _has_security_relevant_pickle_opcode(candidate)
+        and (
+            _has_complete_pickle_stream_without_frame_stop_overrun(candidate)
+            or _looks_like_proto0_or_1_pickle(
+                candidate,
+                sample_is_prefix=False,
+            )
+            or _looks_like_binary_pickle_prefix(candidate, sample_is_prefix=False)
+            or _frame_first_trusted_storage_probe_should_scan(candidate)
         )
-        or _looks_like_binary_pickle_prefix(candidate, sample_is_prefix=False)
-        or _frame_first_trusted_storage_probe_should_scan(candidate)
     ):
         return True
     if _trailing_candidate_has_raw_nested_security_pickle(candidate, sample_is_prefix=sample_is_prefix):
@@ -1920,6 +1931,10 @@ def _looks_like_truncated_proto0_or_1_operand_prefix(candidate: bytes) -> bool:
         declared_size = candidate[1]
         return len(candidate) - 2 < declared_size
     return False
+
+
+def _candidate_starts_with_binary_security_opcode_requiring_existing_stack(candidate: bytes) -> bool:
+    return bool(candidate) and candidate[0] in _BINARY_SECURITY_OPCODE_REQUIRING_EXISTING_STACK_BYTES
 
 
 def _looks_like_truncated_binary_pickle_operand_prefix(candidate: bytes) -> bool:
@@ -2191,13 +2206,11 @@ def _complete_proto0_string_literal_has_nested_security_pickle(sample: bytes) ->
 def _literal_arg_bytes(opcode_name: str, value: Any) -> bytes | None:
     if isinstance(value, bytes):
         return value
-    if isinstance(value, str):
-        if opcode_name in {"STRING", "BINSTRING", "SHORT_BINSTRING"}:
-            try:
-                return value.encode("latin-1")
-            except UnicodeEncodeError:
-                return value.encode("utf-8", errors="surrogatepass")
-        return value.encode("utf-8", errors="surrogatepass")
+    if isinstance(value, str) and opcode_name in _PROTO0_1_LITERAL_OPCODES:
+        try:
+            return value.encode("latin-1")
+        except UnicodeEncodeError:
+            return value.encode("utf-8", errors="surrogatepass")
     return None
 
 
@@ -2299,7 +2312,9 @@ def _literal_value_has_raw_nested_security_pickle(
         if candidate_count > _MAX_RAW_NESTED_PICKLE_CANDIDATES:
             if not fail_closed_on_candidate_budget:
                 return _encoded_raw_nested_security_pickle_candidate_budget_exhausted_needs_scan(value[offset:])
-            return True
+            if marker in _RAW_NESTED_TEXT_SECURITY_PICKLE_START_BYTES:
+                return True
+            return _raw_nested_security_pickle_candidate_budget_exhausted_needs_scan(value[offset:])
         candidate = value[offset : offset + _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES]
         candidate_is_prefix = offset + len(candidate) < len(value)
         if marker == 0x80 and _looks_like_binary_pickle_prefix(candidate, sample_is_prefix=candidate_is_prefix):
@@ -2308,6 +2323,11 @@ def _literal_value_has_raw_nested_security_pickle(
             if candidate_is_prefix:
                 return True
             continue
+        if marker in _RAW_NESTED_BINARY_SECURITY_PICKLE_START_BYTES and _raw_nested_binary_candidate_should_scan(
+            candidate,
+            candidate_is_prefix=candidate_is_prefix,
+        ):
+            return True
         if (
             marker in _PROTO0_1_START_BYTES
             and _has_security_relevant_pickle_opcode(candidate)
@@ -2334,6 +2354,11 @@ def _trailing_candidate_has_raw_nested_security_pickle(value: bytes, *, sample_i
             if _has_security_relevant_pickle_opcode(candidate) or candidate_is_prefix:
                 return True
             continue
+        if marker in _RAW_NESTED_BINARY_SECURITY_PICKLE_START_BYTES and _raw_nested_binary_candidate_should_scan(
+            candidate,
+            candidate_is_prefix=candidate_is_prefix,
+        ):
+            return True
         if (
             marker in _PROTO0_1_START_BYTES
             and _has_security_relevant_pickle_opcode(candidate)
@@ -2347,7 +2372,11 @@ def _trailing_candidate_has_raw_nested_security_pickle(value: bytes, *, sample_i
 
 
 def _raw_nested_security_pickle_candidate_budget_exhausted_needs_scan(value: bytes) -> bool:
-    return _raw_nested_security_pickle_text_marker_seen(value) or bool(value.strip(b"c \t\r\n\x00"))
+    if _raw_nested_security_pickle_text_marker_seen(value):
+        return True
+    if not value.strip(b"c \t\r\n\x00"):
+        return False
+    return not _raw_nested_binary_candidate_budget_suffix_is_noise(value)
 
 
 def _encoded_raw_nested_security_pickle_candidate_budget_exhausted_needs_scan(value: bytes) -> bool:
@@ -2361,6 +2390,11 @@ def _encoded_raw_nested_security_pickle_candidate_budget_exhausted_needs_scan(va
     marker = candidate[0]
     if marker == 0x80 and _looks_like_binary_pickle_prefix(candidate, sample_is_prefix=candidate_is_prefix):
         return _has_security_relevant_pickle_opcode(candidate) or candidate_is_prefix
+    if marker in _RAW_NESTED_BINARY_SECURITY_PICKLE_START_BYTES and _raw_nested_binary_candidate_should_scan(
+        candidate,
+        candidate_is_prefix=candidate_is_prefix,
+    ):
+        return True
     has_candidate_signal = (
         marker in _PROTO0_1_START_BYTES
         and _has_security_relevant_pickle_opcode(candidate)
@@ -2375,12 +2409,28 @@ def _encoded_raw_nested_security_pickle_candidate_budget_exhausted_needs_scan(va
 
 
 def _encoded_raw_nested_security_pickle_candidate_budget_suffix_is_noise(value: bytes) -> bool:
+    return _raw_nested_binary_candidate_budget_suffix_is_noise(value)
+
+
+def _raw_nested_binary_candidate_budget_suffix_is_noise(value: bytes) -> bool:
     if not value:
         return True
     residue = bytes(
-        byte for byte in value if byte not in _RAW_NESTED_SECURITY_PICKLE_START_BYTES and byte not in b" \t\r\n\x00"
+        byte
+        for byte in value
+        if byte not in _RAW_NESTED_TEXT_SECURITY_PICKLE_START_BYTES and byte not in b" \t\r\n\x00"
     )
     return bool(residue) and all(byte >= 0x80 for byte in residue)
+
+
+def _raw_nested_binary_candidate_should_scan(candidate: bytes, *, candidate_is_prefix: bool) -> bool:
+    if not _has_security_relevant_pickle_opcode(candidate):
+        return False
+    if _has_complete_pickle_stream_without_frame_stop_overrun(candidate):
+        return True
+    if _frame_first_trusted_storage_probe_should_scan(candidate):
+        return True
+    return candidate_is_prefix and _has_security_relevant_opcode_in_incomplete_frame(candidate)
 
 
 def _raw_nested_security_pickle_text_marker_seen(value: bytes) -> bool:

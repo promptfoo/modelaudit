@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import os
 import pickle
 import time
@@ -838,6 +839,91 @@ def test_trusted_storage_probe_routes_encoded_pickle_after_long_malformed_separa
 
 def test_trusted_storage_probe_skips_long_malformed_separator_literal_near_match() -> None:
     payload = b"N." + (b"Z" * 16) + b"S'benign-token'\n."
+
+    assert not picklescan_api._proto0_or_1_trusted_storage_probe_should_scan(payload, sample_is_prefix=False)
+
+
+def _headerless_binary_nested_pickle() -> bytes:
+    return b"\x8c\x02os\x8c\x06system\x93)R."
+
+
+@pytest.mark.parametrize(
+    "literal_value",
+    [
+        _headerless_binary_nested_pickle(),
+        base64.b64encode(_headerless_binary_nested_pickle()),
+        binascii.hexlify(_headerless_binary_nested_pickle()),
+    ],
+)
+def test_trusted_storage_probe_routes_headerless_binary_nested_pickle_literal(literal_value: bytes) -> None:
+    payload = b"S'" + literal_value + b"'\n."
+
+    assert picklescan_api._proto0_or_1_trusted_storage_probe_should_scan(payload, sample_is_prefix=False)
+
+
+def test_trusted_storage_probe_routes_frame_first_headerless_binary_nested_literal() -> None:
+    literal_value = base64.b64encode(_headerless_binary_nested_pickle())
+    frame_payload = b"\x8c" + bytes([len(literal_value)]) + literal_value + b"."
+    payload = b"\x95" + len(frame_payload).to_bytes(8, "little") + frame_payload
+
+    assert picklescan_api._frame_first_trusted_storage_probe_should_scan(payload)
+
+
+def test_trusted_storage_probe_routes_compile_call_literal() -> None:
+    payload = b"S\"compile('print(1)', 'x', 'exec')\"\n."
+
+    assert picklescan_api._proto0_or_1_trusted_storage_probe_should_scan(payload, sample_is_prefix=False)
+
+
+def test_trusted_storage_probe_routes_wrapped_encoded_suspicious_text_literal() -> None:
+    encoded = base64.b64encode(b"os.system('id')")
+    wrapped = b"\n".join(encoded[index : index + 4] for index in range(0, len(encoded), 4))
+    payload = b"U" + bytes([len(wrapped)]) + wrapped + b"."
+
+    assert picklescan_api._proto0_or_1_trusted_storage_probe_should_scan(payload, sample_is_prefix=False)
+
+
+def test_trusted_storage_probe_skips_headerless_binary_literal_near_match() -> None:
+    payload = b"S'\x8c\x02ok\x94.'\n."
+
+    assert not picklescan_api._proto0_or_1_trusted_storage_probe_should_scan(payload, sample_is_prefix=False)
+
+
+def test_trusted_storage_probe_skips_stack_global_without_operands_after_trivial_prefix() -> None:
+    payload = b"N.\x93.\x00\x00"
+
+    assert not picklescan_api._proto0_or_1_trusted_storage_probe_should_scan(payload, sample_is_prefix=False)
+
+
+def test_trusted_storage_probe_routes_raw_pickle_after_binary_candidate_budget_noise() -> None:
+    literal = (b"\x8c" * 65) + b"cbuiltins\nopen\n(S'file'\ntR."
+    payload = b"T" + len(literal).to_bytes(4, "little") + literal + b"."
+
+    assert picklescan_api._proto0_or_1_trusted_storage_probe_should_scan(payload, sample_is_prefix=False)
+
+
+def test_trusted_storage_probe_skips_raw_binary_candidate_budget_noise_near_match() -> None:
+    literal = (b"\x8c" * 65) + (b"\xff" * 16)
+
+    assert not picklescan_api._literal_value_has_raw_nested_security_pickle(literal)
+
+
+def test_trusted_storage_probe_routes_legacy_raw_candidate_budget_exhaustion() -> None:
+    literal = (b"\x82" * 65) + (b"\xff" * 16)
+
+    assert picklescan_api._literal_value_has_raw_nested_security_pickle(literal)
+
+
+def test_trusted_storage_probe_routes_encoded_pickle_after_binary_candidate_budget_noise() -> None:
+    encoded = base64.b64encode((b"\x8c" * 65) + b"cbuiltins\nopen\n(S'file'\ntR.")
+    payload = b"S'" + encoded + b"'\n."
+
+    assert picklescan_api._proto0_or_1_trusted_storage_probe_should_scan(payload, sample_is_prefix=False)
+
+
+def test_trusted_storage_probe_skips_encoded_binary_candidate_budget_noise_near_match() -> None:
+    encoded = base64.b64encode((b"\x8c" * 65) + (b"\xff" * 16))
+    payload = b"S'" + encoded + b"'\n."
 
     assert not picklescan_api._proto0_or_1_trusted_storage_probe_should_scan(payload, sample_is_prefix=False)
 

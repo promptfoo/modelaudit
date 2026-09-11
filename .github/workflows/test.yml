@@ -140,30 +140,21 @@ jobs:
         run: |
           uv python pin 3.12
 
-      - name: Install Rust toolchain
-        run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
-
-      - name: Sync dependencies
-        run: |
-          uv sync --extra all-ci
-
       - name: Audit dependencies for vulnerabilities
         run: |
           # CVE-2026-4539 currently has no upstream Pygments fix release.
           # pip-audit cannot audit unpublished editable path requirements, so
           # the standalone Rust-backed pickle package is audited separately.
-          uv export --extra all-ci --no-hashes --no-emit-project \
-            | sed -e '/^-e \.\/packages\/modelaudit-picklescan$/d' -e '/^modelaudit-picklescan==/d' \
+          uv export --frozen --extra all-ci --no-hashes --no-emit-project \
+            --no-emit-package modelaudit-picklescan \
             > /tmp/modelaudit-audit-requirements.txt
           # The export already contains every pinned transitive dependency.
           uvx pip-audit --strict --no-deps --disable-pip --desc \
             --ignore-vuln CVE-2026-4539 -r /tmp/modelaudit-audit-requirements.txt
-          uv export --project packages/modelaudit-picklescan --no-hashes --no-emit-project \
+          uv export --project packages/modelaudit-picklescan --frozen --no-hashes --no-emit-project \
             > /tmp/modelaudit-picklescan-audit-requirements.txt
           if grep -Eq '^[A-Za-z0-9_.-]' /tmp/modelaudit-picklescan-audit-requirements.txt; then
-            uvx pip-audit --strict --desc -r /tmp/modelaudit-picklescan-audit-requirements.txt
+            uvx pip-audit --strict --no-deps --disable-pip --desc -r /tmp/modelaudit-picklescan-audit-requirements.txt
           else
             echo "Standalone picklescan package has no Python dependencies to audit."
           fi
