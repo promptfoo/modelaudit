@@ -1064,8 +1064,10 @@ class BaseScanner(ABC):
         context: str = "",
         enable_check: bool = True,
         raise_on_error: bool = False,
-        max_findings: int | None = None,
+        max_findings: int | ScanResult | None = None,
         result: ScanResult | None = None,
+        *,
+        onnx_metadata_context: bool = False,
     ) -> list[dict]:
         """Collect network communication findings without creating checks.
 
@@ -1074,6 +1076,9 @@ class BaseScanner(ABC):
             context: Context string for reporting
             enable_check: Whether to perform the check (allows disabling)
             raise_on_error: Whether detector failures should propagate to the caller
+            max_findings: Optional finding cap for this detector invocation
+            result: ScanResult to mark inconclusive if detector analysis fails
+            onnx_metadata_context: Whether the bytes come from validated ONNX metadata
 
         Returns:
             List of findings
@@ -1084,13 +1089,22 @@ class BaseScanner(ABC):
         try:
             from modelaudit.detectors.network_comm import NetworkCommDetector
 
+            if isinstance(max_findings, ScanResult):
+                if result is not None:
+                    raise TypeError("result was provided both positionally and by keyword")
+                result = max_findings
+                max_findings = None
+
             detector_config = self.config.get("network_comm_config")
             if max_findings is not None:
                 if detector_config is not None and not isinstance(detector_config, dict):
                     raise TypeError("network_comm_config must be a mapping")
                 detector_config = {**(detector_config or {}), "max_findings": max_findings}
             detector = NetworkCommDetector(detector_config)
-            findings = detector.scan(data, context)
+            if onnx_metadata_context:
+                findings = detector.scan(data, context, onnx_metadata_context=True)
+            else:
+                findings = detector.scan(data, context)
             return [dict(finding) for finding in findings]
 
         except ImportError:

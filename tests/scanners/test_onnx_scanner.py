@@ -6,7 +6,7 @@ import sys
 import time
 import tracemalloc
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 
@@ -2330,6 +2330,26 @@ def test_onnx_scanner_tentative_protobuf_parse_failure_is_inconclusive(tmp_path:
     assert any(issue.severity == IssueSeverity.INFO for issue in result.issues)
 
 
+def test_onnx_scanner_tentative_missing_graph_with_unknown_field_is_rejected_cleanly(tmp_path: Path) -> None:
+    model_path = tmp_path / "ambiguous.bin"
+    model_path.write_bytes(_proto_varint(1, 8) + _proto_varint(27, 1))
+    scanner = OnnxScanner(
+        {
+            FORMAT_VALIDATION_CONFIG_KEY: {"routed_format": PROTOBUF_MODEL_CANDIDATE_FORMAT},
+            "check_jit_script": False,
+            "check_network_comm": False,
+        }
+    )
+
+    result = scanner.scan(str(model_path))
+
+    assert result.scanner_name == "unknown"
+    assert result.success is True
+    assert result.metadata["tentative_protobuf_candidate_rejected"] is True
+    assert result.metadata["onnx_structure_parse"] == {"parse_mode": "in_memory_model_proto"}
+    assert not [check for check in result.checks if check.name == "ONNX Structure Parse Coverage"]
+
+
 def test_onnx_scanner_tentative_invalid_version_still_detects_python_operator(tmp_path: Path) -> None:
     model_path = create_python_onnx_model(tmp_path)
     model = onnx.load(str(model_path))
@@ -2401,9 +2421,11 @@ def test_onnx_scanner_raw_read_failure_falls_back_to_file_backed_parse(
     assert result.bytes_scanned > 0
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert result.metadata["onnx_structure_parse"]["parse_mode"] == "file_backed_structure"
-    assert len(coverage_checks) == 1
-    assert coverage_checks[0].details["detector"] == "raw_file_read"
-    assert coverage_checks[0].details["coverage_gap"] == "file_read_failed"
+    coverage_gaps = {(check.details["detector"], check.details["coverage_gap"]) for check in coverage_checks}
+    assert coverage_gaps == {
+        ("raw_file_read", "file_read_failed"),
+        ("network_communication", "structured_text_unavailable"),
+    }
 
 
 def test_directory_scan_hashes_external_data_for_content_routed_onnx_bin(tmp_path: Path) -> None:
@@ -7287,6 +7309,15 @@ class TestLargeOnnxFileBackedInspection:
         assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
         assert "onnx_raw_detection_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
         assert "onnx_weight_distribution_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+        assert result.metadata["onnx_network_detector_input"]["truncation_reason"] == "structured_text_unavailable"
+        assert not any(
+            check.status == CheckStatus.PASSED for check in self._checks(result, "Network Communication Detection")
+        )
+        assert any(
+            check.details.get("coverage_gap") == "structured_text_unavailable"
+            and check.details.get("detector") == "network_communication"
+            for check in self._checks(result, "Raw Detector Analysis Coverage")
+        )
         assert self._checks(result, "Custom Operator Domain Check")[-1].status == CheckStatus.PASSED
         assert self._checks(result, "Python Operator Detection")[-1].status == CheckStatus.PASSED
         assert self._checks(result, "Tensor Size Validation")[-1].status == CheckStatus.PASSED
@@ -7528,7 +7559,56 @@ class TestLargeOnnxFileBackedInspection:
         assert native.functions[0].metadata_props[0].key == "owner"
         assert native.functions[0].metadata_props[0].value == "modelaudit"
         assert native_tensors == lite_tensors == []
-        assert state.coverage_gaps == {}
+        assert state.coverage_gaps == {"unknown_protobuf_fields": 2}
+        assert state.unknown_field_count == 2
+        assert {sample["field_number"] for sample in state.unknown_field_samples} == {15, 16}
+
+        result = OnnxScanner(
+            config={
+                "onnx_raw_detector_max_bytes": 1,
+                "check_jit_script": False,
+                "check_network_comm": False,
+            },
+        ).scan(str(model_path))
+        coverage_check = self._checks(result, "ONNX Structure Parse Coverage")[-1]
+        structure_metadata = result.metadata["onnx_structure_parse"]
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert coverage_check.status == CheckStatus.FAILED
+        assert coverage_check.details["coverage_gaps"] == {"unknown_protobuf_fields": 2}
+        assert structure_metadata["unknown_field_count"] == 2
+        assert {sample["field_number"] for sample in structure_metadata["unknown_field_samples"]} == {15, 16}
+
+        in_memory_result = OnnxScanner(
+            config={
+                "check_jit_script": False,
+                "check_network_comm": False,
+            },
+        ).scan(str(model_path))
+        in_memory_checks = self._checks(in_memory_result, "ONNX Structure Parse Coverage")
+        in_memory_structure_metadata = in_memory_result.metadata["onnx_structure_parse"]
+        assert in_memory_result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert in_memory_checks[-1].details["coverage_gaps"] == {"unknown_protobuf_fields": 1}
+        assert in_memory_structure_metadata["parse_mode"] == "in_memory_model_proto"
+        assert in_memory_structure_metadata["unknown_field_count"] == 1
+        assert in_memory_structure_metadata["unknown_field_bytes_discarded"] > 0
+        assert in_memory_structure_metadata["unknown_field_detection"] == "discard_unknown_fields_byte_size"
+
+    def test_in_memory_unknown_check_does_not_reject_valid_repeated_graph_field(self, tmp_path: Path) -> None:
+        model_path = create_onnx_model(tmp_path, include_initializer=False)
+        model_path.write_bytes(model_path.read_bytes() + _proto_bytes(7, b""))
+
+        native = onnx.load_model_from_string(model_path.read_bytes())
+        onnx.checker.check_model(native)
+        result = OnnxScanner(
+            config={
+                "check_jit_script": False,
+                "check_network_comm": False,
+            },
+        ).scan(str(model_path))
+
+        assert result.success is True
+        assert result.metadata["onnx_structure_parse"] == {"parse_mode": "in_memory_model_proto"}
+        assert not [check for check in self._checks(result, "ONNX Model Parsing") if check.status == CheckStatus.FAILED]
 
     def test_forced_file_backed_schema_does_not_reopen_path_or_validate_format(
         self,
@@ -8140,6 +8220,203 @@ class TestRawDetectorCoverage:
     def _coverage_checks(result: Any) -> list[Any]:
         return [c for c in result.checks if c.name == "Raw Detector Analysis Coverage"]
 
+    @staticmethod
+    def _network_detection_checks(result: Any) -> list[Any]:
+        return [c for c in result.checks if c.name == "Network Communication Detection"]
+
+    def test_structured_network_extraction_skips_numeric_tensor_payloads(self) -> None:
+        class RepeatedPayload:
+            def __iter__(self) -> Any:
+                raise AssertionError("numeric tensor payload field was enumerated")
+
+        class TensorField:
+            LABEL_REPEATED = 3
+            TYPE_MESSAGE = 11
+            TYPE_BYTES = 12
+            TYPE_STRING = 9
+            name = "float_data"
+            label = LABEL_REPEATED
+            type = 2
+
+        class TensorDescriptor:
+            full_name = "onnx.TensorProto"
+
+            def __init__(self) -> None:
+                self.fields = [TensorField()]
+
+        class TensorMessage:
+            def __init__(self) -> None:
+                self.DESCRIPTOR = TensorDescriptor()
+                self.float_data = RepeatedPayload()
+
+        collector = onnx_scanner_module._OnnxNetworkTextCollector(
+            max_bytes=1024,
+            max_fields=10,
+            check_interrupted=lambda: None,
+        )
+
+        onnx_scanner_module._collect_onnx_proto_text_fields(collector, TensorMessage(), "tensor")
+
+        detector_input = collector.finish()
+        assert detector_input.field_count == 0
+        assert detector_input.data == b""
+
+    def test_structured_network_extraction_bounds_empty_repeated_messages(self) -> None:
+        iterations: list[int] = []
+
+        class EmptyMessage:
+            class Descriptor:
+                fields: ClassVar[tuple[Any, ...]] = ()
+
+            DESCRIPTOR = Descriptor()
+
+        class RepeatedMessageField:
+            LABEL_REPEATED = 3
+            TYPE_MESSAGE = 11
+            TYPE_BYTES = 12
+            TYPE_STRING = 9
+            name = "node"
+            label = LABEL_REPEATED
+            type = TYPE_MESSAGE
+
+        class ParentDescriptor:
+            fields: ClassVar[tuple[Any, ...]] = (RepeatedMessageField(),)
+
+        class RepeatedMessages:
+            def __iter__(self) -> Any:
+                for index in range(100):
+                    iterations.append(index)
+                    yield EmptyMessage()
+
+        class ParentMessage:
+            DESCRIPTOR = ParentDescriptor()
+            node = RepeatedMessages()
+
+        collector = onnx_scanner_module._OnnxNetworkTextCollector(
+            max_bytes=1024,
+            max_fields=4,
+            check_interrupted=lambda: None,
+        )
+
+        onnx_scanner_module._collect_onnx_proto_text_fields(collector, ParentMessage(), "model")
+
+        detector_input = collector.finish()
+        assert len(iterations) == 5
+        assert detector_input.truncated is True
+        assert detector_input.omitted_field_count == 1
+        assert detector_input.field_count == 0
+
+    def test_structured_network_extraction_bounds_empty_repeated_scalar_fields(self) -> None:
+        iterations: list[int] = []
+
+        class RepeatedStringField:
+            LABEL_REPEATED = 3
+            TYPE_MESSAGE = 11
+            TYPE_BYTES = 12
+            TYPE_STRING = 9
+            name = "input"
+            label = LABEL_REPEATED
+            type = TYPE_STRING
+
+        class Descriptor:
+            fields: ClassVar[tuple[Any, ...]] = (RepeatedStringField(),)
+
+        class RepeatedValues:
+            def __iter__(self) -> Any:
+                for index in range(100):
+                    iterations.append(index)
+                    yield ""
+
+        class Message:
+            DESCRIPTOR = Descriptor()
+            input = RepeatedValues()
+
+        collector = onnx_scanner_module._OnnxNetworkTextCollector(
+            max_bytes=1024,
+            max_fields=3,
+            check_interrupted=lambda: None,
+        )
+
+        onnx_scanner_module._collect_onnx_proto_text_fields(collector, Message(), "model.graph.node[0]")
+
+        detector_input = collector.finish()
+        assert len(iterations) == 4
+        assert detector_input.truncated is True
+        assert detector_input.omitted_field_count == 1
+        assert detector_input.field_count == 0
+
+    def test_structured_network_extraction_counts_repeated_scalar_values_once(self) -> None:
+        iterations: list[int] = []
+
+        class RepeatedStringField:
+            LABEL_REPEATED = 3
+            TYPE_MESSAGE = 11
+            TYPE_BYTES = 12
+            TYPE_STRING = 9
+            name = "input"
+            label = LABEL_REPEATED
+            type = TYPE_STRING
+
+        class Descriptor:
+            fields: ClassVar[tuple[Any, ...]] = (RepeatedStringField(),)
+
+        class RepeatedValues:
+            def __iter__(self) -> Any:
+                for index, value in enumerate(("alpha", "beta", "gamma")):
+                    iterations.append(index)
+                    yield value
+
+        class Message:
+            DESCRIPTOR = Descriptor()
+            input = RepeatedValues()
+
+        collector = onnx_scanner_module._OnnxNetworkTextCollector(
+            max_bytes=1024,
+            max_fields=2,
+            check_interrupted=lambda: None,
+        )
+
+        onnx_scanner_module._collect_onnx_proto_text_fields(collector, Message(), "model.graph.node[0]")
+
+        detector_input = collector.finish()
+        assert len(iterations) == 3
+        assert detector_input.truncated is True
+        assert detector_input.omitted_field_count == 1
+        assert detector_input.field_count == 2
+        assert b"alpha" in detector_input.data
+        assert b"beta" in detector_input.data
+        assert b"gamma" not in detector_input.data
+
+    def test_hasfield_value_error_falls_back_to_attribute_traversal(self) -> None:
+        graph = object()
+        tensor = object()
+
+        class SparseTensor:
+            values = "values"
+            indices = "indices"
+
+        class Attribute:
+            g = graph
+            t = tensor
+            sparse_tensor = SparseTensor()
+
+            def __init__(self) -> None:
+                self.graphs: list[Any] = []
+                self.tensors: list[Any] = []
+                self.sparse_tensors: list[Any] = []
+
+            def HasField(self, _name: str) -> bool:
+                raise ValueError("presence not supported")
+
+        attribute = Attribute()
+
+        assert list(onnx_scanner_module._iter_attribute_graphs(attribute)) == [graph]
+        assert list(onnx_scanner_module._iter_attribute_external_data_tensors(attribute)) == [
+            tensor,
+            "values",
+            "indices",
+        ]
+
     def _assert_inconclusive_exit2(self, model_path: Path, direct: Any, *, detector: str) -> None:
         aggregate = scan_model_directory_or_file(str(model_path), recursive=False)
         metadata = next(iter(aggregate.file_metadata.values()))
@@ -8182,6 +8459,907 @@ class TestRawDetectorCoverage:
         assert leaked_secret not in str(coverage_check.details)
         assert leaked_secret not in caplog.text
         assert "<redacted>" in coverage_check.message
+
+    def test_structured_network_text_bounds_strings_before_encoding(self) -> None:
+        class OversizedString(str):
+            def encode(self, *args: Any, **kwargs: Any) -> bytes:
+                raise AssertionError("oversized text should be omitted before encoding")
+
+        collector = onnx_scanner_module._OnnxNetworkTextCollector(
+            max_bytes=32,
+            max_fields=10,
+            check_interrupted=lambda: None,
+        )
+
+        collector.add("model.graph.name", OversizedString("x" * 64))
+        detector_input = collector.finish()
+
+        assert detector_input.truncated is True
+        assert detector_input.omitted_field_count == 1
+        assert detector_input.field_count == 0
+        assert detector_input.sections == ()
+
+    def test_structured_network_text_skips_empty_fields_before_budget(self) -> None:
+        collector = onnx_scanner_module._OnnxNetworkTextCollector(
+            max_bytes=1024,
+            max_fields=1,
+            check_interrupted=lambda: None,
+        )
+
+        collector.add("model.graph.name", "")
+        collector.add("model.graph.doc_string", "documentation text")
+        detector_input = collector.finish()
+
+        assert detector_input.truncated is False
+        assert detector_input.omitted_field_count == 0
+        assert detector_input.field_count == 1
+        assert detector_input.data == b"model.graph.doc_string: documentation text\n"
+
+    def test_structured_network_extraction_skips_repeated_numeric_fields_before_iteration(self) -> None:
+        class RepeatedNumericField:
+            name = "ints"
+            is_repeated = True
+            type = 3
+            LABEL_REPEATED = 3
+            TYPE_MESSAGE = 11
+            TYPE_BYTES = 12
+            TYPE_STRING = 9
+
+        class RepeatedNumericValues:
+            def __iter__(self) -> Any:
+                raise AssertionError("numeric field should be skipped before iteration")
+
+        class AttributeDescriptor:
+            full_name = "onnx.AttributeProto"
+            fields: ClassVar[tuple[Any, ...]] = (RepeatedNumericField(),)
+
+        class AttributeMessage:
+            DESCRIPTOR = AttributeDescriptor()
+            ints = RepeatedNumericValues()
+
+        collector = onnx_scanner_module._OnnxNetworkTextCollector(
+            max_bytes=1024,
+            max_fields=10,
+            check_interrupted=lambda: None,
+        )
+
+        onnx_scanner_module._collect_onnx_proto_text_fields(collector, AttributeMessage(), "attribute")
+
+        assert collector.finish().sections == ()
+
+    def test_structured_network_extraction_accepts_repeated_field_without_label(self) -> None:
+        class RepeatedStringField:
+            name = "input"
+            is_repeated = True
+            type = 9
+            TYPE_MESSAGE = 11
+            TYPE_BYTES = 12
+            TYPE_STRING = 9
+
+        class Descriptor:
+            fields: ClassVar[tuple[Any, ...]] = (RepeatedStringField(),)
+
+        class Message:
+            DESCRIPTOR = Descriptor()
+            input = ("https://docs.ultralytics.com/",)
+
+        collector = onnx_scanner_module._OnnxNetworkTextCollector(
+            max_bytes=1024,
+            max_fields=10,
+            check_interrupted=lambda: None,
+        )
+
+        onnx_scanner_module._collect_onnx_proto_text_fields(collector, Message(), "model.graph.node[0]")
+
+        detector_input = collector.finish()
+        assert detector_input.field_count == 1
+        assert b"model.graph.node[0].input[0]: https://docs.ultralytics.com/" in detector_input.data
+
+    def test_network_detector_ignores_onnx_raw_tensor_bytes(self, tmp_path: Path) -> None:
+        payload = b"quantized calibration bytes 8.8.8.8 are tensor data"
+        tensor = onnx.TensorProto()
+        tensor.name = "W"
+        tensor.data_type = TensorProto.UINT8
+        tensor.dims.extend([len(payload)])
+        tensor.raw_data = payload
+        output = helper.make_tensor_value_info("output", TensorProto.UINT8, [len(payload)])
+        node = helper.make_node("Identity", ["W"], ["output"], name="identity")
+        graph = helper.make_graph([node], "raw_tensor_graph", [], [output], initializer=[tensor])
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        model_path = tmp_path / "raw-tensor-ip.onnx"
+        onnx.save(model, str(model_path))
+
+        result = OnnxScanner(config={"check_jit_script": False}).scan(str(model_path))
+
+        assert result.metadata["onnx_network_detector_input"]["source"] == "structured_text_fields"
+        failed_network_checks = [
+            check for check in self._network_detection_checks(result) if check.status == CheckStatus.FAILED
+        ]
+        assert not [
+            check
+            for check in failed_network_checks
+            if check.details.get("type") == "ipv4_address" and check.details.get("ip") == "8.8.8.8"
+        ]
+        assert any(check.status == CheckStatus.PASSED for check in self._network_detection_checks(result))
+
+    def test_network_detector_scans_onnx_string_initializer_values(self, tmp_path: Path) -> None:
+        endpoint = "https://45.33.32.156/payload"
+        tensor = TensorProto()
+        tensor.name = "S"
+        tensor.data_type = TensorProto.STRING
+        tensor.dims.append(1)
+        tensor.string_data.append(endpoint.encode("utf-8"))
+        output = helper.make_tensor_value_info("output", TensorProto.STRING, [1])
+        node = helper.make_node("Identity", ["S"], ["output"], name="identity")
+        graph = helper.make_graph([node], "string_initializer_graph", [], [output], initializer=[tensor])
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        model_path = tmp_path / "string-initializer-url.onnx"
+        onnx.save(model, str(model_path))
+
+        result = OnnxScanner(config={"check_jit_script": False}).scan(str(model_path))
+
+        failed_network_checks = [
+            check for check in self._network_detection_checks(result) if check.status == CheckStatus.FAILED
+        ]
+        assert any(
+            check.details.get("type") == "url_detected"
+            and "45.33.32.156" in str(check.details.get("url", ""))
+            and check.details.get("onnx_metadata_owned") is False
+            for check in failed_network_checks
+        )
+
+    def test_network_detector_scans_onnx_constant_string_tensor_values(self, tmp_path: Path) -> None:
+        endpoint = "https://45.33.32.157/payload"
+        tensor = TensorProto()
+        tensor.name = "constant_value"
+        tensor.data_type = TensorProto.STRING
+        tensor.dims.append(1)
+        tensor.string_data.append(endpoint.encode("utf-8"))
+        output = helper.make_tensor_value_info("output", TensorProto.STRING, [1])
+        node = helper.make_node("Constant", [], ["output"], name="constant", value=tensor)
+        graph = helper.make_graph([node], "constant_string_graph", [], [output])
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        model_path = tmp_path / "constant-string-url.onnx"
+        onnx.save(model, str(model_path))
+
+        result = OnnxScanner(config={"check_jit_script": False}).scan(str(model_path))
+
+        failed_network_checks = [
+            check for check in self._network_detection_checks(result) if check.status == CheckStatus.FAILED
+        ]
+        assert any(
+            check.details.get("type") == "url_detected"
+            and "45.33.32.157" in str(check.details.get("url", ""))
+            and check.details.get("onnx_metadata_owned") is False
+            for check in failed_network_checks
+        )
+
+    def test_network_detector_preserves_onnx_metadata_urls(self, tmp_path: Path) -> None:
+        model_path = create_onnx_model(tmp_path, include_initializer=False)
+        model = onnx.load(str(model_path))
+        metadata = model.metadata_props.add()
+        metadata.key = "callback"
+        metadata.value = "https://45.33.32.156/payload"
+        onnx.save(model, str(model_path))
+
+        result = OnnxScanner(config={"check_jit_script": False}).scan(str(model_path))
+
+        failed_network_checks = [
+            check for check in self._network_detection_checks(result) if check.status == CheckStatus.FAILED
+        ]
+        assert any(
+            check.details.get("type") == "url_detected" and "45.33.32.156" in str(check.details.get("url", ""))
+            for check in failed_network_checks
+        )
+        assert all(check.details.get("onnx_metadata_owned") is True for check in failed_network_checks)
+
+    def test_network_detector_huggingface_metadata_url_stays_informational(self, tmp_path: Path) -> None:
+        model_path = create_onnx_model(tmp_path, include_initializer=False)
+        model = onnx.load(str(model_path))
+        metadata = model.metadata_props.add()
+        metadata.key = "homepage"
+        metadata.value = "https://huggingface.co/meta-llama/Llama-2-7b"
+        onnx.save(model, str(model_path))
+
+        result = OnnxScanner(config={"check_jit_script": False}).scan(str(model_path))
+
+        failed_network_checks = [
+            check for check in self._network_detection_checks(result) if check.status == CheckStatus.FAILED
+        ]
+        metadata_failures = [
+            check for check in failed_network_checks if check.details.get("onnx_metadata_owned") is True
+        ]
+        assert metadata_failures
+        assert all(check.severity == IssueSeverity.INFO for check in metadata_failures)
+        assert not any(check.details.get("type") == "explicit_network_pattern" for check in failed_network_checks)
+
+    def test_network_detector_preserves_docs_url_metadata_ownership(self, tmp_path: Path) -> None:
+        model_path = create_onnx_model(tmp_path, include_initializer=False)
+        model = onnx.load(str(model_path))
+        metadata = model.metadata_props.add()
+        metadata.key = "documentation"
+        metadata.value = "https://docs.ultralytics.com/"
+        notes = model.metadata_props.add()
+        notes.key = "notes"
+        notes.value = "Documentation includes import socket for examples."
+        onnx.save(model, str(model_path))
+
+        result = OnnxScanner(config={"check_jit_script": False}).scan(str(model_path))
+
+        metadata_input = result.metadata["onnx_network_detector_input"]
+        assert metadata_input["sections"][-1] == {
+            "name": "metadata_props",
+            "field_count": 4,
+            "metadata_owned": True,
+        }
+        failed_network_checks = [
+            check for check in self._network_detection_checks(result) if check.status == CheckStatus.FAILED
+        ]
+        docs_failures = [
+            check
+            for check in failed_network_checks
+            if check.details.get("type") == "url_detected"
+            and check.details.get("url") == "https://docs.ultralytics.com/"
+            and check.details.get("onnx_metadata_owned") is True
+        ]
+        assert docs_failures
+        assert all(check.details.get("onnx_detector_context") == str(model_path) for check in docs_failures)
+        assert not [check for check in failed_network_checks if check.details.get("type") == "network_library"]
+
+    def test_network_detector_metadata_section_uses_protobuf_owned_values(self, tmp_path: Path) -> None:
+        model_path = create_onnx_model(tmp_path, include_initializer=False)
+        model = onnx.load(str(model_path))
+        metadata = model.metadata_props.add()
+        metadata.key = "documentation"
+        metadata.value = "https://docs.ultralytics.com/"
+
+        detector_input = onnx_scanner_module._collect_onnx_network_detector_input(model, check_interrupted=lambda: None)
+        metadata_section = next(section for section in detector_input.sections if section.name == "metadata_props")
+        metadata_view = onnx.load_model_from_string(metadata_section.data)
+
+        assert metadata_section.field_count == 2
+        assert metadata_section.metadata_owned is True
+        assert metadata_view.graph.initializer == []
+        assert [(prop.key, prop.value) for prop in metadata_view.metadata_props] == [
+            ("documentation", "https://docs.ultralytics.com/\n")
+        ]
+
+    def test_network_detector_metadata_protobuf_uses_only_bounded_values(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(onnx_scanner_module, "_ONNX_NETWORK_TEXT_MAX_BYTES", 512)
+        model_path = create_onnx_model(tmp_path, include_initializer=False)
+        model = onnx.load(str(model_path))
+        docs_metadata = model.metadata_props.add()
+        docs_metadata.key = "documentation"
+        docs_metadata.value = "https://docs.ultralytics.com/"
+        oversized_metadata = model.metadata_props.add()
+        oversized_metadata.key = "callback"
+        oversized_metadata.value = "https://45.33.32.157/payload/" + ("a" * 2048)
+
+        detector_input = onnx_scanner_module._collect_onnx_network_detector_input(model, check_interrupted=lambda: None)
+        metadata_section = next(section for section in detector_input.sections if section.name == "metadata_props")
+        metadata_view = onnx.load_model_from_string(metadata_section.data)
+
+        assert detector_input.truncated is True
+        assert detector_input.omitted_field_count == 1
+        assert metadata_section.field_count == 2
+        assert [(prop.key, prop.value) for prop in metadata_view.metadata_props] == [
+            ("documentation", "https://docs.ultralytics.com/\n")
+        ]
+        assert b"45.33.32.157" not in metadata_section.data
+        metadata_text_section = next(
+            section for section in detector_input.sections if section.name == "metadata_text_fields"
+        )
+        assert metadata_text_section.field_count == 1
+        assert b"callback" in metadata_text_section.data
+        assert b"45.33.32.157" not in metadata_text_section.data
+
+    def test_network_detector_preserves_function_metadata_text(self, tmp_path: Path) -> None:
+        url = "https://45.33.32.157/payload"
+        model_metadata = _proto_bytes(1, b"documentation") + _proto_bytes(2, b"https://docs.ultralytics.com/")
+        function_metadata = _proto_bytes(1, b"callback") + _proto_bytes(2, url.encode())
+        function = _proto_bytes(1, b"Fn") + _proto_bytes(14, function_metadata)
+        graph = _proto_bytes(2, b"graph")
+        model = (
+            _proto_varint(1, 8) + _proto_bytes(7, graph) + _proto_bytes(14, model_metadata) + _proto_bytes(25, function)
+        )
+        model_path = _write_onnx_payload(tmp_path, "function-metadata-url.onnx", model)
+
+        result = OnnxScanner(config={"check_jit_script": False}).scan(str(model_path))
+
+        detector_sections = result.metadata["onnx_network_detector_input"]["sections"]
+        assert any(section["name"] == "metadata_props" for section in detector_sections)
+        assert not any(section["name"] == "metadata_text_fields" for section in detector_sections)
+        assert any(
+            check.details.get("type") == "url_detected"
+            and check.details.get("url") == url
+            and check.details.get("onnx_metadata_owned") is True
+            for check in self._network_detection_checks(result)
+            if check.status == CheckStatus.FAILED
+        )
+
+    def test_network_detector_preserves_metadata_value_without_admitted_key(self, tmp_path: Path) -> None:
+        url = "https://45.33.32.157/payload"
+        model_path = create_onnx_model(tmp_path, include_initializer=False)
+        model = onnx.load(str(model_path))
+        metadata = model.metadata_props.add()
+        metadata.key = ""
+        metadata.value = url
+        onnx.save(model, str(model_path))
+
+        result = OnnxScanner(config={"check_jit_script": False}).scan(str(model_path))
+
+        detector_sections = result.metadata["onnx_network_detector_input"]["sections"]
+        assert detector_sections[-1]["name"] == "metadata_props"
+        assert any(
+            check.details.get("type") == "url_detected"
+            and check.details.get("url") == url
+            and check.details.get("onnx_metadata_owned") is True
+            for check in self._network_detection_checks(result)
+            if check.status == CheckStatus.FAILED
+        )
+
+    def test_network_detector_preserves_metadata_key_without_admitted_value(self, tmp_path: Path) -> None:
+        url = "https://45.33.32.157/payload"
+        model_path = create_onnx_model(tmp_path, include_initializer=False)
+        model = onnx.load(str(model_path))
+        docs_metadata = model.metadata_props.add()
+        docs_metadata.key = "documentation"
+        docs_metadata.value = "https://docs.ultralytics.com/"
+        key_only_metadata = model.metadata_props.add()
+        key_only_metadata.key = url
+        key_only_metadata.value = ""
+        onnx.save(model, str(model_path))
+
+        result = OnnxScanner(config={"check_jit_script": False}).scan(str(model_path))
+
+        detector_sections = result.metadata["onnx_network_detector_input"]["sections"]
+        assert [section["name"] for section in detector_sections[-2:]] == ["metadata_props", "metadata_text_fields"]
+        assert any(
+            check.details.get("type") == "url_detected"
+            and check.details.get("url") == url
+            and check.details.get("onnx_metadata_owned") is True
+            for check in self._network_detection_checks(result)
+            if check.status == CheckStatus.FAILED
+        )
+
+    def test_network_detector_metadata_props_preserve_value_boundaries(self, tmp_path: Path) -> None:
+        url = "https://45.33.32.158/payload"
+        model_path = create_onnx_model(tmp_path, include_initializer=False)
+        model = onnx.load(str(model_path))
+        ip_metadata = model.metadata_props.add()
+        ip_metadata.key = "callback"
+        ip_metadata.value = "45.33.32.157"
+        url_metadata = model.metadata_props.add()
+        url_metadata.key = "documentation"
+        url_metadata.value = url
+        author_metadata = model.metadata_props.add()
+        author_metadata.key = "author"
+        author_metadata.value = "Model Team"
+        onnx.save(model, str(model_path))
+
+        result = OnnxScanner(config={"check_jit_script": False}).scan(str(model_path))
+
+        detector_sections = result.metadata["onnx_network_detector_input"]["sections"]
+        assert [section["name"] for section in detector_sections].count("metadata_props") == 1
+        failed_network_checks = [
+            check for check in self._network_detection_checks(result) if check.status == CheckStatus.FAILED
+        ]
+        assert any(
+            check.details.get("type") == "ipv4_address"
+            and check.details.get("ip") == "45.33.32.157"
+            and check.details.get("onnx_metadata_owned") is True
+            for check in failed_network_checks
+        )
+        assert any(
+            check.details.get("type") == "url_detected"
+            and check.details.get("url") == url
+            and check.details.get("onnx_metadata_owned") is True
+            for check in failed_network_checks
+        )
+        assert all("payloadr" not in str(check.details) for check in failed_network_checks)
+        assert all("45.33.32.157r" not in str(check.details) for check in failed_network_checks)
+
+    def test_network_detector_batches_model_metadata_props(self, tmp_path: Path) -> None:
+        model_path = create_onnx_model(tmp_path, include_initializer=False)
+        model = onnx.load(str(model_path))
+        for index in range(20):
+            metadata = model.metadata_props.add()
+            metadata.key = f"url_{index}"
+            metadata.value = f"https://docs.example.com/reference/{index}"
+
+        detector_input = onnx_scanner_module._collect_onnx_network_detector_input(model, check_interrupted=lambda: None)
+
+        sections = detector_input.sections
+        assert len([section for section in sections if section.name == "metadata_props"]) == 1
+        assert not [section for section in sections if section.name == "metadata_text_fields"]
+
+    def test_network_detector_scans_metadata_entry_after_detector_entry_limit(self, tmp_path: Path) -> None:
+        model_path = create_onnx_model(tmp_path, include_initializer=False)
+        model = onnx.load(str(model_path))
+        for index in range(1024):
+            metadata = model.metadata_props.add()
+            metadata.key = f"author_{index}"
+            metadata.value = "Model Team"
+        callback = model.metadata_props.add()
+        callback.key = "callback"
+        callback.value = "host evil.com port=6379"
+        onnx.save(model, str(model_path))
+
+        result = OnnxScanner(config={"check_jit_script": False}).scan(str(model_path))
+
+        failed_network_checks = [
+            check for check in self._network_detection_checks(result) if check.status == CheckStatus.FAILED
+        ]
+        assert any(
+            check.details.get("domain") == "evil.com" and check.details.get("onnx_metadata_owned") is True
+            for check in failed_network_checks
+        )
+        assert any(
+            check.details.get("type") == "suspicious_port"
+            and check.details.get("port") == 6379
+            and check.details.get("onnx_metadata_owned") is True
+            for check in failed_network_checks
+        )
+
+    def test_network_detector_preserves_nested_onnx_metadata_props(self, tmp_path: Path) -> None:
+        model_path = create_onnx_model(tmp_path, include_initializer=False)
+        model = onnx.load(str(model_path))
+        function = helper.make_function(
+            "modelaudit.test",
+            "CallbackFunction",
+            ["function_input"],
+            ["function_output"],
+            [helper.make_node("Identity", ["function_input"], ["function_output"])],
+            [helper.make_opsetid("", 13)],
+        )
+        callback = function.metadata_props.add()
+        callback.key = "callback"
+        callback.value = "host evil.com port=6379"
+        model.functions.extend([function])
+        onnx.save(model, str(model_path))
+
+        result = OnnxScanner(config={"check_jit_script": False}).scan(str(model_path))
+
+        failed_network_checks = [
+            check for check in self._network_detection_checks(result) if check.status == CheckStatus.FAILED
+        ]
+        assert any(
+            check.details.get("domain") == "evil.com" and check.details.get("onnx_metadata_owned") is True
+            for check in failed_network_checks
+        )
+        assert any(
+            check.details.get("type") == "suspicious_port"
+            and check.details.get("port") == 6379
+            and check.details.get("onnx_metadata_owned") is True
+            for check in failed_network_checks
+        )
+
+    def test_network_detector_metadata_contact_domain_stays_clean(self, tmp_path: Path) -> None:
+        model_path = create_onnx_model(tmp_path, include_initializer=False)
+        model = onnx.load(str(model_path))
+        metadata = model.metadata_props.add()
+        metadata.key = "contact"
+        metadata.value = "owner@company.com"
+        onnx.save(model, str(model_path))
+
+        result = OnnxScanner(config={"check_jit_script": False}).scan(str(model_path))
+
+        failed_network_checks = [
+            check for check in self._network_detection_checks(result) if check.status == CheckStatus.FAILED
+        ]
+        assert not failed_network_checks
+        assert any(check.status == CheckStatus.PASSED for check in self._network_detection_checks(result))
+
+    def test_network_detector_extensionless_metadata_contact_domain_stays_clean(self, tmp_path: Path) -> None:
+        source_path = create_onnx_model(tmp_path, include_initializer=False)
+        model = onnx.load(str(source_path))
+        metadata = model.metadata_props.add()
+        metadata.key = "contact"
+        metadata.value = "owner@company.com"
+        model_path = tmp_path / "metadata-contact"
+        onnx.save(model, str(model_path))
+
+        result = OnnxScanner(config={"check_jit_script": False}).scan(str(model_path))
+
+        failed_network_checks = [
+            check for check in self._network_detection_checks(result) if check.status == CheckStatus.FAILED
+        ]
+        assert not failed_network_checks
+        assert any(check.status == CheckStatus.PASSED for check in self._network_detection_checks(result))
+
+    def test_network_detector_extensionless_metadata_callback_domain_remains_actionable(self, tmp_path: Path) -> None:
+        source_path = create_onnx_model(tmp_path, include_initializer=False)
+        model = onnx.load(str(source_path))
+        metadata = model.metadata_props.add()
+        metadata.key = "callback"
+        metadata.value = "host evil.com"
+        model_path = tmp_path / "metadata-callback"
+        onnx.save(model, str(model_path))
+
+        result = OnnxScanner(config={"check_jit_script": False}).scan(str(model_path))
+
+        failed_network_checks = [
+            check for check in self._network_detection_checks(result) if check.status == CheckStatus.FAILED
+        ]
+        assert any(
+            check.details.get("domain") == "evil.com" and check.details.get("onnx_metadata_owned") is True
+            for check in failed_network_checks
+        )
+
+    def test_network_detector_extensionless_metadata_callback_domain_uses_full_value(self, tmp_path: Path) -> None:
+        source_path = create_onnx_model(tmp_path, include_initializer=False)
+        model = onnx.load(str(source_path))
+        metadata = model.metadata_props.add()
+        metadata.key = "callback"
+        metadata.value = ("A" * 129) + " evil.com"
+        model_path = tmp_path / "metadata-callback-padded"
+        onnx.save(model, str(model_path))
+
+        result = OnnxScanner(config={"check_jit_script": False}).scan(str(model_path))
+
+        failed_network_checks = [
+            check for check in self._network_detection_checks(result) if check.status == CheckStatus.FAILED
+        ]
+        assert any(
+            check.details.get("domain") == "evil.com" and check.details.get("onnx_metadata_owned") is True
+            for check in failed_network_checks
+        )
+
+    def test_network_detector_metadata_prose_import_requests_stays_clean(self, tmp_path: Path) -> None:
+        model_path = create_onnx_model(tmp_path, include_initializer=False)
+        model = onnx.load(str(model_path))
+        metadata = model.metadata_props.add()
+        metadata.key = "documentation"
+        metadata.value = "This documentation shows how to import requests for the example"
+        onnx.save(model, str(model_path))
+
+        result = OnnxScanner(config={"check_jit_script": False}).scan(str(model_path))
+
+        failed_network_checks = [
+            check for check in self._network_detection_checks(result) if check.status == CheckStatus.FAILED
+        ]
+        assert not failed_network_checks
+        assert any(check.status == CheckStatus.PASSED for check in self._network_detection_checks(result))
+
+    def test_network_detector_metadata_documentation_port_stays_clean(self, tmp_path: Path) -> None:
+        model_path = create_onnx_model(tmp_path, include_initializer=False)
+        model = onnx.load(str(model_path))
+        metadata = model.metadata_props.add()
+        metadata.key = "documentation"
+        metadata.value = "The local example uses localhost:8080"
+        onnx.save(model, str(model_path))
+
+        result = OnnxScanner(config={"check_jit_script": False}).scan(str(model_path))
+
+        failed_network_checks = [
+            check for check in self._network_detection_checks(result) if check.status == CheckStatus.FAILED
+        ]
+        assert not [check for check in failed_network_checks if check.details.get("type") == "suspicious_port"]
+        assert any(check.status == CheckStatus.PASSED for check in self._network_detection_checks(result))
+
+    def test_network_detector_extensionless_metadata_documentation_port_stays_clean(self, tmp_path: Path) -> None:
+        source_path = create_onnx_model(tmp_path, include_initializer=False)
+        model = onnx.load(str(source_path))
+        metadata = model.metadata_props.add()
+        metadata.key = "documentation"
+        metadata.value = "The local example uses localhost:8080"
+        model_path = tmp_path / "metadata-doc-port"
+        onnx.save(model, str(model_path))
+
+        result = OnnxScanner(config={"check_jit_script": False}).scan(str(model_path))
+
+        failed_network_checks = [
+            check for check in self._network_detection_checks(result) if check.status == CheckStatus.FAILED
+        ]
+        assert not [check for check in failed_network_checks if check.details.get("type") == "suspicious_port"]
+        assert any(check.status == CheckStatus.PASSED for check in self._network_detection_checks(result))
+
+    def test_network_detector_extensionless_metadata_callback_port_remains_actionable(self, tmp_path: Path) -> None:
+        source_path = create_onnx_model(tmp_path, include_initializer=False)
+        model = onnx.load(str(source_path))
+        metadata = model.metadata_props.add()
+        metadata.key = "callback"
+        metadata.value = "connect port=6379"
+        model_path = tmp_path / "metadata-callback-port"
+        onnx.save(model, str(model_path))
+
+        result = OnnxScanner(config={"check_jit_script": False}).scan(str(model_path))
+
+        failed_network_checks = [
+            check for check in self._network_detection_checks(result) if check.status == CheckStatus.FAILED
+        ]
+        assert any(
+            check.details.get("type") == "suspicious_port" and check.details.get("onnx_metadata_owned") is True
+            for check in failed_network_checks
+        )
+
+    def test_network_detector_pb_metadata_port_remains_actionable(self, tmp_path: Path) -> None:
+        source_path = create_onnx_model(tmp_path, include_initializer=False)
+        model = onnx.load(str(source_path))
+        metadata = model.metadata_props.add()
+        metadata.key = "callback"
+        metadata.value = "connect port=6379"
+        model_path = tmp_path / "model.pb"
+        onnx.save(model, str(model_path))
+
+        result = OnnxScanner(config={"check_jit_script": False}).scan(str(model_path))
+
+        failed_network_checks = [
+            check for check in self._network_detection_checks(result) if check.status == CheckStatus.FAILED
+        ]
+        assert any(
+            check.details.get("type") == "suspicious_port" and check.details.get("onnx_metadata_owned") is True
+            for check in failed_network_checks
+        )
+
+    def test_network_detector_nonmetadata_url_remains_actionable(self, tmp_path: Path) -> None:
+        model_path = create_onnx_model(tmp_path, include_initializer=False)
+        model = onnx.load(str(model_path))
+        model.graph.node[0].name = "https://45.33.32.156/payload"
+        onnx.save(model, str(model_path))
+
+        result = OnnxScanner(config={"check_jit_script": False}).scan(str(model_path))
+
+        failed_network_checks = [
+            check for check in self._network_detection_checks(result) if check.status == CheckStatus.FAILED
+        ]
+        assert any(
+            "45.33.32.156" in str(check.details)
+            and check.details.get("onnx_metadata_owned") is False
+            and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+            for check in failed_network_checks
+        )
+
+    def test_network_detector_max_findings_applies_across_sections(self, tmp_path: Path) -> None:
+        model_path = create_onnx_model(tmp_path, include_initializer=False)
+        model = onnx.load(str(model_path))
+        model.graph.node[0].name = "https://45.33.32.156/payload"
+        metadata = model.metadata_props.add()
+        metadata.key = "callback"
+        metadata.value = "https://45.33.32.157/payload"
+        onnx.save(model, str(model_path))
+
+        result = OnnxScanner(
+            config={
+                "check_jit_script": False,
+                "network_comm_config": {"max_findings": 1},
+            },
+        ).scan(str(model_path))
+
+        failed_network_checks = [
+            check for check in self._network_detection_checks(result) if check.status == CheckStatus.FAILED
+        ]
+        actual_findings = [
+            check for check in failed_network_checks if check.details.get("type") != "detector_finding_limit"
+        ]
+        limit_findings = [
+            check for check in failed_network_checks if check.details.get("type") == "detector_finding_limit"
+        ]
+        coverage_checks = self._coverage_checks(result)
+        assert result.success is False
+        assert any(
+            check.details.get("coverage_gap") == "detector_finding_limit"
+            and check.details.get("detector") == "network_communication"
+            and (
+                check.details.get("skipped_section") == "metadata_props"
+                or "metadata_props" in check.details.get("skipped_sections", [])
+            )
+            for check in coverage_checks
+        )
+        assert len(actual_findings) == 1
+        assert limit_findings
+        assert all("45.33.32.157" not in str(check.details) for check in actual_findings)
+
+    def test_network_detector_max_findings_ignores_harmless_later_metadata(self, tmp_path: Path) -> None:
+        model_path = create_onnx_model(tmp_path, include_initializer=False)
+        model = onnx.load(str(model_path))
+        model.graph.node[0].name = "45.33.32.156"
+        metadata = model.metadata_props.add()
+        metadata.key = "author"
+        metadata.value = "Model Team"
+        onnx.save(model, str(model_path))
+
+        result = OnnxScanner(
+            config={
+                "check_jit_script": False,
+                "network_comm_config": {"max_findings": 1},
+            },
+        ).scan(str(model_path))
+
+        failed_network_checks = [
+            check for check in self._network_detection_checks(result) if check.status == CheckStatus.FAILED
+        ]
+        actual_findings = [
+            check for check in failed_network_checks if check.details.get("type") != "detector_finding_limit"
+        ]
+        assert len(actual_findings) == 1
+        assert actual_findings[0].details.get("ip") == "45.33.32.156"
+        assert not [check for check in failed_network_checks if check.details.get("type") == "detector_finding_limit"]
+        assert not [
+            check
+            for check in self._coverage_checks(result)
+            if check.details.get("coverage_gap") == "detector_finding_limit"
+        ]
+
+    def test_network_detector_preserves_later_section_limit_marker(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        model_path = create_onnx_model(tmp_path, include_initializer=False)
+        model = onnx.load(str(model_path))
+        model.graph.node[0].name = "45.33.32.156"
+        metadata = model.metadata_props.add()
+        metadata.key = "documentation"
+        metadata.value = "https://docs.ultralytics.com/"
+        onnx.save(model, str(model_path))
+
+        def fake_collect_network_findings(
+            self: OnnxScanner,
+            data: bytes,
+            context: str = "",
+            enable_check: bool = True,
+            raise_on_error: bool = False,
+            result: Any | None = None,
+            *,
+            max_findings: int | None = None,
+            onnx_metadata_context: bool = False,
+        ) -> list[dict[str, Any]]:
+            if onnx_metadata_context:
+                return [
+                    {
+                        "type": "detector_finding_limit",
+                        "detector": "network_communication",
+                        "severity": "INFO",
+                        "message": "Network detector evidence-redaction work limit reached",
+                        "analysis_incomplete": True,
+                        "truncated_finding_type": "evidence_redaction",
+                    }
+                ]
+            return [
+                {
+                    "type": "ipv4_address",
+                    "severity": "MEDIUM",
+                    "message": "IPv4 address detected: 45.33.32.156",
+                    "ip": "45.33.32.156",
+                    "context": context,
+                }
+            ]
+
+        monkeypatch.setattr(OnnxScanner, "collect_network_communication_findings", fake_collect_network_findings)
+
+        result = OnnxScanner(
+            config={
+                "check_jit_script": False,
+                "network_comm_config": {"max_findings": 1},
+            },
+        ).scan(str(model_path))
+
+        failed_network_checks = [
+            check for check in self._network_detection_checks(result) if check.status == CheckStatus.FAILED
+        ]
+        assert any(
+            check.details.get("type") == "detector_finding_limit"
+            and check.details.get("truncated_finding_type") == "evidence_redaction"
+            and check.details.get("onnx_metadata_owned") is True
+            for check in failed_network_checks
+        )
+        assert any(
+            check.details.get("coverage_gap") == "detector_finding_limit"
+            and check.details.get("detector") == "network_communication"
+            for check in self._coverage_checks(result)
+        )
+
+    def test_network_detector_redaction_work_limit_continues_to_later_metadata(self, tmp_path: Path) -> None:
+        model_path = create_onnx_model(tmp_path, include_initializer=False)
+        model = onnx.load(str(model_path))
+        model.doc_string = "".join("api_key=value endpoint=45.33.32.156\n" for _ in range(100))
+        metadata = model.metadata_props.add()
+        metadata.key = "callback"
+        metadata.value = "https://45.33.32.157/payload"
+        onnx.save(model, str(model_path))
+
+        result = OnnxScanner(config={"check_jit_script": False}).scan(str(model_path))
+
+        failed_network_checks = [
+            check for check in self._network_detection_checks(result) if check.status == CheckStatus.FAILED
+        ]
+        assert any(
+            check.details.get("type") == "detector_finding_limit"
+            and check.details.get("truncated_finding_type") == "endpoint_redaction_classification"
+            and check.details.get("onnx_metadata_owned") is False
+            for check in failed_network_checks
+        )
+        assert any(
+            check.details.get("type") == "url_detected"
+            and "45.33.32.157" in str(check.details.get("url", ""))
+            and check.details.get("onnx_metadata_owned") is True
+            for check in failed_network_checks
+        )
+        assert any(
+            check.details.get("coverage_gap") == "detector_finding_limit"
+            and check.details.get("truncated_section") == "structured_text_fields"
+            and "skipped_sections" not in check.details
+            for check in self._coverage_checks(result)
+        )
+
+    def test_network_detector_preserves_prior_section_findings_after_later_failure(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        model_path = create_onnx_model(tmp_path, include_initializer=False)
+        model = onnx.load(str(model_path))
+        model.graph.node[0].name = "https://45.33.32.156/payload"
+        metadata = model.metadata_props.add()
+        metadata.key = "documentation"
+        metadata.value = "https://docs.ultralytics.com/"
+        onnx.save(model, str(model_path))
+        original_scan = NetworkCommDetector.scan
+
+        def fail_metadata_section(
+            self: NetworkCommDetector,
+            data: bytes,
+            context: str = "",
+            *,
+            onnx_metadata_context: bool = False,
+        ) -> list[dict[str, Any]]:
+            if onnx_metadata_context:
+                raise RuntimeError("metadata detector failed")
+            return original_scan(self, data, context, onnx_metadata_context=onnx_metadata_context)
+
+        monkeypatch.setattr(NetworkCommDetector, "scan", fail_metadata_section)
+
+        result = OnnxScanner(config={"check_jit_script": False}).scan(str(model_path))
+
+        failed_network_checks = [
+            check for check in self._network_detection_checks(result) if check.status == CheckStatus.FAILED
+        ]
+        assert any(
+            check.details.get("type") == "url_detected"
+            and "45.33.32.156" in str(check.details.get("url", ""))
+            and check.details.get("onnx_metadata_owned") is False
+            for check in failed_network_checks
+        )
+        assert any(
+            check.details.get("coverage_gap") == "analysis_failed"
+            and check.details.get("detector") == "network_communication"
+            for check in self._coverage_checks(result)
+        )
+
+    def test_truncated_structured_network_input_does_not_emit_clean_pass(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(onnx_scanner_module, "_ONNX_NETWORK_TEXT_MAX_FIELDS", 1)
+        model_path = create_onnx_model(tmp_path, include_initializer=False)
+        model = onnx.load(str(model_path))
+        metadata = model.metadata_props.add()
+        metadata.key = "owner"
+        metadata.value = "modelaudit"
+        onnx.save(model, str(model_path))
+
+        result = OnnxScanner(config={"check_jit_script": False}).scan(str(model_path))
+
+        coverage_checks = self._coverage_checks(result)
+        assert result.metadata["onnx_network_detector_input"]["truncated"] is True
+        assert result.metadata["onnx_network_detector_input"]["omitted_field_count"] > 0
+        assert any(
+            check.details["coverage_gap"] == "text_field_budget_exceeded"
+            and check.details["detector"] == "network_communication"
+            for check in coverage_checks
+        )
+        assert not any(check.status == CheckStatus.PASSED for check in self._network_detection_checks(result))
 
     def test_network_detector_failure_is_inconclusive(
         self,
