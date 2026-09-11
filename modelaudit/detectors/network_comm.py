@@ -6134,7 +6134,9 @@ class NetworkCommDetector:
             ".pickle",
             ".joblib",
         ]
-        is_ml_model = bool(context) and any(ext in context.lower() for ext in ml_extensions)
+        is_ml_model = self._onnx_metadata_context or (
+            bool(context) and any(ext in context.lower() for ext in ml_extensions)
+        )
 
         # For ML models, we need to be much more conservative to avoid false positives
         # Binary model weights can contain random byte sequences that match port patterns

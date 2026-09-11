@@ -3,7 +3,7 @@ import logging
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import pytest
 
@@ -100,6 +100,36 @@ def test_base_scanner_create_result():
     assert result.issues == []
     assert result.bytes_scanned == 0
     assert result.success is True
+
+
+def test_collect_network_communication_findings_preserves_positional_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The public positional result argument must not be rebound to newer options."""
+    from modelaudit.detectors.network_comm import NetworkCommDetector
+
+    def raise_controlled_failure(
+        self: NetworkCommDetector,
+        data: bytes,
+        context: str = "",
+        *,
+        onnx_metadata_context: bool = False,
+    ) -> list[dict[str, Any]]:
+        raise RuntimeError("controlled network detector failure")
+
+    monkeypatch.setattr(NetworkCommDetector, "scan", raise_controlled_failure)
+    scanner = MockScanner()
+    result = scanner._create_result()
+
+    findings = scanner.collect_network_communication_findings(b"payload", "model.test", True, False, result)
+
+    assert findings == []
+    assert result.metadata["analysis_incomplete"] is True
+    assert any(
+        check.details.get("detector") == "network_communication"
+        and check.details.get("coverage_gap") == "analysis_failed"
+        for check in result.checks
+    )
 
 
 def test_base_scanner_check_path_nonexistent():

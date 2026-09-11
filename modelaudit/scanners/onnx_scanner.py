@@ -133,6 +133,7 @@ _ONNX_WEIGHT_DEFAULT_MAX_ARRAY_SIZE = 100 * 1024 * 1024
 _ONNX_RAW_DETECTOR_DEFAULT_MAX_BYTES = 512 * 1024 * 1024
 _ONNX_NETWORK_TEXT_MAX_BYTES = 4 * 1024 * 1024
 _ONNX_NETWORK_TEXT_MAX_FIELDS = 100_000
+_ONNX_METADATA_DETECTOR_SECTION_MAX_ENTRIES = 1024
 _ONNX_METADATA_PROP_LABEL_PATTERN = re.compile(r"^model\.metadata_props\[(?P<index>[0-9]+)\]\.(?P<field>key|value)$")
 _ONNX_RAW_OR_NUMERIC_TENSOR_PAYLOAD_FIELD_NAMES: frozenset[str] = frozenset(
     {
@@ -701,42 +702,48 @@ def _onnx_metadata_props_detector_sections(
     metadata_entries = list(metadata_props)
     if not metadata_entries:
         return ()
-    included_entries: list[tuple[int, str, str]] = []
+    candidate_entries: list[tuple[int, str, str]] = []
     estimated_bytes = 0
     for index, key, value in metadata_entries:
         value_with_boundary = value + "\n"
         entry_bytes = len(key.encode("utf-8", errors="surrogatepass")) + len(
             value_with_boundary.encode("utf-8", errors="surrogatepass")
         )
-        if included_entries and estimated_bytes + entry_bytes + 64 > max_bytes:
+        if candidate_entries and estimated_bytes + entry_bytes + 64 > max_bytes:
             break
-        included_entries.append((index, key, value_with_boundary))
+        candidate_entries.append((index, key, value_with_boundary))
         estimated_bytes += entry_bytes + 64
-    if not included_entries:
+    if not candidate_entries:
         return ()
     try:
-        while included_entries:
-            metadata_model = type(model)()
-            metadata_model.ir_version = int(getattr(model, "ir_version", 0) or 1)
-            metadata_model.graph.name = "modelaudit_metadata"
-            metadata_model.graph.input.add().name = "modelaudit_input"
-            metadata_model.graph.output.add().name = "modelaudit_output"
-            for _index, key, value in included_entries:
-                metadata_prop = metadata_model.metadata_props.add()
-                metadata_prop.key = key
-                metadata_prop.value = value
-            metadata_data = metadata_model.SerializeToString()
-            if len(metadata_data) <= max_bytes:
+        sections: list[tuple[frozenset[str], bytes]] = []
+        position = 0
+        while position < len(candidate_entries):
+            batch_entries = candidate_entries[position : position + _ONNX_METADATA_DETECTOR_SECTION_MAX_ENTRIES]
+            while batch_entries:
+                metadata_model = type(model)()
+                metadata_model.ir_version = int(getattr(model, "ir_version", 0) or 1)
+                metadata_model.graph.name = "modelaudit_metadata"
+                metadata_model.graph.input.add().name = "modelaudit_input"
+                metadata_model.graph.output.add().name = "modelaudit_output"
+                for _index, key, value in batch_entries:
+                    metadata_prop = metadata_model.metadata_props.add()
+                    metadata_prop.key = key
+                    metadata_prop.value = value
+                metadata_data = metadata_model.SerializeToString()
+                if len(metadata_data) <= max_bytes:
+                    break
+                batch_entries.pop()
+            if not batch_entries:
                 break
-            included_entries.pop()
-        else:
-            return ()
-        metadata_data_labels = frozenset(
-            label
-            for index, _key, _value in included_entries
-            for label in (f"model.metadata_props[{index}].key", f"model.metadata_props[{index}].value")
-        )
-        return ((metadata_data_labels, metadata_data),)
+            metadata_data_labels = frozenset(
+                label
+                for index, _key, _value in batch_entries
+                for label in (f"model.metadata_props[{index}].key", f"model.metadata_props[{index}].value")
+            )
+            sections.append((metadata_data_labels, metadata_data))
+            position += len(batch_entries)
+        return tuple(sections)
     except Exception:  # pragma: no cover - protobuf compatibility fallback
         return ()
 

@@ -1064,9 +1064,10 @@ class BaseScanner(ABC):
         context: str = "",
         enable_check: bool = True,
         raise_on_error: bool = False,
+        result: ScanResult | None = None,
+        *,
         max_findings: int | None = None,
         onnx_metadata_context: bool = False,
-        result: ScanResult | None = None,
     ) -> list[dict]:
         """Collect network communication findings without creating checks.
 
@@ -1075,6 +1076,8 @@ class BaseScanner(ABC):
             context: Context string for reporting
             enable_check: Whether to perform the check (allows disabling)
             raise_on_error: Whether detector failures should propagate to the caller
+            result: ScanResult to mark inconclusive if detector analysis fails
+            max_findings: Optional finding cap for this detector invocation
             onnx_metadata_context: Whether the bytes come from validated ONNX metadata
 
         Returns:
