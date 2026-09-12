@@ -3543,7 +3543,8 @@ class PyTorchZipScanner(BaseScanner):
             if marker in _BINARY_EXTENSION_SECURITY_OPCODE_BYTES:
                 if recovered_extension_context:
                     if PyTorchZipScanner._has_executable_extension_opcode_before_stop(
-                        candidate
+                        candidate,
+                        fail_closed_on_unknown_after_extension=fail_closed_on_candidate_budget,
                     ) or PyTorchZipScanner._raw_nested_binary_candidate_should_scan(
                         candidate,
                         candidate_is_prefix=candidate_is_prefix,
@@ -3553,6 +3554,7 @@ class PyTorchZipScanner(BaseScanner):
                 elif PyTorchZipScanner._raw_nested_extension_opcode_candidate_has_structural_signal(
                     candidate,
                     extension_parse_budget_remaining,
+                    fail_closed_on_unknown_after_extension=fail_closed_on_candidate_budget,
                 ):
                     return True
             if (

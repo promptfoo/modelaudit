@@ -3394,7 +3394,13 @@ def test_pytorch_zip_raw_nested_extension_routes_headerless_literal_extension_ta
 def test_pytorch_zip_raw_nested_extension_scan_shares_candidate_budget(monkeypatch: pytest.MonkeyPatch) -> None:
     remaining_budget_seen: list[int] = []
 
-    def no_signal(_candidate: bytes, parse_budget_remaining: list[int]) -> bool:
+    def no_signal(
+        _candidate: bytes,
+        parse_budget_remaining: list[int],
+        *,
+        fail_closed_on_unknown_after_extension: bool = False,
+    ) -> bool:
+        assert fail_closed_on_unknown_after_extension is True
         remaining_budget_seen.append(parse_budget_remaining[0])
         PyTorchZipScanner._consume_raw_nested_structural_parse_budget(parse_budget_remaining)
         return False
@@ -5823,6 +5829,27 @@ def test_pytorch_zip_scan_routes_extension_callable_in_referenced_storage(
     )
 
 
+def test_pytorch_zip_scan_routes_raw_literal_extension_before_unknown_opcode(tmp_path: Path) -> None:
+    archive_path = tmp_path / "raw_extension_before_unknown_opcode_storage.pt"
+    storage_blob = _proto0_string_literal(b"\x82\x01\xff")
+    storage_blob += b" " * (-len(storage_blob) % 4)
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", storage_blob)
+
+    result = PyTorchZipScanner().scan(str(archive_path))
+
+    assert result.success is False
+    assert result.metadata.get("pickle_verdict") == "unknown"
+    assert result.metadata.get("pickle_files") == ["archive/data.pkl", "archive/data/0"]
+    assert any(
+        issue.rule_code == "S902" and issue.location is not None and "archive/data/0" in issue.location
+        for issue in result.issues
+    )
+
+
 def test_pytorch_zip_trusted_storage_bounds_nested_byte_literal_discovery(tmp_path: Path) -> None:
     archive_path = tmp_path / "nested_byte_literal_storage.pt"
     storage_blob = b"hello"
@@ -6390,6 +6417,10 @@ def test_pytorch_zip_raw_nested_literal_routes_extension_operand_after_budget_ex
     assert PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(
         _budget_exhausted_headerless_extension_literal()
     )
+
+
+def test_pytorch_zip_raw_nested_literal_routes_extension_before_unknown_opcode() -> None:
+    assert PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(b"\x82\x01\xff") is True
 
 
 def test_pytorch_zip_raw_nested_literal_preserves_text_marker_after_budget_exhaustion() -> None:

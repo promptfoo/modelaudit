@@ -2858,7 +2858,10 @@ def _literal_value_has_raw_nested_security_pickle(
             return True
         if marker in _BINARY_EXTENSION_SECURITY_OPCODE_BYTES:
             if recovered_extension_context:
-                if _has_executable_extension_opcode_before_stop(candidate) or _raw_nested_binary_candidate_should_scan(
+                if _has_executable_extension_opcode_before_stop(
+                    candidate,
+                    fail_closed_on_unknown_after_extension=fail_closed_on_candidate_budget,
+                ) or _raw_nested_binary_candidate_should_scan(
                     candidate,
                     candidate_is_prefix=candidate_is_prefix,
                     nested_literal_depth=nested_literal_depth + 1,
@@ -2867,6 +2870,7 @@ def _literal_value_has_raw_nested_security_pickle(
             elif _raw_nested_extension_opcode_candidate_has_structural_signal(
                 candidate,
                 extension_parse_budget_remaining,
+                fail_closed_on_unknown_after_extension=fail_closed_on_candidate_budget,
             ):
                 return True
         if (

@@ -4436,6 +4436,26 @@ def test_scan_file_routes_extension_callable_in_referenced_storage(
     )
 
 
+def test_scan_file_routes_raw_literal_extension_before_unknown_opcode(tmp_path: Path) -> None:
+    storage = _proto0_string_literal(b"\x82\x01\xff")
+    storage += b" " * (-len(storage) % 4)
+    archive_path = tmp_path / "raw-extension-before-unknown-opcode-storage.pt"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage))
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", storage)
+
+    report = scan_file(archive_path)
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/0"]
+    assert any(
+        notice.code == "parse_incomplete" and "archive/data/0" in str(notice.location) for notice in report.notices
+    )
+
+
 def _budget_exhausted_headerless_extension_literal() -> bytes:
     payload = b"c" * (package_api._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)
     return b"C" + bytes([len(payload)]) + payload + b"0\x82\x01"
@@ -8694,6 +8714,10 @@ def test_raw_nested_literal_candidates_fail_closed_after_budget(monkeypatch: pyt
 
 def test_raw_nested_literal_routes_extension_operand_after_budget_exhaustion() -> None:
     assert package_api._literal_value_has_raw_nested_security_pickle(_budget_exhausted_headerless_extension_literal())
+
+
+def test_raw_nested_literal_routes_extension_before_unknown_opcode() -> None:
+    assert package_api._literal_value_has_raw_nested_security_pickle(b"\x82\x01\xff") is True
 
 
 def test_raw_nested_literal_preserves_text_marker_after_budget_exhaustion() -> None:
@@ -19503,7 +19527,13 @@ def test_raw_nested_extension_routes_headerless_literal_extension_tail() -> None
 def test_literal_raw_nested_extension_scan_shares_candidate_budget(monkeypatch: pytest.MonkeyPatch) -> None:
     remaining_budget_seen: list[int] = []
 
-    def no_signal(_candidate: bytes, parse_budget_remaining: list[int]) -> bool:
+    def no_signal(
+        _candidate: bytes,
+        parse_budget_remaining: list[int],
+        *,
+        fail_closed_on_unknown_after_extension: bool = False,
+    ) -> bool:
+        assert fail_closed_on_unknown_after_extension is True
         remaining_budget_seen.append(parse_budget_remaining[0])
         package_api._consume_raw_nested_structural_parse_budget(parse_budget_remaining)
         return False
