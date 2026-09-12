@@ -6718,6 +6718,38 @@ class TestWeightDistributionSemantics:
         assert semantics["coverage_gaps"] == {}
         assert semantics["eligible_initializer_count"] == 0
 
+    def test_rank_reducing_transform_demotes_deferred_matrix_weight_gap(self, tmp_path: Path) -> None:
+        source_names = [f"matrix_weight{index}" for index in range(40)]
+        initializers = [
+            onnx.numpy_helper.from_array(np.ones((1, 4), dtype=np.float32), name=name) for name in source_names
+        ]
+        initializers.append(onnx.numpy_helper.from_array(np.array([4], dtype=np.int64), name="vector_shape"))
+        graph = helper.make_graph(
+            [
+                helper.make_node("Sum", source_names, ["mixed_matrix"]),
+                helper.make_node("Reshape", ["mixed_matrix", "vector_shape"], ["generated_vector"]),
+                helper.make_node("MatMul", ["X", "generated_vector"], ["Y"]),
+            ],
+            "rank_reducing_transform_demotes_deferred_matrix_weight_gap",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 4])],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1])],
+            initializer=initializers,
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / "rank-reducing-transform-demotes-deferred-gap.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        assert result.success is True
+        assert self._extreme_checks(result) == []
+        assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["coverage_gaps"] == {}
+        assert semantics["eligible_initializer_count"] == 0
+
     def test_expand_promotes_deferred_vector_lineage_gap_to_weight_gap(self, tmp_path: Path) -> None:
         shape_names = [f"shape_source{index}" for index in range(32)]
         initializers = [onnx.numpy_helper.from_array(np.array([4], dtype=np.int64), name=name) for name in shape_names]
@@ -7482,6 +7514,82 @@ class TestWeightDistributionSemantics:
         model.ir_version = 8
         onnx.checker.check_model(model)
         path = tmp_path / "integer-cast-deferred-lineage-gap.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        assert result.success is True
+        assert self._extreme_checks(result) == []
+        assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["coverage_gaps"] == {}
+        assert semantics["eligible_initializer_count"] == 0
+
+    def test_integer_cast_clears_float_rank_gap_before_reshape(self, tmp_path: Path) -> None:
+        source_names = [f"float_vector{index}" for index in range(40)]
+        initializers = [
+            onnx.numpy_helper.from_array(np.ones((4,), dtype=np.float32), name=name) for name in source_names
+        ]
+        initializers.append(onnx.numpy_helper.from_array(np.array([4, 1], dtype=np.int64), name="matrix_shape"))
+        graph = helper.make_graph(
+            [
+                helper.make_node("Sum", source_names, ["mixed_vector"]),
+                helper.make_node("Cast", ["mixed_vector"], ["integer_vector"], to=TensorProto.INT64),
+                helper.make_node("Reshape", ["integer_vector", "matrix_shape"], ["generated_integer"]),
+                helper.make_node("MatMul", ["X", "generated_integer"], ["Y"]),
+            ],
+            "integer_cast_clears_float_rank_gap_before_reshape",
+            [helper.make_tensor_value_info("X", TensorProto.INT64, [1, 4])],
+            [helper.make_tensor_value_info("Y", TensorProto.INT64, [1, 1])],
+            initializer=initializers,
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / "integer-cast-clears-float-rank-gap.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        assert result.success is True
+        assert self._extreme_checks(result) == []
+        assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["coverage_gaps"] == {}
+        assert semantics["eligible_initializer_count"] == 0
+
+    def test_custom_scan_function_output_does_not_promote_vector_gap(self, tmp_path: Path) -> None:
+        source_names = [f"float_vector{index}" for index in range(40)]
+        initializers = [
+            onnx.numpy_helper.from_array(np.ones((4,), dtype=np.float32), name=name) for name in source_names
+        ]
+        function = helper.make_function(
+            "local",
+            "Scan",
+            ["function_input"],
+            ["function_output"],
+            [helper.make_node("Identity", ["function_input"], ["function_output"])],
+            opset_imports=[helper.make_opsetid("", 13)],
+        )
+        graph = helper.make_graph(
+            [
+                helper.make_node("Sum", source_names, ["mixed_vector"]),
+                helper.make_node("Scan", ["mixed_vector"], ["custom_scan_output"], domain="local"),
+                helper.make_node("MatMul", ["X", "custom_scan_output"], ["Y"]),
+            ],
+            "custom_scan_function_output_does_not_promote_vector_gap",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 4])],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1])],
+            initializer=initializers,
+        )
+        model = helper.make_model(
+            graph,
+            functions=[function],
+            opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
+        )
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / "custom-scan-function-output-vector-gap.onnx"
         onnx.save(model, str(path))
 
         result = OnnxScanner().scan(str(path))

@@ -3254,6 +3254,15 @@ def _build_onnx_weight_analysis_plan(
                 and output_lineage_limit_gap_count > output_weight_lineage_limit_gap_count
             ):
                 output_weight_lineage_limit_gap_count = output_lineage_limit_gap_count
+            cast_output_is_nonfloating_transform = (
+                supported_transform and node.op_type == "Cast" and not cast_output_may_be_floating(node)
+            )
+            transform_output_demotes_weight_gap = (
+                supported_transform
+                and all_input_output_weight_lineage_limit_gap_count > 0
+                and not any(lineage_could_be_weight(lineage) for lineage in output_lineages.values())
+                and any(lineage_could_be_weight_after_rank_increase(lineage) for lineage in output_lineages.values())
+            )
             if (
                 rank_operator_promotes_deferred_gap
                 and output_rank_promotable_lineage_limit_gap_count > output_weight_lineage_limit_gap_count
@@ -3366,7 +3375,12 @@ def _build_onnx_weight_analysis_plan(
             subgraph_output_lineage_gap_counts = [0 for _ in node.output]
             subgraph_output_weight_lineage_gap_counts = [0 for _ in node.output]
             subgraph_output_rank_promotable_lineage_gap_counts = [0 for _ in node.output]
-            subgraph_output_offset = 1 if node.op_type == "Loop" else 0
+            standard_control_flow_operator = (
+                is_registered_standard_operator
+                and not is_model_local_function
+                and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
+            )
+            subgraph_output_offset = 1 if standard_control_flow_operator and node.op_type == "Loop" else 0
             for (
                 graph_output_lineages,
                 graph_output_dynamic,
@@ -3375,9 +3389,9 @@ def _build_onnx_weight_analysis_plan(
                 graph_output_rank_promotable_lineage_gap_counts,
             ) in subgraph_results:
                 stacked_scan_output_start = len(node.output)
-                if node.op_type == "Loop":
+                if standard_control_flow_operator and node.op_type == "Loop":
                     stacked_scan_output_start = max(len(node.input) - 2, 0)
-                elif node.op_type == "Scan":
+                elif standard_control_flow_operator and node.op_type == "Scan":
                     num_scan_inputs = _onnx_int_attribute(node, "num_scan_inputs", 1)
                     stacked_scan_output_start = max(len(node.input) - num_scan_inputs, 0)
                 for output_index in range(len(node.output)):
@@ -3387,7 +3401,7 @@ def _build_onnx_weight_analysis_plan(
                     graph_output_rank_promotable_gap_count = graph_output_rank_promotable_lineage_gap_counts[
                         graph_output_index
                     ]
-                    stacked_scan_output = output_index >= stacked_scan_output_start
+                    stacked_scan_output = standard_control_flow_operator and output_index >= stacked_scan_output_start
                     merge_lineages(
                         subgraph_output_lineages[output_index],
                         graph_output_lineages[graph_output_index],
@@ -3498,11 +3512,15 @@ def _build_onnx_weight_analysis_plan(
                         0 if subgraph_results else all_input_lineage_limit_gap_count
                     )
                     input_weight_lineage_limit_gap_count_for_output = (
-                        0 if subgraph_results else all_input_output_weight_lineage_limit_gap_count
+                        0
+                        if subgraph_results or transform_output_demotes_weight_gap
+                        else all_input_output_weight_lineage_limit_gap_count
                     )
                     input_rank_promotable_lineage_limit_gap_count_for_output = (
                         0
-                        if subgraph_results or rank_operator_promotes_deferred_gap
+                        if subgraph_results
+                        or rank_operator_promotes_deferred_gap
+                        or cast_output_is_nonfloating_transform
                         else all_input_rank_promotable_lineage_limit_gap_count
                     )
                     propagated_lineage_limit_gap_count = _bounded_onnx_weight_lineage_gap_count(
