@@ -122,6 +122,7 @@ _ONNX_WEIGHT_METADATA_SAMPLE_LIMIT = 100
 _ONNX_WEIGHT_CONSUMER_SAMPLE_LIMIT = 20
 _ONNX_WEIGHT_ANALYSIS_GROUP_LIMIT = 100
 _ONNX_WEIGHT_LINEAGES_PER_VALUE_LIMIT = 32
+_ONNX_WEIGHT_LINEAGE_GAP_COUNT_LIMIT = 1_000_000
 _ONNX_WEIGHT_TRANSFORM_DEPTH_LIMIT = 32
 _ONNX_WEIGHT_RESHAPE_RANK_LIMIT = 64
 _ONNX_RUNTIME_BOOKKEEPING_LINEAGE_REASONS: frozenset[str] = frozenset(
@@ -1441,7 +1442,22 @@ class _OnnxWeightAnalysisPlan:
     unresolved_lineage_samples: list[dict[str, Any]] = field(default_factory=list)
 
     def record_coverage_gap(self, reason: str, count: int = 1) -> None:
-        self.coverage_gaps[reason] = self.coverage_gaps.get(reason, 0) + count
+        current = self.coverage_gaps.get(reason, 0)
+        if reason == "lineages_per_value_limit":
+            self.coverage_gaps[reason] = _bounded_onnx_weight_lineage_gap_count(current, count)
+        else:
+            self.coverage_gaps[reason] = current + count
+
+
+def _bounded_onnx_weight_lineage_gap_count(*counts: int) -> int:
+    total = 0
+    for count in counts:
+        if count <= 0:
+            continue
+        if count >= _ONNX_WEIGHT_LINEAGE_GAP_COUNT_LIMIT - total:
+            return _ONNX_WEIGHT_LINEAGE_GAP_COUNT_LIMIT
+        total += count
+    return total
 
 
 def _bounded_onnx_metadata_text(plan: _OnnxWeightAnalysisPlan, value: Any) -> tuple[str, int, bool]:
@@ -2566,8 +2582,14 @@ def _build_onnx_weight_analysis_plan(
                         ambiguous_reason="ambiguous_operator_input_lineage",
                     )
                     if input_lineages and input_name not in all_input_lineage_limit_gap_names:
-                        all_input_lineage_limit_gap_count += input_lineage_limit_gap_count
-                        all_input_weight_lineage_limit_gap_count += input_weight_lineage_limit_gap_count
+                        all_input_lineage_limit_gap_count = _bounded_onnx_weight_lineage_gap_count(
+                            all_input_lineage_limit_gap_count,
+                            input_lineage_limit_gap_count,
+                        )
+                        all_input_weight_lineage_limit_gap_count = _bounded_onnx_weight_lineage_gap_count(
+                            all_input_weight_lineage_limit_gap_count,
+                            input_weight_lineage_limit_gap_count,
+                        )
                         all_input_lineage_limit_gap_names.add(input_name)
                     merge_lineages(
                         shape_control_input_lineages,
@@ -2581,8 +2603,14 @@ def _build_onnx_weight_analysis_plan(
                         ambiguous_reason="ambiguous_operator_input_lineage",
                     )
                     if input_lineages and input_name not in all_input_lineage_limit_gap_names:
-                        all_input_lineage_limit_gap_count += input_lineage_limit_gap_count
-                        all_input_weight_lineage_limit_gap_count += input_weight_lineage_limit_gap_count
+                        all_input_lineage_limit_gap_count = _bounded_onnx_weight_lineage_gap_count(
+                            all_input_lineage_limit_gap_count,
+                            input_lineage_limit_gap_count,
+                        )
+                        all_input_weight_lineage_limit_gap_count = _bounded_onnx_weight_lineage_gap_count(
+                            all_input_weight_lineage_limit_gap_count,
+                            input_weight_lineage_limit_gap_count,
+                        )
                         all_input_lineage_limit_gap_names.add(input_name)
                 potential_weight_role = _onnx_potential_weight_input(
                     node,
@@ -3155,12 +3183,14 @@ def _build_onnx_weight_analysis_plan(
                         ambiguous_reason="ambiguous_subgraph_output_lineage",
                     )
                     subgraph_output_dynamic[output_index] |= graph_output_dynamic[graph_output_index]
-                    subgraph_output_lineage_gap_counts[output_index] += graph_output_lineage_gap_counts[
-                        graph_output_index
-                    ]
-                    subgraph_output_weight_lineage_gap_counts[output_index] += graph_output_weight_lineage_gap_counts[
-                        graph_output_index
-                    ]
+                    subgraph_output_lineage_gap_counts[output_index] = _bounded_onnx_weight_lineage_gap_count(
+                        subgraph_output_lineage_gap_counts[output_index],
+                        graph_output_lineage_gap_counts[graph_output_index],
+                    )
+                    subgraph_output_weight_lineage_gap_counts[output_index] = _bounded_onnx_weight_lineage_gap_count(
+                        subgraph_output_weight_lineage_gap_counts[output_index],
+                        graph_output_weight_lineage_gap_counts[graph_output_index],
+                    )
 
             for output_index, output_name in enumerate(node.output):
                 if not output_name:
@@ -3244,17 +3274,17 @@ def _build_onnx_weight_analysis_plan(
                     input_weight_lineage_limit_gap_count_for_output = (
                         0 if subgraph_results else all_input_output_weight_lineage_limit_gap_count
                     )
-                    propagated_lineage_limit_gap_count = (
-                        input_lineage_limit_gap_count_for_output
-                        + output_lineage_limit_gap_count
-                        + per_output_lineage_limit_gap_count
-                        + subgraph_output_lineage_gap_counts[output_index]
+                    propagated_lineage_limit_gap_count = _bounded_onnx_weight_lineage_gap_count(
+                        input_lineage_limit_gap_count_for_output,
+                        output_lineage_limit_gap_count,
+                        per_output_lineage_limit_gap_count,
+                        subgraph_output_lineage_gap_counts[output_index],
                     )
-                    propagated_weight_lineage_limit_gap_count = (
-                        input_weight_lineage_limit_gap_count_for_output
-                        + output_weight_lineage_limit_gap_count
-                        + per_output_weight_lineage_limit_gap_count
-                        + subgraph_output_weight_lineage_gap_counts[output_index]
+                    propagated_weight_lineage_limit_gap_count = _bounded_onnx_weight_lineage_gap_count(
+                        input_weight_lineage_limit_gap_count_for_output,
+                        output_weight_lineage_limit_gap_count,
+                        per_output_weight_lineage_limit_gap_count,
+                        subgraph_output_weight_lineage_gap_counts[output_index],
                     )
                     if propagated_lineage_limit_gap_count:
                         value_lineage_limit_gap_counts[name] = propagated_lineage_limit_gap_count

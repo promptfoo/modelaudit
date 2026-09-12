@@ -6605,6 +6605,60 @@ class TestWeightDistributionSemantics:
         assert semantics["coverage_gaps"]["lineages_per_value_limit"] == 8
         assert semantics["analyzed_layer_count"] == 0
 
+    def test_alias_fanout_keeps_deferred_lineage_gap_count_bounded(self, tmp_path: Path) -> None:
+        set_int_max_str_digits = getattr(sys, "set_int_max_str_digits", None)
+        get_int_max_str_digits = getattr(sys, "get_int_max_str_digits", None)
+        if set_int_max_str_digits is None or get_int_max_str_digits is None:
+            pytest.skip("Python integer-string digit guard is unavailable")
+
+        source_names = [f"weight{index}" for index in range(40)]
+        nodes = [helper.make_node("Sum", source_names, ["capped"])]
+        previous = "capped"
+        for index in range(2200):
+            alias = f"alias{index}"
+            joined = f"joined{index}"
+            nodes.append(helper.make_node("Identity", [previous], [alias]))
+            nodes.append(helper.make_node("Add", [previous, alias], [joined]))
+            previous = joined
+        nodes.append(helper.make_node("MatMul", ["X", previous], ["Y"]))
+        initializers = [
+            onnx.numpy_helper.from_array(np.zeros((4, 4), dtype=np.float32), name=name) for name in source_names
+        ]
+        graph = helper.make_graph(
+            nodes,
+            "alias_fanout_keeps_deferred_lineage_gap_count_bounded",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 4])],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 4])],
+            initializer=initializers,
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / "alias-fanout-deferred-lineage-gap.onnx"
+        onnx.save(model, str(path))
+
+        previous_digit_limit = get_int_max_str_digits()
+        set_int_max_str_digits(640)
+        try:
+            result = OnnxScanner().scan(str(path))
+            serialized_gaps = json.dumps(
+                result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"],
+                sort_keys=True,
+            )
+        finally:
+            set_int_max_str_digits(previous_digit_limit)
+
+        assert result.success is False
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert (
+            0
+            < semantics["coverage_gaps"]["lineages_per_value_limit"]
+            <= (onnx_scanner_module._ONNX_WEIGHT_LINEAGE_GAP_COUNT_LIMIT)
+        )
+        assert "lineages_per_value_limit" in serialized_gaps
+
     def test_lexical_subgraph_capture_carries_deferred_lineage_cap_gap(self, tmp_path: Path) -> None:
         initializers = [
             onnx.numpy_helper.from_array(np.array([1], dtype=np.int64), name=f"shape_source{index}")
