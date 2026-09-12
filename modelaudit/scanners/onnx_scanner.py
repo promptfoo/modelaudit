@@ -2190,22 +2190,30 @@ def _build_onnx_weight_analysis_plan(
         compacted.update(dict(representatives.values()))
         return dict(sorted(compacted.items()))
 
-    def bounded_lineages(lineages: dict[int, _OnnxWeightLineage]) -> dict[int, _OnnxWeightLineage]:
+    def bounded_lineages(
+        lineages: dict[int, _OnnxWeightLineage],
+    ) -> tuple[dict[int, _OnnxWeightLineage], int, int]:
         lineages = compact_runtime_bookkeeping_lineages(lineages)
         if len(lineages) <= _ONNX_WEIGHT_LINEAGES_PER_VALUE_LIMIT:
-            return lineages
-        plan.record_coverage_gap(
-            "lineages_per_value_limit",
-            len(lineages) - _ONNX_WEIGHT_LINEAGES_PER_VALUE_LIMIT,
+            return lineages, 0, 0
+        ordered_lineages = sorted(
+            lineages.items(),
+            key=lambda item: (
+                item[1].unresolved_reason in _ONNX_RUNTIME_BOOKKEEPING_LINEAGE_REASONS,
+                item[0],
+            ),
         )
-        return dict(
-            sorted(
-                lineages.items(),
-                key=lambda item: (
-                    item[1].unresolved_reason in _ONNX_RUNTIME_BOOKKEEPING_LINEAGE_REASONS,
-                    item[0],
-                ),
-            )[:_ONNX_WEIGHT_LINEAGES_PER_VALUE_LIMIT]
+        dropped_lineages = ordered_lineages[_ONNX_WEIGHT_LINEAGES_PER_VALUE_LIMIT:]
+        dropped_weight_lineages = sum(
+            1
+            for _initializer_index, lineage in dropped_lineages
+            if lineage.unresolved_reason not in _ONNX_RUNTIME_BOOKKEEPING_LINEAGE_REASONS
+            and lineage_could_be_weight(lineage)
+        )
+        return (
+            dict(ordered_lineages[:_ONNX_WEIGHT_LINEAGES_PER_VALUE_LIMIT]),
+            len(dropped_lineages),
+            dropped_weight_lineages,
         )
 
     def merge_transform_markers(
@@ -2310,6 +2318,10 @@ def _build_onnx_weight_analysis_plan(
         bound_lineages: dict[str, dict[int, _OnnxWeightLineage]] | None = None,
         bound_constants: dict[str, Any] | None = None,
         bound_dynamic_values: set[str] | None = None,
+        inherited_lineage_limit_gap_counts: dict[str, int] | None = None,
+        inherited_weight_lineage_limit_gap_counts: dict[str, int] | None = None,
+        bound_lineage_limit_gap_counts: dict[str, int] | None = None,
+        bound_weight_lineage_limit_gap_counts: dict[str, int] | None = None,
         bound_attributes: dict[str, Any] | None = None,
         bound_attribute_keys: dict[str, tuple[Any, ...]] | None = None,
         function_depth: int = 0,
@@ -2318,16 +2330,22 @@ def _build_onnx_weight_analysis_plan(
             dict[str, dict[int, _OnnxWeightLineage]],
             dict[str, Any],
             set[str],
+            dict[str, int],
+            dict[str, int],
         ]
         | None = None,
-    ) -> tuple[list[dict[int, _OnnxWeightLineage]], list[bool]]:
+    ) -> tuple[list[dict[int, _OnnxWeightLineage]], list[bool], list[int], list[int]]:
         nonlocal graph_counter, node_counter, total_consumer_count
         current_graph_index = graph_counter
         graph_counter += 1
+        inherited_lineage_limit_gap_counts = inherited_lineage_limit_gap_counts or {}
+        inherited_weight_lineage_limit_gap_counts = inherited_weight_lineage_limit_gap_counts or {}
         if root_graph:
             value_lineages = dict(inherited_lineages)
             constants = dict(inherited_constants)
             dynamic_values = set(inherited_dynamic_values)
+            value_lineage_limit_gap_counts = dict(inherited_lineage_limit_gap_counts)
+            value_weight_lineage_limit_gap_counts = dict(inherited_weight_lineage_limit_gap_counts)
         else:
             declared_names = _graph_declared_value_names(current_graph)
             value_lineages = {
@@ -2335,10 +2353,20 @@ def _build_onnx_weight_analysis_plan(
             }
             constants = {name: value for name, value in inherited_constants.items() if name not in declared_names}
             dynamic_values = {name for name in inherited_dynamic_values if name not in declared_names}
+            value_lineage_limit_gap_counts = {
+                name: count for name, count in inherited_lineage_limit_gap_counts.items() if name not in declared_names
+            }
+            value_weight_lineage_limit_gap_counts = {
+                name: count
+                for name, count in inherited_weight_lineage_limit_gap_counts.items()
+                if name not in declared_names
+            }
 
         value_lineages.update(bound_lineages or {})
         constants.update(bound_constants or {})
         dynamic_values.update(bound_dynamic_values or set())
+        value_lineage_limit_gap_counts.update(bound_lineage_limit_gap_counts or {})
+        value_weight_lineage_limit_gap_counts.update(bound_weight_lineage_limit_gap_counts or {})
         attribute_bindings = bound_attributes or {}
         attribute_binding_keys = bound_attribute_keys or {}
         known_value_shapes: dict[str, tuple[int, ...]] = {}
@@ -2432,6 +2460,9 @@ def _build_onnx_weight_analysis_plan(
                 "Unsqueeze",
             }
             all_input_lineages: dict[int, _OnnxWeightLineage] = {}
+            all_input_lineage_limit_gap_count = 0
+            all_input_weight_lineage_limit_gap_count = 0
+            all_input_lineage_limit_gap_names: set[str] = set()
             shape_control_input_lineages: dict[int, _OnnxWeightLineage] = {}
             terminal_weight_lineages: set[int] = set()
             activation_input_lineages: set[int] = set()
@@ -2480,6 +2511,8 @@ def _build_onnx_weight_analysis_plan(
 
             for input_index, input_name in enumerate(node.input):
                 input_lineages = value_lineages.get(str(input_name), {})
+                input_lineage_limit_gap_count = value_lineage_limit_gap_counts.get(str(input_name), 0)
+                input_weight_lineage_limit_gap_count = value_weight_lineage_limit_gap_counts.get(str(input_name), 0)
                 is_array_feature_selector = (
                     is_registered_standard_operator
                     and getattr(node, "domain", "") == "ai.onnx.ml"
@@ -2528,6 +2561,10 @@ def _build_onnx_weight_analysis_plan(
                         shape_control_lineages,
                         ambiguous_reason="ambiguous_operator_input_lineage",
                     )
+                    if input_lineages and input_name not in all_input_lineage_limit_gap_names:
+                        all_input_lineage_limit_gap_count += input_lineage_limit_gap_count
+                        all_input_weight_lineage_limit_gap_count += input_weight_lineage_limit_gap_count
+                        all_input_lineage_limit_gap_names.add(input_name)
                     merge_lineages(
                         shape_control_input_lineages,
                         shape_control_lineages,
@@ -2539,13 +2576,21 @@ def _build_onnx_weight_analysis_plan(
                         input_lineages,
                         ambiguous_reason="ambiguous_operator_input_lineage",
                     )
+                    if input_lineages and input_name not in all_input_lineage_limit_gap_names:
+                        all_input_lineage_limit_gap_count += input_lineage_limit_gap_count
+                        all_input_weight_lineage_limit_gap_count += input_weight_lineage_limit_gap_count
+                        all_input_lineage_limit_gap_names.add(input_name)
+                potential_weight_role = _onnx_potential_weight_input(
+                    node,
+                    input_index,
+                    is_model_local_function=is_model_local_function,
+                    is_registered_standard_operator=is_registered_standard_operator,
+                )
+                recorded_input_lineage_limit_gap = False
+                if potential_weight_role and input_weight_lineage_limit_gap_count:
+                    plan.record_coverage_gap("lineages_per_value_limit", input_weight_lineage_limit_gap_count)
+                    recorded_input_lineage_limit_gap = True
                 for initializer_index, lineage in input_lineages.items():
-                    potential_weight_role = _onnx_potential_weight_input(
-                        node,
-                        input_index,
-                        is_model_local_function=is_model_local_function,
-                        is_registered_standard_operator=is_registered_standard_operator,
-                    )
                     invalid_clip_bound = (
                         is_registered_standard_operator
                         and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
@@ -2568,6 +2613,13 @@ def _build_onnx_weight_analysis_plan(
                             input_index,
                         )
                     potential_weight_input = potential_weight_role and lineage_could_be_weight(lineage)
+                    if (
+                        potential_weight_input
+                        and input_weight_lineage_limit_gap_count
+                        and not recorded_input_lineage_limit_gap
+                    ):
+                        plan.record_coverage_gap("lineages_per_value_limit", input_weight_lineage_limit_gap_count)
+                        recorded_input_lineage_limit_gap = True
                     if supported_transform and input_index == 0:
                         continue
                     if potential_weight_input:
@@ -2695,7 +2747,7 @@ def _build_onnx_weight_analysis_plan(
                                     (slope_axis,),
                                 )
 
-            subgraph_results: list[tuple[list[dict[int, _OnnxWeightLineage]], list[bool]]] = []
+            subgraph_results: list[tuple[list[dict[int, _OnnxWeightLineage]], list[bool], list[int], list[int]]] = []
             for attribute_position, attribute in enumerate(getattr(node, "attribute", ())):
                 resolved_attribute = resolve_attribute(attribute)
                 if resolved_attribute is None:
@@ -2706,6 +2758,8 @@ def _build_onnx_weight_analysis_plan(
                     subgraph_bound_lineages: dict[str, dict[int, _OnnxWeightLineage]] = {}
                     subgraph_bound_constants: dict[str, Any] = {}
                     subgraph_bound_dynamic: set[str] = set()
+                    subgraph_bound_lineage_gaps: dict[str, int] = {}
+                    subgraph_bound_weight_lineage_gaps: dict[str, int] = {}
                     input_pairs: Iterable[tuple[Any, Any]]
                     if node.op_type == "Loop":
                         input_pairs = zip(node.input[2:], subgraph.input[2:], strict=False)
@@ -2722,18 +2776,28 @@ def _build_onnx_weight_analysis_plan(
                             subgraph_bound_constants[graph_input_name] = constants[parent_name]
                         if parent_name in dynamic_values:
                             subgraph_bound_dynamic.add(graph_input_name)
+                        if parent_name in value_lineage_limit_gap_counts:
+                            subgraph_bound_lineage_gaps[graph_input_name] = value_lineage_limit_gap_counts[parent_name]
+                        if parent_name in value_weight_lineage_limit_gap_counts:
+                            subgraph_bound_weight_lineage_gaps[graph_input_name] = (
+                                value_weight_lineage_limit_gap_counts[parent_name]
+                            )
                     subgraph_results.append(
                         walk_graph(
                             subgraph,
                             value_lineages,
                             constants,
                             dynamic_values,
+                            inherited_lineage_limit_gap_counts=value_lineage_limit_gap_counts,
+                            inherited_weight_lineage_limit_gap_counts=value_weight_lineage_limit_gap_counts,
                             root_graph=False,
                             source_scope=(*resolved_attribute_key, "graph", subgraph_position),
                             opset_versions=opset_versions,
                             bound_lineages=subgraph_bound_lineages,
                             bound_constants=subgraph_bound_constants,
                             bound_dynamic_values=subgraph_bound_dynamic,
+                            bound_lineage_limit_gap_counts=subgraph_bound_lineage_gaps,
+                            bound_weight_lineage_limit_gap_counts=subgraph_bound_weight_lineage_gaps,
                             bound_attributes=attribute_bindings,
                             bound_attribute_keys=attribute_binding_keys,
                             function_depth=function_depth,
@@ -2763,6 +2827,8 @@ def _build_onnx_weight_analysis_plan(
                 function_bound_lineages: dict[str, dict[int, _OnnxWeightLineage]] = {}
                 function_bound_constants: dict[str, Any] = {}
                 function_bound_dynamic: set[str] = set()
+                function_bound_lineage_gaps: dict[str, int] = {}
+                function_bound_weight_lineage_gaps: dict[str, int] = {}
                 function_source_scope = ("function", *function_key)
                 function_bound_attributes: dict[str, Any] = {}
                 function_bound_attribute_keys: dict[str, tuple[Any, ...]] = {}
@@ -2793,6 +2859,12 @@ def _build_onnx_weight_analysis_plan(
                         function_bound_constants[function_input_name] = constants[parent_name]
                     if parent_name in dynamic_values:
                         function_bound_dynamic.add(function_input_name)
+                    if parent_name in value_lineage_limit_gap_counts:
+                        function_bound_lineage_gaps[function_input_name] = value_lineage_limit_gap_counts[parent_name]
+                    if parent_name in value_weight_lineage_limit_gap_counts:
+                        function_bound_weight_lineage_gaps[function_input_name] = value_weight_lineage_limit_gap_counts[
+                            parent_name
+                        ]
                 subgraph_results.append(
                     walk_graph(
                         function,
@@ -2809,6 +2881,8 @@ def _build_onnx_weight_analysis_plan(
                         bound_lineages=function_bound_lineages,
                         bound_constants=function_bound_constants,
                         bound_dynamic_values=function_bound_dynamic,
+                        bound_lineage_limit_gap_counts=function_bound_lineage_gaps,
+                        bound_weight_lineage_limit_gap_counts=function_bound_weight_lineage_gaps,
                         bound_attributes=function_bound_attributes,
                         bound_attribute_keys=function_bound_attribute_keys,
                         function_depth=function_depth + 1,
@@ -2939,7 +3013,22 @@ def _build_onnx_weight_analysis_plan(
                         unresolved_reason=unresolved_reason,
                     )
 
-            output_lineages = bounded_lineages(output_lineages)
+            output_lineages, output_lineage_limit_gap_count, output_weight_lineage_limit_gap_count = bounded_lineages(
+                output_lineages
+            )
+            all_input_output_weight_lineage_limit_gap_count = all_input_weight_lineage_limit_gap_count
+            if (
+                supported_transform
+                and node.op_type == "Cast"
+                and all_input_lineage_limit_gap_count > all_input_output_weight_lineage_limit_gap_count
+            ):
+                all_input_output_weight_lineage_limit_gap_count = all_input_lineage_limit_gap_count
+            if (
+                supported_transform
+                and node.op_type == "Cast"
+                and output_lineage_limit_gap_count > output_weight_lineage_limit_gap_count
+            ):
+                output_weight_lineage_limit_gap_count = output_lineage_limit_gap_count
             constant_output_names: set[str] = set()
             constant_output_lineages: dict[str, dict[int, _OnnxWeightLineage]] = {}
             if getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS and node.op_type == "Constant":
@@ -3008,6 +3097,8 @@ def _build_onnx_weight_analysis_plan(
                     constants[name] = constant_tensor
                     constant_output_lineages[name] = {lineage.initializer_index: lineage}
                     constant_output_names.add(name)
+                    value_lineage_limit_gap_counts.pop(name, None)
+                    value_weight_lineage_limit_gap_counts.pop(name, None)
                 elif sparse_constant is not None:
                     name = output_names[0]
                     sparse_constant.values.name = name
@@ -3020,6 +3111,8 @@ def _build_onnx_weight_analysis_plan(
                     )
                     constant_output_lineages[name] = {lineage.initializer_index: lineage}
                     constant_output_names.add(name)
+                    value_lineage_limit_gap_counts.pop(name, None)
+                    value_weight_lineage_limit_gap_counts.pop(name, None)
                 elif unresolved_constant_attribute:
                     name = output_names[0]
                     unresolved_tensor = onnx.TensorProto()
@@ -3032,11 +3125,20 @@ def _build_onnx_weight_analysis_plan(
                     )
                     constant_output_lineages[name] = {lineage.initializer_index: lineage}
                     constant_output_names.add(name)
+                    value_lineage_limit_gap_counts.pop(name, None)
+                    value_weight_lineage_limit_gap_counts.pop(name, None)
 
             subgraph_output_lineages: list[dict[int, _OnnxWeightLineage]] = [{} for _ in node.output]
             subgraph_output_dynamic = [False for _ in node.output]
+            subgraph_output_lineage_gap_counts = [0 for _ in node.output]
+            subgraph_output_weight_lineage_gap_counts = [0 for _ in node.output]
             subgraph_output_offset = 1 if node.op_type == "Loop" else 0
-            for graph_output_lineages, graph_output_dynamic in subgraph_results:
+            for (
+                graph_output_lineages,
+                graph_output_dynamic,
+                graph_output_lineage_gap_counts,
+                graph_output_weight_lineage_gap_counts,
+            ) in subgraph_results:
                 for output_index in range(len(node.output)):
                     graph_output_index = output_index + subgraph_output_offset
                     if graph_output_index >= len(graph_output_lineages):
@@ -3047,6 +3149,12 @@ def _build_onnx_weight_analysis_plan(
                         ambiguous_reason="ambiguous_subgraph_output_lineage",
                     )
                     subgraph_output_dynamic[output_index] |= graph_output_dynamic[graph_output_index]
+                    subgraph_output_lineage_gap_counts[output_index] += graph_output_lineage_gap_counts[
+                        graph_output_index
+                    ]
+                    subgraph_output_weight_lineage_gap_counts[output_index] += graph_output_weight_lineage_gap_counts[
+                        graph_output_index
+                    ]
 
             for output_index, output_name in enumerate(node.output):
                 if not output_name:
@@ -3117,14 +3225,40 @@ def _build_onnx_weight_analysis_plan(
                         )
                         for initializer_index, lineage in per_output_lineages.items()
                     }
-                per_output_lineages = bounded_lineages(per_output_lineages)
+                (
+                    per_output_lineages,
+                    per_output_lineage_limit_gap_count,
+                    per_output_weight_lineage_limit_gap_count,
+                ) = bounded_lineages(per_output_lineages)
                 if per_output_lineages:
                     value_lineages[name] = per_output_lineages
+                    propagated_lineage_limit_gap_count = (
+                        all_input_lineage_limit_gap_count
+                        + output_lineage_limit_gap_count
+                        + per_output_lineage_limit_gap_count
+                        + subgraph_output_lineage_gap_counts[output_index]
+                    )
+                    propagated_weight_lineage_limit_gap_count = (
+                        all_input_output_weight_lineage_limit_gap_count
+                        + output_weight_lineage_limit_gap_count
+                        + per_output_weight_lineage_limit_gap_count
+                        + subgraph_output_weight_lineage_gap_counts[output_index]
+                    )
+                    if propagated_lineage_limit_gap_count:
+                        value_lineage_limit_gap_counts[name] = propagated_lineage_limit_gap_count
+                    else:
+                        value_lineage_limit_gap_counts.pop(name, None)
+                    if propagated_weight_lineage_limit_gap_count:
+                        value_weight_lineage_limit_gap_counts[name] = propagated_weight_lineage_limit_gap_count
+                    else:
+                        value_weight_lineage_limit_gap_counts.pop(name, None)
                     lineage_shapes = {lineage.shape for lineage in per_output_lineages.values()}
                     if len(lineage_shapes) == 1 and None not in lineage_shapes:
                         known_value_shapes[name] = next(iter(lineage_shapes))  # type: ignore[arg-type]
                 else:
                     value_lineages.pop(name, None)
+                    value_lineage_limit_gap_counts.pop(name, None)
+                    value_weight_lineage_limit_gap_counts.pop(name, None)
                     if name in constants:
                         with suppress(AttributeError, TypeError, ValueError):
                             known_value_shapes[name] = tuple(int(dimension) for dimension in constants[name].dims)
@@ -3147,24 +3281,41 @@ def _build_onnx_weight_analysis_plan(
             captured_state[1].update(constants)
             captured_state[2].clear()
             captured_state[2].update(dynamic_values)
+            captured_state[3].clear()
+            captured_state[3].update(value_lineage_limit_gap_counts)
+            captured_state[4].clear()
+            captured_state[4].update(value_weight_lineage_limit_gap_counts)
 
+        output_names = [_onnx_value_name(graph_output) for graph_output in current_graph.output]
         return (
-            [dict(value_lineages.get(_onnx_value_name(graph_output), {})) for graph_output in current_graph.output],
-            [_onnx_value_name(graph_output) in dynamic_values for graph_output in current_graph.output],
+            [dict(value_lineages.get(output_name, {})) for output_name in output_names],
+            [output_name in dynamic_values for output_name in output_names],
+            [value_lineage_limit_gap_counts.get(output_name, 0) for output_name in output_names],
+            [value_weight_lineage_limit_gap_counts.get(output_name, 0) for output_name in output_names],
         )
 
     root_state_lineages: dict[str, dict[int, _OnnxWeightLineage]] = {}
     root_state_constants: dict[str, Any] = {}
     root_state_dynamic: set[str] = set()
-    root_output_lineages, _root_output_dynamic = walk_graph(
-        graph,
-        {},
-        {},
-        set(),
-        root_graph=True,
-        source_scope=("root_graph",),
-        opset_versions=model_opset_versions,
-        captured_state=(root_state_lineages, root_state_constants, root_state_dynamic),
+    root_state_lineage_limit_gap_counts: dict[str, int] = {}
+    root_state_weight_lineage_limit_gap_counts: dict[str, int] = {}
+    root_output_lineages, _root_output_dynamic, _root_output_lineage_gaps, _root_output_weight_lineage_gaps = (
+        walk_graph(
+            graph,
+            {},
+            {},
+            set(),
+            root_graph=True,
+            source_scope=("root_graph",),
+            opset_versions=model_opset_versions,
+            captured_state=(
+                root_state_lineages,
+                root_state_constants,
+                root_state_dynamic,
+                root_state_lineage_limit_gap_counts,
+                root_state_weight_lineage_limit_gap_counts,
+            ),
+        )
     )
 
     main_initializer_lineages: dict[str, dict[int, _OnnxWeightLineage]] = {}
@@ -3202,22 +3353,32 @@ def _build_onnx_weight_analysis_plan(
     }
     training_graph_results: dict[
         tuple[Any, ...],
-        tuple[Any, list[dict[int, _OnnxWeightLineage]], list[bool]],
+        tuple[Any, list[dict[int, _OnnxWeightLineage]], list[bool], list[int], list[int]],
     ] = {}
     algorithm_initializer_lineages: dict[int, dict[str, dict[int, _OnnxWeightLineage]]] = {}
     for source_scope, training_graph in analysis_graph_roots[1:]:
         is_algorithm = source_scope[2] == "algorithm"
-        output_lineages, output_dynamic = walk_graph(
+        output_lineages, output_dynamic, output_lineage_gaps, output_weight_lineage_gaps = walk_graph(
             training_graph,
             root_state_lineages if is_algorithm else {},
             root_state_constants if is_algorithm else {},
             root_state_dynamic if is_algorithm else set(),
+            inherited_lineage_limit_gap_counts=root_state_lineage_limit_gap_counts if is_algorithm else {},
+            inherited_weight_lineage_limit_gap_counts=(
+                root_state_weight_lineage_limit_gap_counts if is_algorithm else {}
+            ),
             root_graph=True,
             source_scope=source_scope,
             opset_versions=model_opset_versions,
             fail_on_unbound_inputs=True,
         )
-        training_graph_results[source_scope] = (training_graph, output_lineages, output_dynamic)
+        training_graph_results[source_scope] = (
+            training_graph,
+            output_lineages,
+            output_dynamic,
+            output_lineage_gaps,
+            output_weight_lineage_gaps,
+        )
         if not is_algorithm:
             continue
         training_index = int(source_scope[1])
@@ -3256,7 +3417,9 @@ def _build_onnx_weight_analysis_plan(
             graph_result = training_graph_results.get(source_scope)
             output_lineages_by_name: dict[str, dict[int, _OnnxWeightLineage]] = {}
             if graph_result is not None:
-                training_graph, output_lineages, _output_dynamic = graph_result
+                training_graph, output_lineages, _output_dynamic, _output_lineage_gaps, _output_weight_lineage_gaps = (
+                    graph_result
+                )
                 output_lineages_by_name = {
                     _onnx_value_name(graph_output): lineages
                     for graph_output, lineages in zip(training_graph.output, output_lineages, strict=False)
