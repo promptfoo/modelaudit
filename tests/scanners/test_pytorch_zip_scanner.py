@@ -5342,6 +5342,17 @@ def test_pytorch_zip_encoded_nested_pickle_route_normalizes_wrapped_tokens() -> 
     assert PyTorchZipScanner._literal_value_has_encoded_nested_security_pickle(wrapped_hex) is True
 
 
+def test_pytorch_zip_base64_literal_route_fails_closed_after_suffix_budget() -> None:
+    payload = b"cposix\nsystem\n)R."
+    token = (b"A=" * (pytorch_zip_scanner_module._MAX_BASE64_LITERAL_ROUTE_TOKEN_STARTS + 1)) + base64.b64encode(
+        payload
+    )
+
+    assert PyTorchZipScanner._base64_literal_route_token_starts(token) is None
+    assert PyTorchZipScanner._literal_value_has_encoded_nested_security_pickle(token) is True
+    assert PyTorchZipScanner._base64_literal_value_has_suspicious_text(token) is True
+
+
 def test_pytorch_zip_encoded_nested_pickle_route_ignores_base64_marker_density_noise() -> None:
     assert PyTorchZipScanner._literal_value_has_encoded_nested_security_pickle(b"a" * 512) is False
 

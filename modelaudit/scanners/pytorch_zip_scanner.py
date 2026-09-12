@@ -223,6 +223,7 @@ _STORAGE_LITERAL_BASE64_DECODE_INPUT_OVERLAP_BYTES = ((_STORAGE_LITERAL_DECODED_
 _STORAGE_LITERAL_BASE64_DECODE_INPUT_STRIDE_BYTES = (
     _MAX_STORAGE_LITERAL_BASE64_DECODE_INPUT_BYTES - _STORAGE_LITERAL_BASE64_DECODE_INPUT_OVERLAP_BYTES
 )
+_MAX_BASE64_LITERAL_ROUTE_TOKEN_STARTS = 64
 
 
 @dataclass(frozen=True)
@@ -3117,7 +3118,11 @@ class PyTorchZipScanner(BaseScanner):
             candidate_count += 1
             if candidate_count > _MAX_STORAGE_LITERAL_TEXT_CANDIDATES:
                 return True
-            for candidate_token in PyTorchZipScanner._base64_literal_route_tokens(compact):
+            token_starts = PyTorchZipScanner._base64_literal_route_token_starts(compact)
+            if token_starts is None:
+                return True
+            for token_start in token_starts:
+                candidate_token = compact[token_start:]
                 for shift in range(min(16, len(candidate_token))):
                     token = candidate_token[shift:]
                     if len(token) < 8:
@@ -3127,15 +3132,19 @@ class PyTorchZipScanner(BaseScanner):
         return False
 
     @staticmethod
-    def _base64_literal_route_tokens(token: bytes) -> tuple[bytes, ...]:
-        tokens = [token]
+    def _base64_literal_route_token_starts(token: bytes) -> tuple[int, ...] | None:
+        starts = [0]
         for match in re.finditer(rb"=+", token):
             suffix_start = match.end()
-            if suffix_start < len(token) and token[suffix_start] in _BASE64_LITERAL_TOKEN_BYTES:
-                suffix = token[suffix_start:]
-                if len(suffix) >= 8:
-                    tokens.append(suffix)
-        return tuple(tokens)
+            if (
+                suffix_start < len(token)
+                and token[suffix_start] in _BASE64_LITERAL_TOKEN_BYTES
+                and len(token) - suffix_start >= 8
+            ):
+                starts.append(suffix_start)
+                if len(starts) > _MAX_BASE64_LITERAL_ROUTE_TOKEN_STARTS:
+                    return None
+        return tuple(starts)
 
     @staticmethod
     def _base64_token_has_storage_route_signal(token: bytes) -> bool:
@@ -3535,7 +3544,11 @@ class PyTorchZipScanner(BaseScanner):
             token = _BASE64_NESTED_LITERAL_SEPARATOR_RE.sub(b"", match.group(0)).translate(
                 bytes.maketrans(b"-_", b"+/")
             )
-            for candidate_token in PyTorchZipScanner._base64_literal_route_tokens(token):
+            token_starts = PyTorchZipScanner._base64_literal_route_token_starts(token)
+            if token_starts is None:
+                return True
+            for token_start in token_starts:
+                candidate_token = token[token_start:]
                 for shift in range(min(4, len(candidate_token))):
                     shifted_token = candidate_token[shift:]
                     shifted_token += b"=" * (-len(shifted_token) % 4)

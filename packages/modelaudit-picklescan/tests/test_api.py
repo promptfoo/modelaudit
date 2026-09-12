@@ -7610,6 +7610,15 @@ def test_encoded_nested_pickle_route_normalizes_wrapped_tokens() -> None:
     assert package_api._literal_value_has_encoded_nested_security_pickle(wrapped_hex) is True
 
 
+def test_base64_literal_route_fails_closed_after_suffix_budget() -> None:
+    payload = b"cposix\nsystem\n)R."
+    token = (b"A=" * (package_api._MAX_BASE64_LITERAL_ROUTE_TOKEN_STARTS + 1)) + base64.b64encode(payload)
+
+    assert package_api._base64_literal_route_token_starts(token) is None
+    assert package_api._literal_value_has_encoded_nested_security_pickle(token) is True
+    assert package_api._base64_literal_value_has_suspicious_text(token) is True
+
+
 def test_encoded_nested_pickle_route_ignores_base64_marker_density_noise() -> None:
     assert package_api._literal_value_has_encoded_nested_security_pickle(b"a" * 512) is False
 
