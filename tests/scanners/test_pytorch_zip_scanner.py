@@ -3113,6 +3113,8 @@ def test_pytorch_zip_discovery_checks_long_window_before_padding_budget(tmp_path
         b"\x82\x01(Ne",
         b"\x82\x01(NNu",
         b"\x82\x01(N\x90",
+        b"\x82\x01",
+        b"(C\x02(.0\x82\x01o",
     ],
 )
 def test_pytorch_zip_routes_raw_nested_extension_reduce_candidate_without_stop(executable_candidate: bytes) -> None:
@@ -3125,11 +3127,7 @@ def test_pytorch_zip_routes_raw_nested_extension_reduce_candidate_without_stop(e
 @pytest.mark.parametrize(
     "benign_candidate",
     [
-        b"\x82\x010)R",
-        b"\x82\x01N)R",
-        base64.b64decode("ggEpUg==")[:-1],
-        b"(0\x82\x01o",
-        b"N\x82\x01a",
+        b"(C\x02\x82\x01o",
     ],
 )
 def test_pytorch_zip_skips_raw_nested_extension_reduce_candidate_removed_or_shadowed(
@@ -3139,6 +3137,17 @@ def test_pytorch_zip_skips_raw_nested_extension_reduce_candidate_removed_or_shad
         benign_candidate,
         [pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES],
     )
+
+
+def test_pytorch_zip_raw_nested_extension_boundary_recovery_charges_shared_budget() -> None:
+    malformed_candidate = b"(" * 256 + b"\xff\x82\x01."
+    parse_budget_remaining = [3]
+
+    assert PyTorchZipScanner._raw_nested_extension_opcode_candidate_has_structural_signal(
+        malformed_candidate,
+        parse_budget_remaining,
+    )
+    assert parse_budget_remaining == [0]
 
 
 def test_pytorch_zip_raw_nested_extension_scan_shares_candidate_budget(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -5460,10 +5469,31 @@ def test_pytorch_zip_trusted_storage_routes_encoded_extension_callable_after_pop
     assert looks_like_pickle is True
 
 
-def test_pytorch_zip_trusted_storage_skips_encoded_extension_removed_by_pop(tmp_path: Path) -> None:
-    archive_path = tmp_path / "headerless_extension_storage_gate_removed.pt"
+def test_pytorch_zip_trusted_storage_routes_truncated_encoded_extension_removed_by_pop(tmp_path: Path) -> None:
+    archive_path = tmp_path / "headerless_extension_storage_gate_removed_truncated.pt"
     encoded_removed_extension_literal = base64.b64encode(b"\x82\x010)R")
     storage_blob = b"C" + bytes([len(encoded_removed_extension_literal)]) + encoded_removed_extension_literal + b"."
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data/0", storage_blob)
+
+    result = ScanResult(scanner_name="pytorch_zip")
+    scanner = PyTorchZipScanner()
+
+    with zipfile.ZipFile(archive_path, "r") as archive:
+        entry = archive.getinfo("archive/data/0")
+        looks_like_pickle = scanner._trusted_storage_entry_looks_like_pickle(
+            archive,
+            entry,
+            result,
+            padding_probe_bytes_remaining=[pytorch_zip_scanner_module._PICKLE_DISCOVERY_LONG_PROBE_BYTES],
+        )
+
+    assert looks_like_pickle is True
+
+
+def test_pytorch_zip_trusted_storage_skips_raw_extension_bytes_in_nonpickle_storage(tmp_path: Path) -> None:
+    archive_path = tmp_path / "headerless_extension_storage_gate_raw_data.pt"
+    storage_blob = b"tensor-storage-bytes:\x82\x01:not-a-pickle"
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.writestr("archive/data/0", storage_blob)
 

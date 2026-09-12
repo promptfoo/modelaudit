@@ -4348,10 +4348,28 @@ def test_trusted_storage_probe_routes_encoded_extension_callable_after_pop(
     assert looks_like_pickle is True
 
 
-def test_trusted_storage_probe_skips_encoded_extension_removed_by_pop(tmp_path: Path) -> None:
+def test_trusted_storage_probe_routes_truncated_encoded_extension_removed_by_pop(tmp_path: Path) -> None:
     encoded_removed_extension_literal = base64.b64encode(b"\x82\x010)R")
     storage = b"C" + bytes([len(encoded_removed_extension_literal)]) + encoded_removed_extension_literal + b"."
-    archive_path = tmp_path / "headerless-extension-storage-removed.pt"
+    archive_path = tmp_path / "headerless-extension-storage-removed-truncated.pt"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data/0", storage)
+
+    with zipfile.ZipFile(archive_path) as archive:
+        entry = archive.getinfo("archive/data/0")
+        looks_like_pickle = package_api._trusted_storage_zip_entry_looks_like_pickle(
+            archive,
+            entry,
+            [package_api._PICKLE_DISCOVERY_LONG_PROBE_BYTES],
+            float("inf"),
+        )
+
+    assert looks_like_pickle is True
+
+
+def test_trusted_storage_probe_skips_raw_extension_bytes_in_nonpickle_storage(tmp_path: Path) -> None:
+    storage = b"tensor-storage-bytes:\x82\x01:not-a-pickle"
+    archive_path = tmp_path / "headerless-extension-storage-raw-data.pt"
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.writestr("archive/data/0", storage)
 
@@ -19182,6 +19200,8 @@ def test_scan_file_scans_binary_storage_member_inside_expanded_probe_window(tmp_
         b"\x82\x01(Ne",
         b"\x82\x01(NNu",
         b"\x82\x01(N\x90",
+        b"\x82\x01",
+        b"(C\x02(.0\x82\x01o",
     ],
 )
 def test_raw_nested_extension_reduce_candidate_routes_without_stop(executable_candidate: bytes) -> None:
@@ -19194,11 +19214,7 @@ def test_raw_nested_extension_reduce_candidate_routes_without_stop(executable_ca
 @pytest.mark.parametrize(
     "benign_candidate",
     [
-        b"\x82\x010)R",
-        b"\x82\x01N)R",
-        base64.b64decode("ggEpUg==")[:-1],
-        b"(0\x82\x01o",
-        b"N\x82\x01a",
+        b"(C\x02\x82\x01o",
     ],
 )
 def test_raw_nested_extension_reduce_candidate_skips_removed_or_shadowed_callable(benign_candidate: bytes) -> None:
@@ -19206,6 +19222,17 @@ def test_raw_nested_extension_reduce_candidate_skips_removed_or_shadowed_callabl
         benign_candidate,
         [package_api._MAX_RAW_NESTED_PICKLE_CANDIDATES],
     )
+
+
+def test_raw_nested_extension_boundary_recovery_charges_shared_budget() -> None:
+    malformed_candidate = b"(" * 256 + b"\xff\x82\x01."
+    parse_budget_remaining = [3]
+
+    assert package_api._raw_nested_extension_opcode_candidate_has_structural_signal(
+        malformed_candidate,
+        parse_budget_remaining,
+    )
+    assert parse_budget_remaining == [0]
 
 
 def test_literal_raw_nested_extension_scan_shares_candidate_budget(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -19236,6 +19263,19 @@ def test_literal_raw_nested_extension_scan_shares_candidate_budget(monkeypatch: 
 )
 def test_scan_bytes_reports_raw_nested_extension_callable_after_pop(nested_payload: bytes) -> None:
     report = scan_bytes(_proto0_string_literal(nested_payload), source="raw-extension-live.pkl")
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.details.get("module") == "copyreg.extension"
+        and finding.details.get("name") == "code_1"
+        for finding in report.findings
+    )
+
+
+def test_scan_bytes_reports_raw_nested_extension_with_literal_stop_like_operand() -> None:
+    report = scan_bytes(_proto0_string_literal(b"(C\x02(.0\x82\x01o"), source="raw-extension-mark-context.pkl")
 
     assert report.status == ScanStatus.INCONCLUSIVE
     assert report.verdict == SafetyVerdict.MALICIOUS
