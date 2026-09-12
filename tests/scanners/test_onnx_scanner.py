@@ -6039,6 +6039,7 @@ class TestWeightDistributionSemantics:
         include_matrix: bool,
         malicious_matrix: bool,
         filename: str,
+        transpose_before_squeeze: bool = False,
     ) -> Path:
         source_names = [f"vector_weight{index}" for index in range(vector_count)]
         initializers = [
@@ -6063,7 +6064,8 @@ class TestWeightDistributionSemantics:
                 matrix[0, 50:55, 3] = 10.0
             initializers.append(onnx.numpy_helper.from_array(matrix, name="special_weight"))
             leaves.append(leaf_graph("special_weight", [1, 100, 100], "special_return"))
-        initializers.append(onnx.numpy_helper.from_array(np.array([0], dtype=np.int64), name="axes"))
+        squeeze_axes = np.array([1 if transpose_before_squeeze else 0], dtype=np.int64)
+        initializers.append(onnx.numpy_helper.from_array(squeeze_axes, name="axes"))
 
         condition_counter = 0
 
@@ -6093,12 +6095,18 @@ class TestWeightDistributionSemantics:
 
         branch = combine_branches(leaves)
         selected = branch.output[0].name
-        nodes = [
-            *branch.node,
-            helper.make_node("Squeeze", [selected, "axes"], ["squeezed"]),
-            helper.make_node("MatMul", ["X", "squeezed"], ["M"]),
-            helper.make_node("ReduceSum", ["M"], ["Y"], keepdims=0),
-        ]
+        selected_for_squeeze = selected
+        nodes = [*branch.node]
+        if transpose_before_squeeze:
+            nodes.append(helper.make_node("Transpose", [selected], ["transposed"], perm=[1, 0]))
+            selected_for_squeeze = "transposed"
+        nodes.extend(
+            [
+                helper.make_node("Squeeze", [selected_for_squeeze, "axes"], ["squeezed"]),
+                helper.make_node("MatMul", ["X", "squeezed"], ["M"]),
+                helper.make_node("ReduceSum", ["M"], ["Y"], keepdims=0),
+            ]
+        )
         inputs = [helper.make_tensor_value_info("X", TensorProto.FLOAT, [100])]
         inputs.extend(
             helper.make_tensor_value_info(f"C{index}", TensorProto.BOOL, []) for index in range(condition_counter)
@@ -6860,6 +6868,25 @@ class TestWeightDistributionSemantics:
             include_matrix=False,
             malicious_matrix=False,
             filename="balanced-if-squeeze-demotes-vector-gap.onnx",
+        )
+
+        result = OnnxScanner().scan(str(path))
+
+        assert result.success is True
+        assert self._extreme_checks(result) == []
+        assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["coverage_gaps"] == {}
+        assert semantics["eligible_initializer_count"] == 0
+
+    def test_balanced_if_transpose_squeeze_demotes_transformed_vector_gap(self, tmp_path: Path) -> None:
+        path = self._write_balanced_if_squeeze_model(
+            tmp_path,
+            vector_count=33,
+            include_matrix=False,
+            malicious_matrix=False,
+            filename="balanced-if-transpose-squeeze-demotes-vector-gap.onnx",
+            transpose_before_squeeze=True,
         )
 
         result = OnnxScanner().scan(str(path))

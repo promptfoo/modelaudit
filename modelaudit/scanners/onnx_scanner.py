@@ -2383,6 +2383,18 @@ def _build_onnx_weight_analysis_plan(
                 return False
         return True
 
+    def transform_weight_gap_summary(
+        summary: _OnnxWeightLineageGapSummary,
+        node: Any,
+        constants: dict[str, Any],
+    ) -> _OnnxWeightLineageGapSummary:
+        if not summary.lineages:
+            return summary
+        return summarize_weight_lineage_gap(
+            (transformed_lineage(lineage, node, constants) for lineage in summary.lineages),
+            truncated=summary.truncated,
+        )
+
     def bounded_lineages(
         lineages: dict[int, _OnnxWeightLineage],
     ) -> tuple[dict[int, _OnnxWeightLineage], int, int, int, int, _OnnxWeightLineageGapSummary]:
@@ -3393,6 +3405,7 @@ def _build_onnx_weight_analysis_plan(
             ) = bounded_lineages(output_lineages)
             all_input_output_weight_lineage_limit_gap_count = all_input_weight_lineage_limit_gap_count
             all_input_output_weight_lineage_gap_summary = all_input_weight_lineage_limit_gap_summary
+            transformed_input_output_weight_lineage_gap_summary = all_input_output_weight_lineage_gap_summary
             promoted_rank_lineage_limit_gap_count = 0
             if (
                 rank_gap_promoting_operator
@@ -3444,6 +3457,12 @@ def _build_onnx_weight_analysis_plan(
                 and not any(lineage_could_be_weight(lineage) for lineage in output_lineages.values())
                 and any(lineage_could_be_weight_after_rank_increase(lineage) for lineage in output_lineages.values())
             )
+            if supported_transform and all_input_output_weight_lineage_limit_gap_count > 0:
+                transformed_input_output_weight_lineage_gap_summary = transform_weight_gap_summary(
+                    all_input_output_weight_lineage_gap_summary,
+                    node,
+                    constants,
+                )
             if (
                 rank_operator_promotes_deferred_gap
                 and output_rank_promotable_lineage_limit_gap_count > output_weight_lineage_limit_gap_count
@@ -3729,7 +3748,7 @@ def _build_onnx_weight_analysis_plan(
                     input_weight_lineage_gap_summary_for_output = (
                         empty_weight_gap_summary
                         if input_weight_lineage_limit_gap_count_for_output == 0
-                        else all_input_output_weight_lineage_gap_summary
+                        else transformed_input_output_weight_lineage_gap_summary
                     )
                     input_non_shape_lineage_limit_gap_count_for_output = (
                         0 if subgraph_results else all_input_non_shape_lineage_limit_gap_count
