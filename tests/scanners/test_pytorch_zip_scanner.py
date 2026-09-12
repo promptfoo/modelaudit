@@ -3107,6 +3107,12 @@ def test_pytorch_zip_discovery_checks_long_window_before_padding_budget(tmp_path
         b"\x82\x01q\x00N\x9400h\x00)R",
         b"\x82\x01q\x00](NNNe0)R",
         b"(\x82\x01)o",
+        b"(N0\x82\x01o",
+        b"\x82\x01Na",
+        b"\x82\x01NNs",
+        b"\x82\x01(Ne",
+        b"\x82\x01(NNu",
+        b"\x82\x01(N\x90",
     ],
 )
 def test_pytorch_zip_routes_raw_nested_extension_reduce_candidate_without_stop(executable_candidate: bytes) -> None:
@@ -3122,6 +3128,8 @@ def test_pytorch_zip_routes_raw_nested_extension_reduce_candidate_without_stop(e
         b"\x82\x010)R",
         b"\x82\x01N)R",
         base64.b64decode("ggEpUg==")[:-1],
+        b"(0\x82\x01o",
+        b"N\x82\x01a",
     ],
 )
 def test_pytorch_zip_skips_raw_nested_extension_reduce_candidate_removed_or_shadowed(
@@ -3131,6 +3139,29 @@ def test_pytorch_zip_skips_raw_nested_extension_reduce_candidate_removed_or_shad
         benign_candidate,
         [pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES],
     )
+
+
+def test_pytorch_zip_raw_nested_extension_scan_shares_candidate_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    remaining_budget_seen: list[int] = []
+
+    def no_signal(_candidate: bytes, parse_budget_remaining: list[int]) -> bool:
+        remaining_budget_seen.append(parse_budget_remaining[0])
+        PyTorchZipScanner._consume_raw_nested_structural_parse_budget(parse_budget_remaining)
+        return False
+
+    monkeypatch.setattr(
+        PyTorchZipScanner,
+        "_raw_nested_extension_opcode_candidate_has_structural_signal",
+        staticmethod(no_signal),
+    )
+
+    assert not PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(b"\x82\x010" * 4)
+    assert remaining_budget_seen == [
+        pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES,
+        pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES - 1,
+        pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES - 2,
+        pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES - 3,
+    ]
 
 
 def test_pytorch_zip_discovery_charges_detected_expanded_probe_once(tmp_path: Path) -> None:

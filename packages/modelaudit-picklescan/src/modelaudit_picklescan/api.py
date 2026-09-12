@@ -2105,6 +2105,16 @@ def _has_executable_extension_opcode_before_stop(candidate: bytes) -> bool:
     def callable_is_extension(offset_from_top: int) -> bool:
         return len(stack) >= offset_from_top and stack[-offset_from_top] == "extension"
 
+    def last_mark_index() -> int:
+        try:
+            return len(stack) - 1 - stack[::-1].index("mark")
+        except ValueError:
+            return -1
+
+    def mark_target_is_extension() -> bool:
+        mark_index = last_mark_index()
+        return mark_index > 0 and stack[mark_index - 1] == "extension"
+
     try:
         for opcode, arg, _pos in pickletools.genops(candidate):
             if opcode.name in _PICKLE_EXTENSION_OPCODES:
@@ -2144,7 +2154,20 @@ def _has_executable_extension_opcode_before_stop(candidate: bytes) -> bool:
                 push("other")
                 continue
             if opcode.name in {"APPENDS", "SETITEMS", "ADDITEMS"}:
+                if mark_target_is_extension():
+                    return True
                 pop_until_mark()
+                continue
+            if opcode.name == "APPEND":
+                if callable_is_extension(2):
+                    return True
+                pop()
+                continue
+            if opcode.name == "SETITEM":
+                if callable_is_extension(3):
+                    return True
+                pop()
+                pop()
                 continue
             if opcode.name == "EMPTY_TUPLE":
                 push("other")
@@ -2177,10 +2200,7 @@ def _has_executable_extension_opcode_before_stop(candidate: bytes) -> bool:
                 push("other")
                 continue
             if opcode.name == "OBJ":
-                try:
-                    mark_index = len(stack) - 1 - stack[::-1].index("mark")
-                except ValueError:
-                    mark_index = -1
+                mark_index = last_mark_index()
                 if mark_index >= 0 and mark_index + 1 < len(stack) and stack[mark_index + 1] == "extension":
                     return True
                 pop_until_mark()
@@ -2740,6 +2760,7 @@ def _literal_value_has_raw_nested_security_pickle(
     if nested_literal_depth > _MAX_NESTED_LITERAL_SCAN_DEPTH:
         return True
     candidate_count = 0
+    extension_parse_budget_remaining = [_MAX_RAW_NESTED_PICKLE_CANDIDATES]
     for offset, marker in enumerate(value):
         if marker not in _RAW_NESTED_SECURITY_PICKLE_START_BYTES:
             continue
@@ -2773,7 +2794,7 @@ def _literal_value_has_raw_nested_security_pickle(
             marker in _BINARY_EXTENSION_SECURITY_OPCODE_BYTES
             and _raw_nested_extension_opcode_candidate_has_structural_signal(
                 candidate,
-                [_MAX_RAW_NESTED_PICKLE_CANDIDATES],
+                extension_parse_budget_remaining,
             )
         ):
             return True
@@ -2994,7 +3015,7 @@ def _raw_nested_extension_opcode_candidate_has_structural_signal(
             return False
         if not _consume_raw_nested_structural_parse_budget(parse_budget_remaining):
             return True
-        candidate_start = offset - 1 if offset > 0 and value[offset - 1] == _PICKLE_MARK_OPCODE_BYTE else offset
+        candidate_start = _raw_nested_extension_candidate_start(value, offset)
         candidate = value[candidate_start : candidate_start + _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES]
         candidate_is_prefix = candidate_start + len(candidate) < len(value)
         if _has_executable_extension_opcode_before_stop(candidate):
@@ -3003,6 +3024,14 @@ def _raw_nested_extension_opcode_candidate_has_structural_signal(
             return True
         search_start = offset + 1
     return False
+
+
+def _raw_nested_extension_candidate_start(value: bytes, offset: int) -> int:
+    window_start = max(0, offset - _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES + 1)
+    stop = value.rfind(b".", window_start, offset)
+    mark_search_start = stop + 1 if stop >= 0 else window_start
+    mark = value.rfind(bytes([_PICKLE_MARK_OPCODE_BYTE]), mark_search_start, offset)
+    return mark if mark >= 0 else offset
 
 
 def _raw_nested_binary_opcode_candidate_has_structural_signal(value: bytes, parse_budget_remaining: list[int]) -> bool:

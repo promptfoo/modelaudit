@@ -19176,6 +19176,12 @@ def test_scan_file_scans_binary_storage_member_inside_expanded_probe_window(tmp_
         b"\x82\x01q\x00N\x9400h\x00)R",
         b"\x82\x01q\x00](NNNe0)R",
         b"(\x82\x01)o",
+        b"(N0\x82\x01o",
+        b"\x82\x01Na",
+        b"\x82\x01NNs",
+        b"\x82\x01(Ne",
+        b"\x82\x01(NNu",
+        b"\x82\x01(N\x90",
     ],
 )
 def test_raw_nested_extension_reduce_candidate_routes_without_stop(executable_candidate: bytes) -> None:
@@ -19191,6 +19197,8 @@ def test_raw_nested_extension_reduce_candidate_routes_without_stop(executable_ca
         b"\x82\x010)R",
         b"\x82\x01N)R",
         base64.b64decode("ggEpUg==")[:-1],
+        b"(0\x82\x01o",
+        b"N\x82\x01a",
     ],
 )
 def test_raw_nested_extension_reduce_candidate_skips_removed_or_shadowed_callable(benign_candidate: bytes) -> None:
@@ -19198,6 +19206,25 @@ def test_raw_nested_extension_reduce_candidate_skips_removed_or_shadowed_callabl
         benign_candidate,
         [package_api._MAX_RAW_NESTED_PICKLE_CANDIDATES],
     )
+
+
+def test_literal_raw_nested_extension_scan_shares_candidate_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    remaining_budget_seen: list[int] = []
+
+    def no_signal(_candidate: bytes, parse_budget_remaining: list[int]) -> bool:
+        remaining_budget_seen.append(parse_budget_remaining[0])
+        package_api._consume_raw_nested_structural_parse_budget(parse_budget_remaining)
+        return False
+
+    monkeypatch.setattr(package_api, "_raw_nested_extension_opcode_candidate_has_structural_signal", no_signal)
+
+    assert not package_api._literal_value_has_raw_nested_security_pickle(b"\x82\x010" * 4)
+    assert remaining_budget_seen == [
+        package_api._MAX_RAW_NESTED_PICKLE_CANDIDATES,
+        package_api._MAX_RAW_NESTED_PICKLE_CANDIDATES - 1,
+        package_api._MAX_RAW_NESTED_PICKLE_CANDIDATES - 2,
+        package_api._MAX_RAW_NESTED_PICKLE_CANDIDATES - 3,
+    ]
 
 
 @pytest.mark.parametrize(
