@@ -8650,6 +8650,44 @@ class TestNetworkCommDetector:
         assert "botnet" in patterns
         assert all(finding.get("position") == data.lower().find(finding["pattern"].encode()) for finding in cc_findings)
 
+    @pytest.mark.parametrize(
+        "data",
+        [
+            b"def _check_input_dim(self, input):\n    pass\n",
+            b"self._check_input_dim(input)\n",
+            b"check_input_dim = input.dim()\n",
+        ],
+    )
+    def test_check_in_prefix_inside_identifier_is_not_cc_pattern(self, data: bytes) -> None:
+        detector = NetworkCommDetector()
+
+        findings = detector.scan(data, "model/code/__torch__/torch/nn/modules/batchnorm.py")
+
+        assert not any(finding["type"] == "cc_pattern" and finding["pattern"] == "check_in" for finding in findings)
+
+    @pytest.mark.parametrize(
+        ("data", "expected_pattern"),
+        [
+            (b'check_in = "https://evil.example/payload"', "check_in"),
+            (b'c2_server = "https://evil.example/payload"', "c2_server"),
+        ],
+    )
+    def test_cc_check_in_and_c2_url_assignments_stay_actionable(
+        self,
+        data: bytes,
+        expected_pattern: str,
+    ) -> None:
+        detector = NetworkCommDetector()
+
+        findings = detector.scan(data, "hook.py")
+
+        assert any(
+            finding["type"] == "cc_pattern"
+            and finding["pattern"] == expected_pattern
+            and finding["severity"] == "CRITICAL"
+            for finding in findings
+        )
+
     def test_cc_pattern_scan_reuses_lowered_payload(self) -> None:
         """Reuse one lowercase payload view across all C&C pattern checks."""
 
