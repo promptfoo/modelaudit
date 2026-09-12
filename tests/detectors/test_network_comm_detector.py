@@ -8672,6 +8672,10 @@ class TestNetworkCommDetector:
             b"agent_check_in()",
             b"check_input_dim_remote()",
             b"_check_input_dim2()",
+            "check_input_dimé()".encode(),
+            "écheck_input_dim()".encode(),
+            "é_check_input_dim()".encode(),
+            b"a" * 8192 + b"check_input_dim()",
         ],
     )
     def test_prefixed_check_in_calls_stay_cc_patterns(self, data: bytes) -> None:

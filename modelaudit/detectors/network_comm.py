@@ -1986,14 +1986,16 @@ def _is_check_input_dim_near_match(data: bytes, match_index: int, token_len: int
     if data[after_index : after_index + len(suffix)] != suffix:
         return False
     after_suffix = after_index + len(suffix)
-    if after_suffix < len(data) and data[after_suffix] in _IDENTIFIER_BYTES:
+    if after_suffix < len(data) and (data[after_suffix] in _IDENTIFIER_BYTES or data[after_suffix] >= 0x80):
         return False
 
-    identifier_start = match_index
-    while identifier_start > 0 and data[identifier_start - 1] in _IDENTIFIER_BYTES:
-        identifier_start -= 1
-    identifier = data[identifier_start : after_index + len(suffix)]
-    return identifier in {b"check_input_dim", b"_check_input_dim"}
+    if match_index > 0 and data[match_index - 1] == ord("_"):
+        before_identifier = match_index - 2 >= 0 and data[match_index - 2] in _IDENTIFIER_BYTES
+        before_unicode = match_index - 2 >= 0 and data[match_index - 2] >= 0x80
+        return not before_identifier and not before_unicode
+    if match_index > 0 and (data[match_index - 1] in _IDENTIFIER_BYTES or data[match_index - 1] >= 0x80):
+        return False
+    return True
 
 
 def _is_ignorable_cc_pattern_near_match(data: bytes, pattern: bytes, match_index: int) -> bool:
@@ -5004,7 +5006,6 @@ class NetworkCommDetector:
         b"phone_home",
         b"check_in",
     ]
-    CC_PATTERNS_REQUIRING_IDENTIFIER_BOUNDARIES: ClassVar[frozenset[bytes]] = frozenset({b"check_in"})
 
     # Suspicious ports
     SUSPICIOUS_PORTS: ClassVar[list[int]] = [
