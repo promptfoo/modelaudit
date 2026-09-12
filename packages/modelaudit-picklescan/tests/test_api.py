@@ -6015,6 +6015,109 @@ def test_scan_file_scans_extension_opcode_crossing_trusted_probe_boundary(tmp_pa
     )
 
 
+def test_scan_file_routes_encoded_extension_with_truncated_operand(tmp_path: Path) -> None:
+    archive_path = tmp_path / "truncated-extension-operand.pt"
+    storage_blob = b"S'ggFxAIwFeA=='\n."
+    storage_blob += b" " * (-len(storage_blob) % 4)
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", storage_blob)
+
+    report = scan_file(archive_path)
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/0"]
+
+
+def test_scan_file_routes_encoded_extension_with_live_mark_context(tmp_path: Path) -> None:
+    archive_path = tmp_path / "live-mark-extension.pt"
+    storage_blob = b"S'KE4wggEpb/8='\n."
+    storage_blob += b" " * (-len(storage_blob) % 4)
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", storage_blob)
+
+    report = scan_file(archive_path)
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/0"]
+
+
+def test_scan_file_routes_nested_mark_extension_context(tmp_path: Path) -> None:
+    archive_path = tmp_path / "nested-mark-extension.pt"
+    payload = b"(N(N10\x82\x01)o\xff"
+    storage_blob = b"C" + bytes([len(payload)]) + payload + b"."
+    storage_blob += b" " * (-len(storage_blob) % 4)
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", storage_blob)
+
+    report = scan_file(archive_path)
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict != SafetyVerdict.CLEAN
+    assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/0"]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"\x82\x01q\x00\xff",
+        (b"N." * 70) + b"(\x82\x01)R\xff",
+    ],
+)
+def test_scan_file_routes_encoded_extension_fail_closed_suffixes(tmp_path: Path, payload: bytes) -> None:
+    archive_path = tmp_path / "extension-fail-closed-suffix.pt"
+    storage_blob = b"S'" + base64.b64encode(payload) + b"'\n."
+    storage_blob += b" " * (-len(storage_blob) % 4)
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", storage_blob)
+
+    report = scan_file(archive_path)
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict != SafetyVerdict.CLEAN
+    assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/0"]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"(" * 20 + b"\xff" + (b"\x82\x01\xff" * 4) + b"\x82\x01)R.",
+        (b"(" * 10) + b"\xff" + (b"\x82\x01\xff" * 10) + b"cposix\nsystem\n)R.",
+    ],
+)
+def test_scan_file_preserves_later_payload_after_exhausted_extension_context(
+    tmp_path: Path,
+    payload: bytes,
+) -> None:
+    archive_path = tmp_path / "extension-exhausted-context-later-payload.pt"
+    storage_blob = b"C" + bytes([len(payload)]) + payload + b"."
+    storage_blob += b" " * (-len(storage_blob) % 4)
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", storage_blob)
+
+    report = scan_file(archive_path)
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(finding.rule_code == "DANGEROUS_CALL" for finding in report.findings)
+    assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/0"]
+
+
 def test_scan_file_scans_repeated_trivial_prefix_crossing_trusted_probe_boundary(tmp_path: Path) -> None:
     archive_path = tmp_path / "model.pt"
     storage_blob = b"N.N." + (b" " * (4096 - 4 - 5)) + b"cposix\nsystem\n(S'echo hidden'\ntR."

@@ -2755,10 +2755,15 @@ class PyTorchZipScanner(BaseScanner):
         return False
 
     @staticmethod
-    def _has_executable_extension_opcode_before_stop(candidate: bytes) -> bool:
+    def _has_executable_extension_opcode_before_stop(
+        candidate: bytes,
+        *,
+        fail_closed_on_truncated_extension: bool = True,
+    ) -> bool:
         stack: list[str] = []
         memo: dict[str, str] = {}
         saw_extension_opcode = False
+        parsed_after_extension = False
 
         def push(value: str) -> None:
             stack.append(value)
@@ -2793,6 +2798,8 @@ class PyTorchZipScanner(BaseScanner):
                     saw_extension_opcode = True
                     push("extension")
                     continue
+                if saw_extension_opcode:
+                    parsed_after_extension = True
                 if opcode.name == "MARK":
                     push("mark")
                     continue
@@ -2892,8 +2899,15 @@ class PyTorchZipScanner(BaseScanner):
                 if opcode.stack_after:
                     for _ in opcode.stack_after:
                         push("other")
-        except Exception:
-            return saw_extension_opcode
+        except Exception as error:
+            if not saw_extension_opcode:
+                return False
+            message = str(error)
+            if "opcode" in message and "unknown" in message:
+                return parsed_after_extension
+            if "pickle exhausted before seeing STOP" in message:
+                return fail_closed_on_truncated_extension
+            return True
         return False
 
     @staticmethod
@@ -3454,13 +3468,33 @@ class PyTorchZipScanner(BaseScanner):
                 return PyTorchZipScanner._raw_nested_security_pickle_candidate_budget_exhausted_needs_scan(
                     value[offset:]
                 )
-            candidate_start = (
-                offset - 1
-                if marker in _BINARY_EXTENSION_SECURITY_OPCODE_BYTES
-                and offset > 0
-                and value[offset - 1] == _PICKLE_MARK_OPCODE_BYTE
-                else offset
-            )
+            candidate_start = offset
+            recovered_extension_context = False
+            if marker in _BINARY_EXTENSION_SECURITY_OPCODE_BYTES:
+                extension_window_start = max(0, offset - _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES + 1)
+                recover_extension_context = (
+                    value.rfind(
+                        bytes([_PICKLE_MARK_OPCODE_BYTE]),
+                        extension_window_start,
+                        offset,
+                    )
+                    >= extension_window_start
+                )
+            else:
+                recover_extension_context = False
+            if recover_extension_context:
+                recovered_start, exhausted_budget = PyTorchZipScanner._raw_nested_extension_candidate_start(
+                    value,
+                    offset,
+                    extension_parse_budget_remaining,
+                )
+                if exhausted_budget:
+                    candidate = value[offset : offset + _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES]
+                    if PyTorchZipScanner._extension_candidate_after_exhausted_context_should_scan(candidate):
+                        return True
+                    continue
+                candidate_start = recovered_start
+                recovered_extension_context = True
             candidate = value[candidate_start : candidate_start + _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES]
             candidate_is_prefix = candidate_start + len(candidate) < len(value)
             if marker == 0x80 and PyTorchZipScanner._looks_like_binary_pickle_prefix(
@@ -3480,14 +3514,21 @@ class PyTorchZipScanner(BaseScanner):
                 )
             ):
                 return True
-            if (
-                marker in _BINARY_EXTENSION_SECURITY_OPCODE_BYTES
-                and PyTorchZipScanner._raw_nested_extension_opcode_candidate_has_structural_signal(
+            if marker in _BINARY_EXTENSION_SECURITY_OPCODE_BYTES:
+                if recovered_extension_context:
+                    if PyTorchZipScanner._has_executable_extension_opcode_before_stop(
+                        candidate
+                    ) or PyTorchZipScanner._raw_nested_binary_candidate_should_scan(
+                        candidate,
+                        candidate_is_prefix=candidate_is_prefix,
+                        nested_literal_depth=nested_literal_depth + 1,
+                    ):
+                        return True
+                elif PyTorchZipScanner._raw_nested_extension_opcode_candidate_has_structural_signal(
                     candidate,
                     extension_parse_budget_remaining,
-                )
-            ):
-                return True
+                ):
+                    return True
             if (
                 marker in PROTO0_1_START_BYTES
                 and PyTorchZipScanner._has_security_relevant_pickle_opcode(candidate)
@@ -3549,7 +3590,12 @@ class PyTorchZipScanner(BaseScanner):
     def _raw_nested_security_pickle_candidate_budget_exhausted_needs_scan(value: bytes) -> bool:
         if PyTorchZipScanner._raw_nested_security_pickle_text_marker_seen(value):
             return True
-        return PyTorchZipScanner._raw_nested_security_pickle_candidate_has_structural_signal(value)
+        if value and value[0] in _BINARY_EXTENSION_SECURITY_OPCODE_BYTES:
+            return True
+        return PyTorchZipScanner._raw_nested_security_pickle_candidate_has_structural_signal(
+            value,
+            fail_closed_on_truncated_extension=False,
+        )
 
     @staticmethod
     def _encoded_raw_nested_security_pickle_candidate_budget_exhausted_needs_scan(value: bytes) -> bool:
@@ -3589,7 +3635,11 @@ class PyTorchZipScanner(BaseScanner):
         return PyTorchZipScanner._raw_nested_security_pickle_candidate_has_structural_signal(value)
 
     @staticmethod
-    def _raw_nested_security_pickle_candidate_has_structural_signal(value: bytes) -> bool:
+    def _raw_nested_security_pickle_candidate_has_structural_signal(
+        value: bytes,
+        *,
+        fail_closed_on_truncated_extension: bool = True,
+    ) -> bool:
         parse_budget_remaining = [_MAX_RAW_NESTED_PICKLE_CANDIDATES]
         if PyTorchZipScanner._raw_nested_proto0_global_ref_seen(value):
             return True
@@ -3601,6 +3651,7 @@ class PyTorchZipScanner(BaseScanner):
         if PyTorchZipScanner._raw_nested_extension_opcode_candidate_has_structural_signal(
             value,
             parse_budget_remaining,
+            fail_closed_on_truncated_extension=fail_closed_on_truncated_extension,
         ):
             return True
         if PyTorchZipScanner._raw_nested_binary_opcode_candidate_has_structural_signal(
@@ -3615,7 +3666,9 @@ class PyTorchZipScanner(BaseScanner):
             return False
         marker = candidate[0]
         if marker in _BINARY_EXTENSION_SECURITY_OPCODE_BYTES:
-            return True
+            return fail_closed_on_truncated_extension or PyTorchZipScanner._has_complete_extension_opcode_stream(
+                candidate
+            )
         if not PyTorchZipScanner._consume_raw_nested_structural_parse_budget(parse_budget_remaining):
             return True
         if marker == 0x80 and PyTorchZipScanner._looks_like_binary_pickle_prefix(
@@ -3719,6 +3772,8 @@ class PyTorchZipScanner(BaseScanner):
     def _raw_nested_extension_opcode_candidate_has_structural_signal(
         value: bytes,
         parse_budget_remaining: list[int],
+        *,
+        fail_closed_on_truncated_extension: bool = True,
     ) -> bool:
         search_limit = min(len(value), _PICKLE_DISCOVERY_LONG_PROBE_BYTES)
         search_start = 0
@@ -3739,10 +3794,17 @@ class PyTorchZipScanner(BaseScanner):
                 parse_budget_remaining,
             )
             if exhausted_budget:
-                return True
+                candidate = value[offset : offset + _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES]
+                if PyTorchZipScanner._extension_candidate_after_exhausted_context_should_scan(candidate):
+                    return True
+                search_start = offset + 1
+                continue
             candidate = value[candidate_start : candidate_start + _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES]
             candidate_is_prefix = candidate_start + len(candidate) < len(value)
-            if PyTorchZipScanner._has_executable_extension_opcode_before_stop(candidate):
+            if PyTorchZipScanner._has_executable_extension_opcode_before_stop(
+                candidate,
+                fail_closed_on_truncated_extension=fail_closed_on_truncated_extension,
+            ):
                 return True
             if PyTorchZipScanner._raw_nested_binary_candidate_should_scan(
                 candidate,
@@ -3793,13 +3855,49 @@ class PyTorchZipScanner(BaseScanner):
         return offset, False
 
     @staticmethod
+    def _has_complete_extension_opcode_stream(candidate: bytes) -> bool:
+        saw_extension_opcode = False
+        try:
+            for opcode, _arg, _pos in pickletools.genops(candidate):
+                if opcode.name in _PICKLE_EXTENSION_OPCODES:
+                    saw_extension_opcode = True
+                    continue
+                if opcode.name == "STOP":
+                    return saw_extension_opcode
+        except Exception:
+            return False
+        return False
+
+    @staticmethod
+    def _extension_candidate_after_exhausted_context_should_scan(candidate: bytes) -> bool:
+        return PyTorchZipScanner._has_complete_extension_opcode_stream(
+            candidate
+        ) or PyTorchZipScanner._has_executable_extension_opcode_before_stop(
+            candidate,
+            fail_closed_on_truncated_extension=False,
+        )
+
+    @staticmethod
     def _parsed_raw_nested_extension_candidate_start(
         value: bytes,
         start: int,
         offset: int,
     ) -> tuple[int | None, int | None]:
         parse_end = min(len(value), offset + 5)
-        live_mark: int | None = None
+        stack: list[int | None] = []
+
+        def pop_stack() -> None:
+            if stack:
+                stack.pop()
+
+        def pop_until_mark() -> None:
+            while stack:
+                if stack.pop() is not None:
+                    break
+
+        def live_mark() -> int | None:
+            return next((item for item in reversed(stack) if item is not None), None)
+
         try:
             for opcode, _arg, pos in pickletools.genops(value[start:parse_end]):
                 if pos is None:
@@ -3807,14 +3905,28 @@ class PyTorchZipScanner(BaseScanner):
                 absolute_pos = start + pos
                 if absolute_pos == offset:
                     if opcode.name in _PICKLE_EXTENSION_OPCODES:
-                        return (live_mark if live_mark is not None else offset), None
+                        mark = live_mark()
+                        return (mark if mark is not None else offset), None
                     return None, None
                 if absolute_pos > offset:
                     return start, None
                 if opcode.name == "STOP":
                     return None, absolute_pos
                 if opcode.name == "MARK":
-                    live_mark = absolute_pos
+                    stack.append(absolute_pos)
+                    continue
+                if opcode.name == "POP":
+                    pop_stack()
+                    continue
+                if opcode.name == "POP_MARK":
+                    pop_until_mark()
+                    continue
+                if opcode.stack_before:
+                    for _ in opcode.stack_before:
+                        pop_stack()
+                if opcode.stack_after:
+                    for _ in opcode.stack_after:
+                        stack.append(None)
         except Exception:
             return None, None
         return None, None
