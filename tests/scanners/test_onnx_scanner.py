@@ -6681,6 +6681,88 @@ class TestWeightDistributionSemantics:
         assert semantics["coverage_gaps"]["lineages_per_value_limit"] == 1
         assert semantics["analyzed_layer_count"] == 0
 
+    def test_integer_cast_does_not_promote_deferred_lineage_gap_to_weight_gap(self, tmp_path: Path) -> None:
+        initializers = [
+            onnx.numpy_helper.from_array(np.array([1], dtype=np.int64), name=f"shape_source{index}")
+            for index in range(32)
+        ]
+        initializers.append(onnx.numpy_helper.from_array(np.ones((4, 4), dtype=np.int64), name="integer_weight"))
+        graph = helper.make_graph(
+            [
+                helper.make_node("Concat", [f"shape_source{index}" for index in range(32)], ["shape_values"], axis=0),
+                helper.make_node("Reshape", ["integer_weight", "shape_values"], ["reshaped_integer"]),
+                helper.make_node("Cast", ["reshaped_integer"], ["generated_integer"], to=TensorProto.INT64),
+                helper.make_node("MatMul", ["X", "generated_integer"], ["Y"]),
+            ],
+            "integer_cast_keeps_deferred_lineage_gap_nonweight",
+            [helper.make_tensor_value_info("X", TensorProto.INT64, [1, 4])],
+            [helper.make_tensor_value_info("Y", TensorProto.INT64, [None, None])],
+            initializer=initializers,
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / "integer-cast-deferred-lineage-gap.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        assert result.success is True
+        assert self._extreme_checks(result) == []
+        assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["coverage_gaps"] == {}
+        assert semantics["eligible_initializer_count"] == 0
+
+    def test_function_independent_output_does_not_inherit_unrelated_weight_gap(self, tmp_path: Path) -> None:
+        gap_inputs = [f"gap_weight{index}" for index in range(40)]
+        function = helper.make_function(
+            "local",
+            "IndependentOutputs",
+            ["gap_input", "function_weight"],
+            ["gap_output", "weight_output"],
+            [
+                helper.make_node("Identity", ["gap_input"], ["gap_output"]),
+                helper.make_node("Identity", ["function_weight"], ["weight_output"]),
+            ],
+            opset_imports=[helper.make_opsetid("", 13)],
+        )
+        initializers = [
+            onnx.numpy_helper.from_array(np.zeros((4, 4), dtype=np.float32), name=name) for name in gap_inputs
+        ]
+        initializers.append(onnx.numpy_helper.from_array(np.zeros((4, 4), dtype=np.float32), name="W"))
+        graph = helper.make_graph(
+            [
+                helper.make_node("Sum", gap_inputs, ["gap_input"]),
+                helper.make_node(
+                    "IndependentOutputs", ["gap_input", "W"], ["unused_gap", "generated_weight"], domain="local"
+                ),
+                helper.make_node("MatMul", ["X", "generated_weight"], ["Y"]),
+            ],
+            "function_independent_output_keeps_gap_scoped",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 4])],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 4])],
+            initializer=initializers,
+        )
+        model = helper.make_model(
+            graph,
+            functions=[function],
+            opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
+        )
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / "function-independent-output-gap-scope.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        assert result.success is True
+        assert self._extreme_checks(result) == []
+        assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["coverage_gaps"] == {}
+        assert semantics["analyzed_layer_count"] == 1
+
     def test_runtime_bookkeeping_recurrent_marker_survives_fanout_compaction(self, tmp_path: Path) -> None:
         initializers = [
             onnx.numpy_helper.from_array(np.zeros(4, dtype=np.float32), name=f"C{index}") for index in range(33)

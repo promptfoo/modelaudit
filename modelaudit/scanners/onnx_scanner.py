@@ -1812,6 +1812,10 @@ def _build_onnx_weight_analysis_plan(
             and (lineage.shape is None or len(lineage.shape) >= 2)
         )
 
+    def cast_output_may_be_floating(node: Any) -> bool:
+        target_data_type = _onnx_int_attribute(node, "to", -1)
+        return target_data_type < 0 or target_data_type in floating_types
+
     def value_info_shape(value_info: Any) -> tuple[int, ...] | None:
         try:
             tensor_type = value_info.type.tensor_type
@@ -3020,12 +3024,14 @@ def _build_onnx_weight_analysis_plan(
             if (
                 supported_transform
                 and node.op_type == "Cast"
+                and cast_output_may_be_floating(node)
                 and all_input_lineage_limit_gap_count > all_input_output_weight_lineage_limit_gap_count
             ):
                 all_input_output_weight_lineage_limit_gap_count = all_input_lineage_limit_gap_count
             if (
                 supported_transform
                 and node.op_type == "Cast"
+                and cast_output_may_be_floating(node)
                 and output_lineage_limit_gap_count > output_weight_lineage_limit_gap_count
             ):
                 output_weight_lineage_limit_gap_count = output_lineage_limit_gap_count
@@ -3232,14 +3238,20 @@ def _build_onnx_weight_analysis_plan(
                 ) = bounded_lineages(per_output_lineages)
                 if per_output_lineages:
                     value_lineages[name] = per_output_lineages
+                    input_lineage_limit_gap_count_for_output = (
+                        0 if subgraph_results else all_input_lineage_limit_gap_count
+                    )
+                    input_weight_lineage_limit_gap_count_for_output = (
+                        0 if subgraph_results else all_input_output_weight_lineage_limit_gap_count
+                    )
                     propagated_lineage_limit_gap_count = (
-                        all_input_lineage_limit_gap_count
+                        input_lineage_limit_gap_count_for_output
                         + output_lineage_limit_gap_count
                         + per_output_lineage_limit_gap_count
                         + subgraph_output_lineage_gap_counts[output_index]
                     )
                     propagated_weight_lineage_limit_gap_count = (
-                        all_input_output_weight_lineage_limit_gap_count
+                        input_weight_lineage_limit_gap_count_for_output
                         + output_weight_lineage_limit_gap_count
                         + per_output_weight_lineage_limit_gap_count
                         + subgraph_output_weight_lineage_gap_counts[output_index]
