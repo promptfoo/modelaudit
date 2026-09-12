@@ -79,7 +79,7 @@ _PICKLE_SECURITY_RELEVANT_OPCODES = frozenset(
     }
 )
 _PICKLE_EXTENSION_OPCODES = frozenset({"EXT1", "EXT2", "EXT4"})
-_PICKLE_EXTENSION_EXECUTION_OPCODES = frozenset({"BUILD", "NEWOBJ", "NEWOBJ_EX", "OBJ", "REDUCE"})
+_PICKLE_MARK_OPCODE_BYTE = ord("(")
 _PICKLE_DISCOVERY_SHORT_PROBE_BYTES = 16
 _PICKLE_DISCOVERY_LONG_PROBE_BYTES = 64 * 1024
 _TRUSTED_STORAGE_PICKLE_PROBE_BYTES = 4 * 1024
@@ -2085,18 +2085,120 @@ def _looks_like_truncated_security_opcode_prefix(candidate: bytes) -> bool:
 
 
 def _has_executable_extension_opcode_before_stop(candidate: bytes) -> bool:
-    extension_seen = False
+    stack: list[str] = []
+    memo: dict[str, str] = {}
+
+    def push(value: str) -> None:
+        stack.append(value)
+
+    def pop() -> str:
+        return stack.pop() if stack else "other"
+
+    def pop_until_mark() -> None:
+        while stack:
+            if stack.pop() == "mark":
+                break
+
+    def memo_key(arg: object) -> str:
+        return str(arg)
+
+    def callable_is_extension(offset_from_top: int) -> bool:
+        return len(stack) >= offset_from_top and stack[-offset_from_top] == "extension"
+
     try:
-        for opcode, _arg, _pos in pickletools.genops(candidate):
+        for opcode, arg, _pos in pickletools.genops(candidate):
             if opcode.name in _PICKLE_EXTENSION_OPCODES:
-                extension_seen = True
+                push("extension")
+                continue
+            if opcode.name == "MARK":
+                push("mark")
                 continue
             if opcode.name == "STOP":
                 return False
-            if extension_seen and opcode.name in _PICKLE_EXTENSION_EXECUTION_OPCODES:
-                return True
-            if opcode.name in {"POP", "POP_MARK"}:
-                extension_seen = False
+            if opcode.name == "POP":
+                pop()
+                continue
+            if opcode.name == "POP_MARK":
+                pop_until_mark()
+                continue
+            if opcode.name in {"BINPUT", "LONG_BINPUT", "PUT"}:
+                if stack:
+                    memo[memo_key(arg)] = stack[-1]
+                continue
+            if opcode.name == "MEMOIZE":
+                if stack:
+                    memo[str(len(memo))] = stack[-1]
+                continue
+            if opcode.name in {"BINGET", "LONG_BINGET", "GET"}:
+                push(memo.get(memo_key(arg), "other"))
+                continue
+            if opcode.name == "DUP":
+                push(stack[-1] if stack else "other")
+                continue
+            if opcode.name == "TUPLE":
+                pop_until_mark()
+                push("other")
+                continue
+            if opcode.name in {"LIST", "DICT", "FROZENSET"}:
+                pop_until_mark()
+                push("other")
+                continue
+            if opcode.name in {"APPENDS", "SETITEMS", "ADDITEMS"}:
+                pop_until_mark()
+                continue
+            if opcode.name == "EMPTY_TUPLE":
+                push("other")
+                continue
+            if opcode.name in {"TUPLE1", "TUPLE2", "TUPLE3"}:
+                for _ in range(int(opcode.name[-1])):
+                    pop()
+                push("other")
+                continue
+            if opcode.name == "REDUCE":
+                if callable_is_extension(2):
+                    return True
+                pop()
+                pop()
+                push("other")
+                continue
+            if opcode.name == "NEWOBJ":
+                if callable_is_extension(2):
+                    return True
+                pop()
+                pop()
+                push("other")
+                continue
+            if opcode.name == "NEWOBJ_EX":
+                if callable_is_extension(3):
+                    return True
+                pop()
+                pop()
+                pop()
+                push("other")
+                continue
+            if opcode.name == "OBJ":
+                try:
+                    mark_index = len(stack) - 1 - stack[::-1].index("mark")
+                except ValueError:
+                    mark_index = -1
+                if mark_index >= 0 and mark_index + 1 < len(stack) and stack[mark_index + 1] == "extension":
+                    return True
+                pop_until_mark()
+                push("other")
+                continue
+            if opcode.name == "BUILD":
+                if callable_is_extension(2):
+                    return True
+                pop()
+                pop()
+                push("other")
+                continue
+            if opcode.stack_before:
+                for _ in opcode.stack_before:
+                    pop()
+            if opcode.stack_after:
+                for _ in opcode.stack_after:
+                    push("other")
     except Exception:
         return False
     return False
@@ -2646,8 +2748,15 @@ def _literal_value_has_raw_nested_security_pickle(
             if not fail_closed_on_candidate_budget:
                 return _encoded_raw_nested_security_pickle_candidate_budget_exhausted_needs_scan(value[offset:])
             return _raw_nested_security_pickle_candidate_budget_exhausted_needs_scan(value[offset:])
-        candidate = value[offset : offset + _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES]
-        candidate_is_prefix = offset + len(candidate) < len(value)
+        candidate_start = (
+            offset - 1
+            if marker in _BINARY_EXTENSION_SECURITY_OPCODE_BYTES
+            and offset > 0
+            and value[offset - 1] == _PICKLE_MARK_OPCODE_BYTE
+            else offset
+        )
+        candidate = value[candidate_start : candidate_start + _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES]
+        candidate_is_prefix = candidate_start + len(candidate) < len(value)
         if marker == 0x80 and _looks_like_binary_pickle_prefix(candidate, sample_is_prefix=candidate_is_prefix):
             if _has_security_relevant_pickle_opcode(candidate):
                 return True
@@ -2885,8 +2994,9 @@ def _raw_nested_extension_opcode_candidate_has_structural_signal(
             return False
         if not _consume_raw_nested_structural_parse_budget(parse_budget_remaining):
             return True
-        candidate = value[offset : offset + _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES]
-        candidate_is_prefix = offset + len(candidate) < len(value)
+        candidate_start = offset - 1 if offset > 0 and value[offset - 1] == _PICKLE_MARK_OPCODE_BYTE else offset
+        candidate = value[candidate_start : candidate_start + _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES]
+        candidate_is_prefix = candidate_start + len(candidate) < len(value)
         if _has_executable_extension_opcode_before_stop(candidate):
             return True
         if _raw_nested_binary_candidate_should_scan(candidate, candidate_is_prefix=candidate_is_prefix):
