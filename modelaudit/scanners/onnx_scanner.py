@@ -3371,10 +3371,20 @@ def _build_onnx_weight_analysis_plan(
                 graph_output_weight_lineage_gap_counts,
                 graph_output_rank_promotable_lineage_gap_counts,
             ) in subgraph_results:
+                stacked_scan_output_start = len(node.output)
+                if node.op_type == "Loop":
+                    stacked_scan_output_start = max(len(node.input) - 2, 0)
+                elif node.op_type == "Scan":
+                    num_scan_inputs = _onnx_int_attribute(node, "num_scan_inputs", 1)
+                    stacked_scan_output_start = max(len(node.input) - num_scan_inputs, 0)
                 for output_index in range(len(node.output)):
                     graph_output_index = output_index + subgraph_output_offset
                     if graph_output_index >= len(graph_output_lineages):
                         continue
+                    graph_output_rank_promotable_gap_count = graph_output_rank_promotable_lineage_gap_counts[
+                        graph_output_index
+                    ]
+                    stacked_scan_output = output_index >= stacked_scan_output_start
                     merge_lineages(
                         subgraph_output_lineages[output_index],
                         graph_output_lineages[graph_output_index],
@@ -3389,12 +3399,20 @@ def _build_onnx_weight_analysis_plan(
                         subgraph_output_weight_lineage_gap_counts[output_index],
                         graph_output_weight_lineage_gap_counts[graph_output_index],
                     )
-                    subgraph_output_rank_promotable_lineage_gap_counts[output_index] = (
-                        _bounded_onnx_weight_lineage_gap_count(
-                            subgraph_output_rank_promotable_lineage_gap_counts[output_index],
-                            graph_output_rank_promotable_lineage_gap_counts[graph_output_index],
+                    if stacked_scan_output and graph_output_rank_promotable_gap_count:
+                        subgraph_output_weight_lineage_gap_counts[output_index] = (
+                            _bounded_onnx_weight_lineage_gap_count(
+                                subgraph_output_weight_lineage_gap_counts[output_index],
+                                graph_output_rank_promotable_gap_count,
+                            )
                         )
-                    )
+                    else:
+                        subgraph_output_rank_promotable_lineage_gap_counts[output_index] = (
+                            _bounded_onnx_weight_lineage_gap_count(
+                                subgraph_output_rank_promotable_lineage_gap_counts[output_index],
+                                graph_output_rank_promotable_gap_count,
+                            )
+                        )
 
             for output_index, output_name in enumerate(node.output):
                 if not output_name:
