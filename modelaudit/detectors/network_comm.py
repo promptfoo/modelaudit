@@ -1993,9 +1993,10 @@ def _is_check_input_dim_near_match(data: bytes, match_index: int, token_len: int
         before_identifier = match_index - 2 >= 0 and data[match_index - 2] in _IDENTIFIER_BYTES
         before_unicode = match_index - 2 >= 0 and data[match_index - 2] >= 0x80
         return not before_identifier and not before_unicode
-    if match_index > 0 and (data[match_index - 1] in _IDENTIFIER_BYTES or data[match_index - 1] >= 0x80):
-        return False
-    return True
+    if match_index == 0:
+        return True
+    before = data[match_index - 1]
+    return before not in _IDENTIFIER_BYTES and before < 0x80
 
 
 def _is_ignorable_cc_pattern_near_match(data: bytes, pattern: bytes, match_index: int) -> bool:
