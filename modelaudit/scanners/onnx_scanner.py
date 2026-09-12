@@ -2321,15 +2321,12 @@ def _build_onnx_weight_analysis_plan(
         )
         dropped_lineages = ordered_lineages[_ONNX_WEIGHT_LINEAGES_PER_VALUE_LIMIT:]
         dropped_weight_lineages = sum(
-            1
-            for _initializer_index, lineage in dropped_lineages
-            if lineage.unresolved_reason != "dynamic_activation_lineage" and lineage_could_be_weight(lineage)
+            1 for _initializer_index, lineage in dropped_lineages if lineage_could_be_weight(lineage)
         )
         dropped_rank_promotable_lineages = sum(
             1
             for _initializer_index, lineage in dropped_lineages
-            if lineage.unresolved_reason != "dynamic_activation_lineage"
-            and lineage_could_be_weight_after_rank_increase(lineage)
+            if lineage_could_be_weight_after_rank_increase(lineage)
         )
         return (
             dict(ordered_lineages[:_ONNX_WEIGHT_LINEAGES_PER_VALUE_LIMIT]),
