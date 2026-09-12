@@ -6750,6 +6750,44 @@ class TestWeightDistributionSemantics:
         assert semantics["coverage_gaps"] == {}
         assert semantics["eligible_initializer_count"] == 0
 
+    def test_rank_reducing_then_restoring_transform_promotes_deferred_weight_gap(self, tmp_path: Path) -> None:
+        source_names = [f"matrix_weight{index}" for index in range(40)]
+        initializers = [
+            onnx.numpy_helper.from_array(np.ones((1, 4), dtype=np.float32), name=name) for name in source_names
+        ]
+        initializers.extend(
+            [
+                onnx.numpy_helper.from_array(np.array([4], dtype=np.int64), name="vector_shape"),
+                onnx.numpy_helper.from_array(np.array([1], dtype=np.int64), name="axes"),
+            ]
+        )
+        graph = helper.make_graph(
+            [
+                helper.make_node("Sum", source_names, ["mixed_matrix"]),
+                helper.make_node("Reshape", ["mixed_matrix", "vector_shape"], ["generated_vector"]),
+                helper.make_node("Unsqueeze", ["generated_vector", "axes"], ["generated_weight"]),
+                helper.make_node("MatMul", ["X", "generated_weight"], ["Y"]),
+            ],
+            "rank_reducing_then_restoring_transform_promotes_deferred_weight_gap",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 4])],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 1])],
+            initializer=initializers,
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / "rank-reducing-restoring-transform-promotes-deferred-gap.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        assert result.success is False
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["coverage_gaps"]["lineages_per_value_limit"] == 8
+        assert semantics["analyzed_layer_count"] == 0
+
     def test_expand_promotes_deferred_vector_lineage_gap_to_weight_gap(self, tmp_path: Path) -> None:
         shape_names = [f"shape_source{index}" for index in range(32)]
         initializers = [onnx.numpy_helper.from_array(np.array([4], dtype=np.int64), name=name) for name in shape_names]
