@@ -1864,12 +1864,20 @@ def _build_onnx_weight_analysis_plan(
         node: Any,
         *,
         input_shape: tuple[int, ...] | None,
+        index_shape: tuple[int, ...] | None,
         constants: dict[str, Any],
     ) -> bool:
         if node.op_type == "Expand":
             shape_name = str(node.input[1]) if len(node.input) > 1 else ""
             target_shape = constant_int64_vector_values(constants.get(shape_name))
             return target_shape is None or len(target_shape) >= 2
+        if node.op_type == "Gather":
+            if input_shape is None or index_shape is None:
+                return True
+            axis = _onnx_gather_axis(node, len(input_shape))
+            if axis is None:
+                return True
+            return len(input_shape) + len(index_shape) - 1 >= 2
         if node.op_type == "Flatten":
             return True
         if node.op_type == "Unsqueeze":
@@ -2581,7 +2589,7 @@ def _build_onnx_weight_analysis_plan(
             rank_gap_promoting_operator = (
                 getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
                 and not is_model_local_function
-                and node.op_type in {"Expand", "Flatten", "Reshape", "Squeeze", "Unsqueeze"}
+                and node.op_type in {"Expand", "Flatten", "Gather", "Reshape", "Squeeze", "Unsqueeze"}
             )
             all_input_lineages: dict[int, _OnnxWeightLineage] = {}
             all_input_lineage_limit_gap_count = 0
@@ -3199,6 +3207,7 @@ def _build_onnx_weight_analysis_plan(
                 and operator_output_may_have_weight_rank(
                     node,
                     input_shape=known_value_shapes.get(input_names[0]) if input_names else None,
+                    index_shape=known_value_shapes.get(input_names[1]) if len(input_names) > 1 else None,
                     constants=constants,
                 )
             )
