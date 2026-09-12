@@ -6129,6 +6129,23 @@ def test_scan_file_routes_encoded_extension_with_live_mark_context(tmp_path: Pat
     assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/0"]
 
 
+def test_scan_file_routes_encoded_extension_operand_cut_after_recovered_mark(tmp_path: Path) -> None:
+    archive_path = tmp_path / "recovered-mark-extension-boundary.pt"
+    nested_payload = b"(" + (b"N" * (package_api._MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES - 2)) + b"\x82\x01)R."
+    storage_blob = _proto0_string_literal(base64.b64encode(nested_payload))
+    storage_blob += b" " * (-len(storage_blob) % 4)
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", storage_blob)
+
+    report = scan_file(archive_path)
+
+    assert report.verdict != SafetyVerdict.CLEAN
+    assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/0"]
+
+
 def test_scan_file_routes_nested_mark_extension_context(tmp_path: Path) -> None:
     archive_path = tmp_path / "nested-mark-extension.pt"
     payload = b"(N(N10\x82\x01)o\xff"
@@ -19509,6 +19526,16 @@ def test_raw_nested_extension_boundary_recovery_charges_shared_budget() -> None:
 
 def test_raw_nested_extension_routes_live_mark_after_context_budget_exhaustion() -> None:
     value = (b"(\xff" * package_api._MAX_RAW_NESTED_PICKLE_CANDIDATES) + b"(](NNNe0\x82\x01)o"
+
+    assert package_api._raw_nested_extension_opcode_candidate_has_structural_signal(
+        value,
+        [package_api._MAX_RAW_NESTED_PICKLE_CANDIDATES],
+    )
+    assert package_api._literal_value_has_raw_nested_security_pickle(value)
+
+
+def test_raw_nested_extension_routes_recovered_operand_boundary() -> None:
+    value = b"(" + (b"N" * (package_api._MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES - 2)) + b"\x82\x01)R."
 
     assert package_api._raw_nested_extension_opcode_candidate_has_structural_signal(
         value,

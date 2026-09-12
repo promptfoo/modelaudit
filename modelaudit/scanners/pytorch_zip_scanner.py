@@ -158,6 +158,7 @@ _RAW_NESTED_SECURITY_PICKLE_START_BYTES = (
     _RAW_NESTED_TEXT_SECURITY_PICKLE_START_BYTES + _RAW_NESTED_BINARY_SECURITY_PICKLE_START_BYTES
 )
 _BINARY_EXTENSION_SECURITY_OPCODE_BYTES = b"\x82\x83\x84"
+_BINARY_EXTENSION_OPCODE_OPERAND_LENGTHS = {0x82: 1, 0x83: 2, 0x84: 4}
 _BINARY_SECURITY_OPCODE_REQUIRING_EXISTING_STACK_BYTES = b"\x81\x92\x93"
 _MAX_RAW_NESTED_PICKLE_CANDIDATES = 64
 _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES = 8 * 1024
@@ -2783,6 +2784,20 @@ class PyTorchZipScanner(BaseScanner):
         return False
 
     @staticmethod
+    def _candidate_truncates_extension_operand(
+        *,
+        candidate_start: int,
+        candidate: bytes,
+        offset: int,
+        marker: int,
+    ) -> bool:
+        operand_len = _BINARY_EXTENSION_OPCODE_OPERAND_LENGTHS.get(marker)
+        if operand_len is None:
+            return False
+        candidate_end = candidate_start + len(candidate)
+        return candidate_start <= offset < candidate_end < offset + 1 + operand_len
+
+    @staticmethod
     def _has_executable_extension_opcode_before_stop(
         candidate: bytes,
         *,
@@ -3523,6 +3538,13 @@ class PyTorchZipScanner(BaseScanner):
                 recovered_extension_context = True
             candidate = value[candidate_start : candidate_start + _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES]
             candidate_is_prefix = candidate_start + len(candidate) < len(value)
+            if recovered_extension_context and PyTorchZipScanner._candidate_truncates_extension_operand(
+                candidate_start=candidate_start,
+                candidate=candidate,
+                offset=offset,
+                marker=marker,
+            ):
+                return True
             if marker == 0x80 and PyTorchZipScanner._looks_like_binary_pickle_prefix(
                 candidate, sample_is_prefix=candidate_is_prefix
             ):
@@ -3644,11 +3666,8 @@ class PyTorchZipScanner(BaseScanner):
             return False
         if offset + len(candidate) < len(value):
             return False
-        operand_len = {0x82: 1, 0x83: 2, 0x84: 4}[candidate[0]]
-        if len(candidate) >= 1 + operand_len:
-            return False
-        trailing = candidate[1 + operand_len :]
-        return not trailing or not trailing.strip(PROTO0_1_IGNORABLE_TRAILING_BYTES)
+        operand_len = _BINARY_EXTENSION_OPCODE_OPERAND_LENGTHS[candidate[0]]
+        return len(candidate) < 1 + operand_len
 
     @staticmethod
     def _encoded_raw_nested_security_pickle_candidate_budget_exhausted_needs_scan(value: bytes) -> bool:
@@ -3851,6 +3870,13 @@ class PyTorchZipScanner(BaseScanner):
                 return True
             candidate = value[candidate_start : candidate_start + _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES]
             candidate_is_prefix = candidate_start + len(candidate) < len(value)
+            if PyTorchZipScanner._candidate_truncates_extension_operand(
+                candidate_start=candidate_start,
+                candidate=candidate,
+                offset=offset,
+                marker=value[offset],
+            ):
+                return True
             if PyTorchZipScanner._has_executable_extension_opcode_before_stop(
                 candidate,
                 fail_closed_on_truncated_extension=fail_closed_on_truncated_extension,

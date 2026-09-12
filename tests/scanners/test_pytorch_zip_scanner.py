@@ -3082,6 +3082,25 @@ def test_pytorch_zip_discovery_routes_encoded_extension_with_live_mark_context(t
     assert "archive/data/0" in result.metadata["pickle_files"]
 
 
+def test_pytorch_zip_discovery_routes_encoded_extension_operand_cut_after_recovered_mark(tmp_path: Path) -> None:
+    model_path = tmp_path / "referenced_recovered_mark_extension_boundary.pt"
+    nested_payload = (
+        b"(" + (b"N" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES - 2)) + b"\x82\x01)R."
+    )
+    storage_blob = _proto0_string_literal(base64.b64encode(nested_payload))
+    storage_blob += b" " * (-len(storage_blob) % 4)
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        zip_file.writestr("archive/data/0", storage_blob)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert result.success is False
+    assert "archive/data/0" in result.metadata["pickle_files"]
+
+
 def test_pytorch_zip_discovery_routes_nested_mark_extension_context(tmp_path: Path) -> None:
     model_path = tmp_path / "referenced_nested_mark_extension.pt"
     payload = b"(N(N10\x82\x01)o\xff"
@@ -3330,6 +3349,16 @@ def test_pytorch_zip_raw_nested_extension_boundary_recovery_charges_shared_budge
 
 def test_pytorch_zip_raw_nested_extension_routes_live_mark_after_context_budget_exhaustion() -> None:
     value = (b"(\xff" * pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES) + b"(](NNNe0\x82\x01)o"
+
+    assert PyTorchZipScanner._raw_nested_extension_opcode_candidate_has_structural_signal(
+        value,
+        [pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES],
+    )
+    assert PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(value)
+
+
+def test_pytorch_zip_raw_nested_extension_routes_recovered_operand_boundary() -> None:
+    value = b"(" + (b"N" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES - 2)) + b"\x82\x01)R."
 
     assert PyTorchZipScanner._raw_nested_extension_opcode_candidate_has_structural_signal(
         value,

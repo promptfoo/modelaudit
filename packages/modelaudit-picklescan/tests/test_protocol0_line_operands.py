@@ -1092,7 +1092,7 @@ def test_trusted_storage_probe_routes_extension_opcode_after_budget_noise() -> N
 
 
 def test_trusted_storage_probe_skips_incomplete_extension_opcode_after_budget_noise() -> None:
-    literal = (b"c" * (picklescan_api._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)) + (b"A" * 10) + b"\x82\x01"
+    literal = (b"c" * (picklescan_api._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)) + (b"A" * 10) + b"\x82"
 
     assert not picklescan_api._literal_value_has_raw_nested_security_pickle(literal)
 
