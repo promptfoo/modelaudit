@@ -126,6 +126,8 @@ _PICKLE_SECURITY_RELEVANT_OPCODES = frozenset(
         "STACK_GLOBAL",
     }
 )
+_PICKLE_EXTENSION_OPCODES = frozenset({"EXT1", "EXT2", "EXT4"})
+_PICKLE_EXTENSION_EXECUTION_OPCODES = frozenset({"BUILD", "NEWOBJ", "NEWOBJ_EX", "OBJ", "REDUCE"})
 _PICKLE_OPCODE_BYTES = frozenset(ord(opcode.code) for opcode in pickletools.opcodes)
 _PROTO0_1_LITERAL_OPCODES = frozenset(
     {
@@ -2753,6 +2755,24 @@ class PyTorchZipScanner(BaseScanner):
         return False
 
     @staticmethod
+    def _has_executable_extension_opcode_before_stop(candidate: bytes) -> bool:
+        extension_seen = False
+        try:
+            for opcode, _arg, _pos in pickletools.genops(candidate):
+                if opcode.name in _PICKLE_EXTENSION_OPCODES:
+                    extension_seen = True
+                    continue
+                if opcode.name == "STOP":
+                    return False
+                if extension_seen and opcode.name in _PICKLE_EXTENSION_EXECUTION_OPCODES:
+                    return True
+                if opcode.name in {"POP", "POP_MARK"}:
+                    extension_seen = False
+        except Exception:
+            return False
+        return False
+
+    @staticmethod
     def _trivial_complete_pickle_prefix_trailing_should_scan(
         sample: bytes,
         *,
@@ -3585,6 +3605,8 @@ class PyTorchZipScanner(BaseScanner):
                 return True
             candidate = value[offset : offset + _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES]
             candidate_is_prefix = offset + len(candidate) < len(value)
+            if PyTorchZipScanner._has_executable_extension_opcode_before_stop(candidate):
+                return True
             if PyTorchZipScanner._raw_nested_binary_candidate_should_scan(
                 candidate,
                 candidate_is_prefix=candidate_is_prefix,

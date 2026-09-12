@@ -78,6 +78,8 @@ _PICKLE_SECURITY_RELEVANT_OPCODES = frozenset(
         "STACK_GLOBAL",
     }
 )
+_PICKLE_EXTENSION_OPCODES = frozenset({"EXT1", "EXT2", "EXT4"})
+_PICKLE_EXTENSION_EXECUTION_OPCODES = frozenset({"BUILD", "NEWOBJ", "NEWOBJ_EX", "OBJ", "REDUCE"})
 _PICKLE_DISCOVERY_SHORT_PROBE_BYTES = 16
 _PICKLE_DISCOVERY_LONG_PROBE_BYTES = 64 * 1024
 _TRUSTED_STORAGE_PICKLE_PROBE_BYTES = 4 * 1024
@@ -2082,6 +2084,24 @@ def _looks_like_truncated_security_opcode_prefix(candidate: bytes) -> bool:
     return False
 
 
+def _has_executable_extension_opcode_before_stop(candidate: bytes) -> bool:
+    extension_seen = False
+    try:
+        for opcode, _arg, _pos in pickletools.genops(candidate):
+            if opcode.name in _PICKLE_EXTENSION_OPCODES:
+                extension_seen = True
+                continue
+            if opcode.name == "STOP":
+                return False
+            if extension_seen and opcode.name in _PICKLE_EXTENSION_EXECUTION_OPCODES:
+                return True
+            if opcode.name in {"POP", "POP_MARK"}:
+                extension_seen = False
+    except Exception:
+        return False
+    return False
+
+
 def _trivial_complete_pickle_prefix_trailing_should_scan(
     sample: bytes,
     *,
@@ -2867,6 +2887,8 @@ def _raw_nested_extension_opcode_candidate_has_structural_signal(
             return True
         candidate = value[offset : offset + _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES]
         candidate_is_prefix = offset + len(candidate) < len(value)
+        if _has_executable_extension_opcode_before_stop(candidate):
+            return True
         if _raw_nested_binary_candidate_should_scan(candidate, candidate_is_prefix=candidate_is_prefix):
             return True
         search_start = offset + 1

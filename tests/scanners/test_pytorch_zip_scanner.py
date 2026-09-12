@@ -3098,6 +3098,19 @@ def test_pytorch_zip_discovery_checks_long_window_before_padding_budget(tmp_path
     assert budget == [0]
 
 
+def test_pytorch_zip_routes_raw_nested_extension_reduce_candidate_without_stop() -> None:
+    executable_candidate = base64.b64decode("ggEpUg==")
+
+    assert PyTorchZipScanner._raw_nested_extension_opcode_candidate_has_structural_signal(
+        executable_candidate,
+        [pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES],
+    )
+    assert not PyTorchZipScanner._raw_nested_extension_opcode_candidate_has_structural_signal(
+        executable_candidate[:-1],
+        [pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES],
+    )
+
+
 def test_pytorch_zip_discovery_charges_detected_expanded_probe_once(tmp_path: Path) -> None:
     model_path = tmp_path / "referenced_detected_expanded_probe_budget_once.pt"
     malicious_suffix = _malicious_proto0_system_payload()

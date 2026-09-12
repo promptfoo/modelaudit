@@ -19084,6 +19084,19 @@ def test_scan_file_scans_binary_storage_member_inside_expanded_probe_window(tmp_
     )
 
 
+def test_raw_nested_extension_reduce_candidate_routes_without_stop() -> None:
+    executable_candidate = base64.b64decode("ggEpUg==")
+
+    assert package_api._raw_nested_extension_opcode_candidate_has_structural_signal(
+        executable_candidate,
+        [package_api._MAX_RAW_NESTED_PICKLE_CANDIDATES],
+    )
+    assert not package_api._raw_nested_extension_opcode_candidate_has_structural_signal(
+        executable_candidate[:-1],
+        [package_api._MAX_RAW_NESTED_PICKLE_CANDIDATES],
+    )
+
+
 @pytest.mark.parametrize(
     ("pickle_prefix", "case_name"),
     [
