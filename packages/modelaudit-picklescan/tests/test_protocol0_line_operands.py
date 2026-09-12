@@ -6,11 +6,13 @@ import os
 import pickle
 import struct
 import time
+import zipfile
 from collections.abc import Mapping
+from pathlib import Path
 
 import pytest
 
-from modelaudit_picklescan import SafetyVerdict, ScanOptions, ScanStatus, scan_bytes
+from modelaudit_picklescan import SafetyVerdict, ScanOptions, ScanStatus, scan_bytes, scan_file
 from modelaudit_picklescan import api as picklescan_api
 
 MAX_PROTOCOL0_LINE_OPERAND_BYTES = 8 * 1024 * 1024
@@ -62,6 +64,27 @@ def _proto0_string_literal(value: bytes) -> bytes:
 
 def _binbytes_literal_pickle(value: bytes) -> bytes:
     return b"B" + struct.pack("<I", len(value)) + value + b"."
+
+
+def _short_binunicode(data: bytes) -> bytes:
+    assert len(data) < 256
+    return b"\x8c" + bytes([len(data)]) + data
+
+
+def _float_storage_persistent_id_payload_for_bytes(key: str, data: bytes) -> bytes:
+    element_count = max(1, len(data) // 4)
+    return (
+        b"\x80\x04("
+        + _short_binunicode(b"storage")
+        + _short_binunicode(b"torch")
+        + _short_binunicode(b"FloatStorage")
+        + b"\x93"
+        + _short_binunicode(key.encode("ascii"))
+        + _short_binunicode(b"cpu")
+        + b"K"
+        + bytes([element_count])
+        + b"tQ."
+    )
 
 
 def _frame(payload: bytes) -> bytes:
@@ -1074,10 +1097,66 @@ def test_trusted_storage_probe_skips_incomplete_extension_opcode_after_budget_no
     assert not picklescan_api._literal_value_has_raw_nested_security_pickle(literal)
 
 
+def test_trusted_storage_probe_routes_later_pickle_after_incomplete_extension_budget_noise() -> None:
+    nested_pickle = b"\x80\x04\x8c\x08builtins\x8c\x04eval\x93\x8c\x031+1\x85R."
+    literal = (
+        (b"c" * (picklescan_api._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1))
+        + (b"A" * 10)
+        + b"\x82\x01"
+        + (b" " * picklescan_api._MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES)
+        + nested_pickle
+    )
+
+    assert picklescan_api._literal_value_has_raw_nested_security_pickle(literal)
+
+
+def test_raw_nested_extension_budget_exhaustion_routes_without_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    literal = (
+        (b"c" * (picklescan_api._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1))
+        + (b"(" * (picklescan_api._MAX_RAW_NESTED_PICKLE_CANDIDATES + 6))
+        + b"\xff"
+        + (b"\x82\x01" * 1900)
+    )
+
+    def fail_if_called(_candidate: bytes) -> bool:
+        raise AssertionError("fallback parser should not run after extension context budget exhaustion")
+
+    monkeypatch.setattr(
+        picklescan_api,
+        "_extension_candidate_after_exhausted_context_should_scan",
+        fail_if_called,
+    )
+    parse_budget_remaining = [picklescan_api._MAX_RAW_NESTED_PICKLE_CANDIDATES]
+
+    assert picklescan_api._raw_nested_extension_opcode_candidate_has_structural_signal(
+        literal,
+        parse_budget_remaining,
+    )
+    assert parse_budget_remaining == [0]
+
+
 def test_trusted_storage_probe_routes_legacy_raw_candidate_budget_exhaustion() -> None:
     literal = (b"\x82" * 65) + (b"\xff" * 16)
 
     assert picklescan_api._literal_value_has_raw_nested_security_pickle(literal)
+
+
+def test_scan_file_keeps_float_storage_extension_like_bytes_clean(tmp_path: Path) -> None:
+    storage_blob = b"\x8c\x01\xff\x3f\x82\x01\xff\x3f"
+    model_path = tmp_path / "float-storage-extension-like-bytes.pt"
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        zip_file.writestr("archive/data/0", storage_blob)
+
+    report = scan_file(model_path)
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert tuple(report.metadata.get("pickle_files", ())) == ("archive/data.pkl",)
 
 
 def test_trusted_storage_probe_routes_encoded_pickle_after_binary_candidate_budget_noise() -> None:

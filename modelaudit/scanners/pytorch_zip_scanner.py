@@ -2182,16 +2182,8 @@ class PyTorchZipScanner(BaseScanner):
                     short_sample,
                     candidate_is_prefix=entry.file_size > len(short_sample),
                 )
-                or PyTorchZipScanner._raw_nested_extension_opcode_candidate_has_structural_signal(
-                    sample,
-                    [_MAX_RAW_NESTED_PICKLE_CANDIDATES],
-                    fail_closed_on_unknown_after_extension=True,
-                )
-                or PyTorchZipScanner._raw_nested_extension_opcode_candidate_has_structural_signal(
-                    short_sample,
-                    [_MAX_RAW_NESTED_PICKLE_CANDIDATES],
-                    fail_closed_on_unknown_after_extension=True,
-                )
+                or PyTorchZipScanner._headerless_extension_candidate_should_scan_trusted_storage_sample(sample)
+                or PyTorchZipScanner._headerless_extension_candidate_should_scan_trusted_storage_sample(short_sample)
             )
             if should_scan:
                 charge_detection_probe_budget()
@@ -2522,6 +2514,23 @@ class PyTorchZipScanner(BaseScanner):
         if PyTorchZipScanner._contains_pickle_frame_opcode(sample):
             return False
         return _looks_like_proto0_or_1_pickle(sample, sample_is_prefix=True)
+
+    @staticmethod
+    def _headerless_extension_candidate_should_scan_trusted_storage_sample(sample: bytes) -> bool:
+        candidate = sample.lstrip(PROTO0_1_IGNORABLE_TRAILING_BYTES)
+        if not candidate:
+            return False
+        if (
+            candidate[0] not in _BINARY_EXTENSION_SECURITY_OPCODE_BYTES
+            and candidate[0] != _PICKLE_MARK_OPCODE_BYTE
+            and PyTorchZipScanner._complete_headerless_byte_literal_prefix_trailing(sample) is None
+        ):
+            return False
+        return PyTorchZipScanner._raw_nested_extension_opcode_candidate_has_structural_signal(
+            sample,
+            [_MAX_RAW_NESTED_PICKLE_CANDIDATES],
+            fail_closed_on_unknown_after_extension=True,
+        )
 
     @staticmethod
     def _proto0_or_1_trusted_storage_probe_needs_expanded_sample(
@@ -3605,11 +3614,35 @@ class PyTorchZipScanner(BaseScanner):
 
     @staticmethod
     def _raw_nested_security_pickle_candidate_budget_exhausted_needs_scan(value: bytes) -> bool:
-        if PyTorchZipScanner._raw_nested_security_pickle_text_marker_seen(value):
-            return True
-        if value and value[0] in _BINARY_EXTENSION_SECURITY_OPCODE_BYTES:
-            return True
+        if PyTorchZipScanner._budget_exhausted_suffix_is_only_incomplete_extension_after_text_noise(value):
+            return False
         return PyTorchZipScanner._raw_nested_security_pickle_candidate_has_structural_signal(value)
+
+    @staticmethod
+    def _budget_exhausted_suffix_is_only_incomplete_extension_after_text_noise(value: bytes) -> bool:
+        if PyTorchZipScanner._raw_nested_proto0_global_ref_seen(value):
+            return False
+        extension_offsets = [
+            offset
+            for offset, byte in enumerate(value[:_MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES])
+            if byte in _BINARY_EXTENSION_SECURITY_OPCODE_BYTES
+        ]
+        if len(extension_offsets) != 1:
+            return False
+        offset = extension_offsets[0]
+        prefix = value[:offset]
+        if not prefix or any(
+            byte not in _PROTO0_GLOBAL_NAME_BYTES and byte not in PROTO0_1_IGNORABLE_TRAILING_BYTES for byte in prefix
+        ):
+            return False
+        candidate = value[offset : offset + _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES]
+        if PyTorchZipScanner._extension_candidate_after_exhausted_context_should_scan(candidate):
+            return False
+        if offset + len(candidate) < len(value):
+            return False
+        operand_len = {0x82: 1, 0x83: 2, 0x84: 4}[candidate[0]]
+        trailing = candidate[1 + operand_len :]
+        return not trailing or not trailing.strip(PROTO0_1_IGNORABLE_TRAILING_BYTES)
 
     @staticmethod
     def _encoded_raw_nested_security_pickle_candidate_budget_exhausted_needs_scan(value: bytes) -> bool:
