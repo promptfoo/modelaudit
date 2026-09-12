@@ -2921,6 +2921,8 @@ def _trailing_candidate_has_raw_nested_security_pickle(
 
 
 def _raw_nested_security_pickle_candidate_budget_exhausted_needs_scan(value: bytes) -> bool:
+    if _raw_nested_security_pickle_text_marker_seen(value):
+        return True
     if _budget_exhausted_suffix_is_only_incomplete_extension_after_text_noise(value):
         return False
     return _raw_nested_security_pickle_candidate_has_structural_signal(value)
@@ -2948,6 +2950,8 @@ def _budget_exhausted_suffix_is_only_incomplete_extension_after_text_noise(value
     if offset + len(candidate) < len(value):
         return False
     operand_len = {0x82: 1, 0x83: 2, 0x84: 4}[candidate[0]]
+    if len(candidate) >= 1 + operand_len:
+        return False
     trailing = candidate[1 + operand_len :]
     return not trailing or not trailing.strip(_PROTO0_1_IGNORABLE_TRAILING_BYTES)
 
@@ -6982,6 +6986,13 @@ def _with_unanalyzed_call_graph_notices(
     report: PickleReport,
     references: tuple[UnanalyzedCallGraphReference, ...],
 ) -> PickleReport:
+    uncovered_references = tuple(
+        reference
+        for reference in references
+        if not _direct_critical_call_finding_covers_unanalyzed_reference(report, reference)
+    )
+    if not uncovered_references:
+        return report
     notices = (
         *report.notices,
         *(
@@ -6998,7 +7009,7 @@ def _with_unanalyzed_call_graph_notices(
                     "analysis_incomplete": True,
                 },
             )
-            for reference in references
+            for reference in uncovered_references
         ),
     )
     metadata = {**report.to_dict()["metadata"], "analysis_incomplete": True}
@@ -7018,6 +7029,23 @@ def _with_unanalyzed_call_graph_notices(
         private_metadata=report.private_metadata,
         duration_s=report.duration_s,
     )
+
+
+def _direct_critical_call_finding_covers_unanalyzed_reference(
+    report: PickleReport,
+    reference: UnanalyzedCallGraphReference,
+) -> bool:
+    for finding in report.findings:
+        if finding.severity != Severity.CRITICAL or finding.rule_code != "DANGEROUS_CALL":
+            continue
+        module = finding.details.get("module")
+        name = finding.details.get("name")
+        if module == reference.module and name == reference.name:
+            return True
+        import_reference = finding.details.get("import_reference")
+        if import_reference == reference.import_reference:
+            return True
+    return False
 
 
 def _call_graph_import_reference_limit_finding_to_report_finding(report: PickleReport) -> Finding:

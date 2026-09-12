@@ -3614,6 +3614,8 @@ class PyTorchZipScanner(BaseScanner):
 
     @staticmethod
     def _raw_nested_security_pickle_candidate_budget_exhausted_needs_scan(value: bytes) -> bool:
+        if PyTorchZipScanner._raw_nested_security_pickle_text_marker_seen(value):
+            return True
         if PyTorchZipScanner._budget_exhausted_suffix_is_only_incomplete_extension_after_text_noise(value):
             return False
         return PyTorchZipScanner._raw_nested_security_pickle_candidate_has_structural_signal(value)
@@ -3641,6 +3643,8 @@ class PyTorchZipScanner(BaseScanner):
         if offset + len(candidate) < len(value):
             return False
         operand_len = {0x82: 1, 0x83: 2, 0x84: 4}[candidate[0]]
+        if len(candidate) >= 1 + operand_len:
+            return False
         trailing = candidate[1 + operand_len :]
         return not trailing or not trailing.strip(PROTO0_1_IGNORABLE_TRAILING_BYTES)
 

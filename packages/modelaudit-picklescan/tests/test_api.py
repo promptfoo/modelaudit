@@ -18,6 +18,7 @@ import os
 import pickle
 import py_compile
 import re
+import struct
 import subprocess
 import sys
 import tarfile
@@ -4435,6 +4436,47 @@ def test_scan_file_routes_extension_callable_in_referenced_storage(
     )
 
 
+def _budget_exhausted_headerless_extension_literal() -> bytes:
+    payload = b"c" * (package_api._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)
+    return b"C" + bytes([len(payload)]) + payload + b"0\x82\x01"
+
+
+def _budget_exhausted_truncated_inst_literal() -> bytes:
+    padding = b"c" * package_api._MAX_RAW_NESTED_PICKLE_CANDIDATES
+    return padding + b"iposix\nsystem\n"
+
+
+@pytest.mark.parametrize(
+    ("literal", "case_name"),
+    [
+        (_budget_exhausted_headerless_extension_literal(), "extension-after-headerless-literal-budget"),
+        (_budget_exhausted_truncated_inst_literal(), "inst-after-candidate-budget"),
+    ],
+)
+def test_scan_file_routes_budget_exhausted_referenced_storage(
+    tmp_path: Path,
+    literal: bytes,
+    case_name: str,
+) -> None:
+    storage = _proto0_string_literal(literal)
+    storage += b" " * (-len(storage) % 4)
+    archive_path = tmp_path / f"{case_name}-storage.pt"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage))
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", storage)
+
+    report = scan_file(archive_path)
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/0"]
+    assert any(
+        notice.code == "parse_incomplete" and "archive/data/0" in str(notice.location) for notice in report.notices
+    )
+
+
 def test_trusted_storage_probe_bounds_nested_byte_literal_discovery(tmp_path: Path) -> None:
     storage = b"hello"
     for _ in range(19):
@@ -8648,6 +8690,14 @@ def test_raw_nested_literal_candidates_fail_closed_after_budget(monkeypatch: pyt
 
     assert package_api._literal_value_has_raw_nested_security_pickle(value) is False
     assert calls == package_api._MAX_RAW_NESTED_PICKLE_CANDIDATES
+
+
+def test_raw_nested_literal_routes_extension_operand_after_budget_exhaustion() -> None:
+    assert package_api._literal_value_has_raw_nested_security_pickle(_budget_exhausted_headerless_extension_literal())
+
+
+def test_raw_nested_literal_preserves_text_marker_after_budget_exhaustion() -> None:
+    assert package_api._literal_value_has_raw_nested_security_pickle(_budget_exhausted_truncated_inst_literal())
 
 
 def test_raw_nested_structural_fallback_bounds_binary_opcode_candidates(
@@ -16990,6 +17040,47 @@ def test_unanalyzed_call_graph_notice_preserves_suspicious_verdict() -> None:
     assert updated.verdict == SafetyVerdict.SUSPICIOUS
     assert updated.findings == (finding,)
     assert updated.metadata["analysis_incomplete"] is True
+
+
+class DirectSystemPayload:
+    def __reduce__(self) -> tuple[Any, tuple[str]]:
+        return (os.system, ("id",))
+
+
+def _alternate_platform_system_reduce_payload() -> tuple[bytes, str]:
+    native_module = b"nt" if os.name == "nt" else b"posix"
+    alternate_module = b"posix" if native_module == b"nt" else b"nt"
+    payload = pickle.dumps(
+        {
+            "state_dict": collections.OrderedDict([("layer.weight", "tensor_data")]),
+            "payload": DirectSystemPayload(),
+        },
+        protocol=4,
+    )
+    native_token = _short_binunicode(native_module)
+    alternate_token = _short_binunicode(alternate_module)
+    assert native_token in payload
+    payload = payload.replace(native_token, alternate_token, 1)
+    if payload.startswith(b"\x80\x04\x95"):
+        payload = payload[:3] + struct.pack("<Q", len(payload) - 11) + payload[11:]
+    return payload, f"{alternate_module.decode()}.system"
+
+
+def test_direct_dangerous_call_suppresses_redundant_source_unavailable_notice() -> None:
+    payload, import_reference = _alternate_platform_system_reduce_payload()
+
+    report = scan_bytes(payload, source="direct-platform-system.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL" and finding.details.get("import_reference") == import_reference
+        for finding in report.findings
+    )
+    assert not any(
+        notice.code == "call_graph_source_unavailable" and notice.details.get("import_reference") == import_reference
+        for notice in report.notices
+    )
 
 
 def test_with_call_graph_findings_preserves_startup_hook_findings_before_limit_error(

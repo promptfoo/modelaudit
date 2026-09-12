@@ -3339,7 +3339,7 @@ def test_pytorch_zip_raw_nested_extension_routes_live_mark_after_context_budget_
 
 
 def test_pytorch_zip_raw_nested_extension_skips_incomplete_opcode_after_budget_noise() -> None:
-    value = (b"c" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)) + b"A" * 10 + b"\x82\x01"
+    value = (b"c" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)) + b"A" * 10 + b"\x82"
 
     assert not PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(value)
 
@@ -5159,6 +5159,43 @@ def test_pytorch_zip_discovery_routes_headerless_binary_pickle_after_budget_nois
     )
 
 
+def _budget_exhausted_headerless_extension_literal() -> bytes:
+    payload = b"c" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)
+    return b"C" + bytes([len(payload)]) + payload + b"0\x82\x01"
+
+
+def _budget_exhausted_truncated_inst_literal() -> bytes:
+    padding = b"c" * pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES
+    return padding + b"iposix\nsystem\n"
+
+
+@pytest.mark.parametrize(
+    ("literal", "case_name"),
+    [
+        (_budget_exhausted_headerless_extension_literal(), "extension_after_headerless_literal_budget"),
+        (_budget_exhausted_truncated_inst_literal(), "inst_after_candidate_budget"),
+    ],
+)
+def test_pytorch_zip_discovery_routes_budget_exhausted_storage(
+    tmp_path: Path,
+    literal: bytes,
+    case_name: str,
+) -> None:
+    model_path = tmp_path / f"referenced_{case_name}.pt"
+    storage_blob = _proto0_string_literal(literal)
+    storage_blob += b" " * (-len(storage_blob) % 4)
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        zip_file.writestr("archive/data/0", storage_blob)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert result.success is False
+    assert "archive/data/0" in result.metadata["pickle_files"]
+
+
 def test_pytorch_zip_discovery_routes_bytearray8_literal_after_trivial_prefix(tmp_path: Path) -> None:
     model_path = tmp_path / "referenced_bytearray8_after_trivial_prefix.pt"
     encoded = base64.b64encode(b"cposix\nsystem\n)R.")
@@ -6347,6 +6384,16 @@ def test_pytorch_zip_discovery_raw_nested_literal_candidates_fail_closed_after_b
 
     assert PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(value) is False
     assert calls == pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES
+
+
+def test_pytorch_zip_raw_nested_literal_routes_extension_operand_after_budget_exhaustion() -> None:
+    assert PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(
+        _budget_exhausted_headerless_extension_literal()
+    )
+
+
+def test_pytorch_zip_raw_nested_literal_preserves_text_marker_after_budget_exhaustion() -> None:
+    assert PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(_budget_exhausted_truncated_inst_literal())
 
 
 def test_pytorch_zip_structural_fallback_bounds_binary_opcode_candidates(
