@@ -1950,9 +1950,11 @@ def test_identity_capture_closes_darwin_monitor_on_retained_keyboard_interrupt(
     assert created_monitors[0].closed is True
 
 
+@pytest.mark.parametrize("retry_capture", [False, True], ids=["initial-capture", "retried-capture"])
 def test_cache_lookup_closes_darwin_monitor_on_retained_keyboard_interrupt(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    retry_capture: bool,
 ) -> None:
     created_monitors: list[Any] = []
 
@@ -1975,13 +1977,25 @@ def test_cache_lookup_closes_darwin_monitor_on_retained_keyboard_interrupt(
     monkeypatch.setattr(scan_results_cache_module.sys, "platform", "darwin")
     monkeypatch.setattr(scan_results_cache_module, "_DarwinPathMonitor", StubDarwinPathMonitor)
     monkeypatch.setattr(cache, "_generate_cache_key_material", interrupt_cache_key)
+    original_hash = cache.hasher.hash_file_with_stat
+    hash_attempts = 0
+
+    def hash_with_retry(path: str, file_stat: os.stat_result) -> str:
+        nonlocal hash_attempts
+        hash_attempts += 1
+        if retry_capture and hash_attempts == 1:
+            raise ValueError("File changed while hashing")
+        return original_hash(path, file_stat)
+
+    monkeypatch.setattr(cache.hasher, "hash_file_with_stat", hash_with_retry)
 
     with pytest.raises(KeyboardInterrupt, match="cache key generation interrupted") as interruption:
         cache.get_cached_result_with_identity(str(file_path))
 
     assert interruption.traceback is not None
-    assert len(created_monitors) == 1
-    assert created_monitors[0].closed is True
+    assert hash_attempts >= (2 if retry_capture else 1)
+    assert len(created_monitors) >= hash_attempts
+    assert all(monitor.closed for monitor in created_monitors)
 
 
 def _stub_darwin_select(queue: Any) -> type[Any]:
