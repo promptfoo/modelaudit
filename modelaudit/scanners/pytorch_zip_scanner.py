@@ -159,6 +159,7 @@ _BINARY_EXTENSION_SECURITY_OPCODE_BYTES = b"\x82\x83\x84"
 _BINARY_SECURITY_OPCODE_REQUIRING_EXISTING_STACK_BYTES = b"\x81\x92\x93"
 _MAX_RAW_NESTED_PICKLE_CANDIDATES = 64
 _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES = 8 * 1024
+_MAX_NESTED_LITERAL_SCAN_DEPTH = 8
 _PROTO0_GLOBAL_OR_INST_PREFIX_WITHOUT_NEWLINE_RE = re.compile(rb"[ci][A-Za-z_][A-Za-z0-9_.]*")
 _REPEATED_PROTO0_INT_STREAM_RE = re.compile(rb"(?:I[+-]?\d+\n\.)+")
 _PROTO0_GLOBAL_NAME_START_BYTES = frozenset(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_")
@@ -2067,6 +2068,10 @@ class PyTorchZipScanner(BaseScanner):
             not is_binary_pickle_candidate
             and not is_frame_first_candidate
             and data_start[0] in _HEADERLESS_BINARY_PICKLE_START_BYTES
+            and PyTorchZipScanner._headerless_binary_byte_literal_has_possible_size(
+                data_start,
+                entry_size=entry.file_size,
+            )
         )
         if (
             not is_binary_pickle_candidate
@@ -2120,8 +2125,8 @@ class PyTorchZipScanner(BaseScanner):
                         detection_probe_budget_charge_bytes = entry.file_size
                 elif (
                     PyTorchZipScanner._trivial_complete_pickle_prefix_has_only_padding(data_start)
-                    and defer_padding_probe is None
-                ):
+                    or PyTorchZipScanner._complete_headerless_byte_literal_prefix_has_only_padding(data_start)
+                ) and defer_padding_probe is None:
                     padding_probe_bytes = min(entry.file_size, _PICKLE_DISCOVERY_PADDING_PROBE_BYTES)
                     if padding_probe_bytes_remaining is None or padding_probe_bytes <= padding_probe_bytes_remaining[0]:
                         probe_bytes = padding_probe_bytes
@@ -2176,6 +2181,15 @@ class PyTorchZipScanner(BaseScanner):
             if should_scan:
                 charge_detection_probe_budget()
                 return True
+            if (
+                max_probe_bytes == _TRUSTED_STORAGE_PICKLE_PROBE_BYTES
+                and defer_padding_probe is not None
+                and entry.file_size > len(sample)
+                and PyTorchZipScanner._complete_headerless_byte_literal_prefix_has_only_padding(sample)
+            ):
+                defer_padding_probe[0] = True
+                charge_deferred_probe_budget_before_skip()
+                return False
             charge_deferred_probe_budget_before_skip()
             return False
         if is_frame_first_candidate:
@@ -2611,7 +2625,14 @@ class PyTorchZipScanner(BaseScanner):
         return False
 
     @staticmethod
-    def _trailing_pickle_probe_should_scan(trailing: bytes, *, sample_is_prefix: bool) -> bool:
+    def _trailing_pickle_probe_should_scan(
+        trailing: bytes,
+        *,
+        sample_is_prefix: bool,
+        nested_literal_depth: int = 0,
+    ) -> bool:
+        if nested_literal_depth > _MAX_NESTED_LITERAL_SCAN_DEPTH:
+            return True
         candidate = trailing.lstrip(PROTO0_1_IGNORABLE_TRAILING_BYTES)
         if not candidate:
             return False
@@ -2633,6 +2654,7 @@ class PyTorchZipScanner(BaseScanner):
         if PyTorchZipScanner._trailing_candidate_has_raw_nested_security_pickle(
             candidate,
             sample_is_prefix=sample_is_prefix,
+            nested_literal_depth=nested_literal_depth,
         ):
             return True
         if PyTorchZipScanner._malformed_separator_proto0_literal_has_nested_security_pickle(candidate):
@@ -2731,11 +2753,17 @@ class PyTorchZipScanner(BaseScanner):
         return False
 
     @staticmethod
-    def _trivial_complete_pickle_prefix_trailing_should_scan(sample: bytes, *, sample_is_prefix: bool) -> bool:
+    def _trivial_complete_pickle_prefix_trailing_should_scan(
+        sample: bytes,
+        *,
+        sample_is_prefix: bool,
+        nested_literal_depth: int = 0,
+    ) -> bool:
         trailing = PyTorchZipScanner._trivial_complete_pickle_prefix_trailing(sample)
         return trailing is not None and PyTorchZipScanner._trailing_pickle_probe_should_scan(
             trailing,
             sample_is_prefix=sample_is_prefix,
+            nested_literal_depth=nested_literal_depth,
         )
 
     @staticmethod
@@ -2846,6 +2874,11 @@ class PyTorchZipScanner(BaseScanner):
         return trailing is not None and not trailing.strip(PROTO0_1_IGNORABLE_TRAILING_BYTES)
 
     @staticmethod
+    def _complete_headerless_byte_literal_prefix_has_only_padding(sample: bytes) -> bool:
+        trailing = PyTorchZipScanner._complete_headerless_byte_literal_prefix_trailing(sample)
+        return trailing is not None and not trailing.strip(PROTO0_1_IGNORABLE_TRAILING_BYTES)
+
+    @staticmethod
     def _trivial_complete_pickle_prefix_has_only_nul_padding(sample: bytes) -> bool:
         trailing = PyTorchZipScanner._trivial_complete_pickle_prefix_trailing(sample)
         return trailing is not None and bool(trailing) and not trailing.strip(b"\x00")
@@ -2911,7 +2944,36 @@ class PyTorchZipScanner(BaseScanner):
         return None
 
     @staticmethod
-    def _complete_trivial_literal_pickle_has_nested_security_pickle(sample: bytes) -> bool:
+    def _complete_headerless_byte_literal_prefix_trailing(sample: bytes) -> bytes | None:
+        if not sample or sample[0] not in _PICKLE_BINARY_BYTE_LITERAL_START_BYTES:
+            return None
+        opcode_count = 0
+        try:
+            for opcode, _arg, pos in pickletools.genops(sample):
+                opcode_count += 1
+                if pos is None:
+                    continue
+                if opcode_count == 1:
+                    if opcode.name not in _PICKLE_BINARY_BYTE_LITERAL_OPCODES:
+                        return None
+                elif opcode.name == "STOP":
+                    if opcode_count != 2:
+                        return None
+                    return sample[pos + 1 :]
+                else:
+                    return None
+        except Exception:
+            return None
+        return None
+
+    @staticmethod
+    def _complete_trivial_literal_pickle_has_nested_security_pickle(
+        sample: bytes,
+        *,
+        nested_literal_depth: int = 0,
+    ) -> bool:
+        if nested_literal_depth > _MAX_NESTED_LITERAL_SCAN_DEPTH:
+            return True
         cursor = 0
         stream = io.BytesIO(sample)
         while cursor < len(sample):
@@ -2939,7 +3001,11 @@ class PyTorchZipScanner(BaseScanner):
                         if opcode_count < 2 or active_frame_end > len(sample):
                             return False
                         if any(
-                            PyTorchZipScanner._literal_value_has_storage_scan_signal(value) for value in literal_values
+                            PyTorchZipScanner._literal_value_has_storage_scan_signal(
+                                value,
+                                nested_literal_depth=nested_literal_depth + 1,
+                            )
+                            for value in literal_values
                         ):
                             return True
                         cursor = pos + 1
@@ -2955,11 +3021,20 @@ class PyTorchZipScanner(BaseScanner):
                 else:
                     return False
             except Exception:
-                return PyTorchZipScanner._complete_proto0_string_literal_has_nested_security_pickle(sample[cursor:])
+                return PyTorchZipScanner._complete_proto0_string_literal_has_nested_security_pickle(
+                    sample[cursor:],
+                    nested_literal_depth=nested_literal_depth,
+                )
         return False
 
     @staticmethod
-    def _complete_proto0_string_literal_has_nested_security_pickle(sample: bytes) -> bool:
+    def _complete_proto0_string_literal_has_nested_security_pickle(
+        sample: bytes,
+        *,
+        nested_literal_depth: int = 0,
+    ) -> bool:
+        if nested_literal_depth > _MAX_NESTED_LITERAL_SCAN_DEPTH:
+            return True
         if not sample.startswith(b"S"):
             return False
         line_end = sample.find(b"\n", 1)
@@ -2981,7 +3056,10 @@ class PyTorchZipScanner(BaseScanner):
             if isinstance(decoded_literal, bytes)
             else PyTorchZipScanner._literal_str_to_scan_bytes(decoded_literal)
         )
-        return PyTorchZipScanner._literal_value_has_storage_scan_signal(literal_value)
+        return PyTorchZipScanner._literal_value_has_storage_scan_signal(
+            literal_value,
+            nested_literal_depth=nested_literal_depth + 1,
+        )
 
     @staticmethod
     def _literal_arg_bytes(opcode_name: str, value: Any) -> bytes | None:
@@ -3011,15 +3089,22 @@ class PyTorchZipScanner(BaseScanner):
         return bytes(output)
 
     @staticmethod
-    def _literal_value_has_nested_security_pickle(value: bytes) -> bool:
+    def _literal_value_has_nested_security_pickle(value: bytes, *, nested_literal_depth: int = 0) -> bool:
+        if nested_literal_depth > _MAX_NESTED_LITERAL_SCAN_DEPTH:
+            return True
         return PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(
-            value
-        ) or PyTorchZipScanner._literal_value_has_encoded_nested_security_pickle(value)
+            value,
+            nested_literal_depth=nested_literal_depth,
+        ) or PyTorchZipScanner._literal_value_has_encoded_nested_security_pickle(
+            value,
+            nested_literal_depth=nested_literal_depth,
+        )
 
     @staticmethod
-    def _literal_value_has_storage_scan_signal(value: bytes) -> bool:
+    def _literal_value_has_storage_scan_signal(value: bytes, *, nested_literal_depth: int = 0) -> bool:
         return PyTorchZipScanner._literal_value_has_nested_security_pickle(
-            value
+            value,
+            nested_literal_depth=nested_literal_depth,
         ) or PyTorchZipScanner._literal_value_has_suspicious_text(value)
 
     @staticmethod
@@ -3204,8 +3289,13 @@ class PyTorchZipScanner(BaseScanner):
 
     @staticmethod
     def _literal_value_has_raw_nested_security_pickle(
-        value: bytes, *, fail_closed_on_candidate_budget: bool = True
+        value: bytes,
+        *,
+        fail_closed_on_candidate_budget: bool = True,
+        nested_literal_depth: int = 0,
     ) -> bool:
+        if nested_literal_depth > _MAX_NESTED_LITERAL_SCAN_DEPTH:
+            return True
         candidate_count = 0
         for offset, marker in enumerate(value):
             if marker not in _RAW_NESTED_SECURITY_PICKLE_START_BYTES:
@@ -3234,6 +3324,7 @@ class PyTorchZipScanner(BaseScanner):
                 and PyTorchZipScanner._raw_nested_binary_candidate_should_scan(
                     candidate,
                     candidate_is_prefix=candidate_is_prefix,
+                    nested_literal_depth=nested_literal_depth + 1,
                 )
             ):
                 return True
@@ -3257,7 +3348,14 @@ class PyTorchZipScanner(BaseScanner):
         return False
 
     @staticmethod
-    def _trailing_candidate_has_raw_nested_security_pickle(value: bytes, *, sample_is_prefix: bool) -> bool:
+    def _trailing_candidate_has_raw_nested_security_pickle(
+        value: bytes,
+        *,
+        sample_is_prefix: bool,
+        nested_literal_depth: int = 0,
+    ) -> bool:
+        if nested_literal_depth > _MAX_NESTED_LITERAL_SCAN_DEPTH:
+            return True
         parse_attempt_count = 0
         for offset, marker in enumerate(value):
             if marker not in _RAW_NESTED_SECURITY_PICKLE_START_BYTES:
@@ -3280,6 +3378,7 @@ class PyTorchZipScanner(BaseScanner):
                 and PyTorchZipScanner._raw_nested_binary_candidate_should_scan(
                     candidate,
                     candidate_is_prefix=candidate_is_prefix,
+                    nested_literal_depth=nested_literal_depth + 1,
                 )
             ):
                 return True
@@ -3525,13 +3624,29 @@ class PyTorchZipScanner(BaseScanner):
         return False
 
     @staticmethod
-    def _raw_nested_binary_candidate_should_scan(candidate: bytes, *, candidate_is_prefix: bool) -> bool:
+    def _raw_nested_binary_candidate_should_scan(
+        candidate: bytes,
+        *,
+        candidate_is_prefix: bool,
+        nested_literal_depth: int = 0,
+    ) -> bool:
+        if nested_literal_depth > _MAX_NESTED_LITERAL_SCAN_DEPTH:
+            return True
         if PyTorchZipScanner._headerless_binary_pickle_prefix_needs_more_bytes(
             candidate,
             candidate_is_prefix=candidate_is_prefix,
         ):
             return True
-        if PyTorchZipScanner._complete_trivial_literal_pickle_has_nested_security_pickle(candidate):
+        if PyTorchZipScanner._complete_trivial_literal_pickle_has_nested_security_pickle(
+            candidate,
+            nested_literal_depth=nested_literal_depth,
+        ):
+            return True
+        if PyTorchZipScanner._trivial_complete_pickle_prefix_trailing_should_scan(
+            candidate,
+            sample_is_prefix=candidate_is_prefix,
+            nested_literal_depth=nested_literal_depth + 1,
+        ):
             return True
         if not PyTorchZipScanner._has_security_relevant_pickle_opcode(candidate):
             return False
@@ -3540,6 +3655,29 @@ class PyTorchZipScanner(BaseScanner):
         if PyTorchZipScanner._frame_first_trusted_storage_probe_should_scan(candidate):
             return True
         return candidate_is_prefix and PyTorchZipScanner._has_security_relevant_opcode_in_incomplete_frame(candidate)
+
+    @staticmethod
+    def _headerless_binary_byte_literal_has_possible_size(candidate: bytes, *, entry_size: int) -> bool:
+        if not candidate or candidate[0] not in _PICKLE_BINARY_BYTE_LITERAL_START_BYTES:
+            return True
+        opcode = candidate[0]
+        if opcode == ord("C"):
+            header_bytes = 2
+        elif opcode == ord("B"):
+            header_bytes = 5
+        else:
+            header_bytes = 9
+        if entry_size < header_bytes + 1:
+            return False
+        if len(candidate) < header_bytes:
+            return True
+        if opcode == ord("C"):
+            literal_size = candidate[1]
+        elif opcode == ord("B"):
+            literal_size = int.from_bytes(candidate[1:5], "little")
+        else:
+            literal_size = int.from_bytes(candidate[1:9], "little")
+        return header_bytes + literal_size + 1 <= entry_size
 
     @staticmethod
     def _headerless_binary_pickle_prefix_needs_more_bytes(candidate: bytes, *, candidate_is_prefix: bool) -> bool:
@@ -3574,7 +3712,9 @@ class PyTorchZipScanner(BaseScanner):
         return any(marker in value for marker in _RAW_NESTED_SECURITY_PICKLE_TEXT_MARKERS)
 
     @staticmethod
-    def _literal_value_has_encoded_nested_security_pickle(value: bytes) -> bool:
+    def _literal_value_has_encoded_nested_security_pickle(value: bytes, *, nested_literal_depth: int = 0) -> bool:
+        if nested_literal_depth > _MAX_NESTED_LITERAL_SCAN_DEPTH:
+            return True
         for match in _BASE64_NESTED_LITERAL_TOKEN_RE.finditer(value):
             token = _BASE64_NESTED_LITERAL_SEPARATOR_RE.sub(b"", match.group(0)).translate(
                 bytes.maketrans(b"-_", b"+/")
@@ -3586,13 +3726,18 @@ class PyTorchZipScanner(BaseScanner):
                 candidate_token = token[token_start:token_end]
                 for shift in range(min(4, len(candidate_token))):
                     shifted_token = candidate_token[shift:]
+                    shifted_token = shifted_token.rstrip(b"=")
+                    if not shifted_token:
+                        continue
                     shifted_token += b"=" * (-len(shifted_token) % 4)
                     try:
                         decoded = base64.b64decode(shifted_token, validate=True)
                     except (binascii.Error, ValueError):
                         continue
                     if decoded and PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(
-                        decoded, fail_closed_on_candidate_budget=False
+                        decoded,
+                        fail_closed_on_candidate_budget=False,
+                        nested_literal_depth=nested_literal_depth + 1,
                     ):
                         return True
         for match in _HEX_NESTED_LITERAL_TOKEN_RE.finditer(value):
@@ -3607,7 +3752,9 @@ class PyTorchZipScanner(BaseScanner):
                 except (binascii.Error, ValueError):
                     continue
                 if decoded and PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(
-                    decoded, fail_closed_on_candidate_budget=False
+                    decoded,
+                    fail_closed_on_candidate_budget=False,
+                    nested_literal_depth=nested_literal_depth + 1,
                 ):
                     return True
         return False

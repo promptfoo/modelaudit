@@ -4316,6 +4316,65 @@ def test_trusted_storage_probe_routes_headerless_binary_stream_at_entry_gate(tmp
     assert looks_like_pickle is True
 
 
+def test_trusted_storage_probe_bounds_nested_byte_literal_discovery(tmp_path: Path) -> None:
+    storage = b"hello"
+    for _ in range(19):
+        literal_pickle = b"B" + len(storage).to_bytes(4, "little") + storage + b"."
+        storage = b"\x95" + len(literal_pickle).to_bytes(8, "little") + literal_pickle
+    archive_path = tmp_path / "nested-byte-literal-storage.pt"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data/0", storage)
+
+    with zipfile.ZipFile(archive_path) as archive:
+        entry = archive.getinfo("archive/data/0")
+        started = time.monotonic()
+        looks_like_pickle = package_api._trusted_storage_zip_entry_looks_like_pickle(
+            archive,
+            entry,
+            [package_api._PICKLE_DISCOVERY_LONG_PROBE_BYTES],
+            started + 0.1,
+        )
+
+    assert looks_like_pickle is True
+    assert time.monotonic() - started < 1.0
+
+
+def test_trusted_storage_probe_bounds_trailing_literal_discovery(tmp_path: Path) -> None:
+    archive_path = tmp_path / "trailing-literal-chain.pt"
+    storage = b"\x8c\x00." * 20
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data/0", storage)
+
+    with zipfile.ZipFile(archive_path) as archive:
+        entry = archive.getinfo("archive/data/0")
+        started = time.monotonic()
+        looks_like_pickle = package_api._trusted_storage_zip_entry_looks_like_pickle(
+            archive,
+            entry,
+            [package_api._PICKLE_DISCOVERY_LONG_PROBE_BYTES],
+            started + 0.1,
+        )
+
+    assert looks_like_pickle is True
+    assert time.monotonic() - started < 1.0
+
+
+@pytest.mark.parametrize(
+    "storage",
+    [
+        pytest.param(b"\x8c\x00." * 20, id="empty-short-binunicode-chain"),
+        pytest.param((b"\x95" + (2).to_bytes(8, "little") + b"N.") * 20, id="frame-none-chain"),
+    ],
+)
+def test_raw_nested_binary_candidate_bounds_trailing_literal_discovery(storage: bytes) -> None:
+    started = time.monotonic()
+
+    should_scan = package_api._raw_nested_binary_candidate_should_scan(storage, candidate_is_prefix=False)
+
+    assert should_scan is True
+    assert time.monotonic() - started < 1.0
+
+
 def test_expanded_trusted_storage_probe_checks_long_window_before_padding_budget(tmp_path: Path) -> None:
     malicious_suffix = b"cposix\nsystem\n(S'echo long-before-padding'\ntR."
     storage = b"N." + (b" " * (package_api._TRUSTED_STORAGE_PICKLE_PROBE_BYTES - len(b"N.")))
@@ -8108,6 +8167,51 @@ def test_scan_file_routes_long_headerless_binbytes_storage(tmp_path: Path) -> No
     )
 
 
+def test_scan_file_routes_padded_headerless_byte_literal_storage(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model.pt"
+    storage_blob = b"C\x06benign." + (b" " * 5000) + b"cposix\nsystem\n)R."
+    storage_blob += b" " * (-len(storage_blob) % 4)
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", storage_blob)
+
+    report = scan_file(archive_path)
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/0"]
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.location is not None
+        and f"{archive_path}:archive/data/0" in finding.location
+        for finding in report.findings
+    )
+
+
+def test_scan_file_routes_redundantly_padded_base64_literal_storage(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model.pt"
+    encoded = base64.b64encode(b"cposix\nsystem\n)R.") + b"="
+    storage_blob = b"S'" + encoded + b"'\n."
+    storage_blob += b" " * (-len(storage_blob) % 4)
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", storage_blob)
+
+    report = scan_file(archive_path)
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/0"]
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.location is not None
+        and f"{archive_path}:archive/data/0" in finding.location
+        for finding in report.findings
+    )
+
+
 def test_scan_file_skips_direct_headerless_byte_literal_near_match(tmp_path: Path) -> None:
     archive_path = tmp_path / "model.pt"
     storage_blob = b"C\x06benign."
@@ -8123,6 +8227,24 @@ def test_scan_file_skips_direct_headerless_byte_literal_near_match(tmp_path: Pat
     assert report.status == ScanStatus.COMPLETE
     assert report.verdict == SafetyVerdict.CLEAN
     assert list(report.metadata["pickle_files"]) == ["archive/data.pkl"]
+
+
+def test_scan_file_skips_impossible_headerless_binbytes_length(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model.pt"
+    storage_blob = b"B" + (10_000_000).to_bytes(4, "little") + (b"\x00\x00\x80\x3f" * 2048)
+    storage_blob += b"\x00" * (-len(storage_blob) % 4)
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", storage_blob)
+
+    report = scan_file(archive_path)
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert list(report.metadata["pickle_files"]) == ["archive/data.pkl"]
+    assert not any(finding.details.get("pickle_filename") == "archive/data/0" for finding in report.findings)
 
 
 def test_scan_file_keeps_long_headerless_binbytes_near_match_clean(tmp_path: Path) -> None:

@@ -5359,6 +5359,74 @@ def test_pytorch_zip_trusted_storage_routes_headerless_byte_literal_at_entry_gat
     assert looks_like_pickle is True
 
 
+def test_pytorch_zip_trusted_storage_bounds_nested_byte_literal_discovery(tmp_path: Path) -> None:
+    archive_path = tmp_path / "nested_byte_literal_storage.pt"
+    storage_blob = b"hello"
+    for _ in range(19):
+        literal_pickle = b"B" + len(storage_blob).to_bytes(4, "little") + storage_blob + b"."
+        storage_blob = b"\x95" + len(literal_pickle).to_bytes(8, "little") + literal_pickle
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data/0", storage_blob)
+
+    result = ScanResult(scanner_name="pytorch_zip")
+    scanner = PyTorchZipScanner()
+
+    with zipfile.ZipFile(archive_path, "r") as archive:
+        entry = archive.getinfo("archive/data/0")
+        started = time.monotonic()
+        looks_like_pickle = scanner._trusted_storage_entry_looks_like_pickle(
+            archive,
+            entry,
+            result,
+            padding_probe_bytes_remaining=[pytorch_zip_scanner_module._PICKLE_DISCOVERY_PADDING_PROBE_BUDGET_BYTES],
+        )
+
+    assert looks_like_pickle is True
+    assert time.monotonic() - started < 1.0
+
+
+def test_pytorch_zip_trusted_storage_bounds_trailing_literal_discovery(tmp_path: Path) -> None:
+    archive_path = tmp_path / "trailing_literal_storage.pt"
+    storage_blob = b"\x8c\x00." * 20
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data/0", storage_blob)
+
+    result = ScanResult(scanner_name="pytorch_zip")
+    scanner = PyTorchZipScanner()
+
+    with zipfile.ZipFile(archive_path, "r") as archive:
+        entry = archive.getinfo("archive/data/0")
+        started = time.monotonic()
+        looks_like_pickle = scanner._trusted_storage_entry_looks_like_pickle(
+            archive,
+            entry,
+            result,
+            padding_probe_bytes_remaining=[pytorch_zip_scanner_module._PICKLE_DISCOVERY_LONG_PROBE_BYTES],
+        )
+
+    assert looks_like_pickle is True
+    assert time.monotonic() - started < 1.0
+
+
+@pytest.mark.parametrize(
+    "storage_blob",
+    [
+        pytest.param(b"\x8c\x00." * 20, id="empty-short-binunicode-chain"),
+        pytest.param((b"\x95" + (2).to_bytes(8, "little") + b"N.") * 20, id="frame-none-chain"),
+    ],
+)
+def test_pytorch_zip_raw_nested_binary_candidate_bounds_trailing_literal_discovery(storage_blob: bytes) -> None:
+    started = time.monotonic()
+
+    should_scan = PyTorchZipScanner._raw_nested_binary_candidate_should_scan(
+        storage_blob,
+        candidate_is_prefix=False,
+    )
+
+    assert should_scan is True
+    assert time.monotonic() - started < 1.0
+
+
 def test_pytorch_zip_discovery_routes_direct_headerless_byte_literal_storage(tmp_path: Path) -> None:
     model_path = tmp_path / "referenced_headerless_byte_literal_storage.pt"
     encoded = base64.b64encode(b"cposix\nsystem\n)R.")
@@ -5399,9 +5467,67 @@ def test_pytorch_zip_discovery_routes_long_headerless_binbytes_storage(tmp_path:
     )
 
 
+def test_pytorch_zip_discovery_routes_padded_headerless_byte_literal_storage(tmp_path: Path) -> None:
+    model_path = tmp_path / "referenced_padded_headerless_byte_literal_storage.pt"
+    storage_blob = b"C\x06benign." + (b" " * 5000) + b"cposix\nsystem\n)R."
+    storage_blob += b" " * (-len(storage_blob) % 4)
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        zip_file.writestr("archive/data/0", storage_blob)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert "archive/data/0" in result.metadata["pickle_files"]
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
+        for issue in result.issues
+    )
+
+
+def test_pytorch_zip_discovery_routes_redundantly_padded_base64_literal_storage(tmp_path: Path) -> None:
+    model_path = tmp_path / "referenced_redundantly_padded_base64_literal_storage.pt"
+    encoded = base64.b64encode(b"cposix\nsystem\n)R.") + b"="
+    storage_blob = b"S'" + encoded + b"'\n."
+    storage_blob += b" " * (-len(storage_blob) % 4)
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        zip_file.writestr("archive/data/0", storage_blob)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert "archive/data/0" in result.metadata["pickle_files"]
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
+        for issue in result.issues
+    )
+
+
 def test_pytorch_zip_discovery_skips_direct_headerless_byte_literal_near_match(tmp_path: Path) -> None:
     model_path = tmp_path / "referenced_headerless_byte_literal_near_match.pt"
     storage_blob = b"C\x06benign."
+    storage_blob += b"\x00" * (-len(storage_blob) % 4)
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        zip_file.writestr("archive/data/0", storage_blob)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert result.success is True
+    assert result.metadata.get("pickle_verdict") == "clean"
+    assert result.metadata["pickle_files"] == ["archive/data.pkl"]
+    assert not any(issue.details.get("pickle_filename") == "archive/data/0" for issue in result.issues)
+    assert not any(check.details.get("pickle_filename") == "archive/data/0" for check in result.checks)
+
+
+def test_pytorch_zip_discovery_skips_impossible_headerless_binbytes_length(tmp_path: Path) -> None:
+    model_path = tmp_path / "referenced_impossible_headerless_binbytes_length.pt"
+    storage_blob = b"B" + (10_000_000).to_bytes(4, "little") + (b"\x00\x00\x80\x3f" * 2048)
     storage_blob += b"\x00" * (-len(storage_blob) % 4)
     with zipfile.ZipFile(model_path, "w") as zip_file:
         zip_file.writestr("archive/version", "3\n")
