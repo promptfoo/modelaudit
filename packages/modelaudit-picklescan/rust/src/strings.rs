@@ -228,6 +228,8 @@ fn strip_python_line_continuations(value: &str) -> Option<String> {
             Some(cursor + 2)
         } else if bytes.get(cursor + 1..cursor + 3) == Some(b"\r\n") {
             Some(cursor + 3)
+        } else if bytes.get(cursor + 1) == Some(&b'\r') {
+            Some(cursor + 2)
         } else {
             None
         };
@@ -1849,6 +1851,8 @@ mod tests {
     fn suspicious_string_matching_keeps_case_insensitive_patterns() {
         assert!(suspicious_string_matches("OS.System('id')").contains(&"os.system".to_string()));
         assert!(suspicious_string_matches("OS . system('id')").contains(&"os.system".to_string()));
+        assert!(suspicious_string_matches("subprocess.\\\rPopen(['id'])")
+            .contains(&"subprocess call".to_string()));
         assert!(
             suspicious_string_matches(&format!("{}os.system('id')", "A".repeat(32)))
                 .contains(&"os.system".to_string())

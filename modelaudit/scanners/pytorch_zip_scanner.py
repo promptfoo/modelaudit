@@ -139,6 +139,7 @@ _PROTO0_1_LITERAL_OPCODES = frozenset(
     }
 )
 _PICKLE_BINARY_BYTE_LITERAL_OPCODES = frozenset({"BINBYTES", "SHORT_BINBYTES", "BINBYTES8", "BYTEARRAY8"})
+_PICKLE_BINARY_BYTE_LITERAL_START_BYTES = b"BC\x8e\x96"
 _PICKLE_LITERAL_OPCODES = _PROTO0_1_LITERAL_OPCODES | _PICKLE_BINARY_BYTE_LITERAL_OPCODES
 _BASE64_NESTED_LITERAL_TOKEN_RE = re.compile(
     rb"[A-Za-z0-9+/_-][A-Za-z0-9+/_=\-\s\r\n\t!\"#$%&'()*.,:;<>?@\[\]\\^`{|}~]{7,}"
@@ -148,6 +149,9 @@ _BASE64_LITERAL_TOKEN_BYTES = frozenset(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijkl
 _HEX_NESTED_LITERAL_TOKEN_RE = re.compile(rb"[0-9A-Fa-f][0-9A-Fa-f\s\r\n\t]{15,}")
 _RAW_NESTED_TEXT_SECURITY_PICKLE_START_BYTES = b"\x80(cioRbP\x82\x83\x84"
 _RAW_NESTED_BINARY_SECURITY_PICKLE_START_BYTES = b"\x8c\x8d\x95"
+_HEADERLESS_BINARY_PICKLE_START_BYTES = (
+    _RAW_NESTED_BINARY_SECURITY_PICKLE_START_BYTES + _PICKLE_BINARY_BYTE_LITERAL_START_BYTES
+)
 _RAW_NESTED_SECURITY_PICKLE_START_BYTES = (
     _RAW_NESTED_TEXT_SECURITY_PICKLE_START_BYTES + _RAW_NESTED_BINARY_SECURITY_PICKLE_START_BYTES
 )
@@ -2064,7 +2068,7 @@ class PyTorchZipScanner(BaseScanner):
         is_headerless_binary_pickle_candidate = (
             not is_binary_pickle_candidate
             and not is_frame_first_candidate
-            and data_start[0] in _RAW_NESTED_BINARY_SECURITY_PICKLE_START_BYTES
+            and data_start[0] in _HEADERLESS_BINARY_PICKLE_START_BYTES
         )
         if (
             not is_binary_pickle_candidate
@@ -3118,11 +3122,11 @@ class PyTorchZipScanner(BaseScanner):
             candidate_count += 1
             if candidate_count > _MAX_STORAGE_LITERAL_TEXT_CANDIDATES:
                 return True
-            token_starts = PyTorchZipScanner._base64_literal_route_token_starts(compact)
-            if token_starts is None:
+            token_segments = PyTorchZipScanner._base64_literal_route_token_segments(compact)
+            if token_segments is None:
                 return True
-            for token_start in token_starts:
-                candidate_token = compact[token_start:]
+            for token_start, token_end in token_segments:
+                candidate_token = compact[token_start:token_end]
                 for shift in range(min(16, len(candidate_token))):
                     token = candidate_token[shift:]
                     if len(token) < 8:
@@ -3132,19 +3136,34 @@ class PyTorchZipScanner(BaseScanner):
         return False
 
     @staticmethod
-    def _base64_literal_route_token_starts(token: bytes) -> tuple[int, ...] | None:
-        starts = [0]
+    def _base64_literal_route_token_segments(token: bytes) -> tuple[tuple[int, int], ...] | None:
+        segments: list[tuple[int, int]] = []
+        seen: set[tuple[int, int]] = set()
+        boundaries = [0]
+
+        def add_segment(start: int, end: int) -> bool:
+            segment = (start, end)
+            if end - start < 8 or segment in seen:
+                return True
+            segments.append(segment)
+            seen.add(segment)
+            return len(segments) <= _MAX_BASE64_LITERAL_ROUTE_TOKEN_STARTS
+
+        if not add_segment(0, len(token)):
+            return None
         for match in re.finditer(rb"=+", token):
             suffix_start = match.end()
-            if (
-                suffix_start < len(token)
-                and token[suffix_start] in _BASE64_LITERAL_TOKEN_BYTES
-                and len(token) - suffix_start >= 8
-            ):
-                starts.append(suffix_start)
-                if len(starts) > _MAX_BASE64_LITERAL_ROUTE_TOKEN_STARTS:
+            if suffix_start < len(token) and token[suffix_start] in _BASE64_LITERAL_TOKEN_BYTES:
+                if len(boundaries) >= _MAX_BASE64_LITERAL_ROUTE_TOKEN_STARTS:
                     return None
-        return tuple(starts)
+                for token_start in boundaries:
+                    if not add_segment(token_start, suffix_start):
+                        return None
+                boundaries.append(suffix_start)
+        for token_start in boundaries:
+            if not add_segment(token_start, len(token)):
+                return None
+        return tuple(segments)
 
     @staticmethod
     def _base64_token_has_storage_route_signal(token: bytes) -> bool:
@@ -3516,11 +3535,7 @@ class PyTorchZipScanner(BaseScanner):
 
     @staticmethod
     def _headerless_binary_pickle_prefix_needs_more_bytes(candidate: bytes, *, candidate_is_prefix: bool) -> bool:
-        if (
-            not candidate_is_prefix
-            or not candidate
-            or candidate[0] not in _RAW_NESTED_BINARY_SECURITY_PICKLE_START_BYTES
-        ):
+        if not candidate_is_prefix or not candidate or candidate[0] not in _HEADERLESS_BINARY_PICKLE_START_BYTES:
             return False
         opcode_count = 0
         try:
@@ -3529,7 +3544,19 @@ class PyTorchZipScanner(BaseScanner):
                 if opcode.name == "STOP":
                     return False
         except ValueError as exc:
-            return candidate_is_prefix and opcode_count >= 4 and "exhausted before seeing stop" in str(exc).lower()
+            message = str(exc).lower()
+            return (
+                candidate_is_prefix
+                and (opcode_count >= 4 or candidate[0] in _PICKLE_BINARY_BYTE_LITERAL_START_BYTES)
+                and (
+                    "exhausted before seeing stop" in message
+                    or (
+                        candidate[0] in _PICKLE_BINARY_BYTE_LITERAL_START_BYTES
+                        and "expected" in message
+                        and "bytes" in message
+                    )
+                )
+            )
         except Exception:
             return False
         return opcode_count >= 4
@@ -3544,11 +3571,11 @@ class PyTorchZipScanner(BaseScanner):
             token = _BASE64_NESTED_LITERAL_SEPARATOR_RE.sub(b"", match.group(0)).translate(
                 bytes.maketrans(b"-_", b"+/")
             )
-            token_starts = PyTorchZipScanner._base64_literal_route_token_starts(token)
-            if token_starts is None:
+            token_segments = PyTorchZipScanner._base64_literal_route_token_segments(token)
+            if token_segments is None:
                 return True
-            for token_start in token_starts:
-                candidate_token = token[token_start:]
+            for token_start, token_end in token_segments:
+                candidate_token = token[token_start:token_end]
                 for shift in range(min(4, len(candidate_token))):
                     shifted_token = candidate_token[shift:]
                     shifted_token += b"=" * (-len(shifted_token) % 4)
