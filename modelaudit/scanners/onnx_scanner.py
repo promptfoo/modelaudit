@@ -1840,12 +1840,36 @@ def _build_onnx_weight_analysis_plan(
         target_data_type = _onnx_int_attribute(node, "to", -1)
         return target_data_type < 0 or target_data_type in floating_types
 
-    def transform_output_may_have_weight_rank(
+    def constant_int64_vector_values(initializer: Any | None) -> tuple[int, ...] | None:
+        if initializer is None:
+            return None
+        dims = tuple(int(dimension) for dimension in getattr(initializer, "dims", ()))
+        element_count = math.prod(dims) if dims else 0
+        if (
+            len(dims) != 1
+            or element_count < 0
+            or element_count > _ONNX_WEIGHT_RESHAPE_RANK_LIMIT
+            or int(getattr(initializer, "data_type", -1)) != int(onnx.TensorProto.INT64)
+            or _onnx_inline_storage_nbytes(initializer) > _ONNX_WEIGHT_RESHAPE_RANK_LIMIT * 8
+            or _onnx_tensor_uses_external_storage(initializer, onnx=onnx)
+        ):
+            return None
+        try:
+            values = tuple(int(value) for value in onnx.numpy_helper.to_array(initializer).reshape(-1).tolist())
+        except Exception:
+            return None
+        return values if len(values) == element_count else None
+
+    def operator_output_may_have_weight_rank(
         node: Any,
         *,
         input_shape: tuple[int, ...] | None,
         constants: dict[str, Any],
     ) -> bool:
+        if node.op_type == "Expand":
+            shape_name = str(node.input[1]) if len(node.input) > 1 else ""
+            target_shape = constant_int64_vector_values(constants.get(shape_name))
+            return target_shape is None or len(target_shape) >= 2
         if node.op_type == "Flatten":
             return True
         if node.op_type == "Unsqueeze":
@@ -2554,6 +2578,11 @@ def _build_onnx_weight_analysis_plan(
                 "Transpose",
                 "Unsqueeze",
             }
+            rank_gap_promoting_operator = (
+                getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
+                and not is_model_local_function
+                and node.op_type in {"Expand", "Flatten", "Reshape", "Squeeze", "Unsqueeze"}
+            )
             all_input_lineages: dict[int, _OnnxWeightLineage] = {}
             all_input_lineage_limit_gap_count = 0
             all_input_weight_lineage_limit_gap_count = 0
@@ -2614,7 +2643,7 @@ def _build_onnx_weight_analysis_plan(
                     str(input_name),
                     0,
                 )
-                if supported_transform and input_index == 0:
+                if rank_gap_promoting_operator and input_index == 0:
                     transform_data_input_rank_promotable_lineage_limit_gap_count = (
                         input_rank_promotable_lineage_limit_gap_count
                     )
@@ -3164,18 +3193,17 @@ def _build_onnx_weight_analysis_plan(
                 output_rank_promotable_lineage_limit_gap_count,
             ) = bounded_lineages(output_lineages)
             all_input_output_weight_lineage_limit_gap_count = all_input_weight_lineage_limit_gap_count
-            rank_transform_promotes_deferred_gap = (
-                supported_transform
-                and node.op_type in {"Flatten", "Reshape", "Squeeze", "Unsqueeze"}
+            rank_operator_promotes_deferred_gap = (
+                rank_gap_promoting_operator
                 and transform_data_input_rank_promotable_lineage_limit_gap_count
-                and transform_output_may_have_weight_rank(
+                and operator_output_may_have_weight_rank(
                     node,
                     input_shape=known_value_shapes.get(input_names[0]) if input_names else None,
                     constants=constants,
                 )
             )
             if (
-                rank_transform_promotes_deferred_gap
+                rank_operator_promotes_deferred_gap
                 and transform_data_input_rank_promotable_lineage_limit_gap_count
                 > all_input_output_weight_lineage_limit_gap_count
             ):
@@ -3197,7 +3225,7 @@ def _build_onnx_weight_analysis_plan(
             ):
                 output_weight_lineage_limit_gap_count = output_lineage_limit_gap_count
             if (
-                rank_transform_promotes_deferred_gap
+                rank_operator_promotes_deferred_gap
                 and output_rank_promotable_lineage_limit_gap_count > output_weight_lineage_limit_gap_count
             ):
                 output_weight_lineage_limit_gap_count = output_rank_promotable_lineage_limit_gap_count
@@ -3426,7 +3454,7 @@ def _build_onnx_weight_analysis_plan(
                     )
                     input_rank_promotable_lineage_limit_gap_count_for_output = (
                         0
-                        if subgraph_results or rank_transform_promotes_deferred_gap
+                        if subgraph_results or rank_operator_promotes_deferred_gap
                         else all_input_rank_promotable_lineage_limit_gap_count
                     )
                     propagated_lineage_limit_gap_count = _bounded_onnx_weight_lineage_gap_count(
