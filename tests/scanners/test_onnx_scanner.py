@@ -6443,6 +6443,105 @@ class TestWeightDistributionSemantics:
         semantics = result.metadata["onnx_weight_distribution_semantics"]
         assert semantics["exclusion_counts"]["bookkeeping_constant"] == 1
 
+    def test_runtime_activation_lineage_fanout_stays_under_value_cap(self, tmp_path: Path) -> None:
+        inputs = [helper.make_tensor_value_info(f"X{index}", TensorProto.FLOAT, [1, 4]) for index in range(40)]
+        initializers = [
+            onnx.numpy_helper.from_array(np.zeros((4, 4), dtype=np.float32), name=f"W{index}") for index in range(40)
+        ]
+        initializers.append(onnx.numpy_helper.from_array(np.zeros((4, 2), dtype=np.float32), name="W_out"))
+        nodes = [helper.make_node("MatMul", [f"X{index}", f"W{index}"], [f"hidden{index}"]) for index in range(40)]
+        nodes.extend(
+            [
+                helper.make_node("Sum", [f"hidden{index}" for index in range(40)], ["merged"]),
+                helper.make_node("Relu", ["merged"], ["activated"]),
+                helper.make_node("MatMul", ["activated", "W_out"], ["Y"]),
+            ]
+        )
+        graph = helper.make_graph(
+            nodes,
+            "runtime_activation_lineage_fanout",
+            inputs,
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 2])],
+            initializer=initializers,
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / "runtime-activation-lineage-fanout.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        assert result.success is True
+        assert self._extreme_checks(result) == []
+        assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["coverage_gaps"] == {}
+        assert semantics["eligible_initializer_count"] == 41
+        assert semantics["analyzed_layer_count"] == 41
+
+    def test_runtime_bookkeeping_recurrent_marker_survives_fanout_compaction(self, tmp_path: Path) -> None:
+        initializers = [
+            onnx.numpy_helper.from_array(np.zeros(4, dtype=np.float32), name=f"C{index}") for index in range(33)
+        ]
+        initializers.extend(
+            [
+                onnx.numpy_helper.from_array(np.zeros((1, 4, 4), dtype=np.float32), name="W"),
+                onnx.numpy_helper.from_array(np.zeros((1, 4, 4), dtype=np.float32), name="R"),
+                onnx.numpy_helper.from_array(np.zeros((4, 1), dtype=np.float32), name="P"),
+                onnx.numpy_helper.from_array(np.array([1, 1, 4], dtype=np.int64), name="state_shape"),
+                onnx.numpy_helper.from_array(np.array([4], dtype=np.int64), name="flat_shape"),
+            ]
+        )
+        nodes = [helper.make_node("Add", [f"C{index}", "X"], [f"A{index}"]) for index in range(33)]
+        nodes.extend(
+            [
+                helper.make_node("Reshape", ["A32", "state_shape"], ["initial_h"]),
+                helper.make_node(
+                    "RNN",
+                    ["sequence", "W", "R", "", "", "initial_h"],
+                    ["sequence_output", "state"],
+                    hidden_size=4,
+                ),
+                helper.make_node("Reshape", ["state", "flat_shape"], ["state_vector"]),
+                helper.make_node("Sum", [*[f"A{index}" for index in range(32)], "state_vector"], ["mixed"]),
+                helper.make_node("MatMul", ["mixed", "P"], ["Y"]),
+            ]
+        )
+        graph = helper.make_graph(
+            nodes,
+            "runtime_bookkeeping_recurrent_marker_compaction",
+            [
+                helper.make_tensor_value_info("X", TensorProto.FLOAT, [4]),
+                helper.make_tensor_value_info("sequence", TensorProto.FLOAT, [1, 1, 4]),
+            ],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1])],
+            initializer=initializers,
+            value_info=[helper.make_tensor_value_info("state_vector", TensorProto.FLOAT, [4])],
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 14)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / "runtime-bookkeeping-recurrent-marker-compaction.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        assert result.success is False
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["coverage_gaps"]["unresolved_initializer_lineage"] == 1
+        assert semantics["coverage_gaps"].get("lineages_per_value_limit", 0) == 0
+        assert any(
+            sample["initializer"] == "C32"
+            and sample["consumer_op"] == "MatMul"
+            and sample["consumer_input_index"] == 0
+            and sample["reason"] == "dynamic_input_lineage"
+            and sample["lineage_transform_count"] >= 2
+            for sample in semantics["unresolved_lineage_samples"]
+        )
+
     @pytest.mark.parametrize("malicious", [False, True])
     def test_shape_gather_path_does_not_create_weight_coverage_gap(
         self,
@@ -6588,6 +6687,72 @@ class TestWeightDistributionSemantics:
             sample["consumer_op"] == "MatMul" and sample["reason"] == "shape_dimensions_lineage"
             for sample in result.metadata["onnx_weight_distribution_semantics"]["unresolved_lineage_samples"]
         )
+
+    def test_shape_dimension_lineage_fanout_still_fails_closed(self, tmp_path: Path) -> None:
+        initializers = [
+            onnx.numpy_helper.from_array(np.zeros((40, 40), dtype=np.float32), name=f"W_runtime{index}")
+            for index in range(40)
+        ]
+        initializers.extend(
+            onnx.numpy_helper.from_array(np.ones((1,), dtype=np.float32), name=f"source{index}") for index in range(40)
+        )
+        initializers.append(onnx.numpy_helper.from_array(np.array([40, 1], dtype=np.int64), name="weight_shape"))
+        runtime_inputs = [
+            helper.make_tensor_value_info(f"runtime{index}", TensorProto.FLOAT, [40]) for index in range(40)
+        ]
+        nodes = [
+            helper.make_node("MatMul", [f"runtime{index}", f"W_runtime{index}"], [f"runtime_delta{index}"])
+            for index in range(40)
+        ]
+        nodes.append(helper.make_node("Sum", [f"runtime_delta{index}" for index in range(40)], ["runtime_delta"]))
+        for index in range(40):
+            nodes.extend(
+                [
+                    helper.make_node("Shape", [f"source{index}"], [f"dimensions{index}"]),
+                    helper.make_node(
+                        "Cast", [f"dimensions{index}"], [f"dimension_weight{index}"], to=TensorProto.FLOAT
+                    ),
+                ]
+            )
+        nodes.extend(
+            [
+                helper.make_node(
+                    "Concat",
+                    [f"dimension_weight{index}" for index in range(40)],
+                    ["flat_weight"],
+                    axis=0,
+                ),
+                helper.make_node("Add", ["flat_weight", "runtime_delta"], ["mixed_flat_weight"]),
+                helper.make_node("Reshape", ["mixed_flat_weight", "weight_shape"], ["generated_weight"]),
+                helper.make_node("MatMul", ["X", "generated_weight"], ["Y"]),
+            ]
+        )
+        graph = helper.make_graph(
+            nodes,
+            "shape_dimension_lineage_fanout",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 40]), *runtime_inputs],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 1])],
+            initializer=initializers,
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / "shape-dimension-lineage-fanout.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        assert result.success is False
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 8
+        assert semantics["coverage_gaps"]["unresolved_initializer_lineage"] == 32
+        assert any(
+            sample["consumer_op"] == "MatMul" and sample["reason"] == "shape_dimensions_lineage"
+            for sample in semantics["unresolved_lineage_samples"]
+        )
+        assert all(sample["reason"] == "shape_dimensions_lineage" for sample in semantics["unresolved_lineage_samples"])
 
     @pytest.mark.parametrize(
         "use",
