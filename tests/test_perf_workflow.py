@@ -396,7 +396,7 @@ def test_dependency_audit_covers_installed_ci_extras() -> None:
 
     audit_step = _step_by_name(steps, "Audit dependencies for vulnerabilities")
 
-    assert "uv export --extra all-ci --no-hashes --no-emit-project" in audit_step["run"]
+    assert "uv export --frozen --extra all-ci --no-hashes --no-emit-project" in audit_step["run"]
     assert "pip-audit --strict --no-deps --disable-pip" in audit_step["run"]
 
 

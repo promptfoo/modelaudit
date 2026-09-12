@@ -1600,6 +1600,13 @@ _TRUSTED_UNRESOLVED_IMPORT_ONLY_REFERENCES = frozenset(
         ("pathlib._local", "PureWindowsPath"),
     }
 )
+_TRUSTED_EMPTY_MAILBOX_CONSTRUCTOR_INVOCATIONS = frozenset(
+    {
+        ("mailbox", "Babyl"),
+        ("mailbox", "MMDF"),
+        ("mailbox", "mbox"),
+    }
+)
 # Canonical-looking specs in sys.modules are forgeable. Identity trust is
 # limited to interpreter modules already loaded when this module initializes.
 _TRUSTED_LOADED_INTERPRETER_MODULES = _capture_trusted_loaded_interpreter_modules()
@@ -1998,6 +2005,8 @@ def find_dangerous_call_graphs(
         name = str(reference.get("name", ""))
         if not module or not name:
             continue
+        if _trusted_empty_mailbox_constructor_invocation_is_safe(module, name, reference):
+            continue
 
         try:
             entrypoints = _call_graph_entrypoints_for_reference(module, name, reference)
@@ -2111,8 +2120,45 @@ def find_startup_hook_write_call_graphs(
         invocation_references = invocations_by_reference.get((module, name), ())
         if require_invocations and not invocation_references:
             continue
+        trusted_mailbox_constructor_invocations: tuple[dict[str, object], ...] = ()
+        if require_invocations:
+            trusted_constructor_references: list[dict[str, object]] = []
+            for invocation_reference in invocation_references:
+                try:
+                    trusted_constructor = _trusted_empty_mailbox_constructor_invocation_is_safe(
+                        module,
+                        name,
+                        invocation_reference,
+                        require_entrypoint_analysis=True,
+                    )
+                except _CallGraphAnalysisLimitError as error:
+                    if analysis_limit_error is None:
+                        analysis_limit_error = error
+                    continue
+                if trusted_constructor:
+                    trusted_constructor_references.append(invocation_reference)
+            trusted_mailbox_constructor_invocations = tuple(trusted_constructor_references)
+        trusted_mailbox_constructor_openers = tuple(
+            invocation_reference
+            for invocation_reference in trusted_mailbox_constructor_invocations
+            if _trusted_mailbox_constructor_invocation_opens_path(module, name, invocation_reference)
+        )
+        if trusted_mailbox_constructor_openers:
+            openers.append(
+                _ImportCallPath(
+                    module=module,
+                    name=name,
+                    import_reference=f"{module}.{name}",
+                    call_path=_trusted_mailbox_constructor_file_open_path(module, name),
+                )
+            )
+        if (
+            require_invocations
+            and invocation_references
+            and len(trusted_mailbox_constructor_invocations) == len(invocation_references)
+        ):
+            continue
         seen.add((module, name))
-
         try:
             entrypoints = (
                 _dedupe_calls(
@@ -2233,7 +2279,11 @@ def find_unanalyzed_callable_call_graph_references(
     for reference in callable_references:
         module = str(reference.get("module", ""))
         name = str(reference.get("name", ""))
-        if not module or not name or (module, name) in seen:
+        if not module or not name:
+            continue
+        if _trusted_empty_mailbox_constructor_invocation_is_safe(module, name, reference):
+            continue
+        if (module, name) in seen:
             continue
         seen.add((module, name))
         if _is_skippable_torch_extension_global_reference(module, name) or _unresolved_trusted_import_reference_is_safe(
@@ -2282,7 +2332,14 @@ def find_analyzed_callable_call_graph_global_positions(
             continue
         module = str(reference.get("module", ""))
         name = str(reference.get("name", ""))
-        if module and name and _call_graph_reference_is_analyzed(module, name, reference):
+        if (
+            module
+            and name
+            and (
+                _trusted_empty_mailbox_constructor_invocation_is_safe(module, name, reference)
+                or _call_graph_reference_is_analyzed(module, name, reference)
+            )
+        ):
             positions.add(global_position)
     return frozenset(positions)
 
@@ -3413,9 +3470,93 @@ def _call_graph_reference_is_analyzed(
     name: str,
     reference: Mapping[str, object],
 ) -> bool:
+    if _trusted_empty_mailbox_constructor_invocation_is_safe(module, name, reference):
+        return True
     if str(reference.get("opcode", "")) == "NEWOBJ_EX" and _complete_keyword_arg_names(reference) is None:
         return False
     return bool(_safe_call_graph_entrypoints(f"{module}.{name}"))
+
+
+def _trusted_empty_mailbox_constructor_invocation_is_safe(
+    module: str,
+    name: str,
+    reference: Mapping[str, object],
+    *,
+    require_entrypoint_analysis: bool = False,
+) -> bool:
+    if (module, name) not in _TRUSTED_EMPTY_MAILBOX_CONSTRUCTOR_INVOCATIONS:
+        return False
+    if str(reference.get("opcode", "")) != "REDUCE":
+        return False
+    positional_arg_count = reference.get("positional_arg_count")
+    if isinstance(positional_arg_count, bool) or not isinstance(positional_arg_count, int):
+        return False
+    if positional_arg_count not in {0, 1}:
+        return False
+    if _complete_keyword_arg_names(reference) != ():
+        return False
+    if not _mailbox_constructor_reference_is_canonical(module, name):
+        return False
+    return not require_entrypoint_analysis or bool(_safe_call_graph_entrypoints(f"{module}.{name}"))
+
+
+def _trusted_mailbox_constructor_invocation_opens_path(
+    module: str,
+    name: str,
+    reference: Mapping[str, object],
+) -> bool:
+    if not _trusted_empty_mailbox_constructor_invocation_is_safe(module, name, reference):
+        return False
+    positional_arg_count = reference.get("positional_arg_count")
+    return (
+        isinstance(positional_arg_count, int)
+        and not isinstance(positional_arg_count, bool)
+        and positional_arg_count >= 1
+    )
+
+
+def _mailbox_constructor_reference_is_canonical(module: str, name: str) -> bool:
+    if _trusted_module_origin_kind(module) != "stdlib":
+        return False
+    loaded, module_object, spec = _loaded_module_state_without_hooks(module)
+    if not loaded:
+        return (
+            _resolve_class_target(f"{module}.{name}") == f"{module}.{name}"
+            and _source_class_context(f"{module}.{name}") is not None
+        )
+    if type(module_object) is not ModuleType or type(spec) is not ModuleSpec:
+        return False
+    origin, loader = _module_spec_fields_without_hooks(spec)
+    if not _loaded_module_metadata_matches_spec_without_hooks(module, module_object, spec, origin, loader):
+        return False
+    reference_state = _loaded_reference_state_without_hooks(module_object, name)
+    _track_loaded_interpreter_reference_state(module, name, reference_state)
+    if not reference_state[0] or not _runtime_value_is_class(reference_state[1]):
+        return False
+    class_object = cast(type[object], reference_state[1])
+    if type.__getattribute__(class_object, "__module__") != module:
+        return False
+    if type.__getattribute__(class_object, "__name__") != name.rpartition(".")[2]:
+        return False
+    return (
+        _source_class_context(f"{module}.{name}") is not None
+        and _class_pickle_owner_matches_trusted_source(
+            class_object,
+            expected_module=module,
+            pickle_entrypoint_methods=_PICKLE_CONSTRUCTOR_ENTRYPOINT_METHODS,
+            pickle_invokes_metaclass_call=True,
+        )
+        and _class_pickle_runtime_dependencies_are_source_independent(
+            class_object,
+            pickle_entrypoint_methods=_PICKLE_CONSTRUCTOR_ENTRYPOINT_METHODS,
+            pickle_invokes_metaclass_call=True,
+        )
+    )
+
+
+def _trusted_mailbox_constructor_file_open_path(module: str, name: str) -> tuple[str, ...]:
+    class_target = _resolve_class_target(f"{module}.{name}") or f"{module}.{name}"
+    return (class_target, "builtins.open")
 
 
 def _filter_class_entrypoints(entrypoints: tuple[str, ...], methods: tuple[str, ...]) -> tuple[str, ...]:
@@ -5892,10 +6033,26 @@ def _resolve_function_target(function_name: str) -> str | None:
         dotted_alias_target = _resolve_dotted_alias_prefix(module_name, qualified_name, analysis)
         if dotted_alias_target is not None:
             return _resolve_alias_function_target(dotted_alias_target)
+        explicit_method_target = _resolve_explicit_class_method_target(module_name, qualified_name)
+        if explicit_method_target is not None:
+            return explicit_method_target
         dotted_module_getattr_target = _resolve_dotted_module_getattr_target(module_name, qualified_name, analysis)
         if dotted_module_getattr_target is not None:
             return dotted_module_getattr_target
     return None
+
+
+def _resolve_explicit_class_method_target(module_name: str, qualified_name: str) -> str | None:
+    class_qualified_name, _separator, method_name = qualified_name.rpartition(".")
+    if not class_qualified_name or not method_name:
+        return None
+    class_target = _resolve_class_target(f"{module_name}.{class_qualified_name}")
+    if class_target is None:
+        return None
+    method_target = f"{class_target}.{method_name}"
+    if method_target == f"{module_name}.{qualified_name}":
+        return None
+    return _resolve_alias_function_target(method_target)
 
 
 def _resolve_dotted_alias_prefix(

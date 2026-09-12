@@ -40,6 +40,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Keep published scan-result cache entries readable when concurrent or interrupted hits update access metadata.
 - Preserve macOS scan-result cache entries during unrelated temporary-file churn while rejecting replaced source files and directories.
 - Keep macOS scan-result caching enabled when hashing updates a model file's access time.
+- Keep scanning referenced PyTorch storage members when hidden pickle, encoded literal, frame-first, or malformed-separator payloads cross trusted probe boundaries.
+- Preserve call-graph coverage for source-backed builtin aliases and non-canonical stdlib mailbox constructors.
 - Scan all bounded encoded pickle metadata that fits the decoded-byte budget, avoiding incomplete PyTorch ZIP coverage on harmless small encoded tokens.
 - Install `tomli` for Python 3.10 runtime environments so no-default-groups scanner installs can read ModelAudit TOML configuration.
 
