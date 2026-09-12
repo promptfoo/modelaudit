@@ -4298,6 +4298,24 @@ def test_expanded_trusted_storage_probe_preserves_short_frame_probe(tmp_path: Pa
     ]
 
 
+def test_expanded_trusted_storage_probe_fails_closed_for_unread_headerless_padding(tmp_path: Path) -> None:
+    storage = b"C\x01x." + (b" " * (package_api._PICKLE_DISCOVERY_PADDING_PROBE_BYTES + 1))
+    archive_path = tmp_path / "headerless-padding-storage.pt"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data/0", storage)
+
+    with zipfile.ZipFile(archive_path) as archive:
+        entry = archive.getinfo("archive/data/0")
+        with pytest.raises(ValueError, match="trusted PyTorch storage padding probe limit reached"):
+            package_api._trusted_storage_zip_entry_looks_like_pickle(
+                archive,
+                entry,
+                [2 * package_api._PICKLE_DISCOVERY_PADDING_PROBE_BYTES],
+                float("inf"),
+                max_probe_bytes=package_api._PICKLE_DISCOVERY_LONG_PROBE_BYTES,
+            )
+
+
 def test_trusted_storage_probe_routes_headerless_binary_stream_at_entry_gate(tmp_path: Path) -> None:
     storage = _short_binunicode(b"os") + _short_binunicode(b"system") + b"\x93)R."
     archive_path = tmp_path / "headerless-binary-storage.pt"
@@ -8466,6 +8484,30 @@ def test_scan_file_keeps_long_headerless_binbytes_near_match_clean(tmp_path: Pat
     assert report.status == ScanStatus.COMPLETE
     assert report.verdict == SafetyVerdict.CLEAN
     assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/0"]
+
+
+def test_scan_file_routes_exact_fit_binbytes_storage_without_stop(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model.pt"
+    byte_literal = (b"A" * 5002) + b"cposix\nsystem\n)R."
+    storage_blob = b"B" + len(byte_literal).to_bytes(4, "little") + byte_literal
+    assert len(storage_blob) == 5024
+
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", storage_blob)
+
+    report = scan_file(archive_path)
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/0"]
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.location is not None
+        and f"{archive_path}:archive/data/0" in finding.location
+        for finding in report.findings
+    )
 
 
 @pytest.mark.parametrize(
@@ -19327,6 +19369,18 @@ def test_raw_nested_extension_reduce_candidate_skips_removed_or_shadowed_callabl
     )
 
 
+def test_raw_nested_extension_routes_unknown_opcode_when_fail_closed_requested() -> None:
+    assert package_api._raw_nested_extension_opcode_candidate_has_structural_signal(
+        b"\x82\x01\xff",
+        [package_api._MAX_RAW_NESTED_PICKLE_CANDIDATES],
+        fail_closed_on_unknown_after_extension=True,
+    )
+    assert not package_api._raw_nested_extension_opcode_candidate_has_structural_signal(
+        b"\x82\x01\xff",
+        [package_api._MAX_RAW_NESTED_PICKLE_CANDIDATES],
+    )
+
+
 def test_raw_nested_extension_boundary_recovery_charges_shared_budget() -> None:
     malformed_candidate = b"(" * 256 + b"\xff\x82\x01."
     parse_budget_remaining = [3]
@@ -19336,6 +19390,23 @@ def test_raw_nested_extension_boundary_recovery_charges_shared_budget() -> None:
         parse_budget_remaining,
     )
     assert parse_budget_remaining == [0]
+
+
+def test_raw_nested_extension_routes_live_mark_after_context_budget_exhaustion() -> None:
+    value = (b"(\xff" * package_api._MAX_RAW_NESTED_PICKLE_CANDIDATES) + b"(](NNNe0\x82\x01)o"
+
+    assert package_api._raw_nested_extension_opcode_candidate_has_structural_signal(
+        value,
+        [package_api._MAX_RAW_NESTED_PICKLE_CANDIDATES],
+    )
+    assert package_api._literal_value_has_raw_nested_security_pickle(value)
+
+
+def test_raw_nested_extension_routes_headerless_literal_extension_tail() -> None:
+    assert package_api._raw_nested_extension_opcode_candidate_has_structural_signal(
+        b"C\x01x0\x82\x01",
+        [package_api._MAX_RAW_NESTED_PICKLE_CANDIDATES],
+    )
 
 
 def test_literal_raw_nested_extension_scan_shares_candidate_budget(monkeypatch: pytest.MonkeyPatch) -> None:

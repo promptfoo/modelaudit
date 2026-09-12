@@ -1543,7 +1543,11 @@ def _trusted_storage_zip_entry_looks_like_pickle(
     ):
         return False
     if max_probe_bytes > _TRUSTED_STORAGE_PICKLE_PROBE_BYTES:
-        if _has_complete_pickle_stream_without_frame_stop_overrun(prefix):
+        if _has_complete_pickle_stream_without_frame_stop_overrun(prefix) and not (
+            is_headerless_binary_pickle_candidate
+            and entry.file_size > len(prefix)
+            and _complete_headerless_byte_literal_prefix_has_only_padding(prefix)
+        ):
             return True
         try:
             for _opcode, _arg, _position in pickletools.genops(prefix):
@@ -1600,12 +1604,25 @@ def _trusted_storage_zip_entry_looks_like_pickle(
         )
     if is_headerless_binary_pickle_candidate:
         short_sample = sample[:_TRUSTED_STORAGE_PICKLE_PROBE_BYTES]
-        should_scan = _raw_nested_binary_candidate_should_scan(
-            sample,
-            candidate_is_prefix=entry.file_size > len(sample),
-        ) or _raw_nested_binary_candidate_should_scan(
-            short_sample,
-            candidate_is_prefix=entry.file_size > len(short_sample),
+        should_scan = (
+            _raw_nested_binary_candidate_should_scan(
+                sample,
+                candidate_is_prefix=entry.file_size > len(sample),
+            )
+            or _raw_nested_binary_candidate_should_scan(
+                short_sample,
+                candidate_is_prefix=entry.file_size > len(short_sample),
+            )
+            or _raw_nested_extension_opcode_candidate_has_structural_signal(
+                sample,
+                [_MAX_RAW_NESTED_PICKLE_CANDIDATES],
+                fail_closed_on_unknown_after_extension=True,
+            )
+            or _raw_nested_extension_opcode_candidate_has_structural_signal(
+                short_sample,
+                [_MAX_RAW_NESTED_PICKLE_CANDIDATES],
+                fail_closed_on_unknown_after_extension=True,
+            )
         )
         if should_scan:
             return True
@@ -1616,6 +1633,12 @@ def _trusted_storage_zip_entry_looks_like_pickle(
             and _complete_headerless_byte_literal_prefix_has_only_padding(sample)
         ):
             defer_padding_probe[0] = True
+        if (
+            max_probe_bytes > _TRUSTED_STORAGE_PICKLE_PROBE_BYTES
+            and entry.file_size > len(sample)
+            and _complete_headerless_byte_literal_prefix_has_only_padding(sample)
+        ):
+            raise ValueError("trusted PyTorch storage padding probe limit reached")
         return False
     if is_frame_first_candidate:
         if _frame_first_trusted_storage_probe_should_scan(sample) or (
@@ -2088,6 +2111,7 @@ def _has_executable_extension_opcode_before_stop(
     candidate: bytes,
     *,
     fail_closed_on_truncated_extension: bool = True,
+    fail_closed_on_unknown_after_extension: bool = False,
 ) -> bool:
     stack: list[str] = []
     memo: dict[str, str] = {}
@@ -2233,7 +2257,7 @@ def _has_executable_extension_opcode_before_stop(
             return False
         message = str(error)
         if "opcode" in message and "unknown" in message:
-            return parsed_after_extension
+            return parsed_after_extension or fail_closed_on_unknown_after_extension
         if "pickle exhausted before seeing STOP" in message:
             return fail_closed_on_truncated_extension
         return True
@@ -2806,10 +2830,7 @@ def _literal_value_has_raw_nested_security_pickle(
                 extension_parse_budget_remaining,
             )
             if exhausted_budget:
-                candidate = value[offset : offset + _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES]
-                if _extension_candidate_after_exhausted_context_should_scan(candidate):
-                    return True
-                continue
+                return True
             candidate_start = recovered_start
             recovered_extension_context = True
         candidate = value[candidate_start : candidate_start + _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES]
@@ -2895,10 +2916,7 @@ def _raw_nested_security_pickle_candidate_budget_exhausted_needs_scan(value: byt
         return True
     if value and value[0] in _BINARY_EXTENSION_SECURITY_OPCODE_BYTES:
         return True
-    return _raw_nested_security_pickle_candidate_has_structural_signal(
-        value,
-        fail_closed_on_truncated_extension=False,
-    )
+    return _raw_nested_security_pickle_candidate_has_structural_signal(value)
 
 
 def _encoded_raw_nested_security_pickle_candidate_budget_exhausted_needs_scan(value: bytes) -> bool:
@@ -3055,6 +3073,7 @@ def _raw_nested_extension_opcode_candidate_has_structural_signal(
     parse_budget_remaining: list[int],
     *,
     fail_closed_on_truncated_extension: bool = True,
+    fail_closed_on_unknown_after_extension: bool = False,
 ) -> bool:
     search_limit = min(len(value), _PICKLE_DISCOVERY_LONG_PROBE_BYTES)
     search_start = 0
@@ -3075,16 +3094,13 @@ def _raw_nested_extension_opcode_candidate_has_structural_signal(
             parse_budget_remaining,
         )
         if exhausted_budget:
-            candidate = value[offset : offset + _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES]
-            if _extension_candidate_after_exhausted_context_should_scan(candidate):
-                return True
-            search_start = offset + 1
-            continue
+            return True
         candidate = value[candidate_start : candidate_start + _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES]
         candidate_is_prefix = candidate_start + len(candidate) < len(value)
         if _has_executable_extension_opcode_before_stop(
             candidate,
             fail_closed_on_truncated_extension=fail_closed_on_truncated_extension,
+            fail_closed_on_unknown_after_extension=fail_closed_on_unknown_after_extension,
         ):
             return True
         if _raw_nested_binary_candidate_should_scan(candidate, candidate_is_prefix=candidate_is_prefix):
@@ -3111,7 +3127,7 @@ def _raw_nested_extension_candidate_start(
             search_start += 1
         candidate_start, stop_pos, exhausted_budget = parse_candidate(search_start)
         if exhausted_budget:
-            return offset, True
+            return search_start, True
         if candidate_start is not None:
             return candidate_start, False
         if stop_pos is None or stop_pos < search_start:
@@ -3122,7 +3138,7 @@ def _raw_nested_extension_candidate_start(
     while mark >= window_start:
         candidate_start, _stop_pos, exhausted_budget = parse_candidate(mark)
         if exhausted_budget:
-            return offset, True
+            return mark, True
         if candidate_start is not None:
             return candidate_start, False
         mark = value.rfind(bytes([_PICKLE_MARK_OPCODE_BYTE]), window_start, mark)
@@ -3278,7 +3294,7 @@ def _headerless_binary_byte_literal_has_possible_size(candidate: bytes, *, entry
         literal_size = int.from_bytes(candidate[1:5], "little")
     else:
         literal_size = int.from_bytes(candidate[1:9], "little")
-    return header_bytes + literal_size + 1 <= entry_size
+    return header_bytes + literal_size <= entry_size
 
 
 def _headerless_binary_pickle_prefix_needs_more_bytes(candidate: bytes, *, candidate_is_prefix: bool) -> bool:
