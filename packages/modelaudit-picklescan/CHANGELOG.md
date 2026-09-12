@@ -5,6 +5,16 @@ All notable changes to `modelaudit-picklescan` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.11](https://github.com/promptfoo/modelaudit/compare/modelaudit-picklescan-v0.1.10...modelaudit-picklescan-v0.1.11) (2026-09-12)
+
+### Bug Fixes
+
+- **cache:** isolate Windows probes and stabilize nightly checks ([#1782](https://github.com/promptfoo/modelaudit/issues/1782)) ([47f94ee](https://github.com/promptfoo/modelaudit/commit/47f94eef3feba8e74c517114094e035c7ea837e8))
+- **picklescan:** avoid scalar storage pickle false positives ([#1842](https://github.com/promptfoo/modelaudit/issues/1842)) ([7408ed1](https://github.com/promptfoo/modelaudit/commit/7408ed1ac48a202ba931a2d6efc5ac79dde4d8ed))
+- **picklescan:** diagnose Windows call-graph source-stability failures ([#1789](https://github.com/promptfoo/modelaudit/issues/1789)) ([89b5024](https://github.com/promptfoo/modelaudit/commit/89b50246fc9226770d46b26e8582a6d161dc0244))
+- **picklescan:** safely parse bounded PyTorch tensor batches ([#1783](https://github.com/promptfoo/modelaudit/issues/1783)) ([705059c](https://github.com/promptfoo/modelaudit/commit/705059c4280056a4b72106fbd474c00e270ecf0b))
+- preserve PyTorch storage import trust ([#1841](https://github.com/promptfoo/modelaudit/issues/1841)) ([a2f040e](https://github.com/promptfoo/modelaudit/commit/a2f040e5af66bde03cc31ffc3ee545dd8d96fa26))
+
 ## [Unreleased]
 
 ### Bug Fixes
