@@ -6031,6 +6031,92 @@ class TestWeightDistributionSemantics:
             and "extremely large weight values" in check.message
         ]
 
+    @staticmethod
+    def _write_balanced_if_squeeze_model(
+        tmp_path: Path,
+        *,
+        vector_count: int,
+        include_matrix: bool,
+        malicious_matrix: bool,
+        filename: str,
+    ) -> Path:
+        source_names = [f"vector_weight{index}" for index in range(vector_count)]
+        initializers = [
+            onnx.numpy_helper.from_array(np.zeros((1, 100), dtype=np.float32), name=name) for name in source_names
+        ]
+        leaves = []
+
+        def leaf_graph(source_name: str, shape: list[int], tag: str) -> Any:
+            return helper.make_graph(
+                [helper.make_node("Identity", [source_name], [tag])],
+                tag,
+                [],
+                [helper.make_tensor_value_info(tag, TensorProto.FLOAT, shape)],
+            )
+
+        for index, source_name in enumerate(source_names):
+            leaves.append(leaf_graph(source_name, [1, 100], f"leaf_{index}"))
+
+        if include_matrix:
+            matrix = np.zeros((1, 100, 100), dtype=np.float32)
+            if malicious_matrix:
+                matrix[0, 50:55, 3] = 10.0
+            initializers.append(onnx.numpy_helper.from_array(matrix, name="special_weight"))
+            leaves.append(leaf_graph("special_weight", [1, 100, 100], "special_return"))
+        initializers.append(onnx.numpy_helper.from_array(np.array([0], dtype=np.int64), name="axes"))
+
+        condition_counter = 0
+
+        def combine_branches(branches: list[Any]) -> Any:
+            nonlocal condition_counter
+            if len(branches) == 1:
+                return branches[0]
+            midpoint = len(branches) // 2
+            left = combine_branches(branches[:midpoint])
+            right = combine_branches(branches[midpoint:])
+            condition_index = condition_counter
+            condition_counter += 1
+            output_name = f"branch_out_{condition_index}"
+            node = helper.make_node(
+                "If",
+                [f"C{condition_index}"],
+                [output_name],
+                then_branch=left,
+                else_branch=right,
+            )
+            return helper.make_graph(
+                [node],
+                f"branch_{condition_index}",
+                [],
+                [helper.make_tensor_value_info(output_name, TensorProto.FLOAT, None)],
+            )
+
+        branch = combine_branches(leaves)
+        selected = branch.output[0].name
+        nodes = [
+            *branch.node,
+            helper.make_node("Squeeze", [selected, "axes"], ["squeezed"]),
+            helper.make_node("MatMul", ["X", "squeezed"], ["M"]),
+            helper.make_node("ReduceSum", ["M"], ["Y"], keepdims=0),
+        ]
+        inputs = [helper.make_tensor_value_info("X", TensorProto.FLOAT, [100])]
+        inputs.extend(
+            helper.make_tensor_value_info(f"C{index}", TensorProto.BOOL, []) for index in range(condition_counter)
+        )
+        graph = helper.make_graph(
+            nodes,
+            filename.removesuffix(".onnx"),
+            inputs,
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [])],
+            initializer=initializers,
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model, full_check=True)
+        path = tmp_path / filename
+        onnx.save(model, str(path))
+        return path
+
     def test_gemm_transposed_weight_uses_the_real_output_axis(self, tmp_path: Path) -> None:
         weights = np.linspace(-0.1, 0.1, 384, dtype=np.float32).reshape(1, 384)
         model_path = create_onnx_weight_model(tmp_path, weights, op_type="Gemm", trans_b=True)
@@ -6749,6 +6835,60 @@ class TestWeightDistributionSemantics:
         semantics = result.metadata["onnx_weight_distribution_semantics"]
         assert semantics["coverage_gaps"] == {}
         assert semantics["eligible_initializer_count"] == 0
+
+    def test_balanced_if_squeeze_detects_matrix_before_lineage_cap(self, tmp_path: Path) -> None:
+        path = self._write_balanced_if_squeeze_model(
+            tmp_path,
+            vector_count=31,
+            include_matrix=True,
+            malicious_matrix=True,
+            filename="balanced-if-squeeze-detects-matrix.onnx",
+        )
+
+        result = OnnxScanner().scan(str(path))
+
+        assert self._extreme_checks(result)
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["coverage_gaps"] == {}
+        assert semantics["eligible_initializer_count"] == 1
+        assert semantics["analyzed_layer_count"] == 1
+
+    def test_balanced_if_squeeze_demotes_homogeneous_vector_gap(self, tmp_path: Path) -> None:
+        path = self._write_balanced_if_squeeze_model(
+            tmp_path,
+            vector_count=33,
+            include_matrix=False,
+            malicious_matrix=False,
+            filename="balanced-if-squeeze-demotes-vector-gap.onnx",
+        )
+
+        result = OnnxScanner().scan(str(path))
+
+        assert result.success is True
+        assert self._extreme_checks(result) == []
+        assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["coverage_gaps"] == {}
+        assert semantics["eligible_initializer_count"] == 0
+
+    def test_balanced_if_squeeze_preserves_heterogeneous_matrix_gap(self, tmp_path: Path) -> None:
+        path = self._write_balanced_if_squeeze_model(
+            tmp_path,
+            vector_count=32,
+            include_matrix=True,
+            malicious_matrix=True,
+            filename="balanced-if-squeeze-preserves-matrix-gap.onnx",
+        )
+
+        result = OnnxScanner().scan(str(path))
+
+        assert result.success is False
+        assert self._extreme_checks(result) == []
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
+        assert semantics["analyzed_layer_count"] == 0
 
     def test_rank_reducing_then_restoring_transform_promotes_deferred_weight_gap(self, tmp_path: Path) -> None:
         source_names = [f"matrix_weight{index}" for index in range(40)]
