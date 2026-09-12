@@ -12682,6 +12682,48 @@ def test_pytorch_zip_allows_torchscript_generated_python_files(tmp_path: Path) -
     ]
 
 
+def test_pytorch_zip_torchscript_check_input_dim_identifier_is_not_s310(tmp_path: Path) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "batchnorm.pt", with_pickle=False, prefix="model")
+    batchnorm_member = "model/code/__torch__/torch/nn/modules/batchnorm.py"
+    with zipfile.ZipFile(model_path, "a") as zip_file:
+        zip_file.writestr(
+            batchnorm_member,
+            "\n".join(
+                [
+                    "class BatchNorm(Module):",
+                    "  __parameters__ = []",
+                    "  __buffers__ = []",
+                    "  training : bool",
+                    "  def _check_input_dim(self: __torch__.torch.nn.modules.batchnorm.BatchNorm,",
+                    "    input: Tensor) -> NoneType:",
+                    "    pass",
+                    "  def forward(self: __torch__.torch.nn.modules.batchnorm.BatchNorm,",
+                    "    input: Tensor) -> Tensor:",
+                    "    self._check_input_dim(input)",
+                    "    return input",
+                    "",
+                ]
+            ),
+        )
+        zip_file.writestr(f"{batchnorm_member}.debug_pkl", _TORCHSCRIPT_DEBUG_PKL)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert not any(
+        issue.rule_code == "S310"
+        and issue.details.get("type") == "cc_pattern"
+        and issue.details.get("pattern") == "check_in"
+        for issue in result.issues
+    )
+    assert not any(
+        check.rule_code == "S310"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("type") == "cc_pattern"
+        and check.details.get("pattern") == "check_in"
+        for check in result.checks
+    )
+
+
 def test_pytorch_zip_hf_google_bert_rust_model_torchscript_reconstruction_control(tmp_path: Path) -> None:
     model_path = tmp_path / "rust_model.ot"
     with zipfile.ZipFile(model_path, "w") as zip_file:

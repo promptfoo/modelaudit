@@ -44,6 +44,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Preserve call-graph coverage for source-backed builtin aliases and non-canonical stdlib mailbox constructors.
 - Scan all bounded encoded pickle metadata that fits the decoded-byte budget, avoiding incomplete PyTorch ZIP coverage on harmless small encoded tokens.
 - Install `tomli` for Python 3.10 runtime environments so no-default-groups scanner installs can read ModelAudit TOML configuration.
+- Avoid command-and-control false positives for generated TorchScript `_check_input_dim` identifiers while preserving actionable `check_in` detections.
 
 ## [0.2.52](https://github.com/promptfoo/modelaudit/compare/v0.2.51...v0.2.52) (2026-07-22)
 
