@@ -144,6 +144,7 @@ _BASE64_NESTED_LITERAL_TOKEN_RE = re.compile(
     rb"[A-Za-z0-9+/_-][A-Za-z0-9+/_=\-\s\r\n\t!\"#$%&'()*.,:;<>?@\[\]\\^`{|}~]{7,}"
 )
 _BASE64_NESTED_LITERAL_SEPARATOR_RE = re.compile(rb"[^A-Za-z0-9+/_=-]+")
+_BASE64_LITERAL_TOKEN_BYTES = frozenset(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/_-")
 _HEX_NESTED_LITERAL_TOKEN_RE = re.compile(rb"[0-9A-Fa-f][0-9A-Fa-f\s\r\n\t]{15,}")
 _RAW_NESTED_TEXT_SECURITY_PICKLE_START_BYTES = b"\x80(cioRbP\x82\x83\x84"
 _RAW_NESTED_BINARY_SECURITY_PICKLE_START_BYTES = b"\x8c\x8d\x95"
@@ -181,12 +182,20 @@ _RAW_NESTED_SECURITY_PICKLE_TEXT_MARKERS = (
     b"commands\ngetoutput\n",
     b"commands\ngetstatusoutput\n",
 )
-_PICKLE_ENGINE_MAGIC_METHOD_LITERAL_PATTERN = r"(?<!\w)__[A-Za-z][A-Za-z0-9_]*__(?!\w)"
+_PICKLE_ENGINE_MAGIC_METHOD_LITERAL_PATTERN = (
+    r"(?<!\w)__(?:reduce|reduce_ex|setstate|getstate|getnewargs|getnewargs_ex|subclasses|globals|code|"
+    r"builtins|import|mro|base|bases|abs|add|aiter|and|anext|bool|bytes|call|ceil|contains|del|"
+    r"delitem|enter|eq|exit|floor|format|fspath|ge|getattribute|getattr|getitem|gt|hash|iadd|iand|"
+    r"ilshift|imatmul|imod|imul|index|invert|ior|ipow|irshift|iter|isub|itruediv|ixor|le|len|"
+    r"length_hint|lshift|lt|matmul|mod|mul|ne|neg|next|or|pos|pow|radd|rand|rlshift|rmatmul|"
+    r"rmod|rmul|ror|rpow|repr|reversed|round|rshift|rrshift|rsub|rtruediv|rxor|setitem|setattr|"
+    r"set_name|str|sub|trunc|truediv|xor|delattr)__(?!\w)"
+)
 _SUSPICIOUS_LITERAL_TEXT_PATTERNS = tuple(
     re.compile(pattern, re.IGNORECASE)
     for pattern in (*SUSPICIOUS_STRING_PATTERNS, _PICKLE_ENGINE_MAGIC_METHOD_LITERAL_PATTERN)
 )
-_PYTHON_LINE_CONTINUATION_RE = re.compile(r"\\\r?\n[ \t\f]*")
+_PYTHON_LINE_CONTINUATION_RE = re.compile(r"\\(?:\r\n?|\n)[ \t\f]*")
 _STORAGE_LITERAL_TEXT_ROUTE_PATTERNS = tuple(
     re.compile(pattern, re.IGNORECASE | re.DOTALL)
     for pattern in (
@@ -203,7 +212,7 @@ _STORAGE_LITERAL_TEXT_ROUTE_PATTERNS = tuple(
         r"getattr\s*\(\s*\w+\s*,\s*['\"](?:system|popen|spawn|exec|eval|call|run|Popen)['\"]",
     )
 )
-_BASE64_LITERAL_TEXT_TOKEN_RE = re.compile(rb"[A-Za-z0-9+/_-][A-Za-z0-9+/_\-\s\r\n\t]{7,}={0,2}")
+_BASE64_LITERAL_TEXT_TOKEN_RE = re.compile(rb"[A-Za-z0-9+/_-][A-Za-z0-9+/_=\-\s\r\n\t]{7,}")
 _HEX_LITERAL_TEXT_TOKEN_RE = re.compile(rb"(?:[0-9A-Fa-f]{2}[\s\r\n\t]*){4,}")
 _MAX_STORAGE_LITERAL_TEXT_CANDIDATES = 64
 _MAX_STORAGE_LITERAL_DECODED_TEXT_BYTES = 64 * 1024
@@ -3108,13 +3117,25 @@ class PyTorchZipScanner(BaseScanner):
             candidate_count += 1
             if candidate_count > _MAX_STORAGE_LITERAL_TEXT_CANDIDATES:
                 return True
-            for shift in range(min(16, len(compact))):
-                token = compact[shift:]
-                if len(token) < 8:
-                    continue
-                if PyTorchZipScanner._base64_token_has_storage_route_signal(token):
-                    return True
+            for candidate_token in PyTorchZipScanner._base64_literal_route_tokens(compact):
+                for shift in range(min(16, len(candidate_token))):
+                    token = candidate_token[shift:]
+                    if len(token) < 8:
+                        continue
+                    if PyTorchZipScanner._base64_token_has_storage_route_signal(token):
+                        return True
         return False
+
+    @staticmethod
+    def _base64_literal_route_tokens(token: bytes) -> tuple[bytes, ...]:
+        tokens = [token]
+        for match in re.finditer(rb"=+", token):
+            suffix_start = match.end()
+            if suffix_start < len(token) and token[suffix_start] in _BASE64_LITERAL_TOKEN_BYTES:
+                suffix = token[suffix_start:]
+                if len(suffix) >= 8:
+                    tokens.append(suffix)
+        return tuple(tokens)
 
     @staticmethod
     def _base64_token_has_storage_route_signal(token: bytes) -> bool:
@@ -3474,6 +3495,8 @@ class PyTorchZipScanner(BaseScanner):
             candidate_is_prefix=candidate_is_prefix,
         ):
             return True
+        if PyTorchZipScanner._complete_trivial_literal_pickle_has_nested_security_pickle(candidate):
+            return True
         if not PyTorchZipScanner._has_security_relevant_pickle_opcode(candidate):
             return False
         if PyTorchZipScanner._has_complete_pickle_stream_without_frame_stop_overrun(candidate):
@@ -3512,17 +3535,18 @@ class PyTorchZipScanner(BaseScanner):
             token = _BASE64_NESTED_LITERAL_SEPARATOR_RE.sub(b"", match.group(0)).translate(
                 bytes.maketrans(b"-_", b"+/")
             )
-            for shift in range(min(4, len(token))):
-                shifted_token = token[shift:]
-                shifted_token += b"=" * (-len(shifted_token) % 4)
-                try:
-                    decoded = base64.b64decode(shifted_token, validate=True)
-                except (binascii.Error, ValueError):
-                    continue
-                if decoded and PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(
-                    decoded, fail_closed_on_candidate_budget=False
-                ):
-                    return True
+            for candidate_token in PyTorchZipScanner._base64_literal_route_tokens(token):
+                for shift in range(min(4, len(candidate_token))):
+                    shifted_token = candidate_token[shift:]
+                    shifted_token += b"=" * (-len(shifted_token) % 4)
+                    try:
+                        decoded = base64.b64decode(shifted_token, validate=True)
+                    except (binascii.Error, ValueError):
+                        continue
+                    if decoded and PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(
+                        decoded, fail_closed_on_candidate_budget=False
+                    ):
+                        return True
         for match in _HEX_NESTED_LITERAL_TOKEN_RE.finditer(value):
             compact = re.sub(rb"\s+", b"", match.group(0))
             for shift in range(min(2, len(compact))):

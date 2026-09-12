@@ -5330,10 +5330,12 @@ def test_pytorch_zip_encoded_nested_pickle_route_normalizes_wrapped_tokens() -> 
     payload = b"cposix\nsystem\n)R."
     base64_token = base64.b64encode(payload)
     wrapped_base64 = base64_token[:8] + b" " + base64_token[8:]
+    padded_decoy_then_base64 = b"AAAA==" + base64_token
     hex_token = binascii.hexlify(payload)
     wrapped_hex = hex_token[:16] + b" " + hex_token[16:]
 
     assert PyTorchZipScanner._literal_value_has_encoded_nested_security_pickle(wrapped_base64) is True
+    assert PyTorchZipScanner._literal_value_has_encoded_nested_security_pickle(padded_decoy_then_base64) is True
     for separator in (b"!", b"@"):
         punctuated_base64 = separator.join(base64_token[index : index + 4] for index in range(0, len(base64_token), 4))
         assert PyTorchZipScanner._literal_value_has_encoded_nested_security_pickle(punctuated_base64) is True
@@ -5361,6 +5363,23 @@ def test_pytorch_zip_raw_nested_binary_route_fails_closed_for_long_headerless_pr
     payload = _pickle_short_binunicode(b"os") + _pickle_short_binunicode(b"system") + (b"N0" * 5000) + b"\x93)R."
 
     assert PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(payload) is True
+
+
+def test_pytorch_zip_raw_nested_binary_route_scans_headerless_scalar_magic_name() -> None:
+    payload = _pickle_short_binunicode(b"__del__") + b"."
+
+    assert PyTorchZipScanner._raw_nested_binary_candidate_should_scan(payload, candidate_is_prefix=False) is True
+
+
+def test_pytorch_zip_storage_literal_route_uses_pickle_engine_magic_names() -> None:
+    for benign_literal in (b"__version__", b"__metadata__", b"__a__"):
+        assert PyTorchZipScanner._literal_value_has_storage_scan_signal(benign_literal) is False
+
+    assert PyTorchZipScanner._literal_value_has_storage_scan_signal(b"__del__") is True
+
+
+def test_pytorch_zip_storage_literal_route_normalizes_lone_cr_line_continuation() -> None:
+    assert PyTorchZipScanner._literal_value_has_storage_scan_signal(b"os.\\\rsystem('id')") is True
 
 
 def test_pytorch_zip_encoded_nested_pickle_route_fails_closed_after_candidate_budget_gap() -> None:
