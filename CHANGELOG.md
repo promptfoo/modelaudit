@@ -41,6 +41,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Preserve macOS scan-result cache entries during unrelated temporary-file churn while rejecting replaced source files and directories.
 - Keep macOS scan-result caching enabled when hashing updates a model file's access time.
 - Scan all bounded encoded pickle metadata that fits the decoded-byte budget, avoiding incomplete PyTorch ZIP coverage on harmless small encoded tokens.
+- Install `tomli` for Python 3.10 runtime environments so no-default-groups scanner installs can read ModelAudit TOML configuration.
 
 ## [0.2.52](https://github.com/promptfoo/modelaudit/compare/v0.2.51...v0.2.52) (2026-07-22)
 
