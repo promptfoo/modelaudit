@@ -3563,7 +3563,9 @@ def _build_onnx_weight_analysis_plan(
                     )
                     input_weight_lineage_limit_gap_count_for_output = (
                         0
-                        if subgraph_results or transform_output_demotes_weight_gap
+                        if subgraph_results
+                        or transform_output_demotes_weight_gap
+                        or cast_output_is_nonfloating_transform
                         else all_input_output_weight_lineage_limit_gap_count
                     )
                     input_non_shape_lineage_limit_gap_count_for_output = (

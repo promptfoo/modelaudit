@@ -7596,6 +7596,37 @@ class TestWeightDistributionSemantics:
         assert semantics["coverage_gaps"] == {}
         assert semantics["eligible_initializer_count"] == 0
 
+    def test_integer_cast_clears_existing_float_weight_gap(self, tmp_path: Path) -> None:
+        source_names = [f"float_matrix{index}" for index in range(40)]
+        initializers = [
+            onnx.numpy_helper.from_array(np.ones((4, 4), dtype=np.float32), name=name) for name in source_names
+        ]
+        graph = helper.make_graph(
+            [
+                helper.make_node("Sum", source_names, ["mixed_matrix"]),
+                helper.make_node("Cast", ["mixed_matrix"], ["integer_matrix"], to=TensorProto.INT64),
+                helper.make_node("MatMul", ["X", "integer_matrix"], ["Y"]),
+            ],
+            "integer_cast_clears_existing_float_weight_gap",
+            [helper.make_tensor_value_info("X", TensorProto.INT64, [1, 4])],
+            [helper.make_tensor_value_info("Y", TensorProto.INT64, [1, 4])],
+            initializer=initializers,
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / "integer-cast-clears-existing-weight-gap.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        assert result.success is True
+        assert self._extreme_checks(result) == []
+        assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["coverage_gaps"] == {}
+        assert semantics["eligible_initializer_count"] == 0
+
     def test_custom_scan_function_output_does_not_promote_vector_gap(self, tmp_path: Path) -> None:
         source_names = [f"float_vector{index}" for index in range(40)]
         initializers = [
