@@ -3086,6 +3086,7 @@ def _build_onnx_weight_analysis_plan(
                 and node.op_type in {"Shape", "Size"}
             )
             output_lineages: dict[int, _OnnxWeightLineage] = {}
+            broadcast_operator_promotes_deferred_gap = False
             if supported_transform:
                 data_lineages = value_lineages.get(str(node.input[0]), {}) if node.input else {}
                 for initializer_index, lineage in data_lineages.items():
@@ -3155,6 +3156,11 @@ def _build_onnx_weight_analysis_plan(
                     if clip_operator and input_names
                     else None
                 )
+                broadcast_operator_promotes_deferred_gap = (
+                    (same_type_elementwise or pow_operator)
+                    and all_input_rank_promotable_lineage_limit_gap_count > 0
+                    and (elementwise_output_shape is None or len(elementwise_output_shape) >= 2)
+                )
                 carries_dynamic_activation = bool(terminal_weight_lineages) and has_dynamic_input
                 carries_dynamic_activation |= prelu_data_is_activation
                 carries_dynamic_activation |= any(
@@ -3208,7 +3214,8 @@ def _build_onnx_weight_analysis_plan(
                 output_rank_promotable_lineage_limit_gap_count,
             ) = bounded_lineages(output_lineages)
             all_input_output_weight_lineage_limit_gap_count = all_input_weight_lineage_limit_gap_count
-            rank_operator_promotes_deferred_gap = (
+            promoted_rank_lineage_limit_gap_count = 0
+            if (
                 rank_gap_promoting_operator
                 and transform_data_input_rank_promotable_lineage_limit_gap_count
                 and operator_output_may_have_weight_rank(
@@ -3217,15 +3224,19 @@ def _build_onnx_weight_analysis_plan(
                     index_shape=known_value_shapes.get(input_names[1]) if len(input_names) > 1 else None,
                     constants=constants,
                 )
-            )
+            ):
+                promoted_rank_lineage_limit_gap_count = transform_data_input_rank_promotable_lineage_limit_gap_count
+            if broadcast_operator_promotes_deferred_gap:
+                promoted_rank_lineage_limit_gap_count = _bounded_onnx_weight_lineage_gap_count(
+                    promoted_rank_lineage_limit_gap_count,
+                    all_input_rank_promotable_lineage_limit_gap_count,
+                )
+            rank_operator_promotes_deferred_gap = promoted_rank_lineage_limit_gap_count > 0
             if (
                 rank_operator_promotes_deferred_gap
-                and transform_data_input_rank_promotable_lineage_limit_gap_count
-                > all_input_output_weight_lineage_limit_gap_count
+                and promoted_rank_lineage_limit_gap_count > all_input_output_weight_lineage_limit_gap_count
             ):
-                all_input_output_weight_lineage_limit_gap_count = (
-                    transform_data_input_rank_promotable_lineage_limit_gap_count
-                )
+                all_input_output_weight_lineage_limit_gap_count = promoted_rank_lineage_limit_gap_count
             if (
                 supported_transform
                 and node.op_type == "Cast"
