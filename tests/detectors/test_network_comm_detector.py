@@ -8666,6 +8666,37 @@ class TestNetworkCommDetector:
         assert not any(finding["type"] == "cc_pattern" and finding["pattern"] == "check_in" for finding in findings)
 
     @pytest.mark.parametrize(
+        "data",
+        [
+            b"_check_in()",
+            b"agent_check_in()",
+            b"check_input_dim_remote()",
+            b"_check_input_dim2()",
+        ],
+    )
+    def test_prefixed_check_in_calls_stay_cc_patterns(self, data: bytes) -> None:
+        detector = NetworkCommDetector()
+
+        findings = detector.scan(data, "hook.py")
+
+        assert any(
+            finding["type"] == "cc_pattern" and finding["pattern"] == "check_in" and finding["severity"] == "CRITICAL"
+            for finding in findings
+        )
+
+    def test_check_input_dim_near_match_does_not_hide_later_check_in(self) -> None:
+        detector = NetworkCommDetector()
+        data = b"def _check_input_dim(self, input):\n    pass\nagent_check_in()\n"
+
+        findings = detector.scan(data, "hook.py")
+
+        check_in_findings = [
+            finding for finding in findings if finding["type"] == "cc_pattern" and finding["pattern"] == "check_in"
+        ]
+        assert len(check_in_findings) == 1
+        assert check_in_findings[0]["position"] == data.find(b"check_in", data.find(b"agent_"))
+
+    @pytest.mark.parametrize(
         ("data", "expected_pattern"),
         [
             (b'check_in = "https://evil.example/payload"', "check_in"),

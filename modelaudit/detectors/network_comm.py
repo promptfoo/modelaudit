@@ -1980,11 +1980,24 @@ def _iter_pattern_matches(data: bytes, pattern: bytes) -> Iterator[int]:
         start = match_index + max(1, len(pattern))
 
 
-def _is_identifier_embedded_match(data: bytes, match_index: int, token_len: int) -> bool:
-    before_is_identifier = match_index > 0 and data[match_index - 1] in _IDENTIFIER_BYTES
+def _is_check_input_dim_near_match(data: bytes, match_index: int, token_len: int) -> bool:
+    suffix = b"put_dim"
     after_index = match_index + token_len
-    after_is_identifier = after_index < len(data) and data[after_index] in _IDENTIFIER_BYTES
-    return before_is_identifier or after_is_identifier
+    if data[after_index : after_index + len(suffix)] != suffix:
+        return False
+    after_suffix = after_index + len(suffix)
+    if after_suffix < len(data) and data[after_suffix] in _IDENTIFIER_BYTES:
+        return False
+
+    identifier_start = match_index
+    while identifier_start > 0 and data[identifier_start - 1] in _IDENTIFIER_BYTES:
+        identifier_start -= 1
+    identifier = data[identifier_start : after_index + len(suffix)]
+    return identifier in {b"check_input_dim", b"_check_input_dim"}
+
+
+def _is_ignorable_cc_pattern_near_match(data: bytes, pattern: bytes, match_index: int) -> bool:
+    return pattern == b"check_in" and _is_check_input_dim_near_match(data, match_index, len(pattern))
 
 
 def _has_call_syntax(data: bytes, match_index: int, token_len: int) -> bool:
@@ -6099,9 +6112,7 @@ class NetworkCommDetector:
         lowered_data = data.lower()
         for pattern in self.cc_patterns:
             for idx in _iter_pattern_matches(lowered_data, pattern):
-                if pattern in self.CC_PATTERNS_REQUIRING_IDENTIFIER_BOUNDARIES and _is_identifier_embedded_match(
-                    data, idx, len(pattern)
-                ):
+                if _is_ignorable_cc_pattern_near_match(lowered_data, pattern, idx):
                     continue
 
                 snippet = _redacted_snippet_for_match(data, idx, idx + len(pattern), before=30, after=30)
