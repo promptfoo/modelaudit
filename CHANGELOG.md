@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- Upgrade gzip, PCRE2, SQLite, and Perl in Docker runtime images to pick up Debian security fixes.
 - Upgrade locked GitPython to 3.1.59 to address four dependency audit advisories.
 - Inspect hidden ZIP archives and malicious pickle payloads in legacy GGML model variants.
 - Stop reporting a ZIP polyglot for GGUF/GGML files whose tensor data merely contains an end-of-central-directory signature.
