@@ -2323,13 +2323,12 @@ def _build_onnx_weight_analysis_plan(
         dropped_weight_lineages = sum(
             1
             for _initializer_index, lineage in dropped_lineages
-            if lineage.unresolved_reason not in _ONNX_RUNTIME_BOOKKEEPING_LINEAGE_REASONS
-            and lineage_could_be_weight(lineage)
+            if lineage.unresolved_reason != "dynamic_activation_lineage" and lineage_could_be_weight(lineage)
         )
         dropped_rank_promotable_lineages = sum(
             1
             for _initializer_index, lineage in dropped_lineages
-            if lineage.unresolved_reason not in _ONNX_RUNTIME_BOOKKEEPING_LINEAGE_REASONS
+            if lineage.unresolved_reason != "dynamic_activation_lineage"
             and lineage_could_be_weight_after_rank_increase(lineage)
         )
         return (
@@ -3181,6 +3180,17 @@ def _build_onnx_weight_analysis_plan(
                         or node.op_type in {"Expand", "Gather", "GatherElements", "GatherND", "Slice", "Tile"}
                     )
                 )
+                preserves_data_type = (
+                    same_type_elementwise
+                    or same_type_unary_elementwise
+                    or clip_operator
+                    or (
+                        is_registered_standard_operator
+                        and not is_model_local_function
+                        and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
+                        and node.op_type in {"Expand", "Gather", "GatherElements", "GatherND", "Slice", "Tile"}
+                    )
+                )
                 for initializer_index, lineage in all_input_lineages.items():
                     if initializer_index in activation_input_lineages:
                         continue
@@ -3198,11 +3208,7 @@ def _build_onnx_weight_analysis_plan(
                     output_lineages[initializer_index] = _OnnxWeightLineage(
                         initializer_index=initializer_index,
                         shape=elementwise_output_shape,
-                        data_type=(
-                            lineage.data_type
-                            if same_type_elementwise or same_type_unary_elementwise or clip_operator
-                            else None
-                        ),
+                        data_type=lineage.data_type if preserves_data_type else None,
                         transforms=lineage.transforms,
                         unresolved_reason=unresolved_reason,
                     )
