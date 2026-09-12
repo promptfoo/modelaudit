@@ -158,8 +158,6 @@ _RAW_NESTED_SECURITY_PICKLE_START_BYTES = (
     _RAW_NESTED_TEXT_SECURITY_PICKLE_START_BYTES + _RAW_NESTED_BINARY_SECURITY_PICKLE_START_BYTES
 )
 _BINARY_EXTENSION_SECURITY_OPCODE_BYTES = b"\x82\x83\x84"
-_BINARY_EXTENSION_OPCODE_OPERAND_BYTES = {0x82: 1, 0x83: 2, 0x84: 4}
-_BINARY_EXTENSION_OPCODE_FOLLOWER_BYTES = b".)Rq\x85\x86\x87\x94\x95"
 _BINARY_SECURITY_OPCODE_REQUIRING_EXISTING_STACK_BYTES = b"\x81\x92\x93"
 _MAX_RAW_NESTED_PICKLE_CANDIDATES = 64
 _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES = 8 * 1024
@@ -2542,7 +2540,10 @@ def _literal_value_has_raw_nested_security_pickle(
             return True
         if (
             marker in _BINARY_EXTENSION_SECURITY_OPCODE_BYTES
-            and _raw_nested_extension_opcode_candidate_has_structural_signal(candidate)
+            and _raw_nested_extension_opcode_candidate_has_structural_signal(
+                candidate,
+                [_MAX_RAW_NESTED_PICKLE_CANDIDATES],
+            )
         ):
             return True
         if (
@@ -2631,7 +2632,7 @@ def _raw_nested_security_pickle_candidate_has_structural_signal(value: bytes) ->
         return True
     if _raw_nested_binary_protocol_candidate_has_structural_signal(value, parse_budget_remaining):
         return True
-    if _raw_nested_extension_opcode_candidate_has_structural_signal(value):
+    if _raw_nested_extension_opcode_candidate_has_structural_signal(value, parse_budget_remaining):
         return True
     if _raw_nested_binary_opcode_candidate_has_structural_signal(value, parse_budget_remaining):
         return True
@@ -2735,7 +2736,10 @@ def _raw_nested_binary_protocol_candidate_has_structural_signal(
     return False
 
 
-def _raw_nested_extension_opcode_candidate_has_structural_signal(value: bytes) -> bool:
+def _raw_nested_extension_opcode_candidate_has_structural_signal(
+    value: bytes,
+    parse_budget_remaining: list[int],
+) -> bool:
     search_limit = min(len(value), _PICKLE_DISCOVERY_LONG_PROBE_BYTES)
     search_start = 0
     while search_start < search_limit:
@@ -2749,13 +2753,11 @@ def _raw_nested_extension_opcode_candidate_has_structural_signal(value: bytes) -
         )
         if offset < 0:
             return False
-        operand_len = _BINARY_EXTENSION_OPCODE_OPERAND_BYTES[value[offset]]
-        follower_offset = offset + 1 + operand_len
-        if (
-            follower_offset < search_limit
-            and follower_offset < len(value)
-            and value[follower_offset] in _BINARY_EXTENSION_OPCODE_FOLLOWER_BYTES
-        ):
+        if not _consume_raw_nested_structural_parse_budget(parse_budget_remaining):
+            return True
+        candidate = value[offset : offset + _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES]
+        candidate_is_prefix = offset + len(candidate) < len(value)
+        if _raw_nested_binary_candidate_should_scan(candidate, candidate_is_prefix=candidate_is_prefix):
             return True
         search_start = offset + 1
     return False

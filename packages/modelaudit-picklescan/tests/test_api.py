@@ -6789,6 +6789,24 @@ def test_scan_file_routes_nested_extension_reference_literal_storage(tmp_path: P
     assert any(finding.rule_code == "EXTENSION_REF" for finding in report.findings)
 
 
+def test_scan_file_routes_base64_extension_reduce_literal_storage(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model.pt"
+    storage_blob = b"S'ggFOMClSLg=='\n."
+    storage_blob += b" " * (-len(storage_blob) % 4)
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", storage_blob)
+
+    report = scan_file(archive_path)
+
+    assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/data/0"]
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(finding.rule_code == "S601" for finding in report.findings)
+    assert any(finding.rule_code == "DANGEROUS_CALL" for finding in report.findings)
+
+
 @pytest.mark.parametrize(
     ("memo_prefix", "memo_suffix"),
     [
