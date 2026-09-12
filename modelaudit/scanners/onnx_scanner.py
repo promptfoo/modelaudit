@@ -1878,6 +1878,13 @@ def _build_onnx_weight_analysis_plan(
             if axis is None:
                 return True
             return len(input_shape) + len(index_shape) - 1 >= 2
+        if node.op_type == "GatherND":
+            if input_shape is None or index_shape is None or not index_shape:
+                return True
+            index_depth = index_shape[-1]
+            if index_depth <= 0 or index_depth > len(input_shape):
+                return True
+            return len(index_shape) - 1 + len(input_shape) - index_depth >= 2
         if node.op_type == "Flatten":
             return True
         if node.op_type == "Unsqueeze":
@@ -2589,7 +2596,7 @@ def _build_onnx_weight_analysis_plan(
             rank_gap_promoting_operator = (
                 getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
                 and not is_model_local_function
-                and node.op_type in {"Expand", "Flatten", "Gather", "Reshape", "Squeeze", "Unsqueeze"}
+                and node.op_type in {"Expand", "Flatten", "Gather", "GatherND", "Reshape", "Squeeze", "Unsqueeze"}
             )
             all_input_lineages: dict[int, _OnnxWeightLineage] = {}
             all_input_lineage_limit_gap_count = 0

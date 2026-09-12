@@ -6890,6 +6890,92 @@ class TestWeightDistributionSemantics:
         assert semantics["coverage_gaps"] == {}
         assert semantics["eligible_initializer_count"] == 0
 
+    def test_gathernd_promotes_deferred_vector_lineage_gap_to_weight_gap(self, tmp_path: Path) -> None:
+        shape_names = [f"shape_source{index}" for index in range(32)]
+        initializers = [onnx.numpy_helper.from_array(np.array([4], dtype=np.int64), name=name) for name in shape_names]
+        initializers.extend(
+            [
+                onnx.numpy_helper.from_array(np.ones((4,), dtype=np.float32), name="W"),
+                onnx.numpy_helper.from_array(np.zeros((4, 4, 1), dtype=np.int64), name="indices"),
+            ]
+        )
+        nodes = []
+        previous = "W"
+        for index, shape_name in enumerate(shape_names):
+            reshaped = f"reshaped{index}"
+            nodes.append(helper.make_node("Reshape", [previous, shape_name], [reshaped]))
+            previous = reshaped
+        nodes.extend(
+            [
+                helper.make_node("GatherND", [previous, "indices"], ["generated_weight"]),
+                helper.make_node("MatMul", ["X", "generated_weight"], ["Y"]),
+            ]
+        )
+        graph = helper.make_graph(
+            nodes,
+            "gathernd_promotes_deferred_vector_lineage_gap",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, [4, 4])],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [4, 4])],
+            initializer=initializers,
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / "gathernd-promotes-deferred-vector-gap.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        assert result.success is False
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["coverage_gaps"]["lineages_per_value_limit"] == 1
+        assert semantics["analyzed_layer_count"] == 0
+
+    def test_integer_gathernd_deferred_lineage_gap_stays_nonweight(self, tmp_path: Path) -> None:
+        shape_names = [f"shape_source{index}" for index in range(32)]
+        initializers = [onnx.numpy_helper.from_array(np.array([4], dtype=np.int64), name=name) for name in shape_names]
+        initializers.extend(
+            [
+                onnx.numpy_helper.from_array(np.ones((4,), dtype=np.int64), name="values"),
+                onnx.numpy_helper.from_array(np.zeros((4, 4, 1), dtype=np.int64), name="indices"),
+            ]
+        )
+        nodes = []
+        previous = "values"
+        for index, shape_name in enumerate(shape_names):
+            reshaped = f"reshaped{index}"
+            nodes.append(helper.make_node("Reshape", [previous, shape_name], [reshaped]))
+            previous = reshaped
+        nodes.extend(
+            [
+                helper.make_node("GatherND", [previous, "indices"], ["generated_values"]),
+                helper.make_node("MatMul", ["X", "generated_values"], ["Y"]),
+            ]
+        )
+        graph = helper.make_graph(
+            nodes,
+            "integer_gathernd_deferred_lineage_gap_stays_nonweight",
+            [helper.make_tensor_value_info("X", TensorProto.INT64, [4, 4])],
+            [helper.make_tensor_value_info("Y", TensorProto.INT64, [4, 4])],
+            initializer=initializers,
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / "integer-gathernd-deferred-lineage-gap.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        assert result.success is True
+        assert self._extreme_checks(result) == []
+        assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["coverage_gaps"] == {}
+        assert semantics["eligible_initializer_count"] == 0
+
     def test_lexical_subgraph_capture_carries_deferred_lineage_cap_gap(self, tmp_path: Path) -> None:
         initializers = [
             onnx.numpy_helper.from_array(np.array([1], dtype=np.int64), name=f"shape_source{index}")
