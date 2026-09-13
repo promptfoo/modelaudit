@@ -7541,6 +7541,114 @@ class TestWeightDistributionSemantics:
         semantics = result.metadata["onnx_weight_distribution_semantics"]
         assert semantics["coverage_gaps"]["lineages_per_value_limit"] == 8
 
+    def test_broadcast_promotion_adds_to_existing_weight_gap_count(self, tmp_path: Path) -> None:
+        retained_vector_names = [f"retained_vector{index}" for index in range(32)]
+        dropped_matrix_names = [f"dropped_matrix{index}" for index in range(8)]
+        dropped_vector_names = [f"dropped_vector{index}" for index in range(8)]
+        initializers = [
+            *[
+                onnx.numpy_helper.from_array(np.ones((4,), dtype=np.float32), name=name)
+                for name in retained_vector_names
+            ],
+            *[
+                onnx.numpy_helper.from_array(np.ones((1, 4), dtype=np.float32), name=name)
+                for name in dropped_matrix_names
+            ],
+            *[
+                onnx.numpy_helper.from_array(np.ones((4,), dtype=np.float32), name=name)
+                for name in dropped_vector_names
+            ],
+        ]
+
+        leaves = []
+        for source_name in retained_vector_names:
+            leaves.append(
+                helper.make_graph(
+                    [helper.make_node("Identity", [source_name], [f"{source_name}_out"])],
+                    f"{source_name}_leaf",
+                    [],
+                    [helper.make_tensor_value_info(f"{source_name}_out", TensorProto.FLOAT, [4])],
+                )
+            )
+        for source_name in dropped_matrix_names:
+            leaves.append(
+                helper.make_graph(
+                    [helper.make_node("Identity", [source_name], [f"{source_name}_out"])],
+                    f"{source_name}_leaf",
+                    [],
+                    [helper.make_tensor_value_info(f"{source_name}_out", TensorProto.FLOAT, [1, 4])],
+                )
+            )
+        for source_name in dropped_vector_names:
+            leaves.append(
+                helper.make_graph(
+                    [helper.make_node("Identity", [source_name], [f"{source_name}_out"])],
+                    f"{source_name}_leaf",
+                    [],
+                    [helper.make_tensor_value_info(f"{source_name}_out", TensorProto.FLOAT, [4])],
+                )
+            )
+
+        condition_counter = 0
+
+        def combine_branches(branches: list[Any]) -> Any:
+            nonlocal condition_counter
+            if len(branches) == 1:
+                return branches[0]
+            midpoint = len(branches) // 2
+            left = combine_branches(branches[:midpoint])
+            right = combine_branches(branches[midpoint:])
+            condition_index = condition_counter
+            condition_counter += 1
+            output_name = f"branch_out_{condition_index}"
+            node = helper.make_node(
+                "If",
+                [f"C{condition_index}"],
+                [output_name],
+                then_branch=left,
+                else_branch=right,
+            )
+            return helper.make_graph(
+                [node],
+                f"branch_{condition_index}",
+                [],
+                [helper.make_tensor_value_info(output_name, TensorProto.FLOAT, None)],
+            )
+
+        branch = combine_branches(leaves)
+        selected = branch.output[0].name
+        graph = helper.make_graph(
+            [
+                *branch.node,
+                helper.make_node("Add", [selected, "runtime_matrix"], ["generated_weight"]),
+                helper.make_node("MatMul", ["X", "generated_weight"], ["Y"]),
+            ],
+            "broadcast_promotion_adds_to_existing_weight_gap_count",
+            [
+                helper.make_tensor_value_info("runtime_matrix", TensorProto.FLOAT, [1, 4]),
+                helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 1]),
+                *[
+                    helper.make_tensor_value_info(f"C{index}", TensorProto.BOOL, [])
+                    for index in range(condition_counter)
+                ],
+            ],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 4])],
+            initializer=initializers,
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / "broadcast-promotion-adds-existing-weight-gap.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        assert result.success is False
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["coverage_gaps"]["lineages_per_value_limit"] == 16
+
     def test_integer_rank_transform_deferred_lineage_gap_stays_nonweight(self, tmp_path: Path) -> None:
         source_names = [f"integer_vector{index}" for index in range(40)]
         initializers = [onnx.numpy_helper.from_array(np.ones((4,), dtype=np.int64), name=name) for name in source_names]
@@ -8012,7 +8120,7 @@ class TestWeightDistributionSemantics:
         assert semantics["coverage_gaps"]["lineages_per_value_limit"] == 1
         assert semantics["analyzed_layer_count"] == 0
 
-    @pytest.mark.parametrize("transform", ["Identity", "Relu", "Cast", "Transpose"])
+    @pytest.mark.parametrize("transform", ["Identity", "Relu", "Cast", "Transpose", "Clip", "Dropout"])
     @pytest.mark.parametrize(
         ("runtime_dims", "x_dims", "y_dims", "expect_gap"),
         [

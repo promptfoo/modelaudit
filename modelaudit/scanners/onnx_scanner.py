@@ -239,6 +239,12 @@ _SAME_TYPE_UNARY_ELEMENTWISE_OPERATORS: frozenset[str] = frozenset(
         "ThresholdedRelu",
     }
 )
+_SHAPE_PRESERVING_UNARY_RANK_OPERATORS: frozenset[str] = _SAME_TYPE_UNARY_ELEMENTWISE_OPERATORS | frozenset(
+    {
+        "Clip",
+        "Dropout",
+    }
+)
 _QUANTIZED_WEIGHT_OPERATORS: frozenset[str] = frozenset(
     {
         "ConvInteger",
@@ -3885,11 +3891,11 @@ def _build_onnx_weight_analysis_plan(
                         broadcast_promoted_summary,
                     )
             rank_operator_promotes_deferred_gap = promoted_rank_lineage_limit_gap_count > 0
-            if (
-                rank_operator_promotes_deferred_gap
-                and promoted_rank_lineage_limit_gap_count > all_input_output_weight_lineage_limit_gap_count
-            ):
-                all_input_output_weight_lineage_limit_gap_count = promoted_rank_lineage_limit_gap_count
+            if rank_operator_promotes_deferred_gap:
+                all_input_output_weight_lineage_limit_gap_count = _bounded_onnx_weight_lineage_gap_count(
+                    all_input_output_weight_lineage_limit_gap_count,
+                    promoted_rank_lineage_limit_gap_count,
+                )
                 all_input_output_weight_lineage_gap_summary = merge_weight_lineage_gap_summaries(
                     all_input_output_weight_lineage_gap_summary,
                     promoted_rank_lineage_gap_summary,
@@ -4309,7 +4315,7 @@ def _build_onnx_weight_analysis_plan(
                 common_output_rank_operator = (
                     is_registered_standard_operator
                     and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
-                    and node.op_type in _SAME_TYPE_UNARY_ELEMENTWISE_OPERATORS
+                    and node.op_type in _SHAPE_PRESERVING_UNARY_RANK_OPERATORS
                 )
                 if common_output_rank_operator:
                     elementwise_output_shape = known_value_shapes.get(input_names[0])
