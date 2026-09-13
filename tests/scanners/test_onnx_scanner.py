@@ -6731,10 +6731,7 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("target_shape", TensorProto.INT64, [1])],
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [None])],
             initializer=[
-                *[
-                    onnx.numpy_helper.from_array(np.zeros((4,), dtype=np.float32), name=name)
-                    for name in source_names
-                ],
+                *[onnx.numpy_helper.from_array(np.zeros((4,), dtype=np.float32), name=name) for name in source_names],
                 onnx.numpy_helper.from_array(np.array([4], dtype=np.int64), name="target_shape"),
                 onnx.numpy_helper.from_array(np.zeros((4, 1), dtype=np.float32), name="projection"),
             ],
@@ -6765,10 +6762,7 @@ class TestWeightDistributionSemantics:
             [],
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 1])],
             initializer=[
-                *[
-                    onnx.numpy_helper.from_array(np.array(0.0, dtype=np.float32), name=name)
-                    for name in scalar_names
-                ],
+                *[onnx.numpy_helper.from_array(np.array(0.0, dtype=np.float32), name=name) for name in scalar_names],
                 *[onnx.numpy_helper.from_array(np.zeros((4,), dtype=np.float32), name=name) for name in vector_names],
                 onnx.numpy_helper.from_array(np.array([0], dtype=np.int64), name="axes"),
                 onnx.numpy_helper.from_array(np.zeros((4, 1), dtype=np.float32), name="projection"),

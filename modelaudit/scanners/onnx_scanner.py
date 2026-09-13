@@ -2669,9 +2669,7 @@ def _build_onnx_weight_analysis_plan(
         inherited_weight_lineage_limit_gap_counts: dict[str, int] | None = None,
         inherited_weight_lineage_limit_gap_summaries: dict[str, _OnnxWeightLineageGapSummary] | None = None,
         inherited_rank_promotable_lineage_limit_gap_counts: dict[str, int] | None = None,
-        inherited_rank_promotable_lineage_limit_gap_summaries: (
-            dict[str, _OnnxWeightLineageGapSummary] | None
-        ) = None,
+        inherited_rank_promotable_lineage_limit_gap_summaries: (dict[str, _OnnxWeightLineageGapSummary] | None) = None,
         bound_lineage_limit_gap_counts: dict[str, int] | None = None,
         bound_non_shape_lineage_limit_gap_counts: dict[str, int] | None = None,
         bound_weight_lineage_limit_gap_counts: dict[str, int] | None = None,
@@ -3095,10 +3093,7 @@ def _build_onnx_weight_analysis_plan(
                     lineage.unresolved_reason == "dynamic_activation_lineage" for lineage in input_lineages.values()
                 )
                 recognized_gap_activation_input = prior_layer_activation_input and (
-                    (
-                        is_registered_standard_operator
-                        and _onnx_opaque_activation_input_candidate(node, input_index)
-                    )
+                    (is_registered_standard_operator and _onnx_opaque_activation_input_candidate(node, input_index))
                     or (
                         _onnx_activation_input_candidate(node, input_index)
                         and (opposite_resolved_weight_for_input or all_lineage_inputs_are_activation_contraction)
@@ -3291,9 +3286,7 @@ def _build_onnx_weight_analysis_plan(
                     subgraph_bound_weight_lineage_gaps: dict[str, int] = {}
                     subgraph_bound_weight_lineage_gap_summaries: dict[str, _OnnxWeightLineageGapSummary] = {}
                     subgraph_bound_rank_promotable_lineage_gaps: dict[str, int] = {}
-                    subgraph_bound_rank_promotable_lineage_gap_summaries: dict[
-                        str, _OnnxWeightLineageGapSummary
-                    ] = {}
+                    subgraph_bound_rank_promotable_lineage_gap_summaries: dict[str, _OnnxWeightLineageGapSummary] = {}
                     input_pairs: Iterable[tuple[Any, Any]]
                     if node.op_type == "Loop":
                         input_pairs = zip(node.input[2:], subgraph.input[2:], strict=False)
@@ -3400,9 +3393,7 @@ def _build_onnx_weight_analysis_plan(
                 function_bound_weight_lineage_gaps: dict[str, int] = {}
                 function_bound_weight_lineage_gap_summaries: dict[str, _OnnxWeightLineageGapSummary] = {}
                 function_bound_rank_promotable_lineage_gaps: dict[str, int] = {}
-                function_bound_rank_promotable_lineage_gap_summaries: dict[
-                    str, _OnnxWeightLineageGapSummary
-                ] = {}
+                function_bound_rank_promotable_lineage_gap_summaries: dict[str, _OnnxWeightLineageGapSummary] = {}
                 function_source_scope = ("function", *function_key)
                 function_bound_attributes: dict[str, Any] = {}
                 function_bound_attribute_keys: dict[str, tuple[Any, ...]] = {}
@@ -3662,9 +3653,7 @@ def _build_onnx_weight_analysis_plan(
                         constants=constants,
                     )
                 ):
-                    promoted_rank_lineage_limit_gap_count = (
-                        transform_data_input_rank_promotable_lineage_limit_gap_count
-                    )
+                    promoted_rank_lineage_limit_gap_count = transform_data_input_rank_promotable_lineage_limit_gap_count
                     promoted_rank_lineage_gap_summary = known_weight_gap_summary(
                         candidate_promoted_summary,
                         promoted_rank_lineage_limit_gap_count,
@@ -3850,9 +3839,7 @@ def _build_onnx_weight_analysis_plan(
             subgraph_output_weight_lineage_gap_counts = [0 for _ in node.output]
             subgraph_output_weight_lineage_gap_summaries = [empty_weight_gap_summary for _ in node.output]
             subgraph_output_rank_promotable_lineage_gap_counts = [0 for _ in node.output]
-            subgraph_output_rank_promotable_lineage_gap_summaries = [
-                empty_weight_gap_summary for _ in node.output
-            ]
+            subgraph_output_rank_promotable_lineage_gap_summaries = [empty_weight_gap_summary for _ in node.output]
 
             def merge_subgraph_output_gap_state(
                 output_index: int,
@@ -3963,8 +3950,7 @@ def _build_onnx_weight_analysis_plan(
                             known_weight_gap_summary(
                                 graph_output_rank_promotable_lineage_gap_summaries[graph_output_index],
                                 graph_output_rank_promotable_gap_count,
-                            )
-                            ,
+                            ),
                             graph_output_rank_promotable_gap_count,
                         )
                         if stacked_scan_weight_gap_summary != empty_weight_gap_summary:
