@@ -2581,6 +2581,17 @@ def _build_onnx_weight_analysis_plan(
     ) -> _OnnxWeightLineageGapSummary:
         return summarize_lineage_gap(lineages, lineage_could_be_weight, truncated=truncated)
 
+    def summarize_non_shape_lineage_gap(
+        lineages: Iterable[_OnnxWeightLineage],
+        *,
+        truncated: bool = False,
+    ) -> _OnnxWeightLineageGapSummary:
+        return summarize_lineage_gap(
+            lineages,
+            lambda lineage: lineage.unresolved_reason != "shape_control_lineage",
+            truncated=truncated,
+        )
+
     def summarize_rank_promotable_lineage_gap(
         lineages: Iterable[_OnnxWeightLineage],
         *,
@@ -2615,6 +2626,17 @@ def _build_onnx_weight_analysis_plan(
         if summary is not None and (summary.lineages or summary.truncated):
             return summary
         return unknown_weight_gap_summary
+
+    def floating_cast_non_shape_gap_may_be_weight(
+        summary: _OnnxWeightLineageGapSummary,
+        node: Any,
+        constants: dict[str, Any],
+    ) -> bool:
+        if summary.truncated or not summary.lineages:
+            return True
+        return any(
+            lineage_could_be_weight(transformed_lineage(lineage, node, constants)) for lineage in summary.lineages
+        )
 
     def weight_gap_summary_demotes_after_transform(
         summary: _OnnxWeightLineageGapSummary,
@@ -2722,6 +2744,7 @@ def _build_onnx_weight_analysis_plan(
         dict[int, _OnnxWeightLineage],
         int,
         int,
+        _OnnxWeightLineageGapSummary,
         int,
         int,
         _OnnxWeightLineageGapSummary,
@@ -2729,7 +2752,16 @@ def _build_onnx_weight_analysis_plan(
     ]:
         lineages = compact_runtime_bookkeeping_lineages(lineages)
         if len(lineages) <= _ONNX_WEIGHT_LINEAGES_PER_VALUE_LIMIT:
-            return lineages, 0, 0, 0, 0, empty_weight_gap_summary, empty_weight_gap_summary
+            return (
+                lineages,
+                0,
+                0,
+                empty_weight_gap_summary,
+                0,
+                0,
+                empty_weight_gap_summary,
+                empty_weight_gap_summary,
+            )
         ordered_lineages = sorted(
             lineages.items(),
             key=lambda item: (
@@ -2754,6 +2786,9 @@ def _build_onnx_weight_analysis_plan(
         dropped_weight_lineage_summary = summarize_weight_lineage_gap(
             lineage for _initializer_index, lineage in dropped_lineages
         )
+        dropped_non_shape_lineage_summary = summarize_non_shape_lineage_gap(
+            lineage for _initializer_index, lineage in dropped_lineages
+        )
         dropped_rank_promotable_lineage_summary = summarize_rank_promotable_lineage_gap(
             lineage for _initializer_index, lineage in dropped_lineages
         )
@@ -2761,6 +2796,7 @@ def _build_onnx_weight_analysis_plan(
             dict(ordered_lineages[:_ONNX_WEIGHT_LINEAGES_PER_VALUE_LIMIT]),
             len(dropped_lineages),
             dropped_non_shape_lineages,
+            dropped_non_shape_lineage_summary,
             dropped_weight_lineages,
             dropped_rank_promotable_lineages,
             dropped_weight_lineage_summary,
@@ -2871,12 +2907,14 @@ def _build_onnx_weight_analysis_plan(
         bound_dynamic_values: set[str] | None = None,
         inherited_lineage_limit_gap_counts: dict[str, int] | None = None,
         inherited_non_shape_lineage_limit_gap_counts: dict[str, int] | None = None,
+        inherited_non_shape_lineage_limit_gap_summaries: dict[str, _OnnxWeightLineageGapSummary] | None = None,
         inherited_weight_lineage_limit_gap_counts: dict[str, int] | None = None,
         inherited_weight_lineage_limit_gap_summaries: dict[str, _OnnxWeightLineageGapSummary] | None = None,
         inherited_rank_promotable_lineage_limit_gap_counts: dict[str, int] | None = None,
         inherited_rank_promotable_lineage_limit_gap_summaries: (dict[str, _OnnxWeightLineageGapSummary] | None) = None,
         bound_lineage_limit_gap_counts: dict[str, int] | None = None,
         bound_non_shape_lineage_limit_gap_counts: dict[str, int] | None = None,
+        bound_non_shape_lineage_limit_gap_summaries: dict[str, _OnnxWeightLineageGapSummary] | None = None,
         bound_weight_lineage_limit_gap_counts: dict[str, int] | None = None,
         bound_weight_lineage_limit_gap_summaries: dict[str, _OnnxWeightLineageGapSummary] | None = None,
         bound_rank_promotable_lineage_limit_gap_counts: dict[str, int] | None = None,
@@ -2891,6 +2929,7 @@ def _build_onnx_weight_analysis_plan(
             set[str],
             dict[str, int],
             dict[str, int],
+            dict[str, _OnnxWeightLineageGapSummary],
             dict[str, int],
             dict[str, _OnnxWeightLineageGapSummary],
             dict[str, int],
@@ -2902,6 +2941,7 @@ def _build_onnx_weight_analysis_plan(
         list[bool],
         list[int],
         list[int],
+        list[_OnnxWeightLineageGapSummary],
         list[int],
         list[_OnnxWeightLineageGapSummary],
         list[int],
@@ -2912,6 +2952,7 @@ def _build_onnx_weight_analysis_plan(
         graph_counter += 1
         inherited_lineage_limit_gap_counts = inherited_lineage_limit_gap_counts or {}
         inherited_non_shape_lineage_limit_gap_counts = inherited_non_shape_lineage_limit_gap_counts or {}
+        inherited_non_shape_lineage_limit_gap_summaries = inherited_non_shape_lineage_limit_gap_summaries or {}
         inherited_weight_lineage_limit_gap_counts = inherited_weight_lineage_limit_gap_counts or {}
         inherited_weight_lineage_limit_gap_summaries = inherited_weight_lineage_limit_gap_summaries or {}
         inherited_rank_promotable_lineage_limit_gap_counts = inherited_rank_promotable_lineage_limit_gap_counts or {}
@@ -2924,6 +2965,7 @@ def _build_onnx_weight_analysis_plan(
             dynamic_values = set(inherited_dynamic_values)
             value_lineage_limit_gap_counts = dict(inherited_lineage_limit_gap_counts)
             value_non_shape_lineage_limit_gap_counts = dict(inherited_non_shape_lineage_limit_gap_counts)
+            value_non_shape_lineage_limit_gap_summaries = dict(inherited_non_shape_lineage_limit_gap_summaries)
             value_weight_lineage_limit_gap_counts = dict(inherited_weight_lineage_limit_gap_counts)
             value_weight_lineage_limit_gap_summaries = dict(inherited_weight_lineage_limit_gap_summaries)
             value_rank_promotable_lineage_limit_gap_counts = dict(inherited_rank_promotable_lineage_limit_gap_counts)
@@ -2943,6 +2985,11 @@ def _build_onnx_weight_analysis_plan(
             value_non_shape_lineage_limit_gap_counts = {
                 name: count
                 for name, count in inherited_non_shape_lineage_limit_gap_counts.items()
+                if name not in declared_names
+            }
+            value_non_shape_lineage_limit_gap_summaries = {
+                name: summary
+                for name, summary in inherited_non_shape_lineage_limit_gap_summaries.items()
                 if name not in declared_names
             }
             value_weight_lineage_limit_gap_counts = {
@@ -2971,6 +3018,7 @@ def _build_onnx_weight_analysis_plan(
         dynamic_values.update(bound_dynamic_values or set())
         value_lineage_limit_gap_counts.update(bound_lineage_limit_gap_counts or {})
         value_non_shape_lineage_limit_gap_counts.update(bound_non_shape_lineage_limit_gap_counts or {})
+        value_non_shape_lineage_limit_gap_summaries.update(bound_non_shape_lineage_limit_gap_summaries or {})
         value_weight_lineage_limit_gap_counts.update(bound_weight_lineage_limit_gap_counts or {})
         value_weight_lineage_limit_gap_summaries.update(bound_weight_lineage_limit_gap_summaries or {})
         value_rank_promotable_lineage_limit_gap_counts.update(bound_rank_promotable_lineage_limit_gap_counts or {})
@@ -3011,6 +3059,7 @@ def _build_onnx_weight_analysis_plan(
         def clear_value_gap_state(name: str) -> None:
             value_lineage_limit_gap_counts.pop(name, None)
             value_non_shape_lineage_limit_gap_counts.pop(name, None)
+            value_non_shape_lineage_limit_gap_summaries.pop(name, None)
             value_weight_lineage_limit_gap_counts.pop(name, None)
             value_weight_lineage_limit_gap_summaries.pop(name, None)
             value_rank_promotable_lineage_limit_gap_counts.pop(name, None)
@@ -3099,6 +3148,7 @@ def _build_onnx_weight_analysis_plan(
             all_input_lineages: dict[int, _OnnxWeightLineage] = {}
             all_input_lineage_limit_gap_count = 0
             all_input_non_shape_lineage_limit_gap_count = 0
+            all_input_non_shape_lineage_gap_summary = empty_weight_gap_summary
             all_input_weight_lineage_limit_gap_count = 0
             all_input_weight_lineage_limit_gap_summary = empty_weight_gap_summary
             all_input_rank_promotable_lineage_limit_gap_count = 0
@@ -3158,6 +3208,10 @@ def _build_onnx_weight_analysis_plan(
                 input_non_shape_lineage_limit_gap_count = value_non_shape_lineage_limit_gap_counts.get(
                     str(input_name),
                     0,
+                )
+                input_non_shape_lineage_gap_summary = known_weight_gap_summary(
+                    value_non_shape_lineage_limit_gap_summaries.get(str(input_name)),
+                    input_non_shape_lineage_limit_gap_count,
                 )
                 input_weight_lineage_limit_gap_count = value_weight_lineage_limit_gap_counts.get(str(input_name), 0)
                 input_weight_lineage_limit_gap_summary = known_weight_gap_summary(
@@ -3268,6 +3322,10 @@ def _build_onnx_weight_analysis_plan(
                         all_input_non_shape_lineage_limit_gap_count = _bounded_onnx_weight_lineage_gap_count(
                             all_input_non_shape_lineage_limit_gap_count,
                             input_non_shape_lineage_limit_gap_count,
+                        )
+                        all_input_non_shape_lineage_gap_summary = merge_weight_lineage_gap_summaries(
+                            all_input_non_shape_lineage_gap_summary,
+                            input_non_shape_lineage_gap_summary,
                         )
                         all_input_weight_lineage_limit_gap_count = _bounded_onnx_weight_lineage_gap_count(
                             all_input_weight_lineage_limit_gap_count,
@@ -3478,6 +3536,7 @@ def _build_onnx_weight_analysis_plan(
                     list[bool],
                     list[int],
                     list[int],
+                    list[_OnnxWeightLineageGapSummary],
                     list[int],
                     list[_OnnxWeightLineageGapSummary],
                     list[int],
@@ -3496,6 +3555,7 @@ def _build_onnx_weight_analysis_plan(
                     subgraph_bound_dynamic: set[str] = set()
                     subgraph_bound_lineage_gaps: dict[str, int] = {}
                     subgraph_bound_non_shape_lineage_gaps: dict[str, int] = {}
+                    subgraph_bound_non_shape_lineage_gap_summaries: dict[str, _OnnxWeightLineageGapSummary] = {}
                     subgraph_bound_weight_lineage_gaps: dict[str, int] = {}
                     subgraph_bound_weight_lineage_gap_summaries: dict[str, _OnnxWeightLineageGapSummary] = {}
                     subgraph_bound_rank_promotable_lineage_gaps: dict[str, int] = {}
@@ -3521,6 +3581,10 @@ def _build_onnx_weight_analysis_plan(
                         if parent_name in value_non_shape_lineage_limit_gap_counts:
                             subgraph_bound_non_shape_lineage_gaps[graph_input_name] = (
                                 value_non_shape_lineage_limit_gap_counts[parent_name]
+                            )
+                            subgraph_bound_non_shape_lineage_gap_summaries[graph_input_name] = known_weight_gap_summary(
+                                value_non_shape_lineage_limit_gap_summaries.get(parent_name),
+                                value_non_shape_lineage_limit_gap_counts[parent_name],
                             )
                         if parent_name in value_weight_lineage_limit_gap_counts:
                             subgraph_bound_weight_lineage_gaps[graph_input_name] = (
@@ -3548,6 +3612,9 @@ def _build_onnx_weight_analysis_plan(
                             dynamic_values,
                             inherited_lineage_limit_gap_counts=value_lineage_limit_gap_counts,
                             inherited_non_shape_lineage_limit_gap_counts=value_non_shape_lineage_limit_gap_counts,
+                            inherited_non_shape_lineage_limit_gap_summaries=(
+                                value_non_shape_lineage_limit_gap_summaries
+                            ),
                             inherited_weight_lineage_limit_gap_counts=value_weight_lineage_limit_gap_counts,
                             inherited_weight_lineage_limit_gap_summaries=value_weight_lineage_limit_gap_summaries,
                             inherited_rank_promotable_lineage_limit_gap_counts=(
@@ -3564,6 +3631,9 @@ def _build_onnx_weight_analysis_plan(
                             bound_dynamic_values=subgraph_bound_dynamic,
                             bound_lineage_limit_gap_counts=subgraph_bound_lineage_gaps,
                             bound_non_shape_lineage_limit_gap_counts=subgraph_bound_non_shape_lineage_gaps,
+                            bound_non_shape_lineage_limit_gap_summaries=(
+                                subgraph_bound_non_shape_lineage_gap_summaries
+                            ),
                             bound_weight_lineage_limit_gap_counts=subgraph_bound_weight_lineage_gaps,
                             bound_weight_lineage_limit_gap_summaries=subgraph_bound_weight_lineage_gap_summaries,
                             bound_rank_promotable_lineage_limit_gap_counts=(
@@ -3603,6 +3673,7 @@ def _build_onnx_weight_analysis_plan(
                 function_bound_dynamic: set[str] = set()
                 function_bound_lineage_gaps: dict[str, int] = {}
                 function_bound_non_shape_lineage_gaps: dict[str, int] = {}
+                function_bound_non_shape_lineage_gap_summaries: dict[str, _OnnxWeightLineageGapSummary] = {}
                 function_bound_weight_lineage_gaps: dict[str, int] = {}
                 function_bound_weight_lineage_gap_summaries: dict[str, _OnnxWeightLineageGapSummary] = {}
                 function_bound_rank_promotable_lineage_gaps: dict[str, int] = {}
@@ -3643,6 +3714,10 @@ def _build_onnx_weight_analysis_plan(
                         function_bound_non_shape_lineage_gaps[function_input_name] = (
                             value_non_shape_lineage_limit_gap_counts[parent_name]
                         )
+                        function_bound_non_shape_lineage_gap_summaries[function_input_name] = known_weight_gap_summary(
+                            value_non_shape_lineage_limit_gap_summaries.get(parent_name),
+                            value_non_shape_lineage_limit_gap_counts[parent_name],
+                        )
                     if parent_name in value_weight_lineage_limit_gap_counts:
                         function_bound_weight_lineage_gaps[function_input_name] = value_weight_lineage_limit_gap_counts[
                             parent_name
@@ -3679,6 +3754,7 @@ def _build_onnx_weight_analysis_plan(
                         bound_dynamic_values=function_bound_dynamic,
                         bound_lineage_limit_gap_counts=function_bound_lineage_gaps,
                         bound_non_shape_lineage_limit_gap_counts=function_bound_non_shape_lineage_gaps,
+                        bound_non_shape_lineage_limit_gap_summaries=function_bound_non_shape_lineage_gap_summaries,
                         bound_weight_lineage_limit_gap_counts=function_bound_weight_lineage_gaps,
                         bound_weight_lineage_limit_gap_summaries=function_bound_weight_lineage_gap_summaries,
                         bound_rank_promotable_lineage_limit_gap_counts=(function_bound_rank_promotable_lineage_gaps),
@@ -3703,6 +3779,44 @@ def _build_onnx_weight_analysis_plan(
             broadcast_operator_promotes_deferred_gap = False
             elementwise_output_shape: tuple[int, ...] | None = None
             elementwise_output_rank: int | None = None
+            same_type_elementwise = (
+                is_registered_standard_operator
+                and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
+                and node.op_type in _SAME_TYPE_ELEMENTWISE_OPERATORS
+            )
+            same_type_unary_elementwise = (
+                is_registered_standard_operator
+                and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
+                and node.op_type in _SAME_TYPE_UNARY_ELEMENTWISE_OPERATORS
+                and len(input_names) == 1
+            )
+            clip_operator = (
+                is_registered_standard_operator
+                and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
+                and node.op_type == "Clip"
+            )
+            pow_operator = (
+                is_registered_standard_operator
+                and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
+                and node.op_type == "Pow"
+            )
+            if same_type_elementwise or same_type_unary_elementwise or pow_operator:
+                elementwise_output_shape = broadcast_shapes(
+                    known_value_shapes.get(input_name) for input_name in input_names
+                )
+                elementwise_input_ranks = [known_value_ranks.get(input_name) for input_name in input_names]
+                elementwise_output_rank = (
+                    len(elementwise_output_shape)
+                    if elementwise_output_shape is not None
+                    else broadcast_rank_from_input_ranks(elementwise_input_ranks)
+                )
+            elif clip_operator and input_names:
+                elementwise_output_shape = known_value_shapes.get(input_names[0])
+                elementwise_output_rank = (
+                    len(elementwise_output_shape)
+                    if elementwise_output_shape is not None
+                    else known_value_ranks.get(input_names[0])
+                )
             if supported_transform:
                 data_lineages = value_lineages.get(str(node.input[0]), {}) if node.input else {}
                 for initializer_index, lineage in data_lineages.items():
@@ -3728,27 +3842,6 @@ def _build_onnx_weight_analysis_plan(
                 and function is None
                 and not subgraph_results
             ):
-                same_type_elementwise = (
-                    is_registered_standard_operator
-                    and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
-                    and node.op_type in _SAME_TYPE_ELEMENTWISE_OPERATORS
-                )
-                same_type_unary_elementwise = (
-                    is_registered_standard_operator
-                    and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
-                    and node.op_type in _SAME_TYPE_UNARY_ELEMENTWISE_OPERATORS
-                    and len(input_names) == 1
-                )
-                clip_operator = (
-                    is_registered_standard_operator
-                    and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
-                    and node.op_type == "Clip"
-                )
-                pow_operator = (
-                    is_registered_standard_operator
-                    and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
-                    and node.op_type == "Pow"
-                )
                 prelu_data_is_activation = (
                     is_registered_standard_operator
                     and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
@@ -3764,21 +3857,6 @@ def _build_onnx_weight_analysis_plan(
                             )
                         )
                     )
-                )
-                elementwise_output_shape = (
-                    broadcast_shapes(known_value_shapes.get(input_name) for input_name in input_names)
-                    if same_type_elementwise or same_type_unary_elementwise or pow_operator
-                    else known_value_shapes.get(input_names[0])
-                    if clip_operator and input_names
-                    else None
-                )
-                elementwise_input_ranks = [known_value_ranks.get(input_name) for input_name in input_names]
-                elementwise_output_rank = (
-                    len(elementwise_output_shape)
-                    if elementwise_output_shape is not None
-                    else broadcast_rank_from_input_ranks(elementwise_input_ranks)
-                    if same_type_elementwise or same_type_unary_elementwise or pow_operator
-                    else None
                 )
                 broadcast_operator_promotes_deferred_gap = (
                     (same_type_elementwise or pow_operator)
@@ -3842,6 +3920,7 @@ def _build_onnx_weight_analysis_plan(
                 output_lineages,
                 output_lineage_limit_gap_count,
                 output_non_shape_lineage_limit_gap_count,
+                output_non_shape_lineage_gap_summary,
                 output_weight_lineage_limit_gap_count,
                 output_rank_promotable_lineage_limit_gap_count,
                 output_weight_lineage_gap_summary,
@@ -3866,6 +3945,7 @@ def _build_onnx_weight_analysis_plan(
             transformed_input_output_rank_promotable_lineage_gap_summary = (
                 all_input_output_rank_promotable_lineage_gap_summary
             )
+            cast_promoted_non_shape_weight_lineage_gap_summary = empty_weight_gap_summary
             promoted_rank_lineage_limit_gap_count = 0
             promoted_rank_lineage_gap_summary = empty_weight_gap_summary
             rank_gap_control_input_is_overridable = (
@@ -3945,15 +4025,28 @@ def _build_onnx_weight_analysis_plan(
                 and cast_output_may_be_floating(node)
                 and all_input_non_shape_lineage_limit_gap_count > all_input_output_weight_lineage_limit_gap_count
             ):
-                residual_non_shape_gap_count = (
-                    all_input_non_shape_lineage_limit_gap_count
-                    - all_input_output_rank_promotable_lineage_limit_gap_count
+                cast_non_shape_gap_summary = known_weight_gap_summary(
+                    all_input_non_shape_lineage_gap_summary,
+                    all_input_non_shape_lineage_limit_gap_count,
                 )
                 cast_output_may_have_weight_rank = not output_lineages or any(
                     lineage.shape is None or len(lineage.shape) >= 2 for lineage in output_lineages.values()
                 )
-                if cast_output_may_have_weight_rank or residual_non_shape_gap_count > 0:
+                if cast_output_may_have_weight_rank or floating_cast_non_shape_gap_may_be_weight(
+                    cast_non_shape_gap_summary,
+                    node,
+                    constants,
+                ):
                     all_input_output_weight_lineage_limit_gap_count = all_input_non_shape_lineage_limit_gap_count
+                    cast_promoted_non_shape_weight_lineage_gap_summary = transform_weight_gap_summary(
+                        cast_non_shape_gap_summary,
+                        node,
+                        constants,
+                    )
+                    all_input_output_weight_lineage_gap_summary = merge_weight_lineage_gap_summaries(
+                        all_input_output_weight_lineage_gap_summary,
+                        cast_promoted_non_shape_weight_lineage_gap_summary,
+                    )
                 else:
                     all_input_output_rank_promotable_lineage_limit_gap_count = _bounded_onnx_weight_lineage_gap_count(
                         all_input_output_rank_promotable_lineage_limit_gap_count,
@@ -3961,7 +4054,7 @@ def _build_onnx_weight_analysis_plan(
                     )
                     all_input_output_rank_promotable_lineage_gap_summary = merge_weight_lineage_gap_summaries(
                         all_input_output_rank_promotable_lineage_gap_summary,
-                        transformed_input_output_rank_promotable_lineage_gap_summary,
+                        cast_non_shape_gap_summary,
                     )
                     transformed_input_output_rank_promotable_lineage_gap_summary = (
                         all_input_output_rank_promotable_lineage_gap_summary
@@ -3972,18 +4065,31 @@ def _build_onnx_weight_analysis_plan(
                 and cast_output_may_be_floating(node)
                 and output_non_shape_lineage_limit_gap_count > output_weight_lineage_limit_gap_count
             ):
-                residual_non_shape_gap_count = (
-                    output_non_shape_lineage_limit_gap_count - output_rank_promotable_lineage_limit_gap_count
+                cast_output_non_shape_gap_summary = known_weight_gap_summary(
+                    output_non_shape_lineage_gap_summary,
+                    output_non_shape_lineage_limit_gap_count,
                 )
                 cast_output_may_have_weight_rank = not output_lineages or any(
                     lineage.shape is None or len(lineage.shape) >= 2 for lineage in output_lineages.values()
                 )
-                if cast_output_may_have_weight_rank or residual_non_shape_gap_count > 0:
+                if cast_output_may_have_weight_rank or floating_cast_non_shape_gap_may_be_weight(
+                    cast_output_non_shape_gap_summary,
+                    node,
+                    constants,
+                ):
                     output_weight_lineage_limit_gap_count = output_non_shape_lineage_limit_gap_count
+                    output_weight_lineage_gap_summary = merge_weight_lineage_gap_summaries(
+                        output_weight_lineage_gap_summary,
+                        transform_weight_gap_summary(cast_output_non_shape_gap_summary, node, constants),
+                    )
                 else:
                     output_rank_promotable_lineage_limit_gap_count = _bounded_onnx_weight_lineage_gap_count(
                         output_rank_promotable_lineage_limit_gap_count,
                         output_non_shape_lineage_limit_gap_count,
+                    )
+                    output_rank_promotable_lineage_gap_summary = merge_weight_lineage_gap_summaries(
+                        output_rank_promotable_lineage_gap_summary,
+                        transform_rank_promotable_gap_summary(cast_output_non_shape_gap_summary, node, constants),
                     )
             cast_output_is_nonfloating_transform = (
                 supported_transform and node.op_type == "Cast" and not cast_output_may_be_floating(node)
@@ -4011,6 +4117,7 @@ def _build_onnx_weight_analysis_plan(
                     )
                     if pre_promotion_weight_lineage_limit_gap_count
                     else empty_weight_gap_summary,
+                    cast_promoted_non_shape_weight_lineage_gap_summary,
                     promoted_rank_lineage_gap_summary
                     if rank_operator_promotes_deferred_gap
                     else empty_weight_gap_summary,
@@ -4139,6 +4246,7 @@ def _build_onnx_weight_analysis_plan(
             subgraph_output_dynamic = [False for _ in node.output]
             subgraph_output_lineage_gap_counts = [0 for _ in node.output]
             subgraph_output_non_shape_lineage_gap_counts = [0 for _ in node.output]
+            subgraph_output_non_shape_lineage_gap_summaries = [empty_weight_gap_summary for _ in node.output]
             subgraph_output_weight_lineage_gap_counts = [0 for _ in node.output]
             subgraph_output_weight_lineage_gap_summaries = [empty_weight_gap_summary for _ in node.output]
             subgraph_output_rank_promotable_lineage_gap_counts = [0 for _ in node.output]
@@ -4151,6 +4259,9 @@ def _build_onnx_weight_analysis_plan(
                 output_dynamic: list[bool] = subgraph_output_dynamic,
                 output_lineage_gap_counts: list[int] = subgraph_output_lineage_gap_counts,
                 output_non_shape_gap_counts: list[int] = subgraph_output_non_shape_lineage_gap_counts,
+                output_non_shape_gap_summaries: list[_OnnxWeightLineageGapSummary] = (
+                    subgraph_output_non_shape_lineage_gap_summaries
+                ),
                 output_weight_gap_counts: list[int] = subgraph_output_weight_lineage_gap_counts,
                 output_weight_gap_summaries: list[_OnnxWeightLineageGapSummary] = (
                     subgraph_output_weight_lineage_gap_summaries
@@ -4168,6 +4279,13 @@ def _build_onnx_weight_analysis_plan(
                 output_non_shape_gap_counts[output_index] = _bounded_onnx_weight_lineage_gap_count(
                     output_non_shape_gap_counts[output_index],
                     value_non_shape_lineage_limit_gap_counts.get(parent_name, 0),
+                )
+                output_non_shape_gap_summaries[output_index] = merge_weight_lineage_gap_summaries(
+                    output_non_shape_gap_summaries[output_index],
+                    known_weight_gap_summary(
+                        value_non_shape_lineage_limit_gap_summaries.get(parent_name),
+                        value_non_shape_lineage_limit_gap_counts.get(parent_name, 0),
+                    ),
                 )
                 parent_weight_gap_count = value_weight_lineage_limit_gap_counts.get(parent_name, 0)
                 output_weight_gap_counts[output_index] = _bounded_onnx_weight_lineage_gap_count(
@@ -4209,6 +4327,7 @@ def _build_onnx_weight_analysis_plan(
                 graph_output_dynamic,
                 graph_output_lineage_gap_counts,
                 graph_output_non_shape_lineage_gap_counts,
+                graph_output_non_shape_lineage_gap_summaries,
                 graph_output_weight_lineage_gap_counts,
                 graph_output_weight_lineage_gap_summaries,
                 graph_output_rank_promotable_lineage_gap_counts,
@@ -4241,6 +4360,13 @@ def _build_onnx_weight_analysis_plan(
                     subgraph_output_non_shape_lineage_gap_counts[output_index] = _bounded_onnx_weight_lineage_gap_count(
                         subgraph_output_non_shape_lineage_gap_counts[output_index],
                         graph_output_non_shape_lineage_gap_counts[graph_output_index],
+                    )
+                    subgraph_output_non_shape_lineage_gap_summaries[output_index] = merge_weight_lineage_gap_summaries(
+                        subgraph_output_non_shape_lineage_gap_summaries[output_index],
+                        known_weight_gap_summary(
+                            graph_output_non_shape_lineage_gap_summaries[graph_output_index],
+                            graph_output_non_shape_lineage_gap_counts[graph_output_index],
+                        ),
                     )
                     subgraph_output_weight_lineage_gap_counts[output_index] = _bounded_onnx_weight_lineage_gap_count(
                         subgraph_output_weight_lineage_gap_counts[output_index],
@@ -4507,6 +4633,7 @@ def _build_onnx_weight_analysis_plan(
                     per_output_lineages,
                     per_output_lineage_limit_gap_count,
                     per_output_non_shape_lineage_limit_gap_count,
+                    per_output_non_shape_lineage_gap_summary,
                     per_output_weight_lineage_limit_gap_count,
                     per_output_rank_promotable_lineage_limit_gap_count,
                     per_output_weight_lineage_gap_summary,
@@ -4531,6 +4658,11 @@ def _build_onnx_weight_analysis_plan(
                     )
                     input_non_shape_lineage_limit_gap_count_for_output = (
                         0 if subgraph_results else all_input_non_shape_lineage_limit_gap_count
+                    )
+                    input_non_shape_lineage_gap_summary_for_output = (
+                        empty_weight_gap_summary
+                        if input_non_shape_lineage_limit_gap_count_for_output == 0
+                        else all_input_non_shape_lineage_gap_summary
                     )
                     input_rank_promotable_lineage_limit_gap_count_for_output = (
                         0
@@ -4567,6 +4699,24 @@ def _build_onnx_weight_analysis_plan(
                         output_non_shape_lineage_limit_gap_count,
                         per_output_non_shape_lineage_limit_gap_count,
                         subgraph_output_non_shape_lineage_gap_counts[output_index],
+                    )
+                    propagated_non_shape_lineage_gap_summary = merge_weight_lineage_gap_summaries(
+                        known_weight_gap_summary(
+                            input_non_shape_lineage_gap_summary_for_output,
+                            input_non_shape_lineage_limit_gap_count_for_output,
+                        ),
+                        known_weight_gap_summary(
+                            output_non_shape_lineage_gap_summary,
+                            output_non_shape_lineage_limit_gap_count,
+                        ),
+                        known_weight_gap_summary(
+                            per_output_non_shape_lineage_gap_summary,
+                            per_output_non_shape_lineage_limit_gap_count,
+                        ),
+                        known_weight_gap_summary(
+                            subgraph_output_non_shape_lineage_gap_summaries[output_index],
+                            subgraph_output_non_shape_lineage_gap_counts[output_index],
+                        ),
                     )
                     propagated_weight_lineage_limit_gap_count = _bounded_onnx_weight_lineage_gap_count(
                         input_weight_lineage_limit_gap_count_for_output,
@@ -4622,8 +4772,10 @@ def _build_onnx_weight_analysis_plan(
                         value_lineage_limit_gap_counts.pop(name, None)
                     if propagated_non_shape_lineage_limit_gap_count:
                         value_non_shape_lineage_limit_gap_counts[name] = propagated_non_shape_lineage_limit_gap_count
+                        value_non_shape_lineage_limit_gap_summaries[name] = propagated_non_shape_lineage_gap_summary
                     else:
                         value_non_shape_lineage_limit_gap_counts.pop(name, None)
+                        value_non_shape_lineage_limit_gap_summaries.pop(name, None)
                     if propagated_weight_lineage_limit_gap_count:
                         value_weight_lineage_limit_gap_counts[name] = propagated_weight_lineage_limit_gap_count
                         value_weight_lineage_limit_gap_summaries[name] = propagated_weight_lineage_gap_summary
@@ -4654,6 +4806,7 @@ def _build_onnx_weight_analysis_plan(
                     value_lineages.pop(name, None)
                     value_lineage_limit_gap_counts.pop(name, None)
                     value_non_shape_lineage_limit_gap_counts.pop(name, None)
+                    value_non_shape_lineage_limit_gap_summaries.pop(name, None)
                     value_weight_lineage_limit_gap_counts.pop(name, None)
                     value_weight_lineage_limit_gap_summaries.pop(name, None)
                     value_rank_promotable_lineage_limit_gap_counts.pop(name, None)
@@ -4692,13 +4845,15 @@ def _build_onnx_weight_analysis_plan(
             captured_state[4].clear()
             captured_state[4].update(value_non_shape_lineage_limit_gap_counts)
             captured_state[5].clear()
-            captured_state[5].update(value_weight_lineage_limit_gap_counts)
+            captured_state[5].update(value_non_shape_lineage_limit_gap_summaries)
             captured_state[6].clear()
-            captured_state[6].update(value_weight_lineage_limit_gap_summaries)
+            captured_state[6].update(value_weight_lineage_limit_gap_counts)
             captured_state[7].clear()
-            captured_state[7].update(value_rank_promotable_lineage_limit_gap_counts)
+            captured_state[7].update(value_weight_lineage_limit_gap_summaries)
             captured_state[8].clear()
-            captured_state[8].update(value_rank_promotable_lineage_limit_gap_summaries)
+            captured_state[8].update(value_rank_promotable_lineage_limit_gap_counts)
+            captured_state[9].clear()
+            captured_state[9].update(value_rank_promotable_lineage_limit_gap_summaries)
 
         output_names = [_onnx_value_name(graph_output) for graph_output in current_graph.output]
         return (
@@ -4706,6 +4861,13 @@ def _build_onnx_weight_analysis_plan(
             [output_name in dynamic_values for output_name in output_names],
             [value_lineage_limit_gap_counts.get(output_name, 0) for output_name in output_names],
             [value_non_shape_lineage_limit_gap_counts.get(output_name, 0) for output_name in output_names],
+            [
+                known_weight_gap_summary(
+                    value_non_shape_lineage_limit_gap_summaries.get(output_name),
+                    value_non_shape_lineage_limit_gap_counts.get(output_name, 0),
+                )
+                for output_name in output_names
+            ],
             [value_weight_lineage_limit_gap_counts.get(output_name, 0) for output_name in output_names],
             [
                 known_weight_gap_summary(
@@ -4729,6 +4891,7 @@ def _build_onnx_weight_analysis_plan(
     root_state_dynamic: set[str] = set()
     root_state_lineage_limit_gap_counts: dict[str, int] = {}
     root_state_non_shape_lineage_limit_gap_counts: dict[str, int] = {}
+    root_state_non_shape_lineage_limit_gap_summaries: dict[str, _OnnxWeightLineageGapSummary] = {}
     root_state_weight_lineage_limit_gap_counts: dict[str, int] = {}
     root_state_weight_lineage_limit_gap_summaries: dict[str, _OnnxWeightLineageGapSummary] = {}
     root_state_rank_promotable_lineage_limit_gap_counts: dict[str, int] = {}
@@ -4738,6 +4901,7 @@ def _build_onnx_weight_analysis_plan(
         _root_output_dynamic,
         _root_output_lineage_gaps,
         _root_output_non_shape_lineage_gaps,
+        _root_output_non_shape_lineage_gap_summaries,
         _root_output_weight_lineage_gaps,
         _root_output_weight_lineage_gap_summaries,
         _root_output_rank_promotable_lineage_gaps,
@@ -4756,6 +4920,7 @@ def _build_onnx_weight_analysis_plan(
             root_state_dynamic,
             root_state_lineage_limit_gap_counts,
             root_state_non_shape_lineage_limit_gap_counts,
+            root_state_non_shape_lineage_limit_gap_summaries,
             root_state_weight_lineage_limit_gap_counts,
             root_state_weight_lineage_limit_gap_summaries,
             root_state_rank_promotable_lineage_limit_gap_counts,
@@ -4804,6 +4969,7 @@ def _build_onnx_weight_analysis_plan(
             list[bool],
             list[int],
             list[int],
+            list[_OnnxWeightLineageGapSummary],
             list[int],
             list[_OnnxWeightLineageGapSummary],
             list[int],
@@ -4818,6 +4984,7 @@ def _build_onnx_weight_analysis_plan(
             output_dynamic,
             output_lineage_gaps,
             output_non_shape_lineage_gaps,
+            output_non_shape_lineage_gap_summaries,
             output_weight_lineage_gaps,
             output_weight_lineage_gap_summaries,
             output_rank_promotable_lineage_gaps,
@@ -4830,6 +4997,9 @@ def _build_onnx_weight_analysis_plan(
             inherited_lineage_limit_gap_counts=root_state_lineage_limit_gap_counts if is_algorithm else {},
             inherited_non_shape_lineage_limit_gap_counts=(
                 root_state_non_shape_lineage_limit_gap_counts if is_algorithm else {}
+            ),
+            inherited_non_shape_lineage_limit_gap_summaries=(
+                root_state_non_shape_lineage_limit_gap_summaries if is_algorithm else {}
             ),
             inherited_weight_lineage_limit_gap_counts=(
                 root_state_weight_lineage_limit_gap_counts if is_algorithm else {}
@@ -4854,6 +5024,7 @@ def _build_onnx_weight_analysis_plan(
             output_dynamic,
             output_lineage_gaps,
             output_non_shape_lineage_gaps,
+            output_non_shape_lineage_gap_summaries,
             output_weight_lineage_gaps,
             output_weight_lineage_gap_summaries,
             output_rank_promotable_lineage_gaps,
@@ -4903,6 +5074,7 @@ def _build_onnx_weight_analysis_plan(
                     _output_dynamic,
                     _output_lineage_gaps,
                     _output_non_shape_lineage_gaps,
+                    _output_non_shape_lineage_gap_summaries,
                     _output_weight_lineage_gaps,
                     _output_weight_lineage_gap_summaries,
                     _output_rank_promotable_lineage_gaps,
