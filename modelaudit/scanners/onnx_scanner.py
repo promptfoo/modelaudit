@@ -1889,9 +1889,11 @@ def _build_onnx_weight_analysis_plan(
         except Exception:
             return None
 
-    def loop_may_skip_body(node: Any, constants: dict[str, Any]) -> bool:
+    def loop_may_skip_body(node: Any, constants: dict[str, Any], graph_input_names: set[str]) -> bool:
         trip_input = str(node.input[0]) if len(node.input) > 0 and node.input[0] else ""
         condition_input = str(node.input[1]) if len(node.input) > 1 and node.input[1] else ""
+        if trip_input in graph_input_names or condition_input in graph_input_names:
+            return True
         trip_count = (
             constant_scalar_value(constants.get(trip_input), int(onnx.TensorProto.INT64)) if trip_input else None
         )
@@ -1938,11 +1940,12 @@ def _build_onnx_weight_analysis_plan(
                 return True
         return False
 
-    def stacked_scan_output_insert_axis(node: Any, stacked_scan_output_start: int, output_index: int) -> int:
-        if node.op_type != "Scan":
-            return 0
+    def stacked_scan_output_insert_axis(
+        scan_output_axes: tuple[int, ...],
+        stacked_scan_output_start: int,
+        output_index: int,
+    ) -> int:
         scan_output_index = output_index - stacked_scan_output_start
-        scan_output_axes = _onnx_int_sequence_attribute(node, "scan_output_axes") or ()
         if scan_output_index < 0 or scan_output_index >= len(scan_output_axes):
             return 0
         return scan_output_axes[scan_output_index]
@@ -3839,9 +3842,12 @@ def _build_onnx_weight_analysis_plan(
             cast_output_is_nonfloating_transform = (
                 supported_transform and node.op_type == "Cast" and not cast_output_may_be_floating(node)
             )
-            transform_can_demote_weight_gap = not (
-                node.op_type == "Reshape" and len(node.input) > 1 and str(node.input[1]) in graph_input_names
+            transform_control_input_is_overridable = (
+                node.op_type in {"Reshape", "Squeeze", "Unsqueeze"}
+                and len(node.input) > 1
+                and str(node.input[1]) in graph_input_names
             )
+            transform_can_demote_weight_gap = not transform_control_input_is_overridable
             transform_output_demotes_weight_gap = (
                 supported_transform
                 and transform_can_demote_weight_gap
@@ -4043,6 +4049,11 @@ def _build_onnx_weight_analysis_plan(
                 and not is_model_local_function
                 and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
             )
+            scan_output_axes = (
+                _onnx_int_sequence_attribute(node, "scan_output_axes") or ()
+                if standard_control_flow_operator and node.op_type == "Scan"
+                else ()
+            )
             subgraph_output_offset = 1 if standard_control_flow_operator and node.op_type == "Loop" else 0
             for (
                 graph_output_lineages,
@@ -4100,7 +4111,11 @@ def _build_onnx_weight_analysis_plan(
                                 graph_output_rank_promotable_gap_count,
                             ),
                             graph_output_rank_promotable_gap_count,
-                            insert_axis=stacked_scan_output_insert_axis(node, stacked_scan_output_start, output_index),
+                            insert_axis=stacked_scan_output_insert_axis(
+                                scan_output_axes,
+                                stacked_scan_output_start,
+                                output_index,
+                            ),
                         )
                         if stacked_scan_weight_gap_summary != empty_weight_gap_summary:
                             subgraph_output_weight_lineage_gap_counts[output_index] = (
@@ -4148,7 +4163,11 @@ def _build_onnx_weight_analysis_plan(
                             )
                         )
 
-            if standard_control_flow_operator and node.op_type == "Loop" and loop_may_skip_body(node, constants):
+            if (
+                standard_control_flow_operator
+                and node.op_type == "Loop"
+                and loop_may_skip_body(node, constants, graph_input_names)
+            ):
                 for output_index, parent_input in enumerate(node.input[2 : 2 + len(node.output)]):
                     if not parent_input:
                         continue
