@@ -8012,7 +8012,7 @@ class TestWeightDistributionSemantics:
         assert semantics["coverage_gaps"]["lineages_per_value_limit"] == 1
         assert semantics["analyzed_layer_count"] == 0
 
-    @pytest.mark.parametrize("transform", ["Identity", "Relu"])
+    @pytest.mark.parametrize("transform", ["Identity", "Relu", "Cast", "Transpose"])
     @pytest.mark.parametrize(
         ("runtime_dims", "x_dims", "y_dims", "expect_gap"),
         [
@@ -8041,7 +8041,18 @@ class TestWeightDistributionSemantics:
             previous = reshaped
         nodes.extend(
             [
-                helper.make_node(transform, ["runtime_weight"], ["runtime_alias"]),
+                helper.make_node(
+                    transform,
+                    ["runtime_weight"],
+                    ["runtime_alias"],
+                    **(
+                        {"to": TensorProto.FLOAT}
+                        if transform == "Cast"
+                        else {"perm": list(reversed(range(len(runtime_dims))))}
+                        if transform == "Transpose"
+                        else {}
+                    ),
+                ),
                 helper.make_node("Add", ["runtime_alias", previous], ["generated_weight"]),
                 helper.make_node("MatMul", ["X", "generated_weight"], ["Y"]),
             ]

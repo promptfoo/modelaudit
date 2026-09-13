@@ -4319,22 +4319,44 @@ def _build_onnx_weight_analysis_plan(
                         else known_value_ranks.get(input_names[0])
                     )
 
+            transform_output_shape: tuple[int, ...] | None = None
+            transform_output_rank: int | None = None
+            if supported_transform and input_names:
+                transform_input_shape = known_value_shapes.get(input_names[0])
+                transform_input_rank = known_value_ranks.get(input_names[0])
+                if node.op_type in {"Identity", "Cast"}:
+                    transform_output_shape = transform_input_shape
+                    transform_output_rank = (
+                        len(transform_output_shape) if transform_output_shape is not None else transform_input_rank
+                    )
+                elif node.op_type == "Transpose":
+                    if transform_input_shape is not None:
+                        permutation = _onnx_int_sequence_attribute(node, "perm") or tuple(
+                            reversed(range(len(transform_input_shape)))
+                        )
+                        if sorted(permutation) == list(range(len(transform_input_shape))):
+                            transform_output_shape = tuple(transform_input_shape[index] for index in permutation)
+                            transform_output_rank = len(transform_output_shape)
+                    elif transform_input_rank is not None:
+                        permutation = _onnx_int_sequence_attribute(node, "perm") or tuple(
+                            reversed(range(transform_input_rank))
+                        )
+                        if sorted(permutation) == list(range(transform_input_rank)):
+                            transform_output_rank = transform_input_rank
+
             for output_index, output_name in enumerate(node.output):
                 if not output_name:
                     continue
                 name = str(output_name)
-                inferred_output_shape = elementwise_output_shape if output_index == 0 else None
-                inferred_output_rank = elementwise_output_rank if output_index == 0 else None
-                identity_input_shape = (
-                    known_value_shapes.get(input_names[0])
-                    if supported_transform and node.op_type == "Identity" and input_names
-                    else None
-                )
-                identity_input_rank = (
-                    known_value_ranks.get(input_names[0])
-                    if supported_transform and node.op_type == "Identity" and input_names
-                    else None
-                )
+                inferred_output_shape = None
+                inferred_output_rank = None
+                if output_index == 0:
+                    inferred_output_shape = (
+                        elementwise_output_shape if elementwise_output_shape is not None else transform_output_shape
+                    )
+                    inferred_output_rank = (
+                        elementwise_output_rank if elementwise_output_rank is not None else transform_output_rank
+                    )
                 per_output_lineages = dict(output_lineages)
                 if (
                     recurrent_state_lineages
@@ -4565,12 +4587,6 @@ def _build_onnx_weight_analysis_plan(
                     elif inferred_output_rank is not None:
                         known_value_shapes.pop(name, None)
                         known_value_ranks[name] = inferred_output_rank
-                    elif identity_input_shape is not None:
-                        known_value_shapes[name] = identity_input_shape
-                        known_value_ranks[name] = len(identity_input_shape)
-                    elif identity_input_rank is not None:
-                        known_value_shapes.pop(name, None)
-                        known_value_ranks[name] = identity_input_rank
 
                 mapped_subgraph_output = bool(subgraph_results) and output_index < len(subgraph_output_dynamic)
                 output_is_dynamic = (
