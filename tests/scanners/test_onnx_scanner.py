@@ -7126,6 +7126,67 @@ class TestWeightDistributionSemantics:
         assert semantics["coverage_gaps"]
         assert semantics["analyzed_layer_count"] == 0
 
+    def test_scan_opset8_sequence_lens_offset_preserves_skipped_state_gap(self, tmp_path: Path) -> None:
+        source_names = [f"W{index}" for index in range(40)]
+        initializers = [
+            onnx.numpy_helper.from_array(np.zeros((4, 4), dtype=np.float32), name=name) for name in source_names
+        ]
+        initializers.append(onnx.numpy_helper.from_array(np.zeros((4, 4), dtype=np.float32), name="clean_weight"))
+        body = helper.make_graph(
+            [
+                helper.make_node("Identity", ["clean_weight"], ["next_state"]),
+                helper.make_node("Identity", ["element"], ["next_element"]),
+            ],
+            "scan8_sequence_lens_body",
+            [
+                helper.make_tensor_value_info("state", TensorProto.FLOAT, [4, 4]),
+                helper.make_tensor_value_info("element", TensorProto.FLOAT, [1]),
+            ],
+            [
+                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, [4, 4]),
+                helper.make_tensor_value_info("next_element", TensorProto.FLOAT, [1]),
+            ],
+        )
+        graph = helper.make_graph(
+            [
+                helper.make_node("Sum", source_names, ["capped"]),
+                helper.make_node(
+                    "Scan",
+                    ["sequence_lens", "capped", "scan_values"],
+                    ["scan_state", "scan_output"],
+                    body=body,
+                    num_scan_inputs=1,
+                ),
+                helper.make_node("MatMul", ["X", "scan_state"], ["Y"]),
+            ],
+            "scan_opset8_sequence_lens_offset_preserves_skipped_state_gap",
+            [
+                helper.make_tensor_value_info("sequence_lens", TensorProto.INT64, [None]),
+                helper.make_tensor_value_info("scan_values", TensorProto.FLOAT, [None, None, 1]),
+                helper.make_tensor_value_info("X", TensorProto.FLOAT, [None, 1, 4]),
+            ],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [None, 1, 4])],
+            initializer=initializers,
+            value_info=[
+                helper.make_tensor_value_info("scan_state", TensorProto.FLOAT, [None, 4, 4]),
+                helper.make_tensor_value_info("scan_output", TensorProto.FLOAT, [None, None, 1]),
+            ],
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 8)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / "scan-opset8-sequence-lens-offset-gap.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        assert result.success is False
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
+        assert semantics["analyzed_layer_count"] == 0
+
     @pytest.mark.parametrize(("scan_length", "expect_gap"), [(1, False), (2, True)])
     def test_scan_graph_input_fixed_extent_bounds_carried_rank_growth(
         self,

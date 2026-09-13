@@ -2057,11 +2057,12 @@ def _build_onnx_weight_analysis_plan(
         untrusted_shape_names: set[str] | None = None,
         *,
         scan_input_axes: tuple[int, ...] | None = None,
+        scan_input_offset: int = 0,
     ) -> bool:
         num_scan_inputs = _onnx_int_attribute(node, "num_scan_inputs", 1)
         if num_scan_inputs <= 0:
             return True
-        scan_input_start = max(len(node.input) - num_scan_inputs, 0)
+        scan_input_start = max(len(node.input) - num_scan_inputs, scan_input_offset)
         scan_inputs = [str(input_name) for input_name in node.input[scan_input_start:] if input_name]
         if len(scan_inputs) < num_scan_inputs:
             return True
@@ -2093,12 +2094,13 @@ def _build_onnx_weight_analysis_plan(
         untrusted_shape_names: set[str] | None = None,
         *,
         scan_input_axes: tuple[int, ...] | None = None,
+        scan_input_offset: int = 0,
     ) -> bool:
         num_scan_inputs = _onnx_int_attribute(node, "num_scan_inputs", 1)
         if num_scan_inputs <= 0:
             return True
         known_shapes = known_shapes or {}
-        scan_input_start = max(len(node.input) - num_scan_inputs, 0)
+        scan_input_start = max(len(node.input) - num_scan_inputs, scan_input_offset)
         scan_inputs = [str(input_name) for input_name in node.input[scan_input_start:] if input_name]
         if len(scan_inputs) < num_scan_inputs:
             return True
@@ -2119,6 +2121,19 @@ def _build_onnx_weight_analysis_plan(
             if shape[axis] <= 0 or shape[axis] > 1:
                 return True
         return False
+
+    def scan_sequence_lens_input_offset(node: Any, opset_versions: dict[str, int]) -> int:
+        if node.op_type != "Scan":
+            return 0
+        domain = str(getattr(node, "domain", "") or "")
+        if domain not in _STANDARD_NEURAL_NETWORK_DOMAINS:
+            return 0
+        version = opset_versions.get(domain)
+        if version is None and domain in {"", "ai.onnx"}:
+            version = opset_versions.get("ai.onnx" if domain == "" else "")
+        if version is None:
+            return 0
+        return 1 if version <= 8 else 0
 
     def stacked_scan_output_insert_axis(
         scan_output_axes: tuple[int, ...],
@@ -3965,18 +3980,22 @@ def _build_onnx_weight_analysis_plan(
                         name for value_info in getattr(subgraph, "input", ()) if (name := _onnx_value_name(value_info))
                     }
                     input_pairs: Iterable[tuple[Any, Any]]
+                    input_pair_index_start = 0
                     scan_input_start = len(node.input)
                     scan_input_axes: tuple[int, ...] = ()
                     if node.op_type == "Loop":
                         input_pairs = zip(node.input[2:], subgraph.input[2:], strict=False)
+                        input_pair_index_start = 2
                     elif node.op_type == "Scan":
                         num_scan_inputs = _onnx_int_attribute(node, "num_scan_inputs", 1)
-                        scan_input_start = max(len(node.input) - max(num_scan_inputs, 0), 0)
+                        scan_input_offset = scan_sequence_lens_input_offset(node, opset_versions)
+                        scan_input_start = max(len(node.input) - max(num_scan_inputs, 0), scan_input_offset)
                         scan_input_axes = resolved_int_sequence_attribute(node, "scan_input_axes") or ()
-                        input_pairs = zip(node.input, subgraph.input, strict=False)
+                        input_pairs = zip(node.input[scan_input_offset:], subgraph.input, strict=False)
+                        input_pair_index_start = scan_input_offset
                     else:
                         input_pairs = ()
-                    for pair_index, (parent_input, graph_input) in enumerate(input_pairs):
+                    for pair_index, (parent_input, graph_input) in enumerate(input_pairs, start=input_pair_index_start):
                         parent_name = str(parent_input)
                         graph_input_name = _onnx_value_name(graph_input)
                         if parent_name in value_lineages:
@@ -4902,7 +4921,13 @@ def _build_onnx_weight_analysis_plan(
                     output_rank_unknown[output_index] = True
 
             def control_flow_state_input_name(output_index: int, *, current_node: Any = node) -> str:
-                state_input_index = output_index + (2 if current_node.op_type == "Loop" else 0)
+                if current_node.op_type == "Loop":
+                    input_offset = 2
+                elif current_node.op_type == "Scan":
+                    input_offset = scan_sequence_lens_input_offset(current_node, opset_versions)
+                else:
+                    input_offset = 0
+                state_input_index = output_index + input_offset
                 if state_input_index >= len(current_node.input) or not current_node.input[state_input_index]:
                     return ""
                 return str(current_node.input[state_input_index])
@@ -4929,6 +4954,11 @@ def _build_onnx_weight_analysis_plan(
                 if standard_control_flow_operator and node.op_type == "Scan"
                 else ()
             )
+            resolved_scan_input_offset = (
+                scan_sequence_lens_input_offset(node, opset_versions)
+                if standard_control_flow_operator and node.op_type == "Scan"
+                else 0
+            )
             trusted_scan_shape_names = proven_value_ranks
             untrusted_scan_shape_names = {
                 name for name in graph_input_names & set(value_lineages) if name not in proven_value_ranks
@@ -4952,7 +4982,7 @@ def _build_onnx_weight_analysis_plan(
                     stacked_scan_output_start = max(len(node.input) - 2, 0)
                 elif standard_control_flow_operator and node.op_type == "Scan":
                     num_scan_inputs = _onnx_int_attribute(node, "num_scan_inputs", 1)
-                    stacked_scan_output_start = max(len(node.input) - num_scan_inputs, 0)
+                    stacked_scan_output_start = max(len(node.input) - resolved_scan_input_offset - num_scan_inputs, 0)
                 for output_index in range(len(node.output)):
                     graph_output_index = output_index + subgraph_output_offset
                     if graph_output_index >= len(graph_output_lineages):
@@ -4994,6 +5024,7 @@ def _build_onnx_weight_analysis_plan(
                                     trusted_scan_shape_names,
                                     untrusted_scan_shape_names,
                                     scan_input_axes=resolved_scan_input_axes,
+                                    scan_input_offset=resolved_scan_input_offset,
                                 )
                             )
                         )
@@ -5048,6 +5079,7 @@ def _build_onnx_weight_analysis_plan(
                                     trusted_scan_shape_names,
                                     untrusted_scan_shape_names,
                                     scan_input_axes=resolved_scan_input_axes,
+                                    scan_input_offset=resolved_scan_input_offset,
                                 )
                             )
                         )
@@ -5101,6 +5133,7 @@ def _build_onnx_weight_analysis_plan(
                                     trusted_scan_shape_names,
                                     untrusted_scan_shape_names,
                                     scan_input_axes=resolved_scan_input_axes,
+                                    scan_input_offset=resolved_scan_input_offset,
                                 )
                             )
                         )
@@ -5219,11 +5252,15 @@ def _build_onnx_weight_analysis_plan(
                     trusted_scan_shape_names,
                     untrusted_scan_shape_names,
                     scan_input_axes=resolved_scan_input_axes,
+                    scan_input_offset=resolved_scan_input_offset,
                 )
             ):
                 num_scan_inputs = _onnx_int_attribute(node, "num_scan_inputs", 1)
-                scan_state_input_count = max(len(node.input) - max(num_scan_inputs, 0), 0)
-                state_inputs = node.input[: min(scan_state_input_count, len(node.output))]
+                scan_state_input_count = max(len(node.input) - resolved_scan_input_offset - max(num_scan_inputs, 0), 0)
+                state_inputs = node.input[
+                    resolved_scan_input_offset : resolved_scan_input_offset
+                    + min(scan_state_input_count, len(node.output))
+                ]
                 for output_index, parent_input in enumerate(state_inputs):
                     if not parent_input:
                         continue
