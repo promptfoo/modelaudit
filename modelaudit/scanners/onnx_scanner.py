@@ -2066,6 +2066,12 @@ def _build_onnx_weight_analysis_plan(
         scan_inputs = [str(input_name) for input_name in node.input[scan_input_start:] if input_name]
         if len(scan_inputs) < num_scan_inputs:
             return True
+        if scan_input_offset and node.input:
+            sequence_lens_input = str(node.input[0] or "")
+            if sequence_lens_input:
+                sequence_lens = constant_int64_vector_values(constants.get(sequence_lens_input))
+                if sequence_lens is None or any(length <= 0 for length in sequence_lens):
+                    return True
         scan_input_axes = (
             scan_input_axes
             if scan_input_axes is not None
@@ -2077,7 +2083,8 @@ def _build_onnx_weight_analysis_plan(
             shape = scan_input_shape(constants, known_shapes, scan_input, trusted_shape_names, untrusted_shape_names)
             if not shape:
                 return True
-            raw_axis = scan_input_axes[input_index] if input_index < len(scan_input_axes) else 0
+            default_axis = 1 if scan_input_offset else 0
+            raw_axis = scan_input_axes[input_index] if input_index < len(scan_input_axes) else default_axis
             axis = raw_axis if raw_axis >= 0 else len(shape) + raw_axis
             if axis < 0 or axis >= len(shape):
                 return True
@@ -2114,7 +2121,8 @@ def _build_onnx_weight_analysis_plan(
             shape = scan_input_shape(constants, known_shapes, scan_input, trusted_shape_names, untrusted_shape_names)
             if not shape:
                 return True
-            raw_axis = scan_input_axes[input_index] if input_index < len(scan_input_axes) else 0
+            default_axis = 1 if scan_input_offset else 0
+            raw_axis = scan_input_axes[input_index] if input_index < len(scan_input_axes) else default_axis
             axis = raw_axis if raw_axis >= 0 else len(shape) + raw_axis
             if axis < 0 or axis >= len(shape):
                 return True

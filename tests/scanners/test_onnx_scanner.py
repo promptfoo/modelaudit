@@ -7187,6 +7187,104 @@ class TestWeightDistributionSemantics:
         assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
         assert semantics["analyzed_layer_count"] == 0
 
+    @pytest.mark.parametrize("batch_size", [1, 2])
+    @pytest.mark.parametrize(
+        ("sequence_lens_mode", "scan_length", "expect_gap"),
+        [
+            ("absent", 0, True),
+            ("absent", 1, False),
+            ("absent", 2, False),
+            ("absent", None, True),
+            ("runtime", 2, True),
+            ("zero", 2, True),
+        ],
+    )
+    def test_scan_opset8_zero_sequence_lengths_preserve_initial_state_gap(
+        self,
+        tmp_path: Path,
+        batch_size: int,
+        sequence_lens_mode: str,
+        scan_length: int | None,
+        expect_gap: bool,
+    ) -> None:
+        source_names = [f"W{index}" for index in range(40)]
+        initializers = [
+            onnx.numpy_helper.from_array(np.zeros((batch_size, 4, 4), dtype=np.float32), name=name)
+            for name in source_names
+        ]
+        body = helper.make_graph(
+            [
+                helper.make_node(
+                    "Constant",
+                    [],
+                    ["next_state"],
+                    value=onnx.numpy_helper.from_array(np.zeros((4, 4), dtype=np.float32)),
+                ),
+                helper.make_node("Identity", ["element"], ["next_element"]),
+            ],
+            "scan8_zero_sequence_lengths_body",
+            [
+                helper.make_tensor_value_info("state", TensorProto.FLOAT, [4, 4]),
+                helper.make_tensor_value_info("element", TensorProto.FLOAT, [1]),
+            ],
+            [
+                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, [4, 4]),
+                helper.make_tensor_value_info("next_element", TensorProto.FLOAT, [1]),
+            ],
+        )
+        sequence_lens_input = "" if sequence_lens_mode == "absent" else "sequence_lens"
+        inputs = [
+            helper.make_tensor_value_info("scan_values", TensorProto.FLOAT, [batch_size, scan_length, 1]),
+            helper.make_tensor_value_info("X", TensorProto.FLOAT, [batch_size, 1, 4]),
+        ]
+        if sequence_lens_mode == "runtime":
+            inputs.append(helper.make_tensor_value_info("sequence_lens", TensorProto.INT64, [batch_size]))
+        elif sequence_lens_mode == "zero":
+            initializers.append(
+                onnx.numpy_helper.from_array(np.zeros((batch_size,), dtype=np.int64), name="sequence_lens")
+            )
+        graph = helper.make_graph(
+            [
+                helper.make_node("Sum", source_names, ["capped"]),
+                helper.make_node(
+                    "Scan",
+                    [sequence_lens_input, "capped", "scan_values"],
+                    ["scan_state", "scan_output"],
+                    body=body,
+                    num_scan_inputs=1,
+                ),
+                helper.make_node("MatMul", ["X", "scan_state"], ["Y"]),
+            ],
+            "scan_opset8_zero_sequence_lengths_preserve_initial_state_gap",
+            inputs,
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [batch_size, 1, 4])],
+            initializer=initializers,
+            value_info=[
+                helper.make_tensor_value_info("scan_state", TensorProto.FLOAT, [batch_size, 4, 4]),
+                helper.make_tensor_value_info("scan_output", TensorProto.FLOAT, [batch_size, scan_length, 1]),
+            ],
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 8)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        onnx.checker.check_model(model, full_check=True)
+        length_label = "unknown" if scan_length is None else str(scan_length)
+        path = tmp_path / f"scan-opset8-zero-length-{sequence_lens_mode}-{batch_size}-{length_label}.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        if expect_gap:
+            assert result.success is False
+            assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
+            assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
+        else:
+            assert result.success is True
+            assert not coverage
+            assert semantics["coverage_gaps"] == {}
+
     @pytest.mark.parametrize(("scan_length", "expect_gap"), [(1, False), (2, True)])
     def test_scan_graph_input_fixed_extent_bounds_carried_rank_growth(
         self,
