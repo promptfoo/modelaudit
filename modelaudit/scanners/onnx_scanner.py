@@ -3005,6 +3005,8 @@ def _build_onnx_weight_analysis_plan(
         bound_weight_lineage_limit_gap_summaries: dict[str, _OnnxWeightLineageGapSummary] | None = None,
         bound_rank_promotable_lineage_limit_gap_counts: dict[str, int] | None = None,
         bound_rank_promotable_lineage_limit_gap_summaries: dict[str, _OnnxWeightLineageGapSummary] | None = None,
+        bound_value_shapes: dict[str, tuple[int, ...]] | None = None,
+        bound_value_ranks: dict[str, int] | None = None,
         bound_attributes: dict[str, Any] | None = None,
         bound_attribute_keys: dict[str, tuple[Any, ...]] | None = None,
         function_depth: int = 0,
@@ -3032,6 +3034,8 @@ def _build_onnx_weight_analysis_plan(
         list[_OnnxWeightLineageGapSummary],
         list[int],
         list[_OnnxWeightLineageGapSummary],
+        list[tuple[int, ...] | None],
+        list[int | None],
     ]:
         nonlocal graph_counter, node_counter, total_consumer_count
         current_graph_index = graph_counter
@@ -3113,6 +3117,9 @@ def _build_onnx_weight_analysis_plan(
         )
         attribute_bindings = bound_attributes or {}
         attribute_binding_keys = bound_attribute_keys or {}
+        graph_input_names = {
+            name for value_info in getattr(current_graph, "input", ()) if (name := _onnx_value_name(value_info))
+        }
         known_value_shapes: dict[str, tuple[int, ...]] = {}
         known_value_ranks: dict[str, int] = {}
         for value_info in (
@@ -3127,14 +3134,23 @@ def _build_onnx_weight_analysis_plan(
                 known_value_ranks[name] = len(shape)
             elif name and (rank := value_info_rank(value_info)) is not None:
                 known_value_ranks[name] = rank
+        for name, shape in (bound_value_shapes or {}).items():
+            known_value_shapes[name] = shape
+            known_value_ranks[name] = len(shape)
+        for name, rank in (bound_value_ranks or {}).items():
+            if name not in known_value_shapes:
+                known_value_ranks[name] = rank
         for name, lineages in value_lineages.items():
+            if (
+                name in graph_input_names
+                and name not in (bound_value_shapes or {})
+                and name not in (bound_value_ranks or {})
+            ):
+                continue
             lineage_shapes = {lineage.shape for lineage in lineages.values()}
             if len(lineage_shapes) == 1 and None not in lineage_shapes:
                 known_value_shapes[name] = next(iter(lineage_shapes))  # type: ignore[arg-type]
                 known_value_ranks[name] = len(known_value_shapes[name])
-        graph_input_names = {
-            name for value_info in getattr(current_graph, "input", ()) if (name := _onnx_value_name(value_info))
-        }
         for name, constant in constants.items():
             if name in graph_input_names:
                 continue
@@ -3633,6 +3649,8 @@ def _build_onnx_weight_analysis_plan(
                     list[_OnnxWeightLineageGapSummary],
                     list[int],
                     list[_OnnxWeightLineageGapSummary],
+                    list[tuple[int, ...] | None],
+                    list[int | None],
                 ]
             ] = []
             for attribute_position, attribute in enumerate(getattr(node, "attribute", ())):
@@ -3652,6 +3670,8 @@ def _build_onnx_weight_analysis_plan(
                     subgraph_bound_weight_lineage_gap_summaries: dict[str, _OnnxWeightLineageGapSummary] = {}
                     subgraph_bound_rank_promotable_lineage_gaps: dict[str, int] = {}
                     subgraph_bound_rank_promotable_lineage_gap_summaries: dict[str, _OnnxWeightLineageGapSummary] = {}
+                    subgraph_bound_value_shapes: dict[str, tuple[int, ...]] = {}
+                    subgraph_bound_value_ranks: dict[str, int] = {}
                     input_pairs: Iterable[tuple[Any, Any]]
                     if node.op_type == "Loop":
                         input_pairs = zip(node.input[2:], subgraph.input[2:], strict=False)
@@ -3668,6 +3688,10 @@ def _build_onnx_weight_analysis_plan(
                             subgraph_bound_constants[graph_input_name] = constants[parent_name]
                         if parent_name in dynamic_values:
                             subgraph_bound_dynamic.add(graph_input_name)
+                        if parent_name in known_value_shapes:
+                            subgraph_bound_value_shapes[graph_input_name] = known_value_shapes[parent_name]
+                        elif parent_name in known_value_ranks:
+                            subgraph_bound_value_ranks[graph_input_name] = known_value_ranks[parent_name]
                         if parent_name in value_lineage_limit_gap_counts:
                             subgraph_bound_lineage_gaps[graph_input_name] = value_lineage_limit_gap_counts[parent_name]
                         if parent_name in value_non_shape_lineage_limit_gap_counts:
@@ -3734,6 +3758,8 @@ def _build_onnx_weight_analysis_plan(
                             bound_rank_promotable_lineage_limit_gap_summaries=(
                                 subgraph_bound_rank_promotable_lineage_gap_summaries
                             ),
+                            bound_value_shapes=subgraph_bound_value_shapes,
+                            bound_value_ranks=subgraph_bound_value_ranks,
                             bound_attributes=attribute_bindings,
                             bound_attribute_keys=attribute_binding_keys,
                             function_depth=function_depth,
@@ -3770,6 +3796,8 @@ def _build_onnx_weight_analysis_plan(
                 function_bound_weight_lineage_gap_summaries: dict[str, _OnnxWeightLineageGapSummary] = {}
                 function_bound_rank_promotable_lineage_gaps: dict[str, int] = {}
                 function_bound_rank_promotable_lineage_gap_summaries: dict[str, _OnnxWeightLineageGapSummary] = {}
+                function_bound_value_shapes: dict[str, tuple[int, ...]] = {}
+                function_bound_value_ranks: dict[str, int] = {}
                 function_source_scope = ("function", *function_key)
                 function_bound_attributes: dict[str, Any] = {}
                 function_bound_attribute_keys: dict[str, tuple[Any, ...]] = {}
@@ -3800,6 +3828,10 @@ def _build_onnx_weight_analysis_plan(
                         function_bound_constants[function_input_name] = constants[parent_name]
                     if parent_name in dynamic_values:
                         function_bound_dynamic.add(function_input_name)
+                    if parent_name in known_value_shapes:
+                        function_bound_value_shapes[function_input_name] = known_value_shapes[parent_name]
+                    elif parent_name in known_value_ranks:
+                        function_bound_value_ranks[function_input_name] = known_value_ranks[parent_name]
                     if parent_name in value_lineage_limit_gap_counts:
                         function_bound_lineage_gaps[function_input_name] = value_lineage_limit_gap_counts[parent_name]
                     if parent_name in value_non_shape_lineage_limit_gap_counts:
@@ -3853,6 +3885,8 @@ def _build_onnx_weight_analysis_plan(
                         bound_rank_promotable_lineage_limit_gap_summaries=(
                             function_bound_rank_promotable_lineage_gap_summaries
                         ),
+                        bound_value_shapes=function_bound_value_shapes,
+                        bound_value_ranks=function_bound_value_ranks,
                         bound_attributes=function_bound_attributes,
                         bound_attribute_keys=function_bound_attribute_keys,
                         function_depth=function_depth + 1,
@@ -4352,6 +4386,8 @@ def _build_onnx_weight_analysis_plan(
             subgraph_output_weight_lineage_gap_summaries = [empty_weight_gap_summary for _ in node.output]
             subgraph_output_rank_promotable_lineage_gap_counts = [0 for _ in node.output]
             subgraph_output_rank_promotable_lineage_gap_summaries = [empty_weight_gap_summary for _ in node.output]
+            subgraph_output_shapes: list[tuple[int, ...] | None] = [None for _ in node.output]
+            subgraph_output_ranks: list[int | None] = [None for _ in node.output]
 
             def merge_subgraph_output_gap_state(
                 output_index: int,
@@ -4433,6 +4469,8 @@ def _build_onnx_weight_analysis_plan(
                 graph_output_weight_lineage_gap_summaries,
                 graph_output_rank_promotable_lineage_gap_counts,
                 graph_output_rank_promotable_lineage_gap_summaries,
+                graph_output_shapes,
+                graph_output_ranks,
             ) in subgraph_results:
                 stacked_scan_output_start = len(node.output)
                 if standard_control_flow_operator and node.op_type == "Loop":
@@ -4453,6 +4491,13 @@ def _build_onnx_weight_analysis_plan(
                         graph_output_lineages[graph_output_index],
                         ambiguous_reason="ambiguous_subgraph_output_lineage",
                     )
+                    graph_output_shape = graph_output_shapes[graph_output_index]
+                    graph_output_rank = graph_output_ranks[graph_output_index]
+                    if graph_output_shape is not None:
+                        subgraph_output_shapes[output_index] = graph_output_shape
+                        subgraph_output_ranks[output_index] = len(graph_output_shape)
+                    elif graph_output_rank is not None and subgraph_output_shapes[output_index] is None:
+                        subgraph_output_ranks[output_index] = graph_output_rank
                     subgraph_output_dynamic[output_index] |= graph_output_dynamic[graph_output_index]
                     subgraph_output_lineage_gap_counts[output_index] = _bounded_onnx_weight_lineage_gap_count(
                         subgraph_output_lineage_gap_counts[output_index],
@@ -4477,6 +4522,27 @@ def _build_onnx_weight_analysis_plan(
                             graph_output_non_shape_lineage_gap_counts[graph_output_index],
                             insert_axis=scan_output_insert_axis,
                         )
+                    elif (
+                        standard_control_flow_operator
+                        and node.op_type == "Loop"
+                        and not stacked_scan_output
+                        and graph_output_non_shape_lineage_gap_counts[graph_output_index]
+                        and loop_may_repeat_body(node, constants, graph_input_names)
+                    ):
+                        state_input_index = output_index + 2
+                        state_input_name = (
+                            str(node.input[state_input_index])
+                            if state_input_index < len(node.input) and node.input[state_input_index]
+                            else ""
+                        )
+                        if gap_summary_may_exceed_input_rank(
+                            graph_output_non_shape_gap_summary,
+                            known_value_ranks.get(state_input_name),
+                        ):
+                            graph_output_non_shape_gap_summary = non_shape_gap_summary_after_rank_increase(
+                                graph_output_non_shape_gap_summary,
+                                graph_output_non_shape_lineage_gap_counts[graph_output_index],
+                            )
                     subgraph_output_non_shape_lineage_gap_summaries[output_index] = merge_weight_lineage_gap_summaries(
                         subgraph_output_non_shape_lineage_gap_summaries[output_index],
                         graph_output_non_shape_gap_summary,
@@ -4665,6 +4731,7 @@ def _build_onnx_weight_analysis_plan(
 
             transform_output_shape: tuple[int, ...] | None = None
             transform_output_rank: int | None = None
+            clear_transform_output_rank = False
             if supported_transform and input_names:
                 transform_input_shape = known_value_shapes.get(input_names[0])
                 transform_input_rank = known_value_ranks.get(input_names[0])
@@ -4742,6 +4809,8 @@ def _build_onnx_weight_analysis_plan(
                                     dimension for dimension in transform_input_shape if dimension != 1
                                 )
                                 transform_output_rank = len(transform_output_shape)
+                            else:
+                                clear_transform_output_rank = True
                         else:
                             normalized_axes = tuple(axis if axis >= 0 else transform_input_rank + axis for axis in axes)
                             if len(set(normalized_axes)) == len(normalized_axes) and all(
@@ -4786,6 +4855,19 @@ def _build_onnx_weight_analysis_plan(
                     inferred_output_rank = (
                         elementwise_output_rank if elementwise_output_rank is not None else transform_output_rank
                     )
+                if output_index < len(subgraph_output_shapes):
+                    subgraph_output_shape = subgraph_output_shapes[output_index]
+                    if subgraph_output_shape is not None:
+                        inferred_output_shape = subgraph_output_shape
+                        inferred_output_rank = len(subgraph_output_shape)
+                    elif subgraph_output_ranks[output_index] is not None and inferred_output_shape is None:
+                        inferred_output_rank = subgraph_output_ranks[output_index]
+                clear_output_rank = (
+                    clear_transform_output_rank
+                    and output_index == 0
+                    and inferred_output_shape is None
+                    and inferred_output_rank is None
+                )
                 per_output_lineages = dict(output_lineages)
                 if (
                     recurrent_state_lineages
@@ -5021,6 +5103,9 @@ def _build_onnx_weight_analysis_plan(
                     elif inferred_output_rank is not None:
                         known_value_shapes.pop(name, None)
                         known_value_ranks[name] = inferred_output_rank
+                    elif clear_output_rank:
+                        known_value_shapes.pop(name, None)
+                        known_value_ranks.pop(name, None)
                     elif len(lineage_shapes) == 1 and None not in lineage_shapes:
                         known_value_shapes[name] = next(iter(lineage_shapes))  # type: ignore[arg-type]
                         known_value_ranks[name] = len(known_value_shapes[name])
@@ -5043,6 +5128,9 @@ def _build_onnx_weight_analysis_plan(
                     elif inferred_output_rank is not None:
                         known_value_shapes.pop(name, None)
                         known_value_ranks[name] = inferred_output_rank
+                    elif clear_output_rank:
+                        known_value_shapes.pop(name, None)
+                        known_value_ranks.pop(name, None)
 
                 mapped_subgraph_output = bool(subgraph_results) and output_index < len(subgraph_output_dynamic)
                 output_is_dynamic = (
@@ -5106,6 +5194,13 @@ def _build_onnx_weight_analysis_plan(
                 )
                 for output_name in output_names
             ],
+            [known_value_shapes.get(output_name) for output_name in output_names],
+            [
+                len(known_value_shapes[output_name])
+                if output_name in known_value_shapes
+                else known_value_ranks.get(output_name)
+                for output_name in output_names
+            ],
         )
 
     root_state_lineages: dict[str, dict[int, _OnnxWeightLineage]] = {}
@@ -5128,6 +5223,8 @@ def _build_onnx_weight_analysis_plan(
         _root_output_weight_lineage_gap_summaries,
         _root_output_rank_promotable_lineage_gaps,
         _root_output_rank_promotable_lineage_gap_summaries,
+        _root_output_shapes,
+        _root_output_ranks,
     ) = walk_graph(
         graph,
         {},
@@ -5196,6 +5293,8 @@ def _build_onnx_weight_analysis_plan(
             list[_OnnxWeightLineageGapSummary],
             list[int],
             list[_OnnxWeightLineageGapSummary],
+            list[tuple[int, ...] | None],
+            list[int | None],
         ],
     ] = {}
     algorithm_initializer_lineages: dict[int, dict[str, dict[int, _OnnxWeightLineage]]] = {}
@@ -5211,6 +5310,8 @@ def _build_onnx_weight_analysis_plan(
             output_weight_lineage_gap_summaries,
             output_rank_promotable_lineage_gaps,
             output_rank_promotable_lineage_gap_summaries,
+            output_shapes,
+            output_ranks,
         ) = walk_graph(
             training_graph,
             root_state_lineages if is_algorithm else {},
@@ -5251,6 +5352,8 @@ def _build_onnx_weight_analysis_plan(
             output_weight_lineage_gap_summaries,
             output_rank_promotable_lineage_gaps,
             output_rank_promotable_lineage_gap_summaries,
+            output_shapes,
+            output_ranks,
         )
         if not is_algorithm:
             continue
@@ -5301,6 +5404,8 @@ def _build_onnx_weight_analysis_plan(
                     _output_weight_lineage_gap_summaries,
                     _output_rank_promotable_lineage_gaps,
                     _output_rank_promotable_lineage_gap_summaries,
+                    _output_shapes,
+                    _output_ranks,
                 ) = graph_result
                 output_lineages_by_name = {
                     _onnx_value_name(graph_output): lineages
