@@ -7694,6 +7694,56 @@ class TestWeightDistributionSemantics:
         assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
         assert semantics["analyzed_layer_count"] == 0
 
+    def test_function_cast_ref_attr_target_fails_closed_for_retained_lineages(self, tmp_path: Path) -> None:
+        source_name = "integer_matrix"
+        cast_node = helper.make_node("Cast", [source_name], ["function_weight"], to=TensorProto.INT64)
+        cast_node.attribute[0].ref_attr_name = "target_type"
+        function = helper.make_function(
+            "local",
+            "CastRetainedToTarget",
+            [source_name],
+            ["function_weight"],
+            [cast_node],
+            opset_imports=[helper.make_opsetid("", 13)],
+            attributes=["target_type"],
+        )
+        initializer = onnx.numpy_helper.from_array(np.arange(16, dtype=np.int64).reshape(4, 4), name=source_name)
+        graph = helper.make_graph(
+            [
+                helper.make_node(
+                    "CastRetainedToTarget",
+                    [source_name],
+                    ["generated_weight"],
+                    domain="local",
+                    target_type=TensorProto.FLOAT,
+                ),
+                helper.make_node("MatMul", ["X", "generated_weight"], ["Y"]),
+            ],
+            "function_cast_ref_attr_target_applies_to_retained_lineages",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, [4, 4])],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [4, 4])],
+            initializer=[initializer],
+        )
+        model = helper.make_model(
+            graph,
+            functions=[function],
+            opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
+        )
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / "function-cast-ref-attr-target-retained.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        assert result.success is False
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["coverage_gaps"]["unresolved_initializer_lineage"] >= 1
+        assert semantics["unresolved_lineage_samples"][0]["reason"] == "dtype_changing_cast_lineage"
+        assert semantics["analyzed_layer_count"] == 0
+
     def test_function_runtime_input_rank_overrides_stale_call_output_annotation(self, tmp_path: Path) -> None:
         shape_names = [f"shape_source{index}" for index in range(32)]
         initializers = [onnx.numpy_helper.from_array(np.array([], dtype=np.int64), name=name) for name in shape_names]
