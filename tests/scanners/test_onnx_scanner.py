@@ -7211,6 +7211,68 @@ class TestWeightDistributionSemantics:
         assert semantics["coverage_gaps"] == {}
         assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
 
+    def test_gathernd_selection_lineage_fails_closed_instead_of_reshape(self, tmp_path: Path) -> None:
+        graph = helper.make_graph(
+            [
+                helper.make_node("GatherND", ["W", "indices"], ["selected"]),
+                helper.make_node("MatMul", ["X", "selected"], ["Y"]),
+            ],
+            "gathernd_selection_lineage_fails_closed",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 2])],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 2])],
+            initializer=[
+                onnx.numpy_helper.from_array(np.array([[8.0, 8.0], [0.0, 0.0]], dtype=np.float32), name="W"),
+                onnx.numpy_helper.from_array(np.array([[0], [0]], dtype=np.int64), name="indices"),
+            ],
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / "gathernd-selection-lineage-fails-closed.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        assert result.success is False
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["coverage_gaps"]["unresolved_initializer_lineage"] == 1
+        assert any(
+            sample["reason"] == "unresolved_gathernd_lineage" for sample in semantics["unresolved_lineage_samples"]
+        )
+
+    def test_gathernd_graph_input_indices_keep_rank_gap_fail_closed(self, tmp_path: Path) -> None:
+        graph = helper.make_graph(
+            [
+                helper.make_node("GatherND", ["W", "indices"], ["selected"], batch_dims=1),
+                helper.make_node("MatMul", ["selected", "projection"], ["Y"]),
+            ],
+            "gathernd_graph_input_indices_keep_rank_gap",
+            [helper.make_tensor_value_info("indices", TensorProto.INT64, [2, "K"])],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [2, 1])],
+            initializer=[
+                onnx.numpy_helper.from_array(np.zeros((2, 4, 4), dtype=np.float32), name="W"),
+                onnx.numpy_helper.from_array(np.array([[0, 0], [1, 0]], dtype=np.int64), name="indices"),
+                onnx.numpy_helper.from_array(np.zeros((4, 1), dtype=np.float32), name="projection"),
+            ],
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        path = tmp_path / "gathernd-graph-input-indices-fail-closed.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        assert result.success is False
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["coverage_gaps"]["unresolved_initializer_lineage"] >= 1
+        assert any(
+            sample["reason"] == "unresolved_gathernd_lineage" for sample in semantics["unresolved_lineage_samples"]
+        )
+
     @pytest.mark.parametrize("rank_two_bias", [False, True])
     @pytest.mark.parametrize("malicious", [False, True])
     def test_dynamic_activation_paths_do_not_propagate_bookkeeping_lineage(
@@ -7950,6 +8012,7 @@ class TestWeightDistributionSemantics:
         assert semantics["coverage_gaps"]["lineages_per_value_limit"] == 1
         assert semantics["analyzed_layer_count"] == 0
 
+    @pytest.mark.parametrize("transform", ["Identity", "Relu"])
     @pytest.mark.parametrize(
         ("runtime_dims", "x_dims", "y_dims", "expect_gap"),
         [
@@ -7958,9 +8021,10 @@ class TestWeightDistributionSemantics:
             ([4], [1, 4], [1], False),
         ],
     )
-    def test_identity_alias_preserves_broadcast_rank_for_deferred_scalar_gap(
+    def test_unary_alias_preserves_broadcast_rank_for_deferred_scalar_gap(
         self,
         tmp_path: Path,
+        transform: str,
         runtime_dims: list[Any],
         x_dims: list[Any],
         y_dims: list[Any],
@@ -7977,14 +8041,14 @@ class TestWeightDistributionSemantics:
             previous = reshaped
         nodes.extend(
             [
-                helper.make_node("Identity", ["runtime_weight"], ["runtime_alias"]),
+                helper.make_node(transform, ["runtime_weight"], ["runtime_alias"]),
                 helper.make_node("Add", ["runtime_alias", previous], ["generated_weight"]),
                 helper.make_node("MatMul", ["X", "generated_weight"], ["Y"]),
             ]
         )
         graph = helper.make_graph(
             nodes,
-            "identity_alias_preserves_broadcast_rank_for_deferred_scalar_gap",
+            "unary_alias_preserves_broadcast_rank_for_deferred_scalar_gap",
             [
                 helper.make_tensor_value_info("runtime_weight", TensorProto.FLOAT, runtime_dims),
                 helper.make_tensor_value_info("X", TensorProto.FLOAT, x_dims),
@@ -7995,7 +8059,7 @@ class TestWeightDistributionSemantics:
         model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
         model.ir_version = 8
         onnx.checker.check_model(model)
-        path = tmp_path / f"identity-broadcast-rank-{len(runtime_dims)}.onnx"
+        path = tmp_path / f"{transform.lower()}-broadcast-rank-{len(runtime_dims)}.onnx"
         onnx.save(model, str(path))
 
         result = OnnxScanner().scan(str(path))

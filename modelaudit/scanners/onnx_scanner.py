@@ -2082,6 +2082,16 @@ def _build_onnx_weight_analysis_plan(
             output_dimensions.append(next(iter(non_singleton_dimensions), 1))
         return tuple(reversed(output_dimensions))
 
+    def broadcast_rank_from_input_ranks(ranks: Iterable[int | None]) -> int | None:
+        observed_ranks = list(ranks)
+        known_ranks = [rank for rank in observed_ranks if rank is not None]
+        if not known_ranks:
+            return None
+        output_rank = max(known_ranks)
+        if any(rank is None for rank in observed_ranks) and output_rank < 2:
+            return None
+        return output_rank
+
     groups: list[dict[tuple[Any, ...], _OnnxWeightConsumerGroup]] = []
     eligible_initializer_indexes: set[int] = set()
     terminal_consumer_counts: list[int] = []
@@ -2432,8 +2442,13 @@ def _build_onnx_weight_analysis_plan(
                     transforms=lineage.transforms,
                     unresolved_reason=lineage.unresolved_reason or "unresolved_gathernd_lineage",
                 )
-            output_shape = gathered_shape
-            transform = _OnnxWeightTransform("Reshape", output_shape)
+            return _OnnxWeightLineage(
+                initializer_index=lineage.initializer_index,
+                shape=gathered_shape,
+                data_type=lineage.data_type,
+                transforms=lineage.transforms,
+                unresolved_reason=lineage.unresolved_reason or "unresolved_gathernd_lineage",
+            )
         else:  # Reshape
             shape_name = str(node.input[1]) if len(node.input) > 1 else ""
             shape_initializer = constants.get(shape_name)
@@ -3719,12 +3734,11 @@ def _build_onnx_weight_analysis_plan(
                     else None
                 )
                 elementwise_input_ranks = [known_value_ranks.get(input_name) for input_name in input_names]
-                elementwise_known_input_ranks = [rank for rank in elementwise_input_ranks if rank is not None]
                 elementwise_output_rank = (
                     len(elementwise_output_shape)
                     if elementwise_output_shape is not None
-                    else max(elementwise_known_input_ranks)
-                    if (same_type_elementwise or pow_operator) and elementwise_known_input_ranks
+                    else broadcast_rank_from_input_ranks(elementwise_input_ranks)
+                    if same_type_elementwise or same_type_unary_elementwise or pow_operator
                     else None
                 )
                 broadcast_operator_promotes_deferred_gap = (
@@ -3814,7 +3828,7 @@ def _build_onnx_weight_analysis_plan(
             promoted_rank_lineage_limit_gap_count = 0
             promoted_rank_lineage_gap_summary = empty_weight_gap_summary
             rank_gap_control_input_is_overridable = (
-                node.op_type in {"Reshape", "Squeeze", "Unsqueeze"}
+                node.op_type in {"GatherND", "Reshape", "Squeeze", "Unsqueeze"}
                 and len(node.input) > 1
                 and str(node.input[1]) in graph_input_names
             )
@@ -4291,10 +4305,26 @@ def _build_onnx_weight_analysis_plan(
                     )
                     merge_subgraph_output_gap_state(output_index, parent_name)
 
+            if elementwise_output_shape is None and elementwise_output_rank is None and len(input_names) == 1:
+                common_output_rank_operator = (
+                    is_registered_standard_operator
+                    and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
+                    and node.op_type in _SAME_TYPE_UNARY_ELEMENTWISE_OPERATORS
+                )
+                if common_output_rank_operator:
+                    elementwise_output_shape = known_value_shapes.get(input_names[0])
+                    elementwise_output_rank = (
+                        len(elementwise_output_shape)
+                        if elementwise_output_shape is not None
+                        else known_value_ranks.get(input_names[0])
+                    )
+
             for output_index, output_name in enumerate(node.output):
                 if not output_name:
                     continue
                 name = str(output_name)
+                inferred_output_shape = elementwise_output_shape if output_index == 0 else None
+                inferred_output_rank = elementwise_output_rank if output_index == 0 else None
                 identity_input_shape = (
                     known_value_shapes.get(input_names[0])
                     if supported_transform and node.op_type == "Identity" and input_names
@@ -4508,7 +4538,13 @@ def _build_onnx_weight_analysis_plan(
                         value_rank_promotable_lineage_limit_gap_counts.pop(name, None)
                         value_rank_promotable_lineage_limit_gap_summaries.pop(name, None)
                     lineage_shapes = {lineage.shape for lineage in per_output_lineages.values()}
-                    if len(lineage_shapes) == 1 and None not in lineage_shapes:
+                    if inferred_output_shape is not None:
+                        known_value_shapes[name] = inferred_output_shape
+                        known_value_ranks[name] = len(inferred_output_shape)
+                    elif inferred_output_rank is not None:
+                        known_value_shapes.pop(name, None)
+                        known_value_ranks[name] = inferred_output_rank
+                    elif len(lineage_shapes) == 1 and None not in lineage_shapes:
                         known_value_shapes[name] = next(iter(lineage_shapes))  # type: ignore[arg-type]
                         known_value_ranks[name] = len(known_value_shapes[name])
                 else:
@@ -4523,7 +4559,13 @@ def _build_onnx_weight_analysis_plan(
                         with suppress(AttributeError, TypeError, ValueError):
                             known_value_shapes[name] = tuple(int(dimension) for dimension in constants[name].dims)
                             known_value_ranks[name] = len(known_value_shapes[name])
-                    if identity_input_shape is not None:
+                    if inferred_output_shape is not None:
+                        known_value_shapes[name] = inferred_output_shape
+                        known_value_ranks[name] = len(inferred_output_shape)
+                    elif inferred_output_rank is not None:
+                        known_value_shapes.pop(name, None)
+                        known_value_ranks[name] = inferred_output_rank
+                    elif identity_input_shape is not None:
                         known_value_shapes[name] = identity_input_shape
                         known_value_ranks[name] = len(identity_input_shape)
                     elif identity_input_rank is not None:
