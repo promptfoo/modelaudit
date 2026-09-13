@@ -523,6 +523,36 @@ def create_cross_training_info_weight_model(tmp_path: Path) -> Path:
     return path
 
 
+def create_training_initializer_shadow_gap_model(tmp_path: Path) -> Path:
+    source_names = [f"root_W{index}" for index in range(40)]
+    root_initializers = [
+        onnx.numpy_helper.from_array(np.zeros((4, 4), dtype=np.float32), name=name) for name in source_names
+    ]
+    main_graph = helper.make_graph(
+        [helper.make_node("Sum", source_names, ["W"])],
+        "main_graph",
+        [],
+        [helper.make_tensor_value_info("W", TensorProto.FLOAT, [4, 4])],
+        initializer=root_initializers,
+    )
+    algorithm = helper.make_graph(
+        [helper.make_node("MatMul", ["X", "W"], ["Y"])],
+        "training_algorithm",
+        [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 4])],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 4])],
+        initializer=[onnx.numpy_helper.from_array(np.zeros((4, 4), dtype=np.float32), name="W")],
+    )
+    training_info = onnx.TrainingInfoProto()
+    training_info.algorithm.CopyFrom(algorithm)
+    model = helper.make_model(main_graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    model.training_info.append(training_info)
+    onnx.checker.check_model(model)
+    path = tmp_path / "training-initializer-shadow-gap.onnx"
+    onnx.save(model, str(path))
+    return path
+
+
 def create_training_initialization_reset_model(tmp_path: Path) -> Path:
     main_input = helper.make_tensor_value_info("main_input", TensorProto.FLOAT, [1])
     main_output = helper.make_tensor_value_info("main_output", TensorProto.FLOAT, [1])
@@ -3923,6 +3953,19 @@ def test_onnx_scanner_cross_training_info_weight_state_fails_closed(tmp_path: Pa
     assert semantics["coverage_gaps"]["unresolved_training_binding"] == 1
 
 
+def test_onnx_scanner_training_local_initializer_clears_shadowed_gap_state(tmp_path: Path) -> None:
+    model_path = create_training_initializer_shadow_gap_model(tmp_path)
+
+    result = OnnxScanner().scan(str(model_path))
+
+    assert result.success is True
+    assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
+    semantics = result.metadata["onnx_weight_distribution_semantics"]
+    assert semantics["coverage_gaps"] == {}
+    assert semantics["eligible_initializer_count"] == 1
+    assert semantics["analyzed_layer_count"] == 1
+
+
 def test_onnx_scanner_training_initialization_binding_fails_closed(tmp_path: Path) -> None:
     model_path = create_training_initialization_reset_model(tmp_path)
 
@@ -6514,6 +6557,84 @@ class TestWeightDistributionSemantics:
         assert len(checks) == 1
         assert checks[0].details["affected_neurons"] == [3]
         assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
+
+    @pytest.mark.parametrize(
+        ("trip_count", "initial_condition", "body_uses_state", "expected_gap"),
+        [
+            (0, True, False, True),
+            (1, False, False, True),
+            (1, True, False, False),
+            (0, True, True, True),
+        ],
+    )
+    def test_loop_carried_state_preserves_initial_gap_when_body_may_skip(
+        self,
+        tmp_path: Path,
+        trip_count: int,
+        initial_condition: bool,
+        body_uses_state: bool,
+        expected_gap: bool,
+    ) -> None:
+        source_names = [f"W{index}" for index in range(40)]
+        initializers = [
+            onnx.numpy_helper.from_array(np.zeros((4, 4), dtype=np.float32), name=name) for name in source_names
+        ]
+        initializers.extend(
+            [
+                onnx.numpy_helper.from_array(np.zeros((4, 4), dtype=np.float32), name="clean_weight"),
+                onnx.numpy_helper.from_array(np.array(trip_count, dtype=np.int64), name="trip"),
+                onnx.numpy_helper.from_array(np.array(initial_condition, dtype=np.bool_), name="condition"),
+            ]
+        )
+        body = helper.make_graph(
+            [
+                helper.make_node("Identity", ["body_condition"], ["next_condition"]),
+                helper.make_node(
+                    "Identity",
+                    ["state" if body_uses_state else "clean_weight"],
+                    ["next_state"],
+                ),
+            ],
+            "loop_body",
+            [
+                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
+                helper.make_tensor_value_info("body_condition", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("state", TensorProto.FLOAT, [4, 4]),
+            ],
+            [
+                helper.make_tensor_value_info("next_condition", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, [4, 4]),
+            ],
+        )
+        graph = helper.make_graph(
+            [
+                helper.make_node("Sum", source_names, ["capped"]),
+                helper.make_node("Loop", ["trip", "condition", "capped"], ["loop_output"], body=body),
+                helper.make_node("MatMul", ["X", "loop_output"], ["Y"]),
+            ],
+            "loop_carried_state_preserves_initial_gap_when_body_may_skip",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 4])],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 4])],
+            initializer=initializers,
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model, full_check=True)
+        model_path = tmp_path / "loop-carried-state-skip-gap.onnx"
+        onnx.save(model, str(model_path))
+
+        result = OnnxScanner().scan(str(model_path))
+
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        if expected_gap:
+            assert result.success is False
+            assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
+            assert any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
+        else:
+            assert result.success is True
+            assert semantics["coverage_gaps"] == {}
+            assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
+        assert semantics["eligible_initializer_count"] >= 1
 
     @pytest.mark.parametrize("rank_two_bias", [False, True])
     @pytest.mark.parametrize("malicious", [False, True])
