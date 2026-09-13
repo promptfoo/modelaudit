@@ -6,12 +6,13 @@ import io
 import os
 import pickle
 import pickletools
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import modelaudit_picklescan.api as picklescan_api
-import modelaudit_picklescan.call_graph as picklescan_call_graph
 import pytest
+from modelaudit_picklescan import Notice, PickleReport, ScanStatus
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.cache.cache_policy import should_cache_scan_result
@@ -252,109 +253,6 @@ def _trust_joblib_test_references(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
-_LEGACY_PYTORCH_CONTROL_TRUSTED_REFERENCES = frozenset(
-    {
-        ("torch", "ByteStorage"),
-        ("torch", "FloatStorage"),
-    }
-)
-
-
-def _legacy_pytorch_control_reference_is_trusted(
-    module: str,
-    name: str,
-    *,
-    pickle_entrypoint_methods: tuple[str, ...] | None = None,
-    pickle_invokes_metaclass_call: bool | None = None,
-) -> bool:
-    del pickle_entrypoint_methods, pickle_invokes_metaclass_call
-    return (module, name) in _LEGACY_PYTORCH_CONTROL_TRUSTED_REFERENCES
-
-
-def _legacy_pytorch_control_invocation_is_trusted(module: str, name: str, reference: dict[str, object]) -> bool:
-    del reference
-    return _legacy_pytorch_control_reference_is_trusted(module, name)
-
-
-def _legacy_pytorch_control_requires_origin_review(module: str, name: str) -> bool:
-    return (module, name) == ("torch._utils", "_rebuild_tensor_v2")
-
-
-def _legacy_pytorch_control_module_is_loaded_without_import_hooks(
-    module: str,
-    _original: Any = picklescan_api.module_is_loaded_without_import_hooks,
-) -> bool:
-    return module != "torch._utils" and _original(module)
-
-
-def _legacy_pytorch_control_module_load_is_safe_for_invocation(
-    module: str,
-    _original: Any = picklescan_api.import_only_module_load_is_proven_safe_for_invocation,
-) -> bool:
-    return module != "torch._utils" and _original(module)
-
-
-def _legacy_pytorch_control_call_graph_module_is_loaded_without_import_hooks(
-    module: str,
-    _original: Any = picklescan_call_graph.module_is_loaded_without_import_hooks,
-) -> bool:
-    return module != "torch._utils" and _original(module)
-
-
-def _legacy_pytorch_control_call_graph_module_load_is_safe_for_invocation(
-    module: str,
-    _original: Any = picklescan_call_graph.import_only_module_load_is_proven_safe_for_invocation,
-) -> bool:
-    return module != "torch._utils" and _original(module)
-
-
-def _trust_legacy_pytorch_storage_but_review_rebuild_tensor(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        "modelaudit.scanners.pickle_scanner.import_only_reference_is_proven_trusted",
-        _legacy_pytorch_control_reference_is_trusted,
-    )
-    monkeypatch.setattr(
-        "modelaudit_picklescan.api.import_only_reference_is_proven_trusted",
-        _legacy_pytorch_control_reference_is_trusted,
-    )
-    monkeypatch.setattr(
-        "modelaudit_picklescan.call_graph.import_only_reference_is_proven_trusted",
-        _legacy_pytorch_control_reference_is_trusted,
-    )
-    monkeypatch.setattr(
-        "modelaudit_picklescan.api.import_only_reference_is_proven_trusted_for_pickle_invocation",
-        _legacy_pytorch_control_invocation_is_trusted,
-    )
-    monkeypatch.setattr(
-        "modelaudit_picklescan.call_graph.import_only_reference_is_proven_trusted_for_pickle_invocation",
-        _legacy_pytorch_control_invocation_is_trusted,
-    )
-    monkeypatch.setattr(
-        "modelaudit_picklescan.api.import_only_module_requires_origin_review",
-        _legacy_pytorch_control_requires_origin_review,
-    )
-    monkeypatch.setattr(
-        "modelaudit_picklescan.call_graph.import_only_module_requires_origin_review",
-        _legacy_pytorch_control_requires_origin_review,
-    )
-    monkeypatch.setattr(
-        "modelaudit_picklescan.api.module_is_loaded_without_import_hooks",
-        _legacy_pytorch_control_module_is_loaded_without_import_hooks,
-    )
-    monkeypatch.setattr(
-        "modelaudit_picklescan.api.import_only_module_load_is_proven_safe_for_invocation",
-        _legacy_pytorch_control_module_load_is_safe_for_invocation,
-    )
-    monkeypatch.setattr(
-        "modelaudit_picklescan.call_graph.module_is_loaded_without_import_hooks",
-        _legacy_pytorch_control_call_graph_module_is_loaded_without_import_hooks,
-    )
-    monkeypatch.setattr(
-        "modelaudit_picklescan.call_graph.import_only_module_load_is_proven_safe_for_invocation",
-        _legacy_pytorch_control_call_graph_module_load_is_safe_for_invocation,
-    )
-
-
 def _binary_opcode_os_system_reduce_payload() -> bytes:
     # The command text is inert here; the scanner only needs a realistic GLOBAL/REDUCE payload shape.
     return _short_binunicode(b"os") + _short_binunicode(b"system") + b"\x93" + _short_binunicode(b"echo") + b"\x85R."
@@ -429,21 +327,6 @@ def _legacy_pytorch_object_stream(
         object_stream += malicious_pickle[2:-1] + b"a"
     object_stream += b"."
     return bytes(object_stream)
-
-
-def _legacy_pytorch_rebuild_tensor_v2_object_stream(storage_size: int) -> bytes:
-    storage_pid = _legacy_pytorch_storage_pid_tuple(
-        "0",
-        storage_size,
-        storage_type=b"ctorch\nFloatStorage\n",
-    )
-    size_tuple = b"(K\x02K\x02t"
-    stride_tuple = b"(K\x02K\x01t"
-    return (
-        b"\x80\x02]"
-        b"ctorch._utils\n_rebuild_tensor_v2\n"
-        b"(" + storage_pid + b"QK\x00" + size_tuple + stride_tuple + b"\x89NtRa."
-    )
 
 
 def _legacy_pytorch_storage_pid_tuple(
@@ -4710,37 +4593,68 @@ def test_legacy_pytorch_container_trusts_canonical_storage_binpersid(tmp_path: P
     assert should_cache_scan_result(serialized_result) is True
 
 
-def test_legacy_pytorch_valid_storage_layout_survives_inconclusive_control_findings(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("inconclusive", "malicious", "truncate_storage"),
+    [
+        (False, False, False),
+        (True, False, False),
+        (True, True, False),
+        (True, False, True),
+    ],
+)
+def test_legacy_pytorch_storage_layout_uses_control_coverage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    inconclusive: bool,
+    malicious: bool,
+    truncate_storage: bool,
 ) -> None:
-    _trust_legacy_pytorch_storage_but_review_rebuild_tensor(monkeypatch)
-    object_stream = _legacy_pytorch_rebuild_tensor_v2_object_stream(4)
-    payload, pickle_end = _make_legacy_pytorch_container_with_object_stream(
-        b"A" * 16,
-        object_stream,
-        declared_storage_size=4,
-    )
-    path = tmp_path / "legacy-source-backed-control.pt"
+    payload, pickle_end = _make_legacy_pytorch_container(b"A" * 16, malicious_object=malicious)
+    if truncate_storage:
+        payload = payload[:-1]
+    path = tmp_path / "legacy-control-coverage.pt"
     path.write_bytes(payload)
+    original_adapter = pickle_scanner.pickle_report_to_scan_result
 
+    def with_report_status(report: PickleReport, **kwargs: Any) -> ScanResult:
+        if inconclusive:
+            report = replace(
+                report,
+                status=ScanStatus.INCONCLUSIVE,
+                notices=(
+                    *report.notices,
+                    Notice(
+                        message="Python call-graph analysis could not inspect invoked callable source",
+                        location=report.source,
+                        code="call_graph_source_unavailable",
+                        details={"analysis_incomplete": True, "reason": "source_unavailable"},
+                    ),
+                ),
+            )
+        return original_adapter(report, **kwargs)
+
+    monkeypatch.setattr(pickle_scanner, "pickle_report_to_scan_result", with_report_status)
     result = PickleScanner().scan(str(path))
 
-    assert result.metadata["legacy_pytorch_container"] is True
-    assert result.metadata["legacy_pytorch_storage_start"] == pickle_end
-    assert result.metadata["legacy_pytorch_storage_end"] == len(payload)
-    assert result.metadata.get("pickle_verdict") in {"suspicious", "malicious"}
-    assert result.has_warnings or result.has_errors
-    assert "legacy_pytorch_storage_layout_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
-    assert not any(
-        check.rule_code == "S902" and check.name == "Legacy PyTorch Storage Layout" for check in result.checks
-    )
-    assert not _persistent_id_issues(result)
-    assert any(
-        issue.rule_code == "NON_ALLOWLISTED_GLOBAL"
-        and issue.details.get("import_reference") == "torch._utils._rebuild_tensor_v2"
-        and issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
-        for issue in result.issues
-    )
+    assert result.success is not inconclusive
+    assert result.metadata["pickle_report_status"] == ("inconclusive" if inconclusive else "complete")
+    assert result.metadata["pickle_coverage"]["raw_scan_complete"] is True
+    assert result.metadata["pickle_coverage"]["opcode_scan_complete"] is True
+    layout_checks = [
+        check for check in result.checks if check.rule_code == "S902" and check.name == "Legacy PyTorch Storage Layout"
+    ]
+    if truncate_storage:
+        assert "legacy_pytorch_storage_layout_incomplete" in result.metadata["scan_outcome_reasons"]
+        assert layout_checks and all(check.status == CheckStatus.FAILED for check in layout_checks)
+        assert result.metadata.get("legacy_pytorch_storage_end") is None
+    else:
+        assert result.metadata["legacy_pytorch_container"] is True
+        assert result.metadata["legacy_pytorch_storage_start"] == pickle_end
+        assert result.metadata["legacy_pytorch_storage_end"] == len(payload)
+        assert "legacy_pytorch_storage_layout_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
+        assert not layout_checks
+    if malicious:
+        assert any(issue.rule_code == "S201" and issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
 
 
 def test_legacy_pytorch_bin_extension_uses_framing_not_suffix_for_storage_trust(tmp_path: Path) -> None:
