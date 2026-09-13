@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import modelaudit_picklescan.api as picklescan_api
+import modelaudit_picklescan.call_graph as picklescan_call_graph
 import pytest
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
@@ -293,6 +294,20 @@ def _legacy_pytorch_control_module_load_is_safe_for_invocation(
     return module != "torch._utils" and _original(module)
 
 
+def _legacy_pytorch_control_call_graph_module_is_loaded_without_import_hooks(
+    module: str,
+    _original: Any = picklescan_call_graph.module_is_loaded_without_import_hooks,
+) -> bool:
+    return module != "torch._utils" and _original(module)
+
+
+def _legacy_pytorch_control_call_graph_module_load_is_safe_for_invocation(
+    module: str,
+    _original: Any = picklescan_call_graph.import_only_module_load_is_proven_safe_for_invocation,
+) -> bool:
+    return module != "torch._utils" and _original(module)
+
+
 def _trust_legacy_pytorch_storage_but_review_rebuild_tensor(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "modelaudit.scanners.pickle_scanner.import_only_reference_is_proven_trusted",
@@ -329,6 +344,14 @@ def _trust_legacy_pytorch_storage_but_review_rebuild_tensor(monkeypatch: pytest.
     monkeypatch.setattr(
         "modelaudit_picklescan.api.import_only_module_load_is_proven_safe_for_invocation",
         _legacy_pytorch_control_module_load_is_safe_for_invocation,
+    )
+    monkeypatch.setattr(
+        "modelaudit_picklescan.call_graph.module_is_loaded_without_import_hooks",
+        _legacy_pytorch_control_call_graph_module_is_loaded_without_import_hooks,
+    )
+    monkeypatch.setattr(
+        "modelaudit_picklescan.call_graph.import_only_module_load_is_proven_safe_for_invocation",
+        _legacy_pytorch_control_call_graph_module_load_is_safe_for_invocation,
     )
 
 
