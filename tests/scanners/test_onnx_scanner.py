@@ -6089,6 +6089,16 @@ class TestWeightDistributionSemantics:
             previous = output
         return nodes, initializers, previous
 
+    def test_concat_output_shape_preserves_unknown_extents(self) -> None:
+        axis_node = helper.make_node("Concat", ["left", "right"], ["output"], axis=1)
+        leading_axis_node = helper.make_node("Concat", ["left", "right"], ["output"], axis=0)
+
+        assert onnx_scanner_module._onnx_concat_output_shape(axis_node, [(2, -1), (2, 2)]) == (2, -1)
+        assert onnx_scanner_module._onnx_concat_output_shape(axis_node, [(2, 2), (2, -1)]) == (2, -1)
+        assert onnx_scanner_module._onnx_concat_output_shape(leading_axis_node, [(-1, 4), (2, 4)]) == (-1, 4)
+        assert onnx_scanner_module._onnx_concat_output_shape(leading_axis_node, [(1, -1), (2, 3)]) == (3, -1)
+        assert onnx_scanner_module._onnx_concat_output_shape(axis_node, [(2, 3), (4, 3)]) is None
+
     @staticmethod
     def _write_onehot_weight_model(
         tmp_path: Path,
@@ -9141,6 +9151,41 @@ class TestWeightDistributionSemantics:
             assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
             assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
             assert semantics["analyzed_layer_count"] == 0
+
+    def test_root_input_rank_metadata_cannot_override_overridable_input_contract(self, tmp_path: Path) -> None:
+        nodes, initializers, previous = self._capped_scalar_expression()
+        initializers.append(onnx.numpy_helper.from_array(np.ones((1, 4), dtype=np.float32), name="runtime_weight"))
+        nodes.extend(
+            [
+                helper.make_node("Add", ["runtime_weight", previous], ["generated_weight"]),
+                helper.make_node("MatMul", ["X", "generated_weight"], ["Y"]),
+            ]
+        )
+        graph = helper.make_graph(
+            nodes,
+            "root_input_rank_metadata_cannot_override_overridable_input_contract",
+            [
+                helper.make_tensor_value_info("runtime_weight", TensorProto.FLOAT, [1, 4]),
+                helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 1]),
+            ],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 4])],
+            initializer=initializers,
+            value_info=[helper.make_tensor_value_info("runtime_weight", TensorProto.FLOAT, [4])],
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / "root-input-rank-metadata-collision.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        assert result.success is False
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
+        assert semantics["analyzed_layer_count"] == 0
 
     @pytest.mark.parametrize("alias", ["direct", "Identity", "Cast", "Relu"])
     def test_onehot_constant_reshape_vector_rank_stays_nonweight(self, tmp_path: Path, alias: str) -> None:

@@ -316,6 +316,32 @@ def _onnx_int_sequence_attribute(node: Any, name: str) -> tuple[int, ...] | None
     return None
 
 
+def _onnx_concat_output_shape(node: Any, input_shapes: Iterable[tuple[int, ...] | None]) -> tuple[int, ...] | None:
+    shapes = list(input_shapes)
+    if not shapes or any(shape is None for shape in shapes):
+        return None
+    concrete_shapes = [shape for shape in shapes if shape is not None]
+    ranks = {len(shape) for shape in concrete_shapes}
+    if len(ranks) != 1:
+        return None
+    rank = next(iter(ranks))
+    axis = _onnx_int_attribute(node, "axis", 0)
+    axis = axis if axis >= 0 else rank + axis
+    if axis < 0 or axis >= rank:
+        return None
+    output_dimensions = list(concrete_shapes[0])
+    for shape in concrete_shapes[1:]:
+        for index, dimension in enumerate(shape):
+            current = output_dimensions[index]
+            if index == axis:
+                output_dimensions[index] = -1 if current < 0 or dimension < 0 else current + dimension
+            elif current < 0 or dimension < 0:
+                output_dimensions[index] = -1
+            elif dimension != current:
+                return None
+    return tuple(output_dimensions)
+
+
 def _onnx_text_attribute(node: Any, name: str) -> str | None:
     """Read a UTF-8 ONNX string attribute without importing ONNX eagerly."""
     for attribute in getattr(node, "attribute", []):
@@ -2265,26 +2291,6 @@ def _build_onnx_weight_analysis_plan(
             return None
         return output_rank
 
-    def concat_output_shape(node: Any, input_shapes: Iterable[tuple[int, ...] | None]) -> tuple[int, ...] | None:
-        shapes = list(input_shapes)
-        if not shapes or any(shape is None for shape in shapes):
-            return None
-        concrete_shapes = [shape for shape in shapes if shape is not None]
-        ranks = {len(shape) for shape in concrete_shapes}
-        if len(ranks) != 1:
-            return None
-        rank = next(iter(ranks))
-        axis = _onnx_int_attribute(node, "axis", 0)
-        axis = axis if axis >= 0 else rank + axis
-        if axis < 0 or axis >= rank:
-            return None
-        output_dimensions = list(concrete_shapes[0])
-        for shape in concrete_shapes[1:]:
-            if any(index != axis and dimension != output_dimensions[index] for index, dimension in enumerate(shape)):
-                return None
-            output_dimensions[axis] += shape[axis]
-        return tuple(output_dimensions)
-
     groups: list[dict[tuple[Any, ...], _OnnxWeightConsumerGroup]] = []
     eligible_initializer_indexes: set[int] = set()
     terminal_consumer_counts: list[int] = []
@@ -3336,18 +3342,22 @@ def _build_onnx_weight_analysis_plan(
                 )
             )
 
-        for value_info in (
-            *getattr(current_graph, "input", ()),
-            *getattr(current_graph, "value_info", ()),
-            *getattr(current_graph, "output", ()),
-        ):
+        for value_info in getattr(current_graph, "input", ()):
             name = _onnx_value_name(value_info)
             shape = value_info_shape(value_info)
-            declared_root_input = root_graph and name in graph_input_names
             if name and shape is not None:
-                set_known_value_shape(name, shape, proven=declared_root_input)
+                set_known_value_shape(name, shape, proven=root_graph)
             elif name and (rank := value_info_rank(value_info)) is not None:
-                set_known_value_rank(name, rank, proven=declared_root_input)
+                set_known_value_rank(name, rank, proven=root_graph)
+        for value_info in (*getattr(current_graph, "value_info", ()), *getattr(current_graph, "output", ())):
+            name = _onnx_value_name(value_info)
+            if root_graph and name in graph_input_names:
+                continue
+            shape = value_info_shape(value_info)
+            if name and shape is not None:
+                set_known_value_shape(name, shape, proven=False)
+            elif name and (rank := value_info_rank(value_info)) is not None:
+                set_known_value_rank(name, rank, proven=False)
         for name, shape in (bound_value_shapes or {}).items():
             set_known_value_shape(name, shape, proven=name in bound_proven_ranks)
         for name, rank in (bound_value_ranks or {}).items():
@@ -5216,7 +5226,7 @@ def _build_onnx_weight_analysis_plan(
                             not value_lineages.get(input_names[0]) or input_names[0] in proven_value_ranks
                         )
                 elif rank_preserving_variadic_operator:
-                    elementwise_output_shape = concat_output_shape(
+                    elementwise_output_shape = _onnx_concat_output_shape(
                         node,
                         (known_value_shapes.get(input_name) for input_name in input_names),
                     )
