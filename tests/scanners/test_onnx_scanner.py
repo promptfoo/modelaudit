@@ -6109,8 +6109,10 @@ class TestWeightDistributionSemantics:
             x_shape = [1, 4]
         weight = weight_source
         if alias != "direct":
-            alias_kwargs = {"to": TensorProto.FLOAT} if alias == "Cast" else {}
-            nodes.append(helper.make_node(alias, [weight_source], ["weight"], **alias_kwargs))
+            if alias == "Cast":
+                nodes.append(helper.make_node("Cast", [weight_source], ["weight"], to=TensorProto.FLOAT))
+            else:
+                nodes.append(helper.make_node(alias, [weight_source], ["weight"]))
             weight = "weight"
         nodes.extend(
             [
