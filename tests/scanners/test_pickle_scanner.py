@@ -251,6 +251,65 @@ def _trust_joblib_test_references(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
+_LEGACY_PYTORCH_CONTROL_TRUSTED_REFERENCES = frozenset(
+    {
+        ("torch", "ByteStorage"),
+        ("torch", "FloatStorage"),
+    }
+)
+
+
+def _legacy_pytorch_control_reference_is_trusted(
+    module: str,
+    name: str,
+    *,
+    pickle_entrypoint_methods: tuple[str, ...] | None = None,
+    pickle_invokes_metaclass_call: bool | None = None,
+) -> bool:
+    del pickle_entrypoint_methods, pickle_invokes_metaclass_call
+    return (module, name) in _LEGACY_PYTORCH_CONTROL_TRUSTED_REFERENCES
+
+
+def _legacy_pytorch_control_invocation_is_trusted(module: str, name: str, reference: dict[str, object]) -> bool:
+    del reference
+    return _legacy_pytorch_control_reference_is_trusted(module, name)
+
+
+def _legacy_pytorch_control_requires_origin_review(module: str, name: str) -> bool:
+    return (module, name) == ("torch._utils", "_rebuild_tensor_v2")
+
+
+def _trust_legacy_pytorch_storage_but_review_rebuild_tensor(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "modelaudit.scanners.pickle_scanner.import_only_reference_is_proven_trusted",
+        _legacy_pytorch_control_reference_is_trusted,
+    )
+    monkeypatch.setattr(
+        "modelaudit_picklescan.api.import_only_reference_is_proven_trusted",
+        _legacy_pytorch_control_reference_is_trusted,
+    )
+    monkeypatch.setattr(
+        "modelaudit_picklescan.call_graph.import_only_reference_is_proven_trusted",
+        _legacy_pytorch_control_reference_is_trusted,
+    )
+    monkeypatch.setattr(
+        "modelaudit_picklescan.api.import_only_reference_is_proven_trusted_for_pickle_invocation",
+        _legacy_pytorch_control_invocation_is_trusted,
+    )
+    monkeypatch.setattr(
+        "modelaudit_picklescan.call_graph.import_only_reference_is_proven_trusted_for_pickle_invocation",
+        _legacy_pytorch_control_invocation_is_trusted,
+    )
+    monkeypatch.setattr(
+        "modelaudit_picklescan.api.import_only_module_requires_origin_review",
+        _legacy_pytorch_control_requires_origin_review,
+    )
+    monkeypatch.setattr(
+        "modelaudit_picklescan.call_graph.import_only_module_requires_origin_review",
+        _legacy_pytorch_control_requires_origin_review,
+    )
+
+
 def _binary_opcode_os_system_reduce_payload() -> bytes:
     # The command text is inert here; the scanner only needs a realistic GLOBAL/REDUCE payload shape.
     return _short_binunicode(b"os") + _short_binunicode(b"system") + b"\x93" + _short_binunicode(b"echo") + b"\x85R."
@@ -4606,7 +4665,10 @@ def test_legacy_pytorch_container_trusts_canonical_storage_binpersid(tmp_path: P
     assert should_cache_scan_result(serialized_result) is True
 
 
-def test_legacy_pytorch_valid_storage_layout_survives_inconclusive_control_findings(tmp_path: Path) -> None:
+def test_legacy_pytorch_valid_storage_layout_survives_inconclusive_control_findings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _trust_legacy_pytorch_storage_but_review_rebuild_tensor(monkeypatch)
     object_stream = _legacy_pytorch_rebuild_tensor_v2_object_stream(4)
     payload, pickle_end = _make_legacy_pytorch_container_with_object_stream(
         b"A" * 16,
@@ -4630,6 +4692,7 @@ def test_legacy_pytorch_valid_storage_layout_survives_inconclusive_control_findi
     assert any(
         issue.rule_code == "NON_ALLOWLISTED_GLOBAL"
         and issue.details.get("import_reference") == "torch._utils._rebuild_tensor_v2"
+        and issue.severity == IssueSeverity.WARNING
         for issue in result.issues
     )
 
