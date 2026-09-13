@@ -2046,7 +2046,7 @@ def _build_onnx_weight_analysis_plan(
             axis = raw_axis if raw_axis >= 0 else len(shape) + raw_axis
             if axis < 0 or axis >= len(shape):
                 return True
-            if shape[axis] > 1:
+            if shape[axis] <= 0 or shape[axis] > 1:
                 return True
         return False
 
@@ -3388,9 +3388,9 @@ def _build_onnx_weight_analysis_plan(
                 value_lineages[name] = {lineage.initializer_index: lineage}
                 if name not in graph_input_names:
                     constants[name] = initializer
+                    set_known_value_shape(name, lineage.shape or (), proven=True)
                 dynamic_values.discard(name)
                 clear_value_gap_state(name)
-                set_known_value_shape(name, lineage.shape or (), proven=True)
         for sparse_position, sparse_initializer in enumerate(getattr(current_graph, "sparse_initializer", ())):
             if sparse_initializer.values.name:
                 name = str(sparse_initializer.values.name)
@@ -5193,18 +5193,10 @@ def _build_onnx_weight_analysis_plan(
                                 math.prod(transform_input_shape[axis:]),
                             )
                 elif node.op_type == "Reshape" and len(input_names) > 1:
-                    reshape_input_lineages = value_lineages.get(input_names[0], {})
                     shape_initializer = constants.get(input_names[1])
                     target_shape = constant_int64_vector_values(shape_initializer)
                     if (
-                        (
-                            not reshape_input_lineages
-                            or all(
-                                lineage.unresolved_reason == "dynamic_activation_lineage"
-                                for lineage in reshape_input_lineages.values()
-                            )
-                        )
-                        and target_shape is not None
+                        target_shape is not None
                         and all(value >= -1 for value in target_shape)
                         and target_shape.count(-1) <= 1
                         and not (

@@ -6090,6 +6090,51 @@ class TestWeightDistributionSemantics:
         return nodes, initializers, previous
 
     @staticmethod
+    def _write_onehot_weight_model(tmp_path: Path, *, vector_reshape: bool, alias: str) -> Path:
+        initializers = [
+            onnx.numpy_helper.from_array(np.array([0, 1], dtype=np.int64), name="indices"),
+            onnx.numpy_helper.from_array(np.array(2, dtype=np.int64), name="depth"),
+            onnx.numpy_helper.from_array(np.array([0.0, 1.0], dtype=np.float32), name="values"),
+            onnx.numpy_helper.from_array(np.array([-1], dtype=np.int64), name="flatten"),
+        ]
+        nodes = [helper.make_node("OneHot", ["indices", "depth", "values"], ["hot"])]
+        weight_source = "hot"
+        value_info_shape = [2, 2]
+        x_shape = [1, 2]
+        if vector_reshape:
+            initializers.append(onnx.numpy_helper.from_array(np.array([4], dtype=np.int64), name="vector_shape"))
+            nodes.append(helper.make_node("Reshape", ["hot", "vector_shape"], ["vector_hot"]))
+            weight_source = "vector_hot"
+            value_info_shape = [4]
+            x_shape = [1, 4]
+        weight = weight_source
+        if alias != "direct":
+            alias_kwargs = {"to": TensorProto.FLOAT} if alias == "Cast" else {}
+            nodes.append(helper.make_node(alias, [weight_source], ["weight"], **alias_kwargs))
+            weight = "weight"
+        nodes.extend(
+            [
+                helper.make_node("MatMul", ["X", weight], ["product"]),
+                helper.make_node("Reshape", ["product", "flatten"], ["Y"]),
+            ]
+        )
+        graph = helper.make_graph(
+            nodes,
+            f"onehot_weight_{'vector' if vector_reshape else 'matrix'}_{alias}",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, x_shape)],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [None])],
+            initializer=initializers,
+            value_info=[helper.make_tensor_value_info(weight_source, TensorProto.FLOAT, value_info_shape)],
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        onnx.checker.check_model(model, full_check=True)
+        path = tmp_path / f"onehot-{'vector' if vector_reshape else 'matrix'}-{alias}.onnx"
+        onnx.save(model, str(path))
+        return path
+
+    @staticmethod
     def _write_balanced_if_squeeze_model(
         tmp_path: Path,
         *,
@@ -6179,6 +6224,7 @@ class TestWeightDistributionSemantics:
         model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
         model.ir_version = 8
         onnx.checker.check_model(model)
+        onnx.checker.check_model(model, full_check=True)
         path = tmp_path / filename
         onnx.save(model, str(path))
         return path
@@ -6635,6 +6681,7 @@ class TestWeightDistributionSemantics:
         model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
         model.ir_version = 8
         onnx.checker.check_model(model)
+        onnx.checker.check_model(model, full_check=True)
         model_path = tmp_path / "loop-carried-state-skip-gap.onnx"
         onnx.save(model, str(model_path))
 
@@ -6697,6 +6744,7 @@ class TestWeightDistributionSemantics:
         model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
         model.ir_version = 8
         onnx.checker.check_model(model)
+        onnx.checker.check_model(model, full_check=True)
         model_path = tmp_path / "loop-carried-state-overridable-controls-gap.onnx"
         onnx.save(model, str(model_path))
 
@@ -6751,7 +6799,7 @@ class TestWeightDistributionSemantics:
         model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
         model.ir_version = 8
         onnx.checker.check_model(model)
-        onnx.checker.check_model(model)
+        onnx.checker.check_model(model, full_check=True)
         path = tmp_path / "loop-carried-repeated-rank-growth-gap.onnx"
         onnx.save(model, str(path))
 
@@ -7126,6 +7174,140 @@ class TestWeightDistributionSemantics:
             assert result.success is True
             assert coverage == []
             assert semantics["coverage_gaps"] == {}
+
+    def test_scan_symbolic_graph_input_default_extent_repeats_conservatively(self, tmp_path: Path) -> None:
+        nodes, initializers, scalar = self._capped_scalar_expression()
+        initializers.extend(
+            [
+                onnx.numpy_helper.from_array(np.array(0.0, dtype=np.float32), name="initial_state"),
+                onnx.numpy_helper.from_array(np.array([0], dtype=np.int64), name="axes"),
+                onnx.numpy_helper.from_array(np.zeros((1,), dtype=np.float32), name="scan_values"),
+            ]
+        )
+        body = helper.make_graph(
+            [
+                helper.make_node("Add", ["state", scalar], ["mixed"]),
+                helper.make_node("Unsqueeze", ["mixed", "axes"], ["next_state"]),
+                helper.make_node("Identity", ["element"], ["next_element"]),
+            ],
+            "scan_symbolic_default_body",
+            [
+                helper.make_tensor_value_info("state", TensorProto.FLOAT, []),
+                helper.make_tensor_value_info("element", TensorProto.FLOAT, []),
+            ],
+            [
+                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, [1]),
+                helper.make_tensor_value_info("next_element", TensorProto.FLOAT, []),
+            ],
+        )
+        nodes.extend(
+            [
+                helper.make_node(
+                    "Scan",
+                    ["initial_state", "scan_values"],
+                    ["scan_state", "scan_output"],
+                    body=body,
+                    num_scan_inputs=1,
+                ),
+                helper.make_node("MatMul", ["X", "scan_state"], ["Y"]),
+            ]
+        )
+        graph = helper.make_graph(
+            nodes,
+            "scan_symbolic_graph_input_default_extent_repeats_conservatively",
+            [
+                helper.make_tensor_value_info("scan_values", TensorProto.FLOAT, ["scan_extent"]),
+                helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 1]),
+            ],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1])],
+            initializer=initializers,
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / "scan-symbolic-default-extent.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert result.success is False
+        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
+        assert semantics["coverage_gaps"]["lineages_per_value_limit"] > 0
+        assert semantics["analyzed_layer_count"] == 0
+
+    def test_scan_unknown_stacked_extent_repeats_conservatively(self, tmp_path: Path) -> None:
+        nodes, initializers, scalar = self._capped_scalar_expression()
+        initializers.extend(
+            [
+                onnx.numpy_helper.from_array(np.array(0.0, dtype=np.float32), name="initial_state"),
+                onnx.numpy_helper.from_array(np.array([0], dtype=np.int64), name="axes"),
+                onnx.numpy_helper.from_array(np.zeros((1,), dtype=np.float32), name="seed_scan_values"),
+            ]
+        )
+        seed_body = helper.make_graph(
+            [helper.make_node("Identity", ["seed_element"], ["runtime_element"])],
+            "scan_unknown_extent_seed_body",
+            [helper.make_tensor_value_info("seed_element", TensorProto.FLOAT, [])],
+            [helper.make_tensor_value_info("runtime_element", TensorProto.FLOAT, [])],
+        )
+        repeated_body = helper.make_graph(
+            [
+                helper.make_node("Add", ["state", scalar], ["mixed"]),
+                helper.make_node("Unsqueeze", ["mixed", "axes"], ["next_state"]),
+                helper.make_node("Identity", ["element"], ["next_element"]),
+            ],
+            "scan_unknown_extent_repeated_body",
+            [
+                helper.make_tensor_value_info("state", TensorProto.FLOAT, []),
+                helper.make_tensor_value_info("element", TensorProto.FLOAT, []),
+            ],
+            [
+                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, [1]),
+                helper.make_tensor_value_info("next_element", TensorProto.FLOAT, []),
+            ],
+        )
+        nodes.extend(
+            [
+                helper.make_node(
+                    "Scan",
+                    ["seed_scan_values"],
+                    ["runtime_scan_values"],
+                    body=seed_body,
+                    num_scan_inputs=1,
+                ),
+                helper.make_node(
+                    "Scan",
+                    ["initial_state", "runtime_scan_values"],
+                    ["scan_state", "scan_output"],
+                    body=repeated_body,
+                    num_scan_inputs=1,
+                ),
+                helper.make_node("MatMul", ["X", "scan_state"], ["Y"]),
+            ]
+        )
+        graph = helper.make_graph(
+            nodes,
+            "scan_unknown_stacked_extent_repeats_conservatively",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 1])],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1])],
+            initializer=initializers,
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / "scan-unknown-stacked-extent.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert result.success is False
+        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
+        assert semantics["coverage_gaps"]["lineages_per_value_limit"] > 0
+        assert semantics["analyzed_layer_count"] == 0
 
     def test_scan_repeat_ignores_stale_intermediate_extent_metadata(self, tmp_path: Path) -> None:
         nodes, initializers, scalar = self._capped_scalar_expression()
@@ -8686,6 +8868,32 @@ class TestWeightDistributionSemantics:
         assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
         semantics = result.metadata["onnx_weight_distribution_semantics"]
         assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
+        assert semantics["analyzed_layer_count"] == 0
+
+    @pytest.mark.parametrize("alias", ["direct", "Identity", "Cast", "Relu"])
+    def test_onehot_constant_reshape_vector_rank_stays_nonweight(self, tmp_path: Path, alias: str) -> None:
+        path = self._write_onehot_weight_model(tmp_path, vector_reshape=True, alias=alias)
+
+        result = OnnxScanner().scan(str(path))
+
+        assert result.success is True
+        assert self._extreme_checks(result) == []
+        assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["coverage_gaps"] == {}
+        assert semantics["eligible_initializer_count"] == 0
+
+    @pytest.mark.parametrize("alias", ["direct", "Identity", "Cast", "Relu"])
+    def test_onehot_matrix_rank_remains_weight_gap(self, tmp_path: Path, alias: str) -> None:
+        path = self._write_onehot_weight_model(tmp_path, vector_reshape=False, alias=alias)
+
+        result = OnnxScanner().scan(str(path))
+
+        assert result.success is False
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["coverage_gaps"]["unresolved_initializer_lineage"] == 3
         assert semantics["analyzed_layer_count"] == 0
 
     def test_broadcast_promotion_adds_to_existing_weight_gap_count(self, tmp_path: Path) -> None:
