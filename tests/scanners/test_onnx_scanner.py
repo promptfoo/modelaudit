@@ -7149,7 +7149,7 @@ class TestWeightDistributionSemantics:
         assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
         assert any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
 
-    def test_symbolic_broadcast_output_promotes_scalar_gap(self, tmp_path: Path) -> None:
+    def test_symbolic_broadcast_input_rank_promotes_scalar_gap(self, tmp_path: Path) -> None:
         source_names = [f"scalar_source{index}" for index in range(40)]
         graph = helper.make_graph(
             [
@@ -7166,7 +7166,7 @@ class TestWeightDistributionSemantics:
             initializer=[
                 *[onnx.numpy_helper.from_array(np.array(0.0, dtype=np.float32), name=name) for name in source_names]
             ],
-            value_info=[helper.make_tensor_value_info("generated_weight", TensorProto.FLOAT, ["N", "M"])],
+            value_info=[helper.make_tensor_value_info("generated_weight", TensorProto.FLOAT, ["M"])],
         )
         model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
         model.ir_version = 8
@@ -7180,6 +7180,36 @@ class TestWeightDistributionSemantics:
         semantics = result.metadata["onnx_weight_distribution_semantics"]
         assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
         assert any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
+
+    def test_gathernd_batch_dims_keeps_rank_one_gap_nonweight(self, tmp_path: Path) -> None:
+        source_names = [f"matrix_source{index}" for index in range(40)]
+        graph = helper.make_graph(
+            [
+                helper.make_node("Sum", source_names, ["capped"]),
+                helper.make_node("GatherND", ["capped", "indices"], ["vector"], batch_dims=1),
+                helper.make_node("MatMul", ["vector", "projection"], ["Y"]),
+            ],
+            "gathernd_batch_dims_rank_one_gap",
+            [],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [])],
+            initializer=[
+                *[onnx.numpy_helper.from_array(np.zeros((2, 4), dtype=np.float32), name=name) for name in source_names],
+                onnx.numpy_helper.from_array(np.array([[0], [1]], dtype=np.int64), name="indices"),
+                onnx.numpy_helper.from_array(np.zeros((2,), dtype=np.float32), name="projection"),
+            ],
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / "gathernd-batch-dims-rank-one-gap.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        assert result.success is True
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["coverage_gaps"] == {}
+        assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
 
     @pytest.mark.parametrize("rank_two_bias", [False, True])
     @pytest.mark.parametrize("malicious", [False, True])
