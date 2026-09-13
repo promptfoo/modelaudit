@@ -4891,7 +4891,9 @@ def _build_onnx_weight_analysis_plan(
                 else ()
             )
             trusted_scan_shape_names = proven_value_ranks
-            untrusted_scan_shape_names = graph_input_names & set(value_lineages)
+            untrusted_scan_shape_names = {
+                name for name in graph_input_names & set(value_lineages) if name not in proven_value_ranks
+            }
             subgraph_output_offset = 1 if standard_control_flow_operator and node.op_type == "Loop" else 0
             for (
                 graph_output_lineages,
