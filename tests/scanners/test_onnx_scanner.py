@@ -6719,6 +6719,81 @@ class TestWeightDistributionSemantics:
             assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
         assert semantics["eligible_initializer_count"] >= 1
 
+    @pytest.mark.parametrize(
+        ("scan_shape", "scan_input_axes", "expected_gap"),
+        [
+            ((1, 0), (1,), True),
+            ((1, 0), (-1,), True),
+            ((1, 0), (0,), False),
+            ((0, 1), (0,), True),
+        ],
+    )
+    def test_scan_state_skip_uses_declared_scan_input_axes(
+        self,
+        tmp_path: Path,
+        scan_shape: tuple[int, int],
+        scan_input_axes: tuple[int, ...],
+        expected_gap: bool,
+    ) -> None:
+        source_names = [f"W{index}" for index in range(40)]
+        normalized_axis = scan_input_axes[0] if scan_input_axes[0] >= 0 else len(scan_shape) + scan_input_axes[0]
+        element_shape = [dimension for index, dimension in enumerate(scan_shape) if index != normalized_axis]
+        initializers = [
+            *[onnx.numpy_helper.from_array(np.zeros((4, 4), dtype=np.float32), name=name) for name in source_names],
+            onnx.numpy_helper.from_array(np.zeros((4, 4), dtype=np.float32), name="clean_weight"),
+            onnx.numpy_helper.from_array(np.zeros(scan_shape, dtype=np.float32), name="scan_input"),
+        ]
+        body = helper.make_graph(
+            [
+                helper.make_node("Identity", ["clean_weight"], ["next_state"]),
+                helper.make_node("Identity", ["element"], ["next_element"]),
+            ],
+            "scan_body",
+            [
+                helper.make_tensor_value_info("state", TensorProto.FLOAT, [4, 4]),
+                helper.make_tensor_value_info("element", TensorProto.FLOAT, element_shape),
+            ],
+            [
+                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, [4, 4]),
+                helper.make_tensor_value_info("next_element", TensorProto.FLOAT, element_shape),
+            ],
+        )
+        graph = helper.make_graph(
+            [
+                helper.make_node("Sum", source_names, ["capped"]),
+                helper.make_node(
+                    "Scan",
+                    ["capped", "scan_input"],
+                    ["scan_state", "scan_output"],
+                    body=body,
+                    num_scan_inputs=1,
+                    scan_input_axes=scan_input_axes,
+                ),
+                helper.make_node("MatMul", ["X", "scan_state"], ["Y"]),
+            ],
+            "scan_state_skip_uses_declared_scan_input_axes",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 4])],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 4])],
+            initializer=initializers,
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model, full_check=True)
+        model_path = tmp_path / "scan-state-skip-axis-gap.onnx"
+        onnx.save(model, str(model_path))
+
+        result = OnnxScanner().scan(str(model_path))
+
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        assert result.success is not expected_gap
+        if expected_gap:
+            assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
+            assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
+        else:
+            assert semantics["coverage_gaps"] == {}
+            assert not coverage
+
     def test_overridable_shape_initializer_keeps_deferred_rank_gap_fail_closed(self, tmp_path: Path) -> None:
         source_names = [f"vector_weight{index}" for index in range(40)]
         graph = helper.make_graph(
@@ -7648,6 +7723,83 @@ class TestWeightDistributionSemantics:
         semantics = result.metadata["onnx_weight_distribution_semantics"]
         assert semantics["coverage_gaps"]["lineages_per_value_limit"] == 1
         assert semantics["analyzed_layer_count"] == 0
+
+    @pytest.mark.parametrize("control_flow_op", ["Loop", "Scan"])
+    def test_loop_scan_output_keeps_deferred_scalar_lineage_gap_nonweight(
+        self, tmp_path: Path, control_flow_op: str
+    ) -> None:
+        shape_names = [f"shape_source{index}" for index in range(32)]
+        initializers = [onnx.numpy_helper.from_array(np.array([], dtype=np.int64), name=name) for name in shape_names]
+        initializers.append(onnx.numpy_helper.from_array(np.array(1.0, dtype=np.float32), name="W"))
+        nodes = []
+        previous = "W"
+        for index, shape_name in enumerate(shape_names):
+            reshaped = f"reshaped{index}"
+            nodes.append(helper.make_node("Reshape", [previous, shape_name], [reshaped]))
+            previous = reshaped
+
+        if control_flow_op == "Loop":
+            initializers.extend(
+                [
+                    onnx.numpy_helper.from_array(np.array(4, dtype=np.int64), name="trip_count"),
+                    onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="condition"),
+                ]
+            )
+            body = helper.make_graph(
+                [
+                    helper.make_node("Identity", ["body_condition"], ["condition_output"]),
+                    helper.make_node("Identity", [previous], ["scan_output"]),
+                ],
+                "scalar_loop_output_body",
+                [
+                    helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
+                    helper.make_tensor_value_info("body_condition", TensorProto.BOOL, []),
+                ],
+                [
+                    helper.make_tensor_value_info("condition_output", TensorProto.BOOL, []),
+                    helper.make_tensor_value_info("scan_output", TensorProto.FLOAT, []),
+                ],
+            )
+            nodes.append(helper.make_node("Loop", ["trip_count", "condition"], ["generated_values"], body=body))
+        else:
+            initializers.append(onnx.numpy_helper.from_array(np.zeros((4,), dtype=np.float32), name="scan_input"))
+            body = helper.make_graph(
+                [helper.make_node("Identity", [previous], ["scan_output"])],
+                "scalar_scan_output_body",
+                [helper.make_tensor_value_info("element", TensorProto.FLOAT, [])],
+                [helper.make_tensor_value_info("scan_output", TensorProto.FLOAT, [])],
+            )
+            nodes.append(
+                helper.make_node(
+                    "Scan",
+                    ["scan_input"],
+                    ["generated_values"],
+                    body=body,
+                    num_scan_inputs=1,
+                )
+            )
+        nodes.append(helper.make_node("MatMul", ["X", "generated_values"], ["Y"]))
+        graph = helper.make_graph(
+            nodes,
+            "loop_scan_output_keeps_deferred_scalar_lineage_gap_nonweight",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, [4, 4])],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [4])],
+            initializer=initializers,
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / f"{control_flow_op.lower()}-scalar-output-deferred-gap.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        assert result.success is True
+        assert self._extreme_checks(result) == []
+        assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["coverage_gaps"] == {}
+        assert semantics["eligible_initializer_count"] == 0
 
     def test_integer_loop_scan_output_deferred_lineage_gap_stays_nonweight(self, tmp_path: Path) -> None:
         shape_names = [f"shape_source{index}" for index in range(32)]
@@ -8696,6 +8848,66 @@ class TestWeightDistributionSemantics:
             and sample["reason"] == "shape_dimensions_lineage"
             for sample in result.metadata["onnx_weight_distribution_semantics"]["unresolved_lineage_samples"]
         )
+
+    @pytest.mark.parametrize("observation", ["Shape", "Size"])
+    @pytest.mark.parametrize("cast_to_float", [False, True])
+    def test_shape_size_integer_summaries_do_not_inherit_weight_gap(
+        self, tmp_path: Path, observation: str, cast_to_float: bool
+    ) -> None:
+        source_names = [f"source{index}" for index in range(40)]
+        nodes = [
+            helper.make_node("Sum", source_names, ["capped"]),
+            helper.make_node(observation, ["capped"], ["measurement"]),
+        ]
+        values = "measurement"
+        value_dtype = TensorProto.INT64
+        if cast_to_float:
+            nodes.append(helper.make_node("Cast", [values], ["measurement_float"], to=TensorProto.FLOAT))
+            values = "measurement_float"
+            value_dtype = TensorProto.FLOAT
+        if observation == "Size":
+            nodes.append(helper.make_node("Unsqueeze", [values, "size_axes"], ["measurement_vector"]))
+            values = "measurement_vector"
+        columns = 1 if observation == "Size" else 2
+        nodes.append(helper.make_node("MatMul", ["projection", values], ["Y"]))
+        projection = (
+            np.ones((1, columns), dtype=np.float32)
+            if value_dtype == TensorProto.FLOAT
+            else np.ones((1, columns), dtype=np.int64)
+        )
+        initializers = [
+            *[onnx.numpy_helper.from_array(np.ones((2, 4), dtype=np.float32), name=name) for name in source_names],
+            onnx.numpy_helper.from_array(projection, name="projection"),
+        ]
+        if observation == "Size":
+            initializers.append(onnx.numpy_helper.from_array(np.array([0], dtype=np.int64), name="size_axes"))
+        graph = helper.make_graph(
+            nodes,
+            "shape_size_integer_summary",
+            [],
+            [helper.make_tensor_value_info("Y", value_dtype, [1])],
+            initializer=initializers,
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model, full_check=True)
+        path = tmp_path / "shape-size-integer-summary.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        assert result.success is not cast_to_float
+        if cast_to_float:
+            assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
+            assert any(
+                sample["consumer_op"] == "MatMul" and sample["reason"] == "shape_dimensions_lineage"
+                for sample in semantics["unresolved_lineage_samples"]
+            )
+        else:
+            assert semantics["coverage_gaps"] == {}
+            assert not coverage
 
     @pytest.mark.parametrize("weight_first", [False, True])
     def test_expand_shape_ownership_does_not_replace_weight_values(self, tmp_path: Path, weight_first: bool) -> None:

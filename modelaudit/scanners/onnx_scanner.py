@@ -301,6 +301,14 @@ def _onnx_int_attribute(node: Any, name: str, default: int = 0) -> int:
     return default
 
 
+def _onnx_int_sequence_attribute(node: Any, name: str) -> tuple[int, ...] | None:
+    """Read an integer-list ONNX node attribute without importing ONNX eagerly."""
+    for attribute in getattr(node, "attribute", []):
+        if attribute.name == name:
+            return tuple(int(value) for value in attribute.ints)
+    return None
+
+
 def _onnx_text_attribute(node: Any, name: str) -> str | None:
     """Read a UTF-8 ONNX string attribute without importing ONNX eagerly."""
     for attribute in getattr(node, "attribute", []):
@@ -1908,11 +1916,16 @@ def _build_onnx_weight_analysis_plan(
         scan_inputs = [str(input_name) for input_name in node.input[scan_input_start:] if input_name]
         if len(scan_inputs) < num_scan_inputs:
             return True
-        for scan_input in scan_inputs:
+        scan_input_axes = _onnx_int_sequence_attribute(node, "scan_input_axes") or ()
+        for input_index, scan_input in enumerate(scan_inputs):
             shape = known_value_shapes.get(scan_input)
             if not shape:
                 return True
-            if shape[0] <= 0:
+            raw_axis = scan_input_axes[input_index] if input_index < len(scan_input_axes) else 0
+            axis = raw_axis if raw_axis >= 0 else len(shape) + raw_axis
+            if axis < 0 or axis >= len(shape):
+                return True
+            if shape[axis] <= 0:
                 return True
         return False
 
@@ -2502,7 +2515,7 @@ def _build_onnx_weight_analysis_plan(
         promoted_lineages = (
             _OnnxWeightLineage(
                 initializer_index=lineage.initializer_index,
-                shape=None,
+                shape=(-1, *lineage.shape) if lineage.shape is not None else None,
                 data_type=lineage.data_type,
                 transforms=lineage.transforms,
                 unresolved_reason=lineage.unresolved_reason,
@@ -3626,6 +3639,9 @@ def _build_onnx_weight_analysis_plan(
             ) = bounded_lineages(output_lineages)
             all_input_output_weight_lineage_limit_gap_count = all_input_weight_lineage_limit_gap_count
             all_input_output_weight_lineage_gap_summary = all_input_weight_lineage_limit_gap_summary
+            if is_shape_query:
+                all_input_output_weight_lineage_limit_gap_count = 0
+                all_input_output_weight_lineage_gap_summary = empty_weight_gap_summary
             transformed_input_output_weight_lineage_gap_summary = all_input_output_weight_lineage_gap_summary
             transformed_input_output_rank_promotable_lineage_gap_summary = (
                 all_input_rank_promotable_lineage_limit_gap_summary
