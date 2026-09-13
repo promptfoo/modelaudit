@@ -3094,11 +3094,17 @@ class PickleScanner(BaseScanner):
         )
 
     @staticmethod
-    def _legacy_pytorch_control_scan_complete(result: ScanResult) -> bool:
+    def _legacy_pytorch_control_coverage_complete(result: ScanResult) -> bool:
+        coverage = result.metadata.get("pickle_coverage")
         return (
-            result.metadata.get("pickle_report_status") == "complete"
-            and not result.metadata.get("analysis_incomplete")
-            and not result.metadata.get("operational_error")
+            isinstance(coverage, dict)
+            and coverage.get("raw_scan_complete") is True
+            and coverage.get("opcode_scan_complete") is True
+            and result.metadata.get("operational_error") is not True
+            and result.metadata.get("parsing_failed") is not True
+            and result.metadata.get("import_references_truncated") is not True
+            and result.metadata.get("callable_invocations_truncated") is not True
+            and result.metadata.get("non_allowlisted_global_imports_truncated") is not True
         )
 
     @staticmethod
@@ -5474,7 +5480,7 @@ class PickleScanner(BaseScanner):
                     source=source,
                     position_offset=start_position,
                 )
-                legacy_storage_valid = legacy_storage_valid and self._legacy_pytorch_control_scan_complete(result)
+                legacy_storage_valid = legacy_storage_valid and self._legacy_pytorch_control_coverage_complete(result)
                 raw_data = raw_data[: legacy_layout.pickle_end]
                 if legacy_storage_valid:
                     assert legacy_layout.storage_end is not None
@@ -5597,7 +5603,7 @@ class PickleScanner(BaseScanner):
             )
             if legacy_layout is not None:
                 result = self._scan_standalone_bytes(payload[: legacy_layout.pickle_end], source=source)
-                legacy_storage_valid = legacy_storage_valid and self._legacy_pytorch_control_scan_complete(result)
+                legacy_storage_valid = legacy_storage_valid and self._legacy_pytorch_control_coverage_complete(result)
                 if legacy_storage_valid and stream_read.short_read:
                     self._add_stream_short_read_check(stream_read, result, source, standalone_size)
                     legacy_storage_valid = False
@@ -5802,7 +5808,9 @@ class PickleScanner(BaseScanner):
                 self.add_file_integrity_check(path, result)
             if legacy_layout is not None:
                 scan_result = self._scan_standalone_bytes(control_probe[: legacy_layout.pickle_end], source=path)
-                legacy_storage_valid = legacy_storage_valid and self._legacy_pytorch_control_scan_complete(scan_result)
+                legacy_storage_valid = legacy_storage_valid and self._legacy_pytorch_control_coverage_complete(
+                    scan_result
+                )
                 detector_data = raw_data[: legacy_layout.pickle_end]
                 if legacy_storage_valid:
                     assert legacy_layout.storage_end is not None

@@ -327,6 +327,21 @@ def _legacy_pytorch_object_stream(
     return bytes(object_stream)
 
 
+def _legacy_pytorch_rebuild_tensor_v2_object_stream(storage_size: int) -> bytes:
+    storage_pid = _legacy_pytorch_storage_pid_tuple(
+        "0",
+        storage_size,
+        storage_type=b"ctorch\nFloatStorage\n",
+    )
+    size_tuple = b"(K\x02K\x02t"
+    stride_tuple = b"(K\x02K\x01t"
+    return (
+        b"\x80\x02]"
+        b"ctorch._utils\n_rebuild_tensor_v2\n"
+        b"(" + storage_pid + b"QK\x00" + size_tuple + stride_tuple + b"\x89NtRa."
+    )
+
+
 def _legacy_pytorch_storage_pid_tuple(
     key: str,
     storage_size: int,
@@ -4589,6 +4604,34 @@ def test_legacy_pytorch_container_trusts_canonical_storage_binpersid(tmp_path: P
     serialized_result = result.to_dict(include_private_metadata=True)
     assert _private_actionable_failed_checks(serialized_result) == []
     assert should_cache_scan_result(serialized_result) is True
+
+
+def test_legacy_pytorch_valid_storage_layout_survives_inconclusive_control_findings(tmp_path: Path) -> None:
+    object_stream = _legacy_pytorch_rebuild_tensor_v2_object_stream(4)
+    payload, pickle_end = _make_legacy_pytorch_container_with_object_stream(
+        b"A" * 16,
+        object_stream,
+        declared_storage_size=4,
+    )
+    path = tmp_path / "legacy-source-backed-control.pt"
+    path.write_bytes(payload)
+
+    result = PickleScanner().scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["legacy_pytorch_container"] is True
+    assert result.metadata["legacy_pytorch_storage_start"] == pickle_end
+    assert result.metadata["legacy_pytorch_storage_end"] == len(payload)
+    assert "legacy_pytorch_storage_layout_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
+    assert not any(
+        check.rule_code == "S902" and check.name == "Legacy PyTorch Storage Layout" for check in result.checks
+    )
+    assert not _persistent_id_issues(result)
+    assert any(
+        issue.rule_code == "NON_ALLOWLISTED_GLOBAL"
+        and issue.details.get("import_reference") == "torch._utils._rebuild_tensor_v2"
+        for issue in result.issues
+    )
 
 
 def test_legacy_pytorch_bin_extension_uses_framing_not_suffix_for_storage_trust(tmp_path: Path) -> None:
