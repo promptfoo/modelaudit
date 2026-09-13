@@ -3322,10 +3322,11 @@ def _build_onnx_weight_analysis_plan(
         ):
             name = _onnx_value_name(value_info)
             shape = value_info_shape(value_info)
+            declared_root_input = root_graph and name in graph_input_names
             if name and shape is not None:
-                set_known_value_shape(name, shape, proven=False)
+                set_known_value_shape(name, shape, proven=declared_root_input)
             elif name and (rank := value_info_rank(value_info)) is not None:
-                set_known_value_rank(name, rank, proven=False)
+                set_known_value_rank(name, rank, proven=declared_root_input)
         for name, shape in (bound_value_shapes or {}).items():
             set_known_value_shape(name, shape, proven=True)
         for name, rank in (bound_value_ranks or {}).items():

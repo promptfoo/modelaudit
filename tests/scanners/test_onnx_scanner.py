@@ -8882,6 +8882,73 @@ class TestWeightDistributionSemantics:
         assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
         assert semantics["analyzed_layer_count"] == 0
 
+    @pytest.mark.parametrize(
+        ("runtime_shape", "runtime_default", "x_shape", "y_shape", "expect_success"),
+        [
+            ([None], np.ones((4,), dtype=np.float32), [1, 4], [1], True),
+            ([None, None], np.ones((1, 4), dtype=np.float32), [1, 1], [1, 4], False),
+        ],
+    )
+    def test_overridable_initializer_input_uses_declared_root_rank(
+        self,
+        tmp_path: Path,
+        runtime_shape: list[int | None],
+        runtime_default: np.ndarray,
+        x_shape: list[int],
+        y_shape: list[int],
+        expect_success: bool,
+    ) -> None:
+        shape_names = [f"shape_source{index}" for index in range(32)]
+        initializers = [onnx.numpy_helper.from_array(np.array([], dtype=np.int64), name=name) for name in shape_names]
+        initializers.extend(
+            [
+                onnx.numpy_helper.from_array(np.array(1.0, dtype=np.float32), name="W"),
+                onnx.numpy_helper.from_array(runtime_default, name="runtime_weight"),
+            ]
+        )
+        nodes = []
+        previous = "W"
+        for index, shape_name in enumerate(shape_names):
+            reshaped = f"reshaped{index}"
+            nodes.append(helper.make_node("Reshape", [previous, shape_name], [reshaped]))
+            previous = reshaped
+        nodes.extend(
+            [
+                helper.make_node("Add", ["runtime_weight", previous], ["generated_weight"]),
+                helper.make_node("MatMul", ["X", "generated_weight"], ["Y"]),
+            ]
+        )
+        graph = helper.make_graph(
+            nodes,
+            "overridable_initializer_input_uses_declared_root_rank",
+            [
+                helper.make_tensor_value_info("runtime_weight", TensorProto.FLOAT, runtime_shape),
+                helper.make_tensor_value_info("X", TensorProto.FLOAT, x_shape),
+            ],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, y_shape)],
+            initializer=initializers,
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        onnx.checker.check_model(model, full_check=True)
+        path = tmp_path / f"overridable-symbolic-rank-{expect_success}.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        if expect_success:
+            assert result.success is True
+            assert coverage == []
+            assert semantics["coverage_gaps"] == {}
+        else:
+            assert result.success is False
+            assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
+            assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
+            assert semantics["analyzed_layer_count"] == 0
+
     @pytest.mark.parametrize("alias", ["direct", "Identity", "Cast", "Relu"])
     def test_onehot_constant_reshape_vector_rank_stays_nonweight(self, tmp_path: Path, alias: str) -> None:
         path = self._write_onehot_weight_model(tmp_path, vector_reshape=True, alias=alias)
