@@ -245,6 +245,7 @@ _SHAPE_PRESERVING_UNARY_RANK_OPERATORS: frozenset[str] = _SAME_TYPE_UNARY_ELEMEN
         "Dropout",
     }
 )
+_RANK_PRESERVING_VARIADIC_OPERATORS: frozenset[str] = frozenset({"Concat"})
 _QUANTIZED_WEIGHT_OPERATORS: frozenset[str] = frozenset(
     {
         "ConvInteger",
@@ -1990,7 +1991,10 @@ def _build_onnx_weight_analysis_plan(
         if node.op_type == "Expand":
             shape_name = str(node.input[1]) if len(node.input) > 1 else ""
             target_shape = constant_int64_vector_values(constants.get(shape_name))
-            return target_shape is None or len(target_shape) >= 2
+            if target_shape is None or input_shape is None:
+                return True
+            output_shape = broadcast_shapes((input_shape, target_shape))
+            return output_shape is None or len(output_shape) >= 2
         if node.op_type == "Gather":
             if input_shape is None or index_shape is None:
                 return True
@@ -2097,6 +2101,26 @@ def _build_onnx_weight_analysis_plan(
         if any(rank is None for rank in observed_ranks) and output_rank < 2:
             return None
         return output_rank
+
+    def concat_output_shape(node: Any, input_shapes: Iterable[tuple[int, ...] | None]) -> tuple[int, ...] | None:
+        shapes = list(input_shapes)
+        if not shapes or any(shape is None for shape in shapes):
+            return None
+        concrete_shapes = [shape for shape in shapes if shape is not None]
+        ranks = {len(shape) for shape in concrete_shapes}
+        if len(ranks) != 1:
+            return None
+        rank = next(iter(ranks))
+        axis = _onnx_int_attribute(node, "axis", 0)
+        axis = axis if axis >= 0 else rank + axis
+        if axis < 0 or axis >= rank:
+            return None
+        output_dimensions = list(concrete_shapes[0])
+        for shape in concrete_shapes[1:]:
+            if any(index != axis and dimension != output_dimensions[index] for index, dimension in enumerate(shape)):
+                return None
+            output_dimensions[axis] += shape[axis]
+        return tuple(output_dimensions)
 
     groups: list[dict[tuple[Any, ...], _OnnxWeightConsumerGroup]] = []
     eligible_initializer_indexes: set[int] = set()
@@ -2414,7 +2438,16 @@ def _build_onnx_weight_analysis_plan(
                     transforms=lineage.transforms,
                     unresolved_reason=lineage.unresolved_reason or "unresolved_expand_lineage",
                 )
-            output_shape = target_shape
+            expanded_shape = broadcast_shapes((lineage.shape, target_shape))
+            if expanded_shape is None:
+                return _OnnxWeightLineage(
+                    initializer_index=lineage.initializer_index,
+                    shape=None,
+                    data_type=lineage.data_type,
+                    transforms=lineage.transforms,
+                    unresolved_reason=lineage.unresolved_reason or "unresolved_expand_lineage",
+                )
+            output_shape = expanded_shape
             transform = _OnnxWeightTransform("Reshape", output_shape)
         elif node.op_type == "Gather":
             index_shape = constant_initializer_shape(constants, node.input[1]) if len(node.input) >= 2 else None
@@ -4331,6 +4364,12 @@ def _build_onnx_weight_analysis_plan(
                     and node.op_type in _SHAPE_PRESERVING_UNARY_RANK_OPERATORS
                     and (len(input_names) == 1 or node.op_type in {"Clip", "Dropout"})
                 )
+                rank_preserving_variadic_operator = (
+                    is_registered_standard_operator
+                    and not is_model_local_function
+                    and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
+                    and node.op_type in _RANK_PRESERVING_VARIADIC_OPERATORS
+                )
                 if common_output_rank_operator:
                     elementwise_output_shape = known_value_shapes.get(input_names[0])
                     elementwise_output_rank = (
@@ -4338,6 +4377,18 @@ def _build_onnx_weight_analysis_plan(
                         if elementwise_output_shape is not None
                         else known_value_ranks.get(input_names[0])
                     )
+                elif rank_preserving_variadic_operator:
+                    elementwise_output_shape = concat_output_shape(
+                        node,
+                        (known_value_shapes.get(input_name) for input_name in input_names),
+                    )
+                    if elementwise_output_shape is not None:
+                        elementwise_output_rank = len(elementwise_output_shape)
+                    else:
+                        input_ranks = [known_value_ranks.get(input_name) for input_name in input_names]
+                        known_ranks = {rank for rank in input_ranks if rank is not None}
+                        if len(known_ranks) == 1 and all(rank is not None for rank in input_ranks):
+                            elementwise_output_rank = next(iter(known_ranks))
 
             transform_output_shape: tuple[int, ...] | None = None
             transform_output_rank: int | None = None
@@ -4380,7 +4431,7 @@ def _build_onnx_weight_analysis_plan(
                 name = str(output_name)
                 inferred_output_shape = None
                 inferred_output_rank = None
-                if output_index == 0:
+                if output_index == 0 or (node.op_type == "Dropout" and output_index == 1):
                     inferred_output_shape = (
                         elementwise_output_shape if elementwise_output_shape is not None else transform_output_shape
                     )

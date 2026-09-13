@@ -8329,6 +8329,205 @@ class TestWeightDistributionSemantics:
             assert semantics["coverage_gaps"] == {}
             assert semantics["eligible_initializer_count"] == 0
 
+    @pytest.mark.parametrize("bound_count", [1, 2])
+    @pytest.mark.parametrize(
+        ("runtime_dims", "x_dims", "y_dims", "expect_gap"),
+        [
+            ([4, 4], [1, 4], [1, 4], True),
+            ([4], [1, 4], [1], False),
+        ],
+    )
+    def test_clip_initializer_bounds_preserve_broadcast_rank_for_deferred_scalar_gap(
+        self,
+        tmp_path: Path,
+        bound_count: int,
+        runtime_dims: list[Any],
+        x_dims: list[Any],
+        y_dims: list[Any],
+        expect_gap: bool,
+    ) -> None:
+        shape_names = [f"shape_source{index}" for index in range(32)]
+        initializers = [onnx.numpy_helper.from_array(np.array([], dtype=np.int64), name=name) for name in shape_names]
+        initializers.extend(
+            [
+                onnx.numpy_helper.from_array(np.array(1.0, dtype=np.float32), name="W"),
+                onnx.numpy_helper.from_array(np.array(0.0, dtype=np.float32), name="minimum"),
+            ]
+        )
+        transform_inputs = ["runtime_weight", "minimum"]
+        if bound_count == 2:
+            initializers.append(onnx.numpy_helper.from_array(np.array(6.0, dtype=np.float32), name="maximum"))
+            transform_inputs.append("maximum")
+        nodes = []
+        previous = "W"
+        for index, shape_name in enumerate(shape_names):
+            reshaped = f"reshaped{index}"
+            nodes.append(helper.make_node("Reshape", [previous, shape_name], [reshaped]))
+            previous = reshaped
+        nodes.extend(
+            [
+                helper.make_node("Clip", transform_inputs, ["runtime_alias"]),
+                helper.make_node("Add", ["runtime_alias", previous], ["generated_weight"]),
+                helper.make_node("MatMul", ["X", "generated_weight"], ["Y"]),
+            ]
+        )
+        graph = helper.make_graph(
+            nodes,
+            "clip_initializer_bounds_preserve_broadcast_rank_for_deferred_scalar_gap",
+            [
+                helper.make_tensor_value_info("runtime_weight", TensorProto.FLOAT, runtime_dims),
+                helper.make_tensor_value_info("X", TensorProto.FLOAT, x_dims),
+            ],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, y_dims)],
+            initializer=initializers,
+            value_info=[helper.make_tensor_value_info("runtime_alias", TensorProto.FLOAT, [4])],
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / f"clip-{bound_count + 1}-input-initializer-bounds-broadcast-rank.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        if expect_gap:
+            assert result.success is False
+            assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
+            assert semantics["coverage_gaps"]["lineages_per_value_limit"] == 1
+            assert semantics["analyzed_layer_count"] == 0
+        else:
+            assert result.success is True
+            assert self._extreme_checks(result) == []
+            assert coverage == []
+            assert semantics["coverage_gaps"] == {}
+            assert semantics["eligible_initializer_count"] == 0
+
+    def test_dropout_mask_preserves_broadcast_rank_for_deferred_scalar_gap(self, tmp_path: Path) -> None:
+        shape_names = [f"shape_source{index}" for index in range(32)]
+        initializers = [onnx.numpy_helper.from_array(np.array([], dtype=np.int64), name=name) for name in shape_names]
+        initializers.append(onnx.numpy_helper.from_array(np.array(1.0, dtype=np.float32), name="W"))
+        nodes = []
+        previous = "W"
+        for index, shape_name in enumerate(shape_names):
+            reshaped = f"reshaped{index}"
+            nodes.append(helper.make_node("Reshape", [previous, shape_name], [reshaped]))
+            previous = reshaped
+        nodes.extend(
+            [
+                helper.make_node(
+                    "Dropout",
+                    ["runtime_weight", "ratio", "training_mode"],
+                    ["dropped", "mask"],
+                ),
+                helper.make_node("Cast", ["mask"], ["mask_float"], to=TensorProto.FLOAT),
+                helper.make_node("Add", ["mask_float", previous], ["generated_weight"]),
+                helper.make_node("MatMul", ["X", "generated_weight"], ["Y"]),
+            ]
+        )
+        graph = helper.make_graph(
+            nodes,
+            "dropout_mask_preserves_broadcast_rank_for_deferred_scalar_gap",
+            [
+                helper.make_tensor_value_info("runtime_weight", TensorProto.FLOAT, [4, 4]),
+                helper.make_tensor_value_info("ratio", TensorProto.FLOAT, []),
+                helper.make_tensor_value_info("training_mode", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("X", TensorProto.FLOAT, [4, 4]),
+            ],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [4, 4])],
+            initializer=initializers,
+            value_info=[
+                helper.make_tensor_value_info("mask", TensorProto.BOOL, [4]),
+                helper.make_tensor_value_info("mask_float", TensorProto.FLOAT, [4]),
+            ],
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / "dropout-mask-broadcast-rank.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        assert result.success is False
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["coverage_gaps"]["lineages_per_value_limit"] == 1
+        assert semantics["analyzed_layer_count"] == 0
+
+    def test_expand_uses_broadcast_shape_for_weight_lineage_rank(self, tmp_path: Path) -> None:
+        initializers = [
+            onnx.numpy_helper.from_array(np.ones((2, 3), dtype=np.float32), name=f"W{index}") for index in range(33)
+        ]
+        initializers.append(onnx.numpy_helper.from_array(np.array([3], dtype=np.int64), name="expand_shape"))
+        graph = helper.make_graph(
+            [
+                helper.make_node("Sum", [f"W{index}" for index in range(33)], ["summed_weight"]),
+                helper.make_node("Expand", ["summed_weight", "expand_shape"], ["expanded_weight"]),
+                helper.make_node("MatMul", ["X", "expanded_weight"], ["Y"]),
+            ],
+            "expand_uses_broadcast_shape_for_weight_lineage_rank",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 2])],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 3])],
+            initializer=initializers,
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / "expand-broadcast-weight-rank.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        assert result.success is False
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["coverage_gaps"]["lineages_per_value_limit"] == 1
+        assert semantics["analyzed_layer_count"] == 0
+
+    def test_concat_preserves_rank_for_deferred_scalar_gap(self, tmp_path: Path) -> None:
+        initializers = [
+            onnx.numpy_helper.from_array(np.array(float(index), dtype=np.float32), name=f"W{index}")
+            for index in range(33)
+        ]
+        nodes = [helper.make_node("Sum", [f"W{index}" for index in range(33)], ["scalar_gap"])]
+        nodes.extend(
+            [
+                helper.make_node("Concat", ["left", "right"], ["runtime_alias"], axis=0),
+                helper.make_node("Add", ["runtime_alias", "scalar_gap"], ["generated_weight"]),
+                helper.make_node("MatMul", ["X", "generated_weight"], ["Y"]),
+            ]
+        )
+        graph = helper.make_graph(
+            nodes,
+            "concat_preserves_rank_for_deferred_scalar_gap",
+            [
+                helper.make_tensor_value_info("left", TensorProto.FLOAT, [4, 4]),
+                helper.make_tensor_value_info("right", TensorProto.FLOAT, [4, 4]),
+                helper.make_tensor_value_info("X", TensorProto.FLOAT, [4, 8]),
+            ],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [4, 4])],
+            initializer=initializers,
+            value_info=[helper.make_tensor_value_info("runtime_alias", TensorProto.FLOAT, [8])],
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / "concat-broadcast-rank.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        assert result.success is False
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["coverage_gaps"]["lineages_per_value_limit"] == 1
+        assert semantics["analyzed_layer_count"] == 0
+
     def test_integer_broadcast_deferred_lineage_gap_stays_nonweight(self, tmp_path: Path) -> None:
         shape_names = [f"shape_source{index}" for index in range(32)]
         initializers = [onnx.numpy_helper.from_array(np.array([4], dtype=np.int64), name=name) for name in shape_names]
