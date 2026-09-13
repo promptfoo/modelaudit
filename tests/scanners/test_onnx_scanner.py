@@ -7717,6 +7717,78 @@ class TestWeightDistributionSemantics:
         assert semantics["coverage_gaps"]["lineages_per_value_limit"] == 1
         assert semantics["analyzed_layer_count"] == 0
 
+    def test_unsqueeze_alias_preserves_broadcast_rank_for_deferred_scalar_gap(self, tmp_path: Path) -> None:
+        scalar_names = [f"scalar_source{index}" for index in range(40)]
+        graph = helper.make_graph(
+            [
+                helper.make_node("Sum", scalar_names, ["mixed_scalar"]),
+                helper.make_node("Unsqueeze", ["runtime_vector", "axes"], ["runtime_matrix"]),
+                helper.make_node("Add", ["runtime_matrix", "mixed_scalar"], ["generated_weight"]),
+                helper.make_node("MatMul", ["X", "generated_weight"], ["Y"]),
+            ],
+            "unsqueeze_alias_preserves_broadcast_rank_for_deferred_scalar_gap",
+            [
+                helper.make_tensor_value_info("runtime_vector", TensorProto.FLOAT, [4]),
+                helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 1]),
+            ],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 4])],
+            initializer=[
+                *[onnx.numpy_helper.from_array(np.array(1.0, dtype=np.float32), name=name) for name in scalar_names],
+                onnx.numpy_helper.from_array(np.array([0], dtype=np.int64), name="axes"),
+            ],
+            value_info=[helper.make_tensor_value_info("runtime_matrix", TensorProto.FLOAT, [4])],
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / "unsqueeze-preserves-broadcast-rank-for-deferred-scalar-gap.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        assert result.success is False
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["coverage_gaps"]["lineages_per_value_limit"] == 8
+        assert semantics["analyzed_layer_count"] == 0
+
+    def test_unsqueeze_alias_rank_one_near_match_stays_clean(self, tmp_path: Path) -> None:
+        scalar_names = [f"scalar_source{index}" for index in range(40)]
+        graph = helper.make_graph(
+            [
+                helper.make_node("Sum", scalar_names, ["mixed_scalar"]),
+                helper.make_node("Unsqueeze", ["runtime_scalar", "axes"], ["runtime_vector"]),
+                helper.make_node("Add", ["runtime_vector", "mixed_scalar"], ["generated_values"]),
+                helper.make_node("MatMul", ["X", "generated_values"], ["Y"]),
+            ],
+            "unsqueeze_alias_rank_one_near_match_stays_clean",
+            [
+                helper.make_tensor_value_info("runtime_scalar", TensorProto.FLOAT, []),
+                helper.make_tensor_value_info("X", TensorProto.FLOAT, [1]),
+            ],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [])],
+            initializer=[
+                *[onnx.numpy_helper.from_array(np.array(1.0, dtype=np.float32), name=name) for name in scalar_names],
+                onnx.numpy_helper.from_array(np.array([0], dtype=np.int64), name="axes"),
+            ],
+            value_info=[helper.make_tensor_value_info("runtime_vector", TensorProto.FLOAT, [1])],
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / "unsqueeze-rank-one-near-match-stays-clean.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        assert result.success is True
+        assert self._extreme_checks(result) == []
+        assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["coverage_gaps"] == {}
+        assert semantics["eligible_initializer_count"] == 0
+
     def test_broadcast_promotion_adds_to_existing_weight_gap_count(self, tmp_path: Path) -> None:
         retained_vector_names = [f"retained_vector{index}" for index in range(32)]
         dropped_matrix_names = [f"dropped_matrix{index}" for index in range(8)]

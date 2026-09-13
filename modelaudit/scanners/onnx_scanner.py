@@ -4569,6 +4569,23 @@ def _build_onnx_weight_analysis_plan(
                                 math.prod(transform_input_shape[:axis]),
                                 math.prod(transform_input_shape[axis:]),
                             )
+                elif node.op_type == "Unsqueeze" and transform_input_rank is not None:
+                    axes = _resolve_onnx_axes(node, constants, onnx=onnx)
+                    if axes is not None:
+                        output_rank = transform_input_rank + len(axes)
+                        normalized_axes = tuple(axis if axis >= 0 else output_rank + axis for axis in axes)
+                        if (
+                            normalized_axes
+                            and len(set(normalized_axes)) == len(normalized_axes)
+                            and all(0 <= axis < output_rank for axis in normalized_axes)
+                        ):
+                            transform_output_rank = output_rank
+                            if transform_input_shape is not None:
+                                source_dimensions = iter(transform_input_shape)
+                                transform_output_shape = tuple(
+                                    1 if index in normalized_axes else next(source_dimensions)
+                                    for index in range(output_rank)
+                                )
 
             for output_index, output_name in enumerate(node.output):
                 if not output_name:
