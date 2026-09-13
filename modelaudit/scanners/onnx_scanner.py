@@ -468,6 +468,57 @@ def _onnx_weight_output_axes(node: Any, input_index: int, rank: int) -> tuple[tu
     return None, "unsupported_consumer"
 
 
+def _onnx_remove_shape_axis(shape: tuple[int, ...], raw_axis: int) -> tuple[int, ...] | None:
+    axis = raw_axis if raw_axis >= 0 else len(shape) + raw_axis
+    if axis < 0 or axis >= len(shape):
+        return None
+    return (*shape[:axis], *shape[axis + 1 :])
+
+
+def _onnx_remove_rank_axis(rank: int, raw_axis: int) -> int | None:
+    axis = raw_axis if raw_axis >= 0 else rank + raw_axis
+    if axis < 0 or axis >= rank:
+        return None
+    return rank - 1
+
+
+def _onnx_remove_known_axis(
+    shape: tuple[int, ...] | None, rank: int | None, raw_axis: int
+) -> tuple[tuple[int, ...] | None, int | None]:
+    if shape is not None:
+        shape = _onnx_remove_shape_axis(shape, raw_axis)
+        return shape, len(shape) if shape is not None else None
+    if rank is not None:
+        return None, _onnx_remove_rank_axis(rank, raw_axis)
+    return shape, rank
+
+
+def _onnx_scan_bound_subgraph_input_shape(
+    parent_shape: tuple[int, ...] | None,
+    parent_rank: int | None,
+    *,
+    pair_index: int,
+    scan_input_start: int,
+    scan_input_offset: int,
+    scan_input_axes: tuple[int, ...],
+) -> tuple[tuple[int, ...] | None, int | None]:
+    scan8_batched_input = bool(scan_input_offset and pair_index >= scan_input_offset)
+    if scan8_batched_input and pair_index < scan_input_start:
+        return _onnx_remove_known_axis(parent_shape, parent_rank, 0)
+    if pair_index < scan_input_start:
+        return parent_shape, parent_rank
+
+    scan_input_index = pair_index - scan_input_start
+    default_scan_input_axis = 1 if scan_input_offset else 0
+    scan_input_axis = (
+        scan_input_axes[scan_input_index] if scan_input_index < len(scan_input_axes) else default_scan_input_axis
+    )
+    parent_shape, parent_rank = _onnx_remove_known_axis(parent_shape, parent_rank, scan_input_axis)
+    if scan8_batched_input:
+        parent_shape, parent_rank = _onnx_remove_known_axis(parent_shape, parent_rank, 0)
+    return parent_shape, parent_rank
+
+
 def _iter_attribute_graphs(attribute: Any) -> Any:
     """Yield graph values declared by an ONNX attribute."""
     yield from attribute.graphs
@@ -2114,12 +2165,6 @@ def _build_onnx_weight_analysis_plan(
         scan_inputs = [str(input_name) for input_name in node.input[scan_input_start:] if input_name]
         if len(scan_inputs) < num_scan_inputs:
             return True
-        if scan_input_offset and node.input:
-            sequence_lens_input = str(node.input[0] or "")
-            if sequence_lens_input:
-                sequence_lens = constant_int64_vector_values(constants.get(sequence_lens_input))
-                if sequence_lens is not None:
-                    return any(length > 1 for length in sequence_lens)
         scan_input_axes = (
             scan_input_axes
             if scan_input_axes is not None
@@ -2162,24 +2207,12 @@ def _build_onnx_weight_analysis_plan(
             return 0
         return scan_output_axes[scan_output_index]
 
-    def remove_shape_axis(shape: tuple[int, ...], raw_axis: int) -> tuple[int, ...] | None:
-        axis = raw_axis if raw_axis >= 0 else len(shape) + raw_axis
-        if axis < 0 or axis >= len(shape):
-            return None
-        return (*shape[:axis], *shape[axis + 1 :])
-
-    def remove_rank_axis(rank: int, raw_axis: int) -> int | None:
-        axis = raw_axis if raw_axis >= 0 else rank + raw_axis
-        if axis < 0 or axis >= rank:
-            return None
-        return rank - 1
-
-    def insert_shape_axis(shape: tuple[int, ...], raw_axis: int) -> tuple[int, ...] | None:
+    def insert_shape_axis(shape: tuple[int, ...], raw_axis: int, extent: int = -1) -> tuple[int, ...] | None:
         output_rank = len(shape) + 1
         axis = raw_axis if raw_axis >= 0 else output_rank + raw_axis
         if axis < 0 or axis > len(shape):
             return None
-        return (*shape[:axis], -1, *shape[axis:])
+        return (*shape[:axis], extent, *shape[axis:])
 
     def insert_rank_axis(rank: int, raw_axis: int) -> int | None:
         output_rank = rank + 1
@@ -4023,19 +4056,15 @@ def _build_onnx_weight_analysis_plan(
                             subgraph_bound_dynamic.add(graph_input_name)
                         parent_shape = known_value_shapes.get(parent_name)
                         parent_rank = known_value_ranks.get(parent_name)
-                        if node.op_type == "Scan" and pair_index >= scan_input_start:
-                            scan_input_index = pair_index - scan_input_start
-                            default_scan_input_axis = 1 if scan_input_offset else 0
-                            scan_input_axis = (
-                                scan_input_axes[scan_input_index]
-                                if scan_input_index < len(scan_input_axes)
-                                else default_scan_input_axis
+                        if node.op_type == "Scan":
+                            parent_shape, parent_rank = _onnx_scan_bound_subgraph_input_shape(
+                                parent_shape,
+                                parent_rank,
+                                pair_index=pair_index,
+                                scan_input_start=scan_input_start,
+                                scan_input_offset=scan_input_offset,
+                                scan_input_axes=scan_input_axes,
                             )
-                            if parent_shape is not None:
-                                parent_shape = remove_shape_axis(parent_shape, scan_input_axis)
-                                parent_rank = len(parent_shape) if parent_shape is not None else None
-                            elif parent_rank is not None:
-                                parent_rank = remove_rank_axis(parent_rank, scan_input_axis)
                         if parent_name in known_value_shapes:
                             if parent_shape is not None:
                                 subgraph_bound_value_shapes[graph_input_name] = parent_shape
@@ -4979,6 +5008,31 @@ def _build_onnx_weight_analysis_plan(
                 if standard_control_flow_operator and node.op_type == "Scan"
                 else 0
             )
+
+            def scan8_batch_extent(
+                output_index: int,
+                *,
+                stacked_output: bool,
+                current_node: Any = node,
+                input_offset: int = resolved_scan_input_offset,
+            ) -> int:
+                if stacked_output:
+                    num_scan_inputs = _onnx_int_attribute(current_node, "num_scan_inputs", 1)
+                    scan_input_start = max(len(current_node.input) - max(num_scan_inputs, 0), input_offset)
+                    scan_output_index = output_index - max(len(current_node.input) - input_offset - num_scan_inputs, 0)
+                    scan_input_index = min(max(scan_output_index, 0), max(num_scan_inputs - 1, 0))
+                    value_index = scan_input_start + scan_input_index
+                    value_name = str(current_node.input[value_index]) if value_index < len(current_node.input) else ""
+                else:
+                    value_name = control_flow_state_input_name(output_index)
+                value_shape = known_value_shapes.get(value_name)
+                if value_shape:
+                    return value_shape[0]
+                initializer_shape = constant_initializer_shape(constants, value_name)
+                if initializer_shape:
+                    return initializer_shape[0]
+                return -1
+
             trusted_scan_shape_names = proven_value_ranks
             untrusted_scan_shape_names = {
                 name for name in graph_input_names & set(value_lineages) if name not in proven_value_ranks
@@ -5026,9 +5080,27 @@ def _build_onnx_weight_analysis_plan(
                     if stacked_scan_output:
                         if graph_output_shape is not None:
                             graph_output_shape = insert_shape_axis(graph_output_shape, scan_output_insert_axis)
+                            if graph_output_shape is not None and resolved_scan_input_offset:
+                                graph_output_shape = insert_shape_axis(
+                                    graph_output_shape,
+                                    0,
+                                    scan8_batch_extent(output_index, stacked_output=True),
+                                )
                             graph_output_rank = len(graph_output_shape) if graph_output_shape is not None else None
                         elif graph_output_rank is not None:
                             graph_output_rank = insert_rank_axis(graph_output_rank, scan_output_insert_axis)
+                            if graph_output_rank is not None and resolved_scan_input_offset:
+                                graph_output_rank = insert_rank_axis(graph_output_rank, 0)
+                    elif standard_control_flow_operator and node.op_type == "Scan" and resolved_scan_input_offset:
+                        if graph_output_shape is not None:
+                            graph_output_shape = insert_shape_axis(
+                                graph_output_shape,
+                                0,
+                                scan8_batch_extent(output_index, stacked_output=False),
+                            )
+                            graph_output_rank = len(graph_output_shape) if graph_output_shape is not None else None
+                        elif graph_output_rank is not None:
+                            graph_output_rank = insert_rank_axis(graph_output_rank, 0)
                     repeated_carried_state = (
                         standard_control_flow_operator
                         and not stacked_scan_output
