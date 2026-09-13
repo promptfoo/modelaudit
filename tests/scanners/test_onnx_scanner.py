@@ -7197,6 +7197,7 @@ class TestWeightDistributionSemantics:
             ("absent", None, True),
             ("runtime", 2, True),
             ("zero", 2, True),
+            ("one", None, False),
         ],
     )
     def test_scan_opset8_zero_sequence_lengths_preserve_initial_state_gap(
@@ -7243,6 +7244,10 @@ class TestWeightDistributionSemantics:
             initializers.append(
                 onnx.numpy_helper.from_array(np.zeros((batch_size,), dtype=np.int64), name="sequence_lens")
             )
+        elif sequence_lens_mode == "one":
+            initializers.append(
+                onnx.numpy_helper.from_array(np.ones((batch_size,), dtype=np.int64), name="sequence_lens")
+            )
         graph = helper.make_graph(
             [
                 helper.make_node("Sum", source_names, ["capped"]),
@@ -7284,6 +7289,147 @@ class TestWeightDistributionSemantics:
             assert result.success is True
             assert not coverage
             assert semantics["coverage_gaps"] == {}
+
+    def test_scan_opset8_constant_sequence_lens_bounds_repeated_rank_growth(self, tmp_path: Path) -> None:
+        source_names = [f"W{index}" for index in range(40)]
+        initializers = [
+            onnx.numpy_helper.from_array(np.array(float(index), dtype=np.float32), name=name)
+            for index, name in enumerate(source_names)
+        ]
+        initializers.extend(
+            [
+                onnx.numpy_helper.from_array(np.ones((2,), dtype=np.int64), name="sequence_lens"),
+            ]
+        )
+        body = helper.make_graph(
+            [
+                helper.make_node("Unsqueeze", ["state"], ["next_state"], axes=[0]),
+                helper.make_node("Identity", ["element"], ["next_element"]),
+            ],
+            "scan8_constant_sequence_lens_bounds_body",
+            [
+                helper.make_tensor_value_info("state", TensorProto.FLOAT, []),
+                helper.make_tensor_value_info("element", TensorProto.FLOAT, [1]),
+            ],
+            [
+                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, [1]),
+                helper.make_tensor_value_info("next_element", TensorProto.FLOAT, [1]),
+            ],
+        )
+        graph = helper.make_graph(
+            [
+                helper.make_node("Sum", source_names, ["capped_scalar"]),
+                helper.make_node(
+                    "Scan",
+                    ["sequence_lens", "capped_scalar", "scan_values"],
+                    ["scan_state", "scan_output"],
+                    body=body,
+                    num_scan_inputs=1,
+                ),
+                helper.make_node("MatMul", ["X", "scan_state"], ["Y"]),
+            ],
+            "scan_opset8_constant_sequence_lens_bounds_repeated_rank_growth",
+            [
+                helper.make_tensor_value_info("scan_values", TensorProto.FLOAT, [2, 2, 1]),
+                helper.make_tensor_value_info("X", TensorProto.FLOAT, [2, 1, 1]),
+            ],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [2, 1])],
+            initializer=initializers,
+            value_info=[
+                helper.make_tensor_value_info("scan_state", TensorProto.FLOAT, [2, 1]),
+                helper.make_tensor_value_info("scan_output", TensorProto.FLOAT, [2, 2, 1]),
+            ],
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 8)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / "scan-opset8-constant-sequence-lens-bounds-repeat.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        assert result.success is True
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        assert coverage == []
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["coverage_gaps"] == {}
+
+    def test_scan_opset8_body_binding_uses_sequence_axis_before_nested_repeat(self, tmp_path: Path) -> None:
+        source_names = [f"W{index}" for index in range(40)]
+        initializers = [
+            onnx.numpy_helper.from_array(np.array(float(index), dtype=np.float32), name=name)
+            for index, name in enumerate(source_names)
+        ]
+        inner_body = helper.make_graph(
+            [
+                helper.make_node("Unsqueeze", ["state"], ["next_state"], axes=[0]),
+                helper.make_node("Identity", ["inner_element"], ["next_element"]),
+            ],
+            "scan8_nested_repeat_body",
+            [
+                helper.make_tensor_value_info("state", TensorProto.FLOAT, None),
+                helper.make_tensor_value_info("inner_element", TensorProto.FLOAT, [2]),
+            ],
+            [
+                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, None),
+                helper.make_tensor_value_info("next_element", TensorProto.FLOAT, [2]),
+            ],
+        )
+        outer_body = helper.make_graph(
+            [
+                helper.make_node("Transpose", ["element"], ["transposed"], perm=[1, 0]),
+                helper.make_node(
+                    "Scan",
+                    ["", "state", "transposed"],
+                    ["next_state", "inner_output"],
+                    body=inner_body,
+                    num_scan_inputs=1,
+                ),
+                helper.make_node("Identity", ["element"], ["next_element"]),
+            ],
+            "scan8_body_binding_uses_sequence_axis_body",
+            [
+                helper.make_tensor_value_info("state", TensorProto.FLOAT, []),
+                helper.make_tensor_value_info("element", TensorProto.FLOAT, [2, 2]),
+            ],
+            [
+                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, None),
+                helper.make_tensor_value_info("next_element", TensorProto.FLOAT, [2, 2]),
+            ],
+        )
+        graph = helper.make_graph(
+            [
+                helper.make_node("Sum", source_names, ["capped_scalar"]),
+                helper.make_node(
+                    "Scan",
+                    ["", "capped_scalar", "scan_values"],
+                    ["scan_state", "scan_output"],
+                    body=outer_body,
+                    num_scan_inputs=1,
+                ),
+                helper.make_node("MatMul", ["X", "scan_state"], ["Y"]),
+            ],
+            "scan_opset8_body_binding_uses_sequence_axis_before_nested_repeat",
+            [
+                helper.make_tensor_value_info("scan_values", TensorProto.FLOAT, [2, 1, 2]),
+                helper.make_tensor_value_info("X", TensorProto.FLOAT, [2, 1, 1]),
+            ],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [2, 1, 1])],
+            initializer=initializers,
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 8)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / "scan-opset8-body-binding-default-axis.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        assert result.success is False
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
 
     @pytest.mark.parametrize(("scan_length", "expect_gap"), [(1, False), (2, True)])
     def test_scan_graph_input_fixed_extent_bounds_carried_rank_growth(
