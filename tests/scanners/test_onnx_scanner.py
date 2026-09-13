@@ -7541,6 +7541,125 @@ class TestWeightDistributionSemantics:
         semantics = result.metadata["onnx_weight_distribution_semantics"]
         assert semantics["coverage_gaps"]["lineages_per_value_limit"] == 8
 
+    def test_unsqueeze_then_squeeze_keeps_promoted_vector_gap_nonweight(self, tmp_path: Path) -> None:
+        source_names = [f"vector_weight{index}" for index in range(33)]
+        initializers = [
+            onnx.numpy_helper.from_array(np.ones((4,), dtype=np.float32), name=name) for name in source_names
+        ]
+        initializers.append(onnx.numpy_helper.from_array(np.array([0], dtype=np.int64), name="axes"))
+        leaves = [
+            helper.make_graph(
+                [helper.make_node("Identity", [source_name], [f"{source_name}_out"])],
+                f"{source_name}_leaf",
+                [],
+                [helper.make_tensor_value_info(f"{source_name}_out", TensorProto.FLOAT, [4])],
+            )
+            for source_name in source_names
+        ]
+        condition_counter = 0
+
+        def combine_branches(branches: list[Any]) -> Any:
+            nonlocal condition_counter
+            if len(branches) == 1:
+                return branches[0]
+            midpoint = len(branches) // 2
+            left = combine_branches(branches[:midpoint])
+            right = combine_branches(branches[midpoint:])
+            condition_index = condition_counter
+            condition_counter += 1
+            output_name = f"branch_out_{condition_index}"
+            node = helper.make_node(
+                "If",
+                [f"C{condition_index}"],
+                [output_name],
+                then_branch=left,
+                else_branch=right,
+            )
+            return helper.make_graph(
+                [node],
+                f"branch_{condition_index}",
+                [],
+                [helper.make_tensor_value_info(output_name, TensorProto.FLOAT, None)],
+            )
+
+        branch = combine_branches(leaves)
+        selected = branch.output[0].name
+        graph = helper.make_graph(
+            [
+                *branch.node,
+                helper.make_node("Unsqueeze", [selected, "axes"], ["generated_matrix"]),
+                helper.make_node("Squeeze", ["generated_matrix", "axes"], ["generated_vector"]),
+                helper.make_node("MatMul", ["X", "generated_vector"], ["Y"]),
+            ],
+            "unsqueeze_then_squeeze_keeps_promoted_vector_gap_nonweight",
+            [
+                helper.make_tensor_value_info("X", TensorProto.FLOAT, [4]),
+                *[
+                    helper.make_tensor_value_info(f"C{index}", TensorProto.BOOL, [])
+                    for index in range(condition_counter)
+                ],
+            ],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [])],
+            initializer=initializers,
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / "unsqueeze-squeeze-keeps-promoted-vector-gap-nonweight.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        assert result.success is True
+        assert self._extreme_checks(result) == []
+        assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["coverage_gaps"] == {}
+        assert semantics["eligible_initializer_count"] == 0
+
+    def test_flatten_alias_preserves_broadcast_rank_for_deferred_scalar_gap(self, tmp_path: Path) -> None:
+        shape_names = [f"shape_source{index}" for index in range(32)]
+        initializers = [onnx.numpy_helper.from_array(np.array([], dtype=np.int64), name=name) for name in shape_names]
+        initializers.append(onnx.numpy_helper.from_array(np.array(1.0, dtype=np.float32), name="W"))
+        nodes = []
+        previous = "W"
+        for index, shape_name in enumerate(shape_names):
+            reshaped = f"reshaped{index}"
+            nodes.append(helper.make_node("Reshape", [previous, shape_name], [reshaped]))
+            previous = reshaped
+        nodes.extend(
+            [
+                helper.make_node("Flatten", ["runtime_weight"], ["runtime_alias"]),
+                helper.make_node("Add", ["runtime_alias", previous], ["generated_weight"]),
+                helper.make_node("MatMul", ["X", "generated_weight"], ["Y"]),
+            ]
+        )
+        graph = helper.make_graph(
+            nodes,
+            "flatten_alias_preserves_broadcast_rank_for_deferred_scalar_gap",
+            [
+                helper.make_tensor_value_info("runtime_weight", TensorProto.FLOAT, [1, 4, 4]),
+                helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 1]),
+            ],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 16])],
+            initializer=initializers,
+            value_info=[helper.make_tensor_value_info("runtime_alias", TensorProto.FLOAT, [16])],
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / "flatten-preserves-broadcast-rank-for-deferred-scalar-gap.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        assert result.success is False
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["coverage_gaps"]["lineages_per_value_limit"] == 1
+        assert semantics["analyzed_layer_count"] == 0
+
     def test_broadcast_promotion_adds_to_existing_weight_gap_count(self, tmp_path: Path) -> None:
         retained_vector_names = [f"retained_vector{index}" for index in range(32)]
         dropped_matrix_names = [f"dropped_matrix{index}" for index in range(8)]
@@ -8147,11 +8266,27 @@ class TestWeightDistributionSemantics:
             reshaped = f"reshaped{index}"
             nodes.append(helper.make_node("Reshape", [previous, shape_name], [reshaped]))
             previous = reshaped
+        transform_inputs = ["runtime_weight"]
+        graph_inputs = [
+            helper.make_tensor_value_info("runtime_weight", TensorProto.FLOAT, runtime_dims),
+            helper.make_tensor_value_info("X", TensorProto.FLOAT, x_dims),
+        ]
+        if transform == "Clip":
+            transform_inputs.append("minimum")
+            graph_inputs.append(helper.make_tensor_value_info("minimum", TensorProto.FLOAT, []))
+        elif transform == "Dropout":
+            transform_inputs.extend(["ratio", "training_mode"])
+            graph_inputs.extend(
+                [
+                    helper.make_tensor_value_info("ratio", TensorProto.FLOAT, []),
+                    helper.make_tensor_value_info("training_mode", TensorProto.BOOL, []),
+                ]
+            )
         nodes.extend(
             [
                 helper.make_node(
                     transform,
-                    ["runtime_weight"],
+                    transform_inputs,
                     ["runtime_alias"],
                     **(
                         {"to": TensorProto.FLOAT}
@@ -8168,10 +8303,7 @@ class TestWeightDistributionSemantics:
         graph = helper.make_graph(
             nodes,
             "unary_alias_preserves_broadcast_rank_for_deferred_scalar_gap",
-            [
-                helper.make_tensor_value_info("runtime_weight", TensorProto.FLOAT, runtime_dims),
-                helper.make_tensor_value_info("X", TensorProto.FLOAT, x_dims),
-            ],
+            graph_inputs,
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, y_dims)],
             initializer=initializers,
         )

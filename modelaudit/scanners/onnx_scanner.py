@@ -3827,6 +3827,8 @@ def _build_onnx_weight_analysis_plan(
                 output_weight_lineage_gap_summary = empty_weight_gap_summary
                 output_rank_promotable_lineage_limit_gap_count = 0
                 output_rank_promotable_lineage_gap_summary = empty_weight_gap_summary
+            pre_promotion_weight_lineage_limit_gap_count = all_input_output_weight_lineage_limit_gap_count
+            pre_promotion_weight_lineage_gap_summary = all_input_output_weight_lineage_gap_summary
             transformed_input_output_weight_lineage_gap_summary = all_input_output_weight_lineage_gap_summary
             transformed_input_output_rank_promotable_lineage_gap_summary = (
                 all_input_output_rank_promotable_lineage_gap_summary
@@ -3900,6 +3902,10 @@ def _build_onnx_weight_analysis_plan(
                     all_input_output_weight_lineage_gap_summary,
                     promoted_rank_lineage_gap_summary,
                 )
+                if promoted_rank_lineage_limit_gap_count == all_input_output_rank_promotable_lineage_limit_gap_count:
+                    all_input_output_rank_promotable_lineage_limit_gap_count = 0
+                    all_input_output_rank_promotable_lineage_gap_summary = empty_weight_gap_summary
+                    transformed_input_output_rank_promotable_lineage_gap_summary = empty_weight_gap_summary
             if (
                 supported_transform
                 and node.op_type == "Cast"
@@ -3964,10 +3970,17 @@ def _build_onnx_weight_analysis_plan(
                 and any(lineage_could_be_weight_after_rank_increase(lineage) for lineage in output_lineages.values())
             )
             if supported_transform and all_input_output_weight_lineage_limit_gap_count > 0:
-                transformed_input_output_weight_lineage_gap_summary = transform_weight_gap_summary(
-                    all_input_output_weight_lineage_gap_summary,
-                    node,
-                    constants,
+                transformed_input_output_weight_lineage_gap_summary = merge_weight_lineage_gap_summaries(
+                    transform_weight_gap_summary(
+                        pre_promotion_weight_lineage_gap_summary,
+                        node,
+                        constants,
+                    )
+                    if pre_promotion_weight_lineage_limit_gap_count
+                    else empty_weight_gap_summary,
+                    promoted_rank_lineage_gap_summary
+                    if rank_operator_promotes_deferred_gap
+                    else empty_weight_gap_summary,
                 )
             if supported_transform and all_input_output_rank_promotable_lineage_limit_gap_count > 0:
                 transformed_input_output_rank_promotable_lineage_gap_summary = transform_rank_promotable_gap_summary(
@@ -4311,11 +4324,12 @@ def _build_onnx_weight_analysis_plan(
                     )
                     merge_subgraph_output_gap_state(output_index, parent_name)
 
-            if elementwise_output_shape is None and elementwise_output_rank is None and len(input_names) == 1:
+            if elementwise_output_shape is None and elementwise_output_rank is None and input_names:
                 common_output_rank_operator = (
                     is_registered_standard_operator
                     and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
                     and node.op_type in _SHAPE_PRESERVING_UNARY_RANK_OPERATORS
+                    and (len(input_names) == 1 or node.op_type in {"Clip", "Dropout"})
                 )
                 if common_output_rank_operator:
                     elementwise_output_shape = known_value_shapes.get(input_names[0])
@@ -4349,6 +4363,16 @@ def _build_onnx_weight_analysis_plan(
                         )
                         if sorted(permutation) == list(range(transform_input_rank)):
                             transform_output_rank = transform_input_rank
+                elif node.op_type == "Flatten" and transform_input_rank is not None:
+                    axis = _onnx_int_attribute(node, "axis", 1)
+                    axis = axis if axis >= 0 else transform_input_rank + axis
+                    if 0 <= axis <= transform_input_rank:
+                        transform_output_rank = 2
+                        if transform_input_shape is not None:
+                            transform_output_shape = (
+                                math.prod(transform_input_shape[:axis]),
+                                math.prod(transform_input_shape[axis:]),
+                            )
 
             for output_index, output_name in enumerate(node.output):
                 if not output_name:
