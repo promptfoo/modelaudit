@@ -3642,6 +3642,14 @@ def _build_onnx_weight_analysis_plan(
                         recorded_input_lineage_limit_gap = True
                     if supported_transform and input_index == 0:
                         continue
+                    known_input_rank = known_value_ranks.get(str(input_name))
+                    if (
+                        potential_weight_input
+                        and known_input_rank is not None
+                        and known_input_rank < 2
+                        and (lineage.shape is None or len(lineage.shape) < 2)
+                    ):
+                        potential_weight_input = False
                     if potential_weight_input:
                         terminal_weight_lineages.add(initializer_index)
                     terminal_consumer_counts[initializer_index] += 1
@@ -4687,14 +4695,21 @@ def _build_onnx_weight_analysis_plan(
                         output_shapes[output_index] = output_shape
                         output_ranks[output_index] = len(output_shape)
                     elif output_shapes[output_index] != output_shape:
+                        current_rank = output_ranks[output_index]
+                        candidate_rank = len(output_shape)
                         output_shapes[output_index] = None
-                        output_ranks[output_index] = None
-                        output_rank_unknown[output_index] = True
+                        if current_rank == candidate_rank:
+                            output_ranks[output_index] = candidate_rank
+                        else:
+                            output_ranks[output_index] = None
+                            output_rank_unknown[output_index] = True
                     output_rank_seen[output_index] = True
                 elif output_rank is not None:
                     if not output_rank_seen[output_index]:
                         output_ranks[output_index] = output_rank
-                    elif output_shapes[output_index] is not None or output_ranks[output_index] != output_rank:
+                    elif output_ranks[output_index] == output_rank:
+                        output_shapes[output_index] = None
+                    else:
                         output_shapes[output_index] = None
                         output_ranks[output_index] = None
                         output_rank_unknown[output_index] = True
@@ -4704,6 +4719,19 @@ def _build_onnx_weight_analysis_plan(
                     output_ranks[output_index] = None
                     output_rank_seen[output_index] = True
                     output_rank_unknown[output_index] = True
+
+            def control_flow_state_input_name(output_index: int, *, current_node: Any = node) -> str:
+                state_input_index = output_index + (2 if current_node.op_type == "Loop" else 0)
+                if state_input_index >= len(current_node.input) or not current_node.input[state_input_index]:
+                    return ""
+                return str(current_node.input[state_input_index])
+
+            def control_flow_state_input_rank(output_index: int) -> int | None:
+                state_input_name = control_flow_state_input_name(output_index)
+                state_input_shape = known_value_shapes.get(state_input_name)
+                return (
+                    len(state_input_shape) if state_input_shape is not None else known_value_ranks.get(state_input_name)
+                )
 
             standard_control_flow_operator = (
                 is_registered_standard_operator
@@ -4770,8 +4798,18 @@ def _build_onnx_weight_analysis_plan(
                         )
                     )
                     if repeated_carried_state:
-                        graph_output_shape = None
-                        graph_output_rank = None
+                        state_input_name = control_flow_state_input_name(output_index)
+                        state_input_shape = known_value_shapes.get(state_input_name)
+                        state_input_rank = (
+                            len(state_input_shape)
+                            if state_input_shape is not None
+                            else known_value_ranks.get(state_input_name)
+                        )
+                        if graph_output_rank != state_input_rank:
+                            graph_output_shape = None
+                            graph_output_rank = None
+                        elif graph_output_shape != state_input_shape:
+                            graph_output_shape = None
                     merge_subgraph_output_rank(output_index, graph_output_shape, graph_output_rank)
                     subgraph_output_dynamic[output_index] |= graph_output_dynamic[graph_output_index]
                     subgraph_output_lineage_gap_counts[output_index] = _bounded_onnx_weight_lineage_gap_count(
@@ -4802,12 +4840,7 @@ def _build_onnx_weight_analysis_plan(
                             or (node.op_type == "Scan" and scan_may_repeat_body(node, constants, graph_input_names))
                         )
                     ):
-                        state_input_index = output_index + (2 if node.op_type == "Loop" else 0)
-                        state_input_name = (
-                            str(node.input[state_input_index])
-                            if state_input_index < len(node.input) and node.input[state_input_index]
-                            else ""
-                        )
+                        state_input_name = control_flow_state_input_name(output_index)
                         if gap_summary_may_exceed_input_rank(
                             graph_output_non_shape_gap_summary,
                             known_value_ranks.get(state_input_name),
@@ -4849,19 +4882,13 @@ def _build_onnx_weight_analysis_plan(
                             or (node.op_type == "Scan" and scan_may_repeat_body(node, constants, graph_input_names))
                         )
                     ):
-                        state_input_index = output_index + (2 if node.op_type == "Loop" else 0)
-                        state_input_name = (
-                            str(node.input[state_input_index])
-                            if state_input_index < len(node.input) and node.input[state_input_index]
-                            else ""
-                        )
                         state_rank_gap_summary = known_weight_gap_summary(
                             graph_output_rank_promotable_lineage_gap_summaries[graph_output_index],
                             graph_output_rank_promotable_gap_count,
                         )
                         if gap_summary_may_exceed_input_rank(
                             state_rank_gap_summary,
-                            known_value_ranks.get(state_input_name),
+                            control_flow_state_input_rank(output_index),
                         ):
                             repeated_state_weight_gap_summary = rank_gap_weight_summary_after_rank_increase(
                                 state_rank_gap_summary,

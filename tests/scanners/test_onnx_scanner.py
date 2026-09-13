@@ -6075,6 +6075,21 @@ class TestWeightDistributionSemantics:
         ]
 
     @staticmethod
+    def _capped_scalar_expression(count: int = 40) -> tuple[list[Any], list[Any], str]:
+        source_names = [f"W{index}" for index in range(count)]
+        initializers = [
+            onnx.numpy_helper.from_array(np.array(float(index), dtype=np.float32), name=name)
+            for index, name in enumerate(source_names)
+        ]
+        nodes = []
+        previous = source_names[0]
+        for index, name in enumerate(source_names[1:], 1):
+            output = f"summed{index}"
+            nodes.append(helper.make_node("Add", [previous, name], [output]))
+            previous = output
+        return nodes, initializers, previous
+
+    @staticmethod
     def _write_balanced_if_squeeze_model(
         tmp_path: Path,
         *,
@@ -6748,6 +6763,154 @@ class TestWeightDistributionSemantics:
         semantics = result.metadata["onnx_weight_distribution_semantics"]
         assert semantics["coverage_gaps"]
         assert semantics["analyzed_layer_count"] == 0
+
+    @pytest.mark.parametrize(
+        ("rank", "left_length", "right_length", "expect_gap"),
+        [(1, 4, 5, False), (2, 4, 5, True), (1, 4, 4, False), (2, 4, 4, True)],
+    )
+    def test_if_same_rank_outputs_with_unknown_dimensions_preserve_rank_boundary(
+        self,
+        tmp_path: Path,
+        rank: int,
+        left_length: int,
+        right_length: int,
+        expect_gap: bool,
+    ) -> None:
+        nodes, initializers, scalar = self._capped_scalar_expression()
+
+        def branch(length: int, input_name: str) -> Any:
+            shape = [length] if rank == 1 else [length, 1]
+            return helper.make_graph(
+                [helper.make_node("Identity", [input_name], ["branch_out"])],
+                f"{input_name}_branch",
+                [],
+                [helper.make_tensor_value_info("branch_out", TensorProto.FLOAT, shape)],
+            )
+
+        nodes.extend(
+            [
+                helper.make_node(
+                    "If",
+                    ["condition"],
+                    ["chosen"],
+                    then_branch=branch(left_length, "left"),
+                    else_branch=branch(right_length, "right"),
+                ),
+                helper.make_node("Add", ["chosen", scalar], ["weight"]),
+                helper.make_node("MatMul", ["X", "weight"], ["Y"]),
+            ]
+        )
+        graph = helper.make_graph(
+            nodes,
+            "if_same_rank_outputs_with_unknown_dimensions_preserve_rank_boundary",
+            [
+                helper.make_tensor_value_info("condition", TensorProto.BOOL, []),
+                helper.make_tensor_value_info(
+                    "left",
+                    TensorProto.FLOAT,
+                    [left_length] if rank == 1 else [left_length, 1],
+                ),
+                helper.make_tensor_value_info(
+                    "right",
+                    TensorProto.FLOAT,
+                    [right_length] if rank == 1 else [right_length, 1],
+                ),
+                helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, "width"]),
+            ],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1] if rank == 1 else [1, 1])],
+            initializer=initializers,
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        onnx.checker.check_model(model, full_check=True)
+        path = tmp_path / f"if-rank-{rank}-dims-{left_length}-{right_length}.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        if expect_gap:
+            assert result.success is False
+            assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
+            assert semantics["coverage_gaps"]["lineages_per_value_limit"] > 0
+            assert semantics["analyzed_layer_count"] == 0
+        else:
+            assert result.success is True
+            assert coverage == []
+            assert semantics["coverage_gaps"] == {}
+            assert semantics["eligible_initializer_count"] == 0
+
+    @pytest.mark.parametrize(("rank", "expect_gap"), [(1, False), (2, True)])
+    def test_loop_identity_preserves_stable_carried_state_rank_boundary(
+        self,
+        tmp_path: Path,
+        rank: int,
+        expect_gap: bool,
+    ) -> None:
+        nodes, initializers, scalar = self._capped_scalar_expression()
+        shape = [4] if rank == 1 else [4, 1]
+        initializers.extend(
+            [
+                onnx.numpy_helper.from_array(np.array(2, dtype=np.int64), name="trip"),
+                onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="condition"),
+            ]
+        )
+        body = helper.make_graph(
+            [
+                helper.make_node("Identity", ["body_condition"], ["next_condition"]),
+                helper.make_node("Identity", ["carried"], ["next_state"]),
+            ],
+            "rank_stable_loop_body",
+            [
+                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
+                helper.make_tensor_value_info("body_condition", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("carried", TensorProto.FLOAT, shape),
+            ],
+            [
+                helper.make_tensor_value_info("next_condition", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, shape),
+            ],
+        )
+        nodes.extend(
+            [
+                helper.make_node("Loop", ["trip", "condition", "runtime"], ["carried_out"], body=body),
+                helper.make_node("Add", ["carried_out", scalar], ["weight"]),
+                helper.make_node("MatMul", ["X", "weight"], ["Y"]),
+            ]
+        )
+        graph = helper.make_graph(
+            nodes,
+            "loop_identity_preserves_stable_carried_state_rank_boundary",
+            [
+                helper.make_tensor_value_info("runtime", TensorProto.FLOAT, shape),
+                helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 4]),
+            ],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1] if rank == 1 else [1, 1])],
+            initializer=initializers,
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        onnx.checker.check_model(model, full_check=True)
+        path = tmp_path / f"loop-identity-rank-{rank}.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        if expect_gap:
+            assert result.success is False
+            assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
+            assert semantics["coverage_gaps"]["lineages_per_value_limit"] > 0
+            assert semantics["analyzed_layer_count"] == 0
+        else:
+            assert result.success is True
+            assert coverage == []
+            assert semantics["coverage_gaps"] == {}
+            assert semantics["eligible_initializer_count"] == 0
 
     def test_scan_carried_state_repeated_rank_growth_promotes_deferred_gap(self, tmp_path: Path) -> None:
         source_names = [f"W{index}" for index in range(33)]
