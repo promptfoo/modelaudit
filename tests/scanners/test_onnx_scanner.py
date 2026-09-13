@@ -8666,6 +8666,182 @@ class TestWeightDistributionSemantics:
         assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
         assert any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
 
+    @pytest.mark.parametrize("transform", ["Concat", "Flatten", "Transpose"])
+    def test_function_transform_ref_attrs_preserve_scan_repeat_extent(self, tmp_path: Path, transform: str) -> None:
+        nodes, initializers, scalar = self._capped_scalar_expression()
+        body = helper.make_graph(
+            [
+                helper.make_node("Unsqueeze", ["state", "axes"], ["next_state"]),
+                helper.make_node("Identity", ["element"], ["next_element"]),
+            ],
+            "function_transform_ref_attr_scan_body",
+            [
+                helper.make_tensor_value_info("state", TensorProto.FLOAT, []),
+                helper.make_tensor_value_info("element", TensorProto.FLOAT, [1]),
+            ],
+            [
+                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, [1]),
+                helper.make_tensor_value_info("next_element", TensorProto.FLOAT, [1]),
+            ],
+            initializer=[onnx.numpy_helper.from_array(np.array([0], dtype=np.int64), name="axes")],
+        )
+        function_inputs = ["initial_state", "values", "X"]
+        function_nodes: list[Any]
+        function_attributes: list[str]
+        call_attributes: dict[str, Any]
+        graph_inputs = [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 1])]
+        scan_axes: list[int] | None = None
+        if transform == "Concat":
+            function_inputs.append("right_values")
+            concat_node = helper.make_node("Concat", ["values", "right_values"], ["scan_values"], axis=0)
+            concat_node.attribute[0].ref_attr_name = "axis"
+            function_nodes = [concat_node]
+            function_attributes = ["axis"]
+            call_attributes = {"axis": 1}
+            graph_inputs.extend(
+                [
+                    helper.make_tensor_value_info("values", TensorProto.FLOAT, [1, 1]),
+                    helper.make_tensor_value_info("right_values", TensorProto.FLOAT, [1, 1]),
+                ]
+            )
+            call_inputs = [scalar, "values", "X", "right_values"]
+            scan_axes = [1]
+        elif transform == "Flatten":
+            flatten_node = helper.make_node("Flatten", ["values"], ["scan_values"], axis=0)
+            flatten_node.attribute[0].ref_attr_name = "axis"
+            function_nodes = [flatten_node]
+            function_attributes = ["axis"]
+            call_attributes = {"axis": 2}
+            graph_inputs.append(helper.make_tensor_value_info("values", TensorProto.FLOAT, [2, 1, 1]))
+            call_inputs = [scalar, "values", "X"]
+        else:
+            transpose_node = helper.make_node("Transpose", ["values"], ["scan_values"])
+            perm_attribute = transpose_node.attribute.add()
+            perm_attribute.name = "perm"
+            perm_attribute.ref_attr_name = "perm"
+            perm_attribute.type = onnx.AttributeProto.INTS
+            function_nodes = [transpose_node]
+            function_attributes = ["perm"]
+            call_attributes = {"perm": [1, 0, 2]}
+            graph_inputs.append(helper.make_tensor_value_info("values", TensorProto.FLOAT, [1, 2, 1]))
+            call_inputs = [scalar, "values", "X"]
+
+        if scan_axes is None:
+            scan_node = helper.make_node(
+                "Scan",
+                ["initial_state", "scan_values"],
+                ["scan_state", "scan_output"],
+                body=body,
+                num_scan_inputs=1,
+            )
+        else:
+            scan_node = helper.make_node(
+                "Scan",
+                ["initial_state", "scan_values"],
+                ["scan_state", "scan_output"],
+                body=body,
+                num_scan_inputs=1,
+                scan_input_axes=scan_axes,
+            )
+        function_nodes.extend([scan_node, helper.make_node("MatMul", ["X", "scan_state"], ["function_output"])])
+        function = helper.make_function(
+            "local",
+            f"{transform}ThenScan",
+            function_inputs,
+            ["function_output"],
+            function_nodes,
+            opset_imports=[helper.make_opsetid("", 13)],
+            attributes=function_attributes,
+        )
+        nodes.append(
+            helper.make_node(
+                f"{transform}ThenScan",
+                call_inputs,
+                ["Y"],
+                domain="local",
+                **call_attributes,
+            )
+        )
+        graph = helper.make_graph(
+            nodes,
+            f"function_{transform.lower()}_ref_attr_preserves_scan_extent",
+            graph_inputs,
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 1])],
+            initializer=initializers,
+        )
+        model = helper.make_model(
+            graph,
+            functions=[function],
+            opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
+        )
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / f"function-{transform.lower()}-ref-attr-scan-extent.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        assert result.success is False
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
+        assert any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
+
+    def test_function_squeeze_ref_attr_axes_preserves_matrix_rank(self, tmp_path: Path) -> None:
+        nodes, initializers, scalar = self._capped_scalar_expression()
+        squeeze_node = helper.make_node("Squeeze", ["values"], ["runtime_matrix"])
+        axes_attribute = squeeze_node.attribute.add()
+        axes_attribute.name = "axes"
+        axes_attribute.ref_attr_name = "axes"
+        axes_attribute.type = onnx.AttributeProto.INTS
+        function = helper.make_function(
+            "local",
+            "SqueezeThenMatMul",
+            ["scalar", "values", "X"],
+            ["function_output"],
+            [
+                squeeze_node,
+                helper.make_node("Add", ["runtime_matrix", "scalar"], ["generated_weight"]),
+                helper.make_node("MatMul", ["X", "generated_weight"], ["function_output"]),
+            ],
+            opset_imports=[helper.make_opsetid("", 12)],
+            attributes=["axes"],
+        )
+        nodes.append(
+            helper.make_node(
+                "SqueezeThenMatMul",
+                [scalar, "values", "X"],
+                ["Y"],
+                domain="local",
+                axes=[0],
+            )
+        )
+        graph = helper.make_graph(
+            nodes,
+            "function_squeeze_ref_attr_axes_preserves_matrix_rank",
+            [
+                helper.make_tensor_value_info("values", TensorProto.FLOAT, [1, 1, 4]),
+                helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 1]),
+            ],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 4])],
+            initializer=initializers,
+        )
+        model = helper.make_model(
+            graph,
+            functions=[function],
+            opset_imports=[helper.make_opsetid("", 12), helper.make_opsetid("local", 1)],
+        )
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / "function-squeeze-ref-attr-axes-matrix-rank.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        assert result.success is False
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
+        assert any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
+
     def test_function_runtime_input_rank_overrides_stale_call_output_annotation(self, tmp_path: Path) -> None:
         shape_names = [f"shape_source{index}" for index in range(32)]
         initializers = [onnx.numpy_helper.from_array(np.array([], dtype=np.int64), name=name) for name in shape_names]

@@ -316,7 +316,12 @@ def _onnx_int_sequence_attribute(node: Any, name: str) -> tuple[int, ...] | None
     return None
 
 
-def _onnx_concat_output_shape(node: Any, input_shapes: Iterable[tuple[int, ...] | None]) -> tuple[int, ...] | None:
+def _onnx_concat_output_shape(
+    node: Any,
+    input_shapes: Iterable[tuple[int, ...] | None],
+    *,
+    axis: int | None = None,
+) -> tuple[int, ...] | None:
     shapes = list(input_shapes)
     if not shapes or any(shape is None for shape in shapes):
         return None
@@ -325,7 +330,7 @@ def _onnx_concat_output_shape(node: Any, input_shapes: Iterable[tuple[int, ...] 
     if len(ranks) != 1:
         return None
     rank = next(iter(ranks))
-    axis = _onnx_int_attribute(node, "axis", 0)
+    axis = _onnx_int_attribute(node, "axis", 0) if axis is None else axis
     axis = axis if axis >= 0 else rank + axis
     if axis < 0 or axis >= rank:
         return None
@@ -1629,10 +1634,19 @@ def _resolve_onnx_reshape_shape(
     return tuple(normalized)
 
 
-def _resolve_onnx_axes(node: Any, constants: dict[str, Any], *, onnx: Any) -> tuple[int, ...] | None:
+def _resolve_onnx_axes(
+    node: Any,
+    constants: dict[str, Any],
+    *,
+    onnx: Any,
+    resolve_attribute: Callable[[Any], Any | None] | None = None,
+) -> tuple[int, ...] | None:
     for attribute in getattr(node, "attribute", ()):
         if attribute.name == "axes":
-            return tuple(int(value) for value in attribute.ints)
+            resolved_attribute = resolve_attribute(attribute) if resolve_attribute is not None else attribute
+            if resolved_attribute is None:
+                return None
+            return tuple(int(value) for value in getattr(resolved_attribute, "ints", ()))
     if len(getattr(node, "input", ())) < 2:
         return ()
 
@@ -1985,8 +1999,19 @@ def _build_onnx_weight_analysis_plan(
         except (AttributeError, TypeError, ValueError):
             return None
 
-    def squeeze_with_empty_axes_is_noop(node: Any, axes: tuple[int, ...]) -> bool:
-        return node.op_type == "Squeeze" and not axes and bool(_onnx_int_attribute(node, "noop_with_empty_axes"))
+    def squeeze_with_empty_axes_is_noop(
+        node: Any,
+        axes: tuple[int, ...],
+        resolve_attribute: Callable[[Any], Any | None] | None = None,
+    ) -> bool:
+        noop_value = 0
+        for attribute in getattr(node, "attribute", ()):
+            if attribute.name != "noop_with_empty_axes":
+                continue
+            resolved_attribute = resolve_attribute(attribute) if resolve_attribute is not None else attribute
+            noop_value = int(getattr(resolved_attribute, "i", 0)) if resolved_attribute is not None else 0
+            break
+        return node.op_type == "Squeeze" and not axes and bool(noop_value)
 
     def gathernd_output_shape(
         node: Any,
@@ -3395,6 +3420,14 @@ def _build_onnx_weight_analysis_plan(
         def resolve_attribute(attribute: Any) -> Any | None:
             reference_name = str(getattr(attribute, "ref_attr_name", ""))
             return attribute_bindings.get(reference_name) if reference_name else attribute
+
+        def resolved_int_attribute(node: Any, name: str, default: int = 0) -> int:
+            for attribute in getattr(node, "attribute", []):
+                if attribute.name != name:
+                    continue
+                resolved_attribute = resolve_attribute(attribute)
+                return int(getattr(resolved_attribute, "i", default)) if resolved_attribute is not None else default
+            return default
 
         def resolved_int_sequence_attribute(node: Any, name: str) -> tuple[int, ...] | None:
             for attribute in getattr(node, "attribute", []):
@@ -5237,6 +5270,7 @@ def _build_onnx_weight_analysis_plan(
                     elementwise_output_shape = _onnx_concat_output_shape(
                         node,
                         (known_value_shapes.get(input_name) for input_name in input_names),
+                        axis=resolved_int_attribute(node, "axis", 0),
                     )
                     elementwise_output_rank_proven = all(
                         not value_lineages.get(input_name) or input_name in proven_value_ranks
@@ -5272,21 +5306,21 @@ def _build_onnx_weight_analysis_plan(
                 elif node.op_type == "Transpose":
                     transform_output_rank_proven = transform_input_rank_proven
                     if transform_input_shape is not None:
-                        permutation = _onnx_int_sequence_attribute(node, "perm") or tuple(
+                        permutation = resolved_int_sequence_attribute(node, "perm") or tuple(
                             reversed(range(len(transform_input_shape)))
                         )
                         if sorted(permutation) == list(range(len(transform_input_shape))):
                             transform_output_shape = tuple(transform_input_shape[index] for index in permutation)
                             transform_output_rank = len(transform_output_shape)
                     elif transform_input_rank is not None:
-                        permutation = _onnx_int_sequence_attribute(node, "perm") or tuple(
+                        permutation = resolved_int_sequence_attribute(node, "perm") or tuple(
                             reversed(range(transform_input_rank))
                         )
                         if sorted(permutation) == list(range(transform_input_rank)):
                             transform_output_rank = transform_input_rank
                 elif node.op_type == "Flatten" and transform_input_rank is not None:
                     transform_output_rank_proven = transform_input_rank_proven
-                    axis = _onnx_int_attribute(node, "axis", 1)
+                    axis = resolved_int_attribute(node, "axis", 1)
                     axis = axis if axis >= 0 else transform_input_rank + axis
                     if 0 <= axis <= transform_input_rank:
                         transform_output_rank = 2
@@ -5303,7 +5337,7 @@ def _build_onnx_weight_analysis_plan(
                         and all(value >= -1 for value in target_shape)
                         and target_shape.count(-1) <= 1
                         and not (
-                            bool(_onnx_int_attribute(node, "allowzero")) and -1 in target_shape and 0 in target_shape
+                            bool(resolved_int_attribute(node, "allowzero")) and -1 in target_shape and 0 in target_shape
                         )
                     ):
                         transform_output_rank = len(target_shape)
@@ -5311,17 +5345,17 @@ def _build_onnx_weight_analysis_plan(
                             transform_output_shape = _resolve_onnx_reshape_shape(
                                 transform_input_shape,
                                 shape_initializer,
-                                allowzero=bool(_onnx_int_attribute(node, "allowzero")),
+                                allowzero=bool(resolved_int_attribute(node, "allowzero")),
                                 onnx=onnx,
                             )
                             if transform_output_shape is None:
                                 transform_output_rank = None
                 elif node.op_type == "Squeeze" and transform_input_rank is not None:
                     transform_output_rank_proven = transform_input_rank_proven
-                    axes = _resolve_onnx_axes(node, constants, onnx=onnx)
+                    axes = _resolve_onnx_axes(node, constants, onnx=onnx, resolve_attribute=resolve_attribute)
                     if axes is not None:
                         if not axes:
-                            if squeeze_with_empty_axes_is_noop(node, axes):
+                            if squeeze_with_empty_axes_is_noop(node, axes, resolve_attribute):
                                 transform_output_shape = transform_input_shape
                                 transform_output_rank = (
                                     len(transform_output_shape)
@@ -5350,7 +5384,7 @@ def _build_onnx_weight_analysis_plan(
                                     )
                 elif node.op_type == "Unsqueeze" and transform_input_rank is not None:
                     transform_output_rank_proven = transform_input_rank_proven
-                    axes = _resolve_onnx_axes(node, constants, onnx=onnx)
+                    axes = _resolve_onnx_axes(node, constants, onnx=onnx, resolve_attribute=resolve_attribute)
                     if axes is not None:
                         output_rank = transform_input_rank + len(axes)
                         normalized_axes = tuple(axis if axis >= 0 else output_rank + axis for axis in axes)
