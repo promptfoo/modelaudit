@@ -1986,7 +1986,10 @@ def _build_onnx_weight_analysis_plan(
         known_shapes: dict[str, tuple[int, ...]],
         value_name: str,
         trusted_shape_names: set[str],
+        untrusted_shape_names: set[str] | None = None,
     ) -> tuple[int, ...] | None:
+        if value_name in (untrusted_shape_names or set()):
+            return None
         initializer_shape = constant_initializer_shape(constants, value_name)
         if initializer_shape is not None:
             return initializer_shape
@@ -1998,6 +2001,11 @@ def _build_onnx_weight_analysis_plan(
         node: Any,
         constants: dict[str, Any],
         graph_input_names: set[str],
+        known_shapes: dict[str, tuple[int, ...]] | None = None,
+        trusted_shape_names: set[str] | None = None,
+        untrusted_shape_names: set[str] | None = None,
+        *,
+        scan_input_axes: tuple[int, ...] | None = None,
     ) -> bool:
         num_scan_inputs = _onnx_int_attribute(node, "num_scan_inputs", 1)
         if num_scan_inputs <= 0:
@@ -2006,11 +2014,15 @@ def _build_onnx_weight_analysis_plan(
         scan_inputs = [str(input_name) for input_name in node.input[scan_input_start:] if input_name]
         if len(scan_inputs) < num_scan_inputs:
             return True
-        scan_input_axes = _onnx_int_sequence_attribute(node, "scan_input_axes") or ()
+        scan_input_axes = (
+            scan_input_axes
+            if scan_input_axes is not None
+            else _onnx_int_sequence_attribute(node, "scan_input_axes") or ()
+        )
+        known_shapes = known_shapes or {}
+        trusted_shape_names = trusted_shape_names or set()
         for input_index, scan_input in enumerate(scan_inputs):
-            if scan_input in graph_input_names:
-                return True
-            shape = constant_initializer_shape(constants, scan_input)
+            shape = scan_input_shape(constants, known_shapes, scan_input, trusted_shape_names, untrusted_shape_names)
             if not shape:
                 return True
             raw_axis = scan_input_axes[input_index] if input_index < len(scan_input_axes) else 0
@@ -2027,6 +2039,9 @@ def _build_onnx_weight_analysis_plan(
         graph_input_names: set[str],
         known_shapes: dict[str, tuple[int, ...]] | None = None,
         trusted_shape_names: set[str] | None = None,
+        untrusted_shape_names: set[str] | None = None,
+        *,
+        scan_input_axes: tuple[int, ...] | None = None,
     ) -> bool:
         num_scan_inputs = _onnx_int_attribute(node, "num_scan_inputs", 1)
         if num_scan_inputs <= 0:
@@ -2036,10 +2051,14 @@ def _build_onnx_weight_analysis_plan(
         scan_inputs = [str(input_name) for input_name in node.input[scan_input_start:] if input_name]
         if len(scan_inputs) < num_scan_inputs:
             return True
-        scan_input_axes = _onnx_int_sequence_attribute(node, "scan_input_axes") or ()
+        scan_input_axes = (
+            scan_input_axes
+            if scan_input_axes is not None
+            else _onnx_int_sequence_attribute(node, "scan_input_axes") or ()
+        )
         trusted_shape_names = trusted_shape_names or set()
         for input_index, scan_input in enumerate(scan_inputs):
-            shape = scan_input_shape(constants, known_shapes, scan_input, trusted_shape_names)
+            shape = scan_input_shape(constants, known_shapes, scan_input, trusted_shape_names, untrusted_shape_names)
             if not shape:
                 return True
             raw_axis = scan_input_axes[input_index] if input_index < len(scan_input_axes) else 0
@@ -3150,6 +3169,7 @@ def _build_onnx_weight_analysis_plan(
         bound_value_shapes: dict[str, tuple[int, ...]] | None = None,
         bound_value_ranks: dict[str, int] | None = None,
         bound_unknown_value_ranks: set[str] | None = None,
+        bound_proven_value_ranks: set[str] | None = None,
         bound_attributes: dict[str, Any] | None = None,
         bound_attribute_keys: dict[str, tuple[Any, ...]] | None = None,
         function_depth: int = 0,
@@ -3260,6 +3280,7 @@ def _build_onnx_weight_analysis_plan(
         )
         attribute_bindings = bound_attributes or {}
         attribute_binding_keys = bound_attribute_keys or {}
+        bound_proven_ranks = bound_proven_value_ranks or set()
         graph_input_names = {
             name for value_info in getattr(current_graph, "input", ()) if (name := _onnx_value_name(value_info))
         }
@@ -3328,10 +3349,10 @@ def _build_onnx_weight_analysis_plan(
             elif name and (rank := value_info_rank(value_info)) is not None:
                 set_known_value_rank(name, rank, proven=declared_root_input)
         for name, shape in (bound_value_shapes or {}).items():
-            set_known_value_shape(name, shape, proven=True)
+            set_known_value_shape(name, shape, proven=name in bound_proven_ranks)
         for name, rank in (bound_value_ranks or {}).items():
             if name not in known_value_shapes:
-                set_known_value_rank(name, rank, proven=True)
+                set_known_value_rank(name, rank, proven=name in bound_proven_ranks)
         for name in bound_unknown_value_ranks or set():
             clear_known_value_rank(name)
         for name, lineages in value_lineages.items():
@@ -3364,6 +3385,16 @@ def _build_onnx_weight_analysis_plan(
         def resolve_attribute(attribute: Any) -> Any | None:
             reference_name = str(getattr(attribute, "ref_attr_name", ""))
             return attribute_bindings.get(reference_name) if reference_name else attribute
+
+        def resolved_int_sequence_attribute(node: Any, name: str) -> tuple[int, ...] | None:
+            for attribute in getattr(node, "attribute", []):
+                if attribute.name != name:
+                    continue
+                resolved_attribute = resolve_attribute(attribute)
+                if resolved_attribute is None:
+                    return None
+                return tuple(int(value) for value in getattr(resolved_attribute, "ints", ()))
+            return None
 
         def attribute_source_key(
             attribute: Any,
@@ -3405,7 +3436,8 @@ def _build_onnx_weight_analysis_plan(
                 value_lineages[name] = {lineage.initializer_index: lineage}
                 dynamic_values.discard(name)
                 clear_value_gap_state(name)
-                set_known_value_shape(name, lineage.shape or (), proven=True)
+                if name not in graph_input_names:
+                    set_known_value_shape(name, lineage.shape or (), proven=True)
 
         for graph_input in getattr(current_graph, "input", ()):
             name = _onnx_value_name(graph_input)
@@ -3885,6 +3917,7 @@ def _build_onnx_weight_analysis_plan(
                     subgraph_bound_value_shapes: dict[str, tuple[int, ...]] = {}
                     subgraph_bound_value_ranks: dict[str, int] = {}
                     subgraph_bound_unknown_value_ranks: set[str] = set()
+                    subgraph_bound_proven_value_ranks: set[str] = set()
                     subgraph_input_names = {
                         name for value_info in getattr(subgraph, "input", ()) if (name := _onnx_value_name(value_info))
                     }
@@ -3896,7 +3929,7 @@ def _build_onnx_weight_analysis_plan(
                     elif node.op_type == "Scan":
                         num_scan_inputs = _onnx_int_attribute(node, "num_scan_inputs", 1)
                         scan_input_start = max(len(node.input) - max(num_scan_inputs, 0), 0)
-                        scan_input_axes = _onnx_int_sequence_attribute(node, "scan_input_axes") or ()
+                        scan_input_axes = resolved_int_sequence_attribute(node, "scan_input_axes") or ()
                         input_pairs = zip(node.input, subgraph.input, strict=False)
                     else:
                         input_pairs = ()
@@ -3924,10 +3957,14 @@ def _build_onnx_weight_analysis_plan(
                         if parent_name in known_value_shapes:
                             if parent_shape is not None:
                                 subgraph_bound_value_shapes[graph_input_name] = parent_shape
+                                if parent_name in proven_value_ranks:
+                                    subgraph_bound_proven_value_ranks.add(graph_input_name)
                             else:
                                 subgraph_bound_unknown_value_ranks.add(graph_input_name)
                         elif parent_rank is not None:
                             subgraph_bound_value_ranks[graph_input_name] = parent_rank
+                            if parent_name in proven_value_ranks:
+                                subgraph_bound_proven_value_ranks.add(graph_input_name)
                         elif parent_name in dynamic_values or parent_name not in constants:
                             subgraph_bound_unknown_value_ranks.add(graph_input_name)
                         if parent_name in value_lineage_limit_gap_counts:
@@ -3963,8 +4000,12 @@ def _build_onnx_weight_analysis_plan(
                             continue
                         if captured_name in known_value_shapes and captured_name not in subgraph_bound_value_shapes:
                             subgraph_bound_value_shapes[captured_name] = known_value_shapes[captured_name]
+                            if captured_name in proven_value_ranks:
+                                subgraph_bound_proven_value_ranks.add(captured_name)
                         elif captured_name in known_value_ranks and captured_name not in subgraph_bound_value_ranks:
                             subgraph_bound_value_ranks[captured_name] = known_value_ranks[captured_name]
+                            if captured_name in proven_value_ranks:
+                                subgraph_bound_proven_value_ranks.add(captured_name)
                     subgraph_results.append(
                         walk_graph(
                             subgraph,
@@ -4006,6 +4047,7 @@ def _build_onnx_weight_analysis_plan(
                             bound_value_shapes=subgraph_bound_value_shapes,
                             bound_value_ranks=subgraph_bound_value_ranks,
                             bound_unknown_value_ranks=subgraph_bound_unknown_value_ranks,
+                            bound_proven_value_ranks=subgraph_bound_proven_value_ranks,
                             bound_attributes=attribute_bindings,
                             bound_attribute_keys=attribute_binding_keys,
                             function_depth=function_depth,
@@ -4829,11 +4871,17 @@ def _build_onnx_weight_analysis_plan(
                 and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
             )
             scan_output_axes = (
-                _onnx_int_sequence_attribute(node, "scan_output_axes") or ()
+                resolved_int_sequence_attribute(node, "scan_output_axes") or ()
                 if standard_control_flow_operator and node.op_type == "Scan"
                 else ()
             )
-            trusted_scan_shape_names = graph_input_names | proven_value_ranks
+            resolved_scan_input_axes = (
+                resolved_int_sequence_attribute(node, "scan_input_axes") or ()
+                if standard_control_flow_operator and node.op_type == "Scan"
+                else ()
+            )
+            trusted_scan_shape_names = proven_value_ranks
+            untrusted_scan_shape_names = graph_input_names & set(value_lineages)
             subgraph_output_offset = 1 if standard_control_flow_operator and node.op_type == "Loop" else 0
             for (
                 graph_output_lineages,
@@ -4893,6 +4941,8 @@ def _build_onnx_weight_analysis_plan(
                                     graph_input_names,
                                     known_value_shapes,
                                     trusted_scan_shape_names,
+                                    untrusted_scan_shape_names,
+                                    scan_input_axes=resolved_scan_input_axes,
                                 )
                             )
                         )
@@ -4945,6 +4995,8 @@ def _build_onnx_weight_analysis_plan(
                                     graph_input_names,
                                     known_value_shapes,
                                     trusted_scan_shape_names,
+                                    untrusted_scan_shape_names,
+                                    scan_input_axes=resolved_scan_input_axes,
                                 )
                             )
                         )
@@ -4996,6 +5048,8 @@ def _build_onnx_weight_analysis_plan(
                                     graph_input_names,
                                     known_value_shapes,
                                     trusted_scan_shape_names,
+                                    untrusted_scan_shape_names,
+                                    scan_input_axes=resolved_scan_input_axes,
                                 )
                             )
                         )
@@ -5106,7 +5160,15 @@ def _build_onnx_weight_analysis_plan(
             if (
                 standard_control_flow_operator
                 and node.op_type == "Scan"
-                and scan_may_skip_body(node, constants, graph_input_names)
+                and scan_may_skip_body(
+                    node,
+                    constants,
+                    graph_input_names,
+                    known_value_shapes,
+                    trusted_scan_shape_names,
+                    untrusted_scan_shape_names,
+                    scan_input_axes=resolved_scan_input_axes,
+                )
             ):
                 num_scan_inputs = _onnx_int_attribute(node, "num_scan_inputs", 1)
                 scan_state_input_count = max(len(node.input) - max(num_scan_inputs, 0), 0)

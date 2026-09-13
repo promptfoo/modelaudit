@@ -7785,6 +7785,122 @@ class TestWeightDistributionSemantics:
         assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
         assert any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
 
+    def test_overridable_sparse_scan_input_preserves_initial_state_gap(self, tmp_path: Path) -> None:
+        nodes, initializers, scalar = self._capped_scalar_expression()
+        initializers.extend(
+            [
+                onnx.numpy_helper.from_array(np.array(0.0, dtype=np.float32), name="initial_state"),
+                onnx.numpy_helper.from_array(np.array([0], dtype=np.int64), name="axes"),
+            ]
+        )
+        sparse_values = helper.make_tensor("scan_input", TensorProto.FLOAT, [1], [0.0])
+        sparse_indices = helper.make_tensor("scan_indices", TensorProto.INT64, [1], [0])
+        sparse_scan_input = helper.make_sparse_tensor(sparse_values, sparse_indices, [1])
+        body = helper.make_graph(
+            [
+                helper.make_node("Add", ["state", scalar], ["mixed"]),
+                helper.make_node("Unsqueeze", ["mixed", "axes"], ["next_state"]),
+                helper.make_node("Identity", ["element"], ["next_element"]),
+            ],
+            "overridable_sparse_scan_body",
+            [
+                helper.make_tensor_value_info("state", TensorProto.FLOAT, []),
+                helper.make_tensor_value_info("element", TensorProto.FLOAT, []),
+            ],
+            [
+                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, [1]),
+                helper.make_tensor_value_info("next_element", TensorProto.FLOAT, []),
+            ],
+        )
+        nodes.extend(
+            [
+                helper.make_node(
+                    "Scan",
+                    ["initial_state", "scan_input"],
+                    ["scan_state", "scan_output"],
+                    body=body,
+                    num_scan_inputs=1,
+                ),
+                helper.make_node("MatMul", ["X", "scan_state"], ["Y"]),
+            ]
+        )
+        graph = helper.make_graph(
+            nodes,
+            "overridable_sparse_scan_input_preserves_initial_state_gap",
+            [
+                helper.make_tensor_value_info("scan_input", TensorProto.FLOAT, [None]),
+                helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 1]),
+            ],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1])],
+            initializer=initializers,
+            sparse_initializer=[sparse_scan_input],
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / "overridable-sparse-scan-input-gap.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        assert result.success is False
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
+        assert any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
+
+    def test_fixed_graph_scan_extent_omits_impossible_skip_gap(self, tmp_path: Path) -> None:
+        source_names = [f"matrix_source{index}" for index in range(40)]
+        body = helper.make_graph(
+            [
+                helper.make_node("Identity", ["clean_weight"], ["next_state"]),
+                helper.make_node("Identity", ["element"], ["next_element"]),
+            ],
+            "fixed_scan_extent_body",
+            [
+                helper.make_tensor_value_info("state", TensorProto.FLOAT, [4, 4]),
+                helper.make_tensor_value_info("element", TensorProto.FLOAT, [1]),
+            ],
+            [
+                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, [4, 4]),
+                helper.make_tensor_value_info("next_element", TensorProto.FLOAT, [1]),
+            ],
+        )
+        graph = helper.make_graph(
+            [
+                helper.make_node("Sum", source_names, ["capped"]),
+                helper.make_node(
+                    "Scan",
+                    ["capped", "scan_input"],
+                    ["scan_state", "scan_output"],
+                    body=body,
+                    num_scan_inputs=1,
+                ),
+                helper.make_node("MatMul", ["X", "scan_state"], ["Y"]),
+            ],
+            "fixed_graph_scan_extent_omits_impossible_skip_gap",
+            [
+                helper.make_tensor_value_info("scan_input", TensorProto.FLOAT, [1, 1]),
+                helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 4]),
+            ],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 4])],
+            initializer=[
+                *[onnx.numpy_helper.from_array(np.zeros((4, 4), dtype=np.float32), name=name) for name in source_names],
+                onnx.numpy_helper.from_array(np.zeros((4, 4), dtype=np.float32), name="clean_weight"),
+            ],
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / "fixed-graph-scan-extent-no-skip-gap.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        assert result.success is True
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["coverage_gaps"] == {}
+        assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
+
     def test_computed_empty_scan_input_ignores_stale_value_info(self, tmp_path: Path) -> None:
         source_names = [f"matrix_source{index}" for index in range(40)]
         body = helper.make_graph(
@@ -8379,6 +8495,83 @@ class TestWeightDistributionSemantics:
         assert semantics["coverage_gaps"]["unresolved_initializer_lineage"] >= 1
         assert semantics["unresolved_lineage_samples"][0]["reason"] == "dtype_changing_cast_lineage"
         assert semantics["analyzed_layer_count"] == 0
+
+    def test_function_scan_ref_attr_input_axes_bounds_repeats(self, tmp_path: Path) -> None:
+        nodes, initializers, scalar = self._capped_scalar_expression()
+        body = helper.make_graph(
+            [
+                helper.make_node("Unsqueeze", ["state", "axes"], ["next_state"]),
+                helper.make_node("Identity", ["element"], ["next_element"]),
+            ],
+            "function_scan_ref_axis_body",
+            [
+                helper.make_tensor_value_info("state", TensorProto.FLOAT, []),
+                helper.make_tensor_value_info("element", TensorProto.FLOAT, [1]),
+            ],
+            [
+                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, [1]),
+                helper.make_tensor_value_info("next_element", TensorProto.FLOAT, [1]),
+            ],
+            initializer=[onnx.numpy_helper.from_array(np.array([0], dtype=np.int64), name="axes")],
+        )
+        scan_node = helper.make_node(
+            "Scan",
+            ["initial_state", "scan_values"],
+            ["scan_state", "scan_output"],
+            body=body,
+            num_scan_inputs=1,
+        )
+        scan_axis_attribute = scan_node.attribute.add()
+        scan_axis_attribute.name = "scan_input_axes"
+        scan_axis_attribute.ref_attr_name = "axis"
+        scan_axis_attribute.type = onnx.AttributeProto.INTS
+        function = helper.make_function(
+            "local",
+            "ScanWithAxis",
+            ["initial_state", "scan_values"],
+            ["scan_state"],
+            [scan_node],
+            opset_imports=[helper.make_opsetid("", 13)],
+            attributes=["axis"],
+        )
+        nodes.extend(
+            [
+                helper.make_node(
+                    "ScanWithAxis",
+                    [scalar, "scan_values"],
+                    ["scan_state"],
+                    domain="local",
+                    axis=[1],
+                ),
+                helper.make_node("MatMul", ["X", "scan_state"], ["Y"]),
+            ]
+        )
+        graph = helper.make_graph(
+            nodes,
+            "function_scan_ref_attr_input_axes_bounds_repeats",
+            [
+                helper.make_tensor_value_info("scan_values", TensorProto.FLOAT, [1, 2]),
+                helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 1]),
+            ],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 1])],
+            initializer=initializers,
+        )
+        model = helper.make_model(
+            graph,
+            functions=[function],
+            opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
+        )
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / "function-scan-ref-attr-input-axis-gap.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        assert result.success is False
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
+        assert any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
 
     def test_function_runtime_input_rank_overrides_stale_call_output_annotation(self, tmp_path: Path) -> None:
         shape_names = [f"shape_source{index}" for index in range(32)]
