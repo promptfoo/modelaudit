@@ -7789,6 +7789,79 @@ class TestWeightDistributionSemantics:
         assert semantics["coverage_gaps"] == {}
         assert semantics["eligible_initializer_count"] == 0
 
+    @pytest.mark.parametrize(
+        ("op_type", "runtime_dims", "control_values", "x_dims", "y_dims", "expect_gap"),
+        [
+            ("Unsqueeze", [], [0], [1], [], False),
+            ("Unsqueeze", [4], [0], [1, 1], [1, 4], True),
+            ("Reshape", [4], [4], [1, 4], [1], False),
+            ("Reshape", [4], [1, 4], [1, 1], [1, 4], True),
+        ],
+    )
+    def test_runtime_rank_transform_alias_preserves_broadcast_rank_for_deferred_scalar_gap(
+        self,
+        tmp_path: Path,
+        op_type: str,
+        runtime_dims: list[int],
+        control_values: list[int],
+        x_dims: list[int],
+        y_dims: list[int],
+        expect_gap: bool,
+    ) -> None:
+        shape_names = [f"shape_source{index}" for index in range(32)]
+        initializers = [onnx.numpy_helper.from_array(np.array([], dtype=np.int64), name=name) for name in shape_names]
+        initializers.extend(
+            [
+                onnx.numpy_helper.from_array(np.array(1.0, dtype=np.float32), name="W"),
+                onnx.numpy_helper.from_array(np.array(control_values, dtype=np.int64), name="rank_control"),
+            ]
+        )
+        nodes = []
+        previous = "W"
+        for index, shape_name in enumerate(shape_names):
+            reshaped = f"reshaped{index}"
+            nodes.append(helper.make_node("Reshape", [previous, shape_name], [reshaped]))
+            previous = reshaped
+        nodes.extend(
+            [
+                helper.make_node(op_type, ["runtime_weight", "rank_control"], ["runtime_alias"]),
+                helper.make_node("Add", ["runtime_alias", previous], ["generated_weight"]),
+                helper.make_node("MatMul", ["X", "generated_weight"], ["Y"]),
+            ]
+        )
+        graph = helper.make_graph(
+            nodes,
+            f"{op_type.lower()}_runtime_rank_transform_alias_preserves_broadcast_rank",
+            [
+                helper.make_tensor_value_info("runtime_weight", TensorProto.FLOAT, runtime_dims),
+                helper.make_tensor_value_info("X", TensorProto.FLOAT, x_dims),
+            ],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, y_dims)],
+            initializer=initializers,
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        onnx.checker.check_model(model, full_check=True)
+        path = tmp_path / f"{op_type.lower()}-runtime-rank-transform-broadcast-rank-{len(runtime_dims)}.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        if expect_gap:
+            assert result.success is False
+            assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
+            assert semantics["coverage_gaps"]["lineages_per_value_limit"] > 0
+            assert semantics["analyzed_layer_count"] == 0
+        else:
+            assert result.success is True
+            assert self._extreme_checks(result) == []
+            assert coverage == []
+            assert semantics["coverage_gaps"] == {}
+            assert semantics["eligible_initializer_count"] == 0
+
     def test_broadcast_promotion_adds_to_existing_weight_gap_count(self, tmp_path: Path) -> None:
         retained_vector_names = [f"retained_vector{index}" for index in range(32)]
         dropped_matrix_names = [f"dropped_matrix{index}" for index in range(8)]

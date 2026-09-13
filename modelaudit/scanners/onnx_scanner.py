@@ -4569,6 +4569,27 @@ def _build_onnx_weight_analysis_plan(
                                 math.prod(transform_input_shape[:axis]),
                                 math.prod(transform_input_shape[axis:]),
                             )
+                elif node.op_type == "Reshape" and len(input_names) > 1 and input_names[0] not in value_lineages:
+                    shape_initializer = constants.get(input_names[1])
+                    target_shape = constant_int64_vector_values(shape_initializer)
+                    if (
+                        target_shape is not None
+                        and all(value >= -1 for value in target_shape)
+                        and target_shape.count(-1) <= 1
+                        and not (
+                            bool(_onnx_int_attribute(node, "allowzero")) and -1 in target_shape and 0 in target_shape
+                        )
+                    ):
+                        transform_output_rank = len(target_shape)
+                        if transform_input_shape is not None and shape_initializer is not None:
+                            transform_output_shape = _resolve_onnx_reshape_shape(
+                                transform_input_shape,
+                                shape_initializer,
+                                allowzero=bool(_onnx_int_attribute(node, "allowzero")),
+                                onnx=onnx,
+                            )
+                            if transform_output_shape is None:
+                                transform_output_rank = None
                 elif node.op_type == "Unsqueeze" and transform_input_rank is not None:
                     axes = _resolve_onnx_axes(node, constants, onnx=onnx)
                     if axes is not None:
