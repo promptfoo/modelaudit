@@ -2672,6 +2672,18 @@ def _build_onnx_weight_analysis_plan(
     ) -> _OnnxWeightLineageGapSummary:
         return transform_lineage_gap_summary(summary, node, constants, lineage_could_be_weight)
 
+    def transform_non_shape_gap_summary(
+        summary: _OnnxWeightLineageGapSummary,
+        node: Any,
+        constants: dict[str, Any],
+    ) -> _OnnxWeightLineageGapSummary:
+        return transform_lineage_gap_summary(
+            summary,
+            node,
+            constants,
+            lambda lineage: lineage.unresolved_reason != "shape_control_lineage",
+        )
+
     def transform_rank_promotable_gap_summary(
         summary: _OnnxWeightLineageGapSummary,
         node: Any,
@@ -3941,6 +3953,7 @@ def _build_onnx_weight_analysis_plan(
                 output_rank_promotable_lineage_gap_summary = empty_weight_gap_summary
             pre_promotion_weight_lineage_limit_gap_count = all_input_output_weight_lineage_limit_gap_count
             pre_promotion_weight_lineage_gap_summary = all_input_output_weight_lineage_gap_summary
+            transformed_input_output_non_shape_lineage_gap_summary = all_input_non_shape_lineage_gap_summary
             transformed_input_output_weight_lineage_gap_summary = all_input_output_weight_lineage_gap_summary
             transformed_input_output_rank_promotable_lineage_gap_summary = (
                 all_input_output_rank_promotable_lineage_gap_summary
@@ -3949,7 +3962,7 @@ def _build_onnx_weight_analysis_plan(
             promoted_rank_lineage_limit_gap_count = 0
             promoted_rank_lineage_gap_summary = empty_weight_gap_summary
             rank_gap_control_input_is_overridable = (
-                node.op_type in {"GatherND", "Reshape", "Squeeze", "Unsqueeze"}
+                node.op_type in {"Expand", "Gather", "GatherND", "Reshape", "Squeeze", "Unsqueeze"}
                 and len(node.input) > 1
                 and str(node.input[1]) in graph_input_names
             )
@@ -4121,6 +4134,12 @@ def _build_onnx_weight_analysis_plan(
                     promoted_rank_lineage_gap_summary
                     if rank_operator_promotes_deferred_gap
                     else empty_weight_gap_summary,
+                )
+            if supported_transform and all_input_non_shape_lineage_limit_gap_count > 0:
+                transformed_input_output_non_shape_lineage_gap_summary = transform_non_shape_gap_summary(
+                    all_input_non_shape_lineage_gap_summary,
+                    node,
+                    constants,
                 )
             if supported_transform and all_input_output_rank_promotable_lineage_limit_gap_count > 0:
                 transformed_input_output_rank_promotable_lineage_gap_summary = transform_rank_promotable_gap_summary(
@@ -4662,7 +4681,7 @@ def _build_onnx_weight_analysis_plan(
                     input_non_shape_lineage_gap_summary_for_output = (
                         empty_weight_gap_summary
                         if input_non_shape_lineage_limit_gap_count_for_output == 0
-                        else all_input_non_shape_lineage_gap_summary
+                        else transformed_input_output_non_shape_lineage_gap_summary
                     )
                     input_rank_promotable_lineage_limit_gap_count_for_output = (
                         0
