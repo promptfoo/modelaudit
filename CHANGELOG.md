@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Avoid incomplete ONNX weight analysis when Gather nodes read dimensions from Shape outputs.
 - Avoid incomplete ONNX weight analysis when large runtime-activation fanout only adds dynamic bookkeeping lineage.
 - Avoid incomplete ONNX weight analysis when mixed shape and activation bookkeeping fanout does not feed generated weights.
+- Preserve ONNX lineage coverage when zero-length Scan paths, overridable shape defaults, or capped rank-promotable values can hide generated weights.
 - Treat documentation, license, and repository links in verified pickle and ONNX metadata as informational across supported Python versions while preserving active and unknown network destinations.
 - Preserve incomplete-scan diagnostics for malformed or unsupported ZIP data in GGUF/GGML files, including cached scans.
 - Report incomplete coverage when a GGUF/GGML source changes during scanning.
