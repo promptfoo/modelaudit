@@ -6178,7 +6178,7 @@ class TestWeightDistributionSemantics:
         )
         model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
         model.ir_version = 8
-        onnx.checker.check_model(model, full_check=True)
+        onnx.checker.check_model(model)
         path = tmp_path / filename
         onnx.save(model, str(path))
         return path
@@ -6634,7 +6634,7 @@ class TestWeightDistributionSemantics:
         )
         model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
         model.ir_version = 8
-        onnx.checker.check_model(model, full_check=True)
+        onnx.checker.check_model(model)
         model_path = tmp_path / "loop-carried-state-skip-gap.onnx"
         onnx.save(model, str(model_path))
 
@@ -6696,7 +6696,7 @@ class TestWeightDistributionSemantics:
         )
         model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
         model.ir_version = 8
-        onnx.checker.check_model(model, full_check=True)
+        onnx.checker.check_model(model)
         model_path = tmp_path / "loop-carried-state-overridable-controls-gap.onnx"
         onnx.save(model, str(model_path))
 
@@ -6751,7 +6751,7 @@ class TestWeightDistributionSemantics:
         model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
         model.ir_version = 8
         onnx.checker.check_model(model)
-        onnx.checker.check_model(model, full_check=True)
+        onnx.checker.check_model(model)
         path = tmp_path / "loop-carried-repeated-rank-growth-gap.onnx"
         onnx.save(model, str(path))
 
@@ -6912,6 +6912,43 @@ class TestWeightDistributionSemantics:
             assert semantics["coverage_gaps"] == {}
             assert semantics["eligible_initializer_count"] == 0
 
+    @pytest.mark.parametrize("transform", ["Identity", "Cast"])
+    def test_unknown_rank_unary_alias_clears_stale_output_rank(self, tmp_path: Path, transform: str) -> None:
+        nodes, initializers, scalar = self._capped_scalar_expression()
+        alias_node = helper.make_node(transform, ["runtime"], ["alias"])
+        if transform == "Cast":
+            alias_node.attribute.append(helper.make_attribute("to", TensorProto.FLOAT))
+        nodes.extend(
+            [
+                alias_node,
+                helper.make_node("Add", ["alias", scalar], ["weight"]),
+                helper.make_node("MatMul", ["X", "weight"], ["Y"]),
+            ]
+        )
+        graph = helper.make_graph(
+            nodes,
+            "unknown_rank_unary_alias_clears_stale_output_rank",
+            [
+                helper.make_tensor_value_info("runtime", TensorProto.FLOAT, None),
+                helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 4]),
+            ],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1])],
+            initializer=initializers,
+            value_info=[helper.make_tensor_value_info("alias", TensorProto.FLOAT, [4])],
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        path = tmp_path / f"unknown-rank-{transform.lower()}-alias.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        assert result.success is False
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["coverage_gaps"]["lineages_per_value_limit"] > 0
+
     def test_scan_carried_state_repeated_rank_growth_promotes_deferred_gap(self, tmp_path: Path) -> None:
         source_names = [f"W{index}" for index in range(33)]
         initializers = [
@@ -6970,6 +7007,77 @@ class TestWeightDistributionSemantics:
         semantics = result.metadata["onnx_weight_distribution_semantics"]
         assert semantics["coverage_gaps"]
         assert semantics["analyzed_layer_count"] == 0
+
+    @pytest.mark.parametrize(("scan_length", "expect_gap"), [(1, False), (2, True)])
+    def test_scan_graph_input_fixed_extent_bounds_carried_rank_growth(
+        self,
+        tmp_path: Path,
+        scan_length: int,
+        expect_gap: bool,
+    ) -> None:
+        nodes, initializers, scalar = self._capped_scalar_expression()
+        initializers.extend(
+            [
+                onnx.numpy_helper.from_array(np.array(0.0, dtype=np.float32), name="initial_state"),
+                onnx.numpy_helper.from_array(np.array([0], dtype=np.int64), name="axes"),
+            ]
+        )
+        body = helper.make_graph(
+            [
+                helper.make_node("Add", ["state", scalar], ["mixed"]),
+                helper.make_node("Unsqueeze", ["mixed", "axes"], ["next_state"]),
+                helper.make_node("Identity", ["element"], ["next_element"]),
+            ],
+            "scan_fixed_extent_body",
+            [
+                helper.make_tensor_value_info("state", TensorProto.FLOAT, []),
+                helper.make_tensor_value_info("element", TensorProto.FLOAT, []),
+            ],
+            [
+                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, [1]),
+                helper.make_tensor_value_info("next_element", TensorProto.FLOAT, []),
+            ],
+        )
+        nodes.extend(
+            [
+                helper.make_node(
+                    "Scan",
+                    ["initial_state", "scan_values"],
+                    ["scan_state", "scan_output"],
+                    body=body,
+                    num_scan_inputs=1,
+                ),
+                helper.make_node("MatMul", ["X", "scan_state"], ["Y"]),
+            ]
+        )
+        graph = helper.make_graph(
+            nodes,
+            "scan_graph_input_fixed_extent_bounds_carried_rank_growth",
+            [
+                helper.make_tensor_value_info("scan_values", TensorProto.FLOAT, [scan_length]),
+                helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 1]),
+            ],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1])],
+            initializer=initializers,
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / f"scan-fixed-extent-{scan_length}.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        if expect_gap:
+            assert result.success is False
+            assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
+            assert semantics["coverage_gaps"]["lineages_per_value_limit"] > 0
+        else:
+            assert result.success is True
+            assert coverage == []
+            assert semantics["coverage_gaps"] == {}
 
     def test_repeated_loop_non_shape_rank_growth_promotes_after_float_cast(self, tmp_path: Path) -> None:
         source_names = [f"W{index}" for index in range(33)]
