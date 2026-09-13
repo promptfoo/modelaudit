@@ -279,6 +279,20 @@ def _legacy_pytorch_control_requires_origin_review(module: str, name: str) -> bo
     return (module, name) == ("torch._utils", "_rebuild_tensor_v2")
 
 
+def _legacy_pytorch_control_module_is_loaded_without_import_hooks(
+    module: str,
+    _original: Any = picklescan_api.module_is_loaded_without_import_hooks,
+) -> bool:
+    return module != "torch._utils" and _original(module)
+
+
+def _legacy_pytorch_control_module_load_is_safe_for_invocation(
+    module: str,
+    _original: Any = picklescan_api.import_only_module_load_is_proven_safe_for_invocation,
+) -> bool:
+    return module != "torch._utils" and _original(module)
+
+
 def _trust_legacy_pytorch_storage_but_review_rebuild_tensor(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "modelaudit.scanners.pickle_scanner.import_only_reference_is_proven_trusted",
@@ -307,6 +321,14 @@ def _trust_legacy_pytorch_storage_but_review_rebuild_tensor(monkeypatch: pytest.
     monkeypatch.setattr(
         "modelaudit_picklescan.call_graph.import_only_module_requires_origin_review",
         _legacy_pytorch_control_requires_origin_review,
+    )
+    monkeypatch.setattr(
+        "modelaudit_picklescan.api.module_is_loaded_without_import_hooks",
+        _legacy_pytorch_control_module_is_loaded_without_import_hooks,
+    )
+    monkeypatch.setattr(
+        "modelaudit_picklescan.api.import_only_module_load_is_proven_safe_for_invocation",
+        _legacy_pytorch_control_module_load_is_safe_for_invocation,
     )
 
 
