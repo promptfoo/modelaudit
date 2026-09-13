@@ -6090,7 +6090,14 @@ class TestWeightDistributionSemantics:
         return nodes, initializers, previous
 
     @staticmethod
-    def _write_onehot_weight_model(tmp_path: Path, *, vector_reshape: bool, alias: str) -> Path:
+    def _write_onehot_weight_model(
+        tmp_path: Path,
+        *,
+        vector_reshape: bool,
+        alias: str,
+        declared_value_info_shape: list[int] | None = None,
+        full_check: bool = True,
+    ) -> Path:
         initializers = [
             onnx.numpy_helper.from_array(np.array([0, 1], dtype=np.int64), name="indices"),
             onnx.numpy_helper.from_array(np.array(2, dtype=np.int64), name="depth"),
@@ -6107,6 +6114,8 @@ class TestWeightDistributionSemantics:
             weight_source = "vector_hot"
             value_info_shape = [4]
             x_shape = [1, 4]
+        if declared_value_info_shape is not None:
+            value_info_shape = declared_value_info_shape
         weight = weight_source
         if alias != "direct":
             if alias == "Cast":
@@ -6131,7 +6140,8 @@ class TestWeightDistributionSemantics:
         model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
         model.ir_version = 8
         onnx.checker.check_model(model)
-        onnx.checker.check_model(model, full_check=True)
+        if full_check:
+            onnx.checker.check_model(model, full_check=True)
         path = tmp_path / f"onehot-{'vector' if vector_reshape else 'matrix'}-{alias}.onnx"
         onnx.save(model, str(path))
         return path
@@ -8888,6 +8898,25 @@ class TestWeightDistributionSemantics:
     @pytest.mark.parametrize("alias", ["direct", "Identity", "Cast", "Relu"])
     def test_onehot_matrix_rank_remains_weight_gap(self, tmp_path: Path, alias: str) -> None:
         path = self._write_onehot_weight_model(tmp_path, vector_reshape=False, alias=alias)
+
+        result = OnnxScanner().scan(str(path))
+
+        assert result.success is False
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["coverage_gaps"]["unresolved_initializer_lineage"] == 3
+        assert semantics["analyzed_layer_count"] == 0
+
+    @pytest.mark.parametrize("alias", ["direct", "Identity", "Cast", "Relu"])
+    def test_onehot_matrix_stale_rank_metadata_remains_weight_gap(self, tmp_path: Path, alias: str) -> None:
+        path = self._write_onehot_weight_model(
+            tmp_path,
+            vector_reshape=False,
+            alias=alias,
+            declared_value_info_shape=[2],
+            full_check=False,
+        )
 
         result = OnnxScanner().scan(str(path))
 

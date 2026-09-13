@@ -4176,6 +4176,7 @@ def _build_onnx_weight_analysis_plan(
                 and node.op_type == "Pow"
             )
             elementwise_has_unknown_dynamic_rank = False
+            elementwise_output_rank_proven = True
             if same_type_elementwise or same_type_unary_elementwise or pow_operator:
                 elementwise_output_shape = broadcast_shapes(
                     known_value_shapes.get(input_name) for input_name in input_names
@@ -4192,12 +4193,18 @@ def _build_onnx_weight_analysis_plan(
                 if elementwise_has_unknown_dynamic_rank:
                     elementwise_output_shape = None
                     elementwise_output_rank = None
+                elementwise_output_rank_proven = all(
+                    not value_lineages.get(input_name) or input_name in proven_value_ranks for input_name in input_names
+                )
             elif clip_operator and input_names:
                 elementwise_output_shape = known_value_shapes.get(input_names[0])
                 elementwise_output_rank = (
                     len(elementwise_output_shape)
                     if elementwise_output_shape is not None
                     else known_value_ranks.get(input_names[0])
+                )
+                elementwise_output_rank_proven = (
+                    not value_lineages.get(input_names[0]) or input_names[0] in proven_value_ranks
                 )
             resolved_cast_target_data_type = (
                 cast_output_data_type(node, resolve_attribute)
@@ -4287,6 +4294,7 @@ def _build_onnx_weight_analysis_plan(
                     )
                 )
                 for initializer_index, lineage in all_input_lineages.items():
+                    lineage_output_shape = elementwise_output_shape if elementwise_output_rank_proven else None
                     if initializer_index in activation_input_lineages:
                         continue
                     unresolved_reason = lineage.unresolved_reason
@@ -4302,7 +4310,7 @@ def _build_onnx_weight_analysis_plan(
                             )
                     output_lineages[initializer_index] = _OnnxWeightLineage(
                         initializer_index=initializer_index,
-                        shape=elementwise_output_shape,
+                        shape=lineage_output_shape,
                         data_type=lineage.data_type if preserves_data_type else None,
                         transforms=lineage.transforms,
                         unresolved_reason=unresolved_reason,
@@ -5141,10 +5149,17 @@ def _build_onnx_weight_analysis_plan(
                             if elementwise_output_shape is not None
                             else known_value_ranks.get(input_names[0])
                         )
+                        elementwise_output_rank_proven = (
+                            not value_lineages.get(input_names[0]) or input_names[0] in proven_value_ranks
+                        )
                 elif rank_preserving_variadic_operator:
                     elementwise_output_shape = concat_output_shape(
                         node,
                         (known_value_shapes.get(input_name) for input_name in input_names),
+                    )
+                    elementwise_output_rank_proven = all(
+                        not value_lineages.get(input_name) or input_name in proven_value_ranks
+                        for input_name in input_names
                     )
                     if elementwise_output_shape is not None:
                         elementwise_output_rank = len(elementwise_output_shape)
@@ -5156,10 +5171,14 @@ def _build_onnx_weight_analysis_plan(
 
             transform_output_shape: tuple[int, ...] | None = None
             transform_output_rank: int | None = None
+            transform_output_rank_proven = True
             clear_transform_output_rank = False
             if supported_transform and input_names:
                 transform_input_shape = known_value_shapes.get(input_names[0])
                 transform_input_rank = known_value_ranks.get(input_names[0])
+                transform_input_rank_proven = (
+                    not value_lineages.get(input_names[0]) or input_names[0] in proven_value_ranks
+                )
                 if node.op_type in {"Identity", "Cast"}:
                     if value_has_unknown_dynamic_rank(input_names[0]):
                         clear_transform_output_rank = True
@@ -5168,7 +5187,9 @@ def _build_onnx_weight_analysis_plan(
                         transform_output_rank = (
                             len(transform_output_shape) if transform_output_shape is not None else transform_input_rank
                         )
+                        transform_output_rank_proven = transform_input_rank_proven
                 elif node.op_type == "Transpose":
+                    transform_output_rank_proven = transform_input_rank_proven
                     if transform_input_shape is not None:
                         permutation = _onnx_int_sequence_attribute(node, "perm") or tuple(
                             reversed(range(len(transform_input_shape)))
@@ -5183,6 +5204,7 @@ def _build_onnx_weight_analysis_plan(
                         if sorted(permutation) == list(range(transform_input_rank)):
                             transform_output_rank = transform_input_rank
                 elif node.op_type == "Flatten" and transform_input_rank is not None:
+                    transform_output_rank_proven = transform_input_rank_proven
                     axis = _onnx_int_attribute(node, "axis", 1)
                     axis = axis if axis >= 0 else transform_input_rank + axis
                     if 0 <= axis <= transform_input_rank:
@@ -5214,6 +5236,7 @@ def _build_onnx_weight_analysis_plan(
                             if transform_output_shape is None:
                                 transform_output_rank = None
                 elif node.op_type == "Squeeze" and transform_input_rank is not None:
+                    transform_output_rank_proven = transform_input_rank_proven
                     axes = _resolve_onnx_axes(node, constants, onnx=onnx)
                     if axes is not None:
                         if not axes:
@@ -5245,6 +5268,7 @@ def _build_onnx_weight_analysis_plan(
                                         if index not in squeeze_axes
                                     )
                 elif node.op_type == "Unsqueeze" and transform_input_rank is not None:
+                    transform_output_rank_proven = transform_input_rank_proven
                     axes = _resolve_onnx_axes(node, constants, onnx=onnx)
                     if axes is not None:
                         output_rank = transform_input_rank + len(axes)
@@ -5268,20 +5292,26 @@ def _build_onnx_weight_analysis_plan(
                 name = str(output_name)
                 inferred_output_shape = None
                 inferred_output_rank = None
+                inferred_output_rank_proven = True
                 if output_index == 0 or (node.op_type == "Dropout" and output_index == 1):
                     inferred_output_shape = (
                         elementwise_output_shape if elementwise_output_shape is not None else transform_output_shape
                     )
-                    inferred_output_rank = (
-                        elementwise_output_rank if elementwise_output_rank is not None else transform_output_rank
-                    )
+                    if elementwise_output_rank is not None:
+                        inferred_output_rank = elementwise_output_rank
+                        inferred_output_rank_proven = elementwise_output_rank_proven
+                    else:
+                        inferred_output_rank = transform_output_rank
+                        inferred_output_rank_proven = transform_output_rank_proven
                 if output_index < len(subgraph_output_shapes):
                     subgraph_output_shape = subgraph_output_shapes[output_index]
                     if subgraph_output_shape is not None:
                         inferred_output_shape = subgraph_output_shape
                         inferred_output_rank = len(subgraph_output_shape)
+                        inferred_output_rank_proven = True
                     elif subgraph_output_ranks[output_index] is not None and inferred_output_shape is None:
                         inferred_output_rank = subgraph_output_ranks[output_index]
+                        inferred_output_rank_proven = True
                     elif subgraph_output_rank_unknown[output_index]:
                         inferred_output_shape = None
                         inferred_output_rank = None
@@ -5528,9 +5558,9 @@ def _build_onnx_weight_analysis_plan(
                         value_rank_promotable_lineage_limit_gap_summaries.pop(name, None)
                     lineage_shapes = {lineage.shape for lineage in per_output_lineages.values()}
                     if inferred_output_shape is not None:
-                        set_known_value_shape(name, inferred_output_shape, proven=True)
+                        set_known_value_shape(name, inferred_output_shape, proven=inferred_output_rank_proven)
                     elif inferred_output_rank is not None:
-                        set_known_value_rank(name, inferred_output_rank, proven=True)
+                        set_known_value_rank(name, inferred_output_rank, proven=inferred_output_rank_proven)
                     elif clear_output_rank:
                         clear_known_value_rank(name)
                     elif len(lineage_shapes) == 1 and None not in lineage_shapes:
@@ -5552,9 +5582,9 @@ def _build_onnx_weight_analysis_plan(
                                 proven=True,
                             )
                     if inferred_output_shape is not None:
-                        set_known_value_shape(name, inferred_output_shape, proven=True)
+                        set_known_value_shape(name, inferred_output_shape, proven=inferred_output_rank_proven)
                     elif inferred_output_rank is not None:
-                        set_known_value_rank(name, inferred_output_rank, proven=True)
+                        set_known_value_rank(name, inferred_output_rank, proven=inferred_output_rank_proven)
                     elif clear_output_rank:
                         clear_known_value_rank(name)
 
