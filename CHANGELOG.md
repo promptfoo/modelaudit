@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- Upgrade gzip, PCRE2, SQLite, and Perl in Docker runtime images to pick up Debian security fixes.
 - Upgrade locked GitPython to 3.1.59 to address four dependency audit advisories.
 - Inspect hidden ZIP archives and malicious pickle payloads in legacy GGML model variants.
 - Stop reporting a ZIP polyglot for GGUF/GGML files whose tensor data merely contains an end-of-central-directory signature.
@@ -45,6 +46,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Scan all bounded encoded pickle metadata that fits the decoded-byte budget, avoiding incomplete PyTorch ZIP coverage on harmless small encoded tokens.
 - Install `tomli` for Python 3.10 runtime environments so no-default-groups scanner installs can read ModelAudit TOML configuration.
 - Avoid command-and-control false positives for generated TorchScript `_check_input_dim` identifiers while preserving actionable `check_in` detections.
+- Avoid incomplete legacy PyTorch storage-layout findings after validating storage bytes when separate source-backed rebuild warnings remain.
 
 ## [0.2.52](https://github.com/promptfoo/modelaudit/compare/v0.2.51...v0.2.52) (2026-07-22)
 

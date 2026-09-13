@@ -6,11 +6,13 @@ import io
 import os
 import pickle
 import pickletools
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import modelaudit_picklescan.api as picklescan_api
 import pytest
+from modelaudit_picklescan import Notice, PickleReport, ScanStatus
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.cache.cache_policy import should_cache_scan_result
@@ -4589,6 +4591,70 @@ def test_legacy_pytorch_container_trusts_canonical_storage_binpersid(tmp_path: P
     serialized_result = result.to_dict(include_private_metadata=True)
     assert _private_actionable_failed_checks(serialized_result) == []
     assert should_cache_scan_result(serialized_result) is True
+
+
+@pytest.mark.parametrize(
+    ("inconclusive", "malicious", "truncate_storage"),
+    [
+        (False, False, False),
+        (True, False, False),
+        (True, True, False),
+        (True, False, True),
+    ],
+)
+def test_legacy_pytorch_storage_layout_uses_control_coverage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    inconclusive: bool,
+    malicious: bool,
+    truncate_storage: bool,
+) -> None:
+    payload, pickle_end = _make_legacy_pytorch_container(b"A" * 16, malicious_object=malicious)
+    if truncate_storage:
+        payload = payload[:-1]
+    path = tmp_path / "legacy-control-coverage.pt"
+    path.write_bytes(payload)
+    original_adapter = pickle_scanner.pickle_report_to_scan_result
+
+    def with_report_status(report: PickleReport, **kwargs: Any) -> ScanResult:
+        if inconclusive:
+            report = replace(
+                report,
+                status=ScanStatus.INCONCLUSIVE,
+                notices=(
+                    *report.notices,
+                    Notice(
+                        message="Python call-graph analysis could not inspect invoked callable source",
+                        location=report.source,
+                        code="call_graph_source_unavailable",
+                        details={"analysis_incomplete": True, "reason": "source_unavailable"},
+                    ),
+                ),
+            )
+        return original_adapter(report, **kwargs)
+
+    monkeypatch.setattr(pickle_scanner, "pickle_report_to_scan_result", with_report_status)
+    result = PickleScanner().scan(str(path))
+
+    assert result.success is not inconclusive
+    assert result.metadata["pickle_report_status"] == ("inconclusive" if inconclusive else "complete")
+    assert result.metadata["pickle_coverage"]["raw_scan_complete"] is True
+    assert result.metadata["pickle_coverage"]["opcode_scan_complete"] is True
+    layout_checks = [
+        check for check in result.checks if check.rule_code == "S902" and check.name == "Legacy PyTorch Storage Layout"
+    ]
+    if truncate_storage:
+        assert "legacy_pytorch_storage_layout_incomplete" in result.metadata["scan_outcome_reasons"]
+        assert layout_checks and all(check.status == CheckStatus.FAILED for check in layout_checks)
+        assert result.metadata.get("legacy_pytorch_storage_end") is None
+    else:
+        assert result.metadata["legacy_pytorch_container"] is True
+        assert result.metadata["legacy_pytorch_storage_start"] == pickle_end
+        assert result.metadata["legacy_pytorch_storage_end"] == len(payload)
+        assert "legacy_pytorch_storage_layout_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
+        assert not layout_checks
+    if malicious:
+        assert any(issue.rule_code == "S201" and issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
 
 
 def test_legacy_pytorch_bin_extension_uses_framing_not_suffix_for_storage_trust(tmp_path: Path) -> None:

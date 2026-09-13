@@ -108,7 +108,7 @@ def test_dockerfiles_pin_python_base_images_by_digest() -> None:
 
 
 @pytest.mark.parametrize("dockerfile", ("Dockerfile", "Dockerfile.full", "Dockerfile.tensorflow"))
-def test_docker_runtime_images_upgrade_vulnerable_util_linux_packages(dockerfile: str) -> None:
+def test_docker_runtime_images_upgrade_vulnerable_debian_packages(dockerfile: str) -> None:
     content = (_REPO_ROOT / dockerfile).read_text(encoding="utf-8")
     runtime_stage = content.split("FROM ${PYTHON_IMAGE} AS runtime", maxsplit=1)[1]
     normalized_stage = re.sub(r"\\\s*\n\s*", " ", runtime_stage)
@@ -117,13 +117,17 @@ def test_docker_runtime_images_upgrade_vulnerable_util_linux_packages(dockerfile
 
     assert {
         "bsdutils",
+        "gzip",
         "libblkid1",
         "liblastlog2-2",
         "libmount1",
+        "libpcre2-8-0",
         "libsmartcols1",
+        "libsqlite3-0",
         "libuuid1",
         "login",
         "mount",
+        "perl-base",
         "util-linux",
     } <= upgraded_packages
 
