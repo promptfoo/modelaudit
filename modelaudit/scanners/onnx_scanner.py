@@ -4097,6 +4097,7 @@ def _build_onnx_weight_analysis_plan(
                 function_bound_value_shapes: dict[str, tuple[int, ...]] = {}
                 function_bound_value_ranks: dict[str, int] = {}
                 function_bound_unknown_value_ranks: set[str] = set()
+                function_bound_proven_value_ranks: set[str] = set()
                 function_source_scope = ("function", *function_key)
                 function_bound_attributes: dict[str, Any] = {}
                 function_bound_attribute_keys: dict[str, tuple[Any, ...]] = {}
@@ -4129,8 +4130,12 @@ def _build_onnx_weight_analysis_plan(
                         function_bound_dynamic.add(function_input_name)
                     if parent_name in known_value_shapes:
                         function_bound_value_shapes[function_input_name] = known_value_shapes[parent_name]
+                        if parent_name in proven_value_ranks:
+                            function_bound_proven_value_ranks.add(function_input_name)
                     elif parent_name in known_value_ranks:
                         function_bound_value_ranks[function_input_name] = known_value_ranks[parent_name]
+                        if parent_name in proven_value_ranks:
+                            function_bound_proven_value_ranks.add(function_input_name)
                     elif parent_name in dynamic_values or parent_name not in constants:
                         function_bound_unknown_value_ranks.add(function_input_name)
                     if parent_name in value_lineage_limit_gap_counts:
@@ -4189,6 +4194,7 @@ def _build_onnx_weight_analysis_plan(
                         bound_value_shapes=function_bound_value_shapes,
                         bound_value_ranks=function_bound_value_ranks,
                         bound_unknown_value_ranks=function_bound_unknown_value_ranks,
+                        bound_proven_value_ranks=function_bound_proven_value_ranks,
                         bound_attributes=function_bound_attributes,
                         bound_attribute_keys=function_bound_attribute_keys,
                         function_depth=function_depth + 1,

@@ -11619,6 +11619,76 @@ class TestWeightDistributionSemantics:
         assert semantics["coverage_gaps"] == {}
         assert semantics["analyzed_layer_count"] == 1
 
+    def test_local_function_scan_preserves_proven_input_extent(self, tmp_path: Path) -> None:
+        source_names = [f"matrix{index}" for index in range(40)]
+        body = helper.make_graph(
+            [
+                helper.make_node("Identity", ["clean_weight"], ["next_state"]),
+                helper.make_node("Identity", ["element"], ["next_element"]),
+            ],
+            "local_function_scan_body",
+            [
+                helper.make_tensor_value_info("state", TensorProto.FLOAT, [4, 4]),
+                helper.make_tensor_value_info("element", TensorProto.FLOAT, [1]),
+            ],
+            [
+                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, [4, 4]),
+                helper.make_tensor_value_info("next_element", TensorProto.FLOAT, [1]),
+            ],
+        )
+        function = helper.make_function(
+            "local",
+            "ApplyScan",
+            ["capped", "scan_input", "X", "clean_weight"],
+            ["function_output"],
+            [
+                helper.make_node(
+                    "Scan",
+                    ["capped", "scan_input"],
+                    ["scan_state", "scan_output"],
+                    body=body,
+                    num_scan_inputs=1,
+                ),
+                helper.make_node("MatMul", ["X", "scan_state"], ["function_output"]),
+            ],
+            opset_imports=[helper.make_opsetid("", 13)],
+        )
+        initializers = [
+            *[onnx.numpy_helper.from_array(np.zeros((4, 4), dtype=np.float32), name=name) for name in source_names],
+            onnx.numpy_helper.from_array(np.zeros((4, 4), dtype=np.float32), name="clean_weight"),
+        ]
+        graph = helper.make_graph(
+            [
+                helper.make_node("Sum", source_names, ["capped"]),
+                helper.make_node("ApplyScan", ["capped", "scan_input", "X", "clean_weight"], ["Y"], domain="local"),
+            ],
+            "local_function_scan_preserves_proven_input_extent",
+            [
+                helper.make_tensor_value_info("scan_input", TensorProto.FLOAT, [1, 1]),
+                helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 4]),
+            ],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 4])],
+            initializer=initializers,
+        )
+        model = helper.make_model(
+            graph,
+            functions=[function],
+            opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
+        )
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / "local-function-scan-preserves-proven-input-extent.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        assert result.success is True
+        assert self._extreme_checks(result) == []
+        assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["coverage_gaps"] == {}
+        assert semantics["eligible_initializer_count"] >= 1
+
     def test_runtime_bookkeeping_recurrent_marker_survives_fanout_compaction(self, tmp_path: Path) -> None:
         initializers = [
             onnx.numpy_helper.from_array(np.zeros(4, dtype=np.float32), name=f"C{index}") for index in range(33)
