@@ -4295,6 +4295,16 @@ def _build_onnx_weight_analysis_plan(
                 if not output_name:
                     continue
                 name = str(output_name)
+                identity_input_shape = (
+                    known_value_shapes.get(input_names[0])
+                    if supported_transform and node.op_type == "Identity" and input_names
+                    else None
+                )
+                identity_input_rank = (
+                    known_value_ranks.get(input_names[0])
+                    if supported_transform and node.op_type == "Identity" and input_names
+                    else None
+                )
                 per_output_lineages = dict(output_lineages)
                 if (
                     recurrent_state_lineages
@@ -4512,6 +4522,13 @@ def _build_onnx_weight_analysis_plan(
                     if name in constants:
                         with suppress(AttributeError, TypeError, ValueError):
                             known_value_shapes[name] = tuple(int(dimension) for dimension in constants[name].dims)
+                            known_value_ranks[name] = len(known_value_shapes[name])
+                    if identity_input_shape is not None:
+                        known_value_shapes[name] = identity_input_shape
+                        known_value_ranks[name] = len(identity_input_shape)
+                    elif identity_input_rank is not None:
+                        known_value_shapes.pop(name, None)
+                        known_value_ranks[name] = identity_input_rank
 
                 mapped_subgraph_output = bool(subgraph_results) and output_index < len(subgraph_output_dynamic)
                 output_is_dynamic = (
