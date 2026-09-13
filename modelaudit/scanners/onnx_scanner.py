@@ -2353,8 +2353,8 @@ def _build_onnx_weight_analysis_plan(
             transform = _OnnxWeightTransform("Reshape", output_shape)
         elif node.op_type == "Gather":
             index_shape = constant_initializer_shape(constants, node.input[1]) if len(node.input) >= 2 else None
-            axis = _onnx_gather_axis(node, len(lineage.shape))
-            if axis is None or index_shape is None:
+            gather_axis = _onnx_gather_axis(node, len(lineage.shape))
+            if gather_axis is None or index_shape is None:
                 return _OnnxWeightLineage(
                     initializer_index=lineage.initializer_index,
                     shape=None,
@@ -2362,12 +2362,20 @@ def _build_onnx_weight_analysis_plan(
                     transforms=lineage.transforms,
                     unresolved_reason=lineage.unresolved_reason or "unresolved_gather_lineage",
                 )
-            output_shape = (*lineage.shape[:axis], *index_shape, *lineage.shape[axis + 1 :])
+            output_shape = (*lineage.shape[:gather_axis], *index_shape, *lineage.shape[gather_axis + 1 :])
             transform = _OnnxWeightTransform("Reshape", output_shape)
         elif node.op_type == "GatherND":
             index_shape = constant_initializer_shape(constants, node.input[1]) if len(node.input) >= 2 else None
-            index_depth = None if not index_shape else index_shape[-1]
-            if index_depth is None or index_depth <= 0 or index_depth > len(lineage.shape):
+            if not index_shape:
+                return _OnnxWeightLineage(
+                    initializer_index=lineage.initializer_index,
+                    shape=None,
+                    data_type=lineage.data_type,
+                    transforms=lineage.transforms,
+                    unresolved_reason=lineage.unresolved_reason or "unresolved_gathernd_lineage",
+                )
+            index_depth = index_shape[-1]
+            if index_depth <= 0 or index_depth > len(lineage.shape):
                 return _OnnxWeightLineage(
                     initializer_index=lineage.initializer_index,
                     shape=None,
