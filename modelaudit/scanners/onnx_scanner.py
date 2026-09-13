@@ -1856,8 +1856,17 @@ def _build_onnx_weight_analysis_plan(
             and len(lineage.shape) < 2
         )
 
-    def cast_output_may_be_floating(node: Any) -> bool:
-        target_data_type = _onnx_int_attribute(node, "to", -1)
+    def cast_output_may_be_floating(
+        node: Any,
+        resolve_attribute: Callable[[Any], Any | None] | None = None,
+    ) -> bool:
+        target_data_type = -1
+        for attribute in getattr(node, "attribute", []):
+            if attribute.name == "to":
+                resolved_attribute = resolve_attribute(attribute) if resolve_attribute is not None else attribute
+                if resolved_attribute is not None:
+                    target_data_type = int(getattr(resolved_attribute, "i", -1))
+                break
         return target_data_type < 0 or target_data_type in floating_types
 
     def constant_int64_vector_values(initializer: Any | None) -> tuple[int, ...] | None:
@@ -2004,6 +2013,13 @@ def _build_onnx_weight_analysis_plan(
         if input_rank is None:
             return bool(summary.lineages)
         return any(lineage.shape is None or len(lineage.shape) > input_rank for lineage in summary.lineages)
+
+    def gap_summary_is_dynamic_activation(summary: _OnnxWeightLineageGapSummary, count: int) -> bool:
+        if count <= 0:
+            return True
+        if summary.truncated or not summary.lineages:
+            return False
+        return all(lineage.unresolved_reason == "dynamic_activation_lineage" for lineage in summary.lineages)
 
     def operator_output_may_have_weight_rank(
         node: Any,
@@ -3435,14 +3451,18 @@ def _build_onnx_weight_analysis_plan(
                 prior_layer_activation_input = bool(input_lineages) and all(
                     lineage.unresolved_reason == "dynamic_activation_lineage" for lineage in input_lineages.values()
                 )
-                recognized_gap_activation_input = prior_layer_activation_input and (
+                activation_input_role = prior_layer_activation_input and (
                     (is_registered_standard_operator and _onnx_opaque_activation_input_candidate(node, input_index))
                     or (
                         _onnx_activation_input_candidate(node, input_index)
                         and (opposite_resolved_weight_for_input or all_lineage_inputs_are_activation_contraction)
                     )
                 )
-                recognized_gap_activation_input |= recurrent_initial_state_input and opposite_resolved_weight_for_input
+                activation_input_role |= recurrent_initial_state_input and opposite_resolved_weight_for_input
+                recognized_gap_activation_input = activation_input_role and gap_summary_is_dynamic_activation(
+                    input_weight_lineage_limit_gap_summary,
+                    input_weight_lineage_limit_gap_count,
+                )
                 recorded_input_lineage_limit_gap = recognized_gap_activation_input
                 if (
                     potential_weight_role
@@ -4095,7 +4115,7 @@ def _build_onnx_weight_analysis_plan(
             if (
                 supported_transform
                 and node.op_type == "Cast"
-                and cast_output_may_be_floating(node)
+                and cast_output_may_be_floating(node, resolve_attribute)
                 and all_input_non_shape_lineage_limit_gap_count > all_input_output_weight_lineage_limit_gap_count
             ):
                 cast_non_shape_gap_summary = known_weight_gap_summary(
@@ -4135,7 +4155,7 @@ def _build_onnx_weight_analysis_plan(
             if (
                 supported_transform
                 and node.op_type == "Cast"
-                and cast_output_may_be_floating(node)
+                and cast_output_may_be_floating(node, resolve_attribute)
                 and output_non_shape_lineage_limit_gap_count > output_weight_lineage_limit_gap_count
             ):
                 cast_output_non_shape_gap_summary = known_weight_gap_summary(
@@ -4165,7 +4185,9 @@ def _build_onnx_weight_analysis_plan(
                         transform_rank_promotable_gap_summary(cast_output_non_shape_gap_summary, node, constants),
                     )
             cast_output_is_nonfloating_transform = (
-                supported_transform and node.op_type == "Cast" and not cast_output_may_be_floating(node)
+                supported_transform
+                and node.op_type == "Cast"
+                and not cast_output_may_be_floating(node, resolve_attribute)
             )
             transform_control_input_is_overridable = rank_gap_control_input_is_overridable
             transform_can_demote_weight_gap = not transform_control_input_is_overridable
@@ -4675,11 +4697,19 @@ def _build_onnx_weight_analysis_plan(
                                 math.prod(transform_input_shape[:axis]),
                                 math.prod(transform_input_shape[axis:]),
                             )
-                elif node.op_type == "Reshape" and len(input_names) > 1 and input_names[0] not in value_lineages:
+                elif node.op_type == "Reshape" and len(input_names) > 1:
+                    reshape_input_lineages = value_lineages.get(input_names[0], {})
                     shape_initializer = constants.get(input_names[1])
                     target_shape = constant_int64_vector_values(shape_initializer)
                     if (
-                        target_shape is not None
+                        (
+                            not reshape_input_lineages
+                            or all(
+                                lineage.unresolved_reason == "dynamic_activation_lineage"
+                                for lineage in reshape_input_lineages.values()
+                            )
+                        )
+                        and target_shape is not None
                         and all(value >= -1 for value in target_shape)
                         and target_shape.count(-1) <= 1
                         and not (
