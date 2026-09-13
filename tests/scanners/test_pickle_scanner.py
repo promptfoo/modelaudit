@@ -4725,10 +4725,12 @@ def test_legacy_pytorch_valid_storage_layout_survives_inconclusive_control_findi
 
     result = PickleScanner().scan(str(path))
 
-    assert result.success is False
     assert result.metadata["legacy_pytorch_container"] is True
     assert result.metadata["legacy_pytorch_storage_start"] == pickle_end
     assert result.metadata["legacy_pytorch_storage_end"] == len(payload)
+    assert result.metadata.get("pickle_verdict") == "suspicious"
+    assert result.has_warnings is True
+    assert result.has_errors is False
     assert "legacy_pytorch_storage_layout_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
     assert not any(
         check.rule_code == "S902" and check.name == "Legacy PyTorch Storage Layout" for check in result.checks
