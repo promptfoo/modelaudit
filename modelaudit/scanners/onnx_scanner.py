@@ -2043,6 +2043,23 @@ def _build_onnx_weight_analysis_plan(
                 attributes[str(attribute.name)] = resolved_attribute
         return attributes
 
+    def bound_function_constants(
+        function: Any, node_input_names: list[str], constants: dict[str, Any]
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        inherited: dict[str, Any] = {}
+        bound_inputs: dict[str, Any] = {}
+        for input_index, actual_name in enumerate(node_input_names):
+            if input_index >= len(getattr(function, "input", ())):
+                break
+            formal_name = _onnx_value_name(function.input[input_index])
+            if formal_name and actual_name in constants:
+                inherited[formal_name] = constants[actual_name]
+                bound_inputs[formal_name] = constants[actual_name]
+        for captured_name in graph_external_reference_names(function):
+            if captured_name in constants:
+                inherited[captured_name] = constants[captured_name]
+        return inherited, bound_inputs
+
     def constant_node_tensor(node: Any) -> Any | None:
         for attribute in getattr(node, "attribute", ()):
             if attribute.name == "value" and _onnx_has_singular_field(attribute, "t"):
@@ -2384,8 +2401,8 @@ def _build_onnx_weight_analysis_plan(
 
     cache_fingerprints: dict[int, tuple[Any, tuple[str, str]]] = {}
     semantic_mapping_keys: dict[
-        tuple[int, tuple[tuple[str, int], ...]],
-        tuple[Any, tuple[tuple[str, Any], ...], tuple[tuple[str, str, str], ...]],
+        tuple[int, tuple[str, ...] | None],
+        tuple[Any, int, tuple[tuple[str, str, str], ...]],
     ] = {}
     rank_reentry_constant_name_cache: dict[tuple[int, int], frozenset[str]] = {}
 
@@ -2418,25 +2435,21 @@ def _build_onnx_weight_analysis_plan(
     ) -> tuple[tuple[str, str, str], ...]:
         if not mapping:
             return ()
-        items = (
-            tuple((name, mapping[name]) for name in sorted(names) if name in mapping)
-            if names is not None
-            else tuple(sorted((str(name), value) for name, value in mapping.items()))
-        )
-        identity_key = (id(mapping), tuple((str(name), id(value)) for name, value in items))
-        cached_mapping_key = semantic_mapping_keys.get(identity_key)
+        names_key = tuple(sorted(str(name) for name in names)) if names is not None else None
+        owner_key = (id(mapping), names_key)
+        cached_mapping_key = semantic_mapping_keys.get(owner_key)
         if (
             cached_mapping_key is not None
             and cached_mapping_key[0] is mapping
-            and len(cached_mapping_key[1]) == len(items)
-            and all(
-                cached_name == name and cached_value is value
-                for (cached_name, cached_value), (name, value) in zip(cached_mapping_key[1], items, strict=True)
-            )
+            and cached_mapping_key[1] == len(mapping)
         ):
             return cached_mapping_key[2]
+        if names_key is not None:
+            items = tuple((name, mapping[name]) for name in names_key if name in mapping)
+        else:
+            items = tuple(sorted((str(name), value) for name, value in mapping.items()))
         cache_key = tuple((str(name), *semantic_cache_fingerprint(value)) for name, value in items)
-        semantic_mapping_keys[identity_key] = (mapping, items, cache_key)
+        semantic_mapping_keys[owner_key] = (mapping, len(mapping), cache_key)
         return cache_key
 
     def attribute_binding_cache_key(attribute_bindings: dict[str, Any] | None) -> tuple[tuple[str, str, str], ...]:
@@ -2484,7 +2497,7 @@ def _build_onnx_weight_analysis_plan(
         for body_node in getattr(subgraph, "node", ()):
             if (
                 getattr(body_node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
-                and body_node.op_type in {"Expand", "Reshape", "Squeeze", "Unsqueeze"}
+                and body_node.op_type in {"Expand", "Gather", "GatherND", "Reshape", "Squeeze", "Unsqueeze"}
                 and len(getattr(body_node, "input", ())) > 1
             ):
                 names.add(str(body_node.input[1]))
@@ -2514,6 +2527,7 @@ def _build_onnx_weight_analysis_plan(
         opset_versions: dict[str, int],
         graph_input_shape: tuple[int, ...] | None,
         attribute_bindings: dict[str, Any] | None = None,
+        bound_input_constants: dict[str, Any] | None = None,
         *,
         depth: int = 0,
     ) -> bool:
@@ -2525,13 +2539,14 @@ def _build_onnx_weight_analysis_plan(
         graph_output_name = _onnx_value_name(graph_outputs[graph_output_index])
         if not graph_output_name:
             return False
+        cache_constants = constants if not bound_input_constants else {**constants, **bound_input_constants}
         cache_key = (
             id(subgraph),
             graph_input_name,
             graph_input_shape,
             opset_cache_key(opset_versions),
             attribute_binding_cache_key(attribute_bindings),
-            constant_binding_cache_key(constants, rank_reentry_constant_names(subgraph)),
+            constant_binding_cache_key(cache_constants, rank_reentry_constant_names(subgraph)),
             depth,
         )
         if cache_key in reentry_promotion_cache:
@@ -2546,6 +2561,8 @@ def _build_onnx_weight_analysis_plan(
             return local_attribute_bindings.get(reference_name) if reference_name else attribute
 
         subgraph_constants = graph_initializer_constants(subgraph, constants)
+        if bound_input_constants:
+            subgraph_constants.update(bound_input_constants)
         tainted = {graph_input_name}
         tainted_shapes = {graph_input_name: graph_input_shape} if graph_input_shape is not None else {}
         promoted: set[str] = set()
@@ -2566,6 +2583,8 @@ def _build_onnx_weight_analysis_plan(
             any_tainted = any(input_name in tainted for input_name in body_inputs)
             data_input_shape = tainted_shapes.get(body_inputs[0]) if body_inputs else None
             index_input_shape = tainted_shapes.get(body_inputs[1]) if len(body_inputs) > 1 else None
+            if index_input_shape is None and body_node.op_type in {"Gather", "GatherND"} and len(body_inputs) > 1:
+                index_input_shape = constant_initializer_shape(subgraph_constants, body_inputs[1])
             data_input_may_promote = data_input_tainted and operator_output_may_have_weight_rank(
                 body_node,
                 input_shape=data_input_shape,
@@ -2577,6 +2596,11 @@ def _build_onnx_weight_analysis_plan(
             nested_promoted_outputs: set[str] = set()
             if function is not None and any_tainted:
                 function_attributes = bound_function_attributes(function, body_node, resolve_reentry_attribute)
+                function_constants, function_bound_input_constants = bound_function_constants(
+                    function,
+                    body_inputs,
+                    subgraph_constants,
+                )
                 function_versions = function_opset_versions(function, opset_versions)
                 for input_index, input_name in enumerate(body_inputs):
                     if input_name not in tainted or input_index >= len(getattr(function, "input", ())):
@@ -2588,10 +2612,11 @@ def _build_onnx_weight_analysis_plan(
                             function,
                             function_input_name,
                             output_index,
-                            subgraph_constants,
+                            function_constants,
                             function_versions,
                             function_input_shape,
                             attribute_bindings=function_attributes,
+                            bound_input_constants=function_bound_input_constants,
                             depth=depth + 1,
                         ):
                             function_promoted_outputs.add(output_name)
@@ -2673,6 +2698,38 @@ def _build_onnx_weight_analysis_plan(
                 output_shape = None
                 if body_node.op_type in {"Cast", "Identity", "Relu"}:
                     output_shape = data_input_shape
+                elif body_node.op_type == "Expand":
+                    shape_name = body_inputs[1] if len(body_inputs) > 1 else ""
+                    target_shape = constant_int64_vector_values(subgraph_constants.get(shape_name))
+                    if target_shape is not None:
+                        output_shape = broadcast_shapes((data_input_shape, target_shape))
+                elif body_node.op_type == "Gather":
+                    if index_input_shape is not None:
+                        gather_axis = _onnx_gather_axis(body_node, len(data_input_shape))
+                        if gather_axis is not None:
+                            output_shape = (
+                                *data_input_shape[:gather_axis],
+                                *index_input_shape,
+                                *data_input_shape[gather_axis + 1 :],
+                            )
+                elif body_node.op_type == "GatherND":
+                    if index_input_shape:
+                        output_shape = gathernd_output_shape(
+                            body_node,
+                            input_shape=data_input_shape,
+                            index_shape=index_input_shape,
+                            resolve_attribute=resolve_reentry_attribute,
+                        )
+                elif body_node.op_type == "Reshape":
+                    shape_name = body_inputs[1] if len(body_inputs) > 1 else ""
+                    shape_initializer = subgraph_constants.get(shape_name)
+                    if shape_initializer is not None:
+                        output_shape = _resolve_onnx_reshape_shape(
+                            data_input_shape,
+                            shape_initializer,
+                            allowzero=bool(_onnx_int_attribute(body_node, "allowzero")),
+                            onnx=onnx,
+                        )
                 elif body_node.op_type == "Unsqueeze":
                     axes = _resolve_onnx_axes(
                         body_node,

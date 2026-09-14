@@ -8152,6 +8152,165 @@ class TestWeightDistributionSemantics:
             assert semantics["coverage_gaps"] == {}
 
     @pytest.mark.parametrize(
+        ("op_type", "index_values", "x_shape", "expected_gap"),
+        [
+            ("Gather", np.arange(4, dtype=np.int64), [1, 4], False),
+            ("Gather", np.zeros((4, 4), dtype=np.int64), [4, 4], True),
+            ("GatherND", np.arange(4, dtype=np.int64).reshape(4, 1), [1, 4], False),
+            ("GatherND", np.zeros((4, 4, 1), dtype=np.int64), [4, 4], True),
+        ],
+    )
+    def test_repeated_loop_rank_reentry_uses_initializer_index_shapes(
+        self,
+        tmp_path: Path,
+        op_type: str,
+        index_values: np.ndarray,
+        x_shape: list[int],
+        expected_gap: bool,
+    ) -> None:
+        initializers = [
+            onnx.numpy_helper.from_array(np.ones((4,), dtype=np.float32), name="initial_state"),
+            onnx.numpy_helper.from_array(index_values, name="indices"),
+            onnx.numpy_helper.from_array(np.array(2, dtype=np.int64), name="trip_count"),
+            onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="initial_condition"),
+            onnx.numpy_helper.from_array(np.array(0.0, dtype=np.float32), name="dummy"),
+        ]
+        gather_node = (
+            helper.make_node("Gather", ["state", "indices"], ["next_state"], axis=0)
+            if op_type == "Gather"
+            else helper.make_node("GatherND", ["state", "indices"], ["next_state"])
+        )
+        body = helper.make_graph(
+            [
+                helper.make_node("MatMul", ["X", "state"], ["body_y"]),
+                gather_node,
+                helper.make_node("Identity", ["condition_in"], ["condition_out"]),
+            ],
+            f"retained_loop_{op_type.lower()}_reentry_body",
+            [
+                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
+                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("state", TensorProto.FLOAT, None),
+            ],
+            [
+                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, None),
+            ],
+        )
+        graph = helper.make_graph(
+            [
+                helper.make_node(
+                    "Loop",
+                    ["trip_count", "initial_condition", "initial_state"],
+                    ["control_flow_state"],
+                    body=body,
+                ),
+                helper.make_node("Identity", ["dummy"], ["Y"]),
+            ],
+            f"retained_loop_{op_type.lower()}_initializer_index_reentry",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, x_shape)],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [])],
+            initializer=initializers,
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / f"retained-loop-{op_type.lower()}-initializer-index-{expected_gap}.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        if expected_gap:
+            assert result.success is False
+            assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
+            assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
+        else:
+            assert result.success is True
+            assert coverage == []
+            assert semantics["coverage_gaps"] == {}
+
+    @pytest.mark.parametrize(
+        ("target_shape", "x_shape", "expected_gap"), [([4], [1, 4], False), ([1, 4], [1, 1], True)]
+    )
+    def test_repeated_loop_local_function_binds_rank_control_constants_to_formals(
+        self,
+        tmp_path: Path,
+        target_shape: list[int],
+        x_shape: list[int],
+        expected_gap: bool,
+    ) -> None:
+        function = helper.make_function(
+            "local",
+            "ProjectState",
+            ["state", "target_shape"],
+            ["function_output"],
+            [helper.make_node("Reshape", ["state", "target_shape"], ["function_output"])],
+            opset_imports=[helper.make_opsetid("", 13)],
+        )
+        body = helper.make_graph(
+            [
+                helper.make_node("MatMul", ["X", "state"], ["body_y"]),
+                helper.make_node("ProjectState", ["state", "state_shape"], ["next_state"], domain="local"),
+                helper.make_node("Identity", ["condition_in"], ["condition_out"]),
+            ],
+            "retained_loop_local_function_formal_constant_reentry_body",
+            [
+                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
+                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("state", TensorProto.FLOAT, None),
+            ],
+            [
+                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, None),
+            ],
+        )
+        graph = helper.make_graph(
+            [
+                helper.make_node(
+                    "Loop",
+                    ["trip_count", "initial_condition", "initial_state"],
+                    ["control_flow_state"],
+                    body=body,
+                ),
+                helper.make_node("Identity", ["dummy"], ["Y"]),
+            ],
+            "retained_loop_local_function_formal_constant_reentry",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, x_shape)],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [])],
+            initializer=[
+                onnx.numpy_helper.from_array(np.ones((4,), dtype=np.float32), name="initial_state"),
+                onnx.numpy_helper.from_array(np.array(target_shape, dtype=np.int64), name="state_shape"),
+                onnx.numpy_helper.from_array(np.array(2, dtype=np.int64), name="trip_count"),
+                onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="initial_condition"),
+                onnx.numpy_helper.from_array(np.array(0.0, dtype=np.float32), name="dummy"),
+            ],
+        )
+        model = helper.make_model(
+            graph,
+            functions=[function],
+            opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
+        )
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / f"retained-loop-local-function-formal-constant-{expected_gap}.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        if expected_gap:
+            assert result.success is False
+            assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
+            assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
+        else:
+            assert result.success is True
+            assert coverage == []
+            assert semantics["coverage_gaps"] == {}
+
+    @pytest.mark.parametrize(
         ("control_flow_op", "rank_promotes", "expected_gap"),
         [
             ("Loop", False, False),
