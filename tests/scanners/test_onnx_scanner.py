@@ -8699,6 +8699,8 @@ class TestWeightDistributionSemantics:
             ("captured_sigmoid_vector_input", "captured_sigmoid", False, False, False, False),
             ("captured_tanh_vector_input", "captured_tanh", False, False, False, False),
             ("captured_identity_matrix_input", "captured_identity", True, False, False, True),
+            ("concat_state_vector_input", "state_concat", False, False, False, False),
+            ("concat_state_matrix_input", "state_concat", True, False, False, True),
             ("where_scalar_condition_formal", "condition_formal", False, False, True, False),
             ("where_initializer_condition_formal", "condition_initializer", False, False, True, False),
             ("where_initializer_condition_formal_matrix", "condition_initializer", True, False, True, True),
@@ -8732,6 +8734,7 @@ class TestWeightDistributionSemantics:
             initializers.append(onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="initial_condition"))
             graph_inputs = [helper.make_tensor_value_info("X", TensorProto.FLOAT, [4, 4])]
         other_name = "other"
+        state_name = "state"
         if source == "sparse":
             sparse = onnx.SparseTensorProto()
             sparse.values.CopyFrom(
@@ -8740,6 +8743,15 @@ class TestWeightDistributionSemantics:
             sparse.indices.CopyFrom(onnx.numpy_helper.from_array(np.array([0], dtype=np.int64), name="sparse_indices"))
             sparse.dims.extend(other_shape)
             body_nodes.append(helper.make_node("Constant", [], ["other"], sparse_value=sparse))
+        elif source == "state_concat":
+            initializers.extend(
+                [
+                    onnx.numpy_helper.from_array(np.zeros(other_shape, dtype=np.float32), name="other"),
+                    onnx.numpy_helper.from_array(np.zeros([0, *other_shape[1:]], dtype=np.float32), name="empty"),
+                ]
+            )
+            state_name = "state_concat"
+            body_nodes.append(helper.make_node("Concat", ["state", "empty"], [state_name], axis=0))
         elif source.startswith("captured"):
             graph_inputs.append(helper.make_tensor_value_info("other", TensorProto.FLOAT, other_shape))
             if source != "captured":
@@ -8767,7 +8779,7 @@ class TestWeightDistributionSemantics:
                 )
             body_nodes.append(helper.make_node("Where", [select_name, "state", other_name], ["next_state"]))
         else:
-            add_inputs = [other_name, "state"] if state_second else ["state", other_name]
+            add_inputs = [other_name, state_name] if state_second else [state_name, other_name]
             body_nodes.append(helper.make_node("Add", add_inputs, ["next_state"]))
         body_nodes.append(helper.make_node("Identity", ["condition_in"], ["condition_out"]))
         body = helper.make_graph(
@@ -10564,7 +10576,7 @@ class TestWeightDistributionSemantics:
         assert semantics["coverage_gaps"]["lineages_per_value_limit"] > 0
         assert semantics["analyzed_layer_count"] == 0
 
-    def test_scan_unknown_stacked_extent_repeats_conservatively(self, tmp_path: Path) -> None:
+    def test_scan_initializer_stacked_extent_bounds_nested_repeat(self, tmp_path: Path) -> None:
         nodes, initializers, scalar = self._capped_scalar_expression()
         initializers.extend(
             [
@@ -10575,7 +10587,7 @@ class TestWeightDistributionSemantics:
         )
         seed_body = helper.make_graph(
             [helper.make_node("Identity", ["seed_element"], ["runtime_element"])],
-            "scan_unknown_extent_seed_body",
+            "scan_initializer_extent_seed_body",
             [helper.make_tensor_value_info("seed_element", TensorProto.FLOAT, [])],
             [helper.make_tensor_value_info("runtime_element", TensorProto.FLOAT, [])],
         )
@@ -10585,7 +10597,7 @@ class TestWeightDistributionSemantics:
                 helper.make_node("Unsqueeze", ["mixed", "axes"], ["next_state"]),
                 helper.make_node("Identity", ["element"], ["next_element"]),
             ],
-            "scan_unknown_extent_repeated_body",
+            "scan_initializer_extent_repeated_body",
             [
                 helper.make_tensor_value_info("state", TensorProto.FLOAT, []),
                 helper.make_tensor_value_info("element", TensorProto.FLOAT, []),
@@ -10616,7 +10628,7 @@ class TestWeightDistributionSemantics:
         )
         graph = helper.make_graph(
             nodes,
-            "scan_unknown_stacked_extent_repeats_conservatively",
+            "scan_initializer_stacked_extent_bounds_nested_repeat",
             [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 1])],
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1])],
             initializer=initializers,
@@ -10624,17 +10636,16 @@ class TestWeightDistributionSemantics:
         model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
         model.ir_version = 8
         onnx.checker.check_model(model)
-        path = tmp_path / "scan-unknown-stacked-extent.onnx"
+        path = tmp_path / "scan-initializer-stacked-extent.onnx"
         onnx.save(model, str(path))
 
         result = OnnxScanner().scan(str(path))
 
         coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
         semantics = result.metadata["onnx_weight_distribution_semantics"]
-        assert result.success is False
-        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
-        assert semantics["coverage_gaps"]["lineages_per_value_limit"] > 0
-        assert semantics["analyzed_layer_count"] == 0
+        assert result.success is True
+        assert coverage == []
+        assert semantics["coverage_gaps"] == {}
 
     def test_scan_repeat_ignores_stale_intermediate_extent_metadata(self, tmp_path: Path) -> None:
         nodes, initializers, scalar = self._capped_scalar_expression()

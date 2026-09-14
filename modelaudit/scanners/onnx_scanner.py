@@ -2949,6 +2949,19 @@ def _build_onnx_weight_analysis_plan(
                 output_shape = None
                 if reentry_shape_preserving_unary_operator(body_node, body_inputs) and data_input_shape is not None:
                     output_shape = data_input_shape
+                elif body_node.op_type in _RANK_PRESERVING_VARIADIC_OPERATORS:
+                    concat_axis = None
+                    for attribute in getattr(body_node, "attribute", ()):
+                        if attribute.name != "axis":
+                            continue
+                        resolved_attribute = resolve_reentry_attribute(attribute)
+                        concat_axis = int(getattr(resolved_attribute, "i", 0)) if resolved_attribute is not None else 0
+                        break
+                    output_shape = _onnx_concat_output_shape(
+                        body_node,
+                        (input_shapes_by_name.get(input_name) for input_name in body_inputs),
+                        axis=0 if concat_axis is None else concat_axis,
+                    )
                 elif body_node.op_type in _SAME_TYPE_ELEMENTWISE_OPERATORS | {"Pow"}:
                     output_shape = broadcast_shapes(input_shapes_by_name.get(input_name) for input_name in body_inputs)
                 elif body_node.op_type == "Expand" and data_input_shape is not None:
@@ -6585,11 +6598,7 @@ def _build_onnx_weight_analysis_plan(
                     if sequence_lens is not None and sequence_lens and all(length >= 0 for length in sequence_lens):
                         return max(sequence_lens)
                     return -1
-                if (
-                    value_name not in trusted_shape_names
-                    or value_name in untrusted_shape_names
-                    or (value_name in constants and value_name not in graph_input_names)
-                ):
+                if value_name not in trusted_shape_names or value_name in untrusted_shape_names:
                     return -1
                 value_shape = known_value_shapes.get(value_name)
                 if not value_shape:
