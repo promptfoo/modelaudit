@@ -2395,9 +2395,13 @@ def _build_onnx_weight_analysis_plan(
         subgraph: Any,
         graph_input_name: str,
         opset_versions: dict[str, int],
+        *,
+        depth: int = 0,
     ) -> bool:
         if not graph_input_name:
             return False
+        if depth > 6:
+            return True
         tainted = {graph_input_name}
         for body_node in getattr(subgraph, "node", ()):
             body_inputs = [str(input_name) for input_name in getattr(body_node, "input", ()) if input_name]
@@ -2414,6 +2418,54 @@ def _build_onnx_weight_analysis_plan(
                 body_node,
                 opset_versions,
             )
+            any_tainted = any(input_name in tainted for input_name in body_inputs)
+            if any_tainted:
+                function = functions.get(function_key)
+                if function is not None:
+                    for input_index, input_name in enumerate(body_inputs):
+                        if input_name not in tainted or input_index >= len(getattr(function, "input", ())):
+                            continue
+                        if subgraph_state_input_can_reach_weight_consumer(
+                            function,
+                            str(function.input[input_index]),
+                            opset_versions,
+                            depth=depth + 1,
+                        ):
+                            return True
+                for attribute in getattr(body_node, "attribute", ()):
+                    for nested_graph in _iter_attribute_graphs(attribute):
+                        for input_index, input_name in enumerate(body_inputs):
+                            if input_name not in tainted:
+                                continue
+                            nested_input_index: int | None = None
+                            if body_node.op_type == "Loop" and input_index >= 2:
+                                nested_input_index = input_index
+                            elif body_node.op_type == "Scan":
+                                nested_input_index = input_index - scan_sequence_lens_input_offset(
+                                    body_node,
+                                    opset_versions,
+                                )
+                            if nested_input_index is None:
+                                continue
+                            if nested_input_index < 0 or nested_input_index >= len(getattr(nested_graph, "input", ())):
+                                return True
+                            if subgraph_state_input_can_reach_weight_consumer(
+                                nested_graph,
+                                _onnx_value_name(nested_graph.input[nested_input_index]),
+                                opset_versions,
+                                depth=depth + 1,
+                            ):
+                                return True
+            for attribute in getattr(body_node, "attribute", ()):
+                for nested_graph in _iter_attribute_graphs(attribute):
+                    for captured_name in graph_external_reference_names(nested_graph) & tainted:
+                        if subgraph_state_input_can_reach_weight_consumer(
+                            nested_graph,
+                            captured_name,
+                            opset_versions,
+                            depth=depth + 1,
+                        ):
+                            return True
             if any(
                 input_name in tainted
                 and _onnx_potential_weight_input(
@@ -2425,7 +2477,7 @@ def _build_onnx_weight_analysis_plan(
                 for input_index, input_name in enumerate(body_inputs)
             ):
                 return True
-            if any(input_name in tainted for input_name in body_inputs):
+            if any_tainted:
                 tainted.update(body_outputs)
         return False
 
@@ -5718,13 +5770,7 @@ def _build_onnx_weight_analysis_plan(
                     )
                     if repeated_carried_state:
                         state_input_name = control_flow_state_input_name(output_index)
-                        subgraph_state_input_index = output_index + (
-                            2
-                            if node.op_type == "Loop"
-                            else scan_sequence_lens_input_offset(node, opset_versions)
-                            if node.op_type == "Scan"
-                            else 0
-                        )
+                        subgraph_state_input_index = output_index + (2 if node.op_type == "Loop" else 0)
                         subgraph_state_input_name = (
                             _onnx_value_name(subgraph.input[subgraph_state_input_index])
                             if subgraph_state_input_index < len(subgraph.input)
