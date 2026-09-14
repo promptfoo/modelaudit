@@ -8913,10 +8913,12 @@ class TestWeightDistributionSemantics:
             assert semantics["coverage_gaps"] == {}
 
     @pytest.mark.parametrize(
-        ("case", "matrix_state_shape", "expected_gap"),
+        ("case", "matrix_state_shape", "matrix_update", "trip_count", "expected_gap"),
         [
-            ("sibling_matrix_state", [2, 2], False),
-            ("sibling_batched_state", [2, 1, 2], True),
+            ("sibling_matrix_state", [2, 2], "identity", 2, False),
+            ("sibling_batched_state", [2, 1, 2], "identity", 2, True),
+            ("sibling_stable_three_trips", [2, 2], "identity", 3, False),
+            ("sibling_later_batched_state", [2, 2], "expand", 3, True),
         ],
     )
     def test_repeated_loop_reentry_matmul_uses_sibling_carried_shapes(
@@ -8924,13 +8926,20 @@ class TestWeightDistributionSemantics:
         tmp_path: Path,
         case: str,
         matrix_state_shape: list[int],
+        matrix_update: str,
+        trip_count: int,
         expected_gap: bool,
     ) -> None:
+        matrix_update_node = (
+            helper.make_node("Expand", ["matrix_state", "matrix_target_shape"], ["next_matrix_state"])
+            if matrix_update == "expand"
+            else helper.make_node("Identity", ["matrix_state"], ["next_matrix_state"])
+        )
         body = helper.make_graph(
             [
                 helper.make_node("MatMul", ["probe", "vector_state"], ["body_y"]),
                 helper.make_node("MatMul", ["vector_state", "matrix_state"], ["next_vector_state"]),
-                helper.make_node("Identity", ["matrix_state"], ["next_matrix_state"]),
+                matrix_update_node,
                 helper.make_node("Identity", ["condition_in"], ["condition_out"]),
             ],
             "retained_loop_reentry_matmul_sibling_shape_body",
@@ -8964,9 +8973,14 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [])],
             initializer=[
                 onnx.numpy_helper.from_array(np.ones((2,), dtype=np.float32), name="initial_vector_state"),
-                onnx.numpy_helper.from_array(np.array(2, dtype=np.int64), name="trip_count"),
+                onnx.numpy_helper.from_array(np.array(trip_count, dtype=np.int64), name="trip_count"),
                 onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="initial_condition"),
                 onnx.numpy_helper.from_array(np.array(0.0, dtype=np.float32), name="dummy"),
+                *(
+                    [onnx.numpy_helper.from_array(np.array([2, 2, 2], dtype=np.int64), name="matrix_target_shape")]
+                    if matrix_update == "expand"
+                    else []
+                ),
             ],
         )
         model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
@@ -8989,24 +9003,42 @@ class TestWeightDistributionSemantics:
             assert semantics["coverage_gaps"] == {}
 
     @pytest.mark.parametrize(
-        ("case", "indices", "indices_shape", "expected_gap"),
+        ("case", "trip_count", "expected_gap"),
         [
-            ("scalar_indices", np.array(0, dtype=np.int64), [], False),
-            ("vector_indices", np.array([0, 1], dtype=np.int64), [2], True),
+            ("one_trip_valid", 1, False),
+            ("first_trip_guard_valid", 2, True),
         ],
     )
     def test_repeated_loop_reentry_onehot_values_rank_promotion_preserves_weight_coverage(
         self,
         tmp_path: Path,
         case: str,
-        indices: np.ndarray,
-        indices_shape: list[int],
+        trip_count: int,
         expected_gap: bool,
     ) -> None:
+        then_branch = helper.make_graph(
+            [helper.make_node("OneHot", ["indices", "depth", "values_state"], ["branch_values"])],
+            "onehot_then_branch",
+            [],
+            [helper.make_tensor_value_info("branch_values", TensorProto.FLOAT, None)],
+        )
+        else_branch = helper.make_graph(
+            [helper.make_node("Identity", ["values_state"], ["branch_values"])],
+            "onehot_else_branch",
+            [],
+            [helper.make_tensor_value_info("branch_values", TensorProto.FLOAT, None)],
+        )
         body = helper.make_graph(
             [
                 helper.make_node("MatMul", ["probe", "values_state"], ["body_y"]),
-                helper.make_node("OneHot", ["indices", "depth", "values_state"], ["next_values_state"]),
+                helper.make_node("Equal", ["iteration", "zero"], ["is_first_trip"]),
+                helper.make_node(
+                    "If",
+                    ["is_first_trip"],
+                    ["next_values_state"],
+                    then_branch=then_branch,
+                    else_branch=else_branch,
+                ),
                 helper.make_node("Identity", ["condition_in"], ["condition_out"]),
             ],
             "retained_loop_reentry_onehot_values_rank_promotion_body",
@@ -9017,7 +9049,7 @@ class TestWeightDistributionSemantics:
             ],
             [
                 helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
-                helper.make_tensor_value_info("next_values_state", TensorProto.FLOAT, [2]),
+                helper.make_tensor_value_info("next_values_state", TensorProto.FLOAT, None),
             ],
         )
         graph = helper.make_graph(
@@ -9035,17 +9067,18 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [])],
             initializer=[
                 onnx.numpy_helper.from_array(np.array([0.0, 1.0], dtype=np.float32), name="initial_values_state"),
-                onnx.numpy_helper.from_array(indices, name="indices"),
+                onnx.numpy_helper.from_array(np.array([0, 1], dtype=np.int64), name="indices"),
                 onnx.numpy_helper.from_array(np.array(2, dtype=np.int64), name="depth"),
-                onnx.numpy_helper.from_array(np.array(2, dtype=np.int64), name="trip_count"),
+                onnx.numpy_helper.from_array(np.array(0, dtype=np.int64), name="zero"),
+                onnx.numpy_helper.from_array(np.array(trip_count, dtype=np.int64), name="trip_count"),
                 onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="initial_condition"),
                 onnx.numpy_helper.from_array(np.array(0.0, dtype=np.float32), name="dummy"),
             ],
-            value_info=[helper.make_tensor_value_info("indices", TensorProto.INT64, indices_shape)],
+            value_info=[helper.make_tensor_value_info("indices", TensorProto.INT64, [2])],
         )
         model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
         model.ir_version = 8
-        onnx.checker.check_model(model)
+        onnx.checker.check_model(model, full_check=True)
         path = tmp_path / f"retained-loop-reentry-onehot-values-rank-promotion-{case}.onnx"
         onnx.save(model, str(path))
 
@@ -11024,7 +11057,20 @@ class TestWeightDistributionSemantics:
         assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
         assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
 
-    def test_repeated_loop_weight_reachability_work_bound_fails_closed(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize(
+        ("case", "include_body_consumer", "expected_gap"),
+        [
+            ("with_body_consumer", True, True),
+            ("without_body_consumer", False, False),
+        ],
+    )
+    def test_repeated_loop_weight_reachability_work_bound_fails_closed(
+        self,
+        tmp_path: Path,
+        case: str,
+        include_body_consumer: bool,
+        expected_gap: bool,
+    ) -> None:
         state_count = 80
         source_names = [f"W{index}" for index in range(40)]
         initializers = [
@@ -11050,7 +11096,8 @@ class TestWeightDistributionSemantics:
         body_nodes.extend(
             helper.make_node("Identity", [f"state{index}"], [f"next_state{index}"]) for index in range(state_count)
         )
-        body_nodes.append(helper.make_node("MatMul", ["probe", "state0"], ["body_y"]))
+        if include_body_consumer:
+            body_nodes.append(helper.make_node("MatMul", ["probe", "state0"], ["body_y"]))
         body = helper.make_graph(
             body_nodes,
             "large_repeated_loop_weight_reachability_body",
@@ -11088,7 +11135,7 @@ class TestWeightDistributionSemantics:
         )
         graph = helper.make_graph(
             nodes,
-            "large_repeated_loop_weight_reachability_bound",
+            f"large_repeated_loop_weight_reachability_bound_{case}",
             [helper.make_tensor_value_info("probe", TensorProto.FLOAT, [1, 4])],
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [])],
             initializer=initializers,
@@ -11096,16 +11143,21 @@ class TestWeightDistributionSemantics:
         model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
         model.ir_version = 8
         onnx.checker.check_model(model)
-        path = tmp_path / "large-repeated-loop-weight-reachability-bound.onnx"
+        path = tmp_path / f"large-repeated-loop-weight-reachability-bound-{case}.onnx"
         onnx.save(model, str(path))
 
         result = OnnxScanner().scan(str(path))
 
         coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
         semantics = result.metadata["onnx_weight_distribution_semantics"]
-        assert result.success is False
-        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
-        assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
+        if expected_gap:
+            assert result.success is False
+            assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
+            assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
+        else:
+            assert result.success is True
+            assert coverage == []
+            assert semantics["coverage_gaps"] == {}
 
     def test_repeated_loop_non_shape_rank_growth_promotes_after_float_cast(self, tmp_path: Path) -> None:
         source_names = [f"W{index}" for index in range(33)]

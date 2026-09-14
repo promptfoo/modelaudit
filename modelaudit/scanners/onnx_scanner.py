@@ -175,7 +175,7 @@ _ONNX_STRUCTURE_RETAINED_OBJECT_BYTES = 1024
 _ONNX_STRUCTURE_RETAINED_SEQUENCE_ENTRY_BYTES = 64
 _ONNX_STRUCTURE_RETAINED_STRING_OVERHEAD_BYTES = 64
 _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_OUTPUTS = 1024
-_ONNX_WEIGHT_REACHABILITY_MAX_GRAPH_WORK = 4096
+_ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK = 4096
 _ONNX_RESULT_MAX_DISTINCT_GROUPS = 1024
 _STANDARD_NEURAL_NETWORK_DOMAINS: frozenset[str] = frozenset({"", "ai.onnx"})
 _SAME_TYPE_ELEMENTWISE_OPERATORS: frozenset[str] = frozenset(
@@ -2661,6 +2661,11 @@ def _build_onnx_weight_analysis_plan(
             and (len(inputs) == 1 or node.op_type in {"Clip", "Dropout"})
         )
 
+    def subgraph_analysis_work_exceeds_limit(subgraph: Any) -> bool:
+        graph_node_count = len(getattr(subgraph, "node", ()))
+        graph_input_count = len(getattr(subgraph, "input", ()))
+        return graph_node_count * max(graph_input_count, 1) > _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
+
     def subgraph_reenters_state_with_rank_promotion(
         subgraph: Any,
         graph_input_name: str,
@@ -2680,7 +2685,9 @@ def _build_onnx_weight_analysis_plan(
         graph_outputs = getattr(subgraph, "output", ())
         if graph_output_index < 0 or graph_output_index >= len(graph_outputs):
             return False
-        if len(graph_outputs) > _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_OUTPUTS:
+        if len(graph_outputs) > _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_OUTPUTS or subgraph_analysis_work_exceeds_limit(
+            subgraph
+        ):
             return True
         graph_output_name = _onnx_value_name(graph_outputs[graph_output_index])
         if not graph_output_name:
@@ -3215,7 +3222,81 @@ def _build_onnx_weight_analysis_plan(
 
     weight_reachability_cache: dict[tuple[Any, ...], bool] = {}
     weight_reachability_in_progress: set[tuple[Any, ...]] = set()
-    weight_reachability_budget_gap_graphs: set[tuple[Any, ...]] = set()
+    potential_weight_consumer_cache: dict[tuple[Any, ...], bool] = {}
+
+    def subgraph_has_potential_weight_consumer(
+        subgraph: Any,
+        opset_versions: dict[str, int],
+        *,
+        attribute_bindings: dict[str, Any] | None = None,
+        depth: int = 0,
+    ) -> bool:
+        if depth > 6:
+            return True
+        cache_key = (
+            id(subgraph),
+            opset_cache_key(opset_versions),
+            attribute_binding_cache_key(attribute_bindings),
+            depth,
+        )
+        if cache_key in potential_weight_consumer_cache:
+            return potential_weight_consumer_cache[cache_key]
+        local_attribute_bindings = attribute_bindings or {}
+
+        def resolve_reentry_attribute(attribute: Any) -> Any | None:
+            reference_name = str(getattr(attribute, "ref_attr_name", ""))
+            return local_attribute_bindings.get(reference_name) if reference_name else attribute
+
+        for body_node in getattr(subgraph, "node", ()):
+            body_inputs = [str(input_name) for input_name in getattr(body_node, "input", ())]
+            function_key = (
+                str(getattr(body_node, "domain", "")),
+                str(getattr(body_node, "op_type", "")),
+                str(getattr(body_node, "overload", "")),
+            )
+            function = functions.get(function_key)
+            is_model_local_function = function_key in functions
+            is_registered_standard_operator = is_model_local_function or has_registered_standard_operator(
+                body_node,
+                opset_versions,
+            )
+            if any(
+                _onnx_potential_weight_input(
+                    body_node,
+                    input_index,
+                    is_model_local_function=is_model_local_function,
+                    is_registered_standard_operator=is_registered_standard_operator,
+                )
+                for input_index in range(len(body_inputs))
+            ):
+                potential_weight_consumer_cache[cache_key] = True
+                return True
+            if function is not None:
+                function_attributes = bound_function_attributes(function, body_node, resolve_reentry_attribute)
+                function_versions = function_opset_versions(function, opset_versions)
+                if subgraph_has_potential_weight_consumer(
+                    function,
+                    function_versions,
+                    attribute_bindings=function_attributes,
+                    depth=depth + 1,
+                ):
+                    potential_weight_consumer_cache[cache_key] = True
+                    return True
+            for attribute in getattr(body_node, "attribute", ()):
+                resolved_attribute = resolve_reentry_attribute(attribute)
+                if resolved_attribute is None:
+                    continue
+                for nested_graph in _iter_attribute_graphs(resolved_attribute):
+                    if subgraph_has_potential_weight_consumer(
+                        nested_graph,
+                        opset_versions,
+                        attribute_bindings=local_attribute_bindings,
+                        depth=depth + 1,
+                    ):
+                        potential_weight_consumer_cache[cache_key] = True
+                        return True
+        potential_weight_consumer_cache[cache_key] = False
+        return False
 
     def subgraph_state_input_can_reach_weight_consumer(
         subgraph: Any,
@@ -3238,20 +3319,15 @@ def _build_onnx_weight_analysis_plan(
         )
         if cache_key in weight_reachability_cache:
             return weight_reachability_cache[cache_key]
-        graph_node_count = len(getattr(subgraph, "node", ()))
-        graph_input_count = len(getattr(subgraph, "input", ()))
-        if graph_node_count * max(graph_input_count, 1) > _ONNX_WEIGHT_REACHABILITY_MAX_GRAPH_WORK:
-            budget_key = (
-                id(subgraph),
-                opset_cache_key(opset_versions),
-                attribute_binding_cache_key(attribute_bindings),
-                depth,
+        if subgraph_analysis_work_exceeds_limit(subgraph):
+            result = subgraph_has_potential_weight_consumer(
+                subgraph,
+                opset_versions,
+                attribute_bindings=attribute_bindings,
+                depth=depth,
             )
-            if budget_key not in weight_reachability_budget_gap_graphs:
-                plan.record_coverage_gap("lineages_per_value_limit", 1)
-                weight_reachability_budget_gap_graphs.add(budget_key)
-            weight_reachability_cache[cache_key] = True
-            return True
+            weight_reachability_cache[cache_key] = result
+            return result
         if cache_key in weight_reachability_in_progress:
             return True
         weight_reachability_in_progress.add(cache_key)
@@ -5538,29 +5614,23 @@ def _build_onnx_weight_analysis_plan(
                             and (loop_condition_name not in value_lineages or immutable_scalar_condition)
                         ):
                             subgraph_trusted_context_shapes[loop_body_condition_name] = loop_condition_shape
-                    for pair_index, (parent_input, graph_input) in enumerate(
-                        input_pairs,
-                        start=input_pair_index_start,
-                    ):
-                        parent_name = str(parent_input)
-                        graph_input_name = _onnx_value_name(graph_input)
-                        trusted_parent_shape = trusted_bound_context_shape(parent_name, pair_index)
-                        if graph_input_name and trusted_parent_shape is not None:
-                            subgraph_trusted_context_shapes[graph_input_name] = trusted_parent_shape
-                    for pair_index, (parent_input, graph_input) in enumerate(input_pairs, start=input_pair_index_start):
-                        parent_name = str(parent_input)
-                        graph_input_name = _onnx_value_name(graph_input)
-                        parent_shape = known_value_shapes.get(parent_name)
-                        parent_rank = known_value_ranks.get(parent_name)
-                        repeated_control_flow_state_input = (
-                            node.op_type == "Loop"
-                            and pair_index >= 2
-                            and loop_may_repeat_body(node, constants, graph_input_names)
-                        ) or (
-                            node.op_type == "Scan"
-                            and pair_index < scan_input_start
-                            and scan_may_repeat_body(
-                                node,
+
+                    scan_num_inputs = num_scan_inputs if node.op_type == "Scan" else 0
+
+                    def is_repeated_control_flow_state_input(
+                        pair_index: int,
+                        *,
+                        current_node: Any = node,
+                        current_scan_input_start: int = scan_input_start,
+                        current_scan_input_axes: tuple[int, ...] = scan_input_axes,
+                        current_scan_input_offset: int = scan_input_offset,
+                        current_scan_num_inputs: int = scan_num_inputs,
+                    ) -> bool:
+                        if current_node.op_type == "Loop":
+                            return pair_index >= 2 and loop_may_repeat_body(current_node, constants, graph_input_names)
+                        if current_node.op_type == "Scan":
+                            return pair_index < current_scan_input_start and scan_may_repeat_body(
+                                current_node,
                                 constants,
                                 graph_input_names,
                                 known_value_shapes,
@@ -5570,11 +5640,53 @@ def _build_onnx_weight_analysis_plan(
                                     for name in graph_input_names & set(value_lineages)
                                     if name not in proven_value_ranks
                                 },
-                                scan_input_axes=scan_input_axes,
-                                scan_input_offset=scan_input_offset,
-                                num_scan_inputs=num_scan_inputs,
+                                scan_input_axes=current_scan_input_axes,
+                                scan_input_offset=current_scan_input_offset,
+                                num_scan_inputs=current_scan_num_inputs,
                             )
-                        )
+                        return False
+
+                    trusted_repeated_context_candidates: list[tuple[int, str, tuple[int, ...]]] = []
+                    for pair_index, (parent_input, graph_input) in enumerate(
+                        input_pairs,
+                        start=input_pair_index_start,
+                    ):
+                        parent_name = str(parent_input)
+                        graph_input_name = _onnx_value_name(graph_input)
+                        trusted_parent_shape = trusted_bound_context_shape(parent_name, pair_index)
+                        if not graph_input_name or trusted_parent_shape is None:
+                            continue
+                        if is_repeated_control_flow_state_input(pair_index):
+                            trusted_repeated_context_candidates.append(
+                                (pair_index, graph_input_name, trusted_parent_shape)
+                            )
+                            continue
+                        subgraph_trusted_context_shapes[graph_input_name] = trusted_parent_shape
+                    trusted_repeated_context_shapes: dict[str, tuple[int, ...]] = {}
+                    for pair_index, graph_input_name, trusted_parent_shape in trusted_repeated_context_candidates:
+                        graph_output_index = control_flow_subgraph_state_output_index(node, pair_index, opset_versions)
+                        output_shapes: dict[int, tuple[int, ...]] = {}
+                        if (
+                            not subgraph_reenters_state_with_rank_promotion(
+                                subgraph,
+                                graph_input_name,
+                                graph_output_index,
+                                constants,
+                                opset_versions,
+                                trusted_parent_shape,
+                                trusted_context_shapes=subgraph_trusted_context_shapes,
+                                output_shapes_out=output_shapes,
+                            )
+                            and output_shapes.get(graph_output_index) == trusted_parent_shape
+                        ):
+                            trusted_repeated_context_shapes[graph_input_name] = trusted_parent_shape
+                    subgraph_trusted_context_shapes.update(trusted_repeated_context_shapes)
+                    for pair_index, (parent_input, graph_input) in enumerate(input_pairs, start=input_pair_index_start):
+                        parent_name = str(parent_input)
+                        graph_input_name = _onnx_value_name(graph_input)
+                        parent_shape = known_value_shapes.get(parent_name)
+                        parent_rank = known_value_ranks.get(parent_name)
+                        repeated_control_flow_state_input = is_repeated_control_flow_state_input(pair_index)
                         repeated_state_reenters_with_rank_promotion = False
                         if repeated_control_flow_state_input:
                             repeated_state_reenters_with_rank_promotion = subgraph_reenters_state_with_rank_promotion(
@@ -5587,11 +5699,12 @@ def _build_onnx_weight_analysis_plan(
                                 trusted_context_shapes=subgraph_trusted_context_shapes,
                             )
                         parent_rank_for_repeated_state = len(parent_shape) if parent_shape is not None else parent_rank
-                        repeated_state_gap_may_feed_weight = repeated_control_flow_state_input and (
+                        repeated_state_rank_gap_may_affect_weight = repeated_control_flow_state_input and (
                             repeated_state_reenters_with_rank_promotion
                             or parent_rank_for_repeated_state is None
                             or parent_rank_for_repeated_state != 1
                         )
+                        repeated_state_gap_may_feed_weight = repeated_state_rank_gap_may_affect_weight
                         if parent_name in value_lineages:
                             subgraph_bound_lineages[graph_input_name] = value_lineages[parent_name]
                             if repeated_state_reenters_with_rank_promotion:
@@ -5642,6 +5755,25 @@ def _build_onnx_weight_analysis_plan(
                             subgraph_bound_unknown_value_ranks.add(graph_input_name)
                         if parent_name in value_lineage_limit_gap_counts:
                             subgraph_bound_lineage_gaps[graph_input_name] = value_lineage_limit_gap_counts[parent_name]
+                            inherited_gap_summary = known_weight_gap_summary(
+                                None,
+                                value_lineage_limit_gap_counts[parent_name],
+                            )
+                            if repeated_state_rank_gap_may_affect_weight:
+                                subgraph_bound_rank_promotable_lineage_gaps[graph_input_name] = (
+                                    _bounded_onnx_weight_lineage_gap_count(
+                                        subgraph_bound_rank_promotable_lineage_gaps.get(graph_input_name, 0),
+                                        value_lineage_limit_gap_counts[parent_name],
+                                    )
+                                )
+                                subgraph_bound_rank_promotable_lineage_gap_summaries[graph_input_name] = (
+                                    merge_weight_lineage_gap_summaries(
+                                        subgraph_bound_rank_promotable_lineage_gap_summaries.get(
+                                            graph_input_name, empty_weight_gap_summary
+                                        ),
+                                        inherited_gap_summary,
+                                    )
+                                )
                             if repeated_state_gap_may_feed_weight:
                                 subgraph_bound_weight_lineage_gaps[graph_input_name] = (
                                     _bounded_onnx_weight_lineage_gap_count(
@@ -5654,7 +5786,7 @@ def _build_onnx_weight_analysis_plan(
                                         subgraph_bound_weight_lineage_gap_summaries.get(
                                             graph_input_name, empty_weight_gap_summary
                                         ),
-                                        known_weight_gap_summary(None, value_lineage_limit_gap_counts[parent_name]),
+                                        inherited_gap_summary,
                                     )
                                 )
                         if parent_name in value_non_shape_lineage_limit_gap_counts:
