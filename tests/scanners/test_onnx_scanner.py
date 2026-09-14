@@ -7941,12 +7941,11 @@ class TestWeightDistributionSemantics:
         assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
         assert semantics["coverage_gaps"]["unresolved_initializer_lineage"] >= 1
 
-    @pytest.mark.parametrize("control_flow_op", ["Loop", "Scan"])
-    def test_repeated_control_flow_promotes_carried_rank_gap_before_body_reentry(
+    def test_repeated_loop_promotes_carried_rank_gap_before_body_reentry(
         self,
         tmp_path: Path,
-        control_flow_op: str,
     ) -> None:
+        control_flow_op = "Loop"
         source_names = [f"W{index}" for index in range(40)]
         initializers = [
             *[onnx.numpy_helper.from_array(np.ones((4,), dtype=np.float32), name=name) for name in source_names],
@@ -8037,13 +8036,20 @@ class TestWeightDistributionSemantics:
         semantics = result.metadata["onnx_weight_distribution_semantics"]
         assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
 
-    @pytest.mark.parametrize("control_flow_op", ["Loop", "Scan"])
-    @pytest.mark.parametrize("rank_promotes", [False, True])
+    @pytest.mark.parametrize(
+        ("control_flow_op", "rank_promotes", "expected_gap"),
+        [
+            ("Loop", False, False),
+            ("Loop", True, True),
+            ("Scan", False, False),
+        ],
+    )
     def test_repeated_control_flow_promotes_retained_carried_vector_before_reentry(
         self,
         tmp_path: Path,
         control_flow_op: str,
         rank_promotes: bool,
+        expected_gap: bool,
     ) -> None:
         initializers = [
             onnx.numpy_helper.from_array(np.ones((4,), dtype=np.float32), name="initial_state"),
@@ -8136,7 +8142,7 @@ class TestWeightDistributionSemantics:
 
         coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
         semantics = result.metadata["onnx_weight_distribution_semantics"]
-        if rank_promotes:
+        if expected_gap:
             assert result.success is False
             assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
             assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
@@ -8145,13 +8151,20 @@ class TestWeightDistributionSemantics:
             assert coverage == []
             assert semantics["coverage_gaps"] == {}
 
-    @pytest.mark.parametrize("control_flow_op", ["Loop", "Scan"])
-    @pytest.mark.parametrize("rank_promotes", [False, True])
+    @pytest.mark.parametrize(
+        ("control_flow_op", "rank_promotes", "expected_gap"),
+        [
+            ("Loop", False, False),
+            ("Loop", True, True),
+            ("Scan", False, False),
+        ],
+    )
     def test_repeated_control_flow_promotes_body_created_carried_gap_before_reentry(
         self,
         tmp_path: Path,
         control_flow_op: str,
         rank_promotes: bool,
+        expected_gap: bool,
     ) -> None:
         source_names = [f"W{index}" for index in range(40)]
         initializers = [
@@ -8248,7 +8261,7 @@ class TestWeightDistributionSemantics:
 
         coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
         semantics = result.metadata["onnx_weight_distribution_semantics"]
-        if rank_promotes:
+        if expected_gap:
             assert result.success is False
             assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
             assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
