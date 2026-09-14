@@ -2268,8 +2268,11 @@ def _build_onnx_weight_analysis_plan(
         *,
         scan_input_axes: tuple[int, ...] | None = None,
         scan_input_offset: int = 0,
+        num_scan_inputs: int | None = None,
     ) -> bool:
-        num_scan_inputs = _onnx_int_attribute(node, "num_scan_inputs", 1)
+        num_scan_inputs = (
+            _onnx_int_attribute(node, "num_scan_inputs", 1) if num_scan_inputs is None else num_scan_inputs
+        )
         if num_scan_inputs <= 0:
             return True
         scan_input_start = max(len(node.input) - num_scan_inputs, scan_input_offset)
@@ -2315,8 +2318,11 @@ def _build_onnx_weight_analysis_plan(
         *,
         scan_input_axes: tuple[int, ...] | None = None,
         scan_input_offset: int = 0,
+        num_scan_inputs: int | None = None,
     ) -> bool:
-        num_scan_inputs = _onnx_int_attribute(node, "num_scan_inputs", 1)
+        num_scan_inputs = (
+            _onnx_int_attribute(node, "num_scan_inputs", 1) if num_scan_inputs is None else num_scan_inputs
+        )
         if num_scan_inputs <= 0:
             return True
         known_shapes = known_shapes or {}
@@ -2560,10 +2566,11 @@ def _build_onnx_weight_analysis_plan(
         opset_versions: dict[str, int],
     ) -> dict[str, Any]:
         if node.op_type == "Loop":
+            if loop_may_repeat_body(node, constants, set()):
+                return {}
             input_pairs = zip(node.input[2:], nested_graph.input[2:], strict=False)
         elif node.op_type == "Scan":
-            scan_input_offset = scan_sequence_lens_input_offset(node, opset_versions)
-            input_pairs = zip(node.input[scan_input_offset:], nested_graph.input, strict=False)
+            return {}
         else:
             return {}
         bindings: dict[str, Any] = {}
@@ -5310,6 +5317,7 @@ def _build_onnx_weight_analysis_plan(
                                 },
                                 scan_input_axes=scan_input_axes,
                                 scan_input_offset=scan_input_offset,
+                                num_scan_inputs=num_scan_inputs,
                             )
                         )
                         repeated_state_reenters_with_rank_promotion = False
@@ -6379,6 +6387,11 @@ def _build_onnx_weight_analysis_plan(
                 if standard_control_flow_operator and node.op_type == "Scan"
                 else 0
             )
+            resolved_scan_input_count = (
+                resolved_int_attribute(node, "num_scan_inputs", 1)
+                if standard_control_flow_operator and node.op_type == "Scan"
+                else 0
+            )
             trusted_scan_shape_names = proven_value_ranks
             untrusted_scan_shape_names = {
                 name for name in graph_input_names & set(value_lineages) if name not in proven_value_ranks
@@ -6570,6 +6583,7 @@ def _build_onnx_weight_analysis_plan(
                                     untrusted_scan_shape_names,
                                     scan_input_axes=resolved_scan_input_axes,
                                     scan_input_offset=resolved_scan_input_offset,
+                                    num_scan_inputs=resolved_scan_input_count,
                                 )
                             )
                         )
@@ -6670,6 +6684,7 @@ def _build_onnx_weight_analysis_plan(
                                     untrusted_scan_shape_names,
                                     scan_input_axes=resolved_scan_input_axes,
                                     scan_input_offset=resolved_scan_input_offset,
+                                    num_scan_inputs=resolved_scan_input_count,
                                 )
                             )
                         )
@@ -6735,6 +6750,7 @@ def _build_onnx_weight_analysis_plan(
                                     untrusted_scan_shape_names,
                                     scan_input_axes=resolved_scan_input_axes,
                                     scan_input_offset=resolved_scan_input_offset,
+                                    num_scan_inputs=resolved_scan_input_count,
                                 )
                             )
                         )
@@ -6898,10 +6914,12 @@ def _build_onnx_weight_analysis_plan(
                     untrusted_scan_shape_names,
                     scan_input_axes=resolved_scan_input_axes,
                     scan_input_offset=resolved_scan_input_offset,
+                    num_scan_inputs=resolved_scan_input_count,
                 )
             ):
-                num_scan_inputs = resolved_int_attribute(node, "num_scan_inputs", 1)
-                scan_state_input_count = max(len(node.input) - resolved_scan_input_offset - max(num_scan_inputs, 0), 0)
+                scan_state_input_count = max(
+                    len(node.input) - resolved_scan_input_offset - max(resolved_scan_input_count, 0), 0
+                )
                 state_inputs = node.input[
                     resolved_scan_input_offset : resolved_scan_input_offset
                     + min(scan_state_input_count, len(node.output))
