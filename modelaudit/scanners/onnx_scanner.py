@@ -2407,11 +2407,11 @@ def _build_onnx_weight_analysis_plan(
         return bindings
 
     reentry_promotion_cache: dict[
-        tuple[int, str, int, tuple[int, ...] | None, tuple[tuple[str, int], ...], tuple[tuple[str, int], ...], int],
-        bool,
+        tuple[int, str, tuple[int, ...] | None, tuple[tuple[str, int], ...], tuple[tuple[str, int], ...], int],
+        frozenset[int],
     ] = {}
     reentry_promotion_in_progress: set[
-        tuple[int, str, int, tuple[int, ...] | None, tuple[tuple[str, int], ...], tuple[tuple[str, int], ...], int]
+        tuple[int, str, tuple[int, ...] | None, tuple[tuple[str, int], ...], tuple[tuple[str, int], ...], int]
     ] = set()
 
     def subgraph_reenters_state_with_rank_promotion(
@@ -2429,20 +2429,20 @@ def _build_onnx_weight_analysis_plan(
             return True
         if graph_output_index < 0 or graph_output_index >= len(getattr(subgraph, "output", ())):
             return False
-        graph_output_name = _onnx_value_name(subgraph.output[graph_output_index])
+        graph_outputs = list(getattr(subgraph, "output", ()))
+        graph_output_name = _onnx_value_name(graph_outputs[graph_output_index])
         if not graph_output_name:
             return False
         cache_key = (
             id(subgraph),
             graph_input_name,
-            graph_output_index,
             graph_input_shape,
             opset_cache_key(opset_versions),
             attribute_binding_cache_key(attribute_bindings),
             depth,
         )
         if cache_key in reentry_promotion_cache:
-            return reentry_promotion_cache[cache_key]
+            return graph_output_index in reentry_promotion_cache[cache_key]
         if cache_key in reentry_promotion_in_progress:
             return True
         reentry_promotion_in_progress.add(cache_key)
@@ -2609,10 +2609,12 @@ def _build_onnx_weight_analysis_plan(
                 if output_shape is not None:
                     for output_name in body_outputs:
                         tainted_shapes[output_name] = output_shape
-        result = graph_output_name in promoted
+        promoted_output_indexes = frozenset(
+            output_index for output_index, output in enumerate(graph_outputs) if _onnx_value_name(output) in promoted
+        )
         reentry_promotion_in_progress.discard(cache_key)
-        reentry_promotion_cache[cache_key] = result
-        return result
+        reentry_promotion_cache[cache_key] = promoted_output_indexes
+        return graph_output_index in promoted_output_indexes
 
     def graph_outputs_may_reference_tainted(
         subgraph: Any,

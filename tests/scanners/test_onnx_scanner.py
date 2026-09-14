@@ -14390,7 +14390,7 @@ class TestWeightDistributionSemantics:
         assert semantics["coverage_gaps"] == {}
 
     def test_repeated_loop_local_function_rank_reentry_fanout_is_bounded(self, tmp_path: Path) -> None:
-        width = 5
+        width = 6
         depth = 5
         functions = []
         for level in range(depth, -1, -1):
