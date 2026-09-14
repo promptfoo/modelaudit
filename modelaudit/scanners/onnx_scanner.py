@@ -2094,6 +2094,8 @@ def _build_onnx_weight_analysis_plan(
                 )
             if attribute.name == "value_float":
                 return onnx.helper.make_tensor("", onnx.TensorProto.FLOAT, [], [resolved_attribute.f])
+            if attribute.name == "sparse_value" and _onnx_has_singular_field(resolved_attribute, "sparse_tensor"):
+                return resolved_attribute.sparse_tensor
         return None
 
     def graph_value_is_constant_false(
@@ -2646,6 +2648,7 @@ def _build_onnx_weight_analysis_plan(
         graph_input_shape: tuple[int, ...] | None,
         attribute_bindings: dict[str, Any] | None = None,
         bound_input_constants: dict[str, Any] | None = None,
+        trusted_context_shapes: dict[str, tuple[int, ...]] | None = None,
         output_shapes_out: dict[int, tuple[int, ...]] | None = None,
         *,
         depth: int = 0,
@@ -2658,10 +2661,12 @@ def _build_onnx_weight_analysis_plan(
         graph_output_name = _onnx_value_name(graph_outputs[graph_output_index])
         if not graph_output_name:
             return False
+        trusted_context_shapes = trusted_context_shapes or {}
         cache_key = (
             id(subgraph),
             graph_input_name,
             graph_input_shape,
+            tuple(sorted((name, shape) for name, shape in trusted_context_shapes.items())),
             opset_cache_key(opset_versions),
             attribute_binding_cache_key(attribute_bindings),
             constant_binding_cache_key(constants, rank_reentry_constant_names(subgraph)),
@@ -2689,6 +2694,15 @@ def _build_onnx_weight_analysis_plan(
         tainted = {graph_input_name}
         tainted_shapes = {graph_input_name: graph_input_shape} if graph_input_shape is not None else {}
         promoted: set[str] = set()
+
+        def reentry_input_shape(input_name: str) -> tuple[int, ...] | None:
+            if input_name in tainted_shapes:
+                return tainted_shapes[input_name]
+            initializer_shape = constant_initializer_shape(subgraph_constants, input_name)
+            if initializer_shape is not None:
+                return initializer_shape
+            return trusted_context_shapes.get(input_name)
+
         for body_node in getattr(subgraph, "node", ()):
             body_inputs = [str(input_name) for input_name in getattr(body_node, "input", ())]
             body_outputs = [str(output_name) for output_name in getattr(body_node, "output", ()) if output_name]
@@ -2712,15 +2726,16 @@ def _build_onnx_weight_analysis_plan(
             data_input_tainted = bool(body_inputs and body_inputs[0] in tainted)
             any_promoted = any(input_name in promoted for input_name in body_inputs)
             any_tainted = any(input_name in tainted for input_name in body_inputs)
-            data_input_shape = tainted_shapes.get(body_inputs[0]) if body_inputs else None
-            index_input_shape = tainted_shapes.get(body_inputs[1]) if len(body_inputs) > 1 else None
+            data_input_shape = (
+                reentry_input_shape(body_inputs[0]) if body_inputs and body_inputs[0] in tainted else None
+            )
+            index_input_shape = reentry_input_shape(body_inputs[1]) if len(body_inputs) > 1 else None
             if index_input_shape is None and body_node.op_type in {"Gather", "GatherND"} and len(body_inputs) > 1:
                 index_input_shape = constant_initializer_shape(subgraph_constants, body_inputs[1])
-            input_shapes_by_name = {
-                input_name: tainted_shapes.get(input_name) or constant_initializer_shape(subgraph_constants, input_name)
-                for input_name in body_inputs
-            }
-            data_input_may_promote = data_input_tainted and operator_output_may_have_weight_rank(
+            input_shapes_by_name = {input_name: reentry_input_shape(input_name) for input_name in body_inputs}
+            elementwise_operator = body_node.op_type in _SAME_TYPE_ELEMENTWISE_OPERATORS or body_node.op_type == "Pow"
+            promotion_input_tainted = any_tainted if elementwise_operator else data_input_tainted
+            data_input_may_promote = promotion_input_tainted and operator_output_may_have_weight_rank(
                 body_node,
                 input_shape=data_input_shape,
                 index_shape=index_input_shape,
@@ -2740,6 +2755,14 @@ def _build_onnx_weight_analysis_plan(
                     subgraph_constants,
                 )
                 function_versions = function_opset_versions(function, opset_versions)
+                function_context_shapes: dict[str, tuple[int, ...]] = {}
+                for input_index, input_name in enumerate(body_inputs):
+                    if input_index >= len(getattr(function, "input", ())):
+                        continue
+                    function_input_name = _onnx_value_name(function.input[input_index])
+                    input_shape = input_shapes_by_name.get(input_name)
+                    if function_input_name and input_shape is not None:
+                        function_context_shapes[function_input_name] = input_shape
                 for input_index, input_name in enumerate(body_inputs):
                     if input_name not in tainted or input_index >= len(getattr(function, "input", ())):
                         continue
@@ -2767,6 +2790,7 @@ def _build_onnx_weight_analysis_plan(
                             function_input_shape,
                             attribute_bindings=function_attributes,
                             bound_input_constants=function_bound_input_constants,
+                            trusted_context_shapes=function_context_shapes,
                             output_shapes_out=function_output_shapes,
                             depth=depth + 1,
                         ):
@@ -2797,9 +2821,22 @@ def _build_onnx_weight_analysis_plan(
                         graph_input: tainted_shapes.get(parent_input)
                         for graph_input, parent_input in nested_graph_inputs.items()
                     }
-                    captured_names = graph_external_reference_names(nested_graph) & tainted
+                    nested_context_shapes = {
+                        graph_input: shape
+                        for graph_input, parent_input in nested_graph_inputs.items()
+                        if (shape := reentry_input_shape(parent_input)) is not None
+                    }
+                    nested_external_names = graph_external_reference_names(nested_graph)
+                    captured_names = nested_external_names & tainted
                     nested_tainted_shapes.update(
                         {captured_name: tainted_shapes.get(captured_name) for captured_name in captured_names}
+                    )
+                    nested_context_shapes.update(
+                        {
+                            captured_name: shape
+                            for captured_name in nested_external_names
+                            if (shape := reentry_input_shape(captured_name)) is not None
+                        }
                     )
                     if not nested_tainted_shapes:
                         continue
@@ -2839,6 +2876,7 @@ def _build_onnx_weight_analysis_plan(
                                 attribute_bindings=local_attribute_bindings,
                                 output_shapes_out=nested_output_shapes,
                                 bound_input_constants=nested_bound_input_constants,
+                                trusted_context_shapes=nested_context_shapes,
                                 depth=depth + 1,
                             ):
                                 nested_promoted_output_indexes.add(output_index)
@@ -2883,18 +2921,18 @@ def _build_onnx_weight_analysis_plan(
                 tainted.update(body_tainted_outputs)
             elif any_tainted:
                 tainted.update(body_tainted_outputs)
-            if any_tainted and data_input_shape is not None:
+            if any_tainted:
                 output_shape = None
-                if body_node.op_type in {"Cast", "Identity", "Relu"}:
+                if body_node.op_type in {"Cast", "Identity", "Relu"} and data_input_shape is not None:
                     output_shape = data_input_shape
                 elif body_node.op_type in _SAME_TYPE_ELEMENTWISE_OPERATORS | {"Pow"}:
                     output_shape = broadcast_shapes(input_shapes_by_name.get(input_name) for input_name in body_inputs)
-                elif body_node.op_type == "Expand":
+                elif body_node.op_type == "Expand" and data_input_shape is not None:
                     shape_name = body_inputs[1] if len(body_inputs) > 1 else ""
                     target_shape = constant_int64_vector_values(subgraph_constants.get(shape_name))
                     if target_shape is not None:
                         output_shape = broadcast_shapes((data_input_shape, target_shape))
-                elif body_node.op_type == "Gather":
+                elif body_node.op_type == "Gather" and data_input_shape is not None:
                     if index_input_shape is not None:
                         gather_axis = _onnx_gather_axis(body_node, len(data_input_shape))
                         if gather_axis is not None:
@@ -2903,7 +2941,7 @@ def _build_onnx_weight_analysis_plan(
                                 *index_input_shape,
                                 *data_input_shape[gather_axis + 1 :],
                             )
-                elif body_node.op_type == "GatherND":
+                elif body_node.op_type == "GatherND" and data_input_shape is not None:
                     if index_input_shape:
                         output_shape = gathernd_output_shape(
                             body_node,
@@ -2911,7 +2949,7 @@ def _build_onnx_weight_analysis_plan(
                             index_shape=index_input_shape,
                             resolve_attribute=resolve_reentry_attribute,
                         )
-                elif body_node.op_type == "Reshape":
+                elif body_node.op_type == "Reshape" and data_input_shape is not None:
                     shape_name = body_inputs[1] if len(body_inputs) > 1 else ""
                     shape_initializer = subgraph_constants.get(shape_name)
                     if shape_initializer is not None:
@@ -2921,7 +2959,7 @@ def _build_onnx_weight_analysis_plan(
                             allowzero=bool(_onnx_int_attribute(body_node, "allowzero")),
                             onnx=onnx,
                         )
-                elif body_node.op_type == "Unsqueeze":
+                elif body_node.op_type == "Unsqueeze" and data_input_shape is not None:
                     axes = _resolve_onnx_axes(
                         body_node,
                         subgraph_constants,
@@ -2941,7 +2979,7 @@ def _build_onnx_weight_analysis_plan(
                                 1 if index in normalized_axes else next(source_dimensions)
                                 for index in range(output_rank)
                             )
-                elif body_node.op_type == "Squeeze":
+                elif body_node.op_type == "Squeeze" and data_input_shape is not None:
                     axes = _resolve_onnx_axes(
                         body_node,
                         subgraph_constants,
@@ -5292,6 +5330,11 @@ def _build_onnx_weight_analysis_plan(
                     subgraph_input_names = {
                         name for value_info in getattr(subgraph, "input", ()) if (name := _onnx_value_name(value_info))
                     }
+                    subgraph_trusted_context_shapes = {
+                        name: known_value_shapes[name]
+                        for name in graph_external_reference_names(subgraph)
+                        if name in known_value_shapes and name in proven_value_ranks and name not in value_lineages
+                    }
                     input_pairs: Iterable[tuple[Any, Any]]
                     input_pair_index_start = 0
                     scan_input_start = len(node.input)
@@ -5346,6 +5389,7 @@ def _build_onnx_weight_analysis_plan(
                                 constants,
                                 opset_versions,
                                 parent_shape,
+                                trusted_context_shapes=subgraph_trusted_context_shapes,
                             )
                         parent_rank_for_repeated_state = len(parent_shape) if parent_shape is not None else parent_rank
                         repeated_state_gap_may_feed_weight = repeated_control_flow_state_input and (
