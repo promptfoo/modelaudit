@@ -14389,6 +14389,88 @@ class TestWeightDistributionSemantics:
         assert coverage == []
         assert semantics["coverage_gaps"] == {}
 
+    def test_repeated_loop_local_function_rank_reentry_fanout_is_bounded(self, tmp_path: Path) -> None:
+        width = 5
+        depth = 5
+        functions = []
+        for level in range(depth, -1, -1):
+            outputs = [f"out{index}" for index in range(width)]
+            if level == depth:
+                nodes = [helper.make_node("Identity", ["state"], [output_name]) for output_name in outputs]
+            else:
+                nodes = []
+                for index, output_name in enumerate(outputs):
+                    child_outputs = [f"child_l{level}_o{index}_{child}" for child in range(width)]
+                    nodes.append(helper.make_node(f"Fanout{level + 1}", ["state"], child_outputs, domain="local"))
+                    nodes.append(helper.make_node("Identity", [child_outputs[0]], [output_name]))
+            functions.append(
+                helper.make_function(
+                    "local",
+                    f"Fanout{level}",
+                    ["state"],
+                    outputs,
+                    nodes,
+                    opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
+                )
+            )
+        body = helper.make_graph(
+            [
+                helper.make_node("MatMul", ["X", "state"], ["body_y"]),
+                helper.make_node(
+                    "Fanout0",
+                    ["state"],
+                    [f"function_output{index}" for index in range(width)],
+                    domain="local",
+                ),
+                helper.make_node("Identity", ["function_output0"], ["next_state"]),
+                helper.make_node("Identity", ["condition_in"], ["condition_out"]),
+            ],
+            "local_function_rank_reentry_fanout_body",
+            [
+                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
+                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("state", TensorProto.FLOAT, [4]),
+            ],
+            [
+                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, [4]),
+            ],
+        )
+        graph = helper.make_graph(
+            [
+                helper.make_node(
+                    "Loop",
+                    ["trip_count", "initial_condition", "initial_state"],
+                    ["control_flow_state"],
+                    body=body,
+                )
+            ],
+            "local_function_rank_reentry_fanout",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 4])],
+            [helper.make_tensor_value_info("control_flow_state", TensorProto.FLOAT, [4])],
+            initializer=[
+                onnx.numpy_helper.from_array(np.zeros((4,), dtype=np.float32), name="initial_state"),
+                onnx.numpy_helper.from_array(np.array(3, dtype=np.int64), name="trip_count"),
+                onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="initial_condition"),
+            ],
+        )
+        model = helper.make_model(
+            graph,
+            functions=functions,
+            opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
+        )
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / "local-function-rank-reentry-fanout.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        assert result.success is True
+        assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["coverage_gaps"] == {}
+
     def test_local_function_scan_preserves_proven_input_extent(self, tmp_path: Path) -> None:
         source_names = [f"matrix{index}" for index in range(40)]
         body = helper.make_graph(

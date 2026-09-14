@@ -2377,6 +2377,14 @@ def _build_onnx_weight_analysis_plan(
             and output_index >= scan_stacked_output_start(node, opset_versions)
         )
 
+    def attribute_binding_cache_key(attribute_bindings: dict[str, Any] | None) -> tuple[tuple[str, int], ...]:
+        if not attribute_bindings:
+            return ()
+        return tuple(sorted((str(name), id(value)) for name, value in attribute_bindings.items()))
+
+    def opset_cache_key(opset_versions: dict[str, int]) -> tuple[tuple[str, int], ...]:
+        return tuple(sorted((str(domain), int(version)) for domain, version in opset_versions.items()))
+
     def bound_control_flow_graph_inputs(
         node: Any,
         nested_graph: Any,
@@ -2398,6 +2406,14 @@ def _build_onnx_weight_analysis_plan(
                 bindings[graph_input_name] = parent_name
         return bindings
 
+    reentry_promotion_cache: dict[
+        tuple[int, str, int, tuple[int, ...] | None, tuple[tuple[str, int], ...], tuple[tuple[str, int], ...], int],
+        bool,
+    ] = {}
+    reentry_promotion_in_progress: set[
+        tuple[int, str, int, tuple[int, ...] | None, tuple[tuple[str, int], ...], tuple[tuple[str, int], ...], int]
+    ] = set()
+
     def subgraph_reenters_state_with_rank_promotion(
         subgraph: Any,
         graph_input_name: str,
@@ -2416,6 +2432,20 @@ def _build_onnx_weight_analysis_plan(
         graph_output_name = _onnx_value_name(subgraph.output[graph_output_index])
         if not graph_output_name:
             return False
+        cache_key = (
+            id(subgraph),
+            graph_input_name,
+            graph_output_index,
+            graph_input_shape,
+            opset_cache_key(opset_versions),
+            attribute_binding_cache_key(attribute_bindings),
+            depth,
+        )
+        if cache_key in reentry_promotion_cache:
+            return reentry_promotion_cache[cache_key]
+        if cache_key in reentry_promotion_in_progress:
+            return True
+        reentry_promotion_in_progress.add(cache_key)
         local_attribute_bindings = attribute_bindings or {}
 
         def resolve_reentry_attribute(attribute: Any) -> Any | None:
@@ -2579,7 +2609,10 @@ def _build_onnx_weight_analysis_plan(
                 if output_shape is not None:
                     for output_name in body_outputs:
                         tainted_shapes[output_name] = output_shape
-        return graph_output_name in promoted
+        result = graph_output_name in promoted
+        reentry_promotion_in_progress.discard(cache_key)
+        reentry_promotion_cache[cache_key] = result
+        return result
 
     def graph_outputs_may_reference_tainted(
         subgraph: Any,
@@ -2599,6 +2632,14 @@ def _build_onnx_weight_analysis_plan(
             )
         )
 
+    graph_taint_cache: dict[
+        tuple[int, tuple[str, ...], tuple[tuple[str, int], ...], tuple[tuple[str, int], ...], int],
+        set[int],
+    ] = {}
+    graph_taint_in_progress: set[
+        tuple[int, tuple[str, ...], tuple[tuple[str, int], ...], tuple[tuple[str, int], ...], int]
+    ] = set()
+
     def graph_tainted_output_indexes(
         subgraph: Any,
         graph_input_names: set[str],
@@ -2612,6 +2653,18 @@ def _build_onnx_weight_analysis_plan(
         graph_outputs = getattr(subgraph, "output", ())
         if depth > 6:
             return set(range(len(graph_outputs)))
+        cache_key = (
+            id(subgraph),
+            tuple(sorted(graph_input_names)),
+            opset_cache_key(opset_versions),
+            attribute_binding_cache_key(attribute_bindings),
+            depth,
+        )
+        if cache_key in graph_taint_cache:
+            return set(graph_taint_cache[cache_key])
+        if cache_key in graph_taint_in_progress:
+            return set(range(len(graph_outputs)))
+        graph_taint_in_progress.add(cache_key)
         local_attribute_bindings = attribute_bindings or {}
 
         def resolve_reentry_attribute(attribute: Any) -> Any | None:
@@ -2690,9 +2743,12 @@ def _build_onnx_weight_analysis_plan(
                 tainted.update(nested_outputs)
             elif any_tainted and not inspected_nested_taint:
                 tainted.update(body_outputs)
-        return {
+        result = {
             output_index for output_index, output in enumerate(graph_outputs) if _onnx_value_name(output) in tainted
         }
+        graph_taint_in_progress.discard(cache_key)
+        graph_taint_cache[cache_key] = set(result)
+        return result
 
     def subgraph_state_input_can_reach_weight_consumer(
         subgraph: Any,
