@@ -246,6 +246,17 @@ _SHAPE_PRESERVING_UNARY_RANK_OPERATORS: frozenset[str] = _SAME_TYPE_UNARY_ELEMEN
     }
 )
 _RANK_PRESERVING_VARIADIC_OPERATORS: frozenset[str] = frozenset({"Concat"})
+_RANK_GAP_PROMOTING_OPERATORS: frozenset[str] = frozenset(
+    {
+        "Expand",
+        "Flatten",
+        "Gather",
+        "GatherND",
+        "Reshape",
+        "Squeeze",
+        "Unsqueeze",
+    }
+)
 _QUANTIZED_WEIGHT_OPERATORS: frozenset[str] = frozenset(
     {
         "ConvInteger",
@@ -2209,6 +2220,12 @@ def _build_onnx_weight_analysis_plan(
                 return True
         return False
 
+    def is_rank_gap_promoting_operator(node: Any) -> bool:
+        return (
+            getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
+            and node.op_type in _RANK_GAP_PROMOTING_OPERATORS
+        )
+
     def scan_sequence_lens_input_offset(node: Any, opset_versions: dict[str, int]) -> int:
         if node.op_type != "Scan":
             return 0
@@ -2221,6 +2238,49 @@ def _build_onnx_weight_analysis_plan(
         if version is None:
             return 0
         return 1 if version <= 8 else 0
+
+    def control_flow_subgraph_state_output_index(
+        node: Any,
+        parent_input_index: int,
+        opset_versions: dict[str, int],
+    ) -> int:
+        if node.op_type == "Loop":
+            return parent_input_index - 1
+        if node.op_type == "Scan":
+            return parent_input_index - scan_sequence_lens_input_offset(node, opset_versions)
+        return -1
+
+    def subgraph_reenters_state_with_rank_promotion(
+        subgraph: Any,
+        graph_input_name: str,
+        graph_output_index: int,
+    ) -> bool:
+        if graph_output_index < 0 or graph_output_index >= len(getattr(subgraph, "output", ())):
+            return False
+        graph_output_name = _onnx_value_name(subgraph.output[graph_output_index])
+        if not graph_output_name:
+            return False
+        tainted = {graph_input_name}
+        promoted: set[str] = set()
+        for body_node in getattr(subgraph, "node", ()):
+            body_inputs = [str(input_name) for input_name in getattr(body_node, "input", ()) if input_name]
+            body_outputs = [str(output_name) for output_name in getattr(body_node, "output", ()) if output_name]
+            if not body_outputs:
+                continue
+            data_input_promoted = bool(body_inputs and body_inputs[0] in promoted)
+            data_input_tainted = bool(body_inputs and body_inputs[0] in tainted)
+            any_promoted = any(input_name in promoted for input_name in body_inputs)
+            any_tainted = any(input_name in tainted for input_name in body_inputs)
+            if (
+                data_input_promoted
+                or any_promoted
+                or (data_input_tainted and is_rank_gap_promoting_operator(body_node))
+            ):
+                promoted.update(body_outputs)
+                tainted.update(body_outputs)
+            elif any_tainted:
+                tainted.update(body_outputs)
+        return graph_output_name in promoted
 
     def stacked_scan_output_insert_axis(
         scan_output_axes: tuple[int, ...],
@@ -3134,6 +3194,31 @@ def _build_onnx_weight_analysis_plan(
             )
         return summarize_weight_lineage_gap(promoted_lineages, truncated=summary.truncated)
 
+    def rank_gap_weight_summary_after_repeated_rank_increase(
+        summary: _OnnxWeightLineageGapSummary,
+        count: int,
+    ) -> _OnnxWeightLineageGapSummary:
+        if count <= 0:
+            return empty_weight_gap_summary
+        if not summary.lineages:
+            return unknown_weight_gap_summary if summary.truncated else empty_weight_gap_summary
+        promoted_lineages: list[_OnnxWeightLineage] = []
+        for lineage in summary.lineages:
+            shape = lineage.shape
+            if shape is not None:
+                while len(shape) < 2:
+                    shape = (-1, *shape)
+            promoted_lineages.append(
+                _OnnxWeightLineage(
+                    initializer_index=lineage.initializer_index,
+                    shape=shape,
+                    data_type=lineage.data_type,
+                    transforms=lineage.transforms,
+                    unresolved_reason=lineage.unresolved_reason,
+                )
+            )
+        return summarize_weight_lineage_gap(promoted_lineages, truncated=summary.truncated)
+
     def lineages_after_control_flow_rank_increase(
         lineages: dict[int, _OnnxWeightLineage],
         *,
@@ -3716,7 +3801,7 @@ def _build_onnx_weight_analysis_plan(
             rank_gap_promoting_operator = (
                 getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
                 and not is_model_local_function
-                and node.op_type in {"Expand", "Flatten", "Gather", "GatherND", "Reshape", "Squeeze", "Unsqueeze"}
+                and is_rank_gap_promoting_operator(node)
             )
             all_input_lineages: dict[int, _OnnxWeightLineage] = {}
             all_input_lineage_limit_gap_count = 0
@@ -4230,6 +4315,30 @@ def _build_onnx_weight_analysis_plan(
                         )
                         if parent_name in value_lineages:
                             subgraph_bound_lineages[graph_input_name] = value_lineages[parent_name]
+                            if repeated_control_flow_state_input and subgraph_reenters_state_with_rank_promotion(
+                                subgraph,
+                                graph_input_name,
+                                control_flow_subgraph_state_output_index(node, pair_index, opset_versions),
+                            ):
+                                retained_rank_summary = rank_gap_weight_summary_after_repeated_rank_increase(
+                                    summarize_rank_promotable_lineage_gap(value_lineages[parent_name].values()),
+                                    len(value_lineages[parent_name]),
+                                )
+                                if retained_rank_summary != empty_weight_gap_summary:
+                                    subgraph_bound_weight_lineage_gaps[graph_input_name] = (
+                                        _bounded_onnx_weight_lineage_gap_count(
+                                            subgraph_bound_weight_lineage_gaps.get(graph_input_name, 0),
+                                            len(retained_rank_summary.lineages),
+                                        )
+                                    )
+                                    subgraph_bound_weight_lineage_gap_summaries[graph_input_name] = (
+                                        merge_weight_lineage_gap_summaries(
+                                            subgraph_bound_weight_lineage_gap_summaries.get(
+                                                graph_input_name, empty_weight_gap_summary
+                                            ),
+                                            retained_rank_summary,
+                                        )
+                                    )
                         if parent_name in constants and not repeated_control_flow_state_input:
                             subgraph_bound_constants[graph_input_name] = constants[parent_name]
                         if parent_name in dynamic_values:
@@ -5261,6 +5370,10 @@ def _build_onnx_weight_analysis_plan(
                 if standard_control_flow_operator and node.op_type == "Scan"
                 else 0
             )
+            trusted_scan_shape_names = proven_value_ranks
+            untrusted_scan_shape_names = {
+                name for name in graph_input_names & set(value_lineages) if name not in proven_value_ranks
+            }
 
             def scan8_batch_extent(
                 output_index: int,
@@ -5286,6 +5399,47 @@ def _build_onnx_weight_analysis_plan(
                     return initializer_shape[0]
                 return -1
 
+            def scan_stacked_output_extent(
+                current_node: Any,
+                output_index: int,
+                *,
+                trusted_shape_names: set[str] = trusted_scan_shape_names,
+                untrusted_shape_names: set[str] = untrusted_scan_shape_names,
+            ) -> int:
+                num_scan_inputs = _onnx_int_attribute(current_node, "num_scan_inputs", 1)
+                if num_scan_inputs <= 0:
+                    return -1
+                input_offset = scan_sequence_lens_input_offset(current_node, opset_versions)
+                scan_input_start = max(len(current_node.input) - num_scan_inputs, input_offset)
+                scan_output_index = output_index - max(len(current_node.input) - input_offset - num_scan_inputs, 0)
+                scan_input_index = min(max(scan_output_index, 0), max(num_scan_inputs - 1, 0))
+                value_index = scan_input_start + scan_input_index
+                value_name = str(current_node.input[value_index]) if value_index < len(current_node.input) else ""
+                if input_offset and current_node.input:
+                    sequence_lens_input = str(current_node.input[0] or "")
+                    sequence_lens = constant_int64_vector_values(constants.get(sequence_lens_input))
+                    if sequence_lens is not None and sequence_lens and all(length >= 0 for length in sequence_lens):
+                        return max(sequence_lens)
+                    return -1
+                if (
+                    value_name not in trusted_shape_names
+                    or value_name in untrusted_shape_names
+                    or (value_name in constants and value_name not in graph_input_names)
+                ):
+                    return -1
+                value_shape = known_value_shapes.get(value_name)
+                if not value_shape:
+                    return -1
+                scan_input_axes = resolved_int_sequence_attribute(current_node, "scan_input_axes") or ()
+                default_axis = 1 if input_offset else 0
+                raw_axis = (
+                    scan_input_axes[scan_input_index] if scan_input_index < len(scan_input_axes) else default_axis
+                )
+                axis = raw_axis if raw_axis >= 0 else len(value_shape) + raw_axis
+                if axis < 0 or axis >= len(value_shape):
+                    return -1
+                return value_shape[axis]
+
             def loop_exact_iteration_count(current_node: Any = node) -> int | None:
                 trip_input = str(current_node.input[0]) if len(current_node.input) > 0 and current_node.input[0] else ""
                 condition_input = (
@@ -5310,10 +5464,6 @@ def _build_onnx_weight_analysis_plan(
                 exact_count = max(int(trip_count), 0)
                 return exact_count if exact_count <= 1 else None
 
-            trusted_scan_shape_names = proven_value_ranks
-            untrusted_scan_shape_names = {
-                name for name in graph_input_names & set(value_lineages) if name not in proven_value_ranks
-            }
             subgraph_output_offset = 1 if standard_control_flow_operator and node.op_type == "Loop" else 0
             for (
                 graph_output_lineages,
@@ -5353,13 +5503,14 @@ def _build_onnx_weight_analysis_plan(
                         output_index,
                     )
                     scan_output_extent = -1
-                    if (
-                        stacked_scan_output
-                        and standard_control_flow_operator
-                        and node.op_type == "Loop"
-                        and (exact_loop_iterations := loop_exact_iteration_count()) is not None
-                    ):
-                        scan_output_extent = exact_loop_iterations
+                    if stacked_scan_output and standard_control_flow_operator:
+                        if (
+                            node.op_type == "Loop"
+                            and (exact_loop_iterations := loop_exact_iteration_count()) is not None
+                        ):
+                            scan_output_extent = exact_loop_iterations
+                        elif node.op_type == "Scan":
+                            scan_output_extent = scan_stacked_output_extent(node, output_index)
                     if stacked_scan_output:
                         if graph_output_shape is not None:
                             graph_output_shape = insert_shape_axis(
