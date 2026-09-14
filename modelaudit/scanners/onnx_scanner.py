@@ -2018,12 +2018,23 @@ def _build_onnx_weight_analysis_plan(
             return None
 
     def graph_initializer_constants(current_graph: Any, inherited_constants: dict[str, Any]) -> dict[str, Any]:
-        graph_constants = dict(inherited_constants)
+        local_input_names = {
+            name for value_info in getattr(current_graph, "input", ()) if (name := _onnx_value_name(value_info))
+        }
+        graph_constants = {
+            name: initializer for name, initializer in inherited_constants.items() if name not in local_input_names
+        }
         for initializer in getattr(current_graph, "initializer", ()):
             name = str(getattr(initializer, "name", "") or "")
             if name:
                 graph_constants[name] = initializer
         return graph_constants
+
+    def constant_node_tensor(node: Any) -> Any | None:
+        for attribute in getattr(node, "attribute", ()):
+            if attribute.name == "value" and _onnx_has_singular_field(attribute, "t"):
+                return attribute.t
+        return None
 
     def graph_value_is_constant_false(
         current_graph: Any,
@@ -2056,6 +2067,13 @@ def _build_onnx_weight_analysis_plan(
             ):
                 current_name = str(producer.input[0])
                 continue
+            if (
+                producer is not None
+                and getattr(producer, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
+                and producer.op_type == "Constant"
+            ):
+                constant_value = constant_scalar_value(constant_node_tensor(producer), int(onnx.TensorProto.BOOL))
+                return constant_value is False if constant_value is not None else False
             return False
         return False
 
@@ -2096,6 +2114,8 @@ def _build_onnx_weight_analysis_plan(
     def loop_may_repeat_body(node: Any, constants: dict[str, Any], graph_input_names: set[str]) -> bool:
         trip_input = str(node.input[0]) if len(node.input) > 0 and node.input[0] else ""
         condition_input = str(node.input[1]) if len(node.input) > 1 and node.input[1] else ""
+        if loop_body_condition_is_constant_false(node, constants):
+            return False
         if (trip_input in graph_input_names and trip_input not in constants) or (
             condition_input in graph_input_names and condition_input not in constants
         ):
@@ -2109,8 +2129,6 @@ def _build_onnx_weight_analysis_plan(
             else True
         )
         if condition_input and initial_condition is False:
-            return False
-        if loop_body_condition_is_constant_false(node, constants):
             return False
         return trip_count is None or int(trip_count) > 1
 
@@ -4514,16 +4532,25 @@ def _build_onnx_weight_analysis_plan(
                                 scan_input_offset=scan_input_offset,
                             )
                         )
-                        if parent_name in value_lineages:
-                            subgraph_bound_lineages[graph_input_name] = value_lineages[parent_name]
-                            if repeated_control_flow_state_input and subgraph_reenters_state_with_rank_promotion(
+                        repeated_state_reenters_with_rank_promotion = False
+                        if repeated_control_flow_state_input:
+                            repeated_state_reenters_with_rank_promotion = subgraph_reenters_state_with_rank_promotion(
                                 subgraph,
                                 graph_input_name,
                                 control_flow_subgraph_state_output_index(node, pair_index, opset_versions),
                                 constants,
                                 opset_versions,
                                 parent_shape,
-                            ):
+                            )
+                        parent_rank_for_repeated_state = len(parent_shape) if parent_shape is not None else parent_rank
+                        repeated_state_gap_may_feed_weight = repeated_control_flow_state_input and (
+                            repeated_state_reenters_with_rank_promotion
+                            or parent_rank_for_repeated_state is None
+                            or parent_rank_for_repeated_state != 1
+                        )
+                        if parent_name in value_lineages:
+                            subgraph_bound_lineages[graph_input_name] = value_lineages[parent_name]
+                            if repeated_state_reenters_with_rank_promotion:
                                 retained_rank_summary = rank_gap_weight_summary_after_repeated_rank_increase(
                                     summarize_rank_promotable_lineage_gap(value_lineages[parent_name].values()),
                                     len(value_lineages[parent_name]),
@@ -4571,7 +4598,7 @@ def _build_onnx_weight_analysis_plan(
                             subgraph_bound_unknown_value_ranks.add(graph_input_name)
                         if parent_name in value_lineage_limit_gap_counts:
                             subgraph_bound_lineage_gaps[graph_input_name] = value_lineage_limit_gap_counts[parent_name]
-                            if repeated_control_flow_state_input:
+                            if repeated_state_gap_may_feed_weight:
                                 subgraph_bound_weight_lineage_gaps[graph_input_name] = (
                                     _bounded_onnx_weight_lineage_gap_count(
                                         subgraph_bound_weight_lineage_gaps.get(graph_input_name, 0),
@@ -4613,7 +4640,7 @@ def _build_onnx_weight_analysis_plan(
                             subgraph_bound_rank_promotable_lineage_gap_summaries[graph_input_name] = (
                                 rank_promotable_summary
                             )
-                            if repeated_control_flow_state_input:
+                            if repeated_state_gap_may_feed_weight:
                                 subgraph_bound_weight_lineage_gaps[graph_input_name] = (
                                     _bounded_onnx_weight_lineage_gap_count(
                                         subgraph_bound_weight_lineage_gaps.get(graph_input_name, 0),
