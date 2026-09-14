@@ -2553,6 +2553,27 @@ def _build_onnx_weight_analysis_plan(
                 bindings[graph_input_name] = parent_name
         return bindings
 
+    def bound_control_flow_graph_constants(
+        node: Any,
+        nested_graph: Any,
+        constants: dict[str, Any],
+        opset_versions: dict[str, int],
+    ) -> dict[str, Any]:
+        if node.op_type == "Loop":
+            input_pairs = zip(node.input[2:], nested_graph.input[2:], strict=False)
+        elif node.op_type == "Scan":
+            scan_input_offset = scan_sequence_lens_input_offset(node, opset_versions)
+            input_pairs = zip(node.input[scan_input_offset:], nested_graph.input, strict=False)
+        else:
+            return {}
+        bindings: dict[str, Any] = {}
+        for parent_input, graph_input in input_pairs:
+            parent_name = str(parent_input)
+            graph_input_name = _onnx_value_name(graph_input)
+            if parent_name in constants and graph_input_name:
+                bindings[graph_input_name] = constants[parent_name]
+        return bindings
+
     def rank_reentry_constant_names(subgraph: Any, *, depth: int = 0) -> frozenset[str]:
         cache_key = (id(subgraph), depth)
         if cache_key in rank_reentry_constant_name_cache:
@@ -2631,8 +2652,11 @@ def _build_onnx_weight_analysis_plan(
             depth,
         )
         if cache_key in reentry_promotion_cache:
-            if output_shapes_out is not None:
-                output_shapes_out.update(reentry_shape_cache.get(cache_key, {}))
+            if (
+                output_shapes_out is not None
+                and (output_shape := reentry_shape_cache.get(cache_key, {}).get(graph_output_index)) is not None
+            ):
+                output_shapes_out[graph_output_index] = output_shape
             return graph_output_index in reentry_promotion_cache[cache_key]
         if cache_key in reentry_promotion_in_progress:
             return True
@@ -2740,6 +2764,15 @@ def _build_onnx_weight_analysis_plan(
                 if resolved_attribute is None:
                     continue
                 for nested_graph in _iter_attribute_graphs(resolved_attribute):
+                    available_nested_constants = {**constants, **subgraph_constants}
+                    nested_bound_input_constants = bound_control_flow_graph_constants(
+                        body_node,
+                        nested_graph,
+                        available_nested_constants,
+                        opset_versions,
+                    )
+                    nested_constants = graph_initializer_constants(nested_graph, available_nested_constants)
+                    nested_constants.update(nested_bound_input_constants)
                     nested_graph_inputs = bound_control_flow_graph_inputs(
                         body_node,
                         nested_graph,
@@ -2754,6 +2787,7 @@ def _build_onnx_weight_analysis_plan(
                     nested_tainted_shapes.update(
                         {captured_name: tainted_shapes.get(captured_name) for captured_name in captured_names}
                     )
+                    nested_output_shapes: dict[int, tuple[int, ...]] = {}
                     for captured_name, captured_shape in nested_tainted_shapes.items():
                         nested_tainted_output_indexes = graph_tainted_output_indexes(
                             nested_graph,
@@ -2775,10 +2809,12 @@ def _build_onnx_weight_analysis_plan(
                                 nested_graph,
                                 captured_name,
                                 output_index,
-                                subgraph_constants,
+                                nested_constants,
                                 opset_versions,
                                 captured_shape,
                                 attribute_bindings=local_attribute_bindings,
+                                output_shapes_out=nested_output_shapes,
+                                bound_input_constants=nested_bound_input_constants,
                                 depth=depth + 1,
                             ):
                                 nested_promoted_output_indexes.add(output_index)
@@ -2799,6 +2835,11 @@ def _build_onnx_weight_analysis_plan(
                                 graph_output_offset=control_flow_output_offset(body_node),
                             )
                         )
+                    nested_output_offset = control_flow_output_offset(body_node)
+                    for output_index, output_shape in nested_output_shapes.items():
+                        node_output_index = output_index - nested_output_offset
+                        if 0 <= node_output_index < len(body_outputs):
+                            tainted_shapes[body_outputs[node_output_index]] = output_shape
             promoted_outputs = function_promoted_outputs | nested_promoted_outputs
             body_tainted_outputs = function_tainted_outputs if function is not None else set(body_outputs)
             if (
@@ -5236,7 +5277,7 @@ def _build_onnx_weight_analysis_plan(
                         input_pairs = zip(node.input[2:], subgraph.input[2:], strict=False)
                         input_pair_index_start = 2
                     elif node.op_type == "Scan":
-                        num_scan_inputs = _onnx_int_attribute(node, "num_scan_inputs", 1)
+                        num_scan_inputs = resolved_int_attribute(node, "num_scan_inputs", 1)
                         scan_input_offset = scan_sequence_lens_input_offset(node, opset_versions)
                         scan_input_start = max(len(node.input) - max(num_scan_inputs, 0), scan_input_offset)
                         scan_input_axes = resolved_int_sequence_attribute(node, "scan_input_axes") or ()
@@ -6351,7 +6392,7 @@ def _build_onnx_weight_analysis_plan(
                 input_offset: int = resolved_scan_input_offset,
             ) -> int:
                 if stacked_output:
-                    num_scan_inputs = _onnx_int_attribute(current_node, "num_scan_inputs", 1)
+                    num_scan_inputs = resolved_int_attribute(current_node, "num_scan_inputs", 1)
                     scan_input_start = max(len(current_node.input) - max(num_scan_inputs, 0), input_offset)
                     scan_output_index = output_index - max(len(current_node.input) - input_offset - num_scan_inputs, 0)
                     scan_input_index = min(max(scan_output_index, 0), max(num_scan_inputs - 1, 0))
@@ -6374,7 +6415,7 @@ def _build_onnx_weight_analysis_plan(
                 trusted_shape_names: set[str] = trusted_scan_shape_names,
                 untrusted_shape_names: set[str] = untrusted_scan_shape_names,
             ) -> int:
-                num_scan_inputs = _onnx_int_attribute(current_node, "num_scan_inputs", 1)
+                num_scan_inputs = resolved_int_attribute(current_node, "num_scan_inputs", 1)
                 if num_scan_inputs <= 0:
                     return -1
                 input_offset = scan_sequence_lens_input_offset(current_node, opset_versions)
@@ -6859,7 +6900,7 @@ def _build_onnx_weight_analysis_plan(
                     scan_input_offset=resolved_scan_input_offset,
                 )
             ):
-                num_scan_inputs = _onnx_int_attribute(node, "num_scan_inputs", 1)
+                num_scan_inputs = resolved_int_attribute(node, "num_scan_inputs", 1)
                 scan_state_input_count = max(len(node.input) - resolved_scan_input_offset - max(num_scan_inputs, 0), 0)
                 state_inputs = node.input[
                     resolved_scan_input_offset : resolved_scan_input_offset
