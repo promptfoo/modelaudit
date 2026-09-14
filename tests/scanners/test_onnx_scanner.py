@@ -8700,6 +8700,8 @@ class TestWeightDistributionSemantics:
             ("captured_tanh_vector_input", "captured_tanh", False, False, False, False),
             ("captured_identity_matrix_input", "captured_identity", True, False, False, True),
             ("where_scalar_condition_formal", "condition_formal", False, False, True, False),
+            ("where_initializer_condition_formal", "condition_initializer", False, False, True, False),
+            ("where_initializer_condition_formal_matrix", "condition_initializer", True, False, True, True),
         ],
     )
     def test_repeated_loop_reentry_broadcast_operands_preserve_shape_context(
@@ -8715,6 +8717,7 @@ class TestWeightDistributionSemantics:
         other_shape = [4, 4] if matrix_operand_or_condition else [4]
         body_nodes = [helper.make_node("MatMul", ["X", "state"], ["body_y"])]
         condition_is_graph_input = source == "condition_formal"
+        condition_uses_loop_formal = source in {"condition_formal", "condition_initializer"}
         initializers = [
             onnx.numpy_helper.from_array(np.ones((4,), dtype=np.float32), name="initial_state"),
             onnx.numpy_helper.from_array(np.array(2, dtype=np.int64), name="trip_count"),
@@ -8750,12 +8753,12 @@ class TestWeightDistributionSemantics:
                 else:
                     raise AssertionError(f"unexpected captured alias {alias}")
         else:
-            initializer_shape = [4] if use_where else other_shape
+            initializer_shape = other_shape if condition_uses_loop_formal or not use_where else [4]
             initializers.append(
                 onnx.numpy_helper.from_array(np.zeros(initializer_shape, dtype=np.float32), name="other")
             )
         if use_where:
-            if condition_is_graph_input:
+            if condition_uses_loop_formal:
                 select_name = "condition_in"
             else:
                 select_name = "select"

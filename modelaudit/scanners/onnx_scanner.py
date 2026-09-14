@@ -5387,14 +5387,20 @@ def _build_onnx_weight_analysis_plan(
                         loop_condition_shape = known_value_shapes.get(loop_condition_name)
                         if loop_condition_shape is None:
                             loop_condition_shape = constant_initializer_shape(constants, loop_condition_name)
+                        immutable_scalar_condition = (
+                            loop_condition_name in constants
+                            and loop_condition_name not in graph_input_names
+                            and constant_scalar_value(
+                                constants.get(loop_condition_name),
+                                int(onnx.TensorProto.BOOL),
+                            )
+                            is not None
+                        )
                         if (
                             loop_body_condition_name
                             and loop_condition_shape is not None
-                            and (
-                                loop_condition_name in proven_value_ranks
-                                or (loop_condition_name in constants and loop_condition_name not in graph_input_names)
-                            )
-                            and loop_condition_name not in value_lineages
+                            and (loop_condition_name in proven_value_ranks or immutable_scalar_condition)
+                            and (loop_condition_name not in value_lineages or immutable_scalar_condition)
                         ):
                             subgraph_trusted_context_shapes[loop_body_condition_name] = loop_condition_shape
                     elif node.op_type == "Scan":
