@@ -174,6 +174,7 @@ _ONNX_STRUCTURE_MAX_RETAINED_ALLOCATION_BYTES = 128 * 1024 * 1024
 _ONNX_STRUCTURE_RETAINED_OBJECT_BYTES = 1024
 _ONNX_STRUCTURE_RETAINED_SEQUENCE_ENTRY_BYTES = 64
 _ONNX_STRUCTURE_RETAINED_STRING_OVERHEAD_BYTES = 64
+_ONNX_REENTRY_ANALYSIS_MAX_GRAPH_OUTPUTS = 1024
 _ONNX_RESULT_MAX_DISTINCT_GROUPS = 1024
 _STANDARD_NEURAL_NETWORK_DOMAINS: frozenset[str] = frozenset({"", "ai.onnx"})
 _SAME_TYPE_ELEMENTWISE_OPERATORS: frozenset[str] = frozenset(
@@ -2675,9 +2676,11 @@ def _build_onnx_weight_analysis_plan(
     ) -> bool:
         if depth > 6:
             return True
-        if graph_output_index < 0 or graph_output_index >= len(getattr(subgraph, "output", ())):
+        graph_outputs = getattr(subgraph, "output", ())
+        if graph_output_index < 0 or graph_output_index >= len(graph_outputs):
             return False
-        graph_outputs = list(getattr(subgraph, "output", ()))
+        if len(graph_outputs) > _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_OUTPUTS:
+            return True
         graph_output_name = _onnx_value_name(graph_outputs[graph_output_index])
         if not graph_output_name:
             return False
@@ -2752,7 +2755,9 @@ def _build_onnx_weight_analysis_plan(
                 index_input_shape = constant_initializer_shape(subgraph_constants, body_inputs[1])
             input_shapes_by_name = {input_name: reentry_input_shape(input_name) for input_name in body_inputs}
             elementwise_operator = body_node.op_type in _SAME_TYPE_ELEMENTWISE_OPERATORS or body_node.op_type == "Pow"
-            promotion_input_tainted = any_tainted if elementwise_operator else data_input_tainted
+            promotion_input_tainted = (
+                any_tainted if elementwise_operator or body_node.op_type == "MatMul" else data_input_tainted
+            )
             data_input_may_promote = promotion_input_tainted and operator_output_may_have_weight_rank(
                 body_node,
                 input_shape=data_input_shape,
@@ -2934,6 +2939,7 @@ def _build_onnx_weight_analysis_plan(
                 or (
                     (
                         is_rank_gap_promoting_operator(body_node)
+                        or body_node.op_type == "MatMul"
                         or body_node.op_type in _SAME_TYPE_ELEMENTWISE_OPERATORS
                         or body_node.op_type == "Pow"
                     )
@@ -2961,6 +2967,11 @@ def _build_onnx_weight_analysis_plan(
                         body_node,
                         (input_shapes_by_name.get(input_name) for input_name in body_inputs),
                         axis=0 if concat_axis is None else concat_axis,
+                    )
+                elif body_node.op_type == "MatMul":
+                    output_shape = matmul_output_shape(
+                        input_shapes_by_name.get(body_inputs[0]) if body_inputs else None,
+                        input_shapes_by_name.get(body_inputs[1]) if len(body_inputs) > 1 else None,
                     )
                 elif body_node.op_type in _SAME_TYPE_ELEMENTWISE_OPERATORS | {"Pow"}:
                     output_shape = broadcast_shapes(input_shapes_by_name.get(input_name) for input_name in body_inputs)
@@ -3457,6 +3468,15 @@ def _build_onnx_weight_analysis_plan(
                 return True
             output_shape = broadcast_shapes(input_shapes)
             return output_shape is None or len(output_shape) >= 2
+        if node.op_type == "MatMul":
+            input_names = [str(input_name) for input_name in getattr(node, "input", ()) if input_name]
+            left_shape = input_shape
+            right_shape = index_shape
+            if input_shapes_by_name and input_names:
+                left_shape = input_shapes_by_name.get(input_names[0])
+                right_shape = input_shapes_by_name.get(input_names[1]) if len(input_names) > 1 else None
+            output_shape = matmul_output_shape(left_shape, right_shape)
+            return output_shape is None or len(output_shape) >= 2
         if node.op_type == "Expand":
             shape_name = str(node.input[1]) if len(node.input) > 1 else ""
             target_shape = constant_int64_vector_values(constants.get(shape_name))
@@ -3565,6 +3585,27 @@ def _build_onnx_weight_analysis_plan(
                 return None
             output_dimensions.append(next(iter(non_singleton_dimensions), 1))
         return tuple(reversed(output_dimensions))
+
+    def matmul_output_shape(
+        left_shape: tuple[int, ...] | None,
+        right_shape: tuple[int, ...] | None,
+    ) -> tuple[int, ...] | None:
+        if left_shape is None or right_shape is None:
+            return None
+        left_rank = len(left_shape)
+        right_rank = len(right_shape)
+        if left_rank == 0 or right_rank == 0:
+            return None
+        if left_rank == 1 and right_rank == 1:
+            return ()
+        if left_rank == 1:
+            return (*right_shape[:-2], right_shape[-1])
+        if right_rank == 1:
+            return left_shape[:-1]
+        batch_shape = broadcast_shapes((left_shape[:-2], right_shape[:-2]))
+        if batch_shape is None:
+            return None
+        return (*batch_shape, left_shape[-2], right_shape[-1])
 
     def flattened_shape_extent(dimensions: tuple[int, ...]) -> int:
         return -1 if any(dimension < 0 for dimension in dimensions) else math.prod(dimensions)

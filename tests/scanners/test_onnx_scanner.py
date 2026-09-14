@@ -8830,6 +8830,89 @@ class TestWeightDistributionSemantics:
             assert semantics["coverage_gaps"] == {}
 
     @pytest.mark.parametrize(
+        ("case", "carried_operand", "other_shape", "loop_trips", "expected_gap"),
+        [
+            ("rhs_review_batched", "rhs", [2, 1, 2], 2, True),
+            ("rhs_square_batched", "rhs", [2, 2, 2], 2, True),
+            ("rhs_matrix_vector", "rhs", [2, 2], 2, False),
+            ("lhs_square_batched", "lhs", [2, 2, 2], 2, True),
+            ("lhs_vector_matrix", "lhs", [2, 2], 2, False),
+            ("rhs_single_trip", "rhs", [2, 1, 2], 1, False),
+        ],
+    )
+    def test_repeated_loop_reentry_matmul_rank_promotion_preserves_weight_coverage(
+        self,
+        tmp_path: Path,
+        case: str,
+        carried_operand: str,
+        other_shape: list[int],
+        loop_trips: int,
+        expected_gap: bool,
+    ) -> None:
+        body = helper.make_graph(
+            [
+                helper.make_node("MatMul", ["probe", "state"], ["body_y"]),
+                helper.make_node(
+                    "MatMul",
+                    ["other", "state"] if carried_operand == "rhs" else ["state", "other"],
+                    ["next_state"],
+                ),
+                helper.make_node("Identity", ["condition_in"], ["condition_out"]),
+            ],
+            "retained_loop_reentry_matmul_rank_promotion_body",
+            [
+                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
+                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("state", TensorProto.FLOAT, None),
+            ],
+            [
+                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, None),
+            ],
+        )
+        graph = helper.make_graph(
+            [
+                helper.make_node(
+                    "Loop",
+                    ["trip_count", "initial_condition", "initial_state"],
+                    ["final_state"],
+                    body=body,
+                ),
+                helper.make_node("Identity", ["dummy"], ["Y"]),
+            ],
+            "retained_loop_reentry_matmul_rank_promotion",
+            [
+                helper.make_tensor_value_info("probe", TensorProto.FLOAT, [2, 2]),
+                helper.make_tensor_value_info("other", TensorProto.FLOAT, other_shape),
+            ],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [])],
+            initializer=[
+                onnx.numpy_helper.from_array(np.ones((2,), dtype=np.float32), name="initial_state"),
+                onnx.numpy_helper.from_array(np.array(loop_trips, dtype=np.int64), name="trip_count"),
+                onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="initial_condition"),
+                onnx.numpy_helper.from_array(np.array(0.0, dtype=np.float32), name="dummy"),
+            ],
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / f"retained-loop-reentry-matmul-rank-promotion-{case}.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        if expected_gap:
+            assert result.success is False
+            assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
+            assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
+        else:
+            assert result.success is True
+            assert coverage == []
+            assert semantics["coverage_gaps"] == {}
+
+    @pytest.mark.parametrize(
         ("scan_input_shape", "expected_gap"),
         [
             ([2, 4], False),
@@ -10710,6 +10793,86 @@ class TestWeightDistributionSemantics:
         semantics = result.metadata["onnx_weight_distribution_semantics"]
         assert semantics["coverage_gaps"]["lineages_per_value_limit"] > 0
         assert semantics["analyzed_layer_count"] == 0
+
+    def test_repeated_scan_reentry_output_bound_fails_closed(self, tmp_path: Path) -> None:
+        state_count = onnx_scanner_module._ONNX_REENTRY_ANALYSIS_MAX_GRAPH_OUTPUTS
+        source_names = [f"W{index}" for index in range(40)]
+        initializers = [
+            *[
+                onnx.numpy_helper.from_array(np.full((4,), float(index), dtype=np.float32), name=name)
+                for index, name in enumerate(source_names)
+            ],
+            onnx.numpy_helper.from_array(np.array([0], dtype=np.int64), name="axes"),
+            *[
+                onnx.numpy_helper.from_array(np.zeros((4,), dtype=np.float32), name=f"clean_state{index}")
+                for index in range(1, state_count)
+            ],
+        ]
+        nodes = []
+        previous = source_names[0]
+        for index, name in enumerate(source_names[1:], 1):
+            output = f"summed{index}"
+            nodes.append(helper.make_node("Add", [previous, name], [output]))
+            previous = output
+        body_nodes = [helper.make_node("Unsqueeze", ["state0", "axes"], ["next_state0"])]
+        body_nodes.extend(
+            helper.make_node("Identity", [f"state{index}"], [f"next_state{index}"]) for index in range(1, state_count)
+        )
+        body_nodes.append(helper.make_node("Identity", ["element"], ["next_element"]))
+        body = helper.make_graph(
+            body_nodes,
+            "large_repeated_scan_reentry_body",
+            [
+                *[
+                    helper.make_tensor_value_info(f"state{index}", TensorProto.FLOAT, [4])
+                    for index in range(state_count)
+                ],
+                helper.make_tensor_value_info("element", TensorProto.FLOAT, []),
+            ],
+            [
+                *[
+                    helper.make_tensor_value_info(f"next_state{index}", TensorProto.FLOAT, None)
+                    for index in range(state_count)
+                ],
+                helper.make_tensor_value_info("next_element", TensorProto.FLOAT, []),
+            ],
+        )
+        scan_outputs = [f"scan_state{index}" for index in range(state_count)] + ["scan_output"]
+        nodes.extend(
+            [
+                helper.make_node(
+                    "Scan",
+                    [previous, *[f"clean_state{index}" for index in range(1, state_count)], "scan_values"],
+                    scan_outputs,
+                    body=body,
+                    num_scan_inputs=1,
+                ),
+                helper.make_node("MatMul", ["X", "scan_state0"], ["Y"]),
+            ]
+        )
+        graph = helper.make_graph(
+            nodes,
+            "large_repeated_scan_reentry_output_bound",
+            [
+                helper.make_tensor_value_info("scan_values", TensorProto.FLOAT, [2]),
+                helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 1]),
+            ],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 4])],
+            initializer=initializers,
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / "large-repeated-scan-reentry-output-bound.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert result.success is False
+        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
+        assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
 
     def test_repeated_loop_non_shape_rank_growth_promotes_after_float_cast(self, tmp_path: Path) -> None:
         source_names = [f"W{index}" for index in range(33)]
