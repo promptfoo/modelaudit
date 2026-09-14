@@ -2374,11 +2374,35 @@ def _build_onnx_weight_analysis_plan(
     def control_flow_output_offset(node: Any) -> int:
         return 1 if node.op_type == "Loop" else 0
 
-    def scan_stacked_output_start(node: Any, opset_versions: dict[str, int]) -> int:
+    def resolved_onnx_int_attribute(
+        node: Any,
+        name: str,
+        default: int = 0,
+        resolve_attribute: Callable[[Any], Any | None] | None = None,
+    ) -> int:
+        if resolve_attribute is None:
+            return _onnx_int_attribute(node, name, default)
+        for attribute in getattr(node, "attribute", ()):
+            if attribute.name != name:
+                continue
+            resolved_attribute = resolve_attribute(attribute)
+            return int(getattr(resolved_attribute, "i", default)) if resolved_attribute is not None else default
+        return default
+
+    def scan_stacked_output_start(
+        node: Any,
+        opset_versions: dict[str, int],
+        resolve_attribute: Callable[[Any], Any | None] | None = None,
+    ) -> int:
         if node.op_type != "Scan" or getattr(node, "domain", "") not in _STANDARD_NEURAL_NETWORK_DOMAINS:
             return len(getattr(node, "output", ()))
         scan_input_offset = scan_sequence_lens_input_offset(node, opset_versions)
-        num_scan_inputs = _onnx_int_attribute(node, "num_scan_inputs", 1)
+        num_scan_inputs = resolved_onnx_int_attribute(
+            node,
+            "num_scan_inputs",
+            1,
+            resolve_attribute=resolve_attribute,
+        )
         if num_scan_inputs <= 0:
             return len(getattr(node, "output", ()))
         return max(len(getattr(node, "input", ())) - scan_input_offset - num_scan_inputs, 0)
@@ -2387,6 +2411,7 @@ def _build_onnx_weight_analysis_plan(
         node: Any,
         graph_output_index: int,
         opset_versions: dict[str, int],
+        resolve_attribute: Callable[[Any], Any | None] | None = None,
     ) -> bool:
         if getattr(node, "domain", "") not in _STANDARD_NEURAL_NETWORK_DOMAINS:
             return False
@@ -2396,7 +2421,11 @@ def _build_onnx_weight_analysis_plan(
         if node.op_type == "Loop":
             return parent_output_index >= max(len(getattr(node, "input", ())) - 2, 0)
         if node.op_type == "Scan":
-            return parent_output_index >= scan_stacked_output_start(node, opset_versions)
+            return parent_output_index >= scan_stacked_output_start(
+                node,
+                opset_versions,
+                resolve_attribute=resolve_attribute,
+            )
         return False
 
     cache_fingerprints: dict[int, tuple[Any, tuple[str, str]]] = {}
@@ -2531,6 +2560,7 @@ def _build_onnx_weight_analysis_plan(
         return result
 
     reentry_promotion_cache: dict[tuple[Any, ...], frozenset[int]] = {}
+    reentry_shape_cache: dict[tuple[Any, ...], dict[int, tuple[int, ...]]] = {}
     reentry_promotion_in_progress: set[tuple[Any, ...]] = set()
 
     def subgraph_reenters_state_with_rank_promotion(
@@ -2542,6 +2572,7 @@ def _build_onnx_weight_analysis_plan(
         graph_input_shape: tuple[int, ...] | None,
         attribute_bindings: dict[str, Any] | None = None,
         bound_input_constants: dict[str, Any] | None = None,
+        output_shapes_out: dict[int, tuple[int, ...]] | None = None,
         *,
         depth: int = 0,
     ) -> bool:
@@ -2553,17 +2584,18 @@ def _build_onnx_weight_analysis_plan(
         graph_output_name = _onnx_value_name(graph_outputs[graph_output_index])
         if not graph_output_name:
             return False
-        cache_constants = constants if not bound_input_constants else {**constants, **bound_input_constants}
         cache_key = (
             id(subgraph),
             graph_input_name,
             graph_input_shape,
             opset_cache_key(opset_versions),
             attribute_binding_cache_key(attribute_bindings),
-            constant_binding_cache_key(cache_constants, rank_reentry_constant_names(subgraph)),
+            constant_binding_cache_key(constants, rank_reentry_constant_names(subgraph)),
             depth,
         )
         if cache_key in reentry_promotion_cache:
+            if output_shapes_out is not None:
+                output_shapes_out.update(reentry_shape_cache.get(cache_key, {}))
             return graph_output_index in reentry_promotion_cache[cache_key]
         if cache_key in reentry_promotion_in_progress:
             return True
@@ -2613,6 +2645,7 @@ def _build_onnx_weight_analysis_plan(
             )
             function_promoted_outputs: set[str] = set()
             function_tainted_outputs: set[str] = set()
+            function_output_shapes: dict[int, tuple[int, ...]] = {}
             nested_promoted_outputs: set[str] = set()
             if function is not None and any_tainted:
                 function_attributes = bound_function_attributes(function, body_node, resolve_reentry_attribute)
@@ -2649,9 +2682,14 @@ def _build_onnx_weight_analysis_plan(
                             function_input_shape,
                             attribute_bindings=function_attributes,
                             bound_input_constants=function_bound_input_constants,
+                            output_shapes_out=function_output_shapes,
                             depth=depth + 1,
                         ):
                             function_promoted_outputs.add(output_name)
+                for output_index, output_name in enumerate(body_outputs):
+                    output_shape = function_output_shapes.get(output_index)
+                    if output_shape is not None:
+                        tainted_shapes[output_name] = output_shape
             for attribute in getattr(body_node, "attribute", ()):
                 resolved_attribute = resolve_reentry_attribute(attribute)
                 if resolved_attribute is None:
@@ -2705,6 +2743,7 @@ def _build_onnx_weight_analysis_plan(
                                     body_node,
                                     output_index,
                                     opset_versions,
+                                    resolve_attribute=resolve_reentry_attribute,
                                 )
                             ):
                                 nested_promoted_output_indexes.add(output_index)
@@ -2822,8 +2861,16 @@ def _build_onnx_weight_analysis_plan(
         promoted_output_indexes = frozenset(
             output_index for output_index, output in enumerate(graph_outputs) if _onnx_value_name(output) in promoted
         )
+        output_shapes = {
+            output_index: output_shape
+            for output_index, output in enumerate(graph_outputs)
+            if (output_shape := tainted_shapes.get(_onnx_value_name(output))) is not None
+        }
         reentry_promotion_in_progress.discard(cache_key)
         reentry_promotion_cache[cache_key] = promoted_output_indexes
+        reentry_shape_cache[cache_key] = output_shapes
+        if output_shapes_out is not None:
+            output_shapes_out.update(output_shapes)
         return graph_output_index in promoted_output_indexes
 
     def graph_outputs_may_reference_tainted(
@@ -6379,13 +6426,6 @@ def _build_onnx_weight_analysis_plan(
                         stacked_scan_output_start,
                         output_index,
                     )
-                    scan_output_index = output_index - stacked_scan_output_start
-                    if (
-                        resolved_scan_input_offset
-                        and 0 <= scan_output_index < len(scan_output_axes)
-                        and scan_output_insert_axis >= 0
-                    ):
-                        scan_output_insert_axis = max(scan_output_insert_axis - 1, 0)
                     scan_output_extent = -1
                     if stacked_scan_output and standard_control_flow_operator:
                         if (

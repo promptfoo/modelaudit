@@ -8252,7 +8252,8 @@ class TestWeightDistributionSemantics:
         body = helper.make_graph(
             [
                 helper.make_node("MatMul", ["X", "state"], ["body_y"]),
-                helper.make_node("ProjectState", ["state", "state_shape"], ["next_state"], domain="local"),
+                helper.make_node("ProjectState", ["state", "state_shape"], ["function_state"], domain="local"),
+                helper.make_node("Reshape", ["function_state", "state_shape"], ["next_state"]),
                 helper.make_node("Identity", ["condition_in"], ["condition_out"]),
             ],
             "retained_loop_local_function_formal_constant_reentry_body",
@@ -8311,11 +8312,17 @@ class TestWeightDistributionSemantics:
             assert semantics["coverage_gaps"] == {}
 
     @pytest.mark.parametrize(
-        ("second_shape", "x_shape", "expected_gap"), [([4], [1, 4], False), ([1, 4], [1, 1], True)]
+        ("first_shape", "second_shape", "x_shape", "expected_gap"),
+        [
+            ([4], [4], [1, 4], False),
+            ([4], [1, 4], [1, 1], True),
+            ([1, 4], [4], [1, 4], False),
+        ],
     )
     def test_repeated_loop_nested_local_function_maps_rank_control_constants_to_callers(
         self,
         tmp_path: Path,
+        first_shape: list[int],
         second_shape: list[int],
         x_shape: list[int],
         expected_gap: bool,
@@ -8339,7 +8346,7 @@ class TestWeightDistributionSemantics:
         body = helper.make_graph(
             [
                 helper.make_node("MatMul", ["X", "state"], ["body_y"]),
-                helper.make_node("OuterProjectState", ["state", "vector_shape"], ["vector_state"], domain="local"),
+                helper.make_node("OuterProjectState", ["state", "first_shape"], ["first_state"], domain="local"),
                 helper.make_node("OuterProjectState", ["state", "second_shape"], ["next_state"], domain="local"),
                 helper.make_node("Identity", ["condition_in"], ["condition_out"]),
             ],
@@ -8369,7 +8376,7 @@ class TestWeightDistributionSemantics:
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [])],
             initializer=[
                 onnx.numpy_helper.from_array(np.ones((4,), dtype=np.float32), name="initial_state"),
-                onnx.numpy_helper.from_array(np.array([4], dtype=np.int64), name="vector_shape"),
+                onnx.numpy_helper.from_array(np.array(first_shape, dtype=np.int64), name="first_shape"),
                 onnx.numpy_helper.from_array(np.array(second_shape, dtype=np.int64), name="second_shape"),
                 onnx.numpy_helper.from_array(np.array(2, dtype=np.int64), name="trip_count"),
                 onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="initial_condition"),
@@ -11405,6 +11412,82 @@ class TestWeightDistributionSemantics:
         model.ir_version = 8
         onnx.checker.check_model(model)
         path = tmp_path / "function-scan-ref-attr-input-axis-gap.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        assert result.success is False
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
+        assert any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
+
+    def test_function_scan_ref_attr_num_scan_inputs_maps_stacked_outputs(self, tmp_path: Path) -> None:
+        nodes, initializers, scalar = self._capped_scalar_expression()
+        body = helper.make_graph(
+            [
+                helper.make_node("Unsqueeze", ["element", "axes"], ["next_element"]),
+            ],
+            "function_scan_ref_count_body",
+            [
+                helper.make_tensor_value_info("element", TensorProto.FLOAT, []),
+                helper.make_tensor_value_info("other", TensorProto.FLOAT, []),
+            ],
+            [helper.make_tensor_value_info("next_element", TensorProto.FLOAT, [1])],
+            initializer=[onnx.numpy_helper.from_array(np.array([0], dtype=np.int64), name="axes")],
+        )
+        scan_node = helper.make_node(
+            "Scan",
+            ["scan_values", "other_values"],
+            ["scan_output"],
+            body=body,
+            num_scan_inputs=1,
+        )
+        next(
+            attribute for attribute in scan_node.attribute if attribute.name == "num_scan_inputs"
+        ).ref_attr_name = "scan_count"
+        function = helper.make_function(
+            "local",
+            "ScanWithCount",
+            ["scan_values", "other_values"],
+            ["scan_output"],
+            [scan_node],
+            opset_imports=[helper.make_opsetid("", 13)],
+            attributes=["scan_count"],
+        )
+        initializers.extend(
+            [
+                onnx.numpy_helper.from_array(np.array([0], dtype=np.int64), name="scan_axes"),
+                onnx.numpy_helper.from_array(np.zeros((1,), dtype=np.float32), name="other_values"),
+            ]
+        )
+        nodes.extend(
+            [
+                helper.make_node("Unsqueeze", [scalar, "scan_axes"], ["scan_values"]),
+                helper.make_node(
+                    "ScanWithCount",
+                    ["scan_values", "other_values"],
+                    ["scan_output"],
+                    domain="local",
+                    scan_count=2,
+                ),
+                helper.make_node("MatMul", ["X", "scan_output"], ["Y"]),
+            ]
+        )
+        graph = helper.make_graph(
+            nodes,
+            "function_scan_ref_attr_num_scan_inputs_maps_stacked_outputs",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 1])],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 1])],
+            initializer=initializers,
+        )
+        model = helper.make_model(
+            graph,
+            functions=[function],
+            opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
+        )
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / "function-scan-ref-attr-num-scan-inputs-gap.onnx"
         onnx.save(model, str(path))
 
         result = OnnxScanner().scan(str(path))
