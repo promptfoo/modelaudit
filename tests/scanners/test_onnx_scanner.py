@@ -14392,6 +14392,7 @@ class TestWeightDistributionSemantics:
     def test_repeated_loop_local_function_rank_reentry_fanout_is_bounded(self, tmp_path: Path) -> None:
         width = 6
         depth = 5
+        tag_attribute = "cache_tag"
         functions = []
         for level in range(depth, -1, -1):
             outputs = [f"out{index}" for index in range(width)]
@@ -14401,7 +14402,15 @@ class TestWeightDistributionSemantics:
                 nodes = []
                 for index, output_name in enumerate(outputs):
                     child_outputs = [f"child_l{level}_o{index}_{child}" for child in range(width)]
-                    nodes.append(helper.make_node(f"Fanout{level + 1}", ["state"], child_outputs, domain="local"))
+                    nodes.append(
+                        helper.make_node(
+                            f"Fanout{level + 1}",
+                            ["state"],
+                            child_outputs,
+                            domain="local",
+                            cache_tag=7,
+                        )
+                    )
                     nodes.append(helper.make_node("Identity", [child_outputs[0]], [output_name]))
             functions.append(
                 helper.make_function(
@@ -14411,6 +14420,7 @@ class TestWeightDistributionSemantics:
                     outputs,
                     nodes,
                     opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
+                    attributes=[tag_attribute],
                 )
             )
         body = helper.make_graph(
@@ -14421,6 +14431,7 @@ class TestWeightDistributionSemantics:
                     ["state"],
                     [f"function_output{index}" for index in range(width)],
                     domain="local",
+                    cache_tag=7,
                 ),
                 helper.make_node("Identity", ["function_output0"], ["next_state"]),
                 helper.make_node("Identity", ["condition_in"], ["condition_out"]),

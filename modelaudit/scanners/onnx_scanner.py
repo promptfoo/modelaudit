@@ -2382,10 +2382,42 @@ def _build_onnx_weight_analysis_plan(
             return parent_output_index >= scan_stacked_output_start(node, opset_versions)
         return False
 
-    def attribute_binding_cache_key(attribute_bindings: dict[str, Any] | None) -> tuple[tuple[str, int], ...]:
+    cache_fingerprints: dict[int, tuple[str, str]] = {}
+
+    def semantic_cache_fingerprint(value: Any) -> tuple[str, str]:
+        value_id = id(value)
+        if value_id in cache_fingerprints:
+            return cache_fingerprints[value_id]
+        type_name = f"{type(value).__module__}.{type(value).__qualname__}"
+        serializer = getattr(value, "SerializeToString", None)
+        try:
+            if callable(serializer):
+                try:
+                    payload = serializer(deterministic=True)
+                except TypeError:
+                    payload = serializer()
+            elif isinstance(value, (bytes, bytearray, memoryview)):
+                payload = bytes(value)
+            else:
+                payload = repr(value).encode("utf-8", errors="surrogatepass")
+        except Exception:
+            payload = repr(value).encode("utf-8", errors="surrogatepass")
+        fingerprint = (type_name, hashlib.sha256(payload).hexdigest())
+        cache_fingerprints[value_id] = fingerprint
+        return fingerprint
+
+    def semantic_mapping_cache_key(mapping: dict[str, Any] | None) -> tuple[tuple[str, str, str], ...]:
+        if not mapping:
+            return ()
+        return tuple(sorted((str(name), *semantic_cache_fingerprint(value)) for name, value in mapping.items()))
+
+    def attribute_binding_cache_key(attribute_bindings: dict[str, Any] | None) -> tuple[tuple[str, str, str], ...]:
         if not attribute_bindings:
             return ()
-        return tuple(sorted((str(name), id(value)) for name, value in attribute_bindings.items()))
+        return semantic_mapping_cache_key(attribute_bindings)
+
+    def constant_binding_cache_key(constants: dict[str, Any]) -> tuple[tuple[str, str, str], ...]:
+        return semantic_mapping_cache_key(constants)
 
     def opset_cache_key(opset_versions: dict[str, int]) -> tuple[tuple[str, int], ...]:
         return tuple(sorted((str(domain), int(version)) for domain, version in opset_versions.items()))
@@ -2411,13 +2443,8 @@ def _build_onnx_weight_analysis_plan(
                 bindings[graph_input_name] = parent_name
         return bindings
 
-    reentry_promotion_cache: dict[
-        tuple[int, str, tuple[int, ...] | None, tuple[tuple[str, int], ...], tuple[tuple[str, int], ...], int],
-        frozenset[int],
-    ] = {}
-    reentry_promotion_in_progress: set[
-        tuple[int, str, tuple[int, ...] | None, tuple[tuple[str, int], ...], tuple[tuple[str, int], ...], int]
-    ] = set()
+    reentry_promotion_cache: dict[tuple[Any, ...], frozenset[int]] = {}
+    reentry_promotion_in_progress: set[tuple[Any, ...]] = set()
 
     def subgraph_reenters_state_with_rank_promotion(
         subgraph: Any,
@@ -2444,6 +2471,7 @@ def _build_onnx_weight_analysis_plan(
             graph_input_shape,
             opset_cache_key(opset_versions),
             attribute_binding_cache_key(attribute_bindings),
+            constant_binding_cache_key(constants),
             depth,
         )
         if cache_key in reentry_promotion_cache:
@@ -2483,6 +2511,7 @@ def _build_onnx_weight_analysis_plan(
                 input_shape=data_input_shape,
                 index_shape=index_input_shape,
                 constants=subgraph_constants,
+                resolve_attribute=resolve_reentry_attribute,
             )
             function_promoted_outputs: set[str] = set()
             nested_promoted_outputs: set[str] = set()
@@ -2585,7 +2614,12 @@ def _build_onnx_weight_analysis_plan(
                 if body_node.op_type in {"Cast", "Identity", "Relu"}:
                     output_shape = data_input_shape
                 elif body_node.op_type == "Unsqueeze":
-                    axes = _resolve_onnx_axes(body_node, subgraph_constants, onnx=onnx)
+                    axes = _resolve_onnx_axes(
+                        body_node,
+                        subgraph_constants,
+                        onnx=onnx,
+                        resolve_attribute=resolve_reentry_attribute,
+                    )
                     if axes is not None:
                         output_rank = len(data_input_shape) + len(axes)
                         normalized_axes = tuple(axis if axis >= 0 else output_rank + axis for axis in axes)
@@ -2600,11 +2634,16 @@ def _build_onnx_weight_analysis_plan(
                                 for index in range(output_rank)
                             )
                 elif body_node.op_type == "Squeeze":
-                    axes = _resolve_onnx_axes(body_node, subgraph_constants, onnx=onnx)
+                    axes = _resolve_onnx_axes(
+                        body_node,
+                        subgraph_constants,
+                        onnx=onnx,
+                        resolve_attribute=resolve_reentry_attribute,
+                    )
                     if axes is not None:
                         normalized_axes = tuple(axis if axis >= 0 else len(data_input_shape) + axis for axis in axes)
                         if not normalized_axes:
-                            if squeeze_with_empty_axes_is_noop(body_node, axes):
+                            if squeeze_with_empty_axes_is_noop(body_node, axes, resolve_reentry_attribute):
                                 output_shape = data_input_shape
                             else:
                                 output_shape = tuple(dimension for dimension in data_input_shape if dimension != 1)
@@ -2646,13 +2685,8 @@ def _build_onnx_weight_analysis_plan(
             )
         )
 
-    graph_taint_cache: dict[
-        tuple[int, tuple[str, ...], tuple[tuple[str, int], ...], tuple[tuple[str, int], ...], int],
-        set[int],
-    ] = {}
-    graph_taint_in_progress: set[
-        tuple[int, tuple[str, ...], tuple[tuple[str, int], ...], tuple[tuple[str, int], ...], int]
-    ] = set()
+    graph_taint_cache: dict[tuple[Any, ...], set[int]] = {}
+    graph_taint_in_progress: set[tuple[Any, ...]] = set()
 
     def graph_tainted_output_indexes(
         subgraph: Any,
@@ -2766,13 +2800,8 @@ def _build_onnx_weight_analysis_plan(
         graph_taint_cache[cache_key] = set(result)
         return result
 
-    weight_reachability_cache: dict[
-        tuple[int, str, tuple[tuple[str, int], ...], tuple[tuple[str, int], ...], int],
-        bool,
-    ] = {}
-    weight_reachability_in_progress: set[
-        tuple[int, str, tuple[tuple[str, int], ...], tuple[tuple[str, int], ...], int]
-    ] = set()
+    weight_reachability_cache: dict[tuple[Any, ...], bool] = {}
+    weight_reachability_in_progress: set[tuple[Any, ...]] = set()
 
     def subgraph_state_input_can_reach_weight_consumer(
         subgraph: Any,
@@ -3053,7 +3082,7 @@ def _build_onnx_weight_analysis_plan(
         if node.op_type == "Flatten":
             return True
         if node.op_type == "Unsqueeze":
-            axes = _resolve_onnx_axes(node, constants, onnx=onnx)
+            axes = _resolve_onnx_axes(node, constants, onnx=onnx, resolve_attribute=resolve_attribute)
             if axes is None or input_shape is None:
                 return True
             output_rank = len(input_shape) + len(axes)
@@ -3066,12 +3095,12 @@ def _build_onnx_weight_analysis_plan(
                 return True
             return output_rank >= 2
         if node.op_type == "Squeeze":
-            axes = _resolve_onnx_axes(node, constants, onnx=onnx)
+            axes = _resolve_onnx_axes(node, constants, onnx=onnx, resolve_attribute=resolve_attribute)
             if axes is None or input_shape is None:
                 return True
             normalized_axes = tuple(axis if axis >= 0 else len(input_shape) + axis for axis in axes)
             if not normalized_axes:
-                if squeeze_with_empty_axes_is_noop(node, axes):
+                if squeeze_with_empty_axes_is_noop(node, axes, resolve_attribute):
                     return len(input_shape) >= 2
                 normalized_axes = tuple(index for index, dimension in enumerate(input_shape) if dimension == 1)
             if (
