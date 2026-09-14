@@ -3456,11 +3456,7 @@ def _build_onnx_weight_analysis_plan(
         for name in bound_unknown_value_ranks or set():
             clear_known_value_rank(name)
         for name, lineages in value_lineages.items():
-            if (
-                name in graph_input_names
-                and name not in (bound_value_shapes or {})
-                and name not in (bound_value_ranks or {})
-            ):
+            if name in graph_input_names:
                 continue
             lineage_shapes = {lineage.shape for lineage in lineages.values()}
             if len(lineage_shapes) == 1 and None not in lineage_shapes:

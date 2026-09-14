@@ -7428,6 +7428,100 @@ class TestWeightDistributionSemantics:
         assert semantics["eligible"][0]["consumer_op"] == "MatMul"
         assert semantics["eligible"][0]["output_axes"] == [1]
 
+    def test_scan_opset8_initializer_state_uses_bound_body_shape(self) -> None:
+        body = helper.make_graph(
+            [
+                helper.make_node("Identity", ["state"], ["next_state"]),
+                helper.make_node("Identity", ["element"], ["next_element"]),
+            ],
+            "scan8_initializer_state_body",
+            [
+                helper.make_tensor_value_info("state", TensorProto.FLOAT, None),
+                helper.make_tensor_value_info("element", TensorProto.FLOAT, None),
+            ],
+            [
+                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, None),
+                helper.make_tensor_value_info("next_element", TensorProto.FLOAT, None),
+            ],
+        )
+        graph = helper.make_graph(
+            [
+                helper.make_node(
+                    "Scan",
+                    ["", "initial", "scan_values"],
+                    ["state_out", "scan_out"],
+                    body=body,
+                    num_scan_inputs=1,
+                ),
+            ],
+            "scan8_initializer_state_bound_body_shape",
+            [helper.make_tensor_value_info("scan_values", TensorProto.FLOAT, [2, 1, 4])],
+            [
+                helper.make_tensor_value_info("state_out", TensorProto.FLOAT, [2, 5]),
+                helper.make_tensor_value_info("scan_out", TensorProto.FLOAT, [2, 1, 4]),
+            ],
+            initializer=[onnx.numpy_helper.from_array(np.zeros((2, 5), dtype=np.float32), name="initial")],
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 8)])
+        model.ir_version = 8
+        inferred = onnx.shape_inference.infer_shapes(model, strict_mode=True)
+        onnx.checker.check_model(inferred)
+        onnx.checker.check_model(inferred, full_check=True)
+
+        events: list[dict[str, Any]] = []
+
+        def profile(frame: Any, event: str, arg: Any) -> None:
+            del arg
+            if (
+                event not in {"call", "return"}
+                or frame.f_code.co_name != "walk_graph"
+                or frame.f_code.co_filename != onnx_scanner_module.__file__
+            ):
+                return
+            local = frame.f_locals
+            if event == "call":
+                events.append(
+                    {
+                        "event": "call",
+                        "graph": local["current_graph"].name,
+                        "bound_shapes": dict(local.get("bound_value_shapes") or {}),
+                    },
+                )
+            else:
+                events.append(
+                    {
+                        "event": "return",
+                        "graph": local["current_graph"].name,
+                        "shapes": dict(local.get("known_value_shapes") or {}),
+                    },
+                )
+
+        sys.setprofile(profile)
+        try:
+            plan = onnx_scanner_module._build_onnx_weight_analysis_plan(
+                inferred,
+                onnx=onnx,
+                np=np,
+                max_array_size=None,
+            )
+        finally:
+            sys.setprofile(None)
+
+        body_call = next(
+            event for event in events if event["event"] == "call" and event["graph"] == "scan8_initializer_state_body"
+        )
+        root_return = next(
+            event
+            for event in events
+            if event["event"] == "return" and event["graph"] == "scan8_initializer_state_bound_body_shape"
+        )
+
+        assert body_call["bound_shapes"]["state"] == (5,)
+        assert body_call["bound_shapes"]["element"] == (4,)
+        assert root_return["shapes"]["state_out"] == (2, 5)
+        assert root_return["shapes"]["scan_out"] == (2, -1, 4)
+        assert plan.coverage_gaps == {}
+
     @pytest.mark.parametrize(("scan_length", "expect_gap"), [(1, False), (2, True)])
     def test_scan_graph_input_fixed_extent_bounds_carried_rank_growth(
         self,
