@@ -4205,9 +4205,14 @@ def _build_onnx_weight_analysis_plan(
                     for pair_index, (parent_input, graph_input) in enumerate(input_pairs, start=input_pair_index_start):
                         parent_name = str(parent_input)
                         graph_input_name = _onnx_value_name(graph_input)
+                        repeated_loop_state_input = (
+                            node.op_type == "Loop"
+                            and pair_index >= 2
+                            and loop_may_repeat_body(node, constants, graph_input_names)
+                        )
                         if parent_name in value_lineages:
                             subgraph_bound_lineages[graph_input_name] = value_lineages[parent_name]
-                        if parent_name in constants:
+                        if parent_name in constants and not repeated_loop_state_input:
                             subgraph_bound_constants[graph_input_name] = constants[parent_name]
                         if parent_name in dynamic_values:
                             subgraph_bound_dynamic.add(graph_input_name)
