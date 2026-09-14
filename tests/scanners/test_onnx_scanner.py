@@ -8502,21 +8502,129 @@ class TestWeightDistributionSemantics:
             assert coverage == []
             assert semantics["coverage_gaps"] == {}
 
-    @pytest.mark.parametrize(("other_shape", "x_shape", "expected_gap"), [([4], [1, 4], False), ([1, 4], [1, 1], True)])
+    @pytest.mark.parametrize(
+        ("other_shape", "x_shape", "expected_gap", "other_from_constant"),
+        [
+            ([4], [1, 4], False, False),
+            ([1, 4], [1, 1], True, False),
+            ([4], [1, 4], False, True),
+            ([1, 4], [1, 1], True, True),
+        ],
+    )
     def test_repeated_loop_broadcast_rank_increase_is_gap(
         self,
         tmp_path: Path,
         other_shape: list[int],
         x_shape: list[int],
         expected_gap: bool,
+        other_from_constant: bool,
     ) -> None:
+        body_nodes = [
+            helper.make_node("MatMul", ["X", "state"], ["body_y"]),
+            helper.make_node("Add", ["state", "other"], ["next_state"]),
+            helper.make_node("Identity", ["condition_in"], ["condition_out"]),
+        ]
+        body_initializers = []
+        other_tensor = onnx.numpy_helper.from_array(np.zeros(other_shape, dtype=np.float32), name="other")
+        if other_from_constant:
+            body_nodes.insert(1, helper.make_node("Constant", [], ["other"], value=other_tensor))
+        else:
+            body_initializers.append(other_tensor)
+        body = helper.make_graph(
+            body_nodes,
+            "retained_loop_broadcast_rank_body",
+            [
+                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
+                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("state", TensorProto.FLOAT, None),
+            ],
+            [
+                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, None),
+            ],
+            initializer=body_initializers,
+        )
+        graph = helper.make_graph(
+            [
+                helper.make_node(
+                    "Loop",
+                    ["trip_count", "initial_condition", "initial_state"],
+                    ["control_flow_state"],
+                    body=body,
+                ),
+                helper.make_node("Identity", ["dummy"], ["Y"]),
+            ],
+            "retained_loop_broadcast_rank",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, x_shape)],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [])],
+            initializer=[
+                onnx.numpy_helper.from_array(np.ones((4,), dtype=np.float32), name="initial_state"),
+                onnx.numpy_helper.from_array(np.array(2, dtype=np.int64), name="trip_count"),
+                onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="initial_condition"),
+                onnx.numpy_helper.from_array(np.array(0.0, dtype=np.float32), name="dummy"),
+            ],
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / f"retained-loop-broadcast-rank-{expected_gap}.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        if expected_gap:
+            assert result.success is False
+            assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
+            assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
+        else:
+            assert result.success is True
+            assert coverage == []
+            assert semantics["coverage_gaps"] == {}
+
+    @pytest.mark.parametrize(
+        ("case", "expected_gap"),
+        [
+            ("vector_only", False),
+            ("vector_first_matrix", True),
+            ("matrix_first_vector_unused", True),
+        ],
+    )
+    def test_repeated_loop_function_broadcast_rank_cache_uses_bound_operand(
+        self,
+        tmp_path: Path,
+        case: str,
+        expected_gap: bool,
+    ) -> None:
+        function = helper.make_function(
+            "local",
+            "BroadcastState",
+            ["state", "other"],
+            ["output"],
+            [helper.make_node("Add", ["state", "other"], ["output"])],
+            opset_imports=[helper.make_opsetid("", 13)],
+        )
+        broadcast_calls = {
+            "vector_only": [
+                helper.make_node("BroadcastState", ["state", "vector_other"], ["next_state"], domain="local"),
+            ],
+            "vector_first_matrix": [
+                helper.make_node("BroadcastState", ["state", "vector_other"], ["unused_vector"], domain="local"),
+                helper.make_node("BroadcastState", ["state", "matrix_other"], ["next_state"], domain="local"),
+            ],
+            "matrix_first_vector_unused": [
+                helper.make_node("BroadcastState", ["state", "matrix_other"], ["next_state"], domain="local"),
+                helper.make_node("BroadcastState", ["state", "vector_other"], ["unused_vector"], domain="local"),
+            ],
+        }
         body = helper.make_graph(
             [
                 helper.make_node("MatMul", ["X", "state"], ["body_y"]),
-                helper.make_node("Add", ["state", "other"], ["next_state"]),
+                *broadcast_calls[case],
                 helper.make_node("Identity", ["condition_in"], ["condition_out"]),
             ],
-            "retained_loop_broadcast_rank_body",
+            "retained_loop_function_broadcast_rank_body",
             [
                 helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
                 helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
@@ -8537,21 +8645,26 @@ class TestWeightDistributionSemantics:
                 ),
                 helper.make_node("Identity", ["dummy"], ["Y"]),
             ],
-            "retained_loop_broadcast_rank",
-            [helper.make_tensor_value_info("X", TensorProto.FLOAT, x_shape)],
+            "retained_loop_function_broadcast_rank",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, [4, 4])],
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [])],
             initializer=[
                 onnx.numpy_helper.from_array(np.ones((4,), dtype=np.float32), name="initial_state"),
-                onnx.numpy_helper.from_array(np.zeros(other_shape, dtype=np.float32), name="other"),
+                onnx.numpy_helper.from_array(np.zeros((4,), dtype=np.float32), name="vector_other"),
+                onnx.numpy_helper.from_array(np.zeros((4, 4), dtype=np.float32), name="matrix_other"),
                 onnx.numpy_helper.from_array(np.array(2, dtype=np.int64), name="trip_count"),
                 onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="initial_condition"),
                 onnx.numpy_helper.from_array(np.array(0.0, dtype=np.float32), name="dummy"),
             ],
         )
-        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model = helper.make_model(
+            graph,
+            functions=[function],
+            opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
+        )
         model.ir_version = 8
         onnx.checker.check_model(model)
-        path = tmp_path / f"retained-loop-broadcast-rank-{expected_gap}.onnx"
+        path = tmp_path / f"retained-loop-function-broadcast-rank-{case}.onnx"
         onnx.save(model, str(path))
 
         result = OnnxScanner().scan(str(path))

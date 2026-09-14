@@ -2066,6 +2066,36 @@ def _build_onnx_weight_analysis_plan(
                 return attribute.t
         return None
 
+    def resolved_constant_node_tensor(
+        node: Any,
+        resolve_attribute: Callable[[Any], Any | None],
+    ) -> Any | None:
+        for attribute in getattr(node, "attribute", ()):
+            resolved_attribute = resolve_attribute(attribute)
+            if resolved_attribute is None:
+                continue
+            if attribute.name == "value" and _onnx_has_singular_field(resolved_attribute, "t"):
+                return resolved_attribute.t
+            if attribute.name == "value_ints":
+                return onnx.helper.make_tensor(
+                    "",
+                    onnx.TensorProto.INT64,
+                    [len(resolved_attribute.ints)],
+                    list(resolved_attribute.ints),
+                )
+            if attribute.name == "value_int":
+                return onnx.helper.make_tensor("", onnx.TensorProto.INT64, [], [resolved_attribute.i])
+            if attribute.name == "value_floats":
+                return onnx.helper.make_tensor(
+                    "",
+                    onnx.TensorProto.FLOAT,
+                    [len(resolved_attribute.floats)],
+                    list(resolved_attribute.floats),
+                )
+            if attribute.name == "value_float":
+                return onnx.helper.make_tensor("", onnx.TensorProto.FLOAT, [], [resolved_attribute.f])
+        return None
+
     def graph_value_is_constant_false(
         current_graph: Any,
         value_name: str,
@@ -2531,12 +2561,19 @@ def _build_onnx_weight_analysis_plan(
             return frozenset()
         names: set[str] = set()
         for body_node in getattr(subgraph, "node", ()):
-            if (
-                getattr(body_node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
-                and body_node.op_type in {"Expand", "Gather", "GatherND", "Reshape", "Squeeze", "Unsqueeze"}
-                and len(getattr(body_node, "input", ())) > 1
+            if getattr(body_node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS and (
+                body_node.op_type in {"Expand", "Gather", "GatherND", "Reshape", "Squeeze", "Unsqueeze"}
+                or body_node.op_type in _SAME_TYPE_ELEMENTWISE_OPERATORS
+                or body_node.op_type == "Pow"
             ):
-                names.add(str(body_node.input[1]))
+                input_indexes = (
+                    range(1, len(getattr(body_node, "input", ())))
+                    if body_node.op_type in {"Expand", "Gather", "GatherND", "Reshape", "Squeeze", "Unsqueeze"}
+                    else range(len(getattr(body_node, "input", ())))
+                )
+                names.update(
+                    str(body_node.input[input_index]) for input_index in input_indexes if body_node.input[input_index]
+                )
             function_key = (
                 str(getattr(body_node, "domain", "")),
                 str(getattr(body_node, "op_type", "")),
@@ -2617,6 +2654,14 @@ def _build_onnx_weight_analysis_plan(
             body_outputs = [str(output_name) for output_name in getattr(body_node, "output", ()) if output_name]
             if not body_outputs:
                 continue
+            if getattr(body_node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS and body_node.op_type == "Constant":
+                constant_tensor = resolved_constant_node_tensor(body_node, resolve_reentry_attribute)
+                if constant_tensor is not None:
+                    for output_name in body_outputs:
+                        subgraph_constants[output_name] = constant_tensor
+                        tainted.discard(output_name)
+                        promoted.discard(output_name)
+                        tainted_shapes.pop(output_name, None)
             function_key = (
                 str(getattr(body_node, "domain", "")),
                 str(getattr(body_node, "op_type", "")),
