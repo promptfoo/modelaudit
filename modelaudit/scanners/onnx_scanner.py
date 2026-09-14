@@ -2357,6 +2357,26 @@ def _build_onnx_weight_analysis_plan(
     def control_flow_output_offset(node: Any) -> int:
         return 1 if node.op_type == "Loop" else 0
 
+    def scan_stacked_output_start(node: Any, opset_versions: dict[str, int]) -> int:
+        if node.op_type != "Scan" or getattr(node, "domain", "") not in _STANDARD_NEURAL_NETWORK_DOMAINS:
+            return len(getattr(node, "output", ()))
+        scan_input_offset = scan_sequence_lens_input_offset(node, opset_versions)
+        num_scan_inputs = _onnx_int_attribute(node, "num_scan_inputs", 1)
+        if num_scan_inputs <= 0:
+            return len(getattr(node, "output", ()))
+        return max(len(getattr(node, "input", ())) - scan_input_offset - num_scan_inputs, 0)
+
+    def control_flow_output_is_stacked_scan_output(
+        node: Any,
+        output_index: int,
+        opset_versions: dict[str, int],
+    ) -> bool:
+        return (
+            node.op_type == "Scan"
+            and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
+            and output_index >= scan_stacked_output_start(node, opset_versions)
+        )
+
     def bound_control_flow_graph_inputs(
         node: Any,
         nested_graph: Any,
@@ -2471,6 +2491,14 @@ def _build_onnx_weight_analysis_plan(
                         {captured_name: tainted_shapes.get(captured_name) for captured_name in captured_names}
                     )
                     for captured_name, captured_shape in nested_tainted_shapes.items():
+                        nested_tainted_output_indexes = graph_tainted_output_indexes(
+                            nested_graph,
+                            {captured_name},
+                            opset_versions,
+                            attribute_bindings=local_attribute_bindings,
+                            depth=depth + 1,
+                        )
+                        nested_promoted_output_indexes: set[int] = set()
                         for output_index in range(len(getattr(nested_graph, "output", ()))):
                             if subgraph_reenters_state_with_rank_promotion(
                                 nested_graph,
@@ -2482,13 +2510,23 @@ def _build_onnx_weight_analysis_plan(
                                 attribute_bindings=local_attribute_bindings,
                                 depth=depth + 1,
                             ):
-                                nested_promoted_outputs.update(
-                                    mapped_node_outputs(
-                                        body_outputs,
-                                        {output_index},
-                                        graph_output_offset=control_flow_output_offset(body_node),
-                                    )
+                                nested_promoted_output_indexes.add(output_index)
+                            if (
+                                output_index in nested_tainted_output_indexes
+                                and control_flow_output_is_stacked_scan_output(
+                                    body_node,
+                                    output_index,
+                                    opset_versions,
                                 )
+                            ):
+                                nested_promoted_output_indexes.add(output_index)
+                        nested_promoted_outputs.update(
+                            mapped_node_outputs(
+                                body_outputs,
+                                nested_promoted_output_indexes,
+                                graph_output_offset=control_flow_output_offset(body_node),
+                            )
+                        )
             promoted_outputs = function_promoted_outputs | nested_promoted_outputs
             if (
                 data_input_promoted
@@ -2616,6 +2654,7 @@ def _build_onnx_weight_analysis_plan(
                     tainted.update(mapped_outputs)
                     continue
             nested_outputs: set[str] = set()
+            inspected_nested_taint = False
             for attribute in getattr(body_node, "attribute", ()):
                 resolved_attribute = resolve_reentry_attribute(attribute)
                 if resolved_attribute is None:
@@ -2633,6 +2672,7 @@ def _build_onnx_weight_analysis_plan(
                     captured_names |= nested_input_names
                     if not captured_names:
                         continue
+                    inspected_nested_taint = True
                     nested_outputs.update(
                         mapped_node_outputs(
                             body_outputs,
@@ -2648,7 +2688,7 @@ def _build_onnx_weight_analysis_plan(
                     )
             if nested_outputs:
                 tainted.update(nested_outputs)
-            elif any_tainted:
+            elif any_tainted and not inspected_nested_taint:
                 tainted.update(body_outputs)
         return {
             output_index for output_index, output in enumerate(graph_outputs) if _onnx_value_name(output) in tainted
@@ -2691,6 +2731,8 @@ def _build_onnx_weight_analysis_plan(
             )
             any_tainted = any(input_name in tainted for input_name in body_inputs)
             function_tainted_outputs: set[str] = set()
+            nested_tainted_outputs: set[str] = set()
+            inspected_nested_taint = False
             if any_tainted:
                 if function is not None:
                     function_attributes = bound_function_attributes(function, body_node, resolve_reentry_attribute)
@@ -2739,20 +2781,38 @@ def _build_onnx_weight_analysis_plan(
                                 continue
                             if nested_input_index < 0 or nested_input_index >= len(getattr(nested_graph, "input", ())):
                                 return True
+                            inspected_nested_taint = True
+                            nested_input_name = _onnx_value_name(nested_graph.input[nested_input_index])
                             if subgraph_state_input_can_reach_weight_consumer(
                                 nested_graph,
-                                _onnx_value_name(nested_graph.input[nested_input_index]),
+                                nested_input_name,
                                 opset_versions,
                                 attribute_bindings=local_attribute_bindings,
                                 depth=depth + 1,
                             ):
                                 return True
+                            nested_tainted_outputs.update(
+                                mapped_node_outputs(
+                                    body_outputs,
+                                    graph_tainted_output_indexes(
+                                        nested_graph,
+                                        {nested_input_name},
+                                        opset_versions,
+                                        attribute_bindings=local_attribute_bindings,
+                                        depth=depth + 1,
+                                    ),
+                                    graph_output_offset=control_flow_output_offset(body_node),
+                                )
+                            )
+                    tainted.update(nested_tainted_outputs)
             for attribute in getattr(body_node, "attribute", ()):
                 resolved_attribute = resolve_reentry_attribute(attribute)
                 if resolved_attribute is None:
                     continue
                 for nested_graph in _iter_attribute_graphs(resolved_attribute):
                     captured_names = graph_external_reference_names(nested_graph) & tainted
+                    if captured_names:
+                        inspected_nested_taint = True
                     for captured_name in captured_names:
                         if subgraph_state_input_can_reach_weight_consumer(
                             nested_graph,
@@ -2786,7 +2846,7 @@ def _build_onnx_weight_analysis_plan(
                 for input_index, input_name in enumerate(body_inputs)
             ):
                 return True
-            if any_tainted and function is None:
+            if any_tainted and function is None and not inspected_nested_taint:
                 tainted.update(body_outputs)
         return False
 
@@ -6003,8 +6063,7 @@ def _build_onnx_weight_analysis_plan(
                 if standard_control_flow_operator and node.op_type == "Loop":
                     stacked_scan_output_start = max(len(node.input) - 2, 0)
                 elif standard_control_flow_operator and node.op_type == "Scan":
-                    num_scan_inputs = _onnx_int_attribute(node, "num_scan_inputs", 1)
-                    stacked_scan_output_start = max(len(node.input) - resolved_scan_input_offset - num_scan_inputs, 0)
+                    stacked_scan_output_start = scan_stacked_output_start(node, opset_versions)
                 for output_index in range(len(node.output)):
                     graph_output_index = output_index + subgraph_output_offset
                     if graph_output_index >= len(graph_output_lineages):
