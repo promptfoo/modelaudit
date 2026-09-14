@@ -2559,26 +2559,35 @@ def _build_onnx_weight_analysis_plan(
                 bindings[graph_input_name] = parent_name
         return bindings
 
-    def bound_control_flow_graph_constants(
+    def bound_control_flow_graph_constant_inputs(
         node: Any,
         nested_graph: Any,
-        constants: dict[str, Any],
+        inherited_constants: dict[str, Any],
         opset_versions: dict[str, int],
-    ) -> dict[str, Any]:
+        local_constants: dict[str, Any] | None = None,
+    ) -> dict[str, str]:
+        local_constants = local_constants or {}
         if node.op_type == "Loop":
-            if loop_may_repeat_body(node, constants, set()):
+            loop_control_constants = {
+                control_name: inherited_constants[control_name]
+                if control_name in inherited_constants
+                else local_constants[control_name]
+                for control_name in (str(input_name) for input_name in node.input[:2] if input_name)
+                if control_name in inherited_constants or control_name in local_constants
+            }
+            if loop_may_repeat_body(node, loop_control_constants, set()):
                 return {}
             input_pairs = zip(node.input[2:], nested_graph.input[2:], strict=False)
         elif node.op_type == "Scan":
             return {}
         else:
             return {}
-        bindings: dict[str, Any] = {}
+        bindings: dict[str, str] = {}
         for parent_input, graph_input in input_pairs:
             parent_name = str(parent_input)
             graph_input_name = _onnx_value_name(graph_input)
-            if parent_name in constants and graph_input_name:
-                bindings[graph_input_name] = constants[parent_name]
+            if (parent_name in inherited_constants or parent_name in local_constants) and graph_input_name:
+                bindings[graph_input_name] = parent_name
         return bindings
 
     def rank_reentry_constant_names(subgraph: Any, *, depth: int = 0) -> frozenset[str]:
@@ -2771,15 +2780,13 @@ def _build_onnx_weight_analysis_plan(
                 if resolved_attribute is None:
                     continue
                 for nested_graph in _iter_attribute_graphs(resolved_attribute):
-                    available_nested_constants = {**constants, **subgraph_constants}
-                    nested_bound_input_constants = bound_control_flow_graph_constants(
+                    nested_bound_input_constant_names = bound_control_flow_graph_constant_inputs(
                         body_node,
                         nested_graph,
-                        available_nested_constants,
+                        constants,
                         opset_versions,
+                        subgraph_constants,
                     )
-                    nested_constants = graph_initializer_constants(nested_graph, available_nested_constants)
-                    nested_constants.update(nested_bound_input_constants)
                     nested_graph_inputs = bound_control_flow_graph_inputs(
                         body_node,
                         nested_graph,
@@ -2794,6 +2801,16 @@ def _build_onnx_weight_analysis_plan(
                     nested_tainted_shapes.update(
                         {captured_name: tainted_shapes.get(captured_name) for captured_name in captured_names}
                     )
+                    if not nested_tainted_shapes:
+                        continue
+                    available_nested_constants = {**constants, **subgraph_constants}
+                    nested_bound_input_constants = {
+                        graph_input: available_nested_constants[parent_input]
+                        for graph_input, parent_input in nested_bound_input_constant_names.items()
+                        if parent_input in available_nested_constants
+                    }
+                    nested_constants = graph_initializer_constants(nested_graph, available_nested_constants)
+                    nested_constants.update(nested_bound_input_constants)
                     nested_output_shapes: dict[int, tuple[int, ...]] = {}
                     for captured_name, captured_shape in nested_tainted_shapes.items():
                         nested_tainted_output_indexes = graph_tainted_output_indexes(
