@@ -8,7 +8,7 @@ import numbers
 import os
 import re
 import stat
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -2471,6 +2471,7 @@ def _build_onnx_weight_analysis_plan(
         tuple[int, tuple[str, ...] | None],
         tuple[Any, int, tuple[tuple[str, str, str], ...]],
     ] = {}
+    trusted_shape_keys: dict[int, tuple[Any, int, tuple[tuple[str, tuple[int, ...]], ...]]] = {}
     rank_reentry_constant_name_cache: dict[tuple[int, int], frozenset[str]] = {}
 
     def semantic_cache_fingerprint(value: Any) -> tuple[str, str]:
@@ -2508,11 +2509,6 @@ def _build_onnx_weight_analysis_plan(
         if not mapping:
             return ()
         names_key = tuple(sorted(str(name) for name in names)) if names is not None else None
-        if names_key is None:
-            return tuple(
-                (str(name), *semantic_cache_fingerprint_with_owner(value, retain_owner=False))
-                for name, value in sorted((str(name), value) for name, value in mapping.items())
-            )
         owner_key = (id(mapping), names_key)
         cached_mapping_key = semantic_mapping_keys.get(owner_key)
         if (
@@ -2521,7 +2517,11 @@ def _build_onnx_weight_analysis_plan(
             and cached_mapping_key[1] == len(mapping)
         ):
             return cached_mapping_key[2]
-        items = tuple((name, mapping[name]) for name in names_key if name in mapping)
+        items = (
+            tuple(sorted((str(name), value) for name, value in mapping.items()))
+            if names_key is None
+            else tuple((name, mapping[name]) for name in names_key if name in mapping)
+        )
         cache_key = tuple((str(name), *semantic_cache_fingerprint(value)) for name, value in items)
         semantic_mapping_keys[owner_key] = (mapping, len(mapping), cache_key)
         return cache_key
@@ -2536,6 +2536,23 @@ def _build_onnx_weight_analysis_plan(
         names: frozenset[str],
     ) -> tuple[tuple[str, str, str], ...]:
         return semantic_mapping_cache_key(constants, names)
+
+    def trusted_context_shape_cache_key(
+        trusted_context_shapes: dict[str, tuple[int, ...]],
+    ) -> tuple[tuple[str, tuple[int, ...]], ...]:
+        if not trusted_context_shapes:
+            return ()
+        owner_key = id(trusted_context_shapes)
+        cached_key = trusted_shape_keys.get(owner_key)
+        if (
+            cached_key is not None
+            and cached_key[0] is trusted_context_shapes
+            and cached_key[1] == len(trusted_context_shapes)
+        ):
+            return cached_key[2]
+        cache_key = tuple(sorted((str(name), tuple(shape)) for name, shape in trusted_context_shapes.items()))
+        trusted_shape_keys[owner_key] = (trusted_context_shapes, len(trusted_context_shapes), cache_key)
+        return cache_key
 
     def opset_cache_key(opset_versions: dict[str, int]) -> tuple[tuple[str, int], ...]:
         return tuple(sorted((str(domain), int(version)) for domain, version in opset_versions.items()))
@@ -2635,6 +2652,13 @@ def _build_onnx_weight_analysis_plan(
     reentry_shape_cache: dict[tuple[Any, ...], dict[int, tuple[int, ...]]] = {}
     reentry_promotion_in_progress: set[tuple[Any, ...]] = set()
 
+    def reentry_shape_preserving_unary_operator(node: Any, inputs: Sequence[str]) -> bool:
+        return (
+            getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
+            and node.op_type in (_SHAPE_PRESERVING_UNARY_RANK_OPERATORS | {"Cast", "Identity"})
+            and (len(inputs) == 1 or node.op_type in {"Clip", "Dropout"})
+        )
+
     def subgraph_reenters_state_with_rank_promotion(
         subgraph: Any,
         graph_input_name: str,
@@ -2662,7 +2686,7 @@ def _build_onnx_weight_analysis_plan(
             id(subgraph),
             graph_input_name,
             graph_input_shape,
-            tuple(sorted((name, shape) for name, shape in trusted_context_shapes.items())),
+            trusted_context_shape_cache_key(trusted_context_shapes),
             opset_cache_key(opset_versions),
             attribute_binding_cache_key(attribute_bindings),
             constant_binding_cache_key(constants, rank_reentry_constant_names(subgraph)),
@@ -2923,7 +2947,7 @@ def _build_onnx_weight_analysis_plan(
                 tainted.update(body_tainted_outputs)
             if any_tainted:
                 output_shape = None
-                if body_node.op_type in {"Cast", "Identity", "Relu"} and data_input_shape is not None:
+                if reentry_shape_preserving_unary_operator(body_node, body_inputs) and data_input_shape is not None:
                     output_shape = data_input_shape
                 elif body_node.op_type in _SAME_TYPE_ELEMENTWISE_OPERATORS | {"Pow"}:
                     output_shape = broadcast_shapes(input_shapes_by_name.get(input_name) for input_name in body_inputs)
@@ -3006,7 +3030,7 @@ def _build_onnx_weight_analysis_plan(
                 if output_shape is not None:
                     for output_name in body_outputs:
                         tainted_shapes[output_name] = output_shape
-            elif body_node.op_type in {"Cast", "Identity", "Relu"} and data_input_shape is not None:
+            elif reentry_shape_preserving_unary_operator(body_node, body_inputs) and data_input_shape is not None:
                 for output_name in body_outputs:
                     tainted_shapes[output_name] = data_input_shape
         promoted_output_indexes = frozenset(
@@ -5360,12 +5384,9 @@ def _build_onnx_weight_analysis_plan(
                     if node.op_type == "Loop" and len(node.input) > 1 and len(getattr(subgraph, "input", ())) > 1:
                         loop_condition_name = str(node.input[1])
                         loop_body_condition_name = _onnx_value_name(subgraph.input[1])
-                        loop_condition_shape = known_value_shapes.get(
-                            loop_condition_name
-                        ) or constant_initializer_shape(
-                            constants,
-                            loop_condition_name,
-                        )
+                        loop_condition_shape = known_value_shapes.get(loop_condition_name)
+                        if loop_condition_shape is None:
+                            loop_condition_shape = constant_initializer_shape(constants, loop_condition_name)
                         if (
                             loop_body_condition_name
                             and loop_condition_shape is not None
@@ -5384,10 +5405,9 @@ def _build_onnx_weight_analysis_plan(
                             if pair_index < scan_input_start:
                                 continue
                             parent_name = str(parent_input)
-                            parent_shape = known_value_shapes.get(parent_name) or constant_initializer_shape(
-                                constants,
-                                parent_name,
-                            )
+                            parent_shape = known_value_shapes.get(parent_name)
+                            if parent_shape is None:
+                                parent_shape = constant_initializer_shape(constants, parent_name)
                             parent_shape, _parent_rank = _onnx_scan_bound_subgraph_input_shape(
                                 parent_shape,
                                 known_value_ranks.get(parent_name),

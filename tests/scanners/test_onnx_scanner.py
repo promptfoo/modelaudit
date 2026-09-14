@@ -8695,7 +8695,11 @@ class TestWeightDistributionSemantics:
             ("captured_identity_vector_input", "captured_identity", False, False, False, False),
             ("captured_cast_vector_input", "captured_cast", False, False, False, False),
             ("captured_relu_vector_input", "captured_relu", False, False, False, False),
+            ("captured_abs_vector_input", "captured_abs", False, False, False, False),
+            ("captured_sigmoid_vector_input", "captured_sigmoid", False, False, False, False),
+            ("captured_tanh_vector_input", "captured_tanh", False, False, False, False),
             ("captured_identity_matrix_input", "captured_identity", True, False, False, True),
+            ("where_scalar_condition_formal", "condition_formal", False, False, True, False),
         ],
     )
     def test_repeated_loop_reentry_broadcast_operands_preserve_shape_context(
@@ -8710,13 +8714,20 @@ class TestWeightDistributionSemantics:
     ) -> None:
         other_shape = [4, 4] if matrix_operand_or_condition else [4]
         body_nodes = [helper.make_node("MatMul", ["X", "state"], ["body_y"])]
+        condition_is_graph_input = source == "condition_formal"
         initializers = [
             onnx.numpy_helper.from_array(np.ones((4,), dtype=np.float32), name="initial_state"),
             onnx.numpy_helper.from_array(np.array(2, dtype=np.int64), name="trip_count"),
-            onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="initial_condition"),
             onnx.numpy_helper.from_array(np.array(0.0, dtype=np.float32), name="dummy"),
         ]
-        graph_inputs = [helper.make_tensor_value_info("X", TensorProto.FLOAT, [4, 4])]
+        if condition_is_graph_input:
+            graph_inputs = [
+                helper.make_tensor_value_info("X", TensorProto.FLOAT, [4, 4]),
+                helper.make_tensor_value_info("initial_condition", TensorProto.BOOL, []),
+            ]
+        else:
+            initializers.append(onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="initial_condition"))
+            graph_inputs = [helper.make_tensor_value_info("X", TensorProto.FLOAT, [4, 4])]
         other_name = "other"
         if source == "sparse":
             sparse = onnx.SparseTensorProto()
@@ -8733,8 +8744,9 @@ class TestWeightDistributionSemantics:
                 other_name = "other_alias"
                 if alias == "cast":
                     body_nodes.append(helper.make_node("Cast", ["other"], [other_name], to=TensorProto.FLOAT))
-                elif alias in {"identity", "relu"}:
-                    body_nodes.append(helper.make_node(alias.capitalize(), ["other"], [other_name]))
+                elif alias in {"abs", "identity", "relu", "sigmoid", "tanh"}:
+                    alias_op_type = "Identity" if alias == "identity" else alias.capitalize()
+                    body_nodes.append(helper.make_node(alias_op_type, ["other"], [other_name]))
                 else:
                     raise AssertionError(f"unexpected captured alias {alias}")
         else:
@@ -8743,8 +8755,13 @@ class TestWeightDistributionSemantics:
                 onnx.numpy_helper.from_array(np.zeros(initializer_shape, dtype=np.float32), name="other")
             )
         if use_where:
-            select_name = "select"
-            initializers.append(onnx.numpy_helper.from_array(np.ones(other_shape, dtype=np.bool_), name=select_name))
+            if condition_is_graph_input:
+                select_name = "condition_in"
+            else:
+                select_name = "select"
+                initializers.append(
+                    onnx.numpy_helper.from_array(np.ones(other_shape, dtype=np.bool_), name=select_name)
+                )
             body_nodes.append(helper.make_node("Where", [select_name, "state", other_name], ["next_state"]))
         else:
             add_inputs = [other_name, "state"] if state_second else ["state", other_name]
