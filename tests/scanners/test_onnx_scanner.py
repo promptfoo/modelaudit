@@ -7475,14 +7475,9 @@ class TestWeightDistributionSemantics:
         assert coverage[0].details["eligible_initializers"] == 1
         assert coverage[0].details["analyzed_initializers"] == 0
         semantics = result.metadata["onnx_weight_distribution_semantics"]
-        if kind == "state_vector":
-            assert coverage[0].details["coverage_gap"] == "partial_initializer_coverage"
-            assert coverage[0].details["extraction_failures"] == 1
-            assert semantics["coverage_gaps"] == {}
-        else:
-            assert coverage[0].details["coverage_gap"] == "unresolved_initializer_lineage"
-            assert coverage[0].details["extraction_failures"] == 0
-            assert semantics["coverage_gaps"]["unresolved_initializer_lineage"] == 1
+        assert coverage[0].details["coverage_gap"] == "partial_initializer_coverage"
+        assert coverage[0].details["extraction_failures"] == 1
+        assert semantics["coverage_gaps"] == {}
         assert semantics["eligible_initializer_count"] == 1
         assert semantics["analyzed_layer_count"] == 0
 
@@ -7715,7 +7710,7 @@ class TestWeightDistributionSemantics:
         assert body_call["bound_shapes"]["state"] == (5,)
         assert body_call["bound_shapes"]["element"] == (4,)
         assert root_return["shapes"]["state_out"] == (2, 5)
-        assert root_return["shapes"]["scan_out"] == (2, 4, -1)
+        assert root_return["shapes"]["scan_out"] == (2, -1, 4)
         assert plan.coverage_gaps == {}
 
     @pytest.mark.parametrize(

@@ -5302,7 +5302,6 @@ def _build_onnx_weight_analysis_plan(
                         scan_output_axes,
                         stacked_scan_output_start,
                         output_index,
-                        default_axis=1 if resolved_scan_input_offset else 0,
                     )
                     scan_output_extent = -1
                     if (
