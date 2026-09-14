@@ -175,6 +175,7 @@ _ONNX_STRUCTURE_RETAINED_OBJECT_BYTES = 1024
 _ONNX_STRUCTURE_RETAINED_SEQUENCE_ENTRY_BYTES = 64
 _ONNX_STRUCTURE_RETAINED_STRING_OVERHEAD_BYTES = 64
 _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_OUTPUTS = 1024
+_ONNX_WEIGHT_REACHABILITY_MAX_GRAPH_WORK = 4096
 _ONNX_RESULT_MAX_DISTINCT_GROUPS = 1024
 _STANDARD_NEURAL_NETWORK_DOMAINS: frozenset[str] = frozenset({"", "ai.onnx"})
 _SAME_TYPE_ELEMENTWISE_OPERATORS: frozenset[str] = frozenset(
@@ -2756,7 +2757,7 @@ def _build_onnx_weight_analysis_plan(
             input_shapes_by_name = {input_name: reentry_input_shape(input_name) for input_name in body_inputs}
             elementwise_operator = body_node.op_type in _SAME_TYPE_ELEMENTWISE_OPERATORS or body_node.op_type == "Pow"
             promotion_input_tainted = (
-                any_tainted if elementwise_operator or body_node.op_type == "MatMul" else data_input_tainted
+                any_tainted if elementwise_operator or body_node.op_type in {"MatMul", "OneHot"} else data_input_tainted
             )
             data_input_may_promote = promotion_input_tainted and operator_output_may_have_weight_rank(
                 body_node,
@@ -2940,6 +2941,7 @@ def _build_onnx_weight_analysis_plan(
                     (
                         is_rank_gap_promoting_operator(body_node)
                         or body_node.op_type == "MatMul"
+                        or body_node.op_type == "OneHot"
                         or body_node.op_type in _SAME_TYPE_ELEMENTWISE_OPERATORS
                         or body_node.op_type == "Pow"
                     )
@@ -2972,6 +2974,12 @@ def _build_onnx_weight_analysis_plan(
                     output_shape = matmul_output_shape(
                         input_shapes_by_name.get(body_inputs[0]) if body_inputs else None,
                         input_shapes_by_name.get(body_inputs[1]) if len(body_inputs) > 1 else None,
+                    )
+                elif body_node.op_type == "OneHot":
+                    output_shape = onehot_output_shape(
+                        body_node,
+                        input_shapes_by_name.get(body_inputs[0]) if body_inputs else None,
+                        subgraph_constants,
                     )
                 elif body_node.op_type in _SAME_TYPE_ELEMENTWISE_OPERATORS | {"Pow"}:
                     output_shape = broadcast_shapes(input_shapes_by_name.get(input_name) for input_name in body_inputs)
@@ -3207,6 +3215,7 @@ def _build_onnx_weight_analysis_plan(
 
     weight_reachability_cache: dict[tuple[Any, ...], bool] = {}
     weight_reachability_in_progress: set[tuple[Any, ...]] = set()
+    weight_reachability_budget_gap_graphs: set[tuple[Any, ...]] = set()
 
     def subgraph_state_input_can_reach_weight_consumer(
         subgraph: Any,
@@ -3229,6 +3238,20 @@ def _build_onnx_weight_analysis_plan(
         )
         if cache_key in weight_reachability_cache:
             return weight_reachability_cache[cache_key]
+        graph_node_count = len(getattr(subgraph, "node", ()))
+        graph_input_count = len(getattr(subgraph, "input", ()))
+        if graph_node_count * max(graph_input_count, 1) > _ONNX_WEIGHT_REACHABILITY_MAX_GRAPH_WORK:
+            budget_key = (
+                id(subgraph),
+                opset_cache_key(opset_versions),
+                attribute_binding_cache_key(attribute_bindings),
+                depth,
+            )
+            if budget_key not in weight_reachability_budget_gap_graphs:
+                plan.record_coverage_gap("lineages_per_value_limit", 1)
+                weight_reachability_budget_gap_graphs.add(budget_key)
+            weight_reachability_cache[cache_key] = True
+            return True
         if cache_key in weight_reachability_in_progress:
             return True
         weight_reachability_in_progress.add(cache_key)
@@ -3477,6 +3500,13 @@ def _build_onnx_weight_analysis_plan(
                 right_shape = input_shapes_by_name.get(input_names[1]) if len(input_names) > 1 else None
             output_shape = matmul_output_shape(left_shape, right_shape)
             return output_shape is None or len(output_shape) >= 2
+        if node.op_type == "OneHot":
+            input_names = [str(input_name) for input_name in getattr(node, "input", ()) if input_name]
+            indices_shape = input_shape
+            if input_shapes_by_name and input_names:
+                indices_shape = input_shapes_by_name.get(input_names[0])
+            output_shape = onehot_output_shape(node, indices_shape, constants)
+            return output_shape is None or len(output_shape) >= 2
         if node.op_type == "Expand":
             shape_name = str(node.input[1]) if len(node.input) > 1 else ""
             target_shape = constant_int64_vector_values(constants.get(shape_name))
@@ -3606,6 +3636,28 @@ def _build_onnx_weight_analysis_plan(
         if batch_shape is None:
             return None
         return (*batch_shape, left_shape[-2], right_shape[-1])
+
+    def onehot_output_shape(
+        node: Any,
+        indices_shape: tuple[int, ...] | None,
+        constants: dict[str, Any],
+    ) -> tuple[int, ...] | None:
+        if indices_shape is None:
+            return None
+        output_rank = len(indices_shape) + 1
+        raw_axis = _onnx_int_attribute(node, "axis", -1)
+        axis = raw_axis if raw_axis >= 0 else output_rank + raw_axis
+        if axis < 0 or axis >= output_rank:
+            return None
+        depth_extent = -1
+        depth_name = str(node.input[1]) if len(node.input) > 1 else ""
+        depth_value = constant_scalar_value(constants.get(depth_name), int(onnx.TensorProto.INT64))
+        if depth_value is not None:
+            try:
+                depth_extent = max(int(depth_value), -1)
+            except (TypeError, ValueError):
+                depth_extent = -1
+        return (*indices_shape[:axis], depth_extent, *indices_shape[axis:])
 
     def flattened_shape_extent(dimensions: tuple[int, ...]) -> int:
         return -1 if any(dimension < 0 for dimension in dimensions) else math.prod(dimensions)
@@ -5435,6 +5487,35 @@ def _build_onnx_weight_analysis_plan(
                         input_pairs = ()
                     input_pairs = tuple(input_pairs)
 
+                    def trusted_bound_context_shape(
+                        parent_name: str,
+                        pair_index: int,
+                        *,
+                        op_type: str = node.op_type,
+                        scan_input_start: int = scan_input_start,
+                        scan_input_offset: int = scan_input_offset,
+                        scan_input_axes: tuple[int, ...] = scan_input_axes,
+                    ) -> tuple[int, ...] | None:
+                        parent_shape = known_value_shapes.get(parent_name)
+                        if parent_shape is None:
+                            parent_shape = constant_initializer_shape(constants, parent_name)
+                        if op_type == "Scan" and pair_index >= scan_input_start:
+                            parent_shape, _parent_rank = _onnx_scan_bound_subgraph_input_shape(
+                                parent_shape,
+                                known_value_ranks.get(parent_name),
+                                pair_index=pair_index,
+                                scan_input_start=scan_input_start,
+                                scan_input_offset=scan_input_offset,
+                                scan_input_axes=scan_input_axes,
+                            )
+                        if parent_shape is None or parent_name in value_lineages:
+                            return None
+                        if parent_name in proven_value_ranks:
+                            return parent_shape
+                        if parent_name in constants and parent_name not in graph_input_names:
+                            return parent_shape
+                        return None
+
                     if node.op_type == "Loop" and len(node.input) > 1 and len(getattr(subgraph, "input", ())) > 1:
                         loop_condition_name = str(node.input[1])
                         loop_body_condition_name = _onnx_value_name(subgraph.input[1])
@@ -5457,36 +5538,15 @@ def _build_onnx_weight_analysis_plan(
                             and (loop_condition_name not in value_lineages or immutable_scalar_condition)
                         ):
                             subgraph_trusted_context_shapes[loop_body_condition_name] = loop_condition_shape
-                    elif node.op_type == "Scan":
-                        for pair_index, (parent_input, graph_input) in enumerate(
-                            input_pairs,
-                            start=input_pair_index_start,
-                        ):
-                            if pair_index < scan_input_start:
-                                continue
-                            parent_name = str(parent_input)
-                            parent_shape = known_value_shapes.get(parent_name)
-                            if parent_shape is None:
-                                parent_shape = constant_initializer_shape(constants, parent_name)
-                            parent_shape, _parent_rank = _onnx_scan_bound_subgraph_input_shape(
-                                parent_shape,
-                                known_value_ranks.get(parent_name),
-                                pair_index=pair_index,
-                                scan_input_start=scan_input_start,
-                                scan_input_offset=scan_input_offset,
-                                scan_input_axes=scan_input_axes,
-                            )
-                            graph_input_name = _onnx_value_name(graph_input)
-                            if (
-                                graph_input_name
-                                and parent_shape is not None
-                                and (
-                                    parent_name in proven_value_ranks
-                                    or (parent_name in constants and parent_name not in graph_input_names)
-                                )
-                                and parent_name not in value_lineages
-                            ):
-                                subgraph_trusted_context_shapes[graph_input_name] = parent_shape
+                    for pair_index, (parent_input, graph_input) in enumerate(
+                        input_pairs,
+                        start=input_pair_index_start,
+                    ):
+                        parent_name = str(parent_input)
+                        graph_input_name = _onnx_value_name(graph_input)
+                        trusted_parent_shape = trusted_bound_context_shape(parent_name, pair_index)
+                        if graph_input_name and trusted_parent_shape is not None:
+                            subgraph_trusted_context_shapes[graph_input_name] = trusted_parent_shape
                     for pair_index, (parent_input, graph_input) in enumerate(input_pairs, start=input_pair_index_start):
                         parent_name = str(parent_input)
                         graph_input_name = _onnx_value_name(graph_input)
