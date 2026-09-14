@@ -7380,7 +7380,8 @@ class TestWeightDistributionSemantics:
         if expect_gap:
             assert result.success is False
             assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
-            assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
+            assert semantics["coverage_gaps"]
+            assert semantics["analyzed_layer_count"] == 0
         else:
             assert result.success is True
             assert not coverage
@@ -10910,6 +10911,108 @@ class TestWeightDistributionSemantics:
         else:
             assert result.success is True
             assert self._extreme_checks(result) == []
+            assert coverage == []
+            assert semantics["coverage_gaps"] == {}
+            assert semantics["eligible_initializer_count"] == 0
+
+    def test_lineage_free_dynamic_input_rank_metadata_stays_untrusted(self, tmp_path: Path) -> None:
+        shape_names = [f"shape_source{index}" for index in range(32)]
+        initializers = [onnx.numpy_helper.from_array(np.array([], dtype=np.int64), name=name) for name in shape_names]
+        initializers.extend(
+            [
+                onnx.numpy_helper.from_array(np.array(1.0, dtype=np.float32), name="W"),
+                onnx.numpy_helper.from_array(np.asarray([True, True, True, True]), name="condition"),
+            ]
+        )
+        nodes = [helper.make_node("Compress", ["runtime_matrix", "condition"], ["dynamic_alias"], axis=0)]
+        previous = "W"
+        for index, shape_name in enumerate(shape_names):
+            reshaped = f"reshaped{index}"
+            nodes.append(helper.make_node("Reshape", [previous, shape_name], [reshaped]))
+            previous = reshaped
+        nodes.extend(
+            [
+                helper.make_node("Add", ["dynamic_alias", previous], ["generated_weight"]),
+                helper.make_node("MatMul", ["X", "generated_weight"], ["Y"]),
+            ]
+        )
+        graph = helper.make_graph(
+            nodes,
+            "lineage_free_dynamic_input_rank_metadata_stays_untrusted",
+            [
+                helper.make_tensor_value_info("runtime_matrix", TensorProto.FLOAT, [4, 4]),
+                helper.make_tensor_value_info("X", TensorProto.FLOAT, [4, 4]),
+            ],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [4, 4])],
+            initializer=initializers,
+            value_info=[helper.make_tensor_value_info("dynamic_alias", TensorProto.FLOAT, [4])],
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / "lineage-free-dynamic-rank-untrusted.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert result.success is False
+        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
+        assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
+
+    @pytest.mark.parametrize(
+        ("runtime_shape", "x_dims", "y_dims", "expect_gap"),
+        [
+            (None, [1, 4], [1, 4], True),
+            ([4], [1, 4], [1], False),
+        ],
+    )
+    def test_unknown_rank_broadcast_promotes_newly_dropped_scalar_gap(
+        self,
+        tmp_path: Path,
+        runtime_shape: list[int] | None,
+        x_dims: list[int],
+        y_dims: list[int],
+        expect_gap: bool,
+    ) -> None:
+        source_names = [f"source{index}" for index in range(33)]
+        initializers = [
+            onnx.numpy_helper.from_array(np.array(1.0, dtype=np.float32), name=name) for name in source_names
+        ]
+        nodes = [
+            helper.make_node("Sum", ["runtime_weight", *source_names], ["generated_weight"]),
+            helper.make_node("MatMul", ["X", "generated_weight"], ["Y"]),
+        ]
+        graph = helper.make_graph(
+            nodes,
+            "unknown_rank_broadcast_promotes_newly_dropped_scalar_gap",
+            [
+                helper.make_tensor_value_info("runtime_weight", TensorProto.FLOAT, runtime_shape),
+                helper.make_tensor_value_info("X", TensorProto.FLOAT, x_dims),
+            ],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, y_dims)],
+            initializer=initializers,
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        if runtime_shape is not None:
+            onnx.checker.check_model(model)
+            onnx.checker.check_model(model, full_check=True)
+        path = tmp_path / f"unknown-rank-new-scalar-gap-{expect_gap}.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        if expect_gap:
+            assert result.success is False
+            assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
+            assert semantics["coverage_gaps"]
+            assert semantics["analyzed_layer_count"] == 0
+        else:
+            assert result.success is True
             assert coverage == []
             assert semantics["coverage_gaps"] == {}
             assert semantics["eligible_initializer_count"] == 0
