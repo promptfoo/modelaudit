@@ -2018,17 +2018,30 @@ def _build_onnx_weight_analysis_plan(
             return None
 
     def graph_initializer_constants(current_graph: Any, inherited_constants: dict[str, Any]) -> dict[str, Any]:
-        local_input_names = {
-            name for value_info in getattr(current_graph, "input", ()) if (name := _onnx_value_name(value_info))
-        }
+        local_declared_names = _graph_declared_value_names(current_graph)
         graph_constants = {
-            name: initializer for name, initializer in inherited_constants.items() if name not in local_input_names
+            name: initializer for name, initializer in inherited_constants.items() if name not in local_declared_names
         }
         for initializer in getattr(current_graph, "initializer", ()):
             name = str(getattr(initializer, "name", "") or "")
             if name:
                 graph_constants[name] = initializer
         return graph_constants
+
+    def function_opset_versions(function: Any, caller_opset_versions: dict[str, int]) -> dict[str, int]:
+        return _opset_versions_by_domain(getattr(function, "opset_import", ())) or caller_opset_versions
+
+    def bound_function_attributes(
+        function: Any,
+        node: Any,
+        resolve_attribute: Callable[[Any], Any | None],
+    ) -> dict[str, Any]:
+        attributes = {str(attribute.name): attribute for attribute in getattr(function, "attribute_proto", ())}
+        for attribute in getattr(node, "attribute", ()):
+            resolved_attribute = resolve_attribute(attribute)
+            if resolved_attribute is not None:
+                attributes[str(attribute.name)] = resolved_attribute
+        return attributes
 
     def constant_node_tensor(node: Any) -> Any | None:
         for attribute in getattr(node, "attribute", ()):
@@ -2330,21 +2343,38 @@ def _build_onnx_weight_analysis_plan(
         constants: dict[str, Any],
         opset_versions: dict[str, int],
         graph_input_shape: tuple[int, ...] | None,
+        attribute_bindings: dict[str, Any] | None = None,
+        *,
+        depth: int = 0,
     ) -> bool:
+        if depth > 6:
+            return True
         if graph_output_index < 0 or graph_output_index >= len(getattr(subgraph, "output", ())):
             return False
         graph_output_name = _onnx_value_name(subgraph.output[graph_output_index])
         if not graph_output_name:
             return False
+        local_attribute_bindings = attribute_bindings or {}
+
+        def resolve_reentry_attribute(attribute: Any) -> Any | None:
+            reference_name = str(getattr(attribute, "ref_attr_name", ""))
+            return local_attribute_bindings.get(reference_name) if reference_name else attribute
+
         subgraph_constants = graph_initializer_constants(subgraph, constants)
         tainted = {graph_input_name}
         tainted_shapes = {graph_input_name: graph_input_shape} if graph_input_shape is not None else {}
         promoted: set[str] = set()
         for body_node in getattr(subgraph, "node", ()):
-            body_inputs = [str(input_name) for input_name in getattr(body_node, "input", ()) if input_name]
+            body_inputs = [str(input_name) for input_name in getattr(body_node, "input", ())]
             body_outputs = [str(output_name) for output_name in getattr(body_node, "output", ()) if output_name]
             if not body_outputs:
                 continue
+            function_key = (
+                str(getattr(body_node, "domain", "")),
+                str(getattr(body_node, "op_type", "")),
+                str(getattr(body_node, "overload", "")),
+            )
+            function = functions.get(function_key)
             data_input_promoted = bool(body_inputs and body_inputs[0] in promoted)
             data_input_tainted = bool(body_inputs and body_inputs[0] in tainted)
             any_promoted = any(input_name in promoted for input_name in body_inputs)
@@ -2357,12 +2387,34 @@ def _build_onnx_weight_analysis_plan(
                 index_shape=index_input_shape,
                 constants=subgraph_constants,
             )
+            function_promoted_outputs: set[str] = set()
+            if function is not None and any_tainted:
+                function_attributes = bound_function_attributes(function, body_node, resolve_reentry_attribute)
+                function_versions = function_opset_versions(function, opset_versions)
+                for input_index, input_name in enumerate(body_inputs):
+                    if input_name not in tainted or input_index >= len(getattr(function, "input", ())):
+                        continue
+                    function_input_name = _onnx_value_name(function.input[input_index])
+                    function_input_shape = tainted_shapes.get(input_name)
+                    for output_index, output_name in enumerate(body_outputs):
+                        if subgraph_reenters_state_with_rank_promotion(
+                            function,
+                            function_input_name,
+                            output_index,
+                            subgraph_constants,
+                            function_versions,
+                            function_input_shape,
+                            attribute_bindings=function_attributes,
+                            depth=depth + 1,
+                        ):
+                            function_promoted_outputs.add(output_name)
             if (
                 data_input_promoted
                 or any_promoted
                 or (is_rank_gap_promoting_operator(body_node) and data_input_may_promote)
+                or function_promoted_outputs
             ):
-                promoted.update(body_outputs)
+                promoted.update(function_promoted_outputs or body_outputs)
                 tainted.update(body_outputs)
             elif any_tainted:
                 tainted.update(body_outputs)
@@ -2409,20 +2461,92 @@ def _build_onnx_weight_analysis_plan(
                         tainted_shapes[output_name] = output_shape
         return graph_output_name in promoted
 
+    def graph_outputs_may_reference_tainted(
+        subgraph: Any,
+        graph_input_names: set[str],
+        opset_versions: dict[str, int],
+        attribute_bindings: dict[str, Any] | None = None,
+        *,
+        depth: int = 0,
+    ) -> bool:
+        if not graph_input_names:
+            return False
+        if depth > 6:
+            return True
+        local_attribute_bindings = attribute_bindings or {}
+
+        def resolve_reentry_attribute(attribute: Any) -> Any | None:
+            reference_name = str(getattr(attribute, "ref_attr_name", ""))
+            return local_attribute_bindings.get(reference_name) if reference_name else attribute
+
+        tainted = set(graph_input_names)
+        for body_node in getattr(subgraph, "node", ()):
+            body_inputs = [str(input_name) for input_name in getattr(body_node, "input", ())]
+            body_outputs = [str(output_name) for output_name in getattr(body_node, "output", ()) if output_name]
+            if not body_outputs:
+                continue
+            function_key = (
+                str(getattr(body_node, "domain", "")),
+                str(getattr(body_node, "op_type", "")),
+                str(getattr(body_node, "overload", "")),
+            )
+            function = functions.get(function_key)
+            any_tainted = any(input_name in tainted for input_name in body_inputs)
+            if function is not None and any_tainted:
+                function_attributes = bound_function_attributes(function, body_node, resolve_reentry_attribute)
+                function_versions = function_opset_versions(function, opset_versions)
+                for input_index, input_name in enumerate(body_inputs):
+                    if input_name not in tainted or input_index >= len(getattr(function, "input", ())):
+                        continue
+                    if graph_outputs_may_reference_tainted(
+                        function,
+                        {_onnx_value_name(function.input[input_index])},
+                        function_versions,
+                        attribute_bindings=function_attributes,
+                        depth=depth + 1,
+                    ):
+                        tainted.update(body_outputs)
+                        break
+            for attribute in getattr(body_node, "attribute", ()):
+                resolved_attribute = resolve_reentry_attribute(attribute)
+                if resolved_attribute is None:
+                    continue
+                for nested_graph in _iter_attribute_graphs(resolved_attribute):
+                    captured_names = graph_external_reference_names(nested_graph) & tainted
+                    if captured_names and graph_outputs_may_reference_tainted(
+                        nested_graph,
+                        captured_names,
+                        opset_versions,
+                        attribute_bindings=local_attribute_bindings,
+                        depth=depth + 1,
+                    ):
+                        tainted.update(body_outputs)
+                        break
+            if any_tainted:
+                tainted.update(body_outputs)
+        return any(_onnx_value_name(output) in tainted for output in getattr(subgraph, "output", ()))
+
     def subgraph_state_input_can_reach_weight_consumer(
         subgraph: Any,
         graph_input_name: str,
         opset_versions: dict[str, int],
         *,
+        attribute_bindings: dict[str, Any] | None = None,
         depth: int = 0,
     ) -> bool:
         if not graph_input_name:
             return False
         if depth > 6:
             return True
+        local_attribute_bindings = attribute_bindings or {}
+
+        def resolve_reentry_attribute(attribute: Any) -> Any | None:
+            reference_name = str(getattr(attribute, "ref_attr_name", ""))
+            return local_attribute_bindings.get(reference_name) if reference_name else attribute
+
         tainted = {graph_input_name}
         for body_node in getattr(subgraph, "node", ()):
-            body_inputs = [str(input_name) for input_name in getattr(body_node, "input", ()) if input_name]
+            body_inputs = [str(input_name) for input_name in getattr(body_node, "input", ())]
             body_outputs = [str(output_name) for output_name in getattr(body_node, "output", ()) if output_name]
             if not body_outputs:
                 continue
@@ -2440,18 +2564,24 @@ def _build_onnx_weight_analysis_plan(
             if any_tainted:
                 function = functions.get(function_key)
                 if function is not None:
+                    function_attributes = bound_function_attributes(function, body_node, resolve_reentry_attribute)
+                    function_versions = function_opset_versions(function, opset_versions)
                     for input_index, input_name in enumerate(body_inputs):
                         if input_name not in tainted or input_index >= len(getattr(function, "input", ())):
                             continue
                         if subgraph_state_input_can_reach_weight_consumer(
                             function,
                             str(function.input[input_index]),
-                            opset_versions,
+                            function_versions,
+                            attribute_bindings=function_attributes,
                             depth=depth + 1,
                         ):
                             return True
                 for attribute in getattr(body_node, "attribute", ()):
-                    for nested_graph in _iter_attribute_graphs(attribute):
+                    resolved_attribute = resolve_reentry_attribute(attribute)
+                    if resolved_attribute is None:
+                        continue
+                    for nested_graph in _iter_attribute_graphs(resolved_attribute):
                         for input_index, input_name in enumerate(body_inputs):
                             if input_name not in tainted:
                                 continue
@@ -2471,19 +2601,33 @@ def _build_onnx_weight_analysis_plan(
                                 nested_graph,
                                 _onnx_value_name(nested_graph.input[nested_input_index]),
                                 opset_versions,
+                                attribute_bindings=local_attribute_bindings,
                                 depth=depth + 1,
                             ):
                                 return True
             for attribute in getattr(body_node, "attribute", ()):
-                for nested_graph in _iter_attribute_graphs(attribute):
-                    for captured_name in graph_external_reference_names(nested_graph) & tainted:
+                resolved_attribute = resolve_reentry_attribute(attribute)
+                if resolved_attribute is None:
+                    continue
+                for nested_graph in _iter_attribute_graphs(resolved_attribute):
+                    captured_names = graph_external_reference_names(nested_graph) & tainted
+                    for captured_name in captured_names:
                         if subgraph_state_input_can_reach_weight_consumer(
                             nested_graph,
                             captured_name,
                             opset_versions,
+                            attribute_bindings=local_attribute_bindings,
                             depth=depth + 1,
                         ):
                             return True
+                    if captured_names and graph_outputs_may_reference_tainted(
+                        nested_graph,
+                        captured_names,
+                        opset_versions,
+                        attribute_bindings=local_attribute_bindings,
+                        depth=depth + 1,
+                    ):
+                        tainted.update(body_outputs)
             if any(
                 input_name in tainted
                 and _onnx_potential_weight_input(
