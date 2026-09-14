@@ -2268,7 +2268,10 @@ def _build_onnx_weight_analysis_plan(
             return True
         if summary.truncated or not summary.lineages:
             return False
-        return all(lineage.unresolved_reason == "dynamic_activation_lineage" for lineage in summary.lineages)
+        return all(
+            lineage.unresolved_reason in {"dynamic_activation_lineage", "shape_control_lineage"}
+            for lineage in summary.lineages
+        )
 
     def operator_output_may_have_weight_rank(
         node: Any,
@@ -3728,6 +3731,25 @@ def _build_onnx_weight_analysis_plan(
                     for lineage in value_lineages[str(input_name)].values()
                 )
             }
+            batch_normalization_activation_parameter_lineages: set[int] = set()
+            if (
+                is_registered_standard_operator
+                and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
+                and node.op_type == "BatchNormalization"
+                and input_names
+                and (
+                    input_names[0] in dynamic_values
+                    or (
+                        bool(value_lineages.get(input_names[0]))
+                        and all(
+                            lineage.unresolved_reason == "dynamic_activation_lineage"
+                            for lineage in value_lineages[input_names[0]].values()
+                        )
+                    )
+                )
+            ):
+                for parameter_name in input_names[1:5]:
+                    batch_normalization_activation_parameter_lineages.update(value_lineages.get(parameter_name, {}))
             all_lineage_inputs_are_activation_contraction = (
                 getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
                 and node.op_type in {"Einsum", "MatMul"}
@@ -4537,6 +4559,17 @@ def _build_onnx_weight_analysis_plan(
                         )
                         or clip_operator
                         or pow_operator
+                        or node.op_type
+                        in {
+                            "AveragePool",
+                            "BatchNormalization",
+                            "Concat",
+                            "Conv",
+                            "ConvTranspose",
+                            "GlobalAveragePool",
+                            "GlobalMaxPool",
+                            "MaxPool",
+                        }
                         or node.op_type in {"Expand", "Gather", "GatherElements", "GatherND", "Slice", "Tile"}
                     )
                 )
@@ -4548,7 +4581,8 @@ def _build_onnx_weight_analysis_plan(
                         is_registered_standard_operator
                         and not is_model_local_function
                         and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
-                        and node.op_type in {"Expand", "Gather", "GatherElements", "GatherND", "Slice", "Tile"}
+                        and node.op_type
+                        in {"Concat", "Expand", "Gather", "GatherElements", "GatherND", "Slice", "Tile"}
                     )
                 )
                 for initializer_index, lineage in all_input_lineages.items():
@@ -4560,7 +4594,10 @@ def _build_onnx_weight_analysis_plan(
                         # Reductions, normalization and unknown operators can turn extents into data values.
                         unresolved_reason = "shape_dimensions_lineage"
                     if unresolved_reason is None:
-                        if carries_dynamic_activation:
+                        if (
+                            initializer_index in batch_normalization_activation_parameter_lineages
+                            or carries_dynamic_activation
+                        ):
                             unresolved_reason = "dynamic_activation_lineage"
                         else:
                             unresolved_reason = (

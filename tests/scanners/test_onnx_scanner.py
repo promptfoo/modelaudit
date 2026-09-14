@@ -13912,6 +13912,101 @@ class TestWeightDistributionSemantics:
         assert samples[0]["reason"] == "dynamic_input_lineage"
         assert samples[0]["consumer_input_index"] == 0
 
+    @pytest.mark.parametrize("malicious", [False, True])
+    def test_batchnorm_parameters_remain_activation_side_before_resolved_gemm_weight(
+        self, tmp_path: Path, malicious: bool
+    ) -> None:
+        weights = np.zeros((100, 10), dtype=np.float32)
+        if malicious:
+            weights[50:55, 3] = 10.0
+        initializers = [
+            onnx.numpy_helper.from_array(np.ones(100, dtype=np.float32), name="scale"),
+            onnx.numpy_helper.from_array(np.zeros(100, dtype=np.float32), name="bias"),
+            onnx.numpy_helper.from_array(np.zeros(100, dtype=np.float32), name="mean"),
+            onnx.numpy_helper.from_array(np.ones(100, dtype=np.float32), name="variance"),
+            onnx.numpy_helper.from_array(weights, name="W"),
+        ]
+        graph = helper.make_graph(
+            [
+                helper.make_node(
+                    "BatchNormalization",
+                    ["X", "scale", "bias", "mean", "variance"],
+                    ["normalized"],
+                    name="batchnorm",
+                ),
+                helper.make_node("Gemm", ["normalized", "W"], ["Y"], name="linear"),
+            ],
+            "batchnorm_activation_side_gemm",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 100])],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 10])],
+            initializer=initializers,
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 14)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / "batchnorm-activation-side-gemm.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        assert result.success is True
+        assert len(self._extreme_checks(result)) == int(malicious)
+        assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["eligible_initializer_count"] == 1
+        assert semantics["analyzed_layer_count"] == 1
+
+    @pytest.mark.parametrize("malicious", [False, True])
+    def test_reshape_shape_controls_remain_layout_through_conv_pool_before_gemm(
+        self, tmp_path: Path, malicious: bool
+    ) -> None:
+        weights = np.zeros((200, 10), dtype=np.float32)
+        if malicious:
+            weights[50:55, 3] = 10.0
+        initializers = [
+            onnx.numpy_helper.from_array(np.array([1, 1, 2, 2], dtype=np.int64), name="shuffle_shape"),
+            onnx.numpy_helper.from_array(np.ones((100, 1, 1, 1), dtype=np.float32), name="conv_weight"),
+            onnx.numpy_helper.from_array(np.ones(100, dtype=np.float32), name="scale"),
+            onnx.numpy_helper.from_array(np.zeros(100, dtype=np.float32), name="bias"),
+            onnx.numpy_helper.from_array(np.zeros(100, dtype=np.float32), name="mean"),
+            onnx.numpy_helper.from_array(np.ones(100, dtype=np.float32), name="variance"),
+            onnx.numpy_helper.from_array(np.array([1, 200], dtype=np.int64), name="flat_shape"),
+            onnx.numpy_helper.from_array(weights, name="pred_weight"),
+        ]
+        graph = helper.make_graph(
+            [
+                helper.make_node("Reshape", ["X", "shuffle_shape"], ["reshaped"]),
+                helper.make_node("Conv", ["reshaped", "conv_weight"], ["conv"]),
+                helper.make_node("BatchNormalization", ["conv", "scale", "bias", "mean", "variance"], ["norm"]),
+                helper.make_node("Concat", ["norm", "skip"], ["joined"], axis=1),
+                helper.make_node("Relu", ["joined"], ["relu"]),
+                helper.make_node("AveragePool", ["relu"], ["pooled"], kernel_shape=[2, 2]),
+                helper.make_node("Reshape", ["pooled", "flat_shape"], ["flat"]),
+                helper.make_node("Gemm", ["flat", "pred_weight"], ["Y"]),
+            ],
+            "reshape_shape_controls_stay_layout",
+            [
+                helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 1, 2, 2]),
+                helper.make_tensor_value_info("skip", TensorProto.FLOAT, [1, 100, 2, 2]),
+            ],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 10])],
+            initializer=initializers,
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 14)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / "reshape-shape-controls-stay-layout.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        assert result.success is True
+        assert len(self._extreme_checks(result)) == int(malicious)
+        assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["eligible_initializer_count"] >= 2
+        assert semantics["analyzed_layer_count"] >= 2
+
     @pytest.mark.parametrize(
         ("model_factory", "expected_layers"),
         [
