@@ -4189,6 +4189,7 @@ def _build_onnx_weight_analysis_plan(
                     input_pairs: Iterable[tuple[Any, Any]]
                     input_pair_index_start = 0
                     scan_input_start = len(node.input)
+                    scan_input_offset = 0
                     scan_input_axes: tuple[int, ...] = ()
                     if node.op_type == "Loop":
                         input_pairs = zip(node.input[2:], subgraph.input[2:], strict=False)
@@ -4205,14 +4206,31 @@ def _build_onnx_weight_analysis_plan(
                     for pair_index, (parent_input, graph_input) in enumerate(input_pairs, start=input_pair_index_start):
                         parent_name = str(parent_input)
                         graph_input_name = _onnx_value_name(graph_input)
-                        repeated_loop_state_input = (
+                        repeated_control_flow_state_input = (
                             node.op_type == "Loop"
                             and pair_index >= 2
                             and loop_may_repeat_body(node, constants, graph_input_names)
+                        ) or (
+                            node.op_type == "Scan"
+                            and pair_index < scan_input_start
+                            and scan_may_repeat_body(
+                                node,
+                                constants,
+                                graph_input_names,
+                                known_value_shapes,
+                                proven_value_ranks,
+                                {
+                                    name
+                                    for name in graph_input_names & set(value_lineages)
+                                    if name not in proven_value_ranks
+                                },
+                                scan_input_axes=scan_input_axes,
+                                scan_input_offset=scan_input_offset,
+                            )
                         )
                         if parent_name in value_lineages:
                             subgraph_bound_lineages[graph_input_name] = value_lineages[parent_name]
-                        if parent_name in constants and not repeated_loop_state_input:
+                        if parent_name in constants and not repeated_control_flow_state_input:
                             subgraph_bound_constants[graph_input_name] = constants[parent_name]
                         if parent_name in dynamic_values:
                             subgraph_bound_dynamic.add(graph_input_name)
@@ -4242,6 +4260,21 @@ def _build_onnx_weight_analysis_plan(
                             subgraph_bound_unknown_value_ranks.add(graph_input_name)
                         if parent_name in value_lineage_limit_gap_counts:
                             subgraph_bound_lineage_gaps[graph_input_name] = value_lineage_limit_gap_counts[parent_name]
+                            if repeated_control_flow_state_input:
+                                subgraph_bound_weight_lineage_gaps[graph_input_name] = (
+                                    _bounded_onnx_weight_lineage_gap_count(
+                                        subgraph_bound_weight_lineage_gaps.get(graph_input_name, 0),
+                                        value_lineage_limit_gap_counts[parent_name],
+                                    )
+                                )
+                                subgraph_bound_weight_lineage_gap_summaries[graph_input_name] = (
+                                    merge_weight_lineage_gap_summaries(
+                                        subgraph_bound_weight_lineage_gap_summaries.get(
+                                            graph_input_name, empty_weight_gap_summary
+                                        ),
+                                        known_weight_gap_summary(None, value_lineage_limit_gap_counts[parent_name]),
+                                    )
+                                )
                         if parent_name in value_non_shape_lineage_limit_gap_counts:
                             subgraph_bound_non_shape_lineage_gaps[graph_input_name] = (
                                 value_non_shape_lineage_limit_gap_counts[parent_name]
@@ -4262,12 +4295,28 @@ def _build_onnx_weight_analysis_plan(
                             subgraph_bound_rank_promotable_lineage_gaps[graph_input_name] = (
                                 value_rank_promotable_lineage_limit_gap_counts[parent_name]
                             )
-                            subgraph_bound_rank_promotable_lineage_gap_summaries[graph_input_name] = (
-                                known_weight_gap_summary(
-                                    value_rank_promotable_lineage_limit_gap_summaries.get(parent_name),
-                                    value_rank_promotable_lineage_limit_gap_counts[parent_name],
-                                )
+                            rank_promotable_summary = known_weight_gap_summary(
+                                value_rank_promotable_lineage_limit_gap_summaries.get(parent_name),
+                                value_rank_promotable_lineage_limit_gap_counts[parent_name],
                             )
+                            subgraph_bound_rank_promotable_lineage_gap_summaries[graph_input_name] = (
+                                rank_promotable_summary
+                            )
+                            if repeated_control_flow_state_input:
+                                subgraph_bound_weight_lineage_gaps[graph_input_name] = (
+                                    _bounded_onnx_weight_lineage_gap_count(
+                                        subgraph_bound_weight_lineage_gaps.get(graph_input_name, 0),
+                                        value_rank_promotable_lineage_limit_gap_counts[parent_name],
+                                    )
+                                )
+                                subgraph_bound_weight_lineage_gap_summaries[graph_input_name] = (
+                                    merge_weight_lineage_gap_summaries(
+                                        subgraph_bound_weight_lineage_gap_summaries.get(
+                                            graph_input_name, empty_weight_gap_summary
+                                        ),
+                                        rank_promotable_summary,
+                                    )
+                                )
                     for captured_name in graph_external_reference_names(subgraph):
                         if captured_name in subgraph_input_names:
                             continue

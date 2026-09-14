@@ -7877,6 +7877,166 @@ class TestWeightDistributionSemantics:
         assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
         assert semantics["coverage_gaps"]["unresolved_initializer_lineage"] >= 1
 
+    def test_repeated_scan_invalidates_mutable_constant_shape_state(self, tmp_path: Path) -> None:
+        source_names = [f"W{index}" for index in range(40)]
+        initializers = [
+            *[onnx.numpy_helper.from_array(np.ones((4,), dtype=np.float32), name=name) for name in source_names],
+            onnx.numpy_helper.from_array(np.array([4], dtype=np.int64), name="initial_shape"),
+            onnx.numpy_helper.from_array(np.zeros((4,), dtype=np.float32), name="initial_data"),
+            onnx.numpy_helper.from_array(np.zeros((2, 2), dtype=np.float32), name="scan_values"),
+        ]
+        body = helper.make_graph(
+            [
+                helper.make_node(
+                    "Constant",
+                    [],
+                    ["next_shape"],
+                    value=onnx.numpy_helper.from_array(np.array([2, 2], dtype=np.int64)),
+                ),
+                helper.make_node("Reshape", ["capped", "shape_state"], ["next_data"]),
+                helper.make_node("Identity", ["element"], ["next_element"]),
+            ],
+            "repeated_scan_mutable_shape_body",
+            [
+                helper.make_tensor_value_info("shape_state", TensorProto.INT64, [None]),
+                helper.make_tensor_value_info("data_state", TensorProto.FLOAT, None),
+                helper.make_tensor_value_info("element", TensorProto.FLOAT, [2]),
+            ],
+            [
+                helper.make_tensor_value_info("next_shape", TensorProto.INT64, [None]),
+                helper.make_tensor_value_info("next_data", TensorProto.FLOAT, None),
+                helper.make_tensor_value_info("next_element", TensorProto.FLOAT, [2]),
+            ],
+        )
+        graph = helper.make_graph(
+            [
+                helper.make_node("Sum", source_names, ["capped"]),
+                helper.make_node(
+                    "Scan",
+                    ["initial_shape", "initial_data", "scan_values"],
+                    ["shape_out", "data_out", "scan_out"],
+                    body=body,
+                    num_scan_inputs=1,
+                ),
+                helper.make_node("MatMul", ["X", "data_out"], ["Y"]),
+            ],
+            "repeated_scan_invalidates_mutable_constant_shape_state",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 2])],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 2])],
+            initializer=initializers,
+            value_info=[helper.make_tensor_value_info("data_out", TensorProto.FLOAT, None)],
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / "repeated-scan-mutable-constant-shape-state.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        assert result.success is False
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
+        assert semantics["coverage_gaps"]["unresolved_initializer_lineage"] >= 1
+
+    @pytest.mark.parametrize("control_flow_op", ["Loop", "Scan"])
+    def test_repeated_control_flow_promotes_carried_rank_gap_before_body_reentry(
+        self,
+        tmp_path: Path,
+        control_flow_op: str,
+    ) -> None:
+        source_names = [f"W{index}" for index in range(40)]
+        initializers = [
+            *[onnx.numpy_helper.from_array(np.ones((4,), dtype=np.float32), name=name) for name in source_names],
+            onnx.numpy_helper.from_array(np.array([1], dtype=np.int64), name="axes"),
+        ]
+        nodes = [
+            helper.make_node("Sum", source_names, ["capped"]),
+        ]
+        graph_inputs = [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 4])]
+        if control_flow_op == "Loop":
+            initializers.extend(
+                [
+                    onnx.numpy_helper.from_array(np.array(2, dtype=np.int64), name="trip_count"),
+                    onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="initial_condition"),
+                ]
+            )
+            body = helper.make_graph(
+                [
+                    helper.make_node("MatMul", ["X", "state"], ["body_y"]),
+                    helper.make_node("Unsqueeze", ["state", "axes"], ["next_state"]),
+                    helper.make_node("Identity", ["condition_in"], ["condition_out"]),
+                ],
+                "repeated_loop_promotes_carried_rank_gap_body",
+                [
+                    helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
+                    helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
+                    helper.make_tensor_value_info("state", TensorProto.FLOAT, None),
+                ],
+                [
+                    helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
+                    helper.make_tensor_value_info("next_state", TensorProto.FLOAT, None),
+                ],
+            )
+            nodes.append(
+                helper.make_node(
+                    "Loop",
+                    ["trip_count", "initial_condition", "capped"],
+                    ["control_flow_state"],
+                    body=body,
+                )
+            )
+        else:
+            initializers.append(onnx.numpy_helper.from_array(np.zeros((2, 1), dtype=np.float32), name="scan_values"))
+            body = helper.make_graph(
+                [
+                    helper.make_node("MatMul", ["X", "state"], ["body_y"]),
+                    helper.make_node("Unsqueeze", ["state", "axes"], ["next_state"]),
+                    helper.make_node("Identity", ["element"], ["next_element"]),
+                ],
+                "repeated_scan_promotes_carried_rank_gap_body",
+                [
+                    helper.make_tensor_value_info("state", TensorProto.FLOAT, None),
+                    helper.make_tensor_value_info("element", TensorProto.FLOAT, [1]),
+                ],
+                [
+                    helper.make_tensor_value_info("next_state", TensorProto.FLOAT, None),
+                    helper.make_tensor_value_info("next_element", TensorProto.FLOAT, [1]),
+                ],
+            )
+            nodes.append(
+                helper.make_node(
+                    "Scan",
+                    ["capped", "scan_values"],
+                    ["control_flow_state", "scan_output"],
+                    body=body,
+                    num_scan_inputs=1,
+                )
+            )
+        nodes.append(helper.make_node("Identity", ["control_flow_state"], ["Y"]))
+        graph = helper.make_graph(
+            nodes,
+            f"repeated_{control_flow_op.lower()}_promotes_carried_rank_gap_before_body_reentry",
+            graph_inputs,
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [None, None])],
+            initializer=initializers,
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / f"repeated-{control_flow_op.lower()}-promotes-carried-gap.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        assert result.success is False
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
+
     @pytest.mark.parametrize("kind", ["state_vector", "stacked_scalar"])
     def test_scan_opset8_direct_body_local_initializer_after_batch_axis_is_accounted(
         self,
