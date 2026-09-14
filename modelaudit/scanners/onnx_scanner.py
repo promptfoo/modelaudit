@@ -2515,7 +2515,14 @@ def _build_onnx_weight_analysis_plan(
             )
             function = functions.get(function_key)
             if function is not None:
-                names.update(rank_reentry_constant_names(function, depth=depth + 1))
+                function_names = rank_reentry_constant_names(function, depth=depth + 1)
+                if function_names:
+                    input_bindings = {
+                        _onnx_value_name(function.input[input_index]): str(actual_name)
+                        for input_index, actual_name in enumerate(getattr(body_node, "input", ()))
+                        if input_index < len(getattr(function, "input", ()))
+                    }
+                    names.update(input_bindings.get(name, name) for name in function_names)
             for attribute in getattr(body_node, "attribute", ()):
                 for nested_graph in _iter_attribute_graphs(attribute):
                     names.update(rank_reentry_constant_names(nested_graph, depth=depth + 1))
