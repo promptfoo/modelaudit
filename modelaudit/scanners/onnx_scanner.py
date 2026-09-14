@@ -2570,15 +2570,6 @@ def _build_onnx_weight_analysis_plan(
     ) -> dict[str, str]:
         local_constants = local_constants or {}
         if node.op_type == "Loop":
-            loop_control_constants = {
-                control_name: inherited_constants[control_name]
-                if control_name in inherited_constants
-                else local_constants[control_name]
-                for control_name in (str(input_name) for input_name in node.input[:2] if input_name)
-                if control_name in inherited_constants or control_name in local_constants
-            }
-            if loop_may_repeat_body(node, loop_control_constants, set()):
-                return {}
             input_pairs = zip(node.input[2:], nested_graph.input[2:], strict=False)
         elif node.op_type == "Scan":
             return {}
@@ -2630,6 +2621,11 @@ def _build_onnx_weight_analysis_plan(
                     names.update(input_bindings.get(name, name) for name in function_names)
             for attribute in getattr(body_node, "attribute", ()):
                 for nested_graph in _iter_attribute_graphs(attribute):
+                    if body_node.op_type == "Loop":
+                        names.update(
+                            str(input_name) for input_name in getattr(body_node, "input", ())[:2] if input_name
+                        )
+                        names.update(graph_external_reference_names(nested_graph))
                     names.update(rank_reentry_constant_names(nested_graph, depth=depth + 1))
         result = frozenset(names)
         rank_reentry_constant_name_cache[cache_key] = result
@@ -2841,11 +2837,17 @@ def _build_onnx_weight_analysis_plan(
                     if not nested_tainted_shapes:
                         continue
                     available_nested_constants = {**constants, **subgraph_constants}
-                    nested_bound_input_constants = {
-                        graph_input: available_nested_constants[parent_input]
-                        for graph_input, parent_input in nested_bound_input_constant_names.items()
-                        if parent_input in available_nested_constants
-                    }
+                    nested_bound_input_constants = {}
+                    if body_node.op_type == "Loop" and not loop_may_repeat_body(
+                        body_node,
+                        available_nested_constants,
+                        set(),
+                    ):
+                        nested_bound_input_constants = {
+                            graph_input: available_nested_constants[parent_input]
+                            for graph_input, parent_input in nested_bound_input_constant_names.items()
+                            if parent_input in available_nested_constants
+                        }
                     nested_constants = graph_initializer_constants(nested_graph, available_nested_constants)
                     nested_constants.update(nested_bound_input_constants)
                     nested_output_shapes: dict[int, tuple[int, ...]] = {}
@@ -6566,7 +6568,11 @@ def _build_onnx_weight_analysis_plan(
                 if standard_control_flow_operator and node.op_type == "Loop":
                     stacked_scan_output_start = max(len(node.input) - 2, 0)
                 elif standard_control_flow_operator and node.op_type == "Scan":
-                    stacked_scan_output_start = scan_stacked_output_start(node, opset_versions)
+                    stacked_scan_output_start = scan_stacked_output_start(
+                        node,
+                        opset_versions,
+                        resolve_attribute=resolve_attribute,
+                    )
                 for output_index in range(len(node.output)):
                     graph_output_index = output_index + subgraph_output_offset
                     if graph_output_index >= len(graph_output_lineages):
