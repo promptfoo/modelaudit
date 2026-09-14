@@ -1850,6 +1850,7 @@ def _build_onnx_weight_analysis_plan(
     initializers: list[Any] = []
     initializer_graph_indexes: list[int] = []
     initializer_source_indexes: dict[tuple[Any, ...], int] = {}
+    constant_output_initializer_indexes: set[int] = set()
     empty_names = 0
     duplicate_names = 0
     invalid_name_samples: list[dict[str, Any]] = []
@@ -2417,9 +2418,12 @@ def _build_onnx_weight_analysis_plan(
         shape: tuple[int, ...] | None = None,
         unresolved_reason: str | None = None,
         source_key: tuple[Any, ...] | None = None,
+        constant_output: bool = False,
     ) -> _OnnxWeightLineage:
         resolved_shape = shape if shape is not None else tuple(int(dimension) for dimension in initializer.dims)
         if source_key is not None and source_key in initializer_source_indexes:
+            if constant_output:
+                constant_output_initializer_indexes.add(initializer_source_indexes[source_key])
             return _OnnxWeightLineage(
                 initializer_index=initializer_source_indexes[source_key],
                 shape=resolved_shape,
@@ -2435,6 +2439,8 @@ def _build_onnx_weight_analysis_plan(
         transform_counts.append(0)
         if source_key is not None:
             initializer_source_indexes[source_key] = initializer_index
+        if constant_output:
+            constant_output_initializer_indexes.add(initializer_index)
         return _OnnxWeightLineage(
             initializer_index=initializer_index,
             shape=resolved_shape,
@@ -3120,7 +3126,7 @@ def _build_onnx_weight_analysis_plan(
             return lineages
         promoted_lineages: dict[int, _OnnxWeightLineage] = {}
         for initializer_index, lineage in lineages.items():
-            if lineage.unresolved_reason is None:
+            if lineage.unresolved_reason is None and initializer_index in constant_output_initializer_indexes:
                 promoted_lineages[initializer_index] = lineage
                 continue
             shape = None
@@ -4971,6 +4977,7 @@ def _build_onnx_weight_analysis_plan(
                         constant_tensor,
                         current_graph_index,
                         source_key=constant_source_key,
+                        constant_output=True,
                     )
                     constants[name] = constant_tensor
                     constant_output_lineages[name] = {lineage.initializer_index: lineage}
@@ -4985,6 +4992,7 @@ def _build_onnx_weight_analysis_plan(
                         shape=tuple(int(dimension) for dimension in sparse_constant.dims),
                         unresolved_reason="sparse_constant_unsupported",
                         source_key=constant_source_key,
+                        constant_output=True,
                     )
                     constant_output_lineages[name] = {lineage.initializer_index: lineage}
                     constant_output_names.add(name)
@@ -4998,6 +5006,7 @@ def _build_onnx_weight_analysis_plan(
                         current_graph_index,
                         unresolved_reason="unresolved_constant_attribute",
                         source_key=(*source_scope, "node", local_node_index, "unresolved_constant"),
+                        constant_output=True,
                     )
                     constant_output_lineages[name] = {lineage.initializer_index: lineage}
                     constant_output_names.add(name)
@@ -5199,7 +5208,8 @@ def _build_onnx_weight_analysis_plan(
                 )
                 if trip_count is None or initial_condition is not True:
                     return None
-                return max(int(trip_count), 0)
+                exact_count = max(int(trip_count), 0)
+                return exact_count if exact_count <= 1 else None
 
             trusted_scan_shape_names = proven_value_ranks
             untrusted_scan_shape_names = {
@@ -5704,11 +5714,7 @@ def _build_onnx_weight_analysis_plan(
                         )
                     ):
                         transform_output_rank = len(target_shape)
-                        if (
-                            transform_input_shape is not None
-                            and shape_initializer is not None
-                            and all(dimension >= 0 for dimension in transform_input_shape)
-                        ):
+                        if transform_input_shape is not None and shape_initializer is not None:
                             transform_output_shape = _resolve_onnx_reshape_shape(
                                 transform_input_shape,
                                 shape_initializer,

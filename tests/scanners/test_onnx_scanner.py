@@ -6733,6 +6733,89 @@ class TestWeightDistributionSemantics:
             assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
         assert semantics["eligible_initializer_count"] >= 1
 
+    @pytest.mark.parametrize(
+        ("trip_count", "body_condition", "expected_loop_shape"),
+        [
+            (0, False, (0, 4)),
+            (1, False, (1, 4)),
+            (5, False, (-1, 4)),
+            (5, True, (-1, 4)),
+        ],
+    )
+    def test_loop_scan_output_uses_exact_shape_only_for_proven_zero_or_one_iteration(
+        self,
+        trip_count: int,
+        body_condition: bool,
+        expected_loop_shape: tuple[int, int],
+    ) -> None:
+        body = helper.make_graph(
+            [
+                helper.make_node(
+                    "Constant",
+                    [],
+                    ["next_condition"],
+                    value=onnx.numpy_helper.from_array(np.array(body_condition, dtype=np.bool_)),
+                ),
+                helper.make_node(
+                    "Constant",
+                    [],
+                    ["scan_value"],
+                    value=onnx.numpy_helper.from_array(np.zeros((4,), dtype=np.float32)),
+                ),
+            ],
+            "loop_scan_exact_shape_body",
+            [
+                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
+                helper.make_tensor_value_info("body_condition", TensorProto.BOOL, []),
+            ],
+            [
+                helper.make_tensor_value_info("next_condition", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("scan_value", TensorProto.FLOAT, [4]),
+            ],
+        )
+        graph = helper.make_graph(
+            [helper.make_node("Loop", ["trip_count", "condition"], ["loop_scan"], body=body)],
+            "loop_scan_exact_shape_only_for_proven_small_counts",
+            [],
+            [helper.make_tensor_value_info("loop_scan", TensorProto.FLOAT, [None, 4])],
+            initializer=[
+                onnx.numpy_helper.from_array(np.array(trip_count, dtype=np.int64), name="trip_count"),
+                onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="condition"),
+            ],
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        onnx.checker.check_model(model, full_check=True)
+        events: list[dict[str, Any]] = []
+
+        def profile(frame: Any, event: str, arg: Any) -> None:
+            del arg
+            if (
+                event != "return"
+                or frame.f_code.co_name != "walk_graph"
+                or frame.f_code.co_filename != onnx_scanner_module.__file__
+            ):
+                return
+            local = frame.f_locals
+            events.append(
+                {
+                    "graph": local["current_graph"].name,
+                    "shapes": dict(local.get("known_value_shapes") or {}),
+                }
+            )
+
+        sys.setprofile(profile)
+        try:
+            onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        finally:
+            sys.setprofile(None)
+
+        root_return = next(
+            event for event in events if event["graph"] == "loop_scan_exact_shape_only_for_proven_small_counts"
+        )
+        assert root_return["shapes"]["loop_scan"] == expected_loop_shape
+
     def test_loop_carried_state_preserves_initial_gap_when_controls_are_overridable(self, tmp_path: Path) -> None:
         source_names = [f"W{index}" for index in range(40)]
         initializers = [
@@ -7627,6 +7710,81 @@ class TestWeightDistributionSemantics:
         assert semantics["coverage_gaps"]["unresolved_initializer_lineage"] >= 1
         if source_count > 32:
             assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
+
+    @pytest.mark.parametrize("kind", ["state_vector", "stacked_scalar"])
+    def test_scan_opset8_direct_body_local_initializer_after_batch_axis_is_accounted(
+        self,
+        tmp_path: Path,
+        kind: str,
+    ) -> None:
+        state_shape = [4] if kind == "state_vector" else [1]
+        weight_shape = (4,) if kind == "state_vector" else ()
+        body = helper.make_graph(
+            [
+                helper.make_node("Identity", ["W0"], ["next_state" if kind == "state_vector" else "next_element"]),
+                helper.make_node(
+                    "Identity",
+                    ["element" if kind == "state_vector" else "state"],
+                    ["next_element" if kind == "state_vector" else "next_state"],
+                ),
+            ],
+            "scan8_body_local_direct_weight",
+            [
+                helper.make_tensor_value_info("state", TensorProto.FLOAT, state_shape),
+                helper.make_tensor_value_info("element", TensorProto.FLOAT, [1]),
+            ],
+            [
+                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, state_shape),
+                helper.make_tensor_value_info(
+                    "next_element",
+                    TensorProto.FLOAT,
+                    [1] if kind == "state_vector" else [],
+                ),
+            ],
+            initializer=[onnx.numpy_helper.from_array(np.ones(weight_shape, dtype=np.float32), name="W0")],
+        )
+        graph = helper.make_graph(
+            [
+                helper.make_node(
+                    "Scan",
+                    ["", "initial", "values"],
+                    ["state_out", "scan_out"],
+                    body=body,
+                    num_scan_inputs=1,
+                ),
+                helper.make_node("MatMul", ["X", "state_out" if kind == "state_vector" else "scan_out"], ["Y"]),
+            ],
+            "scan8_direct_body_local_initializer_after_batch_axis",
+            [
+                helper.make_tensor_value_info("initial", TensorProto.FLOAT, [2, *state_shape]),
+                helper.make_tensor_value_info("values", TensorProto.FLOAT, [2, 1, 1]),
+                helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 2]),
+            ],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 4 if kind == "state_vector" else 1])],
+            value_info=[
+                helper.make_tensor_value_info("state_out", TensorProto.FLOAT, [2, *state_shape]),
+                helper.make_tensor_value_info(
+                    "scan_out",
+                    TensorProto.FLOAT,
+                    [2, 1, 1] if kind == "state_vector" else [2, 1],
+                ),
+            ],
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 8)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        onnx.checker.check_model(model, full_check=True)
+        path = tmp_path / f"scan8-{kind}-direct-body-local-accounted.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert result.success is False
+        assert semantics["eligible_initializer_count"] == 1
+        assert semantics["analyzed_layer_count"] == 0
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
 
     @pytest.mark.parametrize(("scan_length", "expect_gap"), [(1, False), (2, True)])
     def test_scan_graph_input_fixed_extent_bounds_carried_rank_growth(
