@@ -5497,6 +5497,7 @@ def _build_onnx_weight_analysis_plan(
                     graph_output_shape = graph_output_shapes[graph_output_index]
                     graph_output_rank = graph_output_ranks[graph_output_index]
                     graph_output_rank_proven = graph_output_proven_ranks[graph_output_index]
+                    repeated_carried_state_rank_may_change = False
                     scan_output_insert_axis = stacked_scan_output_insert_axis(
                         scan_output_axes,
                         stacked_scan_output_start,
@@ -5573,6 +5574,7 @@ def _build_onnx_weight_analysis_plan(
                             else known_value_ranks.get(state_input_name)
                         )
                         if graph_output_rank != state_input_rank:
+                            repeated_carried_state_rank_may_change = True
                             graph_output_shape = None
                             graph_output_rank = None
                             graph_output_rank_proven = False
@@ -5669,6 +5671,14 @@ def _build_onnx_weight_analysis_plan(
                         graph_output_weight_lineage_gap_summaries[graph_output_index],
                         graph_output_weight_lineage_gap_counts[graph_output_index],
                     )
+                    if (
+                        repeated_carried_state_rank_may_change
+                        and graph_output_weight_lineage_gap_counts[graph_output_index]
+                    ):
+                        plan.record_coverage_gap(
+                            "lineages_per_value_limit",
+                            graph_output_weight_lineage_gap_counts[graph_output_index],
+                        )
                     if stacked_scan_output and graph_output_weight_lineage_gap_counts[graph_output_index]:
                         graph_output_weight_gap_summary = rank_gap_weight_summary_after_rank_increase(
                             graph_output_weight_gap_summary,
@@ -5708,7 +5718,13 @@ def _build_onnx_weight_analysis_plan(
                             graph_output_rank_promotable_lineage_gap_summaries[graph_output_index],
                             graph_output_rank_promotable_gap_count,
                         )
-                        if gap_summary_may_exceed_input_rank(
+                        repeated_state_weight_gap_summary = empty_weight_gap_summary
+                        if repeated_carried_state_rank_may_change:
+                            repeated_state_weight_gap_summary = rank_gap_weight_summary_after_repeated_rank_increase(
+                                state_rank_gap_summary,
+                                graph_output_rank_promotable_gap_count,
+                            )
+                        elif gap_summary_may_exceed_input_rank(
                             state_rank_gap_summary,
                             control_flow_state_input_rank(output_index),
                         ):
@@ -5718,20 +5734,21 @@ def _build_onnx_weight_analysis_plan(
                                 output_shape=graph_output_shape,
                                 output_rank=graph_output_rank,
                             )
-                            if repeated_state_weight_gap_summary != empty_weight_gap_summary:
-                                subgraph_output_weight_lineage_gap_counts[output_index] = (
-                                    _bounded_onnx_weight_lineage_gap_count(
-                                        subgraph_output_weight_lineage_gap_counts[output_index],
-                                        graph_output_rank_promotable_gap_count,
-                                    )
+                        if repeated_state_weight_gap_summary != empty_weight_gap_summary:
+                            plan.record_coverage_gap("lineages_per_value_limit", graph_output_rank_promotable_gap_count)
+                            subgraph_output_weight_lineage_gap_counts[output_index] = (
+                                _bounded_onnx_weight_lineage_gap_count(
+                                    subgraph_output_weight_lineage_gap_counts[output_index],
+                                    graph_output_rank_promotable_gap_count,
                                 )
-                                subgraph_output_weight_lineage_gap_summaries[output_index] = (
-                                    merge_weight_lineage_gap_summaries(
-                                        subgraph_output_weight_lineage_gap_summaries[output_index],
-                                        repeated_state_weight_gap_summary,
-                                    )
+                            )
+                            subgraph_output_weight_lineage_gap_summaries[output_index] = (
+                                merge_weight_lineage_gap_summaries(
+                                    subgraph_output_weight_lineage_gap_summaries[output_index],
+                                    repeated_state_weight_gap_summary,
                                 )
-                                rank_promotable_gap_promoted = True
+                            )
+                            rank_promotable_gap_promoted = True
                     if (
                         standard_control_flow_operator
                         and node.op_type == "Scan"
