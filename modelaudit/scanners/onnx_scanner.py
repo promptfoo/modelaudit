@@ -1643,6 +1643,8 @@ def _resolve_onnx_reshape_shape(
     allowzero: bool,
     onnx: Any,
 ) -> tuple[int, ...] | None:
+    if any(dimension < 0 for dimension in input_shape):
+        return None
     dims = tuple(int(dimension) for dimension in getattr(shape_initializer, "dims", ()))
     element_count = math.prod(dims) if dims else 0
     if (
@@ -2069,10 +2071,18 @@ def _build_onnx_weight_analysis_plan(
         *,
         input_shape: tuple[int, ...],
         index_shape: tuple[int, ...],
+        resolve_attribute: Callable[[Any], Any | None] | None = None,
     ) -> tuple[int, ...] | None:
         if not index_shape:
             return None
         batch_dims = _onnx_int_attribute(node, "batch_dims")
+        if resolve_attribute is not None:
+            for attribute in getattr(node, "attribute", ()):
+                if attribute.name != "batch_dims":
+                    continue
+                resolved_attribute = resolve_attribute(attribute)
+                batch_dims = int(getattr(resolved_attribute, "i", batch_dims)) if resolved_attribute is not None else 0
+                break
         index_depth = index_shape[-1]
         if (
             batch_dims < 0
@@ -2266,6 +2276,7 @@ def _build_onnx_weight_analysis_plan(
         input_shape: tuple[int, ...] | None,
         index_shape: tuple[int, ...] | None,
         constants: dict[str, Any],
+        resolve_attribute: Callable[[Any], Any | None] | None = None,
     ) -> bool:
         if node.op_type == "Expand":
             shape_name = str(node.input[1]) if len(node.input) > 1 else ""
@@ -2284,7 +2295,12 @@ def _build_onnx_weight_analysis_plan(
         if node.op_type == "GatherND":
             if input_shape is None or index_shape is None or not index_shape:
                 return True
-            output_shape = gathernd_output_shape(node, input_shape=input_shape, index_shape=index_shape)
+            output_shape = gathernd_output_shape(
+                node,
+                input_shape=input_shape,
+                index_shape=index_shape,
+                resolve_attribute=resolve_attribute,
+            )
             if output_shape is None:
                 return True
             return len(output_shape) >= 2
@@ -2554,11 +2570,15 @@ def _build_onnx_weight_analysis_plan(
         constants: dict[str, Any],
         *,
         cast_target_data_type: int | None = None,
+        resolve_attribute: Callable[[Any], Any | None] | None = None,
     ) -> _OnnxWeightLineage:
         has_referenced_attributes = any(
             getattr(attribute, "ref_attr_name", "") for attribute in getattr(node, "attribute", ())
         )
-        if has_referenced_attributes and (node.op_type != "Cast" or cast_target_data_type is None):
+        if has_referenced_attributes and not (
+            (node.op_type == "Cast" and cast_target_data_type is not None)
+            or (node.op_type == "GatherND" and resolve_attribute is not None)
+        ):
             return _OnnxWeightLineage(
                 initializer_index=lineage.initializer_index,
                 shape=None,
@@ -2738,7 +2758,12 @@ def _build_onnx_weight_analysis_plan(
                     transforms=lineage.transforms,
                     unresolved_reason=lineage.unresolved_reason or "unresolved_gathernd_lineage",
                 )
-            gathered_shape = gathernd_output_shape(node, input_shape=lineage.shape, index_shape=index_shape)
+            gathered_shape = gathernd_output_shape(
+                node,
+                input_shape=lineage.shape,
+                index_shape=index_shape,
+                resolve_attribute=resolve_attribute,
+            )
             if gathered_shape is None:
                 return _OnnxWeightLineage(
                     initializer_index=lineage.initializer_index,
@@ -2899,12 +2924,19 @@ def _build_onnx_weight_analysis_plan(
         constants: dict[str, Any],
         *,
         cast_target_data_type: int | None = None,
+        resolve_attribute: Callable[[Any], Any | None] | None = None,
     ) -> bool:
         if summary.truncated or not summary.lineages:
             return True
         return any(
             lineage_could_be_weight(
-                transformed_lineage(lineage, node, constants, cast_target_data_type=cast_target_data_type)
+                transformed_lineage(
+                    lineage,
+                    node,
+                    constants,
+                    cast_target_data_type=cast_target_data_type,
+                    resolve_attribute=resolve_attribute,
+                )
             )
             for lineage in summary.lineages
         )
@@ -2915,11 +2947,18 @@ def _build_onnx_weight_analysis_plan(
         constants: dict[str, Any],
         *,
         cast_target_data_type: int | None = None,
+        resolve_attribute: Callable[[Any], Any | None] | None = None,
     ) -> bool:
         if summary.truncated or not summary.lineages:
             return False
         for lineage in summary.lineages:
-            transformed = transformed_lineage(lineage, node, constants, cast_target_data_type=cast_target_data_type)
+            transformed = transformed_lineage(
+                lineage,
+                node,
+                constants,
+                cast_target_data_type=cast_target_data_type,
+                resolve_attribute=resolve_attribute,
+            )
             if lineage_could_be_weight(transformed) or not lineage_could_be_weight_after_rank_increase(transformed):
                 return False
         return True
@@ -2931,12 +2970,19 @@ def _build_onnx_weight_analysis_plan(
         predicate: Callable[[_OnnxWeightLineage], bool],
         *,
         cast_target_data_type: int | None = None,
+        resolve_attribute: Callable[[Any], Any | None] | None = None,
     ) -> _OnnxWeightLineageGapSummary:
         if not summary.lineages:
             return summary
         return summarize_lineage_gap(
             (
-                transformed_lineage(lineage, node, constants, cast_target_data_type=cast_target_data_type)
+                transformed_lineage(
+                    lineage,
+                    node,
+                    constants,
+                    cast_target_data_type=cast_target_data_type,
+                    resolve_attribute=resolve_attribute,
+                )
                 for lineage in summary.lineages
             ),
             predicate,
@@ -2949,6 +2995,7 @@ def _build_onnx_weight_analysis_plan(
         constants: dict[str, Any],
         *,
         cast_target_data_type: int | None = None,
+        resolve_attribute: Callable[[Any], Any | None] | None = None,
     ) -> _OnnxWeightLineageGapSummary:
         return transform_lineage_gap_summary(
             summary,
@@ -2956,6 +3003,7 @@ def _build_onnx_weight_analysis_plan(
             constants,
             lineage_could_be_weight,
             cast_target_data_type=cast_target_data_type,
+            resolve_attribute=resolve_attribute,
         )
 
     def transform_non_shape_gap_summary(
@@ -2964,6 +3012,7 @@ def _build_onnx_weight_analysis_plan(
         constants: dict[str, Any],
         *,
         cast_target_data_type: int | None = None,
+        resolve_attribute: Callable[[Any], Any | None] | None = None,
     ) -> _OnnxWeightLineageGapSummary:
         return transform_lineage_gap_summary(
             summary,
@@ -2971,6 +3020,7 @@ def _build_onnx_weight_analysis_plan(
             constants,
             lambda lineage: lineage.unresolved_reason != "shape_control_lineage",
             cast_target_data_type=cast_target_data_type,
+            resolve_attribute=resolve_attribute,
         )
 
     def transform_rank_promotable_gap_summary(
@@ -2979,6 +3029,7 @@ def _build_onnx_weight_analysis_plan(
         constants: dict[str, Any],
         *,
         cast_target_data_type: int | None = None,
+        resolve_attribute: Callable[[Any], Any | None] | None = None,
     ) -> _OnnxWeightLineageGapSummary:
         return transform_lineage_gap_summary(
             summary,
@@ -2986,6 +3037,7 @@ def _build_onnx_weight_analysis_plan(
             constants,
             lineage_could_be_weight_after_rank_increase,
             cast_target_data_type=cast_target_data_type,
+            resolve_attribute=resolve_attribute,
         )
 
     def promoted_rank_gap_weight_summary(
@@ -2993,12 +3045,19 @@ def _build_onnx_weight_analysis_plan(
         node: Any,
         constants: dict[str, Any],
         count: int,
+        *,
+        resolve_attribute: Callable[[Any], Any | None] | None = None,
     ) -> _OnnxWeightLineageGapSummary:
         if count <= 0:
             return empty_weight_gap_summary
         if not summary.lineages:
             return unknown_weight_gap_summary if summary.truncated else empty_weight_gap_summary
-        transformed_summary = transform_weight_gap_summary(summary, node, constants)
+        transformed_summary = transform_weight_gap_summary(
+            summary,
+            node,
+            constants,
+            resolve_attribute=resolve_attribute,
+        )
         if transformed_summary.lineages or transformed_summary.truncated:
             return transformed_summary
         return empty_weight_gap_summary
@@ -3046,6 +3105,48 @@ def _build_onnx_weight_analysis_plan(
                 )
             )
         return summarize_weight_lineage_gap(promoted_lineages, truncated=summary.truncated)
+
+    def lineages_after_control_flow_rank_increase(
+        lineages: dict[int, _OnnxWeightLineage],
+        *,
+        output_shape: tuple[int, ...] | None = None,
+        output_rank: int | None = None,
+        insert_axis: int = 0,
+    ) -> dict[int, _OnnxWeightLineage]:
+        if not lineages:
+            return lineages
+        promoted_lineages: dict[int, _OnnxWeightLineage] = {}
+        for initializer_index, lineage in lineages.items():
+            if lineage.unresolved_reason is None:
+                promoted_lineages[initializer_index] = lineage
+                continue
+            shape = None
+            if output_shape is not None:
+                shape = output_shape
+            elif lineage.shape is not None and output_rank is not None:
+                target_rank = output_rank
+                if target_rank < len(lineage.shape):
+                    shape = None
+                elif target_rank == len(lineage.shape):
+                    shape = lineage.shape
+                else:
+                    axis = insert_axis if insert_axis >= 0 else target_rank + insert_axis
+                    if axis < 0 or axis > target_rank:
+                        axis = 0
+                    added_rank = target_rank - len(lineage.shape)
+                    shape = (
+                        *lineage.shape[:axis],
+                        *(-1 for _ in range(added_rank)),
+                        *lineage.shape[axis:],
+                    )
+            promoted_lineages[initializer_index] = _OnnxWeightLineage(
+                initializer_index=lineage.initializer_index,
+                shape=shape,
+                data_type=lineage.data_type,
+                transforms=lineage.transforms,
+                unresolved_reason=lineage.unresolved_reason,
+            )
+        return promoted_lineages
 
     def non_shape_gap_summary_after_rank_increase(
         summary: _OnnxWeightLineageGapSummary,
@@ -4376,6 +4477,7 @@ def _build_onnx_weight_analysis_plan(
                         node,
                         constants,
                         cast_target_data_type=resolved_cast_target_data_type,
+                        resolve_attribute=resolve_attribute,
                     )
                 merge_lineages(
                     output_lineages,
@@ -4536,7 +4638,8 @@ def _build_onnx_weight_analysis_plan(
             rank_gap_control_input_is_overridable = (
                 node.op_type in {"Expand", "Gather", "GatherND", "Reshape", "Squeeze", "Unsqueeze"}
                 and len(node.input) > 1
-                and str(node.input[1]) in graph_input_names
+                and (control_input_name := str(node.input[1])) in graph_input_names
+                and control_input_name not in constants
             )
             if (
                 rank_gap_promoting_operator
@@ -4554,6 +4657,7 @@ def _build_onnx_weight_analysis_plan(
                     node,
                     constants,
                     transform_data_input_rank_promotable_lineage_limit_gap_count,
+                    resolve_attribute=resolve_attribute,
                 )
                 rank_gap_promotion_known_not_weight = (
                     transform_data_input_rank_promotable_lineage_limit_gap_summary.lineages
@@ -4567,6 +4671,7 @@ def _build_onnx_weight_analysis_plan(
                         input_shape=known_value_shapes.get(input_names[0]) if input_names else None,
                         index_shape=known_value_shapes.get(input_names[1]) if len(input_names) > 1 else None,
                         constants=constants,
+                        resolve_attribute=resolve_attribute,
                     )
                 ):
                     promoted_rank_lineage_limit_gap_count = transform_data_input_rank_promotable_lineage_limit_gap_count
@@ -4622,6 +4727,7 @@ def _build_onnx_weight_analysis_plan(
                     node,
                     constants,
                     cast_target_data_type=resolved_cast_target_data_type,
+                    resolve_attribute=resolve_attribute,
                 ):
                     all_input_output_weight_lineage_limit_gap_count = all_input_non_shape_lineage_limit_gap_count
                     cast_promoted_non_shape_weight_lineage_gap_summary = transform_weight_gap_summary(
@@ -4629,6 +4735,7 @@ def _build_onnx_weight_analysis_plan(
                         node,
                         constants,
                         cast_target_data_type=resolved_cast_target_data_type,
+                        resolve_attribute=resolve_attribute,
                     )
                     all_input_output_weight_lineage_gap_summary = merge_weight_lineage_gap_summaries(
                         all_input_output_weight_lineage_gap_summary,
@@ -4664,6 +4771,7 @@ def _build_onnx_weight_analysis_plan(
                     node,
                     constants,
                     cast_target_data_type=resolved_cast_target_data_type,
+                    resolve_attribute=resolve_attribute,
                 ):
                     output_weight_lineage_limit_gap_count = output_non_shape_lineage_limit_gap_count
                     output_weight_lineage_gap_summary = merge_weight_lineage_gap_summaries(
@@ -4673,6 +4781,7 @@ def _build_onnx_weight_analysis_plan(
                             node,
                             constants,
                             cast_target_data_type=resolved_cast_target_data_type,
+                            resolve_attribute=resolve_attribute,
                         ),
                     )
                 else:
@@ -4687,6 +4796,7 @@ def _build_onnx_weight_analysis_plan(
                             node,
                             constants,
                             cast_target_data_type=resolved_cast_target_data_type,
+                            resolve_attribute=resolve_attribute,
                         ),
                     )
             cast_output_is_nonfloating_transform = (
@@ -4705,6 +4815,7 @@ def _build_onnx_weight_analysis_plan(
                     node,
                     constants,
                     cast_target_data_type=resolved_cast_target_data_type,
+                    resolve_attribute=resolve_attribute,
                 )
                 and not any(lineage_could_be_weight(lineage) for lineage in output_lineages.values())
                 and any(lineage_could_be_weight_after_rank_increase(lineage) for lineage in output_lineages.values())
@@ -4716,6 +4827,7 @@ def _build_onnx_weight_analysis_plan(
                         node,
                         constants,
                         cast_target_data_type=resolved_cast_target_data_type,
+                        resolve_attribute=resolve_attribute,
                     )
                     if pre_promotion_weight_lineage_limit_gap_count
                     else empty_weight_gap_summary,
@@ -4730,6 +4842,7 @@ def _build_onnx_weight_analysis_plan(
                     node,
                     constants,
                     cast_target_data_type=resolved_cast_target_data_type,
+                    resolve_attribute=resolve_attribute,
                 )
             if supported_transform and all_input_output_rank_promotable_lineage_limit_gap_count > 0:
                 transformed_input_output_rank_promotable_lineage_gap_summary = transform_rank_promotable_gap_summary(
@@ -4737,6 +4850,7 @@ def _build_onnx_weight_analysis_plan(
                     node,
                     constants,
                     cast_target_data_type=resolved_cast_target_data_type,
+                    resolve_attribute=resolve_attribute,
                 )
             if (
                 rank_operator_promotes_deferred_gap
@@ -5029,6 +5143,27 @@ def _build_onnx_weight_analysis_plan(
                     return initializer_shape[0]
                 return -1
 
+            def loop_exact_iteration_count(current_node: Any = node) -> int | None:
+                trip_input = str(current_node.input[0]) if len(current_node.input) > 0 and current_node.input[0] else ""
+                condition_input = (
+                    str(current_node.input[1]) if len(current_node.input) > 1 and current_node.input[1] else ""
+                )
+                if trip_input in graph_input_names or condition_input in graph_input_names:
+                    return None
+                trip_count = (
+                    constant_scalar_value(constants.get(trip_input), int(onnx.TensorProto.INT64))
+                    if trip_input
+                    else None
+                )
+                initial_condition = (
+                    constant_scalar_value(constants.get(condition_input), int(onnx.TensorProto.BOOL))
+                    if condition_input
+                    else True
+                )
+                if trip_count is None or initial_condition is not True:
+                    return None
+                return max(int(trip_count), 0)
+
             trusted_scan_shape_names = proven_value_ranks
             untrusted_scan_shape_names = {
                 name for name in graph_input_names & set(value_lineages) if name not in proven_value_ranks
@@ -5061,11 +5196,7 @@ def _build_onnx_weight_analysis_plan(
                         graph_output_index
                     ]
                     stacked_scan_output = standard_control_flow_operator and output_index >= stacked_scan_output_start
-                    merge_lineages(
-                        subgraph_output_lineages[output_index],
-                        graph_output_lineages[graph_output_index],
-                        ambiguous_reason="ambiguous_subgraph_output_lineage",
-                    )
+                    graph_output_parent_lineages = graph_output_lineages[graph_output_index]
                     graph_output_shape = graph_output_shapes[graph_output_index]
                     graph_output_rank = graph_output_ranks[graph_output_index]
                     scan_output_insert_axis = stacked_scan_output_insert_axis(
@@ -5073,9 +5204,21 @@ def _build_onnx_weight_analysis_plan(
                         stacked_scan_output_start,
                         output_index,
                     )
+                    scan_output_extent = -1
+                    if (
+                        stacked_scan_output
+                        and standard_control_flow_operator
+                        and node.op_type == "Loop"
+                        and (exact_loop_iterations := loop_exact_iteration_count()) is not None
+                    ):
+                        scan_output_extent = exact_loop_iterations
                     if stacked_scan_output:
                         if graph_output_shape is not None:
-                            graph_output_shape = insert_shape_axis(graph_output_shape, scan_output_insert_axis)
+                            graph_output_shape = insert_shape_axis(
+                                graph_output_shape,
+                                scan_output_insert_axis,
+                                scan_output_extent,
+                            )
                             if graph_output_shape is not None and resolved_scan_input_offset:
                                 graph_output_shape = insert_shape_axis(
                                     graph_output_shape,
@@ -5130,6 +5273,26 @@ def _build_onnx_weight_analysis_plan(
                             graph_output_rank = None
                         elif graph_output_shape != state_input_shape:
                             graph_output_shape = None
+                    if graph_output_parent_lineages and (
+                        stacked_scan_output
+                        or (
+                            standard_control_flow_operator
+                            and node.op_type == "Scan"
+                            and resolved_scan_input_offset
+                            and not stacked_scan_output
+                        )
+                    ):
+                        graph_output_parent_lineages = lineages_after_control_flow_rank_increase(
+                            graph_output_parent_lineages,
+                            output_shape=graph_output_shape,
+                            output_rank=graph_output_rank,
+                            insert_axis=scan_output_insert_axis if stacked_scan_output else 0,
+                        )
+                    merge_lineages(
+                        subgraph_output_lineages[output_index],
+                        graph_output_parent_lineages,
+                        ambiguous_reason="ambiguous_subgraph_output_lineage",
+                    )
                     merge_subgraph_output_rank(output_index, graph_output_shape, graph_output_rank)
                     subgraph_output_dynamic[output_index] |= graph_output_dynamic[graph_output_index]
                     subgraph_output_lineage_gap_counts[output_index] = _bounded_onnx_weight_lineage_gap_count(
@@ -5197,6 +5360,8 @@ def _build_onnx_weight_analysis_plan(
                         graph_output_weight_gap_summary = rank_gap_weight_summary_after_rank_increase(
                             graph_output_weight_gap_summary,
                             graph_output_weight_lineage_gap_counts[graph_output_index],
+                            output_shape=graph_output_shape,
+                            output_rank=graph_output_rank,
                             insert_axis=scan_output_insert_axis,
                         )
                     subgraph_output_weight_lineage_gap_summaries[output_index] = merge_weight_lineage_gap_summaries(
@@ -5237,6 +5402,8 @@ def _build_onnx_weight_analysis_plan(
                             repeated_state_weight_gap_summary = rank_gap_weight_summary_after_rank_increase(
                                 state_rank_gap_summary,
                                 graph_output_rank_promotable_gap_count,
+                                output_shape=graph_output_shape,
+                                output_rank=graph_output_rank,
                             )
                             if repeated_state_weight_gap_summary != empty_weight_gap_summary:
                                 subgraph_output_weight_lineage_gap_counts[output_index] = (
@@ -5252,6 +5419,38 @@ def _build_onnx_weight_analysis_plan(
                                     )
                                 )
                                 rank_promotable_gap_promoted = True
+                    if (
+                        standard_control_flow_operator
+                        and node.op_type == "Scan"
+                        and resolved_scan_input_offset
+                        and not stacked_scan_output
+                        and graph_output_rank_promotable_gap_count
+                        and not rank_promotable_gap_promoted
+                    ):
+                        state_rank_gap_summary = known_weight_gap_summary(
+                            graph_output_rank_promotable_lineage_gap_summaries[graph_output_index],
+                            graph_output_rank_promotable_gap_count,
+                        )
+                        batched_state_weight_gap_summary = rank_gap_weight_summary_after_rank_increase(
+                            state_rank_gap_summary,
+                            graph_output_rank_promotable_gap_count,
+                            output_shape=graph_output_shape,
+                            output_rank=graph_output_rank,
+                        )
+                        if batched_state_weight_gap_summary != empty_weight_gap_summary:
+                            subgraph_output_weight_lineage_gap_counts[output_index] = (
+                                _bounded_onnx_weight_lineage_gap_count(
+                                    subgraph_output_weight_lineage_gap_counts[output_index],
+                                    graph_output_rank_promotable_gap_count,
+                                )
+                            )
+                            subgraph_output_weight_lineage_gap_summaries[output_index] = (
+                                merge_weight_lineage_gap_summaries(
+                                    subgraph_output_weight_lineage_gap_summaries[output_index],
+                                    batched_state_weight_gap_summary,
+                                )
+                            )
+                            rank_promotable_gap_promoted = True
                     if rank_promotable_gap_promoted:
                         continue
                     if stacked_scan_output and graph_output_rank_promotable_gap_count:
@@ -5261,6 +5460,8 @@ def _build_onnx_weight_analysis_plan(
                                 graph_output_rank_promotable_gap_count,
                             ),
                             graph_output_rank_promotable_gap_count,
+                            output_shape=graph_output_shape,
+                            output_rank=graph_output_rank,
                             insert_axis=scan_output_insert_axis,
                         )
                         if stacked_scan_weight_gap_summary != empty_weight_gap_summary:
@@ -5466,7 +5667,11 @@ def _build_onnx_weight_analysis_plan(
                         )
                     ):
                         transform_output_rank = len(target_shape)
-                        if transform_input_shape is not None and shape_initializer is not None:
+                        if (
+                            transform_input_shape is not None
+                            and shape_initializer is not None
+                            and all(dimension >= 0 for dimension in transform_input_shape)
+                        ):
                             transform_output_shape = _resolve_onnx_reshape_shape(
                                 transform_input_shape,
                                 shape_initializer,

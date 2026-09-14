@@ -6099,6 +6099,19 @@ class TestWeightDistributionSemantics:
         assert onnx_scanner_module._onnx_concat_output_shape(leading_axis_node, [(1, -1), (2, 3)]) == (3, -1)
         assert onnx_scanner_module._onnx_concat_output_shape(axis_node, [(2, 3), (4, 3)]) is None
 
+    def test_reshape_shape_inference_preserves_unknown_input_extents(self) -> None:
+        target = onnx.numpy_helper.from_array(np.array([-1], dtype=np.int64), name="target_shape")
+
+        assert (
+            onnx_scanner_module._resolve_onnx_reshape_shape(
+                (-1, -1),
+                target,
+                allowzero=False,
+                onnx=onnx,
+            )
+            is None
+        )
+
     @staticmethod
     def _write_onehot_weight_model(
         tmp_path: Path,
@@ -7521,6 +7534,99 @@ class TestWeightDistributionSemantics:
         assert root_return["shapes"]["state_out"] == (2, 5)
         assert root_return["shapes"]["scan_out"] == (2, -1, 4)
         assert plan.coverage_gaps == {}
+
+    @pytest.mark.parametrize(
+        ("kind", "source_count"),
+        [
+            ("state_vector", 32),
+            ("state_vector", 40),
+            ("stacked_scalar", 32),
+            ("stacked_scalar", 40),
+        ],
+    )
+    def test_scan_opset8_batch_axis_promotes_body_local_weight_gap(
+        self,
+        tmp_path: Path,
+        kind: str,
+        source_count: int,
+    ) -> None:
+        source_names = [f"W{index}" for index in range(source_count)]
+        state_shape = [4] if kind == "state_vector" else [1]
+        weight_shape = (4,) if kind == "state_vector" else ()
+        initializers = [
+            onnx.numpy_helper.from_array(np.ones(weight_shape, dtype=np.float32), name=name) for name in source_names
+        ]
+        body = helper.make_graph(
+            [
+                helper.make_node("Sum", source_names, ["next_state" if kind == "state_vector" else "next_element"]),
+                helper.make_node(
+                    "Identity",
+                    ["element" if kind == "state_vector" else "state"],
+                    ["next_element" if kind == "state_vector" else "next_state"],
+                ),
+            ],
+            "scan8_body_local_weight_gap",
+            [
+                helper.make_tensor_value_info("state", TensorProto.FLOAT, state_shape),
+                helper.make_tensor_value_info("element", TensorProto.FLOAT, [1]),
+            ],
+            [
+                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, state_shape),
+                helper.make_tensor_value_info(
+                    "next_element",
+                    TensorProto.FLOAT,
+                    [1] if kind == "state_vector" else [],
+                ),
+            ],
+            initializer=initializers,
+        )
+        graph = helper.make_graph(
+            [
+                helper.make_node(
+                    "Scan",
+                    ["", "initial", "values"],
+                    ["state_out", "scan_out"],
+                    body=body,
+                    num_scan_inputs=1,
+                ),
+                helper.make_node(
+                    "MatMul",
+                    ["X", "state_out" if kind == "state_vector" else "scan_out"],
+                    ["Y"],
+                ),
+            ],
+            "scan8_batch_axis_promotes_body_local_weight_gap",
+            [
+                helper.make_tensor_value_info("initial", TensorProto.FLOAT, [2, *state_shape]),
+                helper.make_tensor_value_info("values", TensorProto.FLOAT, [2, 1, 1]),
+                helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 2]),
+            ],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 4 if kind == "state_vector" else 1])],
+            value_info=[
+                helper.make_tensor_value_info("state_out", TensorProto.FLOAT, [2, *state_shape]),
+                helper.make_tensor_value_info(
+                    "scan_out",
+                    TensorProto.FLOAT,
+                    [2, 1, 1] if kind == "state_vector" else [2, 1],
+                ),
+            ],
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 8)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        onnx.checker.check_model(model, full_check=True)
+        path = tmp_path / f"scan8-{kind}-{source_count}-body-local-gap.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        assert result.success is False
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["coverage_gaps"]["unresolved_initializer_lineage"] >= 1
+        if source_count > 32:
+            assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
 
     @pytest.mark.parametrize(("scan_length", "expect_gap"), [(1, False), (2, True)])
     def test_scan_graph_input_fixed_extent_bounds_carried_rank_growth(
@@ -9061,6 +9167,58 @@ class TestWeightDistributionSemantics:
         semantics = result.metadata["onnx_weight_distribution_semantics"]
         assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
         assert any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
+
+    def test_function_gathernd_ref_attr_batch_dims_keeps_vector_gap_nonweight(self, tmp_path: Path) -> None:
+        source_names = [f"matrix_source{index}" for index in range(40)]
+        gather_node = helper.make_node("GatherND", ["data", "indices"], ["selected"], batch_dims=0)
+        gather_node.attribute[0].ref_attr_name = "batch_dims"
+        function = helper.make_function(
+            "local",
+            "GatherWithBatchDims",
+            ["data", "indices", "X"],
+            ["function_output"],
+            [
+                gather_node,
+                helper.make_node("MatMul", ["X", "selected"], ["function_output"]),
+            ],
+            opset_imports=[helper.make_opsetid("", 13)],
+            attributes=["batch_dims"],
+        )
+        graph = helper.make_graph(
+            [
+                helper.make_node("Sum", source_names, ["capped"]),
+                helper.make_node(
+                    "GatherWithBatchDims",
+                    ["capped", "indices", "X"],
+                    ["Y"],
+                    domain="local",
+                    batch_dims=1,
+                ),
+            ],
+            "function_gathernd_ref_attr_batch_dims_keeps_vector_gap_nonweight",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 2])],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1])],
+            initializer=[
+                *[onnx.numpy_helper.from_array(np.zeros((2, 4), dtype=np.float32), name=name) for name in source_names],
+                onnx.numpy_helper.from_array(np.array([[0], [1]], dtype=np.int64), name="indices"),
+            ],
+        )
+        model = helper.make_model(
+            graph,
+            functions=[function],
+            opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
+        )
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / "function-gathernd-ref-attr-batch-dims.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        assert result.success is True
+        assert self._extreme_checks(result) == []
+        assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
+        assert result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"] == {}
 
     @pytest.mark.parametrize("transform", ["Concat", "Flatten", "Transpose"])
     def test_function_transform_ref_attrs_preserve_scan_repeat_extent(self, tmp_path: Path, transform: str) -> None:
