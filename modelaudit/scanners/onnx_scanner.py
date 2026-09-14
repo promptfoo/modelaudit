@@ -2722,9 +2722,7 @@ def _build_onnx_weight_analysis_plan(
             data_input_tainted = bool(body_inputs and body_inputs[0] in tainted)
             any_promoted = any(input_name in promoted for input_name in body_inputs)
             any_tainted = any(input_name in tainted for input_name in body_inputs)
-            data_input_shape = (
-                reentry_input_shape(body_inputs[0]) if body_inputs and body_inputs[0] in tainted else None
-            )
+            data_input_shape = reentry_input_shape(body_inputs[0]) if body_inputs else None
             index_input_shape = reentry_input_shape(body_inputs[1]) if len(body_inputs) > 1 else None
             if index_input_shape is None and body_node.op_type in {"Gather", "GatherND"} and len(body_inputs) > 1:
                 index_input_shape = constant_initializer_shape(subgraph_constants, body_inputs[1])
@@ -3008,6 +3006,9 @@ def _build_onnx_weight_analysis_plan(
                 if output_shape is not None:
                     for output_name in body_outputs:
                         tainted_shapes[output_name] = output_shape
+            elif body_node.op_type in {"Cast", "Identity", "Relu"} and data_input_shape is not None:
+                for output_name in body_outputs:
+                    tainted_shapes[output_name] = data_input_shape
         promoted_output_indexes = frozenset(
             output_index for output_index, output in enumerate(graph_outputs) if _onnx_value_name(output) in promoted
         )
@@ -5354,6 +5355,58 @@ def _build_onnx_weight_analysis_plan(
                         input_pair_index_start = scan_input_offset
                     else:
                         input_pairs = ()
+                    input_pairs = tuple(input_pairs)
+
+                    if node.op_type == "Loop" and len(node.input) > 1 and len(getattr(subgraph, "input", ())) > 1:
+                        loop_condition_name = str(node.input[1])
+                        loop_body_condition_name = _onnx_value_name(subgraph.input[1])
+                        loop_condition_shape = known_value_shapes.get(
+                            loop_condition_name
+                        ) or constant_initializer_shape(
+                            constants,
+                            loop_condition_name,
+                        )
+                        if (
+                            loop_body_condition_name
+                            and loop_condition_shape is not None
+                            and (
+                                loop_condition_name in proven_value_ranks
+                                or (loop_condition_name in constants and loop_condition_name not in graph_input_names)
+                            )
+                            and loop_condition_name not in value_lineages
+                        ):
+                            subgraph_trusted_context_shapes[loop_body_condition_name] = loop_condition_shape
+                    elif node.op_type == "Scan":
+                        for pair_index, (parent_input, graph_input) in enumerate(
+                            input_pairs,
+                            start=input_pair_index_start,
+                        ):
+                            if pair_index < scan_input_start:
+                                continue
+                            parent_name = str(parent_input)
+                            parent_shape = known_value_shapes.get(parent_name) or constant_initializer_shape(
+                                constants,
+                                parent_name,
+                            )
+                            parent_shape, _parent_rank = _onnx_scan_bound_subgraph_input_shape(
+                                parent_shape,
+                                known_value_ranks.get(parent_name),
+                                pair_index=pair_index,
+                                scan_input_start=scan_input_start,
+                                scan_input_offset=scan_input_offset,
+                                scan_input_axes=scan_input_axes,
+                            )
+                            graph_input_name = _onnx_value_name(graph_input)
+                            if (
+                                graph_input_name
+                                and parent_shape is not None
+                                and (
+                                    parent_name in proven_value_ranks
+                                    or (parent_name in constants and parent_name not in graph_input_names)
+                                )
+                                and parent_name not in value_lineages
+                            ):
+                                subgraph_trusted_context_shapes[graph_input_name] = parent_shape
                     for pair_index, (parent_input, graph_input) in enumerate(input_pairs, start=input_pair_index_start):
                         parent_name = str(parent_input)
                         graph_input_name = _onnx_value_name(graph_input)

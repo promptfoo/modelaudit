@@ -8692,6 +8692,10 @@ class TestWeightDistributionSemantics:
             ("sparse_matrix_constant", "sparse", True, False, False, True),
             ("captured_vector_input", "captured", False, False, False, False),
             ("captured_matrix_input", "captured", True, False, False, True),
+            ("captured_identity_vector_input", "captured_identity", False, False, False, False),
+            ("captured_cast_vector_input", "captured_cast", False, False, False, False),
+            ("captured_relu_vector_input", "captured_relu", False, False, False, False),
+            ("captured_identity_matrix_input", "captured_identity", True, False, False, True),
         ],
     )
     def test_repeated_loop_reentry_broadcast_operands_preserve_shape_context(
@@ -8713,6 +8717,7 @@ class TestWeightDistributionSemantics:
             onnx.numpy_helper.from_array(np.array(0.0, dtype=np.float32), name="dummy"),
         ]
         graph_inputs = [helper.make_tensor_value_info("X", TensorProto.FLOAT, [4, 4])]
+        other_name = "other"
         if source == "sparse":
             sparse = onnx.SparseTensorProto()
             sparse.values.CopyFrom(
@@ -8721,18 +8726,28 @@ class TestWeightDistributionSemantics:
             sparse.indices.CopyFrom(onnx.numpy_helper.from_array(np.array([0], dtype=np.int64), name="sparse_indices"))
             sparse.dims.extend(other_shape)
             body_nodes.append(helper.make_node("Constant", [], ["other"], sparse_value=sparse))
-        elif source == "captured":
+        elif source.startswith("captured"):
             graph_inputs.append(helper.make_tensor_value_info("other", TensorProto.FLOAT, other_shape))
+            if source != "captured":
+                alias = source.removeprefix("captured_")
+                other_name = "other_alias"
+                if alias == "cast":
+                    body_nodes.append(helper.make_node("Cast", ["other"], [other_name], to=TensorProto.FLOAT))
+                elif alias in {"identity", "relu"}:
+                    body_nodes.append(helper.make_node(alias.capitalize(), ["other"], [other_name]))
+                else:
+                    raise AssertionError(f"unexpected captured alias {alias}")
         else:
             initializer_shape = [4] if use_where else other_shape
             initializers.append(
                 onnx.numpy_helper.from_array(np.zeros(initializer_shape, dtype=np.float32), name="other")
             )
         if use_where:
-            initializers.append(onnx.numpy_helper.from_array(np.ones(other_shape, dtype=np.bool_), name="select"))
-            body_nodes.append(helper.make_node("Where", ["select", "state", "other"], ["next_state"]))
+            select_name = "select"
+            initializers.append(onnx.numpy_helper.from_array(np.ones(other_shape, dtype=np.bool_), name=select_name))
+            body_nodes.append(helper.make_node("Where", [select_name, "state", other_name], ["next_state"]))
         else:
-            add_inputs = ["other", "state"] if state_second else ["state", "other"]
+            add_inputs = [other_name, "state"] if state_second else ["state", other_name]
             body_nodes.append(helper.make_node("Add", add_inputs, ["next_state"]))
         body_nodes.append(helper.make_node("Identity", ["condition_in"], ["condition_out"]))
         body = helper.make_graph(
@@ -8767,6 +8782,75 @@ class TestWeightDistributionSemantics:
         model.ir_version = 8
         onnx.checker.check_model(model)
         path = tmp_path / f"retained-loop-reentry-broadcast-shape-context-{case}.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        if expected_gap:
+            assert result.success is False
+            assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
+            assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
+        else:
+            assert result.success is True
+            assert coverage == []
+            assert semantics["coverage_gaps"] == {}
+
+    @pytest.mark.parametrize(
+        ("scan_input_shape", "expected_gap"),
+        [
+            ([2, 4], False),
+            ([2, 4, 4], True),
+        ],
+    )
+    def test_repeated_scan_reentry_uses_explicit_body_input_shape_context(
+        self,
+        tmp_path: Path,
+        scan_input_shape: list[int],
+        expected_gap: bool,
+    ) -> None:
+        element_shape = scan_input_shape[1:]
+        body = helper.make_graph(
+            [
+                helper.make_node("MatMul", ["X", "state"], ["body_y"]),
+                helper.make_node("Add", ["state", "element"], ["next_state"]),
+                helper.make_node("Identity", ["element"], ["next_element"]),
+            ],
+            "retained_scan_reentry_explicit_input_shape_body",
+            [
+                helper.make_tensor_value_info("state", TensorProto.FLOAT, [4]),
+                helper.make_tensor_value_info("element", TensorProto.FLOAT, element_shape),
+            ],
+            [
+                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, element_shape),
+                helper.make_tensor_value_info("next_element", TensorProto.FLOAT, element_shape),
+            ],
+        )
+        graph = helper.make_graph(
+            [
+                helper.make_node(
+                    "Scan",
+                    ["initial_state", "scan_values"],
+                    ["scan_state", "scan_output"],
+                    body=body,
+                    num_scan_inputs=1,
+                ),
+            ],
+            "retained_scan_reentry_explicit_body_input_shape",
+            [
+                helper.make_tensor_value_info("scan_values", TensorProto.FLOAT, scan_input_shape),
+                helper.make_tensor_value_info("X", TensorProto.FLOAT, [4, 4]),
+            ],
+            [helper.make_tensor_value_info("scan_state", TensorProto.FLOAT, element_shape)],
+            initializer=[
+                onnx.numpy_helper.from_array(np.ones((4,), dtype=np.float32), name="initial_state"),
+            ],
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / f"retained-scan-explicit-body-input-shape-{expected_gap}.onnx"
         onnx.save(model, str(path))
 
         result = OnnxScanner().scan(str(path))
