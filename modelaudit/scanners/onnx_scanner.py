@@ -2383,6 +2383,11 @@ def _build_onnx_weight_analysis_plan(
         return False
 
     cache_fingerprints: dict[int, tuple[str, str]] = {}
+    semantic_mapping_keys: dict[
+        tuple[int, tuple[tuple[str, int], ...]],
+        tuple[tuple[str, str, str], ...],
+    ] = {}
+    rank_reentry_constant_name_cache: dict[tuple[int, int], frozenset[str]] = {}
 
     def semantic_cache_fingerprint(value: Any) -> tuple[str, str]:
         value_id = id(value)
@@ -2406,18 +2411,34 @@ def _build_onnx_weight_analysis_plan(
         cache_fingerprints[value_id] = fingerprint
         return fingerprint
 
-    def semantic_mapping_cache_key(mapping: dict[str, Any] | None) -> tuple[tuple[str, str, str], ...]:
+    def semantic_mapping_cache_key(
+        mapping: dict[str, Any] | None,
+        names: frozenset[str] | None = None,
+    ) -> tuple[tuple[str, str, str], ...]:
         if not mapping:
             return ()
-        return tuple(sorted((str(name), *semantic_cache_fingerprint(value)) for name, value in mapping.items()))
+        items = (
+            tuple((name, mapping[name]) for name in sorted(names) if name in mapping)
+            if names is not None
+            else tuple(sorted((str(name), value) for name, value in mapping.items()))
+        )
+        identity_key = (id(mapping), tuple((str(name), id(value)) for name, value in items))
+        if identity_key in semantic_mapping_keys:
+            return semantic_mapping_keys[identity_key]
+        cache_key = tuple((str(name), *semantic_cache_fingerprint(value)) for name, value in items)
+        semantic_mapping_keys[identity_key] = cache_key
+        return cache_key
 
     def attribute_binding_cache_key(attribute_bindings: dict[str, Any] | None) -> tuple[tuple[str, str, str], ...]:
         if not attribute_bindings:
             return ()
         return semantic_mapping_cache_key(attribute_bindings)
 
-    def constant_binding_cache_key(constants: dict[str, Any]) -> tuple[tuple[str, str, str], ...]:
-        return semantic_mapping_cache_key(constants)
+    def constant_binding_cache_key(
+        constants: dict[str, Any],
+        names: frozenset[str],
+    ) -> tuple[tuple[str, str, str], ...]:
+        return semantic_mapping_cache_key(constants, names)
 
     def opset_cache_key(opset_versions: dict[str, int]) -> tuple[tuple[str, int], ...]:
         return tuple(sorted((str(domain), int(version)) for domain, version in opset_versions.items()))
@@ -2442,6 +2463,35 @@ def _build_onnx_weight_analysis_plan(
             if parent_name in source_names and graph_input_name:
                 bindings[graph_input_name] = parent_name
         return bindings
+
+    def rank_reentry_constant_names(subgraph: Any, *, depth: int = 0) -> frozenset[str]:
+        cache_key = (id(subgraph), depth)
+        if cache_key in rank_reentry_constant_name_cache:
+            return rank_reentry_constant_name_cache[cache_key]
+        if depth > 6:
+            return frozenset()
+        names: set[str] = set()
+        for body_node in getattr(subgraph, "node", ()):
+            if (
+                getattr(body_node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
+                and body_node.op_type in {"Expand", "Reshape", "Squeeze", "Unsqueeze"}
+                and len(getattr(body_node, "input", ())) > 1
+            ):
+                names.add(str(body_node.input[1]))
+            function_key = (
+                str(getattr(body_node, "domain", "")),
+                str(getattr(body_node, "op_type", "")),
+                str(getattr(body_node, "overload", "")),
+            )
+            function = functions.get(function_key)
+            if function is not None:
+                names.update(rank_reentry_constant_names(function, depth=depth + 1))
+            for attribute in getattr(body_node, "attribute", ()):
+                for nested_graph in _iter_attribute_graphs(attribute):
+                    names.update(rank_reentry_constant_names(nested_graph, depth=depth + 1))
+        result = frozenset(names)
+        rank_reentry_constant_name_cache[cache_key] = result
+        return result
 
     reentry_promotion_cache: dict[tuple[Any, ...], frozenset[int]] = {}
     reentry_promotion_in_progress: set[tuple[Any, ...]] = set()
@@ -2471,7 +2521,7 @@ def _build_onnx_weight_analysis_plan(
             graph_input_shape,
             opset_cache_key(opset_versions),
             attribute_binding_cache_key(attribute_bindings),
-            constant_binding_cache_key(constants),
+            constant_binding_cache_key(constants, rank_reentry_constant_names(subgraph)),
             depth,
         )
         if cache_key in reentry_promotion_cache:
