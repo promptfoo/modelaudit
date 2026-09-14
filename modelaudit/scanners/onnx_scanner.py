@@ -2766,6 +2766,11 @@ def _build_onnx_weight_analysis_plan(
             promotion_input_tainted = (
                 any_tainted if elementwise_operator or body_node.op_type in {"MatMul", "OneHot"} else data_input_tainted
             )
+            promotion_input_shapes = (
+                [input_shapes_by_name.get(input_name) for input_name in body_inputs if input_name in tainted]
+                if elementwise_operator
+                else None
+            )
             data_input_may_promote = promotion_input_tainted and operator_output_may_have_weight_rank(
                 body_node,
                 input_shape=data_input_shape,
@@ -2773,6 +2778,7 @@ def _build_onnx_weight_analysis_plan(
                 constants=subgraph_constants,
                 resolve_attribute=resolve_reentry_attribute,
                 input_shapes_by_name=input_shapes_by_name,
+                promotion_input_shapes=promotion_input_shapes,
             )
             function_promoted_outputs: set[str] = set()
             function_tainted_outputs: set[str] = set()
@@ -3183,7 +3189,7 @@ def _build_onnx_weight_analysis_plan(
                 if resolved_attribute is None:
                     continue
                 for nested_graph in _iter_attribute_graphs(resolved_attribute):
-                    captured_names = graph_external_reference_names(nested_graph) & tainted
+                    captured_names = set(graph_external_reference_names(nested_graph) & tainted)
                     nested_input_names = set(
                         bound_control_flow_graph_inputs(
                             body_node,
@@ -3441,7 +3447,7 @@ def _build_onnx_weight_analysis_plan(
                 if resolved_attribute is None:
                     continue
                 for nested_graph in _iter_attribute_graphs(resolved_attribute):
-                    captured_names = graph_external_reference_names(nested_graph) & tainted
+                    captured_names = set(graph_external_reference_names(nested_graph) & tainted)
                     if captured_names:
                         inspected_nested_taint = True
                     for captured_name in captured_names:
@@ -3507,13 +3513,13 @@ def _build_onnx_weight_analysis_plan(
             return None
         return output_rank
 
-    graph_external_reference_cache: dict[int, tuple[Any, set[str]]] = {}
+    graph_external_reference_cache: dict[int, tuple[Any, frozenset[str]]] = {}
 
-    def graph_external_reference_names(graph: Any) -> set[str]:
+    def graph_external_reference_names(graph: Any) -> frozenset[str]:
         cache_key = id(graph)
         cached_reference_names = graph_external_reference_cache.get(cache_key)
         if cached_reference_names is not None and cached_reference_names[0] is graph:
-            return set(cached_reference_names[1])
+            return cached_reference_names[1]
         local_names = {name for value_info in getattr(graph, "input", ()) if (name := _onnx_value_name(value_info))}
         local_names.update(
             str(initializer.name)
@@ -3536,9 +3542,9 @@ def _build_onnx_weight_analysis_plan(
             for attribute in getattr(graph_node, "attribute", ()):
                 for subgraph in _iter_attribute_graphs(attribute):
                     referenced_names.update(graph_external_reference_names(subgraph))
-        reference_names = referenced_names - produced_names - local_names
-        graph_external_reference_cache[cache_key] = (graph, set(reference_names))
-        return set(reference_names)
+        reference_names = frozenset(referenced_names - produced_names - local_names)
+        graph_external_reference_cache[cache_key] = (graph, reference_names)
+        return reference_names
 
     def gap_summary_may_exceed_input_rank(summary: _OnnxWeightLineageGapSummary, input_rank: int | None) -> bool:
         if summary.truncated:
@@ -3565,6 +3571,7 @@ def _build_onnx_weight_analysis_plan(
         constants: dict[str, Any],
         resolve_attribute: Callable[[Any], Any | None] | None = None,
         input_shapes_by_name: dict[str, tuple[int, ...] | None] | None = None,
+        promotion_input_shapes: Sequence[tuple[int, ...] | None] | None = None,
     ) -> bool:
         if node.op_type in _SAME_TYPE_ELEMENTWISE_OPERATORS or node.op_type == "Pow":
             input_names = [str(input_name) for input_name in getattr(node, "input", ()) if input_name]
@@ -3574,7 +3581,14 @@ def _build_onnx_weight_analysis_plan(
             if not input_shapes or any(shape is None for shape in input_shapes):
                 return True
             output_shape = broadcast_shapes(input_shapes)
-            return output_shape is None or len(output_shape) >= 2
+            if output_shape is None:
+                return True
+            if promotion_input_shapes:
+                if any(shape is None for shape in promotion_input_shapes):
+                    return True
+                if all(shape == output_shape for shape in promotion_input_shapes):
+                    return False
+            return len(output_shape) >= 2
         if node.op_type == "MatMul":
             input_names = [str(input_name) for input_name in getattr(node, "input", ()) if input_name]
             left_shape = input_shape

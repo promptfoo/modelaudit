@@ -8918,6 +8918,7 @@ class TestWeightDistributionSemantics:
             ("sibling_matrix_state", [2, 2], "identity", 2, False),
             ("sibling_batched_state", [2, 1, 2], "identity", 2, True),
             ("sibling_stable_three_trips", [2, 2], "identity", 3, False),
+            ("sibling_elementwise_stable_three_trips", [2, 2], "add_zero", 3, False),
             ("sibling_later_batched_state", [2, 2], "expand", 3, True),
         ],
     )
@@ -8930,11 +8931,14 @@ class TestWeightDistributionSemantics:
         trip_count: int,
         expected_gap: bool,
     ) -> None:
-        matrix_update_node = (
-            helper.make_node("Expand", ["matrix_state", "matrix_target_shape"], ["next_matrix_state"])
-            if matrix_update == "expand"
-            else helper.make_node("Identity", ["matrix_state"], ["next_matrix_state"])
-        )
+        if matrix_update == "expand":
+            matrix_update_node = helper.make_node(
+                "Expand", ["matrix_state", "matrix_target_shape"], ["next_matrix_state"]
+            )
+        elif matrix_update == "add_zero":
+            matrix_update_node = helper.make_node("Add", ["matrix_state", "zero_matrix"], ["next_matrix_state"])
+        else:
+            matrix_update_node = helper.make_node("Identity", ["matrix_state"], ["next_matrix_state"])
         body = helper.make_graph(
             [
                 helper.make_node("MatMul", ["probe", "vector_state"], ["body_y"]),
@@ -8976,6 +8980,11 @@ class TestWeightDistributionSemantics:
                 onnx.numpy_helper.from_array(np.array(trip_count, dtype=np.int64), name="trip_count"),
                 onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="initial_condition"),
                 onnx.numpy_helper.from_array(np.array(0.0, dtype=np.float32), name="dummy"),
+                *(
+                    [onnx.numpy_helper.from_array(np.zeros((2, 2), dtype=np.float32), name="zero_matrix")]
+                    if matrix_update == "add_zero"
+                    else []
+                ),
                 *(
                     [onnx.numpy_helper.from_array(np.array([2, 2, 2], dtype=np.int64), name="matrix_target_shape")]
                     if matrix_update == "expand"
