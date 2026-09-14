@@ -2282,6 +2282,44 @@ def _build_onnx_weight_analysis_plan(
                 tainted.update(body_outputs)
         return graph_output_name in promoted
 
+    def subgraph_state_input_can_reach_weight_consumer(
+        subgraph: Any,
+        graph_input_name: str,
+        opset_versions: dict[str, int],
+    ) -> bool:
+        if not graph_input_name:
+            return False
+        tainted = {graph_input_name}
+        for body_node in getattr(subgraph, "node", ()):
+            body_inputs = [str(input_name) for input_name in getattr(body_node, "input", ()) if input_name]
+            body_outputs = [str(output_name) for output_name in getattr(body_node, "output", ()) if output_name]
+            if not body_outputs:
+                continue
+            function_key = (
+                str(getattr(body_node, "domain", "")),
+                str(getattr(body_node, "op_type", "")),
+                str(getattr(body_node, "overload", "")),
+            )
+            is_model_local_function = function_key in functions
+            is_registered_standard_operator = is_model_local_function or has_registered_standard_operator(
+                body_node,
+                opset_versions,
+            )
+            if any(
+                input_name in tainted
+                and _onnx_potential_weight_input(
+                    body_node,
+                    input_index,
+                    is_model_local_function=is_model_local_function,
+                    is_registered_standard_operator=is_registered_standard_operator,
+                )
+                for input_index, input_name in enumerate(body_inputs)
+            ):
+                return True
+            if any(input_name in tainted for input_name in body_inputs):
+                tainted.update(body_outputs)
+        return False
+
     def stacked_scan_output_insert_axis(
         scan_output_axes: tuple[int, ...],
         stacked_scan_output_start: int,
@@ -5498,6 +5536,7 @@ def _build_onnx_weight_analysis_plan(
                     graph_output_rank = graph_output_ranks[graph_output_index]
                     graph_output_rank_proven = graph_output_proven_ranks[graph_output_index]
                     repeated_carried_state_rank_may_change = False
+                    repeated_carried_state_input_may_feed_weight = False
                     scan_output_insert_axis = stacked_scan_output_insert_axis(
                         scan_output_axes,
                         stacked_scan_output_start,
@@ -5567,6 +5606,23 @@ def _build_onnx_weight_analysis_plan(
                     )
                     if repeated_carried_state:
                         state_input_name = control_flow_state_input_name(output_index)
+                        subgraph_state_input_index = output_index + (
+                            2
+                            if node.op_type == "Loop"
+                            else scan_sequence_lens_input_offset(node, opset_versions)
+                            if node.op_type == "Scan"
+                            else 0
+                        )
+                        subgraph_state_input_name = (
+                            _onnx_value_name(subgraph.input[subgraph_state_input_index])
+                            if subgraph_state_input_index < len(subgraph.input)
+                            else ""
+                        )
+                        repeated_carried_state_input_may_feed_weight = subgraph_state_input_can_reach_weight_consumer(
+                            subgraph,
+                            subgraph_state_input_name,
+                            opset_versions,
+                        )
                         state_input_shape = known_value_shapes.get(state_input_name)
                         state_input_rank = (
                             len(state_input_shape)
@@ -5672,7 +5728,7 @@ def _build_onnx_weight_analysis_plan(
                         graph_output_weight_lineage_gap_counts[graph_output_index],
                     )
                     if (
-                        repeated_carried_state_rank_may_change
+                        repeated_carried_state_input_may_feed_weight
                         and graph_output_weight_lineage_gap_counts[graph_output_index]
                     ):
                         plan.record_coverage_gap(
@@ -5697,6 +5753,7 @@ def _build_onnx_weight_analysis_plan(
                         and node.op_type in {"Loop", "Scan"}
                         and not stacked_scan_output
                         and graph_output_rank_promotable_gap_count
+                        and repeated_carried_state_input_may_feed_weight
                         and (
                             (node.op_type == "Loop" and loop_may_repeat_body(node, constants, graph_input_names))
                             or (
