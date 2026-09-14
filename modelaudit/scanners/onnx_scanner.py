@@ -2382,17 +2382,18 @@ def _build_onnx_weight_analysis_plan(
             return parent_output_index >= scan_stacked_output_start(node, opset_versions)
         return False
 
-    cache_fingerprints: dict[int, tuple[str, str]] = {}
+    cache_fingerprints: dict[int, tuple[Any, tuple[str, str]]] = {}
     semantic_mapping_keys: dict[
         tuple[int, tuple[tuple[str, int], ...]],
-        tuple[tuple[str, str, str], ...],
+        tuple[Any, tuple[tuple[str, Any], ...], tuple[tuple[str, str, str], ...]],
     ] = {}
     rank_reentry_constant_name_cache: dict[tuple[int, int], frozenset[str]] = {}
 
     def semantic_cache_fingerprint(value: Any) -> tuple[str, str]:
         value_id = id(value)
-        if value_id in cache_fingerprints:
-            return cache_fingerprints[value_id]
+        cached_fingerprint = cache_fingerprints.get(value_id)
+        if cached_fingerprint is not None and cached_fingerprint[0] is value:
+            return cached_fingerprint[1]
         type_name = f"{type(value).__module__}.{type(value).__qualname__}"
         serializer = getattr(value, "SerializeToString", None)
         try:
@@ -2408,7 +2409,7 @@ def _build_onnx_weight_analysis_plan(
         except Exception:
             payload = repr(value).encode("utf-8", errors="surrogatepass")
         fingerprint = (type_name, hashlib.sha256(payload).hexdigest())
-        cache_fingerprints[value_id] = fingerprint
+        cache_fingerprints[value_id] = (value, fingerprint)
         return fingerprint
 
     def semantic_mapping_cache_key(
@@ -2423,10 +2424,19 @@ def _build_onnx_weight_analysis_plan(
             else tuple(sorted((str(name), value) for name, value in mapping.items()))
         )
         identity_key = (id(mapping), tuple((str(name), id(value)) for name, value in items))
-        if identity_key in semantic_mapping_keys:
-            return semantic_mapping_keys[identity_key]
+        cached_mapping_key = semantic_mapping_keys.get(identity_key)
+        if (
+            cached_mapping_key is not None
+            and cached_mapping_key[0] is mapping
+            and len(cached_mapping_key[1]) == len(items)
+            and all(
+                cached_name == name and cached_value is value
+                for (cached_name, cached_value), (name, value) in zip(cached_mapping_key[1], items, strict=True)
+            )
+        ):
+            return cached_mapping_key[2]
         cache_key = tuple((str(name), *semantic_cache_fingerprint(value)) for name, value in items)
-        semantic_mapping_keys[identity_key] = cache_key
+        semantic_mapping_keys[identity_key] = (mapping, items, cache_key)
         return cache_key
 
     def attribute_binding_cache_key(attribute_bindings: dict[str, Any] | None) -> tuple[tuple[str, str, str], ...]:

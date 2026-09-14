@@ -14389,17 +14389,46 @@ class TestWeightDistributionSemantics:
         assert coverage == []
         assert semantics["coverage_gaps"] == {}
 
-    def test_repeated_loop_local_function_rank_reentry_fanout_is_bounded(self, tmp_path: Path) -> None:
-        width = 6
-        depth = 5
+    def _write_local_function_rank_reentry_fanout_model(
+        self,
+        tmp_path: Path,
+        *,
+        width: int = 6,
+        depth: int = 5,
+        distinct_cache_tags: bool = False,
+        use_cache_tag_value: bool = False,
+    ) -> Path:
+        tmp_path.mkdir(parents=True, exist_ok=True)
         tag_attribute = "cache_tag"
+
+        def cache_tag(level: int, index: int) -> float:
+            return float(level * width + index + 1) if distinct_cache_tags else 7.0
+
+        def cache_tag_constant(output_name: str) -> Any:
+            node = helper.make_node("Constant", [], [output_name])
+            node.attribute.extend(
+                [
+                    onnx.AttributeProto(
+                        name="value_float",
+                        ref_attr_name=tag_attribute,
+                        type=onnx.AttributeProto.FLOAT,
+                    ),
+                ],
+            )
+            return node
+
         functions = []
         for level in range(depth, -1, -1):
             outputs = [f"out{index}" for index in range(width)]
+            tag_value = f"tag_l{level}" if use_cache_tag_value else ""
+            nodes = [cache_tag_constant(tag_value)] if use_cache_tag_value else []
             if level == depth:
-                nodes = [helper.make_node("Identity", ["state"], [output_name]) for output_name in outputs]
+                for output_name in outputs:
+                    if use_cache_tag_value:
+                        nodes.append(helper.make_node("Add", ["state", tag_value], [output_name]))
+                    else:
+                        nodes.append(helper.make_node("Identity", ["state"], [output_name]))
             else:
-                nodes = []
                 for index, output_name in enumerate(outputs):
                     child_outputs = [f"child_l{level}_o{index}_{child}" for child in range(width)]
                     nodes.append(
@@ -14408,10 +14437,15 @@ class TestWeightDistributionSemantics:
                             ["state"],
                             child_outputs,
                             domain="local",
-                            cache_tag=7,
+                            cache_tag=cache_tag(level + 1, index),
                         )
                     )
-                    nodes.append(helper.make_node("Identity", [child_outputs[0]], [output_name]))
+                    if use_cache_tag_value:
+                        adjusted_output = f"adjusted_l{level}_o{index}"
+                        nodes.append(helper.make_node("Add", [child_outputs[0], tag_value], [adjusted_output]))
+                        nodes.append(helper.make_node("Identity", [adjusted_output], [output_name]))
+                    else:
+                        nodes.append(helper.make_node("Identity", [child_outputs[0]], [output_name]))
             functions.append(
                 helper.make_function(
                     "local",
@@ -14431,7 +14465,7 @@ class TestWeightDistributionSemantics:
                     ["state"],
                     [f"function_output{index}" for index in range(width)],
                     domain="local",
-                    cache_tag=7,
+                    cache_tag=cache_tag(0, 0),
                 ),
                 helper.make_node("Identity", ["function_output0"], ["next_state"]),
                 helper.make_node("Identity", ["condition_in"], ["condition_out"]),
@@ -14472,8 +14506,17 @@ class TestWeightDistributionSemantics:
         )
         model.ir_version = 8
         onnx.checker.check_model(model)
-        path = tmp_path / "local-function-rank-reentry-fanout.onnx"
+        suffix = "distinct" if distinct_cache_tags else "same"
+        path = tmp_path / f"local-function-rank-reentry-fanout-{suffix}.onnx"
         onnx.save(model, str(path))
+        return path
+
+    def test_repeated_loop_local_function_rank_reentry_fanout_is_bounded(self, tmp_path: Path) -> None:
+        path = self._write_local_function_rank_reentry_fanout_model(
+            tmp_path,
+            distinct_cache_tags=False,
+            use_cache_tag_value=True,
+        )
 
         result = OnnxScanner().scan(str(path))
 
@@ -14481,6 +14524,49 @@ class TestWeightDistributionSemantics:
         assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
         semantics = result.metadata["onnx_weight_distribution_semantics"]
         assert semantics["coverage_gaps"] == {}
+
+    def test_local_function_attribute_fingerprint_cache_retains_protobuf_wrappers(self, tmp_path: Path) -> None:
+        scanner_path = Path(onnx_scanner_module.__file__).resolve()
+
+        for distinct_cache_tags in (False, True):
+            path = self._write_local_function_rank_reentry_fanout_model(
+                tmp_path / ("distinct" if distinct_cache_tags else "same"),
+                distinct_cache_tags=distinct_cache_tags,
+                use_cache_tag_value=True,
+            )
+            mismatch_count = 0
+            fingerprint_returns = 0
+
+            def profile(frame: Any, event: str, arg: Any) -> None:
+                nonlocal fingerprint_returns, mismatch_count
+                if (
+                    event != "return"
+                    or frame.f_code.co_name != "semantic_cache_fingerprint"
+                    or Path(frame.f_code.co_filename).resolve() != scanner_path
+                ):
+                    return
+                value = frame.f_locals.get("value")
+                serializer = getattr(value, "SerializeToString", None)
+                if not callable(serializer):
+                    return
+                expected = (
+                    f"{type(value).__module__}.{type(value).__qualname__}",
+                    hashlib.sha256(serializer(deterministic=True)).hexdigest(),
+                )
+                fingerprint_returns += 1
+                if arg != expected:
+                    mismatch_count += 1
+
+            try:
+                sys.setprofile(profile)
+                result = OnnxScanner().scan(str(path))
+            finally:
+                sys.setprofile(None)
+
+            assert result.success is True
+            assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
+            assert fingerprint_returns >= 6
+            assert mismatch_count == 0
 
     def test_local_function_scan_preserves_proven_input_extent(self, tmp_path: Path) -> None:
         source_names = [f"matrix{index}" for index in range(40)]
