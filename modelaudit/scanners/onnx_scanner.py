@@ -3507,7 +3507,13 @@ def _build_onnx_weight_analysis_plan(
             return None
         return output_rank
 
+    graph_external_reference_cache: dict[int, tuple[Any, set[str]]] = {}
+
     def graph_external_reference_names(graph: Any) -> set[str]:
+        cache_key = id(graph)
+        cached_reference_names = graph_external_reference_cache.get(cache_key)
+        if cached_reference_names is not None and cached_reference_names[0] is graph:
+            return set(cached_reference_names[1])
         local_names = {name for value_info in getattr(graph, "input", ()) if (name := _onnx_value_name(value_info))}
         local_names.update(
             str(initializer.name)
@@ -3530,7 +3536,9 @@ def _build_onnx_weight_analysis_plan(
             for attribute in getattr(graph_node, "attribute", ()):
                 for subgraph in _iter_attribute_graphs(attribute):
                     referenced_names.update(graph_external_reference_names(subgraph))
-        return referenced_names - produced_names - local_names
+        reference_names = referenced_names - produced_names - local_names
+        graph_external_reference_cache[cache_key] = (graph, set(reference_names))
+        return set(reference_names)
 
     def gap_summary_may_exceed_input_rank(summary: _OnnxWeightLineageGapSummary, input_rank: int | None) -> bool:
         if summary.truncated:
@@ -3575,7 +3583,11 @@ def _build_onnx_weight_analysis_plan(
                 left_shape = input_shapes_by_name.get(input_names[0])
                 right_shape = input_shapes_by_name.get(input_names[1]) if len(input_names) > 1 else None
             output_shape = matmul_output_shape(left_shape, right_shape)
-            return output_shape is None or len(output_shape) >= 2
+            if output_shape is None:
+                return True
+            if output_shape in (left_shape, right_shape):
+                return False
+            return len(output_shape) >= 2
         if node.op_type == "OneHot":
             input_names = [str(input_name) for input_name in getattr(node, "input", ()) if input_name]
             indices_shape = input_shape
@@ -5662,25 +5674,56 @@ def _build_onnx_weight_analysis_plan(
                             )
                             continue
                         subgraph_trusted_context_shapes[graph_input_name] = trusted_parent_shape
-                    trusted_repeated_context_shapes: dict[str, tuple[int, ...]] = {}
-                    for pair_index, graph_input_name, trusted_parent_shape in trusted_repeated_context_candidates:
-                        graph_output_index = control_flow_subgraph_state_output_index(node, pair_index, opset_versions)
-                        output_shapes: dict[int, tuple[int, ...]] = {}
-                        if (
-                            not subgraph_reenters_state_with_rank_promotion(
-                                subgraph,
-                                graph_input_name,
-                                graph_output_index,
-                                constants,
+                    remaining_trusted_repeated_context_candidates = list(trusted_repeated_context_candidates)
+                    repeated_context_proof_budget = min(
+                        _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK,
+                        max(
+                            len(remaining_trusted_repeated_context_candidates),
+                            len(remaining_trusted_repeated_context_candidates)
+                            * len(remaining_trusted_repeated_context_candidates),
+                        ),
+                    )
+                    while remaining_trusted_repeated_context_candidates and repeated_context_proof_budget > 0:
+                        unresolved_repeated_context_candidates: list[tuple[int, str, tuple[int, ...]]] = []
+                        trusted_count_before = len(subgraph_trusted_context_shapes)
+                        for (
+                            pair_index,
+                            graph_input_name,
+                            trusted_parent_shape,
+                        ) in remaining_trusted_repeated_context_candidates:
+                            if repeated_context_proof_budget <= 0:
+                                unresolved_repeated_context_candidates.append(
+                                    (pair_index, graph_input_name, trusted_parent_shape)
+                                )
+                                continue
+                            repeated_context_proof_budget -= 1
+                            graph_output_index = control_flow_subgraph_state_output_index(
+                                node,
+                                pair_index,
                                 opset_versions,
-                                trusted_parent_shape,
-                                trusted_context_shapes=subgraph_trusted_context_shapes,
-                                output_shapes_out=output_shapes,
                             )
-                            and output_shapes.get(graph_output_index) == trusted_parent_shape
-                        ):
-                            trusted_repeated_context_shapes[graph_input_name] = trusted_parent_shape
-                    subgraph_trusted_context_shapes.update(trusted_repeated_context_shapes)
+                            output_shapes: dict[int, tuple[int, ...]] = {}
+                            if (
+                                not subgraph_reenters_state_with_rank_promotion(
+                                    subgraph,
+                                    graph_input_name,
+                                    graph_output_index,
+                                    constants,
+                                    opset_versions,
+                                    trusted_parent_shape,
+                                    trusted_context_shapes=subgraph_trusted_context_shapes,
+                                    output_shapes_out=output_shapes,
+                                )
+                                and output_shapes.get(graph_output_index) == trusted_parent_shape
+                            ):
+                                subgraph_trusted_context_shapes[graph_input_name] = trusted_parent_shape
+                                continue
+                            unresolved_repeated_context_candidates.append(
+                                (pair_index, graph_input_name, trusted_parent_shape)
+                            )
+                        if len(subgraph_trusted_context_shapes) == trusted_count_before:
+                            break
+                        remaining_trusted_repeated_context_candidates = unresolved_repeated_context_candidates
                     for pair_index, (parent_input, graph_input) in enumerate(input_pairs, start=input_pair_index_start):
                         parent_name = str(parent_input)
                         graph_input_name = _onnx_value_name(graph_input)
