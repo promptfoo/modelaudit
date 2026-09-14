@@ -2009,7 +2009,9 @@ def _build_onnx_weight_analysis_plan(
     def loop_may_skip_body(node: Any, constants: dict[str, Any], graph_input_names: set[str]) -> bool:
         trip_input = str(node.input[0]) if len(node.input) > 0 and node.input[0] else ""
         condition_input = str(node.input[1]) if len(node.input) > 1 and node.input[1] else ""
-        if trip_input in graph_input_names or condition_input in graph_input_names:
+        if (trip_input in graph_input_names and trip_input not in constants) or (
+            condition_input in graph_input_names and condition_input not in constants
+        ):
             return True
         trip_count = (
             constant_scalar_value(constants.get(trip_input), int(onnx.TensorProto.INT64)) if trip_input else None
@@ -2030,7 +2032,9 @@ def _build_onnx_weight_analysis_plan(
     def loop_may_repeat_body(node: Any, constants: dict[str, Any], graph_input_names: set[str]) -> bool:
         trip_input = str(node.input[0]) if len(node.input) > 0 and node.input[0] else ""
         condition_input = str(node.input[1]) if len(node.input) > 1 and node.input[1] else ""
-        if trip_input in graph_input_names or condition_input in graph_input_names:
+        if (trip_input in graph_input_names and trip_input not in constants) or (
+            condition_input in graph_input_names and condition_input not in constants
+        ):
             return True
         trip_count = (
             constant_scalar_value(constants.get(trip_input), int(onnx.TensorProto.INT64)) if trip_input else None
@@ -2176,6 +2180,16 @@ def _build_onnx_weight_analysis_plan(
         scan_inputs = [str(input_name) for input_name in node.input[scan_input_start:] if input_name]
         if len(scan_inputs) < num_scan_inputs:
             return True
+        constant_sequence_lens: tuple[int, ...] | None = None
+        if scan_input_offset and node.input:
+            sequence_lens_input = str(node.input[0] or "")
+            if sequence_lens_input:
+                constant_sequence_lens = constant_int64_vector_values(constants.get(sequence_lens_input))
+                if constant_sequence_lens is not None:
+                    if any(length < 0 for length in constant_sequence_lens):
+                        return True
+                    if max(constant_sequence_lens, default=0) <= 1:
+                        return False
         scan_input_axes = (
             scan_input_axes
             if scan_input_axes is not None
@@ -2212,10 +2226,12 @@ def _build_onnx_weight_analysis_plan(
         scan_output_axes: tuple[int, ...],
         stacked_scan_output_start: int,
         output_index: int,
+        *,
+        default_axis: int = 0,
     ) -> int:
         scan_output_index = output_index - stacked_scan_output_start
         if scan_output_index < 0 or scan_output_index >= len(scan_output_axes):
-            return 0
+            return default_axis
         return scan_output_axes[scan_output_index]
 
     def insert_shape_axis(shape: tuple[int, ...], raw_axis: int, extent: int = -1) -> tuple[int, ...] | None:
@@ -2390,6 +2406,9 @@ def _build_onnx_weight_analysis_plan(
                 return None
             output_dimensions.append(next(iter(non_singleton_dimensions), 1))
         return tuple(reversed(output_dimensions))
+
+    def flattened_shape_extent(dimensions: tuple[int, ...]) -> int:
+        return -1 if any(dimension < 0 for dimension in dimensions) else math.prod(dimensions)
 
     def broadcast_rank_from_input_ranks(ranks: Iterable[int | None]) -> int | None:
         observed_ranks = list(ranks)
@@ -3126,7 +3145,15 @@ def _build_onnx_weight_analysis_plan(
             return lineages
         promoted_lineages: dict[int, _OnnxWeightLineage] = {}
         for initializer_index, lineage in lineages.items():
-            if lineage.unresolved_reason is None and initializer_index in constant_output_initializer_indexes:
+            target_rank = len(output_shape) if output_shape is not None else output_rank
+            lineage_rank = len(lineage.shape) if lineage.shape is not None else None
+            if (
+                lineage.unresolved_reason is None
+                and initializer_index in constant_output_initializer_indexes
+                and target_rank is not None
+                and lineage_rank is not None
+                and (target_rank <= lineage_rank or lineage_rank >= 2)
+            ):
                 promoted_lineages[initializer_index] = lineage
                 continue
             shape = None
@@ -5197,7 +5224,7 @@ def _build_onnx_weight_analysis_plan(
                     value_name = str(current_node.input[value_index]) if value_index < len(current_node.input) else ""
                 else:
                     value_name = control_flow_state_input_name(output_index)
-                value_shape = known_value_shapes.get(value_name)
+                value_shape = known_value_shapes.get(value_name) if value_name in proven_value_ranks else None
                 if value_shape:
                     return value_shape[0]
                 initializer_shape = constant_initializer_shape(constants, value_name)
@@ -5210,7 +5237,9 @@ def _build_onnx_weight_analysis_plan(
                 condition_input = (
                     str(current_node.input[1]) if len(current_node.input) > 1 and current_node.input[1] else ""
                 )
-                if trip_input in graph_input_names or condition_input in graph_input_names:
+                if (trip_input in graph_input_names and trip_input not in constants) or (
+                    condition_input in graph_input_names and condition_input not in constants
+                ):
                     return None
                 trip_count = (
                     constant_scalar_value(constants.get(trip_input), int(onnx.TensorProto.INT64))
@@ -5268,6 +5297,7 @@ def _build_onnx_weight_analysis_plan(
                         scan_output_axes,
                         stacked_scan_output_start,
                         output_index,
+                        default_axis=1 if resolved_scan_input_offset else 0,
                     )
                     scan_output_extent = -1
                     if (
@@ -5728,8 +5758,8 @@ def _build_onnx_weight_analysis_plan(
                         transform_output_rank = 2
                         if transform_input_shape is not None:
                             transform_output_shape = (
-                                math.prod(transform_input_shape[:axis]),
-                                math.prod(transform_input_shape[axis:]),
+                                flattened_shape_extent(transform_input_shape[:axis]),
+                                flattened_shape_extent(transform_input_shape[axis:]),
                             )
                 elif node.op_type == "Reshape" and len(input_names) > 1:
                     shape_initializer = constants.get(input_names[1])

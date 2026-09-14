@@ -7381,11 +7381,110 @@ class TestWeightDistributionSemantics:
             assert result.success is False
             assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
             assert semantics["coverage_gaps"]
+            assert semantics["coverage_gaps"]["lineages_per_value_limit"] > 0
             assert semantics["analyzed_layer_count"] == 0
         else:
             assert result.success is True
             assert not coverage
             assert semantics["coverage_gaps"] == {}
+
+    @pytest.mark.parametrize("kind", ["state_vector", "stacked_scalar"])
+    def test_scan_opset8_constant_rank_increase_fails_closed(self, tmp_path: Path, kind: str) -> None:
+        state_shape = [4] if kind == "state_vector" else [1]
+        constant_array = np.ones((4,), dtype=np.float32) if kind == "state_vector" else np.array(1.0, dtype=np.float32)
+        if kind == "state_vector":
+            body_nodes = [
+                helper.make_node(
+                    "Constant",
+                    [],
+                    ["body_constant"],
+                    value=onnx.numpy_helper.from_array(constant_array),
+                ),
+                helper.make_node("Identity", ["body_constant"], ["next_state"]),
+                helper.make_node("Identity", ["element"], ["next_element"]),
+            ]
+            body_outputs = [
+                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, [4]),
+                helper.make_tensor_value_info("next_element", TensorProto.FLOAT, [1]),
+            ]
+            weight_output = "scan_state"
+            y_shape = [1, 4]
+            scan_output_shape = [2, 1, 1]
+        else:
+            body_nodes = [
+                helper.make_node(
+                    "Constant",
+                    [],
+                    ["body_constant"],
+                    value=onnx.numpy_helper.from_array(constant_array),
+                ),
+                helper.make_node("Identity", ["state"], ["next_state"]),
+                helper.make_node("Identity", ["body_constant"], ["next_element"]),
+            ]
+            body_outputs = [
+                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, [1]),
+                helper.make_tensor_value_info("next_element", TensorProto.FLOAT, []),
+            ]
+            weight_output = "scan_output"
+            y_shape = [1, 1]
+            scan_output_shape = [2, 1]
+        body = helper.make_graph(
+            body_nodes,
+            "scan8_constant_rank_increase_body",
+            [
+                helper.make_tensor_value_info("state", TensorProto.FLOAT, state_shape),
+                helper.make_tensor_value_info("element", TensorProto.FLOAT, [1]),
+            ],
+            body_outputs,
+        )
+        graph = helper.make_graph(
+            [
+                helper.make_node(
+                    "Scan",
+                    ["", "initial", "values"],
+                    ["scan_state", "scan_output"],
+                    body=body,
+                    num_scan_inputs=1,
+                ),
+                helper.make_node("MatMul", ["X", weight_output], ["Y"]),
+            ],
+            "scan_opset8_constant_rank_increase_fails_closed",
+            [
+                helper.make_tensor_value_info("initial", TensorProto.FLOAT, [2, *state_shape]),
+                helper.make_tensor_value_info("values", TensorProto.FLOAT, [2, 1, 1]),
+                helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 2]),
+            ],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, y_shape)],
+            value_info=[
+                helper.make_tensor_value_info("scan_state", TensorProto.FLOAT, [2, *state_shape]),
+                helper.make_tensor_value_info("scan_output", TensorProto.FLOAT, scan_output_shape),
+            ],
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 8)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        onnx.checker.check_model(model, full_check=True)
+        path = tmp_path / f"scan-opset8-constant-rank-increase-{kind}.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        assert result.success is False
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
+        assert coverage[0].details["eligible_initializers"] == 1
+        assert coverage[0].details["analyzed_initializers"] == 0
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        if kind == "state_vector":
+            assert coverage[0].details["coverage_gap"] == "partial_initializer_coverage"
+            assert coverage[0].details["extraction_failures"] == 1
+            assert semantics["coverage_gaps"] == {}
+        else:
+            assert coverage[0].details["coverage_gap"] == "unresolved_initializer_lineage"
+            assert coverage[0].details["extraction_failures"] == 0
+            assert semantics["coverage_gaps"]["unresolved_initializer_lineage"] == 1
+        assert semantics["eligible_initializer_count"] == 1
+        assert semantics["analyzed_layer_count"] == 0
 
     @pytest.mark.parametrize(
         (
@@ -7616,7 +7715,7 @@ class TestWeightDistributionSemantics:
         assert body_call["bound_shapes"]["state"] == (5,)
         assert body_call["bound_shapes"]["element"] == (4,)
         assert root_return["shapes"]["state_out"] == (2, 5)
-        assert root_return["shapes"]["scan_out"] == (2, -1, 4)
+        assert root_return["shapes"]["scan_out"] == (2, 4, -1)
         assert plan.coverage_gaps == {}
 
     @pytest.mark.parametrize(
@@ -7709,7 +7808,7 @@ class TestWeightDistributionSemantics:
         assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
         semantics = result.metadata["onnx_weight_distribution_semantics"]
         assert semantics["coverage_gaps"]["unresolved_initializer_lineage"] >= 1
-        if source_count > 32:
+        if kind == "state_vector" and source_count > 32:
             assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
 
     @pytest.mark.parametrize("kind", ["state_vector", "stacked_scalar"])
