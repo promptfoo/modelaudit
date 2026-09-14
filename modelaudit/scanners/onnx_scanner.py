@@ -2407,10 +2407,14 @@ def _build_onnx_weight_analysis_plan(
     rank_reentry_constant_name_cache: dict[tuple[int, int], frozenset[str]] = {}
 
     def semantic_cache_fingerprint(value: Any) -> tuple[str, str]:
+        return semantic_cache_fingerprint_with_owner(value, retain_owner=True)
+
+    def semantic_cache_fingerprint_with_owner(value: Any, *, retain_owner: bool) -> tuple[str, str]:
         value_id = id(value)
-        cached_fingerprint = cache_fingerprints.get(value_id)
-        if cached_fingerprint is not None and cached_fingerprint[0] is value:
-            return cached_fingerprint[1]
+        if retain_owner:
+            cached_fingerprint = cache_fingerprints.get(value_id)
+            if cached_fingerprint is not None and cached_fingerprint[0] is value:
+                return cached_fingerprint[1]
         type_name = f"{type(value).__module__}.{type(value).__qualname__}"
         serializer = getattr(value, "SerializeToString", None)
         try:
@@ -2426,7 +2430,8 @@ def _build_onnx_weight_analysis_plan(
         except Exception:
             payload = repr(value).encode("utf-8", errors="surrogatepass")
         fingerprint = (type_name, hashlib.sha256(payload).hexdigest())
-        cache_fingerprints[value_id] = (value, fingerprint)
+        if retain_owner:
+            cache_fingerprints[value_id] = (value, fingerprint)
         return fingerprint
 
     def semantic_mapping_cache_key(
@@ -2436,6 +2441,11 @@ def _build_onnx_weight_analysis_plan(
         if not mapping:
             return ()
         names_key = tuple(sorted(str(name) for name in names)) if names is not None else None
+        if names_key is None:
+            return tuple(
+                (str(name), *semantic_cache_fingerprint_with_owner(value, retain_owner=False))
+                for name, value in sorted((str(name), value) for name, value in mapping.items())
+            )
         owner_key = (id(mapping), names_key)
         cached_mapping_key = semantic_mapping_keys.get(owner_key)
         if (
@@ -2444,10 +2454,7 @@ def _build_onnx_weight_analysis_plan(
             and cached_mapping_key[1] == len(mapping)
         ):
             return cached_mapping_key[2]
-        if names_key is not None:
-            items = tuple((name, mapping[name]) for name in names_key if name in mapping)
-        else:
-            items = tuple(sorted((str(name), value) for name, value in mapping.items()))
+        items = tuple((name, mapping[name]) for name in names_key if name in mapping)
         cache_key = tuple((str(name), *semantic_cache_fingerprint(value)) for name, value in items)
         semantic_mapping_keys[owner_key] = (mapping, len(mapping), cache_key)
         return cache_key
@@ -2585,14 +2592,20 @@ def _build_onnx_weight_analysis_plan(
             index_input_shape = tainted_shapes.get(body_inputs[1]) if len(body_inputs) > 1 else None
             if index_input_shape is None and body_node.op_type in {"Gather", "GatherND"} and len(body_inputs) > 1:
                 index_input_shape = constant_initializer_shape(subgraph_constants, body_inputs[1])
+            input_shapes_by_name = {
+                input_name: tainted_shapes.get(input_name) or constant_initializer_shape(subgraph_constants, input_name)
+                for input_name in body_inputs
+            }
             data_input_may_promote = data_input_tainted and operator_output_may_have_weight_rank(
                 body_node,
                 input_shape=data_input_shape,
                 index_shape=index_input_shape,
                 constants=subgraph_constants,
                 resolve_attribute=resolve_reentry_attribute,
+                input_shapes_by_name=input_shapes_by_name,
             )
             function_promoted_outputs: set[str] = set()
+            function_tainted_outputs: set[str] = set()
             nested_promoted_outputs: set[str] = set()
             if function is not None and any_tainted:
                 function_attributes = bound_function_attributes(function, body_node, resolve_reentry_attribute)
@@ -2607,6 +2620,18 @@ def _build_onnx_weight_analysis_plan(
                         continue
                     function_input_name = _onnx_value_name(function.input[input_index])
                     function_input_shape = tainted_shapes.get(input_name)
+                    function_tainted_outputs.update(
+                        mapped_node_outputs(
+                            body_outputs,
+                            graph_tainted_output_indexes(
+                                function,
+                                {function_input_name},
+                                function_versions,
+                                attribute_bindings=function_attributes,
+                                depth=depth + 1,
+                            ),
+                        )
+                    )
                     for output_index, output_name in enumerate(body_outputs):
                         if subgraph_reenters_state_with_rank_promotion(
                             function,
@@ -2684,20 +2709,30 @@ def _build_onnx_weight_analysis_plan(
                             )
                         )
             promoted_outputs = function_promoted_outputs | nested_promoted_outputs
+            body_tainted_outputs = function_tainted_outputs if function is not None else set(body_outputs)
             if (
                 data_input_promoted
                 or any_promoted
-                or (is_rank_gap_promoting_operator(body_node) and data_input_may_promote)
+                or (
+                    (
+                        is_rank_gap_promoting_operator(body_node)
+                        or body_node.op_type in _SAME_TYPE_ELEMENTWISE_OPERATORS
+                        or body_node.op_type == "Pow"
+                    )
+                    and data_input_may_promote
+                )
                 or promoted_outputs
             ):
-                promoted.update(promoted_outputs or body_outputs)
-                tainted.update(body_outputs)
+                promoted.update(promoted_outputs or body_tainted_outputs)
+                tainted.update(body_tainted_outputs)
             elif any_tainted:
-                tainted.update(body_outputs)
+                tainted.update(body_tainted_outputs)
             if any_tainted and data_input_shape is not None:
                 output_shape = None
                 if body_node.op_type in {"Cast", "Identity", "Relu"}:
                     output_shape = data_input_shape
+                elif body_node.op_type in _SAME_TYPE_ELEMENTWISE_OPERATORS | {"Pow"}:
+                    output_shape = broadcast_shapes(input_shapes_by_name.get(input_name) for input_name in body_inputs)
                 elif body_node.op_type == "Expand":
                     shape_name = body_inputs[1] if len(body_inputs) > 1 else ""
                     target_shape = constant_int64_vector_values(subgraph_constants.get(shape_name))
@@ -3169,7 +3204,17 @@ def _build_onnx_weight_analysis_plan(
         index_shape: tuple[int, ...] | None,
         constants: dict[str, Any],
         resolve_attribute: Callable[[Any], Any | None] | None = None,
+        input_shapes_by_name: dict[str, tuple[int, ...] | None] | None = None,
     ) -> bool:
+        if node.op_type in _SAME_TYPE_ELEMENTWISE_OPERATORS or node.op_type == "Pow":
+            input_names = [str(input_name) for input_name in getattr(node, "input", ()) if input_name]
+            input_shapes = (
+                [input_shapes_by_name.get(input_name) for input_name in input_names] if input_shapes_by_name else []
+            )
+            if not input_shapes or any(shape is None for shape in input_shapes):
+                return True
+            output_shape = broadcast_shapes(input_shapes)
+            return output_shape is None or len(output_shape) >= 2
         if node.op_type == "Expand":
             shape_name = str(node.input[1]) if len(node.input) > 1 else ""
             target_shape = constant_int64_vector_values(constants.get(shape_name))
@@ -6327,6 +6372,13 @@ def _build_onnx_weight_analysis_plan(
                         stacked_scan_output_start,
                         output_index,
                     )
+                    scan_output_index = output_index - stacked_scan_output_start
+                    if (
+                        resolved_scan_input_offset
+                        and 0 <= scan_output_index < len(scan_output_axes)
+                        and scan_output_insert_axis >= 0
+                    ):
+                        scan_output_insert_axis = max(scan_output_insert_axis - 1, 0)
                     scan_output_extent = -1
                     if stacked_scan_output and standard_control_flow_operator:
                         if (
