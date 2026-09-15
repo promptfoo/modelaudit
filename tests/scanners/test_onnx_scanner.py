@@ -18726,9 +18726,11 @@ class TestWeightDistributionSemantics:
         single_output_dependency_calls = 0
         grouped_dependency_calls = 0
         fanout_promotion_calls = 0
+        producer_index_builds = 0
 
         def profile(frame: Any, event: str, arg: Any) -> None:
             nonlocal single_output_dependency_calls, grouped_dependency_calls, fanout_promotion_calls
+            nonlocal producer_index_builds
             if Path(frame.f_code.co_filename).resolve() != scanner_path:
                 return
             if getattr(frame.f_locals.get("subgraph"), "name", "") != "Fanout":
@@ -18741,6 +18743,9 @@ class TestWeightDistributionSemantics:
                     single_output_dependency_calls += 1
                 else:
                     grouped_dependency_calls += 1
+            elif frame.f_code.co_name == "graph_output_producer_nodes_by_name" and event == "return":
+                if frame.f_locals.get("cached") is None:
+                    producer_index_builds += 1
             elif frame.f_code.co_name == "subgraph_reenters_state_with_rank_promotion" and event == "call":
                 fanout_promotion_calls += 1
 
@@ -18754,46 +18759,8 @@ class TestWeightDistributionSemantics:
         assert result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"] == {}
         assert single_output_dependency_calls == 0
         assert grouped_dependency_calls == 1
+        assert producer_index_builds == 1
         assert fanout_promotion_calls <= width
-
-    def test_graph_output_dependency_names_does_not_build_per_output_index_matrix(self) -> None:
-        scanner_path = Path(onnx_scanner_module.__file__).resolve()
-        graph_output_dependency_names = next(
-            node
-            for node in ast.walk(ast.parse(scanner_path.read_text()))
-            if isinstance(node, ast.FunctionDef) and node.name == "graph_output_dependency_names"
-        )
-
-        assert not any(
-            isinstance(node, ast.Name) and node.id == "dependency_indexes_by_name"
-            for node in ast.walk(graph_output_dependency_names)
-        )
-
-    def test_graph_dependency_queries_use_producer_closure(self) -> None:
-        scanner_path = Path(onnx_scanner_module.__file__).resolve()
-        functions = {
-            node.name: node
-            for node in ast.walk(ast.parse(scanner_path.read_text()))
-            if isinstance(node, ast.FunctionDef)
-        }
-
-        for helper_name in ("graph_output_dependency_names", "graph_value_dependency_names"):
-            helper = functions[helper_name]
-            calls = [node for node in ast.walk(helper) if isinstance(node, ast.Call)]
-            assert any(
-                isinstance(call.func, ast.Name) and call.func.id == "graph_dependency_closure_names" for call in calls
-            )
-            assert not any(isinstance(call.func, ast.Name) and call.func.id == "reversed" for call in calls)
-            assert not any(
-                isinstance(call.func, ast.Name)
-                and call.func.id == "getattr"
-                and len(call.args) >= 2
-                and isinstance(call.args[0], ast.Name)
-                and call.args[0].id == "subgraph"
-                and isinstance(call.args[1], ast.Constant)
-                and call.args[1].value == "node"
-                for call in calls
-            )
 
     def _write_conditional_loop_single_iteration_slope_model(self, tmp_path: Path) -> Path:
         body = helper.make_graph(

@@ -2785,8 +2785,7 @@ def _build_onnx_weight_analysis_plan(
     node_input_names_cache: dict[int, tuple[Any, list[str]]] = {}
     node_input_slots_cache: dict[int, tuple[Any, list[str]]] = {}
     node_output_names_cache: dict[int, tuple[Any, list[str]]] = {}
-    graph_output_producer_cache: dict[int, tuple[Any, dict[str, frozenset[int]]]] = {}
-    graph_output_producer_nodes_cache: dict[int, tuple[Any, dict[str, tuple[Any, ...]]]] = {}
+    graph_output_producer_cache: dict[int, tuple[Any, dict[str, tuple[Any, ...]]]] = {}
     dependency_collection_limit_marker = "\0modelaudit_dependency_collection_limit\0"
 
     def dependency_names_exceeded_limit(dependency_names: frozenset[str]) -> bool:
@@ -2828,23 +2827,9 @@ def _build_onnx_weight_analysis_plan(
         node_output_names_cache[cache_key] = (node, names)
         return names
 
-    def graph_output_producer_ids_by_name(subgraph: Any) -> dict[str, frozenset[int]]:
-        cache_key = id(subgraph)
-        cached = graph_output_producer_cache.get(cache_key)
-        if cached is not None and cached[0] is subgraph:
-            return cached[1]
-        producers: dict[str, set[int]] = {}
-        for node in getattr(subgraph, "node", ()):
-            node_id = id(node)
-            for output_name in node_output_names(node):
-                producers.setdefault(output_name, set()).add(node_id)
-        frozen = {name: frozenset(node_ids) for name, node_ids in producers.items()}
-        graph_output_producer_cache[cache_key] = (subgraph, frozen)
-        return frozen
-
     def graph_output_producer_nodes_by_name(subgraph: Any) -> dict[str, tuple[Any, ...]]:
         cache_key = id(subgraph)
-        cached = graph_output_producer_nodes_cache.get(cache_key)
+        cached = graph_output_producer_cache.get(cache_key)
         if cached is not None and cached[0] is subgraph:
             return cached[1]
         producers: dict[str, list[Any]] = {}
@@ -2852,14 +2837,14 @@ def _build_onnx_weight_analysis_plan(
             for output_name in node_output_names(node):
                 producers.setdefault(output_name, []).append(node)
         frozen = {name: tuple(nodes) for name, nodes in producers.items()}
-        graph_output_producer_nodes_cache[cache_key] = (subgraph, frozen)
+        graph_output_producer_cache[cache_key] = (subgraph, frozen)
         return frozen
 
     def graph_nodes_producing_names(subgraph: Any, dependency_names: Iterable[str]) -> frozenset[int]:
-        producers = graph_output_producer_ids_by_name(subgraph)
+        producers = graph_output_producer_nodes_by_name(subgraph)
         node_ids: set[int] = set()
         for dependency_name in dependency_names:
-            node_ids.update(producers.get(dependency_name, ()))
+            node_ids.update(id(node) for node in producers.get(dependency_name, ()))
         return frozenset(node_ids)
 
     def graph_node_direct_dependency_names(
