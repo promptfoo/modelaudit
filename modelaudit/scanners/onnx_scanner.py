@@ -3657,6 +3657,7 @@ def _build_onnx_weight_analysis_plan(
     weight_reachability_cache: dict[tuple[Any, ...], bool] = {}
     weight_reachability_in_progress: set[tuple[Any, ...]] = set()
     potential_weight_consumer_cache: dict[tuple[Any, ...], bool] = {}
+    potential_weight_consumer_dependency_cache: dict[tuple[Any, ...], frozenset[str]] = {}
 
     def subgraph_has_potential_weight_consumer(
         subgraph: Any,
@@ -3732,6 +3733,88 @@ def _build_onnx_weight_analysis_plan(
         potential_weight_consumer_cache[cache_key] = False
         return False
 
+    def subgraph_potential_weight_consumer_dependency_names(
+        subgraph: Any,
+        opset_versions: dict[str, int],
+        *,
+        attribute_bindings: dict[str, Any] | None = None,
+        depth: int = 0,
+    ) -> frozenset[str]:
+        cache_key = (
+            id(subgraph),
+            opset_cache_key(opset_versions),
+            attribute_binding_cache_key(attribute_bindings),
+            depth,
+        )
+        if cache_key in potential_weight_consumer_dependency_cache:
+            return potential_weight_consumer_dependency_cache[cache_key]
+        local_attribute_bindings = attribute_bindings or {}
+
+        def resolve_reentry_attribute(attribute: Any) -> Any | None:
+            reference_name = str(getattr(attribute, "ref_attr_name", ""))
+            return local_attribute_bindings.get(reference_name) if reference_name else attribute
+
+        dependencies: set[str] = set()
+        for body_node in getattr(subgraph, "node", ()):
+            body_input_slots = node_input_slots(body_node)
+            function_key = (
+                str(getattr(body_node, "domain", "")),
+                str(getattr(body_node, "op_type", "")),
+                str(getattr(body_node, "overload", "")),
+            )
+            function = functions.get(function_key)
+            is_model_local_function = function_key in functions
+            is_registered_standard_operator = is_model_local_function or has_registered_standard_operator(
+                body_node,
+                opset_versions,
+            )
+            if function is not None:
+                function_attributes = bound_function_attributes(function, body_node, resolve_reentry_attribute)
+                function_versions = function_opset_versions(function, opset_versions)
+                if subgraph_has_potential_weight_consumer(
+                    function,
+                    function_versions,
+                    attribute_bindings=function_attributes,
+                    depth=depth + 1,
+                ):
+                    dependencies.update(input_name for input_name in body_input_slots if input_name)
+                continue
+            for input_index, input_name in enumerate(body_input_slots):
+                if input_name and _onnx_potential_weight_input(
+                    body_node,
+                    input_index,
+                    is_model_local_function=is_model_local_function,
+                    is_registered_standard_operator=is_registered_standard_operator,
+                ):
+                    dependencies.add(input_name)
+            parent_inputs = {input_name for input_name in body_input_slots if input_name}
+            if not parent_inputs:
+                continue
+            for attribute in getattr(body_node, "attribute", ()):
+                resolved_attribute = resolve_reentry_attribute(attribute)
+                if resolved_attribute is None:
+                    continue
+                for nested_graph in _iter_attribute_graphs(resolved_attribute):
+                    if not subgraph_has_potential_weight_consumer(
+                        nested_graph,
+                        opset_versions,
+                        attribute_bindings=local_attribute_bindings,
+                        depth=depth + 1,
+                    ):
+                        continue
+                    dependencies.update(graph_external_reference_names(nested_graph))
+                    dependencies.update(
+                        bound_control_flow_graph_inputs(
+                            body_node,
+                            nested_graph,
+                            parent_inputs,
+                            opset_versions,
+                        ).values()
+                    )
+        result = frozenset(dependencies)
+        potential_weight_consumer_dependency_cache[cache_key] = result
+        return result
+
     def subgraph_state_input_can_reach_weight_consumer(
         subgraph: Any,
         graph_input_name: str,
@@ -3785,11 +3868,19 @@ def _build_onnx_weight_analysis_plan(
 
         body_nodes = tuple(getattr(subgraph, "node", ()))
         live_names = {name for output in getattr(subgraph, "output", ()) if (name := _onnx_value_name(output))}
+        live_names.update(
+            subgraph_potential_weight_consumer_dependency_names(
+                subgraph,
+                opset_versions,
+                attribute_bindings=attribute_bindings,
+                depth=depth,
+            )
+        )
         live_node_ids = set(graph_nodes_producing_names(subgraph, live_names))
-        live_node_ids_after_node: dict[int, frozenset[int]] = {}
+        node_output_is_live_after_node: dict[int, bool] = {}
         for body_node in reversed(body_nodes):
-            live_node_ids_after_node[id(body_node)] = frozenset(live_node_ids)
             output_is_live = id(body_node) in live_node_ids
+            node_output_is_live_after_node[id(body_node)] = output_is_live
             if not output_is_live:
                 continue
             live_body_inputs = node_input_names(body_node)
@@ -3809,7 +3900,7 @@ def _build_onnx_weight_analysis_plan(
             body_outputs = node_output_names(body_node)
             if not body_outputs:
                 continue
-            body_outputs_live_after = id(body_node) in live_node_ids_after_node.get(id(body_node), frozenset())
+            body_outputs_live_after = node_output_is_live_after_node.get(id(body_node), False)
             function_key = (
                 str(getattr(body_node, "domain", "")),
                 str(getattr(body_node, "op_type", "")),
@@ -3821,6 +3912,20 @@ def _build_onnx_weight_analysis_plan(
                 body_node,
                 opset_versions,
             )
+            function_attributes: dict[str, Any] | None = None
+            function_versions: dict[str, int] | None = None
+            function_has_weight_consumer: bool | None = None
+            if not body_outputs_live_after and function is not None:
+                function_attributes = bound_function_attributes(function, body_node, resolve_reentry_attribute)
+                function_versions = function_opset_versions(function, opset_versions)
+                function_has_weight_consumer = subgraph_has_potential_weight_consumer(
+                    function,
+                    function_versions,
+                    attribute_bindings=function_attributes,
+                    depth=depth + 1,
+                )
+                if not function_has_weight_consumer:
+                    continue
             if not body_outputs_live_after and function is None:
                 raw_input_count = len(getattr(body_node, "input", ()))
                 direct_potential_weight_input = any(
@@ -3862,14 +3967,17 @@ def _build_onnx_weight_analysis_plan(
             inspected_nested_taint = False
             if any_tainted:
                 if function is not None:
-                    function_attributes = bound_function_attributes(function, body_node, resolve_reentry_attribute)
-                    function_versions = function_opset_versions(function, opset_versions)
-                    function_has_weight_consumer = subgraph_has_potential_weight_consumer(
-                        function,
-                        function_versions,
-                        attribute_bindings=function_attributes,
-                        depth=depth + 1,
-                    )
+                    if function_attributes is None:
+                        function_attributes = bound_function_attributes(function, body_node, resolve_reentry_attribute)
+                    if function_versions is None:
+                        function_versions = function_opset_versions(function, opset_versions)
+                    if function_has_weight_consumer is None:
+                        function_has_weight_consumer = subgraph_has_potential_weight_consumer(
+                            function,
+                            function_versions,
+                            attribute_bindings=function_attributes,
+                            depth=depth + 1,
+                        )
                     function_input_names: set[str] = set()
                     for input_index, input_name in enumerate(body_inputs):
                         if input_name not in tainted or input_index >= len(getattr(function, "input", ())):

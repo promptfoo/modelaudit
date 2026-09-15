@@ -9493,6 +9493,165 @@ class TestWeightDistributionSemantics:
             assert coverage == []
             assert semantics["coverage_gaps"] == {}
 
+    @pytest.mark.parametrize(("trip_count", "expected_gap"), [(2, False), (3, True)])
+    def test_repeated_loop_reentry_traces_alias_into_dead_weight_consumer(
+        self,
+        tmp_path: Path,
+        trip_count: int,
+        expected_gap: bool,
+    ) -> None:
+        source_names = [f"W{index}" for index in range(40)]
+        body = helper.make_graph(
+            [
+                helper.make_node("Identity", ["state"], ["state_alias"]),
+                helper.make_node("PRelu", ["activation", "state_alias"], ["body_y"]),
+                helper.make_node("Unsqueeze", ["state", "axes"], ["next_state"]),
+                helper.make_node("Identity", ["condition_in"], ["condition_out"]),
+            ],
+            "retained_loop_reentry_alias_finite_scalar_rank_body",
+            [
+                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
+                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("state", TensorProto.FLOAT, None),
+            ],
+            [
+                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, None),
+            ],
+        )
+        graph = helper.make_graph(
+            [
+                helper.make_node("Sum", source_names, ["initial_state"]),
+                helper.make_node(
+                    "Loop",
+                    ["trip_count", "initial_condition", "initial_state"],
+                    ["final_state"],
+                    body=body,
+                ),
+                helper.make_node("Identity", ["dummy"], ["Y"]),
+            ],
+            "retained_loop_reentry_alias_finite_scalar_rank",
+            [helper.make_tensor_value_info("activation", TensorProto.FLOAT, [1, 1])],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [])],
+            initializer=[
+                *[onnx.numpy_helper.from_array(np.array(1.0, dtype=np.float32), name=name) for name in source_names],
+                onnx.numpy_helper.from_array(np.array([0], dtype=np.int64), name="axes"),
+                onnx.numpy_helper.from_array(np.array(trip_count, dtype=np.int64), name="trip_count"),
+                onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="initial_condition"),
+                onnx.numpy_helper.from_array(np.array(0.0, dtype=np.float32), name="dummy"),
+            ],
+            value_info=[helper.make_tensor_value_info("initial_state", TensorProto.FLOAT, [])],
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / f"retained-loop-reentry-alias-finite-scalar-rank-{trip_count}.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        if expected_gap:
+            assert result.success is False
+            assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
+            assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
+        else:
+            assert result.success is True
+            assert coverage == []
+            assert semantics["coverage_gaps"] == {}
+
+    def test_repeated_loop_reentry_liveness_uses_per_node_flags(self, tmp_path: Path) -> None:
+        source_names = [f"W{index}" for index in range(40)]
+        chain_length = 64
+        body = helper.make_graph(
+            [
+                helper.make_node("PRelu", ["activation", "state"], ["body_y"]),
+                *[
+                    helper.make_node(
+                        "Identity",
+                        ["state" if index == 0 else f"state_alias{index - 1}"],
+                        [f"state_alias{index}"],
+                    )
+                    for index in range(chain_length)
+                ],
+                helper.make_node("Unsqueeze", [f"state_alias{chain_length - 1}", "axes"], ["next_state"]),
+                helper.make_node("Identity", ["condition_in"], ["condition_out"]),
+            ],
+            "retained_loop_reentry_liveness_chain_body",
+            [
+                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
+                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("state", TensorProto.FLOAT, None),
+            ],
+            [
+                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, None),
+            ],
+        )
+        graph = helper.make_graph(
+            [
+                helper.make_node("Sum", source_names, ["initial_state"]),
+                helper.make_node(
+                    "Loop",
+                    ["trip_count", "initial_condition", "initial_state"],
+                    ["final_state"],
+                    body=body,
+                ),
+                helper.make_node("Identity", ["dummy"], ["Y"]),
+            ],
+            "retained_loop_reentry_liveness_chain",
+            [helper.make_tensor_value_info("activation", TensorProto.FLOAT, [1, 1])],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [])],
+            initializer=[
+                *[onnx.numpy_helper.from_array(np.array(1.0, dtype=np.float32), name=name) for name in source_names],
+                onnx.numpy_helper.from_array(np.array([0], dtype=np.int64), name="axes"),
+                onnx.numpy_helper.from_array(np.array(3, dtype=np.int64), name="trip_count"),
+                onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="initial_condition"),
+                onnx.numpy_helper.from_array(np.array(0.0, dtype=np.float32), name="dummy"),
+            ],
+            value_info=[helper.make_tensor_value_info("initial_state", TensorProto.FLOAT, [])],
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / "retained-loop-reentry-liveness-chain.onnx"
+        onnx.save(model, str(path))
+
+        scanner_path = Path(onnx_scanner_module.__file__).resolve()
+        retained_snapshot_entries = 0
+        live_flag_counts: list[int] = []
+
+        def profile(frame: Any, event: str, _arg: Any) -> None:
+            nonlocal retained_snapshot_entries
+            if (
+                event != "return"
+                or Path(frame.f_code.co_filename).resolve() != scanner_path
+                or frame.f_code.co_name != "subgraph_state_input_can_reach_weight_consumer"
+            ):
+                return
+            retained_snapshot_entries += sum(
+                len(snapshot)
+                for snapshot in frame.f_locals.get("live_node_ids_after_node", {}).values()
+                if isinstance(snapshot, frozenset)
+            )
+            live_flag_counts.append(len(frame.f_locals.get("node_output_is_live_after_node", {})))
+
+        sys.setprofile(profile)
+        try:
+            result = OnnxScanner().scan(str(path))
+        finally:
+            sys.setprofile(None)
+
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert result.success is False
+        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
+        assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
+        assert retained_snapshot_entries == 0
+        assert live_flag_counts
+        assert max(live_flag_counts) <= chain_length + 3
+
     def test_nested_loop_reachability_preserves_empty_optional_input_slots(self, tmp_path: Path) -> None:
         source_names = [f"W{index}" for index in range(40)]
         nested_body = helper.make_graph(
@@ -17695,6 +17854,27 @@ class TestWeightDistributionSemantics:
 
         original_potential_weight_input = onnx_scanner_module._onnx_potential_weight_input
         local_function_helper_input_checks = 0
+        scanner_path = Path(onnx_scanner_module.__file__).resolve()
+        generator_lines: set[int] = set()
+        for syntax_node in ast.walk(ast.parse(scanner_path.read_text())):
+            if not (
+                isinstance(syntax_node, ast.FunctionDef)
+                and syntax_node.name == "subgraph_state_input_can_reach_weight_consumer"
+            ):
+                continue
+            for child in ast.walk(syntax_node):
+                if not (
+                    isinstance(child, ast.Assign)
+                    and any(isinstance(target, ast.Name) and target.id == "any_tainted" for target in child.targets)
+                ):
+                    continue
+                generator_lines.update(
+                    grandchild.lineno
+                    for grandchild in ast.walk(child.value)
+                    if isinstance(grandchild, ast.GeneratorExp)
+                )
+        assert len(generator_lines) == 1
+        dead_input_taint_predicates = 0
 
         def counting_potential_weight_input(*args: Any, **kwargs: Any) -> bool:
             nonlocal local_function_helper_input_checks
@@ -17708,13 +17888,32 @@ class TestWeightDistributionSemantics:
                 local_function_helper_input_checks += 1
             return original_potential_weight_input(*args, **kwargs)
 
+        def count_dead_input_predicate_work(frame: Any, event: str, arg: Any) -> None:
+            nonlocal dead_input_taint_predicates
+            if (
+                event == "return"
+                and isinstance(arg, bool)
+                and Path(frame.f_code.co_filename).resolve() == scanner_path
+                and frame.f_code.co_name == "<genexpr>"
+                and frame.f_code.co_firstlineno in generator_lines
+            ):
+                caller = frame.f_back
+                node = caller.f_locals.get("body_node") if caller is not None else None
+                if getattr(node, "op_type", "") == "NoConsumer":
+                    dead_input_taint_predicates += 1
+
         monkeypatch.setattr(onnx_scanner_module, "_onnx_potential_weight_input", counting_potential_weight_input)
 
-        result = OnnxScanner().scan(str(path))
+        sys.setprofile(count_dead_input_predicate_work)
+        try:
+            result = OnnxScanner().scan(str(path))
+        finally:
+            sys.setprofile(None)
 
         assert result.success is True
         assert result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"] == {}
         assert local_function_helper_input_checks == 0
+        assert dead_input_taint_predicates == 0
 
     def _write_repeated_local_function_cached_shape_model(self, tmp_path: Path) -> Path:
         function = helper.make_function(
