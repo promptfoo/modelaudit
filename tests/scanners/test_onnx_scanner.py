@@ -10066,18 +10066,19 @@ class TestWeightDistributionSemantics:
             assert semantics["coverage_gaps"] == {}
 
     @pytest.mark.parametrize(
-        ("control_flow_op", "rank_promotes", "expected_gap"),
+        ("control_flow_op", "body_state_op", "expected_gap"),
         [
-            ("Loop", False, False),
-            ("Loop", True, True),
-            ("Scan", False, False),
+            ("Loop", "identity", False),
+            ("Loop", "unsqueeze", True),
+            ("Loop", "einsum", True),
+            ("Scan", "identity", False),
         ],
     )
     def test_repeated_control_flow_promotes_body_created_carried_gap_before_reentry(
         self,
         tmp_path: Path,
         control_flow_op: str,
-        rank_promotes: bool,
+        body_state_op: str,
         expected_gap: bool,
     ) -> None:
         source_names = [f"W{index}" for index in range(40)]
@@ -10085,14 +10086,16 @@ class TestWeightDistributionSemantics:
             *[onnx.numpy_helper.from_array(np.ones((4,), dtype=np.float32), name=name) for name in source_names],
             onnx.numpy_helper.from_array(np.zeros((4,), dtype=np.float32), name="initial_state"),
             onnx.numpy_helper.from_array(np.array([0], dtype=np.int64), name="axes"),
+            onnx.numpy_helper.from_array(np.ones((4,), dtype=np.float32), name="other"),
             onnx.numpy_helper.from_array(np.array(0.0, dtype=np.float32), name="dummy"),
         ]
         graph_inputs = [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 4])]
-        body_state_node = (
-            helper.make_node("Unsqueeze", ["capped", "axes"], ["next_state"])
-            if rank_promotes
-            else helper.make_node("Identity", ["capped"], ["next_state"])
-        )
+        body_state_node = {
+            "einsum": helper.make_node("Einsum", ["capped", "other"], ["next_state"], equation="i,j->ij"),
+            "identity": helper.make_node("Identity", ["capped"], ["next_state"]),
+            "unsqueeze": helper.make_node("Unsqueeze", ["capped", "axes"], ["next_state"]),
+        }[body_state_op]
+        next_state_shape = [4] if body_state_op == "einsum" else None
         nodes = []
         graph_outputs = [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [])]
         if control_flow_op == "Loop":
@@ -10117,7 +10120,7 @@ class TestWeightDistributionSemantics:
                 ],
                 [
                     helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
-                    helper.make_tensor_value_info("next_state", TensorProto.FLOAT, None),
+                    helper.make_tensor_value_info("next_state", TensorProto.FLOAT, next_state_shape),
                 ],
             )
             nodes.append(
@@ -10168,7 +10171,7 @@ class TestWeightDistributionSemantics:
         model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
         model.ir_version = 8
         onnx.checker.check_model(model)
-        path = tmp_path / f"body-created-{control_flow_op.lower()}-gap-reentry-{rank_promotes}.onnx"
+        path = tmp_path / f"body-created-{control_flow_op.lower()}-gap-reentry-{body_state_op}.onnx"
         onnx.save(model, str(path))
 
         result = OnnxScanner().scan(str(path))
