@@ -3709,11 +3709,18 @@ class PyTorchZipScanner(BaseScanner):
         step = _PICKLE_DISCOVERY_LONG_PROBE_BYTES - _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES + 1
         search_start = step
         while search_start < len(value):
+            original_window_end = search_start + _PICKLE_DISCOVERY_LONG_PROBE_BYTES
             window_start = max(0, search_start - _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES + 1)
-            window = value[window_start : search_start + _PICKLE_DISCOVERY_LONG_PROBE_BYTES]
-            if PyTorchZipScanner._raw_nested_security_pickle_candidate_has_structural_signal(window):
-                return True
-            if search_start + _PICKLE_DISCOVERY_LONG_PROBE_BYTES >= len(value):
+            windows = [(window_start, min(len(value), original_window_end))]
+            if original_window_end >= len(value):
+                tail_window_start = max(0, len(value) - _PICKLE_DISCOVERY_LONG_PROBE_BYTES)
+                if tail_window_start != window_start:
+                    windows.append((tail_window_start, len(value)))
+            for candidate_window_start, candidate_window_end in windows:
+                window = value[candidate_window_start:candidate_window_end]
+                if PyTorchZipScanner._raw_nested_security_pickle_candidate_has_structural_signal(window):
+                    return True
+            if original_window_end >= len(value):
                 return False
             search_start += step
         return False
@@ -3788,6 +3795,8 @@ class PyTorchZipScanner(BaseScanner):
     ) -> bool:
         parse_budget_remaining = [_MAX_RAW_NESTED_PICKLE_CANDIDATES]
         if PyTorchZipScanner._raw_nested_proto0_global_ref_seen(value):
+            return True
+        if PyTorchZipScanner._raw_nested_proto0_inst_ref_seen(value):
             return True
         if PyTorchZipScanner._raw_nested_binary_protocol_candidate_has_structural_signal(
             value,
@@ -3881,6 +3890,52 @@ class PyTorchZipScanner(BaseScanner):
                 name_end += 1
             if name_end < search_limit and value[name_end] == 0x0A:
                 return True
+            search_start = name_end + 1
+        return False
+
+    @staticmethod
+    def _raw_nested_proto0_inst_ref_seen(value: bytes) -> bool:
+        search_limit = min(len(value), _PICKLE_DISCOVERY_LONG_PROBE_BYTES)
+        search_start = 0
+        while search_start < search_limit:
+            offset = value.find(b"i", search_start, search_limit)
+            if offset < 0:
+                return False
+            module_start = offset + 1
+            if module_start >= search_limit:
+                return False
+            if value[module_start] not in _PROTO0_GLOBAL_NAME_START_BYTES:
+                search_start = module_start
+                continue
+            module_end = module_start
+            while module_end < search_limit and value[module_end] in _PROTO0_GLOBAL_NAME_BYTES:
+                module_end += 1
+            if module_end >= search_limit or value[module_end] != 0x0A:
+                search_start = module_end + 1
+                continue
+            name_start = module_end + 1
+            if name_start >= search_limit:
+                return False
+            if value[name_start] not in _PROTO0_GLOBAL_NAME_START_BYTES:
+                search_start = name_start + 1
+                continue
+            name_end = name_start
+            while name_end < search_limit and value[name_end] in _PROTO0_GLOBAL_NAME_BYTES:
+                name_end += 1
+            if name_end >= search_limit or value[name_end] != 0x0A:
+                search_start = name_end + 1
+                continue
+            window_start = max(0, offset - _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES + 1)
+            mark = value.rfind(bytes([_PICKLE_MARK_OPCODE_BYTE]), window_start, offset)
+            while mark >= window_start:
+                candidate = value[mark : mark + _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES]
+                candidate_is_prefix = mark + len(candidate) < len(value)
+                if PyTorchZipScanner._has_security_relevant_pickle_opcode(candidate) and (
+                    PyTorchZipScanner._has_complete_pickle_stream_without_frame_stop_overrun(candidate)
+                    or _looks_like_proto0_or_1_pickle(candidate, sample_is_prefix=candidate_is_prefix)
+                ):
+                    return True
+                mark = value.rfind(bytes([_PICKLE_MARK_OPCODE_BYTE]), window_start, mark)
             search_start = name_end + 1
         return False
 
