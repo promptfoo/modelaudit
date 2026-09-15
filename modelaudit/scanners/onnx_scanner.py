@@ -2757,6 +2757,7 @@ def _build_onnx_weight_analysis_plan(
             id(subgraph),
             graph_input_name,
             graph_input_shape,
+            tuple(sorted(output_dependency_names)),
             trusted_context_shape_cache_key(trusted_context_shapes, output_dependency_names),
             opset_cache_key(opset_versions),
             attribute_binding_cache_key(attribute_bindings),
@@ -2767,11 +2768,8 @@ def _build_onnx_weight_analysis_plan(
             promoted_output_indexes = reentry_promotion_cache[cache_key]
             if promoted_outputs_out is not None:
                 promoted_outputs_out.update(promoted_output_indexes)
-            if (
-                output_shapes_out is not None
-                and (output_shape := reentry_shape_cache.get(cache_key, {}).get(graph_output_index)) is not None
-            ):
-                output_shapes_out[graph_output_index] = output_shape
+            if output_shapes_out is not None:
+                output_shapes_out.update(reentry_shape_cache.get(cache_key, {}))
             return graph_output_index in promoted_output_indexes
         if cache_key in reentry_promotion_in_progress:
             return True
@@ -2924,7 +2922,7 @@ def _build_onnx_weight_analysis_plan(
                         representative_output_index = min(valid_function_tainted_output_indexes)
                         for function_input_name, function_input_shape in relevant_function_tainted_inputs.items():
                             function_promoted_output_indexes: set[int] = set()
-                            subgraph_reenters_state_with_rank_promotion(
+                            representative_promoted = subgraph_reenters_state_with_rank_promotion(
                                 function,
                                 function_input_name,
                                 representative_output_index,
@@ -2939,6 +2937,8 @@ def _build_onnx_weight_analysis_plan(
                                 promoted_outputs_out=function_promoted_output_indexes,
                                 depth=depth + 1,
                             )
+                            if representative_promoted and not function_promoted_output_indexes:
+                                function_promoted_output_indexes.update(valid_function_tainted_output_indexes)
                             function_promoted_outputs.update(
                                 mapped_node_outputs(
                                     body_outputs,

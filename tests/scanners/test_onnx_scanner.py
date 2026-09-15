@@ -17290,6 +17290,150 @@ class TestWeightDistributionSemantics:
         assert grouped_dependency_calls == 1
         assert fanout_promotion_calls <= width
 
+    def _write_repeated_local_function_cached_shape_model(self, tmp_path: Path) -> Path:
+        function = helper.make_function(
+            "local",
+            "Pair",
+            ["input"],
+            ["left", "right"],
+            [
+                helper.make_node("Identity", ["input"], ["left"]),
+                helper.make_node("Identity", ["input"], ["right"]),
+            ],
+            opset_imports=[helper.make_opsetid("", 13)],
+        )
+        body = helper.make_graph(
+            [
+                helper.make_node("Pair", ["state"], ["first_left", "first_right"], domain="local"),
+                helper.make_node("Pair", ["state"], ["second_left", "second_right"], domain="local"),
+                helper.make_node("Add", ["second_left", "second_right"], ["next_state"]),
+                helper.make_node("Identity", ["condition_in"], ["condition_out"]),
+            ],
+            "local_function_cached_shape_body",
+            [
+                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
+                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("state", TensorProto.FLOAT, [2]),
+            ],
+            [
+                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, [2]),
+            ],
+        )
+        graph = helper.make_graph(
+            [
+                helper.make_node(
+                    "Loop",
+                    ["trip_count", "initial_condition", "initial_state"],
+                    ["final_state"],
+                    body=body,
+                ),
+                helper.make_node("MatMul", ["X", "final_state"], ["Y"]),
+            ],
+            "local_function_cached_shape",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 2])],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1])],
+            initializer=[
+                onnx.numpy_helper.from_array(np.ones((2,), dtype=np.float32), name="initial_state"),
+                onnx.numpy_helper.from_array(np.array(2, dtype=np.int64), name="trip_count"),
+                onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="initial_condition"),
+            ],
+        )
+        model = helper.make_model(
+            graph,
+            functions=[function],
+            opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
+        )
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / "local-function-cached-shape.onnx"
+        onnx.save(model, str(path))
+        return path
+
+    def test_repeated_local_function_cache_hit_restores_all_output_shapes(self, tmp_path: Path) -> None:
+        result = OnnxScanner().scan(str(self._write_repeated_local_function_cached_shape_model(tmp_path)))
+
+        assert result.success is True
+        assert result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"] == {}
+
+    def _write_recursive_local_function_promotion_model(self, tmp_path: Path, *, depth: int) -> Path:
+        functions = []
+        for index in range(depth, -1, -1):
+            if index == depth:
+                nodes = [
+                    helper.make_node(
+                        "Constant",
+                        [],
+                        ["axes"],
+                        value=onnx.numpy_helper.from_array(np.array([0], dtype=np.int64)),
+                    ),
+                    helper.make_node("Unsqueeze", ["input", "axes"], ["output"]),
+                ]
+            else:
+                nodes = [helper.make_node(f"Nested{index + 1}", ["input"], ["output"], domain="local")]
+            functions.append(
+                helper.make_function(
+                    "local",
+                    f"Nested{index}",
+                    ["input"],
+                    ["output"],
+                    nodes,
+                    opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
+                )
+            )
+        body = helper.make_graph(
+            [
+                helper.make_node("Nested0", ["state"], ["next_state"], domain="local"),
+                helper.make_node("Identity", ["condition_in"], ["condition_out"]),
+            ],
+            "recursive_local_function_body",
+            [
+                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
+                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("state", TensorProto.FLOAT, [4]),
+            ],
+            [
+                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, [1, 4]),
+            ],
+        )
+        graph = helper.make_graph(
+            [
+                helper.make_node(
+                    "Loop",
+                    ["trip_count", "initial_condition", "initial_state"],
+                    ["final_state"],
+                    body=body,
+                ),
+                helper.make_node("MatMul", ["X", "final_state"], ["Y"]),
+            ],
+            "recursive_local_function_promotion",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 1])],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 4])],
+            initializer=[
+                onnx.numpy_helper.from_array(np.ones((4,), dtype=np.float32), name="initial_state"),
+                onnx.numpy_helper.from_array(np.array(2, dtype=np.int64), name="trip_count"),
+                onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="initial_condition"),
+            ],
+        )
+        model = helper.make_model(
+            graph,
+            functions=functions,
+            opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
+        )
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / "recursive-local-function-promotion.onnx"
+        onnx.save(model, str(path))
+        return path
+
+    def test_recursive_local_function_rank_promotion_fails_closed(self, tmp_path: Path) -> None:
+        result = OnnxScanner().scan(str(self._write_recursive_local_function_promotion_model(tmp_path, depth=8)))
+
+        assert result.success is False
+        gaps = result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"]
+        assert gaps["lineages_per_value_limit"] >= 1
+
     def _write_context_prefix_loop_model(self, tmp_path: Path, *, width: int) -> Path:
         states = [helper.make_tensor_value_info(f"state{index}", TensorProto.FLOAT, [2]) for index in range(width)]
         body = helper.make_graph(
