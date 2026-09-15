@@ -2316,6 +2316,36 @@ class PyTorchZipScanner(BaseScanner):
                 entry_size=entry.file_size,
             )
         ):
+            impossible_prefix_header_end = PyTorchZipScanner._impossible_declared_storage_prefix_header_end(
+                sample,
+                entry_size=entry.file_size,
+            )
+            if impossible_prefix_header_end is not None:
+                if entry.file_size > len(sample):
+                    PyTorchZipScanner._charge_padding_probe_budget(
+                        padding_probe_bytes_remaining,
+                        entry.file_size - len(sample),
+                    )
+                    sample = self._read_member_prefix(
+                        zip_file,
+                        entry,
+                        entry.file_size,
+                        phase="pickle_discovery",
+                        result=result,
+                    )
+                    impossible_prefix_header_end = PyTorchZipScanner._impossible_declared_storage_prefix_header_end(
+                        sample,
+                        entry_size=entry.file_size,
+                    )
+                if (
+                    impossible_prefix_header_end is not None
+                    and not PyTorchZipScanner._trailing_pickle_probe_should_scan(
+                        sample[impossible_prefix_header_end:],
+                        sample_is_prefix=entry.file_size > len(sample),
+                    )
+                ):
+                    charge_deferred_probe_budget_before_skip()
+                    return False
             if PyTorchZipScanner._trivial_complete_pickle_prefix_has_only_padding(sample):
                 if PyTorchZipScanner._trivial_complete_pickle_prefix_has_only_nul_padding(sample):
                     return self._verified_nul_padding_storage_probe_should_scan(
@@ -2558,6 +2588,32 @@ class PyTorchZipScanner(BaseScanner):
         ):
             return True
         return PyTorchZipScanner._trivial_complete_pickle_prefix_has_ambiguous_trivial_trailing(sample)
+
+    @staticmethod
+    def _impossible_declared_storage_prefix_header_end(sample: bytes, *, entry_size: int) -> int | None:
+        candidate = sample.lstrip(PROTO0_1_IGNORABLE_TRAILING_BYTES)
+        skipped_bytes = len(sample) - len(candidate)
+        remaining_entry_bytes = max(0, entry_size - skipped_bytes)
+        if candidate.startswith((b"T", b"X")):
+            header_bytes = 5
+            if len(candidate) < header_bytes:
+                return None
+            declared_size = int.from_bytes(candidate[1:header_bytes], "little")
+        elif candidate.startswith(b"U"):
+            header_bytes = 2
+            if len(candidate) < header_bytes:
+                return None
+            declared_size = candidate[1]
+        elif candidate.startswith(_PICKLE_FRAME_OPCODE):
+            header_bytes = _PICKLE_FRAME_OPCODE_BYTES
+            if len(candidate) < header_bytes:
+                return None
+            declared_size = int.from_bytes(candidate[1:header_bytes], "little")
+        else:
+            return None
+        if declared_size <= max(0, remaining_entry_bytes - header_bytes):
+            return None
+        return skipped_bytes + header_bytes
 
     @staticmethod
     def _frame_first_trusted_storage_probe_should_scan(sample: bytes) -> bool:

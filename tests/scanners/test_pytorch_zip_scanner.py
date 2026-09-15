@@ -2754,6 +2754,120 @@ def test_pytorch_zip_discovery_skips_referenced_storage_blob_pickleish_bytes(tmp
     assert not any(check.details.get("pickle_filename") == "archive/data/0" for check in result.checks)
 
 
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        b"X" + (3_191_733_531).to_bytes(4, "little"),
+        b"T" + (2_000_463_965).to_bytes(4, "little"),
+        b"\x95" + (15_978_500_789_337_202_991).to_bytes(8, "little"),
+    ],
+    ids=["binunicode", "binstring", "frame"],
+)
+def test_pytorch_zip_discovery_skips_referenced_storage_impossible_declared_prefix(
+    tmp_path: Path,
+    prefix: bytes,
+) -> None:
+    model_path = tmp_path / "referenced_storage_impossible_declared_prefix.pt"
+    storage_size = pytorch_zip_scanner_module._PICKLE_DISCOVERY_LONG_PROBE_BYTES + 1024
+    storage_blob = prefix + (b"A" * (storage_size - len(prefix)))
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        zip_file.writestr("archive/data/0", storage_blob)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert result.success is True
+    assert result.metadata.get("pickle_verdict") == "clean"
+    assert result.metadata["pickle_files"] == ["archive/data.pkl"]
+    assert not any(
+        check.name == "Pickle Discovery" and check.details.get("analysis_incomplete") for check in result.checks
+    )
+    assert not any(issue.details.get("pickle_filename") == "archive/data/0" for issue in result.issues)
+    assert not any(check.details.get("pickle_filename") == "archive/data/0" for check in result.checks)
+
+
+def test_pytorch_zip_discovery_fails_closed_for_hidden_pickle_after_impossible_declared_prefix(
+    tmp_path: Path,
+) -> None:
+    model_path = tmp_path / "referenced_storage_impossible_declared_prefix_hidden_pickle.pt"
+    malicious_suffix = _malicious_proto0_system_payload()
+    prefix = b"X" + (3_191_733_531).to_bytes(4, "little")
+    storage_size = pytorch_zip_scanner_module._PICKLE_DISCOVERY_LONG_PROBE_BYTES + 1024
+    storage_blob = prefix + b"A" * 16 + malicious_suffix
+    storage_blob += b"A" * (storage_size - len(storage_blob))
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        zip_file.writestr("archive/data/0", storage_blob)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert result.success is False
+    assert "pytorch_zip_pickle_discovery_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "Pickle Discovery"
+        and check.details.get("analysis_incomplete") is True
+        and "archive/data/0" in check.details.get("zip_entries", [])
+        for check in result.checks
+    )
+
+
+def test_pytorch_zip_discovery_skips_same_sized_benign_unread_tail_after_impossible_prefix(
+    tmp_path: Path,
+) -> None:
+    model_path = tmp_path / "referenced_storage_impossible_declared_prefix_unread_tail_benign.pt"
+    prefix = b"X" + (3_191_733_531).to_bytes(4, "little")
+    storage_size = pytorch_zip_scanner_module._PICKLE_DISCOVERY_LONG_PROBE_BYTES + 512
+    storage_blob = prefix + (b"A" * (storage_size - len(prefix)))
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        zip_file.writestr("archive/data/0", storage_blob)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert result.success is True
+    assert result.metadata.get("pickle_verdict") == "clean"
+    assert result.metadata["pickle_files"] == ["archive/data.pkl"]
+    assert not any(
+        check.name == "Pickle Discovery" and check.details.get("analysis_incomplete") for check in result.checks
+    )
+    assert not any(issue.details.get("pickle_filename") == "archive/data/0" for issue in result.issues)
+    assert not any(check.details.get("pickle_filename") == "archive/data/0" for check in result.checks)
+
+
+def test_pytorch_zip_discovery_fails_closed_for_hidden_pickle_beyond_unread_impossible_prefix(
+    tmp_path: Path,
+) -> None:
+    model_path = tmp_path / "referenced_storage_impossible_declared_prefix_unread_tail_hidden_pickle.pt"
+    malicious_suffix = _malicious_proto0_system_payload()
+    prefix = b"X" + (3_191_733_531).to_bytes(4, "little")
+    malicious_offset = pytorch_zip_scanner_module._PICKLE_DISCOVERY_LONG_PROBE_BYTES + 128
+    storage_size = pytorch_zip_scanner_module._PICKLE_DISCOVERY_LONG_PROBE_BYTES + 512
+    storage_blob = prefix + (b"A" * (malicious_offset - len(prefix))) + malicious_suffix
+    storage_blob += b"A" * (storage_size - len(storage_blob))
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        zip_file.writestr("archive/data/0", storage_blob)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert result.success is False
+    assert "pytorch_zip_pickle_discovery_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "Pickle Discovery"
+        and check.details.get("analysis_incomplete") is True
+        and "archive/data/0" in check.details.get("zip_entries", [])
+        for check in result.checks
+    )
+
+
 def test_pytorch_zip_discovery_skips_referenced_float_storage_extension_like_bytes(tmp_path: Path) -> None:
     model_path = tmp_path / "referenced_float_storage_extension_like_bytes.pt"
     storage_blob = b"\x8c\x01\xff\x3f\x82\x01\xff\x3f"
