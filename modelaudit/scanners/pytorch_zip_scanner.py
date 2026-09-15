@@ -3857,13 +3857,23 @@ class PyTorchZipScanner(BaseScanner):
             return False
         prefix_start = max(0, search_start - _PICKLE_DISCOVERY_LONG_PROBE_BYTES)
         prefix = value[prefix_start:search_start]
-        if not any(byte in {ord("p"), ord("q"), ord("r"), 0x94} for byte in prefix):
+        if not any(byte in {ord("p"), ord("q"), ord("r"), 0x94} for byte in prefix) and not (
+            PyTorchZipScanner._prefix_has_prior_memo_definition(value, prefix_start)
+        ):
             return False
         memo_keys = PyTorchZipScanner._parsed_prefix_memo_keys(prefix)
-        if not memo_keys:
+        memo_context_truncated = False
+        if prefix_start > 0:
+            full_prefix_budget = _PICKLE_DISCOVERY_LONG_PROBE_BYTES * 4
+            if search_start <= full_prefix_budget:
+                memo_keys.update(PyTorchZipScanner._parsed_prefix_memo_keys(value[:search_start]))
+            elif PyTorchZipScanner._prefix_has_prior_memo_definition(value, prefix_start):
+                memo_context_truncated = True
+        if not memo_keys and not memo_context_truncated:
             return False
         step = _PICKLE_DISCOVERY_LONG_PROBE_BYTES - _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES + 1
         window_start = search_start
+        seen_get_offsets: set[int] = set()
         while window_start < len(value):
             window_end = min(len(value), window_start + _PICKLE_DISCOVERY_LONG_PROBE_BYTES)
             window = value[window_start:window_end]
@@ -3880,15 +3890,25 @@ class PyTorchZipScanner(BaseScanner):
                 if offset < 0:
                     break
                 absolute_offset = window_start + offset
+                if absolute_offset in seen_get_offsets:
+                    search_start_in_window = offset + 1
+                    continue
+                seen_get_offsets.add(absolute_offset)
                 if not PyTorchZipScanner._consume_raw_nested_structural_parse_budget(parse_budget_remaining):
                     return True
                 memo_key, truncated_get = PyTorchZipScanner._memo_get_key_at(value, absolute_offset)
                 if truncated_get:
                     return True
+                candidate = value[absolute_offset : absolute_offset + _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES]
                 if memo_key not in memo_keys:
+                    if (
+                        memo_context_truncated
+                        and memo_key is not None
+                        and PyTorchZipScanner._has_security_relevant_pickle_opcode(candidate)
+                    ):
+                        return True
                     search_start_in_window = offset + 1
                     continue
-                candidate = value[absolute_offset : absolute_offset + _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES]
                 if PyTorchZipScanner._has_security_relevant_pickle_opcode(candidate):
                     return True
                 search_start_in_window = offset + 1
@@ -3896,6 +3916,12 @@ class PyTorchZipScanner(BaseScanner):
                 return False
             window_start += step
         return False
+
+    @staticmethod
+    def _prefix_has_prior_memo_definition(value: bytes, end: int) -> bool:
+        if end <= 0:
+            return False
+        return any(value.rfind(bytes([byte]), 0, end) >= 0 for byte in (ord("p"), ord("q"), ord("r"), 0x94))
 
     @staticmethod
     def _canonical_proto0_memo_key(value: object) -> str:
@@ -3918,7 +3944,7 @@ class PyTorchZipScanner(BaseScanner):
     @staticmethod
     def _parsed_prefix_memo_keys_from_start(prefix: bytes) -> set[str]:
         memo_keys: set[str] = set()
-        memoize_index = 0
+        occupied_memo_keys: set[str] = set()
         stack_depth = 0
         mark_depths: list[int] = []
 
@@ -3935,12 +3961,15 @@ class PyTorchZipScanner(BaseScanner):
                     continue
                 if opcode.name in {"BINPUT", "LONG_BINPUT", "PUT"}:
                     if stack_depth > 0:
-                        memo_keys.add(PyTorchZipScanner._canonical_proto0_memo_key(arg))
+                        memo_key = PyTorchZipScanner._canonical_proto0_memo_key(arg)
+                        memo_keys.add(memo_key)
+                        occupied_memo_keys.add(memo_key)
                     continue
                 if opcode.name == "MEMOIZE":
                     if stack_depth > 0:
-                        memo_keys.add(str(memoize_index))
-                    memoize_index += 1
+                        memo_key = str(len(occupied_memo_keys))
+                        memo_keys.add(memo_key)
+                        occupied_memo_keys.add(memo_key)
                     continue
                 if opcode.name in {"TUPLE", "LIST", "DICT", "FROZENSET"}:
                     stack_depth = (mark_depths.pop() if mark_depths else 0) + 1
