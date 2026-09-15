@@ -2152,11 +2152,18 @@ def _build_onnx_weight_analysis_plan(
                 return graph_value_is_constant_false(body, condition_output_name, constants)
         return False
 
+    def graph_input_is_runtime_overridable(
+        value_name: str,
+        graph_input_names: set[str],
+        constants: dict[str, Any],
+    ) -> bool:
+        return bool(value_name) and value_name in graph_input_names and value_name not in constants
+
     def loop_may_skip_body(node: Any, constants: dict[str, Any], graph_input_names: set[str]) -> bool:
         trip_input = str(node.input[0]) if len(node.input) > 0 and node.input[0] else ""
         condition_input = str(node.input[1]) if len(node.input) > 1 and node.input[1] else ""
-        if (trip_input in graph_input_names and trip_input not in constants) or (
-            condition_input in graph_input_names and condition_input not in constants
+        if graph_input_is_runtime_overridable(trip_input, graph_input_names, constants) or (
+            graph_input_is_runtime_overridable(condition_input, graph_input_names, constants)
         ):
             return True
         trip_count = (
@@ -2180,8 +2187,8 @@ def _build_onnx_weight_analysis_plan(
         condition_input = str(node.input[1]) if len(node.input) > 1 and node.input[1] else ""
         if loop_body_condition_is_constant_false(node, constants):
             return False
-        if (trip_input in graph_input_names and trip_input not in constants) or (
-            condition_input in graph_input_names and condition_input not in constants
+        if graph_input_is_runtime_overridable(trip_input, graph_input_names, constants) or (
+            graph_input_is_runtime_overridable(condition_input, graph_input_names, constants)
         ):
             return True
         trip_count = (
@@ -2287,6 +2294,8 @@ def _build_onnx_weight_analysis_plan(
         if scan_input_offset and node.input:
             sequence_lens_input = str(node.input[0] or "")
             if sequence_lens_input:
+                if graph_input_is_runtime_overridable(sequence_lens_input, graph_input_names, constants):
+                    return True
                 constant_sequence_lens = constant_int64_vector_values(constants.get(sequence_lens_input))
                 if constant_sequence_lens is None or any(length <= 0 for length in constant_sequence_lens):
                     return True
@@ -2338,6 +2347,8 @@ def _build_onnx_weight_analysis_plan(
         if scan_input_offset and node.input:
             sequence_lens_input = str(node.input[0] or "")
             if sequence_lens_input:
+                if graph_input_is_runtime_overridable(sequence_lens_input, graph_input_names, constants):
+                    return True
                 constant_sequence_lens = constant_int64_vector_values(constants.get(sequence_lens_input))
                 if constant_sequence_lens is not None:
                     if any(length < 0 for length in constant_sequence_lens):
@@ -2730,6 +2741,25 @@ def _build_onnx_weight_analysis_plan(
         graph_nodes = tuple(getattr(subgraph, "node", ()))
         potential_weight_consumer_seen = False
         potential_weight_consumer_input_edges = 0
+
+        def node_may_have_potential_weight_input(
+            node: Any,
+            *,
+            is_model_local_function: bool,
+            is_registered_standard_operator: bool,
+        ) -> bool:
+            domain = getattr(node, "domain", "")
+            if (
+                domain in _STANDARD_NEURAL_NETWORK_DOMAINS
+                and is_registered_standard_operator
+                and not is_model_local_function
+            ):
+                return (
+                    node.op_type in {"Conv", "ConvTranspose", "Einsum", "Gather", "Gemm", "MatMul", "PRelu"}
+                    or node.op_type in _RECURRENT_WEIGHT_OPERATORS
+                )
+            return True
+
         live_nodes: list[Any]
         if dependency_names is None:
             live_nodes = list(graph_nodes)
@@ -2752,6 +2782,12 @@ def _build_onnx_weight_analysis_plan(
                     node,
                     opset_versions or {},
                 )
+                if not node_may_have_potential_weight_input(
+                    node,
+                    is_model_local_function=is_model_local_function,
+                    is_registered_standard_operator=is_registered_standard_operator,
+                ):
+                    continue
                 node_is_potential_weight_consumer = any(
                     _onnx_potential_weight_input(
                         node,
@@ -3337,6 +3373,10 @@ def _build_onnx_weight_analysis_plan(
                                 for index, dimension in enumerate(data_input_shape)
                                 if index not in squeeze_axes
                             )
+                elif body_node.op_type == "Shape" and data_input_shape is not None:
+                    output_shape = (len(data_input_shape),)
+                elif body_node.op_type == "Size" and data_input_shape is not None:
+                    output_shape = ()
                 if output_shape is not None:
                     for output_name in body_outputs:
                         tainted_shapes[output_name] = output_shape
@@ -5410,6 +5450,16 @@ def _build_onnx_weight_analysis_plan(
             value_rank_promotable_lineage_limit_gap_counts.pop(name, None)
             value_rank_promotable_lineage_limit_gap_summaries.pop(name, None)
 
+        def value_has_bound_runtime_state(name: str) -> bool:
+            return (
+                name in value_lineages
+                or name in dynamic_values
+                or name in value_lineage_limit_gap_counts
+                or name in value_non_shape_lineage_limit_gap_counts
+                or name in value_weight_lineage_limit_gap_counts
+                or name in value_rank_promotable_lineage_limit_gap_counts
+            )
+
         def resolve_attribute(attribute: Any) -> Any | None:
             reference_name = str(getattr(attribute, "ref_attr_name", ""))
             return attribute_bindings.get(reference_name) if reference_name else attribute
@@ -5448,32 +5498,45 @@ def _build_onnx_weight_analysis_plan(
         for initializer_position, initializer in enumerate(getattr(current_graph, "initializer", ())):
             if initializer.name:
                 name = str(initializer.name)
-                lineage = register_initializer(
-                    initializer,
-                    current_graph_index,
-                    source_key=(*source_scope, "initializer", initializer_position),
-                )
-                value_lineages[name] = {lineage.initializer_index: lineage}
+                preserve_bound_runtime_state = name in graph_input_names and value_has_bound_runtime_state(name)
+                if not preserve_bound_runtime_state:
+                    lineage = register_initializer(
+                        initializer,
+                        current_graph_index,
+                        source_key=(*source_scope, "initializer", initializer_position),
+                    )
+                    value_lineages[name] = {lineage.initializer_index: lineage}
                 if name not in graph_input_names:
                     constants[name] = initializer
-                    set_known_value_shape(name, lineage.shape or (), proven=True)
-                dynamic_values.discard(name)
-                clear_value_gap_state(name)
+                    if not preserve_bound_runtime_state:
+                        set_known_value_shape(name, lineage.shape or (), proven=True)
+                    dynamic_values.discard(name)
+                    clear_value_gap_state(name)
+                elif name not in constants:
+                    dynamic_values.add(name)
+                    if not preserve_bound_runtime_state:
+                        clear_value_gap_state(name)
         for sparse_position, sparse_initializer in enumerate(getattr(current_graph, "sparse_initializer", ())):
             if sparse_initializer.values.name:
                 name = str(sparse_initializer.values.name)
-                lineage = register_initializer(
-                    sparse_initializer.values,
-                    current_graph_index,
-                    shape=tuple(int(dimension) for dimension in sparse_initializer.dims),
-                    unresolved_reason="sparse_initializer_unsupported",
-                    source_key=(*source_scope, "sparse_initializer", sparse_position),
-                )
-                value_lineages[name] = {lineage.initializer_index: lineage}
-                dynamic_values.discard(name)
-                clear_value_gap_state(name)
+                preserve_bound_runtime_state = name in graph_input_names and value_has_bound_runtime_state(name)
+                if not preserve_bound_runtime_state:
+                    lineage = register_initializer(
+                        sparse_initializer.values,
+                        current_graph_index,
+                        shape=tuple(int(dimension) for dimension in sparse_initializer.dims),
+                        unresolved_reason="sparse_initializer_unsupported",
+                        source_key=(*source_scope, "sparse_initializer", sparse_position),
+                    )
+                    value_lineages[name] = {lineage.initializer_index: lineage}
                 if name not in graph_input_names:
+                    dynamic_values.discard(name)
+                    clear_value_gap_state(name)
                     set_known_value_shape(name, lineage.shape or (), proven=True)
+                elif name not in constants:
+                    dynamic_values.add(name)
+                    if not preserve_bound_runtime_state:
+                        clear_value_gap_state(name)
 
         for graph_input in getattr(current_graph, "input", ()):
             name = _onnx_value_name(graph_input)
@@ -6842,7 +6905,10 @@ def _build_onnx_weight_analysis_plan(
             rank_gap_control_input_is_overridable = (
                 node.op_type in {"Expand", "Gather", "GatherND", "Reshape", "Squeeze", "Unsqueeze"}
                 and len(node.input) > 1
-                and str(node.input[1]) in graph_input_names
+                and (
+                    graph_input_is_runtime_overridable(str(node.input[1]), graph_input_names, constants)
+                    or str(node.input[1]) in dynamic_values
+                )
             )
             if (
                 rank_gap_promoting_operator
@@ -7386,6 +7452,8 @@ def _build_onnx_weight_analysis_plan(
                 value_name = str(current_node.input[value_index]) if value_index < len(current_node.input) else ""
                 if input_offset and current_node.input:
                     sequence_lens_input = str(current_node.input[0] or "")
+                    if graph_input_is_runtime_overridable(sequence_lens_input, graph_input_names, constants):
+                        return -1
                     sequence_lens = constant_int64_vector_values(constants.get(sequence_lens_input))
                     if sequence_lens is not None and sequence_lens and all(length >= 0 for length in sequence_lens):
                         return max(sequence_lens)

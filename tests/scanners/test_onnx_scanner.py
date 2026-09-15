@@ -8036,6 +8036,80 @@ class TestWeightDistributionSemantics:
         semantics = result.metadata["onnx_weight_distribution_semantics"]
         assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
 
+    @pytest.mark.parametrize("trip_count_is_graph_input", [False, True])
+    @pytest.mark.parametrize("body_redeclares_state_initializer", [False, True])
+    def test_repeated_loop_treats_initializer_backed_controls_as_overridable(
+        self,
+        tmp_path: Path,
+        trip_count_is_graph_input: bool,
+        body_redeclares_state_initializer: bool,
+    ) -> None:
+        source_names = [f"W{index}" for index in range(40)]
+        initializers = [
+            *[onnx.numpy_helper.from_array(np.array(1.0, dtype=np.float32), name=name) for name in source_names],
+            onnx.numpy_helper.from_array(np.array([0], dtype=np.int64), name="axes"),
+            onnx.numpy_helper.from_array(np.array(1, dtype=np.int64), name="trip_count"),
+            onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="initial_condition"),
+        ]
+        body_initializers = (
+            [onnx.numpy_helper.from_array(np.array(0.0, dtype=np.float32), name="state")]
+            if body_redeclares_state_initializer
+            else []
+        )
+        body = helper.make_graph(
+            [
+                helper.make_node("Unsqueeze", ["state", "axes"], ["next_state"]),
+                helper.make_node("Identity", ["condition_in"], ["condition_out"]),
+            ],
+            "initializer_backed_loop_control_body",
+            [
+                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
+                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("state", TensorProto.FLOAT, None),
+            ],
+            [
+                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, None),
+            ],
+            initializer=body_initializers,
+        )
+        graph_inputs = [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 1])]
+        if trip_count_is_graph_input:
+            graph_inputs.append(helper.make_tensor_value_info("trip_count", TensorProto.INT64, []))
+        graph = helper.make_graph(
+            [
+                helper.make_node("Sum", source_names, ["capped"]),
+                helper.make_node(
+                    "Loop",
+                    ["trip_count", "initial_condition", "capped"],
+                    ["control_flow_state"],
+                    body=body,
+                ),
+                helper.make_node("MatMul", ["X", "control_flow_state"], ["Y"]),
+            ],
+            "initializer_backed_loop_control",
+            graph_inputs,
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [None])],
+            initializer=initializers,
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        mode = "overridable" if trip_count_is_graph_input else "constant"
+        redeclared = "body-default" if body_redeclares_state_initializer else "plain"
+        path = tmp_path / f"initializer-backed-loop-control-{mode}-{redeclared}.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        if trip_count_is_graph_input:
+            assert result.success is False
+            assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
+        else:
+            assert result.success is True
+            assert semantics["coverage_gaps"] == {}
+
     @pytest.mark.parametrize(
         ("control_flow_op", "rank_promotes", "expected_gap"),
         [
