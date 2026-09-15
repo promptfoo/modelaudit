@@ -17123,15 +17123,25 @@ class TestWeightDistributionSemantics:
         *,
         width: int,
         matrix_output: bool,
+        shared_dependency: bool = False,
     ) -> Path:
         tmp_path.mkdir(parents=True, exist_ok=True)
         outputs = [f"fanout{index}" for index in range(width)]
+        if shared_dependency:
+            function_nodes = [
+                helper.make_node("Sum", [f"input{index}" for index in range(width)], ["shared_sum"]),
+                *[helper.make_node("Identity", ["shared_sum"], [f"output{index}"]) for index in range(width)],
+            ]
+        else:
+            function_nodes = [
+                helper.make_node("Identity", [f"input{index}"], [f"output{index}"]) for index in range(width)
+            ]
         function = helper.make_function(
             "local",
             "Fanout",
             [f"input{index}" for index in range(width)],
             [f"output{index}" for index in range(width)],
-            [helper.make_node("Identity", [f"input{index}"], [f"output{index}"]) for index in range(width)],
+            function_nodes,
             opset_imports=[helper.make_opsetid("", 13)],
         )
         body_nodes = [
@@ -17184,7 +17194,8 @@ class TestWeightDistributionSemantics:
         )
         model.ir_version = 8
         onnx.checker.check_model(model)
-        path = tmp_path / f"local-function-repeated-alias-{matrix_output}.onnx"
+        mode = "shared" if shared_dependency else "direct"
+        path = tmp_path / f"local-function-repeated-alias-{mode}-{matrix_output}.onnx"
         onnx.save(model, str(path))
         return path
 
@@ -17236,6 +17247,48 @@ class TestWeightDistributionSemantics:
             positive_result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"]["lineages_per_value_limit"]
             >= 1
         )
+
+    def test_repeated_local_function_shared_dependencies_are_batched(self, tmp_path: Path) -> None:
+        width = 32
+        path = self._write_repeated_local_function_alias_model(
+            tmp_path,
+            width=width,
+            matrix_output=False,
+            shared_dependency=True,
+        )
+        scanner_path = Path(onnx_scanner_module.__file__).resolve()
+        single_output_dependency_calls = 0
+        grouped_dependency_calls = 0
+        fanout_promotion_calls = 0
+
+        def profile(frame: Any, event: str, arg: Any) -> None:
+            nonlocal single_output_dependency_calls, grouped_dependency_calls, fanout_promotion_calls
+            if Path(frame.f_code.co_filename).resolve() != scanner_path:
+                return
+            if getattr(frame.f_locals.get("subgraph"), "name", "") != "Fanout":
+                return
+            if frame.f_code.co_name == "graph_output_dependency_names" and event == "return":
+                output_index_key = frame.f_locals.get("output_index_key")
+                if output_index_key is None:
+                    return
+                if len(output_index_key) == 1:
+                    single_output_dependency_calls += 1
+                else:
+                    grouped_dependency_calls += 1
+            elif frame.f_code.co_name == "subgraph_reenters_state_with_rank_promotion" and event == "call":
+                fanout_promotion_calls += 1
+
+        try:
+            sys.setprofile(profile)
+            result = OnnxScanner().scan(str(path))
+        finally:
+            sys.setprofile(None)
+
+        assert result.success is True
+        assert result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"] == {}
+        assert single_output_dependency_calls == 0
+        assert grouped_dependency_calls == 1
+        assert fanout_promotion_calls <= width
 
     def _write_context_prefix_loop_model(self, tmp_path: Path, *, width: int) -> Path:
         states = [helper.make_tensor_value_info(f"state{index}", TensorProto.FLOAT, [2]) for index in range(width)]

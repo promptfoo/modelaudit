@@ -2727,6 +2727,8 @@ def _build_onnx_weight_analysis_plan(
         trusted_context_shapes: dict[str, tuple[int, ...]] | None = None,
         output_shapes_out: dict[int, tuple[int, ...]] | None = None,
         related_graph_input_shapes: dict[str, tuple[int, ...] | None] | None = None,
+        output_dependency_names_override: frozenset[str] | None = None,
+        promoted_outputs_out: set[int] | None = None,
         *,
         depth: int = 0,
     ) -> bool:
@@ -2742,11 +2744,14 @@ def _build_onnx_weight_analysis_plan(
         graph_output_name = _onnx_value_name(graph_outputs[graph_output_index])
         if not graph_output_name:
             return False
-        output_dependency_names = graph_output_dependency_names(
-            subgraph,
-            (graph_output_index,),
-            attribute_bindings=attribute_bindings,
-        )
+        if output_dependency_names_override is None:
+            output_dependency_names = graph_output_dependency_names(
+                subgraph,
+                (graph_output_index,),
+                attribute_bindings=attribute_bindings,
+            )
+        else:
+            output_dependency_names = output_dependency_names_override
         trusted_context_shapes = trusted_context_shapes or {}
         cache_key = (
             id(subgraph),
@@ -2759,12 +2764,15 @@ def _build_onnx_weight_analysis_plan(
             depth,
         )
         if cache_key in reentry_promotion_cache:
+            promoted_output_indexes = reentry_promotion_cache[cache_key]
+            if promoted_outputs_out is not None:
+                promoted_outputs_out.update(promoted_output_indexes)
             if (
                 output_shapes_out is not None
                 and (output_shape := reentry_shape_cache.get(cache_key, {}).get(graph_output_index)) is not None
             ):
                 output_shapes_out[graph_output_index] = output_shape
-            return graph_output_index in reentry_promotion_cache[cache_key]
+            return graph_output_index in promoted_output_indexes
         if cache_key in reentry_promotion_in_progress:
             return True
         reentry_promotion_in_progress.add(cache_key)
@@ -2880,21 +2888,46 @@ def _build_onnx_weight_analysis_plan(
                             function_tainted_output_indexes,
                         )
                     )
-                    for output_index in function_tainted_output_indexes:
-                        if output_index < 0 or output_index >= len(body_outputs):
-                            continue
-                        output_dependency_names = graph_output_dependency_names(
+                    valid_function_tainted_output_indexes = {
+                        output_index
+                        for output_index in function_tainted_output_indexes
+                        if 0 <= output_index < len(body_outputs)
+                    }
+                    if valid_function_tainted_output_indexes:
+                        function_output_dependency_names = graph_output_dependency_names(
                             function,
-                            (output_index,),
+                            valid_function_tainted_output_indexes,
                             attribute_bindings=function_attributes,
                         )
-                        for function_input_name, function_input_shape in function_tainted_inputs.items():
-                            if function_input_name not in output_dependency_names:
-                                continue
-                            if subgraph_reenters_state_with_rank_promotion(
+                        relevant_function_tainted_inputs = {
+                            function_input_name: function_input_shape
+                            for function_input_name, function_input_shape in function_tainted_inputs.items()
+                            if function_input_name in function_output_dependency_names
+                        }
+                    else:
+                        function_output_dependency_names = frozenset()
+                        relevant_function_tainted_inputs = {}
+                    function_analysis_exceeds_limit = (
+                        len(valid_function_tainted_output_indexes) * max(len(relevant_function_tainted_inputs), 1)
+                        > _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
+                        or len(getattr(function, "output", ())) > _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_OUTPUTS
+                        or subgraph_analysis_work_exceeds_limit(function)
+                    )
+                    if function_analysis_exceeds_limit:
+                        function_promoted_outputs.update(
+                            mapped_node_outputs(
+                                body_outputs,
+                                valid_function_tainted_output_indexes,
+                            )
+                        )
+                    elif valid_function_tainted_output_indexes:
+                        representative_output_index = min(valid_function_tainted_output_indexes)
+                        for function_input_name, function_input_shape in relevant_function_tainted_inputs.items():
+                            function_promoted_output_indexes: set[int] = set()
+                            subgraph_reenters_state_with_rank_promotion(
                                 function,
                                 function_input_name,
-                                output_index,
+                                representative_output_index,
                                 function_constants,
                                 function_versions,
                                 function_input_shape,
@@ -2902,10 +2935,16 @@ def _build_onnx_weight_analysis_plan(
                                 bound_input_constants=function_bound_input_constants,
                                 trusted_context_shapes=function_context_shapes,
                                 output_shapes_out=function_output_shapes,
+                                output_dependency_names_override=function_output_dependency_names,
+                                promoted_outputs_out=function_promoted_output_indexes,
                                 depth=depth + 1,
-                            ):
-                                function_promoted_outputs.add(body_outputs[output_index])
-                                break
+                            )
+                            function_promoted_outputs.update(
+                                mapped_node_outputs(
+                                    body_outputs,
+                                    valid_function_tainted_output_indexes & function_promoted_output_indexes,
+                                )
+                            )
                 for output_index, output_name in enumerate(body_outputs):
                     output_shape = function_output_shapes.get(output_index)
                     if output_shape is not None:
@@ -3213,6 +3252,8 @@ def _build_onnx_weight_analysis_plan(
         reentry_promotion_in_progress.discard(cache_key)
         reentry_promotion_cache[cache_key] = promoted_output_indexes
         reentry_shape_cache[cache_key] = output_shapes
+        if promoted_outputs_out is not None:
+            promoted_outputs_out.update(promoted_output_indexes)
         if output_shapes_out is not None:
             output_shapes_out.update(output_shapes)
         return graph_output_index in promoted_output_indexes
