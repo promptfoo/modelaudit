@@ -2073,6 +2073,11 @@ def _build_onnx_weight_analysis_plan(
         node: Any,
         resolve_attribute: Callable[[Any], Any | None],
     ) -> Any | None:
+        def repeated_attribute_tensor_values(values: Any) -> list[Any] | None:
+            if len(values) > _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK:
+                return None
+            return list(values)
+
         for attribute in getattr(node, "attribute", ()):
             resolved_attribute = resolve_attribute(attribute)
             if resolved_attribute is None:
@@ -2080,20 +2085,26 @@ def _build_onnx_weight_analysis_plan(
             if attribute.name == "value" and _onnx_has_singular_field(resolved_attribute, "t"):
                 return resolved_attribute.t
             if attribute.name == "value_ints":
+                values = repeated_attribute_tensor_values(resolved_attribute.ints)
+                if values is None:
+                    return None
                 return onnx.helper.make_tensor(
                     "",
                     onnx.TensorProto.INT64,
-                    [len(resolved_attribute.ints)],
-                    list(resolved_attribute.ints),
+                    [len(values)],
+                    values,
                 )
             if attribute.name == "value_int":
                 return onnx.helper.make_tensor("", onnx.TensorProto.INT64, [], [resolved_attribute.i])
             if attribute.name == "value_floats":
+                values = repeated_attribute_tensor_values(resolved_attribute.floats)
+                if values is None:
+                    return None
                 return onnx.helper.make_tensor(
                     "",
                     onnx.TensorProto.FLOAT,
-                    [len(resolved_attribute.floats)],
-                    list(resolved_attribute.floats),
+                    [len(values)],
+                    values,
                 )
             if attribute.name == "value_float":
                 return onnx.helper.make_tensor("", onnx.TensorProto.FLOAT, [], [resolved_attribute.f])
@@ -2712,10 +2723,26 @@ def _build_onnx_weight_analysis_plan(
     graph_output_dependency_cache: dict[
         tuple[int, tuple[int, ...] | None, tuple[tuple[str, str, str], ...]], frozenset[str]
     ] = {}
+    graph_node_direct_dependency_cache: dict[
+        tuple[int, tuple[tuple[str, str, str], ...]], tuple[Any, frozenset[str]]
+    ] = {}
     node_input_names_cache: dict[int, tuple[Any, list[str]]] = {}
     node_input_slots_cache: dict[int, tuple[Any, list[str]]] = {}
     node_output_names_cache: dict[int, tuple[Any, list[str]]] = {}
     graph_output_producer_cache: dict[int, tuple[Any, dict[str, frozenset[int]]]] = {}
+    dependency_collection_limit_marker = "\0modelaudit_dependency_collection_limit\0"
+
+    def dependency_names_exceeded_limit(dependency_names: frozenset[str]) -> bool:
+        return dependency_collection_limit_marker in dependency_names
+
+    def merge_dependency_names(target: set[str], dependency_names: Iterable[str]) -> bool:
+        for dependency_name in dependency_names:
+            if dependency_name:
+                target.add(str(dependency_name))
+            if len(target) > _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK:
+                target.add(dependency_collection_limit_marker)
+                return True
+        return dependency_collection_limit_marker in target
 
     def node_input_names(node: Any) -> list[str]:
         cache_key = id(node)
@@ -2765,6 +2792,32 @@ def _build_onnx_weight_analysis_plan(
             node_ids.update(producers.get(dependency_name, ()))
         return frozenset(node_ids)
 
+    def graph_node_direct_dependency_names(
+        node: Any,
+        local_attribute_bindings: dict[str, Any],
+    ) -> frozenset[str]:
+        attribute_key = attribute_binding_cache_key(local_attribute_bindings)
+        cache_key = (id(node), attribute_key)
+        cached = graph_node_direct_dependency_cache.get(cache_key)
+        if cached is not None and cached[0] is node:
+            return cached[1]
+        dependencies: set[str] = set()
+        merge_dependency_names(dependencies, getattr(node, "input", ()))
+        if not dependency_names_exceeded_limit(frozenset(dependencies)):
+            for attribute in getattr(node, "attribute", ()):
+                reference_name = str(getattr(attribute, "ref_attr_name", ""))
+                resolved_attribute = local_attribute_bindings.get(reference_name) if reference_name else attribute
+                if resolved_attribute is None:
+                    continue
+                for nested_graph in _iter_attribute_graphs(resolved_attribute):
+                    if merge_dependency_names(dependencies, graph_external_reference_names(nested_graph)):
+                        break
+                if dependency_collection_limit_marker in dependencies:
+                    break
+        result = frozenset(dependencies)
+        graph_node_direct_dependency_cache[cache_key] = (node, result)
+        return result
+
     def graph_output_dependency_names(
         subgraph: Any,
         output_indexes: Iterable[int] | None = None,
@@ -2787,14 +2840,10 @@ def _build_onnx_weight_analysis_plan(
             body_outputs = {str(output_name) for output_name in getattr(body_node, "output", ()) if output_name}
             if not body_outputs & dependencies:
                 continue
-            dependencies.update(str(input_name) for input_name in getattr(body_node, "input", ()) if input_name)
-            for attribute in getattr(body_node, "attribute", ()):
-                reference_name = str(getattr(attribute, "ref_attr_name", ""))
-                resolved_attribute = local_attribute_bindings.get(reference_name) if reference_name else attribute
-                if resolved_attribute is None:
-                    continue
-                for nested_graph in _iter_attribute_graphs(resolved_attribute):
-                    dependencies.update(graph_external_reference_names(nested_graph))
+            if merge_dependency_names(
+                dependencies, graph_node_direct_dependency_names(body_node, local_attribute_bindings)
+            ):
+                break
         result = frozenset(dependencies)
         graph_output_dependency_cache[cache_key] = result
         return result
@@ -2844,6 +2893,8 @@ def _build_onnx_weight_analysis_plan(
         live_nodes: list[Any]
         if dependency_names is None:
             live_nodes = list(graph_nodes)
+        elif dependency_names_exceeded_limit(dependency_names):
+            return True
         else:
             live_node_ids = graph_nodes_producing_names(subgraph, dependency_names)
             live_nodes = []
@@ -3036,7 +3087,11 @@ def _build_onnx_weight_analysis_plan(
             any_tainted = any(input_name in tainted for input_name in body_inputs)
             data_input_shape = reentry_input_shape(body_inputs[0]) if body_inputs else None
             index_input_shape = reentry_input_shape(body_inputs[1]) if len(body_inputs) > 1 else None
-            if index_input_shape is None and body_node.op_type in {"Gather", "GatherND"} and len(body_inputs) > 1:
+            if (
+                index_input_shape is None
+                and body_node.op_type in {"Gather", "GatherElements", "GatherND"}
+                and len(body_inputs) > 1
+            ):
                 index_input_shape = constant_initializer_shape(subgraph_constants, body_inputs[1])
             input_shapes_by_name = {input_name: reentry_input_shape(input_name) for input_name in body_inputs}
             elementwise_operator = body_node.op_type in _SAME_TYPE_ELEMENTWISE_OPERATORS or body_node.op_type == "Pow"
@@ -3430,6 +3485,8 @@ def _build_onnx_weight_analysis_plan(
                                 *index_input_shape,
                                 *data_input_shape[gather_axis + 1 :],
                             )
+                elif body_node.op_type == "GatherElements":
+                    output_shape = index_input_shape
                 elif body_node.op_type == "GatherND" and data_input_shape is not None:
                     if index_input_shape:
                         output_shape = gathernd_output_shape(
@@ -3568,6 +3625,11 @@ def _build_onnx_weight_analysis_plan(
         graph_taint_in_progress.add(cache_key)
         local_attribute_bindings = attribute_bindings or {}
         output_dependency_names = graph_output_dependency_names(subgraph, attribute_bindings=attribute_bindings)
+        if dependency_names_exceeded_limit(output_dependency_names):
+            graph_taint_in_progress.discard(cache_key)
+            result = set(range(len(graph_outputs)))
+            graph_taint_cache[cache_key] = set(result)
+            return result
         output_dependency_node_ids = graph_nodes_producing_names(subgraph, output_dependency_names)
 
         def resolve_reentry_attribute(attribute: Any) -> Any | None:
@@ -3889,6 +3951,21 @@ def _build_onnx_weight_analysis_plan(
             output_is_live = id(body_node) in live_node_ids
             node_output_is_live_after_node[id(body_node)] = output_is_live
             if not output_is_live:
+                for attribute in getattr(body_node, "attribute", ()):
+                    resolved_attribute = resolve_reentry_attribute(attribute)
+                    if resolved_attribute is None:
+                        continue
+                    for nested_graph in _iter_attribute_graphs(resolved_attribute):
+                        if not subgraph_has_potential_weight_consumer(
+                            nested_graph,
+                            opset_versions,
+                            attribute_bindings=local_attribute_bindings,
+                            depth=depth + 1,
+                        ):
+                            continue
+                        external_names = graph_external_reference_names(nested_graph)
+                        live_names.update(external_names)
+                        live_node_ids.update(graph_nodes_producing_names(subgraph, external_names))
                 continue
             live_body_inputs = node_input_names(body_node)
             live_names.update(live_body_inputs)
@@ -3961,11 +4038,18 @@ def _build_onnx_weight_analysis_plan(
                     resolved_attribute = resolve_reentry_attribute(attribute)
                     if resolved_attribute is None:
                         continue
-                    if any(
-                        graph_external_reference_names(nested_graph) & tainted
-                        for nested_graph in _iter_attribute_graphs(resolved_attribute)
-                    ):
-                        has_tainted_nested_capture = True
+                    for nested_graph in _iter_attribute_graphs(resolved_attribute):
+                        if not subgraph_has_potential_weight_consumer(
+                            nested_graph,
+                            opset_versions,
+                            attribute_bindings=local_attribute_bindings,
+                            depth=depth + 1,
+                        ):
+                            continue
+                        if graph_external_reference_names(nested_graph) & tainted:
+                            has_tainted_nested_capture = True
+                            break
+                    if has_tainted_nested_capture:
                         break
             if not body_outputs_live_after and not any_tainted and not has_tainted_nested_capture:
                 continue
@@ -4298,6 +4382,8 @@ def _build_onnx_weight_analysis_plan(
             if axis is None:
                 return True
             return len(input_shape) + len(index_shape) - 1 >= 2
+        if node.op_type == "GatherElements":
+            return index_shape is None or len(index_shape) >= 2
         if node.op_type == "GatherND":
             if input_shape is None or index_shape is None or not index_shape:
                 return True
@@ -6386,6 +6472,8 @@ def _build_onnx_weight_analysis_plan(
                         exact_count = max(int(trip_count), 0)
                         return exact_count if exact_count <= max_count else None
 
+                    exact_loop_replay_work_remaining = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
+
                     def exact_loop_repeated_state_weight_rank_bounds(
                         subgraph: Any,
                         graph_input_name: str,
@@ -6401,7 +6489,12 @@ def _build_onnx_weight_analysis_plan(
                         if current_shape is None or current_rank is None:
                             return None
                         body_consumes_weight_rank = False
+                        nonlocal exact_loop_replay_work_remaining
                         for _iteration in range(exact_loop_iterations):
+                            iteration_work = max(current_rank, 1)
+                            if exact_loop_replay_work_remaining < iteration_work:
+                                return None
+                            exact_loop_replay_work_remaining -= iteration_work
                             body_consumes_weight_rank = body_consumes_weight_rank or current_rank >= 2
                             output_shapes: dict[int, tuple[int, ...]] = {}
                             promoted = subgraph_reenters_state_with_rank_promotion(

@@ -8231,6 +8231,7 @@ class TestWeightDistributionSemantics:
         [
             ("Gather", np.arange(4, dtype=np.int64), [1, 4], False),
             ("Gather", np.zeros((4, 4), dtype=np.int64), [4, 4], True),
+            ("GatherElements", np.arange(4, dtype=np.int64), [1, 4], False),
             ("GatherND", np.arange(4, dtype=np.int64).reshape(4, 1), [1, 4], False),
             ("GatherND", np.zeros((4, 4, 1), dtype=np.int64), [4, 4], True),
         ],
@@ -8250,11 +8251,12 @@ class TestWeightDistributionSemantics:
             onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="initial_condition"),
             onnx.numpy_helper.from_array(np.array(0.0, dtype=np.float32), name="dummy"),
         ]
-        gather_node = (
-            helper.make_node("Gather", ["state", "indices"], ["next_state"], axis=0)
-            if op_type == "Gather"
-            else helper.make_node("GatherND", ["state", "indices"], ["next_state"])
-        )
+        if op_type == "Gather":
+            gather_node = helper.make_node("Gather", ["state", "indices"], ["next_state"], axis=0)
+        elif op_type == "GatherElements":
+            gather_node = helper.make_node("GatherElements", ["state", "indices"], ["next_state"], axis=0)
+        else:
+            gather_node = helper.make_node("GatherND", ["state", "indices"], ["next_state"])
         body = helper.make_graph(
             [
                 helper.make_node("MatMul", ["X", "state"], ["body_y"]),
@@ -9618,6 +9620,96 @@ class TestWeightDistributionSemantics:
             assert coverage == []
             assert semantics["coverage_gaps"] == {}
 
+    @pytest.mark.parametrize(
+        ("optional_condition", "trip_count", "expected_gap"),
+        [("", 2, False), ("", 3, True), ("condition_in", 3, True)],
+    )
+    def test_repeated_loop_reentry_traces_alias_captured_by_inputless_nested_loop(
+        self,
+        tmp_path: Path,
+        optional_condition: str,
+        trip_count: int,
+        expected_gap: bool,
+    ) -> None:
+        source_names = [f"W{index}" for index in range(40)]
+        nested_body = helper.make_graph(
+            [
+                helper.make_node("PRelu", ["activation", "state_alias"], ["nested_y"]),
+                helper.make_node("Identity", ["nested_false"], ["nested_condition_out"]),
+                helper.make_node("Identity", ["dummy"], ["nested_scan"]),
+            ],
+            "inputless_alias_weight_consumer",
+            [
+                helper.make_tensor_value_info("nested_iteration", TensorProto.INT64, []),
+                helper.make_tensor_value_info("nested_condition_in", TensorProto.BOOL, []),
+            ],
+            [
+                helper.make_tensor_value_info("nested_condition_out", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("nested_scan", TensorProto.FLOAT, []),
+            ],
+            initializer=[onnx.numpy_helper.from_array(np.array(False, dtype=np.bool_), name="nested_false")],
+        )
+        body = helper.make_graph(
+            [
+                helper.make_node("Identity", ["state"], ["state_alias"]),
+                helper.make_node("Loop", ["", optional_condition], ["unused_nested_scan"], body=nested_body),
+                helper.make_node("Unsqueeze", ["state", "axes"], ["next_state"]),
+                helper.make_node("Identity", ["condition_in"], ["condition_out"]),
+            ],
+            "retained_loop_reentry_inputless_nested_alias_body",
+            [
+                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
+                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("state", TensorProto.FLOAT, None),
+            ],
+            [
+                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, None),
+            ],
+        )
+        graph = helper.make_graph(
+            [
+                helper.make_node("Sum", source_names, ["initial_state"]),
+                helper.make_node(
+                    "Loop",
+                    ["trip_count", "initial_condition", "initial_state"],
+                    ["final_state"],
+                    body=body,
+                ),
+                helper.make_node("Identity", ["dummy"], ["Y"]),
+            ],
+            "retained_loop_reentry_inputless_nested_alias",
+            [helper.make_tensor_value_info("activation", TensorProto.FLOAT, [1, 1])],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [])],
+            initializer=[
+                *[onnx.numpy_helper.from_array(np.array(1.0, dtype=np.float32), name=name) for name in source_names],
+                onnx.numpy_helper.from_array(np.array([0], dtype=np.int64), name="axes"),
+                onnx.numpy_helper.from_array(np.array(trip_count, dtype=np.int64), name="trip_count"),
+                onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="initial_condition"),
+                onnx.numpy_helper.from_array(np.array(0.0, dtype=np.float32), name="dummy"),
+            ],
+            value_info=[helper.make_tensor_value_info("initial_state", TensorProto.FLOAT, [])],
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model, full_check=True)
+        suffix = "empty-condition" if not optional_condition else "outer-condition"
+        path = tmp_path / f"retained-loop-reentry-inputless-nested-alias-{suffix}-{trip_count}.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        if expected_gap:
+            assert result.success is False
+            assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
+            assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
+        else:
+            assert result.success is True
+            assert coverage == []
+            assert semantics["coverage_gaps"] == {}
+
     def test_repeated_loop_reentry_liveness_uses_per_node_flags(self, tmp_path: Path) -> None:
         source_names = [f"W{index}" for index in range(40)]
         chain_length = 64
@@ -9708,6 +9800,170 @@ class TestWeightDistributionSemantics:
         assert retained_snapshot_entries == 0
         assert live_flag_counts
         assert max(live_flag_counts) <= chain_length + 3
+
+    def test_repeated_loop_reentry_bounds_constant_value_floats_before_tensor_conversion(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        value_count = onnx_scanner_module._ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK + 1
+        source_names = [f"W{index}" for index in range(40)]
+        body = helper.make_graph(
+            [
+                helper.make_node(
+                    "Constant",
+                    [],
+                    ["next_state"],
+                    value_floats=[1.0] * value_count,
+                ),
+                helper.make_node("Identity", ["condition_in"], ["condition_out"]),
+            ],
+            "retained_loop_reentry_oversized_constant_body",
+            [
+                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
+                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("state", TensorProto.FLOAT, [value_count]),
+            ],
+            [
+                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, [value_count]),
+            ],
+        )
+        graph = helper.make_graph(
+            [
+                helper.make_node("Sum", source_names, ["initial_state"]),
+                helper.make_node(
+                    "Loop",
+                    ["trip_count", "initial_condition", "initial_state"],
+                    ["final_state"],
+                    body=body,
+                ),
+                helper.make_node("MatMul", ["X", "final_state"], ["Y"]),
+            ],
+            "retained_loop_reentry_oversized_constant",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, value_count])],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1])],
+            initializer=[
+                *[
+                    onnx.numpy_helper.from_array(np.ones((value_count,), dtype=np.float32), name=name)
+                    for name in source_names
+                ],
+                onnx.numpy_helper.from_array(np.array(2, dtype=np.int64), name="trip_count"),
+                onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="initial_condition"),
+            ],
+            value_info=[helper.make_tensor_value_info("initial_state", TensorProto.FLOAT, [value_count])],
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model, full_check=True)
+        path = tmp_path / "retained-loop-reentry-oversized-constant.onnx"
+        onnx.save(model, str(path))
+        scanner_path = Path(onnx_scanner_module.__file__).resolve()
+        oversized_returns: list[Any] = []
+
+        def profile(frame: Any, event: str, arg: Any) -> None:
+            if (
+                event == "return"
+                and frame.f_code.co_name == "resolved_constant_node_tensor"
+                and Path(frame.f_code.co_filename).resolve() == scanner_path
+            ):
+                node = frame.f_locals.get("node")
+                for attribute in getattr(node, "attribute", ()):
+                    if attribute.name == "value_floats" and len(attribute.floats) > value_count - 1:
+                        oversized_returns.append(arg)
+
+        sys.setprofile(profile)
+        try:
+            result = OnnxScanner().scan(str(path))
+        finally:
+            sys.setprofile(None)
+
+        assert "onnx_weight_distribution_semantics" in result.metadata
+        assert oversized_returns
+        assert all(value is None for value in oversized_returns)
+
+    def test_repeated_loop_exact_rank_replay_shares_budget_across_states(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(onnx_scanner_module, "_ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK", 32)
+        state_count = 4
+        source_names = [f"W{index}" for index in range(40)]
+        body = helper.make_graph(
+            [
+                *[
+                    helper.make_node("Unsqueeze", [f"state{index}", "axes"], [f"next{index}"])
+                    for index in range(state_count)
+                ],
+                helper.make_node("Identity", ["condition_in"], ["condition_out"]),
+            ],
+            "exact_rank_replay_budget_body",
+            [
+                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
+                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
+                *[
+                    helper.make_tensor_value_info(f"state{index}", TensorProto.FLOAT, [None])
+                    for index in range(state_count)
+                ],
+            ],
+            [
+                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
+                *[
+                    helper.make_tensor_value_info(f"next{index}", TensorProto.FLOAT, [None])
+                    for index in range(state_count)
+                ],
+            ],
+        )
+        graph = helper.make_graph(
+            [
+                helper.make_node("Sum", source_names, ["initial_state"]),
+                helper.make_node(
+                    "Loop",
+                    ["trip_count", "initial_condition", *["initial_state" for _index in range(state_count)]],
+                    [f"final{index}" for index in range(state_count)],
+                    body=body,
+                ),
+                helper.make_node("MatMul", ["X", "final0"], ["Y"]),
+            ],
+            "exact_rank_replay_budget",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 2])],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, None])],
+            initializer=[
+                *[onnx.numpy_helper.from_array(np.array(1.0, dtype=np.float32), name=name) for name in source_names],
+                onnx.numpy_helper.from_array(np.array([0], dtype=np.int64), name="axes"),
+                onnx.numpy_helper.from_array(np.array(16, dtype=np.int64), name="trip_count"),
+                onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="initial_condition"),
+            ],
+            value_info=[helper.make_tensor_value_info("initial_state", TensorProto.FLOAT, [])],
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / "exact-rank-replay-budget.onnx"
+        onnx.save(model, str(path))
+        scanner_path = Path(onnx_scanner_module.__file__).resolve()
+        exact_replay_results: list[Any] = []
+
+        def profile(frame: Any, event: str, arg: Any) -> None:
+            if (
+                event == "return"
+                and frame.f_code.co_name == "exact_loop_repeated_state_weight_rank_bounds"
+                and Path(frame.f_code.co_filename).resolve() == scanner_path
+            ):
+                exact_replay_results.append(arg)
+
+        sys.setprofile(profile)
+        try:
+            result = OnnxScanner().scan(str(path))
+        finally:
+            sys.setprofile(None)
+
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert result.success is False
+        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
+        assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
+        assert None in exact_replay_results
 
     def test_nested_loop_reachability_preserves_empty_optional_input_slots(self, tmp_path: Path) -> None:
         source_names = [f"W{index}" for index in range(40)]
@@ -12550,6 +12806,196 @@ class TestWeightDistributionSemantics:
         assert result.success is True
         assert coverage == []
         assert semantics["coverage_gaps"] == {}
+
+    def test_repeated_loop_output_dead_clean_nested_captures_do_not_repeat_per_state(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        state_count = 8
+        nested_count = 24
+        nested_graphs = [
+            helper.make_graph(
+                [helper.make_node("Identity", ["clean"], ["out"])],
+                f"nested_clean_capture_{index}",
+                [],
+                [helper.make_tensor_value_info("out", TensorProto.FLOAT, [2])],
+            )
+            for index in range(nested_count)
+        ]
+        dead_node = helper.make_node("ObserverGraphs", [], ["unused_nested"], domain="custom", name="dead_clean")
+        dead_node.attribute.append(helper.make_attribute("graphs", nested_graphs))
+        body = helper.make_graph(
+            [
+                dead_node,
+                helper.make_node("Identity", ["condition_in"], ["condition_out"]),
+                *[helper.make_node("Identity", [f"state{index}"], [f"next{index}"]) for index in range(state_count)],
+            ],
+            "output_dead_clean_nested_capture_body",
+            [
+                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
+                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
+                *[
+                    helper.make_tensor_value_info(f"state{index}", TensorProto.FLOAT, [2])
+                    for index in range(state_count)
+                ],
+            ],
+            [
+                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
+                *[
+                    helper.make_tensor_value_info(f"next{index}", TensorProto.FLOAT, [2])
+                    for index in range(state_count)
+                ],
+            ],
+        )
+        graph = helper.make_graph(
+            [
+                helper.make_node(
+                    "Loop",
+                    ["trip_count", "initial_condition", *[f"initial{index}" for index in range(state_count)]],
+                    [f"final{index}" for index in range(state_count)],
+                    body=body,
+                ),
+                helper.make_node("MatMul", ["X", "final0"], ["Y"]),
+            ],
+            "output_dead_clean_nested_capture",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 2])],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1])],
+            initializer=[
+                *[
+                    onnx.numpy_helper.from_array(np.ones((2,), dtype=np.float32), name=f"initial{index}")
+                    for index in range(state_count)
+                ],
+                onnx.numpy_helper.from_array(np.array(2, dtype=np.int64), name="trip_count"),
+                onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="initial_condition"),
+                onnx.numpy_helper.from_array(np.ones((2,), dtype=np.float32), name="clean"),
+            ],
+        )
+        model = helper.make_model(
+            graph,
+            opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("custom", 1)],
+        )
+        model.ir_version = 8
+        onnx.checker.check_model(model, full_check=True)
+        path = tmp_path / "output-dead-clean-nested-capture.onnx"
+        onnx.save(model, str(path))
+        scanner_path = Path(onnx_scanner_module.__file__).resolve()
+        clean_capture_reference_calls = 0
+
+        def profile(frame: Any, event: str, _arg: Any) -> None:
+            nonlocal clean_capture_reference_calls
+            if (
+                event == "return"
+                and frame.f_code.co_name == "graph_external_reference_names"
+                and Path(frame.f_code.co_filename).resolve() == scanner_path
+                and getattr(frame.f_locals.get("graph"), "name", "").startswith("nested_clean_capture_")
+            ):
+                clean_capture_reference_calls += 1
+
+        sys.setprofile(profile)
+        try:
+            result = OnnxScanner().scan(str(path))
+        finally:
+            sys.setprofile(None)
+
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert result.success is True
+        assert coverage == []
+        assert semantics["coverage_gaps"] == {}
+        assert clean_capture_reference_calls <= nested_count * 3
+
+    def test_repeated_loop_live_producer_dependencies_are_bounded_before_state_walks(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(onnx_scanner_module, "_ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK", 8)
+        state_count = 4
+        clean_input_count = 9
+        source_names = [f"W{index}" for index in range(40)]
+        body = helper.make_graph(
+            [
+                helper.make_node(
+                    "Sum",
+                    [f"clean{index}" for index in range(clean_input_count)],
+                    ["shared_clean"],
+                    name="shared_clean_inputs",
+                ),
+                *[helper.make_node("Identity", ["shared_clean"], [f"next{index}"]) for index in range(state_count)],
+                helper.make_node("Identity", ["condition_in"], ["condition_out"]),
+            ],
+            "live_producer_dependency_bound_body",
+            [
+                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
+                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
+                *[
+                    helper.make_tensor_value_info(f"state{index}", TensorProto.FLOAT, [2])
+                    for index in range(state_count)
+                ],
+            ],
+            [
+                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
+                *[
+                    helper.make_tensor_value_info(f"next{index}", TensorProto.FLOAT, [2])
+                    for index in range(state_count)
+                ],
+            ],
+        )
+        graph = helper.make_graph(
+            [
+                helper.make_node("Sum", source_names, ["initial_state"]),
+                helper.make_node(
+                    "Loop",
+                    ["trip_count", "initial_condition", *["initial_state" for _index in range(state_count)]],
+                    [f"final{index}" for index in range(state_count)],
+                    body=body,
+                ),
+                helper.make_node("Sum", [f"final{index}" for index in range(state_count)], ["merged"]),
+                helper.make_node("MatMul", ["X", "merged"], ["Y"]),
+            ],
+            "live_producer_dependency_bound",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 2])],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1])],
+            initializer=[
+                *[onnx.numpy_helper.from_array(np.ones((2,), dtype=np.float32), name=name) for name in source_names],
+                *[
+                    onnx.numpy_helper.from_array(np.ones((2,), dtype=np.float32), name=f"clean{index}")
+                    for index in range(clean_input_count)
+                ],
+                onnx.numpy_helper.from_array(np.array(2, dtype=np.int64), name="trip_count"),
+                onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="initial_condition"),
+            ],
+            value_info=[helper.make_tensor_value_info("initial_state", TensorProto.FLOAT, [2])],
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model, full_check=True)
+        path = tmp_path / "live-producer-dependency-bound.onnx"
+        onnx.save(model, str(path))
+        scanner_path = Path(onnx_scanner_module.__file__).resolve()
+        shared_dependency_results: list[frozenset[str]] = []
+
+        def profile(frame: Any, event: str, arg: Any) -> None:
+            if (
+                event == "return"
+                and frame.f_code.co_name == "graph_node_direct_dependency_names"
+                and Path(frame.f_code.co_filename).resolve() == scanner_path
+                and getattr(frame.f_locals.get("node"), "name", "") == "shared_clean_inputs"
+                and isinstance(arg, frozenset)
+            ):
+                shared_dependency_results.append(arg)
+
+        sys.setprofile(profile)
+        try:
+            result = OnnxScanner().scan(str(path))
+        finally:
+            sys.setprofile(None)
+
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert result.success is True
+        assert semantics["coverage_gaps"] == {}
+        assert shared_dependency_results
+        assert all(any("dependency_collection_limit" in name for name in names) for names in shared_dependency_results)
 
     def test_repeated_loop_non_shape_rank_growth_promotes_after_float_cast(self, tmp_path: Path) -> None:
         source_names = [f"W{index}" for index in range(33)]
