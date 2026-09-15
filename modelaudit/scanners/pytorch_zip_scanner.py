@@ -4358,7 +4358,14 @@ class PyTorchZipScanner(BaseScanner):
                 continue
             literal_start = cursor + header_bytes
             literal_end = literal_start + literal_size
-            if literal_start <= offset < literal_end and literal_end <= len(value):
+            if (
+                literal_start <= offset < literal_end
+                and literal_end < len(value)
+                and value[literal_end] == ord(".")
+                and PyTorchZipScanner._has_complete_pickle_stream_without_frame_stop_overrun(
+                    value[cursor : literal_end + 1]
+                )
+            ):
                 return True
             cursor += 1
         return False
@@ -5255,11 +5262,19 @@ class PyTorchZipScanner(BaseScanner):
         opcode_budget_remaining: list[int] | None = None,
     ) -> bool:
         stream.seek(0)
+        truncated = stream_size > _PICKLE_LITERAL_PRESERVATION_STREAM_PROBE_BYTES
         sample = stream.read(min(stream_size, _PICKLE_LITERAL_PRESERVATION_STREAM_PROBE_BYTES))
-        return PyTorchZipScanner._complete_pickle_literal_member_has_line_continuation_suspicious_text(
-            sample,
-            opcode_budget_remaining=opcode_budget_remaining,
+        has_suspicious_literal = (
+            PyTorchZipScanner._complete_pickle_literal_member_has_line_continuation_suspicious_text(
+                sample,
+                opcode_budget_remaining=opcode_budget_remaining,
+            )
         )
+        if not has_suspicious_literal and truncated:
+            raise _PickleLiteralPreservationBudgetExceeded(
+                "pickle literal suspicious-text preservation exceeded its byte probe"
+            )
+        return has_suspicious_literal
 
     @staticmethod
     def _complete_proto0_string_literal_has_line_continuation_suspicious_text(sample: bytes) -> bool:
@@ -5294,13 +5309,27 @@ class PyTorchZipScanner(BaseScanner):
         pickle_source: str,
         pickle_filename: str,
     ) -> None:
-        PyTorchZipScanner._preserve_literal_suspicious_text_finding_from_stream(
-            member_result,
-            io.BytesIO(pickle_data),
-            len(pickle_data),
-            pickle_source=pickle_source,
-            pickle_filename=pickle_filename,
-        )
+        if PyTorchZipScanner._result_has_suspicious_string_finding(member_result):
+            return
+        if any(issue.severity == IssueSeverity.CRITICAL for issue in member_result.issues):
+            return
+        try:
+            has_suspicious_literal = (
+                PyTorchZipScanner._complete_pickle_literal_member_has_line_continuation_suspicious_text(pickle_data)
+            )
+        except _PickleLiteralPreservationBudgetExceeded:
+            PyTorchZipScanner._mark_literal_preservation_incomplete(
+                member_result,
+                pickle_source=pickle_source,
+                pickle_filename=pickle_filename,
+            )
+            return
+        if has_suspicious_literal:
+            PyTorchZipScanner._add_preserved_suspicious_literal_finding(
+                member_result,
+                pickle_source=pickle_source,
+                pickle_filename=pickle_filename,
+            )
 
     @staticmethod
     def _preserve_literal_suspicious_text_finding_from_stream(
@@ -5323,27 +5352,54 @@ class PyTorchZipScanner(BaseScanner):
                 )
             )
         except _PickleLiteralPreservationBudgetExceeded:
-            reason = "pytorch_zip_literal_preservation_incomplete"
-            mark_inconclusive_scan_result(member_result, reason)
-            member_result.metadata["pickle_verdict"] = "unknown"
-            member_result.add_check(
-                name="Suspicious Literal Preservation",
-                passed=False,
-                message="PyTorch ZIP suspicious-literal preservation stopped at its opcode budget",
-                severity=IssueSeverity.INFO,
-                location=pickle_source,
-                details={
-                    "pickle_source": pickle_source,
-                    "pickle_filename": pickle_filename,
-                    "max_opcodes": _PICKLE_LITERAL_PRESERVATION_MAX_OPCODES,
-                    "analysis_incomplete": True,
-                    "scan_outcome_reason": reason,
-                },
+            PyTorchZipScanner._mark_literal_preservation_incomplete(
+                member_result,
+                pickle_source=pickle_source,
+                pickle_filename=pickle_filename,
             )
-            member_result.finish(success=False)
             return
         if not has_suspicious_literal:
             return
+        PyTorchZipScanner._add_preserved_suspicious_literal_finding(
+            member_result,
+            pickle_source=pickle_source,
+            pickle_filename=pickle_filename,
+        )
+
+    @staticmethod
+    def _mark_literal_preservation_incomplete(
+        member_result: ScanResult,
+        *,
+        pickle_source: str,
+        pickle_filename: str,
+    ) -> None:
+        reason = "pytorch_zip_literal_preservation_incomplete"
+        mark_inconclusive_scan_result(member_result, reason)
+        member_result.metadata["pickle_verdict"] = "unknown"
+        member_result.add_check(
+            name="Suspicious Literal Preservation",
+            passed=False,
+            message="PyTorch ZIP suspicious-literal preservation stopped at its opcode or byte budget",
+            severity=IssueSeverity.INFO,
+            location=pickle_source,
+            details={
+                "pickle_source": pickle_source,
+                "pickle_filename": pickle_filename,
+                "max_opcodes": _PICKLE_LITERAL_PRESERVATION_MAX_OPCODES,
+                "max_bytes": _PICKLE_LITERAL_PRESERVATION_STREAM_PROBE_BYTES,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": reason,
+            },
+        )
+        member_result.finish(success=False)
+
+    @staticmethod
+    def _add_preserved_suspicious_literal_finding(
+        member_result: ScanResult,
+        *,
+        pickle_source: str,
+        pickle_filename: str,
+    ) -> None:
         member_result.add_check(
             name="Suspicious String Literal",
             passed=False,

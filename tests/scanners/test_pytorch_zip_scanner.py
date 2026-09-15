@@ -1,7 +1,6 @@
 import base64
 import binascii
 import hashlib
-import io
 import json
 import os
 import pickle
@@ -9,6 +8,7 @@ import stat
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 import warnings
@@ -3458,6 +3458,33 @@ def test_pytorch_zip_discovery_skips_p_marker_inside_binbytes_literal(
     assert not any(issue.details.get("pickle_filename") == "archive/data/0" for issue in result.issues)
 
 
+def test_pytorch_zip_discovery_fails_closed_for_overlapping_persid_literal_decoy(
+    tmp_path: Path,
+) -> None:
+    model_path = tmp_path / "referenced_storage_impossible_declared_prefix_overlapping_persid_decoy.pt"
+    prefix = b"X" + (3_191_733_531).to_bytes(4, "little")
+    decoys = b"c!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)
+    inert_padding = b"!" * (70 * 1024)
+    storage_blob = prefix + decoys + inert_padding + b"B\x06\x00\x00\x00!!!!Px\n."
+    storage_blob += b"!" * (-len(storage_blob) % 4)
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        zip_file.writestr("archive/data/0", storage_blob)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert result.success is False
+    assert "pytorch_zip_pickle_discovery_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "Pickle Discovery"
+        and check.details.get("analysis_incomplete") is True
+        and "archive/data/0" in check.details.get("zip_entries", [])
+        for check in result.checks
+    )
+
+
 def test_pytorch_zip_discovery_fails_closed_for_unicode_stack_global_after_budget_gap(
     tmp_path: Path,
 ) -> None:
@@ -5830,21 +5857,21 @@ def test_pytorch_zip_discovery_preserves_spooled_line_continuation_suspicious_st
 def test_pytorch_zip_discovery_bounds_spooled_literal_preservation_reads() -> None:
     reads: list[int] = []
 
-    class RecordingStream(io.BytesIO):
+    class RecordingStream(tempfile.SpooledTemporaryFile[bytes]):
         def read(self, size: int = -1) -> bytes:
             reads.append(size)
             return super().read(size)
 
     literal_size = pytorch_zip_scanner_module._PICKLE_LITERAL_PRESERVATION_STREAM_PROBE_BYTES + 128
-    stream = RecordingStream(b"B" + literal_size.to_bytes(4, "little") + (b"A" * literal_size) + b".")
+    stream = RecordingStream(max_size=1)
+    stream.write(b"B" + literal_size.to_bytes(4, "little") + (b"A" * literal_size) + b".")
+    stream.seek(0)
 
-    assert (
+    with pytest.raises(pytorch_zip_scanner_module._PickleLiteralPreservationBudgetExceeded):
         PyTorchZipScanner._complete_pickle_literal_stream_has_line_continuation_suspicious_text(
             stream,
-            len(stream.getvalue()),
+            1 + 4 + literal_size + 1,
         )
-        is False
-    )
     assert max(size for size in reads if size >= 0) <= (
         pytorch_zip_scanner_module._PICKLE_LITERAL_PRESERVATION_STREAM_PROBE_BYTES
     )
