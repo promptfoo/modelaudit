@@ -2998,6 +2998,30 @@ def test_pytorch_zip_discovery_fails_closed_after_nul_padding_beyond_trusted_pro
     )
 
 
+def test_pytorch_zip_discovery_fails_closed_after_verified_nul_padding_separator(
+    tmp_path: Path,
+) -> None:
+    model_path = tmp_path / "referenced_storage_nul_padding_separator_hidden_pickle.pt"
+    storage_blob = b"\x00" * 70_000 + b"!cposix\nsystem\n)R."
+    storage_blob += b"!" * (-len(storage_blob) % 4)
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        zip_file.writestr("archive/data/0", storage_blob)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert result.success is False
+    assert "pytorch_zip_pickle_discovery_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "Pickle Discovery"
+        and check.details.get("analysis_incomplete") is True
+        and "archive/data/0" in check.details.get("zip_entries", [])
+        for check in result.checks
+    )
+
+
 def test_pytorch_zip_discovery_fails_closed_for_hidden_pickle_beyond_unread_impossible_prefix(
     tmp_path: Path,
 ) -> None:
@@ -9805,7 +9829,7 @@ def test_pytorch_zip_regular_scan_sparse_zip64_storage_shard_is_bounded(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Whisper-like ZIP64 storage shards should be inspected without full-file hashing."""
+    """Whisper-like ZIP64 storage shards should fail closed without full-file hashing."""
     from modelaudit import core
 
     zip_path = tmp_path / "pytorch_model.bin"
@@ -9831,7 +9855,7 @@ def test_pytorch_zip_regular_scan_sparse_zip64_storage_shard_is_bounded(
     metadata = result.file_metadata[str(zip_path)].model_dump(mode="python")
     file_hashes = metadata["file_hashes"]
 
-    assert result.success is True
+    assert result.success is False
     assert result.content_hash is None
     assert result.bytes_scanned < 1_000_000
     assert "pytorch_zip" in result.scanner_names
@@ -9841,6 +9865,7 @@ def test_pytorch_zip_regular_scan_sparse_zip64_storage_shard_is_bounded(
     assert file_hashes["sha256"] is None
     assert isinstance(file_hashes["sha256_prefix"], str)
     assert "max_file_read_size_exceeded" not in metadata.get("scan_outcome_reasons", [])
+    assert "pytorch_zip_pickle_discovery_incomplete" in metadata.get("scan_outcome_reasons", [])
 
 
 def test_pytorch_zip_scan_does_not_route_numeric_tensor_data_files_as_pickles(tmp_path: Path) -> None:
