@@ -2764,7 +2764,9 @@ def _build_onnx_weight_analysis_plan(
             input_shapes_by_name = {input_name: reentry_input_shape(input_name) for input_name in body_inputs}
             elementwise_operator = body_node.op_type in _SAME_TYPE_ELEMENTWISE_OPERATORS or body_node.op_type == "Pow"
             promotion_input_tainted = (
-                any_tainted if elementwise_operator or body_node.op_type in {"MatMul", "OneHot"} else data_input_tainted
+                any_tainted
+                if elementwise_operator or body_node.op_type in {"Einsum", "MatMul", "OneHot"}
+                else data_input_tainted
             )
             promotion_input_shapes = (
                 [input_shapes_by_name.get(input_name) for input_name in body_inputs if input_name in tainted]
@@ -2868,10 +2870,15 @@ def _build_onnx_weight_analysis_plan(
                     nested_tainted_shapes.update(
                         {captured_name: tainted_shapes.get(captured_name) for captured_name in captured_names}
                     )
+                    external_context_names = nested_external_names
+                    if len(nested_external_names) * max(len(nested_tainted_shapes), 1) > (
+                        _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
+                    ):
+                        external_context_names = captured_names
                     nested_context_shapes.update(
                         {
                             captured_name: shape
-                            for captured_name in nested_external_names
+                            for captured_name in external_context_names
                             if (shape := reentry_input_shape(captured_name)) is not None
                         }
                     )
@@ -2892,21 +2899,22 @@ def _build_onnx_weight_analysis_plan(
                     nested_constants = graph_initializer_constants(nested_graph, available_nested_constants)
                     nested_constants.update(nested_bound_input_constants)
                     nested_output_shapes: dict[int, tuple[int, ...]] = {}
+                    nested_captured_names = set(nested_tainted_shapes)
+                    nested_tainted_output_indexes = graph_tainted_output_indexes(
+                        nested_graph,
+                        nested_captured_names,
+                        opset_versions,
+                        attribute_bindings=local_attribute_bindings,
+                        depth=depth + 1,
+                    )
+                    tainted.update(
+                        mapped_node_outputs(
+                            body_outputs,
+                            nested_tainted_output_indexes,
+                            graph_output_offset=control_flow_output_offset(body_node),
+                        )
+                    )
                     for captured_name, captured_shape in nested_tainted_shapes.items():
-                        nested_tainted_output_indexes = graph_tainted_output_indexes(
-                            nested_graph,
-                            {captured_name},
-                            opset_versions,
-                            attribute_bindings=local_attribute_bindings,
-                            depth=depth + 1,
-                        )
-                        tainted.update(
-                            mapped_node_outputs(
-                                body_outputs,
-                                nested_tainted_output_indexes,
-                                graph_output_offset=control_flow_output_offset(body_node),
-                            )
-                        )
                         nested_promoted_output_indexes: set[int] = set()
                         for output_index in range(len(getattr(nested_graph, "output", ()))):
                             if subgraph_reenters_state_with_rank_promotion(
@@ -2953,6 +2961,7 @@ def _build_onnx_weight_analysis_plan(
                 or (
                     (
                         is_rank_gap_promoting_operator(body_node)
+                        or body_node.op_type == "Einsum"
                         or body_node.op_type == "MatMul"
                         or body_node.op_type == "OneHot"
                         or body_node.op_type in _SAME_TYPE_ELEMENTWISE_OPERATORS
@@ -2966,7 +2975,7 @@ def _build_onnx_weight_analysis_plan(
                 tainted.update(body_tainted_outputs)
             elif any_tainted:
                 tainted.update(body_tainted_outputs)
-            if any_tainted:
+            if any_tainted or any(input_shapes_by_name.get(input_name) is not None for input_name in body_inputs):
                 output_shape = None
                 if reentry_shape_preserving_unary_operator(body_node, body_inputs) and data_input_shape is not None:
                     output_shape = data_input_shape
@@ -2994,6 +3003,8 @@ def _build_onnx_weight_analysis_plan(
                         input_shapes_by_name.get(body_inputs[0]) if body_inputs else None,
                         subgraph_constants,
                     )
+                elif body_node.op_type == "Einsum":
+                    output_shape = einsum_output_shape(body_node, input_shapes_by_name)
                 elif body_node.op_type in _SAME_TYPE_ELEMENTWISE_OPERATORS | {"Pow"}:
                     output_shape = broadcast_shapes(input_shapes_by_name.get(input_name) for input_name in body_inputs)
                 elif body_node.op_type == "Expand" and data_input_shape is not None:
@@ -3546,12 +3557,52 @@ def _build_onnx_weight_analysis_plan(
         graph_external_reference_cache[cache_key] = (graph, reference_names)
         return reference_names
 
+    def einsum_output_shape(
+        node: Any,
+        input_shapes_by_name: dict[str, tuple[int, ...] | None],
+    ) -> tuple[int, ...] | None:
+        equation = _onnx_text_attribute(node, "equation")
+        if equation is None or "..." in equation or equation.count("->") != 1:
+            return None
+        input_expression, output_expression = (part.strip() for part in equation.split("->", 1))
+        input_terms = [term.strip() for term in input_expression.split(",")]
+        input_names = [str(input_name) for input_name in getattr(node, "input", ()) if input_name]
+        if len(input_terms) != len(input_names) or len(set(output_expression)) != len(output_expression):
+            return None
+        label_dimensions: dict[str, int] = {}
+        for term, input_name in zip(input_terms, input_names, strict=False):
+            input_shape = input_shapes_by_name.get(input_name)
+            if input_shape is None or len(term) != len(input_shape) or len(set(term)) != len(term):
+                return None
+            for label, dimension in zip(term, input_shape, strict=False):
+                existing_dimension = label_dimensions.get(label)
+                if existing_dimension is None:
+                    label_dimensions[label] = dimension
+                elif existing_dimension != dimension:
+                    label_dimensions[label] = -1
+        output_dimensions: list[int] = []
+        for label in output_expression:
+            if label not in label_dimensions:
+                return None
+            output_dimensions.append(label_dimensions[label])
+        return tuple(output_dimensions)
+
     def gap_summary_may_exceed_input_rank(summary: _OnnxWeightLineageGapSummary, input_rank: int | None) -> bool:
         if summary.truncated:
             return True
         if input_rank is None:
             return bool(summary.lineages)
         return any(lineage.shape is None or len(lineage.shape) > input_rank for lineage in summary.lineages)
+
+    def gap_summary_has_known_rank_above_input(
+        summary: _OnnxWeightLineageGapSummary,
+        input_rank: int | None,
+    ) -> bool:
+        if summary.truncated:
+            return True
+        if input_rank is None:
+            return bool(summary.lineages)
+        return any(lineage.shape is not None and len(lineage.shape) > input_rank for lineage in summary.lineages)
 
     def gap_summary_is_dynamic_activation(summary: _OnnxWeightLineageGapSummary, count: int) -> bool:
         if count <= 0:
@@ -3608,6 +3659,9 @@ def _build_onnx_weight_analysis_plan(
             if input_shapes_by_name and input_names:
                 indices_shape = input_shapes_by_name.get(input_names[0])
             output_shape = onehot_output_shape(node, indices_shape, constants)
+            return output_shape is None or len(output_shape) >= 2
+        if node.op_type == "Einsum":
+            output_shape = einsum_output_shape(node, input_shapes_by_name or {})
             return output_shape is None or len(output_shape) >= 2
         if node.op_type == "Expand":
             shape_name = str(node.input[1]) if len(node.input) > 1 else ""
@@ -4942,11 +4996,19 @@ def _build_onnx_weight_analysis_plan(
         def rank_one_weight_gap_is_safe(name: str, summary: _OnnxWeightLineageGapSummary, count: int) -> bool:
             if count <= 0:
                 return False
-            value_rank = proven_value_rank(name)
+            proven_rank = proven_value_rank(name)
+            value_rank = proven_rank
+            if value_rank is None and not summary.truncated and summary.lineages:
+                summary_ranks = {len(lineage.shape) for lineage in summary.lineages if lineage.shape is not None}
+                summary_shapes_known = all(lineage.shape is not None for lineage in summary.lineages)
+                if len(summary_ranks) == 1 and summary_shapes_known:
+                    value_rank = next(iter(summary_ranks))
+                elif summary_shapes_known and (known_rank := known_value_ranks.get(name)) is not None:
+                    value_rank = known_rank
             return (
                 value_rank is not None
                 and value_rank < 2
-                and not summary.truncated
+                and (not summary.truncated or proven_rank is not None)
                 and not any(
                     lineage.shape is not None and len(lineage.shape) > value_rank for lineage in summary.lineages
                 )
@@ -5351,6 +5413,15 @@ def _build_onnx_weight_analysis_plan(
                     input_weight_lineage_limit_gap_summary,
                     input_weight_lineage_limit_gap_count,
                 )
+                if rank_one_weight_gap:
+                    input_rank_for_gap = known_value_ranks.get(str(input_name))
+                    rank_one_weight_gap = not (
+                        gap_summary_has_known_rank_above_input(input_non_shape_lineage_gap_summary, input_rank_for_gap)
+                        or gap_summary_has_known_rank_above_input(
+                            input_rank_promotable_lineage_limit_gap_summary,
+                            input_rank_for_gap,
+                        )
+                    )
                 recorded_input_lineage_limit_gap = recognized_gap_activation_input
                 if (
                     potential_weight_role
@@ -5643,6 +5714,36 @@ def _build_onnx_weight_analysis_plan(
 
                     scan_num_inputs = num_scan_inputs if node.op_type == "Scan" else 0
 
+                    def loop_exact_iteration_count(
+                        current_node: Any = node,
+                        *,
+                        max_count: int = 1,
+                    ) -> int | None:
+                        trip_input = (
+                            str(current_node.input[0]) if len(current_node.input) > 0 and current_node.input[0] else ""
+                        )
+                        condition_input = (
+                            str(current_node.input[1]) if len(current_node.input) > 1 and current_node.input[1] else ""
+                        )
+                        if (trip_input in graph_input_names and trip_input not in constants) or (
+                            condition_input in graph_input_names and condition_input not in constants
+                        ):
+                            return None
+                        trip_count = (
+                            constant_scalar_value(constants.get(trip_input), int(onnx.TensorProto.INT64))
+                            if trip_input
+                            else None
+                        )
+                        initial_condition = (
+                            constant_scalar_value(constants.get(condition_input), int(onnx.TensorProto.BOOL))
+                            if condition_input
+                            else True
+                        )
+                        if trip_count is None or initial_condition is not True:
+                            return None
+                        exact_count = max(int(trip_count), 0)
+                        return exact_count if exact_count <= max_count else None
+
                     def is_repeated_control_flow_state_input(
                         pair_index: int,
                         *,
@@ -5742,29 +5843,64 @@ def _build_onnx_weight_analysis_plan(
                         parent_name = str(parent_input)
                         graph_input_name = _onnx_value_name(graph_input)
                         parent_shape = known_value_shapes.get(parent_name)
+                        if parent_shape is None and parent_name in value_lineages:
+                            lineage_shapes = {
+                                lineage.shape
+                                for lineage in value_lineages[parent_name].values()
+                                if lineage.shape is not None
+                            }
+                            if len(lineage_shapes) == 1:
+                                parent_shape = next(iter(lineage_shapes))
                         parent_rank = known_value_ranks.get(parent_name)
                         repeated_control_flow_state_input = is_repeated_control_flow_state_input(pair_index)
                         repeated_state_reenters_with_rank_promotion = False
+                        repeated_state_output_shapes: dict[int, tuple[int, ...]] = {}
+                        graph_output_index = control_flow_subgraph_state_output_index(node, pair_index, opset_versions)
                         if repeated_control_flow_state_input:
                             repeated_state_reenters_with_rank_promotion = subgraph_reenters_state_with_rank_promotion(
                                 subgraph,
                                 graph_input_name,
-                                control_flow_subgraph_state_output_index(node, pair_index, opset_versions),
+                                graph_output_index,
                                 constants,
                                 opset_versions,
                                 parent_shape,
                                 trusted_context_shapes=subgraph_trusted_context_shapes,
+                                output_shapes_out=repeated_state_output_shapes,
                             )
                         parent_rank_for_repeated_state = len(parent_shape) if parent_shape is not None else parent_rank
+                        finite_repeated_state_consumes_weight_rank = True
+                        if (
+                            repeated_control_flow_state_input
+                            and node.op_type == "Loop"
+                            and (
+                                exact_loop_iterations := loop_exact_iteration_count(
+                                    max_count=_ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK,
+                                )
+                            )
+                            is not None
+                        ):
+                            one_iteration_output_shape = repeated_state_output_shapes.get(graph_output_index)
+                            one_iteration_output_rank = (
+                                len(one_iteration_output_shape) if one_iteration_output_shape is not None else None
+                            )
+                            if parent_rank_for_repeated_state is not None and one_iteration_output_rank is not None:
+                                rank_delta = max(one_iteration_output_rank - parent_rank_for_repeated_state, 0)
+                                max_consumed_rank = (
+                                    parent_rank_for_repeated_state + max(exact_loop_iterations - 1, 0) * rank_delta
+                                )
+                                finite_repeated_state_consumes_weight_rank = max_consumed_rank >= 2
                         repeated_state_rank_gap_may_affect_weight = repeated_control_flow_state_input and (
-                            repeated_state_reenters_with_rank_promotion
+                            (repeated_state_reenters_with_rank_promotion and finite_repeated_state_consumes_weight_rank)
                             or parent_rank_for_repeated_state is None
                             or parent_rank_for_repeated_state != 1
                         )
                         repeated_state_gap_may_feed_weight = repeated_state_rank_gap_may_affect_weight
                         if parent_name in value_lineages:
                             subgraph_bound_lineages[graph_input_name] = value_lineages[parent_name]
-                            if repeated_state_reenters_with_rank_promotion:
+                            if (
+                                repeated_state_reenters_with_rank_promotion
+                                and finite_repeated_state_consumes_weight_rank
+                            ):
                                 retained_rank_summary = rank_gap_weight_summary_after_repeated_rank_increase(
                                     summarize_rank_promotable_lineage_gap(value_lineages[parent_name].values()),
                                     len(value_lineages[parent_name]),
@@ -5797,13 +5933,10 @@ def _build_onnx_weight_analysis_plan(
                                 scan_input_offset=scan_input_offset,
                                 scan_input_axes=scan_input_axes,
                             )
-                        if parent_name in known_value_shapes:
-                            if parent_shape is not None:
-                                subgraph_bound_value_shapes[graph_input_name] = parent_shape
-                                if parent_name in proven_value_ranks:
-                                    subgraph_bound_proven_value_ranks.add(graph_input_name)
-                            else:
-                                subgraph_bound_unknown_value_ranks.add(graph_input_name)
+                        if parent_shape is not None:
+                            subgraph_bound_value_shapes[graph_input_name] = parent_shape
+                            if parent_name in proven_value_ranks:
+                                subgraph_bound_proven_value_ranks.add(graph_input_name)
                         elif parent_rank is not None:
                             subgraph_bound_value_ranks[graph_input_name] = parent_rank
                             if parent_name in proven_value_ranks:
@@ -6903,30 +7036,6 @@ def _build_onnx_weight_analysis_plan(
                     return -1
                 return value_shape[axis]
 
-            def loop_exact_iteration_count(current_node: Any = node) -> int | None:
-                trip_input = str(current_node.input[0]) if len(current_node.input) > 0 and current_node.input[0] else ""
-                condition_input = (
-                    str(current_node.input[1]) if len(current_node.input) > 1 and current_node.input[1] else ""
-                )
-                if (trip_input in graph_input_names and trip_input not in constants) or (
-                    condition_input in graph_input_names and condition_input not in constants
-                ):
-                    return None
-                trip_count = (
-                    constant_scalar_value(constants.get(trip_input), int(onnx.TensorProto.INT64))
-                    if trip_input
-                    else None
-                )
-                initial_condition = (
-                    constant_scalar_value(constants.get(condition_input), int(onnx.TensorProto.BOOL))
-                    if condition_input
-                    else True
-                )
-                if trip_count is None or initial_condition is not True:
-                    return None
-                exact_count = max(int(trip_count), 0)
-                return exact_count if exact_count <= 1 else None
-
             subgraph_output_offset = 1 if standard_control_flow_operator and node.op_type == "Loop" else 0
             for (
                 graph_output_lineages,
@@ -7033,6 +7142,8 @@ def _build_onnx_weight_analysis_plan(
                             )
                         )
                     )
+                    graph_output_shape_before_reentry_reset = graph_output_shape
+                    graph_output_rank_before_reentry_reset = graph_output_rank
                     if repeated_carried_state:
                         state_input_name = control_flow_state_input_name(output_index)
                         subgraph_state_input_index = output_index + (2 if node.op_type == "Loop" else 0)
@@ -7155,9 +7266,31 @@ def _build_onnx_weight_analysis_plan(
                         graph_output_weight_lineage_gap_summaries[graph_output_index],
                         graph_output_weight_lineage_gap_counts[graph_output_index],
                     )
+                    finite_loop_body_consumes_output_weight_gap = True
+                    if (
+                        repeated_carried_state_rank_may_increase
+                        and node.op_type == "Loop"
+                        and (
+                            exact_loop_iterations := loop_exact_iteration_count(
+                                max_count=_ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK,
+                            )
+                        )
+                        is not None
+                    ):
+                        state_input_rank = control_flow_state_input_rank(output_index)
+                        one_iteration_output_rank = (
+                            len(graph_output_shape_before_reentry_reset)
+                            if graph_output_shape_before_reentry_reset is not None
+                            else graph_output_rank_before_reentry_reset
+                        )
+                        if state_input_rank is not None and one_iteration_output_rank is not None:
+                            rank_delta = max(one_iteration_output_rank - state_input_rank, 0)
+                            max_body_consumed_rank = state_input_rank + max(exact_loop_iterations - 1, 0) * rank_delta
+                            finite_loop_body_consumes_output_weight_gap = max_body_consumed_rank >= 2
                     if (
                         repeated_carried_state_input_may_feed_weight
                         and graph_output_weight_lineage_gap_counts[graph_output_index]
+                        and finite_loop_body_consumes_output_weight_gap
                     ):
                         plan.record_coverage_gap(
                             "lineages_per_value_limit",
@@ -7205,12 +7338,39 @@ def _build_onnx_weight_analysis_plan(
                             graph_output_rank_promotable_gap_count,
                         )
                         repeated_state_weight_gap_summary = empty_weight_gap_summary
-                        if repeated_carried_state_rank_may_increase:
+                        finite_loop_body_consumes_weight_rank = True
+                        finite_loop_output_reaches_weight_rank = True
+                        if (
+                            node.op_type == "Loop"
+                            and (
+                                exact_loop_iterations := loop_exact_iteration_count(
+                                    max_count=_ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK,
+                                )
+                            )
+                            is not None
+                        ):
+                            state_input_rank = control_flow_state_input_rank(output_index)
+                            one_iteration_output_rank = (
+                                len(graph_output_shape_before_reentry_reset)
+                                if graph_output_shape_before_reentry_reset is not None
+                                else graph_output_rank_before_reentry_reset
+                            )
+                            if state_input_rank is not None and one_iteration_output_rank is not None:
+                                rank_delta = max(one_iteration_output_rank - state_input_rank, 0)
+                                max_body_consumed_rank = (
+                                    state_input_rank + max(exact_loop_iterations - 1, 0) * rank_delta
+                                )
+                                max_output_rank = state_input_rank + exact_loop_iterations * rank_delta
+                                finite_loop_body_consumes_weight_rank = max_body_consumed_rank >= 2
+                                finite_loop_output_reaches_weight_rank = max_output_rank >= 2
+                        if repeated_carried_state_rank_may_increase and finite_loop_output_reaches_weight_rank:
                             repeated_state_weight_gap_summary = rank_gap_weight_summary_after_repeated_rank_increase(
                                 state_rank_gap_summary,
                                 graph_output_rank_promotable_gap_count,
                             )
-                        elif gap_summary_may_exceed_input_rank(
+                        elif (
+                            not repeated_carried_state_rank_may_increase or finite_loop_output_reaches_weight_rank
+                        ) and gap_summary_may_exceed_input_rank(
                             state_rank_gap_summary,
                             control_flow_state_input_rank(output_index),
                         ):
@@ -7221,7 +7381,11 @@ def _build_onnx_weight_analysis_plan(
                                 output_rank=graph_output_rank,
                             )
                         if repeated_state_weight_gap_summary != empty_weight_gap_summary:
-                            plan.record_coverage_gap("lineages_per_value_limit", graph_output_rank_promotable_gap_count)
+                            if finite_loop_body_consumes_weight_rank:
+                                plan.record_coverage_gap(
+                                    "lineages_per_value_limit",
+                                    graph_output_rank_promotable_gap_count,
+                                )
                             subgraph_output_weight_lineage_gap_counts[output_index] = (
                                 _bounded_onnx_weight_lineage_gap_count(
                                     subgraph_output_weight_lineage_gap_counts[output_index],
