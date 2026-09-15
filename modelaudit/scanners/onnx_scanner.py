@@ -2654,14 +2654,21 @@ def _build_onnx_weight_analysis_plan(
     reentry_shape_cache: dict[tuple[Any, ...], dict[int, tuple[int, ...]]] = {}
     reentry_promotion_in_progress: set[tuple[Any, ...]] = set()
     reentry_external_context_shape_cache: dict[tuple[Any, ...], dict[str, tuple[int, ...]]] = {}
-    graph_output_dependency_cache: dict[tuple[int, tuple[int, ...] | None], frozenset[str]] = {}
+    graph_output_dependency_cache: dict[
+        tuple[int, tuple[int, ...] | None, tuple[tuple[str, str, str], ...]], frozenset[str]
+    ] = {}
 
-    def graph_output_dependency_names(subgraph: Any, output_indexes: Iterable[int] | None = None) -> frozenset[str]:
+    def graph_output_dependency_names(
+        subgraph: Any,
+        output_indexes: Iterable[int] | None = None,
+        attribute_bindings: dict[str, Any] | None = None,
+    ) -> frozenset[str]:
         graph_outputs = getattr(subgraph, "output", ())
         output_index_key = None if output_indexes is None else tuple(sorted(set(output_indexes)))
-        cache_key = (id(subgraph), output_index_key)
+        cache_key = (id(subgraph), output_index_key, attribute_binding_cache_key(attribute_bindings))
         if cache_key in graph_output_dependency_cache:
             return graph_output_dependency_cache[cache_key]
+        local_attribute_bindings = attribute_bindings or {}
         if output_index_key is None:
             selected_outputs = graph_outputs
         else:
@@ -2675,7 +2682,11 @@ def _build_onnx_weight_analysis_plan(
                 continue
             dependencies.update(str(input_name) for input_name in getattr(body_node, "input", ()) if input_name)
             for attribute in getattr(body_node, "attribute", ()):
-                for nested_graph in _iter_attribute_graphs(attribute):
+                reference_name = str(getattr(attribute, "ref_attr_name", ""))
+                resolved_attribute = local_attribute_bindings.get(reference_name) if reference_name else attribute
+                if resolved_attribute is None:
+                    continue
+                for nested_graph in _iter_attribute_graphs(resolved_attribute):
                     dependencies.update(graph_external_reference_names(nested_graph))
         result = frozenset(dependencies)
         graph_output_dependency_cache[cache_key] = result
@@ -2720,7 +2731,11 @@ def _build_onnx_weight_analysis_plan(
         graph_output_name = _onnx_value_name(graph_outputs[graph_output_index])
         if not graph_output_name:
             return False
-        output_dependency_names = graph_output_dependency_names(subgraph, (graph_output_index,))
+        output_dependency_names = graph_output_dependency_names(
+            subgraph,
+            (graph_output_index,),
+            attribute_bindings=attribute_bindings,
+        )
         trusted_context_shapes = trusted_context_shapes or {}
         cache_key = (
             id(subgraph),
@@ -3223,7 +3238,7 @@ def _build_onnx_weight_analysis_plan(
             return set(range(len(graph_outputs)))
         graph_taint_in_progress.add(cache_key)
         local_attribute_bindings = attribute_bindings or {}
-        output_dependency_names = graph_output_dependency_names(subgraph)
+        output_dependency_names = graph_output_dependency_names(subgraph, attribute_bindings=attribute_bindings)
 
         def resolve_reentry_attribute(attribute: Any) -> Any | None:
             reference_name = str(getattr(attribute, "ref_attr_name", ""))
