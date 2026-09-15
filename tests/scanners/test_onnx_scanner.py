@@ -17454,6 +17454,19 @@ class TestWeightDistributionSemantics:
         assert benign_result.success is True
         assert benign_result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"] == {}
 
+        benign_capped_result = OnnxScanner().scan(
+            str(
+                self._write_repeated_local_function_clean_output_shape_model(
+                    tmp_path / "benign-capped",
+                    capped_initial_state=True,
+                    consume_weight=True,
+                    matrix_clean_output=False,
+                )
+            )
+        )
+        assert benign_capped_result.success is True
+        assert benign_capped_result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"] == {}
+
         positive_result = OnnxScanner().scan(
             str(
                 self._write_repeated_local_function_clean_output_shape_model(

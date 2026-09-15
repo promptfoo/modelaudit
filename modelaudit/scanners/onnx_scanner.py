@@ -2909,9 +2909,17 @@ def _build_onnx_weight_analysis_plan(
                         if 0 <= output_index < len(body_outputs)
                     }
                     if valid_function_tainted_output_indexes:
+                        downstream_live_function_output_indexes = {
+                            output_index
+                            for output_index, output_name in enumerate(body_outputs)
+                            if output_name in output_dependency_names
+                        }
+                        restorable_function_output_indexes = (
+                            valid_function_tainted_output_indexes | downstream_live_function_output_indexes
+                        )
                         function_output_dependency_names = graph_output_dependency_names(
                             function,
-                            valid_function_tainted_output_indexes,
+                            restorable_function_output_indexes,
                             attribute_bindings=function_attributes,
                         )
                         relevant_function_tainted_inputs = {
@@ -2920,10 +2928,11 @@ def _build_onnx_weight_analysis_plan(
                             if function_input_name in function_output_dependency_names
                         }
                     else:
+                        restorable_function_output_indexes = set()
                         function_output_dependency_names = frozenset()
                         relevant_function_tainted_inputs = {}
                     function_analysis_exceeds_limit = (
-                        len(valid_function_tainted_output_indexes) * max(len(relevant_function_tainted_inputs), 1)
+                        len(restorable_function_output_indexes) * max(len(relevant_function_tainted_inputs), 1)
                         > _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
                         or len(getattr(function, "output", ())) > _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_OUTPUTS
                         or subgraph_analysis_work_exceeds_limit(function)
@@ -2951,7 +2960,7 @@ def _build_onnx_weight_analysis_plan(
                                 trusted_context_shapes=function_context_shapes,
                                 output_shapes_out=function_output_shapes,
                                 output_dependency_names_override=function_output_dependency_names,
-                                restorable_output_indexes_override=frozenset(valid_function_tainted_output_indexes),
+                                restorable_output_indexes_override=frozenset(restorable_function_output_indexes),
                                 promoted_outputs_out=function_promoted_output_indexes,
                                 depth=depth + 1,
                             )
