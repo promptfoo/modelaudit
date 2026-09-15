@@ -9493,6 +9493,81 @@ class TestWeightDistributionSemantics:
             assert coverage == []
             assert semantics["coverage_gaps"] == {}
 
+    def test_nested_loop_reachability_preserves_empty_optional_input_slots(self, tmp_path: Path) -> None:
+        source_names = [f"W{index}" for index in range(40)]
+        nested_body = helper.make_graph(
+            [
+                helper.make_node("MatMul", ["probe", "nested_state"], ["nested_weight_use"]),
+                helper.make_node("Identity", ["nested_state"], ["nested_next_state"]),
+                helper.make_node("Identity", ["nested_condition_in"], ["nested_condition_out"]),
+            ],
+            "nested_optional_slot_body",
+            [
+                helper.make_tensor_value_info("nested_iteration", TensorProto.INT64, []),
+                helper.make_tensor_value_info("nested_condition_in", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("nested_state", TensorProto.FLOAT, [2, 2]),
+            ],
+            [
+                helper.make_tensor_value_info("nested_condition_out", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("nested_next_state", TensorProto.FLOAT, [2, 2]),
+            ],
+        )
+        body = helper.make_graph(
+            [
+                helper.make_node(
+                    "Loop",
+                    ["", "condition_in", "state"],
+                    ["nested_state_out"],
+                    body=nested_body,
+                ),
+                helper.make_node("Identity", ["nested_state_out"], ["next_state"]),
+                helper.make_node("Identity", ["condition_in"], ["condition_out"]),
+            ],
+            "outer_optional_slot_body",
+            [
+                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
+                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("state", TensorProto.FLOAT, [2, 2]),
+            ],
+            [
+                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, [2, 2]),
+            ],
+        )
+        graph = helper.make_graph(
+            [
+                helper.make_node("Sum", source_names, ["initial_state"]),
+                helper.make_node(
+                    "Loop",
+                    ["trip_count", "initial_condition", "initial_state"],
+                    ["final_state"],
+                    body=body,
+                ),
+                helper.make_node("Identity", ["dummy"], ["Y"]),
+            ],
+            "nested_loop_optional_input_slot_reachability",
+            [helper.make_tensor_value_info("probe", TensorProto.FLOAT, [1, 2])],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [])],
+            initializer=[
+                *[onnx.numpy_helper.from_array(np.ones((2, 2), dtype=np.float32), name=name) for name in source_names],
+                onnx.numpy_helper.from_array(np.array(2, dtype=np.int64), name="trip_count"),
+                onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="initial_condition"),
+                onnx.numpy_helper.from_array(np.array(0.0, dtype=np.float32), name="dummy"),
+            ],
+            value_info=[helper.make_tensor_value_info("initial_state", TensorProto.FLOAT, [2, 2])],
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model, full_check=True)
+        path = tmp_path / "nested-loop-optional-input-slot-reachability.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert result.success is False
+        assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
+
     def test_repeated_loop_reentry_rejects_mixed_lineage_shapes_for_body_context(self, tmp_path: Path) -> None:
         source_names = [f"W{index}" for index in range(40)]
         initializers = [

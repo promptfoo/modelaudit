@@ -2713,6 +2713,7 @@ def _build_onnx_weight_analysis_plan(
         tuple[int, tuple[int, ...] | None, tuple[tuple[str, str, str], ...]], frozenset[str]
     ] = {}
     node_input_names_cache: dict[int, tuple[Any, list[str]]] = {}
+    node_input_slots_cache: dict[int, tuple[Any, list[str]]] = {}
     node_output_names_cache: dict[int, tuple[Any, list[str]]] = {}
     graph_output_producer_cache: dict[int, tuple[Any, dict[str, frozenset[int]]]] = {}
 
@@ -2724,6 +2725,15 @@ def _build_onnx_weight_analysis_plan(
         names = [str(input_name) for input_name in getattr(node, "input", ()) if input_name]
         node_input_names_cache[cache_key] = (node, names)
         return names
+
+    def node_input_slots(node: Any) -> list[str]:
+        cache_key = id(node)
+        cached = node_input_slots_cache.get(cache_key)
+        if cached is not None and cached[0] is node:
+            return cached[1]
+        slots = [str(input_name) for input_name in getattr(node, "input", ())]
+        node_input_slots_cache[cache_key] = (node, slots)
+        return slots
 
     def node_output_names(node: Any) -> list[str]:
         cache_key = id(node)
@@ -3868,8 +3878,8 @@ def _build_onnx_weight_analysis_plan(
                             attribute_bindings=local_attribute_bindings,
                             depth=depth + 1,
                         )
-                        for input_index, input_name in enumerate(body_inputs):
-                            if input_name not in tainted:
+                        for input_index, input_name in enumerate(node_input_slots(body_node)):
+                            if not input_name or input_name not in tainted:
                                 continue
                             nested_input_index: int | None = None
                             if body_node.op_type == "Loop" and input_index >= 2:
