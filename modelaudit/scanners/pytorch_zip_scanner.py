@@ -3734,6 +3734,13 @@ class PyTorchZipScanner(BaseScanner):
                     parse_budget_remaining=parse_budget_remaining,
                 ):
                     return True
+                if PyTorchZipScanner._raw_nested_proto0_inst_with_prior_window_mark_seen(
+                    value,
+                    candidate_window_start,
+                    candidate_window_end,
+                    parse_budget_remaining,
+                ):
+                    return True
             if original_window_end >= len(value):
                 return False
             search_start += step
@@ -3910,6 +3917,26 @@ class PyTorchZipScanner(BaseScanner):
         return False
 
     @staticmethod
+    def _raw_nested_proto0_inst_name_end(value: bytes, offset: int, limit: int) -> int | None:
+        module_start = offset + 1
+        if module_start >= limit or value[module_start] not in _PROTO0_GLOBAL_NAME_START_BYTES:
+            return None
+        module_end = module_start
+        while module_end < limit and value[module_end] in _PROTO0_GLOBAL_NAME_BYTES:
+            module_end += 1
+        if module_end >= limit or value[module_end] != 0x0A:
+            return None
+        name_start = module_end + 1
+        if name_start >= limit or value[name_start] not in _PROTO0_GLOBAL_NAME_START_BYTES:
+            return None
+        name_end = name_start
+        while name_end < limit and value[name_end] in _PROTO0_GLOBAL_NAME_BYTES:
+            name_end += 1
+        if name_end >= limit or value[name_end] != 0x0A:
+            return None
+        return name_end
+
+    @staticmethod
     def _raw_nested_proto0_inst_ref_seen(value: bytes, parse_budget_remaining: list[int]) -> bool:
         search_limit = min(len(value), _PICKLE_DISCOVERY_LONG_PROBE_BYTES)
         search_start = 0
@@ -3917,29 +3944,9 @@ class PyTorchZipScanner(BaseScanner):
             offset = value.find(b"i", search_start, search_limit)
             if offset < 0:
                 return False
-            module_start = offset + 1
-            if module_start >= search_limit:
-                return False
-            if value[module_start] not in _PROTO0_GLOBAL_NAME_START_BYTES:
-                search_start = module_start
-                continue
-            module_end = module_start
-            while module_end < search_limit and value[module_end] in _PROTO0_GLOBAL_NAME_BYTES:
-                module_end += 1
-            if module_end >= search_limit or value[module_end] != 0x0A:
-                search_start = module_end + 1
-                continue
-            name_start = module_end + 1
-            if name_start >= search_limit:
-                return False
-            if value[name_start] not in _PROTO0_GLOBAL_NAME_START_BYTES:
-                search_start = name_start + 1
-                continue
-            name_end = name_start
-            while name_end < search_limit and value[name_end] in _PROTO0_GLOBAL_NAME_BYTES:
-                name_end += 1
-            if name_end >= search_limit or value[name_end] != 0x0A:
-                search_start = name_end + 1
+            name_end = PyTorchZipScanner._raw_nested_proto0_inst_name_end(value, offset, search_limit)
+            if name_end is None:
+                search_start = offset + 1
                 continue
             window_start = max(0, offset - _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES + 1)
             mark = value.rfind(bytes([_PICKLE_MARK_OPCODE_BYTE]), window_start, offset)
@@ -3955,6 +3962,41 @@ class PyTorchZipScanner(BaseScanner):
                     return True
                 mark = value.rfind(bytes([_PICKLE_MARK_OPCODE_BYTE]), window_start, mark)
             if window_start > 0 and value.rfind(bytes([_PICKLE_MARK_OPCODE_BYTE]), 0, window_start) >= 0:
+                return True
+            search_start = name_end + 1
+        return False
+
+    @staticmethod
+    def _raw_nested_proto0_inst_with_prior_window_mark_seen(
+        value: bytes,
+        window_start: int,
+        window_end: int,
+        parse_budget_remaining: list[int],
+    ) -> bool:
+        search_start = window_start
+        while search_start < window_end:
+            offset = value.find(b"i", search_start, window_end)
+            if offset < 0:
+                return False
+            name_end = PyTorchZipScanner._raw_nested_proto0_inst_name_end(value, offset, len(value))
+            if name_end is None:
+                search_start = offset + 1
+                continue
+
+            local_window_start = max(window_start, offset - _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES + 1)
+            mark = value.rfind(bytes([_PICKLE_MARK_OPCODE_BYTE]), local_window_start, offset)
+            while mark >= local_window_start:
+                if not PyTorchZipScanner._consume_raw_nested_structural_parse_budget(parse_budget_remaining):
+                    return True
+                candidate = value[mark : mark + _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES]
+                candidate_is_prefix = mark + len(candidate) < len(value)
+                if PyTorchZipScanner._has_security_relevant_pickle_opcode(candidate) and (
+                    PyTorchZipScanner._has_complete_pickle_stream_without_frame_stop_overrun(candidate)
+                    or _looks_like_proto0_or_1_pickle(candidate, sample_is_prefix=candidate_is_prefix)
+                ):
+                    return True
+                mark = value.rfind(bytes([_PICKLE_MARK_OPCODE_BYTE]), local_window_start, mark)
+            if local_window_start > 0 and value.rfind(bytes([_PICKLE_MARK_OPCODE_BYTE]), 0, local_window_start) >= 0:
                 return True
             search_start = name_end + 1
         return False
