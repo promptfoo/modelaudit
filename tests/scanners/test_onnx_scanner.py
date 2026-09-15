@@ -17631,6 +17631,91 @@ class TestWeightDistributionSemantics:
         assert grouped_dependency_calls == 1
         assert fanout_promotion_calls <= width
 
+    def test_dead_local_function_inputs_do_not_repeat_weight_input_checks(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        width = 128
+        clean_inputs = [f"clean{index}" for index in range(width)]
+        function = helper.make_function(
+            "local",
+            "NoConsumer",
+            clean_inputs,
+            ["out"],
+            [helper.make_node("Identity", [clean_inputs[0]], ["out"])],
+            opset_imports=[helper.make_opsetid("", 13)],
+        )
+        body = helper.make_graph(
+            [
+                helper.make_node("NoConsumer", clean_inputs, ["dead_out"], domain="local"),
+                helper.make_node("Identity", ["state"], ["next_state"]),
+                helper.make_node("Identity", ["condition_in"], ["condition_out"]),
+            ],
+            "dead_local_function_inputs_body",
+            [
+                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
+                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("state", TensorProto.FLOAT, [2]),
+            ],
+            [
+                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, [2]),
+            ],
+        )
+        graph = helper.make_graph(
+            [
+                helper.make_node(
+                    "Loop",
+                    ["trip_count", "initial_condition", "initial_state"],
+                    ["final_state"],
+                    body=body,
+                ),
+                helper.make_node("MatMul", ["X", "final_state"], ["Y"]),
+            ],
+            "dead_local_function_inputs",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 2])],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1])],
+            initializer=[
+                *(onnx.numpy_helper.from_array(np.ones((2,), dtype=np.float32), name=name) for name in clean_inputs),
+                onnx.numpy_helper.from_array(np.ones((2,), dtype=np.float32), name="initial_state"),
+                onnx.numpy_helper.from_array(np.array(2, dtype=np.int64), name="trip_count"),
+                onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="initial_condition"),
+            ],
+        )
+        model = helper.make_model(
+            graph,
+            functions=[function],
+            opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
+        )
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / "dead-local-function-inputs.onnx"
+        onnx.save(model, str(path))
+
+        original_potential_weight_input = onnx_scanner_module._onnx_potential_weight_input
+        local_function_helper_input_checks = 0
+
+        def counting_potential_weight_input(*args: Any, **kwargs: Any) -> bool:
+            nonlocal local_function_helper_input_checks
+            node = args[0] if args else None
+            caller = sys._getframe(1).f_code.co_name
+            if (
+                caller in {"subgraph_analysis_work_exceeds_limit", "subgraph_has_potential_weight_consumer"}
+                and kwargs.get("is_model_local_function")
+                and getattr(node, "op_type", "") == "NoConsumer"
+            ):
+                local_function_helper_input_checks += 1
+            return original_potential_weight_input(*args, **kwargs)
+
+        monkeypatch.setattr(onnx_scanner_module, "_onnx_potential_weight_input", counting_potential_weight_input)
+
+        result = OnnxScanner().scan(str(path))
+
+        assert result.success is True
+        assert result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"] == {}
+        assert local_function_helper_input_checks == 0
+
     def _write_repeated_local_function_cached_shape_model(self, tmp_path: Path) -> Path:
         function = helper.make_function(
             "local",

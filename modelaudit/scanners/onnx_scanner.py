@@ -2812,10 +2812,16 @@ def _build_onnx_weight_analysis_plan(
         *,
         include_potential_weight_consumers: bool = False,
         opset_versions: dict[str, int] | None = None,
+        attribute_bindings: dict[str, Any] | None = None,
     ) -> bool:
         graph_nodes = tuple(getattr(subgraph, "node", ()))
         potential_weight_consumer_seen = False
         potential_weight_consumer_input_edges = 0
+        local_attribute_bindings = attribute_bindings or {}
+
+        def resolve_work_attribute(attribute: Any) -> Any | None:
+            reference_name = str(getattr(attribute, "ref_attr_name", ""))
+            return local_attribute_bindings.get(reference_name) if reference_name else attribute
 
         def node_may_have_potential_weight_input(
             node: Any,
@@ -2857,6 +2863,18 @@ def _build_onnx_weight_analysis_plan(
                     node,
                     opset_versions or {},
                 )
+                function = functions.get(function_key)
+                if function is not None:
+                    function_attributes = bound_function_attributes(function, node, resolve_work_attribute)
+                    function_versions = function_opset_versions(function, opset_versions or {})
+                    if subgraph_has_potential_weight_consumer(
+                        function,
+                        function_versions,
+                        attribute_bindings=function_attributes,
+                    ):
+                        potential_weight_consumer_seen = True
+                        potential_weight_consumer_input_edges += len(node_input_names(node))
+                    continue
                 if not node_may_have_potential_weight_input(
                     node,
                     is_model_local_function=is_model_local_function,
@@ -2925,6 +2943,7 @@ def _build_onnx_weight_analysis_plan(
             output_dependency_names,
             include_potential_weight_consumers=True,
             opset_versions=opset_versions,
+            attribute_bindings=attribute_bindings,
         ):
             return True
         restorable_output_indexes = (
@@ -3133,6 +3152,7 @@ def _build_onnx_weight_analysis_plan(
                             function_output_dependency_names,
                             include_potential_weight_consumers=True,
                             opset_versions=function_versions,
+                            attribute_bindings=function_attributes,
                         )
                     )
                     if function_analysis_exceeds_limit:
@@ -3674,17 +3694,6 @@ def _build_onnx_weight_analysis_plan(
                 body_node,
                 opset_versions,
             )
-            if any(
-                _onnx_potential_weight_input(
-                    body_node,
-                    input_index,
-                    is_model_local_function=is_model_local_function,
-                    is_registered_standard_operator=is_registered_standard_operator,
-                )
-                for input_index in range(len(body_inputs))
-            ):
-                potential_weight_consumer_cache[cache_key] = True
-                return True
             if function is not None:
                 function_attributes = bound_function_attributes(function, body_node, resolve_reentry_attribute)
                 function_versions = function_opset_versions(function, opset_versions)
@@ -3696,6 +3705,17 @@ def _build_onnx_weight_analysis_plan(
                 ):
                     potential_weight_consumer_cache[cache_key] = True
                     return True
+            elif any(
+                _onnx_potential_weight_input(
+                    body_node,
+                    input_index,
+                    is_model_local_function=is_model_local_function,
+                    is_registered_standard_operator=is_registered_standard_operator,
+                )
+                for input_index in range(len(body_inputs))
+            ):
+                potential_weight_consumer_cache[cache_key] = True
+                return True
             for attribute in getattr(body_node, "attribute", ()):
                 resolved_attribute = resolve_reentry_attribute(attribute)
                 if resolved_attribute is None:
@@ -3738,6 +3758,7 @@ def _build_onnx_weight_analysis_plan(
             graph_output_dependency_names(subgraph, attribute_bindings=attribute_bindings),
             include_potential_weight_consumers=True,
             opset_versions=opset_versions,
+            attribute_bindings=attribute_bindings,
         ):
             result = subgraph_has_potential_weight_consumer(
                 subgraph,
@@ -3822,7 +3843,19 @@ def _build_onnx_weight_analysis_plan(
                     continue
             body_inputs = node_input_names(body_node)
             any_tainted = any(input_name in tainted for input_name in body_inputs)
-            if not body_outputs_live_after and not any_tainted:
+            has_tainted_nested_capture = False
+            if not any_tainted:
+                for attribute in getattr(body_node, "attribute", ()):
+                    resolved_attribute = resolve_reentry_attribute(attribute)
+                    if resolved_attribute is None:
+                        continue
+                    if any(
+                        graph_external_reference_names(nested_graph) & tainted
+                        for nested_graph in _iter_attribute_graphs(resolved_attribute)
+                    ):
+                        has_tainted_nested_capture = True
+                        break
+            if not body_outputs_live_after and not any_tainted and not has_tainted_nested_capture:
                 continue
             function_tainted_outputs: set[str] = set()
             nested_tainted_outputs: set[str] = set()
@@ -3853,7 +3886,7 @@ def _build_onnx_weight_analysis_plan(
                             depth=depth + 1,
                         ):
                             return finish(True)
-                    if body_outputs_live_after and function_input_names:
+                    if function_input_names:
                         function_tainted_outputs.update(
                             mapped_node_outputs(
                                 body_outputs,
