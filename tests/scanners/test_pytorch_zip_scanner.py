@@ -5793,6 +5793,72 @@ def test_pytorch_zip_discovery_fails_closed_for_later_window_stack_global_with_p
     )
 
 
+def test_pytorch_zip_discovery_fails_closed_for_prior_memo_execution_spanning_candidate_cap(
+    tmp_path: Path,
+) -> None:
+    memo_prefix = b"\x8c\x02osq\x00\x8c\x06systemq\x01\x8c\x04trueq\x02"
+    neutral_padding = b"(1" * 5000
+    literal = (
+        memo_prefix
+        + (b"c!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1))
+        + (b"!" * 9_000)
+        + b"h\x00"
+        + neutral_padding
+        + b"h\x01"
+        + neutral_padding
+        + b"\x93h\x02"
+        + neutral_padding
+        + b"\x85R."
+    )
+    storage_blob = _proto0_string_literal(literal)
+
+    result = _scan_referenced_float_storage_blob(
+        tmp_path,
+        "referenced_prior_memo_stack_global_spans_candidate_cap.pt",
+        storage_blob,
+    )
+
+    assert result.success is False
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
+        for issue in result.issues
+    )
+
+
+def test_pytorch_zip_discovery_skips_prior_memo_span_without_stack_dependent_opcode(
+    tmp_path: Path,
+) -> None:
+    memo_prefix = b"\x8c\x02osq\x00\x8c\x06systemq\x01\x8c\x04trueq\x02"
+    neutral_padding = b"(1" * 5000
+    literal = (
+        memo_prefix
+        + (b"c!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1))
+        + (b"!" * 9_000)
+        + b"h\x00"
+        + neutral_padding
+        + b"h\x01"
+        + neutral_padding
+        + b"h\x02"
+        + neutral_padding
+        + b"."
+    )
+    storage_blob = _proto0_string_literal(literal)
+
+    result = _scan_referenced_float_storage_blob(
+        tmp_path,
+        "referenced_prior_memo_long_span_near_match.pt",
+        storage_blob,
+    )
+
+    assert result.success is True
+    assert result.metadata.get("pickle_verdict") == "clean"
+    assert not any(issue.details.get("pickle_filename") == "archive/data/0" for issue in result.issues)
+    assert not any(
+        check.name == "Pickle Discovery" and "archive/data/0" in check.details.get("zip_entries", [])
+        for check in result.checks
+    )
+
+
 def test_pytorch_zip_discovery_fails_closed_for_prior_memo_beyond_later_window_lookback(
     tmp_path: Path,
 ) -> None:
@@ -7306,6 +7372,23 @@ def test_pytorch_zip_encoded_nested_pickle_route_fails_closed_after_candidate_bu
 
     assert PyTorchZipScanner._literal_value_has_encoded_nested_security_pickle(base64.b64encode(payload)) is True
     assert PyTorchZipScanner._literal_value_has_encoded_nested_security_pickle(binascii.hexlify(payload)) is True
+
+
+def test_pytorch_zip_encoded_nested_pickle_route_scans_later_structural_windows() -> None:
+    long_literal = b"X" + (70_000).to_bytes(4, "little") + (b"A" * 70_000)
+    payload = (
+        (b"U\x00" + b"0") * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)
+        + long_literal
+        + b"X\x02\x00\x00\x00osX\x06\x00\x00\x00system\x93)R."
+    )
+    near_match = (
+        (b"U\x00" + b"0") * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)
+        + long_literal
+        + b"X\x02\x00\x00\x00osX\x06\x00\x00\x00system."
+    )
+
+    assert PyTorchZipScanner._literal_value_has_encoded_nested_security_pickle(base64.b64encode(payload)) is True
+    assert PyTorchZipScanner._literal_value_has_encoded_nested_security_pickle(base64.b64encode(near_match)) is False
 
 
 def test_pytorch_zip_base64_literal_text_route_scans_middle_windows_without_size_only_signal() -> None:

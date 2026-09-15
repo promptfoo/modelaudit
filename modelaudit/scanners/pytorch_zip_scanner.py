@@ -3911,11 +3911,25 @@ class PyTorchZipScanner(BaseScanner):
                     continue
                 if PyTorchZipScanner._has_security_relevant_pickle_opcode(candidate):
                     return True
+                candidate_is_prefix = absolute_offset + len(candidate) < len(value)
+                if candidate_is_prefix and PyTorchZipScanner._prior_memo_get_has_later_stack_dependent_security_opcode(
+                    value,
+                    absolute_offset,
+                ):
+                    return True
                 search_start_in_window = offset + 1
             if window_end >= len(value):
                 return False
             window_start += step
         return False
+
+    @staticmethod
+    def _prior_memo_get_has_later_stack_dependent_security_opcode(value: bytes, get_offset: int) -> bool:
+        search_start = get_offset + 1
+        search_end = min(len(value), get_offset + (_PICKLE_DISCOVERY_LONG_PROBE_BYTES * 4))
+        return any(value.find(bytes([byte]), search_start, search_end) >= 0 for byte in b"\x81\x92\x93") or (
+            search_end < len(value)
+        )
 
     @staticmethod
     def _prefix_has_prior_memo_definition(value: bytes, end: int) -> bool:
@@ -4083,7 +4097,14 @@ class PyTorchZipScanner(BaseScanner):
         )
         if has_candidate_signal:
             return True
-        return PyTorchZipScanner._raw_nested_security_pickle_candidate_has_structural_signal(value)
+        parse_budget_remaining = [_MAX_RAW_NESTED_PICKLE_CANDIDATES]
+        return PyTorchZipScanner._raw_nested_security_pickle_candidate_has_structural_signal(
+            value,
+            parse_budget_remaining=parse_budget_remaining,
+        ) or PyTorchZipScanner._raw_nested_security_pickle_candidate_has_later_structural_signal(
+            value,
+            parse_budget_remaining=parse_budget_remaining,
+        )
 
     @staticmethod
     def _raw_nested_security_pickle_candidate_has_structural_signal(
