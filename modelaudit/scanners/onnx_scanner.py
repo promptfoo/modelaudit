@@ -8,7 +8,7 @@ import numbers
 import os
 import re
 import stat
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence, Set
 from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -2712,6 +2712,31 @@ def _build_onnx_weight_analysis_plan(
     graph_output_dependency_cache: dict[
         tuple[int, tuple[int, ...] | None, tuple[tuple[str, str, str], ...]], frozenset[str]
     ] = {}
+    node_input_names_cache: dict[int, tuple[Any, list[str]]] = {}
+    node_output_names_cache: dict[int, tuple[Any, list[str]]] = {}
+
+    def node_input_names(node: Any) -> list[str]:
+        cache_key = id(node)
+        cached = node_input_names_cache.get(cache_key)
+        if cached is not None and cached[0] is node:
+            return cached[1]
+        names = [str(input_name) for input_name in getattr(node, "input", ()) if input_name]
+        node_input_names_cache[cache_key] = (node, names)
+        return names
+
+    def node_output_names(node: Any) -> list[str]:
+        cache_key = id(node)
+        cached = node_output_names_cache.get(cache_key)
+        if cached is not None and cached[0] is node:
+            return cached[1]
+        names = [str(output_name) for output_name in getattr(node, "output", ()) if output_name]
+        node_output_names_cache[cache_key] = (node, names)
+        return names
+
+    def node_outputs_intersect(node: Any, dependency_names: Set[str]) -> bool:
+        if not dependency_names:
+            return False
+        return any(output_name in dependency_names for output_name in node_output_names(node))
 
     def graph_output_dependency_names(
         subgraph: Any,
@@ -2789,12 +2814,11 @@ def _build_onnx_weight_analysis_plan(
         else:
             live_nodes = []
             for node in graph_nodes:
-                if {str(output_name) for output_name in getattr(node, "output", ()) if output_name} & dependency_names:
+                if node_outputs_intersect(node, dependency_names):
                     live_nodes.append(node)
                     continue
                 if not include_potential_weight_consumers:
                     continue
-                body_inputs = [str(input_name) for input_name in getattr(node, "input", ())]
                 function_key = (
                     str(getattr(node, "domain", "")),
                     str(getattr(node, "op_type", "")),
@@ -2811,6 +2835,7 @@ def _build_onnx_weight_analysis_plan(
                     is_registered_standard_operator=is_registered_standard_operator,
                 ):
                     continue
+                input_count = len(node_input_names(node))
                 node_is_potential_weight_consumer = any(
                     _onnx_potential_weight_input(
                         node,
@@ -2818,11 +2843,11 @@ def _build_onnx_weight_analysis_plan(
                         is_model_local_function=is_model_local_function,
                         is_registered_standard_operator=is_registered_standard_operator,
                     )
-                    for input_index in range(len(body_inputs))
+                    for input_index in range(input_count)
                 )
                 if node_is_potential_weight_consumer:
                     potential_weight_consumer_seen = True
-                    potential_weight_consumer_input_edges += len(body_inputs)
+                    potential_weight_consumer_input_edges += input_count
         graph_node_count = len(live_nodes)
         graph_input_count = len(getattr(subgraph, "input", ()))
         node_input_edges = sum(len(getattr(node, "input", ())) for node in live_nodes)
@@ -2925,13 +2950,13 @@ def _build_onnx_weight_analysis_plan(
             return trusted_context_shapes.get(input_name)
 
         for body_node in getattr(subgraph, "node", ()):
-            body_outputs = [str(output_name) for output_name in getattr(body_node, "output", ()) if output_name]
+            body_outputs = node_output_names(body_node)
             if not body_outputs:
                 continue
-            body_outputs_feed_selected_output = bool(set(body_outputs) & output_dependency_names)
+            body_outputs_feed_selected_output = node_outputs_intersect(body_node, output_dependency_names)
             if not body_outputs_feed_selected_output:
                 continue
-            body_inputs = [str(input_name) for input_name in getattr(body_node, "input", ())]
+            body_inputs = node_input_names(body_node)
             if getattr(body_node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS and body_node.op_type == "Constant":
                 constant_tensor = resolved_constant_node_tensor(body_node, resolve_reentry_attribute)
                 if constant_tensor is not None:
@@ -3712,61 +3737,30 @@ def _build_onnx_weight_analysis_plan(
         live_after_node: dict[int, frozenset[str]] = {}
         for body_node in reversed(body_nodes):
             live_after_node[id(body_node)] = frozenset(live_names)
-            live_body_inputs = [str(input_name) for input_name in getattr(body_node, "input", ()) if input_name]
-            live_body_outputs = {str(output_name) for output_name in getattr(body_node, "output", ()) if output_name}
-            function_key = (
-                str(getattr(body_node, "domain", "")),
-                str(getattr(body_node, "op_type", "")),
-                str(getattr(body_node, "overload", "")),
-            )
-            function = functions.get(function_key)
-            is_model_local_function = function_key in functions
-            is_registered_standard_operator = is_model_local_function or has_registered_standard_operator(
-                body_node,
-                opset_versions,
-            )
-            output_is_live = bool(live_body_outputs & live_names)
-            node_consumes_weight = any(
-                _onnx_potential_weight_input(
-                    body_node,
-                    input_index,
-                    is_model_local_function=is_model_local_function,
-                    is_registered_standard_operator=is_registered_standard_operator,
-                )
-                for input_index in range(len(live_body_inputs))
-            )
-            if output_is_live or node_consumes_weight:
-                live_names.update(live_body_inputs)
-            if function is not None:
-                function_attributes = bound_function_attributes(function, body_node, resolve_reentry_attribute)
-                function_versions = function_opset_versions(function, opset_versions)
-                if output_is_live or subgraph_has_potential_weight_consumer(
-                    function,
-                    function_versions,
-                    attribute_bindings=function_attributes,
-                    depth=depth + 1,
-                ):
-                    live_names.update(live_body_inputs)
+            output_is_live = node_outputs_intersect(body_node, live_names)
+            if not output_is_live:
+                continue
+            live_body_inputs = node_input_names(body_node)
+            live_names.update(live_body_inputs)
             for attribute in getattr(body_node, "attribute", ()):
                 resolved_attribute = resolve_reentry_attribute(attribute)
                 if resolved_attribute is None:
                     continue
                 for nested_graph in _iter_attribute_graphs(resolved_attribute):
-                    if output_is_live or subgraph_has_potential_weight_consumer(
-                        nested_graph,
-                        opset_versions,
-                        attribute_bindings=local_attribute_bindings,
-                        depth=depth + 1,
-                    ):
-                        live_names.update(graph_external_reference_names(nested_graph))
+                    live_names.update(graph_external_reference_names(nested_graph))
 
         tainted = {graph_input_name}
         for body_node in body_nodes:
-            body_inputs = [str(input_name) for input_name in getattr(body_node, "input", ())]
-            body_outputs = [str(output_name) for output_name in getattr(body_node, "output", ()) if output_name]
+            body_outputs = node_output_names(body_node)
             if not body_outputs:
                 continue
-            body_outputs_live_after = bool(set(body_outputs) & live_after_node.get(id(body_node), frozenset()))
+            body_outputs_live_after = node_outputs_intersect(
+                body_node,
+                live_after_node.get(id(body_node), frozenset()),
+            )
+            if not body_outputs_live_after:
+                continue
+            body_inputs = node_input_names(body_node)
             function_key = (
                 str(getattr(body_node, "domain", "")),
                 str(getattr(body_node, "op_type", "")),

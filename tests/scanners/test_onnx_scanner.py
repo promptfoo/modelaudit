@@ -1,3 +1,4 @@
+import ast
 import hashlib
 import json
 import os
@@ -18305,8 +18306,21 @@ class TestWeightDistributionSemantics:
 
     def test_dead_reentry_nodes_are_skipped_before_input_walk(self, tmp_path: Path) -> None:
         state_count = 80
+        split_width = 64
         body_nodes = [
-            helper.make_node("Sum", [f"state{index}" for index in range(state_count)], ["dead_sum"]),
+            helper.make_node(
+                "Sum",
+                [f"state{index}" for index in range(state_count)],
+                ["dead_sum"],
+                name="dead_input_sum",
+            ),
+            helper.make_node(
+                "Split",
+                ["dead_vector"],
+                [f"dead_split_{index}" for index in range(split_width)],
+                axis=0,
+                name="dead_output_split",
+            ),
             helper.make_node("Identity", ["state0"], ["next0"]),
             helper.make_node("Identity", ["condition_in"], ["condition_out"]),
         ]
@@ -18356,6 +18370,7 @@ class TestWeightDistributionSemantics:
                     onnx.numpy_helper.from_array(np.ones((2,), dtype=np.float32), name=f"initial{index}")
                     for index in range(state_count)
                 ],
+                onnx.numpy_helper.from_array(np.ones((split_width,), dtype=np.float32), name="dead_vector"),
             ],
         )
         model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
@@ -18364,32 +18379,64 @@ class TestWeightDistributionSemantics:
         path = tmp_path / "dead-wide-reentry.onnx"
         onnx.save(model, str(path))
         scanner_path = Path(onnx_scanner_module.__file__).resolve()
-        dead_sum_shape_inputs: list[str] = []
+        comprehension_fields: dict[int, str] = {}
+        for syntax_node in ast.walk(ast.parse(scanner_path.read_text())):
+            if not isinstance(syntax_node, (ast.ListComp, ast.SetComp)):
+                continue
+            fields: set[str] = set()
+            for child in ast.walk(syntax_node):
+                if (
+                    isinstance(child, ast.Call)
+                    and isinstance(child.func, ast.Name)
+                    and child.func.id == "getattr"
+                    and len(child.args) > 1
+                    and isinstance(child.args[1], ast.Constant)
+                    and child.args[1].value in {"input", "output"}
+                ):
+                    fields.add(str(child.args[1].value))
+            if len(fields) == 1:
+                comprehension_fields[syntax_node.lineno] = next(iter(fields))
+        traced_helpers = {
+            "subgraph_analysis_work_exceeds_limit",
+            "subgraph_reenters_state_with_rank_promotion",
+            "subgraph_state_input_can_reach_weight_consumer",
+        }
+        last_line_by_frame: dict[int, int | None] = {}
+        dead_edge_walks: dict[str, int] = {}
 
         def profile(frame: Any, event: str, arg: Any) -> None:
+            if frame.f_code.co_name not in traced_helpers or Path(frame.f_code.co_filename).resolve() != scanner_path:
+                return
+            frame_id = id(frame)
+            if event == "call":
+                last_line_by_frame[frame_id] = None
+                return
+            if event == "return":
+                last_line_by_frame.pop(frame_id, None)
+                return
             if (
-                event == "call"
-                and frame.f_code.co_name == "reentry_input_shape"
-                and Path(frame.f_code.co_filename).resolve() == scanner_path
+                event != "line"
+                or frame.f_lineno not in comprehension_fields
+                or last_line_by_frame.get(frame_id) == frame.f_lineno
             ):
-                caller_node = frame.f_back.f_locals.get("body_node") if frame.f_back is not None else None
-                if getattr(caller_node, "op_type", "") != "Sum":
-                    return
-                if "dead_sum" not in {str(output_name) for output_name in getattr(caller_node, "output", ())}:
-                    return
-                input_name = frame.f_locals.get("input_name")
-                if isinstance(input_name, str):
-                    dead_sum_shape_inputs.append(input_name)
+                return
+            last_line_by_frame[frame_id] = frame.f_lineno
+            body_node = frame.f_locals.get("body_node", frame.f_locals.get("node"))
+            if not str(getattr(body_node, "name", "")).startswith("dead_"):
+                return
+            field = comprehension_fields[frame.f_lineno]
+            key = f"{frame.f_code.co_name}:{getattr(body_node, 'name', '')}:{field}"
+            dead_edge_walks[key] = dead_edge_walks.get(key, 0) + len(getattr(body_node, field, ()))
 
         try:
-            sys.setprofile(profile)
+            sys.settrace(profile)
             result = OnnxScanner().scan(str(path))
         finally:
-            sys.setprofile(None)
+            sys.settrace(None)
 
         assert result.success is True
         assert result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"] == {}
-        assert dead_sum_shape_inputs == []
+        assert dead_edge_walks == {}
 
     def test_local_function_scan_preserves_proven_input_extent(self, tmp_path: Path) -> None:
         source_names = [f"matrix{index}" for index in range(40)]
