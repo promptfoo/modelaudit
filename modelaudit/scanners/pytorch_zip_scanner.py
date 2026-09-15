@@ -2071,6 +2071,14 @@ class PyTorchZipScanner(BaseScanner):
         )
         if not data_start:
             return False
+        if entry.file_size > len(data_start) and not data_start.strip(PROTO0_1_IGNORABLE_TRAILING_BYTES):
+            data_start = self._read_member_prefix(
+                zip_file,
+                entry,
+                min(entry.file_size, _TRUSTED_STORAGE_PICKLE_PROBE_BYTES),
+                phase="pickle_discovery",
+                result=result,
+            )
         is_frame_first_candidate = data_start.startswith(_PICKLE_FRAME_OPCODE)
         is_binary_pickle_candidate = data_start.startswith(_PICKLE_BINARY_PROTOCOL_PREFIXES)
         is_headerless_binary_pickle_candidate = (
@@ -2141,6 +2149,7 @@ class PyTorchZipScanner(BaseScanner):
             if impossible_prefix_header_end is None:
                 return None
             if entry.file_size > len(sample):
+                charge_detection_probe_budget()
                 PyTorchZipScanner._charge_padding_probe_budget(
                     padding_probe_bytes_remaining,
                     entry.file_size - len(sample),
@@ -3644,7 +3653,8 @@ class PyTorchZipScanner(BaseScanner):
             if candidate_count > _MAX_RAW_NESTED_PICKLE_CANDIDATES:
                 if not fail_closed_on_candidate_budget:
                     return PyTorchZipScanner._encoded_raw_nested_security_pickle_candidate_budget_exhausted_needs_scan(
-                        value[offset:]
+                        value,
+                        search_start=offset,
                     )
                 return PyTorchZipScanner._raw_nested_security_pickle_candidate_budget_exhausted_needs_scan(
                     value,
@@ -4008,8 +4018,6 @@ class PyTorchZipScanner(BaseScanner):
     @staticmethod
     def _parsed_prefix_memo_keys(prefix: bytes) -> set[str]:
         memo_keys = PyTorchZipScanner._parsed_prefix_memo_keys_from_start(prefix)
-        if memo_keys:
-            return memo_keys
         starts_checked = 0
         for offset, marker in enumerate(prefix[1:], start=1):
             if marker not in _RAW_NESTED_SECURITY_PICKLE_START_BYTES:
@@ -4018,8 +4026,6 @@ class PyTorchZipScanner(BaseScanner):
             if starts_checked > _MAX_RAW_NESTED_PICKLE_CANDIDATES:
                 return memo_keys
             memo_keys.update(PyTorchZipScanner._parsed_prefix_memo_keys_from_start(prefix[offset:]))
-            if memo_keys:
-                return memo_keys
         return memo_keys
 
     @staticmethod
@@ -4072,12 +4078,17 @@ class PyTorchZipScanner(BaseScanner):
         return len(candidate) < 1 + operand_len
 
     @staticmethod
-    def _encoded_raw_nested_security_pickle_candidate_budget_exhausted_needs_scan(value: bytes) -> bool:
-        if PyTorchZipScanner._raw_nested_security_pickle_text_marker_seen(value):
+    def _encoded_raw_nested_security_pickle_candidate_budget_exhausted_needs_scan(
+        value: bytes,
+        *,
+        search_start: int = 0,
+    ) -> bool:
+        suffix = value[search_start:]
+        if PyTorchZipScanner._raw_nested_security_pickle_text_marker_seen(suffix):
             return True
-        value = value.lstrip(b"c \t\r\n\x00")
-        candidate = value[:_MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES]
-        candidate_is_prefix = len(value) > len(candidate)
+        stripped_suffix = suffix.lstrip(b"c \t\r\n\x00")
+        candidate = stripped_suffix[:_MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES]
+        candidate_is_prefix = len(stripped_suffix) > len(candidate)
         if not candidate:
             return False
         marker = candidate[0]
@@ -4108,17 +4119,23 @@ class PyTorchZipScanner(BaseScanner):
             return True
         parse_budget_remaining = [_MAX_RAW_NESTED_PICKLE_CANDIDATES]
         return (
-            PyTorchZipScanner._raw_nested_persistent_id_opcode_seen(
+            PyTorchZipScanner._raw_nested_suffix_uses_prior_memo_security_context(
                 value,
+                search_start,
+                parse_budget_remaining,
+            )
+            or PyTorchZipScanner._raw_nested_persistent_id_opcode_seen(
+                stripped_suffix,
                 parse_budget_remaining,
             )
             or PyTorchZipScanner._raw_nested_security_pickle_candidate_has_structural_signal(
-                value,
+                stripped_suffix,
                 parse_budget_remaining=parse_budget_remaining,
             )
             or PyTorchZipScanner._raw_nested_security_pickle_candidate_has_later_structural_signal(
                 value,
                 parse_budget_remaining=parse_budget_remaining,
+                search_start=search_start,
             )
         )
 
