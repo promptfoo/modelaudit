@@ -2635,6 +2635,21 @@ class PyTorchZipScanner(BaseScanner):
             if len(candidate) < header_bytes:
                 return None
             declared_size = int.from_bytes(candidate[1:header_bytes], "little")
+        elif candidate.startswith(b"C"):
+            header_bytes = 2
+            if len(candidate) < header_bytes:
+                return None
+            declared_size = candidate[1]
+        elif candidate.startswith(b"B"):
+            header_bytes = 5
+            if len(candidate) < header_bytes:
+                return None
+            declared_size = int.from_bytes(candidate[1:header_bytes], "little")
+        elif candidate.startswith((b"\x8e", b"\x96")):
+            header_bytes = 9
+            if len(candidate) < header_bytes:
+                return None
+            declared_size = int.from_bytes(candidate[1:header_bytes], "little")
         elif candidate.startswith(_PICKLE_FRAME_OPCODE):
             header_bytes = _PICKLE_FRAME_OPCODE_BYTES
             if len(candidate) < header_bytes:
@@ -3847,31 +3862,61 @@ class PyTorchZipScanner(BaseScanner):
         memo_keys = PyTorchZipScanner._parsed_prefix_memo_keys(prefix)
         if not memo_keys:
             return False
-        suffix = value[search_start : search_start + _PICKLE_DISCOVERY_LONG_PROBE_BYTES]
-        search_start_in_suffix = 0
-        while search_start_in_suffix < len(suffix):
-            offset = min(
-                (found for marker in b"ghj" if (found := suffix.find(bytes([marker]), search_start_in_suffix)) >= 0),
-                default=-1,
-            )
-            if offset < 0:
+        step = _PICKLE_DISCOVERY_LONG_PROBE_BYTES - _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES + 1
+        window_start = search_start
+        while window_start < len(value):
+            window_end = min(len(value), window_start + _PICKLE_DISCOVERY_LONG_PROBE_BYTES)
+            window = value[window_start:window_end]
+            search_start_in_window = 0
+            while search_start_in_window < len(window):
+                offset = min(
+                    (
+                        found
+                        for marker in b"ghj"
+                        if (found := window.find(bytes([marker]), search_start_in_window)) >= 0
+                    ),
+                    default=-1,
+                )
+                if offset < 0:
+                    break
+                absolute_offset = window_start + offset
+                if not PyTorchZipScanner._consume_raw_nested_structural_parse_budget(parse_budget_remaining):
+                    return True
+                memo_key, truncated_get = PyTorchZipScanner._memo_get_key_at(value, absolute_offset)
+                if truncated_get:
+                    return True
+                if memo_key not in memo_keys:
+                    search_start_in_window = offset + 1
+                    continue
+                candidate = value[absolute_offset : absolute_offset + _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES]
+                if PyTorchZipScanner._has_security_relevant_pickle_opcode(candidate):
+                    return True
+                search_start_in_window = offset + 1
+            if window_end >= len(value):
                 return False
-            if not PyTorchZipScanner._consume_raw_nested_structural_parse_budget(parse_budget_remaining):
-                return True
-            memo_key, truncated_get = PyTorchZipScanner._memo_get_key_at(suffix, offset)
-            if truncated_get:
-                return True
-            if memo_key not in memo_keys:
-                search_start_in_suffix = offset + 1
-                continue
-            candidate = suffix[offset : offset + _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES]
-            if PyTorchZipScanner._has_security_relevant_pickle_opcode(candidate):
-                return True
-            search_start_in_suffix = offset + 1
+            window_start += step
         return False
 
     @staticmethod
-    def _parsed_prefix_memo_keys(prefix: bytes) -> set[str]:
+    def _canonical_proto0_memo_key(value: object) -> str:
+        if isinstance(value, bool):
+            return str(int(value))
+        if isinstance(value, int):
+            return str(value)
+        if isinstance(value, bytes):
+            try:
+                value = value.decode("ascii")
+            except UnicodeDecodeError:
+                return repr(value)
+        if isinstance(value, str):
+            try:
+                return str(int(value))
+            except ValueError:
+                return value
+        return str(value)
+
+    @staticmethod
+    def _parsed_prefix_memo_keys_from_start(prefix: bytes) -> set[str]:
         memo_keys: set[str] = set()
         memoize_index = 0
         stack_depth = 0
@@ -3890,7 +3935,7 @@ class PyTorchZipScanner(BaseScanner):
                     continue
                 if opcode.name in {"BINPUT", "LONG_BINPUT", "PUT"}:
                     if stack_depth > 0:
-                        memo_keys.add(str(arg))
+                        memo_keys.add(PyTorchZipScanner._canonical_proto0_memo_key(arg))
                     continue
                 if opcode.name == "MEMOIZE":
                     if stack_depth > 0:
@@ -3906,6 +3951,23 @@ class PyTorchZipScanner(BaseScanner):
                 stack_depth = max(0, stack_depth - len(opcode.stack_before)) + len(opcode.stack_after)
         except Exception:
             return memo_keys
+        return memo_keys
+
+    @staticmethod
+    def _parsed_prefix_memo_keys(prefix: bytes) -> set[str]:
+        memo_keys = PyTorchZipScanner._parsed_prefix_memo_keys_from_start(prefix)
+        if memo_keys:
+            return memo_keys
+        starts_checked = 0
+        for offset, marker in enumerate(prefix[1:], start=1):
+            if marker not in _RAW_NESTED_SECURITY_PICKLE_START_BYTES:
+                continue
+            starts_checked += 1
+            if starts_checked > _MAX_RAW_NESTED_PICKLE_CANDIDATES:
+                return memo_keys
+            memo_keys.update(PyTorchZipScanner._parsed_prefix_memo_keys_from_start(prefix[offset:]))
+            if memo_keys:
+                return memo_keys
         return memo_keys
 
     @staticmethod
@@ -3926,9 +3988,10 @@ class PyTorchZipScanner(BaseScanner):
             if end < 0:
                 return None, True
             try:
-                return value[offset + 1 : end].decode("ascii"), False
+                key = value[offset + 1 : end].decode("ascii")
             except UnicodeDecodeError:
                 return None, False
+            return PyTorchZipScanner._canonical_proto0_memo_key(key), False
         return None, False
 
     @staticmethod
@@ -4920,18 +4983,12 @@ class PyTorchZipScanner(BaseScanner):
         cursor = 0
         stream = io.BytesIO(sample)
         while cursor < len(sample):
-            literal_values: list[bytes] = []
             try:
                 stream.seek(cursor)
                 for opcode, arg, pos in pickletools.genops(stream):
                     if pos is None:
                         continue
                     if opcode.name == "STOP":
-                        if any(
-                            PyTorchZipScanner._literal_value_has_line_continuation_suspicious_text(value)
-                            for value in literal_values
-                        ):
-                            return True
                         cursor = pos + 1
                         while cursor < len(sample) and sample[cursor] in PROTO0_1_IGNORABLE_TRAILING_BYTES:
                             cursor += 1
@@ -4940,8 +4997,11 @@ class PyTorchZipScanner(BaseScanner):
                         break
                     if opcode.name in _PICKLE_LITERAL_OPCODES:
                         literal_value = PyTorchZipScanner._literal_arg_bytes(opcode.name, arg)
-                        if literal_value is not None:
-                            literal_values.append(literal_value)
+                        if (
+                            literal_value is not None
+                            and PyTorchZipScanner._literal_value_has_line_continuation_suspicious_text(literal_value)
+                        ):
+                            return True
                 else:
                     return False
             except Exception:
