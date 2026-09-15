@@ -18185,6 +18185,212 @@ class TestWeightDistributionSemantics:
             assert fingerprint_returns >= 6
             assert mismatch_count == 0
 
+    def test_reentry_constant_uses_bounded_semantic_fingerprint_when_protobuf_exceeds_cap(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(onnx_scanner_module, "_ONNX_SEMANTIC_FINGERPRINT_MAX_SERIALIZED_BYTES", 0)
+        path = self._write_local_function_rank_reentry_fanout_model(
+            tmp_path,
+            distinct_cache_tags=True,
+            use_cache_tag_value=True,
+        )
+        scanner_path = Path(onnx_scanner_module.__file__).resolve()
+        bounded_payload_lengths: list[int] = []
+
+        def profile(frame: Any, event: str, arg: Any) -> None:
+            if (
+                event == "return"
+                and frame.f_code.co_name == "semantic_cache_fingerprint_with_owner"
+                and Path(frame.f_code.co_filename).resolve() == scanner_path
+                and frame.f_locals.get("protobuf_size", 0)
+                > onnx_scanner_module._ONNX_SEMANTIC_FINGERPRINT_MAX_SERIALIZED_BYTES
+            ):
+                payload = frame.f_locals.get("payload")
+                if isinstance(payload, bytes):
+                    bounded_payload_lengths.append(len(payload))
+
+        try:
+            sys.setprofile(profile)
+            result = OnnxScanner().scan(str(path))
+        finally:
+            sys.setprofile(None)
+
+        assert result.success is True
+        assert result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"] == {}
+        assert bounded_payload_lengths
+        assert max(bounded_payload_lengths) < 256
+
+    def _write_local_size_function_output_shape_model(self, tmp_path: Path, *, matrix_clean_output: bool) -> Path:
+        tmp_path.mkdir(parents=True, exist_ok=True)
+        source_names = [f"source{index}" for index in range(40)]
+        function = helper.make_function(
+            "local",
+            "Size",
+            ["clean_input"],
+            ["clean_output"],
+            [helper.make_node("Identity", ["clean_input"], ["clean_output"])],
+            opset_imports=[helper.make_opsetid("", 13)],
+        )
+        body = helper.make_graph(
+            [
+                helper.make_node(
+                    "Size",
+                    ["clean_matrix" if matrix_clean_output else "clean_vector"],
+                    ["clean_output"],
+                    domain="local",
+                ),
+                helper.make_node("Add", ["state", "clean_output"], ["next_state"]),
+                helper.make_node("Identity", ["condition_in"], ["condition_out"]),
+            ],
+            "local_size_function_body",
+            [
+                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
+                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("state", TensorProto.FLOAT, [2]),
+            ],
+            [
+                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, [2, 2] if matrix_clean_output else [2]),
+            ],
+        )
+        graph = helper.make_graph(
+            [
+                helper.make_node("Sum", source_names, ["initial_state"]),
+                helper.make_node(
+                    "Loop",
+                    ["trip_count", "initial_condition", "initial_state"],
+                    ["final_state"],
+                    body=body,
+                ),
+                helper.make_node("MatMul", ["X", "final_state"], ["Y"]),
+            ],
+            "local_size_function_output_shape",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 2])],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 2] if matrix_clean_output else [1])],
+            initializer=[
+                *[onnx.numpy_helper.from_array(np.ones((2,), dtype=np.float32), name=name) for name in source_names],
+                onnx.numpy_helper.from_array(np.array(2, dtype=np.int64), name="trip_count"),
+                onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="initial_condition"),
+                onnx.numpy_helper.from_array(np.ones((2,), dtype=np.float32), name="clean_vector"),
+                onnx.numpy_helper.from_array(np.ones((2, 2), dtype=np.float32), name="clean_matrix"),
+            ],
+        )
+        model = helper.make_model(
+            graph,
+            functions=[function],
+            opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
+        )
+        model.ir_version = 8
+        onnx.checker.check_model(model, full_check=True)
+        mode = "matrix" if matrix_clean_output else "vector"
+        path = tmp_path / f"local-size-function-output-shape-{mode}.onnx"
+        onnx.save(model, str(path))
+        return path
+
+    def test_local_size_function_does_not_impersonate_standard_size(self, tmp_path: Path) -> None:
+        benign_result = OnnxScanner().scan(
+            str(self._write_local_size_function_output_shape_model(tmp_path / "benign", matrix_clean_output=False))
+        )
+        assert benign_result.success is True
+        assert benign_result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"] == {}
+
+        positive_result = OnnxScanner().scan(
+            str(self._write_local_size_function_output_shape_model(tmp_path / "positive", matrix_clean_output=True))
+        )
+        assert positive_result.success is False
+        assert (
+            positive_result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"]["lineages_per_value_limit"]
+            >= 1
+        )
+
+    def test_dead_reentry_nodes_are_skipped_before_input_walk(self, tmp_path: Path) -> None:
+        state_count = 80
+        body_nodes = [
+            helper.make_node("Sum", [f"state{index}" for index in range(state_count)], ["dead_sum"]),
+            helper.make_node("Identity", ["state0"], ["next0"]),
+            helper.make_node("Identity", ["condition_in"], ["condition_out"]),
+        ]
+        body_nodes.extend(
+            helper.make_node("Identity", [f"state{index}"], [f"next{index}"]) for index in range(1, state_count)
+        )
+        body = helper.make_graph(
+            body_nodes,
+            "dead_wide_reentry_body",
+            [
+                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
+                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
+                *[
+                    helper.make_tensor_value_info(f"state{index}", TensorProto.FLOAT, [2])
+                    for index in range(state_count)
+                ],
+            ],
+            [
+                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
+                *[
+                    helper.make_tensor_value_info(f"next{index}", TensorProto.FLOAT, [2])
+                    for index in range(state_count)
+                ],
+            ],
+        )
+        graph = helper.make_graph(
+            [
+                helper.make_node(
+                    "Loop",
+                    [
+                        "trip_count",
+                        "initial_condition",
+                        *[f"initial{index}" for index in range(state_count)],
+                    ],
+                    [f"final{index}" for index in range(state_count)],
+                    body=body,
+                ),
+                helper.make_node("MatMul", ["X", "final0"], ["Y"]),
+            ],
+            "dead_wide_reentry",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 2])],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1])],
+            initializer=[
+                onnx.numpy_helper.from_array(np.array(2, dtype=np.int64), name="trip_count"),
+                onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="initial_condition"),
+                *[
+                    onnx.numpy_helper.from_array(np.ones((2,), dtype=np.float32), name=f"initial{index}")
+                    for index in range(state_count)
+                ],
+            ],
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model, full_check=True)
+        path = tmp_path / "dead-wide-reentry.onnx"
+        onnx.save(model, str(path))
+        scanner_path = Path(onnx_scanner_module.__file__).resolve()
+        dead_sum_shape_inputs: list[str] = []
+
+        def profile(frame: Any, event: str, arg: Any) -> None:
+            if (
+                event == "call"
+                and frame.f_code.co_name == "reentry_input_shape"
+                and Path(frame.f_code.co_filename).resolve() == scanner_path
+            ):
+                caller_node = frame.f_back.f_locals.get("body_node") if frame.f_back is not None else None
+                if getattr(caller_node, "op_type", "") != "Sum":
+                    return
+                if "dead_sum" not in {str(output_name) for output_name in getattr(caller_node, "output", ())}:
+                    return
+                input_name = frame.f_locals.get("input_name")
+                if isinstance(input_name, str):
+                    dead_sum_shape_inputs.append(input_name)
+
+        try:
+            sys.setprofile(profile)
+            result = OnnxScanner().scan(str(path))
+        finally:
+            sys.setprofile(None)
+
+        assert result.success is True
+        assert result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"] == {}
+        assert dead_sum_shape_inputs == []
+
     def test_local_function_scan_preserves_proven_input_extent(self, tmp_path: Path) -> None:
         source_names = [f"matrix{index}" for index in range(40)]
         body = helper.make_graph(

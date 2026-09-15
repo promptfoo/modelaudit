@@ -174,6 +174,7 @@ _ONNX_STRUCTURE_MAX_RETAINED_ALLOCATION_BYTES = 128 * 1024 * 1024
 _ONNX_STRUCTURE_RETAINED_OBJECT_BYTES = 1024
 _ONNX_STRUCTURE_RETAINED_SEQUENCE_ENTRY_BYTES = 64
 _ONNX_STRUCTURE_RETAINED_STRING_OVERHEAD_BYTES = 64
+_ONNX_SEMANTIC_FINGERPRINT_MAX_SERIALIZED_BYTES = _ONNX_STRUCTURE_STRING_MAX_BYTES
 _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_OUTPUTS = 1024
 _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK = 4096
 _ONNX_RESULT_MAX_DISTINCT_GROUPS = 1024
@@ -2500,6 +2501,28 @@ def _build_onnx_weight_analysis_plan(
             if cached_fingerprint is not None and cached_fingerprint[0] is value:
                 return cached_fingerprint[1]
         type_name = f"{type(value).__module__}.{type(value).__qualname__}"
+        byte_size = getattr(value, "ByteSize", None)
+        if callable(byte_size):
+            try:
+                protobuf_size = int(byte_size())
+            except Exception:
+                protobuf_size = None
+            if protobuf_size is not None and protobuf_size > _ONNX_SEMANTIC_FINGERPRINT_MAX_SERIALIZED_BYTES:
+                descriptor = getattr(value, "DESCRIPTOR", None)
+                descriptor_name = str(getattr(descriptor, "full_name", ""))
+                payload = (
+                    f"protobuf:{descriptor_name}:bytes={protobuf_size}:owner={value_id}".encode(
+                        "utf-8", errors="surrogatepass"
+                    )
+                    if retain_owner
+                    else f"protobuf:{descriptor_name}:bytes={protobuf_size}:bounded".encode(
+                        "utf-8", errors="surrogatepass"
+                    )
+                )
+                fingerprint = (type_name, hashlib.sha256(payload).hexdigest())
+                if retain_owner:
+                    cache_fingerprints[value_id] = (value, fingerprint)
+                return fingerprint
         serializer = getattr(value, "SerializeToString", None)
         try:
             if callable(serializer):
@@ -2902,11 +2925,13 @@ def _build_onnx_weight_analysis_plan(
             return trusted_context_shapes.get(input_name)
 
         for body_node in getattr(subgraph, "node", ()):
-            body_inputs = [str(input_name) for input_name in getattr(body_node, "input", ())]
             body_outputs = [str(output_name) for output_name in getattr(body_node, "output", ()) if output_name]
             if not body_outputs:
                 continue
             body_outputs_feed_selected_output = bool(set(body_outputs) & output_dependency_names)
+            if not body_outputs_feed_selected_output:
+                continue
+            body_inputs = [str(input_name) for input_name in getattr(body_node, "input", ())]
             if getattr(body_node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS and body_node.op_type == "Constant":
                 constant_tensor = resolved_constant_node_tensor(body_node, resolve_reentry_attribute)
                 if constant_tensor is not None:
@@ -2921,6 +2946,17 @@ def _build_onnx_weight_analysis_plan(
                 str(getattr(body_node, "overload", "")),
             )
             function = functions.get(function_key)
+            is_model_local_function = function is not None
+            is_registered_standard_operator = is_model_local_function or has_registered_standard_operator(
+                body_node,
+                opset_versions,
+            )
+            is_shape_query = (
+                is_registered_standard_operator
+                and not is_model_local_function
+                and getattr(body_node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
+                and body_node.op_type in {"Shape", "Size"}
+            )
             data_input_promoted = bool(body_inputs and body_inputs[0] in promoted)
             data_input_tainted = bool(body_inputs and body_inputs[0] in tainted)
             any_promoted = any(input_name in promoted for input_name in body_inputs)
@@ -3085,8 +3121,6 @@ def _build_onnx_weight_analysis_plan(
                     if output_shape is not None:
                         tainted_shapes[output_name] = output_shape
             for attribute in getattr(body_node, "attribute", ()):
-                if not body_outputs_feed_selected_output:
-                    continue
                 resolved_attribute = resolve_reentry_attribute(attribute)
                 if resolved_attribute is None:
                     continue
@@ -3267,7 +3301,7 @@ def _build_onnx_weight_analysis_plan(
                 tainted.update(body_tainted_outputs)
             if (
                 any_tainted
-                or body_node.op_type == "Size"
+                or is_shape_query
                 or any(input_shapes_by_name.get(input_name) is not None for input_name in body_inputs)
             ):
                 output_shape = None
@@ -3377,9 +3411,9 @@ def _build_onnx_weight_analysis_plan(
                                 for index, dimension in enumerate(data_input_shape)
                                 if index not in squeeze_axes
                             )
-                elif body_node.op_type == "Shape" and data_input_shape is not None:
+                elif is_shape_query and body_node.op_type == "Shape" and data_input_shape is not None:
                     output_shape = (len(data_input_shape),)
-                elif body_node.op_type == "Size" and not any_tainted:
+                elif is_shape_query and body_node.op_type == "Size" and not any_tainted:
                     output_shape = ()
                 if output_shape is not None:
                     for output_name in body_outputs:
