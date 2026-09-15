@@ -2908,12 +2908,12 @@ def _build_onnx_weight_analysis_plan(
                         for output_index in function_tainted_output_indexes
                         if 0 <= output_index < len(body_outputs)
                     }
-                    if valid_function_tainted_output_indexes:
-                        downstream_live_function_output_indexes = {
-                            output_index
-                            for output_index, output_name in enumerate(body_outputs)
-                            if output_name in output_dependency_names
-                        }
+                    downstream_live_function_output_indexes = {
+                        output_index
+                        for output_index, output_name in enumerate(body_outputs)
+                        if output_name in output_dependency_names
+                    }
+                    if valid_function_tainted_output_indexes or downstream_live_function_output_indexes:
                         restorable_function_output_indexes = (
                             valid_function_tainted_output_indexes | downstream_live_function_output_indexes
                         )
@@ -2927,6 +2927,9 @@ def _build_onnx_weight_analysis_plan(
                             for function_input_name, function_input_shape in function_tainted_inputs.items()
                             if function_input_name in function_output_dependency_names
                         }
+                        if not relevant_function_tainted_inputs and downstream_live_function_output_indexes:
+                            probe_name, probe_shape = next(iter(function_tainted_inputs.items()))
+                            relevant_function_tainted_inputs = {probe_name: probe_shape}
                     else:
                         restorable_function_output_indexes = set()
                         function_output_dependency_names = frozenset()
@@ -2944,8 +2947,8 @@ def _build_onnx_weight_analysis_plan(
                                 valid_function_tainted_output_indexes,
                             )
                         )
-                    elif valid_function_tainted_output_indexes:
-                        representative_output_index = min(valid_function_tainted_output_indexes)
+                    elif restorable_function_output_indexes:
+                        representative_output_index = min(restorable_function_output_indexes)
                         for function_input_name, function_input_shape in relevant_function_tainted_inputs.items():
                             function_promoted_output_indexes: set[int] = set()
                             representative_promoted = subgraph_reenters_state_with_rank_promotion(

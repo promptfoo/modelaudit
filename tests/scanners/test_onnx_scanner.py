@@ -17483,6 +17483,100 @@ class TestWeightDistributionSemantics:
             >= 1
         )
 
+    def _write_repeated_local_function_clean_only_output_shape_model(
+        self,
+        tmp_path: Path,
+        *,
+        matrix_clean_output: bool,
+    ) -> Path:
+        tmp_path.mkdir(parents=True, exist_ok=True)
+        source_names = [f"source{index}" for index in range(40)]
+        function = helper.make_function(
+            "local",
+            "CleanOnly",
+            ["state_input", "clean_input"],
+            ["clean_output"],
+            [helper.make_node("Identity", ["clean_input"], ["clean_output"])],
+            opset_imports=[helper.make_opsetid("", 13)],
+        )
+        clean_name = "clean_matrix" if matrix_clean_output else "clean_vector"
+        body = helper.make_graph(
+            [
+                helper.make_node("CleanOnly", ["state", clean_name], ["clean_output"], domain="local"),
+                helper.make_node("Add", ["state", "clean_output"], ["next_state"]),
+                helper.make_node("Identity", ["condition_in"], ["condition_out"]),
+            ],
+            "local_function_clean_only_output_shape_body",
+            [
+                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
+                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("state", TensorProto.FLOAT, [2]),
+            ],
+            [
+                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, [2, 2] if matrix_clean_output else [2]),
+            ],
+        )
+        graph = helper.make_graph(
+            [
+                helper.make_node("Sum", source_names, ["initial_state"]),
+                helper.make_node(
+                    "Loop",
+                    ["trip_count", "initial_condition", "initial_state"],
+                    ["final_state"],
+                    body=body,
+                ),
+                helper.make_node("MatMul", ["X", "final_state"], ["Y"]),
+            ],
+            "local_function_clean_only_output_shape",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 2])],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 2] if matrix_clean_output else [1])],
+            initializer=[
+                *[onnx.numpy_helper.from_array(np.ones((2,), dtype=np.float32), name=name) for name in source_names],
+                onnx.numpy_helper.from_array(np.array(2, dtype=np.int64), name="trip_count"),
+                onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="initial_condition"),
+                onnx.numpy_helper.from_array(np.ones((2,), dtype=np.float32), name="clean_vector"),
+                onnx.numpy_helper.from_array(np.ones((2, 2), dtype=np.float32), name="clean_matrix"),
+            ],
+        )
+        model = helper.make_model(
+            graph,
+            functions=[function],
+            opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
+        )
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        mode = "matrix" if matrix_clean_output else "vector"
+        path = tmp_path / f"local-function-clean-only-output-shape-{mode}.onnx"
+        onnx.save(model, str(path))
+        return path
+
+    def test_repeated_local_function_cache_restores_downstream_clean_only_output_shape(self, tmp_path: Path) -> None:
+        benign_result = OnnxScanner().scan(
+            str(
+                self._write_repeated_local_function_clean_only_output_shape_model(
+                    tmp_path / "benign",
+                    matrix_clean_output=False,
+                )
+            )
+        )
+        assert benign_result.success is True
+        assert benign_result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"] == {}
+
+        positive_result = OnnxScanner().scan(
+            str(
+                self._write_repeated_local_function_clean_only_output_shape_model(
+                    tmp_path / "positive",
+                    matrix_clean_output=True,
+                )
+            )
+        )
+        assert positive_result.success is False
+        assert (
+            positive_result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"]["lineages_per_value_limit"]
+            >= 1
+        )
+
     def _write_recursive_local_function_promotion_model(self, tmp_path: Path, *, depth: int) -> Path:
         functions = []
         for index in range(depth, -1, -1):
