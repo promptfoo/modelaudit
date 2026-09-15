@@ -6214,6 +6214,27 @@ def test_pytorch_zip_trusted_storage_routes_headerless_binary_stream_at_entry_ga
     assert looks_like_pickle is True
 
 
+def test_pytorch_zip_trusted_storage_fails_closed_after_impossible_binunicode8_prefix(tmp_path: Path) -> None:
+    archive_path = tmp_path / "impossible_binunicode8_storage_gate.pt"
+    security_tail = b"\x80\x04cposix\nsystem\n)R."
+    storage_blob = b"\x8d" + (len(security_tail) + 1024).to_bytes(8, "little") + security_tail
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data/0", storage_blob)
+
+    result = ScanResult(scanner_name="pytorch_zip")
+    scanner = PyTorchZipScanner()
+
+    with zipfile.ZipFile(archive_path, "r") as archive:
+        entry = archive.getinfo("archive/data/0")
+        with pytest.raises(ValueError, match="trusted PyTorch storage prefix exceeds pickle discovery probe"):
+            scanner._trusted_storage_entry_looks_like_pickle(
+                archive,
+                entry,
+                result,
+                padding_probe_bytes_remaining=[pytorch_zip_scanner_module._PICKLE_DISCOVERY_LONG_PROBE_BYTES],
+            )
+
+
 def test_pytorch_zip_trusted_storage_routes_headerless_byte_literal_at_entry_gate(tmp_path: Path) -> None:
     archive_path = tmp_path / "headerless_byte_literal_storage_gate.pt"
     encoded = base64.b64encode(b"cposix\nsystem\n)R.")
@@ -7009,6 +7030,53 @@ def test_pytorch_zip_structural_fallback_advances_after_malformed_proto0_inst_na
 
     assert PyTorchZipScanner._raw_nested_security_pickle_candidate_has_structural_signal(b"i" * 128) is False
     assert calls == 1
+
+
+def test_pytorch_zip_prior_window_inst_name_parse_is_window_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    parse_budget_remaining = [pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES]
+    spans: list[int] = []
+    original = PyTorchZipScanner._raw_nested_proto0_inst_name_end
+
+    def counted_name_end(value: bytes, offset: int, limit: int) -> tuple[int | None, int]:
+        spans.append(limit - offset)
+        return original(value, offset, limit)
+
+    monkeypatch.setattr(
+        PyTorchZipScanner,
+        "_raw_nested_proto0_inst_name_end",
+        staticmethod(counted_name_end),
+    )
+
+    window_end = pytorch_zip_scanner_module._PICKLE_DISCOVERY_LONG_PROBE_BYTES
+    value = b"x" * 64 + b"i" * (window_end * 4)
+
+    assert (
+        PyTorchZipScanner._raw_nested_proto0_inst_with_prior_window_mark_seen(
+            value,
+            0,
+            window_end,
+            parse_budget_remaining,
+        )
+        is False
+    )
+    assert spans
+    assert max(spans) <= window_end
+    assert parse_budget_remaining == [pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES - 1]
+
+
+def test_pytorch_zip_prior_window_inst_name_parse_fails_closed_after_budget() -> None:
+    value = b"x" * 64 + b"i" * (pytorch_zip_scanner_module._PICKLE_DISCOVERY_LONG_PROBE_BYTES * 4)
+    parse_budget_remaining = [0]
+
+    assert (
+        PyTorchZipScanner._raw_nested_proto0_inst_with_prior_window_mark_seen(
+            value,
+            0,
+            pytorch_zip_scanner_module._PICKLE_DISCOVERY_LONG_PROBE_BYTES,
+            parse_budget_remaining,
+        )
+        is True
+    )
 
 
 def test_pytorch_zip_structural_fallback_bounds_markless_proto0_inst_searches() -> None:

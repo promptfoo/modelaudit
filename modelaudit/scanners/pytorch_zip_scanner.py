@@ -2267,6 +2267,9 @@ class PyTorchZipScanner(BaseScanner):
         ):
             charge_detection_probe_budget()
             return True
+        impossible_prefix_decision = impossible_prefix_tail_decision()
+        if impossible_prefix_decision is not None:
+            return impossible_prefix_decision
         if (
             max_probe_bytes == _TRUSTED_STORAGE_PICKLE_PROBE_BYTES
             and entry.file_size > len(sample)
@@ -2621,11 +2624,16 @@ class PyTorchZipScanner(BaseScanner):
             if len(candidate) < header_bytes:
                 return None
             declared_size = int.from_bytes(candidate[1:header_bytes], "little")
-        elif candidate.startswith(b"U"):
+        elif candidate.startswith((b"U", bytes([0x8C]))):
             header_bytes = 2
             if len(candidate) < header_bytes:
                 return None
             declared_size = candidate[1]
+        elif candidate.startswith(bytes([0x8D])):
+            header_bytes = 9
+            if len(candidate) < header_bytes:
+                return None
+            declared_size = int.from_bytes(candidate[1:header_bytes], "little")
         elif candidate.startswith(_PICKLE_FRAME_OPCODE):
             header_bytes = _PICKLE_FRAME_OPCODE_BYTES
             if len(candidate) < header_bytes:
@@ -4039,12 +4047,18 @@ class PyTorchZipScanner(BaseScanner):
             offset = value.find(b"i", search_start, window_end)
             if offset < 0:
                 return False
+            name_limit = min(len(value), window_end)
             name_end, next_search_start = PyTorchZipScanner._raw_nested_proto0_inst_name_end(
                 value,
                 offset,
-                len(value),
+                name_limit,
             )
             if name_end is None:
+                reached_name_limit = next_search_start >= name_limit
+                if reached_name_limit and not PyTorchZipScanner._consume_raw_nested_structural_parse_budget(
+                    parse_budget_remaining
+                ):
+                    return True
                 search_start = max(next_search_start, offset + 1)
                 continue
 
@@ -4348,9 +4362,9 @@ class PyTorchZipScanner(BaseScanner):
             return False
         if len(candidate) < header_bytes:
             return True
-        if opcode == ord("C"):
+        if opcode in {ord("C"), 0x8C}:
             literal_size = candidate[1]
-        elif opcode == ord("B"):
+        elif opcode in {ord("B"), ord("T"), ord("X")}:
             literal_size = int.from_bytes(candidate[1:5], "little")
         else:
             literal_size = int.from_bytes(candidate[1:9], "little")
