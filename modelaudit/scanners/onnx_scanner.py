@@ -2871,9 +2871,7 @@ def _build_onnx_weight_analysis_plan(
                         {captured_name: tainted_shapes.get(captured_name) for captured_name in captured_names}
                     )
                     external_context_names = nested_external_names
-                    if len(nested_external_names) * max(len(nested_tainted_shapes), 1) > (
-                        _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
-                    ):
+                    if len(nested_external_names) > _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK:
                         external_context_names = captured_names
                     nested_context_shapes.update(
                         {
@@ -2914,9 +2912,27 @@ def _build_onnx_weight_analysis_plan(
                             graph_output_offset=control_flow_output_offset(body_node),
                         )
                     )
+                    nested_promoted_output_indexes: set[int] = set()
+                    for output_index in nested_tainted_output_indexes:
+                        if control_flow_graph_output_is_stacked_output(
+                            body_node,
+                            output_index,
+                            opset_versions,
+                            resolve_attribute=resolve_reentry_attribute,
+                        ):
+                            nested_promoted_output_indexes.add(output_index)
+                    nested_promotion_work_remaining = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
+                    nested_promotion_call_work = max(len(getattr(nested_graph, "node", ())), 1)
+                    nested_output_count = len(getattr(nested_graph, "output", ()))
                     for captured_name, captured_shape in nested_tainted_shapes.items():
-                        nested_promoted_output_indexes: set[int] = set()
-                        for output_index in range(len(getattr(nested_graph, "output", ()))):
+                        if nested_promotion_work_remaining <= 0:
+                            break
+                        for output_index in range(nested_output_count):
+                            if nested_promotion_work_remaining < nested_promotion_call_work:
+                                nested_promoted_output_indexes.update(nested_tainted_output_indexes)
+                                nested_promotion_work_remaining = 0
+                                break
+                            nested_promotion_work_remaining -= nested_promotion_call_work
                             if subgraph_reenters_state_with_rank_promotion(
                                 nested_graph,
                                 captured_name,
@@ -2931,23 +2947,13 @@ def _build_onnx_weight_analysis_plan(
                                 depth=depth + 1,
                             ):
                                 nested_promoted_output_indexes.add(output_index)
-                            if (
-                                output_index in nested_tainted_output_indexes
-                                and control_flow_graph_output_is_stacked_output(
-                                    body_node,
-                                    output_index,
-                                    opset_versions,
-                                    resolve_attribute=resolve_reentry_attribute,
-                                )
-                            ):
-                                nested_promoted_output_indexes.add(output_index)
-                        nested_promoted_outputs.update(
-                            mapped_node_outputs(
-                                body_outputs,
-                                nested_promoted_output_indexes,
-                                graph_output_offset=control_flow_output_offset(body_node),
-                            )
+                    nested_promoted_outputs.update(
+                        mapped_node_outputs(
+                            body_outputs,
+                            nested_promoted_output_indexes,
+                            graph_output_offset=control_flow_output_offset(body_node),
                         )
+                    )
                     nested_output_offset = control_flow_output_offset(body_node)
                     for output_index, output_shape in nested_output_shapes.items():
                         node_output_index = output_index - nested_output_offset
@@ -5725,9 +5731,7 @@ def _build_onnx_weight_analysis_plan(
                         condition_input = (
                             str(current_node.input[1]) if len(current_node.input) > 1 and current_node.input[1] else ""
                         )
-                        if (trip_input in graph_input_names and trip_input not in constants) or (
-                            condition_input in graph_input_names and condition_input not in constants
-                        ):
+                        if trip_input in graph_input_names or condition_input in graph_input_names:
                             return None
                         trip_count = (
                             constant_scalar_value(constants.get(trip_input), int(onnx.TensorProto.INT64))
@@ -5844,13 +5848,9 @@ def _build_onnx_weight_analysis_plan(
                         graph_input_name = _onnx_value_name(graph_input)
                         parent_shape = known_value_shapes.get(parent_name)
                         if parent_shape is None and parent_name in value_lineages:
-                            lineage_shapes = {
-                                lineage.shape
-                                for lineage in value_lineages[parent_name].values()
-                                if lineage.shape is not None
-                            }
-                            if len(lineage_shapes) == 1:
-                                parent_shape = next(iter(lineage_shapes))
+                            lineage_shapes = {lineage.shape for lineage in value_lineages[parent_name].values()}
+                            if len(lineage_shapes) == 1 and None not in lineage_shapes:
+                                parent_shape = next(iter(lineage_shapes))  # type: ignore[assignment]
                         parent_rank = known_value_ranks.get(parent_name)
                         repeated_control_flow_state_input = is_repeated_control_flow_state_input(pair_index)
                         repeated_state_reenters_with_rank_promotion = False
