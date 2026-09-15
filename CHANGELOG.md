@@ -48,6 +48,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Avoid command-and-control false positives for generated TorchScript `_check_input_dim` identifiers while preserving actionable `check_in` detections.
 - Avoid incomplete legacy PyTorch storage-layout findings after validating storage bytes when separate source-backed rebuild warnings remain.
 - Avoid incomplete PyTorch ZIP storage discovery when a tensor member starts with an impossible length-prefixed pickle opcode and no hidden payload is present.
+- Keep PyTorch ZIP storage discovery failed closed when decoy candidates exhaust the structural budget before a later hidden pickle payload.
 - Treat passive built-in CoreML license-reference URLs as informational while preserving active metadata URL and command detections.
 
 ## [0.2.52](https://github.com/promptfoo/modelaudit/compare/v0.2.51...v0.2.52) (2026-07-22)

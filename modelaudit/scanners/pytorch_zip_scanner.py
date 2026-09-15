@@ -3698,7 +3698,25 @@ class PyTorchZipScanner(BaseScanner):
             return True
         if PyTorchZipScanner._budget_exhausted_suffix_is_only_incomplete_extension_after_text_noise(value):
             return False
-        return PyTorchZipScanner._raw_nested_security_pickle_candidate_has_structural_signal(value)
+        return PyTorchZipScanner._raw_nested_security_pickle_candidate_has_structural_signal(
+            value
+        ) or PyTorchZipScanner._raw_nested_security_pickle_candidate_has_later_structural_signal(value)
+
+    @staticmethod
+    def _raw_nested_security_pickle_candidate_has_later_structural_signal(value: bytes) -> bool:
+        if len(value) <= _PICKLE_DISCOVERY_LONG_PROBE_BYTES:
+            return False
+        step = _PICKLE_DISCOVERY_LONG_PROBE_BYTES - _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES + 1
+        search_start = step
+        while search_start < len(value):
+            window_start = max(0, search_start - _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES + 1)
+            window = value[window_start : search_start + _PICKLE_DISCOVERY_LONG_PROBE_BYTES]
+            if PyTorchZipScanner._raw_nested_security_pickle_candidate_has_structural_signal(window):
+                return True
+            if search_start + _PICKLE_DISCOVERY_LONG_PROBE_BYTES >= len(value):
+                return False
+            search_start += step
+        return False
 
     @staticmethod
     def _budget_exhausted_suffix_is_only_incomplete_extension_after_text_noise(value: bytes) -> bool:
