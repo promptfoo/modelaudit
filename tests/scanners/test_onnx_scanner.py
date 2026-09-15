@@ -18381,7 +18381,7 @@ class TestWeightDistributionSemantics:
         scanner_path = Path(onnx_scanner_module.__file__).resolve()
         comprehension_fields: dict[int, str] = {}
         for syntax_node in ast.walk(ast.parse(scanner_path.read_text())):
-            if not isinstance(syntax_node, (ast.ListComp, ast.SetComp)):
+            if not isinstance(syntax_node, (ast.GeneratorExp, ast.ListComp, ast.SetComp)):
                 continue
             fields: set[str] = set()
             for child in ast.walk(syntax_node):
