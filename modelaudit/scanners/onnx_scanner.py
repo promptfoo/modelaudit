@@ -2723,6 +2723,9 @@ def _build_onnx_weight_analysis_plan(
     graph_output_dependency_cache: dict[
         tuple[int, tuple[int, ...] | None, tuple[tuple[str, str, str], ...]], frozenset[str]
     ] = {}
+    graph_value_dependency_cache: dict[
+        tuple[int, tuple[str, ...], tuple[tuple[str, str, str], ...]], tuple[Any, frozenset[str]]
+    ] = {}
     graph_node_direct_dependency_cache: dict[
         tuple[int, tuple[tuple[str, str, str], ...]], tuple[Any, frozenset[str]]
     ] = {}
@@ -2853,8 +2856,14 @@ def _build_onnx_weight_analysis_plan(
         value_names: Iterable[str],
         attribute_bindings: dict[str, Any] | None = None,
     ) -> frozenset[str]:
+        value_name_key = tuple(sorted(str(value_name) for value_name in value_names if value_name))
+        attribute_key = attribute_binding_cache_key(attribute_bindings)
+        cache_key = (id(subgraph), value_name_key, attribute_key)
+        cached_dependencies = graph_value_dependency_cache.get(cache_key)
+        if cached_dependencies is not None and cached_dependencies[0] is subgraph:
+            return cached_dependencies[1]
         local_attribute_bindings = attribute_bindings or {}
-        dependencies = {str(value_name) for value_name in value_names if value_name}
+        dependencies = set(value_name_key)
         for body_node in reversed(getattr(subgraph, "node", ())):
             body_outputs = {str(output_name) for output_name in getattr(body_node, "output", ()) if output_name}
             if not body_outputs & dependencies:
@@ -2864,7 +2873,9 @@ def _build_onnx_weight_analysis_plan(
                 graph_node_direct_dependency_names(body_node, local_attribute_bindings),
             ):
                 break
-        return frozenset(dependencies)
+        result = frozenset(dependencies)
+        graph_value_dependency_cache[cache_key] = (subgraph, result)
+        return result
 
     def reentry_shape_preserving_unary_operator(node: Any, inputs: Sequence[str]) -> bool:
         return (
@@ -6829,6 +6840,243 @@ def _build_onnx_weight_analysis_plan(
                                 )
                             return None
 
+                        def function_input_consumes_weight_rank_at_or_above_two(
+                            function_graph: Any,
+                            function_input_name: str,
+                            function_input_shape: tuple[int, ...],
+                            function_versions: dict[str, int],
+                            function_attributes: dict[str, Any],
+                            function_constants: dict[str, Any],
+                            function_context_shapes: dict[str, tuple[int, ...]],
+                        ) -> bool | None:
+                            nonlocal exact_loop_replay_work_exhausted, exact_loop_replay_work_remaining
+                            weight_dependency_names = subgraph_potential_weight_consumer_dependency_names(
+                                function_graph,
+                                function_versions,
+                                attribute_bindings=function_attributes,
+                            )
+                            if dependency_names_exceeded_limit(weight_dependency_names):
+                                return None
+                            weight_dependency_names = graph_value_dependency_names(
+                                function_graph,
+                                weight_dependency_names,
+                                attribute_bindings=function_attributes,
+                            )
+                            if dependency_names_exceeded_limit(weight_dependency_names):
+                                return None
+                            live_node_ids = graph_nodes_producing_names(function_graph, weight_dependency_names)
+                            local_tainted_shapes: dict[str, tuple[int, ...] | None] = {
+                                function_input_name: function_input_shape
+                            }
+
+                            def local_known_input_shape(input_name: str) -> tuple[int, ...] | None:
+                                if input_name in local_tainted_shapes:
+                                    return local_tainted_shapes[input_name]
+                                if input_name in function_context_shapes:
+                                    return function_context_shapes[input_name]
+                                return constant_initializer_shape(function_constants, input_name)
+
+                            def local_output_shape(
+                                function_node: Any,
+                                function_inputs: Sequence[str],
+                            ) -> tuple[int, ...] | None:
+                                data_input_shape = (
+                                    local_known_input_shape(function_inputs[0]) if function_inputs else None
+                                )
+                                input_shapes_by_name = {
+                                    input_name: local_known_input_shape(input_name)
+                                    for input_name in function_inputs
+                                    if local_known_input_shape(input_name) is not None
+                                }
+                                if (
+                                    reentry_shape_preserving_unary_operator(function_node, function_inputs)
+                                    and data_input_shape is not None
+                                ):
+                                    return data_input_shape
+                                if function_node.op_type in _RANK_PRESERVING_VARIADIC_OPERATORS:
+                                    return _onnx_concat_output_shape(
+                                        function_node,
+                                        (local_tainted_shapes.get(input_name) for input_name in function_inputs),
+                                        axis=_onnx_int_attribute(function_node, "axis"),
+                                    )
+                                if function_node.op_type == "MatMul":
+                                    return matmul_output_shape(
+                                        local_tainted_shapes.get(function_inputs[0]) if function_inputs else None,
+                                        (
+                                            local_tainted_shapes.get(function_inputs[1])
+                                            if len(function_inputs) > 1
+                                            else None
+                                        ),
+                                    )
+                                if function_node.op_type == "OneHot":
+                                    return onehot_output_shape(
+                                        function_node,
+                                        local_tainted_shapes.get(function_inputs[0]) if function_inputs else None,
+                                        function_constants,
+                                    )
+                                if function_node.op_type == "Einsum":
+                                    return einsum_output_shape(function_node, input_shapes_by_name)
+                                if function_node.op_type in _SAME_TYPE_ELEMENTWISE_OPERATORS | {"Pow"}:
+                                    return broadcast_shapes(
+                                        local_tainted_shapes.get(input_name) for input_name in function_inputs
+                                    )
+                                if function_node.op_type == "Expand" and data_input_shape is not None:
+                                    shape_name = function_inputs[1] if len(function_inputs) > 1 else ""
+                                    target_shape = constant_int64_vector_values(function_constants.get(shape_name))
+                                    return (
+                                        broadcast_shapes((data_input_shape, target_shape))
+                                        if target_shape is not None
+                                        else None
+                                    )
+                                if function_node.op_type == "Reshape" and data_input_shape is not None:
+                                    shape_name = function_inputs[1] if len(function_inputs) > 1 else ""
+                                    shape_initializer = function_constants.get(shape_name)
+                                    if shape_initializer is None:
+                                        return None
+                                    return _resolve_onnx_reshape_shape(
+                                        data_input_shape,
+                                        shape_initializer,
+                                        allowzero=bool(_onnx_int_attribute(function_node, "allowzero")),
+                                        onnx=onnx,
+                                    )
+                                if function_node.op_type == "Unsqueeze" and data_input_shape is not None:
+                                    axes = _resolve_onnx_axes(function_node, function_constants, onnx=onnx)
+                                    if axes is None:
+                                        return None
+                                    output_rank = len(data_input_shape) + len(axes)
+                                    normalized_axes = tuple(axis if axis >= 0 else output_rank + axis for axis in axes)
+                                    if (
+                                        not normalized_axes
+                                        or len(set(normalized_axes)) != len(normalized_axes)
+                                        or any(axis < 0 or axis >= output_rank for axis in normalized_axes)
+                                    ):
+                                        return None
+                                    source_dimensions = iter(data_input_shape)
+                                    return tuple(
+                                        1 if index in normalized_axes else next(source_dimensions)
+                                        for index in range(output_rank)
+                                    )
+                                if function_node.op_type == "Squeeze" and data_input_shape is not None:
+                                    axes = _resolve_onnx_axes(function_node, function_constants, onnx=onnx)
+                                    if axes is None:
+                                        return None
+                                    normalized_axes = tuple(
+                                        axis if axis >= 0 else len(data_input_shape) + axis for axis in axes
+                                    )
+                                    if not normalized_axes:
+                                        if squeeze_with_empty_axes_is_noop(function_node, axes, None):
+                                            return data_input_shape
+                                        return tuple(dimension for dimension in data_input_shape if dimension != 1)
+                                    if (
+                                        len(set(normalized_axes)) != len(normalized_axes)
+                                        or any(axis < 0 or axis >= len(data_input_shape) for axis in normalized_axes)
+                                        or any(data_input_shape[axis] != 1 for axis in normalized_axes)
+                                    ):
+                                        return None
+                                    squeeze_axes = set(normalized_axes)
+                                    return tuple(
+                                        dimension
+                                        for index, dimension in enumerate(data_input_shape)
+                                        if index not in squeeze_axes
+                                    )
+                                return None
+
+                            for function_node in getattr(function_graph, "node", ()):
+                                function_inputs = node_input_names(function_node)
+                                function_outputs = node_output_names(function_node)
+                                if not function_outputs:
+                                    continue
+                                function_key = (
+                                    str(getattr(function_node, "domain", "")),
+                                    str(getattr(function_node, "op_type", "")),
+                                    str(getattr(function_node, "overload", "")),
+                                )
+                                function_standard_domain = (
+                                    getattr(function_node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
+                                )
+                                if function_standard_domain and function_node.op_type == "Constant":
+                                    constant_tensor = resolved_constant_node_tensor(
+                                        function_node,
+                                        lambda attribute: attribute,
+                                    )
+                                    if constant_tensor is not None:
+                                        for output_name in function_outputs:
+                                            function_constants[output_name] = constant_tensor
+                                            local_tainted_shapes.pop(output_name, None)
+                                        continue
+                                nested_function = functions.get(function_key)
+                                if nested_function is not None or any(
+                                    _iter_attribute_graphs(attribute)
+                                    for attribute in getattr(function_node, "attribute", ())
+                                ):
+                                    return None
+                                is_registered_standard_operator = has_registered_standard_operator(
+                                    function_node,
+                                    function_versions,
+                                )
+                                is_registered_standard_operator = is_registered_standard_operator or (
+                                    function_standard_domain
+                                    and (
+                                        function_node.op_type
+                                        in (
+                                            _RANK_PRESERVING_VARIADIC_OPERATORS
+                                            | _SAME_TYPE_ELEMENTWISE_OPERATORS
+                                            | {
+                                                "Cast",
+                                                "Constant",
+                                                "Einsum",
+                                                "Expand",
+                                                "Identity",
+                                                "MatMul",
+                                                "OneHot",
+                                                "PRelu",
+                                                "Pow",
+                                                "Reshape",
+                                                "Squeeze",
+                                                "Unsqueeze",
+                                            }
+                                        )
+                                    )
+                                )
+                                any_tainted_input = any(
+                                    input_name in local_tainted_shapes for input_name in function_inputs
+                                )
+                                if not any_tainted_input:
+                                    continue
+                                input_work = max(len(function_inputs), 1)
+                                if exact_loop_replay_work_remaining < input_work:
+                                    exact_loop_replay_work_exhausted = True
+                                    return None
+                                exact_loop_replay_work_remaining -= input_work
+                                has_live_output = id(function_node) in live_node_ids
+                                has_tainted_weight_input = False
+                                for input_index, input_name in enumerate(function_inputs):
+                                    if input_name not in local_tainted_shapes:
+                                        continue
+                                    if not _onnx_potential_weight_input(
+                                        function_node,
+                                        input_index,
+                                        is_model_local_function=False,
+                                        is_registered_standard_operator=is_registered_standard_operator,
+                                    ):
+                                        continue
+                                    has_tainted_weight_input = True
+                                    input_shape = local_tainted_shapes[input_name]
+                                    if input_shape is None:
+                                        return None
+                                    if len(input_shape) >= 2:
+                                        return True
+                                if not has_live_output and not has_tainted_weight_input:
+                                    continue
+                                output_shape = (
+                                    local_output_shape(function_node, function_inputs)
+                                    if function_standard_domain
+                                    else None
+                                )
+                                for output_name in function_outputs:
+                                    local_tainted_shapes[output_name] = output_shape
+                            return False
+
                         for body_node in getattr(subgraph, "node", ()):
                             body_inputs = node_input_names(body_node)
                             body_outputs = node_output_names(body_node)
@@ -6912,6 +7160,20 @@ def _build_onnx_weight_analysis_plan(
                             if function is not None:
                                 if function_attributes is None or function_versions is None:
                                     return None
+                                function_constants, function_bound_input_constants = bound_function_constants(
+                                    function,
+                                    body_inputs,
+                                    subgraph_constants,
+                                )
+                                function_constants.update(function_bound_input_constants)
+                                function_context_shapes: dict[str, tuple[int, ...]] = {}
+                                for input_index, input_name in enumerate(body_inputs):
+                                    if input_index >= len(getattr(function, "input", ())):
+                                        continue
+                                    function_input_name = _onnx_value_name(function.input[input_index])
+                                    input_shape = known_input_shape(input_name)
+                                    if function_input_name and input_shape is not None:
+                                        function_context_shapes[function_input_name] = input_shape
                                 for input_index, input_name in enumerate(body_inputs):
                                     if input_name not in tainted_shapes or input_index >= len(
                                         getattr(function, "input", ())
@@ -6928,7 +7190,18 @@ def _build_onnx_weight_analysis_plan(
                                     tainted_shape = tainted_shapes.get(input_name)
                                     if tainted_shape is None:
                                         return None
-                                    if len(tainted_shape) >= 2:
+                                    function_consumes_weight_rank = function_input_consumes_weight_rank_at_or_above_two(
+                                        function,
+                                        function_input_name,
+                                        tainted_shape,
+                                        function_versions,
+                                        function_attributes,
+                                        function_constants,
+                                        function_context_shapes,
+                                    )
+                                    if function_consumes_weight_rank is None:
+                                        return None
+                                    if function_consumes_weight_rank:
                                         return True, None
                                 if node_is_live_for_output:
                                     return None
@@ -7113,6 +7386,119 @@ def _build_onnx_weight_analysis_plan(
                                 return None
                             tainted_names.update(body_outputs)
                         return graph_output_name in tainted_names
+
+                    def state_weight_consumer_dependency_names_bounded(
+                        subgraph: Any,
+                        graph_input_name: str,
+                    ) -> frozenset[str] | None:
+                        tainted_names = {graph_input_name}
+                        dependency_names: set[str] = set()
+                        work_remaining = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
+                        for body_node in getattr(subgraph, "node", ()):
+                            body_inputs = node_input_names(body_node)
+                            body_outputs = node_output_names(body_node)
+                            if not body_outputs or not any(input_name in tainted_names for input_name in body_inputs):
+                                continue
+                            work_remaining -= max(len(body_inputs), 1)
+                            if work_remaining < 0:
+                                return None
+                            function_key = (
+                                str(getattr(body_node, "domain", "")),
+                                str(getattr(body_node, "op_type", "")),
+                                str(getattr(body_node, "overload", "")),
+                            )
+                            function = functions.get(function_key)
+                            is_model_local_function = function is not None
+                            is_registered_standard_operator = (
+                                is_model_local_function
+                                or has_registered_standard_operator(
+                                    body_node,
+                                    opset_versions,
+                                )
+                            )
+                            if function is not None:
+                                return None
+                            has_nested_attribute_graph = any(
+                                _iter_attribute_graphs(attribute) for attribute in getattr(body_node, "attribute", ())
+                            )
+                            if has_nested_attribute_graph:
+                                return None
+                            for input_index, input_name in enumerate(body_inputs):
+                                if input_name not in tainted_names:
+                                    continue
+                                if not _onnx_potential_weight_input(
+                                    body_node,
+                                    input_index,
+                                    is_model_local_function=is_model_local_function,
+                                    is_registered_standard_operator=is_registered_standard_operator,
+                                ):
+                                    continue
+                                if merge_dependency_names(
+                                    dependency_names,
+                                    graph_value_dependency_names(subgraph, (input_name,)),
+                                ):
+                                    return None
+                            tainted_names.update(body_outputs)
+                        return frozenset(dependency_names)
+
+                    repeated_state_output_indexes_by_input: dict[str, int] = {}
+                    for related_pair_index, (_parent_input, related_graph_input) in enumerate(
+                        input_pairs,
+                        start=input_pair_index_start,
+                    ):
+                        related_graph_input_name = _onnx_value_name(related_graph_input)
+                        if not related_graph_input_name:
+                            continue
+                        repeated_state_output_indexes_by_input[related_graph_input_name] = (
+                            control_flow_subgraph_state_output_index(
+                                node,
+                                related_pair_index,
+                                opset_versions,
+                            )
+                        )
+
+                    def repeated_state_update_dependency_names_bounded(
+                        subgraph: Any,
+                        graph_output_index: int,
+                        state_output_indexes_by_input: dict[str, int] = repeated_state_output_indexes_by_input,
+                    ) -> frozenset[str] | None:
+                        dependency_names = set(graph_output_dependency_names(subgraph, (graph_output_index,)))
+                        if dependency_collection_limit_marker in dependency_names:
+                            return None
+                        pending_inputs = [
+                            input_name for input_name in dependency_names if input_name in state_output_indexes_by_input
+                        ]
+                        visited_inputs: set[str] = set()
+                        work_remaining = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
+                        while pending_inputs:
+                            input_name = pending_inputs.pop()
+                            if input_name in visited_inputs:
+                                continue
+                            visited_inputs.add(input_name)
+                            work_remaining -= 1
+                            if work_remaining < 0:
+                                return None
+                            sibling_output_index = state_output_indexes_by_input[input_name]
+                            sibling_dependency_names = graph_output_dependency_names(
+                                subgraph,
+                                (sibling_output_index,),
+                            )
+                            if dependency_names_exceeded_limit(sibling_dependency_names):
+                                return None
+                            before_count = len(dependency_names)
+                            if merge_dependency_names(dependency_names, sibling_dependency_names):
+                                return None
+                            if len(dependency_names) == before_count:
+                                continue
+                            pending_inputs.extend(
+                                sibling_input_name
+                                for sibling_input_name in sibling_dependency_names
+                                if (
+                                    sibling_input_name in state_output_indexes_by_input
+                                    and sibling_input_name not in visited_inputs
+                                )
+                            )
+                        return frozenset(dependency_names)
 
                     def is_repeated_control_flow_state_input(
                         pair_index: int,
@@ -7336,6 +7722,14 @@ def _build_onnx_weight_analysis_plan(
                                 opset_versions,
                             )
                         ):
+                            current_update_dependency_names = repeated_state_update_dependency_names_bounded(
+                                subgraph,
+                                graph_output_index,
+                            )
+                            current_weight_consumer_dependency_names = state_weight_consumer_dependency_names_bounded(
+                                subgraph,
+                                graph_input_name,
+                            )
                             for sibling_output_index, sibling_parent_input in enumerate(
                                 getattr(node, "input", ())[2 : 2 + len(getattr(node, "output", ()))]
                             ):
@@ -7354,6 +7748,13 @@ def _build_onnx_weight_analysis_plan(
                                     subgraph,
                                     sibling_graph_input_name,
                                     opset_versions,
+                                ):
+                                    continue
+                                if (
+                                    current_update_dependency_names is not None
+                                    and sibling_graph_input_name not in current_update_dependency_names
+                                    and current_weight_consumer_dependency_names is not None
+                                    and sibling_graph_input_name not in current_weight_consumer_dependency_names
                                 ):
                                     continue
                                 sibling_parent_name = str(sibling_parent_input)

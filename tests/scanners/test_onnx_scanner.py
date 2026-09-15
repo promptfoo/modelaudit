@@ -9574,6 +9574,83 @@ class TestWeightDistributionSemantics:
             assert coverage == []
             assert semantics["coverage_gaps"] == {}
 
+    def test_repeated_loop_reentry_replays_dead_local_function_weight_transform(self, tmp_path: Path) -> None:
+        source_names = [f"W{index}" for index in range(40)]
+        body = helper.make_graph(
+            [
+                helper.make_node("UseSqueezedWeight", ["activation", "state"], ["unused_consumer"], domain="local"),
+                helper.make_node("Unsqueeze", ["state", "axes"], ["next_state"]),
+                helper.make_node("Identity", ["condition_in"], ["condition_out"]),
+            ],
+            "retained_loop_reentry_dead_local_function_transform_body",
+            [
+                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
+                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("state", TensorProto.FLOAT, None),
+            ],
+            [
+                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, None),
+            ],
+        )
+        graph = helper.make_graph(
+            [
+                helper.make_node("Sum", source_names, ["initial_state"]),
+                helper.make_node(
+                    "Loop",
+                    ["trip_count", "initial_condition", "initial_state"],
+                    ["final_state"],
+                    body=body,
+                ),
+                helper.make_node("Identity", ["dummy"], ["Y"]),
+            ],
+            "retained_loop_reentry_dead_local_function_transform",
+            [helper.make_tensor_value_info("activation", TensorProto.FLOAT, [1, 1])],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [])],
+            initializer=[
+                *[onnx.numpy_helper.from_array(np.ones((1,), dtype=np.float32), name=name) for name in source_names],
+                onnx.numpy_helper.from_array(np.array([0], dtype=np.int64), name="axes"),
+                onnx.numpy_helper.from_array(np.array(2, dtype=np.int64), name="trip_count"),
+                onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="initial_condition"),
+                onnx.numpy_helper.from_array(np.array(0.0, dtype=np.float32), name="dummy"),
+            ],
+            value_info=[helper.make_tensor_value_info("initial_state", TensorProto.FLOAT, [1])],
+        )
+        function = helper.make_function(
+            "local",
+            "UseSqueezedWeight",
+            ["function_activation", "function_state"],
+            ["function_y"],
+            [
+                helper.make_node(
+                    "Constant",
+                    [],
+                    ["function_axes"],
+                    value=onnx.numpy_helper.from_array(np.array([0], dtype=np.int64)),
+                ),
+                helper.make_node("Squeeze", ["function_state", "function_axes"], ["function_slope"]),
+                helper.make_node("PRelu", ["function_activation", "function_slope"], ["function_y"]),
+            ],
+            opset_imports=[helper.make_opsetid("", 13)],
+        )
+        model = helper.make_model(
+            graph,
+            functions=[function],
+            opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
+        )
+        model.ir_version = 8
+        onnx.checker.check_model(model, full_check=True)
+        path = tmp_path / "retained-loop-reentry-dead-local-function-transform.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert result.success is True
+        assert coverage == []
+        assert semantics["coverage_gaps"] == {}
+
     @pytest.mark.parametrize(
         ("consumer_depends_on_sibling", "trip_count", "expected_gap"),
         [
@@ -9601,6 +9678,7 @@ class TestWeightDistributionSemantics:
                 ),
                 helper.make_node("Identity", ["state"], ["next_state"]),
                 helper.make_node("Unsqueeze", ["sibling", "axes"], ["next_sibling"]),
+                helper.make_node("PRelu", ["activation", "next_sibling"], ["unused_sibling_consumer"]),
                 helper.make_node("Identity", ["condition_in"], ["condition_out"]),
             ],
             "retained_loop_reentry_sibling_rank_body",
@@ -9628,11 +9706,13 @@ class TestWeightDistributionSemantics:
                 helper.make_node("Identity", ["dummy"], ["Y"]),
             ],
             "retained_loop_reentry_sibling_rank",
-            [helper.make_tensor_value_info("activation", TensorProto.FLOAT, [1, 1])],
+            [
+                helper.make_tensor_value_info("activation", TensorProto.FLOAT, [1, 1]),
+                helper.make_tensor_value_info("initial_sibling", TensorProto.FLOAT, [1]),
+            ],
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [])],
             initializer=[
                 *[onnx.numpy_helper.from_array(np.ones((1,), dtype=np.float32), name=name) for name in source_names],
-                onnx.numpy_helper.from_array(np.ones((1,), dtype=np.float32), name="initial_sibling"),
                 onnx.numpy_helper.from_array(np.array([0], dtype=np.int64), name="axes"),
                 onnx.numpy_helper.from_array(np.array(trip_count, dtype=np.int64), name="trip_count"),
                 onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="initial_condition"),
