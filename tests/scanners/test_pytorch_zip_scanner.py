@@ -5788,14 +5788,64 @@ def test_pytorch_zip_discovery_skips_post_budget_stack_global_without_prior_memo
     assert not any(issue.details.get("pickle_filename") == "archive/data/0" for issue in result.issues)
 
 
+def test_pytorch_zip_discovery_skips_raw_memo_byte_without_coherent_prior_memo(
+    tmp_path: Path,
+) -> None:
+    prefix = b"X" + (3_191_733_531).to_bytes(4, "little")
+    storage_blob = (
+        prefix
+        + b"!q"
+        + (b"c!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1))
+        + (b"!" * 9_000)
+        + b"h\x00R."
+    )
+    storage_blob += b"!" * (-len(storage_blob) % 4)
+
+    result = _scan_referenced_float_storage_blob(
+        tmp_path,
+        "referenced_raw_memo_byte_without_prior_memo.pt",
+        storage_blob,
+    )
+
+    assert result.success is True
+    assert result.metadata.get("pickle_verdict") == "clean"
+    assert result.metadata["pickle_files"] == ["archive/data.pkl"]
+    assert not any(issue.details.get("pickle_filename") == "archive/data/0" for issue in result.issues)
+
+
+def test_pytorch_zip_discovery_skips_same_sized_raw_memo_byte_near_match(
+    tmp_path: Path,
+) -> None:
+    prefix = b"X" + (3_191_733_531).to_bytes(4, "little")
+    storage_blob = (
+        prefix
+        + b"!!"
+        + (b"c!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1))
+        + (b"!" * 9_000)
+        + b"h\x00R."
+    )
+    storage_blob += b"!" * (-len(storage_blob) % 4)
+
+    result = _scan_referenced_float_storage_blob(
+        tmp_path,
+        "referenced_raw_memo_byte_without_prior_memo_near_match.pt",
+        storage_blob,
+    )
+
+    assert result.success is True
+    assert result.metadata.get("pickle_verdict") == "clean"
+    assert result.metadata["pickle_files"] == ["archive/data.pkl"]
+    assert not any(issue.details.get("pickle_filename") == "archive/data/0" for issue in result.issues)
+
+
 def test_pytorch_zip_discovery_fails_closed_for_post_budget_long_unicode_stack_global(
     tmp_path: Path,
 ) -> None:
     prefix = b"X" + (3_191_733_531).to_bytes(4, "little")
     decoys = b"c!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)
     inert_padding = b"!" * (70 * 1024)
-    malicious_suffix = b"!Vposix\nVsystem\n\x93(V" + (b"a" * 9216) + b"\ntR."
-    storage_blob = prefix + decoys + inert_padding + malicious_suffix
+    malicious_suffix = b"Vposix\nVsystem\n\x93(V" + (b"a" * 9216) + b"\ntR."
+    storage_blob = prefix + b"!" + decoys + inert_padding + malicious_suffix
 
     result = _scan_referenced_float_storage_blob(
         tmp_path,
@@ -5819,8 +5869,8 @@ def test_pytorch_zip_discovery_skips_same_sized_long_unicode_stack_global_near_m
     prefix = b"X" + (3_191_733_531).to_bytes(4, "little")
     decoys = b"c!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)
     inert_padding = b"!" * (70 * 1024)
-    malicious_suffix = b"!Vposix\nVsystem\n\x93(V" + (b"a" * 9216) + b"\ntR."
-    storage_blob = prefix + decoys + inert_padding + (b"!" * len(malicious_suffix))
+    malicious_suffix = b"Vposix\nVsystem\n\x93(V" + (b"a" * 9216) + b"\ntR."
+    storage_blob = prefix + b"!" + decoys + inert_padding + (b"!" * len(malicious_suffix))
 
     result = _scan_referenced_float_storage_blob(
         tmp_path,

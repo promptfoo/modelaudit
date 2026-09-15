@@ -2743,6 +2743,27 @@ class PyTorchZipScanner(BaseScanner):
         return False
 
     @staticmethod
+    def _has_security_relevant_opcode_before_truncated_candidate(sample: bytes) -> bool:
+        saw_security_opcode = False
+        try:
+            for opcode, _arg, _pos in pickletools.genops(sample):
+                if opcode.name in _PICKLE_SECURITY_RELEVANT_OPCODES:
+                    saw_security_opcode = True
+        except ValueError as exc:
+            if not saw_security_opcode:
+                return False
+            message = str(exc).lower()
+            return (
+                "exhausted before seeing stop" in message
+                or "no newline found" in message
+                or "not enough data" in message
+                or "expected" in message
+            )
+        except Exception:
+            return False
+        return False
+
+    @staticmethod
     def _trailing_pickle_probe_should_scan(
         trailing: bytes,
         *,
@@ -3823,6 +3844,9 @@ class PyTorchZipScanner(BaseScanner):
         prefix = value[prefix_start:search_start]
         if not any(byte in {ord("p"), ord("q"), ord("r"), 0x94} for byte in prefix):
             return False
+        memo_keys = PyTorchZipScanner._parsed_prefix_memo_keys(prefix)
+        if not memo_keys:
+            return False
         suffix = value[search_start : search_start + _PICKLE_DISCOVERY_LONG_PROBE_BYTES]
         search_start_in_suffix = 0
         while search_start_in_suffix < len(suffix):
@@ -3834,11 +3858,78 @@ class PyTorchZipScanner(BaseScanner):
                 return False
             if not PyTorchZipScanner._consume_raw_nested_structural_parse_budget(parse_budget_remaining):
                 return True
+            memo_key, truncated_get = PyTorchZipScanner._memo_get_key_at(suffix, offset)
+            if truncated_get:
+                return True
+            if memo_key not in memo_keys:
+                search_start_in_suffix = offset + 1
+                continue
             candidate = suffix[offset : offset + _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES]
             if PyTorchZipScanner._has_security_relevant_pickle_opcode(candidate):
                 return True
             search_start_in_suffix = offset + 1
         return False
+
+    @staticmethod
+    def _parsed_prefix_memo_keys(prefix: bytes) -> set[str]:
+        memo_keys: set[str] = set()
+        memoize_index = 0
+        stack_depth = 0
+        mark_depths: list[int] = []
+
+        try:
+            for opcode, arg, _pos in pickletools.genops(prefix):
+                if opcode.name == "MARK":
+                    mark_depths.append(stack_depth)
+                    continue
+                if opcode.name == "POP":
+                    stack_depth = max(0, stack_depth - 1)
+                    continue
+                if opcode.name == "POP_MARK":
+                    stack_depth = mark_depths.pop() if mark_depths else 0
+                    continue
+                if opcode.name in {"BINPUT", "LONG_BINPUT", "PUT"}:
+                    if stack_depth > 0:
+                        memo_keys.add(str(arg))
+                    continue
+                if opcode.name == "MEMOIZE":
+                    if stack_depth > 0:
+                        memo_keys.add(str(memoize_index))
+                    memoize_index += 1
+                    continue
+                if opcode.name in {"TUPLE", "LIST", "DICT", "FROZENSET"}:
+                    stack_depth = (mark_depths.pop() if mark_depths else 0) + 1
+                    continue
+                if opcode.name in {"APPENDS", "SETITEMS", "ADDITEMS"}:
+                    stack_depth = (mark_depths.pop() if mark_depths else max(1, stack_depth)) + 1
+                    continue
+                stack_depth = max(0, stack_depth - len(opcode.stack_before)) + len(opcode.stack_after)
+        except Exception:
+            return memo_keys
+        return memo_keys
+
+    @staticmethod
+    def _memo_get_key_at(value: bytes, offset: int) -> tuple[str | None, bool]:
+        if offset >= len(value):
+            return None, True
+        marker = value[offset]
+        if marker == ord("h"):
+            if offset + 2 > len(value):
+                return None, True
+            return str(value[offset + 1]), False
+        if marker == ord("j"):
+            if offset + 5 > len(value):
+                return None, True
+            return str(int.from_bytes(value[offset + 1 : offset + 5], "little")), False
+        if marker == ord("g"):
+            end = value.find(b"\n", offset + 1)
+            if end < 0:
+                return None, True
+            try:
+                return value[offset + 1 : end].decode("ascii"), False
+            except UnicodeDecodeError:
+                return None, False
+        return None, False
 
     @staticmethod
     def _budget_exhausted_suffix_is_only_incomplete_extension_after_text_noise(value: bytes) -> bool:
@@ -4428,7 +4519,10 @@ class PyTorchZipScanner(BaseScanner):
             return True
         if PyTorchZipScanner._frame_first_trusted_storage_probe_should_scan(candidate):
             return True
-        return candidate_is_prefix and PyTorchZipScanner._has_security_relevant_opcode_in_incomplete_frame(candidate)
+        return candidate_is_prefix and (
+            PyTorchZipScanner._has_security_relevant_opcode_in_incomplete_frame(candidate)
+            or PyTorchZipScanner._has_security_relevant_opcode_before_truncated_candidate(candidate)
+        )
 
     @staticmethod
     def _headerless_binary_byte_literal_has_possible_size(candidate: bytes, *, entry_size: int) -> bool:
