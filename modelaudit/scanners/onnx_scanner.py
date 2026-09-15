@@ -2507,13 +2507,23 @@ def _build_onnx_weight_analysis_plan(
             cache_fingerprints[value_id] = (value, fingerprint)
         return fingerprint
 
+    dependency_names_key_cache: dict[frozenset[str], tuple[str, ...]] = {}
+
+    def dependency_names_cache_key(names: frozenset[str]) -> tuple[str, ...]:
+        cached_key = dependency_names_key_cache.get(names)
+        if cached_key is not None:
+            return cached_key
+        key = tuple(sorted(str(name) for name in names))
+        dependency_names_key_cache[names] = key
+        return key
+
     def semantic_mapping_cache_key(
         mapping: dict[str, Any] | None,
         names: frozenset[str] | None = None,
     ) -> tuple[tuple[str, str, str], ...]:
         if not mapping:
             return ()
-        names_key = tuple(sorted(str(name) for name in names)) if names is not None else None
+        names_key = dependency_names_cache_key(names) if names is not None else None
         owner_key = (id(mapping), names_key)
         cached_mapping_key = semantic_mapping_keys.get(owner_key)
         if (
@@ -2548,7 +2558,7 @@ def _build_onnx_weight_analysis_plan(
     ) -> tuple[tuple[str, tuple[int, ...]], ...]:
         if not trusted_context_shapes:
             return ()
-        names_key = tuple(sorted(str(name) for name in names)) if names is not None else None
+        names_key = dependency_names_cache_key(names) if names is not None else None
         owner_key = (id(trusted_context_shapes), names_key)
         cached_key = trusted_shape_keys.get(owner_key)
         if (
@@ -2728,6 +2738,7 @@ def _build_onnx_weight_analysis_plan(
         output_shapes_out: dict[int, tuple[int, ...]] | None = None,
         related_graph_input_shapes: dict[str, tuple[int, ...] | None] | None = None,
         output_dependency_names_override: frozenset[str] | None = None,
+        restorable_output_indexes_override: frozenset[int] | None = None,
         promoted_outputs_out: set[int] | None = None,
         *,
         depth: int = 0,
@@ -2752,12 +2763,18 @@ def _build_onnx_weight_analysis_plan(
             )
         else:
             output_dependency_names = output_dependency_names_override
+        restorable_output_indexes = (
+            restorable_output_indexes_override
+            if restorable_output_indexes_override is not None
+            else frozenset({graph_output_index})
+        )
         trusted_context_shapes = trusted_context_shapes or {}
         cache_key = (
             id(subgraph),
             graph_input_name,
             graph_input_shape,
-            tuple(sorted(output_dependency_names)),
+            dependency_names_cache_key(output_dependency_names),
+            tuple(sorted(restorable_output_indexes)),
             trusted_context_shape_cache_key(trusted_context_shapes, output_dependency_names),
             opset_cache_key(opset_versions),
             attribute_binding_cache_key(attribute_bindings),
@@ -2934,6 +2951,7 @@ def _build_onnx_weight_analysis_plan(
                                 trusted_context_shapes=function_context_shapes,
                                 output_shapes_out=function_output_shapes,
                                 output_dependency_names_override=function_output_dependency_names,
+                                restorable_output_indexes_override=frozenset(valid_function_tainted_output_indexes),
                                 promoted_outputs_out=function_promoted_output_indexes,
                                 depth=depth + 1,
                             )
@@ -3123,7 +3141,10 @@ def _build_onnx_weight_analysis_plan(
                 )
                 or promoted_outputs
             ):
-                promoted.update(promoted_outputs or body_tainted_outputs)
+                outputs_to_promote = set(promoted_outputs)
+                if data_input_promoted or any_promoted or data_input_may_promote:
+                    outputs_to_promote.update(body_tainted_outputs)
+                promoted.update(outputs_to_promote or body_tainted_outputs)
                 tainted.update(body_tainted_outputs)
             elif any_tainted:
                 tainted.update(body_tainted_outputs)
@@ -3247,7 +3268,8 @@ def _build_onnx_weight_analysis_plan(
         output_shapes = {
             output_index: output_shape
             for output_index, output in enumerate(graph_outputs)
-            if (output_shape := tainted_shapes.get(_onnx_value_name(output))) is not None
+            if output_index in restorable_output_indexes
+            and (output_shape := tainted_shapes.get(_onnx_value_name(output))) is not None
         }
         reentry_promotion_in_progress.discard(cache_key)
         reentry_promotion_cache[cache_key] = promoted_output_indexes

@@ -17356,6 +17356,120 @@ class TestWeightDistributionSemantics:
         assert result.success is True
         assert result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"] == {}
 
+    def _write_repeated_local_function_clean_output_shape_model(
+        self,
+        tmp_path: Path,
+        *,
+        capped_initial_state: bool,
+        consume_weight: bool,
+        matrix_clean_output: bool,
+    ) -> Path:
+        tmp_path.mkdir(parents=True, exist_ok=True)
+        source_names = [f"source{index}" for index in range(40)]
+        function = helper.make_function(
+            "local",
+            "Pair",
+            ["state_input", "clean_input"],
+            ["state_output", "clean_output"],
+            [
+                helper.make_node("Identity", ["state_input"], ["state_output"]),
+                helper.make_node("Identity", ["clean_input"], ["clean_output"]),
+            ],
+            opset_imports=[helper.make_opsetid("", 13)],
+        )
+        second_clean_name = "clean_matrix" if matrix_clean_output else "clean_vector"
+        body = helper.make_graph(
+            [
+                helper.make_node("Pair", ["state", "clean_vector"], ["first_state", "first_clean"], domain="local"),
+                helper.make_node(
+                    "Pair", ["state", second_clean_name], ["second_state", "second_clean"], domain="local"
+                ),
+                helper.make_node("Add", ["second_state", "second_clean"], ["next_state"]),
+                helper.make_node("Identity", ["condition_in"], ["condition_out"]),
+            ],
+            "local_function_clean_output_shape_body",
+            [
+                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
+                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("state", TensorProto.FLOAT, [2]),
+            ],
+            [
+                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, [2, 2] if matrix_clean_output else [2]),
+            ],
+        )
+        graph_nodes = [helper.make_node("Sum", source_names, ["initial_state"])] if capped_initial_state else []
+        graph_nodes.append(
+            helper.make_node(
+                "Loop",
+                ["trip_count", "initial_condition", "initial_state"],
+                ["final_state"],
+                body=body,
+            )
+        )
+        if consume_weight:
+            graph_nodes.append(helper.make_node("MatMul", ["X", "final_state"], ["Y"]))
+        else:
+            graph_nodes.append(helper.make_node("Identity", ["final_state"], ["Y"]))
+        graph = helper.make_graph(
+            graph_nodes,
+            "local_function_clean_output_shape",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 2])],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 2] if matrix_clean_output else [1])],
+            initializer=[
+                *(
+                    [onnx.numpy_helper.from_array(np.ones((2,), dtype=np.float32), name=name) for name in source_names]
+                    if capped_initial_state
+                    else [onnx.numpy_helper.from_array(np.ones((2,), dtype=np.float32), name="initial_state")]
+                ),
+                onnx.numpy_helper.from_array(np.array(2, dtype=np.int64), name="trip_count"),
+                onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="initial_condition"),
+                onnx.numpy_helper.from_array(np.ones((2,), dtype=np.float32), name="clean_vector"),
+                onnx.numpy_helper.from_array(np.ones((2, 2), dtype=np.float32), name="clean_matrix"),
+            ],
+        )
+        model = helper.make_model(
+            graph,
+            functions=[function],
+            opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
+        )
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        mode = "matrix" if matrix_clean_output else "vector"
+        path = tmp_path / f"local-function-clean-output-shape-{mode}.onnx"
+        onnx.save(model, str(path))
+        return path
+
+    def test_repeated_local_function_cache_restores_only_dependency_covered_shapes(self, tmp_path: Path) -> None:
+        benign_result = OnnxScanner().scan(
+            str(
+                self._write_repeated_local_function_clean_output_shape_model(
+                    tmp_path / "benign",
+                    capped_initial_state=False,
+                    consume_weight=False,
+                    matrix_clean_output=False,
+                )
+            )
+        )
+        assert benign_result.success is True
+        assert benign_result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"] == {}
+
+        positive_result = OnnxScanner().scan(
+            str(
+                self._write_repeated_local_function_clean_output_shape_model(
+                    tmp_path / "positive",
+                    capped_initial_state=True,
+                    consume_weight=True,
+                    matrix_clean_output=True,
+                )
+            )
+        )
+        assert positive_result.success is False
+        assert (
+            positive_result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"]["lineages_per_value_limit"]
+            >= 1
+        )
+
     def _write_recursive_local_function_promotion_model(self, tmp_path: Path, *, depth: int) -> Path:
         functions = []
         for index in range(depth, -1, -1):
@@ -17433,6 +17547,129 @@ class TestWeightDistributionSemantics:
         assert result.success is False
         gaps = result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"]
         assert gaps["lineages_per_value_limit"] >= 1
+
+    def _write_promoted_local_function_identity_model(
+        self,
+        tmp_path: Path,
+        *,
+        capped_initial_state: bool,
+        consume_weight: bool,
+    ) -> Path:
+        tmp_path.mkdir(parents=True, exist_ok=True)
+        source_names = [f"source{index}" for index in range(40)]
+        function = helper.make_function(
+            "local",
+            "IdentityAndPromote",
+            ["input"],
+            ["identity_output", "promoted_output"],
+            [
+                helper.make_node(
+                    "Constant",
+                    [],
+                    ["function_axes"],
+                    value=onnx.numpy_helper.from_array(np.array([0], dtype=np.int64)),
+                ),
+                helper.make_node("Identity", ["input"], ["identity_output"]),
+                helper.make_node("Unsqueeze", ["input", "function_axes"], ["promoted_output"]),
+            ],
+            opset_imports=[helper.make_opsetid("", 13)],
+        )
+        body = helper.make_graph(
+            [
+                helper.make_node("Unsqueeze", ["state", "axes"], ["matrix_state"]),
+                helper.make_node(
+                    "IdentityAndPromote",
+                    ["matrix_state"],
+                    ["next_state", "unused_promoted"],
+                    domain="local",
+                ),
+                helper.make_node("Identity", ["condition_in"], ["condition_out"]),
+            ],
+            "promoted_local_function_identity_body",
+            [
+                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
+                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("state", TensorProto.FLOAT, [2]),
+            ],
+            [
+                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, [1, 2]),
+            ],
+        )
+        graph_nodes = []
+        if capped_initial_state:
+            graph_nodes.append(helper.make_node("Sum", source_names, ["initial_state"]))
+        graph_nodes.append(
+            helper.make_node(
+                "Loop",
+                ["trip_count", "initial_condition", "initial_state"],
+                ["final_state"],
+                body=body,
+            )
+        )
+        if consume_weight:
+            graph_nodes.append(helper.make_node("MatMul", ["X", "final_state"], ["Y"]))
+            outputs = [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 2])]
+        else:
+            graph_nodes.append(helper.make_node("Identity", ["final_state"], ["Y"]))
+            outputs = [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 2])]
+        initializers = [
+            onnx.numpy_helper.from_array(np.array([0], dtype=np.int64), name="axes"),
+            onnx.numpy_helper.from_array(np.array(2, dtype=np.int64), name="trip_count"),
+            onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="initial_condition"),
+        ]
+        if capped_initial_state:
+            initializers.extend(
+                onnx.numpy_helper.from_array(np.ones((2,), dtype=np.float32), name=name) for name in source_names
+            )
+        else:
+            initializers.append(onnx.numpy_helper.from_array(np.ones((2,), dtype=np.float32), name="initial_state"))
+        graph = helper.make_graph(
+            graph_nodes,
+            "promoted_local_function_identity",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 1])],
+            outputs,
+            initializer=initializers,
+        )
+        model = helper.make_model(
+            graph,
+            functions=[function],
+            opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
+        )
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        mode = "capped" if capped_initial_state else "clean"
+        path = tmp_path / f"promoted-local-function-identity-{mode}.onnx"
+        onnx.save(model, str(path))
+        return path
+
+    def test_promoted_local_function_input_preserves_all_tainted_outputs(self, tmp_path: Path) -> None:
+        benign_result = OnnxScanner().scan(
+            str(
+                self._write_promoted_local_function_identity_model(
+                    tmp_path / "benign",
+                    capped_initial_state=False,
+                    consume_weight=False,
+                )
+            )
+        )
+        assert benign_result.success is True
+        assert benign_result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"] == {}
+
+        positive_result = OnnxScanner().scan(
+            str(
+                self._write_promoted_local_function_identity_model(
+                    tmp_path / "positive",
+                    capped_initial_state=True,
+                    consume_weight=True,
+                )
+            )
+        )
+        assert positive_result.success is False
+        assert (
+            positive_result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"]["lineages_per_value_limit"]
+            >= 1
+        )
 
     def _write_context_prefix_loop_model(self, tmp_path: Path, *, width: int) -> Path:
         states = [helper.make_tensor_value_info(f"state{index}", TensorProto.FLOAT, [2]) for index in range(width)]
