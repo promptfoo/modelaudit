@@ -3293,11 +3293,20 @@ def _build_onnx_weight_analysis_plan(
                             attribute_bindings=local_attribute_bindings,
                             depth=depth + 1,
                         )
+                    nested_output_offset = control_flow_output_offset(body_node)
+                    downstream_live_nested_output_indexes = {
+                        output_index + nested_output_offset
+                        for output_index, output_name in enumerate(body_outputs)
+                        if output_name in output_dependency_names
+                    }
+                    nested_tainted_output_indexes &= downstream_live_nested_output_indexes
+                    if not nested_tainted_output_indexes:
+                        continue
                     tainted.update(
                         mapped_node_outputs(
                             body_outputs,
                             nested_tainted_output_indexes,
-                            graph_output_offset=control_flow_output_offset(body_node),
+                            graph_output_offset=nested_output_offset,
                         )
                     )
                     nested_promoted_output_indexes: set[int] = set()
@@ -3311,11 +3320,10 @@ def _build_onnx_weight_analysis_plan(
                             nested_promoted_output_indexes.add(output_index)
                     nested_promotion_work_remaining = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
                     nested_promotion_call_work = max(len(getattr(nested_graph, "node", ())), 1)
-                    nested_output_count = len(getattr(nested_graph, "output", ()))
                     for captured_name, captured_shape in nested_tainted_shapes.items():
                         if nested_promotion_work_remaining <= 0:
                             break
-                        for output_index in range(nested_output_count):
+                        for output_index in sorted(nested_tainted_output_indexes):
                             if nested_promotion_work_remaining < nested_promotion_call_work:
                                 nested_promoted_output_indexes.update(nested_tainted_output_indexes)
                                 nested_promotion_work_remaining = 0
@@ -3343,7 +3351,6 @@ def _build_onnx_weight_analysis_plan(
                             graph_output_offset=control_flow_output_offset(body_node),
                         )
                     )
-                    nested_output_offset = control_flow_output_offset(body_node)
                     for output_index, output_shape in nested_output_shapes.items():
                         node_output_index = output_index - nested_output_offset
                         if 0 <= node_output_index < len(body_outputs):
@@ -6379,6 +6386,45 @@ def _build_onnx_weight_analysis_plan(
                         exact_count = max(int(trip_count), 0)
                         return exact_count if exact_count <= max_count else None
 
+                    def exact_loop_repeated_state_weight_rank_bounds(
+                        subgraph: Any,
+                        graph_input_name: str,
+                        graph_output_index: int,
+                        initial_shape: tuple[int, ...] | None,
+                        initial_rank: int | None,
+                        exact_loop_iterations: int,
+                        trusted_context_shapes: dict[str, tuple[int, ...]],
+                        related_graph_input_shapes: dict[str, tuple[int, ...] | None],
+                    ) -> tuple[bool, bool] | None:
+                        current_shape = initial_shape
+                        current_rank = len(current_shape) if current_shape is not None else initial_rank
+                        if current_shape is None or current_rank is None:
+                            return None
+                        body_consumes_weight_rank = False
+                        for _iteration in range(exact_loop_iterations):
+                            body_consumes_weight_rank = body_consumes_weight_rank or current_rank >= 2
+                            output_shapes: dict[int, tuple[int, ...]] = {}
+                            promoted = subgraph_reenters_state_with_rank_promotion(
+                                subgraph,
+                                graph_input_name,
+                                graph_output_index,
+                                constants,
+                                opset_versions,
+                                current_shape,
+                                trusted_context_shapes=trusted_context_shapes,
+                                output_shapes_out=output_shapes,
+                                related_graph_input_shapes=related_graph_input_shapes,
+                            )
+                            next_shape = output_shapes.get(graph_output_index)
+                            if next_shape is None:
+                                return None
+                            next_rank = len(next_shape)
+                            if promoted and next_rank <= current_rank:
+                                return None
+                            current_shape = next_shape
+                            current_rank = next_rank
+                        return body_consumes_weight_rank, current_rank >= 2
+
                     def is_repeated_control_flow_state_input(
                         pair_index: int,
                         *,
@@ -6536,16 +6582,29 @@ def _build_onnx_weight_analysis_plan(
                             )
                             is not None
                         ):
-                            one_iteration_output_shape = repeated_state_output_shapes.get(graph_output_index)
-                            one_iteration_output_rank = (
-                                len(one_iteration_output_shape) if one_iteration_output_shape is not None else None
+                            exact_rank_bounds = exact_loop_repeated_state_weight_rank_bounds(
+                                subgraph,
+                                graph_input_name,
+                                graph_output_index,
+                                parent_shape,
+                                parent_rank_for_repeated_state,
+                                exact_loop_iterations,
+                                subgraph_trusted_context_shapes,
+                                related_repeated_state_shapes,
                             )
-                            if parent_rank_for_repeated_state is not None and one_iteration_output_rank is not None:
-                                rank_delta = max(one_iteration_output_rank - parent_rank_for_repeated_state, 0)
-                                max_consumed_rank = (
-                                    parent_rank_for_repeated_state + max(exact_loop_iterations - 1, 0) * rank_delta
+                            if exact_rank_bounds is not None:
+                                finite_repeated_state_consumes_weight_rank = exact_rank_bounds[0]
+                            else:
+                                one_iteration_output_shape = repeated_state_output_shapes.get(graph_output_index)
+                                one_iteration_output_rank = (
+                                    len(one_iteration_output_shape) if one_iteration_output_shape is not None else None
                                 )
-                                finite_repeated_state_consumes_weight_rank = max_consumed_rank >= 2
+                                if parent_rank_for_repeated_state is not None and one_iteration_output_rank is not None:
+                                    rank_delta = max(one_iteration_output_rank - parent_rank_for_repeated_state, 0)
+                                    max_consumed_rank = (
+                                        parent_rank_for_repeated_state + max(exact_loop_iterations - 1, 0) * rank_delta
+                                    )
+                                    finite_repeated_state_consumes_weight_rank = max_consumed_rank >= 2
                         repeated_state_rank_gap_may_affect_weight = repeated_control_flow_state_input and (
                             (repeated_state_reenters_with_rank_promotion and finite_repeated_state_consumes_weight_rank)
                             or parent_rank_for_repeated_state is None
@@ -7931,6 +7990,7 @@ def _build_onnx_weight_analysis_plan(
                         graph_output_weight_lineage_gap_summaries[graph_output_index],
                         graph_output_weight_lineage_gap_counts[graph_output_index],
                     )
+                    finite_loop_rank_bounds: tuple[bool, bool] | None = None
                     finite_loop_body_consumes_output_weight_gap = True
                     if (
                         repeated_carried_state_rank_may_increase
@@ -7942,16 +8002,32 @@ def _build_onnx_weight_analysis_plan(
                         )
                         is not None
                     ):
+                        state_input_name = control_flow_state_input_name(output_index)
                         state_input_rank = control_flow_state_input_rank(output_index)
-                        one_iteration_output_rank = (
-                            len(graph_output_shape_before_reentry_reset)
-                            if graph_output_shape_before_reentry_reset is not None
-                            else graph_output_rank_before_reentry_reset
+                        finite_loop_rank_bounds = exact_loop_repeated_state_weight_rank_bounds(
+                            subgraph,
+                            subgraph_state_input_name,
+                            graph_output_index,
+                            known_value_shapes.get(state_input_name),
+                            state_input_rank,
+                            exact_loop_iterations,
+                            subgraph_trusted_context_shapes,
+                            related_repeated_state_shapes,
                         )
-                        if state_input_rank is not None and one_iteration_output_rank is not None:
-                            rank_delta = max(one_iteration_output_rank - state_input_rank, 0)
-                            max_body_consumed_rank = state_input_rank + max(exact_loop_iterations - 1, 0) * rank_delta
-                            finite_loop_body_consumes_output_weight_gap = max_body_consumed_rank >= 2
+                        if finite_loop_rank_bounds is not None:
+                            finite_loop_body_consumes_output_weight_gap = finite_loop_rank_bounds[0]
+                        else:
+                            one_iteration_output_rank = (
+                                len(graph_output_shape_before_reentry_reset)
+                                if graph_output_shape_before_reentry_reset is not None
+                                else graph_output_rank_before_reentry_reset
+                            )
+                            if state_input_rank is not None and one_iteration_output_rank is not None:
+                                rank_delta = max(one_iteration_output_rank - state_input_rank, 0)
+                                max_body_consumed_rank = (
+                                    state_input_rank + max(exact_loop_iterations - 1, 0) * rank_delta
+                                )
+                                finite_loop_body_consumes_output_weight_gap = max_body_consumed_rank >= 2
                     if (
                         repeated_carried_state_input_may_feed_weight
                         and graph_output_weight_lineage_gap_counts[graph_output_index]
@@ -8015,19 +8091,35 @@ def _build_onnx_weight_analysis_plan(
                             is not None
                         ):
                             state_input_rank = control_flow_state_input_rank(output_index)
-                            one_iteration_output_rank = (
-                                len(graph_output_shape_before_reentry_reset)
-                                if graph_output_shape_before_reentry_reset is not None
-                                else graph_output_rank_before_reentry_reset
-                            )
-                            if state_input_rank is not None and one_iteration_output_rank is not None:
-                                rank_delta = max(one_iteration_output_rank - state_input_rank, 0)
-                                max_body_consumed_rank = (
-                                    state_input_rank + max(exact_loop_iterations - 1, 0) * rank_delta
+                            if finite_loop_rank_bounds is None:
+                                state_input_name = control_flow_state_input_name(output_index)
+                                finite_loop_rank_bounds = exact_loop_repeated_state_weight_rank_bounds(
+                                    subgraph,
+                                    subgraph_state_input_name,
+                                    graph_output_index,
+                                    known_value_shapes.get(state_input_name),
+                                    state_input_rank,
+                                    exact_loop_iterations,
+                                    subgraph_trusted_context_shapes,
+                                    related_repeated_state_shapes,
                                 )
-                                max_output_rank = state_input_rank + exact_loop_iterations * rank_delta
-                                finite_loop_body_consumes_weight_rank = max_body_consumed_rank >= 2
-                                finite_loop_output_reaches_weight_rank = max_output_rank >= 2
+                            if finite_loop_rank_bounds is not None:
+                                finite_loop_body_consumes_weight_rank = finite_loop_rank_bounds[0]
+                                finite_loop_output_reaches_weight_rank = finite_loop_rank_bounds[1]
+                            else:
+                                one_iteration_output_rank = (
+                                    len(graph_output_shape_before_reentry_reset)
+                                    if graph_output_shape_before_reentry_reset is not None
+                                    else graph_output_rank_before_reentry_reset
+                                )
+                                if state_input_rank is not None and one_iteration_output_rank is not None:
+                                    rank_delta = max(one_iteration_output_rank - state_input_rank, 0)
+                                    max_body_consumed_rank = (
+                                        state_input_rank + max(exact_loop_iterations - 1, 0) * rank_delta
+                                    )
+                                    max_output_rank = state_input_rank + exact_loop_iterations * rank_delta
+                                    finite_loop_body_consumes_weight_rank = max_body_consumed_rank >= 2
+                                    finite_loop_output_reaches_weight_rank = max_output_rank >= 2
                         if repeated_carried_state_rank_may_increase and finite_loop_output_reaches_weight_rank:
                             repeated_state_weight_gap_summary = rank_gap_weight_summary_after_repeated_rank_increase(
                                 state_rank_gap_summary,
