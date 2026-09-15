@@ -4056,10 +4056,14 @@ class PyTorchZipScanner(BaseScanner):
             )
             if name_end is None:
                 reached_name_limit = next_search_start >= name_limit
-                if reached_name_limit and not PyTorchZipScanner._consume_raw_nested_structural_parse_budget(
-                    parse_budget_remaining
-                ):
-                    return True
+                if reached_name_limit:
+                    has_prior_mark = value.rfind(bytes([_PICKLE_MARK_OPCODE_BYTE]), 0, offset) >= 0
+                    if has_prior_mark:
+                        if not PyTorchZipScanner._consume_raw_nested_structural_parse_budget(parse_budget_remaining):
+                            return True
+                        return True
+                    if not PyTorchZipScanner._consume_raw_nested_structural_parse_budget(parse_budget_remaining):
+                        return True
                 search_start = max(next_search_start, offset + 1)
                 continue
 
@@ -4303,10 +4307,16 @@ class PyTorchZipScanner(BaseScanner):
             )
             if offset < 0:
                 return False
-            if not PyTorchZipScanner._consume_raw_nested_structural_parse_budget(parse_budget_remaining):
-                return True
             candidate = value[offset : offset + _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES]
             candidate_is_prefix = offset + len(candidate) < len(value)
+            if not PyTorchZipScanner._raw_nested_structural_literal_candidate_has_plausible_operand(
+                candidate,
+                candidate_is_prefix=candidate_is_prefix,
+            ):
+                search_start = offset + 1
+                continue
+            if not PyTorchZipScanner._consume_raw_nested_structural_parse_budget(parse_budget_remaining):
+                return True
             if PyTorchZipScanner._raw_nested_binary_candidate_should_scan(
                 candidate,
                 candidate_is_prefix=candidate_is_prefix,
@@ -4314,6 +4324,38 @@ class PyTorchZipScanner(BaseScanner):
                 return True
             search_start = offset + 1
         return False
+
+    @staticmethod
+    def _raw_nested_structural_literal_candidate_has_plausible_operand(
+        candidate: bytes,
+        *,
+        candidate_is_prefix: bool,
+    ) -> bool:
+        if not candidate:
+            return False
+        marker = candidate[0]
+        if marker == ord("S"):
+            return (len(candidate) == 1 and candidate_is_prefix) or (
+                len(candidate) >= 2 and candidate[1] in {ord("'"), ord('"')}
+            )
+        if marker == ord("V"):
+            return (len(candidate) == 1 and candidate_is_prefix) or b"\n" in candidate[1:] or candidate_is_prefix
+        if marker in {ord("T"), ord("X")}:
+            if len(candidate) < 5:
+                return candidate_is_prefix
+            declared_size = int.from_bytes(candidate[1:5], "little")
+            return len(candidate) - 5 >= declared_size or candidate_is_prefix
+        if marker in {ord("U"), 0x8C}:
+            if len(candidate) < 2:
+                return candidate_is_prefix
+            declared_size = candidate[1]
+            return len(candidate) - 2 >= declared_size or candidate_is_prefix
+        if marker == 0x8D:
+            if len(candidate) < 9:
+                return candidate_is_prefix
+            declared_size = int.from_bytes(candidate[1:9], "little")
+            return len(candidate) - 9 >= declared_size or candidate_is_prefix
+        return True
 
     @staticmethod
     def _raw_nested_binary_candidate_should_scan(
