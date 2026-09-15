@@ -2071,6 +2071,7 @@ class PyTorchZipScanner(BaseScanner):
         )
         if not data_start:
             return False
+        initial_padding_probe_charge_bytes = 0
         if entry.file_size > len(data_start) and not data_start.strip(PROTO0_1_IGNORABLE_TRAILING_BYTES):
             data_start = self._read_member_prefix(
                 zip_file,
@@ -2079,6 +2080,34 @@ class PyTorchZipScanner(BaseScanner):
                 phase="pickle_discovery",
                 result=result,
             )
+            if entry.file_size > len(data_start) and not data_start.strip(PROTO0_1_IGNORABLE_TRAILING_BYTES):
+                expanded_probe_bytes = min(entry.file_size, max_probe_bytes)
+                if expanded_probe_bytes > len(data_start):
+                    initial_padding_probe_charge_bytes = expanded_probe_bytes - len(data_start)
+                    data_start = self._read_member_prefix(
+                        zip_file,
+                        entry,
+                        expanded_probe_bytes,
+                        phase="pickle_discovery",
+                        result=result,
+                    )
+            if entry.file_size > len(data_start) and not data_start.strip(PROTO0_1_IGNORABLE_TRAILING_BYTES):
+                if not data_start.strip(b"\x00"):
+                    return False
+                if defer_padding_probe is not None:
+                    defer_padding_probe[0] = True
+                    return False
+                if PyTorchZipScanner._trivial_complete_pickle_prefix_has_only_nul_padding(data_start):
+                    return self._verified_nul_padding_storage_probe_should_scan(
+                        zip_file,
+                        entry,
+                        data_start,
+                        result,
+                        padding_probe_bytes_remaining,
+                        nul_padding_verify_bytes_remaining,
+                        is_frame_first_candidate=False,
+                    )
+                raise ValueError("trusted PyTorch storage padding probe limit reached")
         is_frame_first_candidate = data_start.startswith(_PICKLE_FRAME_OPCODE)
         is_binary_pickle_candidate = data_start.startswith(_PICKLE_BINARY_PROTOCOL_PREFIXES)
         is_headerless_binary_pickle_candidate = (
@@ -2109,7 +2138,7 @@ class PyTorchZipScanner(BaseScanner):
             return False
 
         sample = data_start
-        detection_probe_budget_charge_bytes = 0
+        detection_probe_budget_charge_bytes = initial_padding_probe_charge_bytes
         charge_deferred_probe_budget_on_skip = False
 
         def charge_detection_probe_budget() -> None:
@@ -4260,21 +4289,30 @@ class PyTorchZipScanner(BaseScanner):
             )
             if offset < 0:
                 return False
-            if not PyTorchZipScanner._consume_raw_nested_structural_parse_budget(parse_budget_remaining):
-                return True
             candidate = value[offset : offset + _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES]
             candidate_is_prefix = offset + len(candidate) < len(value)
-            if PyTorchZipScanner._has_security_relevant_pickle_opcode(candidate) and (
-                PyTorchZipScanner._has_complete_pickle_stream_without_frame_stop_overrun(candidate)
-                or _looks_like_proto0_or_1_pickle(candidate, sample_is_prefix=candidate_is_prefix)
-                or (
-                    candidate_is_prefix
-                    and PyTorchZipScanner._has_security_relevant_opcode_before_truncated_candidate(candidate)
-                )
-            ):
+            if not PyTorchZipScanner._raw_nested_persistent_id_candidate_should_scan(candidate, candidate_is_prefix):
+                search_start = offset + 1
+                continue
+            if not PyTorchZipScanner._consume_raw_nested_structural_parse_budget(parse_budget_remaining):
                 return True
-            search_start = offset + 1
+            return True
         return False
+
+    @staticmethod
+    def _raw_nested_persistent_id_candidate_should_scan(candidate: bytes, candidate_is_prefix: bool) -> bool:
+        if candidate.startswith(b"P") and b"\n" not in candidate[1:]:
+            return candidate_is_prefix
+        if not PyTorchZipScanner._has_security_relevant_pickle_opcode(candidate):
+            return False
+        return (
+            PyTorchZipScanner._has_complete_pickle_stream_without_frame_stop_overrun(candidate)
+            or _looks_like_proto0_or_1_pickle(candidate, sample_is_prefix=candidate_is_prefix)
+            or (
+                candidate_is_prefix
+                and PyTorchZipScanner._has_security_relevant_opcode_before_truncated_candidate(candidate)
+            )
+        )
 
     @staticmethod
     def _raw_nested_proto0_inst_name_end(value: bytes, offset: int, limit: int) -> tuple[int | None, int]:
@@ -5048,6 +5086,14 @@ class PyTorchZipScanner(BaseScanner):
                         source=pickle_source,
                         _pytorch_zip_storage_member_sizes=pytorch_data_pickle_storage_sizes,
                     )
+                    spool.seek(0)
+                    self._preserve_literal_suspicious_text_finding_from_stream(
+                        sub_result,
+                        spool,
+                        member_size,
+                        pickle_source=pickle_source,
+                        pickle_filename=name,
+                    )
             sub_result.metadata.setdefault("archive_file_size", original_file_size)
             apply_pickle_member_context(sub_result, archive_path=path, member_name=name)
             trusted_storage_keys = trusted_pytorch_storage_persistent_id_data_pkl_members.get(name)
@@ -5136,6 +5182,55 @@ class PyTorchZipScanner(BaseScanner):
         return False
 
     @staticmethod
+    def _complete_pickle_literal_stream_has_line_continuation_suspicious_text(
+        stream: Any,
+        stream_size: int,
+        *,
+        opcode_budget_remaining: list[int] | None = None,
+    ) -> bool:
+        if opcode_budget_remaining is None:
+            opcode_budget_remaining = [_PICKLE_LITERAL_PRESERVATION_MAX_OPCODES]
+        cursor = 0
+        while cursor < stream_size:
+            try:
+                stream.seek(cursor)
+                for opcode, arg, pos in pickletools.genops(stream):
+                    if opcode_budget_remaining[0] <= 0:
+                        raise _PickleLiteralPreservationBudgetExceeded(
+                            "pickle literal suspicious-text preservation exceeded its opcode budget"
+                        )
+                    opcode_budget_remaining[0] -= 1
+                    if pos is None:
+                        continue
+                    if opcode.name == "STOP":
+                        cursor = pos + 1
+                        stream.seek(cursor)
+                        while cursor < stream_size:
+                            byte = stream.read(1)
+                            if not byte:
+                                return False
+                            if byte[0] not in PROTO0_1_IGNORABLE_TRAILING_BYTES:
+                                break
+                            cursor += 1
+                        else:
+                            return False
+                        break
+                    if opcode.name in _PICKLE_LITERAL_OPCODES:
+                        literal_value = PyTorchZipScanner._literal_arg_bytes(opcode.name, arg)
+                        if (
+                            literal_value is not None
+                            and PyTorchZipScanner._literal_value_has_line_continuation_suspicious_text(literal_value)
+                        ):
+                            return True
+                else:
+                    return False
+            except _PickleLiteralPreservationBudgetExceeded:
+                raise
+            except Exception:
+                return False
+        return False
+
+    @staticmethod
     def _complete_proto0_string_literal_has_line_continuation_suspicious_text(sample: bytes) -> bool:
         if not sample.startswith(b"S"):
             return False
@@ -5168,13 +5263,33 @@ class PyTorchZipScanner(BaseScanner):
         pickle_source: str,
         pickle_filename: str,
     ) -> None:
+        PyTorchZipScanner._preserve_literal_suspicious_text_finding_from_stream(
+            member_result,
+            io.BytesIO(pickle_data),
+            len(pickle_data),
+            pickle_source=pickle_source,
+            pickle_filename=pickle_filename,
+        )
+
+    @staticmethod
+    def _preserve_literal_suspicious_text_finding_from_stream(
+        member_result: ScanResult,
+        pickle_stream: Any,
+        pickle_size: int,
+        *,
+        pickle_source: str,
+        pickle_filename: str,
+    ) -> None:
         if PyTorchZipScanner._result_has_suspicious_string_finding(member_result):
             return
         if any(issue.severity == IssueSeverity.CRITICAL for issue in member_result.issues):
             return
         try:
             has_suspicious_literal = (
-                PyTorchZipScanner._complete_pickle_literal_member_has_line_continuation_suspicious_text(pickle_data)
+                PyTorchZipScanner._complete_pickle_literal_stream_has_line_continuation_suspicious_text(
+                    pickle_stream,
+                    pickle_size,
+                )
             )
         except _PickleLiteralPreservationBudgetExceeded:
             reason = "pytorch_zip_literal_preservation_incomplete"
