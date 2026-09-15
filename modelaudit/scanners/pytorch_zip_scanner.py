@@ -2093,7 +2093,28 @@ class PyTorchZipScanner(BaseScanner):
                     )
             if entry.file_size > len(data_start) and not data_start.strip(PROTO0_1_IGNORABLE_TRAILING_BYTES):
                 if not data_start.strip(b"\x00"):
-                    return False
+                    if defer_padding_probe is not None:
+                        defer_padding_probe[0] = True
+                        return False
+                    try:
+                        data_start = self._verified_nul_padding_storage_probe_sample(
+                            zip_file,
+                            entry,
+                            data_start,
+                            verified_prefix_bytes=len(data_start),
+                            result=result,
+                            padding_probe_bytes_remaining=padding_probe_bytes_remaining,
+                            nul_padding_verify_bytes_remaining=nul_padding_verify_bytes_remaining,
+                        )
+                    except ValueError:
+                        if entry.file_size >= 0xFFFFFFFF and entry.CRC == 0:
+                            return False
+                        raise
+                    if not data_start.strip(b"\x00"):
+                        return False
+                    data_start = data_start.lstrip(PROTO0_1_IGNORABLE_TRAILING_BYTES)
+                    if not data_start:
+                        return False
                 if defer_padding_probe is not None:
                     defer_padding_probe[0] = True
                     return False

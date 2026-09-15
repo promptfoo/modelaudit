@@ -2969,6 +2969,34 @@ def test_pytorch_zip_discovery_fails_closed_after_padding_beyond_trusted_probe(
     )
 
 
+def test_pytorch_zip_discovery_fails_closed_after_nul_padding_beyond_trusted_probe(
+    tmp_path: Path,
+) -> None:
+    model_path = tmp_path / "referenced_storage_nul_padding_beyond_trusted_probe_hidden_pickle.pt"
+    prefix = b"X" + (3_191_733_531).to_bytes(4, "little")
+    malicious_suffix = _malicious_proto0_system_payload()
+    storage_blob = b"\x00" * (pytorch_zip_scanner_module._TRUSTED_STORAGE_PICKLE_PROBE_BYTES + 8)
+    storage_blob += prefix + b"A" * 16 + malicious_suffix
+    storage_blob += b"A" * (pytorch_zip_scanner_module._PICKLE_DISCOVERY_LONG_PROBE_BYTES - len(storage_blob) + 512)
+    storage_blob += b"!" * (-len(storage_blob) % 4)
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        zip_file.writestr("archive/data/0", storage_blob)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert result.success is False
+    assert "pytorch_zip_pickle_discovery_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "Pickle Discovery"
+        and check.details.get("analysis_incomplete") is True
+        and "archive/data/0" in check.details.get("zip_entries", [])
+        for check in result.checks
+    )
+
+
 def test_pytorch_zip_discovery_fails_closed_for_hidden_pickle_beyond_unread_impossible_prefix(
     tmp_path: Path,
 ) -> None:
