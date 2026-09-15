@@ -342,6 +342,7 @@ _PICKLE_DISCOVERY_NUL_PADDING_VERIFY_BUDGET_BYTES = 64 * 1024 * 1024
 _PICKLE_INCOMPLETE_FRAME_MIN_PAYLOAD_OPCODES = 4
 _PYTORCH_STORAGE_TRUST_MAX_OPCODES = 100_000
 _PICKLE_LITERAL_PRESERVATION_MAX_OPCODES = _PYTORCH_STORAGE_TRUST_MAX_OPCODES
+_PICKLE_LITERAL_PRESERVATION_STREAM_PROBE_BYTES = 1024 * 1024
 _PYTORCH_STORAGE_TRUST_MAX_STACK_DEPTH = 1024
 _PYTORCH_STORAGE_TRUST_MAX_MEMO_ENTRIES = 100_000
 _PYTORCH_STORAGE_TRUST_MAX_TUPLE_WIDTH = 64
@@ -4310,6 +4311,9 @@ class PyTorchZipScanner(BaseScanner):
             )
             if offset < 0:
                 return False
+            if PyTorchZipScanner._raw_nested_offset_is_inside_binary_byte_literal(value, offset):
+                search_start = offset + 1
+                continue
             candidate = value[offset : offset + _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES]
             candidate_is_prefix = offset + len(candidate) < len(value)
             if not PyTorchZipScanner._raw_nested_persistent_id_candidate_should_scan(candidate, candidate_is_prefix):
@@ -4318,6 +4322,40 @@ class PyTorchZipScanner(BaseScanner):
             if not PyTorchZipScanner._consume_raw_nested_structural_parse_budget(parse_budget_remaining):
                 return True
             return True
+        return False
+
+    @staticmethod
+    def _raw_nested_offset_is_inside_binary_byte_literal(value: bytes, offset: int) -> bool:
+        search_start = max(0, offset - _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES)
+        cursor = search_start
+        while cursor < offset:
+            marker = value[cursor]
+            if marker == ord("B"):
+                header_bytes = 5
+                if cursor + header_bytes > len(value):
+                    cursor += 1
+                    continue
+                literal_size = int.from_bytes(value[cursor + 1 : cursor + header_bytes], "little")
+            elif marker == ord("C"):
+                header_bytes = 2
+                if cursor + header_bytes > len(value):
+                    cursor += 1
+                    continue
+                literal_size = value[cursor + 1]
+            elif marker in {0x8E, 0x96}:
+                header_bytes = 9
+                if cursor + header_bytes > len(value):
+                    cursor += 1
+                    continue
+                literal_size = int.from_bytes(value[cursor + 1 : cursor + header_bytes], "little")
+            else:
+                cursor += 1
+                continue
+            literal_start = cursor + header_bytes
+            literal_end = literal_start + literal_size
+            if literal_start <= offset < literal_end and literal_end <= len(value):
+                return True
+            cursor += 1
         return False
 
     @staticmethod
@@ -5038,6 +5076,7 @@ class PyTorchZipScanner(BaseScanner):
             pickle_data_size = info.file_size
             pickle_source = f"{path}:{name}"
             pytorch_data_pickle_storage_sizes = pytorch_data_pickle_storage_sizes_by_data_pkl.get(name)
+            trusted_storage_keys = trusted_pytorch_storage_persistent_id_data_pkl_members.get(name)
 
             if self.pickle_scanner is None:
                 bytes_scanned += pickle_data_size
@@ -5107,6 +5146,8 @@ class PyTorchZipScanner(BaseScanner):
                         source=pickle_source,
                         _pytorch_zip_storage_member_sizes=pytorch_data_pickle_storage_sizes,
                     )
+                    if trusted_storage_keys is not None:
+                        self._downgrade_trusted_storage_persistent_ids(sub_result, trusted_storage_keys)
                     spool.seek(0)
                     self._preserve_literal_suspicious_text_finding_from_stream(
                         sub_result,
@@ -5117,8 +5158,7 @@ class PyTorchZipScanner(BaseScanner):
                     )
             sub_result.metadata.setdefault("archive_file_size", original_file_size)
             apply_pickle_member_context(sub_result, archive_path=path, member_name=name)
-            trusted_storage_keys = trusted_pytorch_storage_persistent_id_data_pkl_members.get(name)
-            if trusted_storage_keys is not None:
+            if trusted_storage_keys is not None and in_memory_pickle_data is not None:
                 self._downgrade_trusted_storage_persistent_ids(sub_result, trusted_storage_keys)
             if in_memory_pickle_data is not None:
                 self._preserve_literal_suspicious_text_finding(
@@ -5209,47 +5249,12 @@ class PyTorchZipScanner(BaseScanner):
         *,
         opcode_budget_remaining: list[int] | None = None,
     ) -> bool:
-        if opcode_budget_remaining is None:
-            opcode_budget_remaining = [_PICKLE_LITERAL_PRESERVATION_MAX_OPCODES]
-        cursor = 0
-        while cursor < stream_size:
-            try:
-                stream.seek(cursor)
-                for opcode, arg, pos in pickletools.genops(stream):
-                    if opcode_budget_remaining[0] <= 0:
-                        raise _PickleLiteralPreservationBudgetExceeded(
-                            "pickle literal suspicious-text preservation exceeded its opcode budget"
-                        )
-                    opcode_budget_remaining[0] -= 1
-                    if pos is None:
-                        continue
-                    if opcode.name == "STOP":
-                        cursor = pos + 1
-                        stream.seek(cursor)
-                        while cursor < stream_size:
-                            byte = stream.read(1)
-                            if not byte:
-                                return False
-                            if byte[0] not in PROTO0_1_IGNORABLE_TRAILING_BYTES:
-                                break
-                            cursor += 1
-                        else:
-                            return False
-                        break
-                    if opcode.name in _PICKLE_LITERAL_OPCODES:
-                        literal_value = PyTorchZipScanner._literal_arg_bytes(opcode.name, arg)
-                        if (
-                            literal_value is not None
-                            and PyTorchZipScanner._literal_value_has_line_continuation_suspicious_text(literal_value)
-                        ):
-                            return True
-                else:
-                    return False
-            except _PickleLiteralPreservationBudgetExceeded:
-                raise
-            except Exception:
-                return False
-        return False
+        stream.seek(0)
+        sample = stream.read(min(stream_size, _PICKLE_LITERAL_PRESERVATION_STREAM_PROBE_BYTES))
+        return PyTorchZipScanner._complete_pickle_literal_member_has_line_continuation_suspicious_text(
+            sample,
+            opcode_budget_remaining=opcode_budget_remaining,
+        )
 
     @staticmethod
     def _complete_proto0_string_literal_has_line_continuation_suspicious_text(sample: bytes) -> bool:

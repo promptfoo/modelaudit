@@ -1,6 +1,7 @@
 import base64
 import binascii
 import hashlib
+import io
 import json
 import os
 import pickle
@@ -3405,6 +3406,34 @@ def test_pytorch_zip_discovery_skips_marker_rich_binbytes_persid_near_match(
     assert not any(issue.details.get("pickle_filename") == "archive/data/0" for issue in result.issues)
 
 
+def test_pytorch_zip_discovery_skips_p_marker_inside_binbytes_literal(
+    tmp_path: Path,
+) -> None:
+    model_path = tmp_path / "referenced_storage_impossible_declared_prefix_p_marker_binbytes.pt"
+    prefix = b"X" + (3_191_733_531).to_bytes(4, "little")
+    decoys = b"c!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)
+    inert_padding = b"!" * (70 * 1024)
+    literal_payload = b"P" + (b"!" * (9 * 1024))
+    storage_blob = prefix + decoys + inert_padding
+    storage_blob += b"B" + len(literal_payload).to_bytes(4, "little") + literal_payload + b"."
+    storage_blob += b"!" * (-len(storage_blob) % 4)
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        zip_file.writestr("archive/data/0", storage_blob)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert result.success is True
+    assert result.metadata.get("pickle_verdict") == "clean"
+    assert result.metadata["pickle_files"] == ["archive/data.pkl"]
+    assert not any(
+        check.name == "Pickle Discovery" and check.details.get("analysis_incomplete") for check in result.checks
+    )
+    assert not any(issue.details.get("pickle_filename") == "archive/data/0" for issue in result.issues)
+
+
 def test_pytorch_zip_discovery_fails_closed_for_unicode_stack_global_after_budget_gap(
     tmp_path: Path,
 ) -> None:
@@ -5770,6 +5799,54 @@ def test_pytorch_zip_discovery_preserves_spooled_line_continuation_suspicious_st
         issue.severity == IssueSeverity.WARNING
         and issue.details.get("pickle_rule_code") == "SUSPICIOUS_STRING"
         and issue.details.get("pickle_filename") == "archive/data/0"
+        for issue in result.issues
+    )
+
+
+def test_pytorch_zip_discovery_bounds_spooled_literal_preservation_reads() -> None:
+    reads: list[int] = []
+
+    class RecordingStream(io.BytesIO):
+        def read(self, size: int = -1) -> bytes:
+            reads.append(size)
+            return super().read(size)
+
+    literal_size = pytorch_zip_scanner_module._PICKLE_LITERAL_PRESERVATION_STREAM_PROBE_BYTES + 128
+    stream = RecordingStream(b"B" + literal_size.to_bytes(4, "little") + (b"A" * literal_size) + b".")
+
+    assert (
+        PyTorchZipScanner._complete_pickle_literal_stream_has_line_continuation_suspicious_text(
+            stream,
+            len(stream.getvalue()),
+        )
+        is False
+    )
+    assert max(size for size in reads if size >= 0) <= (
+        pytorch_zip_scanner_module._PICKLE_LITERAL_PRESERVATION_STREAM_PROBE_BYTES
+    )
+
+
+def test_pytorch_zip_discovery_preserves_spooled_literal_after_trusted_id_downgrade(
+    tmp_path: Path,
+) -> None:
+    model_path = tmp_path / "referenced_spooled_data_pkl_trusted_id_then_suspicious_literal.pt"
+    storage_blob = b"\x00" * 16
+    data_pkl = _float_storage_persistent_id_payload_for_bytes("0", storage_blob)
+    data_pkl += b"S'os.\\\\\\nsystem'\n."
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", data_pkl)
+        zip_file.writestr("archive/data/0", storage_blob)
+
+    result = PyTorchZipScanner(config={"pickle_max_memory_read": 1}).scan(str(model_path))
+
+    assert "archive/data.pkl" in result.metadata["pickle_files"]
+    assert result.metadata["pickle_verdict"] == "suspicious"
+    assert any(
+        issue.severity == IssueSeverity.WARNING
+        and issue.details.get("pickle_rule_code") == "SUSPICIOUS_STRING"
+        and issue.details.get("pickle_filename") == "archive/data.pkl"
         for issue in result.issues
     )
 
