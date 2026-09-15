@@ -2776,9 +2776,6 @@ def _build_onnx_weight_analysis_plan(
     graph_output_dependency_cache: dict[
         tuple[int, tuple[int, ...] | None, tuple[tuple[str, str, str], ...]], frozenset[str]
     ] = {}
-    graph_output_dependencies_by_index_cache: dict[
-        tuple[int, tuple[tuple[str, str, str], ...]], tuple[frozenset[str], ...]
-    ] = {}
     graph_value_dependency_cache: dict[
         tuple[int, tuple[str, ...], tuple[tuple[str, str, str], ...]], tuple[Any, frozenset[str]]
     ] = {}
@@ -2888,43 +2885,27 @@ def _build_onnx_weight_analysis_plan(
         if cache_key in graph_output_dependency_cache:
             return graph_output_dependency_cache[cache_key]
         local_attribute_bindings = attribute_bindings or {}
-        per_output_dependencies_cache_key = (id(subgraph), attribute_binding_cache_key(attribute_bindings))
-        per_output_dependencies = graph_output_dependencies_by_index_cache.get(per_output_dependencies_cache_key)
-        if per_output_dependencies is None:
-            dependencies_by_index = [
-                {name} if (name := _onnx_value_name(output)) else set() for output in graph_outputs
-            ]
-            dependency_indexes_by_name: dict[str, set[int]] = {}
-            for output_index, output_dependencies in enumerate(dependencies_by_index):
-                for dependency_name in output_dependencies:
-                    dependency_indexes_by_name.setdefault(dependency_name, set()).add(output_index)
-            for body_node in reversed(getattr(subgraph, "node", ())):
-                impacted_indexes: set[int] = set()
-                for output_name in node_output_names(body_node):
-                    impacted_indexes.update(dependency_indexes_by_name.get(output_name, ()))
-                if not impacted_indexes:
-                    continue
-                direct_dependencies = graph_node_direct_dependency_names(body_node, local_attribute_bindings)
-                for output_index in impacted_indexes:
-                    before_count = len(dependencies_by_index[output_index])
-                    if merge_dependency_names(dependencies_by_index[output_index], direct_dependencies):
-                        continue
-                    if len(dependencies_by_index[output_index]) == before_count:
-                        continue
-                    for dependency_name in dependencies_by_index[output_index]:
-                        dependency_indexes_by_name.setdefault(dependency_name, set()).add(output_index)
-            per_output_dependencies = tuple(frozenset(dependencies) for dependencies in dependencies_by_index)
-            graph_output_dependencies_by_index_cache[per_output_dependencies_cache_key] = per_output_dependencies
+        if output_index_key is None and len(graph_outputs) > _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_OUTPUTS:
+            result = frozenset({dependency_collection_limit_marker})
+            graph_output_dependency_cache[cache_key] = result
+            return result
         if output_index_key is None:
-            dependencies = set().union(*per_output_dependencies) if per_output_dependencies else set()
+            dependencies = {output_name for output in graph_outputs if (output_name := _onnx_value_name(output))}
         else:
-            dependencies = set().union(
-                *(
-                    per_output_dependencies[index]
-                    for index in output_index_key
-                    if 0 <= index < len(per_output_dependencies)
-                )
-            )
+            dependencies = {
+                output_name
+                for index in output_index_key
+                if 0 <= index < len(graph_outputs)
+                if (output_name := _onnx_value_name(graph_outputs[index]))
+            }
+        for body_node in reversed(getattr(subgraph, "node", ())):
+            if not any(output_name in dependencies for output_name in node_output_names(body_node)):
+                continue
+            if merge_dependency_names(
+                dependencies,
+                graph_node_direct_dependency_names(body_node, local_attribute_bindings),
+            ):
+                break
         result = frozenset(dependencies)
         graph_output_dependency_cache[cache_key] = result
         return result
@@ -7405,7 +7386,7 @@ def _build_onnx_weight_analysis_plan(
                                     related_input_name,
                                     related_shape,
                                     related_output_index,
-                                    {**current_related_shapes, graph_input_name: next_shape},
+                                    {**current_related_shapes, graph_input_name: current_shape},
                                 )
                                 if related_analysis is None:
                                     next_related_shapes[related_input_name] = None

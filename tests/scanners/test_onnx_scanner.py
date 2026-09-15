@@ -18756,6 +18756,19 @@ class TestWeightDistributionSemantics:
         assert grouped_dependency_calls == 1
         assert fanout_promotion_calls <= width
 
+    def test_graph_output_dependency_names_does_not_build_per_output_index_matrix(self) -> None:
+        scanner_path = Path(onnx_scanner_module.__file__).resolve()
+        graph_output_dependency_names = next(
+            node
+            for node in ast.walk(ast.parse(scanner_path.read_text()))
+            if isinstance(node, ast.FunctionDef) and node.name == "graph_output_dependency_names"
+        )
+
+        assert not any(
+            isinstance(node, ast.Name) and node.id == "dependency_indexes_by_name"
+            for node in ast.walk(graph_output_dependency_names)
+        )
+
     def _write_conditional_loop_single_iteration_slope_model(self, tmp_path: Path) -> Path:
         body = helper.make_graph(
             [
@@ -18876,6 +18889,12 @@ class TestWeightDistributionSemantics:
 
         assert result.success is False
         assert result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"]["lineages_per_value_limit"] >= 1
+
+    def test_repeated_loop_replay_uses_same_iteration_sibling_context(self) -> None:
+        scanner_source = Path(onnx_scanner_module.__file__).resolve().read_text()
+
+        assert "{**current_related_shapes, graph_input_name: next_shape}" not in scanner_source
+        assert "{**current_related_shapes, graph_input_name: current_shape}" in scanner_source
 
     def test_dead_local_function_inputs_do_not_repeat_weight_input_checks(
         self,
