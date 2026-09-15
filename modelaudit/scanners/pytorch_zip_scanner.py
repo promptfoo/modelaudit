@@ -151,11 +151,12 @@ _BASE64_LITERAL_TOKEN_BYTES = frozenset(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijkl
 _HEX_NESTED_LITERAL_TOKEN_RE = re.compile(rb"[0-9A-Fa-f][0-9A-Fa-f\s\r\n\t]{15,}")
 _RAW_NESTED_TEXT_SECURITY_PICKLE_START_BYTES = b"\x80(cioRbP\x82\x83\x84"
 _RAW_NESTED_BINARY_SECURITY_PICKLE_START_BYTES = b"X\x8c\x8d\x95"
+_RAW_NESTED_STRUCTURAL_STRING_START_BYTES = _RAW_NESTED_BINARY_SECURITY_PICKLE_START_BYTES + b"STUV"
 _HEADERLESS_BINARY_PICKLE_START_BYTES = (
     _RAW_NESTED_BINARY_SECURITY_PICKLE_START_BYTES + _PICKLE_BINARY_BYTE_LITERAL_START_BYTES
 )
 _RAW_NESTED_SECURITY_PICKLE_START_BYTES = (
-    _RAW_NESTED_TEXT_SECURITY_PICKLE_START_BYTES + _RAW_NESTED_BINARY_SECURITY_PICKLE_START_BYTES
+    _RAW_NESTED_TEXT_SECURITY_PICKLE_START_BYTES + _RAW_NESTED_STRUCTURAL_STRING_START_BYTES
 )
 _BINARY_EXTENSION_SECURITY_OPCODE_BYTES = b"\x82\x83\x84"
 _BINARY_EXTENSION_OPCODE_OPERAND_LENGTHS = {0x82: 1, 0x83: 2, 0x84: 4}
@@ -3650,7 +3651,7 @@ class PyTorchZipScanner(BaseScanner):
                     return True
                 continue
             if (
-                marker in _RAW_NESTED_BINARY_SECURITY_PICKLE_START_BYTES
+                marker in _RAW_NESTED_STRUCTURAL_STRING_START_BYTES
                 and PyTorchZipScanner._raw_nested_binary_candidate_should_scan(
                     candidate,
                     candidate_is_prefix=candidate_is_prefix,
@@ -3716,7 +3717,7 @@ class PyTorchZipScanner(BaseScanner):
                     return True
                 continue
             if (
-                marker in _RAW_NESTED_BINARY_SECURITY_PICKLE_START_BYTES
+                marker in _RAW_NESTED_STRUCTURAL_STRING_START_BYTES
                 and PyTorchZipScanner._raw_nested_binary_candidate_should_scan(
                     candidate,
                     candidate_is_prefix=candidate_is_prefix,
@@ -3848,7 +3849,7 @@ class PyTorchZipScanner(BaseScanner):
         ):
             return PyTorchZipScanner._has_security_relevant_pickle_opcode(candidate) or candidate_is_prefix
         if (
-            marker in _RAW_NESTED_BINARY_SECURITY_PICKLE_START_BYTES
+            marker in _RAW_NESTED_STRUCTURAL_STRING_START_BYTES
             and PyTorchZipScanner._raw_nested_binary_candidate_should_scan(
                 candidate,
                 candidate_is_prefix=candidate_is_prefix,
@@ -3914,7 +3915,7 @@ class PyTorchZipScanner(BaseScanner):
         ):
             return PyTorchZipScanner._has_security_relevant_pickle_opcode(candidate) or candidate_is_prefix
         if (
-            marker in _RAW_NESTED_BINARY_SECURITY_PICKLE_START_BYTES
+            marker in _RAW_NESTED_STRUCTURAL_STRING_START_BYTES
             and PyTorchZipScanner._raw_nested_binary_candidate_should_scan(
                 candidate,
                 candidate_is_prefix=candidate_is_prefix,
@@ -4295,7 +4296,7 @@ class PyTorchZipScanner(BaseScanner):
             offset = min(
                 (
                     found
-                    for marker in _RAW_NESTED_BINARY_SECURITY_PICKLE_START_BYTES
+                    for marker in _RAW_NESTED_STRUCTURAL_STRING_START_BYTES
                     if (found := value.find(bytes([marker]), search_start, search_limit)) >= 0
                 ),
                 default=-1,
