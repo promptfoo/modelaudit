@@ -13900,8 +13900,13 @@ class TestWeightDistributionSemantics:
     def test_function_runtime_input_rank_overrides_stale_call_output_annotation(self, tmp_path: Path) -> None:
         shape_names = [f"shape_source{index}" for index in range(32)]
         initializers = [onnx.numpy_helper.from_array(np.array([], dtype=np.int64), name=name) for name in shape_names]
-        initializers.append(onnx.numpy_helper.from_array(np.array(1.0, dtype=np.float32), name="W"))
-        nodes = []
+        initializers.extend(
+            [
+                onnx.numpy_helper.from_array(np.array(1.0, dtype=np.float32), name="W"),
+                onnx.numpy_helper.from_array(np.asarray([True, True, True, True]), name="condition_mask"),
+            ]
+        )
+        nodes = [helper.make_node("Compress", ["runtime_source", "condition_mask"], ["runtime_unknown"], axis=0)]
         previous = "W"
         for index, shape_name in enumerate(shape_names):
             reshaped = f"reshaped{index}"
@@ -13917,7 +13922,7 @@ class TestWeightDistributionSemantics:
         )
         nodes.extend(
             [
-                helper.make_node("IdentityAlias", ["runtime_matrix"], ["runtime_alias"], domain="local"),
+                helper.make_node("IdentityAlias", ["runtime_unknown"], ["runtime_alias"], domain="local"),
                 helper.make_node("Add", ["runtime_alias", previous], ["generated_weight"]),
                 helper.make_node("MatMul", ["X", "generated_weight"], ["Y"]),
             ]
@@ -13926,7 +13931,7 @@ class TestWeightDistributionSemantics:
             nodes,
             "function_runtime_input_rank_overrides_stale_call_output_annotation",
             [
-                helper.make_tensor_value_info("runtime_matrix", TensorProto.FLOAT, [4, 4]),
+                helper.make_tensor_value_info("runtime_source", TensorProto.FLOAT, [4, 4]),
                 helper.make_tensor_value_info("X", TensorProto.FLOAT, [4, 4]),
             ],
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [4, 4])],
@@ -15812,6 +15817,125 @@ class TestWeightDistributionSemantics:
         model.ir_version = 8
         onnx.checker.check_model(model)
         path = tmp_path / f"{control_flow_op.lower()}-scalar-output-deferred-gap.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        assert result.success is True
+        assert self._extreme_checks(result) == []
+        assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert semantics["coverage_gaps"] == {}
+        assert semantics["eligible_initializer_count"] == 0
+
+    @pytest.mark.parametrize("control_flow_op", ["Loop", "Scan"])
+    def test_loop_scan_size_of_unknown_rank_input_keeps_scalar_gap_nonweight(
+        self, tmp_path: Path, control_flow_op: str
+    ) -> None:
+        shape_names = [f"shape_source{index}" for index in range(32)]
+        initializers = [onnx.numpy_helper.from_array(np.array([], dtype=np.int64), name=name) for name in shape_names]
+        initializers.append(onnx.numpy_helper.from_array(np.array(1.0, dtype=np.float32), name="W"))
+        nodes = []
+        previous = "W"
+        for index, shape_name in enumerate(shape_names):
+            reshaped = f"reshaped{index}"
+            nodes.append(helper.make_node("Reshape", [previous, shape_name], [reshaped]))
+            previous = reshaped
+
+        if control_flow_op == "Loop":
+            initializers.extend(
+                [
+                    onnx.numpy_helper.from_array(np.array(4, dtype=np.int64), name="trip_count"),
+                    onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="condition"),
+                ]
+            )
+            body = helper.make_graph(
+                [
+                    helper.make_node("Identity", ["body_condition"], ["condition_output"]),
+                    helper.make_node(
+                        "Compress",
+                        ["runtime_source", "runtime_mask"],
+                        ["runtime_unknown"],
+                        axis=0,
+                    ),
+                    helper.make_node("Size", ["runtime_unknown"], ["runtime_unknown_size"]),
+                    helper.make_node(
+                        "Cast",
+                        ["runtime_unknown_size"],
+                        ["runtime_unknown_size_float"],
+                        to=TensorProto.FLOAT,
+                    ),
+                    helper.make_node("Add", [previous, "runtime_unknown_size_float"], ["scan_output"]),
+                ],
+                "scalar_loop_size_unknown_rank_body",
+                [
+                    helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
+                    helper.make_tensor_value_info("body_condition", TensorProto.BOOL, []),
+                ],
+                [
+                    helper.make_tensor_value_info("condition_output", TensorProto.BOOL, []),
+                    helper.make_tensor_value_info("scan_output", TensorProto.FLOAT, []),
+                ],
+            )
+            nodes.append(helper.make_node("Loop", ["trip_count", "condition"], ["generated_values"], body=body))
+            graph_inputs = [
+                helper.make_tensor_value_info("runtime_source", TensorProto.FLOAT, [4, 4]),
+                helper.make_tensor_value_info("runtime_mask", TensorProto.BOOL, [4]),
+                helper.make_tensor_value_info("X", TensorProto.FLOAT, [4, 4]),
+            ]
+        else:
+            body = helper.make_graph(
+                [
+                    helper.make_node(
+                        "Compress",
+                        ["scan_source", "body_condition_mask"],
+                        ["runtime_unknown"],
+                        axis=0,
+                    ),
+                    helper.make_node("Size", ["runtime_unknown"], ["runtime_unknown_size"]),
+                    helper.make_node(
+                        "Cast",
+                        ["runtime_unknown_size"],
+                        ["runtime_unknown_size_float"],
+                        to=TensorProto.FLOAT,
+                    ),
+                    helper.make_node("Add", [previous, "runtime_unknown_size_float"], ["scan_output"]),
+                ],
+                "scalar_scan_size_unknown_rank_body",
+                [
+                    helper.make_tensor_value_info("scan_source", TensorProto.FLOAT, [4]),
+                    helper.make_tensor_value_info("body_condition_mask", TensorProto.BOOL, [4]),
+                ],
+                [helper.make_tensor_value_info("scan_output", TensorProto.FLOAT, [])],
+            )
+            nodes.append(
+                helper.make_node(
+                    "Scan",
+                    ["runtime_source", "runtime_mask"],
+                    ["generated_values"],
+                    body=body,
+                    num_scan_inputs=2,
+                )
+            )
+            graph_inputs = [
+                helper.make_tensor_value_info("runtime_source", TensorProto.FLOAT, [4, 4]),
+                helper.make_tensor_value_info("runtime_mask", TensorProto.BOOL, [4, 4]),
+                helper.make_tensor_value_info("X", TensorProto.FLOAT, [4, 4]),
+            ]
+        nodes.append(helper.make_node("MatMul", ["X", "generated_values"], ["Y"]))
+        graph = helper.make_graph(
+            nodes,
+            f"{control_flow_op.lower()}_size_unknown_rank_keeps_deferred_scalar_gap_nonweight",
+            graph_inputs,
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [4])],
+            initializer=initializers,
+            value_info=[helper.make_tensor_value_info(previous, TensorProto.FLOAT, [])],
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        onnx.checker.check_model(model, full_check=True)
+        path = tmp_path / f"{control_flow_op.lower()}-size-unknown-rank-scalar-gap.onnx"
         onnx.save(model, str(path))
 
         result = OnnxScanner().scan(str(path))

@@ -3265,7 +3265,11 @@ def _build_onnx_weight_analysis_plan(
                 tainted.update(body_tainted_outputs)
             elif any_tainted:
                 tainted.update(body_tainted_outputs)
-            if any_tainted or any(input_shapes_by_name.get(input_name) is not None for input_name in body_inputs):
+            if (
+                any_tainted
+                or body_node.op_type == "Size"
+                or any(input_shapes_by_name.get(input_name) is not None for input_name in body_inputs)
+            ):
                 output_shape = None
                 if reentry_shape_preserving_unary_operator(body_node, body_inputs) and data_input_shape is not None:
                     output_shape = data_input_shape
@@ -3375,7 +3379,7 @@ def _build_onnx_weight_analysis_plan(
                             )
                 elif body_node.op_type == "Shape" and data_input_shape is not None:
                     output_shape = (len(data_input_shape),)
-                elif body_node.op_type == "Size" and data_input_shape is not None:
+                elif body_node.op_type == "Size" and not any_tainted:
                     output_shape = ()
                 if output_shape is not None:
                     for output_name in body_outputs:
@@ -6683,6 +6687,7 @@ def _build_onnx_weight_analysis_plan(
                 and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
                 and node.op_type == "Pow"
             )
+            size_operator = is_shape_query and node.op_type == "Size" and not all_input_lineages
             elementwise_has_unknown_dynamic_rank = False
             elementwise_output_rank_proven = True
             if same_type_elementwise or same_type_unary_elementwise or pow_operator:
@@ -6712,6 +6717,9 @@ def _build_onnx_weight_analysis_plan(
                     else known_value_ranks.get(input_names[0])
                 )
                 elementwise_output_rank_proven = value_rank_is_proven_or_unknown(input_names[0])
+            elif size_operator:
+                elementwise_output_shape = ()
+                elementwise_output_rank = 0
             resolved_cast_target_data_type = (
                 cast_output_data_type(node, resolve_attribute)
                 if supported_transform and node.op_type == "Cast"
