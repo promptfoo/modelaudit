@@ -2674,6 +2674,9 @@ def _build_onnx_weight_analysis_plan(
             if not body_outputs & dependencies:
                 continue
             dependencies.update(str(input_name) for input_name in getattr(body_node, "input", ()) if input_name)
+            for attribute in getattr(body_node, "attribute", ()):
+                for nested_graph in _iter_attribute_graphs(attribute):
+                    dependencies.update(graph_external_reference_names(nested_graph))
         result = frozenset(dependencies)
         graph_output_dependency_cache[cache_key] = result
         return result
@@ -3437,7 +3440,53 @@ def _build_onnx_weight_analysis_plan(
         live_after_node: dict[int, frozenset[str]] = {}
         for body_node in reversed(body_nodes):
             live_after_node[id(body_node)] = frozenset(live_names)
-            live_names.update(str(input_name) for input_name in getattr(body_node, "input", ()) if input_name)
+            live_body_inputs = [str(input_name) for input_name in getattr(body_node, "input", ()) if input_name]
+            live_body_outputs = {str(output_name) for output_name in getattr(body_node, "output", ()) if output_name}
+            function_key = (
+                str(getattr(body_node, "domain", "")),
+                str(getattr(body_node, "op_type", "")),
+                str(getattr(body_node, "overload", "")),
+            )
+            function = functions.get(function_key)
+            is_model_local_function = function_key in functions
+            is_registered_standard_operator = is_model_local_function or has_registered_standard_operator(
+                body_node,
+                opset_versions,
+            )
+            output_is_live = bool(live_body_outputs & live_names)
+            node_consumes_weight = any(
+                _onnx_potential_weight_input(
+                    body_node,
+                    input_index,
+                    is_model_local_function=is_model_local_function,
+                    is_registered_standard_operator=is_registered_standard_operator,
+                )
+                for input_index in range(len(live_body_inputs))
+            )
+            if output_is_live or node_consumes_weight:
+                live_names.update(live_body_inputs)
+            if function is not None:
+                function_attributes = bound_function_attributes(function, body_node, resolve_reentry_attribute)
+                function_versions = function_opset_versions(function, opset_versions)
+                if output_is_live or subgraph_has_potential_weight_consumer(
+                    function,
+                    function_versions,
+                    attribute_bindings=function_attributes,
+                    depth=depth + 1,
+                ):
+                    live_names.update(live_body_inputs)
+            for attribute in getattr(body_node, "attribute", ()):
+                resolved_attribute = resolve_reentry_attribute(attribute)
+                if resolved_attribute is None:
+                    continue
+                for nested_graph in _iter_attribute_graphs(resolved_attribute):
+                    if output_is_live or subgraph_has_potential_weight_consumer(
+                        nested_graph,
+                        opset_versions,
+                        attribute_bindings=local_attribute_bindings,
+                        depth=depth + 1,
+                    ):
+                        live_names.update(graph_external_reference_names(nested_graph))
 
         tainted = {graph_input_name}
         for body_node in body_nodes:
@@ -5912,8 +5961,7 @@ def _build_onnx_weight_analysis_plan(
                                 scan_input_offset=scan_input_offset,
                                 scan_input_axes=scan_input_axes,
                             )
-                        if related_parent_shape is not None:
-                            related_repeated_state_shapes[graph_input_name] = related_parent_shape
+                        related_repeated_state_shapes[graph_input_name] = related_parent_shape
                     remaining_trusted_repeated_context_candidates = list(trusted_repeated_context_candidates)
                     repeated_context_proof_budget = min(
                         _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK,
