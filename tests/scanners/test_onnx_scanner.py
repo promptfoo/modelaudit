@@ -18769,6 +18769,32 @@ class TestWeightDistributionSemantics:
             for node in ast.walk(graph_output_dependency_names)
         )
 
+    def test_graph_dependency_queries_use_producer_closure(self) -> None:
+        scanner_path = Path(onnx_scanner_module.__file__).resolve()
+        functions = {
+            node.name: node
+            for node in ast.walk(ast.parse(scanner_path.read_text()))
+            if isinstance(node, ast.FunctionDef)
+        }
+
+        for helper_name in ("graph_output_dependency_names", "graph_value_dependency_names"):
+            helper = functions[helper_name]
+            calls = [node for node in ast.walk(helper) if isinstance(node, ast.Call)]
+            assert any(
+                isinstance(call.func, ast.Name) and call.func.id == "graph_dependency_closure_names" for call in calls
+            )
+            assert not any(isinstance(call.func, ast.Name) and call.func.id == "reversed" for call in calls)
+            assert not any(
+                isinstance(call.func, ast.Name)
+                and call.func.id == "getattr"
+                and len(call.args) >= 2
+                and isinstance(call.args[0], ast.Name)
+                and call.args[0].id == "subgraph"
+                and isinstance(call.args[1], ast.Constant)
+                and call.args[1].value == "node"
+                for call in calls
+            )
+
     def _write_conditional_loop_single_iteration_slope_model(self, tmp_path: Path) -> Path:
         body = helper.make_graph(
             [
