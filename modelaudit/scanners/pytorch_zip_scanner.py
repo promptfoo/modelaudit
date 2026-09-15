@@ -3698,12 +3698,23 @@ class PyTorchZipScanner(BaseScanner):
             return True
         if PyTorchZipScanner._budget_exhausted_suffix_is_only_incomplete_extension_after_text_noise(value):
             return False
+        parse_budget_remaining = [_MAX_RAW_NESTED_PICKLE_CANDIDATES]
         return PyTorchZipScanner._raw_nested_security_pickle_candidate_has_structural_signal(
-            value
-        ) or PyTorchZipScanner._raw_nested_security_pickle_candidate_has_later_structural_signal(value)
+            value,
+            parse_budget_remaining=parse_budget_remaining,
+        ) or PyTorchZipScanner._raw_nested_security_pickle_candidate_has_later_structural_signal(
+            value,
+            parse_budget_remaining=parse_budget_remaining,
+        )
 
     @staticmethod
-    def _raw_nested_security_pickle_candidate_has_later_structural_signal(value: bytes) -> bool:
+    def _raw_nested_security_pickle_candidate_has_later_structural_signal(
+        value: bytes,
+        *,
+        parse_budget_remaining: list[int] | None = None,
+    ) -> bool:
+        if parse_budget_remaining is None:
+            parse_budget_remaining = [_MAX_RAW_NESTED_PICKLE_CANDIDATES]
         if len(value) <= _PICKLE_DISCOVERY_LONG_PROBE_BYTES:
             return False
         step = _PICKLE_DISCOVERY_LONG_PROBE_BYTES - _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES + 1
@@ -3718,7 +3729,10 @@ class PyTorchZipScanner(BaseScanner):
                     windows.append((tail_window_start, len(value)))
             for candidate_window_start, candidate_window_end in windows:
                 window = value[candidate_window_start:candidate_window_end]
-                if PyTorchZipScanner._raw_nested_security_pickle_candidate_has_structural_signal(window):
+                if PyTorchZipScanner._raw_nested_security_pickle_candidate_has_structural_signal(
+                    window,
+                    parse_budget_remaining=parse_budget_remaining,
+                ):
                     return True
             if original_window_end >= len(value):
                 return False
@@ -3792,11 +3806,13 @@ class PyTorchZipScanner(BaseScanner):
         value: bytes,
         *,
         fail_closed_on_truncated_extension: bool = True,
+        parse_budget_remaining: list[int] | None = None,
     ) -> bool:
-        parse_budget_remaining = [_MAX_RAW_NESTED_PICKLE_CANDIDATES]
+        if parse_budget_remaining is None:
+            parse_budget_remaining = [_MAX_RAW_NESTED_PICKLE_CANDIDATES]
         if PyTorchZipScanner._raw_nested_proto0_global_ref_seen(value):
             return True
-        if PyTorchZipScanner._raw_nested_proto0_inst_ref_seen(value):
+        if PyTorchZipScanner._raw_nested_proto0_inst_ref_seen(value, parse_budget_remaining):
             return True
         if PyTorchZipScanner._raw_nested_binary_protocol_candidate_has_structural_signal(
             value,
@@ -3894,7 +3910,7 @@ class PyTorchZipScanner(BaseScanner):
         return False
 
     @staticmethod
-    def _raw_nested_proto0_inst_ref_seen(value: bytes) -> bool:
+    def _raw_nested_proto0_inst_ref_seen(value: bytes, parse_budget_remaining: list[int]) -> bool:
         search_limit = min(len(value), _PICKLE_DISCOVERY_LONG_PROBE_BYTES)
         search_start = 0
         while search_start < search_limit:
@@ -3928,6 +3944,8 @@ class PyTorchZipScanner(BaseScanner):
             window_start = max(0, offset - _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES + 1)
             mark = value.rfind(bytes([_PICKLE_MARK_OPCODE_BYTE]), window_start, offset)
             while mark >= window_start:
+                if not PyTorchZipScanner._consume_raw_nested_structural_parse_budget(parse_budget_remaining):
+                    return True
                 candidate = value[mark : mark + _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES]
                 candidate_is_prefix = mark + len(candidate) < len(value)
                 if PyTorchZipScanner._has_security_relevant_pickle_opcode(candidate) and (
@@ -3936,6 +3954,8 @@ class PyTorchZipScanner(BaseScanner):
                 ):
                     return True
                 mark = value.rfind(bytes([_PICKLE_MARK_OPCODE_BYTE]), window_start, mark)
+            if window_start > 0 and value.rfind(bytes([_PICKLE_MARK_OPCODE_BYTE]), 0, window_start) >= 0:
+                return True
             search_start = name_end + 1
         return False
 
