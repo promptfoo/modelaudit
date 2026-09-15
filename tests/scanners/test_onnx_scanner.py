@@ -9629,6 +9629,83 @@ class TestWeightDistributionSemantics:
         assert coverage == []
         assert semantics["coverage_gaps"] == {}
 
+    def test_repeated_loop_unused_nested_output_preserves_internal_weight_consumer(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(onnx_scanner_module, "_ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK", 20)
+        source_names = [f"W{index}" for index in range(40)]
+        then_branch = helper.make_graph(
+            [
+                helper.make_node("MatMul", ["probe", "state"], ["branch_y"]),
+                helper.make_node("Identity", ["dummy"], ["branch_out"]),
+            ],
+            "unused_nested_output_internal_consumer_then_branch",
+            [],
+            [helper.make_tensor_value_info("branch_out", TensorProto.FLOAT, [])],
+        )
+        else_branch = helper.make_graph(
+            [helper.make_node("Identity", ["dummy"], ["branch_out"])],
+            "unused_nested_output_internal_consumer_else_branch",
+            [],
+            [helper.make_tensor_value_info("branch_out", TensorProto.FLOAT, [])],
+        )
+        body = helper.make_graph(
+            [
+                helper.make_node(
+                    "If",
+                    ["condition_in"],
+                    ["unused_branch_output"],
+                    then_branch=then_branch,
+                    else_branch=else_branch,
+                ),
+                helper.make_node("Identity", ["condition_in"], ["condition_out"]),
+                helper.make_node("Identity", ["state"], ["next_state"]),
+            ],
+            "unused_nested_output_internal_consumer_body",
+            [
+                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
+                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("state", TensorProto.FLOAT, None),
+            ],
+            [
+                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, None),
+            ],
+        )
+        graph = helper.make_graph(
+            [
+                helper.make_node("Sum", source_names, ["initial_state"]),
+                helper.make_node(
+                    "Loop", ["trip_count", "initial_condition", "initial_state"], ["final_state"], body=body
+                ),
+                helper.make_node("Identity", ["dummy"], ["Y"]),
+            ],
+            "unused_nested_output_internal_consumer",
+            [helper.make_tensor_value_info("probe", TensorProto.FLOAT, [1, 2])],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [])],
+            initializer=[
+                *[onnx.numpy_helper.from_array(np.ones((2, 2), dtype=np.float32), name=name) for name in source_names],
+                onnx.numpy_helper.from_array(np.array(2, dtype=np.int64), name="trip_count"),
+                onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="initial_condition"),
+                onnx.numpy_helper.from_array(np.array(0.0, dtype=np.float32), name="dummy"),
+            ],
+            value_info=[helper.make_tensor_value_info("initial_state", TensorProto.FLOAT, [2, 2])],
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        onnx.checker.check_model(model, full_check=True)
+        path = tmp_path / "unused-nested-output-internal-consumer.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        assert result.success is False
+        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
+        assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
+
     @pytest.mark.parametrize(
         ("scan_input_shape", "expected_gap"),
         [
