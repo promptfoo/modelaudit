@@ -10627,6 +10627,73 @@ class TestWeightDistributionSemantics:
         assert coverage == []
         assert semantics["coverage_gaps"] == {}
 
+    @pytest.mark.parametrize("wide_node_is_live", [False, True])
+    def test_repeated_loop_reentry_work_budget_counts_live_node_inputs(
+        self,
+        tmp_path: Path,
+        wide_node_is_live: bool,
+    ) -> None:
+        source_names = [f"W{index}" for index in range(40)]
+        body_nodes = [
+            helper.make_node("Sum", ["state"] * 5000, ["wide_state" if wide_node_is_live else "dead_wide_state"]),
+        ]
+        if not wide_node_is_live:
+            body_nodes.append(helper.make_node("Identity", ["state"], ["next_state"]))
+        body_nodes.append(helper.make_node("Identity", ["condition_in"], ["condition_out"]))
+        body = helper.make_graph(
+            body_nodes,
+            "wide_input_reentry_budget_body",
+            [
+                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
+                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("state", TensorProto.FLOAT, [4]),
+            ],
+            [
+                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
+                helper.make_tensor_value_info(
+                    "wide_state" if wide_node_is_live else "next_state",
+                    TensorProto.FLOAT,
+                    [4],
+                ),
+            ],
+        )
+        graph = helper.make_graph(
+            [
+                helper.make_node("Sum", source_names, ["initial_state"]),
+                helper.make_node(
+                    "Loop",
+                    ["trip_count", "initial_condition", "initial_state"],
+                    ["final_state"],
+                    body=body,
+                ),
+                helper.make_node("MatMul", ["X", "final_state"], ["Y"]),
+            ],
+            "wide_input_reentry_budget",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 4])],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1])],
+            initializer=[
+                *[onnx.numpy_helper.from_array(np.ones((4,), dtype=np.float32), name=name) for name in source_names],
+                onnx.numpy_helper.from_array(np.array(2, dtype=np.int64), name="trip_count"),
+                onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="initial_condition"),
+            ],
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        mode = "live" if wide_node_is_live else "dead"
+        path = tmp_path / f"wide-input-reentry-budget-{mode}.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        if wide_node_is_live:
+            assert result.success is False
+            assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
+        else:
+            assert result.success is True
+            assert semantics["coverage_gaps"] == {}
+
     def test_scan_opset8_repeated_state_reentry_uses_body_state_input(
         self,
         tmp_path: Path,
@@ -17488,21 +17555,27 @@ class TestWeightDistributionSemantics:
         tmp_path: Path,
         *,
         matrix_clean_output: bool,
+        tainted_actual: bool = True,
     ) -> Path:
         tmp_path.mkdir(parents=True, exist_ok=True)
         source_names = [f"source{index}" for index in range(40)]
+        function_inputs = ["state_input", "clean_input"] if tainted_actual else ["clean_input"]
+        function_actuals = (
+            ["state", "clean_matrix" if matrix_clean_output else "clean_vector"]
+            if tainted_actual
+            else ["clean_matrix" if matrix_clean_output else "clean_vector"]
+        )
         function = helper.make_function(
             "local",
             "CleanOnly",
-            ["state_input", "clean_input"],
+            function_inputs,
             ["clean_output"],
             [helper.make_node("Identity", ["clean_input"], ["clean_output"])],
             opset_imports=[helper.make_opsetid("", 13)],
         )
-        clean_name = "clean_matrix" if matrix_clean_output else "clean_vector"
         body = helper.make_graph(
             [
-                helper.make_node("CleanOnly", ["state", clean_name], ["clean_output"], domain="local"),
+                helper.make_node("CleanOnly", function_actuals, ["clean_output"], domain="local"),
                 helper.make_node("Add", ["state", "clean_output"], ["next_state"]),
                 helper.make_node("Identity", ["condition_in"], ["condition_out"]),
             ],
@@ -17563,6 +17636,18 @@ class TestWeightDistributionSemantics:
         assert benign_result.success is True
         assert benign_result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"] == {}
 
+        benign_untainted_result = OnnxScanner().scan(
+            str(
+                self._write_repeated_local_function_clean_only_output_shape_model(
+                    tmp_path / "benign-untainted",
+                    matrix_clean_output=False,
+                    tainted_actual=False,
+                )
+            )
+        )
+        assert benign_untainted_result.success is True
+        assert benign_untainted_result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"] == {}
+
         positive_result = OnnxScanner().scan(
             str(
                 self._write_repeated_local_function_clean_only_output_shape_model(
@@ -17574,6 +17659,23 @@ class TestWeightDistributionSemantics:
         assert positive_result.success is False
         assert (
             positive_result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"]["lineages_per_value_limit"]
+            >= 1
+        )
+
+        positive_untainted_result = OnnxScanner().scan(
+            str(
+                self._write_repeated_local_function_clean_only_output_shape_model(
+                    tmp_path / "positive-untainted",
+                    matrix_clean_output=True,
+                    tainted_actual=False,
+                )
+            )
+        )
+        assert positive_untainted_result.success is False
+        assert (
+            positive_untainted_result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"][
+                "lineages_per_value_limit"
+            ]
             >= 1
         )
 
@@ -18381,6 +18483,47 @@ class TestWeightDistributionSemantics:
             and sample["reason"] == "shape_dimensions_lineage"
             for sample in result.metadata["onnx_weight_distribution_semantics"]["unresolved_lineage_samples"]
         )
+
+    @pytest.mark.parametrize("overridable_shape", [False, True])
+    def test_initializer_backed_graph_input_shape_control_is_overridable(
+        self,
+        tmp_path: Path,
+        overridable_shape: bool,
+    ) -> None:
+        source_names = [f"source{index}" for index in range(40)]
+        graph_inputs = [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 4])]
+        if overridable_shape:
+            graph_inputs.append(helper.make_tensor_value_info("target_shape", TensorProto.INT64, [None]))
+        graph = helper.make_graph(
+            [
+                helper.make_node("Sum", source_names, ["capped"]),
+                helper.make_node("Reshape", ["capped", "target_shape"], ["reshaped"]),
+                helper.make_node("MatMul", ["X", "reshaped"], ["Y"]),
+            ],
+            "initializer_backed_shape_control",
+            graph_inputs,
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1])],
+            initializer=[
+                *[onnx.numpy_helper.from_array(np.ones((4,), dtype=np.float32), name=name) for name in source_names],
+                onnx.numpy_helper.from_array(np.array([4], dtype=np.int64), name="target_shape"),
+            ],
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        mode = "overridable" if overridable_shape else "constant"
+        path = tmp_path / f"initializer-backed-shape-control-{mode}.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        if overridable_shape:
+            assert result.success is False
+            assert semantics["coverage_gaps"]["lineages_per_value_limit"] >= 1
+        else:
+            assert result.success is True
+            assert semantics["coverage_gaps"] == {}
 
     @pytest.mark.parametrize("transform", ["Identity", "Relu"])
     @pytest.mark.parametrize("observation", ["Shape", "Size"])

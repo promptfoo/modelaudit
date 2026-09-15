@@ -2720,10 +2720,59 @@ def _build_onnx_weight_analysis_plan(
             and (len(inputs) == 1 or node.op_type in {"Clip", "Dropout"})
         )
 
-    def subgraph_analysis_work_exceeds_limit(subgraph: Any) -> bool:
-        graph_node_count = len(getattr(subgraph, "node", ()))
+    def subgraph_analysis_work_exceeds_limit(
+        subgraph: Any,
+        dependency_names: frozenset[str] | None = None,
+        *,
+        include_potential_weight_consumers: bool = False,
+        opset_versions: dict[str, int] | None = None,
+    ) -> bool:
+        graph_nodes = tuple(getattr(subgraph, "node", ()))
+        potential_weight_consumer_seen = False
+        potential_weight_consumer_input_edges = 0
+        live_nodes: list[Any]
+        if dependency_names is None:
+            live_nodes = list(graph_nodes)
+        else:
+            live_nodes = []
+            for node in graph_nodes:
+                if {str(output_name) for output_name in getattr(node, "output", ()) if output_name} & dependency_names:
+                    live_nodes.append(node)
+                    continue
+                if not include_potential_weight_consumers:
+                    continue
+                body_inputs = [str(input_name) for input_name in getattr(node, "input", ())]
+                function_key = (
+                    str(getattr(node, "domain", "")),
+                    str(getattr(node, "op_type", "")),
+                    str(getattr(node, "overload", "")),
+                )
+                is_model_local_function = function_key in functions
+                is_registered_standard_operator = is_model_local_function or has_registered_standard_operator(
+                    node,
+                    opset_versions or {},
+                )
+                node_is_potential_weight_consumer = any(
+                    _onnx_potential_weight_input(
+                        node,
+                        input_index,
+                        is_model_local_function=is_model_local_function,
+                        is_registered_standard_operator=is_registered_standard_operator,
+                    )
+                    for input_index in range(len(body_inputs))
+                )
+                if node_is_potential_weight_consumer:
+                    potential_weight_consumer_seen = True
+                    potential_weight_consumer_input_edges += len(body_inputs)
+        graph_node_count = len(live_nodes)
         graph_input_count = len(getattr(subgraph, "input", ()))
-        return graph_node_count * max(graph_input_count, 1) > _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
+        node_input_edges = sum(len(getattr(node, "input", ())) for node in live_nodes)
+        work = graph_node_count * max(graph_input_count, 1) + node_input_edges
+        if potential_weight_consumer_seen:
+            potential_work = len(graph_nodes) * max(graph_input_count, 1) + potential_weight_consumer_input_edges
+            if potential_work > _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK:
+                return True
+        return work > _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
 
     def subgraph_reenters_state_with_rank_promotion(
         subgraph: Any,
@@ -2748,10 +2797,6 @@ def _build_onnx_weight_analysis_plan(
         graph_outputs = getattr(subgraph, "output", ())
         if graph_output_index < 0 or graph_output_index >= len(graph_outputs):
             return False
-        if len(graph_outputs) > _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_OUTPUTS or subgraph_analysis_work_exceeds_limit(
-            subgraph
-        ):
-            return True
         graph_output_name = _onnx_value_name(graph_outputs[graph_output_index])
         if not graph_output_name:
             return False
@@ -2763,6 +2808,13 @@ def _build_onnx_weight_analysis_plan(
             )
         else:
             output_dependency_names = output_dependency_names_override
+        if len(graph_outputs) > _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_OUTPUTS or subgraph_analysis_work_exceeds_limit(
+            subgraph,
+            output_dependency_names,
+            include_potential_weight_consumers=True,
+            opset_versions=opset_versions,
+        ):
+            return True
         restorable_output_indexes = (
             restorable_output_indexes_override
             if restorable_output_indexes_override is not None
@@ -2866,7 +2918,7 @@ def _build_onnx_weight_analysis_plan(
             function_tainted_outputs: set[str] = set()
             function_output_shapes: dict[int, tuple[int, ...]] = {}
             nested_promoted_outputs: set[str] = set()
-            if function is not None and any_tainted:
+            if function is not None and (any_tainted or body_outputs_feed_selected_output):
                 function_attributes = bound_function_attributes(function, body_node, resolve_reentry_attribute)
                 function_constants, function_bound_input_constants = bound_function_constants(
                     function,
@@ -2889,6 +2941,12 @@ def _build_onnx_weight_analysis_plan(
                     function_input_name = _onnx_value_name(function.input[input_index])
                     if function_input_name:
                         function_tainted_inputs[function_input_name] = tainted_shapes.get(input_name)
+                downstream_live_function_output_indexes = {
+                    output_index
+                    for output_index, output_name in enumerate(body_outputs)
+                    if output_name in output_dependency_names
+                }
+                function_tainted_output_indexes: set[int] = set()
                 if function_tainted_inputs:
                     function_tainted_output_indexes = graph_tainted_output_indexes(
                         function,
@@ -2903,42 +2961,53 @@ def _build_onnx_weight_analysis_plan(
                             function_tainted_output_indexes,
                         )
                     )
-                    valid_function_tainted_output_indexes = {
-                        output_index
-                        for output_index in function_tainted_output_indexes
-                        if 0 <= output_index < len(body_outputs)
+                valid_function_tainted_output_indexes = {
+                    output_index
+                    for output_index in function_tainted_output_indexes
+                    if 0 <= output_index < len(body_outputs)
+                }
+                if valid_function_tainted_output_indexes or downstream_live_function_output_indexes:
+                    restorable_function_output_indexes = (
+                        valid_function_tainted_output_indexes | downstream_live_function_output_indexes
+                    )
+                    function_output_dependency_names = graph_output_dependency_names(
+                        function,
+                        restorable_function_output_indexes,
+                        attribute_bindings=function_attributes,
+                    )
+                    relevant_function_inputs: dict[str, tuple[int, ...] | None] = {
+                        function_input_name: function_input_shape
+                        for function_input_name, function_input_shape in function_tainted_inputs.items()
+                        if function_input_name in function_output_dependency_names
                     }
-                    downstream_live_function_output_indexes = {
-                        output_index
-                        for output_index, output_name in enumerate(body_outputs)
-                        if output_name in output_dependency_names
-                    }
-                    if valid_function_tainted_output_indexes or downstream_live_function_output_indexes:
-                        restorable_function_output_indexes = (
-                            valid_function_tainted_output_indexes | downstream_live_function_output_indexes
-                        )
-                        function_output_dependency_names = graph_output_dependency_names(
-                            function,
-                            restorable_function_output_indexes,
-                            attribute_bindings=function_attributes,
-                        )
-                        relevant_function_tainted_inputs = {
+                    if not relevant_function_inputs and downstream_live_function_output_indexes:
+                        relevant_function_inputs = {
                             function_input_name: function_input_shape
-                            for function_input_name, function_input_shape in function_tainted_inputs.items()
+                            for function_input_name, function_input_shape in function_context_shapes.items()
                             if function_input_name in function_output_dependency_names
                         }
-                        if not relevant_function_tainted_inputs and downstream_live_function_output_indexes:
-                            probe_name, probe_shape = next(iter(function_tainted_inputs.items()))
-                            relevant_function_tainted_inputs = {probe_name: probe_shape}
-                    else:
-                        restorable_function_output_indexes = set()
-                        function_output_dependency_names = frozenset()
-                        relevant_function_tainted_inputs = {}
+                    if (
+                        not relevant_function_inputs
+                        and downstream_live_function_output_indexes
+                        and function_tainted_inputs
+                    ):
+                        probe_name, probe_shape = next(iter(function_tainted_inputs.items()))
+                        relevant_function_inputs = {probe_name: probe_shape}
+                else:
+                    restorable_function_output_indexes = set()
+                    function_output_dependency_names = frozenset()
+                    relevant_function_inputs = {}
+                if restorable_function_output_indexes:
                     function_analysis_exceeds_limit = (
-                        len(restorable_function_output_indexes) * max(len(relevant_function_tainted_inputs), 1)
+                        len(restorable_function_output_indexes) * max(len(relevant_function_inputs), 1)
                         > _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
                         or len(getattr(function, "output", ())) > _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_OUTPUTS
-                        or subgraph_analysis_work_exceeds_limit(function)
+                        or subgraph_analysis_work_exceeds_limit(
+                            function,
+                            function_output_dependency_names,
+                            include_potential_weight_consumers=True,
+                            opset_versions=function_versions,
+                        )
                     )
                     if function_analysis_exceeds_limit:
                         function_promoted_outputs.update(
@@ -2947,9 +3016,9 @@ def _build_onnx_weight_analysis_plan(
                                 valid_function_tainted_output_indexes,
                             )
                         )
-                    elif restorable_function_output_indexes:
+                    else:
                         representative_output_index = min(restorable_function_output_indexes)
-                        for function_input_name, function_input_shape in relevant_function_tainted_inputs.items():
+                        for function_input_name, function_input_shape in relevant_function_inputs.items():
                             function_promoted_output_indexes: set[int] = set()
                             representative_promoted = subgraph_reenters_state_with_rank_promotion(
                                 function,
@@ -3531,7 +3600,12 @@ def _build_onnx_weight_analysis_plan(
         )
         if cache_key in weight_reachability_cache:
             return weight_reachability_cache[cache_key]
-        if subgraph_analysis_work_exceeds_limit(subgraph):
+        if subgraph_analysis_work_exceeds_limit(
+            subgraph,
+            graph_output_dependency_names(subgraph, attribute_bindings=attribute_bindings),
+            include_potential_weight_consumers=True,
+            opset_versions=opset_versions,
+        ):
             result = subgraph_has_potential_weight_consumer(
                 subgraph,
                 opset_versions,
@@ -6768,8 +6842,7 @@ def _build_onnx_weight_analysis_plan(
             rank_gap_control_input_is_overridable = (
                 node.op_type in {"Expand", "Gather", "GatherND", "Reshape", "Squeeze", "Unsqueeze"}
                 and len(node.input) > 1
-                and (control_input_name := str(node.input[1])) in graph_input_names
-                and control_input_name not in constants
+                and str(node.input[1]) in graph_input_names
             )
             if (
                 rank_gap_promoting_operator
