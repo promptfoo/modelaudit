@@ -264,6 +264,10 @@ class _ValidatedPytorchStorageDataPklMembers:
     storage_member_sizes_by_data_pkl: dict[str, dict[str, int]]
 
 
+class _PickleLiteralPreservationBudgetExceeded(ValueError):
+    """Raised when suspicious-literal preservation cannot finish boundedly."""
+
+
 _TORCHSCRIPT_FORBIDDEN_AST_NAMES: frozenset[str] = frozenset(
     {
         "__builtins__",
@@ -337,6 +341,7 @@ _PICKLE_DISCOVERY_PADDING_PROBE_BUDGET_BYTES = 4 * 1024 * 1024
 _PICKLE_DISCOVERY_NUL_PADDING_VERIFY_BUDGET_BYTES = 64 * 1024 * 1024
 _PICKLE_INCOMPLETE_FRAME_MIN_PAYLOAD_OPCODES = 4
 _PYTORCH_STORAGE_TRUST_MAX_OPCODES = 100_000
+_PICKLE_LITERAL_PRESERVATION_MAX_OPCODES = _PYTORCH_STORAGE_TRUST_MAX_OPCODES
 _PYTORCH_STORAGE_TRUST_MAX_STACK_DEPTH = 1024
 _PYTORCH_STORAGE_TRUST_MAX_MEMO_ENTRIES = 100_000
 _PYTORCH_STORAGE_TRUST_MAX_TUPLE_WIDTH = 64
@@ -5029,13 +5034,24 @@ class PyTorchZipScanner(BaseScanner):
         return False
 
     @staticmethod
-    def _complete_pickle_literal_member_has_line_continuation_suspicious_text(sample: bytes) -> bool:
+    def _complete_pickle_literal_member_has_line_continuation_suspicious_text(
+        sample: bytes,
+        *,
+        opcode_budget_remaining: list[int] | None = None,
+    ) -> bool:
+        if opcode_budget_remaining is None:
+            opcode_budget_remaining = [_PICKLE_LITERAL_PRESERVATION_MAX_OPCODES]
         cursor = 0
         stream = io.BytesIO(sample)
         while cursor < len(sample):
             try:
                 stream.seek(cursor)
                 for opcode, arg, pos in pickletools.genops(stream):
+                    if opcode_budget_remaining[0] <= 0:
+                        raise _PickleLiteralPreservationBudgetExceeded(
+                            "pickle literal suspicious-text preservation exceeded its opcode budget"
+                        )
+                    opcode_budget_remaining[0] -= 1
                     if pos is None:
                         continue
                     if opcode.name == "STOP":
@@ -5054,6 +5070,8 @@ class PyTorchZipScanner(BaseScanner):
                             return True
                 else:
                     return False
+            except _PickleLiteralPreservationBudgetExceeded:
+                raise
             except Exception:
                 return PyTorchZipScanner._complete_proto0_string_literal_has_line_continuation_suspicious_text(
                     sample[cursor:]
@@ -5097,7 +5115,31 @@ class PyTorchZipScanner(BaseScanner):
             return
         if any(issue.severity == IssueSeverity.CRITICAL for issue in member_result.issues):
             return
-        if not PyTorchZipScanner._complete_pickle_literal_member_has_line_continuation_suspicious_text(pickle_data):
+        try:
+            has_suspicious_literal = (
+                PyTorchZipScanner._complete_pickle_literal_member_has_line_continuation_suspicious_text(pickle_data)
+            )
+        except _PickleLiteralPreservationBudgetExceeded:
+            reason = "pytorch_zip_literal_preservation_incomplete"
+            mark_inconclusive_scan_result(member_result, reason)
+            member_result.metadata["pickle_verdict"] = "unknown"
+            member_result.add_check(
+                name="Suspicious Literal Preservation",
+                passed=False,
+                message="PyTorch ZIP suspicious-literal preservation stopped at its opcode budget",
+                severity=IssueSeverity.INFO,
+                location=pickle_source,
+                details={
+                    "pickle_source": pickle_source,
+                    "pickle_filename": pickle_filename,
+                    "max_opcodes": _PICKLE_LITERAL_PRESERVATION_MAX_OPCODES,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": reason,
+                },
+            )
+            member_result.finish(success=False)
+            return
+        if not has_suspicious_literal:
             return
         member_result.add_check(
             name="Suspicious String Literal",

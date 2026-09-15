@@ -7473,6 +7473,32 @@ def test_pytorch_zip_literal_suspicious_text_preservation_streams_literals() -> 
     )
 
 
+def test_pytorch_zip_literal_suspicious_text_preservation_budget_exhaustion_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(pytorch_zip_scanner_module, "_PICKLE_LITERAL_PRESERVATION_MAX_OPCODES", 8)
+    member_result = ScanResult(scanner_name="pickle")
+    member_result.metadata["pickle_verdict"] = "clean"
+    member_result.finish(success=True)
+    payload = b"".join(b"S'benign'\n0" for _ in range(20)) + b"S'benign'\n."
+
+    PyTorchZipScanner._preserve_literal_suspicious_text_finding(
+        member_result,
+        payload,
+        pickle_source="model.pt:archive/data/0",
+        pickle_filename="archive/data/0",
+    )
+
+    assert member_result.success is False
+    assert member_result.metadata["pickle_verdict"] == "unknown"
+    assert member_result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "pytorch_zip_literal_preservation_incomplete" in member_result.metadata["scan_outcome_reasons"]
+    preservation_checks = [check for check in member_result.checks if check.name == "Suspicious Literal Preservation"]
+    assert len(preservation_checks) == 1
+    assert preservation_checks[0].details["analysis_incomplete"] is True
+    assert preservation_checks[0].details["scan_outcome_reason"] == "pytorch_zip_literal_preservation_incomplete"
+
+
 def test_pytorch_zip_discovery_scans_whitespace_hex_nested_pickle_literal(tmp_path: Path) -> None:
     model_path = tmp_path / "referenced_scalar_literal_hex_nested_pickle.pt"
     encoded = binascii.hexlify(b"cposix\nsystem\n)R.")
