@@ -2112,10 +2112,11 @@ def _build_onnx_weight_analysis_plan(
                 return resolved_attribute.sparse_tensor
         return None
 
-    def graph_value_is_constant_false(
+    def graph_value_is_constant_bool(
         current_graph: Any,
         value_name: str,
         inherited_constants: dict[str, Any],
+        expected_value: bool,
     ) -> bool:
         graph_constants = graph_initializer_constants(current_graph, inherited_constants)
         producers = {
@@ -2132,7 +2133,7 @@ def _build_onnx_weight_analysis_plan(
             seen.add(current_name)
             constant_value = constant_scalar_value(graph_constants.get(current_name), int(onnx.TensorProto.BOOL))
             if constant_value is not None:
-                return constant_value is False
+                return constant_value is expected_value
             producer = producers.get(current_name)
             if (
                 producer is not None
@@ -2149,9 +2150,23 @@ def _build_onnx_weight_analysis_plan(
                 and producer.op_type == "Constant"
             ):
                 constant_value = constant_scalar_value(constant_node_tensor(producer), int(onnx.TensorProto.BOOL))
-                return constant_value is False if constant_value is not None else False
+                return constant_value is expected_value if constant_value is not None else False
             return False
         return False
+
+    def graph_value_is_constant_false(
+        current_graph: Any,
+        value_name: str,
+        inherited_constants: dict[str, Any],
+    ) -> bool:
+        return graph_value_is_constant_bool(current_graph, value_name, inherited_constants, False)
+
+    def graph_value_is_constant_true(
+        current_graph: Any,
+        value_name: str,
+        inherited_constants: dict[str, Any],
+    ) -> bool:
+        return graph_value_is_constant_bool(current_graph, value_name, inherited_constants, True)
 
     def loop_body_condition_is_constant_false(node: Any, constants: dict[str, Any]) -> bool:
         for attribute in getattr(node, "attribute", ()):
@@ -2163,6 +2178,44 @@ def _build_onnx_weight_analysis_plan(
                 condition_output_name = _onnx_value_name(body.output[0])
                 return graph_value_is_constant_false(body, condition_output_name, constants)
         return False
+
+    def loop_body_condition_remains_true(node: Any, subgraph: Any, constants: dict[str, Any]) -> bool:
+        if node.op_type != "Loop":
+            return True
+        graph_outputs = getattr(subgraph, "output", ())
+        if not graph_outputs:
+            return False
+        condition_output_name = _onnx_value_name(graph_outputs[0])
+        if not condition_output_name:
+            return False
+        graph_inputs: tuple[Any, ...] = tuple(getattr(subgraph, "input", ()))
+        condition_input_name = _onnx_value_name(graph_inputs[1]) if len(graph_inputs) > 1 else ""
+        if condition_output_name and condition_output_name == condition_input_name:
+            return True
+        producers = {
+            str(output_name): body_node
+            for body_node in getattr(subgraph, "node", ())
+            for output_name in getattr(body_node, "output", ())
+            if output_name
+        }
+        seen: set[str] = set()
+        current_name = condition_output_name
+        for _ in range(8):
+            if not current_name or current_name in seen:
+                break
+            seen.add(current_name)
+            if current_name == condition_input_name:
+                return True
+            producer = producers.get(current_name)
+            if (
+                producer is None
+                or getattr(producer, "domain", "") not in _STANDARD_NEURAL_NETWORK_DOMAINS
+                or producer.op_type != "Identity"
+                or not getattr(producer, "input", ())
+            ):
+                break
+            current_name = str(producer.input[0])
+        return graph_value_is_constant_true(subgraph, condition_output_name, constants)
 
     def graph_input_is_runtime_overridable(
         value_name: str,
@@ -2723,6 +2776,9 @@ def _build_onnx_weight_analysis_plan(
     graph_output_dependency_cache: dict[
         tuple[int, tuple[int, ...] | None, tuple[tuple[str, str, str], ...]], frozenset[str]
     ] = {}
+    graph_output_dependencies_by_index_cache: dict[
+        tuple[int, tuple[tuple[str, str, str], ...]], tuple[frozenset[str], ...]
+    ] = {}
     graph_value_dependency_cache: dict[
         tuple[int, tuple[str, ...], tuple[tuple[str, str, str], ...]], tuple[Any, frozenset[str]]
     ] = {}
@@ -2832,21 +2888,43 @@ def _build_onnx_weight_analysis_plan(
         if cache_key in graph_output_dependency_cache:
             return graph_output_dependency_cache[cache_key]
         local_attribute_bindings = attribute_bindings or {}
+        per_output_dependencies_cache_key = (id(subgraph), attribute_binding_cache_key(attribute_bindings))
+        per_output_dependencies = graph_output_dependencies_by_index_cache.get(per_output_dependencies_cache_key)
+        if per_output_dependencies is None:
+            dependencies_by_index = [
+                {name} if (name := _onnx_value_name(output)) else set() for output in graph_outputs
+            ]
+            dependency_indexes_by_name: dict[str, set[int]] = {}
+            for output_index, output_dependencies in enumerate(dependencies_by_index):
+                for dependency_name in output_dependencies:
+                    dependency_indexes_by_name.setdefault(dependency_name, set()).add(output_index)
+            for body_node in reversed(getattr(subgraph, "node", ())):
+                impacted_indexes: set[int] = set()
+                for output_name in node_output_names(body_node):
+                    impacted_indexes.update(dependency_indexes_by_name.get(output_name, ()))
+                if not impacted_indexes:
+                    continue
+                direct_dependencies = graph_node_direct_dependency_names(body_node, local_attribute_bindings)
+                for output_index in impacted_indexes:
+                    before_count = len(dependencies_by_index[output_index])
+                    if merge_dependency_names(dependencies_by_index[output_index], direct_dependencies):
+                        continue
+                    if len(dependencies_by_index[output_index]) == before_count:
+                        continue
+                    for dependency_name in dependencies_by_index[output_index]:
+                        dependency_indexes_by_name.setdefault(dependency_name, set()).add(output_index)
+            per_output_dependencies = tuple(frozenset(dependencies) for dependencies in dependencies_by_index)
+            graph_output_dependencies_by_index_cache[per_output_dependencies_cache_key] = per_output_dependencies
         if output_index_key is None:
-            selected_outputs = graph_outputs
+            dependencies = set().union(*per_output_dependencies) if per_output_dependencies else set()
         else:
-            selected_outputs = tuple(
-                graph_outputs[index] for index in output_index_key if 0 <= index < len(graph_outputs)
+            dependencies = set().union(
+                *(
+                    per_output_dependencies[index]
+                    for index in output_index_key
+                    if 0 <= index < len(per_output_dependencies)
+                )
             )
-        dependencies = {name for output in selected_outputs if (name := _onnx_value_name(output))}
-        for body_node in reversed(getattr(subgraph, "node", ())):
-            body_outputs = {str(output_name) for output_name in getattr(body_node, "output", ()) if output_name}
-            if not body_outputs & dependencies:
-                continue
-            if merge_dependency_names(
-                dependencies, graph_node_direct_dependency_names(body_node, local_attribute_bindings)
-            ):
-                break
         result = frozenset(dependencies)
         graph_output_dependency_cache[cache_key] = result
         return result
@@ -6495,6 +6573,7 @@ def _build_onnx_weight_analysis_plan(
 
                     def loop_exact_iteration_count(
                         current_node: Any = node,
+                        current_subgraph: Any = subgraph,
                         *,
                         max_count: int = 1,
                     ) -> int | None:
@@ -6519,6 +6598,12 @@ def _build_onnx_weight_analysis_plan(
                         if trip_count is None or initial_condition is not True:
                             return None
                         exact_count = max(int(trip_count), 0)
+                        if exact_count > 1 and not loop_body_condition_remains_true(
+                            current_node,
+                            current_subgraph,
+                            constants,
+                        ):
+                            return None
                         return exact_count if exact_count <= max_count else None
 
                     exact_loop_replay_work_remaining = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
@@ -6756,7 +6841,7 @@ def _build_onnx_weight_analysis_plan(
                             if body_node.op_type == "Einsum":
                                 return einsum_output_shape(body_node, input_shapes_by_name)
                             if body_node.op_type in _SAME_TYPE_ELEMENTWISE_OPERATORS | {"Pow"}:
-                                return broadcast_shapes(tainted_shapes.get(input_name) for input_name in body_inputs)
+                                return broadcast_shapes(known_input_shape(input_name) for input_name in body_inputs)
                             if body_node.op_type == "Expand" and data_input_shape is not None:
                                 shape_name = body_inputs[1] if len(body_inputs) > 1 else ""
                                 target_shape = constant_int64_vector_values(subgraph_constants.get(shape_name))
@@ -7287,7 +7372,7 @@ def _build_onnx_weight_analysis_plan(
                                     current_shape,
                                     trusted_context_shapes=trusted_context_shapes,
                                     output_shapes_out=output_shapes,
-                                    related_graph_input_shapes=related_graph_input_shapes,
+                                    related_graph_input_shapes=current_related_shapes,
                                 )
                                 next_shape = output_shapes.get(graph_output_index)
                                 if next_shape is None:

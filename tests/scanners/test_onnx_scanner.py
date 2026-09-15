@@ -18756,6 +18756,127 @@ class TestWeightDistributionSemantics:
         assert grouped_dependency_calls == 1
         assert fanout_promotion_calls <= width
 
+    def _write_conditional_loop_single_iteration_slope_model(self, tmp_path: Path) -> Path:
+        body = helper.make_graph(
+            [
+                helper.make_node("PRelu", ["activation", "state"], ["unused_activation"]),
+                helper.make_node("Unsqueeze", ["state", "axes"], ["next_state"]),
+                helper.make_node(
+                    "Constant",
+                    [],
+                    ["condition_out"],
+                    value=onnx.numpy_helper.from_array(np.array(False, dtype=np.bool_)),
+                ),
+            ],
+            "conditional_loop_single_iteration_slope_body",
+            [
+                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
+                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("state", TensorProto.FLOAT, [2]),
+            ],
+            [
+                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, [1, 2]),
+            ],
+            initializer=[
+                onnx.numpy_helper.from_array(np.ones((2,), dtype=np.float32), name="activation"),
+                onnx.numpy_helper.from_array(np.array([0], dtype=np.int64), name="axes"),
+            ],
+        )
+        graph = helper.make_graph(
+            [
+                helper.make_node("Sum", [f"source{index}" for index in range(40)], ["initial_state"]),
+                helper.make_node(
+                    "Loop",
+                    ["trip_count", "initial_condition", "initial_state"],
+                    ["final_state"],
+                    body=body,
+                ),
+                helper.make_node("Identity", ["final_state"], ["Y"]),
+            ],
+            "conditional_loop_single_iteration_slope",
+            [],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 2])],
+            initializer=[
+                *[
+                    onnx.numpy_helper.from_array(np.ones((2,), dtype=np.float32), name=f"source{index}")
+                    for index in range(40)
+                ],
+                onnx.numpy_helper.from_array(np.array(3, dtype=np.int64), name="trip_count"),
+                onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="initial_condition"),
+            ],
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / "conditional-loop-single-iteration-slope.onnx"
+        onnx.save(model, str(path))
+        return path
+
+    def test_repeated_loop_treats_body_condition_as_trip_count_bound(self, tmp_path: Path) -> None:
+        result = OnnxScanner().scan(str(self._write_conditional_loop_single_iteration_slope_model(tmp_path)))
+
+        assert result.success is True
+        assert result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"] == {}
+
+    def _write_repeated_loop_evolving_sibling_shape_model(self, tmp_path: Path) -> Path:
+        body = helper.make_graph(
+            [
+                helper.make_node("Add", ["state_a", "state_b"], ["next_a"]),
+                helper.make_node("Unsqueeze", ["state_b", "axes"], ["next_b"]),
+                helper.make_node("PRelu", ["activation", "next_a"], ["body_activation"]),
+                helper.make_node("Identity", ["condition_in"], ["condition_out"]),
+            ],
+            "repeated_loop_evolving_sibling_shape_body",
+            [
+                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
+                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("state_a", TensorProto.FLOAT, [2]),
+                helper.make_tensor_value_info("state_b", TensorProto.FLOAT, [2]),
+            ],
+            [
+                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("next_a", TensorProto.FLOAT, [1, 2]),
+                helper.make_tensor_value_info("next_b", TensorProto.FLOAT, [None, None]),
+            ],
+            initializer=[
+                onnx.numpy_helper.from_array(np.ones((2,), dtype=np.float32), name="activation"),
+                onnx.numpy_helper.from_array(np.array([0], dtype=np.int64), name="axes"),
+            ],
+        )
+        graph = helper.make_graph(
+            [
+                helper.make_node(
+                    "Loop",
+                    ["trip_count", "initial_condition", "initial_a", "initial_b"],
+                    ["final_a", "final_b"],
+                    body=body,
+                ),
+                helper.make_node("MatMul", ["X", "final_a"], ["Y"]),
+            ],
+            "repeated_loop_evolving_sibling_shape",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 1])],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 2])],
+            initializer=[
+                onnx.numpy_helper.from_array(np.ones((2,), dtype=np.float32), name="initial_a"),
+                onnx.numpy_helper.from_array(np.ones((2,), dtype=np.float32), name="initial_b"),
+                onnx.numpy_helper.from_array(np.array(2, dtype=np.int64), name="trip_count"),
+                onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="initial_condition"),
+            ],
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / "repeated-loop-evolving-sibling-shape.onnx"
+        onnx.save(model, str(path))
+        return path
+
+    def test_repeated_loop_replays_current_sibling_shapes(self, tmp_path: Path) -> None:
+        result = OnnxScanner().scan(str(self._write_repeated_loop_evolving_sibling_shape_model(tmp_path)))
+
+        assert result.success is False
+        assert result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"]["lineages_per_value_limit"] >= 1
+
     def test_dead_local_function_inputs_do_not_repeat_weight_input_checks(
         self,
         tmp_path: Path,
