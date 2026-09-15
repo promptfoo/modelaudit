@@ -2473,7 +2473,10 @@ def _build_onnx_weight_analysis_plan(
         tuple[int, tuple[str, ...] | None],
         tuple[Any, int, tuple[tuple[str, str, str], ...]],
     ] = {}
-    trusted_shape_keys: dict[int, tuple[Any, int, tuple[tuple[str, tuple[int, ...]], ...]]] = {}
+    trusted_shape_keys: dict[
+        tuple[int, tuple[str, ...] | None],
+        tuple[Any, int, tuple[tuple[str, tuple[int, ...]], ...]],
+    ] = {}
     rank_reentry_constant_name_cache: dict[tuple[int, int], frozenset[str]] = {}
 
     def semantic_cache_fingerprint(value: Any) -> tuple[str, str]:
@@ -2541,10 +2544,12 @@ def _build_onnx_weight_analysis_plan(
 
     def trusted_context_shape_cache_key(
         trusted_context_shapes: dict[str, tuple[int, ...]],
+        names: frozenset[str] | None = None,
     ) -> tuple[tuple[str, tuple[int, ...]], ...]:
         if not trusted_context_shapes:
             return ()
-        owner_key = id(trusted_context_shapes)
+        names_key = tuple(sorted(str(name) for name in names)) if names is not None else None
+        owner_key = (id(trusted_context_shapes), names_key)
         cached_key = trusted_shape_keys.get(owner_key)
         if (
             cached_key is not None
@@ -2552,7 +2557,13 @@ def _build_onnx_weight_analysis_plan(
             and cached_key[1] == len(trusted_context_shapes)
         ):
             return cached_key[2]
-        cache_key = tuple(sorted((str(name), tuple(shape)) for name, shape in trusted_context_shapes.items()))
+        cache_key = (
+            tuple(sorted((str(name), tuple(shape)) for name, shape in trusted_context_shapes.items()))
+            if names_key is None
+            else tuple(
+                (name, tuple(trusted_context_shapes[name])) for name in names_key if name in trusted_context_shapes
+            )
+        )
         trusted_shape_keys[owner_key] = (trusted_context_shapes, len(trusted_context_shapes), cache_key)
         return cache_key
 
@@ -2741,7 +2752,7 @@ def _build_onnx_weight_analysis_plan(
             id(subgraph),
             graph_input_name,
             graph_input_shape,
-            trusted_context_shape_cache_key(trusted_context_shapes),
+            trusted_context_shape_cache_key(trusted_context_shapes, output_dependency_names),
             opset_cache_key(opset_versions),
             attribute_binding_cache_key(attribute_bindings),
             constant_binding_cache_key(constants, rank_reentry_constant_names(subgraph)),
@@ -2848,38 +2859,53 @@ def _build_onnx_weight_analysis_plan(
                     input_shape = input_shapes_by_name.get(input_name)
                     if function_input_name and input_shape is not None:
                         function_context_shapes[function_input_name] = input_shape
+                function_tainted_inputs: dict[str, tuple[int, ...] | None] = {}
                 for input_index, input_name in enumerate(body_inputs):
                     if input_name not in tainted or input_index >= len(getattr(function, "input", ())):
                         continue
                     function_input_name = _onnx_value_name(function.input[input_index])
-                    function_input_shape = tainted_shapes.get(input_name)
+                    if function_input_name:
+                        function_tainted_inputs[function_input_name] = tainted_shapes.get(input_name)
+                if function_tainted_inputs:
+                    function_tainted_output_indexes = graph_tainted_output_indexes(
+                        function,
+                        set(function_tainted_inputs),
+                        function_versions,
+                        attribute_bindings=function_attributes,
+                        depth=depth + 1,
+                    )
                     function_tainted_outputs.update(
                         mapped_node_outputs(
                             body_outputs,
-                            graph_tainted_output_indexes(
-                                function,
-                                {function_input_name},
-                                function_versions,
-                                attribute_bindings=function_attributes,
-                                depth=depth + 1,
-                            ),
+                            function_tainted_output_indexes,
                         )
                     )
-                    for output_index, output_name in enumerate(body_outputs):
-                        if subgraph_reenters_state_with_rank_promotion(
+                    for output_index in function_tainted_output_indexes:
+                        if output_index < 0 or output_index >= len(body_outputs):
+                            continue
+                        output_dependency_names = graph_output_dependency_names(
                             function,
-                            function_input_name,
-                            output_index,
-                            function_constants,
-                            function_versions,
-                            function_input_shape,
+                            (output_index,),
                             attribute_bindings=function_attributes,
-                            bound_input_constants=function_bound_input_constants,
-                            trusted_context_shapes=function_context_shapes,
-                            output_shapes_out=function_output_shapes,
-                            depth=depth + 1,
-                        ):
-                            function_promoted_outputs.add(output_name)
+                        )
+                        for function_input_name, function_input_shape in function_tainted_inputs.items():
+                            if function_input_name not in output_dependency_names:
+                                continue
+                            if subgraph_reenters_state_with_rank_promotion(
+                                function,
+                                function_input_name,
+                                output_index,
+                                function_constants,
+                                function_versions,
+                                function_input_shape,
+                                attribute_bindings=function_attributes,
+                                bound_input_constants=function_bound_input_constants,
+                                trusted_context_shapes=function_context_shapes,
+                                output_shapes_out=function_output_shapes,
+                                depth=depth + 1,
+                            ):
+                                function_promoted_outputs.add(body_outputs[output_index])
+                                break
                 for output_index, output_name in enumerate(body_outputs):
                     output_shape = function_output_shapes.get(output_index)
                     if output_shape is not None:
@@ -2925,7 +2951,7 @@ def _build_onnx_weight_analysis_plan(
                     )
                     external_context_cache_key = (
                         id(nested_graph),
-                        trusted_context_shape_cache_key(trusted_context_shapes),
+                        trusted_context_shape_cache_key(trusted_context_shapes, nested_external_names),
                         constant_binding_cache_key(subgraph_constants, nested_external_names),
                         depth,
                     )
@@ -3265,15 +3291,19 @@ def _build_onnx_weight_analysis_plan(
                 mapped_outputs: set[str] = set()
                 function_attributes = bound_function_attributes(function, body_node, resolve_reentry_attribute)
                 function_versions = function_opset_versions(function, opset_versions)
-                for input_index, input_name in enumerate(body_inputs):
-                    if input_name not in tainted or input_index >= len(getattr(function, "input", ())):
-                        continue
+                function_input_names = {
+                    _onnx_value_name(function.input[input_index])
+                    for input_index, input_name in enumerate(body_inputs)
+                    if input_name in tainted and input_index < len(getattr(function, "input", ()))
+                }
+                function_input_names.discard("")
+                if function_input_names:
                     mapped_outputs.update(
                         mapped_node_outputs(
                             body_outputs,
                             graph_tainted_output_indexes(
                                 function,
-                                {_onnx_value_name(function.input[input_index])},
+                                function_input_names,
                                 function_versions,
                                 attribute_bindings=function_attributes,
                                 depth=depth + 1,
@@ -3535,30 +3565,35 @@ def _build_onnx_weight_analysis_plan(
                         attribute_bindings=function_attributes,
                         depth=depth + 1,
                     )
+                    function_input_names: set[str] = set()
                     for input_index, input_name in enumerate(body_inputs):
                         if input_name not in tainted or input_index >= len(getattr(function, "input", ())):
                             continue
+                        function_input_name = _onnx_value_name(function.input[input_index])
+                        if not function_input_name:
+                            continue
+                        function_input_names.add(function_input_name)
                         if function_has_weight_consumer and subgraph_state_input_can_reach_weight_consumer(
                             function,
-                            str(function.input[input_index]),
+                            function_input_name,
                             function_versions,
                             attribute_bindings=function_attributes,
                             depth=depth + 1,
                         ):
                             return finish(True)
-                        if body_outputs_live_after:
-                            function_tainted_outputs.update(
-                                mapped_node_outputs(
-                                    body_outputs,
-                                    graph_tainted_output_indexes(
-                                        function,
-                                        {_onnx_value_name(function.input[input_index])},
-                                        function_versions,
-                                        attribute_bindings=function_attributes,
-                                        depth=depth + 1,
-                                    ),
-                                )
+                    if body_outputs_live_after and function_input_names:
+                        function_tainted_outputs.update(
+                            mapped_node_outputs(
+                                body_outputs,
+                                graph_tainted_output_indexes(
+                                    function,
+                                    function_input_names,
+                                    function_versions,
+                                    attribute_bindings=function_attributes,
+                                    depth=depth + 1,
+                                ),
                             )
+                        )
                     tainted.update(function_tainted_outputs)
                 for attribute in getattr(body_node, "attribute", ()):
                     resolved_attribute = resolve_reentry_attribute(attribute)

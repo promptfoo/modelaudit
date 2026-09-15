@@ -17117,6 +17117,191 @@ class TestWeightDistributionSemantics:
         semantics = result.metadata["onnx_weight_distribution_semantics"]
         assert semantics["coverage_gaps"] == {}
 
+    def _write_repeated_local_function_alias_model(
+        self,
+        tmp_path: Path,
+        *,
+        width: int,
+        matrix_output: bool,
+    ) -> Path:
+        tmp_path.mkdir(parents=True, exist_ok=True)
+        outputs = [f"fanout{index}" for index in range(width)]
+        function = helper.make_function(
+            "local",
+            "Fanout",
+            [f"input{index}" for index in range(width)],
+            [f"output{index}" for index in range(width)],
+            [helper.make_node("Identity", [f"input{index}"], [f"output{index}"]) for index in range(width)],
+            opset_imports=[helper.make_opsetid("", 13)],
+        )
+        body_nodes = [
+            helper.make_node("Fanout", ["state"] * width, outputs, domain="local"),
+        ]
+        next_state = outputs[0]
+        next_state_shape: list[int | None] = [2]
+        if matrix_output:
+            body_nodes.append(helper.make_node("Unsqueeze", [outputs[0], "unsqueeze_axis"], ["next_state"]))
+            next_state = "next_state"
+            next_state_shape = [2, 1]
+        body_nodes.append(helper.make_node("Identity", ["condition_in"], ["condition_out"]))
+        body = helper.make_graph(
+            body_nodes,
+            "local_function_repeated_alias_body",
+            [
+                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
+                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("state", TensorProto.FLOAT, [2]),
+            ],
+            [
+                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
+                helper.make_tensor_value_info(next_state, TensorProto.FLOAT, next_state_shape),
+            ],
+        )
+        graph = helper.make_graph(
+            [
+                helper.make_node(
+                    "Loop",
+                    ["trip_count", "initial_condition", "initial_state"],
+                    ["final_state"],
+                    body=body,
+                ),
+                helper.make_node("MatMul", ["X", "final_state"], ["Y"]),
+            ],
+            "local_function_repeated_alias",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 2])],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 1] if matrix_output else [1])],
+            initializer=[
+                onnx.numpy_helper.from_array(np.ones((2,), dtype=np.float32), name="initial_state"),
+                onnx.numpy_helper.from_array(np.array(2, dtype=np.int64), name="trip_count"),
+                onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="initial_condition"),
+                onnx.numpy_helper.from_array(np.array([1], dtype=np.int64), name="unsqueeze_axis"),
+            ],
+        )
+        model = helper.make_model(
+            graph,
+            functions=[function],
+            opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
+        )
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / f"local-function-repeated-alias-{matrix_output}.onnx"
+        onnx.save(model, str(path))
+        return path
+
+    def test_repeated_local_function_alias_taint_is_grouped(self, tmp_path: Path) -> None:
+        width = 16
+        path = self._write_repeated_local_function_alias_model(tmp_path, width=width, matrix_output=False)
+        scanner_path = Path(onnx_scanner_module.__file__).resolve()
+        fanout_taint_walks = 0
+        fanout_taint_node_visits = 0
+        fanout_promotion_calls = 0
+        fanout_queries: set[tuple[str, ...]] = set()
+
+        def profile(frame: Any, event: str, arg: Any) -> None:
+            nonlocal fanout_taint_node_visits, fanout_taint_walks, fanout_promotion_calls
+            if Path(frame.f_code.co_filename).resolve() != scanner_path:
+                return
+            if getattr(frame.f_locals.get("subgraph"), "name", "") != "Fanout":
+                return
+            if frame.f_code.co_name == "graph_tainted_output_indexes":
+                if event == "call":
+                    fanout_queries.add(tuple(sorted(frame.f_locals.get("graph_input_names", ()))))
+                elif event == "return" and isinstance(arg, set) and "tainted" in frame.f_locals:
+                    fanout_taint_walks += 1
+                    fanout_taint_node_visits += len(frame.f_locals["subgraph"].node)
+            elif frame.f_code.co_name == "subgraph_reenters_state_with_rank_promotion" and event == "call":
+                fanout_promotion_calls += 1
+
+        try:
+            sys.setprofile(profile)
+            result = OnnxScanner().scan(str(path))
+        finally:
+            sys.setprofile(None)
+
+        assert result.success is True
+        assert result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"] == {}
+        assert len(fanout_queries) == 1
+        assert fanout_taint_walks == 1
+        assert fanout_taint_node_visits == width
+        assert fanout_promotion_calls <= width
+
+        positive_path = self._write_repeated_local_function_alias_model(
+            tmp_path / "positive",
+            width=width,
+            matrix_output=True,
+        )
+        positive_result = OnnxScanner().scan(str(positive_path))
+        assert positive_result.success is False
+        assert (
+            positive_result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"]["lineages_per_value_limit"]
+            >= 1
+        )
+
+    def _write_context_prefix_loop_model(self, tmp_path: Path, *, width: int) -> Path:
+        states = [helper.make_tensor_value_info(f"state{index}", TensorProto.FLOAT, [2]) for index in range(width)]
+        body = helper.make_graph(
+            [],
+            "unchanged_state_body",
+            [
+                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
+                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
+                *states,
+            ],
+            [helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []), *states],
+        )
+        graph = helper.make_graph(
+            [
+                helper.make_node(
+                    "Loop",
+                    ["trip_count", "initial_condition", *[f"initial{index}" for index in range(width)]],
+                    [f"final{index}" for index in range(width)],
+                    body=body,
+                ),
+                helper.make_node("Identity", ["dummy"], ["Y"]),
+            ],
+            "context_prefix_loop",
+            [helper.make_tensor_value_info(f"initial{index}", TensorProto.FLOAT, [2]) for index in range(width)],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [])],
+            initializer=[
+                onnx.numpy_helper.from_array(np.array(2, dtype=np.int64), name="trip_count"),
+                onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="initial_condition"),
+                onnx.numpy_helper.from_array(np.array(0.0, dtype=np.float32), name="dummy"),
+            ],
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model, full_check=True)
+        path = tmp_path / "context-prefix-loop.onnx"
+        onnx.save(model, str(path))
+        return path
+
+    def test_trusted_context_shape_keys_are_scoped_to_dependencies(self, tmp_path: Path) -> None:
+        width = 32
+        path = self._write_context_prefix_loop_model(tmp_path, width=width)
+        scanner_path = Path(onnx_scanner_module.__file__).resolve()
+        shape_key_lengths: list[int] = []
+
+        def profile(frame: Any, event: str, arg: Any) -> None:
+            if (
+                event == "return"
+                and frame.f_code.co_name == "trusted_context_shape_cache_key"
+                and Path(frame.f_code.co_filename).resolve() == scanner_path
+                and isinstance(arg, tuple)
+            ):
+                shape_key_lengths.append(len(arg))
+
+        try:
+            sys.setprofile(profile)
+            result = OnnxScanner().scan(str(path))
+        finally:
+            sys.setprofile(None)
+
+        assert result.success is True
+        assert result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"] == {}
+        assert shape_key_lengths
+        assert max(shape_key_lengths) <= 2
+        assert sum(shape_key_lengths) <= width * 3
+
     def test_local_function_attribute_fingerprint_cache_retains_protobuf_wrappers(self, tmp_path: Path) -> None:
         scanner_path = Path(onnx_scanner_module.__file__).resolve()
 
