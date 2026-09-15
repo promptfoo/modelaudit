@@ -20,6 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Avoid incomplete ONNX weight analysis when Gather nodes read dimensions from Shape outputs.
 - Avoid incomplete ONNX weight analysis when large runtime-activation fanout only adds dynamic bookkeeping lineage.
+- Avoid incomplete ONNX weight analysis when mixed shape and activation bookkeeping fanout does not feed generated weights.
+- Preserve ONNX lineage coverage when zero-length Scan paths, overridable shape defaults, or capped rank-promotable values can hide generated weights.
 - Treat documentation, license, and repository links in verified pickle and ONNX metadata as informational across supported Python versions while preserving active and unknown network destinations.
 - Preserve incomplete-scan diagnostics for malformed or unsupported ZIP data in GGUF/GGML files, including cached scans.
 - Report incomplete coverage when a GGUF/GGML source changes during scanning.
@@ -42,6 +44,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Preserve macOS scan-result cache entries during unrelated temporary-file churn while rejecting replaced source files and directories.
 - Keep macOS scan-result caching enabled when hashing updates a model file's access time.
 - Keep scanning referenced PyTorch storage members when hidden pickle, encoded literal, frame-first, or malformed-separator payloads cross trusted probe boundaries.
+- Bound ONNX repeated-state reentry work while preserving local-function, shape, and lineage coverage.
 - Preserve call-graph coverage for source-backed builtin aliases and non-canonical stdlib mailbox constructors.
 - Scan all bounded encoded pickle metadata that fits the decoded-byte budget, avoiding incomplete PyTorch ZIP coverage on harmless small encoded tokens.
 - Install `tomli` for Python 3.10 runtime environments so no-default-groups scanner installs can read ModelAudit TOML configuration.
