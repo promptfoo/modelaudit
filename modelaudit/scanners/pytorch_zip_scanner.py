@@ -4705,7 +4705,7 @@ class PyTorchZipScanner(BaseScanner):
             literal_start = literal_opcode_start + 1
         else:
             return None
-        literal_scan_limit = min(len(value), literal_start + _PICKLE_DISCOVERY_LONG_PROBE_BYTES)
+        literal_scan_limit = min(len(value), literal_start + _PICKLE_DISCOVERY_LONG_PROBE_BYTES + 1)
         if value.find(b"\n", literal_start, literal_scan_limit) >= 0:
             return None
         return literal_scan_limit
@@ -4741,7 +4741,7 @@ class PyTorchZipScanner(BaseScanner):
             if literal_opcode_start + 2 > len(value) or value[literal_opcode_start + 1] not in {ord("'"), ord('"')}:
                 return None
             literal_start = literal_opcode_start + 2
-            literal_scan_limit = min(len(value), literal_start + _PICKLE_DISCOVERY_LONG_PROBE_BYTES)
+            literal_scan_limit = min(len(value), literal_start + _PICKLE_DISCOVERY_LONG_PROBE_BYTES + 1)
             literal_end = value.find(b"\n", literal_start, literal_scan_limit)
             if literal_end < 0:
                 return None
@@ -4750,7 +4750,7 @@ class PyTorchZipScanner(BaseScanner):
             return None
         elif marker == ord("V"):
             literal_start = literal_opcode_start + 1
-            literal_scan_limit = min(len(value), literal_start + _PICKLE_DISCOVERY_LONG_PROBE_BYTES)
+            literal_scan_limit = min(len(value), literal_start + _PICKLE_DISCOVERY_LONG_PROBE_BYTES + 1)
             literal_end = value.find(b"\n", literal_start, literal_scan_limit)
             if literal_end < 0:
                 return None

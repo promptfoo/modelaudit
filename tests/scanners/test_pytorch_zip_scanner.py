@@ -8994,6 +8994,21 @@ def test_pytorch_zip_raw_nested_proto0_string_long_terminated_literal_span() -> 
     assert PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(positive_persid) is True
 
 
+def test_pytorch_zip_raw_nested_proto0_string_boundary_newline_literal_span() -> None:
+    persid_noise = b"Pnot-a-persid"
+    prefix = b"!" * 128
+    suffix = b"!" * (pytorch_zip_scanner_module._PICKLE_DISCOVERY_LONG_PROBE_BYTES - len(prefix) - len(persid_noise))
+    literal_body = prefix + persid_noise + suffix
+    benign_string = b"S'" + literal_body + b"\n."
+    benign_unicode = b"V" + literal_body + b"\n."
+    positive_persid = b"S'benign'\nPstorage-key\n."
+
+    assert len(literal_body) == pytorch_zip_scanner_module._PICKLE_DISCOVERY_LONG_PROBE_BYTES
+    assert PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(benign_string) is False
+    assert PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(benign_unicode) is False
+    assert PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(positive_persid) is True
+
+
 def test_pytorch_zip_proto0_string_enclosing_span_recovery() -> None:
     value = b"S'" + (b"!" * 128) + b"Pnot-a-persid" + (b"!" * 128) + b"'\n."
     offset = value.index(b"P")
