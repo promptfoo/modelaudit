@@ -4139,13 +4139,21 @@ class PyTorchZipScanner(BaseScanner):
     def _parsed_prefix_memo_keys(prefix: bytes) -> set[str]:
         memo_keys = PyTorchZipScanner._parsed_prefix_memo_keys_from_start(prefix)
         starts_checked = 0
-        for offset, marker in enumerate(prefix[1:], start=1):
+        offset = 1
+        while offset < len(prefix):
+            marker = prefix[offset]
             if marker not in _RAW_NESTED_SECURITY_PICKLE_START_BYTES:
+                offset += 1
+                continue
+            span = PyTorchZipScanner._raw_nested_enclosing_pickle_literal_span(prefix, offset)
+            if span is not None:
+                offset = max(offset + 1, span[2] + 1)
                 continue
             starts_checked += 1
             if starts_checked > _MAX_RAW_NESTED_PICKLE_CANDIDATES:
                 return memo_keys
             memo_keys.update(PyTorchZipScanner._parsed_prefix_memo_keys_from_start(prefix[offset:]))
+            offset += 1
         return memo_keys
 
     @staticmethod
@@ -4465,47 +4473,52 @@ class PyTorchZipScanner(BaseScanner):
 
     @staticmethod
     def _raw_nested_enclosing_pickle_literal_span(value: bytes, offset: int) -> tuple[int, int, int] | None:
-        search_end = offset
-        attempts = 0
-        while search_end > 0 and attempts < _MAX_RAW_NESTED_PICKLE_CANDIDATES:
-            cursor = max(
+        search_start = max(0, offset - (_PICKLE_DISCOVERY_LONG_PROBE_BYTES * 4))
+        cursor = search_start
+        while cursor < offset:
+            literal_opcode_start = min(
                 (
                     found
                     for marker in _PICKLE_LENGTH_DELIMITED_LITERAL_START_BYTES
-                    if (found := value.rfind(bytes([marker]), 0, search_end)) >= 0
+                    if (found := value.find(bytes([marker]), cursor, offset)) >= 0
                 ),
                 default=-1,
             )
-            if cursor < 0:
+            if literal_opcode_start < 0:
                 return None
-            attempts += 1
-            marker = value[cursor]
+            marker = value[literal_opcode_start]
             if marker in {ord("B"), ord("T"), ord("X")}:
                 header_bytes = 5
-                if cursor + header_bytes > len(value):
-                    cursor += 1
+                if literal_opcode_start + header_bytes > len(value):
+                    cursor = literal_opcode_start + 1
                     continue
-                literal_size = int.from_bytes(value[cursor + 1 : cursor + header_bytes], "little")
+                literal_size = int.from_bytes(
+                    value[literal_opcode_start + 1 : literal_opcode_start + header_bytes],
+                    "little",
+                )
             elif marker in {ord("C"), ord("U"), 0x8C}:
                 header_bytes = 2
-                if cursor + header_bytes > len(value):
-                    cursor += 1
+                if literal_opcode_start + header_bytes > len(value):
+                    cursor = literal_opcode_start + 1
                     continue
-                literal_size = value[cursor + 1]
+                literal_size = value[literal_opcode_start + 1]
             elif marker in {0x8D, 0x8E, 0x96}:
                 header_bytes = 9
-                if cursor + header_bytes > len(value):
-                    cursor += 1
+                if literal_opcode_start + header_bytes > len(value):
+                    cursor = literal_opcode_start + 1
                     continue
-                literal_size = int.from_bytes(value[cursor + 1 : cursor + header_bytes], "little")
+                literal_size = int.from_bytes(
+                    value[literal_opcode_start + 1 : literal_opcode_start + header_bytes],
+                    "little",
+                )
             else:
-                cursor += 1
+                cursor = literal_opcode_start + 1
                 continue
-            literal_start = cursor + header_bytes
+            literal_start = literal_opcode_start + header_bytes
             literal_end = literal_start + literal_size
             if literal_start <= offset < literal_end and literal_end < len(value) and value[literal_end] == ord("."):
-                return cursor, literal_start, literal_end
-            search_end = cursor
+                return literal_opcode_start, literal_start, literal_end
+            cursor = literal_opcode_start + 1
         return None
 
     @staticmethod

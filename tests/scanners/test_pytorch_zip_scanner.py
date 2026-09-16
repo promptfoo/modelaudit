@@ -3565,6 +3565,35 @@ def test_pytorch_zip_discovery_skips_deep_p_marker_inside_binbytes_literal(
     assert not any(issue.details.get("pickle_filename") == "archive/data/0" for issue in result.issues)
 
 
+def test_pytorch_zip_discovery_skips_literal_p_marker_after_decoy_headers(
+    tmp_path: Path,
+) -> None:
+    model_path = tmp_path / "referenced_storage_impossible_prefix_literal_p_after_decoy_headers.pt"
+    prefix = b"X" + (3_191_733_531).to_bytes(4, "little")
+    decoys = b"c!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)
+    inert_padding = b"!" * (70 * 1024)
+    decoy_headers = b"B!!!!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)
+    literal_payload = decoy_headers + b"P" + (b"!" * (9 * 1024))
+    storage_blob = prefix + decoys + inert_padding
+    storage_blob += b"B" + len(literal_payload).to_bytes(4, "little") + literal_payload + b"."
+    storage_blob += b"!" * (-len(storage_blob) % 4)
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        zip_file.writestr("archive/data/0", storage_blob)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert result.success is True
+    assert result.metadata.get("pickle_verdict") == "clean"
+    assert result.metadata["pickle_files"] == ["archive/data.pkl"]
+    assert not any(
+        check.name == "Pickle Discovery" and check.details.get("analysis_incomplete") for check in result.checks
+    )
+    assert not any(issue.details.get("pickle_filename") == "archive/data/0" for issue in result.issues)
+
+
 def test_pytorch_zip_discovery_skips_deep_p_marker_inside_binunicode_literal(
     tmp_path: Path,
 ) -> None:
@@ -8119,6 +8148,32 @@ def test_pytorch_zip_encoded_nested_pickle_route_scans_later_structural_windows(
 
 def test_pytorch_zip_raw_nested_budget_recovery_collects_later_memo_streams() -> None:
     decoy_stream = b"S'decoy'\np9\n."
+    real_memo_stream = b"S'safe_module'\np0\nS'safe_name'\np1\nS'safe_arg'\np2\n"
+    decoys = b"c!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)
+    gap = b"B" + (9 * 1024).to_bytes(4, "little") + (b"A" * (9 * 1024)) + b"0"
+    payload = decoy_stream + real_memo_stream + decoys + b"g0\n" + gap + b"g1\n\x93g2\n\x85R."
+    near_match = decoy_stream + real_memo_stream + decoys + b"g0\n" + gap + b"g1\n."
+    search_start = payload.index(b"g0\n")
+
+    assert (
+        PyTorchZipScanner._raw_nested_security_pickle_candidate_budget_exhausted_needs_scan(
+            payload,
+            search_start=search_start,
+        )
+        is True
+    )
+    assert (
+        PyTorchZipScanner._raw_nested_security_pickle_candidate_budget_exhausted_needs_scan(
+            near_match,
+            search_start=search_start,
+        )
+        is False
+    )
+
+
+def test_pytorch_zip_raw_nested_budget_recovery_skips_literal_noise_before_memos() -> None:
+    decoy_payload = b"U!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)
+    decoy_stream = b"B" + len(decoy_payload).to_bytes(4, "little") + decoy_payload + b"."
     real_memo_stream = b"S'safe_module'\np0\nS'safe_name'\np1\nS'safe_arg'\np2\n"
     decoys = b"c!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)
     gap = b"B" + (9 * 1024).to_bytes(4, "little") + (b"A" * (9 * 1024)) + b"0"
