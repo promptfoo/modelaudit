@@ -4409,7 +4409,7 @@ class PyTorchZipScanner(BaseScanner):
                     cursor += 1
                     continue
                 literal_size = value[cursor + 1]
-            elif marker in {0x8E, 0x96}:
+            elif marker in {0x8D, 0x8E, 0x96}:
                 header_bytes = 9
                 if cursor + header_bytes > len(value):
                     cursor += 1
