@@ -4337,7 +4337,7 @@ class PyTorchZipScanner(BaseScanner):
             )
             if offset < 0:
                 return False
-            if PyTorchZipScanner._raw_nested_offset_is_inside_binary_byte_literal(value, offset):
+            if PyTorchZipScanner._raw_nested_offset_is_inside_pickle_literal(value, offset):
                 search_start = offset + 1
                 continue
             candidate = value[offset : offset + _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES]
@@ -4351,17 +4351,17 @@ class PyTorchZipScanner(BaseScanner):
         return False
 
     @staticmethod
-    def _raw_nested_offset_is_inside_binary_byte_literal(value: bytes, offset: int) -> bool:
+    def _raw_nested_offset_is_inside_pickle_literal(value: bytes, offset: int) -> bool:
         cursor = 0
         while cursor < offset:
             marker = value[cursor]
-            if marker == ord("B"):
+            if marker in {ord("B"), ord("T"), ord("X")}:
                 header_bytes = 5
                 if cursor + header_bytes > len(value):
                     cursor += 1
                     continue
                 literal_size = int.from_bytes(value[cursor + 1 : cursor + header_bytes], "little")
-            elif marker == ord("C"):
+            elif marker in {ord("C"), ord("U"), 0x8C}:
                 header_bytes = 2
                 if cursor + header_bytes > len(value):
                     cursor += 1
@@ -4378,14 +4378,7 @@ class PyTorchZipScanner(BaseScanner):
                 continue
             literal_start = cursor + header_bytes
             literal_end = literal_start + literal_size
-            if (
-                literal_start <= offset < literal_end
-                and literal_end < len(value)
-                and value[literal_end] == ord(".")
-                and PyTorchZipScanner._has_complete_pickle_stream_without_frame_stop_overrun(
-                    value[cursor : literal_end + 1]
-                )
-            ):
+            if literal_start <= offset < literal_end and literal_end < len(value) and value[literal_end] == ord("."):
                 return True
             cursor += 1
         return False
