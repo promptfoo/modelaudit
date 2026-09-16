@@ -2712,7 +2712,7 @@ class PyTorchZipScanner(BaseScanner):
             header_bytes = 5
             if len(candidate) < header_bytes:
                 return None
-            declared_size = int.from_bytes(candidate[1:header_bytes], "little")
+            declared_size = int.from_bytes(candidate[1:header_bytes], "little", signed=True)
         elif candidate.startswith(bytes([0x8D])):
             header_bytes = 9
             if len(candidate) < header_bytes:
@@ -2740,6 +2740,8 @@ class PyTorchZipScanner(BaseScanner):
             declared_size = int.from_bytes(candidate[1:header_bytes], "little")
         else:
             return None
+        if declared_size < 0:
+            return skipped_bytes + header_bytes
         if declared_size <= max(0, remaining_entry_bytes - header_bytes):
             return None
         return skipped_bytes + header_bytes
@@ -4200,6 +4202,12 @@ class PyTorchZipScanner(BaseScanner):
             or PyTorchZipScanner._raw_nested_security_pickle_candidate_has_structural_signal(
                 stripped_suffix,
                 parse_budget_remaining=parse_budget_remaining,
+            )
+            or PyTorchZipScanner._raw_nested_proto0_inst_with_prior_window_mark_seen(
+                value,
+                search_start,
+                min(len(value), search_start + _PICKLE_DISCOVERY_LONG_PROBE_BYTES),
+                parse_budget_remaining,
             )
             or PyTorchZipScanner._raw_nested_security_pickle_candidate_has_later_structural_signal(
                 value,

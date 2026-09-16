@@ -3097,6 +3097,18 @@ def test_pytorch_zip_discovery_fails_closed_for_impossible_long_prefix(
     )
 
 
+def test_pytorch_zip_discovery_treats_negative_long4_size_as_impossible() -> None:
+    sample = b"\x8b\x00\x00\x00\x80" + _malicious_proto0_system_payload()
+
+    assert (
+        PyTorchZipScanner._impossible_declared_storage_prefix_header_end(
+            sample,
+            entry_size=(2**31) + len(_malicious_proto0_system_payload()),
+        )
+        == 5
+    )
+
+
 @pytest.mark.parametrize("padding_kib", [70, 118])
 def test_pytorch_zip_discovery_fails_closed_for_hidden_pickle_after_raw_candidate_budget_gap(
     tmp_path: Path,
@@ -7909,6 +7921,20 @@ def test_pytorch_zip_encoded_nested_pickle_route_fails_closed_after_candidate_bu
 
     assert PyTorchZipScanner._literal_value_has_encoded_nested_security_pickle(base64.b64encode(payload)) is True
     assert PyTorchZipScanner._literal_value_has_encoded_nested_security_pickle(binascii.hexlify(payload)) is True
+
+
+def test_pytorch_zip_encoded_nested_pickle_route_preserves_prior_mark_inst_context() -> None:
+    payload = (
+        b"("
+        + (b"c!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1))
+        + b"g0\n"
+        + (b"N" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES + 64))
+        + b"ishutil\nrmtree\n"
+    )
+    near_match = b"!" + payload[1:]
+
+    assert PyTorchZipScanner._literal_value_has_encoded_nested_security_pickle(base64.b64encode(payload)) is True
+    assert PyTorchZipScanner._literal_value_has_encoded_nested_security_pickle(base64.b64encode(near_match)) is False
 
 
 def test_pytorch_zip_encoded_nested_pickle_route_scans_later_structural_windows() -> None:
