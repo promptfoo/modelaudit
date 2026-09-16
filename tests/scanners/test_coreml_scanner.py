@@ -40,12 +40,13 @@ def _build_user_metadata_entry(key: str, value: str) -> bytes:
 def _build_metadata(
     *,
     short_description: str = "Safe CoreML model",
+    license_text: str = "MIT",
     user_defined: dict[str, str] | None = None,
 ) -> bytes:
     metadata = _field_bytes(1, short_description.encode("utf-8"))
     metadata += _field_bytes(2, b"1.0.0")
     metadata += _field_bytes(3, b"ModelAudit Tests")
-    metadata += _field_bytes(4, b"MIT")
+    metadata += _field_bytes(4, license_text.encode("utf-8"))
 
     if user_defined:
         for key, value in user_defined.items():
@@ -478,6 +479,55 @@ def test_coreml_scanner_safe_metadata_keys_still_scan_suspicious_urls(tmp_path: 
 
     assert findings
     assert all(issue.severity == IssueSeverity.WARNING for issue in findings)
+
+
+def test_coreml_scanner_builtin_license_reference_url_is_informational(tmp_path: Path) -> None:
+    model_path = _write_model(
+        tmp_path / "license_reference.mlmodel",
+        _build_model(
+            description=_build_description(
+                metadata=_build_metadata(
+                    license_text="Please see https://github.com/fchollet/deep-learning-models for license information."
+                )
+            ),
+            neural_network=_build_neural_network(layers=[_build_layer("dense_1")]),
+        ),
+    )
+
+    result = CoreMLScanner().scan(str(model_path))
+
+    assert result.success is True
+    assert not [
+        issue
+        for issue in result.issues
+        if issue.details.get("metadata_key") == "license" and issue.details.get("pattern_type") == "network"
+    ]
+
+
+def test_coreml_scanner_builtin_license_reference_still_detects_appended_command(tmp_path: Path) -> None:
+    model_path = _write_model(
+        tmp_path / "license_reference_command.mlmodel",
+        _build_model(
+            description=_build_description(
+                metadata=_build_metadata(
+                    license_text=(
+                        "Please see https://github.com/fchollet/deep-learning-models for license information.\n"
+                        "python3 -c 'print(1)'"
+                    )
+                )
+            ),
+            neural_network=_build_neural_network(layers=[_build_layer("dense_1")]),
+        ),
+    )
+
+    result = CoreMLScanner().scan(str(model_path))
+
+    assert any(
+        issue.details.get("metadata_key") == "license"
+        and issue.details.get("pattern_type") == "command"
+        and issue.severity == IssueSeverity.WARNING
+        for issue in result.issues
+    )
 
 
 def test_coreml_scanner_detects_python3_command_in_metadata(tmp_path: Path) -> None:

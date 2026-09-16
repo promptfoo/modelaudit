@@ -65,6 +65,24 @@ def test_complete_malicious_assets_preserve_security_signal(
     assert any(issue.rule_code == rule_code and issue.message == message for issue in result.issues)
 
 
+def test_malicious_model_realistic_nested_builtin_payload_is_source_independent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected_enrichment(_report: package_api.PickleReport) -> package_api.PickleReport:
+        raise AssertionError("malicious_model_realistic.pkl should not enter call-graph enrichment")
+
+    monkeypatch.setattr(package_api, "_with_call_graph_findings", unexpected_enrichment)
+
+    result = _scan_asset("malicious_model_realistic.pkl")
+
+    assert result.has_errors is False
+    assert results_have_inconclusive_outcome(result) is False
+    assert determine_exit_code(result) == 1
+    assert any(
+        issue.rule_code == "S601" and issue.message == "Encoded pickle payload detected" for issue in result.issues
+    )
+
+
 def test_intentional_incomplete_pickle_asset_preserves_security_exit() -> None:
     """The dill fixture is intentionally incomplete but still security-positive."""
     result = _scan_asset("dill_func.pkl")

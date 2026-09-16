@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- Upgrade gzip, PCRE2, SQLite, and Perl in Docker runtime images to pick up Debian security fixes.
 - Upgrade locked GitPython to 3.1.59 to address four dependency audit advisories.
 - Inspect hidden ZIP archives and malicious pickle payloads in legacy GGML model variants.
 - Stop reporting a ZIP polyglot for GGUF/GGML files whose tensor data merely contains an end-of-central-directory signature.
@@ -18,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - Avoid incomplete ONNX weight analysis when Gather nodes read dimensions from Shape outputs.
+- Avoid incomplete ONNX weight analysis when large runtime-activation fanout only adds dynamic bookkeeping lineage.
 - Treat documentation, license, and repository links in verified pickle and ONNX metadata as informational across supported Python versions while preserving active and unknown network destinations.
 - Preserve incomplete-scan diagnostics for malformed or unsupported ZIP data in GGUF/GGML files, including cached scans.
 - Report incomplete coverage when a GGUF/GGML source changes during scanning.
@@ -39,7 +41,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Keep published scan-result cache entries readable when concurrent or interrupted hits update access metadata.
 - Preserve macOS scan-result cache entries during unrelated temporary-file churn while rejecting replaced source files and directories.
 - Keep macOS scan-result caching enabled when hashing updates a model file's access time.
+- Keep scanning referenced PyTorch storage members when hidden pickle, encoded literal, frame-first, or malformed-separator payloads cross trusted probe boundaries.
+- Preserve call-graph coverage for source-backed builtin aliases and non-canonical stdlib mailbox constructors.
 - Scan all bounded encoded pickle metadata that fits the decoded-byte budget, avoiding incomplete PyTorch ZIP coverage on harmless small encoded tokens.
+- Install `tomli` for Python 3.10 runtime environments so no-default-groups scanner installs can read ModelAudit TOML configuration.
+- Avoid command-and-control false positives for generated TorchScript `_check_input_dim` identifiers while preserving actionable `check_in` detections.
+- Avoid incomplete legacy PyTorch storage-layout findings after validating storage bytes when separate source-backed rebuild warnings remain.
+- Treat passive built-in CoreML license-reference URLs as informational while preserving active metadata URL and command detections.
 
 ## [0.2.52](https://github.com/promptfoo/modelaudit/compare/v0.2.51...v0.2.52) (2026-07-22)
 

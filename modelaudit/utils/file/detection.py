@@ -2821,6 +2821,7 @@ PROTO0_1_IGNORABLE_TRAILING_BYTES: bytes = b" \t\r\n\x00"
 PROTO0_1_PREFIX_TRUNCATION_ERROR_PREFIXES: tuple[str, ...] = (
     "pickle exhausted before seeing STOP",
     "no newline found when trying to read ",
+    "not enough data in stream to read ",
 )
 
 

@@ -6,6 +6,7 @@ import ast
 import builtins
 import importlib
 import io
+import mailbox
 import os
 import pickle
 import py_compile
@@ -3618,6 +3619,222 @@ def test_incomplete_newobj_ex_invocation_is_not_hidden_by_complete_duplicate(
             reason="invocation_metadata_incomplete",
         ),
     )
+
+
+def test_trusted_mailbox_constructor_does_not_hide_later_unanalyzed_shape(monkeypatch: pytest.MonkeyPatch) -> None:
+    original_entrypoints_for_reference = call_graph._call_graph_entrypoints_for_reference
+    original_source_reason = call_graph._call_graph_source_unavailable_reason
+
+    def fake_entrypoints_for_reference(
+        module: str,
+        name: str,
+        reference: dict[str, object],
+    ) -> tuple[str, ...]:
+        if module == "mailbox" and name == "mbox":
+            return ()
+        return original_entrypoints_for_reference(module, name, reference)
+
+    def fake_source_reason(module_name: str) -> str | None:
+        if module_name == "mailbox":
+            return "source_unavailable"
+        return original_source_reason(module_name)
+
+    monkeypatch.setattr(call_graph, "_call_graph_entrypoints_for_reference", fake_entrypoints_for_reference)
+    monkeypatch.setattr(call_graph, "_call_graph_source_unavailable_reason", fake_source_reason)
+    invocations = (
+        {
+            "opcode": "REDUCE",
+            "module": "mailbox",
+            "name": "mbox",
+            "positional_arg_count": 1,
+            "global_position": 1,
+        },
+        {
+            "opcode": "REDUCE",
+            "module": "mailbox",
+            "name": "mbox",
+            "positional_arg_count": 2,
+            "global_position": 2,
+        },
+    )
+
+    references = call_graph.find_unanalyzed_callable_call_graph_references(invocations)
+
+    assert references == (
+        call_graph.UnanalyzedCallGraphReference(
+            module="mailbox",
+            name="mbox",
+            import_reference="mailbox.mbox",
+            reason="source_unavailable",
+        ),
+    )
+
+
+def test_mailbox_constructor_invocation_is_not_treated_as_empty_safe(monkeypatch: pytest.MonkeyPatch) -> None:
+    reference = {"opcode": "OBJ", "positional_arg_count": 1}
+
+    assert call_graph._trusted_empty_mailbox_constructor_invocation_is_safe("mailbox", "mbox", reference) is False
+
+    class mbox(mailbox.mbox):
+        def __init__(
+            self,
+            dirname: str | os.PathLike[str],
+            factory: Any = None,
+            create: bool = True,
+        ) -> None:
+            super().__init__(dirname, factory, create)
+
+    mbox.__module__ = "mailbox"
+    monkeypatch.setattr(mailbox, "mbox", mbox)
+
+    for opcode in ("REDUCE", "OBJ", "INST"):
+        assert (
+            call_graph._trusted_empty_mailbox_constructor_invocation_is_safe(
+                "mailbox",
+                "mbox",
+                {"opcode": opcode, "positional_arg_count": 1},
+            )
+            is False
+        )
+
+
+def test_trusted_mailbox_constructor_requires_loaded_source_backed_class(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        call_graph,
+        "_loaded_module_state_without_hooks",
+        lambda module_name: (False, None, None) if module_name == "mailbox" else (True, None, None),
+    )
+
+    assert (
+        call_graph._trusted_empty_mailbox_constructor_invocation_is_safe(
+            "mailbox",
+            "mbox",
+            {"opcode": "OBJ", "positional_arg_count": 1},
+        )
+        is False
+    )
+
+
+def test_trusted_mailbox_constructor_remains_startup_hook_opener(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    module_name = "modelaudit_tp_mailbox_startup_writer"
+    (module_dir / f"{module_name}.py").write_text(
+        "def write_payload(handle, value):\n    return handle.write(value)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(module_dir))
+    importlib.invalidate_caches()
+    importlib.import_module(module_name)
+    _clear_call_graph_caches()
+    invocations = (
+        {
+            "opcode": "REDUCE",
+            "module": "mailbox",
+            "name": "mbox",
+            "positional_arg_count": 1,
+            "global_position": 1,
+        },
+        {
+            "opcode": "REDUCE",
+            "module": module_name,
+            "name": "write_payload",
+            "positional_arg_count": 2,
+            "global_position": 2,
+        },
+    )
+    import_references = (
+        {
+            "opcode": "STACK_GLOBAL",
+            "module": "mailbox",
+            "name": "mbox",
+            "import_reference": "mailbox.mbox",
+            "position": 1,
+        },
+        {
+            "opcode": "STACK_GLOBAL",
+            "module": module_name,
+            "name": "write_payload",
+            "import_reference": f"{module_name}.write_payload",
+            "position": 2,
+        },
+    )
+
+    try:
+        findings = call_graph.find_startup_hook_write_call_graphs(import_references, invocations)
+    finally:
+        _clear_call_graph_caches()
+
+    assert findings
+    assert findings[0].opener_import_reference == "mailbox.mbox"
+    assert findings[0].writer_import_reference == f"{module_name}.write_payload"
+    assert findings[0].open_sink == "builtins.open"
+    assert findings[0].write_sink == "handle.write"
+
+
+def test_zero_arg_trusted_mailbox_constructor_is_not_startup_hook_opener(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    module_name = "modelaudit_tp_mailbox_zero_arg_startup_writer"
+    (module_dir / f"{module_name}.py").write_text(
+        "def write_payload(handle, value):\n    return handle.write(value)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(module_dir))
+    importlib.invalidate_caches()
+    _clear_call_graph_caches()
+    invocations = (
+        {
+            "opcode": "REDUCE",
+            "module": "mailbox",
+            "name": "mbox",
+            "positional_arg_count": 0,
+            "global_position": 1,
+        },
+        {
+            "opcode": "REDUCE",
+            "module": module_name,
+            "name": "write_payload",
+            "positional_arg_count": 2,
+            "global_position": 2,
+        },
+    )
+    import_references = (
+        {
+            "opcode": "STACK_GLOBAL",
+            "module": "mailbox",
+            "name": "mbox",
+            "import_reference": "mailbox.mbox",
+            "position": 1,
+        },
+        {
+            "opcode": "STACK_GLOBAL",
+            "module": module_name,
+            "name": "write_payload",
+            "import_reference": f"{module_name}.write_payload",
+            "position": 2,
+        },
+    )
+
+    try:
+        findings = call_graph.find_startup_hook_write_call_graphs(import_references, invocations)
+    finally:
+        _clear_call_graph_caches()
+
+    assert findings == ()
+
+
+def test_pathlib_path_write_text_reexport_resolves_to_source_method() -> None:
+    entrypoints = call_graph._safe_call_graph_entrypoints("pathlib.Path.write_text")
+
+    assert entrypoints
+    assert any(call_graph._find_file_write_path(entrypoint) is not None for entrypoint in entrypoints)
 
 
 def test_scan_bytes_analyzes_shadowed_torch_extension_callable_invocation(

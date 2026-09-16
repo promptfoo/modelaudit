@@ -124,6 +124,9 @@ _ONNX_WEIGHT_ANALYSIS_GROUP_LIMIT = 100
 _ONNX_WEIGHT_LINEAGES_PER_VALUE_LIMIT = 32
 _ONNX_WEIGHT_TRANSFORM_DEPTH_LIMIT = 32
 _ONNX_WEIGHT_RESHAPE_RANK_LIMIT = 64
+_ONNX_RUNTIME_BOOKKEEPING_LINEAGE_REASONS: frozenset[str] = frozenset(
+    {"dynamic_activation_lineage", "dynamic_input_lineage"}
+)
 _ONNX_WEIGHT_METADATA_TEXT_LIMIT = 256
 _ONNX_WEIGHT_METADATA_SEQUENCE_LIMIT = 64
 _ONNX_CUSTOM_OPERATOR_REPRESENTATIVE_LIMIT = 5
@@ -2167,14 +2170,43 @@ def _build_onnx_weight_analysis_plan(
             unresolved_reason=lineage.unresolved_reason,
         )
 
+    def compact_runtime_bookkeeping_lineages(
+        lineages: dict[int, _OnnxWeightLineage],
+    ) -> dict[int, _OnnxWeightLineage]:
+        if len(lineages) <= _ONNX_WEIGHT_LINEAGES_PER_VALUE_LIMIT:
+            return lineages
+        representatives: dict[str, tuple[int, _OnnxWeightLineage]] = {}
+        compacted: dict[int, _OnnxWeightLineage] = {}
+        for initializer_index, lineage in sorted(lineages.items()):
+            if lineage.unresolved_reason in _ONNX_RUNTIME_BOOKKEEPING_LINEAGE_REASONS:
+                if lineage.transforms:
+                    compacted[initializer_index] = lineage
+                else:
+                    representatives.setdefault(lineage.unresolved_reason, (initializer_index, lineage))
+            else:
+                compacted[initializer_index] = lineage
+        if not representatives:
+            return lineages
+        compacted.update(dict(representatives.values()))
+        return dict(sorted(compacted.items()))
+
     def bounded_lineages(lineages: dict[int, _OnnxWeightLineage]) -> dict[int, _OnnxWeightLineage]:
+        lineages = compact_runtime_bookkeeping_lineages(lineages)
         if len(lineages) <= _ONNX_WEIGHT_LINEAGES_PER_VALUE_LIMIT:
             return lineages
         plan.record_coverage_gap(
             "lineages_per_value_limit",
             len(lineages) - _ONNX_WEIGHT_LINEAGES_PER_VALUE_LIMIT,
         )
-        return dict(sorted(lineages.items())[:_ONNX_WEIGHT_LINEAGES_PER_VALUE_LIMIT])
+        return dict(
+            sorted(
+                lineages.items(),
+                key=lambda item: (
+                    item[1].unresolved_reason in _ONNX_RUNTIME_BOOKKEEPING_LINEAGE_REASONS,
+                    item[0],
+                ),
+            )[:_ONNX_WEIGHT_LINEAGES_PER_VALUE_LIMIT]
+        )
 
     def merge_transform_markers(
         left: tuple[_OnnxWeightTransform, ...],

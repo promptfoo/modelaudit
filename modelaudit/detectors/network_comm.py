@@ -189,6 +189,7 @@ _S3_REGIONAL_HOST_PATTERN = re.compile(r"^s3[.-][a-z0-9-]+\.amazonaws\.com$")
 _AZURE_STORAGE_HOST_SUFFIXES = (".blob.core.windows.net", ".dfs.core.windows.net")
 _AZURE_AUTHORITY_CONTAINER_SCHEMES = frozenset({"wasb", "wasbs", "abfs", "abfss"})
 _AZURE_CONTAINER_NAME_PATTERN = re.compile(r"^(?:\$root|[a-z0-9](?:[a-z0-9-]{1,61}[a-z0-9])?)$")
+_IDENTIFIER_BYTES: frozenset[int] = frozenset(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_")
 
 
 def _split_trailing_path_delimiters(segment: str) -> tuple[str, str]:
@@ -1977,6 +1978,29 @@ def _iter_pattern_matches(data: bytes, pattern: bytes) -> Iterator[int]:
             break
         yield match_index
         start = match_index + max(1, len(pattern))
+
+
+def _is_check_input_dim_near_match(data: bytes, match_index: int, token_len: int) -> bool:
+    suffix = b"put_dim"
+    after_index = match_index + token_len
+    if data[after_index : after_index + len(suffix)] != suffix:
+        return False
+    after_suffix = after_index + len(suffix)
+    if after_suffix < len(data) and (data[after_suffix] in _IDENTIFIER_BYTES or data[after_suffix] >= 0x80):
+        return False
+
+    if match_index > 0 and data[match_index - 1] == ord("_"):
+        before_identifier = match_index - 2 >= 0 and data[match_index - 2] in _IDENTIFIER_BYTES
+        before_unicode = match_index - 2 >= 0 and data[match_index - 2] >= 0x80
+        return not before_identifier and not before_unicode
+    if match_index == 0:
+        return True
+    before = data[match_index - 1]
+    return before not in _IDENTIFIER_BYTES and before < 0x80
+
+
+def _is_ignorable_cc_pattern_near_match(data: bytes, pattern: bytes, match_index: int) -> bool:
+    return pattern == b"check_in" and _is_check_input_dim_near_match(data, match_index, len(pattern))
 
 
 def _has_call_syntax(data: bytes, match_index: int, token_len: int) -> bool:
@@ -6089,32 +6113,33 @@ class NetworkCommDetector:
         """Scan for command & control patterns."""
         lowered_data = data.lower()
         for pattern in self.cc_patterns:
-            idx = lowered_data.find(pattern)
-            if idx < 0:
-                continue
+            for idx in _iter_pattern_matches(lowered_data, pattern):
+                if _is_ignorable_cc_pattern_near_match(lowered_data, pattern, idx):
+                    continue
 
-            snippet = _redacted_snippet_for_match(data, idx, idx + len(pattern), before=30, after=30)
+                snippet = _redacted_snippet_for_match(data, idx, idx + len(pattern), before=30, after=30)
 
-            confidence = 0.8
-            severity = "CRITICAL"
+                confidence = 0.8
+                severity = "CRITICAL"
 
-            # Very suspicious patterns
-            if pattern in [b"malware", b"backdoor", b"trojan", b"botnet"]:
-                confidence = 0.95
+                # Very suspicious patterns
+                if pattern in [b"malware", b"backdoor", b"trojan", b"botnet"]:
+                    confidence = 0.95
 
-            if not self._record_finding(
-                {
-                    "type": "cc_pattern",
-                    "severity": severity,
-                    "confidence": confidence,
-                    "message": f"C&C pattern detected: {pattern.decode()}",
-                    "pattern": pattern.decode(),
-                    "snippet": snippet,
-                    "position": idx,
-                    "context": context,
-                }
-            ):
-                return
+                if not self._record_finding(
+                    {
+                        "type": "cc_pattern",
+                        "severity": severity,
+                        "confidence": confidence,
+                        "message": f"C&C pattern detected: {pattern.decode()}",
+                        "pattern": pattern.decode(),
+                        "snippet": snippet,
+                        "position": idx,
+                        "context": context,
+                    }
+                ):
+                    return
+                break
 
     def _scan_suspicious_ports(self, data: bytes, context: str) -> None:
         """Scan for references to suspicious ports."""

@@ -33,6 +33,10 @@ _COMMAND_PATTERN = re.compile(
 )
 _BASE64_PATTERN = re.compile(r"^[A-Za-z0-9+/]+={0,2}$")
 _SAFE_VALUE_PATTERN = re.compile(r"^[A-Za-z0-9._:/\-\s]{1,256}$")
+_PASSIVE_LICENSE_REFERENCE_PATTERN = re.compile(
+    r"(?i)^\s*please\s+see\s+https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+"
+    r"\s+for\s+license\s+information\.?\s*$"
+)
 
 
 class _ProtoField(NamedTuple):
@@ -980,6 +984,13 @@ class CoreMLScanner(BaseScanner):
         has_network_pattern = bool(_NETWORK_PATTERN.search(value_for_scan))
         decoded_payload = self._decode_base64_payload(value_for_scan)
 
+        if has_network_pattern and self._is_passive_builtin_license_reference(
+            key=key,
+            value=value_for_scan,
+            user_defined=user_defined,
+        ):
+            has_network_pattern = False
+
         if safe_user_metadata and not has_command_pattern and not has_network_pattern and decoded_payload is None:
             return findings
 
@@ -1031,6 +1042,14 @@ class CoreMLScanner(BaseScanner):
             findings += 1
 
         return findings
+
+    @staticmethod
+    def _is_passive_builtin_license_reference(*, key: str, value: str, user_defined: bool) -> bool:
+        return (
+            not user_defined
+            and key.lower() == "license"
+            and _PASSIVE_LICENSE_REFERENCE_PATTERN.fullmatch(value) is not None
+        )
 
     def _decode_base64_payload(self, value: str) -> str | None:
         compact = "".join(value.split())

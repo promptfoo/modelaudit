@@ -104,7 +104,11 @@ fn suspicious_string_matches_impl(value: &str, scan_base64: bool) -> Vec<String>
         return Vec::new();
     }
 
-    let raw_has_plain_seed = has_suspicious_ascii_seed(value.as_bytes());
+    let normalized_raw_value = strip_python_line_continuations(value);
+    let raw_has_plain_seed = has_suspicious_ascii_seed(value.as_bytes())
+        || normalized_raw_value
+            .as_ref()
+            .is_some_and(|normalized| has_suspicious_ascii_seed(normalized.as_bytes()));
     let raw_has_encoded_seed = scan_base64
         && has_base64_dangerous_seed(
             value
@@ -116,7 +120,12 @@ fn suspicious_string_matches_impl(value: &str, scan_base64: bool) -> Vec<String>
     }
 
     let (plain_value, url_limit_exceeded, url_context_incomplete) = strip_url_spans(value);
-    let has_plain_seed = raw_has_plain_seed && has_suspicious_ascii_seed(plain_value.as_bytes());
+    let normalized_plain_value = strip_python_line_continuations(plain_value.as_ref());
+    let has_plain_seed = raw_has_plain_seed
+        && (has_suspicious_ascii_seed(plain_value.as_bytes())
+            || normalized_plain_value
+                .as_ref()
+                .is_some_and(|normalized| has_suspicious_ascii_seed(normalized.as_bytes())));
     let has_encoded_seed = raw_has_encoded_seed
         && has_base64_dangerous_seed(
             plain_value
@@ -137,68 +146,111 @@ fn suspicious_string_matches_impl(value: &str, scan_base64: bool) -> Vec<String>
         return matches;
     }
 
-    let lower = plain_value.to_ascii_lowercase();
-    let plain = plain_value.as_ref();
-    if plain.contains("__") && contains_magic_method(plain) {
-        matches.push("magic method".to_string());
-    }
+    for plain in std::iter::once(plain_value.as_ref()).chain(normalized_plain_value.as_deref()) {
+        if !has_suspicious_ascii_seed(plain.as_bytes()) {
+            continue;
+        }
+        let lower = plain.to_ascii_lowercase();
+        if plain.contains("__") && contains_magic_method(plain) {
+            push_unique(&mut matches, "magic method");
+        }
 
-    for (name, label) in CALL_LIKE_PATTERNS {
-        if contains_call_like(&lower, name) {
-            matches.push((*label).to_string());
-        }
-    }
-    for pattern in MODULE_ATTR_PATTERNS {
-        if find_module_attr(&lower, pattern.module, pattern.attr, pattern.prefix) {
-            matches.push(pattern.label.to_string());
-        }
-    }
-    if any_qualified_call_like(&lower, SUBPROCESS_CALL_NEEDLES) {
-        matches.push("subprocess call".to_string());
-    }
-    if any_qualified_call_like(&lower, COMMANDS_CALL_NEEDLES) {
-        matches.push("commands call".to_string());
-    }
-    if any_qualified_call_like(&lower, PICKLE_LOADER_NEEDLES) {
-        matches.push("pickle loader call".to_string());
-    }
-    if any_qualified_call_like(&lower, COPYREG_EXTENSION_NEEDLES) {
-        matches.push("copyreg extension".to_string());
-    }
-    if lower.contains("import") && contains_import_statement(&lower) {
-        matches.push("import statement".to_string());
-    }
-    if lower.contains("importlib")
-        && (contains_call_like(&lower, "importlib.import_module")
-            || contains_call_like(&lower, "importlib.reload")
-            || contains_import_statement(&lower))
-    {
-        matches.push("importlib".to_string());
-    }
-    if contains_call_like(&lower, "__import__") {
-        matches.push("__import__(".to_string());
-    }
-    if lower.contains("\\x") && contains_hex_escape(value) {
-        matches.push("hex escape".to_string());
-    }
-    if lower.contains("getattr") {
-        let (getattr_targets, nested_getattr) = find_getattr_matches(plain);
-        for (target, label) in GETATTR_TARGET_PATTERNS {
-            if getattr_targets & getattr_target_bit(target) != 0 {
-                matches.push((*label).to_string());
+        for (name, label) in CALL_LIKE_PATTERNS {
+            if contains_call_like(&lower, name) {
+                push_unique(&mut matches, label);
             }
         }
-        if GETATTR_PROCESS_TARGETS
-            .iter()
-            .any(|target| getattr_targets & getattr_target_bit(target) != 0)
-        {
-            matches.push("getattr process call".to_string());
+        for pattern in MODULE_ATTR_PATTERNS {
+            if find_module_attr(&lower, pattern.module, pattern.attr, pattern.prefix) {
+                push_unique(&mut matches, pattern.label);
+            }
         }
-        if nested_getattr {
-            matches.push("nested getattr".to_string());
+        if any_qualified_call_like(&lower, SUBPROCESS_CALL_NEEDLES) {
+            push_unique(&mut matches, "subprocess call");
+        }
+        if any_qualified_call_like(&lower, COMMANDS_CALL_NEEDLES) {
+            push_unique(&mut matches, "commands call");
+        }
+        if any_qualified_call_like(&lower, PICKLE_LOADER_NEEDLES) {
+            push_unique(&mut matches, "pickle loader call");
+        }
+        if any_qualified_call_like(&lower, COPYREG_EXTENSION_NEEDLES) {
+            push_unique(&mut matches, "copyreg extension");
+        }
+        if lower.contains("import") && contains_import_statement(&lower) {
+            push_unique(&mut matches, "import statement");
+        }
+        if lower.contains("importlib")
+            && (contains_call_like(&lower, "importlib.import_module")
+                || contains_call_like(&lower, "importlib.reload")
+                || contains_import_statement(&lower))
+        {
+            push_unique(&mut matches, "importlib");
+        }
+        if contains_call_like(&lower, "__import__") {
+            push_unique(&mut matches, "__import__(");
+        }
+        if lower.contains("\\x") && contains_hex_escape(plain) {
+            push_unique(&mut matches, "hex escape");
+        }
+        if lower.contains("getattr") {
+            let (getattr_targets, nested_getattr) = find_getattr_matches(plain);
+            for (target, label) in GETATTR_TARGET_PATTERNS {
+                if getattr_targets & getattr_target_bit(target) != 0 {
+                    push_unique(&mut matches, label);
+                }
+            }
+            if GETATTR_PROCESS_TARGETS
+                .iter()
+                .any(|target| getattr_targets & getattr_target_bit(target) != 0)
+            {
+                push_unique(&mut matches, "getattr process call");
+            }
+            if nested_getattr {
+                push_unique(&mut matches, "nested getattr");
+            }
         }
     }
     matches
+}
+
+fn strip_python_line_continuations(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut output: Option<String> = None;
+    let mut copied_through = 0usize;
+    let mut cursor = 0usize;
+    while cursor < bytes.len() {
+        if bytes[cursor] != b'\\' {
+            cursor += 1;
+            continue;
+        }
+        let newline_end = if bytes.get(cursor + 1) == Some(&b'\n') {
+            Some(cursor + 2)
+        } else if bytes.get(cursor + 1..cursor + 3) == Some(b"\r\n") {
+            Some(cursor + 3)
+        } else if bytes.get(cursor + 1) == Some(&b'\r') {
+            Some(cursor + 2)
+        } else {
+            None
+        };
+        let Some(mut continuation_end) = newline_end else {
+            cursor += 1;
+            continue;
+        };
+        while matches!(bytes.get(continuation_end), Some(b' ' | b'\t' | b'\x0c')) {
+            continuation_end += 1;
+        }
+        let normalized = output.get_or_insert_with(|| String::with_capacity(value.len()));
+        normalized.push_str(&value[copied_through..cursor]);
+        copied_through = continuation_end;
+        cursor = continuation_end;
+    }
+    if let Some(mut normalized) = output {
+        normalized.push_str(&value[copied_through..]);
+        Some(normalized)
+    } else {
+        None
+    }
 }
 
 const URL_SCHEMES: &[&[u8]] = &[
@@ -1799,6 +1851,8 @@ mod tests {
     fn suspicious_string_matching_keeps_case_insensitive_patterns() {
         assert!(suspicious_string_matches("OS.System('id')").contains(&"os.system".to_string()));
         assert!(suspicious_string_matches("OS . system('id')").contains(&"os.system".to_string()));
+        assert!(suspicious_string_matches("subprocess.\\\rPopen(['id'])")
+            .contains(&"subprocess call".to_string()));
         assert!(
             suspicious_string_matches(&format!("{}os.system('id')", "A".repeat(32)))
                 .contains(&"os.system".to_string())

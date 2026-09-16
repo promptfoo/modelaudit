@@ -12,7 +12,8 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Ignore canonical PyTorch storage persistent-ID globals during source-sensitive call-graph enrichment.
 - Report which snapshot gate invalidated a shared call-graph source-stability failure.
 - Validate bounded batched PyTorch state-dictionary entries without falsely flagging canonical tensor reconstruction.
-- Keep scanning storage members between the trusted and expanded pickle probe sizes.
+- Keep scanning PyTorch storage members when hidden pickle, encoded literal, frame-first, or malformed-separator payloads cross trusted probe boundaries.
+- Preserve call-graph coverage for source-backed builtin aliases and non-canonical stdlib mailbox constructors.
 
 ## [0.1.10](https://github.com/promptfoo/modelaudit/compare/modelaudit-picklescan-v0.1.9...modelaudit-picklescan-v0.1.10) (2026-07-22)
 
