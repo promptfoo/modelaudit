@@ -31,10 +31,12 @@ from modelaudit_picklescan.call_graph import (
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.cache.cache_policy import should_cache_scan_result
+from modelaudit.config import ModelAuditConfig, set_config
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file, scan_model_streaming
 from modelaudit.detectors import jit_script as jit_script_module
 from modelaudit.detectors import network_comm as network_comm_module
 from modelaudit.detectors.suspicious_symbols import CVE_COMBINED_PATTERNS
+from modelaudit.rules import RuleRegistry, Severity
 from modelaudit.scanner_results import (
     ACTIONABLE_FAILED_CHECKS_METADATA_KEY,
     INCONCLUSIVE_SCAN_OUTCOME,
@@ -8441,10 +8443,46 @@ def test_pytorch_zip_preserved_suspicious_literal_uses_rule_code() -> None:
 
     suspicious_checks = [check for check in member_result.checks if check.name == "Suspicious String Literal"]
     assert len(suspicious_checks) == 1
-    assert suspicious_checks[0].rule_code == "SUSPICIOUS_STRING"
+    assert suspicious_checks[0].rule_code == "S905"
+    assert RuleRegistry.get_rule(suspicious_checks[0].rule_code) is not None
     assert suspicious_checks[0].status == CheckStatus.FAILED
     assert suspicious_checks[0].severity == IssueSeverity.WARNING
     assert member_result.metadata["pickle_verdict"] == "suspicious"
+
+
+def test_pytorch_zip_preserved_suspicious_literal_honors_rule_config() -> None:
+    suppressed = ModelAuditConfig()
+    suppressed.suppress = {"S905"}
+    set_config(suppressed)
+    suppressed_result = ScanResult(scanner_name="pickle")
+    suppressed_result.metadata["pickle_verdict"] = "clean"
+
+    PyTorchZipScanner._add_preserved_suspicious_literal_finding(
+        suppressed_result,
+        pickle_source="model.pt:archive/data/0",
+        pickle_filename="archive/data/0",
+    )
+
+    assert not [check for check in suppressed_result.checks if check.name == "Suspicious String Literal"]
+    assert suppressed_result.metadata["pickle_verdict"] == "clean"
+
+    info_override = ModelAuditConfig()
+    info_override.severity = {"S905": Severity.INFO}
+    set_config(info_override)
+    info_result = ScanResult(scanner_name="pickle")
+    info_result.metadata["pickle_verdict"] = "clean"
+
+    PyTorchZipScanner._add_preserved_suspicious_literal_finding(
+        info_result,
+        pickle_source="model.pt:archive/data/0",
+        pickle_filename="archive/data/0",
+    )
+
+    suspicious_checks = [check for check in info_result.checks if check.name == "Suspicious String Literal"]
+    assert len(suspicious_checks) == 1
+    assert suspicious_checks[0].rule_code == "S905"
+    assert suspicious_checks[0].severity == IssueSeverity.INFO
+    assert info_result.metadata["pickle_verdict"] == "clean"
 
 
 def test_pytorch_zip_discovery_scans_whitespace_hex_nested_pickle_literal(tmp_path: Path) -> None:
@@ -8572,6 +8610,17 @@ def test_pytorch_zip_raw_nested_literal_scans_payload_continuation_to_stop() -> 
     assert PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(near_match_outer_literal) is False
 
 
+def test_pytorch_zip_raw_nested_literal_advances_past_clean_binary_candidate() -> None:
+    assert PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(b"\x80\x04N.") is False
+    assert (
+        PyTorchZipScanner._trailing_candidate_has_raw_nested_security_pickle(
+            b"\x80\x04N.",
+            sample_is_prefix=False,
+        )
+        is False
+    )
+
+
 def test_pytorch_zip_raw_nested_literal_reprocesses_following_security_opcode() -> None:
     payload = b"T\x01\x00\x00\x00xcos\nsystem\n)R."
     near_match = payload.replace(b"c", b"!", 1)
@@ -8657,9 +8706,11 @@ def test_pytorch_zip_proto_memo_keys_preserve_in_place_batch_depth() -> None:
 
 def test_pytorch_zip_proto_memo_keys_pop_mark_preserves_underlying_value() -> None:
     valid_mark_pop_memo = b"S'safe_module'\n(0p0\n"
+    invalid_nested_mark_pop_memo = b"S'safe_module'\n((0p0\n"
     invalid_value_pop_memo = b"S'safe_module'\n0p0\n"
 
     assert PyTorchZipScanner._parsed_prefix_memo_keys(valid_mark_pop_memo) == {"0"}
+    assert PyTorchZipScanner._parsed_prefix_memo_keys(invalid_nested_mark_pop_memo) == set()
     assert PyTorchZipScanner._parsed_prefix_memo_keys(invalid_value_pop_memo) == set()
 
 
@@ -8865,6 +8916,32 @@ def test_pytorch_zip_prior_mark_search_skips_literal_spans() -> None:
 
     assert PyTorchZipScanner._raw_nested_prior_mark_outside_literal(literal, 0, len(literal)) == -1
     assert PyTorchZipScanner._raw_nested_prior_mark_outside_literal(value, 0, len(value)) == live_mark_offset
+
+
+def test_pytorch_zip_literal_window_span_recovery_budget_bounds_invalid_headers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+    original = PyTorchZipScanner._raw_nested_enclosing_pickle_literal_span
+
+    def counted_span(value: bytes, offset: int) -> tuple[int, int, int] | None:
+        nonlocal calls
+        calls += 1
+        return original(value, offset)
+
+    monkeypatch.setattr(PyTorchZipScanner, "_raw_nested_enclosing_pickle_literal_span", staticmethod(counted_span))
+
+    invalid_headers = b"B" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 8)
+
+    assert (
+        PyTorchZipScanner._raw_nested_window_has_literal_security_stream(
+            invalid_headers,
+            0,
+            len(invalid_headers),
+        )
+        is True
+    )
+    assert calls <= pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES
 
 
 def test_pytorch_zip_prior_window_inst_name_parse_fails_closed_after_budget() -> None:

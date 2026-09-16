@@ -79,6 +79,7 @@ from .pytorch_zip_support import (
     read_member_to_spooled_file,
     read_zip_header,
 )
+from .rule_mapper import get_generic_rule_code
 from .zip_scanner import ZipPreflightRejected
 
 logger = logging.getLogger(__name__)
@@ -3802,6 +3803,7 @@ class PyTorchZipScanner(BaseScanner):
                     return True
                 if candidate_is_prefix:
                     return True
+                offset += 1
                 continue
             if (
                 marker in _RAW_NESTED_STRUCTURAL_STRING_START_BYTES
@@ -3887,6 +3889,7 @@ class PyTorchZipScanner(BaseScanner):
             ):
                 if PyTorchZipScanner._has_security_relevant_pickle_opcode(candidate) or candidate_is_prefix:
                     return True
+                offset += 1
                 continue
             if (
                 marker in _RAW_NESTED_STRUCTURAL_STRING_START_BYTES
@@ -4157,13 +4160,13 @@ class PyTorchZipScanner(BaseScanner):
                     stack_depth = mark_depths.pop() if mark_depths else 0
                     continue
                 if opcode.name in {"BINPUT", "LONG_BINPUT", "PUT"}:
-                    if stack_depth > 0:
+                    if stack_depth > 0 and not (mark_depths and mark_depths[-1] == stack_depth):
                         memo_key = PyTorchZipScanner._canonical_proto0_memo_key(arg)
                         memo_keys.add(memo_key)
                         occupied_memo_keys.add(memo_key)
                     continue
                 if opcode.name == "MEMOIZE":
-                    if stack_depth > 0:
+                    if stack_depth > 0 and not (mark_depths and mark_depths[-1] == stack_depth):
                         memo_key = str(len(occupied_memo_keys))
                         memo_keys.add(memo_key)
                         occupied_memo_keys.add(memo_key)
@@ -4506,6 +4509,7 @@ class PyTorchZipScanner(BaseScanner):
         literal_marker_bytes = bytes(
             set(b"PQ" + _PICKLE_LENGTH_DELIMITED_LITERAL_START_BYTES + _RAW_NESTED_SECURITY_PICKLE_START_BYTES)
         )
+        span_recovery_budget = _MAX_RAW_NESTED_PICKLE_CANDIDATES
         while offset < window_end:
             marker_offset = min(
                 (
@@ -4519,6 +4523,12 @@ class PyTorchZipScanner(BaseScanner):
                 return False
             span = PyTorchZipScanner._raw_nested_pickle_literal_span_starting_at(value, marker_offset)
             if span is None:
+                if span_recovery_budget <= 0:
+                    if value[marker_offset] in _PICKLE_LENGTH_DELIMITED_LITERAL_START_BYTES:
+                        return True
+                    offset = marker_offset + 1
+                    continue
+                span_recovery_budget -= 1
                 span = PyTorchZipScanner._raw_nested_enclosing_pickle_literal_span(value, marker_offset)
             if span is None:
                 offset = marker_offset + 1
@@ -5719,14 +5729,16 @@ class PyTorchZipScanner(BaseScanner):
         pickle_source: str,
         pickle_filename: str,
     ) -> None:
+        message = "Suspicious string literal contains code execution pattern: storage route"
+        rule_code = get_generic_rule_code(message)
         checks_before = len(member_result.checks)
         member_result.add_check(
             name="Suspicious String Literal",
             passed=False,
-            message="Suspicious string literal contains code execution pattern: storage route",
+            message=message,
             severity=IssueSeverity.WARNING,
             location=f"{pickle_source} (pos 0)",
-            rule_code="SUSPICIOUS_STRING",
+            rule_code=rule_code,
             details={
                 "pickle_source": pickle_source,
                 "opcode": "STRING",
