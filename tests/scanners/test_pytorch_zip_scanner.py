@@ -8640,6 +8640,40 @@ def test_pytorch_zip_raw_nested_literal_ignores_security_pickle_inside_long_oper
     assert PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(positive_after_long) is True
 
 
+def test_pytorch_zip_raw_nested_literal_bounds_dense_persid_candidates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+    original = PyTorchZipScanner._raw_nested_persistent_id_candidate_should_scan
+
+    def counted_should_scan(candidate: bytes, candidate_is_prefix: bool) -> bool:
+        nonlocal calls
+        calls += 1
+        return original(candidate, candidate_is_prefix)
+
+    monkeypatch.setattr(
+        PyTorchZipScanner,
+        "_raw_nested_persistent_id_candidate_should_scan",
+        staticmethod(counted_should_scan),
+    )
+
+    dense_payload = b"Q" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES * 2)
+    dense_literal = b"B" + len(dense_payload).to_bytes(4, "little") + dense_payload + b"."
+    dense_span = PyTorchZipScanner._raw_nested_pickle_literal_span_starting_at(dense_literal, 0)
+    positive_payload = b"Qcos\nsystem\n)R."
+    positive_literal = b"B" + len(positive_payload).to_bytes(4, "little") + positive_payload + b"."
+    positive_span = PyTorchZipScanner._raw_nested_pickle_literal_span_starting_at(positive_literal, 0)
+
+    assert dense_span is not None
+    assert positive_span is not None
+    assert PyTorchZipScanner._raw_nested_literal_span_has_overlapping_persid_stream(dense_literal, dense_span) is False
+    assert calls <= 2
+    assert (
+        PyTorchZipScanner._raw_nested_literal_span_has_overlapping_persid_stream(positive_literal, positive_span)
+        is True
+    )
+
+
 def test_pytorch_zip_raw_nested_literal_advances_past_clean_binary_candidate() -> None:
     assert PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(b"\x80\x04N.") is False
     assert (
@@ -9113,6 +9147,49 @@ def test_pytorch_zip_literal_window_reuses_recursive_literal_span_coverage(
         )
         is True
     )
+
+
+def test_pytorch_zip_later_windows_share_recursive_literal_span_coverage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+    original = PyTorchZipScanner._literal_value_has_raw_nested_security_pickle
+
+    def counted_literal_scan(
+        value: bytes,
+        *,
+        fail_closed_on_candidate_budget: bool = True,
+        nested_literal_depth: int = 0,
+    ) -> bool:
+        nonlocal calls
+        calls += 1
+        return original(
+            value,
+            fail_closed_on_candidate_budget=fail_closed_on_candidate_budget,
+            nested_literal_depth=nested_literal_depth,
+        )
+
+    monkeypatch.setattr(
+        PyTorchZipScanner,
+        "_literal_value_has_raw_nested_security_pickle",
+        staticmethod(counted_literal_scan),
+    )
+
+    long_probe_bytes = pytorch_zip_scanner_module._PICKLE_DISCOVERY_LONG_PROBE_BYTES
+    payload = (b"!" * (long_probe_bytes + 1024)) + b"c!"
+    payload += (b"!" * (long_probe_bytes + 1024)) + b"c!"
+    literal = b"B" + len(payload).to_bytes(4, "little") + payload + b"."
+    value = (b"!" * (long_probe_bytes + 512)) + literal
+
+    assert (
+        PyTorchZipScanner._raw_nested_security_pickle_candidate_has_later_structural_signal(
+            value,
+            parse_budget_remaining=[pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES],
+            search_start=0,
+        )
+        is False
+    )
+    assert calls <= 2
 
 
 def test_pytorch_zip_prior_window_inst_name_parse_fails_closed_after_budget() -> None:
