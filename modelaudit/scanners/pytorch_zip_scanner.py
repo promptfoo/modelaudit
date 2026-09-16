@@ -149,7 +149,7 @@ _PROTO0_1_LITERAL_OPCODES = frozenset(
 _PICKLE_BINARY_BYTE_LITERAL_OPCODES = frozenset({"BINBYTES", "SHORT_BINBYTES", "BINBYTES8", "BYTEARRAY8"})
 _PICKLE_BINARY_BYTE_LITERAL_START_BYTES = b"BC\x8e\x96"
 _PICKLE_PROTO0_TEXT_LITERAL_START_BYTES = b"SV"
-_PICKLE_LENGTH_DELIMITED_LITERAL_START_BYTES = b"BCTXU\x8c\x8d\x8e\x96"
+_PICKLE_LENGTH_DELIMITED_LITERAL_START_BYTES = b"BCTXU\x8a\x8b\x8c\x8d\x8e\x96"
 _PICKLE_LITERAL_OPCODES = _PROTO0_1_LITERAL_OPCODES | _PICKLE_BINARY_BYTE_LITERAL_OPCODES
 _BASE64_NESTED_LITERAL_TOKEN_RE = re.compile(
     rb"[A-Za-z0-9+/_-][A-Za-z0-9+/_=\-\s\r\n\t!\"#$%&'()*.,:;<>?@\[\]\\^`{|}~]{7,}"
@@ -4599,7 +4599,7 @@ class PyTorchZipScanner(BaseScanner):
         literal_opcode_start: int,
     ) -> tuple[int, int, int] | None:
         marker = value[literal_opcode_start]
-        if marker in {ord("B"), ord("T"), ord("X")}:
+        if marker in {ord("B"), ord("T"), ord("X"), 0x8B}:
             header_bytes = 5
             if literal_opcode_start + header_bytes > len(value):
                 return None
@@ -4607,7 +4607,7 @@ class PyTorchZipScanner(BaseScanner):
                 value[literal_opcode_start + 1 : literal_opcode_start + header_bytes],
                 "little",
             )
-        elif marker in {ord("C"), ord("U"), 0x8C}:
+        elif marker in {ord("C"), ord("U"), 0x8A, 0x8C}:
             header_bytes = 2
             if literal_opcode_start + header_bytes > len(value):
                 return None
@@ -4669,10 +4669,14 @@ class PyTorchZipScanner(BaseScanner):
     def _raw_nested_window_with_literal_payloads_masked(value: bytes, window_start: int, window_end: int) -> bytes:
         window = bytearray(value[window_start:window_end])
         offset = window_start
+        span_recovery_budget = _MAX_RAW_NESTED_PICKLE_CANDIDATES
         while offset < window_end:
             if value[offset] not in _RAW_NESTED_SECURITY_PICKLE_START_BYTES:
                 offset += 1
                 continue
+            if span_recovery_budget <= 0:
+                break
+            span_recovery_budget -= 1
             span = PyTorchZipScanner._raw_nested_enclosing_pickle_literal_span(value, offset)
             if span is None:
                 offset += 1

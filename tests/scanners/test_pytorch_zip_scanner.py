@@ -8622,6 +8622,15 @@ def test_pytorch_zip_raw_nested_literal_parses_continuation_operands_to_stop() -
     assert PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(near_match_outer_literal) is False
 
 
+def test_pytorch_zip_raw_nested_literal_ignores_persid_marker_inside_long_operand() -> None:
+    long_payload = b"P" + (b"!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES + 32))
+    long_operand = b"\x8b" + len(long_payload).to_bytes(4, "little") + long_payload + b"."
+    positive_persid = b"\x8b\x01\x00\x00\x00xPstorage-key\n."
+
+    assert PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(long_operand) is False
+    assert PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(positive_persid) is True
+
+
 def test_pytorch_zip_raw_nested_literal_advances_past_clean_binary_candidate() -> None:
     assert PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(b"\x80\x04N.") is False
     assert (
@@ -8964,6 +8973,26 @@ def test_pytorch_zip_literal_window_span_recovery_budget_bounds_invalid_headers(
         )
         is True
     )
+    assert calls <= pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES
+
+
+def test_pytorch_zip_literal_payload_masking_bounds_span_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+    original = PyTorchZipScanner._raw_nested_enclosing_pickle_literal_span
+
+    def counted_span(value: bytes, offset: int) -> tuple[int, int, int] | None:
+        nonlocal calls
+        calls += 1
+        return original(value, offset)
+
+    monkeypatch.setattr(PyTorchZipScanner, "_raw_nested_enclosing_pickle_literal_span", staticmethod(counted_span))
+
+    c_rich = b"c" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1024)
+
+    PyTorchZipScanner._raw_nested_window_with_literal_payloads_masked(c_rich, 0, len(c_rich))
+
     assert calls <= pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES
 
 
