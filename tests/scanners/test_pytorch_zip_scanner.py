@@ -8521,6 +8521,69 @@ def test_pytorch_zip_raw_nested_literal_scans_nested_literal_payload_security_st
     assert PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(near_match_outer_literal) is False
 
 
+def test_pytorch_zip_raw_nested_literal_scans_payload_that_borrows_enclosing_stop() -> None:
+    nested_payload = b"cos\nsystem\n)R"
+    outer_literal = b"B" + len(nested_payload).to_bytes(4, "little") + nested_payload + b"."
+    near_match_payload = b"!os\nsystem\n)!"
+    near_match_outer_literal = b"B" + len(near_match_payload).to_bytes(4, "little") + near_match_payload + b"."
+
+    assert PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(outer_literal) is True
+    assert PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(near_match_outer_literal) is False
+
+
+def test_pytorch_zip_raw_nested_later_windows_inspect_literal_payloads_before_masking() -> None:
+    decoys = b"c!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)
+    padding = b"!" * (pytorch_zip_scanner_module._PICKLE_DISCOVERY_LONG_PROBE_BYTES + 32)
+    nested_payload = b"\x8c\x02os\x8c\x06system\x93)R."
+    nested_literal = b"B" + len(nested_payload).to_bytes(4, "little") + nested_payload + b"."
+    near_match_payload = b"\x8c\x02os\x8c\x06system."
+    near_match_literal = b"B" + len(near_match_payload).to_bytes(4, "little") + near_match_payload + b"."
+
+    assert (
+        PyTorchZipScanner._raw_nested_security_pickle_candidate_has_later_structural_signal(
+            decoys + padding + nested_literal,
+            parse_budget_remaining=[pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES],
+            search_start=0,
+        )
+        is True
+    )
+    assert (
+        PyTorchZipScanner._raw_nested_security_pickle_candidate_has_later_structural_signal(
+            decoys + padding + near_match_literal,
+            parse_budget_remaining=[pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES],
+            search_start=0,
+        )
+        is False
+    )
+
+
+def test_pytorch_zip_raw_nested_inst_context_ignores_literal_mark_before_valid_opcode() -> None:
+    candidate_bytes = pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES
+    inert_literal_prefix = b"C\x01(0N."
+    benign_value = inert_literal_prefix + (b"!" * (candidate_bytes + 16)) + b"ishutil\nrmtree\n"
+    live_mark_value = b"(" + inert_literal_prefix.replace(b"(", b"!", 1)
+    live_mark_value += (b"!" * (candidate_bytes + 16)) + b"ishutil\nrmtree\n"
+
+    assert (
+        PyTorchZipScanner._raw_nested_proto0_inst_with_prior_window_mark_seen(
+            benign_value,
+            0,
+            len(benign_value),
+            [pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES],
+        )
+        is False
+    )
+    assert (
+        PyTorchZipScanner._raw_nested_proto0_inst_with_prior_window_mark_seen(
+            live_mark_value,
+            0,
+            len(live_mark_value),
+            [pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES],
+        )
+        is True
+    )
+
+
 def test_pytorch_zip_proto0_memo_keys_canonicalize_zero_padded_get() -> None:
     prefix = b"S'a'\np00\n"
 

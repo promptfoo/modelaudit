@@ -3740,7 +3740,11 @@ class PyTorchZipScanner(BaseScanner):
                     return True
                 _literal_opcode_start, literal_start, literal_end = span
                 if PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(
-                    value[literal_start:literal_end],
+                    PyTorchZipScanner._raw_nested_literal_payload_for_recursive_scan(
+                        value,
+                        literal_start,
+                        literal_end,
+                    ),
                     fail_closed_on_candidate_budget=fail_closed_on_candidate_budget,
                     nested_literal_depth=nested_literal_depth + 1,
                 ):
@@ -3860,7 +3864,11 @@ class PyTorchZipScanner(BaseScanner):
                     return True
                 _literal_opcode_start, literal_start, literal_end = span
                 if PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(
-                    value[literal_start:literal_end],
+                    PyTorchZipScanner._raw_nested_literal_payload_for_recursive_scan(
+                        value,
+                        literal_start,
+                        literal_end,
+                    ),
                     nested_literal_depth=nested_literal_depth + 1,
                 ):
                     return True
@@ -3962,7 +3970,7 @@ class PyTorchZipScanner(BaseScanner):
                 if tail_window_start != window_start:
                     windows.append((tail_window_start, len(value)))
             for candidate_window_start, candidate_window_end in windows:
-                if PyTorchZipScanner._raw_nested_window_has_overlapping_literal_persid_stream(
+                if PyTorchZipScanner._raw_nested_window_has_literal_security_stream(
                     value,
                     candidate_window_start,
                     candidate_window_end,
@@ -4483,24 +4491,43 @@ class PyTorchZipScanner(BaseScanner):
         return literal_end > search_budget_end
 
     @staticmethod
-    def _raw_nested_window_has_overlapping_literal_persid_stream(
+    def _raw_nested_window_has_literal_security_stream(
         value: bytes,
         window_start: int,
         window_end: int,
+        *,
+        nested_literal_depth: int = 0,
     ) -> bool:
         offset = window_start
+        literal_marker_bytes = b"PQ" + _PICKLE_LENGTH_DELIMITED_LITERAL_START_BYTES
         while offset < window_end:
             marker_offset = min(
-                (found for marker in b"PQ" if (found := value.find(bytes([marker]), offset, window_end)) >= 0),
+                (
+                    found
+                    for marker in literal_marker_bytes
+                    if (found := value.find(bytes([marker]), offset, window_end)) >= 0
+                ),
                 default=-1,
             )
             if marker_offset < 0:
                 return False
-            span = PyTorchZipScanner._raw_nested_enclosing_pickle_literal_span(value, marker_offset)
+            span = PyTorchZipScanner._raw_nested_pickle_literal_span_starting_at(value, marker_offset)
+            if span is None:
+                span = PyTorchZipScanner._raw_nested_enclosing_pickle_literal_span(value, marker_offset)
             if span is None:
                 offset = marker_offset + 1
                 continue
             if PyTorchZipScanner._raw_nested_literal_span_has_overlapping_persid_stream(value, span):
+                return True
+            _literal_opcode_start, literal_start, literal_end = span
+            if PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(
+                PyTorchZipScanner._raw_nested_literal_payload_for_recursive_scan(
+                    value,
+                    literal_start,
+                    literal_end,
+                ),
+                nested_literal_depth=nested_literal_depth + 1,
+            ):
                 return True
             offset = max(marker_offset + 1, span[2] + 1)
         return False
@@ -4575,9 +4602,16 @@ class PyTorchZipScanner(BaseScanner):
             return None
         literal_start = literal_opcode_start + header_bytes
         literal_end = literal_start + literal_size
-        if literal_end < len(value) and value[literal_end] == ord("."):
+        if literal_end < len(value) and value[literal_end] in _PICKLE_OPCODE_BYTES:
             return literal_opcode_start, literal_start, literal_end
         return None
+
+    @staticmethod
+    def _raw_nested_literal_payload_for_recursive_scan(value: bytes, literal_start: int, literal_end: int) -> bytes:
+        scan_end = literal_end
+        if literal_end < len(value) and value[literal_end] == ord("."):
+            scan_end += 1
+        return value[literal_start:scan_end]
 
     @staticmethod
     def _raw_nested_window_with_literal_payloads_masked(value: bytes, window_start: int, window_end: int) -> bytes:
