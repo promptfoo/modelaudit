@@ -3728,10 +3728,17 @@ class PyTorchZipScanner(BaseScanner):
             return True
         candidate_count = 0
         extension_parse_budget_remaining = [_MAX_RAW_NESTED_PICKLE_CANDIDATES]
-        for offset, marker in enumerate(value):
+        offset = 0
+        while offset < len(value):
+            marker = value[offset]
             if marker not in _RAW_NESTED_SECURITY_PICKLE_START_BYTES:
+                offset += 1
                 continue
-            if PyTorchZipScanner._raw_nested_enclosing_pickle_literal_end(value, offset) is not None:
+            span = PyTorchZipScanner._raw_nested_enclosing_pickle_literal_span(value, offset)
+            if span is not None:
+                if PyTorchZipScanner._raw_nested_literal_span_has_overlapping_persid_stream(value, span):
+                    return True
+                offset = max(offset + 1, span[2] + 1)
                 continue
             candidate_count += 1
             if candidate_count > _MAX_RAW_NESTED_PICKLE_CANDIDATES:
@@ -3820,6 +3827,7 @@ class PyTorchZipScanner(BaseScanner):
                 )
             ):
                 return True
+            offset += 1
         return False
 
     @staticmethod
@@ -3833,11 +3841,17 @@ class PyTorchZipScanner(BaseScanner):
         if nested_literal_depth > _MAX_NESTED_LITERAL_SCAN_DEPTH:
             return True
         parse_attempt_count = 0
-        for offset in range(max(search_start, 0), len(value)):
+        offset = max(search_start, 0)
+        while offset < len(value):
             marker = value[offset]
             if marker not in _RAW_NESTED_SECURITY_PICKLE_START_BYTES:
+                offset += 1
                 continue
-            if PyTorchZipScanner._raw_nested_enclosing_pickle_literal_end(value, offset) is not None:
+            span = PyTorchZipScanner._raw_nested_enclosing_pickle_literal_span(value, offset)
+            if span is not None:
+                if PyTorchZipScanner._raw_nested_literal_span_has_overlapping_persid_stream(value, span):
+                    return True
+                offset = max(offset + 1, span[2] + 1)
                 continue
             candidate = value[offset : offset + _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES]
             candidate_is_prefix = offset + len(candidate) < len(value) or sample_is_prefix
@@ -3871,6 +3885,7 @@ class PyTorchZipScanner(BaseScanner):
                 )
             ):
                 return True
+            offset += 1
         return False
 
     @staticmethod
@@ -3934,6 +3949,12 @@ class PyTorchZipScanner(BaseScanner):
                 if tail_window_start != window_start:
                     windows.append((tail_window_start, len(value)))
             for candidate_window_start, candidate_window_end in windows:
+                if PyTorchZipScanner._raw_nested_window_has_overlapping_literal_persid_stream(
+                    value,
+                    candidate_window_start,
+                    candidate_window_end,
+                ):
+                    return True
                 window = PyTorchZipScanner._raw_nested_window_with_literal_payloads_masked(
                     value,
                     candidate_window_start,
@@ -4003,6 +4024,10 @@ class PyTorchZipScanner(BaseScanner):
                     search_start_in_window = offset + 1
                     continue
                 seen_get_offsets.add(absolute_offset)
+                span = PyTorchZipScanner._raw_nested_enclosing_pickle_literal_span(value, absolute_offset)
+                if span is not None:
+                    search_start_in_window = max(offset + 1, min(window_end, span[2] + 1) - window_start)
+                    continue
                 if not PyTorchZipScanner._consume_raw_nested_structural_parse_budget(parse_budget_remaining):
                     return True
                 memo_key, truncated_get = PyTorchZipScanner._memo_get_key_at(value, absolute_offset)
@@ -4379,6 +4404,64 @@ class PyTorchZipScanner(BaseScanner):
     def _raw_nested_enclosing_pickle_literal_end(value: bytes, offset: int) -> int | None:
         span = PyTorchZipScanner._raw_nested_enclosing_pickle_literal_span(value, offset)
         return None if span is None else span[2]
+
+    @staticmethod
+    def _raw_nested_literal_span_has_overlapping_persid_stream(
+        value: bytes,
+        span: tuple[int, int, int],
+    ) -> bool:
+        _literal_opcode_start, literal_start, literal_end = span
+        search_start = literal_start
+        checked = 0
+        while search_start < literal_end and checked < _MAX_RAW_NESTED_PICKLE_CANDIDATES:
+            offset = min(
+                (found for marker in b"PQ" if (found := value.find(bytes([marker]), search_start, literal_end)) >= 0),
+                default=-1,
+            )
+            if offset < 0:
+                return False
+            checked += 1
+            if value[offset] == ord("P"):
+                newline = value.find(b"\n", offset + 1, literal_end)
+                if newline < 0:
+                    search_start = offset + 1
+                    continue
+                if (newline + 1 < literal_end and value[newline + 1] == ord(".")) or (
+                    newline + 1 == literal_end and literal_end < len(value) and value[literal_end] == ord(".")
+                ):
+                    return True
+            candidate_end = min(literal_end, offset + _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES)
+            candidate = value[offset:candidate_end]
+            candidate_is_prefix = False
+            if PyTorchZipScanner._raw_nested_persistent_id_candidate_should_scan(candidate, candidate_is_prefix):
+                return True
+            search_start = offset + 1
+        return False
+
+    @staticmethod
+    def _raw_nested_window_has_overlapping_literal_persid_stream(
+        value: bytes,
+        window_start: int,
+        window_end: int,
+    ) -> bool:
+        offset = window_start
+        checked = 0
+        while offset < window_end and checked < _MAX_RAW_NESTED_PICKLE_CANDIDATES:
+            marker_offset = min(
+                (found for marker in b"PQ" if (found := value.find(bytes([marker]), offset, window_end)) >= 0),
+                default=-1,
+            )
+            if marker_offset < 0:
+                return False
+            checked += 1
+            span = PyTorchZipScanner._raw_nested_enclosing_pickle_literal_span(value, marker_offset)
+            if span is None:
+                offset = marker_offset + 1
+                continue
+            if PyTorchZipScanner._raw_nested_literal_span_has_overlapping_persid_stream(value, span):
+                return True
+            offset = max(marker_offset + 1, span[2] + 1)
+        return False
 
     @staticmethod
     def _raw_nested_enclosing_pickle_literal_span(value: bytes, offset: int) -> tuple[int, int, int] | None:
