@@ -148,6 +148,7 @@ _PROTO0_1_LITERAL_OPCODES = frozenset(
 )
 _PICKLE_BINARY_BYTE_LITERAL_OPCODES = frozenset({"BINBYTES", "SHORT_BINBYTES", "BINBYTES8", "BYTEARRAY8"})
 _PICKLE_BINARY_BYTE_LITERAL_START_BYTES = b"BC\x8e\x96"
+_PICKLE_PROTO0_TEXT_LITERAL_START_BYTES = b"SV"
 _PICKLE_LENGTH_DELIMITED_LITERAL_START_BYTES = b"BCTXU\x8c\x8d\x8e\x96"
 _PICKLE_LITERAL_OPCODES = _PROTO0_1_LITERAL_OPCODES | _PICKLE_BINARY_BYTE_LITERAL_OPCODES
 _BASE64_NESTED_LITERAL_TOKEN_RE = re.compile(
@@ -4507,7 +4508,12 @@ class PyTorchZipScanner(BaseScanner):
     ) -> bool:
         offset = window_start
         literal_marker_bytes = bytes(
-            set(b"PQ" + _PICKLE_LENGTH_DELIMITED_LITERAL_START_BYTES + _RAW_NESTED_SECURITY_PICKLE_START_BYTES)
+            set(
+                b"PQ"
+                + _PICKLE_LENGTH_DELIMITED_LITERAL_START_BYTES
+                + _PICKLE_PROTO0_TEXT_LITERAL_START_BYTES
+                + _RAW_NESTED_SECURITY_PICKLE_START_BYTES
+            )
         )
         span_recovery_budget = _MAX_RAW_NESTED_PICKLE_CANDIDATES
         while offset < window_end:
@@ -4614,6 +4620,24 @@ class PyTorchZipScanner(BaseScanner):
                 value[literal_opcode_start + 1 : literal_opcode_start + header_bytes],
                 "little",
             )
+        elif marker == ord("S"):
+            if literal_opcode_start + 2 > len(value) or value[literal_opcode_start + 1] not in {ord("'"), ord('"')}:
+                return None
+            literal_start = literal_opcode_start + 2
+            literal_end = value.find(b"\n", literal_start)
+            if literal_end < 0:
+                return None
+            if literal_end + 1 < len(value) and value[literal_end + 1] in _PICKLE_OPCODE_BYTES:
+                return literal_opcode_start, literal_start, literal_end
+            return None
+        elif marker == ord("V"):
+            literal_start = literal_opcode_start + 1
+            literal_end = value.find(b"\n", literal_start)
+            if literal_end < 0:
+                return None
+            if literal_end + 1 < len(value) and value[literal_end + 1] in _PICKLE_OPCODE_BYTES:
+                return literal_opcode_start, literal_start, literal_end
+            return None
         else:
             return None
         literal_start = literal_opcode_start + header_bytes
@@ -4625,8 +4649,14 @@ class PyTorchZipScanner(BaseScanner):
     @staticmethod
     def _raw_nested_literal_payload_for_recursive_scan(value: bytes, literal_start: int, literal_end: int) -> bytes:
         scan_limit = min(len(value), literal_end + _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES)
-        stop = value.find(b".", literal_end, scan_limit)
-        scan_end = stop + 1 if stop >= 0 else scan_limit
+        scan_end = scan_limit
+        try:
+            for opcode, _arg, pos in pickletools.genops(value[literal_end:scan_limit]):
+                if opcode.name == "STOP" and pos is not None:
+                    scan_end = literal_end + pos + 1
+                    break
+        except Exception:
+            pass
         return value[literal_start:scan_end]
 
     @staticmethod

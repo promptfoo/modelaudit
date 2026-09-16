@@ -8610,6 +8610,18 @@ def test_pytorch_zip_raw_nested_literal_scans_payload_continuation_to_stop() -> 
     assert PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(near_match_outer_literal) is False
 
 
+def test_pytorch_zip_raw_nested_literal_parses_continuation_operands_to_stop() -> None:
+    nested_payload = b"cos\nsystem\n)R"
+    continuation = b"\x8c\x01.0."
+    outer_literal = b"B" + len(nested_payload).to_bytes(4, "little") + nested_payload + continuation
+    near_match_payload = b"!os\nsystem\n)R"
+    near_match_outer_literal = b"B" + len(near_match_payload).to_bytes(4, "little") + near_match_payload
+    near_match_outer_literal += continuation
+
+    assert PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(outer_literal) is True
+    assert PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(near_match_outer_literal) is False
+
+
 def test_pytorch_zip_raw_nested_literal_advances_past_clean_binary_candidate() -> None:
     assert PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(b"\x80\x04N.") is False
     assert (
@@ -8906,6 +8918,17 @@ def test_pytorch_zip_proto0_inst_context_ignores_mark_inside_literal() -> None:
         )
         is True
     )
+
+
+def test_pytorch_zip_raw_nested_proto0_string_boundaries_hide_literal_persid_noise() -> None:
+    long_noise = b"!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES + 32)
+    benign_string = b"S'" + long_noise + b"Pnot-a-persid" + long_noise + b"'\n."
+    benign_unicode = b"V" + long_noise + b"Pnot-a-persid" + long_noise + b"\n."
+    positive_persid = b"S'benign'\nPstorage-key\n."
+
+    assert PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(benign_string) is False
+    assert PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(benign_unicode) is False
+    assert PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(positive_persid) is True
 
 
 def test_pytorch_zip_prior_mark_search_skips_literal_spans() -> None:
