@@ -3505,6 +3505,34 @@ def test_pytorch_zip_discovery_skips_p_marker_inside_binbytes_literal(
     assert not any(issue.details.get("pickle_filename") == "archive/data/0" for issue in result.issues)
 
 
+def test_pytorch_zip_discovery_skips_deep_p_marker_inside_binbytes_literal(
+    tmp_path: Path,
+) -> None:
+    model_path = tmp_path / "referenced_storage_impossible_declared_prefix_deep_p_marker_binbytes.pt"
+    prefix = b"X" + (3_191_733_531).to_bytes(4, "little")
+    decoys = b"c!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)
+    inert_padding = b"!" * (70 * 1024)
+    literal_payload = (b"!" * (9 * 1024)) + b"P" + (b"!" * 128)
+    storage_blob = prefix + decoys + inert_padding
+    storage_blob += b"B" + len(literal_payload).to_bytes(4, "little") + literal_payload + b"."
+    storage_blob += b"!" * (-len(storage_blob) % 4)
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        zip_file.writestr("archive/data/0", storage_blob)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert result.success is True
+    assert result.metadata.get("pickle_verdict") == "clean"
+    assert result.metadata["pickle_files"] == ["archive/data.pkl"]
+    assert not any(
+        check.name == "Pickle Discovery" and check.details.get("analysis_incomplete") for check in result.checks
+    )
+    assert not any(issue.details.get("pickle_filename") == "archive/data/0" for issue in result.issues)
+
+
 def test_pytorch_zip_discovery_fails_closed_for_overlapping_persid_literal_decoy(
     tmp_path: Path,
 ) -> None:
@@ -4287,6 +4315,46 @@ def test_pytorch_zip_discovery_checks_long_window_before_padding_budget(tmp_path
 
     assert looks_like_pickle is True
     assert budget == [0]
+
+
+def test_pytorch_zip_discovery_charges_whitespace_probe_before_expanded_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = tmp_path / "referenced_whitespace_padding_budget_before_read.pt"
+    storage_blob = b" " * (pytorch_zip_scanner_module._PICKLE_DISCOVERY_LONG_PROBE_BYTES + 1)
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/data/0", storage_blob)
+
+    scanner = PyTorchZipScanner()
+    original_read_member_prefix = scanner._read_member_prefix
+    read_sizes: list[int] = []
+
+    def recording_read_member_prefix(
+        zip_file: zipfile.ZipFile,
+        entry: zipfile.ZipInfo,
+        max_bytes: int,
+        *,
+        phase: str,
+        result: ScanResult,
+    ) -> bytes:
+        read_sizes.append(max_bytes)
+        return original_read_member_prefix(zip_file, entry, max_bytes, phase=phase, result=result)
+
+    monkeypatch.setattr(scanner, "_read_member_prefix", recording_read_member_prefix)
+    result = ScanResult(scanner_name="pytorch_zip")
+    with zipfile.ZipFile(model_path) as zip_file:
+        entry = zip_file.getinfo("archive/data/0")
+        with pytest.raises(ValueError, match="trusted PyTorch storage padding probe budget exceeded"):
+            scanner._trusted_storage_entry_looks_like_pickle(
+                zip_file,
+                entry,
+                result,
+                max_probe_bytes=pytorch_zip_scanner_module._PICKLE_DISCOVERY_LONG_PROBE_BYTES,
+                padding_probe_bytes_remaining=[1],
+            )
+
+    assert max(read_sizes) <= pytorch_zip_scanner_module._TRUSTED_STORAGE_PICKLE_PROBE_BYTES
 
 
 def test_pytorch_zip_discovery_fails_closed_for_unread_headerless_padding(tmp_path: Path) -> None:
@@ -5898,6 +5966,15 @@ def test_pytorch_zip_discovery_preserves_spooled_line_continuation_suspicious_st
         and issue.details.get("pickle_rule_code") == "SUSPICIOUS_STRING"
         and issue.details.get("pickle_filename") == "archive/data/0"
         for issue in result.issues
+    )
+
+
+def test_pytorch_zip_discovery_filters_spooled_line_continuation_passive_url() -> None:
+    assert not PyTorchZipScanner._complete_pickle_literal_member_has_line_continuation_suspicious_text(
+        b"S'https://docs.example.invalid/os.\\\\\\nsystem(command)'\n."
+    )
+    assert PyTorchZipScanner._complete_pickle_literal_member_has_line_continuation_suspicious_text(
+        b"S'os.\\\\\\nsystem'\n."
     )
 
 

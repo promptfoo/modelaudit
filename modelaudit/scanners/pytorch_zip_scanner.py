@@ -62,7 +62,12 @@ from .archive_member_security import (
     probe_executable_archive_member_signature,
 )
 from .base import BaseScanner, Check, CheckStatus, IssueSeverity, ScanResult
-from .pickle_scanner import PickleScanner, _pickle_literal_url_stripped_scan_view
+from .pickle_scanner import (
+    _PICKLE_LITERAL_URL_TEXT_RE,
+    PickleScanner,
+    _pickle_literal_url_is_proven_inert,
+    _pickle_literal_url_stripped_scan_view,
+)
 from .picklescan_adapter import apply_pickle_member_context
 from .pytorch_zip_support import (
     RelaxedZipCrcTracker,
@@ -2072,7 +2077,6 @@ class PyTorchZipScanner(BaseScanner):
         )
         if not data_start:
             return False
-        initial_padding_probe_charge_bytes = 0
         if entry.file_size > len(data_start) and not data_start.strip(PROTO0_1_IGNORABLE_TRAILING_BYTES):
             data_start = self._read_member_prefix(
                 zip_file,
@@ -2084,7 +2088,10 @@ class PyTorchZipScanner(BaseScanner):
             if entry.file_size > len(data_start) and not data_start.strip(PROTO0_1_IGNORABLE_TRAILING_BYTES):
                 expanded_probe_bytes = min(entry.file_size, max_probe_bytes)
                 if expanded_probe_bytes > len(data_start):
-                    initial_padding_probe_charge_bytes = expanded_probe_bytes - len(data_start)
+                    PyTorchZipScanner._charge_padding_probe_budget(
+                        padding_probe_bytes_remaining,
+                        expanded_probe_bytes - len(data_start),
+                    )
                     data_start = self._read_member_prefix(
                         zip_file,
                         entry,
@@ -2166,7 +2173,7 @@ class PyTorchZipScanner(BaseScanner):
             return False
 
         sample = data_start
-        detection_probe_budget_charge_bytes = initial_padding_probe_charge_bytes
+        detection_probe_budget_charge_bytes = 0
         charge_deferred_probe_budget_on_skip = False
 
         def charge_detection_probe_budget() -> None:
@@ -4337,8 +4344,7 @@ class PyTorchZipScanner(BaseScanner):
 
     @staticmethod
     def _raw_nested_offset_is_inside_binary_byte_literal(value: bytes, offset: int) -> bool:
-        search_start = max(0, offset - _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES)
-        cursor = search_start
+        cursor = 0
         while cursor < offset:
             marker = value[cursor]
             if marker == ord("B"):
@@ -5211,9 +5217,30 @@ class PyTorchZipScanner(BaseScanner):
             if not text:
                 continue
             normalized = _PYTHON_LINE_CONTINUATION_RE.sub("", text)
-            if normalized != text and PyTorchZipScanner._literal_text_has_storage_route_signal(text):
+            if normalized != text and PyTorchZipScanner._literal_text_has_storage_route_signal(
+                PyTorchZipScanner._strip_inert_literal_urls_from_text(normalized)
+            ):
                 return True
         return False
+
+    @staticmethod
+    def _strip_inert_literal_urls_from_text(text: str) -> str:
+        if "://" not in text:
+            return text
+        parts: list[str] = []
+        last_end = 0
+        stripped = False
+        for match in _PICKLE_LITERAL_URL_TEXT_RE.finditer(text):
+            if not _pickle_literal_url_is_proven_inert(text, match.start(), match.end()):
+                continue
+            parts.append(text[last_end : match.start()])
+            parts.append("https://example.invalid/")
+            last_end = match.end()
+            stripped = True
+        if not stripped:
+            return text
+        parts.append(text[last_end:])
+        return "".join(parts)
 
     @staticmethod
     def _complete_pickle_literal_member_has_line_continuation_suspicious_text(
