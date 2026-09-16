@@ -8949,6 +8949,17 @@ def test_pytorch_zip_raw_nested_proto0_string_boundaries_hide_literal_persid_noi
     assert PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(positive_persid) is True
 
 
+def test_pytorch_zip_raw_nested_proto0_string_long_terminated_literal_span() -> None:
+    long_noise = b"!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES * 2)
+    benign_string = b"S'" + long_noise + b"Pnot-a-persid" + long_noise + b"'\n."
+    benign_unicode = b"V" + long_noise + b"Pnot-a-persid" + long_noise + b"\n."
+    positive_persid = b"S'benign'\nPstorage-key\n."
+
+    assert PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(benign_string) is False
+    assert PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(benign_unicode) is False
+    assert PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(positive_persid) is True
+
+
 def test_pytorch_zip_proto0_string_enclosing_span_recovery() -> None:
     value = b"S'" + (b"!" * 128) + b"Pnot-a-persid" + (b"!" * 128) + b"'\n."
     offset = value.index(b"P")
@@ -8963,6 +8974,25 @@ def test_pytorch_zip_proto0_unterminated_string_span_search_is_bounded() -> None
     value = b"S'" + (b"!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES + 32))
 
     assert PyTorchZipScanner._raw_nested_pickle_literal_span_starting_at(value, 0) is None
+
+
+def test_pytorch_zip_proto0_unterminated_string_window_search_is_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+    original = PyTorchZipScanner._raw_nested_pickle_literal_span_starting_at
+
+    def counted_span(value: bytes, literal_opcode_start: int) -> tuple[int, int, int] | None:
+        nonlocal calls
+        calls += 1
+        return original(value, literal_opcode_start)
+
+    monkeypatch.setattr(PyTorchZipScanner, "_raw_nested_pickle_literal_span_starting_at", staticmethod(counted_span))
+
+    value = (b"S'!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES * 4)) + b"!" * 1024
+
+    assert PyTorchZipScanner._raw_nested_window_has_literal_security_stream(value, 0, len(value)) is False
+    assert calls == 1
 
 
 def test_pytorch_zip_prior_mark_search_skips_literal_spans() -> None:

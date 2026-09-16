@@ -4544,6 +4544,7 @@ class PyTorchZipScanner(BaseScanner):
         )
         span_recovery_budget = _MAX_RAW_NESTED_PICKLE_CANDIDATES
         recursive_literal_scanned_until = window_start
+        proto0_text_no_newline_until = window_start
         while offset < window_end:
             marker_offset = min(
                 (
@@ -4555,8 +4556,22 @@ class PyTorchZipScanner(BaseScanner):
             )
             if marker_offset < 0:
                 return False
+            if (
+                marker_offset < proto0_text_no_newline_until
+                and value[marker_offset] in _PICKLE_PROTO0_TEXT_LITERAL_START_BYTES
+            ):
+                offset = marker_offset + 1
+                continue
             span = PyTorchZipScanner._raw_nested_pickle_literal_span_starting_at(value, marker_offset)
             if span is None:
+                no_newline_until = PyTorchZipScanner._raw_nested_proto0_text_literal_no_newline_until(
+                    value,
+                    marker_offset,
+                )
+                if no_newline_until is not None:
+                    proto0_text_no_newline_until = max(proto0_text_no_newline_until, no_newline_until)
+                    offset = marker_offset + 1
+                    continue
                 if span_recovery_budget <= 0:
                     if value[marker_offset] in _PICKLE_LENGTH_DELIMITED_LITERAL_START_BYTES:
                         return True
@@ -4612,6 +4627,7 @@ class PyTorchZipScanner(BaseScanner):
         if search_end is None:
             search_end = offset
         cursor = search_start
+        proto0_text_no_newline_until = search_start
         while cursor < search_end:
             literal_opcode_start = min(
                 (
@@ -4623,13 +4639,42 @@ class PyTorchZipScanner(BaseScanner):
             )
             if literal_opcode_start < 0:
                 return None
+            if (
+                literal_opcode_start < proto0_text_no_newline_until
+                and value[literal_opcode_start] in _PICKLE_PROTO0_TEXT_LITERAL_START_BYTES
+            ):
+                cursor = literal_opcode_start + 1
+                continue
             span = PyTorchZipScanner._raw_nested_pickle_literal_span_starting_at(value, literal_opcode_start)
             if span is not None:
                 _literal_opcode_start, literal_start, literal_end = span
                 if literal_start <= offset < literal_end:
                     return span
+            else:
+                no_newline_until = PyTorchZipScanner._raw_nested_proto0_text_literal_no_newline_until(
+                    value,
+                    literal_opcode_start,
+                )
+                if no_newline_until is not None:
+                    proto0_text_no_newline_until = max(proto0_text_no_newline_until, no_newline_until)
             cursor = literal_opcode_start + 1
         return None
+
+    @staticmethod
+    def _raw_nested_proto0_text_literal_no_newline_until(value: bytes, literal_opcode_start: int) -> int | None:
+        marker = value[literal_opcode_start]
+        if marker == ord("S"):
+            if literal_opcode_start + 2 > len(value) or value[literal_opcode_start + 1] not in {ord("'"), ord('"')}:
+                return None
+            literal_start = literal_opcode_start + 2
+        elif marker == ord("V"):
+            literal_start = literal_opcode_start + 1
+        else:
+            return None
+        literal_scan_limit = min(len(value), literal_start + _PICKLE_DISCOVERY_LONG_PROBE_BYTES)
+        if value.find(b"\n", literal_start, literal_scan_limit) >= 0:
+            return None
+        return literal_scan_limit
 
     @staticmethod
     def _raw_nested_pickle_literal_span_starting_at(
@@ -4662,7 +4707,7 @@ class PyTorchZipScanner(BaseScanner):
             if literal_opcode_start + 2 > len(value) or value[literal_opcode_start + 1] not in {ord("'"), ord('"')}:
                 return None
             literal_start = literal_opcode_start + 2
-            literal_scan_limit = min(len(value), literal_start + _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES)
+            literal_scan_limit = min(len(value), literal_start + _PICKLE_DISCOVERY_LONG_PROBE_BYTES)
             literal_end = value.find(b"\n", literal_start, literal_scan_limit)
             if literal_end < 0:
                 return None
@@ -4671,7 +4716,7 @@ class PyTorchZipScanner(BaseScanner):
             return None
         elif marker == ord("V"):
             literal_start = literal_opcode_start + 1
-            literal_scan_limit = min(len(value), literal_start + _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES)
+            literal_scan_limit = min(len(value), literal_start + _PICKLE_DISCOVERY_LONG_PROBE_BYTES)
             literal_end = value.find(b"\n", literal_start, literal_scan_limit)
             if literal_end < 0:
                 return None
@@ -4731,12 +4776,21 @@ class PyTorchZipScanner(BaseScanner):
                 + _PICKLE_PROTO0_TEXT_LITERAL_START_BYTES
             )
         )
+        proto0_text_no_newline_until = window_start
         while offset < window_end:
             if value[offset] not in mask_marker_bytes:
                 offset += 1
                 continue
+            if offset < proto0_text_no_newline_until and value[offset] in _PICKLE_PROTO0_TEXT_LITERAL_START_BYTES:
+                offset += 1
+                continue
             span = PyTorchZipScanner._raw_nested_pickle_literal_span_starting_at(value, offset)
             if span is None:
+                no_newline_until = PyTorchZipScanner._raw_nested_proto0_text_literal_no_newline_until(value, offset)
+                if no_newline_until is not None:
+                    proto0_text_no_newline_until = max(proto0_text_no_newline_until, no_newline_until)
+                    offset += 1
+                    continue
                 if value[offset] not in _RAW_NESTED_SECURITY_PICKLE_START_BYTES:
                     offset += 1
                     continue
