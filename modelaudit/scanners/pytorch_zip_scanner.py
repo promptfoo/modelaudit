@@ -4148,7 +4148,10 @@ class PyTorchZipScanner(BaseScanner):
                     mark_depths.append(stack_depth)
                     continue
                 if opcode.name == "POP":
-                    stack_depth = max(0, stack_depth - 1)
+                    if mark_depths and mark_depths[-1] == stack_depth:
+                        mark_depths.pop()
+                    else:
+                        stack_depth = max(0, stack_depth - 1)
                     continue
                 if opcode.name == "POP_MARK":
                     stack_depth = mark_depths.pop() if mark_depths else 0
@@ -4193,7 +4196,8 @@ class PyTorchZipScanner(BaseScanner):
             starts_checked += 1
             if starts_checked > _MAX_RAW_NESTED_PICKLE_CANDIDATES:
                 return memo_keys
-            memo_keys.update(PyTorchZipScanner._parsed_prefix_memo_keys_from_start(prefix[offset:]))
+            parse_end = min(len(prefix), offset + _PICKLE_DISCOVERY_LONG_PROBE_BYTES)
+            memo_keys.update(PyTorchZipScanner._parsed_prefix_memo_keys_from_start(prefix[offset:parse_end]))
             offset += 1
         return memo_keys
 
@@ -4715,8 +4719,12 @@ class PyTorchZipScanner(BaseScanner):
     def _raw_nested_prior_mark_outside_literal(value: bytes, start: int, end: int) -> int:
         mark = value.rfind(bytes([_PICKLE_MARK_OPCODE_BYTE]), start, end)
         while mark >= start:
-            if PyTorchZipScanner._raw_nested_enclosing_pickle_literal_span(value, mark) is None:
+            literal_span = PyTorchZipScanner._raw_nested_enclosing_pickle_literal_span(value, mark)
+            if literal_span is None:
                 return mark
+            if literal_span[0] > start:
+                mark = value.rfind(bytes([_PICKLE_MARK_OPCODE_BYTE]), start, literal_span[0])
+                continue
             mark = value.rfind(bytes([_PICKLE_MARK_OPCODE_BYTE]), start, mark)
         return -1
 
@@ -5703,12 +5711,14 @@ class PyTorchZipScanner(BaseScanner):
         pickle_source: str,
         pickle_filename: str,
     ) -> None:
+        checks_before = len(member_result.checks)
         member_result.add_check(
             name="Suspicious String Literal",
             passed=False,
             message="Suspicious string literal contains code execution pattern: storage route",
             severity=IssueSeverity.WARNING,
             location=f"{pickle_source} (pos 0)",
+            rule_code="SUSPICIOUS_STRING",
             details={
                 "pickle_source": pickle_source,
                 "opcode": "STRING",
@@ -5721,6 +5731,13 @@ class PyTorchZipScanner(BaseScanner):
                 "helper code during deserialization workflows."
             ),
         )
+        new_actionable_checks = (
+            check
+            for check in member_result.checks[checks_before:]
+            if check.status == CheckStatus.FAILED and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        )
+        if not any(new_actionable_checks):
+            return
         verdict = member_result.metadata.get("pickle_verdict")
         if (
             not isinstance(verdict, str)

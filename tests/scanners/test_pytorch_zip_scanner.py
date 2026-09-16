@@ -8429,6 +8429,24 @@ def test_pytorch_zip_literal_suspicious_text_preservation_budget_exhaustion_fail
     assert preservation_checks[0].details["scan_outcome_reason"] == "pytorch_zip_literal_preservation_incomplete"
 
 
+def test_pytorch_zip_preserved_suspicious_literal_uses_rule_code() -> None:
+    member_result = ScanResult(scanner_name="pickle")
+    member_result.metadata["pickle_verdict"] = "clean"
+
+    PyTorchZipScanner._add_preserved_suspicious_literal_finding(
+        member_result,
+        pickle_source="model.pt:archive/data/0",
+        pickle_filename="archive/data/0",
+    )
+
+    suspicious_checks = [check for check in member_result.checks if check.name == "Suspicious String Literal"]
+    assert len(suspicious_checks) == 1
+    assert suspicious_checks[0].rule_code == "SUSPICIOUS_STRING"
+    assert suspicious_checks[0].status == CheckStatus.FAILED
+    assert suspicious_checks[0].severity == IssueSeverity.WARNING
+    assert member_result.metadata["pickle_verdict"] == "suspicious"
+
+
 def test_pytorch_zip_discovery_scans_whitespace_hex_nested_pickle_literal(tmp_path: Path) -> None:
     model_path = tmp_path / "referenced_scalar_literal_hex_nested_pickle.pt"
     encoded = binascii.hexlify(b"cposix\nsystem\n)R.")
@@ -8606,6 +8624,33 @@ def test_pytorch_zip_proto_memo_keys_preserve_in_place_batch_depth() -> None:
     assert PyTorchZipScanner._parsed_prefix_memo_keys(invalid_popped_list_memo) == set()
 
 
+def test_pytorch_zip_proto_memo_keys_pop_mark_preserves_underlying_value() -> None:
+    valid_mark_pop_memo = b"S'safe_module'\n(0p0\n"
+    invalid_value_pop_memo = b"S'safe_module'\n0p0\n"
+
+    assert PyTorchZipScanner._parsed_prefix_memo_keys(valid_mark_pop_memo) == {"0"}
+    assert PyTorchZipScanner._parsed_prefix_memo_keys(invalid_value_pop_memo) == set()
+
+
+def test_pytorch_zip_proto_memo_alt_start_parsing_is_window_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    original = PyTorchZipScanner._parsed_prefix_memo_keys_from_start
+    lengths: list[int] = []
+
+    def counted_parse(prefix: bytes) -> set[str]:
+        lengths.append(len(prefix))
+        return original(prefix)
+
+    monkeypatch.setattr(PyTorchZipScanner, "_parsed_prefix_memo_keys_from_start", staticmethod(counted_parse))
+
+    long_probe_bytes = pytorch_zip_scanner_module._PICKLE_DISCOVERY_LONG_PROBE_BYTES
+    prefix = b"!" + (b"c!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 4))
+    prefix += b"!" * (long_probe_bytes * 3)
+
+    assert PyTorchZipScanner._parsed_prefix_memo_keys(prefix) == set()
+    assert lengths
+    assert max(lengths[1:], default=0) <= long_probe_bytes
+
+
 def test_pytorch_zip_prior_memo_scan_deduplicates_overlapping_get_offsets() -> None:
     memo_prefix = b"\x8c\x02osq\x00\x8c\x06systemq\x01\x8c\x04trueq\x02"
     long_probe_bytes = pytorch_zip_scanner_module._PICKLE_DISCOVERY_LONG_PROBE_BYTES
@@ -8779,6 +8824,16 @@ def test_pytorch_zip_proto0_inst_context_ignores_mark_inside_literal() -> None:
         )
         is True
     )
+
+
+def test_pytorch_zip_prior_mark_search_skips_literal_spans() -> None:
+    literal_payload = b"(" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 32)
+    literal = b"B" + len(literal_payload).to_bytes(4, "little") + literal_payload + b"."
+    live_mark_offset = len(literal)
+    value = literal + b"(tail"
+
+    assert PyTorchZipScanner._raw_nested_prior_mark_outside_literal(literal, 0, len(literal)) == -1
+    assert PyTorchZipScanner._raw_nested_prior_mark_outside_literal(value, 0, len(value)) == live_mark_offset
 
 
 def test_pytorch_zip_prior_window_inst_name_parse_fails_closed_after_budget() -> None:
