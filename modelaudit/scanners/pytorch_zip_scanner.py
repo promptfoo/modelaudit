@@ -2121,6 +2121,7 @@ class PyTorchZipScanner(BaseScanner):
                         context_start=0,
                     ):
                         raise ValueError("trusted PyTorch storage prefix exceeds pickle discovery probe")
+                    return False
                 if defer_padding_probe is not None:
                     defer_padding_probe[0] = True
                     return False
@@ -2695,11 +2696,16 @@ class PyTorchZipScanner(BaseScanner):
             if len(candidate) < header_bytes:
                 return None
             declared_size = int.from_bytes(candidate[1:header_bytes], "little")
-        elif candidate.startswith((b"U", bytes([0x8C]))):
+        elif candidate.startswith((b"U", bytes([0x8A]), bytes([0x8C]))):
             header_bytes = 2
             if len(candidate) < header_bytes:
                 return None
             declared_size = candidate[1]
+        elif candidate.startswith(bytes([0x8B])):
+            header_bytes = 5
+            if len(candidate) < header_bytes:
+                return None
+            declared_size = int.from_bytes(candidate[1:header_bytes], "little")
         elif candidate.startswith(bytes([0x8D])):
             header_bytes = 9
             if len(candidate) < header_bytes:
