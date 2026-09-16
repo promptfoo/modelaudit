@@ -8940,6 +8940,22 @@ def test_pytorch_zip_raw_nested_proto0_string_boundaries_hide_literal_persid_noi
     assert PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(positive_persid) is True
 
 
+def test_pytorch_zip_proto0_string_enclosing_span_recovery() -> None:
+    value = b"S'" + (b"!" * 128) + b"Pnot-a-persid" + (b"!" * 128) + b"'\n."
+    offset = value.index(b"P")
+
+    span = PyTorchZipScanner._raw_nested_enclosing_pickle_literal_span(value, offset)
+
+    assert span is not None
+    assert span[1] < offset < span[2]
+
+
+def test_pytorch_zip_proto0_unterminated_string_span_search_is_bounded() -> None:
+    value = b"S'" + (b"!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES + 32))
+
+    assert PyTorchZipScanner._raw_nested_pickle_literal_span_starting_at(value, 0) is None
+
+
 def test_pytorch_zip_prior_mark_search_skips_literal_spans() -> None:
     literal_payload = b"(" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 32)
     literal = b"B" + len(literal_payload).to_bytes(4, "little") + literal_payload + b"."

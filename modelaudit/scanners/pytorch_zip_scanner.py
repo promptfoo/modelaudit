@@ -4578,7 +4578,7 @@ class PyTorchZipScanner(BaseScanner):
             literal_opcode_start = min(
                 (
                     found
-                    for marker in _PICKLE_LENGTH_DELIMITED_LITERAL_START_BYTES
+                    for marker in _PICKLE_LENGTH_DELIMITED_LITERAL_START_BYTES + _PICKLE_PROTO0_TEXT_LITERAL_START_BYTES
                     if (found := value.find(bytes([marker]), cursor, search_end)) >= 0
                 ),
                 default=-1,
@@ -4624,7 +4624,8 @@ class PyTorchZipScanner(BaseScanner):
             if literal_opcode_start + 2 > len(value) or value[literal_opcode_start + 1] not in {ord("'"), ord('"')}:
                 return None
             literal_start = literal_opcode_start + 2
-            literal_end = value.find(b"\n", literal_start)
+            literal_scan_limit = min(len(value), literal_start + _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES)
+            literal_end = value.find(b"\n", literal_start, literal_scan_limit)
             if literal_end < 0:
                 return None
             if literal_end + 1 < len(value) and value[literal_end + 1] in _PICKLE_OPCODE_BYTES:
@@ -4632,7 +4633,8 @@ class PyTorchZipScanner(BaseScanner):
             return None
         elif marker == ord("V"):
             literal_start = literal_opcode_start + 1
-            literal_end = value.find(b"\n", literal_start)
+            literal_scan_limit = min(len(value), literal_start + _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES)
+            literal_end = value.find(b"\n", literal_start, literal_scan_limit)
             if literal_end < 0:
                 return None
             if literal_end + 1 < len(value) and value[literal_end + 1] in _PICKLE_OPCODE_BYTES:
@@ -4656,6 +4658,7 @@ class PyTorchZipScanner(BaseScanner):
                     scan_end = literal_end + pos + 1
                     break
         except Exception:
+            # Invalid continuation bytes are handled by scanning the bounded slice below.
             pass
         return value[literal_start:scan_end]
 
