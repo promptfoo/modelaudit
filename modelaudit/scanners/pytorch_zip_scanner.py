@@ -4094,11 +4094,20 @@ class PyTorchZipScanner(BaseScanner):
         if end <= 0:
             return False
         prefix_budget = _PICKLE_DISCOVERY_LONG_PROBE_BYTES * 4
-        if PyTorchZipScanner._parsed_prefix_memo_keys(value[: min(end, prefix_budget)]):
-            return True
-        if end <= prefix_budget:
-            return False
-        return bool(PyTorchZipScanner._parsed_prefix_memo_keys(value[max(0, end - prefix_budget) : end]))
+        step = max(1, prefix_budget - _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES + 1)
+        window_start = 0
+        windows_checked = 0
+        while window_start < end:
+            window_end = min(end, window_start + prefix_budget)
+            if PyTorchZipScanner._parsed_prefix_memo_keys(value[window_start:window_end]):
+                return True
+            if window_end >= end:
+                return False
+            windows_checked += 1
+            if windows_checked > _MAX_RAW_NESTED_PICKLE_CANDIDATES:
+                return True
+            window_start = min(window_start + step, max(0, end - prefix_budget))
+        return False
 
     @staticmethod
     def _canonical_proto0_memo_key(value: object) -> str:
@@ -4152,7 +4161,7 @@ class PyTorchZipScanner(BaseScanner):
                     stack_depth = (mark_depths.pop() if mark_depths else 0) + 1
                     continue
                 if opcode.name in {"APPENDS", "SETITEMS", "ADDITEMS"}:
-                    stack_depth = (mark_depths.pop() if mark_depths else max(1, stack_depth)) + 1
+                    stack_depth = mark_depths.pop() if mark_depths else 0
                     continue
                 stack_depth = max(0, stack_depth - len(opcode.stack_before)) + len(opcode.stack_after)
         except Exception:
@@ -4444,15 +4453,18 @@ class PyTorchZipScanner(BaseScanner):
     ) -> bool:
         _literal_opcode_start, literal_start, literal_end = span
         search_start = literal_start
-        checked = 0
-        while search_start < literal_end and checked < _MAX_RAW_NESTED_PICKLE_CANDIDATES:
+        search_budget_end = min(literal_end, literal_start + _PICKLE_DISCOVERY_PADDING_PROBE_BUDGET_BYTES)
+        while search_start < search_budget_end:
             offset = min(
-                (found for marker in b"PQ" if (found := value.find(bytes([marker]), search_start, literal_end)) >= 0),
+                (
+                    found
+                    for marker in b"PQ"
+                    if (found := value.find(bytes([marker]), search_start, search_budget_end)) >= 0
+                ),
                 default=-1,
             )
             if offset < 0:
-                return False
-            checked += 1
+                return literal_end > search_budget_end
             if value[offset] == ord("P"):
                 newline = value.find(b"\n", offset + 1, literal_end)
                 if newline < 0:
@@ -4468,7 +4480,7 @@ class PyTorchZipScanner(BaseScanner):
             if PyTorchZipScanner._raw_nested_persistent_id_candidate_should_scan(candidate, candidate_is_prefix):
                 return True
             search_start = offset + 1
-        return False
+        return literal_end > search_budget_end
 
     @staticmethod
     def _raw_nested_window_has_overlapping_literal_persid_stream(
@@ -4477,15 +4489,13 @@ class PyTorchZipScanner(BaseScanner):
         window_end: int,
     ) -> bool:
         offset = window_start
-        checked = 0
-        while offset < window_end and checked < _MAX_RAW_NESTED_PICKLE_CANDIDATES:
+        while offset < window_end:
             marker_offset = min(
                 (found for marker in b"PQ" if (found := value.find(bytes([marker]), offset, window_end)) >= 0),
                 default=-1,
             )
             if marker_offset < 0:
                 return False
-            checked += 1
             span = PyTorchZipScanner._raw_nested_enclosing_pickle_literal_span(value, marker_offset)
             if span is None:
                 offset = marker_offset + 1
@@ -4498,51 +4508,75 @@ class PyTorchZipScanner(BaseScanner):
     @staticmethod
     def _raw_nested_enclosing_pickle_literal_span(value: bytes, offset: int) -> tuple[int, int, int] | None:
         search_start = max(0, offset - (_PICKLE_DISCOVERY_LONG_PROBE_BYTES * 4))
+        span = PyTorchZipScanner._raw_nested_enclosing_pickle_literal_span_in_range(value, offset, search_start)
+        if span is not None:
+            return span
+        if search_start <= 0 or offset > _PICKLE_DISCOVERY_PADDING_PROBE_BUDGET_BYTES:
+            return None
+        return PyTorchZipScanner._raw_nested_enclosing_pickle_literal_span_in_range(value, offset, 0, search_start)
+
+    @staticmethod
+    def _raw_nested_enclosing_pickle_literal_span_in_range(
+        value: bytes,
+        offset: int,
+        search_start: int,
+        search_end: int | None = None,
+    ) -> tuple[int, int, int] | None:
+        if search_end is None:
+            search_end = offset
         cursor = search_start
-        while cursor < offset:
+        while cursor < search_end:
             literal_opcode_start = min(
                 (
                     found
                     for marker in _PICKLE_LENGTH_DELIMITED_LITERAL_START_BYTES
-                    if (found := value.find(bytes([marker]), cursor, offset)) >= 0
+                    if (found := value.find(bytes([marker]), cursor, search_end)) >= 0
                 ),
                 default=-1,
             )
             if literal_opcode_start < 0:
                 return None
-            marker = value[literal_opcode_start]
-            if marker in {ord("B"), ord("T"), ord("X")}:
-                header_bytes = 5
-                if literal_opcode_start + header_bytes > len(value):
-                    cursor = literal_opcode_start + 1
-                    continue
-                literal_size = int.from_bytes(
-                    value[literal_opcode_start + 1 : literal_opcode_start + header_bytes],
-                    "little",
-                )
-            elif marker in {ord("C"), ord("U"), 0x8C}:
-                header_bytes = 2
-                if literal_opcode_start + header_bytes > len(value):
-                    cursor = literal_opcode_start + 1
-                    continue
-                literal_size = value[literal_opcode_start + 1]
-            elif marker in {0x8D, 0x8E, 0x96}:
-                header_bytes = 9
-                if literal_opcode_start + header_bytes > len(value):
-                    cursor = literal_opcode_start + 1
-                    continue
-                literal_size = int.from_bytes(
-                    value[literal_opcode_start + 1 : literal_opcode_start + header_bytes],
-                    "little",
-                )
-            else:
-                cursor = literal_opcode_start + 1
-                continue
-            literal_start = literal_opcode_start + header_bytes
-            literal_end = literal_start + literal_size
-            if literal_start <= offset < literal_end and literal_end < len(value) and value[literal_end] == ord("."):
-                return literal_opcode_start, literal_start, literal_end
+            span = PyTorchZipScanner._raw_nested_pickle_literal_span_starting_at(value, literal_opcode_start)
+            if span is not None:
+                _literal_opcode_start, literal_start, literal_end = span
+                if literal_start <= offset < literal_end:
+                    return span
             cursor = literal_opcode_start + 1
+        return None
+
+    @staticmethod
+    def _raw_nested_pickle_literal_span_starting_at(
+        value: bytes,
+        literal_opcode_start: int,
+    ) -> tuple[int, int, int] | None:
+        marker = value[literal_opcode_start]
+        if marker in {ord("B"), ord("T"), ord("X")}:
+            header_bytes = 5
+            if literal_opcode_start + header_bytes > len(value):
+                return None
+            literal_size = int.from_bytes(
+                value[literal_opcode_start + 1 : literal_opcode_start + header_bytes],
+                "little",
+            )
+        elif marker in {ord("C"), ord("U"), 0x8C}:
+            header_bytes = 2
+            if literal_opcode_start + header_bytes > len(value):
+                return None
+            literal_size = value[literal_opcode_start + 1]
+        elif marker in {0x8D, 0x8E, 0x96}:
+            header_bytes = 9
+            if literal_opcode_start + header_bytes > len(value):
+                return None
+            literal_size = int.from_bytes(
+                value[literal_opcode_start + 1 : literal_opcode_start + header_bytes],
+                "little",
+            )
+        else:
+            return None
+        literal_start = literal_opcode_start + header_bytes
+        literal_end = literal_start + literal_size
+        if literal_end < len(value) and value[literal_end] == ord("."):
+            return literal_opcode_start, literal_start, literal_end
         return None
 
     @staticmethod
