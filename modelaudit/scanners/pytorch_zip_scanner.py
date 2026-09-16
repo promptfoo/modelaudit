@@ -3749,7 +3749,7 @@ class PyTorchZipScanner(BaseScanner):
                     nested_literal_depth=nested_literal_depth + 1,
                 ):
                     return True
-                offset = max(offset + 1, span[2] + 1)
+                offset = PyTorchZipScanner._raw_nested_offset_after_literal_span(value, offset, span[2])
                 continue
             candidate_count += 1
             if candidate_count > _MAX_RAW_NESTED_PICKLE_CANDIDATES:
@@ -4503,7 +4503,9 @@ class PyTorchZipScanner(BaseScanner):
         nested_literal_depth: int = 0,
     ) -> bool:
         offset = window_start
-        literal_marker_bytes = b"PQ" + _PICKLE_LENGTH_DELIMITED_LITERAL_START_BYTES
+        literal_marker_bytes = bytes(
+            set(b"PQ" + _PICKLE_LENGTH_DELIMITED_LITERAL_START_BYTES + _RAW_NESTED_SECURITY_PICKLE_START_BYTES)
+        )
         while offset < window_end:
             marker_offset = min(
                 (
@@ -4533,7 +4535,7 @@ class PyTorchZipScanner(BaseScanner):
                 nested_literal_depth=nested_literal_depth + 1,
             ):
                 return True
-            offset = max(marker_offset + 1, span[2] + 1)
+            offset = PyTorchZipScanner._raw_nested_offset_after_literal_span(value, marker_offset, span[2])
         return False
 
     @staticmethod
@@ -4612,10 +4614,16 @@ class PyTorchZipScanner(BaseScanner):
 
     @staticmethod
     def _raw_nested_literal_payload_for_recursive_scan(value: bytes, literal_start: int, literal_end: int) -> bytes:
-        scan_end = literal_end
-        if literal_end < len(value) and value[literal_end] == ord("."):
-            scan_end += 1
+        scan_limit = min(len(value), literal_end + _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES)
+        stop = value.find(b".", literal_end, scan_limit)
+        scan_end = stop + 1 if stop >= 0 else scan_limit
         return value[literal_start:scan_end]
+
+    @staticmethod
+    def _raw_nested_offset_after_literal_span(value: bytes, marker_offset: int, literal_end: int) -> int:
+        if literal_end < len(value) and value[literal_end] == ord("."):
+            return max(marker_offset + 1, literal_end + 1)
+        return max(marker_offset + 1, literal_end)
 
     @staticmethod
     def _raw_nested_window_with_literal_payloads_masked(value: bytes, window_start: int, window_end: int) -> bytes:

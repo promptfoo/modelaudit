@@ -8539,6 +8539,19 @@ def test_pytorch_zip_raw_nested_literal_scans_nested_literal_payload_security_st
     assert PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(near_match_outer_literal) is False
 
 
+def test_pytorch_zip_raw_nested_literal_scans_security_start_inside_spanning_literal() -> None:
+    padding = b"!" * (pytorch_zip_scanner_module._PICKLE_DISCOVERY_LONG_PROBE_BYTES + 32)
+    nested_payload = b"cevilmod\nrun\n)R."
+    outer_payload = padding + nested_payload + b"!" * 32
+    outer_literal = b"B" + len(outer_payload).to_bytes(4, "little") + outer_payload + b"."
+    near_match_payload = padding + b"safe_text\nrun\n!!." + b"!" * 32
+    near_match_outer_literal = b"B" + len(near_match_payload).to_bytes(4, "little")
+    near_match_outer_literal += near_match_payload + b"."
+
+    assert PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(outer_literal) is True
+    assert PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(near_match_outer_literal) is False
+
+
 def test_pytorch_zip_raw_nested_literal_scans_payload_that_borrows_enclosing_stop() -> None:
     nested_payload = b"cos\nsystem\n)R"
     outer_literal = b"B" + len(nested_payload).to_bytes(4, "little") + nested_payload + b"."
@@ -8547,6 +8560,24 @@ def test_pytorch_zip_raw_nested_literal_scans_payload_that_borrows_enclosing_sto
 
     assert PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(outer_literal) is True
     assert PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(near_match_outer_literal) is False
+
+
+def test_pytorch_zip_raw_nested_literal_scans_payload_continuation_to_stop() -> None:
+    nested_payload = b"cos\nsystem\n)R"
+    outer_literal = b"B" + len(nested_payload).to_bytes(4, "little") + nested_payload + b"\x94."
+    near_match_payload = b"!os\nsystem\n)R"
+    near_match_outer_literal = b"B" + len(near_match_payload).to_bytes(4, "little") + near_match_payload + b"\x94."
+
+    assert PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(outer_literal) is True
+    assert PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(near_match_outer_literal) is False
+
+
+def test_pytorch_zip_raw_nested_literal_reprocesses_following_security_opcode() -> None:
+    payload = b"T\x01\x00\x00\x00xcos\nsystem\n)R."
+    near_match = payload.replace(b"c", b"!", 1)
+
+    assert PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(payload) is True
+    assert PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(near_match) is False
 
 
 def test_pytorch_zip_raw_nested_later_windows_inspect_literal_payloads_before_masking() -> None:
