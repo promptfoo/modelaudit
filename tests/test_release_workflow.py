@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tarfile
@@ -166,6 +167,30 @@ def test_standalone_package_lint_uses_locked_root_ruff_version() -> None:
         guide_lines = guide.read_text(encoding="utf-8").splitlines()
         for expected_command in expected_commands:
             assert expected_command in guide_lines
+
+
+@pytest.mark.parametrize(
+    ("workflow_name", "job_name"),
+    [("test.yml", "picklescan-package"), ("release-please.yml", "build-picklescan-package")],
+)
+def test_standalone_type_check_uses_supported_mypy(workflow_name: str, job_name: str) -> None:
+    root_dir = Path(__file__).resolve().parents[1]
+    root_project = tomllib.loads((root_dir / "pyproject.toml").read_text(encoding="utf-8"))
+    root_requirement = next(
+        requirement
+        for entry in root_project["dependency-groups"]["dev"]
+        if (requirement := Requirement(entry)).name == "mypy"
+    )
+    workflow = yaml.safe_load((root_dir / ".github" / "workflows" / workflow_name).read_text(encoding="utf-8"))
+    step = _step_by_name(_job_steps(workflow, job_name), "Type check standalone package with mypy")
+    command = shlex.split(step["run"])
+    requirements = [Requirement(command[index + 1]) for index, arg in enumerate(command) if arg == "--with"]
+    standalone_requirement = next(requirement for requirement in requirements if requirement.name == "mypy")
+
+    assert standalone_requirement.specifier == root_requirement.specifier
+    assert standalone_requirement.specifier.contains("1.20.0")
+    assert not standalone_requirement.specifier.contains("2.0.0")
+    assert any(requirement.name == "pytest" for requirement in requirements)
 
 
 def test_release_workflow_manual_dispatch_inputs_and_guardrails() -> None:
