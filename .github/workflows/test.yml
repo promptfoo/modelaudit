@@ -1020,7 +1020,7 @@ jobs:
 
       - name: Type check standalone package with mypy
         run: |
-          uv run --with mypy mypy src tests
+          uv run --with 'mypy>=1.16.0,<2.0.0' --with pytest mypy src tests
 
       - name: Run standalone package tests
         run: |
