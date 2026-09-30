@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import pickle
+import pickletools
 import stat
 import struct
 import subprocess
@@ -8178,6 +8179,86 @@ def test_pytorch_zip_base64_literal_route_fails_closed_after_dense_padding_bound
     assert PyTorchZipScanner._base64_literal_route_token_segments(token) is None
 
 
+@pytest.mark.parametrize("encoding", ["base64", "hex"])
+@pytest.mark.parametrize("security_signal", [False, True])
+def test_pytorch_zip_encoded_candidate_boundary_preserves_global(
+    tmp_path: Path, encoding: str, security_signal: bool
+) -> None:
+    decoys = b"(~" * pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES
+    stream = b"cmod\nrun\n)R." if security_signal else b"cmod;run;)R."
+    payload = decoys + stream
+    encoded = base64.b64encode(payload) if encoding == "base64" else binascii.hexlify(payload)
+
+    assert PyTorchZipScanner._literal_value_has_encoded_nested_security_pickle(encoded) is security_signal
+    result = _scan_referenced_float_storage_blob(tmp_path, "encoded-boundary.pt", _pickle_binbytes(encoded))
+    if security_signal:
+        assert result.success is False
+        assert "archive/data/0" in result.metadata["pickle_files"]
+        assert "pickle_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+        assert any(issue.message == "Encoded pickle payload detected" for issue in result.issues)
+    else:
+        assert result.success is True
+        assert result.metadata.get("pickle_verdict") == "clean"
+        assert result.metadata["pickle_files"] == ["archive/data.pkl"]
+
+
+@pytest.mark.parametrize("security_signal", [False, True])
+def test_pytorch_zip_fallback_frame_length_cannot_hide_global(security_signal: bool) -> None:
+    decoys = b"(j" * pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES
+    frame_size = 0x20008B
+    prefix = b"N0" * 4093
+    operation = b"cmod\nrun\n)R0" if security_signal else b"N0"
+    literal_size = frame_size - len(prefix) - len(operation) - 6
+    body = prefix + operation + b"B" + literal_size.to_bytes(4, "little") + b"!" * literal_size + b"."
+    framed = b"\x95" + len(body).to_bytes(8, "little") + body
+    opcodes = {op.name for op, _arg, _pos in pickletools.genops(framed)}
+    assert len(body) == frame_size
+    assert ("GLOBAL" in opcodes and "REDUCE" in opcodes) is security_signal
+
+    assert (
+        PyTorchZipScanner._raw_nested_security_pickle_candidate_budget_exhausted_needs_scan(
+            decoys + framed, search_start=len(decoys)
+        )
+        is security_signal
+    )
+
+
+def test_pytorch_zip_invalid_frame_length_does_not_mask_overlapping_global() -> None:
+    value = b"\x95cmod\nf\n."
+
+    assert PyTorchZipScanner._raw_nested_pickle_literal_span_starting_at(value, 0) is None
+    assert PyTorchZipScanner._raw_nested_security_pickle_candidate_budget_exhausted_needs_scan(value) is True
+
+
+@pytest.mark.parametrize("noise_size", [256 * 1024, 512 * 1024])
+@pytest.mark.parametrize("marker", [b"h", b"j"])
+@pytest.mark.parametrize("security_signal", [False, True])
+def test_pytorch_zip_later_windows_bound_fixed_operand_work(
+    monkeypatch: pytest.MonkeyPatch, noise_size: int, marker: bytes, security_signal: bool
+) -> None:
+    calls = 0
+    original = PyTorchZipScanner._raw_nested_pickle_literal_span_starting_at
+
+    def counted_span(value: bytes, literal_opcode_start: int) -> tuple[int, int, int] | None:
+        nonlocal calls
+        calls += 1
+        return original(value, literal_opcode_start)
+
+    monkeypatch.setattr(PyTorchZipScanner, "_raw_nested_pickle_literal_span_starting_at", staticmethod(counted_span))
+    decoys = b"(j" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)
+    value = decoys + marker * noise_size + b"NNNNN."
+    if security_signal:
+        value += b"cmod\nrun\n)R."
+
+    assert (
+        PyTorchZipScanner._raw_nested_security_pickle_candidate_budget_exhausted_needs_scan(
+            value, search_start=len(decoys)
+        )
+        is security_signal
+    )
+    assert calls <= 6 * len(value)
+
+
 def test_pytorch_zip_encoded_nested_pickle_route_ignores_base64_marker_density_noise() -> None:
     assert PyTorchZipScanner._literal_value_has_encoded_nested_security_pickle(b"a" * 512) is False
 
@@ -8977,7 +9058,7 @@ def test_pytorch_zip_proto_memo_alt_start_parsing_is_window_bounded(monkeypatch:
     monkeypatch.setattr(PyTorchZipScanner, "_parsed_prefix_memo_key_offsets_from_start", staticmethod(counted_parse))
 
     long_probe_bytes = pytorch_zip_scanner_module._PICKLE_DISCOVERY_LONG_PROBE_BYTES
-    prefix = b"!" + (b"c!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 4))
+    prefix = b"!p" + (b"c!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 4))
     prefix += b"!" * (long_probe_bytes * 3)
 
     assert PyTorchZipScanner._parsed_prefix_memo_keys(prefix) == set()
