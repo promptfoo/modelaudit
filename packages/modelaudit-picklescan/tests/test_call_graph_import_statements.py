@@ -12579,3 +12579,91 @@ def test_returned_member_metaclass_proof_has_bounded_work(
     assert report.status == (ScanStatus.INCONCLUSIVE if incomplete else ScanStatus.COMPLETE)
     assert report.verdict == (SafetyVerdict.MALICIOUS if dangerous else SafetyVerdict.SUSPICIOUS)
     assert any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings) is dangerous
+
+
+@pytest.mark.parametrize("dangerous", [False, True])
+@pytest.mark.parametrize("deep_first", [False, True])
+@pytest.mark.parametrize("branches", [2, 1100])
+def test_source_context_failure_preserves_other_invocation_findings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dangerous: bool, deep_first: bool, branches: int
+) -> None:
+    constructor_module = "modelaudit_context_constructor"
+    condition_module = "modelaudit_context_deep_branch"
+    body = "os.system('not-executed')" if dangerous else "pass"
+    (tmp_path / f"{constructor_module}.py").write_text(
+        f"import os\nclass Gadget:\n    def __init__(self):\n        {body}\n", encoding="utf-8"
+    )
+    (tmp_path / f"{condition_module}.py").write_text(
+        "if False:\n    pass\n" + "elif False:\n    pass\n" * branches + "def probe():\n    return None\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    references = [(constructor_module, "Gadget"), (condition_module, "probe")]
+    if deep_first:
+        references.reverse()
+    payload = b"\x80\x04" + b"".join(_global_operand(module, name) + b")R0" for module, name in references) + b"N."
+    _clear_call_graph_caches()
+    try:
+        report = scan_bytes(payload)
+    finally:
+        _clear_call_graph_caches()
+
+    assert constructor_module not in sys.modules
+    assert condition_module not in sys.modules
+    assert report.status == (ScanStatus.INCONCLUSIVE if branches == 1100 else ScanStatus.COMPLETE)
+    assert report.verdict == (SafetyVerdict.MALICIOUS if dangerous else SafetyVerdict.SUSPICIOUS)
+    assert any("recursion" in error.message for error in report.errors) is (branches == 1100)
+    assert any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings) is dangerous
+
+
+@pytest.mark.parametrize("write_file", [False, True])
+@pytest.mark.parametrize("ambiguous_helper", [False, True])
+@pytest.mark.parametrize("custom_metaclass", [False, True])
+def test_metaclass_probe_error_preserves_member_file_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_file: bool,
+    ambiguous_helper: bool,
+    custom_metaclass: bool,
+) -> None:
+    module_name = "modelaudit_member_probe"
+    helper_name = "modelaudit_member_probe_helper"
+    alias_source = (
+        "if bool(int('1')):\n    alias = os.system\nelse:\n    alias = os.popen\n" if ambiguous_helper else ""
+    )
+    (tmp_path / f"{helper_name}.py").write_text(
+        f"import os\n{alias_source}def helper():\n    return None\n", encoding="utf-8"
+    )
+    bases = "(metaclass=Meta)" if custom_metaclass else ""
+    writes = "        handle = open(path, 'w')\n        handle.write(content)\n" if write_file else ""
+    (tmp_path / f"{module_name}.py").write_text(
+        f"import {helper_name}\nclass Meta(type):\n    pass\nclass Actual{bases}:\n"
+        f"    @staticmethod\n    def run(path, content):\n{writes}        {helper_name}.helper()\n"
+        "def __getattr__(name):\n    return Actual\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    target = tmp_path / "sitecustomize.py"
+    payload = (
+        b"\x80\x04"
+        + _global_operand(module_name, "Gadget.run")
+        + _unicode_operand(str(target))
+        + _unicode_operand("not-executed")
+        + b"\x86R."
+    )
+    _clear_call_graph_caches()
+    try:
+        report = scan_bytes(payload)
+    finally:
+        _clear_call_graph_caches()
+
+    assert not target.exists()
+    assert module_name not in sys.modules
+    assert helper_name not in sys.modules
+    assert report.status == (ScanStatus.INCONCLUSIVE if ambiguous_helper or custom_metaclass else ScanStatus.COMPLETE)
+    assert report.verdict == (SafetyVerdict.MALICIOUS if write_file else SafetyVerdict.SUSPICIOUS)
+    assert any(finding.rule_code == "DANGEROUS_CALL_GRAPH_FILE_WRITE" for finding in report.findings) is write_file
+    if ambiguous_helper:
+        assert any("ambiguous conditional rebinding" in error.message for error in report.errors)
+    elif custom_metaclass:
+        assert any("unproven metaclass" in error.message for error in report.errors)

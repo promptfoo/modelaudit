@@ -3437,20 +3437,25 @@ def _call_graph_entrypoints_for_reference(
     except _CallGraphAnalysisLimitError as error:
         analysis_limit_error = error
         entrypoints = error.partial_entrypoints
-    context = _module_source_context(module)
-    if context is not None:
-        export_name, separator, _member_path = name.partition(".")
-        deleted = export_name in context.deleted_names
-        if "__getattr__" in context.deleted_names:
-            analysis = _analyze_module(module)
-            if analysis is not None:
-                getter = _resolve_module_getattr_target(
-                    module, export_name, analysis, allow_loaded_extension_bypass=not separator
-                )
-                deleted |= getter is not None and getter in entrypoints
-        if deleted and analysis_limit_error is None:
-            # Keep existing possible paths; later namespace mutations can restore deleted exports.
-            analysis_limit_error = _CallGraphAnalysisLimitError("module export deletion is not fully analyzed")
+    try:
+        context = _module_source_context(module)
+        if context is not None:
+            export_name, separator, _member_path = name.partition(".")
+            deleted = export_name in context.deleted_names
+            if "__getattr__" in context.deleted_names:
+                analysis = _analyze_module(module)
+                if analysis is not None:
+                    getter = _resolve_module_getattr_target(
+                        module, export_name, analysis, allow_loaded_extension_bypass=not separator
+                    )
+                    deleted |= getter is not None and getter in entrypoints
+            if deleted and analysis_limit_error is None:
+                # Keep existing possible paths; later namespace mutations can restore deleted exports.
+                analysis_limit_error = _CallGraphAnalysisLimitError("module export deletion is not fully analyzed")
+    except (_CallGraphAnalysisLimitError, RecursionError) as error:
+        raise _CallGraphAnalysisLimitError(
+            str(analysis_limit_error or error), partial_entrypoints=entrypoints
+        ) from error
     if analysis_limit_error is not None:
         raise _CallGraphAnalysisLimitError(
             str(analysis_limit_error), partial_entrypoints=entrypoints
@@ -6869,13 +6874,16 @@ def _returned_class_target_entrypoints(
     entrypoints = (
         _call_graph_entrypoints(f"{class_target}.{member_path}") if member_path else _class_entrypoints(class_target)
     )
-    class_context = _source_class_context(class_target)
-    if class_context is None or not _class_lookup_has_source_backed_plain_metaclass(class_context):
-        selected = entrypoints if member_path or methods is None else _filter_class_entrypoints(entrypoints, methods)
-        if not any(_find_sink_path(entrypoint) is not None for entrypoint in selected):
-            raise _CallGraphAnalysisLimitError(
-                "module __getattr__ returns a class with an unproven metaclass", partial_entrypoints=entrypoints
+    try:
+        class_context = _source_class_context(class_target)
+        if class_context is None or not _class_lookup_has_source_backed_plain_metaclass(class_context):
+            selected = (
+                entrypoints if member_path or methods is None else _filter_class_entrypoints(entrypoints, methods)
             )
+            if not any(_find_sink_path(entrypoint) is not None for entrypoint in selected):
+                raise _CallGraphAnalysisLimitError("module __getattr__ returns a class with an unproven metaclass")
+    except (_CallGraphAnalysisLimitError, RecursionError) as error:
+        raise _CallGraphAnalysisLimitError(str(error), partial_entrypoints=entrypoints) from error
     if member_path and not entrypoints:
         raise _CallGraphAnalysisLimitError("module __getattr__ returns a class with an unresolved member path")
     return entrypoints

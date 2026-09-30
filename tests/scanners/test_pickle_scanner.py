@@ -3480,6 +3480,206 @@ def test_metaclass_proof_budget_preserves_root_outcome(
     assert determine_exit_code(aggregate) == (2 if incomplete else 1)
 
 
+@pytest.mark.parametrize("dangerous", [False, True])
+@pytest.mark.parametrize("deep_first", [False, True])
+@pytest.mark.parametrize("branches", [2, 1100])
+def test_source_context_failure_preserves_root_outcome(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dangerous: bool, deep_first: bool, branches: int
+) -> None:
+    constructor_module = "modelaudit_root_context_constructor"
+    condition_module = "modelaudit_root_context_deep_branch"
+    body = "os.system('not-executed')" if dangerous else "pass"
+    (tmp_path / f"{constructor_module}.py").write_text(
+        f"import os\nclass Gadget:\n    def __init__(self):\n        {body}\n", encoding="utf-8"
+    )
+    (tmp_path / f"{condition_module}.py").write_text(
+        "if False:\n    pass\n" + "elif False:\n    pass\n" * branches + "def probe():\n    return None\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    references = [(constructor_module, "Gadget"), (condition_module, "probe")]
+    if deep_first:
+        references.reverse()
+    path = tmp_path / "context-failure.pkl"
+    path.write_bytes(
+        b"\x80\x04"
+        + b"".join(b"c" + module.encode() + b"\n" + name.encode() + b"\n)R0" for module, name in references)
+        + b"N."
+    )
+    _clear_source_sensitive_caches()
+    try:
+        result = PickleScanner().scan(str(path))
+    finally:
+        _clear_source_sensitive_caches()
+    aggregate = create_initial_audit_result()
+    merge_scan_result(aggregate, result)
+    incomplete = branches == 1100
+
+    assert constructor_module not in sys.modules
+    assert condition_module not in sys.modules
+    assert result.success is (not incomplete)
+    assert result.metadata["pickle_report_status"] == ("inconclusive" if incomplete else "complete")
+    assert result.metadata["pickle_verdict"] == ("malicious" if dangerous else "suspicious")
+    assert any("recursion" in issue.message for issue in result.issues) is incomplete
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues) is dangerous
+    assert should_cache_scan_result(result.to_dict(include_private_metadata=True)) is False
+    assert determine_exit_code(aggregate) == (2 if incomplete else 1)
+
+
+@pytest.mark.parametrize("write_file", [False, True])
+@pytest.mark.parametrize("ambiguous_helper", [False, True])
+@pytest.mark.parametrize("custom_metaclass", [False, True])
+def test_metaclass_probe_error_preserves_root_file_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_file: bool,
+    ambiguous_helper: bool,
+    custom_metaclass: bool,
+) -> None:
+    module_name = "modelaudit_root_member_probe"
+    helper_name = "modelaudit_root_member_probe_helper"
+    alias_source = (
+        "if bool(int('1')):\n    alias = os.system\nelse:\n    alias = os.popen\n" if ambiguous_helper else ""
+    )
+    (tmp_path / f"{helper_name}.py").write_text(
+        f"import os\n{alias_source}def helper():\n    return None\n", encoding="utf-8"
+    )
+    bases = "(metaclass=Meta)" if custom_metaclass else ""
+    writes = "        handle = open(path, 'w')\n        handle.write(content)\n" if write_file else ""
+    (tmp_path / f"{module_name}.py").write_text(
+        f"import {helper_name}\nclass Meta(type):\n    pass\nclass Actual{bases}:\n"
+        f"    @staticmethod\n    def run(path, content):\n{writes}        {helper_name}.helper()\n"
+        "def __getattr__(name):\n    return Actual\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    target = tmp_path / "sitecustomize.py"
+    encoded_path = str(target).encode()
+    path = tmp_path / "member-probe.pkl"
+    path.write_bytes(
+        b"\x80\x04c"
+        + module_name.encode()
+        + b"\nGadget.run\nX"
+        + len(encoded_path).to_bytes(4, "little")
+        + encoded_path
+        + _short_binunicode(b"not-executed")
+        + b"\x86R."
+    )
+    _clear_source_sensitive_caches()
+    try:
+        result = PickleScanner().scan(str(path))
+    finally:
+        _clear_source_sensitive_caches()
+    aggregate = create_initial_audit_result()
+    merge_scan_result(aggregate, result)
+    incomplete = ambiguous_helper or custom_metaclass
+
+    assert not target.exists()
+    assert module_name not in sys.modules
+    assert helper_name not in sys.modules
+    assert result.success is (not incomplete)
+    assert result.metadata["pickle_report_status"] == ("inconclusive" if incomplete else "complete")
+    assert result.metadata["pickle_verdict"] == ("malicious" if write_file else "suspicious")
+    assert (
+        any(issue.details.get("pickle_rule_code") == "DANGEROUS_CALL_GRAPH_FILE_WRITE" for issue in result.issues)
+        is write_file
+    )
+    if ambiguous_helper:
+        assert any("ambiguous conditional rebinding" in issue.message for issue in result.issues)
+    elif custom_metaclass:
+        assert any("unproven metaclass" in issue.message for issue in result.issues)
+    assert should_cache_scan_result(result.to_dict(include_private_metadata=True)) is False
+    assert determine_exit_code(aggregate) == (2 if incomplete else 1)
+
+
+@pytest.mark.parametrize("malicious_literal", [False, True])
+@pytest.mark.parametrize("route", ["file", "seekable", "non_seekable"])
+@pytest.mark.parametrize("gap_kind", ["export deletion", "returned function invocation", "unproven metaclass"])
+def test_call_graph_gap_preserves_supplemental_checks_and_finalization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, malicious_literal: bool, route: str, gap_kind: str
+) -> None:
+    module_name = "modelaudit_root_supplemental_gap"
+    export_name = b"Gadget"
+    if gap_kind == "export deletion":
+        source = "class Gadget:\n    pass\nif bool(int('0')):\n    del Gadget\n"
+    elif gap_kind == "returned function invocation":
+        source = "def benign():\n    return None\ndef __getattr__(name):\n    return benign\n"
+    else:
+        source = (
+            "class Meta(type):\n    pass\nclass Actual(metaclass=Meta):\n"
+            "    @staticmethod\n    def run():\n        return None\ndef __getattr__(name):\n    return Actual\n"
+        )
+        export_name = b"Gadget.run"
+    (tmp_path / f"{module_name}.py").write_text(source, encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    literal = b"eval\x00(1)" if malicious_literal else b"value(1)"
+    payload = (
+        b"\x80\x04c" + module_name.encode() + b"\n" + export_name + b"\n)R" + _short_binunicode(literal) + b"\x86."
+    )
+    path = tmp_path / "supplemental-gap.pkl"
+    path.write_bytes(payload)
+    _clear_source_sensitive_caches()
+    try:
+        if route == "file":
+            result = PickleScanner().scan(str(path))
+        else:
+            stream = io.BytesIO(payload) if route == "seekable" else NonSeekableBytesIO(payload)
+            result = PickleScanner().scan_stream(stream, len(payload), source=str(path))
+    finally:
+        _clear_source_sensitive_caches()
+    aggregate = create_initial_audit_result()
+    merge_scan_result(aggregate, result)
+
+    assert module_name not in sys.modules
+    assert result.success is False
+    assert result.metadata["pickle_report_status"] == "inconclusive"
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert any(gap_kind in issue.message for issue in result.issues)
+    assert (
+        any(issue.rule_code == "S104" and issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+        is malicious_literal
+    )
+    assert should_cache_scan_result(result.to_dict(include_private_metadata=True)) is False
+    assert determine_exit_code(aggregate) == 2
+
+
+@pytest.mark.parametrize("malicious_literal", [False, True])
+def test_pytorch_zip_preserves_supplemental_findings_after_call_graph_gap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, malicious_literal: bool
+) -> None:
+    import zipfile
+
+    from modelaudit.scanners.pytorch_zip_scanner import PyTorchZipScanner
+
+    module_name = "modelaudit_zip_supplemental_gap"
+    (tmp_path / f"{module_name}.py").write_text(
+        "class Gadget:\n    pass\nif bool(int('0')):\n    del Gadget\n", encoding="utf-8"
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    literal = b"eval\x00(1)" if malicious_literal else b"value(1)"
+    payload = b"\x80\x04c" + module_name.encode() + b"\nGadget\n)R" + _short_binunicode(literal) + b"\x86."
+    path = create_mock_pytorch_zip(tmp_path / "supplemental-gap.pt", with_pickle=False)
+    with zipfile.ZipFile(path, "a") as archive:
+        archive.writestr("data.pkl", payload)
+    _clear_source_sensitive_caches()
+    try:
+        result = PyTorchZipScanner().scan(str(path))
+    finally:
+        _clear_source_sensitive_caches()
+    aggregate = create_initial_audit_result()
+    merge_scan_result(aggregate, result)
+
+    assert module_name not in sys.modules
+    assert result.success is False
+    assert any("export deletion" in issue.message for issue in result.issues)
+    assert (
+        any(issue.rule_code == "S104" and issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+        is malicious_literal
+    )
+    assert should_cache_scan_result(result.to_dict(include_private_metadata=True)) is False
+    assert determine_exit_code(aggregate) == 2
+
+
 def test_large_legacy_pytorch_container_defers_file_size_limit(tmp_path: Path) -> None:
     payload, pickle_end = _make_legacy_pytorch_container(b"A" * 512)
     path = tmp_path / "legacy-large.bin"

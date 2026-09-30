@@ -5390,7 +5390,11 @@ class PickleScanner(BaseScanner):
                     source=source,
                     pytorch_zip_storage_member_sizes=_pytorch_zip_storage_member_sizes,
                 )
-                if result.metadata.get("operational_error"):
+                if (
+                    result.metadata.get("operational_error")
+                    and result.metadata.get("operational_error_reason") != "call_graph_analysis_error"
+                ):
+                    result.finish(success=False)
                     return result
                 try:
                     file_obj.seek(start_position)
