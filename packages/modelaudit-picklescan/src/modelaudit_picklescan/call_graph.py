@@ -3481,9 +3481,9 @@ def _resolved_call_graph_entrypoints_for_reference(
     analysis_limit_error = None
     try:
         returned_entrypoints = _module_getattr_returned_class_entrypoints(f"{module}.{name}", methods=methods)
-    except _CallGraphAnalysisLimitError as error:
+    except (_CallGraphAnalysisLimitError, RecursionError) as error:
         analysis_limit_error = error
-        returned_entrypoints = error.partial_entrypoints
+        returned_entrypoints = error.partial_entrypoints if isinstance(error, _CallGraphAnalysisLimitError) else ()
     if methods is not None:
         returned_entrypoints = _filter_class_entrypoints(returned_entrypoints, methods)
     # Resolving an export still executes the hook before invoking its returned class.

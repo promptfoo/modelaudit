@@ -3680,6 +3680,92 @@ def test_pytorch_zip_preserves_supplemental_findings_after_call_graph_gap(
     assert determine_exit_code(aggregate) == 2
 
 
+@pytest.mark.parametrize("injected_error", [False, True])
+@pytest.mark.parametrize("padding", [False, True])
+@pytest.mark.parametrize("route", ["file", "seekable", "non_seekable"])
+def test_trusted_tail_cannot_override_call_graph_operational_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, injected_error: bool, padding: bool, route: str
+) -> None:
+    from collections import OrderedDict
+
+    payload = pickle.dumps(OrderedDict(), protocol=4) + (b"\0" if padding else b"")
+
+    def fail_call_graph(*args: object, **kwargs: object) -> None:
+        raise picklescan_call_graph._CallGraphAnalysisLimitError("bounded call-graph test failure")
+
+    if injected_error:
+        monkeypatch.setattr(picklescan_api, "find_dangerous_call_graphs", fail_call_graph)
+    path = tmp_path / "trusted-tail.pkl"
+    path.write_bytes(payload)
+    scanner = PickleScanner()
+    if route == "file":
+        result = scanner.scan(str(path))
+    else:
+        stream = NonSeekableBytesIO(payload) if route == "non_seekable" else io.BytesIO(payload)
+        result = scanner.scan_stream(stream, len(payload), source=str(path))
+    aggregate = create_initial_audit_result()
+    merge_scan_result(aggregate, result)
+    incomplete = padding or injected_error
+
+    assert result.success is (not injected_error and not (padding and route == "file"))
+    assert (result.metadata.get("trusted_incomplete_tail") is True) is padding
+    assert result.metadata["pickle_report_status"] == ("inconclusive" if incomplete else "complete")
+    assert result.metadata["pickle_verdict"] == ("unknown" if incomplete else "clean")
+    assert any("bounded call-graph test failure" in issue.message for issue in result.issues) is injected_error
+    assert (result.metadata.get("operational_error_reason") == "call_graph_analysis_error") is injected_error
+    assert should_cache_scan_result(result.to_dict(include_private_metadata=True)) is (not incomplete)
+    assert determine_exit_code(aggregate) == (2 if incomplete else 0)
+
+
+@pytest.mark.parametrize("dangerous", [False, True])
+@pytest.mark.parametrize("hook_first", [False, True])
+@pytest.mark.parametrize("branches", [2, 600])
+def test_hook_binding_recursion_preserves_root_outcome(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dangerous: bool, hook_first: bool, branches: int
+) -> None:
+    hook_module = "modelaudit_root_deep_hook_binding"
+    constructor_module = "modelaudit_root_hook_binding_constructor"
+    body = "os.system('not-executed')" if dangerous else "pass"
+    (tmp_path / f"{hook_module}.py").write_text(
+        "import os\nif False:\n    pass\n"
+        + "elif False:\n    pass\n" * branches
+        + f"def __getattr__(name):\n    {body}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / f"{constructor_module}.py").write_text(
+        f"import os\nclass Gadget:\n    def __init__(self):\n        {body}\n", encoding="utf-8"
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    references = [(constructor_module, "Gadget"), (hook_module, "Missing")]
+    if hook_first:
+        references.reverse()
+    path = tmp_path / "hook-binding.pkl"
+    path.write_bytes(
+        b"\x80\x04"
+        + b"".join(b"c" + module.encode() + b"\n" + name.encode() + b"\n)R0" for module, name in references)
+        + b"N."
+    )
+    _clear_source_sensitive_caches()
+    try:
+        result = PickleScanner().scan(str(path))
+    finally:
+        _clear_source_sensitive_caches()
+    aggregate = create_initial_audit_result()
+    merge_scan_result(aggregate, result)
+    incomplete = any("recursion" in issue.message for issue in result.issues)
+
+    assert hook_module not in sys.modules
+    assert constructor_module not in sys.modules
+    assert result.success is (not incomplete)
+    assert result.metadata["pickle_report_status"] == ("inconclusive" if incomplete else "complete")
+    assert result.metadata["pickle_verdict"] == ("malicious" if dangerous else "suspicious")
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues) is dangerous
+    assert should_cache_scan_result(result.to_dict(include_private_metadata=True)) is False
+    assert determine_exit_code(aggregate) == (2 if incomplete else 1)
+    if branches == 2:
+        assert not incomplete
+
+
 def test_large_legacy_pytorch_container_defers_file_size_limit(tmp_path: Path) -> None:
     payload, pickle_end = _make_legacy_pytorch_container(b"A" * 512)
     path = tmp_path / "legacy-large.bin"

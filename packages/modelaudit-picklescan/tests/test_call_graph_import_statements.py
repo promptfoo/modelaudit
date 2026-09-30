@@ -12667,3 +12667,64 @@ def test_metaclass_probe_error_preserves_member_file_write(
         assert any("ambiguous conditional rebinding" in error.message for error in report.errors)
     elif custom_metaclass:
         assert any("unproven metaclass" in error.message for error in report.errors)
+
+
+@pytest.mark.parametrize("dangerous_hook", [False, True])
+@pytest.mark.parametrize("dangerous_constructor", [False, True])
+@pytest.mark.parametrize("hook_first", [False, True])
+@pytest.mark.parametrize("branches", [2, 600])
+def test_hook_binding_recursion_preserves_resolved_and_independent_findings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    dangerous_hook: bool,
+    dangerous_constructor: bool,
+    hook_first: bool,
+    branches: int,
+) -> None:
+    hook_module = "modelaudit_deep_hook_binding"
+    constructor_module = "modelaudit_hook_binding_constructor"
+    hook_body = "os.system('not-executed')" if dangerous_hook else "return None"
+    constructor_body = "os.system('not-executed')" if dangerous_constructor else "pass"
+    (tmp_path / f"{hook_module}.py").write_text(
+        "import os\nif False:\n    pass\n"
+        + "elif False:\n    pass\n" * branches
+        + f"def __getattr__(name):\n    {hook_body}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / f"{constructor_module}.py").write_text(
+        f"import os\nclass Gadget:\n    def __init__(self):\n        {constructor_body}\n", encoding="utf-8"
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    references = [(constructor_module, "Gadget"), (hook_module, "Missing")]
+    if hook_first:
+        references.reverse()
+    payload = b"\x80\x04" + b"".join(_global_operand(module, name) + b")R0" for module, name in references) + b"N."
+    _clear_call_graph_caches()
+    try:
+        report = scan_bytes(payload)
+    finally:
+        _clear_call_graph_caches()
+
+    assert hook_module not in sys.modules
+    assert constructor_module not in sys.modules
+    assert report.verdict == (
+        SafetyVerdict.MALICIOUS if dangerous_hook or dangerous_constructor else SafetyVerdict.SUSPICIOUS
+    )
+    for entrypoint, dangerous in (
+        (f"{hook_module}.__getattr__", dangerous_hook),
+        (f"{constructor_module}.Gadget.__init__", dangerous_constructor),
+    ):
+        assert (
+            any(
+                finding.rule_code == "DANGEROUS_CALL_GRAPH" and entrypoint in finding.details.get("call_path", ())
+                for finding in report.findings
+            )
+            is dangerous
+        )
+    # Comprehension inlining changes the recursion boundary across supported Python versions.
+    assert all(
+        error.category == "call_graph_analysis_error" and "recursion" in error.message for error in report.errors
+    )
+    assert report.status == (ScanStatus.INCONCLUSIVE if report.errors else ScanStatus.COMPLETE)
+    if branches == 2:
+        assert not report.errors

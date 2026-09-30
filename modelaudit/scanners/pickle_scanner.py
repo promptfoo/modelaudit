@@ -3683,11 +3683,11 @@ class PickleScanner(BaseScanner):
 
     def _finish_after_wrapper_analysis(self, result: ScanResult, *, base_success: bool) -> None:
         success = base_success
-        if result.metadata.get("trusted_incomplete_tail") is True:
+        if result.metadata.get("operational_error"):
+            success = False
+        elif result.metadata.get("trusted_incomplete_tail") is True:
             success = True
-        elif (
-            result.metadata.get("operational_error") or result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
-        ):
+        elif result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME:
             success = False
         result.finish(success=success)
 
