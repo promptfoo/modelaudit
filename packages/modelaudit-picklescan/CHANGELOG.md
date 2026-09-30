@@ -10,6 +10,7 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - Detect invoked class constructors returned by source-backed module compatibility hooks, including Click 8.5's legacy LazyFile export.
+- Preserve annotated compatibility aliases and report incomplete analysis for returned function-local classes.
 - Ignore canonical PyTorch storage persistent-ID globals during source-sensitive call-graph enrichment.
 - Report which snapshot gate invalidated a shared call-graph source-stability failure.
 - Validate bounded batched PyTorch state-dictionary entries without falsely flagging canonical tensor reconstruction.

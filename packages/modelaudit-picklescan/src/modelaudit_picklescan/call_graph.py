@@ -6344,6 +6344,8 @@ def _module_getattr_binding_statements(
                 return bindings, True
             if isinstance(statement, ast.Return | ast.Raise):
                 return bindings, True
+            if isinstance(statement, ast.AnnAssign) and statement.value is None:
+                continue
             if isinstance(statement, ast.Delete) and any(
                 _assignment_target_binds_name(target, name) for target in statement.targets
             ):
@@ -6490,13 +6492,21 @@ def _returned_class_entrypoints_for_getter(
 ) -> tuple[str, ...]:
     if not _module_getattr_decorators_preserve_returns(getter, module_name, context):
         return ()
-    scope_nodes = list(ast.iter_child_nodes(getter))
+    scope_nodes = [(node, True) for node in ast.iter_child_nodes(getter)]
+    runtime_assignments: set[str] = set()
     while scope_nodes:
-        node = scope_nodes.pop()
+        node, runtime_context = scope_nodes.pop()
         if isinstance(node, ast.Yield | ast.YieldFrom):
             return ()
+        if isinstance(node, ast.AnnAssign) and node.value is None:
+            scope_nodes.append((node.annotation, False))
+            continue
+        if runtime_context and isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store | ast.Del):
+            runtime_assignments.add(node.id)
+        elif runtime_context and isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+            runtime_assignments.add(node.name)
         if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef | ast.Lambda):
-            scope_nodes.extend(ast.iter_child_nodes(node))
+            scope_nodes.extend((child, runtime_context) for child in ast.iter_child_nodes(node))
     parameters = (*getter.args.posonlyargs, *getter.args.args)
     if (
         (not parameters and getter.args.vararg is None)
@@ -6515,9 +6525,10 @@ def _returned_class_entrypoints_for_getter(
     parameter_symbol = symbols.get(parameter_name)
     condition_parameter = parameter_name
     condition_value: object = export_name
-    if parameter_symbol is not None and (parameter_symbol.is_assigned() or parameter_symbol.is_imported()):
+    parameter_assigned = parameter_name in runtime_assignments
+    if parameter_symbol is not None and (parameter_assigned or parameter_symbol.is_imported()):
         parameter_name = ""
-        if parameter_symbol.is_assigned():
+        if parameter_assigned:
             condition_parameter = ""
         else:
             condition_value = object()
@@ -6618,7 +6629,11 @@ def _returned_class_entrypoints_for_getter(
             imported = _collect_import_aliases((binding,), module_name, context.is_package).get(root_name)
             if imported is not None:
                 yield (f"{imported}.{remainder}" if separator else imported), before, in_function
-            elif isinstance(binding, ast.ClassDef) and not function_binding:
+            elif isinstance(binding, ast.ClassDef):
+                if function_binding:
+                    raise _CallGraphAnalysisLimitError(
+                        "module __getattr__ returns a function-local class whose closure is not analyzed"
+                    )
                 yield f"{module_name}.{target_name}", before, in_function
             elif isinstance(binding, ast.Assign | ast.AnnAssign) and binding.value is not None:
                 if root_name not in _assignment_alias_target_names(binding):

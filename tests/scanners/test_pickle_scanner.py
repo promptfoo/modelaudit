@@ -13,6 +13,7 @@ from typing import Any
 import modelaudit_picklescan.api as picklescan_api
 import pytest
 from modelaudit_picklescan import Notice, PickleReport, ScanStatus
+from modelaudit_picklescan.call_graph import _clear_source_sensitive_caches
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.cache.cache_policy import should_cache_scan_result
@@ -3104,6 +3105,44 @@ def test_legacy_pytorch_container_does_not_report_known_stream_truncated(tmp_pat
     assert "known_stream_truncated" not in result.metadata.get("scan_outcome_reasons", [])
     assert not any(check.details.get("notice_code") == "known_stream_truncated" for check in result.checks)
     assert result.metadata["legacy_pytorch_storage_start"] == pickle_end
+
+
+@pytest.mark.parametrize("dangerous_getter", [False, True])
+def test_returned_local_class_coverage_gap_preserves_outcome_and_cache_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dangerous_getter: bool
+) -> None:
+    module_name = "modelaudit_root_returned_local_class"
+    getter = "os.system('not-executed')" if dangerous_getter else "pass"
+    (tmp_path / f"{module_name}.py").write_text(
+        f"import os\ndef __getattr__(name):\n    {getter}\n"
+        "    class Local:\n        def __init__(self):\n            os.system('not-executed')\n"
+        "    return Local\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    payload = b"c" + module_name.encode() + b"\nGadget\n)R."
+    path = tmp_path / "returned-local-class.pkl"
+    path.write_bytes(payload)
+    _clear_source_sensitive_caches()
+    try:
+        result = PickleScanner().scan(str(path))
+    finally:
+        _clear_source_sensitive_caches()
+    aggregate = create_initial_audit_result()
+    merge_scan_result(aggregate, result)
+
+    if dangerous_getter:
+        assert result.success is True
+        assert result.metadata["pickle_verdict"] == "malicious"
+        assert determine_exit_code(aggregate) == 1
+        assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+    else:
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "pickle_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+        assert any("function-local class" in issue.message for issue in result.issues)
+        assert should_cache_scan_result(result.to_dict(include_private_metadata=True)) is False
+        assert determine_exit_code(aggregate) == 2
 
 
 def test_large_legacy_pytorch_container_defers_file_size_limit(tmp_path: Path) -> None:

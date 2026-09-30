@@ -2823,6 +2823,136 @@ def test_module_getattr_returned_class_follows_assigned_aliases(
     assert any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings) is dangerous
 
 
+@pytest.mark.parametrize("scope", ["module", "function"])
+@pytest.mark.parametrize(
+    ("bindings", "dangerous"),
+    [
+        ("Alias = _Danger\nAlias: type", True),
+        ("Alias = _Safe\nAlias: type", False),
+        ("Alias = _Danger\nAlias: type = _Safe", False),
+        ("Alias = _Safe\nAlias: type = _Danger", True),
+        ("Alias = _Danger\ndel Alias\nAlias: type", False),
+        ("Alias: type", False),
+    ],
+)
+def test_module_getattr_alias_annotations_preserve_runtime_values(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scope: str, bindings: str, dangerous: bool
+) -> None:
+    hook = "def __getattr__(name):\n    return Alias"
+    if scope == "module":
+        source = bindings + "\n" + hook
+    else:
+        source = "def __getattr__(name):\n    " + bindings.replace("\n", "\n    ") + "\n    return Alias"
+    report = _scan_module_getattr_class_source(tmp_path, monkeypatch, source)
+
+    assert any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings) is dangerous
+
+
+def test_module_getattr_annotation_does_not_erase_hook_definition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    report = _scan_module_getattr_class_source(
+        tmp_path, monkeypatch, "def __getattr__(name):\n    return _Danger\n__getattr__: object"
+    )
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings)
+
+
+def test_module_getattr_local_annotation_still_shadows_global_alias(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    report = _scan_module_getattr_class_source(
+        tmp_path, monkeypatch, "Alias = _Danger\ndef __getattr__(name):\n    Alias: type\n    return Alias"
+    )
+
+    assert not any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings)
+
+
+@pytest.mark.parametrize("dangerous", [False, True])
+@pytest.mark.parametrize("annotation", ["str", "(name := str)"])
+def test_module_getattr_parameter_annotation_preserves_export_value(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dangerous: bool, annotation: str
+) -> None:
+    result = "_Danger" if dangerous else "_Safe"
+    report = _scan_module_getattr_class_source(
+        tmp_path,
+        monkeypatch,
+        f"def __getattr__(name):\n    name: {annotation}\n"
+        f"    if name == 'Gadget':\n        return {result}\n    return _Danger",
+    )
+
+    assert any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings) is dangerous
+
+
+def test_module_getattr_annotation_yield_still_makes_generator(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    report = _scan_module_getattr_class_source(
+        tmp_path, monkeypatch, "def __getattr__(name):\n    name: (yield 1)\n    return _Danger"
+    )
+
+    assert not any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings)
+
+
+@pytest.mark.parametrize("return_expression", ["Local", "Alias", "{'Gadget': Local}[name]"])
+@pytest.mark.parametrize("dangerous_constructor", [False, True])
+@pytest.mark.parametrize("dangerous_getter", [False, True])
+def test_module_getattr_returned_local_class_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    return_expression: str,
+    dangerous_constructor: bool,
+    dangerous_getter: bool,
+) -> None:
+    module_name = "modelaudit_getattr_local_class"
+    marker = tmp_path / "hook-executed"
+    constructor = "os.system('not-executed')" if dangerous_constructor else "self.value = 1"
+    getter = "os.system('not-executed')" if dangerous_getter else "pass"
+    (tmp_path / f"{module_name}.py").write_text(
+        "import os\nfrom pathlib import Path\n"
+        f"def __getattr__(name):\n    Path({str(marker)!r}).write_text('executed')\n    {getter}\n"
+        f"    class Local:\n        def __init__(self):\n            {constructor}\n"
+        f"    Alias = Local\n    return {return_expression}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    _clear_call_graph_caches()
+    try:
+        report = scan_bytes(_global_call_payload(module_name, "Gadget"))
+    finally:
+        _clear_call_graph_caches()
+
+    if dangerous_getter:
+        assert report.verdict == SafetyVerdict.MALICIOUS
+        assert any(
+            finding.rule_code == "DANGEROUS_CALL_GRAPH"
+            and f"{module_name}.__getattr__" in finding.details.get("call_path", ())
+            for finding in report.findings
+        )
+    else:
+        assert report.status == ScanStatus.INCONCLUSIVE
+        assert report.verdict == SafetyVerdict.SUSPICIOUS
+        assert report.metadata["analysis_incomplete"] is True
+        assert any(
+            error.category == "call_graph_analysis_error" and "function-local class" in error.message
+            for error in report.errors
+        )
+    assert not marker.exists()
+    assert module_name not in sys.modules
+
+
+@pytest.mark.parametrize("class_after_return", [False, True])
+def test_module_getattr_unreturned_local_class_does_not_create_coverage_gap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, class_after_return: bool
+) -> None:
+    class_source = "    class Local:\n        def __init__(self):\n            os.system('not-executed')\n"
+    return_source = "    return _Safe\n"
+    body = return_source + class_source if class_after_return else class_source + return_source
+    report = _scan_module_getattr_class_source(tmp_path, monkeypatch, "def __getattr__(name):\n" + body)
+
+    assert not any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings)
+    assert not report.metadata.get("analysis_incomplete")
+
+
 @pytest.mark.parametrize(
     "decorator",
     ["staticmethod", "functools.cache", "cached", "functools.lru_cache(maxsize=8)"],
