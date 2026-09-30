@@ -2472,7 +2472,11 @@ def test_module_getattr_returned_name_respects_hook_bindings(
     )
     monkeypatch.syspath_prepend(str(tmp_path))
 
-    assert _returned_class_system_paths(module_name) == ()
+    if binding.startswith("for "):
+        with pytest.raises(call_graph._CallGraphAnalysisLimitError, match="loop-target binding"):
+            _returned_class_system_paths(module_name)
+    else:
+        assert _returned_class_system_paths(module_name) == ()
     assert module_name not in sys.modules
 
 
@@ -2540,7 +2544,7 @@ def test_module_getattr_returned_class_distinguishes_runtime_binding(
 
 
 def _scan_module_getattr_class_source(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, hook_source: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, hook_source: str, *, expected_gap: str | None = None
 ) -> PickleReport:
     module_name = "modelaudit_getattr_control_flow"
     (tmp_path / f"{module_name}.py").write_text(
@@ -2555,7 +2559,15 @@ def _scan_module_getattr_class_source(
     finally:
         _clear_call_graph_caches()
     assert module_name not in sys.modules
-    assert not any(error.category == "call_graph_analysis_error" for error in report.errors)
+    if expected_gap is None:
+        assert not any(error.category == "call_graph_analysis_error" for error in report.errors)
+    else:
+        assert report.status == ScanStatus.INCONCLUSIVE
+        assert report.verdict == SafetyVerdict.SUSPICIOUS
+        assert report.metadata["analysis_incomplete"] is True
+        assert any(
+            error.category == "call_graph_analysis_error" and expected_gap in error.message for error in report.errors
+        )
     return report
 
 
@@ -11591,3 +11603,80 @@ def test_module_getattr_conditional_return_expression_selects_export(
     assert any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings) is dangerous
     if dangerous:
         assert report.verdict == SafetyVerdict.MALICIOUS
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "for Alias in (_Danger,):\n    pass\nreturn Alias",
+        "for Alias in (_Safe,):\n    pass\nreturn Alias",
+        "for Alias in (_Danger,):\n    return Alias",
+        "for _, Alias in ((_Safe, _Danger),):\n    pass\nreturn Alias",
+        "global Alias\nfor Alias in (_Danger,):\n    pass\nreturn Alias",
+        "for Alias in (_Danger,):\n    pass\nCopied = Alias\nreturn Copied",
+    ],
+)
+def test_module_getattr_loop_target_return_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, body: str
+) -> None:
+    _scan_module_getattr_class_source(
+        tmp_path,
+        monkeypatch,
+        "def __getattr__(name):\n    " + body.replace("\n", "\n    "),
+        expected_gap="loop-target binding",
+    )
+
+
+@pytest.mark.parametrize(
+    ("body", "dangerous"),
+    [
+        ("while False:\n    return _Danger\nreturn _Safe", False),
+        ("while False:\n    return _Safe\nreturn _Danger", True),
+        ("while name == 'Other':\n    return _Danger\nreturn _Safe", False),
+        ("while False:\n    return _Danger\nelse:\n    return _Safe", False),
+        ("Alias = _Safe\nwhile False:\n    Alias = _Danger\nreturn Alias", False),
+        ("Alias = _Danger\nwhile False:\n    Alias = _Safe\nreturn Alias", True),
+        ("for Alias in ():\n    return _Danger\nreturn _Safe", False),
+        ("Alias = _Safe\nfor Alias in []:\n    pass\nreturn Alias", False),
+        ("for _ in {}:\n    return _Danger\nelse:\n    return _Safe", False),
+        ("for Alias in (_Danger,):\n    pass\nAlias = _Safe\nreturn Alias", False),
+        ("for Alias in (_Safe,):\n    pass\nAlias = _Danger\nreturn Alias", True),
+    ],
+)
+def test_module_getattr_loop_reachability_preserves_returns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, body: str, dangerous: bool
+) -> None:
+    report = _scan_module_getattr_class_source(
+        tmp_path, monkeypatch, "def __getattr__(name):\n    " + body.replace("\n", "\n    ")
+    )
+
+    assert any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings) is dangerous
+
+
+@pytest.mark.parametrize("inherited", [False, True])
+@pytest.mark.parametrize("dangerous", [False, True])
+@pytest.mark.parametrize("dangerous_constructor", [False, True])
+def test_module_getattr_returned_custom_metaclass_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, inherited: bool, dangerous: bool, dangerous_constructor: bool
+) -> None:
+    body = "os.system('not-executed')" if dangerous else "return object()"
+    constructor = "os.system('not-executed')" if dangerous_constructor else "pass"
+    classes = f"class _Returned(metaclass=_Meta):\n    def __init__(self):\n        {constructor}\n"
+    if inherited:
+        classes = (
+            "class _Base(metaclass=_Meta):\n    pass\n"
+            f"class _Returned(_Base):\n    def __init__(self):\n        {constructor}\n"
+        )
+    source = (
+        "class _Meta(type):\n    def __call__(cls):\n        "
+        + body
+        + "\n"
+        + classes
+        + "def __getattr__(name):\n    return _Returned\n"
+    )
+    report = _scan_module_getattr_class_source(
+        tmp_path, monkeypatch, source, expected_gap=None if dangerous_constructor else "unproven metaclass"
+    )
+    if dangerous_constructor:
+        assert report.verdict == SafetyVerdict.MALICIOUS
+        assert any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings)

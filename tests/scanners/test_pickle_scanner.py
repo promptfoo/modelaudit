@@ -3108,7 +3108,9 @@ def test_legacy_pytorch_container_does_not_report_known_stream_truncated(tmp_pat
 
 
 @pytest.mark.parametrize("dangerous_getter", [False, True])
-@pytest.mark.parametrize("gap_kind", ["function-local class", "unresolved member path"])
+@pytest.mark.parametrize(
+    "gap_kind", ["function-local class", "unresolved member path", "loop-target binding", "unproven metaclass"]
+)
 def test_returned_class_coverage_gap_preserves_outcome_and_cache_policy(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dangerous_getter: bool, gap_kind: str
 ) -> None:
@@ -3121,13 +3123,26 @@ def test_returned_class_coverage_gap_preserves_outcome_and_cache_policy(
             "    return Local\n"
         )
         export_name = b"Gadget"
-    else:
+    elif gap_kind == "unresolved member path":
         source = (
             "import os\nclass Resolved:\n    class Inner:\n        @staticmethod\n"
             "        def run():\n            os.system('not-executed')\n"
             f"def __getattr__(name):\n    {getter}\n    return Resolved\n"
         )
         export_name = b"Gadget.Inner.run"
+    elif gap_kind == "loop-target binding":
+        source = (
+            "import os\nclass Resolved:\n    def __init__(self):\n        os.system('not-executed')\n"
+            f"def __getattr__(name):\n    {getter}\n    for Alias in (Resolved,):\n        pass\n    return Alias\n"
+        )
+        export_name = b"Gadget"
+    else:
+        source = (
+            "import os\nclass Meta(type):\n    def __call__(cls):\n        os.system('not-executed')\n"
+            "class Resolved(metaclass=Meta):\n    pass\n"
+            f"def __getattr__(name):\n    {getter}\n    return Resolved\n"
+        )
+        export_name = b"Gadget"
     (tmp_path / f"{module_name}.py").write_text(
         source,
         encoding="utf-8",

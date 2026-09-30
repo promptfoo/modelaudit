@@ -3442,7 +3442,7 @@ def _call_graph_entrypoints_for_reference(
         return entrypoints
     if _resolve_class_target(f"{module}.{name}") is not None:
         return _filter_class_entrypoints(entrypoints, methods)
-    returned_entrypoints = _module_getattr_returned_class_entrypoints(f"{module}.{name}")
+    returned_entrypoints = _module_getattr_returned_class_entrypoints(f"{module}.{name}", methods=methods)
     # Resolving an export still executes the hook before invoking its returned class.
     return _dedupe_calls((*entrypoints, *_filter_class_entrypoints(returned_entrypoints, methods)))
 
@@ -6269,6 +6269,19 @@ def _module_getattr_condition_value(test: ast.expr, parameter_name: str, export_
     return None
 
 
+def _module_getattr_loop_body_is_unreachable(
+    statement: ast.For | ast.While, parameter_name: str, export_name: object
+) -> bool:
+    if isinstance(statement, ast.While):
+        return _module_getattr_condition_value(statement.test, parameter_name, export_name) is False
+    iterable = statement.iter
+    if isinstance(iterable, ast.Tuple | ast.List | ast.Set):
+        return not iterable.elts
+    if isinstance(iterable, ast.Dict):
+        return not iterable.keys
+    return isinstance(iterable, ast.Constant) and isinstance(iterable.value, str | bytes) and not iterable.value
+
+
 def _module_getattr_return_statements(
     getter: ast.FunctionDef, parameter_name: str, export_name: object
 ) -> tuple[ast.Return, ...]:
@@ -6280,7 +6293,14 @@ def _module_getattr_return_statements(
                 return returns, True
             if isinstance(statement, ast.Raise):
                 return returns, True
-            if isinstance(statement, ast.If):
+            if isinstance(statement, ast.For | ast.While) and _module_getattr_loop_body_is_unreachable(
+                statement, parameter_name, export_name
+            ):
+                loop_returns, loop_terminated = visit(statement.orelse)
+                returns.extend(loop_returns)
+                if loop_terminated:
+                    return returns, True
+            elif isinstance(statement, ast.If):
                 condition = _module_getattr_condition_value(statement.test, parameter_name, export_name)
                 branches: tuple[list[ast.stmt], ...]
                 if condition is None:
@@ -6354,6 +6374,18 @@ def _module_getattr_binding_statements(
                 bindings = ()
             elif _module_statement_binds_name(statement, name):
                 bindings = (statement,)
+            elif isinstance(statement, ast.For | ast.While) and _module_getattr_loop_body_is_unreachable(
+                statement, parameter_name, export_name
+            ):
+                bindings, terminated = visit(statement.orelse, bindings)
+                if terminated:
+                    return bindings, True
+            elif isinstance(statement, ast.For):
+                loop_bindings = (statement,) if _assignment_target_binds_name(statement.target, name) else bindings
+                body_bindings, _ = visit(statement.body, loop_bindings)
+                loop_continuing = bounded((*bindings, *body_bindings))
+                else_bindings, _ = visit(statement.orelse, loop_continuing)
+                bindings = bounded((*loop_continuing, *else_bindings))
             elif isinstance(statement, ast.If):
                 condition = _module_getattr_condition_value(statement.test, parameter_name, export_name)
                 branches = (
@@ -6416,7 +6448,9 @@ def _module_getattr_function_definitions(
 
 @_register_source_sensitive_cache
 @lru_cache(maxsize=4096)
-def _module_getattr_returned_class_entrypoints(function_name: str) -> tuple[str, ...]:
+def _module_getattr_returned_class_entrypoints(
+    function_name: str, *, methods: tuple[str, ...] | None = None
+) -> tuple[str, ...]:
     module_name, qualified_name = _split_function_name(function_name)
     if module_name is None:
         return ()
@@ -6443,7 +6477,7 @@ def _module_getattr_returned_class_entrypoints(function_name: str) -> tuple[str,
         entrypoints.update(
             dict.fromkeys(
                 _returned_class_entrypoints_for_getter(
-                    module_name, export_name, getter, context, analysis, member_path=member_path
+                    module_name, export_name, getter, context, analysis, member_path=member_path, methods=methods
                 )
             )
         )
@@ -6498,6 +6532,7 @@ def _returned_class_entrypoints_for_getter(
     analysis: _ModuleAnalysis,
     *,
     member_path: str = "",
+    methods: tuple[str, ...] | None = None,
 ) -> tuple[str, ...]:
     if not _module_getattr_decorators_preserve_returns(getter, module_name, context):
         return ()
@@ -6663,6 +6698,8 @@ def _returned_class_entrypoints_for_getter(
                         "module __getattr__ returns a function-local class whose closure is not analyzed"
                     )
                 yield f"{module_name}.{target_name}", before, in_function
+            elif isinstance(binding, ast.For):
+                raise _CallGraphAnalysisLimitError("module __getattr__ returns an unresolved loop-target binding")
             elif isinstance(binding, ast.Assign | ast.AnnAssign) and binding.value is not None:
                 if root_name not in _assignment_alias_target_names(binding):
                     continue
@@ -6692,6 +6729,18 @@ def _returned_class_entrypoints_for_getter(
                     if member_path
                     else _class_entrypoints(class_target)
                 )
+                if not member_path:
+                    class_context = _source_class_context(class_target)
+                    if class_context is None or not _class_lookup_has_source_backed_plain_metaclass(class_context):
+                        selected = (
+                            class_entrypoints
+                            if methods is None
+                            else _filter_class_entrypoints(class_entrypoints, methods)
+                        )
+                        if not any(_find_sink_path(entrypoint) is not None for entrypoint in selected):
+                            raise _CallGraphAnalysisLimitError(
+                                "module __getattr__ returns a class with an unproven metaclass"
+                            )
                 if member_path and not class_entrypoints:
                     raise _CallGraphAnalysisLimitError(
                         "module __getattr__ returns a class with an unresolved member path"
