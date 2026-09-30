@@ -2859,6 +2859,9 @@ class PyTorchZipScanner(BaseScanner):
             stream.seek(offset)
             try:
                 for opcode, _arg, pos in pickletools.genops(stream):
+                    # Newer pickletools decodes INST as UTF-8; unpicklers still require ASCII.
+                    if opcode.name == "INST" and isinstance(_arg, str) and not _arg.isascii():
+                        return False
                     if opcode.name in _PICKLE_SECURITY_RELEVANT_OPCODES:
                         return True
                     if opcode.name == "STOP" and pos is not None:
@@ -4069,7 +4072,8 @@ class PyTorchZipScanner(BaseScanner):
                 window,
                 parse_budget_remaining=parse_budget_remaining,
                 nested_literal_depth=nested_literal_depth,
-                original_value=value[window_start:window_end],
+                original_value=value,
+                original_offset=window_start,
             ):
                 return True
             if PyTorchZipScanner._raw_nested_proto0_inst_with_prior_window_mark_seen(
@@ -4486,14 +4490,17 @@ class PyTorchZipScanner(BaseScanner):
         parse_budget_remaining: list[int] | None = None,
         nested_literal_depth: int = 0,
         original_value: bytes | None = None,
+        original_offset: int = 0,
     ) -> bool:
         if parse_budget_remaining is None:
             parse_budget_remaining = [_MAX_RAW_NESTED_PICKLE_CANDIDATES]
         # Operand masking must not repair invalid GLOBAL/INST encodings.
-        if PyTorchZipScanner._raw_nested_proto0_global_ref_seen(value, original_value=original_value):
+        if PyTorchZipScanner._raw_nested_proto0_global_ref_seen(
+            value, original_value=original_value, original_offset=original_offset
+        ):
             return True
         if PyTorchZipScanner._raw_nested_proto0_inst_ref_seen(
-            value, parse_budget_remaining, original_value=original_value
+            value, parse_budget_remaining, original_value=original_value, original_offset=original_offset
         ):
             return True
         if PyTorchZipScanner._raw_nested_persistent_id_opcode_seen(value, parse_budget_remaining):
@@ -4561,17 +4568,31 @@ class PyTorchZipScanner(BaseScanner):
         return True
 
     @staticmethod
-    def _raw_nested_proto0_global_ref_seen(value: bytes, *, original_value: bytes | None = None) -> bool:
+    def _raw_nested_proto0_global_ref_seen(
+        value: bytes, *, original_value: bytes | None = None, original_offset: int = 0
+    ) -> bool:
         search_limit = min(len(value), _PICKLE_DISCOVERY_LONG_PROBE_BYTES)
         search_start = 0
+        source = original_value if original_value is not None else value
+        # A name can outlive the opcode-search window, but not the discovery byte budget.
+        name_limit = min(len(source), original_offset + _PICKLE_DISCOVERY_PADDING_PROBE_BUDGET_BYTES)
         while search_start < search_limit:
             offset = value.find(b"c", search_start, search_limit)
             if offset < 0:
                 return False
-            name_end, search_start, _truncated = PyTorchZipScanner._raw_nested_proto0_name_end(
-                original_value if original_value is not None else value, offset, search_limit
+            name_end, next_start, truncated = PyTorchZipScanner._raw_nested_proto0_name_end(
+                source, original_offset + offset, name_limit
             )
+            search_start = next_start - original_offset
             if name_end is not None:
+                if name_end >= original_offset + search_limit:
+                    # A later literal cannot supply delimiters for an earlier decoy GLOBAL.
+                    span_at = PyTorchZipScanner._raw_nested_literal_span_lookup(source, search_end=name_end + 1)
+                    module_end = source.find(b"\n", original_offset + offset + 1, name_end)
+                    if span_at(module_end) is not None or span_at(name_end) is not None:
+                        continue
+                return True
+            if truncated and name_limit < len(source):
                 return True
         return False
 
@@ -5109,7 +5130,11 @@ class PyTorchZipScanner(BaseScanner):
 
     @staticmethod
     def _raw_nested_proto0_inst_ref_seen(
-        value: bytes, parse_budget_remaining: list[int], *, original_value: bytes | None = None
+        value: bytes,
+        parse_budget_remaining: list[int],
+        *,
+        original_value: bytes | None = None,
+        original_offset: int = 0,
     ) -> bool:
         search_limit = min(len(value), _PICKLE_DISCOVERY_LONG_PROBE_BYTES)
         search_start = 0
@@ -5119,9 +5144,12 @@ class PyTorchZipScanner(BaseScanner):
                 return False
             name_end, next_search_start, truncated = PyTorchZipScanner._raw_nested_proto0_name_end(
                 original_value if original_value is not None else value,
-                offset,
-                search_limit,
+                original_offset + offset,
+                original_offset + search_limit,
             )
+            next_search_start -= original_offset
+            if name_end is not None:
+                name_end -= original_offset
             if name_end is None:
                 if truncated:
                     if PyTorchZipScanner._raw_nested_prior_mark_outside_literal(value, 0, offset) >= 0:

@@ -51,6 +51,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Avoid incomplete PyTorch ZIP storage discovery when a tensor member starts with an impossible length-prefixed pickle opcode and no hidden payload is present.
 - Keep PyTorch ZIP storage discovery failed closed when hidden payloads overlap invalid length fields, follow exhausted candidate budgets, or define memo state after candidate exhaustion.
 - Keep PyTorch ZIP storage discovery failed closed when memo-dependent or encoded structural payloads span the nested-candidate cap.
+- Validate long `GLOBAL` names across discovery windows within the existing 4 MiB discovery budget, and fail closed when names exceed that budget. Reject invalid non-ASCII `INST` names consistently across supported Python versions.
 - Treat passive built-in CoreML license-reference URLs as informational while preserving active metadata URL and command detections.
 
 ## [0.2.52](https://github.com/promptfoo/modelaudit/compare/v0.2.51...v0.2.52) (2026-07-22)

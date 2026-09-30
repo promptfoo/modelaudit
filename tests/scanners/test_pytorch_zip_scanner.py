@@ -7486,10 +7486,12 @@ def test_pytorch_zip_later_raw_scan_starts_after_scanned_suffix(
         parse_budget_remaining: list[int] | None = None,
         nested_literal_depth: int = 0,
         original_value: bytes | None = None,
+        original_offset: int = 0,
     ) -> bool:
         del fail_closed_on_truncated_extension, parse_budget_remaining
         assert nested_literal_depth == 0
-        assert original_value == window
+        assert original_value is not None
+        assert original_value[original_offset : original_offset + len(window)] == window
         calls.append(window)
         return False
 
@@ -9296,7 +9298,7 @@ def test_pytorch_zip_proto0_memo_keys_canonicalize_zero_padded_get() -> None:
 def test_pytorch_zip_memoize_cardinality_survives_fallback_windows(
     tmp_path: Path, explicit_definitions: bytes, get_key: int, security_signal: bool, windows: int
 ) -> None:
-    decoys = b"c!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)
+    decoys = b"c\xff" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)
     gap = b"N0" * (pytorch_zip_scanner_module._PICKLE_DISCOVERY_LONG_PROBE_BYTES * windows // 2 + 17)
     operand_gap = b"N0" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES // 2 + 17)
     stream = b"S'mod'\n" + explicit_definitions + gap + b"S'run'\n" + operand_gap
@@ -21944,6 +21946,8 @@ def test_pytorch_zip_exhausted_candidates_preserve_utf8_names(
         b"foo/bar\nrun\n",
         b"mod\nrun name\n",
         "模块\n运行\n".encode(),
+        "mód\nrun\n".encode(),
+        "mod\né\n".encode(),
         b"mod\n\xffrun\n",
     ],
 )
@@ -22253,3 +22257,90 @@ def test_pytorch_zip_name_validation_matches_runtime_for_each_byte(opcode: bytes
             stream, 1 if opcode == b"i" else 0, len(stream)
         )
         assert (name_end is not None) is bool(seen), (opcode, field, value)
+
+
+@pytest.mark.parametrize("field", [0, 1])
+@pytest.mark.parametrize("later_window", [False, True])
+@pytest.mark.parametrize("valid", [False, True])
+@pytest.mark.parametrize("name_prefix", [b"a", b"!"])
+def test_pytorch_zip_long_global_name_crosses_fallback_windows(
+    tmp_path: Path, field: int, later_window: bool, valid: bool, name_prefix: bytes
+) -> None:
+    names = [b"mod", b"run"]
+    names[field] = (b"" if valid else b"\xff") + name_prefix + b"a" * 70_000
+    stream = b"c" + b"\n".join(names) + b"\n."
+    seen: list[tuple[str, str]] = []
+
+    class RecordingUnpickler(pickle.Unpickler):
+        def find_class(self, module: str, name: str) -> type[object]:
+            seen.append((module, name))
+            return object
+
+    if valid:
+        RecordingUnpickler(io.BytesIO(stream)).load()
+        assert seen == [(names[0].decode(), names[1].decode())]
+    else:
+        with pytest.raises(UnicodeDecodeError):
+            RecordingUnpickler(io.BytesIO(stream)).load()
+        assert not seen
+    value = b"c\xff" * 65 + b"!" * (65_536 if later_window else 0) + stream
+
+    assert PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(value) is valid
+    assert PyTorchZipScanner._trailing_candidate_has_raw_nested_security_pickle(value, sample_is_prefix=False) is valid
+    result = _scan_referenced_float_storage_blob(tmp_path, "long-global-name.pt", b"X\xff\xff\xff\x7f" + value)
+    if valid:
+        assert result.success is False
+        assert "pytorch_zip_pickle_discovery_incomplete" in result.metadata["scan_outcome_reasons"]
+        _assert_pytorch_zip_inconclusive_not_cached(
+            tmp_path / "long-global-name.pt",
+            tmp_path / "long-global-cache",
+            "pytorch_zip_pickle_discovery_incomplete",
+            expected_success=False,
+            expected_exit_code=2,
+        )
+    else:
+        assert result.success is True
+        assert result.metadata.get("pickle_verdict") == "clean"
+
+
+@pytest.mark.parametrize(
+    "tail", [b"c", b"c" + b"!" * 70_000, b"cmod\n" + b"!" * 70_000], ids=["opcode_only", "module", "symbol"]
+)
+@pytest.mark.parametrize("later_window", [False, True])
+def test_pytorch_zip_eof_global_name_near_matches_stay_inert(tmp_path: Path, tail: bytes, later_window: bool) -> None:
+    value = b"c\xff" * 65 + b"!" * (65_536 if later_window else 0) + tail
+
+    assert PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(value) is False
+    assert PyTorchZipScanner._trailing_candidate_has_raw_nested_security_pickle(value, sample_is_prefix=False) is False
+    result = _scan_referenced_float_storage_blob(tmp_path, "incomplete-global-name.pt", b"X\xff\xff\xff\x7f" + value)
+    assert result.success is True
+    assert result.metadata.get("pickle_verdict") == "clean"
+
+
+@pytest.mark.parametrize("field", [0, 1])
+@pytest.mark.parametrize("valid_prefix", [False, True])
+def test_pytorch_zip_cross_window_global_name_validation_is_bounded(
+    monkeypatch: pytest.MonkeyPatch, field: int, valid_prefix: bool
+) -> None:
+    class CountingBytes(bytes):
+        copied_bytes = 0
+
+        def __getitem__(self, key: Any) -> Any:
+            result = super().__getitem__(key)
+            if isinstance(result, bytes):
+                self.copied_bytes += len(result)
+            return result
+
+    budget = 256
+    monkeypatch.setattr(pytorch_zip_scanner_module, "_PICKLE_DISCOVERY_PADDING_PROBE_BUDGET_BYTES", budget)
+    names = [b"mod", b"run"]
+    names[field] = (b"" if valid_prefix else b"\xff") + b"a" * 1024
+    source = CountingBytes(b"!" * 17 + b"c" + b"\n".join(names) + b"\n.")
+    window = source[17:145]
+    source.copied_bytes = 0
+
+    assert (
+        PyTorchZipScanner._raw_nested_proto0_global_ref_seen(window, original_value=source, original_offset=17)
+        is valid_prefix
+    )
+    assert 0 < source.copied_bytes <= budget
