@@ -1,6 +1,7 @@
 import ast
 import hashlib
 import json
+import math
 import os
 import struct
 import sys
@@ -6065,6 +6066,146 @@ class TestWeightDistributionCoverage:
 
 class TestWeightDistributionSemantics:
     """Regression tests for ONNX initializer semantics and output axes."""
+
+    @pytest.mark.parametrize("max_array_size", [None, 32])
+    @pytest.mark.parametrize(
+        ("stored_shape", "target_shape"),
+        [((4,), (4, 4)), ((1, 4), (4, 1)), ((4, 1), (1, 4)), ((4, 4), (1,))],
+    )
+    def test_expand_weight_uses_broadcast_values_and_shared_storage(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        stored_shape: tuple[int, ...],
+        target_shape: tuple[int, ...],
+        max_array_size: int | None,
+    ) -> None:
+        weights = np.linspace(-0.1, 0.1, math.prod(stored_shape), dtype=np.float32).reshape(stored_shape)
+        graph = helper.make_graph(
+            [
+                helper.make_node("Expand", ["W", "shape"], ["expanded"]),
+                helper.make_node("MatMul", ["X", "expanded"], ["Y"]),
+            ],
+            "expanded_initializer_weight",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 4])],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 4])],
+            initializer=[
+                onnx.numpy_helper.from_array(weights, name="W"),
+                onnx.numpy_helper.from_array(np.array(target_shape, dtype=np.int64), name="shape"),
+            ],
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model, full_check=True)
+        if max_array_size is not None:
+
+            def reject_broadcast(*args: Any, **kwargs: Any) -> None:
+                raise AssertionError("Oversized broadcast must be rejected before preparing a view")
+
+            monkeypatch.setattr(np, "broadcast_to", reject_broadcast)
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(
+            model, onnx=onnx, np=np, max_array_size=max_array_size
+        )
+
+        assert plan.extraction_failures == 0
+        path = tmp_path / "expand-weight.onnx"
+        onnx.save(model, str(path))
+        result = OnnxScanner({"max_array_size": max_array_size} if max_array_size is not None else {}).scan(str(path))
+        if max_array_size is not None:
+            assert plan.oversized_initializers_skipped == 1
+            assert plan.specs == []
+            assert result.success is False
+            coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+            assert coverage and coverage[0].details["oversized_initializers_skipped"] == 1
+            assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+            return
+        assert len(plan.specs) == 1
+        expected = np.broadcast_to(weights, np.broadcast_shapes(stored_shape, target_shape))
+        np.testing.assert_array_equal(plan.specs[0].weights, expected)
+        assert plan.specs[0].context["analysis_storage_shares_memory"] is True
+
+        assert result.success is True
+        assert result.metadata["onnx_weight_distribution_semantics"]["analyzed_layer_count"] == 1
+        assert result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"] == {}
+
+    @pytest.mark.parametrize("malicious", [False, True])
+    def test_expand_preserves_weight_distribution_findings(self, tmp_path: Path, malicious: bool) -> None:
+        weights = np.zeros((100, 1), dtype=np.float32)
+        if malicious:
+            weights[50:55, 0] = 10.0
+        reference_path = create_onnx_weight_model(
+            tmp_path, np.broadcast_to(weights, (100, 100)).copy(), op_type="MatMul", filename="reference.onnx"
+        )
+        reference = OnnxScanner().scan(str(reference_path))
+        model = onnx.load(str(reference_path))
+        model.graph.initializer[0].CopyFrom(onnx.numpy_helper.from_array(weights, name="W"))
+        model.graph.initializer.append(onnx.numpy_helper.from_array(np.array([100, 100], dtype=np.int64), name="shape"))
+        model.graph.node[0].input[1] = "expanded"
+        model.graph.node.insert(0, helper.make_node("Expand", ["W", "shape"], ["expanded"]))
+        onnx.checker.check_model(model, full_check=True)
+        path = tmp_path / "expanded.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        assert result.success is True
+        assert bool(self._extreme_checks(reference)) is malicious
+        assert bool(self._extreme_checks(result)) is malicious
+        assert result.metadata["onnx_weight_distribution_semantics"]["analyzed_layer_count"] == 1
+
+    @pytest.mark.parametrize("extent", [0, 1, 2])
+    @pytest.mark.parametrize("overridable", [False, True])
+    def test_scan_reentry_respects_proven_zero_or_one_scan_extent(
+        self, tmp_path: Path, extent: int, overridable: bool
+    ) -> None:
+        body = helper.make_graph(
+            [
+                helper.make_node("MatMul", ["X", "state"], ["body_y"]),
+                helper.make_node("Unsqueeze", ["state", "axes"], ["next_state"]),
+                helper.make_node("Identity", ["element"], ["next_element"]),
+            ],
+            "scan_extent_body",
+            [
+                helper.make_tensor_value_info("state", TensorProto.FLOAT, None),
+                helper.make_tensor_value_info("element", TensorProto.FLOAT, [1]),
+            ],
+            [
+                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, None),
+                helper.make_tensor_value_info("next_element", TensorProto.FLOAT, [1]),
+            ],
+        )
+        inputs = [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 4])]
+        if overridable:
+            inputs.append(helper.make_tensor_value_info("scan_values", TensorProto.FLOAT, [None, 1]))
+        graph = helper.make_graph(
+            [
+                helper.make_node(
+                    "Scan", ["initial_state", "scan_values"], ["final_state", "Y"], body=body, num_scan_inputs=1
+                )
+            ],
+            "scan_known_extent",
+            inputs,
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [None, 1])],
+            initializer=[
+                onnx.numpy_helper.from_array(np.ones((4,), dtype=np.float32), name="initial_state"),
+                onnx.numpy_helper.from_array(np.array([1], dtype=np.int64), name="axes"),
+                onnx.numpy_helper.from_array(np.zeros((extent, 1), dtype=np.float32), name="scan_values"),
+            ],
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        model.ir_version = 8
+        onnx.checker.check_model(model, full_check=True)
+        path = tmp_path / f"scan-extent-{extent}-{overridable}.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        if extent > 1 or overridable:
+            assert result.success is False
+            assert semantics["coverage_gaps"]["lineages_per_value_limit"] > 0
+        else:
+            assert result.success is True
+            assert semantics["coverage_gaps"] == {}
 
     @staticmethod
     def _extreme_checks(result: Any) -> list[Any]:

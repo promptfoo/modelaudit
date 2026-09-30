@@ -2468,7 +2468,7 @@ def _build_onnx_weight_analysis_plan(
             axis = raw_axis if raw_axis >= 0 else len(shape) + raw_axis
             if axis < 0 or axis >= len(shape):
                 return True
-            if shape[axis] <= 0 or shape[axis] > 1:
+            if shape[axis] < 0 or shape[axis] > 1:
                 return True
         return False
 
@@ -5033,7 +5033,7 @@ def _build_onnx_weight_analysis_plan(
                     unresolved_reason=lineage.unresolved_reason or "unresolved_expand_lineage",
                 )
             output_shape = expanded_shape
-            transform = _OnnxWeightTransform("Reshape", output_shape)
+            transform = _OnnxWeightTransform("Expand", output_shape)
         elif node.op_type == "Gather":
             index_shape = constant_initializer_shape(constants, node.input[1]) if len(node.input) >= 2 else None
             gather_axis = _onnx_gather_axis(node, len(lineage.shape))
@@ -10541,7 +10541,20 @@ def _build_onnx_weight_analysis_plan(
                 continue
 
             transformed_views: dict[tuple[_OnnxWeightTransform, ...], Any] = {(): array}
+            oversized_view_skipped = False
             for consumer_group in initializer_groups.values():
+                if (
+                    max_array_size is not None
+                    and max_array_size > 0
+                    and any(
+                        transform.kind == "Expand" and math.prod(transform.parameters) * itemsize > max_array_size
+                        for transform in consumer_group.lineage.transforms
+                    )
+                ):
+                    if not oversized_view_skipped:
+                        plan.oversized_initializers_skipped += 1
+                        oversized_view_skipped = True
+                    continue
                 transformed = transformed_views.get(consumer_group.lineage.transforms)
                 if transformed is None:
                     transformed = array
@@ -10552,6 +10565,8 @@ def _build_onnx_weight_analysis_plan(
                             transformed = np.transpose(transformed, axes=transform.parameters)
                         elif transform.kind == "Reshape":
                             transformed = np.reshape(transformed, transform.parameters)
+                        elif transform.kind == "Expand":
+                            transformed = np.broadcast_to(transformed, transform.parameters)
                         if transformed.size and not np.shares_memory(array, transformed):
                             raise RuntimeError("ONNX weight lineage transform requires a full-tensor copy")
                     transformed_views[consumer_group.lineage.transforms] = transformed
