@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- Detect invoked class constructors returned by source-backed module compatibility hooks, including Click 8.5's legacy LazyFile export.
 - Avoid incomplete ONNX weight analysis when Gather nodes read dimensions from Shape outputs.
 - Avoid incomplete ONNX weight analysis when large runtime-activation fanout only adds dynamic bookkeeping lineage.
 - Treat documentation, license, and repository links in verified pickle and ONNX metadata as informational across supported Python versions while preserving active and unknown network destinations.

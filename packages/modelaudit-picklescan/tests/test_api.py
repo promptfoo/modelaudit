@@ -16006,7 +16006,8 @@ def test_scan_bytes_warns_on_unknown_legacy_compat_global(module: str) -> None:
 
 
 def test_with_call_graph_findings_promotes_click_startup_hook_write_paths() -> None:
-    pytest.importorskip("click")
+    click_utils = pytest.importorskip("click.utils")
+    lazy_file_name = "_LazyFile" if "_LazyFile" in vars(click_utils) else "LazyFile"
 
     report = PickleReport(
         source="click-startup-hook-write.pkl",
@@ -16041,7 +16042,7 @@ def test_with_call_graph_findings_promotes_click_startup_hook_write_paths() -> N
     assert finding.details["write_sink"] == "binary_file.write"
     assert finding.details["opener_call_path"] == (
         "click.utils.open_file",
-        "click.utils.LazyFile.__init__",
+        f"click.utils.{lazy_file_name}.__init__",
         "builtins.open",
     )
     assert finding.details["writer_call_path"] == ("click.utils.echo", "binary_file.write")

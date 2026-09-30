@@ -3434,21 +3434,14 @@ def _call_graph_entrypoints_for_reference(
         return ()
     if _is_explicit_method_import_reference(name):
         return entrypoints
-    if _resolve_class_target(f"{module}.{name}") is None:
+    methods, _ = _pickle_owner_proof_for_reference(reference)
+    if methods is None:
         return entrypoints
-    opcode = str(reference.get("opcode", ""))
-    if opcode in _NEWOBJ_OPCODES:
-        if not isinstance(reference.get("positional_arg_count"), int):
-            return _filter_class_entrypoints(entrypoints, (*_PICKLE_LIFECYCLE_ENTRYPOINT_METHODS, "__new__"))
-        return _filter_class_entrypoints(entrypoints, ("__new__",))
-    if opcode in _BUILD_OPCODES:
-        methods: tuple[str, ...] = _PICKLE_BUILD_ENTRYPOINT_METHODS
-        if reference.get("build_uses_slot_state") is False:
-            methods = tuple(method for method in methods if method != "__setattr__")
+    if _resolve_class_target(f"{module}.{name}") is not None:
         return _filter_class_entrypoints(entrypoints, methods)
-    if opcode in _CONSTRUCTOR_OPCODES:
-        return _filter_class_entrypoints(entrypoints, _PICKLE_CONSTRUCTOR_ENTRYPOINT_METHODS)
-    return entrypoints
+    returned_entrypoints = _module_getattr_returned_class_entrypoints(f"{module}.{name}")
+    # Resolving an export still executes the hook before invoking its returned class.
+    return _dedupe_calls((*entrypoints, *_filter_class_entrypoints(returned_entrypoints, methods)))
 
 
 def _pickle_entrypoint_positional_arg_count(
@@ -6235,6 +6228,90 @@ def _resolve_class_target(function_name: str) -> str | None:
         if dotted_alias_target is not None:
             return _resolve_class_target(dotted_alias_target)
     return None
+
+
+@_register_source_sensitive_cache
+@lru_cache(maxsize=4096)
+def _module_getattr_returned_class_entrypoints(function_name: str) -> tuple[str, ...]:
+    module_name, qualified_name = _split_function_name(function_name)
+    if module_name is None or "." in qualified_name:
+        return ()
+    if _resolve_function_target(function_name) != f"{module_name}.__getattr__":
+        return ()
+    if _find_sink_path(f"{module_name}.__getattr__") is not None:
+        return ()
+    context = _module_source_context(module_name)
+    analysis = _analyze_module(module_name)
+    if context is None or analysis is None:
+        return ()
+    getter = next(
+        (
+            statement
+            for statement in reversed(context.module_statements)
+            if isinstance(statement, ast.FunctionDef) and statement.name == "__getattr__"
+        ),
+        None,
+    )
+    if getter is None:
+        return ()
+    parameters = (*getter.args.posonlyargs, *getter.args.args)
+    if len(parameters) != 1:
+        return ()
+    parameter_name = parameters[0].arg
+    statements = _definition_scope_statements(getter.body)
+    if any(_module_statement_binds_name(statement, parameter_name) for statement in statements):
+        return ()
+    globals_is_builtin = "globals" not in analysis.direct_names and parameter_name != "globals"
+    globals_is_builtin &= not any(_module_statement_binds_name(statement, "globals") for statement in statements)
+    entrypoints: dict[str, None] = {}
+    for statement in statements:
+        if not isinstance(statement, ast.Return):
+            continue
+        expression = statement.value
+        target_name: str | None = expression.id if isinstance(expression, ast.Name) else None
+        if (
+            globals_is_builtin
+            and isinstance(expression, ast.Subscript)
+            and isinstance(expression.value, ast.Call)
+            and isinstance(expression.value.func, ast.Name)
+            and expression.value.func.id == "globals"
+            and not expression.value.args
+            and not expression.value.keywords
+        ):
+            key = expression.slice
+            if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                target_name = key.value
+            elif isinstance(key, ast.JoinedStr):
+                parts: list[str] = []
+                key_length = 0
+                for part in key.values:
+                    if isinstance(part, ast.Constant) and isinstance(part.value, str):
+                        text = part.value
+                    elif (
+                        isinstance(part, ast.FormattedValue)
+                        and isinstance(part.value, ast.Name)
+                        and part.value.id == parameter_name
+                        and part.conversion == -1
+                        and part.format_spec is None
+                    ):
+                        text = qualified_name
+                    else:
+                        break
+                    key_length += len(text)
+                    if key_length > _MAX_SOURCE_MODULE_NAME_CHARS:
+                        raise _CallGraphAnalysisLimitError("module __getattr__ export name exceeds analysis limit")
+                    parts.append(text)
+                else:
+                    target_name = "".join(parts)
+        if target_name is not None:
+            if len(target_name) > _MAX_SOURCE_MODULE_NAME_CHARS:
+                raise _CallGraphAnalysisLimitError("module __getattr__ export name exceeds analysis limit")
+            entrypoints.update(dict.fromkeys(analysis.class_entrypoints.get(f"{module_name}.{target_name}", ())))
+            if len(entrypoints) > _MAX_CALLS_PER_FUNCTION:
+                raise _CallGraphAnalysisLimitError(
+                    "module __getattr__ returned-class entrypoints exceed analysis limit"
+                )
+    return tuple(entrypoints)
 
 
 def _class_entrypoints(class_name: str) -> tuple[str, ...]:

@@ -12,7 +12,6 @@ These tests verify that the asset inventory functionality works correctly across
 import json
 import os
 import pickle
-import tempfile
 import zipfile
 from pathlib import Path
 
@@ -245,15 +244,9 @@ class TestAssetInventoryIntegration:
         with zipfile.ZipFile(inner_zip, "w") as inner_zf:
             # Add SafeTensors file to inner ZIP
             safetensors_data = {"weight": np.array([1, 2, 3, 4]).astype(np.float32)}
-            with tempfile.NamedTemporaryFile(
-                suffix=".safetensors",
-                delete=False,
-            ) as tmp:
-                save_file(safetensors_data, tmp.name)
-                tmp.close()  # Close temp file before reopening (required on Windows)
-                with open(tmp.name, "rb") as f:
-                    inner_zf.writestr("model.safetensors", f.read())
-                os.unlink(tmp.name)
+            safetensors_file = tmp_path / "model.safetensors"
+            save_file(safetensors_data, str(safetensors_file))
+            inner_zf.writestr("model.safetensors", safetensors_file.read_bytes())
 
         outer_zip = tmp_path / "outer.zip"
         with zipfile.ZipFile(outer_zip, "w") as outer_zf, open(inner_zip, "rb") as f:

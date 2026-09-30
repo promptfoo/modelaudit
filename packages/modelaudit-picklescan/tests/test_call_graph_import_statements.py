@@ -2292,6 +2292,117 @@ def test_call_graph_models_missing_dotted_dunder_module_getattr(
     )
 
 
+@pytest.mark.parametrize("return_expression", ["_Gadget", "globals()['_Gadget']", 'globals()[f"_{name}"]'])
+@pytest.mark.parametrize("opcode", ["REDUCE", "NEWOBJ"])
+@pytest.mark.parametrize("dangerous_location", ["constructor", "getter", "neither"])
+def test_module_getattr_returned_class_preserves_invocation_and_hook_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    return_expression: str,
+    opcode: str,
+    dangerous_location: str,
+) -> None:
+    module_name = "modelaudit_getattr_returned_class"
+    marker = tmp_path / "getter-ran"
+    constructor_body = "os.system('not-executed')" if dangerous_location == "constructor" else "self.value = 1"
+    getter_body = "os.system('not-executed')" if dangerous_location == "getter" else "pass"
+    (tmp_path / f"{module_name}.py").write_text(
+        "import os\nfrom pathlib import Path\n"
+        f"class _Gadget:\n    def __init__(self):\n        {constructor_body}\n"
+        f"def __getattr__(name):\n    Path({str(marker)!r}).write_text('executed')\n"
+        f"    {getter_body}\n    if name == 'Gadget':\n        return {return_expression}\n"
+        "    raise AttributeError(name)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    reference = {"module": module_name, "name": "Gadget"}
+    invocation = {**reference, "opcode": opcode, "positional_arg_count": 0}
+    _clear_call_graph_caches()
+    try:
+        findings = call_graph.find_dangerous_call_graphs([reference], [invocation])
+    finally:
+        _clear_call_graph_caches()
+
+    expected = dangerous_location == "getter" or (dangerous_location == "constructor" and opcode == "REDUCE")
+    system_findings = [finding for finding in findings if finding.sink == "os.system"]
+    assert bool(system_findings) is expected
+    if expected:
+        entrypoint = "__getattr__" if dangerous_location == "getter" else "_Gadget.__init__"
+        assert any(f"{module_name}.{entrypoint}" in finding.call_path for finding in system_findings)
+    assert not marker.exists()
+    assert module_name not in sys.modules
+
+
+@pytest.mark.parametrize("limit_kind", ["export_name", "entrypoints"])
+@pytest.mark.parametrize("dangerous_getter", [False, True])
+def test_module_getattr_returned_class_limits_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, limit_kind: str, dangerous_getter: bool
+) -> None:
+    module_name = "modelaudit_getattr_class_limit"
+    expression = 'globals()[f"_' + "{name}" * 64 + '"]' if limit_kind == "export_name" else "_Gadget"
+    getter_body = "os.system('not-executed')" if dangerous_getter else "pass"
+    (tmp_path / f"{module_name}.py").write_text(
+        "import os\nclass _Gadget:\n"
+        "    def __new__(cls):\n        return object.__new__(cls)\n"
+        "    def __init__(self):\n        self.value = 1\n"
+        f"def __getattr__(name):\n    {getter_body}\n    return {expression}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    limit_name = "_MAX_SOURCE_MODULE_NAME_CHARS" if limit_kind == "export_name" else "_MAX_CALLS_PER_FUNCTION"
+    monkeypatch.setattr(call_graph, limit_name, 128 if limit_kind == "export_name" else 1)
+    _clear_call_graph_caches()
+    try:
+        report = scan_bytes(_global_call_payload(module_name, "Gadget"))
+    finally:
+        _clear_call_graph_caches()
+
+    if dangerous_getter:
+        assert report.verdict == SafetyVerdict.MALICIOUS
+        assert any(
+            finding.rule_code == "DANGEROUS_CALL_GRAPH"
+            and f"{module_name}.__getattr__" in finding.details.get("call_path", ())
+            for finding in report.findings
+        )
+        return
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert report.metadata["analysis_incomplete"] is True
+    assert any(
+        error.category == "call_graph_analysis_error"
+        and error.exception_type == "_CallGraphAnalysisLimitError"
+        and "module __getattr__" in error.message
+        for error in report.errors
+    )
+
+
+@pytest.mark.parametrize("dangerous_last", [False, True])
+def test_module_getattr_returned_class_uses_last_definition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dangerous_last: bool
+) -> None:
+    module_name = "modelaudit_redefined_getattr"
+    first, last = ("_Safe", "_Danger") if dangerous_last else ("_Danger", "_Safe")
+    (tmp_path / f"{module_name}.py").write_text(
+        "import os\nclass _Danger:\n    def __init__(self):\n        os.system('not-executed')\n"
+        "class _Safe:\n    def __init__(self):\n        self.value = 1\n"
+        f"def __getattr__(name):\n    return {first}\n"
+        f"def __getattr__(name):\n    return {last}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    reference = {"module": module_name, "name": "Gadget"}
+    _clear_call_graph_caches()
+    try:
+        findings = call_graph.find_dangerous_call_graphs(
+            [reference], [{**reference, "opcode": "REDUCE", "positional_arg_count": 0}]
+        )
+    finally:
+        _clear_call_graph_caches()
+
+    assert any(finding.sink == "os.system" for finding in findings) is dangerous_last
+    assert module_name not in sys.modules
+
+
 def test_scan_bytes_marks_zipimported_invoked_call_graph_source_unavailable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
