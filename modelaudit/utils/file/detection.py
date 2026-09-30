@@ -10531,7 +10531,7 @@ def validate_file_type_with_formats(
     header_format: str,
     ext_format: str,
     *,
-    gzip_tar_trailing_status: _GzipTarTrailingStatus | None | object = _GZIP_TAR_STATUS_UNSET,
+    gzip_tar_trailing_status: _GzipTarTrailingStatus | object | None = _GZIP_TAR_STATUS_UNSET,
 ) -> bool:
     """Validate file type using precomputed magic/header and extension formats."""
     try:

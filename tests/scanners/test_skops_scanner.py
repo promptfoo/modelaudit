@@ -6,7 +6,7 @@ import stat
 import textwrap
 import zipfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 
@@ -635,7 +635,7 @@ class TestSkopsScannerEdgeCases:
         def open_with_failure(
             archive: zipfile.ZipFile,
             name: str | zipfile.ZipInfo,
-            mode: str = "r",
+            mode: Literal["r", "w"] = "r",
             pwd: bytes | None = None,
             *,
             force_zip64: bool = False,
@@ -778,7 +778,7 @@ class TestSkopsScannerEdgeCases:
         def open_with_failure(
             archive: zipfile.ZipFile,
             name: str | zipfile.ZipInfo,
-            mode: str = "r",
+            mode: Literal["r", "w"] = "r",
             pwd: bytes | None = None,
             *,
             force_zip64: bool = False,
@@ -826,7 +826,7 @@ class TestSkopsScannerEdgeCases:
         def open_with_failure(
             archive: zipfile.ZipFile,
             name: str | zipfile.ZipInfo,
-            mode: str = "r",
+            mode: Literal["r", "w"] = "r",
             pwd: bytes | None = None,
             *,
             force_zip64: bool = False,
@@ -867,7 +867,7 @@ class TestSkopsScannerEdgeCases:
         def open_with_failure(
             archive: zipfile.ZipFile,
             name: str | zipfile.ZipInfo,
-            mode: str = "r",
+            mode: Literal["r", "w"] = "r",
             pwd: bytes | None = None,
             *,
             force_zip64: bool = False,
@@ -909,7 +909,7 @@ class TestSkopsScannerEdgeCases:
         def open_with_failure(
             archive: zipfile.ZipFile,
             name: str | zipfile.ZipInfo,
-            mode: str = "r",
+            mode: Literal["r", "w"] = "r",
             pwd: bytes | None = None,
             *,
             force_zip64: bool = False,
@@ -951,7 +951,7 @@ class TestSkopsScannerEdgeCases:
         def open_with_failure(
             archive: zipfile.ZipFile,
             name: str | zipfile.ZipInfo,
-            mode: str = "r",
+            mode: Literal["r", "w"] = "r",
             pwd: bytes | None = None,
             *,
             force_zip64: bool = False,

@@ -11,7 +11,7 @@ import os
 import time
 import zipfile
 from collections.abc import Callable
-from typing import Any, TypeVar, cast
+from typing import Any, TypeVar
 
 from ...cache.optimized_config import get_config_extractor
 from ..file.hdf5 import find_hdf5_signature_offset
@@ -273,7 +273,7 @@ def _max_file_read_size_for_hash_deferral(config: dict[str, Any]) -> int:
         value = config["max_file_read_size"]
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             return BaseScanner.default_max_file_read_size
-        return cast(int, value)
+        return value
 
     if "max_file_size" in config:
         value = config["max_file_size"]

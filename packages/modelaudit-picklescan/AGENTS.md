@@ -40,9 +40,9 @@ Run from `packages/modelaudit-picklescan/`:
 
 ```bash
 uv lock --check
-uv run --with 'ruff==0.15.10' ruff check src tests
-uv run --with 'ruff==0.15.10' ruff format --check src tests
-uv run --with 'mypy>=1.16.0,<2.0.0' --with pytest mypy src tests
+uv run --with 'ruff==0.16.9' ruff check src tests
+uv run --with 'ruff==0.16.9' ruff format --check src tests
+uv run --with 'mypy>=2.3.1,<2.4.0' --with pytest mypy src tests
 uv run --with pytest --with pytest-xdist pytest -n auto tests --tb=short
 
 cargo fmt --manifest-path Cargo.toml -- --check

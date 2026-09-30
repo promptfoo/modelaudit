@@ -2064,14 +2064,16 @@ def test_cli_report_writers_do_not_replace_destination_created_during_install(
     assert not list(tmp_path.glob(".modelaudit-output-*.tmp"))
 
 
-@pytest.mark.skipif(not hasattr(os, "setxattr"), reason="Extended attributes are unavailable")
 def test_cli_report_writers_preserve_existing_xattrs(tmp_path: Path) -> None:
     """Overwriting an existing report must preserve its security metadata."""
+    if not hasattr(os, "setxattr") or not hasattr(os, "getxattr"):
+        pytest.skip("Extended attributes are unavailable")
+    set_xattr, get_xattr = (getattr(os, name) for name in ("setxattr", "getxattr"))
     output_path = tmp_path / "scanners.json"
     output_path.write_text("stale")
     attribute_name = b"user.modelaudit_test"
     try:
-        os.setxattr(output_path, attribute_name, b"keep")
+        set_xattr(output_path, attribute_name, b"keep")
     except OSError as exc:
         pytest.skip(f"Extended attributes are unsupported: {exc}")
 
@@ -2081,7 +2083,7 @@ def test_cli_report_writers_preserve_existing_xattrs(tmp_path: Path) -> None:
     )
 
     assert result.exit_code == 0, result.output
-    assert os.getxattr(output_path, attribute_name) == b"keep"
+    assert get_xattr(output_path, attribute_name) == b"keep"
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX descriptor metadata is required")
