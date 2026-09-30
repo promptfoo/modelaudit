@@ -2022,25 +2022,58 @@ def _build_onnx_weight_analysis_plan(
 
     def graph_initializer_constants(current_graph: Any, inherited_constants: dict[str, Any]) -> dict[str, Any]:
         local_declared_names = _graph_declared_value_names(current_graph)
+        graph_input_names = {_onnx_value_name(graph_input) for graph_input in getattr(current_graph, "input", ())}
         graph_constants = {
             name: initializer for name, initializer in inherited_constants.items() if name not in local_declared_names
         }
         for initializer in getattr(current_graph, "initializer", ()):
             name = str(getattr(initializer, "name", "") or "")
-            if name:
+            if name and name not in graph_input_names:
                 graph_constants[name] = initializer
         return graph_constants
 
     def function_opset_versions(function: Any, caller_opset_versions: dict[str, int]) -> dict[str, int]:
         return _opset_versions_by_domain(getattr(function, "opset_import", ())) or caller_opset_versions
 
+    function_attribute_references: dict[int, frozenset[str] | None] = {}
+
+    def referenced_function_attributes(function: Any) -> frozenset[str] | None:
+        function_id = id(function)
+        if function_id in function_attribute_references:
+            return function_attribute_references[function_id]
+        referenced_names: set[str] = set()
+        graphs = [function]
+        while graphs:
+            for node in getattr(graphs.pop(), "node", ()):
+                for attribute in getattr(node, "attribute", ()):
+                    reference_name = str(getattr(attribute, "ref_attr_name", ""))
+                    if reference_name:
+                        # GRAPH=5 / GRAPHS=10 bindings may reference other function attributes.
+                        if getattr(attribute, "type", None) in {None, 5, 10}:
+                            function_attribute_references[function_id] = None
+                            return None
+                        referenced_names.add(reference_name)
+                    graphs.extend(_iter_attribute_graphs(attribute))
+        result = frozenset(referenced_names)
+        function_attribute_references[function_id] = result
+        return result
+
     def bound_function_attributes(
         function: Any,
         node: Any,
         resolve_attribute: Callable[[Any], Any | None],
     ) -> dict[str, Any]:
-        attributes = {str(attribute.name): attribute for attribute in getattr(function, "attribute_proto", ())}
+        referenced_names = referenced_function_attributes(function)
+        if referenced_names == frozenset():
+            return {}
+        attributes = {
+            str(attribute.name): attribute
+            for attribute in getattr(function, "attribute_proto", ())
+            if referenced_names is None or str(attribute.name) in referenced_names
+        }
         for attribute in getattr(node, "attribute", ()):
+            if referenced_names is not None and str(attribute.name) not in referenced_names:
+                continue
             resolved_attribute = resolve_attribute(attribute)
             if resolved_attribute is not None:
                 attributes[str(attribute.name)] = resolved_attribute

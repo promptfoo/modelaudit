@@ -12466,6 +12466,7 @@ class TestWeightDistributionSemantics:
         ("condition_mode", "expected_gap"),
         [
             ("shadowed_body_input", True),
+            ("body_input_default", True),
             ("unbound_outer_inputs", False),
             ("constant_node_false", False),
         ],
@@ -12518,7 +12519,11 @@ class TestWeightDistributionSemantics:
                 ]
             )
             condition_nodes = [helper.make_node("Identity", ["condition_in"], ["condition_out"])]
-            body_initializers = []
+            body_initializers = (
+                [onnx.numpy_helper.from_array(np.array(False, dtype=np.bool_), name="condition_in")]
+                if condition_mode == "body_input_default"
+                else []
+            )
         body = helper.make_graph(
             [
                 helper.make_node("MatMul", ["X", "state"], ["body_y"]),
@@ -18569,19 +18574,42 @@ class TestWeightDistributionSemantics:
         onnx.save(model, str(path))
         return path
 
-    def test_repeated_loop_local_function_rank_reentry_fanout_is_bounded(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize("distinct_cache_tags", [False, True])
+    @pytest.mark.parametrize(("width", "depth"), [(6, 5), (10, 2)])
+    def test_repeated_loop_local_function_rank_reentry_fanout_is_bounded(
+        self, tmp_path: Path, distinct_cache_tags: bool, width: int, depth: int
+    ) -> None:
         path = self._write_local_function_rank_reentry_fanout_model(
             tmp_path,
-            distinct_cache_tags=False,
+            width=width,
+            depth=depth,
+            distinct_cache_tags=distinct_cache_tags,
             use_cache_tag_value=False,
         )
+        scanner_path = Path(onnx_scanner_module.__file__).resolve()
+        function_node_visits = 0
 
-        result = OnnxScanner().scan(str(path))
+        def profile(frame: Any, event: str, arg: Any) -> None:
+            nonlocal function_node_visits
+            if (
+                event == "return"
+                and frame.f_code.co_name == "graph_tainted_output_indexes"
+                and Path(frame.f_code.co_filename).resolve() == scanner_path
+                and "body_node" in frame.f_locals
+            ):
+                function_node_visits += len(frame.f_locals["subgraph"].node)
+
+        try:
+            sys.setprofile(profile)
+            result = OnnxScanner().scan(str(path))
+        finally:
+            sys.setprofile(None)
 
         assert result.success is True
         assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
         semantics = result.metadata["onnx_weight_distribution_semantics"]
         assert semantics["coverage_gaps"] == {}
+        assert function_node_visits <= width * (depth + 1) * 4
 
     def _write_repeated_local_function_alias_model(
         self,

@@ -5785,7 +5785,7 @@ class TorchServeMarScanner(BaseScanner):
                     scanned_referenced_payloads.add(normalized_member)
 
                 if normalized_member in serialized_refs:
-                    severities = [
+                    severities: list[IssueSeverity] = [
                         issue.severity
                         for issue in file_result.issues
                         if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
