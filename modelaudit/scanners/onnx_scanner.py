@@ -2516,8 +2516,9 @@ def _build_onnx_weight_analysis_plan(
             if output_index < 0:
                 continue
             if output_index >= len(body_outputs):
-                return set(body_outputs)
-            mapped_outputs.add(body_outputs[output_index])
+                return {output_name for output_name in body_outputs if output_name}
+            if body_outputs[output_index]:
+                mapped_outputs.add(body_outputs[output_index])
         return mapped_outputs
 
     def control_flow_output_offset(node: Any) -> int:
@@ -3263,15 +3264,17 @@ def _build_onnx_weight_analysis_plan(
             function_output_shapes: dict[int, tuple[int, ...]] = {}
             nested_promoted_outputs: set[str] = set()
             if function is not None and (any_tainted or body_outputs_feed_selected_output):
+                function_actuals = node_input_slots(body_node)
+                function_outputs = [str(output) for output in getattr(body_node, "output", ())]
                 function_attributes = bound_function_attributes(function, body_node, resolve_reentry_attribute)
                 function_constants, function_bound_input_constants = bound_function_constants(
                     function,
-                    body_inputs,
+                    function_actuals,
                     subgraph_constants,
                 )
                 function_versions = function_opset_versions(function, opset_versions)
                 function_context_shapes: dict[str, tuple[int, ...]] = {}
-                for input_index, input_name in enumerate(body_inputs):
+                for input_index, input_name in enumerate(function_actuals):
                     if input_index >= len(getattr(function, "input", ())):
                         continue
                     function_input_name = _onnx_value_name(function.input[input_index])
@@ -3279,7 +3282,7 @@ def _build_onnx_weight_analysis_plan(
                     if function_input_name and input_shape is not None:
                         function_context_shapes[function_input_name] = input_shape
                 function_tainted_inputs: dict[str, tuple[int, ...] | None] = {}
-                for input_index, input_name in enumerate(body_inputs):
+                for input_index, input_name in enumerate(function_actuals):
                     if input_name not in tainted or input_index >= len(getattr(function, "input", ())):
                         continue
                     function_input_name = _onnx_value_name(function.input[input_index])
@@ -3287,7 +3290,7 @@ def _build_onnx_weight_analysis_plan(
                         function_tainted_inputs[function_input_name] = tainted_shapes.get(input_name)
                 downstream_live_function_output_indexes = {
                     output_index
-                    for output_index, output_name in enumerate(body_outputs)
+                    for output_index, output_name in enumerate(function_outputs)
                     if output_name in output_dependency_names
                 }
                 function_tainted_output_indexes: set[int] = set()
@@ -3301,14 +3304,14 @@ def _build_onnx_weight_analysis_plan(
                     )
                     function_tainted_outputs.update(
                         mapped_node_outputs(
-                            body_outputs,
+                            function_outputs,
                             function_tainted_output_indexes,
                         )
                     )
                 valid_function_tainted_output_indexes = {
                     output_index
                     for output_index in function_tainted_output_indexes
-                    if 0 <= output_index < len(body_outputs)
+                    if 0 <= output_index < len(function_outputs)
                 }
                 if valid_function_tainted_output_indexes or downstream_live_function_output_indexes:
                     restorable_function_output_indexes = (
@@ -3357,7 +3360,7 @@ def _build_onnx_weight_analysis_plan(
                     if function_analysis_exceeds_limit:
                         function_promoted_outputs.update(
                             mapped_node_outputs(
-                                body_outputs,
+                                function_outputs,
                                 valid_function_tainted_output_indexes,
                             )
                         )
@@ -3385,11 +3388,13 @@ def _build_onnx_weight_analysis_plan(
                                 function_promoted_output_indexes.update(valid_function_tainted_output_indexes)
                             function_promoted_outputs.update(
                                 mapped_node_outputs(
-                                    body_outputs,
+                                    function_outputs,
                                     valid_function_tainted_output_indexes & function_promoted_output_indexes,
                                 )
                             )
-                for output_index, output_name in enumerate(body_outputs):
+                for output_index, output_name in enumerate(function_outputs):
+                    if not output_name:
+                        continue
                     output_shape = function_output_shapes.get(output_index)
                     if output_shape is not None:
                         tainted_shapes[output_name] = output_shape
@@ -4221,7 +4226,7 @@ def _build_onnx_weight_analysis_plan(
                             depth=depth + 1,
                         )
                     function_input_names: set[str] = set()
-                    for input_index, input_name in enumerate(body_inputs):
+                    for input_index, input_name in enumerate(node_input_slots(body_node)):
                         if input_name not in tainted or input_index >= len(getattr(function, "input", ())):
                             continue
                         function_input_name = _onnx_value_name(function.input[input_index])
@@ -4239,7 +4244,7 @@ def _build_onnx_weight_analysis_plan(
                     if function_input_names:
                         function_tainted_outputs.update(
                             mapped_node_outputs(
-                                body_outputs,
+                                [str(output) for output in getattr(body_node, "output", ())],
                                 graph_tainted_output_indexes(
                                     function,
                                     function_input_names,
@@ -6957,6 +6962,7 @@ def _build_onnx_weight_analysis_plan(
                             function_attributes: dict[str, Any],
                             function_constants: dict[str, Any],
                             function_context_shapes: dict[str, tuple[int, ...]],
+                            output_shapes_out: dict[str, tuple[int, ...]] | None = None,
                         ) -> bool | None:
                             nonlocal exact_loop_replay_work_exhausted, exact_loop_replay_work_remaining
                             weight_dependency_names = subgraph_potential_weight_consumer_dependency_names(
@@ -6966,6 +6972,20 @@ def _build_onnx_weight_analysis_plan(
                             )
                             if dependency_names_exceeded_limit(weight_dependency_names):
                                 return None
+                            if output_shapes_out is not None:
+                                function_outputs = getattr(function_graph, "output", ())
+                                # The exact shape helpers below require literal attributes.
+                                if (
+                                    len(function_outputs) > _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_OUTPUTS
+                                    or referenced_function_attributes(function_graph) != frozenset()
+                                ):
+                                    return None
+                                combined_names = set(weight_dependency_names)
+                                if merge_dependency_names(
+                                    combined_names, (_onnx_value_name(output) for output in function_outputs)
+                                ):
+                                    return None
+                                weight_dependency_names = frozenset(combined_names)
                             weight_dependency_names = graph_value_dependency_names(
                                 function_graph,
                                 weight_dependency_names,
@@ -7184,6 +7204,18 @@ def _build_onnx_weight_analysis_plan(
                                 )
                                 for output_name in function_outputs:
                                     local_tainted_shapes[output_name] = output_shape
+                            if output_shapes_out is not None:
+                                for function_output in getattr(function_graph, "output", ()):
+                                    output_name = _onnx_value_name(function_output)
+                                    known_output_shape = local_tainted_shapes.get(output_name)
+                                    if known_output_shape is None:
+                                        return None
+                                    if (
+                                        output_name in output_shapes_out
+                                        and output_shapes_out[output_name] != known_output_shape
+                                    ):
+                                        return None
+                                    output_shapes_out[output_name] = known_output_shape
                             return False
 
                         for body_node in getattr(subgraph, "node", ()):
@@ -7257,7 +7289,9 @@ def _build_onnx_weight_analysis_plan(
                                 and not has_tainted_nested_capture
                             ):
                                 continue
-                            input_walk_work = max(len(body_inputs), 1)
+                            input_walk_work = max(
+                                len(node_input_slots(body_node)) if function is not None else len(body_inputs), 1
+                            )
                             if exact_loop_replay_work_remaining < input_walk_work:
                                 exact_loop_replay_work_exhausted = True
                                 return None
@@ -7269,31 +7303,36 @@ def _build_onnx_weight_analysis_plan(
                             if function is not None:
                                 if function_attributes is None or function_versions is None:
                                     return None
+                                function_actuals = node_input_slots(body_node)
                                 function_constants, function_bound_input_constants = bound_function_constants(
                                     function,
-                                    body_inputs,
+                                    function_actuals,
                                     subgraph_constants,
                                 )
                                 function_constants.update(function_bound_input_constants)
                                 function_context_shapes: dict[str, tuple[int, ...]] = {}
-                                for input_index, input_name in enumerate(body_inputs):
+                                for input_index, input_name in enumerate(function_actuals):
                                     if input_index >= len(getattr(function, "input", ())):
                                         continue
                                     function_input_name = _onnx_value_name(function.input[input_index])
                                     input_shape = known_input_shape(input_name)
                                     if function_input_name and input_shape is not None:
                                         function_context_shapes[function_input_name] = input_shape
-                                for input_index, input_name in enumerate(body_inputs):
+                                function_output_shapes: dict[str, tuple[int, ...]] = {}
+                                for input_index, input_name in enumerate(function_actuals):
                                     if input_name not in tainted_shapes or input_index >= len(
                                         getattr(function, "input", ())
                                     ):
                                         continue
                                     function_input_name = _onnx_value_name(function.input[input_index])
-                                    if not function_input_name or not subgraph_state_input_can_reach_weight_consumer(
-                                        function,
-                                        function_input_name,
-                                        function_versions,
-                                        attribute_bindings=function_attributes,
+                                    if not function_input_name or (
+                                        not node_is_live_for_output
+                                        and not subgraph_state_input_can_reach_weight_consumer(
+                                            function,
+                                            function_input_name,
+                                            function_versions,
+                                            attribute_bindings=function_attributes,
+                                        )
                                     ):
                                         continue
                                     tainted_shape = tainted_shapes.get(input_name)
@@ -7307,13 +7346,23 @@ def _build_onnx_weight_analysis_plan(
                                         function_attributes,
                                         function_constants,
                                         function_context_shapes,
+                                        function_output_shapes if node_is_live_for_output else None,
                                     )
                                     if function_consumes_weight_rank is None:
                                         return None
                                     if function_consumes_weight_rank:
                                         return True, None
                                 if node_is_live_for_output:
-                                    return None
+                                    for output_index, output_name in enumerate(getattr(body_node, "output", ())):
+                                        if not output_name:
+                                            continue
+                                        if output_index >= len(getattr(function, "output", ())):
+                                            return None
+                                        function_output_name = _onnx_value_name(function.output[output_index])
+                                        known_output_shape = function_output_shapes.get(function_output_name)
+                                        if known_output_shape is None:
+                                            return None
+                                        tainted_shapes[output_name] = known_output_shape
                                 continue
                             if nested_attribute_references:
                                 return None

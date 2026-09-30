@@ -9574,6 +9574,120 @@ class TestWeightDistributionSemantics:
             assert coverage == []
             assert semantics["coverage_gaps"] == {}
 
+    @pytest.mark.parametrize(
+        ("transform", "trip_count", "before_gap", "after_gap"),
+        [
+            ("reshape_vector", 3, False, False),
+            ("reshape_matrix", 1, False, True),
+            ("reshape_matrix", 2, True, True),
+            ("unsqueeze", 1, False, False),
+            ("unsqueeze", 2, False, True),
+            ("unsqueeze", 3, True, True),
+        ],
+    )
+    @pytest.mark.parametrize("consume_after", [False, True])
+    @pytest.mark.parametrize("omit_first_output", [False, True])
+    @pytest.mark.parametrize("omit_first_input", [False, True])
+    def test_repeated_loop_reentry_replays_live_local_function_output_shape(
+        self,
+        tmp_path: Path,
+        transform: str,
+        trip_count: int,
+        before_gap: bool,
+        after_gap: bool,
+        consume_after: bool,
+        omit_first_output: bool,
+        omit_first_input: bool,
+    ) -> None:
+        source_names = [f"W{index}" for index in range(40)]
+        consumer = helper.make_node(
+            "PRelu", ["activation", "next_state" if consume_after else "state"], ["unused_consumer"]
+        )
+        update = helper.make_node(
+            "Transform",
+            ["", "state"] if omit_first_input else ["state"],
+            ["", "next_state"] if omit_first_output else ["next_state"],
+            domain="local",
+        )
+        body = helper.make_graph(
+            [
+                *([update, consumer] if consume_after else [consumer, update]),
+                helper.make_node("Identity", ["condition_in"], ["condition_out"]),
+            ],
+            "live_function_replay_body",
+            [
+                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
+                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("state", TensorProto.FLOAT, None),
+            ],
+            [
+                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("next_state", TensorProto.FLOAT, None),
+            ],
+        )
+        graph = helper.make_graph(
+            [
+                helper.make_node("Sum", source_names, ["initial_state"]),
+                helper.make_node(
+                    "Loop", ["trip_count", "initial_condition", "initial_state"], ["final_state"], body=body
+                ),
+                helper.make_node("Identity", ["dummy"], ["Y"]),
+            ],
+            "live_function_replay",
+            [helper.make_tensor_value_info("activation", TensorProto.FLOAT, [1, 1])],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [])],
+            initializer=[
+                *[onnx.numpy_helper.from_array(np.array(1.0, dtype=np.float32), name=name) for name in source_names],
+                onnx.numpy_helper.from_array(np.array(trip_count, dtype=np.int64), name="trip_count"),
+                onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="initial_condition"),
+                onnx.numpy_helper.from_array(np.array(0.0, dtype=np.float32), name="dummy"),
+            ],
+            value_info=[helper.make_tensor_value_info("initial_state", TensorProto.FLOAT, [])],
+        )
+        shape_or_axes = [0] if transform == "unsqueeze" else [1, 1] if transform == "reshape_matrix" else [1]
+        function = helper.make_function(
+            "local",
+            "Transform",
+            ["unused_input", "function_state"] if omit_first_input else ["function_state"],
+            ["passthrough", "function_output"] if omit_first_output else ["function_output"],
+            [
+                *([helper.make_node("Identity", ["function_state"], ["passthrough"])] if omit_first_output else []),
+                helper.make_node(
+                    "Constant",
+                    [],
+                    ["shape_or_axes"],
+                    value=onnx.numpy_helper.from_array(np.array(shape_or_axes, dtype=np.int64)),
+                ),
+                helper.make_node(
+                    "Unsqueeze" if transform == "unsqueeze" else "Reshape",
+                    ["function_state", "shape_or_axes"],
+                    ["function_output"],
+                ),
+            ],
+            opset_imports=[helper.make_opsetid("", 13)],
+        )
+        model = helper.make_model(
+            graph, functions=[function], opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)]
+        )
+        model.ir_version = 8
+        onnx.checker.check_model(model, full_check=True)
+        path = tmp_path / "live-function-replay.onnx"
+        onnx.save(model, str(path))
+
+        result = OnnxScanner().scan(str(path))
+
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        gaps = result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"]
+        expected_gap = after_gap if consume_after else before_gap
+        if expected_gap:
+            assert result.success is False
+            assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
+            assert gaps["lineages_per_value_limit"] >= 1
+        else:
+            assert result.success is True
+            assert coverage == []
+            assert gaps == {}
+
     def test_repeated_loop_reentry_replays_dead_local_function_weight_transform(self, tmp_path: Path) -> None:
         source_names = [f"W{index}" for index in range(40)]
         body = helper.make_graph(
