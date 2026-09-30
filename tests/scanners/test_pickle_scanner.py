@@ -6,6 +6,7 @@ import io
 import os
 import pickle
 import pickletools
+import sys
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -3388,6 +3389,40 @@ def test_reexported_hook_binding_preserves_root_outcome(
     assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues) is dangerous
     assert should_cache_scan_result(result.to_dict(include_private_metadata=True)) is False
     assert determine_exit_code(aggregate) == 2
+
+
+@pytest.mark.parametrize("dangerous", [False, True])
+@pytest.mark.parametrize("statement", ["if", "while"])
+@pytest.mark.parametrize("negations", [2, 1100])
+def test_deep_module_condition_preserves_root_outcome(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dangerous: bool, statement: str, negations: int
+) -> None:
+    module_name = "modelaudit_root_deep_condition"
+    body = "os.system('not-executed')" if dangerous else "pass"
+    condition = "not " * negations + "False"
+    (tmp_path / f"{module_name}.py").write_text(
+        f"import os\nclass Gadget:\n    def __init__(self):\n        {body}\n{statement} {condition}:\n    pass\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    path = tmp_path / "deep-condition.pkl"
+    path.write_bytes(b"\x80\x04c" + module_name.encode() + b"\nGadget\n)R.")
+    _clear_source_sensitive_caches()
+    try:
+        result = PickleScanner().scan(str(path))
+    finally:
+        _clear_source_sensitive_caches()
+    aggregate = create_initial_audit_result()
+    merge_scan_result(aggregate, result)
+
+    assert module_name not in sys.modules
+    assert result.success is True
+    assert result.metadata["pickle_report_status"] == "complete"
+    assert result.metadata["pickle_verdict"] == ("malicious" if dangerous else "suspicious")
+    assert result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues) is dangerous
+    assert should_cache_scan_result(result.to_dict(include_private_metadata=True)) is False
+    assert determine_exit_code(aggregate) == 1
 
 
 def test_large_legacy_pytorch_container_defers_file_size_limit(tmp_path: Path) -> None:

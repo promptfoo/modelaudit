@@ -12457,3 +12457,55 @@ def test_context_manager_alias_preserves_previous_possible_class(
     )
 
     assert any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings) is dangerous
+
+
+@pytest.mark.parametrize("dangerous", [False, True])
+@pytest.mark.parametrize("statement", ["if", "while"])
+@pytest.mark.parametrize("negations", [2, 1100])
+def test_deep_module_condition_preserves_constructor_findings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dangerous: bool, statement: str, negations: int
+) -> None:
+    target = "_Danger" if dangerous else "_Safe"
+    condition = "not " * negations + "False"
+    report = _scan_module_getattr_class_source(
+        tmp_path, monkeypatch, f"Gadget = {target}\n{statement} {condition}:\n    pass"
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == (SafetyVerdict.MALICIOUS if dangerous else SafetyVerdict.SUSPICIOUS)
+    assert any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings) is dangerous
+
+
+@pytest.mark.parametrize("dangerous", [False, True])
+@pytest.mark.parametrize("deep_first", [False, True])
+@pytest.mark.parametrize("negations", [2, 1100])
+def test_deep_unrelated_condition_preserves_other_invocation_findings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dangerous: bool, deep_first: bool, negations: int
+) -> None:
+    constructor_module = "modelaudit_condition_constructor"
+    condition_module = "modelaudit_deep_condition"
+    body = "os.system('not-executed')" if dangerous else "pass"
+    (tmp_path / f"{constructor_module}.py").write_text(
+        f"import os\nclass Gadget:\n    def __init__(self):\n        {body}\n", encoding="utf-8"
+    )
+    condition = "not " * negations + "False"
+    (tmp_path / f"{condition_module}.py").write_text(
+        f"if {condition}:\n    pass\ndef probe():\n    return None\n", encoding="utf-8"
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    references = [(constructor_module, "Gadget"), (condition_module, "probe")]
+    if deep_first:
+        references.reverse()
+    payload = b"\x80\x04" + b"".join(_global_operand(module, name) + b")R0" for module, name in references) + b"N."
+    _clear_call_graph_caches()
+    try:
+        report = scan_bytes(payload)
+    finally:
+        _clear_call_graph_caches()
+
+    assert constructor_module not in sys.modules
+    assert condition_module not in sys.modules
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == (SafetyVerdict.MALICIOUS if dangerous else SafetyVerdict.SUSPICIOUS)
+    assert not any(error.category == "call_graph_analysis_error" for error in report.errors)
+    assert any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings) is dangerous

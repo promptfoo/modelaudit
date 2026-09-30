@@ -146,6 +146,7 @@ _BYTECODE_CACHE_OPTIMIZATIONS = (("", 0), ("1", 1), ("2", 2))
 _MAX_CALL_GRAPH_DEPTH = 4
 _MAX_VISITED_FUNCTIONS = 64
 _MAX_CALLS_PER_FUNCTION = 128
+_MAX_CONDITION_DEPTH = 64
 _MAX_ASSIGNMENT_ALIASES = 128
 _MAX_ASSIGNMENT_ALIAS_PASSES = 256
 _MAX_FUNCTION_INSTANCE_ALIASES = 32
@@ -6274,16 +6275,23 @@ def _resolve_class_target(function_name: str) -> str | None:
     return None
 
 
-def _module_getattr_condition_value(test: ast.expr, parameter_name: str, export_name: object) -> bool | None:
+def _module_getattr_condition_value(
+    test: ast.expr, parameter_name: str, export_name: object, *, depth: int = 0
+) -> bool | None:
+    if depth >= _MAX_CONDITION_DEPTH:
+        return None
     if isinstance(test, ast.Constant):
         return bool(test.value)
     if isinstance(test, ast.Name) and test.id == parameter_name:
         return bool(export_name)
     if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
-        value = _module_getattr_condition_value(test.operand, parameter_name, export_name)
+        value = _module_getattr_condition_value(test.operand, parameter_name, export_name, depth=depth + 1)
         return not value if value is not None else None
     if isinstance(test, ast.BoolOp):
-        values = [_module_getattr_condition_value(value, parameter_name, export_name) for value in test.values]
+        values = [
+            _module_getattr_condition_value(value, parameter_name, export_name, depth=depth + 1)
+            for value in test.values
+        ]
         decisive = isinstance(test.op, ast.Or)
         if decisive in values:
             return decisive
