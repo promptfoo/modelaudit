@@ -3751,13 +3751,14 @@ class PyTorchZipScanner(BaseScanner):
         candidate_count = 0
         extension_parse_budget_remaining = [_MAX_RAW_NESTED_PICKLE_CANDIDATES]
         recursive_literal_scanned_until = 0
+        span_at = PyTorchZipScanner._raw_nested_literal_span_lookup(value)
         offset = 0
         while offset < len(value):
             marker = value[offset]
             if marker not in _RAW_NESTED_SECURITY_PICKLE_START_BYTES:
                 offset += 1
                 continue
-            span = PyTorchZipScanner._raw_nested_enclosing_pickle_literal_span(value, offset)
+            span = span_at(offset)
             if span is not None:
                 _literal_opcode_start, literal_start, literal_end = span
                 if PyTorchZipScanner._raw_nested_literal_span_is_mask_only(value, span):
@@ -3821,6 +3822,8 @@ class PyTorchZipScanner(BaseScanner):
                 recovered_extension_context = True
             candidate = value[candidate_start : candidate_start + _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES]
             candidate_is_prefix = candidate_start + len(candidate) < len(value)
+            if PyTorchZipScanner._raw_nested_text_candidate_has_later_security_context(value, candidate_start):
+                return True
             if recovered_extension_context and PyTorchZipScanner._candidate_truncates_extension_operand(
                 candidate_start=candidate_start,
                 candidate=candidate,
@@ -3887,13 +3890,14 @@ class PyTorchZipScanner(BaseScanner):
             return True
         parse_attempt_count = 0
         recursive_literal_scanned_until = 0
+        span_at = PyTorchZipScanner._raw_nested_literal_span_lookup(value)
         offset = max(search_start, 0)
         while offset < len(value):
             marker = value[offset]
             if marker not in _RAW_NESTED_SECURITY_PICKLE_START_BYTES:
                 offset += 1
                 continue
-            span = PyTorchZipScanner._raw_nested_enclosing_pickle_literal_span(value, offset)
+            span = span_at(offset)
             if span is not None:
                 _literal_opcode_start, literal_start, literal_end = span
                 if PyTorchZipScanner._raw_nested_literal_span_is_mask_only(value, span):
@@ -3921,6 +3925,8 @@ class PyTorchZipScanner(BaseScanner):
                 continue
             candidate = value[offset : offset + _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES]
             candidate_is_prefix = offset + len(candidate) < len(value) or sample_is_prefix
+            if PyTorchZipScanner._raw_nested_text_candidate_has_later_security_context(value, offset):
+                return True
             parse_attempt_count += 1
             if parse_attempt_count > _MAX_RAW_NESTED_PICKLE_CANDIDATES:
                 return PyTorchZipScanner._raw_nested_security_pickle_candidate_budget_exhausted_needs_scan(
@@ -4054,6 +4060,7 @@ class PyTorchZipScanner(BaseScanner):
                 window_start,
                 window_end,
                 parse_budget_remaining,
+                window_start_spans=window_start_spans,
             ):
                 return True
         return False
@@ -4080,9 +4087,14 @@ class PyTorchZipScanner(BaseScanner):
         window_start = search_start
         memo_offsets = dict.fromkeys(memo_keys, -1)
         seen_get_offsets: set[int] = set()
+        window_start_span_at = PyTorchZipScanner._raw_nested_literal_span_lookup(value)
         while window_start < len(value):
             window_end = min(len(value), window_start + _PICKLE_DISCOVERY_LONG_PROBE_BYTES)
             window = value[window_start:window_end]
+            initial_span = window_start_span_at(window_start)
+            span_at = PyTorchZipScanner._raw_nested_literal_span_lookup(
+                value, window_start, window_end, initial_span=initial_span
+            )
             # Seed only earlier definitions so overlap cannot advance MEMOIZE twice.
             memo_keys = {key for key, position in memo_offsets.items() if position < window_start}
             memo_definitions = sorted(
@@ -4092,6 +4104,7 @@ class PyTorchZipScanner(BaseScanner):
                     context=value,
                     context_start=window_start,
                     initial_memo_keys=frozenset(memo_keys),
+                    context_start_spans={window_start: initial_span},
                 ).items()
             )
             memo_cursor = 0
@@ -4120,9 +4133,12 @@ class PyTorchZipScanner(BaseScanner):
                     search_start_in_window = offset + 1
                     continue
                 seen_get_offsets.add(absolute_offset)
-                span = PyTorchZipScanner._raw_nested_enclosing_pickle_literal_span(value, absolute_offset)
+                span = span_at(absolute_offset)
                 if span is not None:
-                    search_start_in_window = max(offset + 1, min(window_end, span[2] + 1) - window_start)
+                    after_span = PyTorchZipScanner._raw_nested_offset_after_literal_span(
+                        value, absolute_offset, span[2]
+                    )
+                    search_start_in_window = min(window_end, after_span) - window_start
                     continue
                 if not PyTorchZipScanner._consume_raw_nested_structural_parse_budget(parse_budget_remaining):
                     return True
@@ -4142,7 +4158,7 @@ class PyTorchZipScanner(BaseScanner):
                 if PyTorchZipScanner._has_security_relevant_pickle_opcode(candidate):
                     return True
                 candidate_is_prefix = absolute_offset + len(candidate) < len(value)
-                if candidate_is_prefix and PyTorchZipScanner._prior_memo_get_has_later_stack_dependent_security_opcode(
+                if candidate_is_prefix and PyTorchZipScanner._prior_context_has_later_stack_dependent_security_opcode(
                     value,
                     absolute_offset,
                 ):
@@ -4157,9 +4173,10 @@ class PyTorchZipScanner(BaseScanner):
         return False
 
     @staticmethod
-    def _prior_memo_get_has_later_stack_dependent_security_opcode(value: bytes, get_offset: int) -> bool:
-        search_start = get_offset + 1
-        search_end = min(len(value), get_offset + (_PICKLE_DISCOVERY_LONG_PROBE_BYTES * 4))
+    def _prior_context_has_later_stack_dependent_security_opcode(value: bytes, context_offset: int) -> bool:
+        search_start = context_offset + 1
+        search_end = min(len(value), context_offset + (_PICKLE_DISCOVERY_LONG_PROBE_BYTES * 4))
+        span_at = PyTorchZipScanner._raw_nested_literal_span_lookup(value, search_end=search_end)
         offset = search_start
         while offset < search_end:
             found = min(
@@ -4168,9 +4185,9 @@ class PyTorchZipScanner(BaseScanner):
             )
             if found < 0:
                 break
-            literal_end = PyTorchZipScanner._raw_nested_enclosing_pickle_literal_end(value, found)
-            if literal_end is not None:
-                offset = max(found + 1, literal_end + 1)
+            span = span_at(found)
+            if span is not None:
+                offset = PyTorchZipScanner._raw_nested_offset_after_literal_span(value, found, span[2])
                 continue
             return True
         return search_end < len(value)
@@ -4272,12 +4289,19 @@ class PyTorchZipScanner(BaseScanner):
         context: bytes | None = None,
         context_start: int = 0,
         initial_memo_keys: frozenset[str] = frozenset(),
+        context_start_spans: dict[int, tuple[int, int, int] | None] | None = None,
     ) -> dict[str, int]:
         if not any(marker in prefix for marker in b"pqr\x94"):
             return {}
         source = prefix if context is None else context
         source_start = 0 if context is None else context_start
-        enclosing_span = PyTorchZipScanner._raw_nested_enclosing_pickle_literal_span(source, source_start)
+        span_at = PyTorchZipScanner._raw_nested_literal_span_lookup(
+            source,
+            source_start if context_start_spans is not None else 0,
+            source_start + len(prefix),
+            initial_span=context_start_spans[source_start] if context_start_spans is not None else None,
+        )
+        enclosing_span = span_at(source_start)
         parse_start = min(len(prefix), enclosing_span[2] - source_start) if enclosing_span is not None else 0
         memo_keys = {
             key: parse_start + position
@@ -4292,9 +4316,12 @@ class PyTorchZipScanner(BaseScanner):
             if marker not in _RAW_NESTED_SECURITY_PICKLE_START_BYTES:
                 offset += 1
                 continue
-            span = PyTorchZipScanner._raw_nested_enclosing_pickle_literal_span(source, source_start + offset)
+            span = span_at(source_start + offset)
             if span is not None:
-                offset = max(offset + 1, span[2] + 1 - source_start)
+                offset = (
+                    PyTorchZipScanner._raw_nested_offset_after_literal_span(source, source_start + offset, span[2])
+                    - source_start
+                )
                 continue
             starts_checked += 1
             if starts_checked > _MAX_RAW_NESTED_PICKLE_CANDIDATES:
@@ -4542,8 +4569,7 @@ class PyTorchZipScanner(BaseScanner):
     def _raw_nested_persistent_id_opcode_seen(value: bytes, parse_budget_remaining: list[int]) -> bool:
         search_limit = min(len(value), _PICKLE_DISCOVERY_LONG_PROBE_BYTES)
         search_start = 0
-        spans = PyTorchZipScanner._raw_nested_pickle_literal_spans_in_range(value, 0, search_limit)
-        span: tuple[int, int, int] | None = None
+        span_at = PyTorchZipScanner._raw_nested_literal_span_lookup(value, search_end=search_limit)
         while search_start < search_limit:
             offset = min(
                 (found for marker in b"PQ" if (found := value.find(bytes([marker]), search_start, search_limit)) >= 0),
@@ -4551,11 +4577,8 @@ class PyTorchZipScanner(BaseScanner):
             )
             if offset < 0:
                 return False
-            while span is None or span[2] <= offset:
-                span = next(spans, None)
-                if span is None:
-                    break
-            if span is not None and span[1] <= offset < span[2]:
+            span = span_at(offset)
+            if span is not None:
                 search_start = PyTorchZipScanner._raw_nested_offset_after_literal_span(value, offset, span[2])
                 continue
             candidate = value[offset : offset + _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES]
@@ -4569,9 +4592,30 @@ class PyTorchZipScanner(BaseScanner):
         return False
 
     @staticmethod
-    def _raw_nested_enclosing_pickle_literal_end(value: bytes, offset: int) -> int | None:
-        span = PyTorchZipScanner._raw_nested_enclosing_pickle_literal_span(value, offset)
-        return None if span is None else span[2]
+    def _raw_nested_literal_span_lookup(
+        value: bytes,
+        search_start: int = 0,
+        search_end: int | None = None,
+        *,
+        initial_span: tuple[int, int, int] | None = None,
+    ) -> Callable[[int], tuple[int, int, int] | None]:
+        """Reuse operand ownership for nondecreasing offsets without storing all spans."""
+        spans = PyTorchZipScanner._raw_nested_pickle_literal_spans_in_range(
+            value,
+            max(search_start, initial_span[2]) if initial_span is not None else search_start,
+            len(value) if search_end is None else search_end,
+        )
+        span = initial_span
+
+        def span_at(offset: int) -> tuple[int, int, int] | None:
+            nonlocal span
+            while span is None or span[2] <= offset:
+                span = next(spans, None)
+                if span is None:
+                    break
+            return span if span is not None and span[1] <= offset < span[2] else None
+
+        return span_at
 
     @staticmethod
     def _raw_nested_literal_span_has_overlapping_persid_stream(
@@ -5074,16 +5118,20 @@ class PyTorchZipScanner(BaseScanner):
 
     @staticmethod
     def _raw_nested_prior_mark_outside_literal(value: bytes, start: int, end: int) -> int:
-        mark = value.rfind(bytes([_PICKLE_MARK_OPCODE_BYTE]), start, end)
-        while mark >= start:
-            literal_span = PyTorchZipScanner._raw_nested_enclosing_pickle_literal_span(value, mark)
+        span_at = PyTorchZipScanner._raw_nested_literal_span_lookup(value, search_end=end)
+        search_start = start
+        last_mark = -1
+        while search_start < end:
+            mark = value.find(bytes([_PICKLE_MARK_OPCODE_BYTE]), search_start, end)
+            if mark < 0:
+                break
+            literal_span = span_at(mark)
             if literal_span is None:
-                return mark
-            if literal_span[0] > start:
-                mark = value.rfind(bytes([_PICKLE_MARK_OPCODE_BYTE]), start, literal_span[0])
-                continue
-            mark = value.rfind(bytes([_PICKLE_MARK_OPCODE_BYTE]), start, mark)
-        return -1
+                last_mark = mark
+                search_start = mark + 1
+            else:
+                search_start = PyTorchZipScanner._raw_nested_offset_after_literal_span(value, mark, literal_span[2])
+        return last_mark
 
     @staticmethod
     def _raw_nested_proto0_inst_with_prior_window_mark_seen(
@@ -5091,15 +5139,23 @@ class PyTorchZipScanner(BaseScanner):
         window_start: int,
         window_end: int,
         parse_budget_remaining: list[int],
+        *,
+        window_start_spans: dict[int, tuple[int, int, int] | None] | None = None,
     ) -> bool:
         search_start = window_start
+        span_at = PyTorchZipScanner._raw_nested_literal_span_lookup(
+            value,
+            window_start if window_start_spans is not None else 0,
+            window_end,
+            initial_span=window_start_spans[window_start] if window_start_spans is not None else None,
+        )
         while search_start < window_end:
             offset = value.find(b"i", search_start, window_end)
             if offset < 0:
                 return False
-            literal_end = PyTorchZipScanner._raw_nested_enclosing_pickle_literal_end(value, offset)
-            if literal_end is not None:
-                search_start = max(offset + 1, literal_end + 1)
+            span = span_at(offset)
+            if span is not None:
+                search_start = PyTorchZipScanner._raw_nested_offset_after_literal_span(value, offset, span[2])
                 continue
             name_limit = min(len(value), window_end)
             name_end, next_search_start = PyTorchZipScanner._raw_nested_proto0_inst_name_end(
@@ -5363,6 +5419,8 @@ class PyTorchZipScanner(BaseScanner):
                 continue
             if not PyTorchZipScanner._consume_raw_nested_structural_parse_budget(parse_budget_remaining):
                 return True
+            if PyTorchZipScanner._raw_nested_text_candidate_has_later_security_context(value, offset):
+                return True
             if PyTorchZipScanner._raw_nested_binary_candidate_should_scan(
                 candidate,
                 candidate_is_prefix=candidate_is_prefix,
@@ -5454,6 +5512,63 @@ class PyTorchZipScanner(BaseScanner):
             PyTorchZipScanner._has_security_relevant_opcode_in_incomplete_frame(candidate)
             or PyTorchZipScanner._has_security_relevant_opcode_before_truncated_candidate(candidate)
         )
+
+    @staticmethod
+    def _raw_nested_text_candidate_has_later_security_context(value: bytes, offset: int) -> bool:
+        end = offset + _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES
+        return (
+            end < len(value)
+            and value[offset] in b"SV"
+            and PyTorchZipScanner._truncated_text_pickle_has_live_string_operands(value[offset:end])
+            and PyTorchZipScanner._prior_context_has_later_stack_dependent_security_opcode(value, end - 1)
+        )
+
+    @staticmethod
+    def _truncated_text_pickle_has_live_string_operands(candidate: bytes) -> bool:
+        if len(candidate) < _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES or candidate[0] not in b"SV":
+            return False
+        # Preserve possible STACK_GLOBAL operands before the candidate budget drops
+        # their prefix. Never carry stack state across STOP or malformed opcodes.
+        stack: list[bool | None] = []
+        try:
+            for opcode, _arg, _pos in pickletools.genops(candidate[:_MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES]):
+                if opcode.name == "STOP":
+                    return False
+                if opcode.name == "MARK":
+                    stack.append(None)
+                    continue
+                if opcode.name in _PROTO0_1_LITERAL_OPCODES:
+                    stack.append(True)
+                    continue
+                if opcode.name == "DUP":
+                    if not stack or stack[-1] is None:
+                        return False
+                    stack.append(stack[-1])
+                    continue
+                if opcode.name == "MEMOIZE":
+                    if not stack or stack[-1] is None:
+                        return False
+                    continue
+                for operand in reversed(opcode.stack_before):
+                    if operand.name == "stackslice":
+                        while stack and stack[-1] is not None:
+                            stack.pop()
+                    elif not stack:
+                        return False
+                    else:
+                        item = stack.pop()
+                        if (operand.name == "mark") != (item is None) and opcode.name != "POP":
+                            return False
+                stack.extend(False for _ in opcode.stack_after)
+        except ValueError as exc:
+            message = str(exc)
+            truncated = message.startswith(PROTO0_1_PREFIX_TRUNCATION_ERROR_PREFIXES) or (
+                message.startswith("expected ") and "bytes" in message and "remain" in message
+            )
+            return truncated and stack.count(True) >= 2
+        except Exception:
+            return False
+        return False
 
     @staticmethod
     def _headerless_binary_byte_literal_has_possible_size(candidate: bytes, *, entry_size: int) -> bool:
