@@ -3108,19 +3108,32 @@ def test_legacy_pytorch_container_does_not_report_known_stream_truncated(tmp_pat
 
 
 @pytest.mark.parametrize("dangerous_getter", [False, True])
-def test_returned_local_class_coverage_gap_preserves_outcome_and_cache_policy(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dangerous_getter: bool
+@pytest.mark.parametrize("gap_kind", ["function-local class", "unresolved member path"])
+def test_returned_class_coverage_gap_preserves_outcome_and_cache_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dangerous_getter: bool, gap_kind: str
 ) -> None:
     module_name = "modelaudit_root_returned_local_class"
     getter = "os.system('not-executed')" if dangerous_getter else "pass"
+    if gap_kind == "function-local class":
+        source = (
+            f"import os\ndef __getattr__(name):\n    {getter}\n"
+            "    class Local:\n        def __init__(self):\n            os.system('not-executed')\n"
+            "    return Local\n"
+        )
+        export_name = b"Gadget"
+    else:
+        source = (
+            "import os\nclass Resolved:\n    class Inner:\n        @staticmethod\n"
+            "        def run():\n            os.system('not-executed')\n"
+            f"def __getattr__(name):\n    {getter}\n    return Resolved\n"
+        )
+        export_name = b"Gadget.Inner.run"
     (tmp_path / f"{module_name}.py").write_text(
-        f"import os\ndef __getattr__(name):\n    {getter}\n"
-        "    class Local:\n        def __init__(self):\n            os.system('not-executed')\n"
-        "    return Local\n",
+        source,
         encoding="utf-8",
     )
     monkeypatch.syspath_prepend(str(tmp_path))
-    payload = b"c" + module_name.encode() + b"\nGadget\n)R."
+    payload = b"\x80\x04c" + module_name.encode() + b"\n" + export_name + b"\n)R."
     path = tmp_path / "returned-local-class.pkl"
     path.write_bytes(payload)
     _clear_source_sensitive_caches()
@@ -3140,7 +3153,7 @@ def test_returned_local_class_coverage_gap_preserves_outcome_and_cache_policy(
         assert result.success is False
         assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
         assert "pickle_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
-        assert any("function-local class" in issue.message for issue in result.issues)
+        assert any(gap_kind in issue.message for issue in result.issues)
         assert should_cache_scan_result(result.to_dict(include_private_metadata=True)) is False
         assert determine_exit_code(aggregate) == 2
 

@@ -3435,7 +3435,8 @@ def _call_graph_entrypoints_for_reference(
     if not entrypoints:
         return ()
     if _is_explicit_method_import_reference(name):
-        return entrypoints
+        returned_entrypoints = _module_getattr_returned_class_entrypoints(f"{module}.{name}")
+        return _dedupe_calls((*entrypoints, *returned_entrypoints))
     methods, _ = _pickle_owner_proof_for_reference(reference)
     if methods is None:
         return entrypoints
@@ -6327,6 +6328,7 @@ def _module_getattr_binding_statements(
     parameter_name: str = "",
     export_name: object = "",
     before: ast.stmt | None = None,
+    initial_bindings: tuple[ast.stmt, ...] = (),
 ) -> tuple[ast.stmt, ...]:
     matched: list[ast.stmt] = []
 
@@ -6398,7 +6400,7 @@ def _module_getattr_binding_statements(
                 )
         return bindings, False
 
-    bindings, _ = visit(statements, ())
+    bindings, _ = visit(statements, bounded(initial_bindings))
     return bounded(matched) if before is not None else bindings
 
 
@@ -6416,12 +6418,15 @@ def _module_getattr_function_definitions(
 @lru_cache(maxsize=4096)
 def _module_getattr_returned_class_entrypoints(function_name: str) -> tuple[str, ...]:
     module_name, qualified_name = _split_function_name(function_name)
-    if module_name is None or "." in qualified_name:
+    if module_name is None:
         return ()
+    export_name, _separator, member_path = qualified_name.partition(".")
     exporting_analysis = _analyze_module(module_name)
     if exporting_analysis is None:
         return ()
-    getter_target = _resolve_module_getattr_target(module_name, qualified_name, exporting_analysis)
+    getter_target = _resolve_module_getattr_target(
+        module_name, export_name, exporting_analysis, allow_loaded_extension_bypass=not member_path
+    )
     if getter_target is None or _resolve_function_target(function_name) != getter_target:
         return ()
     if _find_sink_path(getter_target) is not None:
@@ -6437,7 +6442,9 @@ def _module_getattr_returned_class_entrypoints(function_name: str) -> tuple[str,
     for getter in _module_getattr_function_definitions(context.module_body, getter_name):
         entrypoints.update(
             dict.fromkeys(
-                _returned_class_entrypoints_for_getter(module_name, qualified_name, getter, context, analysis)
+                _returned_class_entrypoints_for_getter(
+                    module_name, export_name, getter, context, analysis, member_path=member_path
+                )
             )
         )
         if len(entrypoints) > _MAX_CALLS_PER_FUNCTION:
@@ -6489,6 +6496,8 @@ def _returned_class_entrypoints_for_getter(
     getter: ast.FunctionDef,
     context: _ModuleSourceContext,
     analysis: _ModuleAnalysis,
+    *,
+    member_path: str = "",
 ) -> tuple[str, ...]:
     if not _module_getattr_decorators_preserve_returns(getter, module_name, context):
         return ()
@@ -6577,6 +6586,18 @@ def _returned_class_entrypoints_for_getter(
         remaining_values -= 1
         if remaining_values < 0:
             raise _CallGraphAnalysisLimitError("module __getattr__ returned-value resolution exceeds analysis limit")
+        if isinstance(expression, ast.IfExp):
+            condition = _module_getattr_condition_value(
+                expression.test, condition_parameter if in_function else "", condition_value
+            )
+            branches = (
+                (expression.body, expression.orelse)
+                if condition is None
+                else (expression.body if condition else expression.orelse,)
+            )
+            for branch in branches:
+                yield from values(branch, before, in_function, force_global=force_global)
+            return
         if isinstance(expression, ast.Dict):
             if len(expression.keys) > _MAX_CALLS_PER_FUNCTION:
                 raise _CallGraphAnalysisLimitError("module __getattr__ mapping exceeds analysis limit")
@@ -6618,19 +6639,26 @@ def _returned_class_entrypoints_for_getter(
         )
         if force_global and symbol is not None and not symbol.is_global():
             function_binding = False
+        module_bindings = (
+            _module_getattr_binding_statements(context.module_body, root_name)
+            if function_binding and symbol is not None and symbol.is_global()
+            else ()
+        )
         bindings = _module_getattr_binding_statements(
             getter.body if function_binding else context.module_body,
             root_name,
             parameter_name=condition_parameter if function_binding else "",
             export_name=condition_value,
             before=before if function_binding or not in_function else None,
+            initial_bindings=module_bindings,
         )
         for binding in bindings:
+            binding_in_function = function_binding and binding not in module_bindings
             imported = _collect_import_aliases((binding,), module_name, context.is_package).get(root_name)
             if imported is not None:
                 yield (f"{imported}.{remainder}" if separator else imported), before, in_function
             elif isinstance(binding, ast.ClassDef):
-                if function_binding:
+                if binding_in_function:
                     raise _CallGraphAnalysisLimitError(
                         "module __getattr__ returns a function-local class whose closure is not analyzed"
                     )
@@ -6638,7 +6666,7 @@ def _returned_class_entrypoints_for_getter(
             elif isinstance(binding, ast.Assign | ast.AnnAssign) and binding.value is not None:
                 if root_name not in _assignment_alias_target_names(binding):
                     continue
-                for value, value_before, value_in_function in values(binding.value, binding, function_binding):
+                for value, value_before, value_in_function in values(binding.value, binding, binding_in_function):
                     if separator:
                         if isinstance(value, str):
                             yield f"{value}.{remainder}", value_before, value_in_function
@@ -6659,7 +6687,16 @@ def _returned_class_entrypoints_for_getter(
                 continue
             class_target = _resolve_class_target(target)
             if class_target is not None:
-                entrypoints.update(dict.fromkeys(_class_entrypoints(class_target)))
+                class_entrypoints = (
+                    _call_graph_entrypoints(f"{class_target}.{member_path}")
+                    if member_path
+                    else _class_entrypoints(class_target)
+                )
+                if member_path and not class_entrypoints:
+                    raise _CallGraphAnalysisLimitError(
+                        "module __getattr__ returns a class with an unresolved member path"
+                    )
+                entrypoints.update(dict.fromkeys(class_entrypoints))
             if len(entrypoints) > _MAX_CALLS_PER_FUNCTION:
                 raise _CallGraphAnalysisLimitError(
                     "module __getattr__ returned-class entrypoints exceed analysis limit"

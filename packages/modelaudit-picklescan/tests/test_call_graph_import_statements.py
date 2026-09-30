@@ -11490,3 +11490,104 @@ def bridge(target, command):
 
     assert "benchmod.Runner.execute" in resolved_calls
     assert calls == 1
+
+
+@pytest.mark.parametrize("member_path", ["run", "Inner.run"])
+@pytest.mark.parametrize("dangerous", [False, True])
+@pytest.mark.parametrize("invoked", [False, True])
+def test_module_getattr_returned_class_dotted_member_invocation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, member_path: str, dangerous: bool, invoked: bool
+) -> None:
+    module_name = "modelaudit_getattr_dotted_member"
+    marker = tmp_path / "hook-executed"
+    body = "os.system('not-executed')" if dangerous else "return 1"
+    (tmp_path / f"{module_name}.py").write_text(
+        "import os\nfrom pathlib import Path\n"
+        f"class _Resolved:\n    @staticmethod\n    def run():\n        {body}\n"
+        f"    class Inner:\n        @staticmethod\n        def run():\n            {body}\n"
+        f"def __getattr__(name):\n    Path({str(marker)!r}).write_text('executed')\n"
+        "    if name == 'Gadget':\n        return _Resolved\n    raise AttributeError(name)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    name = "Gadget." + member_path
+    payload = (
+        _global_call_payload(module_name, name) if invoked else b"\x80\x04" + _global_operand(module_name, name) + b"."
+    )
+    _clear_call_graph_caches()
+    try:
+        report = scan_bytes(payload)
+    finally:
+        _clear_call_graph_caches()
+
+    findings = [finding for finding in report.findings if finding.rule_code == "DANGEROUS_CALL_GRAPH"]
+    if member_path == "run":
+        assert bool(findings) is dangerous
+        if dangerous:
+            assert report.verdict == SafetyVerdict.MALICIOUS
+            assert any(f"{module_name}._Resolved.run" in finding.details.get("call_path", ()) for finding in findings)
+        assert not any(error.category == "call_graph_analysis_error" for error in report.errors)
+    else:
+        assert report.status == ScanStatus.INCONCLUSIVE
+        assert report.verdict == SafetyVerdict.SUSPICIOUS
+        assert report.metadata["analysis_incomplete"] is True
+        assert any(
+            error.category == "call_graph_analysis_error" and "unresolved member path" in error.message
+            for error in report.errors
+        )
+    assert not marker.exists()
+    assert module_name not in sys.modules
+
+
+@pytest.mark.parametrize(
+    ("module_binding", "body", "dangerous"),
+    [
+        ("Alias = _Danger", "global Alias\nif name == 'Other':\n    Alias = _Safe\nreturn Alias", True),
+        ("Alias = _Safe", "global Alias\nif name == 'Other':\n    Alias = _Danger\nreturn Alias", False),
+        ("Alias = _Danger", "global Alias\nif name == 'Gadget':\n    Alias = _Safe\nreturn Alias", False),
+        ("Alias = _Safe", "global Alias\nif name == 'Gadget':\n    Alias = _Danger\nreturn Alias", True),
+        ("Alias = _Danger", "global Alias\nif bool(int('0')):\n    Alias = _Safe\nreturn Alias", True),
+        ("Alias = _Danger", "global Alias\nif name == 'Other':\n    del Alias\nreturn Alias", True),
+        ("Alias = _Danger", "global Alias\nif name == 'Gadget':\n    del Alias\nreturn Alias", False),
+        ("", "global _Danger\nif name == 'Other':\n    _Danger = _Safe\nreturn _Danger", True),
+    ],
+)
+def test_module_getattr_conditional_global_assignment_preserves_module_binding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, module_binding: str, body: str, dangerous: bool
+) -> None:
+    source = module_binding + "\ndef __getattr__(name):\n    " + body.replace("\n", "\n    ")
+    report = _scan_module_getattr_class_source(tmp_path, monkeypatch, source)
+
+    assert any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings) is dangerous
+    if dangerous:
+        assert report.verdict == SafetyVerdict.MALICIOUS
+
+
+@pytest.mark.parametrize("return_kind", ["direct", "alias", "mapping"])
+@pytest.mark.parametrize(
+    ("expression", "dangerous"),
+    [
+        ("_Danger if name == 'Gadget' else _Safe", True),
+        ("_Danger if name == 'Other' else _Safe", False),
+        ("_Safe if name != 'Gadget' else _Danger", True),
+        ("_Danger if bool(int('0')) else _Safe", True),
+        ("(_Safe if name == 'Gadget' else _Danger) if name != 'Other' else _Danger", False),
+        ("_Danger if name == 'Other' else None", False),
+    ],
+)
+def test_module_getattr_conditional_return_expression_selects_export(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, return_kind: str, expression: str, dangerous: bool
+) -> None:
+    if return_kind == "alias":
+        body = f"Alias = {expression}\nreturn Alias"
+    elif return_kind == "mapping":
+        body = f"return {{'Gadget': {expression}}}[name]"
+    else:
+        body = f"return {expression}"
+    report = _scan_module_getattr_class_source(
+        tmp_path, monkeypatch, "def __getattr__(name):\n    " + body.replace("\n", "\n    ")
+    )
+
+    assert any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings) is dangerous
+    if dangerous:
+        assert report.verdict == SafetyVerdict.MALICIOUS
