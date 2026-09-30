@@ -3166,7 +3166,7 @@ def test_returned_class_coverage_gap_preserves_outcome_and_cache_policy(
             "import os\ndef Gadget():\n    os.system('not-executed')\nAlias = Gadget\ndel Gadget\n"
             f"def __getattr__(name):\n    {getter}\n    return Alias\n"
         )
-        export_name = b"Gadget"
+        export_name = b"Missing"
     elif gap_kind == "unproven metaclass member":
         source = (
             "import os\nclass Meta(type):\n    def __getattribute__(cls, name):\n"
@@ -3244,6 +3244,38 @@ def test_returned_class_partial_coverage_preserves_malicious_verdict(
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert "pickle_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
     assert any("unproven metaclass" in issue.message for issue in result.issues)
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues) is dangerous
+    assert should_cache_scan_result(result.to_dict(include_private_metadata=True)) is False
+    assert determine_exit_code(aggregate) == 2
+
+
+@pytest.mark.parametrize("dangerous", [False, True])
+@pytest.mark.parametrize("function", [False, True])
+def test_export_deletion_preserves_paths_outcome_and_cache_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dangerous: bool, function: bool
+) -> None:
+    module_name = "modelaudit_root_deleted_export"
+    body = "os.system('not-executed')" if dangerous else "pass"
+    definition = f"def Gadget():\n    {body}" if function else f"class Gadget:\n    def __init__(self):\n        {body}"
+    (tmp_path / f"{module_name}.py").write_text(
+        f"import os\n{definition}\nSaved = Gadget\ndel Gadget\n(Gadget := Saved)\n", encoding="utf-8"
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    path = tmp_path / "deleted-export.pkl"
+    path.write_bytes(b"\x80\x04c" + module_name.encode() + b"\nGadget\n)R.")
+    _clear_source_sensitive_caches()
+    try:
+        result = PickleScanner().scan(str(path))
+    finally:
+        _clear_source_sensitive_caches()
+    aggregate = create_initial_audit_result()
+    merge_scan_result(aggregate, result)
+
+    assert result.success is False
+    assert result.metadata["pickle_verdict"] == ("malicious" if dangerous else "suspicious")
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "pickle_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert any("export deletion" in issue.message for issue in result.issues)
     assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues) is dangerous
     assert should_cache_scan_result(result.to_dict(include_private_metadata=True)) is False
     assert determine_exit_code(aggregate) == 2
