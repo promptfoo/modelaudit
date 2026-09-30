@@ -1659,12 +1659,14 @@ class _CallGraphAnalysisLimitError(RuntimeError):
         partial_findings: tuple[CallGraphFinding, ...] = (),
         partial_startup_hook_write_findings: tuple[StartupHookWriteFinding, ...] = (),
         partial_path: tuple[str, ...] | None = None,
+        partial_entrypoints: tuple[str, ...] = (),
         stability_reason: str | None = None,
     ) -> None:
         super().__init__(message)
         self.partial_findings = partial_findings
         self.partial_startup_hook_write_findings = partial_startup_hook_write_findings
         self.partial_path = partial_path
+        self.partial_entrypoints = partial_entrypoints
         # Which snapshot gate invalidated the run, reported without changing the message text.
         self.stability_reason = stability_reason
 
@@ -2016,7 +2018,7 @@ def find_dangerous_call_graphs(
         except _CallGraphAnalysisLimitError as error:
             if analysis_limit_error is None:
                 analysis_limit_error = error
-            continue
+            entrypoints = error.partial_entrypoints
         if not entrypoints:
             continue
         allow_invoked_non_lifecycle_entrypoint = _is_explicit_method_import_reference(name)
@@ -2181,7 +2183,7 @@ def find_startup_hook_write_call_graphs(
         except _CallGraphAnalysisLimitError as error:
             if analysis_limit_error is None:
                 analysis_limit_error = error
-            continue
+            entrypoints = error.partial_entrypoints
         if not entrypoints:
             continue
         try:
@@ -3446,17 +3448,28 @@ def _call_graph_entrypoints_for_reference(
     entrypoints = _safe_call_graph_entrypoints(f"{module}.{name}")
     if not entrypoints:
         return ()
-    if _is_explicit_method_import_reference(name):
-        returned_entrypoints = _module_getattr_returned_class_entrypoints(f"{module}.{name}")
-        return _dedupe_calls((*entrypoints, *returned_entrypoints))
-    methods, _ = _pickle_owner_proof_for_reference(reference)
-    if methods is None:
-        return entrypoints
-    if _resolve_class_target(f"{module}.{name}") is not None and not _module_export_is_deleted(module, name):
-        return _filter_class_entrypoints(entrypoints, methods)
-    returned_entrypoints = _module_getattr_returned_class_entrypoints(f"{module}.{name}", methods=methods)
+    methods = None
+    if not _is_explicit_method_import_reference(name):
+        methods, _ = _pickle_owner_proof_for_reference(reference)
+        if methods is None:
+            return entrypoints
+        if _resolve_class_target(f"{module}.{name}") is not None and not _module_export_is_deleted(module, name):
+            return _filter_class_entrypoints(entrypoints, methods)
+    analysis_limit_error = None
+    try:
+        returned_entrypoints = _module_getattr_returned_class_entrypoints(f"{module}.{name}", methods=methods)
+    except _CallGraphAnalysisLimitError as error:
+        analysis_limit_error = error
+        returned_entrypoints = error.partial_entrypoints
+    if methods is not None:
+        returned_entrypoints = _filter_class_entrypoints(returned_entrypoints, methods)
     # Resolving an export still executes the hook before invoking its returned class.
-    return _dedupe_calls((*entrypoints, *_filter_class_entrypoints(returned_entrypoints, methods)))
+    combined = _dedupe_calls((*entrypoints, *returned_entrypoints))
+    if analysis_limit_error is not None:
+        raise _CallGraphAnalysisLimitError(
+            str(analysis_limit_error), partial_entrypoints=combined
+        ) from analysis_limit_error
+    return combined
 
 
 def _pickle_entrypoint_positional_arg_count(
@@ -6387,6 +6400,12 @@ def _module_getattr_binding_statements(
                 and any(_assignment_target_binds_name(target, name) for target in statement.targets)
             ) or _module_statement_binds_name(statement, name):
                 bindings = (statement,)
+            elif (
+                isinstance(statement, ast.ImportFrom)
+                and any(alias.name == "*" for alias in statement.names)
+                and any(isinstance(binding, ast.Delete) for binding in bindings)
+            ):
+                bindings = bounded((*bindings, statement))
             elif isinstance(statement, ast.For | ast.While) and _module_getattr_loop_body_is_unreachable(
                 statement, parameter_name, export_name
             ):
@@ -6462,6 +6481,11 @@ def _module_export_is_deleted(module_name: str, name: str) -> bool:
         return False
     bindings = _module_getattr_binding_statements(context.module_body, name)
     deleted = any(isinstance(binding, ast.Delete) for binding in bindings)
+    if deleted and any(
+        isinstance(binding, ast.ImportFrom) and any(alias.name == "*" for alias in binding.names)
+        for binding in bindings
+    ):
+        raise _CallGraphAnalysisLimitError("module export has an unresolved wildcard rebinding after deletion")
     if deleted and any(not isinstance(binding, ast.Delete) for binding in bindings):
         raise _CallGraphAnalysisLimitError("module export has an unresolved conditional deletion")
     return deleted
@@ -6506,16 +6530,23 @@ def _module_getattr_returned_class_entrypoints(
     if context is None or analysis is None:
         return ()
     entrypoints: dict[str, None] = {}
+    analysis_limit_error = None
     for getter in _module_getattr_function_definitions(context.module_body, getter_name):
-        entrypoints.update(
-            dict.fromkeys(
-                _returned_class_entrypoints_for_getter(
-                    module_name, export_name, getter, context, analysis, member_path=member_path, methods=methods
-                )
+        try:
+            returned_entrypoints = _returned_class_entrypoints_for_getter(
+                module_name, export_name, getter, context, analysis, member_path=member_path, methods=methods
             )
-        )
+        except _CallGraphAnalysisLimitError as error:
+            if analysis_limit_error is None:
+                analysis_limit_error = error
+            returned_entrypoints = error.partial_entrypoints
+        entrypoints.update(dict.fromkeys(returned_entrypoints))
         if len(entrypoints) > _MAX_CALLS_PER_FUNCTION:
             raise _CallGraphAnalysisLimitError("module __getattr__ returned-class entrypoints exceed analysis limit")
+    if analysis_limit_error is not None:
+        raise _CallGraphAnalysisLimitError(
+            str(analysis_limit_error), partial_entrypoints=tuple(entrypoints)
+        ) from analysis_limit_error
     return tuple(entrypoints)
 
 
@@ -6652,7 +6683,7 @@ def _returned_class_entrypoints_for_getter(
         in_function: bool,
         *,
         force_global: bool = False,
-    ) -> Iterator[tuple[str | ast.Dict, ast.stmt | None, bool]]:
+    ) -> Iterator[tuple[str | ast.Dict | ast.FunctionDef | ast.AsyncFunctionDef, ast.stmt | None, bool]]:
         nonlocal remaining_values
         remaining_values -= 1
         if remaining_values < 0:
@@ -6734,6 +6765,8 @@ def _returned_class_entrypoints_for_getter(
                         "module __getattr__ returns a function-local class whose closure is not analyzed"
                     )
                 yield f"{module_name}.{target_name}", before, in_function
+            elif isinstance(binding, ast.FunctionDef | ast.AsyncFunctionDef):
+                yield binding, before, in_function
             elif isinstance(binding, ast.For):
                 raise _CallGraphAnalysisLimitError("module __getattr__ returns an unresolved loop-target binding")
             elif isinstance(binding, ast.With | ast.AsyncWith):
@@ -6745,49 +6778,73 @@ def _returned_class_entrypoints_for_getter(
                     if separator:
                         if isinstance(value, str):
                             yield f"{value}.{remainder}", value_before, value_in_function
+                        elif isinstance(value, ast.FunctionDef | ast.AsyncFunctionDef):
+                            yield value, value_before, value_in_function
                     else:
                         yield value, value_before, value_in_function
         if not bindings and not function_binding and root_name not in analysis.direct_names:
             yield f"{module_name}.{target_name}", before, in_function
 
     entrypoints: dict[str, None] = {}
+    analysis_limit_error = None
     returns = _module_getattr_return_statements(getter, condition_parameter, condition_value)
     if len(returns) > _MAX_CALLS_PER_FUNCTION:
         raise _CallGraphAnalysisLimitError("module __getattr__ return statements exceed analysis limit")
     for statement in returns:
         if statement.value is None:
             continue
-        for target, _before, _in_function in values(statement.value, statement, True):
-            if not isinstance(target, str):
-                continue
-            class_target = _resolve_class_target(target)
-            if class_target is not None:
-                class_entrypoints = (
-                    _call_graph_entrypoints(f"{class_target}.{member_path}")
-                    if member_path
-                    else _class_entrypoints(class_target)
-                )
-                class_context = _source_class_context(class_target)
-                if class_context is None or not _class_lookup_has_source_backed_plain_metaclass(class_context):
-                    selected = (
-                        class_entrypoints
-                        if member_path or methods is None
-                        else _filter_class_entrypoints(class_entrypoints, methods)
-                    )
-                    if not any(_find_sink_path(entrypoint) is not None for entrypoint in selected):
+        try:
+            for target, _before, _in_function in values(statement.value, statement, True):
+                try:
+                    if isinstance(target, ast.FunctionDef | ast.AsyncFunctionDef):
                         raise _CallGraphAnalysisLimitError(
-                            "module __getattr__ returns a class with an unproven metaclass"
+                            "module __getattr__ returned function invocation is not analyzed"
                         )
-                if member_path and not class_entrypoints:
+                    if not isinstance(target, str):
+                        continue
+                    returned_entrypoints = _returned_class_target_entrypoints(target, member_path, methods)
+                except _CallGraphAnalysisLimitError as error:
+                    if analysis_limit_error is None:
+                        analysis_limit_error = error
+                    returned_entrypoints = error.partial_entrypoints
+                entrypoints.update(dict.fromkeys(returned_entrypoints))
+                if len(entrypoints) > _MAX_CALLS_PER_FUNCTION:
                     raise _CallGraphAnalysisLimitError(
-                        "module __getattr__ returns a class with an unresolved member path"
+                        "module __getattr__ returned-class entrypoints exceed analysis limit"
                     )
-                entrypoints.update(dict.fromkeys(class_entrypoints))
-            if len(entrypoints) > _MAX_CALLS_PER_FUNCTION:
-                raise _CallGraphAnalysisLimitError(
-                    "module __getattr__ returned-class entrypoints exceed analysis limit"
-                )
+        except _CallGraphAnalysisLimitError as error:
+            if analysis_limit_error is None:
+                analysis_limit_error = error
+        if len(entrypoints) > _MAX_CALLS_PER_FUNCTION:
+            raise _CallGraphAnalysisLimitError("module __getattr__ returned-class entrypoints exceed analysis limit")
+    if analysis_limit_error is not None:
+        raise _CallGraphAnalysisLimitError(
+            str(analysis_limit_error), partial_entrypoints=tuple(entrypoints)
+        ) from analysis_limit_error
     return tuple(entrypoints)
+
+
+def _returned_class_target_entrypoints(
+    target: str, member_path: str, methods: tuple[str, ...] | None
+) -> tuple[str, ...]:
+    class_target = _resolve_class_target(target)
+    if class_target is None:
+        if _resolve_alias_function_target(target) is not None:
+            raise _CallGraphAnalysisLimitError("module __getattr__ returned function invocation is not analyzed")
+        return ()
+    entrypoints = (
+        _call_graph_entrypoints(f"{class_target}.{member_path}") if member_path else _class_entrypoints(class_target)
+    )
+    class_context = _source_class_context(class_target)
+    if class_context is None or not _class_lookup_has_source_backed_plain_metaclass(class_context):
+        selected = entrypoints if member_path or methods is None else _filter_class_entrypoints(entrypoints, methods)
+        if not any(_find_sink_path(entrypoint) is not None for entrypoint in selected):
+            raise _CallGraphAnalysisLimitError(
+                "module __getattr__ returns a class with an unproven metaclass", partial_entrypoints=entrypoints
+            )
+    if member_path and not entrypoints:
+        raise _CallGraphAnalysisLimitError("module __getattr__ returns a class with an unresolved member path")
+    return entrypoints
 
 
 def _class_entrypoints(class_name: str) -> tuple[str, ...]:
@@ -7917,7 +7974,7 @@ def _conditionally_rebound_assignment_nodes(
         terminating_bodies: tuple[Iterable[ast.stmt], ...]
         deterministic_terminal_bodies: tuple[Iterable[ast.stmt], ...] | None = None
         if isinstance(node, ast.If):
-            alternate_bodies = (node.body, node.orelse)
+            alternate_bodies = _definition_scope_child_bodies(node)
             terminating_bodies = tuple(
                 branch_body for branch_body in alternate_bodies if not _can_complete_normally(branch_body)
             )

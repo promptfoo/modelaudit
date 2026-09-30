@@ -3118,6 +3118,7 @@ def test_legacy_pytorch_container_does_not_report_known_stream_truncated(tmp_pat
         "class-method hook",
         "context-manager binding",
         "unproven metaclass member",
+        "returned function invocation",
     ],
 )
 def test_returned_class_coverage_gap_preserves_outcome_and_cache_policy(
@@ -3158,6 +3159,12 @@ def test_returned_class_coverage_gap_preserves_outcome_and_cache_policy(
             "class CM:\n    def __enter__(self):\n        return Resolved\n"
             "    def __exit__(self, *args):\n        return False\n"
             f"def __getattr__(name):\n    {getter}\n    with CM() as Alias:\n        pass\n    return Alias\n"
+        )
+        export_name = b"Gadget"
+    elif gap_kind == "returned function invocation":
+        source = (
+            "import os\ndef Gadget():\n    os.system('not-executed')\nAlias = Gadget\ndel Gadget\n"
+            f"def __getattr__(name):\n    {getter}\n    return Alias\n"
         )
         export_name = b"Gadget"
     elif gap_kind == "unproven metaclass member":
@@ -3204,6 +3211,42 @@ def test_returned_class_coverage_gap_preserves_outcome_and_cache_policy(
         assert any(message in issue.message for issue in result.issues)
         assert should_cache_scan_result(result.to_dict(include_private_metadata=True)) is False
         assert determine_exit_code(aggregate) == 2
+
+
+@pytest.mark.parametrize("dangerous", [False, True])
+@pytest.mark.parametrize("unknown_first", [False, True])
+def test_returned_class_partial_coverage_preserves_malicious_verdict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dangerous: bool, unknown_first: bool
+) -> None:
+    module_name = "modelaudit_root_returned_alternatives"
+    body = "os.system('not-executed')" if dangerous else "return 1"
+    first, last = ("Unknown", "Known") if unknown_first else ("Known", "Unknown")
+    (tmp_path / f"{module_name}.py").write_text(
+        f"import os\nclass Known:\n    @staticmethod\n    def run():\n        {body}\n"
+        "class Meta(type):\n    pass\nclass Unknown(metaclass=Meta):\n"
+        "    @staticmethod\n    def run():\n        return 1\n"
+        f"def __getattr__(name):\n    if bool(int('1')):\n        return {first}\n    return {last}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    path = tmp_path / "returned-alternatives.pkl"
+    path.write_bytes(b"\x80\x04c" + module_name.encode() + b"\nGadget.run\n)R.")
+    _clear_source_sensitive_caches()
+    try:
+        result = PickleScanner().scan(str(path))
+    finally:
+        _clear_source_sensitive_caches()
+    aggregate = create_initial_audit_result()
+    merge_scan_result(aggregate, result)
+
+    assert result.success is False
+    assert result.metadata["pickle_verdict"] == ("malicious" if dangerous else "suspicious")
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "pickle_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert any("unproven metaclass" in issue.message for issue in result.issues)
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues) is dangerous
+    assert should_cache_scan_result(result.to_dict(include_private_metadata=True)) is False
+    assert determine_exit_code(aggregate) == 2
 
 
 def test_large_legacy_pytorch_container_defers_file_size_limit(tmp_path: Path) -> None:
