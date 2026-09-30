@@ -2403,6 +2403,139 @@ def test_module_getattr_returned_class_uses_last_definition(
     assert module_name not in sys.modules
 
 
+def _returned_class_system_paths(module_name: str, export_name: str = "Gadget") -> tuple[tuple[str, ...], ...]:
+    reference = {"module": module_name, "name": export_name}
+    _clear_call_graph_caches()
+    try:
+        findings = call_graph.find_dangerous_call_graphs(
+            [reference], [{**reference, "opcode": "REDUCE", "positional_arg_count": 0}]
+        )
+        return tuple(finding.call_path for finding in findings if finding.sink == "os.system")
+    finally:
+        _clear_call_graph_caches()
+
+
+@pytest.mark.parametrize(("imported_class", "imported_hook"), [(True, False), (False, True), (True, True)])
+@pytest.mark.parametrize("dangerous", [False, True])
+def test_module_getattr_returned_class_follows_import_aliases(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, imported_class: bool, imported_hook: bool, dangerous: bool
+) -> None:
+    module_name = "modelaudit_getattr_alias_export"
+    hook_module = f"{module_name}_hook" if imported_hook else module_name
+    class_module = f"{module_name}_class" if imported_class else hook_module
+    hook_name = "compat" if imported_hook else "__getattr__"
+    constructor_body = "os.system('not-executed')" if dangerous else "self.value = 1"
+    class_source = f"import os\nclass _Gadget:\n    def __init__(self):\n        {constructor_body}\n"
+    if imported_class:
+        (tmp_path / f"{class_module}.py").write_text(class_source, encoding="utf-8")
+        class_source = f"from {class_module} import _Gadget\n"
+    (tmp_path / f"{hook_module}.py").write_text(
+        class_source + f"def {hook_name}(name):\n    return _Gadget\n", encoding="utf-8"
+    )
+    if imported_hook:
+        (tmp_path / f"{module_name}.py").write_text(
+            f"from {hook_module} import compat as __getattr__\n", encoding="utf-8"
+        )
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    paths = _returned_class_system_paths(module_name)
+
+    assert bool(paths) is dangerous
+    if dangerous:
+        assert any(f"{class_module}._Gadget.__init__" in path for path in paths)
+    assert all(name not in sys.modules for name in (module_name, hook_module, class_module))
+
+
+@pytest.mark.parametrize(
+    "binding",
+    [
+        "_Gadget = safe",
+        "for _Gadget in (safe,):\n        pass",
+        "if (_Gadget := safe):\n        pass",
+        "def _Gadget():\n        return None",
+        "try:\n        raise ValueError()\n    except ValueError as _Gadget:\n        return _Gadget",
+        "global _Gadget\n    _Gadget = safe",
+    ],
+)
+def test_module_getattr_returned_name_respects_hook_bindings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, binding: str
+) -> None:
+    module_name = "modelaudit_getattr_shadowed_class"
+    (tmp_path / f"{module_name}.py").write_text(
+        "import os\nclass _Gadget:\n    def __init__(self):\n        os.system('not-executed')\n"
+        "def safe():\n    return None\n"
+        f"def __getattr__(name):\n    {binding}\n    return _Gadget\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    assert _returned_class_system_paths(module_name) == ()
+    assert module_name not in sys.modules
+
+
+@pytest.mark.parametrize(
+    "condition",
+    [
+        "name == 'Bad'",
+        "'Bad' == name",
+        "name in ('Bad', 'VeryBad')",
+        "name != 'Good'",
+        "name not in {'Good'}",
+        "not (name == 'Good')",
+        "name == 'Bad' and name != 'Good'",
+        "name == 'Bad' or name == 'VeryBad'",
+    ],
+)
+@pytest.mark.parametrize("export_name", ["Good", "Bad"])
+def test_module_getattr_returned_class_matches_requested_export(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, condition: str, export_name: str
+) -> None:
+    module_name = "modelaudit_getattr_export_branches"
+    (tmp_path / f"{module_name}.py").write_text(
+        "import os\nclass _Bad:\n    def __init__(self):\n        os.system('not-executed')\n"
+        "class _Safe:\n    def __init__(self):\n        self.value = 1\n"
+        f"def __getattr__(name):\n    if {condition}:\n        return _Bad\n"
+        "    return _Safe\n    return _Bad\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    assert bool(_returned_class_system_paths(module_name, export_name)) is (export_name == "Bad")
+    assert module_name not in sys.modules
+
+
+@pytest.mark.parametrize(
+    ("getter_prefix", "getter_body", "expected"),
+    [
+        ("", "yield None\n    return _Gadget", False),
+        ("", "def unrelated():\n        yield None\n    return _Gadget", True),
+        ("@lambda function: (lambda name: None)\n", "return _Gadget", False),
+        ("", "_Gadget = None\n    return globals()['_Gadget']", True),
+        ("", "global _Gadget\n    _Gadget = None\n    return globals()['_Gadget']", False),
+        ("", "import os as name\n    if name == 'Gadget':\n        return _Gadget", False),
+        ("", "global globals\n    import os as globals\n    return globals()['_Gadget']", False),
+        ("", "global _Gadget\n    import os as _Gadget\n    return _Gadget", False),
+    ],
+)
+def test_module_getattr_returned_class_distinguishes_runtime_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    getter_prefix: str,
+    getter_body: str,
+    expected: bool,
+) -> None:
+    module_name = "modelaudit_getattr_runtime_binding"
+    (tmp_path / f"{module_name}.py").write_text(
+        "import os\nclass _Gadget:\n    def __init__(self):\n        os.system('not-executed')\n"
+        f"{getter_prefix}def __getattr__(name):\n    {getter_body}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    assert bool(_returned_class_system_paths(module_name)) is expected
+    assert module_name not in sys.modules
+
+
 def test_scan_bytes_marks_zipimported_invoked_call_graph_source_unavailable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -4162,7 +4295,9 @@ def test_scan_bytes_fails_closed_for_late_loaded_torch_layout_module_dict_lookup
     torch = pytest.importorskip("torch")
     if not hasattr(torch, "strided"):
         pytest.skip("usable PyTorch API is unavailable")
-    payload = pickle.dumps(torch.strided, protocol=4)
+    # Other tests restore copyreg after importing torch, removing its layout reducer.
+    payload = b"\x80\x04ctorch.serialization\n_get_layout\n(Vtorch.strided\ntR."
+    assert pickle.loads(payload) is torch.strided
 
     report = scan_bytes(payload, source="torch-layout-clean.pkl")
 

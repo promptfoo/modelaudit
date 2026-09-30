@@ -11,6 +11,7 @@ import os
 import re
 import stat
 import struct
+import symtable
 import sys
 import sysconfig
 import threading
@@ -6230,15 +6231,89 @@ def _resolve_class_target(function_name: str) -> str | None:
     return None
 
 
+def _module_getattr_condition_value(test: ast.expr, parameter_name: str, export_name: str) -> bool | None:
+    if isinstance(test, ast.Constant):
+        return bool(test.value)
+    if isinstance(test, ast.Name) and test.id == parameter_name:
+        return bool(export_name)
+    if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
+        value = _module_getattr_condition_value(test.operand, parameter_name, export_name)
+        return not value if value is not None else None
+    if isinstance(test, ast.BoolOp):
+        values = [_module_getattr_condition_value(value, parameter_name, export_name) for value in test.values]
+        decisive = isinstance(test.op, ast.Or)
+        if decisive in values:
+            return decisive
+        return None if None in values else not decisive
+    if not isinstance(test, ast.Compare) or len(test.ops) != 1:
+        return None
+    left, right = test.left, test.comparators[0]
+    operator = test.ops[0]
+    if isinstance(operator, ast.Eq | ast.NotEq):
+        if isinstance(right, ast.Name) and right.id == parameter_name:
+            left, right = right, left
+        if isinstance(left, ast.Name) and left.id == parameter_name and isinstance(right, ast.Constant):
+            matches = export_name == right.value
+            return matches if isinstance(operator, ast.Eq) else not matches
+    if (
+        isinstance(operator, ast.In | ast.NotIn)
+        and isinstance(left, ast.Name)
+        and left.id == parameter_name
+        and isinstance(right, ast.Tuple | ast.List | ast.Set)
+        and all(isinstance(item, ast.Constant) for item in right.elts)
+    ):
+        matches = any(export_name == item.value for item in right.elts if isinstance(item, ast.Constant))
+        return matches if isinstance(operator, ast.In) else not matches
+    return None
+
+
+def _module_getattr_return_statements(
+    getter: ast.FunctionDef, parameter_name: str, export_name: str
+) -> tuple[ast.Return, ...]:
+    returns: list[ast.Return] = []
+
+    def visit(statements: Iterable[ast.stmt]) -> bool:
+        for statement in statements:
+            if isinstance(statement, ast.Return):
+                returns.append(statement)
+                return True
+            if isinstance(statement, ast.Raise):
+                return True
+            if isinstance(statement, ast.If):
+                condition = _module_getattr_condition_value(statement.test, parameter_name, export_name)
+                branches: tuple[list[ast.stmt], ...]
+                if condition is None:
+                    branches = (statement.body, statement.orelse)
+                else:
+                    branches = (statement.body if condition else statement.orelse,)
+                terminated = [visit(branch) for branch in branches]
+                if all(terminated):
+                    return True
+            else:
+                for body in _definition_scope_child_bodies(statement):
+                    visit(body)
+        return False
+
+    visit(getter.body)
+    return tuple(returns)
+
+
 @_register_source_sensitive_cache
 @lru_cache(maxsize=4096)
 def _module_getattr_returned_class_entrypoints(function_name: str) -> tuple[str, ...]:
     module_name, qualified_name = _split_function_name(function_name)
     if module_name is None or "." in qualified_name:
         return ()
-    if _resolve_function_target(function_name) != f"{module_name}.__getattr__":
+    exporting_analysis = _analyze_module(module_name)
+    if exporting_analysis is None:
         return ()
-    if _find_sink_path(f"{module_name}.__getattr__") is not None:
+    getter_target = _resolve_module_getattr_target(module_name, qualified_name, exporting_analysis)
+    if getter_target is None or _resolve_function_target(function_name) != getter_target:
+        return ()
+    if _find_sink_path(getter_target) is not None:
+        return ()
+    module_name, getter_name = _split_function_name(getter_target)
+    if module_name is None or "." in getter_name:
         return ()
     context = _module_source_context(module_name)
     analysis = _analyze_module(module_name)
@@ -6248,27 +6323,40 @@ def _module_getattr_returned_class_entrypoints(function_name: str) -> tuple[str,
         (
             statement
             for statement in reversed(context.module_statements)
-            if isinstance(statement, ast.FunctionDef) and statement.name == "__getattr__"
+            if isinstance(statement, ast.FunctionDef) and statement.name == getter_name
         ),
         None,
     )
-    if getter is None:
+    if getter is None or getter.decorator_list:
         return ()
+    scope_nodes = list(ast.iter_child_nodes(getter))
+    while scope_nodes:
+        node = scope_nodes.pop()
+        if isinstance(node, ast.Yield | ast.YieldFrom):
+            return ()
+        if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef | ast.Lambda):
+            scope_nodes.extend(ast.iter_child_nodes(node))
     parameters = (*getter.args.posonlyargs, *getter.args.args)
     if len(parameters) != 1:
         return ()
     parameter_name = parameters[0].arg
-    statements = _definition_scope_statements(getter.body)
-    if any(_module_statement_binds_name(statement, parameter_name) for statement in statements):
+    scope = symtable.symtable(ast.unparse(getter), str(context.source_path), "exec").get_children()[0]
+    symbols = {symbol.get_name(): symbol for symbol in scope.get_symbols()}
+    if symbols[parameter_name].is_assigned() or symbols[parameter_name].is_imported():
         return ()
     globals_is_builtin = "globals" not in analysis.direct_names and parameter_name != "globals"
-    globals_is_builtin &= not any(_module_statement_binds_name(statement, "globals") for statement in statements)
+    globals_symbol = symbols.get("globals")
+    globals_is_builtin &= globals_symbol is None or not (
+        globals_symbol.is_local() or globals_symbol.is_assigned() or globals_symbol.is_imported()
+    )
     entrypoints: dict[str, None] = {}
-    for statement in statements:
-        if not isinstance(statement, ast.Return):
-            continue
+    for statement in _module_getattr_return_statements(getter, parameter_name, qualified_name):
         expression = statement.value
         target_name: str | None = expression.id if isinstance(expression, ast.Name) else None
+        if target_name is not None:
+            symbol = symbols.get(target_name)
+            if symbol is not None and (symbol.is_local() or symbol.is_assigned() or symbol.is_imported()):
+                continue
         if (
             globals_is_builtin
             and isinstance(expression, ast.Subscript)
@@ -6306,7 +6394,12 @@ def _module_getattr_returned_class_entrypoints(function_name: str) -> tuple[str,
         if target_name is not None:
             if len(target_name) > _MAX_SOURCE_MODULE_NAME_CHARS:
                 raise _CallGraphAnalysisLimitError("module __getattr__ export name exceeds analysis limit")
-            entrypoints.update(dict.fromkeys(analysis.class_entrypoints.get(f"{module_name}.{target_name}", ())))
+            symbol = symbols.get(target_name)
+            if symbol is not None and symbol.is_global() and (symbol.is_assigned() or symbol.is_imported()):
+                continue
+            class_target = _resolve_class_target(f"{module_name}.{target_name}")
+            if class_target is not None:
+                entrypoints.update(dict.fromkeys(_class_entrypoints(class_target)))
             if len(entrypoints) > _MAX_CALLS_PER_FUNCTION:
                 raise _CallGraphAnalysisLimitError(
                     "module __getattr__ returned-class entrypoints exceed analysis limit"
