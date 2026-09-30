@@ -563,7 +563,9 @@ class TestJITScriptDetector:
     def test_prioritized_rescan_fails_closed_when_source_start_budget_is_exceeded(self) -> None:
         line_count = jit_script_module._MAX_EMBEDDED_PYTHON_SOURCE_START_PROBES + 2
         source = b"}\x00\n".join(f"if True: import webbrowser as wb_{index}".encode() for index in range(line_count))
-        prioritized = jit_script_module._candidate_embedded_python_snippets(source)
+        prioritized = jit_script_module._prioritized_embedded_python_snippets(
+            jit_script_module._candidate_embedded_python_snippets(source), bounded=source
+        )
 
         findings = JITScriptDetector()._extract_and_check_python_code(
             source,
@@ -8492,7 +8494,7 @@ class TestJITScriptDetector:
         dangerous = b"import webbrowser as wb\nwb.open('https://example.invalid')\n"
         dangerous_start = len(safe) + 1
         data = safe + b"\x00" + dangerous
-        candidates: list[jit_script_module._EmbeddedPythonCandidate] = [
+        candidates: list[jit_script_module._SelectedEmbeddedPythonCandidate] = [
             (safe, (0, len(safe)), ((0, len(safe)),)),
             (
                 dangerous,

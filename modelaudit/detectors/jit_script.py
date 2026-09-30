@@ -356,6 +356,7 @@ _EMBEDDED_PYTHON_STATIC_MAPPING_CALL_CONTEXT_START_PATTERN = re.compile(
 )
 _EmbeddedPythonCandidateData = bytes | memoryview
 _EmbeddedPythonCandidate = tuple[_EmbeddedPythonCandidateData, tuple[int, int], tuple[tuple[int, int], ...]]
+_SelectedEmbeddedPythonCandidate = tuple[bytes, tuple[int, int], tuple[tuple[int, int], ...]]
 
 
 def _has_source_like_embedded_python_start(data: bytes, *, start_offset: int = 0) -> bool:
@@ -682,11 +683,11 @@ def _bounded_priority_embedded_python_candidate(
     candidate: bytes,
     span: tuple[int, int],
     priority_offsets: list[int],
-) -> _EmbeddedPythonCandidate:
+) -> _SelectedEmbeddedPythonCandidate:
     index = bisect_left(priority_offsets, span[0])
     if index >= len(priority_offsets) or priority_offsets[index] >= span[1]:
         return candidate, span, (span,)
-    fallback_candidate: _EmbeddedPythonCandidate | None = None
+    fallback_candidate: _SelectedEmbeddedPythonCandidate | None = None
     for priority_offset in priority_offsets[index:]:
         if priority_offset >= span[1]:
             break
@@ -9929,8 +9930,8 @@ def _compact_candidate_segments(candidate: bytes, segment_ranges: list[tuple[int
 def _select_prioritized_embedded_python_snippets(
     candidates: list[_EmbeddedPythonCandidate],
     bounded: bytes | None = None,
-) -> tuple[list[_EmbeddedPythonCandidate], list[tuple[int, int]]]:
-    selected: list[_EmbeddedPythonCandidate] = []
+) -> tuple[list[_SelectedEmbeddedPythonCandidate], list[tuple[int, int]]]:
+    selected: list[_SelectedEmbeddedPythonCandidate] = []
     selected_spans: set[tuple[int, int]] = set()
     priority_offsets = _priority_import_offsets(bounded) if bounded is not None else []
     selected_default_candidates = 0
@@ -9992,7 +9993,7 @@ def _select_prioritized_embedded_python_snippets(
 def _prioritized_embedded_python_snippets(
     candidates: list[_EmbeddedPythonCandidate],
     bounded: bytes | None = None,
-) -> list[_EmbeddedPythonCandidate]:
+) -> list[_SelectedEmbeddedPythonCandidate]:
     selected, _omitted_budgeted_spans = _select_prioritized_embedded_python_snippets(candidates, bounded)
     return selected
 
@@ -16994,7 +16995,7 @@ class JITScriptDetector:
     @staticmethod
     def _looks_like_framed_dangerous_python_source(
         data: bytes,
-        prioritized_snippets_by_window: dict[int, list[_EmbeddedPythonCandidate]] | None = None,
+        prioritized_snippets_by_window: dict[int, list[_SelectedEmbeddedPythonCandidate]] | None = None,
         *,
         extraction_windows: list[tuple[bytes, bool]] | None = None,
     ) -> bool:
@@ -22488,7 +22489,7 @@ class JITScriptDetector:
         context: str,
         *,
         include_full_source: bool = False,
-        prioritized_snippets: list[_EmbeddedPythonCandidate] | None = None,
+        prioritized_snippets: list[_SelectedEmbeddedPythonCandidate] | None = None,
     ) -> list["JITScriptFinding"]:
         """Extract and analyze embedded Python code.
 
@@ -22508,6 +22509,7 @@ class JITScriptDetector:
             return findings
 
         bounded = data if include_full_source else data[:_EMBEDDED_PYTHON_EXTRACT_BYTE_LIMIT]
+        matches: Sequence[_EmbeddedPythonCandidate]
         if prioritized_snippets is None:
             matches = _candidate_embedded_python_snippets(bounded, include_full_source=include_full_source)
             prioritized_matches, omitted_budgeted_spans = _select_prioritized_embedded_python_snippets(
@@ -23368,7 +23370,7 @@ class JITScriptDetector:
         elif not dangerous_python_source and (
             not model_specific_embedded_python_fully_scanned or any(marker in data[2:] for marker in (b"\x00", b"\xff"))
         ):
-            prioritized_snippets_by_window: dict[int, list[_EmbeddedPythonCandidate]] = {}
+            prioritized_snippets_by_window: dict[int, list[_SelectedEmbeddedPythonCandidate]] = {}
             extraction_windows = _embedded_python_extraction_windows(data)
             if self._looks_like_framed_dangerous_python_source(
                 data,

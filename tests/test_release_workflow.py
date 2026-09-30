@@ -188,8 +188,8 @@ def test_standalone_type_check_uses_supported_mypy(workflow_name: str, job_name:
     standalone_requirement = next(requirement for requirement in requirements if requirement.name == "mypy")
 
     assert standalone_requirement.specifier == root_requirement.specifier
-    assert standalone_requirement.specifier.contains("1.20.0")
-    assert not standalone_requirement.specifier.contains("2.0.0")
+    assert standalone_requirement.specifier.contains("2.3.1")
+    assert not standalone_requirement.specifier.contains("2.4.0")
     assert any(requirement.name == "pytest" for requirement in requirements)
 
 
