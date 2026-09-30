@@ -1957,6 +1957,7 @@ class _ModuleSourceContext:
     module_body: tuple[ast.stmt, ...]
     module_statements: tuple[ast.stmt, ...]
     is_package: bool
+    deleted_names: frozenset[str]
 
 
 @dataclass(frozen=True)
@@ -3253,6 +3254,17 @@ def shared_source_sensitive_caches() -> Iterator[None]:
 @lru_cache(maxsize=4096)
 def _safe_call_graph_entrypoints(function_name: str) -> tuple[str, ...]:
     try:
+        module_name, qualified_name = _split_function_name(function_name)
+        if module_name is not None:
+            export_name, separator, _member_path = qualified_name.partition(".")
+            if _module_export_is_deleted(module_name, export_name):
+                analysis = _analyze_module(module_name)
+                if analysis is None:
+                    return ()
+                getter = _resolve_module_getattr_target(
+                    module_name, export_name, analysis, allow_loaded_extension_bypass=not separator
+                )
+                return (getter,) if getter is not None else ()
         return _call_graph_entrypoints(function_name)
     except _CallGraphAnalysisLimitError:
         raise
@@ -3440,7 +3452,7 @@ def _call_graph_entrypoints_for_reference(
     methods, _ = _pickle_owner_proof_for_reference(reference)
     if methods is None:
         return entrypoints
-    if _resolve_class_target(f"{module}.{name}") is not None:
+    if _resolve_class_target(f"{module}.{name}") is not None and not _module_export_is_deleted(module, name):
         return _filter_class_entrypoints(entrypoints, methods)
     returned_entrypoints = _module_getattr_returned_class_entrypoints(f"{module}.{name}", methods=methods)
     # Resolving an export still executes the hook before invoking its returned class.
@@ -6097,7 +6109,9 @@ def _resolve_module_getattr_target(
     *,
     allow_loaded_extension_bypass: bool = True,
 ) -> str | None:
-    if qualified_name in analysis.direct_names:
+    if qualified_name in analysis.direct_names and not _module_export_is_deleted(module_name, qualified_name):
+        return None
+    if _module_export_is_deleted(module_name, "__getattr__"):
         return None
 
     module_getattr = f"{module_name}.__getattr__"
@@ -6368,11 +6382,10 @@ def _module_getattr_binding_statements(
                 return bindings, True
             if isinstance(statement, ast.AnnAssign) and statement.value is None:
                 continue
-            if isinstance(statement, ast.Delete) and any(
-                _assignment_target_binds_name(target, name) for target in statement.targets
-            ):
-                bindings = ()
-            elif _module_statement_binds_name(statement, name):
+            if (
+                isinstance(statement, ast.Delete)
+                and any(_assignment_target_binds_name(target, name) for target in statement.targets)
+            ) or _module_statement_binds_name(statement, name):
                 bindings = (statement,)
             elif isinstance(statement, ast.For | ast.While) and _module_getattr_loop_body_is_unreachable(
                 statement, parameter_name, export_name
@@ -6416,6 +6429,11 @@ def _module_getattr_binding_statements(
                 if terminated:
                     return (), True
             elif isinstance(statement, ast.With | ast.AsyncWith):
+                if any(
+                    item.optional_vars is not None and _assignment_target_binds_name(item.optional_vars, name)
+                    for item in statement.items
+                ):
+                    bindings = (statement,)
                 bindings, terminated = visit(statement.body, bindings)
                 if terminated:
                     return (), True
@@ -6434,6 +6452,19 @@ def _module_getattr_binding_statements(
 
     bindings, _ = visit(statements, bounded(initial_bindings))
     return bounded(matched) if before is not None else bindings
+
+
+@_register_source_sensitive_cache
+@lru_cache(maxsize=4096)
+def _module_export_is_deleted(module_name: str, name: str) -> bool:
+    context = _module_source_context(module_name)
+    if context is None or name not in context.deleted_names:
+        return False
+    bindings = _module_getattr_binding_statements(context.module_body, name)
+    deleted = any(isinstance(binding, ast.Delete) for binding in bindings)
+    if deleted and any(not isinstance(binding, ast.Delete) for binding in bindings):
+        raise _CallGraphAnalysisLimitError("module export has an unresolved conditional deletion")
+    return deleted
 
 
 def _module_getattr_function_definitions(
@@ -6461,7 +6492,7 @@ def _module_getattr_returned_class_entrypoints(
     getter_target = _resolve_module_getattr_target(
         module_name, export_name, exporting_analysis, allow_loaded_extension_bypass=not member_path
     )
-    if getter_target is None or _resolve_function_target(function_name) != getter_target:
+    if getter_target is None or _safe_call_graph_entrypoints(function_name) != (getter_target,):
         return ()
     if _find_sink_path(getter_target) is not None:
         return ()
@@ -6502,6 +6533,9 @@ def _module_getattr_decorators_preserve_returns(
         if not bindings and name == "staticmethod":
             targets.add("builtins.staticmethod")
         for binding in bindings:
+            if isinstance(binding, ast.Delete) and name == "staticmethod":
+                targets.add("builtins.staticmethod")
+                continue
             imported = _collect_import_aliases((binding,), module_name, context.is_package).get(root)
             if imported is None:
                 return False
@@ -6702,6 +6736,8 @@ def _returned_class_entrypoints_for_getter(
                 yield f"{module_name}.{target_name}", before, in_function
             elif isinstance(binding, ast.For):
                 raise _CallGraphAnalysisLimitError("module __getattr__ returns an unresolved loop-target binding")
+            elif isinstance(binding, ast.With | ast.AsyncWith):
+                raise _CallGraphAnalysisLimitError("module __getattr__ returns an unresolved context-manager binding")
             elif isinstance(binding, ast.Assign | ast.AnnAssign) and binding.value is not None:
                 if root_name not in _assignment_alias_target_names(binding):
                     continue
@@ -6731,18 +6767,17 @@ def _returned_class_entrypoints_for_getter(
                     if member_path
                     else _class_entrypoints(class_target)
                 )
-                if not member_path:
-                    class_context = _source_class_context(class_target)
-                    if class_context is None or not _class_lookup_has_source_backed_plain_metaclass(class_context):
-                        selected = (
-                            class_entrypoints
-                            if methods is None
-                            else _filter_class_entrypoints(class_entrypoints, methods)
+                class_context = _source_class_context(class_target)
+                if class_context is None or not _class_lookup_has_source_backed_plain_metaclass(class_context):
+                    selected = (
+                        class_entrypoints
+                        if member_path or methods is None
+                        else _filter_class_entrypoints(class_entrypoints, methods)
+                    )
+                    if not any(_find_sink_path(entrypoint) is not None for entrypoint in selected):
+                        raise _CallGraphAnalysisLimitError(
+                            "module __getattr__ returns a class with an unproven metaclass"
                         )
-                        if not any(_find_sink_path(entrypoint) is not None for entrypoint in selected):
-                            raise _CallGraphAnalysisLimitError(
-                                "module __getattr__ returns a class with an unproven metaclass"
-                            )
                 if member_path and not class_entrypoints:
                     raise _CallGraphAnalysisLimitError(
                         "module __getattr__ returns a class with an unresolved member path"
@@ -6856,11 +6891,19 @@ def _module_source_context(module_name: str) -> _ModuleSourceContext | None:
 
     is_package = source_path.name == "__init__.py"
     module_body = _runtime_selected_module_statements(tree.body, module_name)
+    module_statements = _definition_scope_statements(module_body)
     return _ModuleSourceContext(
         source_path=source_path,
         module_body=module_body,
-        module_statements=_definition_scope_statements(module_body),
+        module_statements=module_statements,
         is_package=is_package,
+        deleted_names=frozenset(
+            name
+            for statement in module_statements
+            if isinstance(statement, ast.Delete)
+            for target in statement.targets
+            for name in _assignment_target_names(target)
+        ),
     )
 
 
@@ -7239,6 +7282,13 @@ def _definition_scope_statements(nodes: Iterable[ast.stmt]) -> tuple[ast.stmt, .
 
 def _definition_scope_child_bodies(statement: ast.stmt) -> tuple[Iterable[ast.stmt], ...]:
     if isinstance(statement, ast.If):
+        if all(
+            isinstance(node, ast.Constant | ast.UnaryOp | ast.Not | ast.BoolOp | ast.And | ast.Or)
+            for node in ast.walk(statement.test)
+        ):
+            condition = _module_getattr_condition_value(statement.test, "", "")
+            if condition is not None:
+                return (statement.body if condition else statement.orelse,)
         return (statement.body, statement.orelse)
     if isinstance(statement, ast.Try):
         return (

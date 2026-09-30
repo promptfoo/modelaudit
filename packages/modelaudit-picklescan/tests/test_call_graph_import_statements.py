@@ -2544,7 +2544,12 @@ def test_module_getattr_returned_class_distinguishes_runtime_binding(
 
 
 def _scan_module_getattr_class_source(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, hook_source: str, *, expected_gap: str | None = None
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    hook_source: str,
+    *,
+    expected_gap: str | None = None,
+    export_name: str = "Gadget",
 ) -> PickleReport:
     module_name = "modelaudit_getattr_control_flow"
     (tmp_path / f"{module_name}.py").write_text(
@@ -2555,7 +2560,7 @@ def _scan_module_getattr_class_source(
     monkeypatch.syspath_prepend(str(tmp_path))
     _clear_call_graph_caches()
     try:
-        report = scan_bytes(_global_call_payload(module_name, "Gadget"))
+        report = scan_bytes(_global_call_payload(module_name, export_name))
     finally:
         _clear_call_graph_caches()
     assert module_name not in sys.modules
@@ -2567,7 +2572,7 @@ def _scan_module_getattr_class_source(
         assert report.metadata["analysis_incomplete"] is True
         assert any(
             error.category == "call_graph_analysis_error" and expected_gap in error.message for error in report.errors
-        )
+        ), report.errors
     return report
 
 
@@ -11742,3 +11747,191 @@ def test_module_getattr_replaced_method_alias_uses_active_hook(
     )
 
     assert not any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings)
+
+
+@pytest.mark.parametrize("inherited", [False, True])
+@pytest.mark.parametrize("lookup_method", ["__getattribute__", "__getattr__"])
+@pytest.mark.parametrize("dangerous_member", [False, True])
+def test_module_getattr_dotted_member_checks_returned_metaclass(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    inherited: bool,
+    lookup_method: str,
+    dangerous_member: bool,
+) -> None:
+    member_body = "os.system('not-executed')" if dangerous_member else "return 1"
+    base = "_Base" if inherited else "metaclass=_Meta"
+    source = (
+        f"class _Meta(type):\n    def {lookup_method}(cls, name):\n        os.system('not-executed')\n"
+        "class _Base(metaclass=_Meta):\n    pass\n"
+        f"class _Returned({base}):\n    def __init__(self):\n        os.system('not-executed')\n"
+        f"    @staticmethod\n    def run():\n        {member_body}\n"
+        "def __getattr__(name):\n    return _Returned\n"
+    )
+    report = _scan_module_getattr_class_source(
+        tmp_path,
+        monkeypatch,
+        source,
+        export_name="Gadget.run",
+        expected_gap=None if dangerous_member else "unproven metaclass",
+    )
+
+    findings = [finding for finding in report.findings if finding.rule_code == "DANGEROUS_CALL_GRAPH"]
+    assert bool(findings) is dangerous_member
+    if dangerous_member:
+        assert report.verdict == SafetyVerdict.MALICIOUS
+        assert any(
+            "modelaudit_getattr_control_flow._Returned.run" in finding.details["call_path"] for finding in findings
+        )
+
+
+@pytest.mark.parametrize(
+    "binding",
+    [
+        "Gadget = None",
+        "Gadget = _Safe",
+        "class Gadget:\n    pass",
+        "def Gadget():\n    return 1",
+        "from builtins import object as Gadget",
+    ],
+)
+@pytest.mark.parametrize(
+    ("deletion", "deleted"),
+    [("del Gadget", True), ("if True:\n    del Gadget", True), ("if False:\n    del Gadget", False)],
+)
+@pytest.mark.parametrize("member", [False, True])
+def test_module_getattr_deleted_export_uses_hook(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, binding: str, deletion: str, deleted: bool, member: bool
+) -> None:
+    source = (
+        f"{binding}\n{deletion}\n"
+        "class _Returned:\n    def __init__(self):\n        os.system('not-executed')\n"
+        "    @staticmethod\n    def run():\n        os.system('not-executed')\n"
+        "def __getattr__(name):\n    return _Returned\n"
+    )
+    report = _scan_module_getattr_class_source(
+        tmp_path, monkeypatch, source, export_name="Gadget.run" if member else "Gadget"
+    )
+
+    assert any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings) is deleted
+    if deleted:
+        assert report.verdict == SafetyVerdict.MALICIOUS
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "Gadget = None\ndel Gadget\nGadget = _Safe\ndef __getattr__(name):\n    return _Danger",
+        "class Gadget:\n    def __init__(self):\n        os.system('not-executed')\n"
+        "del Gadget\ndef __getattr__(name):\n    return _Safe",
+        "def Gadget():\n    os.system('not-executed')\ndel Gadget\ndef __getattr__(name):\n    return _Safe",
+    ],
+)
+def test_module_getattr_deleted_export_drops_inactive_binding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str
+) -> None:
+    report = _scan_module_getattr_class_source(tmp_path, monkeypatch, source)
+
+    assert not any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings)
+
+
+@pytest.mark.parametrize("dangerous", [False, True])
+def test_module_getattr_alias_preserves_deleted_class_definition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dangerous: bool
+) -> None:
+    name = "_Danger" if dangerous else "_Safe"
+    report = _scan_module_getattr_class_source(
+        tmp_path, monkeypatch, f"Alias = {name}\ndel {name}\ndef __getattr__(name):\n    return Alias"
+    )
+
+    assert any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings) is dangerous
+
+
+@pytest.mark.parametrize("binding", ["Gadget = _Safe", "class Gadget:\n    pass"])
+def test_module_getattr_conditional_export_deletion_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, binding: str
+) -> None:
+    _scan_module_getattr_class_source(
+        tmp_path,
+        monkeypatch,
+        f"{binding}\nif bool(int('1')):\n    del Gadget\ndef __getattr__(name):\n    return _Danger",
+        expected_gap="conditional deletion",
+    )
+
+
+@pytest.mark.parametrize("condition", ["True", "False", "not False", "1 and True", "bool(int('1'))"])
+@pytest.mark.parametrize("dangerous_first", [False, True])
+def test_module_getattr_conditional_class_keeps_active_definition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, condition: str, dangerous_first: bool
+) -> None:
+    dangerous_body = "os.system('not-executed')"
+    first = dangerous_body if dangerous_first else "pass"
+    last = "pass" if dangerous_first else dangerous_body
+    source = (
+        f"if {condition}:\n    class _Returned:\n        def __init__(self):\n            {first}\n"
+        f"else:\n    class _Returned:\n        def __init__(self):\n            {last}\n"
+        "def __getattr__(name):\n    return _Returned\n"
+    )
+    report = _scan_module_getattr_class_source(tmp_path, monkeypatch, source)
+
+    expected = True if condition == "bool(int('1'))" else (dangerous_first is (condition != "False"))
+    assert any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings) is expected
+    if expected:
+        assert report.verdict == SafetyVerdict.MALICIOUS
+
+
+@pytest.mark.parametrize(
+    ("body", "expected_gap", "dangerous"),
+    [
+        ("with CM() as Alias:\n    pass\nreturn Alias", True, False),
+        ("with CM() as Alias:\n    return Alias", True, False),
+        ("with CM() as (_, Alias):\n    pass\nreturn Alias", True, False),
+        ("global Alias\nwith CM() as Alias:\n    pass\nreturn Alias", True, False),
+        ("with CM() as Alias:\n    pass\nCopied = Alias\nreturn Copied", True, False),
+        ("with CM() as Alias:\n    pass\nreturn _Safe", False, False),
+        ("with CM() as Alias:\n    pass\nAlias = _Safe\nreturn Alias", False, False),
+        ("with CM() as Alias:\n    pass\nAlias = _Danger\nreturn Alias", False, True),
+        ("with CM() as Alias:\n    Alias = _Safe\nreturn Alias", False, False),
+        ("with CM() as Alias:\n    Alias = _Danger\nreturn Alias", False, True),
+    ],
+)
+def test_module_getattr_context_manager_binding_preserves_coverage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, body: str, expected_gap: bool, dangerous: bool
+) -> None:
+    source = (
+        "class CM:\n    def __enter__(self):\n        return _Danger\n"
+        "    def __exit__(self, *args):\n        return False\n"
+        "def __getattr__(name):\n    " + body.replace("\n", "\n    ")
+    )
+    report = _scan_module_getattr_class_source(
+        tmp_path, monkeypatch, source, expected_gap="context-manager binding" if expected_gap else None
+    )
+
+    assert any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings) is dangerous
+
+
+def test_module_getattr_deleted_hook_cannot_handle_deleted_export(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    report = _scan_module_getattr_class_source(
+        tmp_path,
+        monkeypatch,
+        "Gadget = None\ndel Gadget\ndef __getattr__(name):\n    os.system('not-executed')\n"
+        "    return _Danger\ndel __getattr__",
+    )
+
+    assert not any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings)
+
+
+@pytest.mark.parametrize("dangerous", [False, True])
+def test_module_getattr_deleted_decorator_alias_restores_builtin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dangerous: bool
+) -> None:
+    result = "_Danger" if dangerous else "_Safe"
+    report = _scan_module_getattr_class_source(
+        tmp_path,
+        monkeypatch,
+        f"staticmethod = None\ndel staticmethod\n@staticmethod\ndef __getattr__(name):\n    return {result}",
+    )
+
+    assert any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings) is dangerous

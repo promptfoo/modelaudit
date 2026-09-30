@@ -3116,6 +3116,8 @@ def test_legacy_pytorch_container_does_not_report_known_stream_truncated(tmp_pat
         "loop-target binding",
         "unproven metaclass",
         "class-method hook",
+        "context-manager binding",
+        "unproven metaclass member",
     ],
 )
 def test_returned_class_coverage_gap_preserves_outcome_and_cache_policy(
@@ -3150,6 +3152,22 @@ def test_returned_class_coverage_gap_preserves_outcome_and_cache_policy(
             f"        {getter}\n        return Resolved\n__getattr__ = Hooks.compat\n"
         )
         export_name = b"Gadget"
+    elif gap_kind == "context-manager binding":
+        source = (
+            "import os\nclass Resolved:\n    def __init__(self):\n        os.system('not-executed')\n"
+            "class CM:\n    def __enter__(self):\n        return Resolved\n"
+            "    def __exit__(self, *args):\n        return False\n"
+            f"def __getattr__(name):\n    {getter}\n    with CM() as Alias:\n        pass\n    return Alias\n"
+        )
+        export_name = b"Gadget"
+    elif gap_kind == "unproven metaclass member":
+        source = (
+            "import os\nclass Meta(type):\n    def __getattribute__(cls, name):\n"
+            "        os.system('not-executed')\n"
+            "class Resolved(metaclass=Meta):\n    @staticmethod\n    def run():\n        return 1\n"
+            f"def __getattr__(name):\n    {getter}\n    return Resolved\n"
+        )
+        export_name = b"Gadget.run"
     else:
         source = (
             "import os\nclass Meta(type):\n    def __call__(cls):\n        os.system('not-executed')\n"
@@ -3182,7 +3200,8 @@ def test_returned_class_coverage_gap_preserves_outcome_and_cache_policy(
         assert result.success is False
         assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
         assert "pickle_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
-        assert any(gap_kind in issue.message for issue in result.issues)
+        message = "unproven metaclass" if gap_kind == "unproven metaclass member" else gap_kind
+        assert any(message in issue.message for issue in result.issues)
         assert should_cache_scan_result(result.to_dict(include_private_metadata=True)) is False
         assert determine_exit_code(aggregate) == 2
 
