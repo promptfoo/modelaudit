@@ -23,7 +23,7 @@ from importlib.machinery import (
 )
 from pathlib import Path
 from types import ModuleType
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, cast
 
 import modelaudit_picklescan.call_graph as _picklescan_call_graph
 
@@ -1307,7 +1307,7 @@ class ScanResultsCache:
                             and getattr(wrapper_closer, "close_called", False)
                         ):
                             with suppress(OSError):
-                                underlying_probe.close()
+                                cast(BinaryIO, underlying_probe).close()
 
                     if not existing_probe.closed:
                         raise ValueError(f"No writable cache identity probe directory for: {file_path}")
@@ -2477,7 +2477,7 @@ class ScanResultsCache:
                             and getattr(wrapper_closer, "close_called", False)
                         ):
                             with suppress(OSError):
-                                underlying_probe.close()
+                                cast(BinaryIO, underlying_probe).close()
 
                     if not probe.closed:
                         probe_name = getattr(probe, "name", None)

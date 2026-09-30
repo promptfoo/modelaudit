@@ -47,7 +47,9 @@ line-length = 120
 target-version = "py310"
 
 [tool.ruff.lint]
-extend-select = [
+# Keep the project rule set explicit across Ruff default-rule changes.
+select = [
+    "F",
     "I",
     "W",
     "E",

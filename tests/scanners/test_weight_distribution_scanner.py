@@ -7,7 +7,7 @@ import types
 import zipfile
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 
@@ -831,7 +831,7 @@ def test_pytorch_blocked_load_fallback_honors_remaining_metadata_budget(
     def fail_if_data_pkl_is_opened(
         archive: zipfile.ZipFile,
         name: str | zipfile.ZipInfo,
-        mode: str = "r",
+        mode: Literal["r", "w"] = "r",
         pwd: bytes | None = None,
         *,
         force_zip64: bool = False,
@@ -2297,7 +2297,7 @@ class TestWeightDistributionScanner:
         def fail_if_data_pkl_is_opened(
             archive: zipfile.ZipFile,
             name: str | zipfile.ZipInfo,
-            mode: str = "r",
+            mode: Literal["r", "w"] = "r",
             pwd: bytes | None = None,
             *,
             force_zip64: bool = False,

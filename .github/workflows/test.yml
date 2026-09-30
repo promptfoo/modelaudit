@@ -1008,19 +1008,19 @@ jobs:
 
       - name: Lint standalone package with Ruff
         run: |
-          uv run --with 'ruff==0.15.10' ruff check src tests
+          uv run --with 'ruff==0.16.9' ruff check src tests
 
       - name: Check standalone package import organization with Ruff
         run: |
-          uv run --with 'ruff==0.15.10' ruff check --select I src tests
+          uv run --with 'ruff==0.16.9' ruff check --select I src tests
 
       - name: Check standalone package formatting with Ruff
         run: |
-          uv run --with 'ruff==0.15.10' ruff format --check src tests
+          uv run --with 'ruff==0.16.9' ruff format --check src tests
 
       - name: Type check standalone package with mypy
         run: |
-          uv run --with mypy mypy src tests
+          uv run --with 'mypy>=2.3.1,<2.4.0' --with pytest mypy src tests
 
       - name: Run standalone package tests
         run: |
