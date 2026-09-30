@@ -3109,7 +3109,14 @@ def test_legacy_pytorch_container_does_not_report_known_stream_truncated(tmp_pat
 
 @pytest.mark.parametrize("dangerous_getter", [False, True])
 @pytest.mark.parametrize(
-    "gap_kind", ["function-local class", "unresolved member path", "loop-target binding", "unproven metaclass"]
+    "gap_kind",
+    [
+        "function-local class",
+        "unresolved member path",
+        "loop-target binding",
+        "unproven metaclass",
+        "class-method hook",
+    ],
 )
 def test_returned_class_coverage_gap_preserves_outcome_and_cache_policy(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dangerous_getter: bool, gap_kind: str
@@ -3134,6 +3141,13 @@ def test_returned_class_coverage_gap_preserves_outcome_and_cache_policy(
         source = (
             "import os\nclass Resolved:\n    def __init__(self):\n        os.system('not-executed')\n"
             f"def __getattr__(name):\n    {getter}\n    for Alias in (Resolved,):\n        pass\n    return Alias\n"
+        )
+        export_name = b"Gadget"
+    elif gap_kind == "class-method hook":
+        source = (
+            "import os\nclass Resolved:\n    def __init__(self):\n        os.system('not-executed')\n"
+            "class Hooks:\n    @classmethod\n    def compat(cls, name):\n"
+            f"        {getter}\n        return Resolved\n__getattr__ = Hooks.compat\n"
         )
         export_name = b"Gadget"
     else:

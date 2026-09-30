@@ -6466,8 +6466,10 @@ def _module_getattr_returned_class_entrypoints(
     if _find_sink_path(getter_target) is not None:
         return ()
     module_name, getter_name = _split_function_name(getter_target)
-    if module_name is None or "." in getter_name:
+    if module_name is None:
         return ()
+    if "." in getter_name:
+        raise _CallGraphAnalysisLimitError("module __getattr__ uses a class-method hook whose returns are not analyzed")
     context = _module_source_context(module_name)
     analysis = _analyze_module(module_name)
     if context is None or analysis is None:

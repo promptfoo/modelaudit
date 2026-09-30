@@ -11680,3 +11680,65 @@ def test_module_getattr_returned_custom_metaclass_fails_closed(
     if dangerous_constructor:
         assert report.verdict == SafetyVerdict.MALICIOUS
         assert any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings)
+
+
+@pytest.mark.parametrize("descriptor", ["staticmethod", "classmethod"])
+@pytest.mark.parametrize("returned_class", ["_Danger", "_Safe"])
+@pytest.mark.parametrize("dangerous_getter", [False, True])
+def test_module_getattr_method_alias_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    descriptor: str,
+    returned_class: str,
+    dangerous_getter: bool,
+) -> None:
+    parameters = "name" if descriptor == "staticmethod" else "cls, name"
+    body = "os.system('not-executed')" if dangerous_getter else "pass"
+    report = _scan_module_getattr_class_source(
+        tmp_path,
+        monkeypatch,
+        f"class Hooks:\n    @{descriptor}\n    def compat({parameters}):\n"
+        f"        {body}\n        return {returned_class}\n"
+        "__getattr__ = Hooks.compat",
+        expected_gap=None if dangerous_getter else "class-method hook",
+    )
+
+    if dangerous_getter:
+        assert report.verdict == SafetyVerdict.MALICIOUS
+        assert any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings)
+
+
+@pytest.mark.parametrize("descriptor", ["staticmethod", "classmethod"])
+def test_module_getattr_imported_method_alias_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, descriptor: str
+) -> None:
+    parameters = "name" if descriptor == "staticmethod" else "cls, name"
+    module_name = "modelaudit_imported_method_hook"
+    (tmp_path / f"{module_name}.py").write_text(
+        "import os\nclass Dangerous:\n    def __init__(self):\n        os.system('not-executed')\n"
+        f"class Hooks:\n    @{descriptor}\n    def compat({parameters}):\n        return Dangerous\n",
+        encoding="utf-8",
+    )
+
+    _scan_module_getattr_class_source(
+        tmp_path,
+        monkeypatch,
+        f"from {module_name} import Hooks\n__getattr__ = Hooks.compat",
+        expected_gap="class-method hook",
+    )
+    assert module_name not in sys.modules
+
+
+@pytest.mark.parametrize("descriptor", ["staticmethod", "classmethod"])
+def test_module_getattr_replaced_method_alias_uses_active_hook(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, descriptor: str
+) -> None:
+    parameters = "name" if descriptor == "staticmethod" else "cls, name"
+    report = _scan_module_getattr_class_source(
+        tmp_path,
+        monkeypatch,
+        f"class Hooks:\n    @{descriptor}\n    def compat({parameters}):\n        return _Danger\n"
+        "__getattr__ = Hooks.compat\ndef __getattr__(name):\n    return _Safe",
+    )
+
+    assert not any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings)
