@@ -1821,9 +1821,9 @@ def _safe_eval_string_dict_lookup(node: ast.Dict, lookup_key: str) -> str | None
     return result if isinstance(result, str) else None
 
 
-def _safe_eval_string_dict_lookup_result(node: ast.Dict, lookup_key: str) -> str | None | object:
+def _safe_eval_string_dict_lookup_result(node: ast.Dict, lookup_key: str) -> str | object | None:
     total = 0
-    selected_value: str | None | object = DICT_LOOKUP_MISSING
+    selected_value: str | object | None = DICT_LOOKUP_MISSING
     unknown_before_selection = False
     unknown_after_selection = False
     for key_node, value_node in zip(node.keys, node.values, strict=True):

@@ -6248,7 +6248,7 @@ class PyTorchZipScanner(BaseScanner):
         self,
         version_info: dict[str, Any],
         *,
-        installed_version: str | None | object = _INSTALLED_PYTORCH_VERSION_UNSET,
+        installed_version: str | object | None = _INSTALLED_PYTORCH_VERSION_UNSET,
     ) -> tuple[str | None, str | None]:
         """Return raw PyTorch version evidence, preferring artifact metadata when present.
 
