@@ -2333,7 +2333,7 @@ def test_module_getattr_returned_class_preserves_invocation_and_hook_paths(
     assert module_name not in sys.modules
 
 
-@pytest.mark.parametrize("limit_kind", ["export_name", "entrypoints"])
+@pytest.mark.parametrize("limit_kind", ["export_name", "entrypoints", "returns"])
 @pytest.mark.parametrize("dangerous_getter", [False, True])
 def test_module_getattr_returned_class_limits_fail_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, limit_kind: str, dangerous_getter: bool
@@ -2341,11 +2341,12 @@ def test_module_getattr_returned_class_limits_fail_closed(
     module_name = "modelaudit_getattr_class_limit"
     expression = 'globals()[f"_' + "{name}" * 64 + '"]' if limit_kind == "export_name" else "_Gadget"
     getter_body = "os.system('not-executed')" if dangerous_getter else "pass"
+    extra_return = "    if bool(int('1')):\n        return _Gadget\n" if limit_kind == "returns" else ""
     (tmp_path / f"{module_name}.py").write_text(
         "import os\nclass _Gadget:\n"
         "    def __new__(cls):\n        return object.__new__(cls)\n"
         "    def __init__(self):\n        self.value = 1\n"
-        f"def __getattr__(name):\n    {getter_body}\n    return {expression}\n",
+        f"def __getattr__(name):\n    {getter_body}\n{extra_return}    return {expression}\n",
         encoding="utf-8",
     )
     monkeypatch.syspath_prepend(str(tmp_path))
@@ -2374,6 +2375,8 @@ def test_module_getattr_returned_class_limits_fail_closed(
         and "module __getattr__" in error.message
         for error in report.errors
     )
+    if limit_kind == "returns":
+        assert any("return statements exceed analysis limit" in error.message for error in report.errors)
 
 
 @pytest.mark.parametrize("dangerous_last", [False, True])
@@ -2667,6 +2670,160 @@ def test_module_getattr_returned_class_uses_generic_function_scope(
     assert any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings) is dangerous
     if dangerous:
         assert report.verdict == SafetyVerdict.MALICIOUS
+
+
+@pytest.mark.parametrize("style", ["from", "alias", "module"])
+@pytest.mark.parametrize("dangerous", [False, True])
+def test_module_getattr_returned_class_follows_lazy_imports(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, style: str, dangerous: bool
+) -> None:
+    provider = "modelaudit_lazy_class_provider"
+    constructor = "os.system('not-executed')" if dangerous else "self.value = 1"
+    (tmp_path / f"{provider}.py").write_text(
+        f"import os\nclass Gadget:\n    def __init__(self):\n        {constructor}\n", encoding="utf-8"
+    )
+    binding, returned = {
+        "from": (f"from {provider} import Gadget", "Gadget"),
+        "alias": (f"from {provider} import Gadget as Imported", "Imported"),
+        "module": (f"import {provider} as impl", "impl.Gadget"),
+    }[style]
+    report = _scan_module_getattr_class_source(
+        tmp_path, monkeypatch, f"def __getattr__(name):\n    {binding}\n    return {returned}"
+    )
+
+    assert any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings) is dangerous
+    assert provider not in sys.modules
+    if dangerous:
+        assert report.verdict == SafetyVerdict.MALICIOUS
+
+
+@pytest.mark.parametrize("local", [False, True])
+@pytest.mark.parametrize("condition", ["True", "False", "bool(int('1'))", "name == 'Gadget'"])
+@pytest.mark.parametrize("dangerous_first", [False, True])
+def test_module_getattr_returned_class_tracks_conditional_imports(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, local: bool, condition: str, dangerous_first: bool
+) -> None:
+    providers = ("modelaudit_conditional_danger", "modelaudit_conditional_safe")
+    for provider, constructor in zip(providers, ("os.system('not-executed')", "self.value = 1"), strict=True):
+        (tmp_path / f"{provider}.py").write_text(
+            f"import os\nclass Gadget:\n    def __init__(self):\n        {constructor}\n", encoding="utf-8"
+        )
+    first, second = providers if dangerous_first else tuple(reversed(providers))
+    bindings = (
+        f"if {condition}:\n    from {first} import Gadget as Imported\n"
+        f"else:\n    from {second} import Gadget as Imported\n"
+    )
+    if local:
+        source = "def __getattr__(name):\n    " + bindings.replace("\n", "\n    ") + "return Imported"
+    else:
+        source = "name = 'Gadget'\n" + bindings + "def __getattr__(name):\n    return Imported"
+    report = _scan_module_getattr_class_source(tmp_path, monkeypatch, source)
+
+    unknown = condition == "bool(int('1'))" or (not local and condition == "name == 'Gadget'")
+    expected = True if unknown else (dangerous_first is (condition != "False"))
+    assert any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings) is expected
+    assert all(provider not in sys.modules for provider in providers)
+    if expected:
+        assert report.verdict == SafetyVerdict.MALICIOUS
+
+
+@pytest.mark.parametrize(
+    ("body", "dangerous"),
+    [
+        ("name = 'ignored'\nreturn _Danger", True),
+        ("name = 'ignored'\nreturn _Safe", False),
+        ("import os as name\nreturn _Danger", True),
+        ("name = 'ignored'\nif name == 'Gadget':\n    return _Safe\nreturn _Danger", True),
+        ("name = 'ignored'\nreturn globals()[f'_{name}']", False),
+    ],
+)
+def test_module_getattr_rebound_parameter_preserves_unconditional_returns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, body: str, dangerous: bool
+) -> None:
+    report = _scan_module_getattr_class_source(
+        tmp_path, monkeypatch, "def __getattr__(name):\n    " + body.replace("\n", "\n    ")
+    )
+
+    assert any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings) is dangerous
+
+
+@pytest.mark.parametrize(
+    ("suffix", "dangerous"),
+    [
+        ("del __getattr__", False),
+        ("if True:\n    del __getattr__", False),
+        ("if False:\n    del __getattr__", True),
+        ("del __getattr__\ndef __getattr__(name):\n    return _Safe", False),
+    ],
+)
+def test_module_getattr_deleted_hook_has_no_returned_class(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, suffix: str, dangerous: bool
+) -> None:
+    report = _scan_module_getattr_class_source(
+        tmp_path, monkeypatch, "def __getattr__(name):\n    return _Danger\n" + suffix
+    )
+
+    assert any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings) is dangerous
+
+
+@pytest.mark.parametrize(
+    ("body", "dangerous"),
+    [
+        ("return Imported\nfrom PROVIDER import Gadget as Imported", False),
+        ("if False:\n    from PROVIDER import Gadget as Imported\nreturn Imported", False),
+        ("from PROVIDER import Gadget as Imported\nImported = _Safe\nreturn Imported", False),
+        ("from PROVIDER import Gadget as Imported\ndel Imported\nreturn Imported", False),
+        ("from PROVIDER import Gadget as Imported\nreturn Imported\nImported = _Safe", True),
+        (
+            "if name == 'Other':\n    from PROVIDER import Gadget as Imported\n    return Imported\nreturn _Safe",
+            False,
+        ),
+        (
+            "try:\n    from PROVIDER import Gadget as Imported\n    return Imported\nfinally:\n    return _Safe",
+            False,
+        ),
+    ],
+)
+def test_module_getattr_lazy_imports_respect_return_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, body: str, dangerous: bool
+) -> None:
+    provider = "modelaudit_ordered_lazy_provider"
+    (tmp_path / f"{provider}.py").write_text(
+        "import os\nclass Gadget:\n    def __init__(self):\n        os.system('not-executed')\n", encoding="utf-8"
+    )
+    report = _scan_module_getattr_class_source(
+        tmp_path,
+        monkeypatch,
+        "def __getattr__(name):\n    " + body.replace("PROVIDER", provider).replace("\n", "\n    "),
+    )
+
+    assert any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings) is dangerous
+    assert provider not in sys.modules
+
+
+def test_module_getattr_binding_walk_visits_nested_finally_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    body = "if True:\n    from provider import Gadget as Imported\n"
+    for _ in range(12):
+        body = "try:\n    pass\nfinally:\n" + "".join(f"    {line}\n" for line in body.splitlines())
+    source = "def __getattr__(name):\n" + "".join(f"    {line}\n" for line in body.splitlines())
+    source += "    return Imported\n"
+    getter = ast.parse(source).body[0]
+    assert isinstance(getter, ast.FunctionDef)
+    calls = 0
+    original = call_graph._module_statement_binds_name
+
+    def counted_binds(statement: ast.stmt, name: str) -> bool:
+        nonlocal calls
+        calls += 1
+        return original(statement, name)
+
+    monkeypatch.setattr(call_graph, "_module_statement_binds_name", counted_binds)
+    bindings = call_graph._module_getattr_binding_statements(getter.body, "Imported", before=getter.body[-1])
+
+    assert len(bindings) == 1
+    assert isinstance(bindings[0], ast.ImportFrom)
+    assert bindings[0].module == "provider"
+    assert calls <= 64
 
 
 def test_scan_bytes_marks_zipimported_invoked_call_graph_source_unavailable(

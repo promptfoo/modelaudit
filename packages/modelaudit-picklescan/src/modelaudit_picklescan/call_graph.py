@@ -6232,7 +6232,7 @@ def _resolve_class_target(function_name: str) -> str | None:
     return None
 
 
-def _module_getattr_condition_value(test: ast.expr, parameter_name: str, export_name: str) -> bool | None:
+def _module_getattr_condition_value(test: ast.expr, parameter_name: str, export_name: object) -> bool | None:
     if isinstance(test, ast.Constant):
         return bool(test.value)
     if isinstance(test, ast.Name) and test.id == parameter_name:
@@ -6269,7 +6269,7 @@ def _module_getattr_condition_value(test: ast.expr, parameter_name: str, export_
 
 
 def _module_getattr_return_statements(
-    getter: ast.FunctionDef, parameter_name: str, export_name: str
+    getter: ast.FunctionDef, parameter_name: str, export_name: object
 ) -> tuple[ast.Return, ...]:
     def visit(statements: Iterable[ast.stmt]) -> tuple[list[ast.Return], bool]:
         returns: list[ast.Return] = []
@@ -6320,59 +6320,94 @@ def _module_getattr_return_statements(
     return tuple(visit(getter.body)[0])
 
 
-def _module_getattr_function_definitions(
-    statements: Iterable[ast.stmt], getter_name: str
-) -> tuple[ast.FunctionDef, ...]:
-    def visit(body: Iterable[ast.stmt], definitions: tuple[ast.FunctionDef, ...]) -> tuple[ast.FunctionDef, ...]:
+def _module_getattr_binding_statements(
+    statements: Iterable[ast.stmt],
+    name: str,
+    *,
+    parameter_name: str = "",
+    export_name: object = "",
+    before: ast.stmt | None = None,
+) -> tuple[ast.stmt, ...]:
+    matched: list[ast.stmt] = []
+
+    def bounded(nodes: Iterable[ast.stmt]) -> tuple[ast.stmt, ...]:
+        bindings = tuple(dict.fromkeys(nodes))
+        if len(bindings) > _MAX_CALLS_PER_FUNCTION:
+            raise _CallGraphAnalysisLimitError("module __getattr__ definitions exceed analysis limit")
+        return bindings
+
+    def visit(body: Iterable[ast.stmt], bindings: tuple[ast.stmt, ...]) -> tuple[tuple[ast.stmt, ...], bool]:
         for statement in body:
-            if isinstance(statement, ast.FunctionDef) and statement.name == getter_name:
-                definitions = (statement,)
-            elif _module_statement_binds_name(statement, getter_name):
-                definitions = ()
+            if statement is before:
+                matched.extend(bindings)
+                matched[:] = bounded(matched)
+                return bindings, True
+            if isinstance(statement, ast.Return | ast.Raise):
+                return bindings, True
+            if isinstance(statement, ast.Delete) and any(
+                _assignment_target_binds_name(target, name) for target in statement.targets
+            ):
+                bindings = ()
+            elif _module_statement_binds_name(statement, name):
+                bindings = (statement,)
             elif isinstance(statement, ast.If):
-                condition = _module_getattr_condition_value(statement.test, "", "")
+                condition = _module_getattr_condition_value(statement.test, parameter_name, export_name)
                 branches = (
                     (statement.body, statement.orelse)
                     if condition is None
                     else (statement.body if condition else statement.orelse,)
                 )
-                definitions = tuple(dict.fromkeys(node for branch in branches for node in visit(branch, definitions)))
+                paths = [visit(branch, bindings) for branch in branches]
+                if all(terminated for _, terminated in paths):
+                    return (), True
+                bindings = bounded(node for path, terminated in paths if not terminated for node in path)
             elif isinstance(statement, ast.Try):
-                body_definitions = visit(statement.body, definitions)
-                handler_definitions = tuple(dict.fromkeys((*definitions, *body_definitions)))
-                definitions = tuple(
-                    dict.fromkeys(
-                        (
-                            *visit(statement.orelse, body_definitions),
-                            *(
-                                node
-                                for handler in statement.handlers
-                                for node in visit(handler.body, handler_definitions)
-                            ),
-                        )
-                    )
-                )
-                definitions = visit(statement.finalbody, definitions)
+                body_bindings, body_terminated = visit(statement.body, bindings)
+                handler_bindings = bounded((*bindings, *body_bindings))
+                paths = [
+                    (body_bindings, True) if body_terminated else visit(statement.orelse, body_bindings),
+                    *(visit(handler.body, handler_bindings) for handler in statement.handlers),
+                ]
+                if before is not None and any(
+                    node is before for final_statement in statement.finalbody for node in ast.walk(final_statement)
+                ):
+                    visit(statement.finalbody, bounded(node for path, _ in paths for node in path))
+                    return (), True
+                continuing = [path for path, terminated in paths if not terminated]
+                if not continuing:
+                    return (), True
+                bindings, terminated = visit(statement.finalbody, bounded(node for path in continuing for node in path))
+                if terminated:
+                    return (), True
             elif isinstance(statement, ast.With | ast.AsyncWith):
-                definitions = visit(statement.body, definitions)
+                bindings, terminated = visit(statement.body, bindings)
+                if terminated:
+                    return (), True
             else:
-                definitions = tuple(
-                    dict.fromkeys(
-                        (
-                            *definitions,
-                            *(
-                                node
-                                for child in _definition_scope_child_bodies(statement)
-                                for node in visit(child, definitions)
-                            ),
-                        )
+                bindings = bounded(
+                    (
+                        *bindings,
+                        *(
+                            node
+                            for child in _definition_scope_child_bodies(statement)
+                            for node in visit(child, bindings)[0]
+                        ),
                     )
                 )
-            if len(definitions) > _MAX_CALLS_PER_FUNCTION:
-                raise _CallGraphAnalysisLimitError("module __getattr__ definitions exceed analysis limit")
-        return definitions
+        return bindings, False
 
-    return visit(statements, ())
+    bindings, _ = visit(statements, ())
+    return bounded(matched) if before is not None else bindings
+
+
+def _module_getattr_function_definitions(
+    statements: Iterable[ast.stmt], getter_name: str
+) -> tuple[ast.FunctionDef, ...]:
+    return tuple(
+        statement
+        for statement in _module_getattr_binding_statements(statements, getter_name)
+        if isinstance(statement, ast.FunctionDef)
+    )
 
 
 @_register_source_sensitive_cache
@@ -6440,20 +6475,30 @@ def _returned_class_entrypoints_for_getter(
         scope = children[0]
     symbols = {symbol.get_name(): symbol for symbol in scope.get_symbols()}
     parameter_symbol = symbols.get(parameter_name)
+    condition_parameter = parameter_name
+    condition_value: object = export_name
     if parameter_symbol is not None and (parameter_symbol.is_assigned() or parameter_symbol.is_imported()):
-        return ()
+        parameter_name = ""
+        if parameter_symbol.is_assigned():
+            condition_parameter = ""
+        else:
+            condition_value = object()
     globals_is_builtin = "globals" not in analysis.direct_names and parameter_name != "globals"
     globals_symbol = symbols.get("globals")
     globals_is_builtin &= globals_symbol is None or not (
         not globals_symbol.is_global() or globals_symbol.is_assigned() or globals_symbol.is_imported()
     )
     entrypoints: dict[str, None] = {}
-    for statement in _module_getattr_return_statements(getter, parameter_name, export_name):
+    returns = _module_getattr_return_statements(getter, condition_parameter, condition_value)
+    if len(returns) > _MAX_CALLS_PER_FUNCTION:
+        raise _CallGraphAnalysisLimitError("module __getattr__ return statements exceed analysis limit")
+    for statement in returns:
         expression = statement.value
-        target_name: str | None = expression.id if isinstance(expression, ast.Name) else None
+        target_name = _resolve_expr(expression, module_name, {}, set()) if expression is not None else None
+        global_lookup = False
         if target_name is not None:
-            symbol = symbols.get(target_name)
-            if symbol is not None and (not symbol.is_global() or symbol.is_assigned() or symbol.is_imported()):
+            symbol = symbols.get(target_name.partition(".")[0])
+            if symbol is not None and not symbol.is_imported() and (not symbol.is_global() or symbol.is_assigned()):
                 continue
         if (
             globals_is_builtin
@@ -6464,6 +6509,7 @@ def _returned_class_entrypoints_for_getter(
             and not expression.value.args
             and not expression.value.keywords
         ):
+            global_lookup = True
             key = expression.slice
             if isinstance(key, ast.Constant) and isinstance(key.value, str):
                 target_name = key.value
@@ -6492,12 +6538,31 @@ def _returned_class_entrypoints_for_getter(
         if target_name is not None:
             if len(target_name) > _MAX_SOURCE_MODULE_NAME_CHARS:
                 raise _CallGraphAnalysisLimitError("module __getattr__ export name exceeds analysis limit")
-            symbol = symbols.get(target_name)
-            if symbol is not None and symbol.is_global() and (symbol.is_assigned() or symbol.is_imported()):
+            root_name, separator, remaining = target_name.partition(".")
+            symbol = symbols.get(root_name)
+            if global_lookup and symbol is not None and symbol.is_global() and symbol.is_assigned():
                 continue
-            class_target = _resolve_class_target(f"{module_name}.{target_name}")
-            if class_target is not None:
-                entrypoints.update(dict.fromkeys(_class_entrypoints(class_target)))
+            local_import = not global_lookup and symbol is not None and symbol.is_imported()
+            bindings = _module_getattr_binding_statements(
+                getter.body if local_import else context.module_body,
+                root_name,
+                parameter_name=condition_parameter if local_import else "",
+                export_name=condition_value,
+                before=statement if local_import else None,
+            )
+            targets: set[str] = set()
+            for binding in bindings:
+                imported = _collect_import_aliases((binding,), module_name, context.is_package).get(root_name)
+                if imported is not None:
+                    targets.add(f"{imported}.{remaining}" if separator else imported)
+                elif not local_import:
+                    targets.add(f"{module_name}.{target_name}")
+            if not bindings and not local_import and root_name not in analysis.direct_names:
+                targets.add(f"{module_name}.{target_name}")
+            for target in sorted(targets):
+                class_target = _resolve_class_target(target)
+                if class_target is not None:
+                    entrypoints.update(dict.fromkeys(_class_entrypoints(class_target)))
             if len(entrypoints) > _MAX_CALLS_PER_FUNCTION:
                 raise _CallGraphAnalysisLimitError(
                     "module __getattr__ returned-class entrypoints exceed analysis limit"
