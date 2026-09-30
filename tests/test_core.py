@@ -27,7 +27,7 @@ from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import pytest
 
@@ -10379,7 +10379,7 @@ def test_scan_file_keeps_unreadable_skops_member_inconclusive_in_llamafile_polyg
     def open_with_failure(
         archive: zipfile.ZipFile,
         name: str | zipfile.ZipInfo,
-        mode: str = "r",
+        mode: Literal["r", "w"] = "r",
         pwd: bytes | None = None,
         *,
         force_zip64: bool = False,
