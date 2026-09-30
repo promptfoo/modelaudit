@@ -208,8 +208,9 @@ line-length = 120
 target-version = "py310"
 
 [tool.ruff.lint]
-# Extend the default rule set to be more prescriptive
-extend-select = [
+# Keep the project rule set explicit across Ruff default-rule changes.
+select = [
+    "F",    # pyflakes - undefined names and unused imports
     "I",    # isort - import sorting
     "W",    # pycodestyle warnings (includes trailing whitespace)
     "E",    # pycodestyle errors  
