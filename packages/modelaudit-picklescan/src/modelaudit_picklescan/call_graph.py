@@ -147,6 +147,7 @@ _MAX_CALL_GRAPH_DEPTH = 4
 _MAX_VISITED_FUNCTIONS = 64
 _MAX_CALLS_PER_FUNCTION = 128
 _MAX_CONDITION_DEPTH = 64
+_MAX_METACLASS_BASES = 128
 _MAX_ASSIGNMENT_ALIASES = 128
 _MAX_ASSIGNMENT_ALIAS_PASSES = 256
 _MAX_FUNCTION_INSTANCE_ALIASES = 32
@@ -7572,32 +7573,38 @@ def _class_body_statement_or_nested_statement_binds_name(statement: ast.stmt, na
     )
 
 
-def _class_lookup_has_source_backed_plain_metaclass(
-    context: _ClassSourceContext,
-    visited: frozenset[str] = frozenset(),
-) -> bool:
-    class_key = f"{context.module_name}.{context.class_node.name}"
-    if class_key in visited:
-        return True
-    if _class_definition_has_dynamic_lookup_context(context.class_node):
-        return False
-    next_visited = visited | {class_key}
-    base_targets = _class_base_targets_for_static_lookup(
-        context.class_node, context.module_name, context.aliases, context.local_defs
-    )
-    if base_targets is None:
-        return False
-    for base in base_targets:
-        base_context = _class_source_context_for_target(
-            base,
-            context.module_name,
-            context.aliases,
-            context.local_defs,
-            context.local_class_nodes,
-            context.module_statements,
-        )
-        if base_context is None or not _class_lookup_has_source_backed_plain_metaclass(base_context, next_visited):
+def _class_lookup_has_source_backed_plain_metaclass(context: _ClassSourceContext) -> bool:
+    pending = [context]
+    visited: set[tuple[str, int, int]] = set()
+    remaining_bases = _MAX_METACLASS_BASES
+    while pending:
+        current = pending.pop()
+        class_node = current.class_node
+        # Imported class contexts may parse the same definition into distinct AST nodes.
+        class_key = (current.module_name, class_node.lineno, class_node.col_offset)
+        if class_key in visited:
+            continue
+        visited.add(class_key)
+        if _class_definition_has_dynamic_lookup_context(class_node) or len(class_node.bases) > remaining_bases:
             return False
+        remaining_bases -= len(class_node.bases)
+        base_targets = _class_base_targets_for_static_lookup(
+            class_node, current.module_name, current.aliases, current.local_defs
+        )
+        if base_targets is None:
+            return False
+        for base in base_targets:
+            base_context = _class_source_context_for_target(
+                base,
+                current.module_name,
+                current.aliases,
+                current.local_defs,
+                current.local_class_nodes,
+                current.module_statements,
+            )
+            if base_context is None:
+                return False
+            pending.append(base_context)
     return True
 
 

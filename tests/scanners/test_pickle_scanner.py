@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import base64
 import hashlib
 import io
@@ -12,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import modelaudit_picklescan.api as picklescan_api
+import modelaudit_picklescan.call_graph as picklescan_call_graph
 import pytest
 from modelaudit_picklescan import Notice, PickleReport, ScanStatus
 from modelaudit_picklescan.call_graph import _clear_source_sensitive_caches
@@ -3423,6 +3425,59 @@ def test_deep_module_condition_preserves_root_outcome(
     assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues) is dangerous
     assert should_cache_scan_result(result.to_dict(include_private_metadata=True)) is False
     assert determine_exit_code(aggregate) == 1
+
+
+@pytest.mark.parametrize("dangerous", [False, True])
+@pytest.mark.parametrize("layers", [20, 60])
+def test_metaclass_proof_budget_preserves_root_outcome(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dangerous: bool, layers: int
+) -> None:
+    module_name = "modelaudit_root_metaclass_diamond"
+    source = ["import os", "class _Left0:\n    pass", "class _Right0:\n    pass"]
+    for layer in range(1, layers + 1):
+        bases = f"_Left{layer - 1}, _Right{layer - 1}"
+        source.extend([f"class _Left{layer}({bases}):\n    pass", f"class _Right{layer}({bases}):\n    pass"])
+    body = "os.system('not-executed')" if dangerous else "return 1"
+    source.extend(
+        [
+            f"class _Resolved(_Left{layers}, _Right{layers}):\n    @staticmethod\n    def run():\n        {body}",
+            "def __getattr__(name):\n    return _Resolved",
+        ]
+    )
+    (tmp_path / f"{module_name}.py").write_text("\n".join(source) + "\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    visits = 0
+    work_limit = 32 * (2 * layers + 3)
+    original = picklescan_call_graph._class_definition_has_dynamic_lookup_context
+
+    def count_class_visits(class_node: ast.ClassDef) -> bool:
+        nonlocal visits
+        visits += 1
+        if visits > work_limit:
+            raise RuntimeError("metaclass fixture work limit exceeded")
+        return original(class_node)
+
+    monkeypatch.setattr(picklescan_call_graph, "_class_definition_has_dynamic_lookup_context", count_class_visits)
+    path = tmp_path / "metaclass-diamond.pkl"
+    path.write_bytes(b"\x80\x04c" + module_name.encode() + b"\nGadget.run\n)R.")
+    _clear_source_sensitive_caches()
+    try:
+        result = PickleScanner().scan(str(path))
+    finally:
+        _clear_source_sensitive_caches()
+    aggregate = create_initial_audit_result()
+    merge_scan_result(aggregate, result)
+    incomplete = layers == 60 and not dangerous
+
+    assert visits <= work_limit
+    assert module_name not in sys.modules
+    assert result.success is (not incomplete)
+    assert result.metadata["pickle_report_status"] == ("inconclusive" if incomplete else "complete")
+    assert result.metadata["pickle_verdict"] == ("malicious" if dangerous else "suspicious")
+    assert any("unproven metaclass" in issue.message for issue in result.issues) is incomplete
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues) is dangerous
+    assert should_cache_scan_result(result.to_dict(include_private_metadata=True)) is False
+    assert determine_exit_code(aggregate) == (2 if incomplete else 1)
 
 
 def test_large_legacy_pytorch_container_defers_file_size_limit(tmp_path: Path) -> None:

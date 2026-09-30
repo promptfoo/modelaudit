@@ -12509,3 +12509,73 @@ def test_deep_unrelated_condition_preserves_other_invocation_findings(
     assert report.verdict == (SafetyVerdict.MALICIOUS if dangerous else SafetyVerdict.SUSPICIOUS)
     assert not any(error.category == "call_graph_analysis_error" for error in report.errors)
     assert any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings) is dangerous
+
+
+def _diamond_metaclass_source(layers: int, dangerous: bool, unproven_metaclass: bool) -> str:
+    source = ["import os", "class _Meta(type):\n    pass"]
+    metaclass = "(metaclass=_Meta)" if unproven_metaclass else ""
+    source.extend([f"class _Left0{metaclass}:\n    pass", "class _Right0:\n    pass"])
+    for layer in range(1, layers + 1):
+        bases = f"_Left{layer - 1}, _Right{layer - 1}"
+        source.extend([f"class _Left{layer}({bases}):\n    pass", f"class _Right{layer}({bases}):\n    pass"])
+    body = "os.system('not-executed')" if dangerous else "return 1"
+    source.extend(
+        [
+            f"class _Resolved(_Left{layers}, _Right{layers}):\n    @staticmethod\n    def run():\n        {body}",
+            "def __getattr__(name):\n    return _Resolved",
+        ]
+    )
+    return "\n".join(source)
+
+
+@pytest.mark.parametrize("dangerous", [False, True])
+@pytest.mark.parametrize("unproven_metaclass", [False, True])
+@pytest.mark.parametrize("layers", [1, 20, 60])
+@pytest.mark.parametrize("imported_bases", [False, True])
+def test_returned_member_metaclass_proof_has_bounded_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    dangerous: bool,
+    unproven_metaclass: bool,
+    layers: int,
+    imported_bases: bool,
+) -> None:
+    provider = "modelaudit_diamond_provider"
+    if imported_bases:
+        (tmp_path / f"{provider}.py").write_text(
+            _diamond_metaclass_source(layers, False, unproven_metaclass), encoding="utf-8"
+        )
+        body = "os.system('not-executed')" if dangerous else "return 1"
+        source = (
+            f"from {provider} import _Left{layers}, _Right{layers}\n"
+            f"class _Resolved(_Left{layers}, _Right{layers}):\n    @staticmethod\n    def run():\n        {body}\n"
+            "def __getattr__(name):\n    return _Resolved"
+        )
+    else:
+        source = _diamond_metaclass_source(layers, dangerous, unproven_metaclass)
+    visits = 0
+    work_limit = 32 * (2 * layers + 3)
+    original = call_graph._class_definition_has_dynamic_lookup_context
+
+    def count_class_visits(class_node: ast.ClassDef) -> bool:
+        nonlocal visits
+        visits += 1
+        if visits > work_limit:
+            raise RuntimeError("metaclass fixture work limit exceeded")
+        return original(class_node)
+
+    monkeypatch.setattr(call_graph, "_class_definition_has_dynamic_lookup_context", count_class_visits)
+    incomplete = (unproven_metaclass or layers == 60) and not dangerous
+    report = _scan_module_getattr_class_source(
+        tmp_path,
+        monkeypatch,
+        source,
+        export_name="Gadget.run",
+        expected_gap="unproven metaclass" if incomplete else None,
+    )
+
+    assert visits <= work_limit
+    assert provider not in sys.modules
+    assert report.status == (ScanStatus.INCONCLUSIVE if incomplete else ScanStatus.COMPLETE)
+    assert report.verdict == (SafetyVerdict.MALICIOUS if dangerous else SafetyVerdict.SUSPICIOUS)
+    assert any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings) is dangerous
