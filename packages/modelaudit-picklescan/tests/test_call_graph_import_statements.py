@@ -2536,6 +2536,139 @@ def test_module_getattr_returned_class_distinguishes_runtime_binding(
     assert module_name not in sys.modules
 
 
+def _scan_module_getattr_class_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, hook_source: str
+) -> PickleReport:
+    module_name = "modelaudit_getattr_control_flow"
+    (tmp_path / f"{module_name}.py").write_text(
+        "import os\nclass _Danger:\n    def __init__(self):\n        os.system('not-executed')\n"
+        "class _Safe:\n    def __init__(self):\n        self.value = 1\n" + hook_source + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    _clear_call_graph_caches()
+    try:
+        report = scan_bytes(_global_call_payload(module_name, "Gadget"))
+    finally:
+        _clear_call_graph_caches()
+    assert module_name not in sys.modules
+    assert not any(error.category == "call_graph_analysis_error" for error in report.errors)
+    return report
+
+
+@pytest.mark.parametrize(
+    ("body", "dangerous"),
+    [
+        ("try:\n    return _Danger\nfinally:\n    return _Safe", False),
+        ("try:\n    return _Safe\nfinally:\n    return _Danger", True),
+        ("try:\n    return _Danger\nfinally:\n    raise AttributeError(name)", False),
+        ("try:\n    return _Danger\nfinally:\n    pass", True),
+        ("try:\n    return _Safe\nfinally:\n    pass\nreturn _Danger", False),
+        ("try:\n    return _Danger\nfinally:\n    if name == 'Gadget':\n        return _Safe", False),
+        ("try:\n    return _Safe\nfinally:\n    if name == 'Other':\n        return _Danger", False),
+        ("try:\n    return _Safe\nexcept ValueError:\n    return _Safe\nelse:\n    return _Danger", False),
+        ("try:\n    pass\nexcept ValueError:\n    return _Safe\nelse:\n    return _Danger", True),
+        ("try:\n    raise ValueError()\nexcept ValueError:\n    return _Danger\nfinally:\n    return _Safe", False),
+    ],
+)
+def test_module_getattr_returned_class_respects_finally(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, body: str, dangerous: bool
+) -> None:
+    report = _scan_module_getattr_class_source(
+        tmp_path, monkeypatch, "def __getattr__(name):\n    " + body.replace("\n", "\n    ")
+    )
+
+    assert any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings) is dangerous
+    if dangerous:
+        assert report.verdict == SafetyVerdict.MALICIOUS
+
+
+@pytest.mark.parametrize("condition", ["True", "False", "not False", "1 and True", "bool(int('1'))"])
+@pytest.mark.parametrize("dangerous_first", [False, True])
+def test_module_getattr_returned_class_tracks_conditional_definitions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, condition: str, dangerous_first: bool
+) -> None:
+    first, last = ("_Danger", "_Safe") if dangerous_first else ("_Safe", "_Danger")
+    source = (
+        f"if {condition}:\n    def __getattr__(name):\n        return {first}\n"
+        f"else:\n    def __getattr__(name):\n        return {last}"
+    )
+    report = _scan_module_getattr_class_source(tmp_path, monkeypatch, source)
+
+    expected = True if condition == "bool(int('1'))" else (dangerous_first is (condition != "False"))
+    assert any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings) is expected
+    if expected:
+        assert report.verdict == SafetyVerdict.MALICIOUS
+
+
+@pytest.mark.parametrize("dangerous_last", [False, True])
+def test_module_getattr_conditional_definition_is_overridden_by_later_definition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dangerous_last: bool
+) -> None:
+    result = "_Danger" if dangerous_last else "_Safe"
+    report = _scan_module_getattr_class_source(
+        tmp_path,
+        monkeypatch,
+        "if bool(int('1')):\n    def __getattr__(name):\n        return _Danger\n"
+        "else:\n    def __getattr__(name):\n        return _Safe\n"
+        f"def __getattr__(name):\n    return {result}",
+    )
+
+    assert any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings) is dangerous_last
+
+
+def test_module_getattr_conditional_definition_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    tree = ast.parse(
+        "if flag:\n    def __getattr__(name):\n        return _Danger\n"
+        "else:\n    def __getattr__(name):\n        return _Safe\n"
+    )
+    monkeypatch.setattr(call_graph, "_MAX_CALLS_PER_FUNCTION", 1)
+
+    with pytest.raises(call_graph._CallGraphAnalysisLimitError, match="module __getattr__ definitions"):
+        call_graph._module_getattr_function_definitions(tree.body, "__getattr__")
+
+
+@pytest.mark.parametrize(
+    ("parameters", "callable_with_name"),
+    [
+        ("name, cache=None", True),
+        ("name, /, cache=None", True),
+        ("name, *, cache=None", True),
+        ("name, *args, **kwargs", True),
+        ("name=None", True),
+        ("*args", True),
+        ("name, cache", False),
+        ("name, *, required", False),
+        ("*, name", False),
+        ("", False),
+    ],
+)
+def test_module_getattr_returned_class_accepts_optional_parameters(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, parameters: str, callable_with_name: bool
+) -> None:
+    report = _scan_module_getattr_class_source(
+        tmp_path, monkeypatch, f"def __getattr__({parameters}):\n    return _Danger"
+    )
+
+    assert any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings) is callable_with_name
+    if callable_with_name:
+        assert report.verdict == SafetyVerdict.MALICIOUS
+
+
+@pytest.mark.skipif(sys.version_info < (3, 12), reason="generic function syntax requires Python 3.12")
+@pytest.mark.parametrize(("type_parameter", "dangerous"), [("T", True), ("_Danger", False)])
+def test_module_getattr_returned_class_uses_generic_function_scope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, type_parameter: str, dangerous: bool
+) -> None:
+    report = _scan_module_getattr_class_source(
+        tmp_path, monkeypatch, f"def __getattr__[{type_parameter}](name):\n    return _Danger"
+    )
+
+    assert any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings) is dangerous
+    if dangerous:
+        assert report.verdict == SafetyVerdict.MALICIOUS
+
+
 def test_scan_bytes_marks_zipimported_invoked_call_graph_source_unavailable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

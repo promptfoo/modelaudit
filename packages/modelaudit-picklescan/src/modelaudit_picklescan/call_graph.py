@@ -1954,6 +1954,7 @@ class _WildcardExportSummary:
 @dataclass(frozen=True)
 class _ModuleSourceContext:
     source_path: Path
+    module_body: tuple[ast.stmt, ...]
     module_statements: tuple[ast.stmt, ...]
     is_package: bool
 
@@ -6270,15 +6271,14 @@ def _module_getattr_condition_value(test: ast.expr, parameter_name: str, export_
 def _module_getattr_return_statements(
     getter: ast.FunctionDef, parameter_name: str, export_name: str
 ) -> tuple[ast.Return, ...]:
-    returns: list[ast.Return] = []
-
-    def visit(statements: Iterable[ast.stmt]) -> bool:
+    def visit(statements: Iterable[ast.stmt]) -> tuple[list[ast.Return], bool]:
+        returns: list[ast.Return] = []
         for statement in statements:
             if isinstance(statement, ast.Return):
                 returns.append(statement)
-                return True
+                return returns, True
             if isinstance(statement, ast.Raise):
-                return True
+                return returns, True
             if isinstance(statement, ast.If):
                 condition = _module_getattr_condition_value(statement.test, parameter_name, export_name)
                 branches: tuple[list[ast.stmt], ...]
@@ -6286,16 +6286,93 @@ def _module_getattr_return_statements(
                     branches = (statement.body, statement.orelse)
                 else:
                     branches = (statement.body if condition else statement.orelse,)
-                terminated = [visit(branch) for branch in branches]
+                terminated = []
+                for branch in branches:
+                    branch_returns, branch_terminated = visit(branch)
+                    returns.extend(branch_returns)
+                    terminated.append(branch_terminated)
                 if all(terminated):
-                    return True
+                    return returns, True
+            elif isinstance(statement, ast.Try):
+                final_returns, final_terminated = visit(statement.finalbody)
+                if final_terminated:
+                    returns.extend(final_returns)
+                    return returns, True
+                body_returns, body_terminated = visit(statement.body)
+                returns.extend(body_returns)
+                if not body_terminated:
+                    else_returns, body_terminated = visit(statement.orelse)
+                    returns.extend(else_returns)
+                handlers_terminated = []
+                for handler in statement.handlers:
+                    handler_returns, handler_terminated = visit(handler.body)
+                    returns.extend(handler_returns)
+                    handlers_terminated.append(handler_terminated)
+                returns.extend(final_returns)
+                if body_terminated and all(handlers_terminated):
+                    return returns, True
             else:
                 for body in _definition_scope_child_bodies(statement):
-                    visit(body)
-        return False
+                    body_returns, _ = visit(body)
+                    returns.extend(body_returns)
+        return returns, False
 
-    visit(getter.body)
-    return tuple(returns)
+    return tuple(visit(getter.body)[0])
+
+
+def _module_getattr_function_definitions(
+    statements: Iterable[ast.stmt], getter_name: str
+) -> tuple[ast.FunctionDef, ...]:
+    def visit(body: Iterable[ast.stmt], definitions: tuple[ast.FunctionDef, ...]) -> tuple[ast.FunctionDef, ...]:
+        for statement in body:
+            if isinstance(statement, ast.FunctionDef) and statement.name == getter_name:
+                definitions = (statement,)
+            elif _module_statement_binds_name(statement, getter_name):
+                definitions = ()
+            elif isinstance(statement, ast.If):
+                condition = _module_getattr_condition_value(statement.test, "", "")
+                branches = (
+                    (statement.body, statement.orelse)
+                    if condition is None
+                    else (statement.body if condition else statement.orelse,)
+                )
+                definitions = tuple(dict.fromkeys(node for branch in branches for node in visit(branch, definitions)))
+            elif isinstance(statement, ast.Try):
+                body_definitions = visit(statement.body, definitions)
+                handler_definitions = tuple(dict.fromkeys((*definitions, *body_definitions)))
+                definitions = tuple(
+                    dict.fromkeys(
+                        (
+                            *visit(statement.orelse, body_definitions),
+                            *(
+                                node
+                                for handler in statement.handlers
+                                for node in visit(handler.body, handler_definitions)
+                            ),
+                        )
+                    )
+                )
+                definitions = visit(statement.finalbody, definitions)
+            elif isinstance(statement, ast.With | ast.AsyncWith):
+                definitions = visit(statement.body, definitions)
+            else:
+                definitions = tuple(
+                    dict.fromkeys(
+                        (
+                            *definitions,
+                            *(
+                                node
+                                for child in _definition_scope_child_bodies(statement)
+                                for node in visit(child, definitions)
+                            ),
+                        )
+                    )
+                )
+            if len(definitions) > _MAX_CALLS_PER_FUNCTION:
+                raise _CallGraphAnalysisLimitError("module __getattr__ definitions exceed analysis limit")
+        return definitions
+
+    return visit(statements, ())
 
 
 @_register_source_sensitive_cache
@@ -6319,15 +6396,26 @@ def _module_getattr_returned_class_entrypoints(function_name: str) -> tuple[str,
     analysis = _analyze_module(module_name)
     if context is None or analysis is None:
         return ()
-    getter = next(
-        (
-            statement
-            for statement in reversed(context.module_statements)
-            if isinstance(statement, ast.FunctionDef) and statement.name == getter_name
-        ),
-        None,
-    )
-    if getter is None or getter.decorator_list:
+    entrypoints: dict[str, None] = {}
+    for getter in _module_getattr_function_definitions(context.module_body, getter_name):
+        entrypoints.update(
+            dict.fromkeys(
+                _returned_class_entrypoints_for_getter(module_name, qualified_name, getter, context, analysis)
+            )
+        )
+        if len(entrypoints) > _MAX_CALLS_PER_FUNCTION:
+            raise _CallGraphAnalysisLimitError("module __getattr__ returned-class entrypoints exceed analysis limit")
+    return tuple(entrypoints)
+
+
+def _returned_class_entrypoints_for_getter(
+    module_name: str,
+    export_name: str,
+    getter: ast.FunctionDef,
+    context: _ModuleSourceContext,
+    analysis: _ModuleAnalysis,
+) -> tuple[str, ...]:
+    if getter.decorator_list:
         return ()
     scope_nodes = list(ast.iter_child_nodes(getter))
     while scope_nodes:
@@ -6337,25 +6425,35 @@ def _module_getattr_returned_class_entrypoints(function_name: str) -> tuple[str,
         if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef | ast.Lambda):
             scope_nodes.extend(ast.iter_child_nodes(node))
     parameters = (*getter.args.posonlyargs, *getter.args.args)
-    if len(parameters) != 1:
+    if (
+        (not parameters and getter.args.vararg is None)
+        or len(parameters) - len(getter.args.defaults) > 1
+        or any(default is None for default in getter.args.kw_defaults)
+    ):
         return ()
-    parameter_name = parameters[0].arg
-    scope = symtable.symtable(ast.unparse(getter), str(context.source_path), "exec").get_children()[0]
+    parameter_name = parameters[0].arg if parameters else ""
+    scope = symtable.symtable(ast.unparse(getter), str(context.source_path), "exec")
+    while scope.get_type() != "function":
+        children = [child for child in scope.get_children() if child.get_name() == getter.name]
+        if not children:
+            return ()
+        scope = children[0]
     symbols = {symbol.get_name(): symbol for symbol in scope.get_symbols()}
-    if symbols[parameter_name].is_assigned() or symbols[parameter_name].is_imported():
+    parameter_symbol = symbols.get(parameter_name)
+    if parameter_symbol is not None and (parameter_symbol.is_assigned() or parameter_symbol.is_imported()):
         return ()
     globals_is_builtin = "globals" not in analysis.direct_names and parameter_name != "globals"
     globals_symbol = symbols.get("globals")
     globals_is_builtin &= globals_symbol is None or not (
-        globals_symbol.is_local() or globals_symbol.is_assigned() or globals_symbol.is_imported()
+        not globals_symbol.is_global() or globals_symbol.is_assigned() or globals_symbol.is_imported()
     )
     entrypoints: dict[str, None] = {}
-    for statement in _module_getattr_return_statements(getter, parameter_name, qualified_name):
+    for statement in _module_getattr_return_statements(getter, parameter_name, export_name):
         expression = statement.value
         target_name: str | None = expression.id if isinstance(expression, ast.Name) else None
         if target_name is not None:
             symbol = symbols.get(target_name)
-            if symbol is not None and (symbol.is_local() or symbol.is_assigned() or symbol.is_imported()):
+            if symbol is not None and (not symbol.is_global() or symbol.is_assigned() or symbol.is_imported()):
                 continue
         if (
             globals_is_builtin
@@ -6382,7 +6480,7 @@ def _module_getattr_returned_class_entrypoints(function_name: str) -> tuple[str,
                         and part.conversion == -1
                         and part.format_spec is None
                     ):
-                        text = qualified_name
+                        text = export_name
                     else:
                         break
                     key_length += len(text)
@@ -6507,8 +6605,13 @@ def _module_source_context(module_name: str) -> _ModuleSourceContext | None:
         return None
 
     is_package = source_path.name == "__init__.py"
-    module_statements = _module_level_statements(tree, module_name)
-    return _ModuleSourceContext(source_path=source_path, module_statements=module_statements, is_package=is_package)
+    module_body = _runtime_selected_module_statements(tree.body, module_name)
+    return _ModuleSourceContext(
+        source_path=source_path,
+        module_body=module_body,
+        module_statements=_definition_scope_statements(module_body),
+        is_package=is_package,
+    )
 
 
 def _source_has_importable_untrusted_cache(source_path: Path, source: str) -> bool:
