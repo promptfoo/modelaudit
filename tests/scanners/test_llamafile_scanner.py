@@ -108,16 +108,16 @@ def _build_mapped_executable_header(
     if executable_format == "pe":
         optional_header_size = 0xF0
         section_table_offset = 0x80 + 24 + optional_header_size
-        header = bytearray(section_table_offset + 40)
-        header[:2] = b"MZ"
-        struct.pack_into("<I", header, 0x3C, 0x80)
-        header[0x80:0x84] = b"PE\x00\x00"
-        struct.pack_into("<HHIIIHH", header, 0x84, 0x8664, 1, 0, 0, 0, optional_header_size, 0x2022)
-        struct.pack_into("<H", header, 0x98, 0x20B)
-        struct.pack_into("<I", header, 0x98 + 60, 512)
-        header[section_table_offset : section_table_offset + 8] = b".text\x00\x00\x00"
-        struct.pack_into("<II", header, section_table_offset + 16, mapped_size, 0)
-        return bytes(header)
+        pe_header = bytearray(section_table_offset + 40)
+        pe_header[:2] = b"MZ"
+        struct.pack_into("<I", pe_header, 0x3C, 0x80)
+        pe_header[0x80:0x84] = b"PE\x00\x00"
+        struct.pack_into("<HHIIIHH", pe_header, 0x84, 0x8664, 1, 0, 0, 0, optional_header_size, 0x2022)
+        struct.pack_into("<H", pe_header, 0x98, 0x20B)
+        struct.pack_into("<I", pe_header, 0x98 + 60, 512)
+        pe_header[section_table_offset : section_table_offset + 8] = b".text\x00\x00\x00"
+        struct.pack_into("<II", pe_header, section_table_offset + 16, mapped_size, 0)
+        return bytes(pe_header)
 
     if executable_format == "mach-o":
         header = b"\xcf\xfa\xed\xfe" + struct.pack("<iiIIIII", 0x01000007, 3, 2, 1, 72, 0, 0)
