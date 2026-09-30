@@ -3281,6 +3281,115 @@ def test_export_deletion_preserves_paths_outcome_and_cache_policy(
     assert determine_exit_code(aggregate) == 2
 
 
+@pytest.mark.parametrize("dangerous", [False, True])
+@pytest.mark.parametrize("active_else", [False, True])
+@pytest.mark.parametrize("loop", ["while False", "for unused in ()"])
+def test_export_deletion_loop_reachability_preserves_root_outcome(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dangerous: bool, active_else: bool, loop: str
+) -> None:
+    module_name = "modelaudit_root_deletion_loop"
+    body = "os.system('not-executed')" if dangerous else "pass"
+    source = f"import os\nclass Gadget:\n    def __init__(self):\n        {body}\n"
+    source += f"{loop}:\n    pass\nelse:\n    del Gadget\n" if active_else else f"{loop}:\n    del Gadget\n"
+    (tmp_path / f"{module_name}.py").write_text(source, encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    path = tmp_path / "deletion-loop.pkl"
+    path.write_bytes(b"\x80\x04c" + module_name.encode() + b"\nGadget\n)R.")
+    _clear_source_sensitive_caches()
+    try:
+        result = PickleScanner().scan(str(path))
+    finally:
+        _clear_source_sensitive_caches()
+    aggregate = create_initial_audit_result()
+    merge_scan_result(aggregate, result)
+
+    assert result.success is (not active_else)
+    assert result.metadata["pickle_report_status"] == ("inconclusive" if active_else else "complete")
+    assert any("export deletion" in issue.message for issue in result.issues) is active_else
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues) is dangerous
+    assert determine_exit_code(aggregate) == (2 if active_else else 1)
+    if active_else:
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert should_cache_scan_result(result.to_dict(include_private_metadata=True)) is False
+
+
+@pytest.mark.parametrize("write_state", [False, True])
+def test_partial_invocation_coverage_keeps_root_file_write_finding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, write_state: bool
+) -> None:
+    module_name = "modelaudit_root_partial_file_write"
+    state_body = "self.handle.write(state)" if write_state else "self.value = state"
+    (tmp_path / f"{module_name}.py").write_text(
+        "class Gadget:\n    def __init__(self, path):\n        self.handle = open(path, 'w')\n"
+        f"    def __setstate__(self, state):\n        {state_body}\n"
+        "if bool(int('0')):\n    del Gadget\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    target = tmp_path / "sitecustomize.py"
+    encoded_path = str(target).encode("utf-8")
+    path = tmp_path / "partial-file-write.pkl"
+    path.write_bytes(
+        b"\x80\x04c"
+        + module_name.encode()
+        + b"\nGadget\nX"
+        + len(encoded_path).to_bytes(4, "little")
+        + encoded_path
+        + b"\x85R\x8c\x07payloadb."
+    )
+    _clear_source_sensitive_caches()
+    try:
+        result = PickleScanner().scan(str(path))
+    finally:
+        _clear_source_sensitive_caches()
+    aggregate = create_initial_audit_result()
+    merge_scan_result(aggregate, result)
+
+    assert not target.exists()
+    assert result.success is False
+    assert result.metadata["pickle_verdict"] == ("malicious" if write_state else "suspicious")
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert any("export deletion" in issue.message for issue in result.issues)
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues) is write_state
+    assert should_cache_scan_result(result.to_dict(include_private_metadata=True)) is False
+    assert determine_exit_code(aggregate) == 2
+
+
+@pytest.mark.parametrize("dangerous", [False, True])
+def test_reexported_hook_binding_preserves_root_outcome(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dangerous: bool
+) -> None:
+    provider = "modelaudit_root_hook_provider"
+    module_name = "modelaudit_root_hook_exporter"
+    body = "os.system('not-executed')" if dangerous else "pass"
+    (tmp_path / f"{provider}.py").write_text(
+        f"import os\nclass Actual:\n    def __init__(self):\n        {body}\n"
+        "def Hook(name):\n    return Actual\nSaved = Hook\n"
+        "class CM:\n    def __enter__(self):\n        return Saved\n"
+        "    def __exit__(self, *args):\n        return False\nwith CM() as Hook:\n    pass\n",
+        encoding="utf-8",
+    )
+    (tmp_path / f"{module_name}.py").write_text(f"from {provider} import Hook as __getattr__\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    path = tmp_path / "reexported-hook.pkl"
+    path.write_bytes(b"\x80\x04c" + module_name.encode() + b"\nGadget\n)R.")
+    _clear_source_sensitive_caches()
+    try:
+        result = PickleScanner().scan(str(path))
+    finally:
+        _clear_source_sensitive_caches()
+    aggregate = create_initial_audit_result()
+    merge_scan_result(aggregate, result)
+
+    assert result.success is False
+    assert result.metadata["pickle_verdict"] == ("malicious" if dangerous else "suspicious")
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert any("context-manager binding" in issue.message for issue in result.issues)
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues) is dangerous
+    assert should_cache_scan_result(result.to_dict(include_private_metadata=True)) is False
+    assert determine_exit_code(aggregate) == 2
+
+
 def test_large_legacy_pytorch_container_defers_file_size_limit(tmp_path: Path) -> None:
     payload, pickle_end = _make_legacy_pytorch_container(b"A" * 512)
     path = tmp_path / "legacy-large.bin"

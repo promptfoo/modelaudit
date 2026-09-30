@@ -2649,7 +2649,7 @@ def test_module_getattr_conditional_definition_limit(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(call_graph, "_MAX_CALLS_PER_FUNCTION", 1)
 
     with pytest.raises(call_graph._CallGraphAnalysisLimitError, match="module __getattr__ definitions"):
-        call_graph._module_getattr_function_definitions(tree.body, "__getattr__")
+        call_graph._module_getattr_binding_statements(tree.body, "__getattr__")
 
 
 @pytest.mark.parametrize(
@@ -12181,10 +12181,12 @@ def test_context_manager_hook_binding_reports_coverage(
         "    def __exit__(self, *args):\n        return False\n"
         "with CM() as __getattr__:\n    pass",
         expected_gap="context-manager binding",
-        expected_verdict=SafetyVerdict.MALICIOUS if dangerous_hook else SafetyVerdict.SUSPICIOUS,
+        expected_verdict=SafetyVerdict.MALICIOUS if dangerous or dangerous_hook else SafetyVerdict.SUSPICIOUS,
     )
 
-    assert any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings) is dangerous_hook
+    assert any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings) is (
+        dangerous or dangerous_hook
+    )
 
 
 @pytest.mark.parametrize("dangerous", [False, True])
@@ -12265,3 +12267,193 @@ def test_unresolved_return_values_preserve_other_alternatives(
     )
 
     assert any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings)
+
+
+@pytest.mark.parametrize("dangerous", [False, True])
+@pytest.mark.parametrize("deletion", ["", "if False:\n    del Gadget", "if bool(int('0')):\n    del Gadget"])
+def test_module_getattr_wildcard_return_survives_conditional_deletion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dangerous: bool, deletion: str
+) -> None:
+    provider = "modelaudit_deleted_wildcard_return"
+    body = "os.system('not-executed')" if dangerous else "pass"
+    (tmp_path / f"{provider}.py").write_text(
+        f"import os\nclass Gadget:\n    def __init__(self):\n        {body}\n",
+        encoding="utf-8",
+    )
+    report = _scan_module_getattr_class_source(
+        tmp_path,
+        monkeypatch,
+        f"from {provider} import *\n{deletion}\ndef __getattr__(name):\n    return Gadget",
+        export_name="Missing",
+    )
+
+    assert provider not in sys.modules
+    assert report.status == ScanStatus.COMPLETE
+    assert any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings) is dangerous
+
+
+@pytest.mark.parametrize("dangerous", [False, True])
+@pytest.mark.parametrize("getter", [False, True])
+@pytest.mark.parametrize(
+    "loop",
+    [
+        "while False",
+        "while 0",
+        "while not True",
+        "for unused in ()",
+        "for unused in []",
+        "for unused in {}",
+        "for unused in ''",
+        "for unused in b''",
+    ],
+)
+def test_unreachable_export_deletion_preserves_complete_coverage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dangerous: bool, getter: bool, loop: str
+) -> None:
+    target = "_Danger" if dangerous else "_Safe"
+    binding = f"def __getattr__(name):\n    return {target}" if getter else f"Gadget = {target}"
+    deleted = "__getattr__" if getter else "Gadget"
+    report = _scan_module_getattr_class_source(tmp_path, monkeypatch, f"{binding}\n{loop}:\n    del {deleted}")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings) is dangerous
+
+
+@pytest.mark.parametrize("dangerous", [False, True])
+@pytest.mark.parametrize("loop", ["while False", "for unused in ()"])
+def test_empty_loop_else_retains_export_deletion_coverage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dangerous: bool, loop: str
+) -> None:
+    target = "_Danger" if dangerous else "_Safe"
+    report = _scan_module_getattr_class_source(
+        tmp_path,
+        monkeypatch,
+        f"Gadget = {target}\n{loop}:\n    pass\nelse:\n    del Gadget",
+        expected_gap="export deletion",
+        expected_verdict=SafetyVerdict.MALICIOUS if dangerous else SafetyVerdict.SUSPICIOUS,
+    )
+
+    assert any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings) is dangerous
+
+
+@pytest.mark.parametrize("write_state", [False, True])
+@pytest.mark.parametrize("deletion", [False, True])
+def test_partial_entrypoints_preserve_reduce_and_build_file_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, write_state: bool, deletion: bool
+) -> None:
+    module_name = "modelaudit_partial_file_write"
+    state_body = "self.handle.write(state)" if write_state else "self.value = state"
+    source = (
+        "class Gadget:\n    def __init__(self, path):\n        self.handle = open(path, 'w')\n"
+        f"    def __setstate__(self, state):\n        {state_body}\n"
+    )
+    if deletion:
+        source += "if bool(int('0')):\n    del Gadget\n"
+    (tmp_path / f"{module_name}.py").write_text(source, encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    target = tmp_path / "sitecustomize.py"
+    payload = (
+        b"\x80\x04"
+        + _global_operand(module_name, "Gadget")
+        + _unicode_operand(str(target))
+        + b"\x85R"
+        + _unicode_operand("not-executed")
+        + b"b."
+    )
+    _clear_call_graph_caches()
+    try:
+        report = scan_bytes(payload)
+    finally:
+        _clear_call_graph_caches()
+
+    assert module_name not in sys.modules
+    assert not target.exists()
+    assert report.status == (ScanStatus.INCONCLUSIVE if deletion else ScanStatus.COMPLETE)
+    assert report.verdict == (SafetyVerdict.MALICIOUS if write_state else SafetyVerdict.SUSPICIOUS)
+    assert any(finding.rule_code == "DANGEROUS_CALL_GRAPH_FILE_WRITE" for finding in report.findings) is write_state
+    assert any("export deletion" in error.message for error in report.errors) is deletion
+
+
+@pytest.mark.parametrize("dangerous", [False, True])
+@pytest.mark.parametrize("dangerous_hook", [False, True])
+@pytest.mark.parametrize("binding_kind", ["context-manager", "loop-target"])
+def test_reexported_hook_binding_preserves_paths_and_coverage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dangerous: bool, dangerous_hook: bool, binding_kind: str
+) -> None:
+    provider = "modelaudit_reexported_hook_binding"
+    constructor = "os.system('not-executed')" if dangerous else "pass"
+    hook = "os.system('not-executed')" if dangerous_hook else "pass"
+    source = (
+        f"import os\nclass Actual:\n    def __init__(self):\n        {constructor}\n"
+        f"def Hook(name):\n    {hook}\n    return Actual\nSaved = Hook\n"
+        "class CM:\n    def __enter__(self):\n        return Saved\n"
+        "    def __exit__(self, *args):\n        return False\n"
+    )
+    source += (
+        "with CM() as Hook:\n    pass\n" if binding_kind == "context-manager" else "for Hook in (Hook,):\n    pass\n"
+    )
+    (tmp_path / f"{provider}.py").write_text(source, encoding="utf-8")
+    report = _scan_module_getattr_class_source(
+        tmp_path,
+        monkeypatch,
+        f"from {provider} import Hook as __getattr__",
+        expected_gap=f"{binding_kind} binding",
+        expected_verdict=SafetyVerdict.MALICIOUS if dangerous or dangerous_hook else SafetyVerdict.SUSPICIOUS,
+    )
+
+    assert provider not in sys.modules
+    assert any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings) is (
+        dangerous or dangerous_hook
+    )
+
+
+@pytest.mark.parametrize("dangerous", [False, True])
+@pytest.mark.parametrize("binding_kind", ["context-manager", "loop-target"])
+def test_reexported_hook_replacement_has_complete_coverage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dangerous: bool, binding_kind: str
+) -> None:
+    provider = "modelaudit_reexported_hook_replacement"
+    constructor = "os.system('not-executed')" if dangerous else "pass"
+    source = (
+        f"import os\nclass Actual:\n    def __init__(self):\n        {constructor}\n"
+        "class CM:\n    def __enter__(self):\n        return lambda name: Actual\n"
+        "    def __exit__(self, *args):\n        return False\n"
+    )
+    source += (
+        "with CM() as Hook:\n    pass\n" if binding_kind == "context-manager" else "for Hook in (None,):\n    pass\n"
+    )
+    source += "def Hook(name):\n    return Actual\n"
+    (tmp_path / f"{provider}.py").write_text(source, encoding="utf-8")
+    report = _scan_module_getattr_class_source(tmp_path, monkeypatch, f"from {provider} import Hook as __getattr__")
+
+    assert provider not in sys.modules
+    assert report.status == ScanStatus.COMPLETE
+    assert any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings) is dangerous
+
+
+@pytest.mark.parametrize("dangerous", [False, True])
+@pytest.mark.parametrize("local", [False, True])
+def test_context_manager_alias_preserves_previous_possible_class(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dangerous: bool, local: bool
+) -> None:
+    target = "_Danger" if dangerous else "_Safe"
+    source = (
+        "class CM:\n    def __init__(self, value):\n        self.value = value\n"
+        "    def __enter__(self):\n        return self.value\n"
+        "    def __exit__(self, *args):\n        return False\n"
+    )
+    binding = f"Alias = {target}\nwith CM(Alias) as Alias:\n    pass\n"
+    source += (
+        "def __getattr__(name):\n    " + (binding + "return Alias").replace("\n", "\n    ")
+        if local
+        else binding + "def __getattr__(name):\n    return Alias"
+    )
+    report = _scan_module_getattr_class_source(
+        tmp_path,
+        monkeypatch,
+        source,
+        expected_gap="context-manager binding",
+        expected_verdict=SafetyVerdict.MALICIOUS if dangerous else SafetyVerdict.SUSPICIOUS,
+    )
+
+    assert any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings) is dangerous

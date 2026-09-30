@@ -2164,26 +2164,21 @@ def find_startup_hook_write_call_graphs(
         ):
             continue
         seen.add((module, name))
-        try:
-            entrypoints = (
-                _dedupe_calls(
-                    tuple(
-                        entrypoint
-                        for invocation_reference in invocation_references
-                        for entrypoint in _call_graph_entrypoints_for_reference(
-                            module,
-                            name,
-                            invocation_reference,
-                        )
-                    )
+        selected_entrypoints: dict[str, None] = {}
+        references: Iterable[Mapping[str, object] | None] = invocation_references if require_invocations else (None,)
+        for candidate_reference in references:
+            try:
+                resolved_entrypoints = (
+                    _call_graph_entrypoints_for_reference(module, name, candidate_reference)
+                    if candidate_reference is not None
+                    else _safe_call_graph_entrypoints(f"{module}.{name}")
                 )
-                if require_invocations
-                else _safe_call_graph_entrypoints(f"{module}.{name}")
-            )
-        except _CallGraphAnalysisLimitError as error:
-            if analysis_limit_error is None:
-                analysis_limit_error = error
-            entrypoints = error.partial_entrypoints
+            except _CallGraphAnalysisLimitError as error:
+                if analysis_limit_error is None:
+                    analysis_limit_error = error
+                resolved_entrypoints = error.partial_entrypoints
+            selected_entrypoints.update(dict.fromkeys(resolved_entrypoints))
+        entrypoints = tuple(selected_entrypoints)
         if not entrypoints:
             continue
         try:
@@ -6414,10 +6409,11 @@ def _module_getattr_binding_statements(
                 return bindings, True
             if isinstance(statement, ast.AnnAssign) and statement.value is None:
                 continue
-            if (
-                isinstance(statement, ast.Delete)
-                and any(_assignment_target_binds_name(target, name) for target in statement.targets)
-            ) or _module_statement_binds_name(statement, name):
+            if isinstance(statement, ast.Delete) and any(
+                _assignment_target_binds_name(target, name) for target in statement.targets
+            ):
+                bindings = ()
+            elif _module_statement_binds_name(statement, name):
                 bindings = (statement,)
             elif isinstance(statement, ast.For | ast.While) and _module_getattr_loop_body_is_unreachable(
                 statement, parameter_name, export_name
@@ -6465,7 +6461,7 @@ def _module_getattr_binding_statements(
                     item.optional_vars is not None and _assignment_target_binds_name(item.optional_vars, name)
                     for item in statement.items
                 ):
-                    bindings = (statement,)
+                    bindings = bounded((*bindings, statement))
                 bindings, terminated = visit(statement.body, bindings)
                 if terminated:
                     return (), True
@@ -6486,14 +6482,13 @@ def _module_getattr_binding_statements(
     return bounded(matched) if before is not None else bindings
 
 
-def _module_getattr_function_definitions(
-    statements: Iterable[ast.stmt], getter_name: str
-) -> tuple[ast.FunctionDef, ...]:
-    return tuple(
-        statement
-        for statement in _module_getattr_binding_statements(statements, getter_name)
-        if isinstance(statement, ast.FunctionDef)
-    )
+def _module_getattr_hook_binding_error(bindings: Iterable[ast.stmt]) -> _CallGraphAnalysisLimitError | None:
+    for binding in bindings:
+        if isinstance(binding, ast.With | ast.AsyncWith):
+            return _CallGraphAnalysisLimitError("module __getattr__ has an unresolved context-manager binding")
+        if isinstance(binding, ast.For):
+            return _CallGraphAnalysisLimitError("module __getattr__ has an unresolved loop-target binding")
+    return None
 
 
 @_register_source_sensitive_cache
@@ -6516,28 +6511,32 @@ def _module_getattr_returned_class_entrypoints(
     analysis_limit_error = None
     exporting_context = _module_source_context(module_name)
     if exporting_context is not None:
-        for binding in _module_getattr_binding_statements(exporting_context.module_body, "__getattr__"):
-            if isinstance(binding, ast.With | ast.AsyncWith):
-                analysis_limit_error = _CallGraphAnalysisLimitError(
-                    "module __getattr__ has an unresolved context-manager binding"
-                )
-            elif isinstance(binding, ast.For):
-                analysis_limit_error = _CallGraphAnalysisLimitError(
-                    "module __getattr__ has an unresolved loop-target binding"
-                )
-    if _find_sink_path(getter_target) is not None and analysis_limit_error is None:
-        return ()
+        analysis_limit_error = _module_getattr_hook_binding_error(
+            _module_getattr_binding_statements(exporting_context.module_body, "__getattr__")
+        )
     module_name, getter_name = _split_function_name(getter_target)
     if module_name is None:
+        if analysis_limit_error is not None:
+            raise analysis_limit_error
         return ()
     if "." in getter_name:
+        if _find_sink_path(getter_target) is not None and analysis_limit_error is None:
+            return ()
         raise _CallGraphAnalysisLimitError("module __getattr__ uses a class-method hook whose returns are not analyzed")
     context = _module_source_context(module_name)
     analysis = _analyze_module(module_name)
     if context is None or analysis is None:
+        if analysis_limit_error is not None:
+            raise analysis_limit_error
+        return ()
+    getter_bindings = _module_getattr_binding_statements(context.module_body, getter_name)
+    analysis_limit_error = analysis_limit_error or _module_getattr_hook_binding_error(getter_bindings)
+    if _find_sink_path(getter_target) is not None and analysis_limit_error is None:
         return ()
     entrypoints: dict[str, None] = {}
-    for getter in _module_getattr_function_definitions(context.module_body, getter_name):
+    for getter in getter_bindings:
+        if not isinstance(getter, ast.FunctionDef):
+            continue
         try:
             returned_entrypoints = _returned_class_entrypoints_for_getter(
                 module_name, export_name, getter, context, analysis, member_path=member_path, methods=methods
@@ -6570,9 +6569,6 @@ def _module_getattr_decorators_preserve_returns(
         if not bindings and name == "staticmethod":
             targets.add("builtins.staticmethod")
         for binding in bindings:
-            if isinstance(binding, ast.Delete) and name == "staticmethod":
-                targets.add("builtins.staticmethod")
-                continue
             imported = _collect_import_aliases((binding,), module_name, context.is_package).get(root)
             if imported is None:
                 return False
@@ -6983,14 +6979,24 @@ def _module_source_context(module_name: str) -> _ModuleSourceContext | None:
         module_body=module_body,
         module_statements=module_statements,
         is_package=is_package,
-        deleted_names=frozenset(
-            name
-            for statement in module_statements
-            if isinstance(statement, ast.Delete)
-            for target in statement.targets
-            for name in _assignment_target_names(target)
-        ),
+        deleted_names=_module_deleted_export_names(module_body),
     )
+
+
+def _module_deleted_export_names(nodes: Iterable[ast.stmt]) -> frozenset[str]:
+    deleted_names: set[str] = set()
+    pending = list(nodes)
+    while pending:
+        statement = pending.pop()
+        if isinstance(statement, ast.Delete):
+            for target in statement.targets:
+                deleted_names.update(_assignment_target_names(target))
+        elif isinstance(statement, ast.For | ast.While) and _module_getattr_loop_body_is_unreachable(statement, "", ""):
+            pending.extend(statement.orelse)
+        else:
+            for body in _definition_scope_child_bodies(statement):
+                pending.extend(body)
+    return frozenset(deleted_names)
 
 
 def _source_has_importable_untrusted_cache(source_path: Path, source: str) -> bool:
