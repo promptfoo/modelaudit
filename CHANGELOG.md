@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Upgrade gzip, PCRE2, SQLite, and Perl in Docker runtime images to pick up Debian security fixes.
 - Upgrade locked GitPython to 3.1.59 to address four dependency audit advisories.
-- Upgrade locked GitPython to 3.1.60 and AnyIO to 4.14.2 to address newly disclosed dependency audit advisories.
+- Upgrade locked GitPython to 3.1.60 to address newly disclosed dependency audit advisories.
 - Inspect hidden ZIP archives and malicious pickle payloads in legacy GGML model variants.
 - Stop reporting a ZIP polyglot for GGUF/GGML files whose tensor data merely contains an end-of-central-directory signature.
 - Upgrade Debian util-linux packages in all Docker runtime images to remediate CVE-2026-53615.

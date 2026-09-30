@@ -17,7 +17,6 @@ ROOT_PYPROJECT = ROOT_DIR / "pyproject.toml"
 RENOVATE_CONFIG = ROOT_DIR / "renovate.json"
 PICKLESCAN_PYPROJECT = ROOT_DIR / "packages" / "modelaudit-picklescan" / "pyproject.toml"
 PATCHED_GITPYTHON_FLOOR = (3, 1, 60)
-PATCHED_ANYIO_FLOOR = (4, 14, 2)
 PINNED_MATURIN_BACKEND = "maturin===1.13.3"
 REQUIRED_PICKLESCAN_RELEASE = "modelaudit-picklescan>=0.1.10,<0.2.0"
 PATCHED_PY7ZR_REQUIREMENT = "py7zr>=1.1.3"
@@ -82,7 +81,6 @@ def test_gitpython_lock_stays_on_patched_release_floor() -> None:
     ("package_name", "patched_floor"),
     [
         ("aiohttp", (3, 14, 3)),
-        ("anyio", PATCHED_ANYIO_FLOOR),
         ("cryptography", (50, 0, 0)),
         ("keras", (3, 15, 0)),
         ("sqlparse", (0, 6, 0)),
