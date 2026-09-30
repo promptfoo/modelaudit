@@ -6443,6 +6443,44 @@ def _module_getattr_returned_class_entrypoints(function_name: str) -> tuple[str,
     return tuple(entrypoints)
 
 
+def _module_getattr_decorators_preserve_returns(
+    getter: ast.FunctionDef, module_name: str, context: _ModuleSourceContext
+) -> bool:
+    for decorator in getter.decorator_list:
+        expression = decorator.func if isinstance(decorator, ast.Call) else decorator
+        name = _resolve_expr(expression, module_name, {}, set())
+        if name is None:
+            return False
+        root, separator, remainder = name.partition(".")
+        bindings = _module_getattr_binding_statements(context.module_body, root, before=getter)
+        targets: set[str] = set()
+        if not bindings and name == "staticmethod":
+            targets.add("builtins.staticmethod")
+        for binding in bindings:
+            imported = _collect_import_aliases((binding,), module_name, context.is_package).get(root)
+            if imported is None:
+                return False
+            targets.add(f"{imported}.{remainder}" if separator else imported)
+        if not targets or not targets <= {"builtins.staticmethod", "functools.cache", "functools.lru_cache"}:
+            return False
+        if isinstance(decorator, ast.Call):
+            if targets != {"functools.lru_cache"} or len(decorator.args) > 1:
+                return False
+            arguments: list[tuple[str | None, ast.expr]] = [("maxsize", argument) for argument in decorator.args]
+            arguments.extend((keyword.arg, keyword.value) for keyword in decorator.keywords)
+            if len({name for name, _value in arguments}) != len(arguments):
+                return False
+            for argument_name, value in arguments:
+                if not isinstance(value, ast.Constant):
+                    return False
+                if argument_name == "maxsize" and (value.value is None or type(value.value) is int):
+                    continue
+                if argument_name == "typed" and type(value.value) is bool:
+                    continue
+                return False
+    return True
+
+
 def _returned_class_entrypoints_for_getter(
     module_name: str,
     export_name: str,
@@ -6450,7 +6488,7 @@ def _returned_class_entrypoints_for_getter(
     context: _ModuleSourceContext,
     analysis: _ModuleAnalysis,
 ) -> tuple[str, ...]:
-    if getter.decorator_list:
+    if not _module_getattr_decorators_preserve_returns(getter, module_name, context):
         return ()
     scope_nodes = list(ast.iter_child_nodes(getter))
     while scope_nodes:
@@ -6488,81 +6526,125 @@ def _returned_class_entrypoints_for_getter(
     globals_is_builtin &= globals_symbol is None or not (
         not globals_symbol.is_global() or globals_symbol.is_assigned() or globals_symbol.is_imported()
     )
+    remaining_values = _MAX_CALLS_PER_FUNCTION
+
+    def export_key(expression: ast.expr) -> str | None:
+        if isinstance(expression, ast.Constant) and isinstance(expression.value, str):
+            return expression.value
+        if isinstance(expression, ast.Name) and expression.id == parameter_name:
+            return export_name
+        if isinstance(expression, ast.JoinedStr):
+            parts: list[str] = []
+            key_length = 0
+            for part in expression.values:
+                if isinstance(part, ast.Constant) and isinstance(part.value, str):
+                    parts.append(part.value)
+                elif (
+                    isinstance(part, ast.FormattedValue)
+                    and isinstance(part.value, ast.Name)
+                    and part.value.id == parameter_name
+                    and part.conversion == -1
+                    and part.format_spec is None
+                ):
+                    parts.append(export_name)
+                else:
+                    return None
+                key_length += len(parts[-1])
+                if key_length > _MAX_SOURCE_MODULE_NAME_CHARS:
+                    raise _CallGraphAnalysisLimitError("module __getattr__ export name exceeds analysis limit")
+            return "".join(parts)
+        return None
+
+    def values(
+        expression: ast.expr,
+        before: ast.stmt | None,
+        in_function: bool,
+        *,
+        force_global: bool = False,
+    ) -> Iterator[tuple[str | ast.Dict, ast.stmt | None, bool]]:
+        nonlocal remaining_values
+        remaining_values -= 1
+        if remaining_values < 0:
+            raise _CallGraphAnalysisLimitError("module __getattr__ returned-value resolution exceeds analysis limit")
+        if isinstance(expression, ast.Dict):
+            if len(expression.keys) > _MAX_CALLS_PER_FUNCTION:
+                raise _CallGraphAnalysisLimitError("module __getattr__ mapping exceeds analysis limit")
+            yield expression, before, in_function
+            return
+        if isinstance(expression, ast.Subscript):
+            key = export_key(expression.slice)
+            if (
+                globals_is_builtin
+                and isinstance(expression.value, ast.Call)
+                and isinstance(expression.value.func, ast.Name)
+                and expression.value.func.id == "globals"
+                and not expression.value.args
+                and not expression.value.keywords
+            ):
+                if key is not None:
+                    yield from values(ast.Name(id=key), before, in_function, force_global=True)
+                return
+            for mapping, mapping_before, mapping_in_function in values(expression.value, before, in_function):
+                if not isinstance(mapping, ast.Dict):
+                    continue
+                for entry_key, entry_value in reversed(tuple(zip(mapping.keys, mapping.values, strict=True))):
+                    if entry_key is None:
+                        raise _CallGraphAnalysisLimitError("module __getattr__ mapping has unresolved unpacking")
+                    if key is None or not isinstance(entry_key, ast.Constant) or entry_key.value == key:
+                        yield from values(entry_value, mapping_before, mapping_in_function)
+                        if key is not None and isinstance(entry_key, ast.Constant):
+                            break
+            return
+        target_name = _resolve_expr(expression, module_name, {}, set())
+        if target_name is None:
+            return
+        if len(target_name) > _MAX_SOURCE_MODULE_NAME_CHARS:
+            raise _CallGraphAnalysisLimitError("module __getattr__ export name exceeds analysis limit")
+        root_name, separator, remainder = target_name.partition(".")
+        symbol = symbols.get(root_name) if in_function else None
+        function_binding = symbol is not None and (
+            symbol.is_assigned() or symbol.is_imported() or not symbol.is_global()
+        )
+        if force_global and symbol is not None and not symbol.is_global():
+            function_binding = False
+        bindings = _module_getattr_binding_statements(
+            getter.body if function_binding else context.module_body,
+            root_name,
+            parameter_name=condition_parameter if function_binding else "",
+            export_name=condition_value,
+            before=before if function_binding or not in_function else None,
+        )
+        for binding in bindings:
+            imported = _collect_import_aliases((binding,), module_name, context.is_package).get(root_name)
+            if imported is not None:
+                yield (f"{imported}.{remainder}" if separator else imported), before, in_function
+            elif isinstance(binding, ast.ClassDef) and not function_binding:
+                yield f"{module_name}.{target_name}", before, in_function
+            elif isinstance(binding, ast.Assign | ast.AnnAssign) and binding.value is not None:
+                if root_name not in _assignment_alias_target_names(binding):
+                    continue
+                for value, value_before, value_in_function in values(binding.value, binding, function_binding):
+                    if separator:
+                        if isinstance(value, str):
+                            yield f"{value}.{remainder}", value_before, value_in_function
+                    else:
+                        yield value, value_before, value_in_function
+        if not bindings and not function_binding and root_name not in analysis.direct_names:
+            yield f"{module_name}.{target_name}", before, in_function
+
     entrypoints: dict[str, None] = {}
     returns = _module_getattr_return_statements(getter, condition_parameter, condition_value)
     if len(returns) > _MAX_CALLS_PER_FUNCTION:
         raise _CallGraphAnalysisLimitError("module __getattr__ return statements exceed analysis limit")
     for statement in returns:
-        expression = statement.value
-        target_name = _resolve_expr(expression, module_name, {}, set()) if expression is not None else None
-        global_lookup = False
-        if target_name is not None:
-            symbol = symbols.get(target_name.partition(".")[0])
-            if symbol is not None and not symbol.is_imported() and (not symbol.is_global() or symbol.is_assigned()):
+        if statement.value is None:
+            continue
+        for target, _before, _in_function in values(statement.value, statement, True):
+            if not isinstance(target, str):
                 continue
-        if (
-            globals_is_builtin
-            and isinstance(expression, ast.Subscript)
-            and isinstance(expression.value, ast.Call)
-            and isinstance(expression.value.func, ast.Name)
-            and expression.value.func.id == "globals"
-            and not expression.value.args
-            and not expression.value.keywords
-        ):
-            global_lookup = True
-            key = expression.slice
-            if isinstance(key, ast.Constant) and isinstance(key.value, str):
-                target_name = key.value
-            elif isinstance(key, ast.JoinedStr):
-                parts: list[str] = []
-                key_length = 0
-                for part in key.values:
-                    if isinstance(part, ast.Constant) and isinstance(part.value, str):
-                        text = part.value
-                    elif (
-                        isinstance(part, ast.FormattedValue)
-                        and isinstance(part.value, ast.Name)
-                        and part.value.id == parameter_name
-                        and part.conversion == -1
-                        and part.format_spec is None
-                    ):
-                        text = export_name
-                    else:
-                        break
-                    key_length += len(text)
-                    if key_length > _MAX_SOURCE_MODULE_NAME_CHARS:
-                        raise _CallGraphAnalysisLimitError("module __getattr__ export name exceeds analysis limit")
-                    parts.append(text)
-                else:
-                    target_name = "".join(parts)
-        if target_name is not None:
-            if len(target_name) > _MAX_SOURCE_MODULE_NAME_CHARS:
-                raise _CallGraphAnalysisLimitError("module __getattr__ export name exceeds analysis limit")
-            root_name, separator, remaining = target_name.partition(".")
-            symbol = symbols.get(root_name)
-            if global_lookup and symbol is not None and symbol.is_global() and symbol.is_assigned():
-                continue
-            local_import = not global_lookup and symbol is not None and symbol.is_imported()
-            bindings = _module_getattr_binding_statements(
-                getter.body if local_import else context.module_body,
-                root_name,
-                parameter_name=condition_parameter if local_import else "",
-                export_name=condition_value,
-                before=statement if local_import else None,
-            )
-            targets: set[str] = set()
-            for binding in bindings:
-                imported = _collect_import_aliases((binding,), module_name, context.is_package).get(root_name)
-                if imported is not None:
-                    targets.add(f"{imported}.{remaining}" if separator else imported)
-                elif not local_import:
-                    targets.add(f"{module_name}.{target_name}")
-            if not bindings and not local_import and root_name not in analysis.direct_names:
-                targets.add(f"{module_name}.{target_name}")
-            for target in sorted(targets):
-                class_target = _resolve_class_target(target)
-                if class_target is not None:
-                    entrypoints.update(dict.fromkeys(_class_entrypoints(class_target)))
+            class_target = _resolve_class_target(target)
+            if class_target is not None:
+                entrypoints.update(dict.fromkeys(_class_entrypoints(class_target)))
             if len(entrypoints) > _MAX_CALLS_PER_FUNCTION:
                 raise _CallGraphAnalysisLimitError(
                     "module __getattr__ returned-class entrypoints exceed analysis limit"
