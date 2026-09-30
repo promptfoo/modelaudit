@@ -150,6 +150,13 @@ _PICKLE_BINARY_BYTE_LITERAL_OPCODES = frozenset({"BINBYTES", "SHORT_BINBYTES", "
 _PICKLE_BINARY_BYTE_LITERAL_START_BYTES = b"BC\x8e\x96"
 _PICKLE_PROTO0_TEXT_LITERAL_START_BYTES = b"SV"
 _PICKLE_LENGTH_DELIMITED_LITERAL_START_BYTES = b"BCTXU\x8a\x8b\x8c\x8d\x8e\x96"
+_PICKLE_FIXED_WIDTH_LITERAL_SIZES = {ord("J"): 4, ord("K"): 1, ord("M"): 2, ord("G"): 8}
+_PICKLE_LITERAL_OPERAND_START_BYTES = (
+    _PICKLE_LENGTH_DELIMITED_LITERAL_START_BYTES
+    + _PICKLE_PROTO0_TEXT_LITERAL_START_BYTES
+    + bytes(_PICKLE_FIXED_WIDTH_LITERAL_SIZES)
+)
+_PICKLE_LITERAL_OPERAND_START_RE = re.compile(b"[" + re.escape(_PICKLE_LITERAL_OPERAND_START_BYTES) + b"]")
 _PICKLE_LITERAL_OPCODES = _PROTO0_1_LITERAL_OPCODES | _PICKLE_BINARY_BYTE_LITERAL_OPCODES
 _BASE64_NESTED_LITERAL_TOKEN_RE = re.compile(
     rb"[A-Za-z0-9+/_-][A-Za-z0-9+/_=\-\s\r\n\t!\"#$%&'()*.,:;<>?@\[\]\\^`{|}~]{7,}"
@@ -4498,11 +4505,12 @@ class PyTorchZipScanner(BaseScanner):
         search_start = literal_start
         search_budget_end = min(literal_end, literal_start + _PICKLE_DISCOVERY_PADDING_PROBE_BUDGET_BYTES)
         non_persid_security_starts = bytes(set(_RAW_NESTED_SECURITY_PICKLE_START_BYTES) - {ord("P"), ord("Q")})
+        persid_markers = b"PQ"
         while search_start < search_budget_end:
             offset = min(
                 (
                     found
-                    for marker in b"PQ"
+                    for marker in persid_markers
                     if (found := value.find(bytes([marker]), search_start, search_budget_end)) >= 0
                 ),
                 default=-1,
@@ -4512,6 +4520,8 @@ class PyTorchZipScanner(BaseScanner):
             if value[offset] == ord("P"):
                 newline = value.find(b"\n", offset + 1, literal_end)
                 if newline < 0:
+                    # No later P can terminate, but Q can still begin an overlapping stream.
+                    persid_markers = b"Q"
                     search_start = offset + 1
                     continue
                 if (newline + 1 < literal_end and value[newline + 1] == ord(".")) or (
@@ -4543,7 +4553,10 @@ class PyTorchZipScanner(BaseScanner):
     @staticmethod
     def _raw_nested_literal_span_is_mask_only(value: bytes, span: tuple[int, int, int]) -> bool:
         literal_opcode_start, _literal_start, _literal_end = span
-        return value[literal_opcode_start] in {0x8A, 0x8B}
+        return (
+            value[literal_opcode_start] in {0x8A, 0x8B}
+            or value[literal_opcode_start] in _PICKLE_FIXED_WIDTH_LITERAL_SIZES
+        )
 
     @staticmethod
     def _raw_nested_window_has_literal_security_stream(
@@ -4556,12 +4569,7 @@ class PyTorchZipScanner(BaseScanner):
     ) -> bool:
         offset = window_start
         literal_marker_bytes = bytes(
-            set(
-                b"PQ"
-                + _PICKLE_LENGTH_DELIMITED_LITERAL_START_BYTES
-                + _PICKLE_PROTO0_TEXT_LITERAL_START_BYTES
-                + _RAW_NESTED_SECURITY_PICKLE_START_BYTES
-            )
+            set(b"PQ" + _PICKLE_LITERAL_OPERAND_START_BYTES + _RAW_NESTED_SECURITY_PICKLE_START_BYTES)
         )
         span_recovery_budget = _MAX_RAW_NESTED_PICKLE_CANDIDATES
         recursive_literal_scanned_until = max(
@@ -4571,16 +4579,10 @@ class PyTorchZipScanner(BaseScanner):
         persistent_id_parse_budget_remaining = [_MAX_RAW_NESTED_PICKLE_CANDIDATES]
         proto0_text_no_newline_until = window_start
         while offset < window_end:
-            marker_offset = min(
-                (
-                    found
-                    for marker in literal_marker_bytes
-                    if (found := value.find(bytes([marker]), offset, window_end)) >= 0
-                ),
-                default=-1,
-            )
-            if marker_offset < 0:
-                return False
+            marker_offset = offset
+            if value[marker_offset] not in literal_marker_bytes:
+                offset += 1
+                continue
             if (
                 marker_offset < proto0_text_no_newline_until
                 and value[marker_offset] in _PICKLE_PROTO0_TEXT_LITERAL_START_BYTES
@@ -4663,16 +4665,10 @@ class PyTorchZipScanner(BaseScanner):
         cursor = search_start
         proto0_text_no_newline_until = search_start
         while cursor < search_end:
-            literal_opcode_start = min(
-                (
-                    found
-                    for marker in _PICKLE_LENGTH_DELIMITED_LITERAL_START_BYTES + _PICKLE_PROTO0_TEXT_LITERAL_START_BYTES
-                    if (found := value.find(bytes([marker]), cursor, search_end)) >= 0
-                ),
-                default=-1,
-            )
-            if literal_opcode_start < 0:
+            match = _PICKLE_LITERAL_OPERAND_START_RE.search(value, cursor, search_end)
+            if match is None:
                 return None
+            literal_opcode_start = match.start()
             if (
                 literal_opcode_start < proto0_text_no_newline_until
                 and value[literal_opcode_start] in _PICKLE_PROTO0_TEXT_LITERAL_START_BYTES
@@ -4716,7 +4712,10 @@ class PyTorchZipScanner(BaseScanner):
         literal_opcode_start: int,
     ) -> tuple[int, int, int] | None:
         marker = value[literal_opcode_start]
-        if marker in {ord("B"), ord("T"), ord("X"), 0x8B}:
+        if marker in _PICKLE_FIXED_WIDTH_LITERAL_SIZES:
+            header_bytes = 1
+            literal_size = _PICKLE_FIXED_WIDTH_LITERAL_SIZES[marker]
+        elif marker in {ord("B"), ord("T"), ord("X"), 0x8B}:
             header_bytes = 5
             if literal_opcode_start + header_bytes > len(value):
                 return None
@@ -4803,13 +4802,7 @@ class PyTorchZipScanner(BaseScanner):
         window = bytearray(value[window_start:window_end])
         offset = window_start
         span_recovery_budget = _MAX_RAW_NESTED_PICKLE_CANDIDATES
-        mask_marker_bytes = bytes(
-            set(
-                _RAW_NESTED_SECURITY_PICKLE_START_BYTES
-                + _PICKLE_LENGTH_DELIMITED_LITERAL_START_BYTES
-                + _PICKLE_PROTO0_TEXT_LITERAL_START_BYTES
-            )
-        )
+        mask_marker_bytes = bytes(set(_RAW_NESTED_SECURITY_PICKLE_START_BYTES + _PICKLE_LITERAL_OPERAND_START_BYTES))
         proto0_text_no_newline_until = window_start
         while offset < window_end:
             if value[offset] not in mask_marker_bytes:

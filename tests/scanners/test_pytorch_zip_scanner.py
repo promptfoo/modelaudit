@@ -8640,6 +8640,55 @@ def test_pytorch_zip_raw_nested_literal_ignores_security_pickle_inside_long_oper
     assert PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(positive_after_long) is True
 
 
+@pytest.mark.parametrize("numeric", [b"JP\x00\x00\x00", b"KP", b"MP\x00", b"GP\x00\x00\x00\x00\x00\x00\x00"])
+@pytest.mark.parametrize("later_window", [False, True])
+@pytest.mark.parametrize("hidden_pickle", [False, True])
+def test_pytorch_zip_storage_numeric_operands_preserve_following_security_stream(
+    tmp_path: Path, numeric: bytes, later_window: bool, hidden_pickle: bool
+) -> None:
+    decoys = b"c!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)
+    padding = b"!" * (pytorch_zip_scanner_module._PICKLE_DISCOVERY_LONG_PROBE_BYTES if later_window else 0)
+    suffix = b"0cos\nsystem\n)R." if hidden_pickle else b"."
+    storage = b"X\xff\xff\xff\x7f" + decoys + padding + numeric + suffix + b"!" * 9000
+
+    result = _scan_referenced_float_storage_blob(tmp_path, "numeric-operand.pt", storage)
+
+    if hidden_pickle:
+        assert result.success is False
+        assert "pytorch_zip_pickle_discovery_incomplete" in result.metadata["scan_outcome_reasons"]
+    else:
+        assert result.success is True
+        assert result.metadata.get("pickle_verdict") == "clean"
+        assert result.metadata["pickle_files"] == ["archive/data.pkl"]
+
+
+@pytest.mark.parametrize("marker", [b"P", b"c"])
+def test_pytorch_zip_literal_marker_search_work_is_linear(marker: bytes) -> None:
+    class CountingBytes(bytes):
+        search_bytes = 0
+
+        def find(self, sub: Any, start: Any = 0, end: Any = None) -> int:
+            stop = len(self) if end is None else end
+            type(self).search_bytes += max(0, stop - start)
+            return super().find(sub, start, stop)
+
+    payload = marker * pytorch_zip_scanner_module._PICKLE_DISCOVERY_LONG_PROBE_BYTES
+    if marker == b"P":
+        value = CountingBytes(_pickle_binbytes(payload))
+        span = PyTorchZipScanner._raw_nested_pickle_literal_span_starting_at(value, 0)
+        assert span is not None
+        assert PyTorchZipScanner._raw_nested_literal_span_has_overlapping_persid_stream(value, span) is False
+        positive_payload = payload + b"Q\x82\x01."
+        positive_literal = _pickle_binbytes(positive_payload)
+        positive_span = PyTorchZipScanner._raw_nested_pickle_literal_span_starting_at(positive_literal, 0)
+        assert positive_span is not None
+        assert PyTorchZipScanner._raw_nested_literal_span_has_overlapping_persid_stream(positive_literal, positive_span)
+    else:
+        value = CountingBytes(payload)
+        assert PyTorchZipScanner._raw_nested_window_has_literal_security_stream(value, 0, len(value)) is False
+    assert CountingBytes.search_bytes <= len(value) * 64
+
+
 def test_pytorch_zip_raw_nested_literal_bounds_dense_persid_candidates(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -8999,7 +9048,7 @@ def test_pytorch_zip_raw_nested_proto0_string_boundary_newline_literal_span() ->
     prefix = b"!" * 128
     suffix = b"!" * (pytorch_zip_scanner_module._PICKLE_DISCOVERY_LONG_PROBE_BYTES - len(prefix) - len(persid_noise))
     literal_body = prefix + persid_noise + suffix
-    benign_string = b"S'" + literal_body + b"\n."
+    benign_string = b"S'" + literal_body[:-1] + b"'\n."
     benign_unicode = b"V" + literal_body + b"\n."
     positive_persid = b"S'benign'\nPstorage-key\n."
 
