@@ -8687,16 +8687,30 @@ def test_pytorch_zip_raw_nested_literal_ignores_persid_marker_inside_long_operan
     assert PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(positive_persid) is True
 
 
-def test_pytorch_zip_raw_nested_literal_ignores_security_pickle_inside_long_operand() -> None:
+@pytest.mark.parametrize("after_budget", [False, True])
+def test_pytorch_zip_raw_nested_literal_ignores_security_pickle_inside_long_operand(after_budget: bool) -> None:
     long_payload = b"cos\nsystem\n)R."
     long_operand = b"\x8b" + len(long_payload).to_bytes(4, "little") + long_payload + b"."
     positive_after_long = b"\x8b\x01\x00\x00\x00x" + long_payload
+    prefix = b"c!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1) if after_budget else b""
 
-    assert PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(long_operand) is False
-    assert PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(positive_after_long) is True
+    assert PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(prefix + long_operand) is False
+    assert PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(prefix + positive_after_long) is True
 
 
-@pytest.mark.parametrize("numeric", [b"JP\x00\x00\x00", b"KP", b"MP\x00", b"GP\x00\x00\x00\x00\x00\x00\x00"])
+@pytest.mark.parametrize(
+    "numeric",
+    [
+        b"JP\x00\x00\x00",
+        b"KP",
+        b"MP\x00",
+        b"GP\x00\x00\x00\x00\x00\x00\x00",
+        b"NqP",
+        b"NrP\x00\x00\x00",
+        b"NqP0hP",
+        b"NrP\x00\x00\x000jP\x00\x00\x00",
+    ],
+)
 @pytest.mark.parametrize("later_window", [False, True])
 @pytest.mark.parametrize("hidden_pickle", [False, True])
 def test_pytorch_zip_storage_numeric_operands_preserve_following_security_stream(
@@ -8716,6 +8730,75 @@ def test_pytorch_zip_storage_numeric_operands_preserve_following_security_stream
         assert result.success is True
         assert result.metadata.get("pickle_verdict") == "clean"
         assert result.metadata["pickle_files"] == ["archive/data.pkl"]
+
+
+@pytest.mark.parametrize("hidden_pickle", [False, True])
+@pytest.mark.parametrize("outer_windows", [1, 6])
+def test_pytorch_zip_storage_fake_long_header_cannot_mask_later_window(
+    tmp_path: Path, hidden_pickle: bool, outer_windows: int
+) -> None:
+    decoys = b"c!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)
+    probe_bytes = pytorch_zip_scanner_module._PICKLE_DISCOVERY_LONG_PROBE_BYTES
+    outer_size = probe_bytes * outer_windows + 16
+    outer_start = len(decoys)
+    outer_end = outer_start + 5 + outer_size
+    fake_start = outer_end - 8192
+    fake_size = 2 * probe_bytes
+    fake_end = fake_start + 5 + fake_size
+    value = bytearray(b"!" * (fake_end + 9001))
+    value[:outer_start] = decoys
+    value[outer_start : outer_start + 5] = b"\x8b" + outer_size.to_bytes(4, "little")
+    value[outer_end] = ord(".")
+    value[fake_start : fake_start + 5] = b"\x8b" + fake_size.to_bytes(4, "little")
+    value[fake_end] = ord(".")
+    live_start = outer_end + probe_bytes + 32
+    payload = b"cbuiltins\n__import__\n." if hidden_pickle else b"!builtins\n__import__\n."
+    value[live_start : live_start + len(payload)] = payload
+
+    assert PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(bytes(value)) is hidden_pickle
+    result = _scan_referenced_float_storage_blob(tmp_path, "overlapping-long.pt", b"X\xff\xff\xff\x7f" + value)
+
+    if hidden_pickle:
+        assert result.success is False
+        assert "pytorch_zip_pickle_discovery_incomplete" in result.metadata["scan_outcome_reasons"]
+    else:
+        assert result.success is True
+        assert result.metadata.get("pickle_verdict") == "clean"
+        assert result.metadata["pickle_files"] == ["archive/data.pkl"]
+
+
+@pytest.mark.parametrize("marker", [b"h", b"j", b"g"])
+def test_pytorch_zip_memo_get_noise_without_definitions_skips_span_recovery(
+    monkeypatch: pytest.MonkeyPatch, marker: bytes
+) -> None:
+    calls = 0
+    original = PyTorchZipScanner._raw_nested_enclosing_pickle_literal_span
+
+    def counted_span(value: bytes, offset: int) -> tuple[int, int, int] | None:
+        nonlocal calls
+        calls += 1
+        return original(value, offset)
+
+    monkeypatch.setattr(PyTorchZipScanner, "_raw_nested_enclosing_pickle_literal_span", staticmethod(counted_span))
+    value = b"!" + marker * 4096
+
+    assert PyTorchZipScanner._raw_nested_suffix_uses_prior_memo_security_context(value, 1, [64]) is False
+    assert calls <= pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES
+
+
+@pytest.mark.parametrize(
+    ("module_name", "symbol_name"),
+    [("builtins", "__import__"), ("subprocess", "check_output"), ("shutil", "rmtree"), ("qhjr", "qhrj")],
+)
+@pytest.mark.parametrize("later_window", [False, True])
+def test_pytorch_zip_memo_operand_masking_preserves_global_names(
+    module_name: str, symbol_name: str, later_window: bool
+) -> None:
+    decoys = b"c!" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)
+    padding = b"!" * (pytorch_zip_scanner_module._PICKLE_DISCOVERY_LONG_PROBE_BYTES if later_window else 0)
+    payload = f"c{module_name}\n{symbol_name}\n.".encode()
+
+    assert PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(decoys + padding + payload) is True
 
 
 @pytest.mark.parametrize("marker", [b"P", b"c"])
@@ -9220,6 +9303,34 @@ def test_pytorch_zip_literal_payload_masking_bounds_span_recovery(
     PyTorchZipScanner._raw_nested_window_with_literal_payloads_masked(c_rich, 0, len(c_rich))
 
     assert calls <= pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES
+
+
+@pytest.mark.parametrize("mode", ["literal", "mask", "prefix"])
+def test_pytorch_zip_literal_helpers_bound_repeated_proto0_name_searches(
+    monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    calls = 0
+    original = PyTorchZipScanner._raw_nested_proto0_inst_name_end
+
+    def counted_name_end(value: bytes, offset: int, limit: int) -> tuple[int | None, int]:
+        nonlocal calls
+        calls += 1
+        return original(value, offset, limit)
+
+    monkeypatch.setattr(PyTorchZipScanner, "_raw_nested_proto0_inst_name_end", staticmethod(counted_name_end))
+    noise = b"ci" * 2048
+
+    if mode == "literal":
+        assert PyTorchZipScanner._raw_nested_window_has_literal_security_stream(noise, 0, len(noise)) is False
+    elif mode == "mask":
+        assert PyTorchZipScanner._raw_nested_window_with_literal_payloads_masked(noise, 0, len(noise)) == noise
+    else:
+        assert PyTorchZipScanner._raw_nested_enclosing_pickle_literal_span(noise, len(noise) - 1) is None
+    assert calls <= pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 2
+
+    payload = b"cos\nsystem\n)R."
+    literal = b"T" + len(payload).to_bytes(4, "little") + payload + b"."
+    assert PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(noise + literal) is True
 
 
 def test_pytorch_zip_literal_payload_masking_keeps_direct_spans_after_recovery_budget() -> None:
