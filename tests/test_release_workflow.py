@@ -188,9 +188,28 @@ def test_standalone_type_check_uses_supported_mypy(workflow_name: str, job_name:
     standalone_requirement = next(requirement for requirement in requirements if requirement.name == "mypy")
 
     assert standalone_requirement.specifier == root_requirement.specifier
-    assert standalone_requirement.specifier.contains("2.3.1")
-    assert not standalone_requirement.specifier.contains("2.4.0")
+    assert not standalone_requirement.specifier.contains("2.3.1")
+    assert standalone_requirement.specifier.contains("2.4.0")
+    assert not standalone_requirement.specifier.contains("2.5.0")
     assert any(requirement.name == "pytest" for requirement in requirements)
+
+    for guide in (
+        root_dir / "packages/modelaudit-picklescan/AGENTS.md",
+        root_dir / "docs/agents/picklescan-package-split.md",
+    ):
+        guide_commands = [
+            shlex.split(line)
+            for line in guide.read_text(encoding="utf-8").splitlines()
+            if line.startswith("uv run --with ") and " mypy src tests" in line
+        ]
+        assert guide_commands, f"{guide.name} must document standalone Mypy validation"
+        for guide_command in guide_commands:
+            guide_requirements = [
+                Requirement(guide_command[index + 1]) for index, arg in enumerate(guide_command) if arg == "--with"
+            ]
+            guide_mypy = next(requirement for requirement in guide_requirements if requirement.name == "mypy")
+            assert guide_mypy.specifier == root_requirement.specifier
+            assert any(requirement.name == "pytest" for requirement in guide_requirements)
 
 
 def test_release_workflow_manual_dispatch_inputs_and_guardrails() -> None:

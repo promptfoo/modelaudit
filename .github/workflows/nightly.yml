@@ -19,7 +19,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
         python-version: ["3.10", "3.11", "3.12", "3.13"]
-        shard: [0, 1]
+        shard: [0, 1, 2]
         exclude:
           - { os: windows-latest, python-version: "3.10" }
           - { os: windows-latest, python-version: "3.12" }
@@ -48,7 +48,7 @@ jobs:
 
       - name: Run correctness shard (fast + slow + integration)
         run: |
-          uv run pytest -n auto -m "not performance" --modelaudit-shard-count 2 --modelaudit-shard-index ${{ matrix.shard }} --tb=short --durations=20
+          uv run pytest -n auto -m "not performance" --modelaudit-shard-count 3 --modelaudit-shard-index ${{ matrix.shard }} --tb=short --durations=20
 
   performance:
     name: Performance Tests (Python 3.11, single process)
