@@ -95,25 +95,11 @@ class TestCacheCLI:
 
     def test_cache_clear_with_custom_dir(self, tmp_path):
         """Test cache clear with custom cache directory."""
-        cache_dir = tmp_path / "custom_cache"
-        cache_dir.mkdir()
-
-        runner = CliRunner()
-        result = runner.invoke(cli, ["cache", "clear", "--cache-dir", str(cache_dir)])
-
-        assert result.exit_code == 0
-        assert "Cleared" in result.output
+        _assert_custom_cache_cli(tmp_path, "clear", "Cleared")
 
     def test_cache_stats_with_custom_dir(self, tmp_path):
         """Test cache stats with custom cache directory."""
-        cache_dir = tmp_path / "custom_cache"
-        cache_dir.mkdir()
-
-        runner = CliRunner()
-        result = runner.invoke(cli, ["cache", "stats", "--cache-dir", str(cache_dir)])
-
-        assert result.exit_code == 0
-        assert "Cache Statistics" in result.output
+        _assert_custom_cache_cli(tmp_path, "stats", "Cache Statistics")
 
     def test_cache_error_handling(self):
         """Test cache commands handle errors gracefully."""
@@ -177,3 +163,14 @@ def test_scan_command_has_cache_options():
     assert "--no-cache" in result.output
     assert "--cache-dir" in result.output
     assert "defaults" in result.output.lower()
+
+
+def _assert_custom_cache_cli(tmp_path: Path, case_command: str, case_output: str) -> None:
+    cache_dir = tmp_path / "custom_cache"
+    cache_dir.mkdir()
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["cache", case_command, "--cache-dir", str(cache_dir)])
+
+    assert result.exit_code == 0
+    assert case_output in result.output

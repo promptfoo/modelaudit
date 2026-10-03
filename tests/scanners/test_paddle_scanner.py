@@ -10,11 +10,7 @@ from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.paddle_scanner import PaddleScanner
 from modelaudit.utils.file.detection import validate_file_type
-
-
-def _write_chunk_boundary_payload(path: Path, pattern: bytes, *, prefix_len: int, suffix: bytes = b"") -> None:
-    chunk_size = 1024 * 1024
-    path.write_bytes(b"\x00" * (chunk_size - prefix_len) + pattern[:prefix_len] + pattern[prefix_len:] + suffix)
+from tests.helpers.file_creators import write_chunk_boundary_payload as _write_chunk_boundary_payload
 
 
 def test_paddle_scanner_can_handle(tmp_path: Path) -> None:

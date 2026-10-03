@@ -175,12 +175,13 @@ jobs:
     if: needs.release-please.outputs.pr_branch != ''
     runs-on: ubuntu-latest
     needs: release-please
-    permissions:
+    permissions: &read-contents-permissions
       contents: read
     outputs:
       source_sha: ${{ steps.source.outputs.sha }}
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - &checkout-release-metadata
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.release-please.outputs.pr_branch }}
           fetch-depth: 1
@@ -194,7 +195,7 @@ jobs:
         uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
 
       - name: Install Rust toolchain for standalone lock refresh
-        run: |
+        run: &install-rust-toolchain |
           rustup toolchain install stable --profile minimal
           rustup default stable
 
@@ -240,11 +241,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          ref: ${{ needs.release-please.outputs.pr_branch }}
-          fetch-depth: 1
-          persist-credentials: false
+      - *checkout-release-metadata
 
       - name: Download release metadata
         id: download-metadata
@@ -306,22 +303,20 @@ jobs:
     if: needs.release-please.outputs.release_created == 'true'
     runs-on: ubuntu-latest
     needs: release-please
-    permissions:
-      contents: read
+    permissions: *read-contents-permissions
     outputs:
       artifact-name: ${{ steps.upload.outputs.artifact-id }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
-      - name: Install uv
+      - &install-uv
+        name: Install uv
         uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
         with:
           enable-cache: true
 
       - name: Install Rust toolchain
-        run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
+        run: *install-rust-toolchain
 
       - name: Type check root package with mypy
         run: |
@@ -593,7 +588,7 @@ jobs:
       - name: Upload build artifacts
         id: upload
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
+        with: &root-dist-artifact
           name: dist
           path: dist/
 
@@ -602,8 +597,7 @@ jobs:
     name: Build standalone pickle package (${{ matrix.artifact-suffix }})
     runs-on: ${{ matrix.os }}
     needs: release-please
-    permissions:
-      contents: read
+    permissions: *read-contents-permissions
     strategy:
       fail-fast: false
       matrix:
@@ -630,10 +624,7 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
-        with:
-          enable-cache: true
+      - *install-uv
 
       - name: Pin Python version
         run: |
@@ -679,7 +670,7 @@ jobs:
         run: uv run --with 'ruff==0.16.9' ruff format --check src tests
 
       - name: Type check standalone package with mypy
-        run: uv run --with 'mypy>=2.3.1,<2.4.0' --with pytest mypy src tests
+        run: uv run --with 'mypy>=2.4.0,<2.5.0' --with pytest mypy src tests
 
       - name: Run standalone package tests
         run: uv run --with pytest --with pytest-xdist pytest -n auto tests --tb=short
@@ -825,15 +816,14 @@ jobs:
     environment:
       name: pypi
       url: https://pypi.org/project/modelaudit/
-    permissions:
+    permissions: &pypi-publish-permissions
       contents: read
       id-token: write
     steps:
-      - name: Download build artifacts
+      - &shared-download-build-artifacts
+        name: Download build artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          name: dist
-          path: dist/
+        with: *root-dist-artifact
 
       - name: Verify the root picklescan dependency is available on PyPI
         run: |
@@ -935,7 +925,8 @@ jobs:
               raise SystemExit(f"Refusing to publish modelaudit with an unavailable picklescan dependency: {last_status}")
           PY
 
-      - name: Publish to PyPI
+      - &shared-publish-to-pypi
+        name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1
         with:
           print-hash: true
@@ -948,34 +939,30 @@ jobs:
     environment:
       name: pypi
       url: https://pypi.org/project/modelaudit-picklescan/
-    permissions:
-      contents: read
-      id-token: write
+    permissions: *pypi-publish-permissions
     steps:
-      - name: Download standalone pickle package artifacts
+      - &shared-download-standalone-pickle-package-artifacts
+        name: Download standalone pickle package artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           pattern: modelaudit-picklescan-dist-*
           path: dist/
           merge-multiple: true
 
-      - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1
-        with:
-          print-hash: true
-          attestations: true
+      - *shared-publish-to-pypi
 
   verify-picklescan-pypi:
     if: needs.release-please.outputs.picklescan_release_created == 'true'
     needs: [publish-picklescan-pypi, release-please]
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
+    permissions: *read-contents-permissions
     env:
       EXPECTED_VERSION: ${{ needs.release-please.outputs.picklescan_version }}
     steps:
       - name: Wait for modelaudit-picklescan files on PyPI
-        run: |
+        env:
+          PYPI_PROJECT: modelaudit-picklescan
+        run: &wait-for-pypi-files |
           python - <<'PY'
           import gzip
           import json
@@ -985,16 +972,27 @@ jobs:
           import zlib
 
           version = os.environ["EXPECTED_VERSION"]
+          project = os.environ["PYPI_PROJECT"]
           expected_files = {
-              f"modelaudit_picklescan-{version}-cp310-abi3-macosx_10_12_x86_64.whl",
-              f"modelaudit_picklescan-{version}-cp310-abi3-macosx_11_0_arm64.whl",
-              f"modelaudit_picklescan-{version}-cp310-abi3-manylinux_2_28_aarch64.whl",
-              f"modelaudit_picklescan-{version}-cp310-abi3-manylinux_2_28_x86_64.whl",
-              f"modelaudit_picklescan-{version}-cp310-abi3-win_amd64.whl",
-              f"modelaudit_picklescan-{version}.tar.gz",
+              'modelaudit-picklescan': {
+                  f"modelaudit_picklescan-{version}-cp310-abi3-macosx_10_12_x86_64.whl",
+                  f"modelaudit_picklescan-{version}-cp310-abi3-macosx_11_0_arm64.whl",
+                  f"modelaudit_picklescan-{version}-cp310-abi3-manylinux_2_28_aarch64.whl",
+                  f"modelaudit_picklescan-{version}-cp310-abi3-manylinux_2_28_x86_64.whl",
+                  f"modelaudit_picklescan-{version}-cp310-abi3-win_amd64.whl",
+                  f"modelaudit_picklescan-{version}.tar.gz",
+              },
+              'modelaudit': {
+                  f"modelaudit-{version}-py3-none-any.whl",
+                  f"modelaudit-{version}.tar.gz",
+              },
+          }[project]
+          url_templates = {
+              "modelaudit-picklescan": ("https://pypi.org/pypi/modelaudit-picklescan/{version}/json", "https://pypi.org/simple/modelaudit-picklescan/"),
+              "modelaudit": ("https://pypi.org/pypi/modelaudit/{version}/json", "https://pypi.org/simple/modelaudit/"),
           }
-          url = f"https://pypi.org/pypi/modelaudit-picklescan/{version}/json"
-          simple_url = "https://pypi.org/simple/modelaudit-picklescan/"
+          url, simple_url = url_templates[project]
+          url = url.format(version=version)
           deadline = time.monotonic() + 600
           last_status = "not checked"
 
@@ -1028,14 +1026,14 @@ jobs:
                   missing_simple = sorted(expected_files - simple_filenames)
                   info_version = payload.get("info", {}).get("version")
                   if info_version == version and not missing and not missing_simple:
-                      print(f"PyPI has modelaudit-picklescan {version}: {sorted(filenames)}")
+                      print(f"PyPI has {project} {version}: {sorted(filenames)}")
                       break
                   last_status = f"version={info_version!r}, missing={missing}, missing_simple={missing_simple}"
               except Exception as exc:
                   last_status = repr(exc)
               time.sleep(10)
           else:
-              raise SystemExit(f"Timed out waiting for modelaudit-picklescan {version} on PyPI: {last_status}")
+              raise SystemExit(f"Timed out waiting for {project} {version} on PyPI: {last_status}")
           PY
 
       - name: Install published modelaudit-picklescan and smoke test API
@@ -1103,8 +1101,7 @@ jobs:
         verify-picklescan-pypi,
       ]
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
+    permissions: *read-contents-permissions
     env:
       EXPECTED_VERSION: ${{ needs.release-please.outputs.version }}
       EXPECTED_PICKLESCAN_VERSION: ${{ needs.release-please.outputs.picklescan_version }}
@@ -1112,64 +1109,9 @@ jobs:
       PROMPTFOO_DISABLE_TELEMETRY: "1"
     steps:
       - name: Wait for modelaudit files on PyPI
-        run: |
-          python - <<'PY'
-          import gzip
-          import json
-          import os
-          import time
-          import urllib.request
-          import zlib
-
-          version = os.environ["EXPECTED_VERSION"]
-          expected_files = {
-              f"modelaudit-{version}-py3-none-any.whl",
-              f"modelaudit-{version}.tar.gz",
-          }
-          url = f"https://pypi.org/pypi/modelaudit/{version}/json"
-          simple_url = "https://pypi.org/simple/modelaudit/"
-          deadline = time.monotonic() + 600
-          last_status = "not checked"
-
-          while time.monotonic() < deadline:
-              try:
-                  with urllib.request.urlopen(url, timeout=20) as response:
-                      payload = json.load(response)
-                  request = urllib.request.Request(
-                      simple_url,
-                      headers={
-                          "Accept": "application/vnd.pypi.simple.v1+json, application/vnd.pypi.simple.v1+html; q=0.1, text/html; q=0.01",
-                          "Accept-Encoding": "gzip, deflate",
-                          "Cache-Control": "max-age=0",
-                      },
-                  )
-                  with urllib.request.urlopen(request, timeout=20) as response:
-                      simple_body = response.read()
-                      content_encoding = response.headers.get("Content-Encoding", "identity").lower()
-                  if content_encoding == "gzip":
-                      simple_body = gzip.decompress(simple_body)
-                  elif content_encoding == "deflate":
-                      simple_body = zlib.decompress(simple_body)
-                  elif content_encoding not in ("", "identity"):
-                      raise ValueError(f"Unsupported Simple API Content-Encoding: {content_encoding!r}")
-                  simple_payload = json.loads(simple_body)
-                  filenames = {entry["filename"] for entry in payload.get("urls", [])}
-                  simple_filenames = {
-                      entry["filename"] for entry in simple_payload.get("files", []) if not entry.get("yanked", False)
-                  }
-                  missing = sorted(expected_files - filenames)
-                  missing_simple = sorted(expected_files - simple_filenames)
-                  info_version = payload.get("info", {}).get("version")
-                  if info_version == version and not missing and not missing_simple:
-                      print(f"PyPI has modelaudit {version}: {sorted(filenames)}")
-                      break
-                  last_status = f"version={info_version!r}, missing={missing}, missing_simple={missing_simple}"
-              except Exception as exc:
-                  last_status = repr(exc)
-              time.sleep(10)
-          else:
-              raise SystemExit(f"Timed out waiting for modelaudit {version} on PyPI: {last_status}")
-          PY
+        env:
+          PYPI_PROJECT: modelaudit
+        run: *wait-for-pypi-files
 
       - name: Install published modelaudit and run end-to-end smoke tests
         run: |
@@ -1320,29 +1262,23 @@ jobs:
       }}
     needs: [build, publish-pypi, verify-pypi, release-please]
     runs-on: ubuntu-latest
-    permissions:
+    permissions: &provenance-permissions
       contents: write
       id-token: write
       attestations: write
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          sparse-checkout: |
+          sparse-checkout: &root-lock-inputs |
             pyproject.toml
             uv.lock
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
-        with:
-          enable-cache: true
+      - *install-uv
 
-      - name: Download build artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          name: dist
-          path: dist/
+      - *shared-download-build-artifacts
 
-      - name: Generate artifact attestations
+      - &shared-generate-artifact-attestations
+        name: Generate artifact attestations
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
         with:
           subject-path: "dist/*"
@@ -1362,7 +1298,7 @@ jobs:
       # Upload wheel/sdist and SBOM to the GitHub Release as an alternative
       # download location alongside PyPI. --clobber ensures idempotency on re-runs.
       - name: Upload build artifacts to GitHub Release
-        env:
+        env: &github-token-env
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release upload "${{ needs.release-please.outputs.tag_name }}" dist/* \
@@ -1388,9 +1324,7 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: refs/tags/${{ needs.release-please.outputs.tag_name }}
-          sparse-checkout: |
-            pyproject.toml
-            uv.lock
+          sparse-checkout: *root-lock-inputs
           persist-credentials: false
 
       - name: Verify original root publish run
@@ -1548,7 +1482,7 @@ jobs:
           run-id: ${{ needs.release-please.outputs.root_provenance_run_id }}
 
       - name: Verify recovered root artifacts match PyPI
-        env:
+        env: &root-version-env
           EXPECTED_VERSION: ${{ needs.release-please.outputs.version }}
         run: |
           python - <<'PY'
@@ -1734,14 +1668,10 @@ jobs:
           predicate: >-
             {"package":"modelaudit","version":"${{ needs.release-please.outputs.version }}","tag":"${{ needs.release-please.outputs.tag_name }}","source_run_id":"${{ needs.release-please.outputs.root_provenance_run_id }}","source_commit":"${{ steps.verify-source.outputs.source_head_sha }}","tag_commit":"${{ steps.verify-source.outputs.tag_commit_sha }}","pypi_json_url":"https://pypi.org/pypi/modelaudit/${{ needs.release-please.outputs.version }}/json"}
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
-        with:
-          enable-cache: true
+      - *install-uv
 
       - name: Generate SBOM from tagged root lockfile
-        env:
-          EXPECTED_VERSION: ${{ needs.release-please.outputs.version }}
+        env: *root-version-env
         run: |
           uv export \
             --frozen \
@@ -1767,10 +1697,7 @@ jobs:
     if: needs.release-please.outputs.picklescan_release_created == 'true'
     needs: [build-picklescan-package, publish-picklescan-pypi, release-please]
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      id-token: write
-      attestations: write
+    permissions: *provenance-permissions
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -1778,22 +1705,11 @@ jobs:
             packages/modelaudit-picklescan/pyproject.toml
             packages/modelaudit-picklescan/uv.lock
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
-        with:
-          enable-cache: true
+      - *install-uv
 
-      - name: Download standalone pickle package artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          pattern: modelaudit-picklescan-dist-*
-          path: dist/
-          merge-multiple: true
+      - *shared-download-standalone-pickle-package-artifacts
 
-      - name: Generate artifact attestations
-        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
-        with:
-          subject-path: "dist/*"
+      - *shared-generate-artifact-attestations
 
       - name: Generate standalone package SBOM
         working-directory: packages/modelaudit-picklescan
@@ -1809,8 +1725,7 @@ jobs:
           ls -la ../../dist/*.cdx.json
 
       - name: Upload standalone artifacts to GitHub Release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        env: *github-token-env
         run: |
           gh release upload "${{ needs.release-please.outputs.picklescan_tag_name }}" dist/* \
             --repo "${{ github.repository }}" \

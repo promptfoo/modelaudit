@@ -1,5 +1,6 @@
 import builtins
 import struct
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -10,17 +11,9 @@ from modelaudit.detectors.suspicious_symbols import BINARY_CODE_PATTERNS
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.pytorch_binary_scanner import PyTorchBinaryScanner
 from tests.helpers import create_mock_onnx
+from tests.helpers.file_creators import write_chunk_boundary_payload
 
-
-def _write_chunk_boundary_payload(
-    path: Path,
-    pattern: bytes,
-    *,
-    prefix_len: int,
-    suffix: bytes = b"\x00" * 128,
-) -> None:
-    chunk_size = 1024 * 1024
-    path.write_bytes(b"\x00" * (chunk_size - prefix_len) + pattern[:prefix_len] + pattern[prefix_len:] + suffix)
+_write_chunk_boundary_payload = partial(write_chunk_boundary_payload, suffix=b"\x00" * 128)
 
 
 def _valid_elf64_header() -> bytes:
@@ -548,9 +541,7 @@ def test_pytorch_binary_scanner_ignores_invalid_mz_after_first_chunk(tmp_path: P
     chunk_size = 1024 * 1024
     binary_file.write_bytes(b"\x00" * (chunk_size + 512) + b"MZ" + b"\x00" * 128)
 
-    result = scanner.scan(str(binary_file))
-
-    assert not any(issue.rule_code == "S501" and "Windows executable" in issue.message for issue in result.issues)
+    _assert_no_signature(scanner, binary_file, "Windows executable")
 
 
 def test_pytorch_binary_scanner_ignores_late_elf_magic_without_valid_header(tmp_path: Path) -> None:
@@ -558,9 +549,7 @@ def test_pytorch_binary_scanner_ignores_late_elf_magic_without_valid_header(tmp_
     chunk_size = 1024 * 1024
     binary_file.write_bytes(b"\xff" * (chunk_size + 512) + b"\x7fELF" + b"\xff" * 128)
 
-    result = PyTorchBinaryScanner().scan(str(binary_file))
-
-    assert not any(issue.rule_code == "S501" and "Linux executable" in issue.message for issue in result.issues)
+    _assert_no_signature(PyTorchBinaryScanner(), binary_file, "Linux executable")
 
 
 def test_pytorch_binary_scanner_detects_late_little_endian_macho32(tmp_path: Path) -> None:
@@ -585,9 +574,7 @@ def test_pytorch_binary_scanner_ignores_late_macho_magic_without_valid_header(tm
     chunk_size = 1024 * 1024
     binary_file.write_bytes(b"\xff" * (chunk_size + 512) + b"\xce\xfa\xed\xfe" + b"\xff" * 128)
 
-    result = PyTorchBinaryScanner().scan(str(binary_file))
-
-    assert not any(issue.rule_code == "S501" and "Mach-O" in issue.message for issue in result.issues)
+    _assert_no_signature(PyTorchBinaryScanner(), binary_file, "Mach-O")
 
 
 def test_pytorch_binary_scanner_defers_ml_context_without_executable_candidates(
@@ -650,9 +637,7 @@ def test_pytorch_binary_scanner_ignores_invalid_late_shebang_alias(tmp_path: Pat
     chunk_size = 1024 * 1024
     binary_file.write_bytes(b"\x00" * (chunk_size + 512) + b"#!/bin/not-an-interpreter\n" + b"\x00" * 128)
 
-    result = scanner.scan(str(binary_file))
-
-    assert not any(issue.rule_code == "S501" and "Shell script shebang" in issue.message for issue in result.issues)
+    _assert_no_signature(scanner, binary_file, "Shell script shebang")
 
 
 def test_pytorch_binary_scanner_detects_late_shebang_across_chunk_boundary_once(tmp_path: Path) -> None:
@@ -690,39 +675,11 @@ def test_pytorch_binary_scanner_coalesces_late_shebang_aliases(tmp_path: Path) -
 
 
 def test_pytorch_binary_scanner_reconsiders_carried_shebang_under_new_chunk_context(tmp_path: Path) -> None:
-    scanner = PyTorchBinaryScanner()
-    binary_file = tmp_path / "carried_shebang_context.bin"
-    chunk_size = 1024 * 1024
-    shebang = b"#!/bin/bash\n"
-    shebang_offset = chunk_size - 20
-    binary_file.write_bytes(b"\x00" * shebang_offset + shebang + b"\x00" * (20 - len(shebang)) + b"\xff" * 1024)
-
-    result = scanner.scan(str(binary_file))
-
-    shebang_issues = [
-        issue for issue in result.issues if issue.rule_code == "S501" and "Shell script shebang" in issue.message
-    ]
-    assert len(shebang_issues) == 1
-    assert shebang_issues[0].details["signature"] == b"#!/".hex()
-    assert shebang_issues[0].details["offset"] == shebang_offset
+    _assert_carried_pytorch_shebang(tmp_path, ("carried_shebang_context.bin"), (b"\x00"), (b"\x00"))
 
 
 def test_pytorch_binary_scanner_deduplicates_carried_shebang(tmp_path: Path) -> None:
-    scanner = PyTorchBinaryScanner()
-    binary_file = tmp_path / "carried_shebang.bin"
-    chunk_size = 1024 * 1024
-    shebang = b"#!/bin/bash\n"
-    shebang_offset = chunk_size - 20
-    binary_file.write_bytes(b"\xff" * shebang_offset + shebang + b"\xff" * (20 - len(shebang)) + b"\xff" * 1024)
-
-    result = scanner.scan(str(binary_file))
-
-    shebang_issues = [
-        issue for issue in result.issues if issue.rule_code == "S501" and "Shell script shebang" in issue.message
-    ]
-    assert len(shebang_issues) == 1
-    assert shebang_issues[0].details["signature"] == b"#!/".hex()
-    assert shebang_issues[0].details["offset"] == shebang_offset
+    _assert_carried_pytorch_shebang(tmp_path, ("carried_shebang.bin"), (b"\xff"), (b"\xff"))
 
 
 def test_pytorch_binary_scanner_ignores_invalid_late_shebang_interpreter_subpath(tmp_path: Path) -> None:
@@ -731,9 +688,7 @@ def test_pytorch_binary_scanner_ignores_invalid_late_shebang_interpreter_subpath
     chunk_size = 1024 * 1024
     binary_file.write_bytes(b"\xff" * (chunk_size + 512) + b"#!/bin/bash/not-an-interpreter\n" + b"\xff" * 128)
 
-    result = scanner.scan(str(binary_file))
-
-    assert not any(issue.rule_code == "S501" and "Shell script shebang" in issue.message for issue in result.issues)
+    _assert_no_signature(scanner, binary_file, "Shell script shebang")
 
 
 @pytest.mark.skip(
@@ -876,3 +831,29 @@ def test_pickle_scanner_handles_pickle_bin_files(tmp_path):
     result = scanner.scan(str(pickle_bin))
     assert result.success
     assert result.bytes_scanned > 0
+
+
+def _assert_carried_pytorch_shebang(tmp_path: Path, filename: str, prefix_byte: bytes, padding_byte: bytes) -> None:
+    scanner = PyTorchBinaryScanner()
+    binary_file = tmp_path / filename
+    chunk_size = 1024 * 1024
+    shebang = b"#!/bin/bash\n"
+    shebang_offset = chunk_size - 20
+    binary_file.write_bytes(
+        prefix_byte * shebang_offset + shebang + padding_byte * (20 - len(shebang)) + b"\xff" * 1024
+    )
+
+    result = scanner.scan(str(binary_file))
+
+    shebang_issues = [
+        issue for issue in result.issues if issue.rule_code == "S501" and "Shell script shebang" in issue.message
+    ]
+    assert len(shebang_issues) == 1
+    assert shebang_issues[0].details["signature"] == b"#!/".hex()
+    assert shebang_issues[0].details["offset"] == shebang_offset
+
+
+def _assert_no_signature(scanner: PyTorchBinaryScanner, binary_file: Path, description: str) -> None:
+    result = scanner.scan(str(binary_file))
+
+    assert not any(issue.rule_code == "S501" and description in issue.message for issue in result.issues)

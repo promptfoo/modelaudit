@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "modelaudit"
-version = "0.2.52"
+version = "0.2.53"
 description = "Static scanning library for detecting malicious code, potential backdoor indicators, and other security risks in ML model files"
 authors = [
     { name = "Ian Webster", email = "ian@promptfoo.dev" },
@@ -53,7 +53,7 @@ dependencies = [
     "protobuf>=5.29.0",
     "msgpack>=1.2.1,<2.0",
     "tomli>=2.0.0; python_version < '3.11'",
-    "modelaudit-picklescan>=0.1.10,<0.2.0",
+    "modelaudit-picklescan>=0.1.11,<0.2.0",
 ]
 
 [project.optional-dependencies]
@@ -178,7 +178,7 @@ Changelog = "https://github.com/promptfoo/modelaudit/blob/main/CHANGELOG.md"
 dev = [
     "pytest>=8.4.0",
     "coverage>=7.9.0",
-    "mypy>=2.3.1,<2.4.0",
+    "mypy>=2.4.0,<2.5.0",
     "ruff>=0.16.9,<0.17.0",
     "types-PyYAML>=6.0.12.20250516",
     "types-tensorflow>=2.18.0.20250516",
@@ -353,11 +353,6 @@ ignore_errors = true
 module = "modelaudit.scanners.*"
 # Scanners use dynamic patterns that need Any
 warn_return_any = false
-
-[[tool.mypy.overrides]]
-module = "modelaudit.suspicious_symbols"
-# Runtime validation needs to check types even with annotations
-warn_unreachable = false
 
 [[tool.mypy.overrides]]
 module = "modelaudit.scanners.oci_layer_scanner"

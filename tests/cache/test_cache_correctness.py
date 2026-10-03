@@ -10,6 +10,7 @@ import threading
 import time
 import zipfile
 from collections.abc import Callable, Iterator
+from functools import partial
 from importlib.abc import MetaPathFinder
 from importlib.machinery import (
     BYTECODE_SUFFIXES,
@@ -61,6 +62,7 @@ from modelaudit.config.rule_config import ModelAuditConfig, get_config, reset_co
 from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME, ScanResult
 from modelaudit.utils.helpers.cache_decorator import cached_scan
 from modelaudit.utils.repository_context import REPOSITORY_SCAN_ROOT_CONFIG_KEY
+from tests.helpers.pickle_framework import _replace_source_after_fstat, _replace_source_on_read
 
 
 @pytest.fixture(autouse=True)
@@ -166,6 +168,27 @@ def _scope_cache_ancestor_identity_to_tree(
         return AncestorIdentity(entries)
 
     monkeypatch.setattr(cache, "_capture_ancestor_identity", capture_ancestor_identity)
+
+
+def _record_opened_descriptors(opened_descriptors: list[int]) -> Callable[[str, int], int]:
+    def open_path(_path: str, _flags: int) -> int:
+        descriptor = 100 + len(opened_descriptors)
+        opened_descriptors.append(descriptor)
+        return descriptor
+
+    return open_path
+
+
+def _count_identity_releases(monkeypatch: pytest.MonkeyPatch, cache: ScanResultsCache) -> list[int]:
+    release_calls = [0]
+    original_release = cache.release_ancestor_identity
+
+    def release_identity(identity: AncestorIdentity | None) -> None:
+        release_calls[0] += 1
+        original_release(identity)
+
+    monkeypatch.setattr(cache, "release_ancestor_identity", release_identity)
+    return release_calls
 
 
 def test_cache_config_hash_preserves_128_bits(tmp_path: Path) -> None:
@@ -1916,11 +1939,19 @@ def test_cache_identity_selects_darwin_path_monitor(
     assert monitor.closed is True
 
 
+@pytest.mark.parametrize("retry_capture", [False, True], ids=["initial-capture", "retried-capture"])
 def test_identity_capture_closes_darwin_monitor_on_retained_keyboard_interrupt(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    retry_capture: bool,
 ) -> None:
     created_monitors: list[Any] = []
+    stat_comparisons = 0
+
+    def stat_matches(_left: os.stat_result, _right: os.stat_result) -> bool:
+        nonlocal stat_comparisons
+        stat_comparisons += 1
+        return not retry_capture or stat_comparisons > 1
 
     class StubDarwinPathMonitor:
         def __init__(self, _file_path: str, _ancestor_identity: tuple[Any, ...]) -> None:
@@ -1938,21 +1969,32 @@ def test_identity_capture_closes_darwin_monitor_on_retained_keyboard_interrupt(
 
     file_path = _make_cacheable_file(tmp_path)
     cache = ScanResultsCache(str(tmp_path / "cache"))
+    ancestor_identity = cache._capture_ancestor_identity(str(file_path))
+    barrier_token = max(1, *(entry[-1] for entry in ancestor_identity)) + 1
+    monkeypatch.setattr(cache, "_get_file_change_token", lambda _path, _stat: 1)
+    monkeypatch.setattr(cache, "_capture_ancestor_identity", lambda _path: ancestor_identity)
+    monkeypatch.setattr(cache, "_advance_change_clock", lambda *_args: barrier_token)
+    monkeypatch.setattr(cache, "_stat_matches", stat_matches)
     monkeypatch.setattr(scan_results_cache_module.sys, "platform", "darwin")
     monkeypatch.setattr(scan_results_cache_module, "_DarwinPathMonitor", StubDarwinPathMonitor)
     monkeypatch.setattr(cache.hasher, "hash_file_with_stat", interrupt_hash)
 
-    with pytest.raises(KeyboardInterrupt, match="identity hashing interrupted") as interruption:
-        cache.capture_file_identity(str(file_path))
+    with tempfile.TemporaryFile(mode="w+b", dir=tmp_path) as probe:
+        monkeypatch.setattr(cache, "_get_change_clock_probe", lambda _path, _device: probe)
+        with pytest.raises(KeyboardInterrupt, match="identity hashing interrupted") as interruption:
+            cache.capture_file_identity(str(file_path))
 
     assert interruption.traceback is not None
-    assert len(created_monitors) == 1
-    assert created_monitors[0].closed is True
+    assert stat_comparisons == (2 if retry_capture else 1)
+    assert len(created_monitors) == stat_comparisons
+    assert all(monitor.closed for monitor in created_monitors)
 
 
+@pytest.mark.parametrize("retry_capture", [False, True], ids=["initial-capture", "retried-capture"])
 def test_cache_lookup_closes_darwin_monitor_on_retained_keyboard_interrupt(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    retry_capture: bool,
 ) -> None:
     created_monitors: list[Any] = []
 
@@ -1975,13 +2017,25 @@ def test_cache_lookup_closes_darwin_monitor_on_retained_keyboard_interrupt(
     monkeypatch.setattr(scan_results_cache_module.sys, "platform", "darwin")
     monkeypatch.setattr(scan_results_cache_module, "_DarwinPathMonitor", StubDarwinPathMonitor)
     monkeypatch.setattr(cache, "_generate_cache_key_material", interrupt_cache_key)
+    original_hash = cache.hasher.hash_file_with_stat
+    hash_attempts = 0
+
+    def hash_with_retry(path: str, file_stat: os.stat_result) -> str:
+        nonlocal hash_attempts
+        hash_attempts += 1
+        if retry_capture and hash_attempts == 1:
+            raise ValueError("File changed while hashing")
+        return original_hash(path, file_stat)
+
+    monkeypatch.setattr(cache.hasher, "hash_file_with_stat", hash_with_retry)
 
     with pytest.raises(KeyboardInterrupt, match="cache key generation interrupted") as interruption:
         cache.get_cached_result_with_identity(str(file_path))
 
     assert interruption.traceback is not None
-    assert len(created_monitors) == 1
-    assert created_monitors[0].closed is True
+    assert hash_attempts >= (2 if retry_capture else 1)
+    assert len(created_monitors) >= hash_attempts
+    assert all(monitor.closed for monitor in created_monitors)
 
 
 def _stub_darwin_select(queue: Any) -> type[Any]:
@@ -2186,10 +2240,7 @@ def test_darwin_path_monitor_ignores_file_access_time_attribute_changes(
     opened_descriptors: list[int] = []
     closed_descriptors: list[int] = []
 
-    def open_path(_path: str, _flags: int) -> int:
-        descriptor = 100 + len(opened_descriptors)
-        opened_descriptors.append(descriptor)
-        return descriptor
+    open_path = _record_opened_descriptors(opened_descriptors)
 
     monkeypatch.setattr(scan_results_cache_module, "select", select_stub)
     monkeypatch.setattr(scan_results_cache_module.os, "open", open_path)
@@ -2237,10 +2288,7 @@ def test_darwin_path_monitor_reports_ancestor_attribute_changes(
     opened_descriptors: list[int] = []
     closed_descriptors: list[int] = []
 
-    def open_path(_path: str, _flags: int) -> int:
-        descriptor = 100 + len(opened_descriptors)
-        opened_descriptors.append(descriptor)
-        return descriptor
+    open_path = _record_opened_descriptors(opened_descriptors)
 
     monkeypatch.setattr(scan_results_cache_module, "select", select_stub)
     monkeypatch.setattr(scan_results_cache_module.os, "open", open_path)
@@ -2294,10 +2342,7 @@ def test_darwin_path_monitor_preserves_non_attribute_file_events(
     opened_descriptors: list[int] = []
     closed_descriptors: list[int] = []
 
-    def open_path(_path: str, _flags: int) -> int:
-        descriptor = 100 + len(opened_descriptors)
-        opened_descriptors.append(descriptor)
-        return descriptor
+    open_path = _record_opened_descriptors(opened_descriptors)
 
     monkeypatch.setattr(scan_results_cache_module, "select", select_stub)
     monkeypatch.setattr(scan_results_cache_module.os, "open", open_path)
@@ -2366,10 +2411,7 @@ def test_darwin_path_monitor_closes_descriptors_when_registration_fails(
     opened_descriptors: list[int] = []
     closed_descriptors: list[int] = []
 
-    def open_path(_path: str, _flags: int) -> int:
-        descriptor = 100 + len(opened_descriptors)
-        opened_descriptors.append(descriptor)
-        return descriptor
+    open_path = _record_opened_descriptors(opened_descriptors)
 
     monkeypatch.setattr(scan_results_cache_module, "select", _stub_darwin_select(queue))
     monkeypatch.setattr(scan_results_cache_module.os, "open", open_path)
@@ -2577,11 +2619,7 @@ def test_cached_scan_persists_miss_and_hits_on_second_call(tmp_path: Path) -> No
     config = {"cache_enabled": True, "cache_dir": str(cache_dir), "timeout": 30}
     calls = {"count": 0}
 
-    @cached_scan()
-    def scan(path: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
-        assert config is not None
-        calls["count"] += 1
-        return {"call_count": calls["count"], "timeout": config["timeout"]}
+    scan = cached_scan()(partial(_count_scan, calls))
 
     first = scan(str(file_path), config)
     second = scan(str(file_path), config)
@@ -2644,22 +2682,7 @@ def test_cache_lookup_rejects_transient_clean_hash_for_malicious_final_bytes(
 
     file_path.write_bytes(malicious_payload)
     os.utime(file_path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
-    original_hash = cache.hasher.hash_file_with_stat
-    raced = False
-
-    def hash_transient_clean_bytes(path: str, file_stat: os.stat_result) -> str:
-        nonlocal raced
-        if raced:
-            return original_hash(path, file_stat)
-        raced = True
-        Path(path).write_bytes(clean_payload)
-        os.utime(path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
-        clean_hash = original_hash(path, Path(path).stat())
-        Path(path).write_bytes(malicious_payload)
-        os.utime(path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
-        return clean_hash
-
-    monkeypatch.setattr(cache.hasher, "hash_file_with_stat", hash_transient_clean_bytes)
+    _inject_transient_clean_hash(monkeypatch, cache, clean_payload, malicious_payload, original_stat)
 
     assert cache.get_cached_result(str(file_path), version_context=version_context) is None
     assert file_path.read_bytes() == malicious_payload
@@ -3386,11 +3409,7 @@ def test_cached_scan_invalidates_on_material_scan_config_change(tmp_path: Path) 
     cache_dir = tmp_path / "cache"
     calls = {"count": 0}
 
-    @cached_scan()
-    def scan(path: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
-        assert config is not None
-        calls["count"] += 1
-        return {"call_count": calls["count"], "timeout": config["timeout"]}
+    scan = cached_scan()(partial(_count_scan, calls))
 
     base_config = {"cache_enabled": True, "cache_dir": str(cache_dir), "timeout": 30}
     changed_config = {**base_config, "timeout": 5}
@@ -4589,19 +4608,7 @@ def test_source_fingerprint_rejects_path_replacement_during_read(
     malicious_source = b"import os\nos.system('id')\n"
     replacement_path.write_bytes(malicious_source)
     displaced_path = tmp_path / "displaced.py"
-    original_read = os.read
-    replaced = False
-
-    def replace_after_first_read(file_descriptor: int, size: int) -> bytes:
-        nonlocal replaced
-        chunk = original_read(file_descriptor, size)
-        if chunk and not replaced:
-            replaced = True
-            source_path.rename(displaced_path)
-            replacement_path.rename(source_path)
-        return chunk
-
-    monkeypatch.setattr(os, "read", replace_after_first_read)
+    _replace_source_on_read(monkeypatch, source_path, displaced_path, replacement_path)
 
     with pytest.raises(ValueError, match="changed while being read"):
         ScanResultsCache._bounded_source_fingerprint(source_path)
@@ -4620,19 +4627,7 @@ def test_read_fingerprint_rejects_path_replacement_during_read(
     malicious_source = b"malicious bytecode"
     replacement_path.write_bytes(malicious_source)
     displaced_path = tmp_path / "displaced.pyc"
-    original_read = os.read
-    replaced = False
-
-    def replace_after_first_read(file_descriptor: int, size: int) -> bytes:
-        nonlocal replaced
-        chunk = original_read(file_descriptor, size)
-        if chunk and not replaced:
-            replaced = True
-            source_path.rename(displaced_path)
-            replacement_path.rename(source_path)
-        return chunk
-
-    monkeypatch.setattr(os, "read", replace_after_first_read)
+    _replace_source_on_read(monkeypatch, source_path, displaced_path, replacement_path)
 
     with pytest.raises(ValueError, match="changed while being read"):
         ScanResultsCache._bounded_read_fingerprint(source_path, 64 * 1024, True)
@@ -4650,19 +4645,7 @@ def test_extension_fingerprint_rejects_path_replacement_during_validation(
     replacement_path = tmp_path / f"replacement{EXTENSION_SUFFIXES[0]}"
     replacement_path.write_bytes(b"malicious extension")
     displaced_path = tmp_path / f"displaced{EXTENSION_SUFFIXES[0]}"
-    original_fstat = os.fstat
-    fstat_calls = 0
-
-    def replace_after_second_fstat(file_descriptor: int) -> os.stat_result:
-        nonlocal fstat_calls
-        file_stat = original_fstat(file_descriptor)
-        fstat_calls += 1
-        if fstat_calls == 2:
-            extension_path.rename(displaced_path)
-            replacement_path.rename(extension_path)
-        return file_stat
-
-    monkeypatch.setattr(os, "fstat", replace_after_second_fstat)
+    _replace_source_after_fstat(monkeypatch, extension_path, displaced_path, replacement_path)
 
     with pytest.raises(ValueError, match="changed while being read"):
         ScanResultsCache._bounded_source_fingerprint(extension_path)
@@ -5542,15 +5525,7 @@ def test_cached_scan_does_not_serialize_known_uncacheable_scan_result(
         return None, pre_scan_identity
 
     monkeypatch.setattr(cache_manager, "get_cached_result_with_identity", get_cached_result_with_identity)
-    release_calls = 0
-    original_release = cache_manager.cache.release_ancestor_identity
-
-    def release_identity(identity: AncestorIdentity | None) -> None:
-        nonlocal release_calls
-        release_calls += 1
-        original_release(identity)
-
-    monkeypatch.setattr(cache_manager.cache, "release_ancestor_identity", release_identity)
+    release_calls = _count_identity_releases(monkeypatch, cache_manager.cache)
 
     class UnserializableFailedResult(ScanResult):
         def to_dict(self, *, include_private_metadata: bool = False) -> dict[str, Any]:
@@ -5567,7 +5542,7 @@ def test_cached_scan_does_not_serialize_known_uncacheable_scan_result(
     assert isinstance(result, ScanResult)
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert cache_manager.get_stats()["total_entries"] == 0
-    assert release_calls == 1
+    assert release_calls[0] == 1
 
 
 def test_cached_scan_skips_persisting_scan_timed_out_messages(
@@ -5586,15 +5561,7 @@ def test_cached_scan_skips_persisting_scan_timed_out_messages(
         return None, pre_scan_identities.pop(0)
 
     monkeypatch.setattr(cache_manager, "get_cached_result_with_identity", get_cached_result_with_identity)
-    release_calls = 0
-    original_release = cache_manager.cache.release_ancestor_identity
-
-    def release_identity(identity: AncestorIdentity | None) -> None:
-        nonlocal release_calls
-        release_calls += 1
-        original_release(identity)
-
-    monkeypatch.setattr(cache_manager.cache, "release_ancestor_identity", release_identity)
+    release_calls = _count_identity_releases(monkeypatch, cache_manager.cache)
 
     @cached_scan()
     def scan(path: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -5613,108 +5580,25 @@ def test_cached_scan_skips_persisting_scan_timed_out_messages(
     assert calls["count"] == 2
     assert pre_scan_identities == []
     assert cache_manager.get_stats()["total_entries"] == 0
-    assert release_calls == 2
+    assert release_calls[0] == 2
 
 
 def test_cached_scan_skips_persisting_package_not_installed_messages(tmp_path: Path) -> None:
-    file_path = _make_cacheable_file(tmp_path)
-    cache_dir = tmp_path / "cache"
-    config = {"cache_enabled": True, "cache_dir": str(cache_dir)}
-    calls = {"count": 0}
-
-    @cached_scan()
-    def scan(path: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
-        calls["count"] += 1
-        return {
-            "checks": [
-                {
-                    "message": "paddlepaddle package not installed. Install with 'pip install paddlepaddle'",
-                    "status": "failed",
-                }
-            ],
-            "issues": [],
-            "scan_count": calls["count"],
-        }
-
-    first = scan(str(file_path), config)
-    second = scan(str(file_path), config)
-
-    assert first["scan_count"] == 1
-    assert second["scan_count"] == 2
-    assert calls["count"] == 2
-    assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    _assert_uncached_missing_package(
+        tmp_path, "paddlepaddle package not installed. Install with 'pip install paddlepaddle'"
+    )
 
 
 def test_cached_scan_skips_persisting_os_level_errors(tmp_path: Path) -> None:
-    file_path = _make_cacheable_file(tmp_path)
-    cache_dir = tmp_path / "cache"
-    config = {"cache_enabled": True, "cache_dir": str(cache_dir)}
-    calls = {"count": 0}
-
-    @cached_scan()
-    def scan(path: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
-        calls["count"] += 1
-        return {
-            "checks": [],
-            "issues": [{"message": "No such file or directory while opening sidecar", "severity": "warning"}],
-            "scan_count": calls["count"],
-        }
-
-    first = scan(str(file_path), config)
-    second = scan(str(file_path), config)
-
-    assert first["scan_count"] == 1
-    assert second["scan_count"] == 2
-    assert calls["count"] == 2
-    assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    _assert_uncached_os_error(tmp_path, "No such file or directory while opening sidecar")
 
 
 def test_cached_scan_skips_persisting_scanning_error_messages(tmp_path: Path) -> None:
-    file_path = _make_cacheable_file(tmp_path)
-    cache_dir = tmp_path / "cache"
-    config = {"cache_enabled": True, "cache_dir": str(cache_dir)}
-    calls = {"count": 0}
-
-    @cached_scan()
-    def scan(path: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
-        calls["count"] += 1
-        return {
-            "checks": [],
-            "issues": [{"message": "Scanning error: failed to read shard 0", "severity": "warning"}],
-            "scan_count": calls["count"],
-        }
-
-    first = scan(str(file_path), config)
-    second = scan(str(file_path), config)
-
-    assert first["scan_count"] == 1
-    assert second["scan_count"] == 2
-    assert calls["count"] == 2
-    assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    _assert_uncached_os_error(tmp_path, "Scanning error: failed to read shard 0")
 
 
 def test_cached_scan_skips_persisting_memory_mapped_scan_errors(tmp_path: Path) -> None:
-    file_path = _make_cacheable_file(tmp_path)
-    cache_dir = tmp_path / "cache"
-    config = {"cache_enabled": True, "cache_dir": str(cache_dir)}
-    calls = {"count": 0}
-
-    @cached_scan()
-    def scan(path: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
-        calls["count"] += 1
-        return {
-            "checks": [{"message": "Memory-mapped scan error: invalid mapping", "status": "failed"}],
-            "issues": [],
-            "scan_count": calls["count"],
-        }
-
-    first = scan(str(file_path), config)
-    second = scan(str(file_path), config)
-
-    assert first["scan_count"] == 1
-    assert second["scan_count"] == 2
-    assert calls["count"] == 2
-    assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    _assert_uncached_missing_package(tmp_path, "Memory-mapped scan error: invalid mapping")
 
 
 def test_cached_scan_persists_deterministic_validation_findings(tmp_path: Path) -> None:
@@ -5741,27 +5625,7 @@ def test_cached_scan_persists_deterministic_validation_findings(tmp_path: Path) 
 
 
 def test_cached_scan_does_not_persist_missing_associated_weights(tmp_path: Path) -> None:
-    file_path = _make_cacheable_file(tmp_path)
-    cache_dir = tmp_path / "cache"
-    config = {"cache_enabled": True, "cache_dir": str(cache_dir)}
-    calls = {"count": 0}
-
-    @cached_scan()
-    def scan(path: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
-        calls["count"] += 1
-        return {
-            "checks": [],
-            "issues": [{"message": "Associated .bin weights file not found", "severity": "warning"}],
-            "scan_count": calls["count"],
-        }
-
-    first = scan(str(file_path), config)
-    second = scan(str(file_path), config)
-
-    assert first["scan_count"] == 1
-    assert second["scan_count"] == 2
-    assert calls["count"] == 2
-    assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    _assert_uncached_os_error(tmp_path, "Associated .bin weights file not found")
 
 
 def test_configuration_extractor_rebuilds_cached_config_after_mutation() -> None:
@@ -5851,22 +5715,7 @@ def test_batch_lookup_rejects_transient_clean_hash_for_malicious_final_bytes(
 
     file_path.write_bytes(malicious_payload)
     os.utime(file_path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
-    original_hash = cache.hasher.hash_file_with_stat
-    raced = False
-
-    def hash_transient_clean_bytes(path: str, file_stat: os.stat_result) -> str:
-        nonlocal raced
-        if raced:
-            return original_hash(path, file_stat)
-        raced = True
-        Path(path).write_bytes(clean_payload)
-        os.utime(path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
-        clean_hash = original_hash(path, Path(path).stat())
-        Path(path).write_bytes(malicious_payload)
-        os.utime(path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
-        return clean_hash
-
-    monkeypatch.setattr(cache.hasher, "hash_file_with_stat", hash_transient_clean_bytes)
+    _inject_transient_clean_hash(monkeypatch, cache, clean_payload, malicious_payload, original_stat)
 
     cached_results = batch_ops.batch_lookup([str(file_path)], version_context=version_context)
 
@@ -5913,15 +5762,7 @@ def test_batch_store_skips_operational_failures(tmp_path: Path, monkeypatch: pyt
     cache_manager = get_cache_manager(str(cache_dir), enabled=True)
     assert cache_manager.cache is not None
     file_identity = cache_manager.cache.capture_file_identity(str(file_path))
-    release_calls = 0
-    original_release = cache_manager.cache.release_ancestor_identity
-
-    def release_identity(identity: AncestorIdentity | None) -> None:
-        nonlocal release_calls
-        release_calls += 1
-        original_release(identity)
-
-    monkeypatch.setattr(cache_manager.cache, "release_ancestor_identity", release_identity)
+    release_calls = _count_identity_releases(monkeypatch, cache_manager.cache)
     batch_ops = BatchCacheOperations(cache_manager)
 
     stored_count = batch_ops.batch_store(
@@ -5943,7 +5784,7 @@ def test_batch_store_skips_operational_failures(tmp_path: Path, monkeypatch: pyt
 
     assert stored_count == 0
     assert cache_manager.get_stats()["total_entries"] == 0
-    assert release_calls == 1
+    assert release_calls[0] == 1
 
 
 def test_batch_store_skips_results_without_scanned_identity(tmp_path: Path) -> None:
@@ -6496,3 +6337,87 @@ def test_same_size_rewrite_with_restored_mtime_invalidates_cache(tmp_path: Path)
     cached_result = cache.get_cached_result(str(file_path), version_context=version_context)
 
     assert cached_result is None
+
+
+def _inject_transient_clean_hash(
+    monkeypatch: pytest.MonkeyPatch,
+    cache: ScanResultsCache,
+    clean_payload: bytes,
+    malicious_payload: bytes,
+    original_stat: os.stat_result,
+) -> None:
+    original_hash = cache.hasher.hash_file_with_stat
+    raced = False
+
+    def hash_transient_clean_bytes(path: str, file_stat: os.stat_result) -> str:
+        nonlocal raced
+        if raced:
+            return original_hash(path, file_stat)
+        raced = True
+        Path(path).write_bytes(clean_payload)
+        os.utime(path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+        clean_hash = original_hash(path, Path(path).stat())
+        Path(path).write_bytes(malicious_payload)
+        os.utime(path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+        return clean_hash
+
+    monkeypatch.setattr(cache.hasher, "hash_file_with_stat", hash_transient_clean_bytes)
+
+
+def _count_scan(calls: dict[str, int], path: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
+    assert config is not None
+    calls["count"] += 1
+    return {"call_count": calls["count"], "timeout": config["timeout"]}
+
+
+def _assert_uncached_os_error(tmp_path: Path, case_message: str) -> None:
+    file_path = _make_cacheable_file(tmp_path)
+    cache_dir = tmp_path / "cache"
+    config = {"cache_enabled": True, "cache_dir": str(cache_dir)}
+    calls = {"count": 0}
+
+    @cached_scan()
+    def scan(path: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
+        calls["count"] += 1
+        return {
+            "checks": [],
+            "issues": [{"message": case_message, "severity": "warning"}],
+            "scan_count": calls["count"],
+        }
+
+    first = scan(str(file_path), config)
+    second = scan(str(file_path), config)
+
+    assert first["scan_count"] == 1
+    assert second["scan_count"] == 2
+    assert calls["count"] == 2
+    assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+
+
+def _assert_uncached_missing_package(tmp_path: Path, case_message: str) -> None:
+    file_path = _make_cacheable_file(tmp_path)
+    cache_dir = tmp_path / "cache"
+    config = {"cache_enabled": True, "cache_dir": str(cache_dir)}
+    calls = {"count": 0}
+
+    @cached_scan()
+    def scan(path: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
+        calls["count"] += 1
+        return {
+            "checks": [
+                {
+                    "message": case_message,
+                    "status": "failed",
+                }
+            ],
+            "issues": [],
+            "scan_count": calls["count"],
+        }
+
+    first = scan(str(file_path), config)
+    second = scan(str(file_path), config)
+
+    assert first["scan_count"] == 1
+    assert second["scan_count"] == 2
+    assert calls["count"] == 2
+    assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0

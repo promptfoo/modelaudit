@@ -2684,45 +2684,13 @@ def test_license_metadata_percent_encoded_backslash_text_without_url_stays_clean
         f"{ordinary_license_text_without_url()}\n"
         "Documentation note: %5C is a percent-encoded backslash in Windows path prose."
     )
-    write_raw_safetensors(
-        file_path,
-        {
-            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
-            "__metadata__": {"license": payload},
-        },
-        b"\x00",
-    )
-
-    result = SafeTensorsScanner().scan(str(file_path))
-
-    assert len(payload) < 1000
-    assert "http://" not in payload
-    assert "https://" not in payload
-    assert result.success is True
-    assert result.metadata["custom_metadata_security_flags"] == []
-    assert not [issue for issue in result.issues if issue.rule_code == "S905"]
+    _assert_license_backslash_text(file_path, payload)
 
 
 def test_license_metadata_raw_backslash_text_without_url_stays_clean(tmp_path: Path) -> None:
     file_path = tmp_path / "short_raw_backslash_text_license_metadata.safetensors"
     payload = f"{ordinary_license_text_without_url()}\nDocumentation note: C:\\models\\license is a local path example."
-    write_raw_safetensors(
-        file_path,
-        {
-            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
-            "__metadata__": {"license": payload},
-        },
-        b"\x00",
-    )
-
-    result = SafeTensorsScanner().scan(str(file_path))
-
-    assert len(payload) < 1000
-    assert "http://" not in payload
-    assert "https://" not in payload
-    assert result.success is True
-    assert result.metadata["custom_metadata_security_flags"] == []
-    assert not [issue for issue in result.issues if issue.rule_code == "S905"]
+    _assert_license_backslash_text(file_path, payload)
 
 
 def test_license_metadata_entity_encoded_backslash_text_without_url_stays_clean(tmp_path: Path) -> None:
@@ -2732,23 +2700,7 @@ def test_license_metadata_entity_encoded_backslash_text_without_url_stays_clean(
         "Documentation note: &#x5c; names a backslash, &amp;#x2f; names a slash, "
         "and C:&#x5c;models&#x5c;license is ordinary path prose."
     )
-    write_raw_safetensors(
-        file_path,
-        {
-            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
-            "__metadata__": {"license": payload},
-        },
-        b"\x00",
-    )
-
-    result = SafeTensorsScanner().scan(str(file_path))
-
-    assert len(payload) < 1000
-    assert "http://" not in payload
-    assert "https://" not in payload
-    assert result.success is True
-    assert result.metadata["custom_metadata_security_flags"] == []
-    assert not [issue for issue in result.issues if issue.rule_code == "S905"]
+    _assert_license_backslash_text(file_path, payload)
 
 
 def test_license_metadata_trusted_url_with_unrelated_nested_entity_stays_clean(tmp_path: Path) -> None:
@@ -3256,33 +3208,13 @@ def test_corrupted_header(tmp_path: Path) -> None:
 
 
 def test_non_object_header_is_inconclusive_not_clean(tmp_path: Path) -> None:
-    file_path = tmp_path / "array_header.safetensors"
-    write_raw_safetensors_header(file_path, b"[]")
-
-    direct = SafeTensorsScanner().scan(str(file_path))
-
-    assert direct.success is False
-    assert direct.has_errors is False
-    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-    assert "safetensors_header_validation_failed" in direct.metadata["scan_outcome_reasons"]
-    assert any(
-        check.name == "Header Format Validation" and check.status == CheckStatus.FAILED for check in direct.checks
-    )
-    assert not any(issue.severity == IssueSeverity.CRITICAL for issue in direct.issues)
+    _assert_safetensors_invalid_header(tmp_path, ("array_header.safetensors"), (b"[]"), ("Header Format Validation"))
 
 
 def test_invalid_utf8_header_is_inconclusive_not_scanner_crash(tmp_path: Path) -> None:
-    file_path = tmp_path / "invalid_utf8_header.safetensors"
-    write_raw_safetensors_header(file_path, b"{\xff}")
-
-    direct = SafeTensorsScanner().scan(str(file_path))
-
-    assert direct.success is False
-    assert direct.has_errors is False
-    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-    assert "safetensors_header_validation_failed" in direct.metadata["scan_outcome_reasons"]
-    assert any(check.name == "SafeTensors JSON Parse" and check.status == CheckStatus.FAILED for check in direct.checks)
-    assert not any(issue.severity == IssueSeverity.CRITICAL for issue in direct.issues)
+    _assert_safetensors_invalid_header(
+        tmp_path, ("invalid_utf8_header.safetensors"), (b"{\xff}"), ("SafeTensors JSON Parse")
+    )
 
 
 def test_invalid_utf8_license_metadata_is_inconclusive(tmp_path: Path) -> None:
@@ -3532,6 +3464,36 @@ def test_zlib_shaped_header_keeps_safetensors_security_routing(tmp_path: Path) -
     assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
 
 
+@pytest.mark.parametrize(
+    ("description", "expected_critical"),
+    [("<script>alert('xss')</script>", True), ("Model weights", False)],
+)
+def test_fdict_shaped_native_safetensors_keeps_security_routing(
+    tmp_path: Path, description: str, expected_critical: bool
+) -> None:
+    file_path = tmp_path / "fdict-shaped-header.safetensors"
+    header_len = 0x2078
+    header = json.dumps(
+        {
+            "__metadata__": {"description": description},
+            "tensor": {
+                "dtype": "U8",
+                "shape": [1],
+                "data_offsets": [0, 1],
+            },
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+    write_raw_safetensors_header(file_path, header + b" " * (header_len - len(header)), b"\x00")
+
+    result = scan_file(str(file_path))
+
+    assert file_path.read_bytes()[:2] == b"\x78\x20"
+    assert result.scanner_name == "safetensors"
+    assert result.success is (not expected_critical)
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues) is expected_critical
+
+
 def test_zlib_shaped_deep_header_fails_closed(tmp_path: Path) -> None:
     file_path = tmp_path / "deep-zlib-shaped.unknown"
     header_len = 0x9C78
@@ -3745,22 +3707,8 @@ def test_benign_metadata_references_are_not_injection_patterns(tmp_path: Path, v
 )
 def test_open_html_injection_flags_xss(tmp_path: Path, value: str) -> None:
     file_path = tmp_path / "open_script_metadata.safetensors"
-    write_raw_safetensors(
-        file_path,
-        {
-            "t": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
-            "__metadata__": {"description": value},
-        },
-        b"\x00",
-    )
-
-    result = SafeTensorsScanner().scan(str(file_path))
-
-    assert result.success is False
-    assert "xss_html_injection" in result.metadata["custom_metadata_security_flags"]
-    assert any(
-        check.name == "SafeTensors XSS/HTML Injection Detection" and check.status == CheckStatus.FAILED
-        for check in result.checks
+    _assert_metadata_injection(
+        file_path, value, "description", "xss_html_injection", "SafeTensors XSS/HTML Injection Detection"
     )
 
 
@@ -3774,23 +3722,7 @@ def test_open_html_injection_flags_xss(tmp_path: Path, value: str) -> None:
 )
 def test_executable_decoder_and_loader_calls_flag_code_injection(tmp_path: Path, value: str) -> None:
     file_path = tmp_path / "executable_loader_metadata.safetensors"
-    write_raw_safetensors(
-        file_path,
-        {
-            "t": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
-            "__metadata__": {"payload": value},
-        },
-        b"\x00",
-    )
-
-    result = SafeTensorsScanner().scan(str(file_path))
-
-    assert result.success is False
-    assert "code_injection" in result.metadata["custom_metadata_security_flags"]
-    assert any(
-        check.name == "SafeTensors Code Injection Detection" and check.status == CheckStatus.FAILED
-        for check in result.checks
-    )
+    _assert_metadata_injection(file_path, value, "payload", "code_injection", "SafeTensors Code Injection Detection")
 
 
 def test_literal_unicode_escape_metadata_still_flags_code_injection(tmp_path: Path) -> None:
@@ -3952,3 +3884,56 @@ def test_multiple_distinct_patterns(tmp_path: Path) -> None:
     assert flagged_keys.issuperset(expected_keys), (
         f"Expected all keys {expected_keys} to be flagged, got {flagged_keys}"
     )
+
+
+def _assert_safetensors_invalid_header(tmp_path: Path, filename: str, header: bytes, check_name: str) -> None:
+    file_path = tmp_path / filename
+    write_raw_safetensors_header(file_path, header)
+
+    direct = SafeTensorsScanner().scan(str(file_path))
+
+    assert direct.success is False
+    assert direct.has_errors is False
+    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "safetensors_header_validation_failed" in direct.metadata["scan_outcome_reasons"]
+    assert any(check.name == check_name and check.status == CheckStatus.FAILED for check in direct.checks)
+    assert not any(issue.severity == IssueSeverity.CRITICAL for issue in direct.issues)
+
+
+def _assert_license_backslash_text(file_path: Path, payload: str) -> None:
+    write_raw_safetensors(
+        file_path,
+        {
+            "tensor": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
+            "__metadata__": {"license": payload},
+        },
+        b"\x00",
+    )
+
+    result = SafeTensorsScanner().scan(str(file_path))
+
+    assert len(payload) < 1000
+    assert "http://" not in payload
+    assert "https://" not in payload
+    assert result.success is True
+    assert result.metadata["custom_metadata_security_flags"] == []
+    assert not [issue for issue in result.issues if issue.rule_code == "S905"]
+
+
+def _assert_metadata_injection(
+    file_path: Path, value: str, metadata_key: str, security_flag: str, check_name: str
+) -> None:
+    write_raw_safetensors(
+        file_path,
+        {
+            "t": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1]},
+            "__metadata__": {metadata_key: value},
+        },
+        b"\x00",
+    )
+
+    result = SafeTensorsScanner().scan(str(file_path))
+
+    assert result.success is False
+    assert security_flag in result.metadata["custom_metadata_security_flags"]
+    assert any(check.name == check_name and check.status == CheckStatus.FAILED for check in result.checks)

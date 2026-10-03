@@ -1427,16 +1427,9 @@ def test_scan_mlflow_model_rejects_unallowlisted_logged_model_overlay_before_dow
         def __init__(self) -> None:
             self.repo = RemoteArtifactRepository("s3://trusted-bucket/runs/run-1/model")
 
-        @staticmethod
-        def parse_runs_uri(uri: str) -> tuple[str, str | None]:
-            assert uri == "runs:/run-1/model"
-            return "run-1", "model"
+        parse_runs_uri = staticmethod(_parse_runs_fixture_uri)
 
-        @staticmethod
-        def get_underlying_uri(uri: str, tracking_uri: str | None = None) -> str:
-            assert uri == "runs:/run-1/model"
-            assert tracking_uri is None
-            return "s3://trusted-bucket/runs/run-1/model"
+        get_underlying_uri = staticmethod(_runs_fixture_underlying_uri)
 
         @staticmethod
         def _get_logged_model_artifact_repo(*, run_id: str, name: str) -> RemoteArtifactRepository:
@@ -1519,16 +1512,9 @@ def test_scan_mlflow_model_downloads_from_the_validated_logged_model_repository(
             self.download_artifacts = MagicMock(side_effect=AssertionError("wrapper download must not be used"))
             self._get_logged_model_artifact_repo = MagicMock()
 
-        @staticmethod
-        def parse_runs_uri(uri: str) -> tuple[str, str | None]:
-            assert uri == "runs:/run-1/model"
-            return "run-1", "model"
+        parse_runs_uri = staticmethod(_parse_runs_fixture_uri)
 
-        @staticmethod
-        def get_underlying_uri(uri: str, tracking_uri: str | None = None) -> str:
-            assert uri == "runs:/run-1/model"
-            assert tracking_uri is None
-            return "s3://trusted-bucket/runs/run-1/model"
+        get_underlying_uri = staticmethod(_runs_fixture_underlying_uri)
 
     class ModelsArtifactRepository:
         def __init__(self, repo: Any) -> None:
@@ -3470,3 +3456,14 @@ def test_scan_mlflow_model_no_registry_uri(tmp_path: Path, monkeypatch: pytest.M
 
         # Verify set_registry_uri was not called
         mock_mlflow.set_registry_uri.assert_not_called()
+
+
+def _parse_runs_fixture_uri(uri: str) -> tuple[str, str | None]:
+    assert uri == "runs:/run-1/model"
+    return "run-1", "model"
+
+
+def _runs_fixture_underlying_uri(uri: str, tracking_uri: str | None = None) -> str:
+    assert uri == "runs:/run-1/model"
+    assert tracking_uri is None
+    return "s3://trusted-bucket/runs/run-1/model"

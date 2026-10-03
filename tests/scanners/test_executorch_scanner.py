@@ -20,6 +20,7 @@ from modelaudit.scanners.executorch_scanner import (
 )
 from modelaudit.scanners.pytorch_binary_scanner import PyTorchBinaryScanner
 from modelaudit.utils.file.detection import detect_file_format
+from tests.helpers.file_creators import EvalPayload
 
 _ASSETS_DIR = Path(__file__).resolve().parents[1] / "assets"
 
@@ -55,12 +56,7 @@ def create_executorch_archive(tmp_path: Path, *, malicious: bool = False) -> Pat
         z.writestr("version", "1")
         data: dict[str, object] = {"weights": [1, 2, 3]}
         if malicious:
-
-            class Evil:
-                def __reduce__(self):
-                    return (eval, ("print('evil')",))
-
-            data["malicious"] = Evil()
+            data["malicious"] = EvalPayload(("print('evil')",))
         z.writestr("bytecode.pkl", pickle.dumps(data))
     return zip_path
 
@@ -1622,99 +1618,47 @@ def test_executorch_scans_hidden_protocol6_pickle_member(tmp_path: Path) -> None
 
 
 def test_executorch_protocol6_near_match_remains_unselected(tmp_path: Path) -> None:
-    model_path = tmp_path / "protocol6-near-match.ptl"
-    with zipfile.ZipFile(model_path, "w") as zipf:
-        zipf.writestr("version", "1")
-        zipf.writestr("payload", b"\x80\x06not a pickle payload")
-
-    result = ExecuTorchScanner().scan(str(model_path))
-
-    assert result.success is True
-    assert result.metadata["pickle_files"] == []
+    _assert_executorch_pickle_near_match_unselected(
+        tmp_path, ("protocol6-near-match.ptl"), (b"\x80\x06not a pickle payload")
+    )
 
 
 def test_executorch_scans_hidden_protocol1_binint2_pickle_member(tmp_path: Path) -> None:
-    model_path = tmp_path / "hidden-protocol1-binint2-pickle.ptl"
-    payload = b"M\x01\x000cbuiltins\neval\n(S\"print('evil')\"\ntR."
-    with zipfile.ZipFile(model_path, "w") as zipf:
-        zipf.writestr("version", "1")
-        zipf.writestr("payload", payload)
-
-    result = ExecuTorchScanner().scan(str(model_path))
-
-    assert result.metadata["pickle_files"] == ["payload"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "payload"
-        for issue in result.issues
+    _assert_executorch_hidden_pickle(
+        tmp_path, ("hidden-protocol1-binint2-pickle.ptl"), (b"M\x01\x000cbuiltins\neval\n(S\"print('evil')\"\ntR.")
     )
 
 
 def test_executorch_protocol1_binint2_near_match_remains_unselected(tmp_path: Path) -> None:
-    model_path = tmp_path / "protocol1-binint2-near-match.ptl"
-    with zipfile.ZipFile(model_path, "w") as zipf:
-        zipf.writestr("version", "1")
-        zipf.writestr("payload", b"M\x01\x00not a pickle payload")
-
-    result = ExecuTorchScanner().scan(str(model_path))
-
-    assert result.success is True
-    assert result.metadata["pickle_files"] == []
+    _assert_executorch_pickle_near_match_unselected(
+        tmp_path, ("protocol1-binint2-near-match.ptl"), (b"M\x01\x00not a pickle payload")
+    )
 
 
 def test_executorch_scans_hidden_protocol0_pickle_with_global_comment_token(tmp_path: Path) -> None:
-    model_path = tmp_path / "hidden-protocol0-comment-token.ptl"
-    payload = b"cposix\nsystem\n#\n(S'echo pwned'\ntR."
-    with zipfile.ZipFile(model_path, "w") as zipf:
-        zipf.writestr("version", "1")
-        zipf.writestr("payload", payload)
-
-    result = ExecuTorchScanner().scan(str(model_path))
-
-    assert result.metadata["pickle_files"] == ["payload"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "payload"
-        for issue in result.issues
+    _assert_executorch_hidden_pickle(
+        tmp_path, ("hidden-protocol0-comment-token.ptl"), (b"cposix\nsystem\n#\n(S'echo pwned'\ntR.")
     )
 
 
 def test_executorch_scans_hidden_protocol0_pickle_with_repeated_global_comment_tokens(tmp_path: Path) -> None:
-    model_path = tmp_path / "hidden-protocol0-repeated-comment-tokens.ptl"
-    payload = b"cposix\nsystem\n#\n#\nN0cbuiltins\neval\n#\n(S'echo pwned'\ntR."
-    with zipfile.ZipFile(model_path, "w") as zipf:
-        zipf.writestr("version", "1")
-        zipf.writestr("payload", payload)
-
-    result = ExecuTorchScanner().scan(str(model_path))
-
-    assert result.metadata["pickle_files"] == ["payload"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "payload"
-        for issue in result.issues
+    _assert_executorch_hidden_pickle(
+        tmp_path,
+        ("hidden-protocol0-repeated-comment-tokens.ptl"),
+        (b"cposix\nsystem\n#\n#\nN0cbuiltins\neval\n#\n(S'echo pwned'\ntR."),
     )
 
 
 def test_executorch_protocol0_global_comment_near_match_remains_unselected(tmp_path: Path) -> None:
-    model_path = tmp_path / "protocol0-comment-near-match.ptl"
-    with zipfile.ZipFile(model_path, "w") as zipf:
-        zipf.writestr("version", "1")
-        zipf.writestr("payload", b"cmetadata\nlabel\n#\nplain text")
-
-    result = ExecuTorchScanner().scan(str(model_path))
-
-    assert result.success is True
-    assert result.metadata["pickle_files"] == []
+    _assert_executorch_pickle_near_match_unselected(
+        tmp_path, ("protocol0-comment-near-match.ptl"), (b"cmetadata\nlabel\n#\nplain text")
+    )
 
 
 def test_executorch_protocol0_repeated_global_comment_near_match_remains_unselected(tmp_path: Path) -> None:
-    model_path = tmp_path / "protocol0-repeated-comment-near-match.ptl"
-    with zipfile.ZipFile(model_path, "w") as zipf:
-        zipf.writestr("version", "1")
-        zipf.writestr("payload", b"cmetadata\nlabel\n#\n#\nplain text")
-
-    result = ExecuTorchScanner().scan(str(model_path))
-
-    assert result.success is True
-    assert result.metadata["pickle_files"] == []
+    _assert_executorch_pickle_near_match_unselected(
+        tmp_path, ("protocol0-repeated-comment-near-match.ptl"), (b"cmetadata\nlabel\n#\n#\nplain text")
+    )
 
 
 def test_executorch_protocol0_global_comment_token_limit_fails_closed(tmp_path: Path) -> None:
@@ -1781,18 +1725,10 @@ def test_executorch_scans_hidden_protocolless_binary_pickle(tmp_path: Path) -> N
 
 
 def test_executorch_scans_hidden_protocolless_binary_pickle_without_frame(tmp_path: Path) -> None:
-    model_path = tmp_path / "hidden-protocolless-binary-without-frame.ptl"
-    payload = b"\x8c\x08builtins\x94\x8c\x04eval\x94\x93\x94\x8c\rprint('evil')\x94\x85R."
-    with zipfile.ZipFile(model_path, "w") as zipf:
-        zipf.writestr("version", "1")
-        zipf.writestr("payload", payload)
-
-    result = ExecuTorchScanner().scan(str(model_path))
-
-    assert result.metadata["pickle_files"] == ["payload"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "payload"
-        for issue in result.issues
+    _assert_executorch_hidden_pickle(
+        tmp_path,
+        ("hidden-protocolless-binary-without-frame.ptl"),
+        (b"\x8c\x08builtins\x94\x8c\x04eval\x94\x93\x94\x8c\rprint('evil')\x94\x85R."),
     )
 
 
@@ -1821,15 +1757,9 @@ def test_executorch_binary_pickle_near_match_remains_unselected(tmp_path: Path) 
 
 
 def test_executorch_complete_binary_opcode_near_match_remains_unselected(tmp_path: Path) -> None:
-    model_path = tmp_path / "complete-binary-opcode-near-match.ptl"
-    with zipfile.ZipFile(model_path, "w") as zipf:
-        zipf.writestr("version", "1")
-        zipf.writestr("payload", b"\x80\x04NNNnot-a-pickle")
-
-    result = ExecuTorchScanner().scan(str(model_path))
-
-    assert result.success is True
-    assert result.metadata["pickle_files"] == []
+    _assert_executorch_pickle_near_match_unselected(
+        tmp_path, ("complete-binary-opcode-near-match.ptl"), (b"\x80\x04NNNnot-a-pickle")
+    )
 
 
 def test_executorch_hidden_pickle_discovery_does_not_short_circuit_on_data_pkl(tmp_path: Path) -> None:
@@ -2174,3 +2104,31 @@ def test_executorch_case_insensitive_python_suffix_is_flagged(tmp_path: Path) ->
     result = ExecuTorchScanner().scan(str(model_path))
 
     assert any(issue.rule_code == "S104" and issue.details.get("file") == "hooks.PY" for issue in result.issues)
+
+
+def _assert_executorch_hidden_pickle(tmp_path: Path, filename: str, pickle_payload: bytes) -> None:
+    model_path = tmp_path / filename
+    payload = pickle_payload
+    with zipfile.ZipFile(model_path, "w") as zipf:
+        zipf.writestr("version", "1")
+        zipf.writestr("payload", payload)
+
+    result = ExecuTorchScanner().scan(str(model_path))
+
+    assert result.metadata["pickle_files"] == ["payload"]
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "payload"
+        for issue in result.issues
+    )
+
+
+def _assert_executorch_pickle_near_match_unselected(tmp_path: Path, filename: str, pickle_payload: bytes) -> None:
+    model_path = tmp_path / filename
+    with zipfile.ZipFile(model_path, "w") as zipf:
+        zipf.writestr("version", "1")
+        zipf.writestr("payload", pickle_payload)
+
+    result = ExecuTorchScanner().scan(str(model_path))
+
+    assert result.success is True
+    assert result.metadata["pickle_files"] == []
