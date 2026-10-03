@@ -865,3 +865,93 @@ def test_sbom_deleted_local_paths_keep_literal_classification(
         _write_scan_sbom(str(target), result, [str(path)], _ScanPathState(), scan_and_delete=True)
         output = target.read_text()
     assert json.loads(output)["components"][0]["type"] == expected
+
+
+@pytest.mark.parametrize("generator", ["legacy", "pydantic", "cli"])
+@pytest.mark.parametrize(
+    "extension, kind", [(".pkl", "machine-learning-model"), (".zip", "container"), (".json", "data")]
+)
+@pytest.mark.parametrize(
+    "template, cli_uses_extension",
+    [
+        ("s3://bucket/model{extension}?token=synthetic", True),
+        ("stream://https://bucket.s3.amazonaws.com/model{extension}%3Ftoken%3Dsynthetic", True),
+        ("https://example.test/model{extension}?token=synthetic", True),
+        ("https://user:synthetic@bucket.s3.amazonaws.com/model{extension}%3Ftoken%3Dsynthetic", False),
+        ("https://huggingface.co/org/model/resolve/main/model{extension}?token=synthetic", True),
+        ("hf://org/model/model{extension}%3Ftoken%3Dsynthetic", False),
+        ("https://user:synthetic@example.jfrog.io/artifactory/repo/model{extension}?token=synthetic", True),
+        ("models:/Example/1/model{extension}?token=synthetic", False),
+    ],
+)
+def test_sbom_public_source_types_preserve_cli_boundary(
+    tmp_path: Path, generator: str, extension: str, kind: str, template: str, cli_uses_extension: bool
+) -> None:
+    from modelaudit.cli import _ScanPathState, _write_scan_sbom
+
+    source = template.format(extension=extension)
+    result = create_initial_audit_result()
+    result.assets = [AssetModel(path=source, type="pickle", size=3, is_streamed=True)]
+    if generator == "legacy":
+        output = generate_sbom([source], result.model_dump(mode="python"))
+    elif generator == "pydantic":
+        output = generate_sbom_pydantic([source], result)
+    else:
+        target = tmp_path / "scan.sbom.json"
+        _write_scan_sbom(str(target), result, [source], _ScanPathState(), scan_and_delete=True)
+        output = target.read_text()
+    # Public generators historically classify the literal input; the CLI first normalizes its sources.
+    expected = kind if generator == "cli" and cli_uses_extension else "file"
+    assert json.loads(output)["components"][0]["type"] == expected
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows filenames cannot contain a question mark")
+@pytest.mark.parametrize("generator", ["legacy", "pydantic", "cli"])
+def test_sbom_directory_owner_risk_uses_historical_finding_location(tmp_path: Path, generator: str) -> None:
+    from modelaudit.cli import _ScanPathState, _write_scan_sbom
+    from modelaudit.core import scan_model_directory_or_file
+
+    root = tmp_path / "owner?revision=main"
+    root.mkdir()
+    (root / "metadata.json").write_text(
+        json.dumps({"version": "0.1.0", "type": "orbax_checkpoint", "restore_fn": "lambda x: eval(x.decode())"})
+    )
+    scanned = scan_model_directory_or_file(str(root), cache_enabled=False)
+    result = ModelAuditResultModel.model_validate_json(scanned.model_dump_json())
+    if generator == "legacy":
+        output = generate_sbom([str(root)], result.model_dump())
+    elif generator == "pydantic":
+        output = generate_sbom_pydantic([str(root)], result)
+    else:
+        target = tmp_path / "scan.sbom.json"
+        _write_scan_sbom(str(target), result, [str(root)], _ScanPathState(), scan_and_delete=True)
+        output = target.read_text()
+    components = json.loads(output)["components"]
+    assert components
+    # The owner and child findings historically associate only the child with this component.
+    assert all(
+        next(prop["value"] for prop in c["properties"] if prop["name"] == "risk_score") == "5" for c in components
+    )
+
+
+@pytest.mark.parametrize("generator", ["legacy", "pydantic", "cli"])
+def test_sbom_risk_preserves_direct_api_and_cli_source_boundary(tmp_path: Path, generator: str) -> None:
+    from modelaudit.cli import _ScanPathState, _write_scan_sbom
+
+    source = "s3://bucket/model.pkl?token=synthetic"
+    result = create_initial_audit_result()
+    result.issues = [
+        Issue(message="Existing finding", severity=IssueSeverity.CRITICAL, location="s3://bucket/model.pkl")
+    ]
+    if generator == "legacy":
+        output = generate_sbom([source], result.model_dump())
+    elif generator == "pydantic":
+        output = generate_sbom_pydantic([source], result)
+    else:
+        target = tmp_path / "scan.sbom.json"
+        _write_scan_sbom(str(target), result, [source], _ScanPathState(), scan_and_delete=True)
+        output = target.read_text()
+    component = json.loads(output)["components"][0]
+    assert next(prop["value"] for prop in component["properties"] if prop["name"] == "risk_score") == (
+        "5" if generator == "cli" else "0"
+    )

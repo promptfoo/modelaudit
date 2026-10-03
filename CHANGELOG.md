@@ -10,7 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Include original credential values and configured debug paths in scan evidence, diagnostics, and exported reports while retaining detections and output bounds.
-- Include `source_url` in streamed finding details so SARIF identities preserve scanner positions across signed URLs and saved-result round trips.
+- Use emitted raw source keys for `file_metadata` lookups; previously masked keys are no longer aliases. Metadata values and per-source associations remain intact.
+- Preserve bounded producer identity metadata separately from raw stream, Hugging Face, MLflow and directory-owner evidence, retaining historical finding fingerprints and check grouping through saved-result round trips.
 
 ### Security
 

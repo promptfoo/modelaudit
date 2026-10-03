@@ -16,6 +16,8 @@ from urllib.parse import unquote, urlparse
 
 from ..models import Check, CheckStatus, Issue, IssueSeverity, ModelAuditResultModel, create_initial_audit_result
 from ..utils.helpers.evidence import format_evidence_string, format_evidence_value
+from ..utils.helpers.finding_identity import preserve_finding_identity
+from ._mlflow_identity import mlflow_source_identity
 
 logger = logging.getLogger(__name__)
 
@@ -198,6 +200,9 @@ def _mlflow_budget_failure_result(model_uri: str, message: str, details: dict[st
             type="mlflow_download_budget",
         )
     )
+    identity_location = mlflow_source_identity(model_uri)
+    for record in [result.issues[-1], result.checks[-1]]:
+        preserve_finding_identity(record, "mlflow_acquisition", location=identity_location)
     result.finalize_statistics()
     return result
 
@@ -243,6 +248,9 @@ def _mlflow_artifact_trust_failure_result(
             type=_MLFLOW_ARTIFACT_TRUST_FAILURE_TYPE,
         )
     )
+    identity_location = mlflow_source_identity(model_uri)
+    for record in [result.issues[-1], result.checks[-1]]:
+        preserve_finding_identity(record, "mlflow_acquisition", location=identity_location)
     result.finalize_statistics()
     return result
 
@@ -290,6 +298,9 @@ def _mlflow_download_safety_failure_result(
             type="mlflow_download_path",
         )
     )
+    identity_location = mlflow_source_identity(model_uri)
+    for record in [result.issues[-1], result.checks[-1]]:
+        preserve_finding_identity(record, "mlflow_acquisition", location=identity_location)
     result.finalize_statistics()
     return result
 

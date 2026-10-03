@@ -4,9 +4,10 @@ import hashlib
 import io
 import json
 import os
+import sys
 import time
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -1624,7 +1625,8 @@ def test_stream_fingerprints_preserve_baseline_suffixes(
         assert finding["partialFingerprints"]["primaryLocationLineHash"] == fingerprint
         assert finding["message"]["text"] == issue.message
         assert converted.issues[0].location == source + suffix
-        assert converted.issues[0].details == {**issue.details, "source_url": source}
+        assert converted.issues[0].details == issue.details
+        assert getattr(converted.issues[0], "finding_identity", {})["producer"] == "stream"
         assert finding["properties"]["custom"] == "retained"
     assert result.model_dump_json() == before
 
@@ -1646,7 +1648,7 @@ def test_overlapping_signed_stream_sources_preserve_baseline_identities(monkeypa
         transport.assert_called_once_with("https")
         filesystem.info.assert_called_once_with(source)
         filesystem.open.assert_called_once_with(source, "rb")
-        assert all(issue.details["source_url"] == source for issue in result.issues)
+        assert all(getattr(issue, "finding_identity", {})["producer"] == "stream" for issue in result.issues)
         assert result.issues[0].location == source + " (pos 4)"
         merged.issues.extend(result.issues)
         merged.assets.extend(result.assets)
@@ -1672,7 +1674,7 @@ def test_stream_failure_fingerprint_survives_saved_results(monkeypatch: pytest.M
         finding = _create_run(converted, [], False)["results"][0]
         assert finding["partialFingerprints"]["primaryLocationLineHash"] == "5386d5566b6f8146"
         assert source in finding["message"]["text"]
-        assert converted.issues[0].details["source_url"] == source
+        assert getattr(converted.issues[0], "finding_identity", {})["producer"] == "stream"
 
 
 def test_stream_identity_context_excludes_local_and_huggingface_downloads() -> None:
@@ -1689,3 +1691,230 @@ def test_stream_identity_context_excludes_local_and_huggingface_downloads() -> N
     expected = _create_run(result, [], False)["results"]
     result.assets = [AssetModel(path=source, type="pickle", is_streamed=True)]
     assert _create_run(result, [], False)["results"] == expected
+
+
+@pytest.mark.parametrize(
+    "mode, hashes",
+    [
+        ("budget", ("cd69d800710289bc", "cc721fc7dc9c02d5")),
+        ("trust", ("db7cf136ad10ad54", "64b60a051d5364bd")),
+        ("path", ("3f8bce7b2d2ed0bd", "e8d603c2a13f4ed9")),
+    ],
+)
+@pytest.mark.parametrize(
+    "query", ["?code=FIRSTSYNTHETIC", "?code=SECONDSYNTHETIC", "?code=" + "x" * 700 + "&version=actual"]
+)
+def test_mlflow_acquisition_identity_survives_bounded_raw_output(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, mode: str, hashes: tuple[str, str], query: str
+) -> None:
+    from modelaudit.integrations.mlflow import scan_mlflow_model
+
+    # Parent-derived hashes include source normalization before the 512-character display limit.
+    source = "models:/PublicModel/1" + query
+    module = ModuleType("mlflow")
+    repository = SimpleNamespace(artifact_uri="s3://trusted-bucket/models")
+    lookup = Mock(side_effect=RuntimeError("unavailable")) if mode == "budget" else Mock(return_value=repository)
+    module.__dict__["artifacts"] = SimpleNamespace(get_artifact_repository=lookup)
+    monkeypatch.setitem(sys.modules, "mlflow", module)
+    monkeypatch.setenv("MODELAUDIT_MLFLOW_ALLOWED_ARTIFACT_URIS", "s3://trusted-bucket" if mode == "path" else "")
+    monkeypatch.setattr("modelaudit.integrations.mlflow.tempfile.mkdtemp", lambda **kwargs: str(tmp_path / "missing"))
+    result = scan_mlflow_model(source, max_file_size=1 if mode == "budget" else 0)
+    expected_location = source if len(source) <= 512 else source[:509] + "..."
+    assert result.issues[0].location == result.checks[0].location == expected_location
+    assert len(getattr(result.issues[0], "finding_identity", {})["fields"]["location"]) <= 512
+    aggregate = create_initial_audit_result()
+    aggregate.aggregate_scan_result(result)
+    direct = create_initial_audit_result()
+    scanned = ScanResult(scanner_name="mlflow")
+    scanned.issues, scanned.checks = result.issues, result.checks
+    direct.aggregate_scan_result_direct(scanned)
+    for converted in [
+        result,
+        aggregate,
+        direct,
+        ModelAuditResultModel.model_validate_json(aggregate.model_dump_json()),
+    ]:
+        finding = _create_run(converted, [], False)["results"][0]
+        assert finding["partialFingerprints"]["primaryLocationLineHash"] == hashes[int(len(source) > 512)]
+        assert finding["message"]["text"] == result.issues[0].message
+        assert converted.issues[0].location == expected_location
+        assert getattr(converted.checks[0], "finding_identity", {}) == getattr(result.checks[0], "finding_identity", {})
+
+
+@pytest.mark.parametrize("query", ["", "?revision=main"])
+@pytest.mark.skipif(os.name == "nt", reason="Literal question marks are not valid Windows directory names")
+def test_directory_owner_preserves_parent_finding_and_check_identities(tmp_path: Path, query: str) -> None:
+    from modelaudit.core_results import consolidate_checks
+
+    root = tmp_path / ("owner" + query)
+    root.mkdir()
+    metadata = root / "metadata.json"
+    metadata.write_text(
+        json.dumps({"version": "0.1.0", "type": "orbax_checkpoint", "restore_fn": "lambda x: eval(x.decode())"})
+    )
+    result = scan_model_directory_or_file(str(root), cache_enabled=False)
+    # Parent reports the same restore function through owner and child when normalization makes their keys differ.
+    expected_locations = ([str(tmp_path / "owner") + "?revision=<redacted>"] if query else []) + [str(metadata)]
+    expected_hashes = [
+        hashlib.sha256(
+            ("Dangerous restore function detected in Orbax metadata" + location + "IssueSeverity.CRITICAL").encode()
+        ).hexdigest()[:16]
+        for location in expected_locations
+    ]
+    expected_counts = (9, 7, 2) if query else (8, 7, 1)
+    for converted in [result, ModelAuditResultModel.model_validate_json(result.model_dump_json())]:
+        converted.deduplicate_issues()
+        consolidate_checks(converted)
+        findings = [item for item in _create_run(converted, [], False)["results"] if item["ruleId"] == "S302"]
+        assert [item["partialFingerprints"]["primaryLocationLineHash"] for item in findings] == expected_hashes
+        assert (converted.total_checks, converted.passed_checks, converted.failed_checks) == expected_counts
+        assert all(issue.location == str(metadata) for issue in converted.issues if issue.rule_code == "S302")
+
+
+@pytest.mark.parametrize("owner_path", ["/proc/self/fd/11", "/synthetic/staged-owner", "."])
+def test_directory_owner_identity_keeps_message_rules_and_evidence(tmp_path: Path, owner_path: str) -> None:
+    from modelaudit.core import _normalize_directory_owner_scan_result_for_reporting
+    from modelaudit.utils.helpers.finding_identity import finding_identity
+
+    report_path = str(tmp_path / "owner")
+    scanned = ScanResult(scanner_name="jax_checkpoint")
+    url = "https://example.com/a?revision=main"
+    issue = Issue(
+        message="Fetch " + url, location=owner_path, type=url, rule_code=url, details={"evidence_fingerprint": url}
+    )
+    scanned.issues.append(issue)
+    _normalize_directory_owner_scan_result_for_reporting(scanned, owner_path, report_path)
+    identity = finding_identity(issue)
+    expected_url = url if owner_path == "." else "https://example.com/a?revision=<redacted>"
+    assert identity.message == "Fetch " + expected_url
+    assert identity.type == identity.rule_code == identity.details["evidence_fingerprint"] == expected_url
+    assert issue.message == "Fetch " + url
+    assert issue.type == issue.rule_code == issue.details["evidence_fingerprint"] == url
+    assert identity.location == issue.location == report_path
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        None,
+        [],
+        {"producer": []},
+        {"producer": {}},
+        {"producer": "unknown"},
+        {"producer": "directory_owner", "fields": []},
+    ],
+)
+def test_malformed_or_evidence_owned_identity_metadata_is_ignored(metadata: object) -> None:
+    from modelaudit.utils.helpers.finding_identity import finding_identity
+
+    issue = Issue(
+        message="original",
+        location="model.pkl",
+        finding_identity=metadata,
+        details={"finding_identity": {"producer": "directory_owner", "fields": {"message": "spoofed"}}},
+    )
+    saved = Issue.model_validate_json(issue.model_dump_json())
+    assert finding_identity(saved).message == "original"
+    assert (
+        _create_results([saved])[0]["partialFingerprints"]
+        == _create_results([Issue(message="original", location="model.pkl")])[0]["partialFingerprints"]
+    )
+
+
+def test_real_stream_aggregation_retains_parent_deduplication(monkeypatch: pytest.MonkeyPatch) -> None:
+    payload = b"cos\nsystem\n(S'printf sample'\ntR."
+    aggregate = create_initial_audit_result()
+    for token in ["alpha", "beta"]:
+        source = "https://bucket.s3.amazonaws.com/model.pkl?token=" + token
+        filesystem = Mock()
+        filesystem.info.return_value = {"size": len(payload)}
+        filesystem.open.side_effect = lambda *args: io.BytesIO(payload)
+        monkeypatch.setattr("fsspec.filesystem", Mock(return_value=filesystem))
+        result = scan_model_directory_or_file("stream://" + source, cache_scan_results=False)
+        assert all(source in issue.location for issue in result.issues if issue.location)
+        aggregate.aggregate_scan_result(result.model_dump())
+    aggregate.finalize_statistics()
+    for converted in [aggregate, ModelAuditResultModel.model_validate_json(aggregate.model_dump_json())]:
+        converted.deduplicate_issues()
+        assert len(converted.issues) == 2
+        assert [
+            item["partialFingerprints"]["primaryLocationLineHash"]
+            for item in _create_run(converted, [], False)["results"]
+        ] == [
+            "fb2ab0e5be0479b9",
+            "141c46e33bef25d8",
+        ]
+
+
+@pytest.mark.parametrize("output_format", ["json", "sarif"])
+def test_huggingface_cli_preserves_parent_source_deduplication(
+    monkeypatch: pytest.MonkeyPatch, output_format: str
+) -> None:
+    from click.testing import CliRunner
+
+    from modelaudit.cli import cli
+
+    paths = [
+        "https://huggingface.co/synthetic/model?revision=v1&token=" + token
+        for token in ["FIRSTSYNTHETIC", "SECONDSYNTHETIC"]
+    ]
+    downloader = Mock(side_effect=RuntimeError("403 Forbidden: gated model"))
+    monkeypatch.setattr("modelaudit.cli.download_model", downloader)
+    result = CliRunner().invoke(cli, ["scan", "--quiet", "--no-cache", "--format", output_format, *paths])
+    assert result.exit_code == 2
+    assert downloader.call_count == 2
+    exported = json.loads(result.output[result.output.index("{") :])
+    if output_format == "json":
+        assert len(exported["issues"]) == 1
+        assert paths[0] in exported["issues"][0]["location"]
+        saved = ModelAuditResultModel.model_validate(exported)
+        saved.deduplicate_issues()
+        findings = _create_run(saved, [], False)["results"]
+    else:
+        findings = exported["runs"][0]["results"]
+    assert len(findings) == 1
+    assert findings[0]["partialFingerprints"]["primaryLocationLineHash"] == "e551792c82a8ce3b"
+
+
+def test_direct_raw_sarif_models_do_not_infer_producer_normalization() -> None:
+    source = "https://bucket.s3.amazonaws.com/model.pkl?token=alpha"
+    result = create_initial_audit_result()
+    result.issues = [
+        Issue(
+            message="Found dangerous pickle global",
+            location=source + suffix,
+            severity=IssueSeverity.CRITICAL,
+            type="pickle_check",
+            rule_code="S201",
+        )
+        for suffix in ["", " (pos 30)", ":42"]
+    ]
+    findings = _create_run(result, ["stream://" + source], False)["results"]
+    assert [item["partialFingerprints"]["primaryLocationLineHash"] for item in findings] == ["69306204a0e4ca52"] * 3
+    source = "https://huggingface.co/org/repo?token=alpha@main"
+    result.issues = [
+        Issue(
+            message="Failed to download " + source + ": unavailable",
+            location=source,
+            severity=IssueSeverity.INFO,
+            type="huggingface_acquisition_error",
+            details={"requested_revision": "main"},
+        )
+    ]
+    assert (
+        _create_run(result, [source], False)["results"][0]["partialFingerprints"]["primaryLocationLineHash"]
+        == "015d415c5d3be61c"
+    )
+
+
+def test_stream_rule_classification_uses_identity_but_keeps_raw_description(monkeypatch: pytest.MonkeyPatch) -> None:
+    source = "stream://https://bucket.s3.amazonaws.com/model.pkl?token=pickle-exec-secret-license-cve-network"
+    filesystem = Mock()
+    filesystem.info.side_effect = RuntimeError("transport unavailable")
+    monkeypatch.setattr("fsspec.filesystem", Mock(return_value=filesystem))
+    result = scan_model_directory_or_file(source, cache_scan_results=False)
+    for converted in [result, ModelAuditResultModel.model_validate_json(result.model_dump_json())]:
+        rule = _create_run(converted, [source], False)["tool"]["driver"]["rules"][0]
+        assert rule["properties"]["tags"] == ["security", "ml-model"]
+        assert rule["shortDescription"]["text"] == converted.issues[0].message[:100]
+        assert "pickle-exec-secret-license-cve-network" in converted.issues[0].message

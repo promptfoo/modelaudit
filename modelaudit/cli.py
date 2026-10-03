@@ -95,6 +95,7 @@ from .utils.helpers.auto_defaults import (
     generate_auto_defaults,
     parse_size_string,
 )
+from .utils.helpers.finding_identity import preserve_finding_identity
 from .utils.helpers.interrupt_handler import interruptible_scan
 from .utils.repository_context import (
     REPOSITORY_CURRENT_FILE_CONFIG_KEY,
@@ -116,7 +117,7 @@ from .utils.sources.huggingface import (
     parse_huggingface_file_url,
     parse_huggingface_url_with_revision,
 )
-from .utils.sources.huggingface_paths import _huggingface_classification_error
+from .utils.sources.huggingface_paths import _huggingface_classification_error, _huggingface_classification_url
 from .utils.sources.jfrog import (
     is_jfrog_url,
 )
@@ -2068,6 +2069,15 @@ def _record_huggingface_acquisition_error(
             type="huggingface_acquisition_error",
         )
     )
+    identity_source = _huggingface_classification_url(path)
+    if requested_revision and not is_huggingface_file_url(path):
+        identity_source = f"{identity_source}@{requested_revision}"
+    preserve_finding_identity(
+        audit_result.issues[-1],
+        "huggingface_acquisition",
+        location=identity_source,
+        message=issue_message.replace(source_key, identity_source, 1),
+    )
     audit_result.file_metadata[source_key] = FileMetadataModel(
         source="huggingface",
         source_url=source_key,
@@ -2795,7 +2805,7 @@ def _write_scan_sbom(
     if not sbom:
         return
 
-    from .integrations.sbom_generator import generate_sbom_pydantic
+    from .integrations.sbom_generator import _cli_source_classification_path, generate_sbom_pydantic
 
     asset_paths = list(
         dict.fromkeys(asset.path for asset in audit_result.assets if asset.path and asset.type != "skipped")
@@ -2811,7 +2821,11 @@ def _write_scan_sbom(
             else [_report_source_path(path) for path in expanded_paths]
         )
 
-    sbom_text = generate_sbom_pydantic(paths_for_sbom, audit_result)
+    sbom_text = generate_sbom_pydantic(
+        paths_for_sbom,
+        audit_result,
+        _classification_paths={path: _cli_source_classification_path(path) for path in paths_for_sbom},
+    )
     _write_output_text_file(sbom, sbom_text)
 
 
