@@ -349,3 +349,14 @@ def redact_stream_url_for_display(url: str) -> str:
     except Exception:
         return "<cloud URL redacted>"
     return redact_url_for_display(url)
+
+
+def redact_stream_error_for_display(message: object, source_url: str) -> str:
+    """Remove a stream source URL from exception text, including malformed identifiers."""
+    safe_url = redact_stream_url_for_display(source_url)
+    redacted = str(message)
+    if not source_url:
+        return redact_cloud_error_for_display(redacted.replace("stream://", f"stream://{safe_url}"))
+    redacted = redacted.replace(f"stream://{source_url}", f"stream://{safe_url}")
+    redacted = redacted.replace(source_url, safe_url)
+    return redact_cloud_error_for_display(redacted)

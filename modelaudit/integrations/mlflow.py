@@ -14,8 +14,10 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import unquote, urlparse
 
+from ..finding_identity import preserve_finding_identity
 from ..models import Check, CheckStatus, Issue, IssueSeverity, ModelAuditResultModel, create_initial_audit_result
 from ..utils.helpers.evidence import format_evidence_string, format_evidence_value
+from ._mlflow_identity import mlflow_source_identity
 
 logger = logging.getLogger(__name__)
 
@@ -184,6 +186,9 @@ def _mlflow_acquisition_failure_result(
             type=issue_type,
         )
     )
+    identity_location = mlflow_source_identity(model_uri)
+    for record in [result.issues[-1], result.checks[-1]]:
+        preserve_finding_identity(record, "mlflow_acquisition", location=identity_location)
     result.finalize_statistics()
     return result
 

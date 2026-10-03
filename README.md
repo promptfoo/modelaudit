@@ -216,6 +216,10 @@ Common scan options:
 --list-scanners              List scanner IDs, class names, extensions, and dependencies
 ```
 
+Reports retain raw source identifiers and credential-bearing evidence. Consumers of `file_metadata`
+should use the emitted raw keys; previously masked source keys are no longer lookup aliases.
+Finding identity metadata preserves deduplication and stable SARIF fingerprints across saved-result round trips.
+
 Targeted scanner selection:
 
 ```bash
