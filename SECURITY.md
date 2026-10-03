@@ -1,5 +1,13 @@
 # Security Policy
 
+## Raw local output: no redaction
+
+ModelAudit is a local analysis tool. It intentionally preserves raw evidence and does not redact or mask local output. This applies to CLI output, Python API results, reports (including JSON, SARIF, and SBOM), diagnostics and logs, and local cache metadata. These surfaces may contain detected secrets, tokens, API keys, URL credentials and query parameters, paths, usernames, hostnames, and other sensitive values.
+
+Unredacted local output is supported behavior and an accepted risk. Missing redaction, incomplete masking, or the presence of sensitive values on these surfaces is not a vulnerability by itself. Do not add or reintroduce redaction as a security fix. Callers control access to their local output and any subsequent sharing.
+
+Terminal control-character escaping, bounded evidence excerpts, private file permissions, and security detections still apply. Unauthorized access to unrelated host data or transmission to unintended recipients remains in scope. Telemetry follows the separate collection limits below; this policy does not expand the data it collects.
+
 ## What constitutes a security vulnerability
 
 A security vulnerability is any bug that threatens the safety of ModelAudit users or their scanning environments. Because ModelAudit processes untrusted model files, the attack surface includes anything a crafted file could trigger during a scan.
@@ -11,12 +19,13 @@ A security vulnerability is any bug that threatens the safety of ModelAudit user
 | Code execution in the scanner | A crafted model file causes ModelAudit itself to execute arbitrary code during scanning                                               |
 | Material detection bypass     | A practical evasion defeats a documented, security-relevant detection guarantee or broad attack class that ModelAudit claims to cover |
 | Denial of service             | A crafted file causes an out-of-memory condition, infinite loop, or crash in ModelAudit                                               |
-| Information disclosure        | Scan results or error output leak host filesystem paths, environment variables, or API keys                                           |
+| Information disclosure        | Untrusted input causes unauthorized access to host data or disclosure to unintended recipients                                        |
 | Supply chain compromise       | Malicious code introduced through the PyPI package, Docker images, or GitHub Actions workflows                                        |
 
 **Not considered a vulnerability:**
 
 - Malicious content that ModelAudit **correctly detects** — that is working as designed.
+- Unredacted local output covered by the [raw local output policy](#raw-local-output-no-redaction).
 - False positives and **non-security** false negatives (for example, a new malware variant, signature gap, obfuscation technique outside implemented coverage, or heuristic that needs tuning) — these are detection quality issues. Report them via [GitHub Issues](https://github.com/promptfoo/modelaudit/issues) using the bug report template, or see [CONTRIBUTING.md](CONTRIBUTING.md) for guidance. A false negative becomes a security vulnerability only when it materially defeats a documented security guarantee, common malicious-model attack class, or enforcement boundary that users reasonably rely on. Narrow misses in niche formats or runtime-specific paths may still be accepted privately during triage, but they are not automatically High severity and may be closed as detection-quality improvements if the practical security impact is low.
 - Bugs in third-party dependencies that are not reachable through ModelAudit's own code paths — report those to the respective upstream maintainers.
 - Issues that require the attacker to already have equivalent privilege on the scanning host **and** do not enable privilege escalation, lateral movement, persistence, or additional data access. (Bugs exploitable in shared CI runners or multi-tenant environments where the attacker starts with limited access are in scope.)
@@ -33,7 +42,7 @@ Packaged installs enable telemetry by default. Editable development installs dis
 
 ## How to report a vulnerability
 
-**Do not open a public GitHub issue.** Public disclosure of unpatched vulnerabilities puts all ModelAudit users at risk. If this happens, maintainers may close the issue, redact sensitive details when possible, and redirect you to private reporting channels.
+**Do not open a public GitHub issue.** Public disclosure of unpatched vulnerabilities puts all ModelAudit users at risk. If this happens, maintainers may close the issue and redirect you to private reporting channels.
 
 ### Primary: GitHub Private Vulnerability Reporting
 
@@ -56,7 +65,7 @@ A good report helps us confirm and fix the issue quickly. Include as much of the
 - **Python version** (`python --version`).
 - **Operating system and architecture** (e.g., Ubuntu 22.04 x86_64, macOS 15 arm64).
 - **Installation method** (pip, uv, Docker, source).
-- **Verbose scan output** (`modelaudit scan <file> --verbose`), with sensitive data redacted (paths, usernames, hostnames, tokens, credentials, keys).
+- **Verbose scan output** (`modelaudit scan <file> --verbose`), shared through private reporting or an agreed secure transfer channel. Redaction is not required for privately submitted evidence.
 - **Fuzzer details**, if the issue was found through fuzzing — include the fuzzer name, configuration, and corpus entry.
 
 If you cannot share the triggering file, describe how to generate a file that reproduces the issue.
@@ -85,7 +94,7 @@ We assess severity using [CVSS v3.1](https://www.first.org/cvss/v3.1/specificati
 
 - A crafted model file that causes arbitrary code execution in the scanner is treated as **Critical**.
 - Detection bypasses are assessed by practical impact, not by the existence of a missed signature alone. Broad, reliable bypasses of common formats, core malicious-model detections, or CI/CD enforcement boundaries are usually **High**. Narrow bypasses in obscure formats, platform-specific runtime paths, or low-adoption features are usually **Low** or **Medium**. Ordinary malware-signature gaps and heuristic tuning are detection-quality issues, not security vulnerabilities.
-- Exposure of host secrets or credentials during scanning is treated as at least **High**.
+- Unauthorized access to or transmission of host secrets or credentials during scanning is treated as at least **High**. Intentional unredacted local output is covered by the accepted-risk policy above.
 - A vulnerability reachable only through an optional dependency not installed by default may be reduced by one tier.
 
 ## Embargo and non-disclosure
@@ -109,7 +118,7 @@ We request CVE IDs through [GitHub's CVE Numbering Authority (CNA)](https://docs
 - Remote code execution in ModelAudit when scanning untrusted input.
 - Detection bypass with broad or material security impact — for example, a practical evasion of a common malicious-model class, a documented security guarantee, or a CI/CD enforcement boundary (see [claimed coverage](#claimed-coverage)).
 - Supply chain compromise of the PyPI package, Docker images, or release pipeline.
-- Information disclosure of sensitive host data during a scan.
+- Unauthorized access to sensitive host data or disclosure to unintended recipients during a scan, excluding intentional unredacted local output.
 
 **Typically no CVE (fixed in a normal release):**
 
