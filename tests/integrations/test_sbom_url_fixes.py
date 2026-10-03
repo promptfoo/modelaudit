@@ -1218,3 +1218,52 @@ def test_mlflow_emitted_finding_paths_keep_original_sbom_association(
     output = generate_sbom(paths, result.model_dump()) if legacy else generate_sbom_pydantic(paths, result)
     component = json.loads(output)["components"][0]
     assert next(prop["value"] for prop in component["properties"] if prop["name"] == "risk_score") == "1"
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_mlflow_saved_result_keeps_colliding_source_previews(monkeypatch: pytest.MonkeyPatch, legacy: bool) -> None:
+    _refuse_mlflow_acquisition(monkeypatch)
+    prefix = "models:/PublicModel/1/access_token=" + "x" * 700
+    sources = [prefix + tail for tail in ["&version=actual", "&revision=actual"]]
+    exports = []
+    for inputs in [sources, list(reversed(sources)), sources + sources]:
+        invocation = CliRunner().invoke(
+            cli, ["scan", *inputs, "--quiet", "--no-cache", "--max-size", "1MB", "--format", "json"]
+        )
+        assert invocation.exit_code == 2
+        result = ModelAuditResultModel.model_validate_json(invocation.output[invocation.output.index("{") :])
+        paths = [issue.location for issue in result.issues if issue.location]
+        assert len(paths) == len(set(paths)) == 2
+        assert all(len(path) <= 512 for path in paths)
+        output = generate_sbom(paths, result.model_dump()) if legacy else generate_sbom_pydantic(paths, result)
+        components = json.loads(output)["components"]
+        assert len(components) == len({component["bom-ref"] for component in components}) == 2
+        assert all(
+            next(prop["value"] for prop in c["properties"] if prop["name"] == "risk_score") == "1" for c in components
+        )
+        exports.append(components)
+        result.issues[0].severity = IssueSeverity.CRITICAL
+        output = generate_sbom(paths, result.model_dump()) if legacy else generate_sbom_pydantic(paths, result)
+        risk_by_path = {
+            c["bom-ref"]: next(prop["value"] for prop in c["properties"] if prop["name"] == "risk_score")
+            for c in json.loads(output)["components"]
+        }
+        assert risk_by_path == {paths[0]: "5", paths[1]: "1"}
+    assert exports[0] == exports[1] == exports[2]
+
+
+def test_mlflow_source_preview_cannot_alias_a_literal_uri(monkeypatch: pytest.MonkeyPatch) -> None:
+    from modelaudit.integrations.mlflow import scan_mlflow_model
+
+    _refuse_mlflow_acquisition(monkeypatch)
+    source = "models:/PublicModel/1/access_token=" + "x" * 700 + "&version=actual"
+    marker = "#modelaudit-source-sha256-"
+    literal = source[: 512 - len(marker) - 64] + marker + hashlib.sha256(source.encode()).hexdigest()
+    locations = []
+    for uri in [source, literal, literal.replace("modelaudit", "model\u200baudit")]:
+        result = scan_mlflow_model(uri, max_file_size=1)
+        location = result.issues[0].location
+        assert location is not None and len(location) <= 512
+        assert location == result.checks[0].location
+        locations.append(location)
+    assert len(set(locations)) == 3

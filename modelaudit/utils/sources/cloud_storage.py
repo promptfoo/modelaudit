@@ -40,6 +40,7 @@ from modelaudit.utils.helpers.auto_defaults import (
     _is_r2_https_host,
     _is_s3_https_host,
 )
+from modelaudit.utils.helpers.evidence import format_evidence_string
 from modelaudit.utils.helpers.retry import retry_with_backoff
 
 from ..helpers.disk_space import check_disk_space
@@ -1009,7 +1010,7 @@ class GCSCache:
             if not _is_within_directory(self.cache_dir, cached_path):
                 logger.warning(
                     "Dropping cache entry for %s because cached path %s is outside cache dir %s",
-                    url,
+                    format_evidence_string(url, max_chars=None),
                     cached_path,
                     self.cache_dir,
                 )
@@ -2390,12 +2391,19 @@ def download_from_cloud(
                 if size > 0:
                     object_size = int(size)
                     if show_progress:
-                        click.echo(f"⚠️  Falling back to metadata size estimate for disk check: {exc}")
+                        click.echo(
+                            format_evidence_string(
+                                f"⚠️  Falling back to metadata size estimate for disk check: {exc}", max_chars=None
+                            )
+                        )
                 else:
                     object_size = None
                     if show_progress:
                         click.echo(
-                            f"⚠️  Unable to determine download size for {url}; continuing without disk check: {exc}"
+                            format_evidence_string(
+                                f"⚠️  Unable to determine download size for {url}; continuing without disk check: {exc}",
+                                max_chars=None,
+                            )
                         )
 
         if object_size is not None:

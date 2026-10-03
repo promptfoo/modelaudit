@@ -543,6 +543,23 @@ def test_streaming_signed_url_routing_exception_log_is_preserved(caplog: pytest.
     assert "X-Amz-Signature" in caplog.text
 
 
+def test_streaming_failure_filters_terminal_controls_but_preserves_saved_evidence(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    source = "s3://synthetic-bucket/model.pkl?token=\x1b]52;c;U1lOVEhFVElD\x07"
+    with (
+        caplog.at_level(logging.ERROR, logger="modelaudit.core"),
+        patch("fsspec.filesystem", side_effect=AssertionError("unsupported source must not access network")) as fs,
+    ):
+        result = scan_model_directory_or_file("stream://" + source, cache_scan_results=False)
+    fs.assert_not_called()
+    assert determine_exit_code(result) == 2
+    assert "Error during scan" in caplog.text
+    assert "\x1b" not in caplog.text and "\x07" not in caplog.text
+    saved = json.loads(result.model_dump_json())
+    assert any(source in issue["message"] for issue in saved["issues"])
+
+
 def test_streaming_signed_url_with_invalid_port_fails_closed() -> None:
     """Malformed URL authorities fail closed with their source in the report."""
     _assert_stream_port_error(
