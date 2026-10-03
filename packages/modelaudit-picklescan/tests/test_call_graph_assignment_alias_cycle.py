@@ -24,8 +24,9 @@ from modelaudit_picklescan.call_graph import (
     _CallGraphAnalysisLimitError,
     _collect_assignment_aliases,
     _collect_local_defs,
+    _definition_scope_statements,
     _first_matching_path,
-    _module_level_statements,
+    _runtime_selected_module_statements,
     _safe_call_graph_entrypoints,
     find_dangerous_call_graphs,
     find_startup_hook_write_call_graphs,
@@ -650,7 +651,7 @@ def _run_with_timeout(target: object, timeout: float = 10.0) -> None:
 )
 def test_collect_assignment_aliases_fails_closed_on_stable_branch_rebind(source: str) -> None:
     tree = ast.parse(source)
-    statements = _module_level_statements(tree)
+    statements = _definition_scope_statements(_runtime_selected_module_statements(tree.body, None))
     local_defs = _collect_local_defs(statements)
     local_class_targets = {"testmod.A", "testmod.B", "testmod.Final"}
 
@@ -672,7 +673,7 @@ def test_collect_assignment_aliases_converges_on_deterministic_final_rebind(
     expected_target: str,
 ) -> None:
     tree = ast.parse(source)
-    statements = _module_level_statements(tree)
+    statements = _definition_scope_statements(_runtime_selected_module_statements(tree.body, None))
     local_defs = _collect_local_defs(statements)
     local_class_targets = {"testmod.A", "testmod.B", "testmod.Final"}
 
@@ -689,7 +690,7 @@ def test_collect_assignment_aliases_converges_on_deterministic_final_rebind(
 
 def test_collect_assignment_aliases_allows_alias_read_after_deterministic_overwrite() -> None:
     tree = ast.parse(_OVERWRITE_BEFORE_READ_SOURCE)
-    statements = _module_level_statements(tree)
+    statements = _definition_scope_statements(_runtime_selected_module_statements(tree.body, None))
     local_defs = _collect_local_defs(statements)
 
     aliases = _collect_assignment_aliases(
@@ -743,7 +744,7 @@ def test_collect_assignment_aliases_allows_alias_read_after_deterministic_overwr
 )
 def test_collect_assignment_aliases_allows_matching_terminal_branch_overwrites(source: str) -> None:
     tree = ast.parse(source)
-    statements = _module_level_statements(tree)
+    statements = _definition_scope_statements(_runtime_selected_module_statements(tree.body, None))
     local_defs = _collect_local_defs(statements)
 
     aliases = _collect_assignment_aliases(
@@ -760,7 +761,7 @@ def test_collect_assignment_aliases_allows_matching_terminal_branch_overwrites(s
 
 def test_collect_assignment_aliases_fails_closed_on_cyclic_dependency_propagation() -> None:
     tree = ast.parse(_DEPENDENT_CYCLE_SOURCE)
-    statements = _module_level_statements(tree)
+    statements = _definition_scope_statements(_runtime_selected_module_statements(tree.body, None))
     local_defs = _collect_local_defs(statements)
     local_class_targets = {"testmod.A", "testmod.B"}
 
@@ -782,7 +783,7 @@ def test_collect_assignment_aliases_fails_closed_on_long_period_cycles() -> None
             source_lines.append(f"ring_{ring_index}_{position} = ring_{ring_index}_{next_position}")
 
     tree = ast.parse("\n".join(source_lines))
-    statements = _module_level_statements(tree)
+    statements = _definition_scope_statements(_runtime_selected_module_statements(tree.body, None))
     local_defs = _collect_local_defs(statements)
     _assert_alias_collection_limited(statements, local_defs, local_class_targets)
 
