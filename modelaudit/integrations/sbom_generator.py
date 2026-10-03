@@ -139,7 +139,11 @@ def _get_component_type(path: str, metadata: dict[str, Any] | None) -> Component
 def _source_identity_path(path: str, metadata: FileMetadataModel | dict[str, Any] | None) -> str:
     """Keep the producer's component semantics while exporting its raw source."""
     identity = metadata.get("source_identity") if isinstance(metadata, (dict, FileMetadataModel)) else None
-    if isinstance(identity, dict) and identity.get("producer") in ("stream", "huggingface_acquisition"):
+    if isinstance(identity, dict) and identity.get("producer") in (
+        "stream",
+        "huggingface_acquisition",
+        "mlflow_acquisition",
+    ):
         identity_path = identity.get("path")
         if isinstance(identity_path, str):
             return identity_path
@@ -543,9 +547,11 @@ def _is_non_filesystem_identifier(path: str) -> bool:
     return False
 
 
-def _component_identity(path: str, sha256: str, bom_ref_state: _BomRefState | None = None) -> tuple[str, str]:
+def _component_identity(
+    path: str, sha256: str, bom_ref_state: _BomRefState | None = None, reported_path: str | None = None
+) -> tuple[str, str]:
     """Preserve source identities and disambiguate bounded or expanded references."""
-    identifier = serialize_source_identifier(path)
+    identifier = serialize_source_identifier(path if reported_path is None else reported_path)
     reference = identifier
     if identifier != path and sha256:
         reference = f"{reference}#modelaudit-content-sha256-{sha256}"
@@ -736,6 +742,7 @@ def _component_for_file(
     bom_ref_state: _BomRefState | None = None,
     typed: bool = False,
     classification_path: str | None = None,
+    reported_path: str | None = None,
 ) -> Component:
     size, sha256 = _resolve_component_size_and_sha256(
         path,
@@ -858,7 +865,7 @@ def _component_for_file(
         else None
     )
     component_type = _get_component_type(identity_path, component_metadata)
-    component_name, bom_ref = _component_identity(path, sha256, bom_ref_state)
+    component_name, bom_ref = _component_identity(path, sha256, bom_ref_state, reported_path)
 
     component = Component(
         name=component_name,
@@ -876,7 +883,12 @@ def _component_for_file(
 
 
 def _generate_sbom(
-    paths: Iterable[str], results: Any, *, typed: bool, classification_paths: dict[str, str] | None = None
+    paths: Iterable[str],
+    results: Any,
+    *,
+    typed: bool,
+    classification_paths: dict[str, str] | None = None,
+    reported_paths: dict[str, str] | None = None,
 ) -> str:
     bom = Bom()
     issues = results.issues or [] if typed else results.get("issues", [])
@@ -954,6 +966,7 @@ def _generate_sbom(
                     bom_ref_state=bom_ref_state,
                     typed=typed,
                     classification_path=(classification_paths or {}).get(input_path),
+                    reported_path=(reported_paths or {}).get(input_path),
                 )
                 bom.components.add(component)
             finally:
@@ -968,7 +981,11 @@ def generate_sbom(paths: Iterable[str], results: dict[str, Any] | Any) -> str:
 
 
 def generate_sbom_pydantic(
-    paths: Iterable[str], results: ModelAuditResultModel, *, _classification_paths: dict[str, str] | None = None
+    paths: Iterable[str],
+    results: ModelAuditResultModel,
+    *,
+    _classification_paths: dict[str, str] | None = None,
+    _reported_paths: dict[str, str] | None = None,
 ) -> str:
     """
     Generate SBOM directly from Pydantic models (type-safe version).
@@ -976,4 +993,6 @@ def generate_sbom_pydantic(
     This is the preferred method that works directly with Pydantic models
     without any dict conversions, providing full type safety.
     """
-    return _generate_sbom(paths, results, typed=True, classification_paths=_classification_paths)
+    return _generate_sbom(
+        paths, results, typed=True, classification_paths=_classification_paths, reported_paths=_reported_paths
+    )

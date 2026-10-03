@@ -505,7 +505,7 @@ def _normalize_path_to_uri(path: str) -> str:
     uri_path = p.as_posix()
 
     # URL-encode special characters
-    return quote(uri_path, safe="/")
+    return quote(uri_path, safe="/", errors="backslashreplace")
 
 
 def _get_mime_type(file_type: str) -> str:

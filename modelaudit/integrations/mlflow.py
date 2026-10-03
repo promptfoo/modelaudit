@@ -15,7 +15,15 @@ from typing import Any
 from urllib.parse import unquote, urlparse
 
 from ..finding_identity import preserve_finding_identity
-from ..models import Check, CheckStatus, Issue, IssueSeverity, ModelAuditResultModel, create_initial_audit_result
+from ..models import (
+    Check,
+    CheckStatus,
+    FileMetadataModel,
+    Issue,
+    IssueSeverity,
+    ModelAuditResultModel,
+    create_initial_audit_result,
+)
 from ..utils.helpers.evidence import format_evidence_string, format_evidence_value
 from ._mlflow_identity import mlflow_source_identity
 
@@ -189,6 +197,9 @@ def _mlflow_acquisition_failure_result(
     identity_location = mlflow_source_identity(model_uri)
     for record in [result.issues[-1], result.checks[-1]]:
         preserve_finding_identity(record, "mlflow_acquisition", location=identity_location)
+    result.file_metadata[safe_model_uri] = FileMetadataModel(
+        source_identity={"producer": "mlflow_acquisition", "path": identity_location}
+    )
     result.finalize_statistics()
     return result
 
