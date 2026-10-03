@@ -114,10 +114,6 @@ def _merged_record_context(
     return workload, target, size, files
 
 
-def _format_change(delta_ratio: float) -> str:
-    return f"{delta_ratio:+.1%}"
-
-
 def _build_summary(
     current: dict[str, BenchmarkRecord],
     baseline: dict[str, BenchmarkRecord] | None,
@@ -216,7 +212,7 @@ def _build_summary(
         total_delta_ratio = 0.0 if baseline_total == 0 else (current_total - baseline_total) / baseline_total
         lines.append(
             f"Aggregate shared-benchmark median: {_format_duration(baseline_total)} "
-            f"-> {_format_duration(current_total)} ({_format_change(total_delta_ratio)})."
+            f"-> {_format_duration(current_total)} ({f'{total_delta_ratio:+.1%}'})."
         )
 
     top_regressions = [row for row in sorted_rows if row.status == "regression"][:3]
@@ -225,7 +221,7 @@ def _build_summary(
         lines.append("Top regressions:")
         for row in top_regressions:
             lines.append(
-                f"- `{row.name}` {_format_change(row.delta_ratio)} "
+                f"- `{row.name}` {f'{row.delta_ratio:+.1%}'} "
                 f"({_format_duration(row.baseline_median)} -> {_format_duration(row.current_median)}, "
                 f"{row.workload}, {row.target}, size={row.size}, files={row.files})"
             )
@@ -236,7 +232,7 @@ def _build_summary(
         lines.append("Top improvements:")
         for row in top_improvements:
             lines.append(
-                f"- `{row.name}` {_format_change(row.delta_ratio)} "
+                f"- `{row.name}` {f'{row.delta_ratio:+.1%}'} "
                 f"({_format_duration(row.baseline_median)} -> {_format_duration(row.current_median)}, "
                 f"{row.workload}, {row.target}, size={row.size}, files={row.files})"
             )
@@ -249,7 +245,7 @@ def _build_summary(
         lines.append(
             f"| `{row.workload}` | `{row.name}` | `{row.target}` | {row.size} | {row.files} | "
             f"{_format_duration(row.baseline_median)} | {_format_duration(row.current_median)} | "
-            f"{_format_change(row.delta_ratio)} | {row.status} |"
+            f"{f'{row.delta_ratio:+.1%}'} | {row.status} |"
         )
 
     if new_in_current:

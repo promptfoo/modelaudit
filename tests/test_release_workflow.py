@@ -16,11 +16,13 @@ import zipfile
 import zlib
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import pytest
 import yaml
 from packaging.requirements import Requirement
+
+from tests.helpers.workflows import _jobs, _step_by_name, _workflow_triggers
 
 try:
     import tomllib
@@ -47,13 +49,6 @@ def _load_release_workflow() -> dict[str, Any]:
     return workflow
 
 
-def _workflow_triggers(workflow: dict[str, Any]) -> dict[str, Any]:
-    raw_workflow = cast(dict[Any, Any], workflow)
-    triggers = raw_workflow.get("on", raw_workflow.get(True))
-    assert isinstance(triggers, dict)
-    return triggers
-
-
 def _job_steps(workflow: dict[str, Any], job_name: str) -> list[dict[str, Any]]:
     jobs = workflow["jobs"]
     assert isinstance(jobs, dict)
@@ -62,19 +57,6 @@ def _job_steps(workflow: dict[str, Any], job_name: str) -> list[dict[str, Any]]:
     steps = job["steps"]
     assert isinstance(steps, list)
     return steps
-
-
-def _step_by_name(steps: list[dict[str, Any]], name: str) -> dict[str, Any]:
-    for step in steps:
-        if step.get("name") == name:
-            return step
-    raise AssertionError(f"Step {name!r} not found")
-
-
-def _jobs(workflow: dict[str, Any]) -> dict[str, Any]:
-    jobs = workflow["jobs"]
-    assert isinstance(jobs, dict)
-    return jobs
 
 
 def _run_manual_release_step(
@@ -623,6 +605,7 @@ def test_release_workflow_verifies_published_picklescan_package() -> None:
 
     steps = _job_steps(workflow, "verify-picklescan-pypi")
     wait_step = _step_by_name(steps, "Wait for modelaudit-picklescan files on PyPI")
+    assert wait_step["env"] == {"PYPI_PROJECT": "modelaudit-picklescan"}
     wait_run = wait_step["run"]
     assert "https://pypi.org/pypi/modelaudit-picklescan/{version}/json" in wait_run
     assert "https://pypi.org/simple/modelaudit-picklescan/" in wait_run
@@ -730,6 +713,7 @@ def test_release_workflow_waits_for_compressed_pypi_simple_index(
 
     ticks = iter((0.0, 1.0, 2.0, 3.0))
     monkeypatch.setenv("EXPECTED_VERSION", version)
+    monkeypatch.setenv("PYPI_PROJECT", project)
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
     monkeypatch.setattr(time, "monotonic", lambda: next(ticks, 3.0))
     monkeypatch.setattr(time, "sleep", lambda _seconds: None)
@@ -879,6 +863,7 @@ def test_release_workflow_verifies_published_root_package_after_picklescan() -> 
 
     steps = _job_steps(workflow, "verify-pypi")
     wait_step = _step_by_name(steps, "Wait for modelaudit files on PyPI")
+    assert wait_step["env"] == {"PYPI_PROJECT": "modelaudit"}
     wait_run = wait_step["run"]
     assert "https://pypi.org/pypi/modelaudit/{version}/json" in wait_run
     assert "https://pypi.org/simple/modelaudit/" in wait_run

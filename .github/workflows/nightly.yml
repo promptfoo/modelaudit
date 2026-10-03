@@ -25,10 +25,12 @@ jobs:
           - { os: windows-latest, python-version: "3.12" }
           - { os: windows-latest, python-version: "3.13" }
     steps:
-      - name: Checkout repo
+      - &checkout-repo
+        name: Checkout repo
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
-      - name: Install uv
+      - &install-uv
+        name: Install uv
         uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
         with:
           enable-cache: true
@@ -37,7 +39,8 @@ jobs:
         run: |
           uv python pin ${{ matrix.python-version }}
 
-      - name: Install Rust toolchain
+      - &install-rust-toolchain
+        name: Install Rust toolchain
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
@@ -55,22 +58,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - *checkout-repo
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
-        with:
-          enable-cache: true
+      - *install-uv
 
       - name: Pin Python version
         run: |
           uv python pin 3.11
 
-      - name: Install Rust toolchain
-        run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
+      - *install-rust-toolchain
 
       - name: Sync dependencies
         run: |
@@ -85,13 +81,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - *checkout-repo
 
-      - name: Install Rust toolchain
-        run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
+      - *install-rust-toolchain
 
       - name: Run standalone picklescan Rust tests once
         run: |

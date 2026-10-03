@@ -71,30 +71,19 @@ echo "Compiling protobuf files..."
 COMPILED=0
 FAILED=0
 
-# Compile ALL proto files in the framework directory
-echo "  Compiling framework protos..."
-for proto in tensorflow/core/framework/*.proto; do
-    if [[ -f "$proto" ]]; then
-        if protoc --python_out="$OUTPUT_DIR" -I. "$proto" 2>&1; then
-            COMPILED=$((COMPILED + 1))
-        else
-            echo "  WARNING: Failed to compile $proto"
-            FAILED=$((FAILED + 1))
+# Compile ALL proto files in the framework and protobuf directories.
+for proto_group in framework protobuf; do
+    echo "  Compiling $proto_group protos..."
+    for proto in tensorflow/core/"$proto_group"/*.proto; do
+        if [[ -f "$proto" ]]; then
+            if protoc --python_out="$OUTPUT_DIR" -I. "$proto" 2>&1; then
+                COMPILED=$((COMPILED + 1))
+            else
+                echo "  WARNING: Failed to compile $proto"
+                FAILED=$((FAILED + 1))
+            fi
         fi
-    fi
-done
-
-# Compile ALL proto files in the protobuf directory
-echo "  Compiling protobuf protos..."
-for proto in tensorflow/core/protobuf/*.proto; do
-    if [[ -f "$proto" ]]; then
-        if protoc --python_out="$OUTPUT_DIR" -I. "$proto" 2>&1; then
-            COMPILED=$((COMPILED + 1))
-        else
-            echo "  WARNING: Failed to compile $proto"
-            FAILED=$((FAILED + 1))
-        fi
-    fi
+    done
 done
 
 echo ""
