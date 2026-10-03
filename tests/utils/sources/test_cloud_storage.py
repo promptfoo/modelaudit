@@ -615,7 +615,7 @@ def test_rejects_cloud_provider_hostname_near_matches(url: str) -> None:
 def test_analyze_cloud_target_retains_signed_url_retry_logs(
     mock_fs: MagicMock, mock_sleep: MagicMock, caplog: pytest.LogCaptureFixture
 ) -> None:
-    url = "s3://bucket/model.bin?X-Amz-Signature=secret"
+    url = "s3://bucket/model.bin?X-Amz-Signature=\x1b]52;c;secret\x07"
     fs = make_fs_mock()
     fs.info.side_effect = OSError(f"Forbidden while opening {url}")
     mock_fs.return_value = fs
@@ -625,7 +625,8 @@ def test_analyze_cloud_target_retains_signed_url_retry_logs(
 
     assert result["type"] == "unknown"
     assert "Failed after 4 attempts" in result["error"]
-    assert url in caplog.text
+    assert url.replace("\x1b", "").replace("\x07", "") in caplog.text
+    assert "\x1b" not in caplog.text and "\x07" not in caplog.text
     assert fs.info.call_count == 4
     assert mock_sleep.call_count == 3
 
@@ -5282,3 +5283,34 @@ def _assert_distinct_cloud_names(
     ):
         plan = _build_cloud_download_plan(base_url, files, tmp_path)
     assert [local_path.name for _, _, local_path in plan] == [first_name, second_name]
+
+
+def test_cloud_cache_warning_filters_source_controls(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.WARNING, logger="modelaudit.utils.sources.cloud_storage")
+    cache = GCSCache(cache_dir=tmp_path / "cache")
+    url = "s3://bucket/model.pkl?token=\x1b]52;c;U1lOVEhFVElD\x07"
+    cache.metadata[cache.get_cache_key(url)] = {"path": str(tmp_path / "outside.pkl")}
+    assert cache.get_cached_path(url) is None
+    assert "Dropping cache entry" in caplog.text
+    assert "\x1b" not in caplog.text and "\x07" not in caplog.text
+
+
+@pytest.mark.parametrize("size", [0, 4])
+def test_cloud_unknown_size_progress_filters_controls(
+    size: int, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    url = "s3://bucket/model.bin?token=\x1b]52;c;U1lOVEhFVElD\x07"
+    fs = make_fs_mock()
+    fs.info.side_effect = RuntimeError("Cannot read " + url)
+    metadata = {"type": "file", "size": size, "name": "model.bin", "human_size": "4 B", "estimated_time": "instant"}
+    with (
+        patch("fsspec.filesystem", return_value=fs),
+        patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new=AsyncMock(return_value=metadata)),
+        patch("modelaudit.utils.sources.cloud_storage.check_disk_space", return_value=(True, "")),
+    ):
+        result = download_from_cloud(url, cache_dir=tmp_path, use_cache=False, show_progress=True)
+    assert isinstance(result, Path)
+    fs.get.assert_called_once()
+    output = capsys.readouterr().out
+    assert "disk check" in output
+    assert "\x1b" not in output and "\x07" not in output

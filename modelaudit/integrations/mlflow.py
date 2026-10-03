@@ -172,12 +172,23 @@ def _split_mlflow_artifact_uri(mlflow_module: Any, model_uri: str) -> tuple[str,
     return f"models:/{parts[0]}/{parts[1]}", "/".join(parts[2:])
 
 
+def _mlflow_report_source_identifier(model_uri: str) -> str:
+    """Keep lossy source previews distinct without exceeding the evidence bound."""
+    marker = "#modelaudit-source-sha256-"
+    preview = format_evidence_string(model_uri, max_chars=_MAX_MLFLOW_ERROR_DISPLAY_CHARS)
+    if preview == model_uri and marker not in model_uri:
+        return preview
+    # Reserve the suffix syntax so a literal URI cannot impersonate a generated identifier.
+    digest = hashlib.sha256(model_uri.encode("utf-8", errors="surrogatepass")).hexdigest()
+    return preview[: _MAX_MLFLOW_ERROR_DISPLAY_CHARS - len(marker) - len(digest)] + marker + digest
+
+
 def _mlflow_budget_failure_result(model_uri: str, message: str, details: dict[str, Any]) -> ModelAuditResultModel:
     result = create_initial_audit_result()
     result.scanner_names = ["mlflow"]
     result.has_errors = True
     result.success = False
-    safe_model_uri = format_evidence_string(model_uri, max_chars=_MAX_MLFLOW_ERROR_DISPLAY_CHARS)
+    safe_model_uri = _mlflow_report_source_identifier(model_uri)
     safe_details = format_evidence_value(
         details,
         max_string_chars=_MAX_MLFLOW_ERROR_DISPLAY_CHARS,
@@ -227,7 +238,7 @@ def _mlflow_artifact_trust_failure_result(
     result.scanner_names = ["mlflow"]
     result.has_errors = True
     result.success = False
-    safe_model_uri = format_evidence_string(model_uri, max_chars=_MAX_MLFLOW_ERROR_DISPLAY_CHARS)
+    safe_model_uri = _mlflow_report_source_identifier(model_uri)
     safe_details = format_evidence_value(
         details,
         max_string_chars=_MAX_MLFLOW_ERROR_DISPLAY_CHARS,
@@ -278,7 +289,7 @@ def _mlflow_download_safety_failure_result(
     result.scanner_names = ["mlflow"]
     result.has_errors = True
     result.success = False
-    safe_model_uri = format_evidence_string(model_uri, max_chars=_MAX_MLFLOW_ERROR_DISPLAY_CHARS)
+    safe_model_uri = _mlflow_report_source_identifier(model_uri)
     safe_details = format_evidence_value(
         details,
         max_string_chars=_MAX_MLFLOW_ERROR_DISPLAY_CHARS,
