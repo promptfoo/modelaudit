@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "modelaudit"
-version = "0.2.52"
+version = "0.2.53"
 description = "Static scanning library for detecting malicious code, potential backdoor indicators, and other security risks in ML model files"
 authors = [
     { name = "Ian Webster", email = "ian@promptfoo.dev" },
@@ -53,7 +53,7 @@ dependencies = [
     "protobuf>=5.29.0",
     "msgpack>=1.2.1,<2.0",
     "tomli>=2.0.0; python_version < '3.11'",
-    "modelaudit-picklescan>=0.1.10,<0.2.0",
+    "modelaudit-picklescan>=0.1.11,<0.2.0",
 ]
 
 [project.optional-dependencies]
