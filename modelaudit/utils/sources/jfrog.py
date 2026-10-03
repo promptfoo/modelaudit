@@ -24,6 +24,7 @@ import requests
 from requests.auth import AuthBase
 
 from ...config.constants import SCANNABLE_MODEL_EXTENSIONS
+from ..helpers.evidence import format_evidence_string
 
 logger = logging.getLogger(__name__)
 
@@ -464,7 +465,7 @@ def _build_jfrog_auth_headers(
         if api_token or access_token or os.getenv("JFROG_API_TOKEN") or os.getenv("JFROG_ACCESS_TOKEN"):
             logger.warning(
                 "Skipping JFrog credentials for untrusted or insecure URL %s",
-                url,
+                format_evidence_string(url, max_chars=None),
             )
         return {}
 
@@ -922,7 +923,7 @@ def _build_jfrog_probe_auth_headers(
         return headers
     logger.warning(
         "Skipping JFrog probe credentials for parser-confused or untrusted URL %s",
-        url,
+        format_evidence_string(url, max_chars=None),
     )
     return {}
 
@@ -1636,7 +1637,9 @@ def list_jfrog_folder_contents(
                                 size = fetched_size
                             size_known = bool(file_info.get("size_known", fetched_size is not None))
                     except Exception as e:
-                        logger.warning(f"Failed to fetch size for {child_url}: {e!s}")
+                        logger.warning(
+                            format_evidence_string(f"Failed to fetch size for {child_url}: {e!s}", max_chars=None)
+                        )
 
                 files.append(
                     {
@@ -1898,7 +1901,7 @@ def download_jfrog_folder(
             except BaseException as e:
                 display_error = str(e)
                 error_msg = f"Failed to download {file_info['name']}: {display_error}"
-                logger.warning(error_msg)
+                logger.warning(format_evidence_string(error_msg, max_chars=None))
                 if show_progress:
                     click.echo("❌ Aborting JFrog folder download to avoid scanning a partial dataset")
                 current_file_candidates = [

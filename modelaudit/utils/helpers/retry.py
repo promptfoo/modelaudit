@@ -10,6 +10,8 @@ from typing import Any, TypeVar
 
 import click
 
+from .evidence import format_evidence_string
+
 logger = logging.getLogger(__name__)
 
 # The retired sanitizer keyword stays accepted so existing retry calls keep working.
@@ -85,7 +87,8 @@ def exponential_backoff(
 
                 # Log retry attempt
                 logger.debug(
-                    f"Attempt {attempt + 1} failed for {getattr(func, '__name__', 'unknown')}: {e}. "
+                    f"Attempt {attempt + 1} failed for {getattr(func, '__name__', 'unknown')}: "
+                    f"{format_evidence_string(str(e), max_chars=None)}. "
                     f"Retrying in {delay:.1f} seconds..."
                 )
 

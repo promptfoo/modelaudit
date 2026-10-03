@@ -9272,3 +9272,23 @@ def _assert_invalid_cli_rule_option(
     assert result.exit_code == 2
     assert case_message in result.output
     assert case_detail in result.output
+
+
+def test_verbose_streaming_failure_filters_terminal_controls_only(tmp_path: Path) -> None:
+    source = "https://bucket.s3.amazonaws.com/model.pkl?token=\x1b]52;c;U1lOVEhFVElD\x07"
+    filesystem = MagicMock()
+    filesystem.info.side_effect = OSError("Cannot read " + source)
+    output = tmp_path / "result.json"
+    with (
+        patch("modelaudit.cli.download_from_cloud", return_value="stream://" + source),
+        patch("fsspec.filesystem", return_value=filesystem),
+    ):
+        invocation = CliRunner().invoke(
+            cli, ["scan", source, "--no-cache", "--verbose", "--format", "json", "--output", str(output)]
+        )
+    filesystem.info.assert_called_once()
+    assert invocation.exit_code == 2
+    assert "Streaming analysis failed" in invocation.output
+    assert "\x1b" not in invocation.output and "\x07" not in invocation.output
+    saved = json.loads(output.read_text())
+    assert any(source in issue["message"] for issue in saved["issues"])
