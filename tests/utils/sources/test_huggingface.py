@@ -4,6 +4,7 @@ import gzip
 import hashlib
 import importlib
 import json
+import logging
 import os
 import pickle
 import shutil
@@ -12699,8 +12700,10 @@ class TestGetModelInfo:
     def test_get_model_info_marks_gated_content_probe_only_inventory_incomplete(
         self,
         mock_hf_api_class: MagicMock,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
         """Gated content-probe candidates must not disappear into complete empty inventory."""
+        caplog.set_level(logging.DEBUG, logger="modelaudit.utils.sources.huggingface")
         mock_api = MagicMock()
         mock_hf_api_class.return_value = mock_api
         mock_api.repo_info.return_value = SimpleNamespace(
@@ -12716,7 +12719,9 @@ class TestGetModelInfo:
 
         with patch(
             "modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format",
-            side_effect=PermissionError("401 Unauthorized: gated file https://huggingface.co/test/model?token=secret"),
+            side_effect=PermissionError(
+                "401 Unauthorized: gated file https://huggingface.co/test/model?token=\x1b]52;c;secret\x07"
+            ),
         ) as mock_detect_content:
             info = get_model_info("https://huggingface.co/test/model")
 
@@ -12737,6 +12742,9 @@ class TestGetModelInfo:
             revision=_HF_TEST_REVISION,
         )
         mock_detect_content.assert_called_once_with("test/model", "hidden.payload", _HF_TEST_REVISION, ANY)
+
+        assert "Skipping inaccessible gated" in caplog.text
+        assert "\x1b" not in caplog.text and "\x07" not in caplog.text
 
     @patch("huggingface_hub.HfApi")
     def test_get_model_info_counts_unknown_size_for_gated_selected_file(

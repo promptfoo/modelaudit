@@ -2387,8 +2387,11 @@ def test_cloud_directory_cache_scope_versions_selective_routing() -> None:
 
 
 @patch("fsspec.filesystem")
-def test_download_from_cloud_does_not_reuse_cached_file_over_max_size(mock_fs: MagicMock, tmp_path: Path) -> None:
-    url = "s3://bucket/model.pt"
+def test_download_from_cloud_does_not_reuse_cached_file_over_max_size(
+    mock_fs: MagicMock, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.WARNING, logger="modelaudit.utils.sources.cloud_storage")
+    url = "s3://bucket/model.pt?token=\x1b]52;c;U1lOVEhFVElD\x07"
 
     first_meta = make_fs_mock()
     first_meta.info.return_value = {"type": "file", "size": 4, "ETag": "etag-v1"}
@@ -2416,6 +2419,9 @@ def test_download_from_cloud_does_not_reuse_cached_file_over_max_size(mock_fs: M
     assert second.read_bytes() == b"data"
     second_downloader.open.assert_called_once_with(url, "rb")
     assert mock_fs.call_count == 4
+
+    assert "Ignoring cached version" in caplog.text
+    assert "\x1b" not in caplog.text and "\x07" not in caplog.text
 
 
 @patch("fsspec.filesystem")
