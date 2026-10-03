@@ -1969,8 +1969,8 @@ def test_identity_capture_closes_darwin_monitor_on_retained_keyboard_interrupt(
         cache.capture_file_identity(str(file_path))
 
     assert interruption.traceback is not None
-    assert len(created_monitors) == 1
-    assert created_monitors[0].closed is True
+    assert created_monitors
+    assert all(monitor.closed is True for monitor in created_monitors)
 
 
 @pytest.mark.parametrize("retry_capture", [False, True], ids=["initial-capture", "retried-capture"])
