@@ -3569,9 +3569,9 @@ def scan_model_directory_or_file(
                     scan_result, analysis_complete = stream_analyze_file(stream_url, scanner)
                 if scan_result:
                     _replace_result_report_path(scan_result, stream_url, stream_url)
-                    _preserve_scan_result_identity(
-                        scan_result, "stream", stream_url, redact_stream_url_for_display(stream_url)
-                    )
+                    identity_source = redact_stream_url_for_display(stream_url)
+                    _preserve_scan_result_identity(scan_result, "stream", stream_url, identity_source)
+                    scan_result.metadata["source_identity"] = {"producer": "stream", "path": identity_source}
                     if not analysis_complete:
                         _mark_inconclusive_scan_outcome(scan_result, "streaming_analysis_incomplete")
                     results.files_scanned += 1
@@ -5757,6 +5757,11 @@ def scan_model_directory_or_file(
             details={"exception_type": type(e).__name__},
         )
         if is_stream_url(path):
+            from .models import FileMetadataModel
+
+            results.file_metadata[report_path] = FileMetadataModel(
+                source_identity={"producer": "stream", "path": f"stream://{redact_stream_url_for_display(path[9:])}"}
+            )
             preserve_finding_identity(
                 results.issues[-1],
                 "stream",

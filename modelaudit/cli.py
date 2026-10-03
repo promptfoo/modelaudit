@@ -2079,6 +2079,7 @@ def _record_huggingface_acquisition_error(
         message=issue_message.replace(source_key, identity_source, 1),
     )
     audit_result.file_metadata[source_key] = FileMetadataModel(
+        source_identity={"producer": "huggingface_acquisition", "path": identity_source},
         source="huggingface",
         source_url=source_key,
         acquisition_error=True,
@@ -2805,7 +2806,11 @@ def _write_scan_sbom(
     if not sbom:
         return
 
-    from .integrations.sbom_generator import _cli_source_classification_path, generate_sbom_pydantic
+    from .integrations.sbom_generator import (
+        _cli_source_classification_path,
+        _source_identity_path,
+        generate_sbom_pydantic,
+    )
 
     asset_paths = list(
         dict.fromkeys(asset.path for asset in audit_result.assets if asset.path and asset.type != "skipped")
@@ -2824,7 +2829,10 @@ def _write_scan_sbom(
     sbom_text = generate_sbom_pydantic(
         paths_for_sbom,
         audit_result,
-        _classification_paths={path: _cli_source_classification_path(path) for path in paths_for_sbom},
+        _classification_paths={
+            path: _cli_source_classification_path(_source_identity_path(path, audit_result.file_metadata.get(path)))
+            for path in paths_for_sbom
+        },
     )
     _write_output_text_file(sbom, sbom_text)
 

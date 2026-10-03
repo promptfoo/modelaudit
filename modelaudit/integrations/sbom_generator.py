@@ -136,6 +136,16 @@ def _get_component_type(path: str, metadata: dict[str, Any] | None) -> Component
     return ComponentType.FILE
 
 
+def _source_identity_path(path: str, metadata: FileMetadataModel | dict[str, Any] | None) -> str:
+    """Keep the producer's component semantics while exporting its raw source."""
+    identity = metadata.get("source_identity") if isinstance(metadata, (dict, FileMetadataModel)) else None
+    if isinstance(identity, dict) and identity.get("producer") in ("stream", "huggingface_acquisition"):
+        identity_path = identity.get("path")
+        if isinstance(identity_path, str):
+            return identity_path
+    return path
+
+
 def _cli_source_classification_path(path: str) -> str:
     """Preserve the CLI's historical type input without changing source evidence."""
     from urllib.parse import urlparse, urlunparse
@@ -742,7 +752,9 @@ def _component_for_file_pydantic(
     props = [Property(name="size", value=str(size))]
 
     # Calculate and add risk score
-    risk_score = _calculate_risk_score(path if classification_path is None else classification_path, issues)
+    if classification_path is None:
+        classification_path = _source_identity_path(path, metadata)
+    risk_score = _calculate_risk_score(classification_path, issues)
     props.append(Property(name="risk_score", value=str(risk_score)))
 
     # Add metadata-based properties if available
@@ -752,9 +764,7 @@ def _component_for_file_pydantic(
         props.extend(_create_metadata_properties(metadata))
 
     # Determine appropriate component type for CycloneDX v1.6
-    component_type = _get_component_type(
-        path if classification_path is None else classification_path, metadata.model_dump() if metadata else None
-    )
+    component_type = _get_component_type(classification_path, metadata.model_dump() if metadata else None)
     component_name, bom_ref = _component_identity(path, sha256, bom_ref_state)
 
     # Create the component
@@ -797,7 +807,8 @@ def _component_for_file(
     props = [Property(name="size", value=str(size))]
 
     # Compute risk score based on issues related to this file
-    score = _calculate_legacy_risk_score(path, issues)
+    classification_path = _source_identity_path(path, metadata)
+    score = _calculate_legacy_risk_score(classification_path, issues)
     props.append(Property(name="risk_score", value=str(score)))
 
     # Enhanced license handling
@@ -887,7 +898,7 @@ def _component_for_file(
     props.append(Property(name="security:scanner_version", value=SCANNER_VERSION))
 
     # Determine appropriate component type for CycloneDX v1.6
-    component_type = _get_component_type(path, metadata if isinstance(metadata, dict) else None)
+    component_type = _get_component_type(classification_path, metadata if isinstance(metadata, dict) else None)
     component_name, bom_ref = _component_identity(path, sha256, bom_ref_state)
 
     component = Component(
@@ -919,7 +930,11 @@ def generate_sbom(paths: Iterable[str], results: dict[str, Any] | Any) -> str:
     file_meta: dict[str, Any] = results.get("file_metadata", {})
     trusted_metadata_paths = _trusted_metadata_fallback_paths(results.get("assets", []))
 
-    ordered_paths = _source_order(paths, lambda path: _calculate_legacy_risk_score(path, issues_dicts), file_meta.get)
+    ordered_paths = _source_order(
+        paths,
+        lambda path: _calculate_legacy_risk_score(_source_identity_path(path, file_meta.get(path)), issues_dicts),
+        file_meta.get,
+    )
     bom_ref_state = _BomRefState(reserved={path for path in ordered_paths if serialize_source_identifier(path) == path})
     for input_path in ordered_paths:
         is_remote_identifier = _is_non_filesystem_identifier(input_path)
@@ -1009,7 +1024,9 @@ def generate_sbom_pydantic(
 
     ordered_paths = _source_order(
         paths,
-        lambda path: _calculate_risk_score((_classification_paths or {}).get(path, path), issues),
+        lambda path: _calculate_risk_score(
+            (_classification_paths or {}).get(path, _source_identity_path(path, file_metadata.get(path))), issues
+        ),
         file_metadata.get,
     )
     bom_ref_state = _BomRefState(reserved={path for path in ordered_paths if serialize_source_identifier(path) == path})
