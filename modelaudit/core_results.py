@@ -10,6 +10,7 @@ from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any
 
+from modelaudit.finding_identity import finding_identity, preserve_finding_identity
 from modelaudit.models import (
     ModelAuditResultModel,
     _details_have_incomplete_coverage,
@@ -552,10 +553,11 @@ def _group_checks_by_asset(checks_list: list[Any]) -> dict[tuple[str, str], list
             logger.warning(f"Invalid check format at index {i}, skipping: {type(check)}")
             continue
 
-        check_name = check.get("name", "Unknown Check")
-        location = check.get("location", "")
+        identity = finding_identity(check)
+        check_name = identity.get("name", "Unknown Check")
+        location = identity.get("location", "")
         primary_asset = _extract_primary_asset_from_location(location)
-        details = check.get("details")
+        details = identity.get("details")
         zip_entry_id = details.get("zip_entry_id") if isinstance(details, dict) else None
         zip_entry = details.get("zip_entry") if isinstance(details, dict) else None
 
@@ -681,15 +683,33 @@ def consolidate_checks(results: ModelAuditResultModel) -> None:
         else:
             consolidated_status = "skipped"
 
+        identity_checks = [finding_identity(check) for check in group_checks]
+        identity_message = _create_consolidated_message(check_name, identity_checks, consolidated_status, failed_count)
+        raw_check_name = group_checks[0].get("name", check_name)
+        message = next(
+            (
+                check["message"]
+                for check, identity in zip(group_checks, identity_checks, strict=True)
+                if identity.get("message") == identity_message
+            ),
+            _create_consolidated_message(raw_check_name, identity_checks, consolidated_status, failed_count),
+        )
         consolidated_check = {
-            "name": check_name,
+            "name": raw_check_name,
             "status": consolidated_status,
-            "message": _create_consolidated_message(check_name, group_checks, consolidated_status, failed_count),
+            "message": message,
             "location": group_checks[0].get("location", primary_asset),
             "details": _collect_consolidated_details(group_checks),
             "timestamp": _get_consolidated_timestamp(group_checks),
         }
 
+        preserve_finding_identity(
+            consolidated_check,
+            "check_consolidation",
+            name=check_name,
+            message=identity_message,
+            location=identity_checks[0].get("location", primary_asset),
+        )
         consolidated_severity, consolidated_why = _extract_failure_context(group_checks)
         if consolidated_severity:
             consolidated_check["severity"] = consolidated_severity

@@ -1,7 +1,10 @@
 """Tests for modelaudit.models module."""
 
 import json
+import subprocess
+import sys
 import time
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -40,6 +43,26 @@ from modelaudit.scanner_results import (
     mark_inconclusive_scan_result,
 )
 from modelaudit.scanners.base import Issue, IssueSeverity, ScanResult
+
+
+@pytest.mark.parametrize(
+    "module", ["modelaudit.models", "modelaudit.core", "modelaudit.cli", "modelaudit.cache.cache_policy"]
+)
+def test_public_modules_import_independently(module: str) -> None:
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import importlib, pathlib, sys; module = importlib.import_module(sys.argv[1]); "
+            "assert pathlib.Path(module.__file__).resolve().is_relative_to(pathlib.Path.cwd())",
+            module,
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stderr
 
 
 class TestDetectorFinding:
