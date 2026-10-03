@@ -31,6 +31,7 @@ from modelaudit.integrations.source_serialization import (
 )
 from modelaudit.models import ModelAuditResultModel
 from modelaudit.scanner_results import IssueSeverity
+from modelaudit.utils.sources.huggingface_paths import _huggingface_classification_url, is_huggingface_file_url
 
 _JSON_VALUE_ADAPTER: TypeAdapter[Any] = TypeAdapter(Any)
 
@@ -275,7 +276,19 @@ def _create_results(
         import hashlib
 
         fingerprint = ""
-        fingerprint_location = _identity_location(issue.location or "")
+        fingerprint_message = issue.message
+        fingerprint_location = issue.location or ""
+        # Acquisition identities historically append the revision after URL normalization.
+        if issue.type == "huggingface_acquisition_error" and fingerprint_location:
+            revision = (issue.details or {}).get("requested_revision")
+            if revision and not is_huggingface_file_url(fingerprint_location):
+                source = _huggingface_classification_url(fingerprint_location.removesuffix(f"@{revision}"))
+                source = f"{source}@{revision}"
+            else:
+                source = _huggingface_classification_url(fingerprint_location)
+            fingerprint_message = fingerprint_message.replace(fingerprint_location, source, 1)
+            fingerprint_location = source
+        fingerprint_location = _identity_location(fingerprint_location)
         if issue.details:
             evidence_fingerprint = _identity_text(str(issue.details.get("evidence_fingerprint", "")))
             if evidence_fingerprint:
@@ -283,7 +296,7 @@ def _create_results(
                     "\x1f".join((evidence_fingerprint, fingerprint_location, str(issue.severity))).encode()
                 ).hexdigest()[:16]
         if not fingerprint:
-            fingerprint_message = _identity_text(issue.message)
+            fingerprint_message = _identity_text(fingerprint_message)
             fingerprint = hashlib.sha256(
                 f"{fingerprint_message}{fingerprint_location}{issue.severity}".encode()
             ).hexdigest()[:16]
