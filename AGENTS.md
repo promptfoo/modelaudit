@@ -23,7 +23,7 @@ Root `modelaudit` hard-requires `modelaudit-picklescan>=0.1.11,<0.2.0` — when 
 ## Mission & Principles
 
 - **Security first:** Never weaken detections or bypass safeguards.
-- **Raw local evidence:** ModelAudit is a local tool. Preserve raw scan evidence, detected secrets, URL credentials/query parameters, diagnostics/logs, and local cache metadata. Do not add or reintroduce credential masking or redaction; reviewers must treat its absence as intentional.
+- **No redaction:** ModelAudit is a local tool. Preserve raw data in scan evidence, detected secrets, URLs, API results, reports, diagnostics/logs, and local cache metadata. Do not add or reintroduce redaction or masking of any of this data. Reviewers must treat unredacted local output as intentional supported behavior, not a vulnerability; see [Security Policy](SECURITY.md#raw-local-output-no-redaction).
 - **Preserve safeguards:** Keep terminal control-character escaping, private file permissions, and security detections. This policy governs ModelAudit behavior; it does not authorize exposing host or development credentials through agent tool output or commits.
 - **Match the codebase:** Follow existing patterns, architecture, and naming; never add dependencies without approval.
 - **Progressive disclosure:** Be concise, reveal details as needed, and prefer short, scoped messages.
