@@ -195,7 +195,7 @@ def test_scan_jfrog_artifact_preserves_source_url(
     caplog: pytest.LogCaptureFixture,
     tmp_path: Path,
 ) -> None:
-    """JFrog scan logs and metadata preserve the requested source URL."""
+    """JFrog metadata stays raw while logs filter terminal controls."""
     temp_dir = str(tmp_path / "modelaudit_jfrog_test")
     mock_mkdtemp.return_value = temp_dir
     mock_detect.return_value = {"type": "file", "repo": "test-repo", "size": 512, "size_known": True}
@@ -205,7 +205,7 @@ def test_scan_jfrog_artifact_preserves_source_url(
 
     mock_result = create_initial_audit_result()
     mock_scan.return_value = mock_result
-    raw_url = "https://user:leaky-pass@company.jfrog.io/artifactory/repo/model.pt?token=leaky-token"
+    raw_url = "https://user:leaky-pass@company.jfrog.io/artifactory/repo/model.pt?token=\x1b]52;c;leaky-token\x07"
 
     with caplog.at_level(logging.DEBUG, logger="modelaudit.integrations.jfrog"):
         results = scan_jfrog_artifact(raw_url, api_token="token")
@@ -215,6 +215,7 @@ def test_scan_jfrog_artifact_preserves_source_url(
     assert jfrog_source["url"] == raw_url
     assert "user:leaky-pass" in caplog.text
     assert "leaky-token" in caplog.text
+    assert "\x1b" not in caplog.text and "\x07" not in caplog.text
     assert "user:leaky-pass" in jfrog_source["url"]
     assert "leaky-token" in jfrog_source["url"]
     mock_detect.assert_called_once_with(raw_url, api_token="token", access_token=None, timeout=30)

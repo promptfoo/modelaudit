@@ -2374,7 +2374,7 @@ def download_from_cloud(
                 logger.warning(
                     "Ignoring cached version for %s because its local size exceeds or cannot be validated against "
                     "the maximum download size",
-                    url,
+                    format_evidence_string(url, max_chars=None),
                 )
             else:
                 if show_progress:
