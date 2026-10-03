@@ -18,7 +18,6 @@ from ..utils.sources.jfrog import (
     download_artifact,
     download_jfrog_folder,
     format_size,
-    redact_jfrog_url_for_display,
 )
 
 logger = logging.getLogger(__name__)
@@ -144,7 +143,7 @@ def scan_jfrog_artifact(
     scan_cache_dir = str(Path(raw_cache_dir).expanduser()) if cache_enabled and raw_cache_dir else None
     download_dir, cleanup_download_dir = _prepare_download_dir(url, scan_cache_dir)
     start_time = time.time()
-    display_url = redact_jfrog_url_for_display(url)
+    display_url = url
 
     try:
         # Detect if URL points to a file or folder

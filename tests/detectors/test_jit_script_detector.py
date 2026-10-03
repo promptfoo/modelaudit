@@ -283,7 +283,7 @@ class TestJITScriptDetector:
         assert any("exec" in getattr(f, "builtin", "") for f in findings)
         assert any("__import__" in getattr(f, "builtin", "") for f in findings)
 
-    def test_embedded_python_code_snippets_redact_secret_assignments(self) -> None:
+    def test_embedded_python_code_snippets_preserve_secret_assignments(self) -> None:
         detector = JITScriptDetector()
         secret = "SECRETKEY1234567890"
         fallback_secret = "FALLBACKSECRET1234567890"
@@ -300,15 +300,16 @@ class TestJITScriptDetector:
         builtin_finding = next(
             finding for finding in findings if finding.type == "dangerous_builtin" and finding.builtin == "eval"
         )
-        assert secret not in serialized
-        assert fallback_secret not in serialized
+        assert secret in serialized
+        assert fallback_secret in serialized
         assert builtin_finding.code_snippet is not None
         assert "AWS_SECRET_ACCESS_KEY" in builtin_finding.code_snippet
-        assert 'os.environ["AWS_SECRET_ACCESS_KEY"] = "<redacted>"' in builtin_finding.code_snippet
-        assert "client_secret = <redacted>" in builtin_finding.code_snippet
-        assert 'eval("1 + 1' in builtin_finding.code_snippet
+        assert f'os.environ["AWS_SECRET_ACCESS_KEY"] = "{secret}"' in builtin_finding.code_snippet
+        assert "client_secret = os.getenv" in builtin_finding.code_snippet
+        assert len(builtin_finding.code_snippet) == 200
+        assert builtin_finding.code_snippet.endswith("...")
 
-    def test_contextual_builtin_fallback_redacts_code_snippet(
+    def test_contextual_builtin_fallback_preserves_code_snippet(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
@@ -327,8 +328,8 @@ class TestJITScriptDetector:
             finding for finding in findings if finding.type == "dangerous_builtin" and finding.builtin == "eval"
         )
         assert builtin_finding.code_snippet is not None
-        assert secret not in builtin_finding.code_snippet
-        assert 'api_key = "<redacted>"' in builtin_finding.code_snippet
+        assert secret in builtin_finding.code_snippet
+        assert f'api_key = "{secret}"' in builtin_finding.code_snippet
         assert 'eval("1 + 1")' in builtin_finding.code_snippet
 
     def test_detect_dangerous_builtin_alias_assigned_by_tuple_unpacking(self) -> None:

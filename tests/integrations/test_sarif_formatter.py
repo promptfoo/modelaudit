@@ -23,7 +23,6 @@ _get_rule_name = sarif_formatter._get_rule_name
 _get_rule_short_description = sarif_formatter._get_rule_short_description
 _get_tags_for_issue = sarif_formatter._get_tags_for_issue
 _normalize_path_to_uri = sarif_formatter._normalize_path_to_uri
-_redact_path_for_sarif = sarif_formatter._redact_path_for_sarif
 _severity_to_rank = sarif_formatter._severity_to_rank
 _severity_to_sarif_level = sarif_formatter._severity_to_sarif_level
 format_sarif_output = sarif_formatter.format_sarif_output
@@ -64,13 +63,13 @@ class TestFormatSarifOutput:
         assert len(run["results"]) == 1
         assert len(run["tool"]["driver"]["rules"]) == 1
 
-    def test_signed_stream_paths_are_redacted(self) -> None:
-        """SARIF must not retain signed URL query material in paths."""
+    def test_signed_stream_paths_and_values_are_preserved(self) -> None:
+        """SARIF preserves raw source paths and nested evidence types."""
         raw_path = (
             "stream://https://bucket.s3.amazonaws.com/model.pkl?"
             "X-Amz-Credential=AKIASECRET&X-Amz-Signature=deadbeef&token=secret-token"
         )
-        safe_path = "stream://https://bucket.s3.amazonaws.com/model.pkl"
+        safe_path = raw_path
         result = create_initial_audit_result()
         result.assets = [AssetModel(path=raw_path, type="pickle")]
         result.issues = [
@@ -111,125 +110,12 @@ class TestFormatSarifOutput:
             "standalone-auth-secret",
             "standalone-client-secret",
         ):
-            assert leaked not in output
+            assert leaked in output
         assert "sentencepiece" in output
-        assert raw_path not in output
+        assert raw_path in output
         assert safe_path in output
         assert safe_path in invocation["commandLine"]
         assert invocation["arguments"] == [safe_path]
-
-    def test_mixed_case_signed_stream_paths_are_redacted(self) -> None:
-        """URI scheme casing must not bypass SARIF stream redaction."""
-        raw_path = "STREAM://HTTPS://BUCKET.S3.AMAZONAWS.COM/model.pkl?X-Amz-Signature=secret"
-        result = create_initial_audit_result()
-        result.assets = [AssetModel(path=raw_path, type="pickle")]
-        result.finalize_statistics()
-
-        output = format_sarif_output(result, [raw_path])
-
-        assert "secret" not in output
-        assert "X-Amz-Signature" not in output
-        assert "stream://https://bucket.s3.amazonaws.com/model.pkl" in output
-
-    def test_escaped_url_delimiters_cannot_bypass_sarif_redaction(self) -> None:
-        escaped_url = r"https:\/\/collector.example\/callback\u003ftoken\u003dENCODED-SARIF-SECRET"
-        result = create_initial_audit_result()
-        result.issues = [
-            Issue(
-                message=f"Related endpoint: {escaped_url}",
-                severity=IssueSeverity.WARNING,
-                details={"related_url": escaped_url},
-                timestamp=time.time(),
-            )
-        ]
-        result.finalize_statistics()
-
-        output = format_sarif_output(result, ["/test/path"])
-
-        assert "ENCODED-SARIF-SECRET" not in output
-        assert "https://collector.example/callback" in output
-        assert "token=" not in output
-
-    @pytest.mark.parametrize(
-        "mixed_encoded_url",
-        [
-            "https%3A//user:password@collector.example/model.pkl?token=MIXED-TOKEN-LEAK",
-            "https:%2F%2Fuser:password@collector.example/model.pkl?token=MIXED-TOKEN-LEAK",
-            "https%253A/%252Fuser:password@collector.example/model.pkl?token=MIXED-TOKEN-LEAK",
-        ],
-    )
-    def test_mixed_encoded_url_prefixes_cannot_bypass_sarif_redaction(self, mixed_encoded_url: str) -> None:
-        result = create_initial_audit_result()
-        result.issues = [
-            Issue(
-                message=f"Related endpoint: {mixed_encoded_url}",
-                severity=IssueSeverity.WARNING,
-                details={"related_url": mixed_encoded_url},
-                timestamp=time.time(),
-            )
-        ]
-        result.finalize_statistics()
-
-        output = format_sarif_output(result, ["/test/path"])
-
-        assert "user:password" not in output
-        assert "MIXED-TOKEN-LEAK" not in output
-        assert "https://collector.example/model.pkl" in output
-
-    def test_malformed_stream_paths_fail_closed(self) -> None:
-        """SARIF invocation and asset paths must not retain malformed stream queries."""
-        raw_path = "stream://bucket/model.pkl?token=secret-token"
-        result = create_initial_audit_result()
-        result.assets = [AssetModel(path=raw_path, type="pickle")]
-        result.finalize_statistics()
-
-        output = format_sarif_output(result, [raw_path])
-
-        assert "secret-token" not in output
-        assert "token=" not in output
-        assert "stream://<cloud URL redacted>" in output
-
-    def test_already_redacted_url_preserves_benign_query_context(self) -> None:
-        """Repeated SARIF sanitization must not corrupt safe query context."""
-        safe_url = "https://collector.example/upload?visible=yes&token=<redacted>"
-        partially_redacted_url = f"{safe_url}&Signature=remaining-secret"
-        fully_redacted_url = f"{safe_url}&Signature=<redacted>"
-        result = create_initial_audit_result()
-        result.issues = [
-            Issue(
-                message=f"Related endpoint: {partially_redacted_url}",
-                severity=IssueSeverity.WARNING,
-                details={"related_url": partially_redacted_url},
-                timestamp=time.time(),
-            )
-        ]
-        result.finalize_statistics()
-
-        output = format_sarif_output(result, ["/test/path"])
-
-        assert fully_redacted_url in output
-        assert "remaining-secret" not in output
-        assert "https://collector.example/upload<redacted>" not in output
-
-    def test_signed_url_rotation_preserves_finding_fingerprint(self) -> None:
-        """Renewing a signed URL must not create a different SARIF finding identity."""
-
-        def _fingerprint(signature: str) -> str:
-            raw_url = f"https://bucket.s3.amazonaws.com/model.pkl?X-Amz-Signature={signature}"
-            result = create_initial_audit_result()
-            result.issues = [
-                Issue(
-                    message=f"Dangerous payload from {raw_url}",
-                    severity=IssueSeverity.WARNING,
-                    location=raw_url,
-                    timestamp=time.time(),
-                )
-            ]
-            result.finalize_statistics()
-            parsed = json.loads(format_sarif_output(result, [raw_url]))
-            return str(parsed["runs"][0]["results"][0]["partialFingerprints"]["primaryLocationLineHash"])
-
-        assert _fingerprint("first-secret") == _fingerprint("renewed-secret")
 
     def test_benign_raw_query_context_is_preserved(self) -> None:
         """SARIF text sanitization should retain non-credential query parameters."""
@@ -249,147 +135,13 @@ class TestFormatSarifOutput:
 
         assert documentation_url in output
 
-    def test_raw_url_preserves_benign_query_context_while_redacting_credentials(self) -> None:
-        """Finding evidence keeps useful query context without retaining credentials."""
-        raw_url = "https://evil.example/c2?campaign=test&session=secret-session&token=secret-token"
-        result = create_initial_audit_result()
-        result.issues = [
-            Issue(
-                message=f"Detected callback {raw_url}",
-                severity=IssueSeverity.WARNING,
-                timestamp=time.time(),
-            )
-        ]
-        result.finalize_statistics()
-
-        output = format_sarif_output(result, ["/test/path"])
-
-        assert "campaign=test" in output
-        assert "session=" not in output
-        assert "token=" not in output
-        assert "secret-session" not in output
-        assert "secret-token" not in output
-
-    def test_raw_url_redacts_unknown_query_values(self) -> None:
-        """Unknown evidence parameters must fail closed even without a credential-like key."""
-        raw_url = "https://evil.example/c2?campaign=test&opaque=SUPERSECRET"
-        result = create_initial_audit_result()
-        result.issues = [
-            Issue(
-                message=f"Detected callback {raw_url}",
-                severity=IssueSeverity.WARNING,
-                timestamp=time.time(),
-            )
-        ]
-        result.finalize_statistics()
-
-        output = format_sarif_output(result, ["/test/path"])
-
-        assert "campaign=test" in output
-        assert "opaque=" not in output
-        assert "SUPERSECRET" not in output
-
-    def test_safe_query_key_cannot_hide_encoded_nested_credentials(self) -> None:
-        """Allowlisted evidence keys must not preserve encoded nested credentials."""
-        raw_url = "https://evil.example/c2?lang=en%26access_token%3DSUPERSECRET"
-        result = create_initial_audit_result()
-        result.issues = [
-            Issue(
-                message=f"Detected callback {raw_url}",
-                severity=IssueSeverity.WARNING,
-                details={"callback": raw_url},
-                timestamp=time.time(),
-            )
-        ]
-        result.finalize_statistics()
-
-        output = format_sarif_output(result, ["/test/path"])
-
-        assert "lang=" not in output
-        assert "access_token" not in output
-        assert "SUPERSECRET" not in output
-
-    def test_percent_encoded_url_delimiters_cannot_hide_credentials(self) -> None:
-        """Encoded URL structure must be exposed before SARIF evidence redaction."""
-        raw_url = (
-            "https://bucket.s3.amazonaws.com/model.pkl"
-            "%3Fvisible%3Dyes%26X-Amz-Signature%3Ddeadbeef%26token%3Dprivate-token-value"
-        )
-        result = create_initial_audit_result()
-        result.issues = [
-            Issue(
-                message=f"Provider failed while opening {raw_url}",
-                severity=IssueSeverity.WARNING,
-                details={"source": raw_url},
-                timestamp=time.time(),
-            )
-        ]
-        result.finalize_statistics()
-
-        output = format_sarif_output(result, [raw_url])
-
-        assert "visible=yes" in output
-        assert "X-Amz-Signature" not in output
-        assert "token=" not in output
-        assert "deadbeef" not in output
-        assert "private-token-value" not in output
-
-    def test_percent_encoded_url_userinfo_cannot_hide_credentials(self) -> None:
-        raw_url = (
-            "https%3A%2F%2Fuser%3Aencoded-password%40bucket.s3.amazonaws.com%2Fmodel.pkl"
-            "%3Fvisible%3Dyes%26token%3Dprivate-token-value"
-        )
-        result = create_initial_audit_result()
-        result.issues = [
-            Issue(
-                message=f"Provider failed while opening {raw_url}",
-                severity=IssueSeverity.WARNING,
-                details={"source": raw_url},
-                timestamp=time.time(),
-            )
-        ]
-        result.finalize_statistics()
-
-        output = format_sarif_output(result, [raw_url])
-
-        assert "bucket.s3.amazonaws.com/model.pkl" in output
-        assert "visible=yes" in output
-        assert "encoded-password" not in output
-        assert "private-token-value" not in output
-
-    def test_sarif_path_redaction_does_not_treat_windows_drive_as_url(self) -> None:
+    def test_sarif_windows_path_uri(self) -> None:
         """Local Windows paths must not be rewritten as URL schemes."""
         windows_path = r"C:\models\model.pkl"
 
-        assert _redact_path_for_sarif(windows_path) == windows_path
-
-    def test_sarif_path_redaction_handles_encoded_url_prefix(self) -> None:
-        """Encoded URL-like paths still need credential stripping."""
-        raw_url = (
-            "https%253A%252F%252Fbucket.s3.amazonaws.com%252Fmodel.pkl%253FX-Amz-Signature%253Dprivate-token-value"
-        )
-
-        assert _redact_path_for_sarif(raw_url) == "https://bucket.s3.amazonaws.com/model.pkl"
-
-    def test_bare_query_and_fragment_credentials_are_removed(self) -> None:
-        """Opaque URL components must not bypass key/value redaction."""
-        raw_url = "https://evil.example/c2?campaign=test&BARE-QUERY-SECRET#section=overview&BARE-FRAGMENT-SECRET"
         result = create_initial_audit_result()
-        result.issues = [
-            Issue(
-                message=f"Detected callback {raw_url}",
-                severity=IssueSeverity.WARNING,
-                timestamp=time.time(),
-            )
-        ]
-        result.finalize_statistics()
-
-        output = format_sarif_output(result, ["/test/path"])
-
-        assert "campaign=test" in output
-        assert "section=overview" in output
-        assert "BARE-QUERY-SECRET" not in output
-        assert "BARE-FRAGMENT-SECRET" not in output
+        parsed = json.loads(format_sarif_output(result, [windows_path]))
+        assert parsed["runs"][0]["invocations"][0]["arguments"] == [windows_path]
 
     def test_verbose_includes_debug(self):
         """Test that verbose mode includes debug issues."""
@@ -1184,3 +936,46 @@ class TestHelperFunctions:
         """Test MIME type is case insensitive."""
         assert _get_mime_type("PICKLE") == "application/octet-stream"
         assert _get_mime_type("PyTorch") == "application/octet-stream"
+
+
+def test_report_value_serialization_preserves_shapes_and_bounds() -> None:
+    from pydantic import AnyUrl, BaseModel
+
+    from modelaudit.integrations.source_serialization import serialize_source_identifier, serialize_source_value
+
+    class Details(BaseModel):
+        url: AnyUrl
+
+    value = {
+        "tuple": (b"plain", bytearray(b"bytes")),
+        "set": {"z", "a"},
+        "frozen": frozenset({2, 1}),
+        "model": Details(url=AnyUrl("https://user:secret@example.com/?token=raw")),
+        "binary": b"\xff",
+        "raw": "password=raw",
+    }
+    assert serialize_source_value(value) == {
+        "tuple": ("plain", "bytes"),
+        "set": ["a", "z"],
+        "frozen": [1, 2],
+        "model": {"url": "https://user:secret@example.com/?token=raw"},
+        "binary": "<binary data>",
+        "raw": "password=raw",
+    }
+    recursive: dict[str, object] = {}
+    recursive["self"] = recursive
+    assert serialize_source_value(recursive) == {"self": "<redacted recursive value>"}
+    nested: object = "leaf"
+    for _ in range(33):
+        nested = [nested]
+    converted = serialize_source_value(nested)
+    for _ in range(33):
+        converted = converted[0]
+    assert converted == "<redacted>"
+    assert serialize_source_value("x" * (256 * 1024)) == "x" * (256 * 1024)
+    assert serialize_source_value("x" * (256 * 1024 + 1)) == "<redacted oversized value>"
+    assert serialize_source_identifier("x" * (256 * 1024 + 1)) == "<source redacted>"
+    assert serialize_source_value({(1, 2): "tuple", "(1, 2)": "text"}) == {
+        "(1, 2)": "tuple",
+        "(1, 2)#modelaudit-redacted-key-2": "text",
+    }

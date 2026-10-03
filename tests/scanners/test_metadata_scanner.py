@@ -296,8 +296,8 @@ class TestMetadataScanner:
         assert "SECRET_TOKEN" not in serialized
         assert "SECRET_FRAGMENT" not in serialized
 
-    def test_scan_suspicious_urls_redacts_path_tokens_in_outputs(self, tmp_path: Path) -> None:
-        """Suspicious URL findings should not preserve credentials embedded in paths."""
+    def test_scan_suspicious_urls_preserves_classification_and_raw_secret_evidence(self, tmp_path: Path) -> None:
+        """URL classification stays normalized while aggregate reports retain secret evidence."""
         aws_key = "AKIAABCDEFGHIJKLMNOP"
         readme_path = tmp_path / "README.md"
         readme_path.write_text(
@@ -320,8 +320,10 @@ class TestMetadataScanner:
             aggregate.model_dump_json(),
             sarif_output,
         ]
+        assert aws_key not in serialized_outputs[0]
+        assert aws_key in serialized_outputs[1]
+        assert aws_key in serialized_outputs[2]
         for serialized in serialized_outputs:
-            assert aws_key not in serialized
             assert "SECRET_TOKEN" not in serialized
             assert "SECRET_FRAGMENT" not in serialized
 
@@ -354,8 +356,8 @@ class TestMetadataScanner:
         assert len(result.issues) >= 1  # Should detect at least one potential secret
         assert any(issue.severity == IssueSeverity.INFO for issue in result.issues)
 
-    def test_scan_exposed_secrets_redacts_match_preview_in_outputs(self, tmp_path: Path) -> None:
-        """Secret details should not preserve raw prefixes or token values."""
+    def test_scan_exposed_secrets_preserves_classification_and_raw_aggregate_evidence(self, tmp_path: Path) -> None:
+        """Keep metadata classification and raw aggregate secret evidence."""
         aws_key = "AKIAABCDEFGHIJKLMNOP"
         openai_key = "sk-1234567890abcdef1234567890abcdef1234567890abcdef"
         bearer_token = "Bearer AbCdEfGhIjKlMnOpQrStUvWxYz012345"
@@ -381,16 +383,14 @@ class TestMetadataScanner:
         assert len(exposed_secret_issues) >= 3
         assert all(issue.details["match_preview"] == "<redacted>" for issue in exposed_secret_issues)
 
-        serialized_outputs = [
-            json.dumps([issue.details for issue in direct.issues], sort_keys=True),
-            aggregate.model_dump_json(),
-            sarif_output,
-        ]
-        for serialized in serialized_outputs:
-            assert aws_key not in serialized
-            assert openai_key not in serialized
-            assert bearer_token not in serialized
-            assert "AKIAABCDEFGHIJKLMNOP" not in serialized
+        direct_details = json.dumps([issue.details for issue in direct.issues], sort_keys=True)
+        for secret in (aws_key, openai_key, bearer_token):
+            assert secret not in direct_details
+
+        for serialized in (aggregate.model_dump_json(), sarif_output):
+            assert aws_key in serialized
+            assert openai_key in serialized
+            assert bearer_token in serialized
 
     def test_scan_ignores_placeholder_secrets(self) -> None:
         """Test that obvious placeholders are not flagged as secrets."""

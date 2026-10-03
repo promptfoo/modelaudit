@@ -10,27 +10,23 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
+from pydantic import TypeAdapter
+
 from modelaudit import __version__
 from modelaudit.core_results import (
     determine_exit_code,
     results_have_inconclusive_outcome,
     results_have_operational_error,
 )
-from modelaudit.integrations.source_redaction import (
-    redact_prevalidated_source_value as _redact_prevalidated_value_for_sarif,
-)
-from modelaudit.integrations.source_redaction import (
-    redact_source_identifier as _redact_path_for_sarif,
-)
-from modelaudit.integrations.source_redaction import (
-    redact_source_text as _redact_text_for_sarif,
-)
-from modelaudit.integrations.source_redaction import (
-    redact_source_value as _redact_value_for_sarif,
+from modelaudit.integrations.source_serialization import (
+    serialize_source_identifier,
+    serialize_source_text,
+    serialize_source_value,
 )
 from modelaudit.models import ModelAuditResultModel
 from modelaudit.scanner_results import IssueSeverity
-from modelaudit.scanners._catboost_evidence_redaction import redact_evidence_string as _redact_catboost_evidence
+
+_JSON_VALUE_ADAPTER: TypeAdapter[Any] = TypeAdapter(Any)
 
 
 def format_sarif_output(
@@ -54,7 +50,7 @@ def format_sarif_output(
         "runs": [_create_run(audit_result, scan_paths, verbose)],
     }
 
-    return json.dumps(sarif_output, indent=2)
+    return json.dumps(_JSON_VALUE_ADAPTER.dump_python(sarif_output, mode="json"), indent=2)
 
 
 def _create_run(
@@ -63,7 +59,7 @@ def _create_run(
     verbose: bool,
 ) -> dict[str, Any]:
     """Create a SARIF run object from ModelAudit results."""
-    safe_scan_paths = [_redact_path_for_sarif(path) for path in scan_paths]
+    safe_scan_paths = [serialize_source_identifier(path) for path in scan_paths]
 
     # Filter issues based on verbosity
     issues = audit_result.issues
@@ -215,7 +211,7 @@ def _create_rules(issues: list, *, prefiltered: bool = False) -> list[dict[str, 
 
             # Add help information if available
             if hasattr(issue, "why") and issue.why:
-                redacted_why = _redact_text_for_sarif(issue.why)
+                redacted_why = serialize_source_text(issue.why)
                 rule["help"] = {"text": redacted_why, "markdown": redacted_why}
 
             rules.append(rule)
@@ -242,7 +238,7 @@ def _create_results(
             "ruleId": rule_id,
             "ruleIndex": rule_indices[rule_id],
             "level": _severity_to_sarif_level(issue.severity),
-            "message": {"text": _redact_text_for_sarif(issue.message)},
+            "message": {"text": serialize_source_text(issue.message)},
             "locations": [],
             "partialFingerprints": {},
             "relatedLocations": [],
@@ -273,66 +269,39 @@ def _create_results(
         import hashlib
 
         fingerprint = ""
-        fingerprint_location = _redact_path_for_sarif(issue.location or "")
+        fingerprint_location = serialize_source_identifier(issue.location or "")
         if issue.details:
-            evidence_fingerprint = _redact_text_for_sarif(str(issue.details.get("evidence_fingerprint", "")))
+            evidence_fingerprint = serialize_source_text(str(issue.details.get("evidence_fingerprint", "")))
             if evidence_fingerprint:
                 fingerprint = hashlib.sha256(
                     "\x1f".join((evidence_fingerprint, fingerprint_location, str(issue.severity))).encode()
                 ).hexdigest()[:16]
         if not fingerprint:
-            fingerprint_message = _redact_text_for_sarif(issue.message)
+            fingerprint_message = serialize_source_text(issue.message)
             fingerprint = hashlib.sha256(
                 f"{fingerprint_message}{fingerprint_location}{issue.severity}".encode()
             ).hexdigest()[:16]
         result["partialFingerprints"]["primaryLocationLineHash"] = fingerprint  # type: ignore[index]
 
         # Add properties with additional details
-        # Revalidate CatBoost evidence before trusting its redaction markers, then
-        # apply source URL protection without discarding sanitized command context.
-        catboost_issue = getattr(issue, "type", None) == "catboost_check"
-        details = dict(issue.details or {})
-        if catboost_issue:
-            details = _redact_catboost_details_for_sarif(details)
-        properties = (
-            _redact_prevalidated_value_for_sarif(details) if catboost_issue else _redact_value_for_sarif(details)
-        )
+        properties = serialize_source_value(dict(issue.details or {}))
         properties.pop("rule_code", None)
         properties.pop("issue_type", None)
         rule_code = _get_issue_rule_code(issue)
         if rule_code:
             properties["rule_code"] = rule_code
         if hasattr(issue, "type") and issue.type:
-            properties["issue_type"] = _redact_text_for_sarif(issue.type)
+            properties["issue_type"] = serialize_source_text(issue.type)
         if properties:
             result["properties"] = properties
 
         # Add fix suggestions if available
         if hasattr(issue, "recommendation") and issue.recommendation:
-            result["fixes"] = [{"description": {"text": _redact_text_for_sarif(issue.recommendation)}}]
+            result["fixes"] = [{"description": {"text": serialize_source_text(issue.recommendation)}}]
 
         results.append(result)
 
     return results
-
-
-def _redact_catboost_details_for_sarif(value: Any) -> Any:
-    """Revalidate scanner-redacted CatBoost evidence before export."""
-    if isinstance(value, str):
-        return _redact_catboost_evidence(value, max_chars=len(value))
-    if isinstance(value, dict):
-        return {key: _redact_catboost_details_for_sarif(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_redact_catboost_details_for_sarif(item) for item in value]
-    if isinstance(value, tuple):
-        return tuple(_redact_catboost_details_for_sarif(item) for item in value)
-    if isinstance(value, set):
-        return {_redact_catboost_details_for_sarif(item) for item in value}
-    if isinstance(value, frozenset):
-        return frozenset(_redact_catboost_details_for_sarif(item) for item in value)
-    # Unknown structured values and binary evidence still take the conservative
-    # generic path before the prevalidated source pass sees them.
-    return _redact_value_for_sarif(value)
 
 
 def _create_artifacts(audit_result: ModelAuditResultModel) -> list[dict[str, Any]]:
@@ -366,7 +335,7 @@ def _create_artifacts(audit_result: ModelAuditResultModel) -> list[dict[str, Any
                     artifact["hashes"] = hashes
             member_file_hashes = getattr(metadata, "member_file_hashes", None)
             if member_file_hashes:
-                artifact["properties"]["memberFileHashes"] = _redact_value_for_sarif(
+                artifact["properties"]["memberFileHashes"] = serialize_source_value(
                     {
                         member_path: (
                             record.model_dump(mode="json", exclude_none=True)
@@ -407,11 +376,11 @@ def _get_rule_id(issue: Any) -> str:
         return rule_code
 
     if hasattr(issue, "type") and issue.type:
-        redacted_type = _redact_text_for_sarif(str(issue.type))
+        redacted_type = serialize_source_text(str(issue.type))
         return f"MA{redacted_type.replace(' ', '-').upper()}"
 
     # Generate from message if no type
-    redacted_message = _redact_text_for_sarif(issue.message)
+    redacted_message = serialize_source_text(issue.message)
     base = redacted_message[:30].replace(" ", "-").replace(":", "").upper()
     # Remove special characters
     base = "".join(c if c.isalnum() or c == "-" else "" for c in base)
@@ -422,17 +391,17 @@ def _get_issue_rule_code(issue: Any) -> str | None:
     """Return the stable ModelAudit rule code for an issue when available."""
     rule_code = getattr(issue, "rule_code", None)
     if isinstance(rule_code, str) and rule_code:
-        return _redact_text_for_sarif(rule_code)
+        return serialize_source_text(rule_code)
     return None
 
 
 def _get_rule_name(issue: Any) -> str:
     """Get a human-readable rule name from an issue."""
     if hasattr(issue, "type") and issue.type:
-        return _redact_text_for_sarif(str(issue.type)).replace("_", " ").title()
+        return serialize_source_text(str(issue.type)).replace("_", " ").title()
 
     # Extract from message
-    redacted_message = _redact_text_for_sarif(issue.message)
+    redacted_message = serialize_source_text(issue.message)
     return str(redacted_message.split(":")[0] if ":" in redacted_message else redacted_message[:50])
 
 
@@ -454,7 +423,7 @@ def _get_rule_short_description(issue: Any) -> str:
     elif "blacklist" in lowered_message:
         return "Blacklisted model name detected"
     else:
-        return str(_redact_text_for_sarif(issue.message)[:100])
+        return str(serialize_source_text(issue.message)[:100])
 
 
 def _get_rule_full_description(issue: Any) -> str:
@@ -462,7 +431,7 @@ def _get_rule_full_description(issue: Any) -> str:
     desc = _get_rule_short_description(issue)
 
     if hasattr(issue, "why") and issue.why:
-        desc += f" {_redact_text_for_sarif(issue.why)}"
+        desc += f" {serialize_source_text(issue.why)}"
 
     return desc
 
@@ -514,7 +483,7 @@ def _get_tags_for_issue(issue: Any) -> list[str]:
 
 def _normalize_path_to_uri(path: str) -> str:
     """Normalize a file path to a URI format."""
-    path = _redact_path_for_sarif(path)
+    path = serialize_source_identifier(path)
     # Convert to Path object for normalization
     p = Path(path)
 

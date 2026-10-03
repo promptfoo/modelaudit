@@ -50,6 +50,8 @@ Files scanned: 1 | Issues found: 2 critical, 1 warning
    Why: Could execute code when the model loads
 ```
 
+Scan evidence and source errors can include original credential values, including in JSON, SARIF, SBOM, and shared reports. Credential normalization remains where it affects detection, grouping, or suppression.
+
 ## What It Detects
 
 - **Code execution attacks** in Pickle, PyTorch, NumPy, and Joblib files

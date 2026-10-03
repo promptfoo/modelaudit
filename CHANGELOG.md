@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Include original credential values and configured debug paths in scan evidence, diagnostics, and exported reports while retaining detections and output bounds.
+
 ### Security
 
 - Upgrade gzip, PCRE2, SQLite, and Perl in Docker runtime images to pick up Debian security fixes.

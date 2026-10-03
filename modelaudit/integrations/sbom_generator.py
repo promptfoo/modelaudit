@@ -15,7 +15,7 @@ from cyclonedx.output import OutputFormat, SchemaVersion, make_outputter
 
 from ..models import FileMetadataModel, ModelAuditResultModel
 from ..scanner_results import Issue, IssueSeverity
-from .source_redaction import redact_source_identifier, redact_source_reference, redact_source_value
+from .source_serialization import serialize_source_identifier, serialize_source_value
 
 SCANNER_VERSION = f"v{_pkg_version('modelaudit')}"
 _MAX_SYMLINK_HOPS = 40
@@ -36,7 +36,7 @@ def _sbom_property_value(value: object) -> str:
 
 
 def _serialize_member_file_hashes(value: object) -> str:
-    return json.dumps(redact_source_value(value), sort_keys=True, separators=(",", ":"))
+    return json.dumps(serialize_source_value(value), sort_keys=True, separators=(",", ":"))
 
 
 def _append_member_file_hash_summary_properties(props: list[Property], metadata: FileMetadataModel) -> None:
@@ -479,27 +479,37 @@ def _is_non_filesystem_identifier(path: str) -> bool:
     return False
 
 
-def _redacted_component_identity(
-    path: str,
-    sha256: str = "",
-    bom_ref_state: _BomRefState | None = None,
-) -> tuple[str, str]:
-    """Return credential-safe component name and bom-ref values for exported SBOMs."""
-    safe_identifier = redact_source_identifier(path)
-    component_name = os.path.basename(safe_identifier) or safe_identifier
-    if safe_identifier == path:
-        base_reference = safe_identifier
-    else:
-        base_reference = redact_source_reference(path)
-        if sha256:
-            base_reference = f"{base_reference}#modelaudit-content-sha256-{sha256}"
+def _component_identity(path: str, sha256: str, bom_ref_state: _BomRefState | None = None) -> tuple[str, str]:
+    """Preserve source identities and disambiguate bounded or expanded references."""
+    identifier = serialize_source_identifier(path)
+    reference = identifier
+    if identifier != path and sha256:
+        reference = f"{reference}#modelaudit-content-sha256-{sha256}"
+    if bom_ref_state:
+        reference = bom_ref_state.allocate(reference, literal_reference=identifier == path)
+    return os.path.basename(identifier) or identifier, reference
 
-    if bom_ref_state is None:
-        return component_name, base_reference
-    return component_name, bom_ref_state.allocate(
-        base_reference,
-        literal_reference=safe_identifier == path,
-    )
+
+def _source_order(
+    paths: Iterable[str], risk_score: Callable[[str], int], metadata_for: Callable[[str], Any]
+) -> list[str]:
+    """Sort raw sources, retaining tie order when oversized identifiers are bounded."""
+
+    def order_key(path: str) -> tuple[str, bool, int, str]:
+        identifier = serialize_source_identifier(path)
+        if identifier == path:
+            return identifier, False, 0, ""
+        metadata = metadata_for(path)
+        if hasattr(metadata, "model_dump"):
+            metadata = metadata.model_dump(mode="python")
+        metadata = serialize_source_value(metadata or {})
+        if isinstance(metadata, dict):
+            metadata.pop("risk_score", None)
+            metadata.pop("scan_timestamp", None)
+        encoded = json.dumps(metadata, sort_keys=True, separators=(",", ":"), default=repr)
+        return identifier, True, -risk_score(path), hashlib.sha256(encoded.encode()).hexdigest()
+
+    return sorted(dict.fromkeys(paths), key=order_key)
 
 
 def _trusted_metadata_fallback_paths(assets: Iterable[Any] | None) -> set[str]:
@@ -549,47 +559,6 @@ def _calculate_legacy_risk_score(path: str, issues: Iterable[dict[str, Any]]) ->
         elif severity == "info":
             score += 1
     return min(score, 10)
-
-
-def _stable_source_order(
-    paths: Iterable[str],
-    risk_score: Callable[[str], int],
-    metadata_identity: Callable[[str], str] | None = None,
-) -> list[str]:
-    """Order sources so colliding redacted refs keep deterministic risk attribution."""
-    grouped_paths: dict[str, list[str]] = {}
-    seen_paths: set[str] = set()
-    for path in paths:
-        if path in seen_paths:
-            continue
-        seen_paths.add(path)
-        reference = redact_source_reference(path)
-        grouped_paths.setdefault(reference, []).append(path)
-
-    ordered_paths: list[str] = []
-    for reference in sorted(grouped_paths):
-        ordered_paths.extend(
-            sorted(
-                grouped_paths[reference],
-                key=lambda path: (
-                    redact_source_identifier(path) != path,
-                    -risk_score(path),
-                    metadata_identity(path) if metadata_identity is not None else "",
-                ),
-            )
-        )
-    return ordered_paths
-
-
-def _metadata_identity_sort_key(metadata: Any) -> str:
-    if hasattr(metadata, "model_dump"):
-        metadata = metadata.model_dump(mode="python")
-    safe_metadata = redact_source_value(metadata or {})
-    if isinstance(safe_metadata, dict):
-        safe_metadata.pop("risk_score", None)
-        safe_metadata.pop("scan_timestamp", None)
-    serialized = json.dumps(safe_metadata, sort_keys=True, separators=(",", ":"), default=repr)
-    return hashlib.sha256(serialized.encode()).hexdigest()
 
 
 def _extract_license_expressions(metadata: FileMetadataModel) -> list[LicenseExpression]:
@@ -726,7 +695,7 @@ def _component_for_file_pydantic(
 
     # Determine appropriate component type for CycloneDX v1.6
     component_type = _get_component_type(path, metadata.model_dump() if metadata else None)
-    component_name, bom_ref = _redacted_component_identity(path, sha256, bom_ref_state)
+    component_name, bom_ref = _component_identity(path, sha256, bom_ref_state)
 
     # Create the component
     component = Component(
@@ -859,7 +828,7 @@ def _component_for_file(
 
     # Determine appropriate component type for CycloneDX v1.6
     component_type = _get_component_type(path, metadata if isinstance(metadata, dict) else None)
-    component_name, bom_ref = _redacted_component_identity(path, sha256, bom_ref_state)
+    component_name, bom_ref = _component_identity(path, sha256, bom_ref_state)
 
     component = Component(
         name=component_name,
@@ -890,14 +859,8 @@ def generate_sbom(paths: Iterable[str], results: dict[str, Any] | Any) -> str:
     file_meta: dict[str, Any] = results.get("file_metadata", {})
     trusted_metadata_paths = _trusted_metadata_fallback_paths(results.get("assets", []))
 
-    ordered_paths = _stable_source_order(
-        paths,
-        lambda path: _calculate_legacy_risk_score(path, issues_dicts),
-        lambda path: _metadata_identity_sort_key(file_meta.get(path)),
-    )
-    bom_ref_state = _BomRefState(
-        reserved={redact_source_reference(path) for path in ordered_paths if redact_source_identifier(path) == path}
-    )
+    ordered_paths = _source_order(paths, lambda path: _calculate_legacy_risk_score(path, issues_dicts), file_meta.get)
+    bom_ref_state = _BomRefState(reserved={path for path in ordered_paths if serialize_source_identifier(path) == path})
     for input_path in ordered_paths:
         is_remote_identifier = _is_non_filesystem_identifier(input_path)
         if not is_remote_identifier and os.path.isdir(input_path):
@@ -982,14 +945,8 @@ def generate_sbom_pydantic(paths: Iterable[str], results: ModelAuditResultModel)
     file_metadata: dict[str, FileMetadataModel] = results.file_metadata or {}
     trusted_metadata_paths = _trusted_metadata_fallback_paths(results.assets)
 
-    ordered_paths = _stable_source_order(
-        paths,
-        lambda path: _calculate_risk_score(path, issues),
-        lambda path: _metadata_identity_sort_key(file_metadata.get(path)),
-    )
-    bom_ref_state = _BomRefState(
-        reserved={redact_source_reference(path) for path in ordered_paths if redact_source_identifier(path) == path}
-    )
+    ordered_paths = _source_order(paths, lambda path: _calculate_risk_score(path, issues), file_metadata.get)
+    bom_ref_state = _BomRefState(reserved={path for path in ordered_paths if serialize_source_identifier(path) == path})
     for input_path in ordered_paths:
         is_remote_identifier = _is_non_filesystem_identifier(input_path)
         if not is_remote_identifier and os.path.isdir(input_path):

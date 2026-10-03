@@ -186,7 +186,7 @@ def test_scan_jfrog_artifact_rejects_unknown_file_size_when_capped(
 @patch("modelaudit.integrations.jfrog.detect_jfrog_target_type")
 @patch("modelaudit.integrations.jfrog.download_artifact")
 @patch("modelaudit.core.scan_model_directory_or_file")
-def test_scan_jfrog_artifact_redacts_source_url(
+def test_scan_jfrog_artifact_preserves_source_url(
     mock_scan: MagicMock,
     mock_download: MagicMock,
     mock_detect: MagicMock,
@@ -195,7 +195,7 @@ def test_scan_jfrog_artifact_redacts_source_url(
     caplog: pytest.LogCaptureFixture,
     tmp_path: Path,
 ) -> None:
-    """JFrog scan logs and metadata should not store URL credentials."""
+    """JFrog scan logs and metadata preserve the requested source URL."""
     temp_dir = str(tmp_path / "modelaudit_jfrog_test")
     mock_mkdtemp.return_value = temp_dir
     mock_detect.return_value = {"type": "file", "repo": "test-repo", "size": 512, "size_known": True}
@@ -212,11 +212,11 @@ def test_scan_jfrog_artifact_redacts_source_url(
 
     assert results.model_extra is not None
     jfrog_source = results.model_extra["metadata"]["jfrog_source"]
-    assert jfrog_source["url"] == "https://<credentials-redacted>@company.jfrog.io/artifactory/repo/model.pt"
-    assert "user:leaky-pass" not in caplog.text
-    assert "leaky-token" not in caplog.text
-    assert "user:leaky-pass" not in jfrog_source["url"]
-    assert "leaky-token" not in jfrog_source["url"]
+    assert jfrog_source["url"] == raw_url
+    assert "user:leaky-pass" in caplog.text
+    assert "leaky-token" in caplog.text
+    assert "user:leaky-pass" in jfrog_source["url"]
+    assert "leaky-token" in jfrog_source["url"]
     mock_detect.assert_called_once_with(raw_url, api_token="token", access_token=None, timeout=30)
     mock_download.assert_called_once_with(
         raw_url,
