@@ -1,12 +1,10 @@
 name: CodeQL Security Analysis
 
 on:
-  push:
+  push: &main-branch-trigger
     branches:
       - main
-  pull_request:
-    branches:
-      - main
+  pull_request: *main-branch-trigger
   schedule:
     # Run weekly on Monday at 06:00 UTC
     - cron: "0 6 * * 1"

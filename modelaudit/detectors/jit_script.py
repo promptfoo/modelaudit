@@ -356,6 +356,7 @@ _EMBEDDED_PYTHON_STATIC_MAPPING_CALL_CONTEXT_START_PATTERN = re.compile(
 )
 _EmbeddedPythonCandidateData = bytes | memoryview
 _EmbeddedPythonCandidate = tuple[_EmbeddedPythonCandidateData, tuple[int, int], tuple[tuple[int, int], ...]]
+_SelectedEmbeddedPythonCandidate = tuple[bytes, tuple[int, int], tuple[tuple[int, int], ...]]
 
 
 def _has_source_like_embedded_python_start(data: bytes, *, start_offset: int = 0) -> bool:
@@ -682,11 +683,11 @@ def _bounded_priority_embedded_python_candidate(
     candidate: bytes,
     span: tuple[int, int],
     priority_offsets: list[int],
-) -> _EmbeddedPythonCandidate:
+) -> _SelectedEmbeddedPythonCandidate:
     index = bisect_left(priority_offsets, span[0])
     if index >= len(priority_offsets) or priority_offsets[index] >= span[1]:
         return candidate, span, (span,)
-    fallback_candidate: _EmbeddedPythonCandidate | None = None
+    fallback_candidate: _SelectedEmbeddedPythonCandidate | None = None
     for priority_offset in priority_offsets[index:]:
         if priority_offset >= span[1]:
             break
@@ -9929,8 +9930,8 @@ def _compact_candidate_segments(candidate: bytes, segment_ranges: list[tuple[int
 def _select_prioritized_embedded_python_snippets(
     candidates: list[_EmbeddedPythonCandidate],
     bounded: bytes | None = None,
-) -> tuple[list[_EmbeddedPythonCandidate], list[tuple[int, int]]]:
-    selected: list[_EmbeddedPythonCandidate] = []
+) -> tuple[list[_SelectedEmbeddedPythonCandidate], list[tuple[int, int]]]:
+    selected: list[_SelectedEmbeddedPythonCandidate] = []
     selected_spans: set[tuple[int, int]] = set()
     priority_offsets = _priority_import_offsets(bounded) if bounded is not None else []
     selected_default_candidates = 0
@@ -9992,7 +9993,7 @@ def _select_prioritized_embedded_python_snippets(
 def _prioritized_embedded_python_snippets(
     candidates: list[_EmbeddedPythonCandidate],
     bounded: bytes | None = None,
-) -> list[_EmbeddedPythonCandidate]:
+) -> list[_SelectedEmbeddedPythonCandidate]:
     selected, _omitted_budgeted_spans = _select_prioritized_embedded_python_snippets(candidates, bounded)
     return selected
 
@@ -16994,7 +16995,7 @@ class JITScriptDetector:
     @staticmethod
     def _looks_like_framed_dangerous_python_source(
         data: bytes,
-        prioritized_snippets_by_window: dict[int, list[_EmbeddedPythonCandidate]] | None = None,
+        prioritized_snippets_by_window: dict[int, list[_SelectedEmbeddedPythonCandidate]] | None = None,
         *,
         extraction_windows: list[tuple[bytes, bool]] | None = None,
     ) -> bool:
@@ -18104,7 +18105,8 @@ class JITScriptDetector:
                     ):
                         continue
                     item = cls._sequence_index_element(index_map[element[1]], new_length)
-                    reindexed[(item, *path[1:])] = value
+                    nested_container_path: tuple[object, ...] = (item, *path[1:])
+                    reindexed[nested_container_path] = value
                 return reindexed
 
             @classmethod
@@ -18359,7 +18361,8 @@ class JITScriptDetector:
                         resolved[(item,)] = self._resolve_builtin(element)
                         nested = self._resolve_builtin_container(element)
                         for path, builtin in nested.items():
-                            resolved[(item, *path)] = builtin
+                            nested_container_path: tuple[object, ...] = (item, *path)
+                            resolved[nested_container_path] = builtin
                     return resolved
                 if isinstance(node, ast.Set):
                     resolved = {}
@@ -18367,7 +18370,8 @@ class JITScriptDetector:
                         unordered_item = self._unordered_element(index)
                         resolved[(unordered_item,)] = self._resolve_builtin(element)
                         for path, builtin in self._resolve_builtin_container(element).items():
-                            resolved[(unordered_item, *path)] = builtin
+                            nested_container_path = (unordered_item, *path)
+                            resolved[nested_container_path] = builtin
                     return resolved
                 if isinstance(node, ast.Dict):
                     dict_resolved: dict[tuple[object, ...], str | None] = {}
@@ -18384,7 +18388,8 @@ class JITScriptDetector:
                             self._replace_mapping_container_entries(dict_resolved, {}, {key})
                             dict_resolved[(key,)] = builtin
                             for path, nested_builtin in self._resolve_builtin_container(value_node).items():
-                                dict_resolved[(key, *path)] = nested_builtin
+                                nested_container_path = (key, *path)
+                                dict_resolved[nested_container_path] = nested_builtin
                     return dict_resolved
                 if isinstance(node, ast.Call):
                     if popitem_binding := self._mapping_popitem_binding(node):
@@ -18416,7 +18421,8 @@ class JITScriptDetector:
                                         binding = self._binding_from_expression(value_node)
                                         dict_call_resolved[(key,)] = binding[0]
                                         for path, builtin in binding[2].items():
-                                            dict_call_resolved[(key, *path)] = builtin
+                                            nested_container_path = (key, *path)
+                                            dict_call_resolved[nested_container_path] = builtin
                             else:
                                 dict_call_resolved = dict(self._resolve_builtin_container(first_argument))
                         for keyword in node.keywords:
@@ -18428,7 +18434,8 @@ class JITScriptDetector:
                                 continue
                             dict_call_resolved[(keyword.arg,)] = self._resolve_builtin(keyword.value)
                             for path, builtin in self._resolve_builtin_container(keyword.value).items():
-                                dict_call_resolved[(keyword.arg, *path)] = builtin
+                                nested_container_path = (keyword.arg, *path)
+                                dict_call_resolved[nested_container_path] = builtin
                         return dict_call_resolved
                 if isinstance(node, ast.Subscript):
                     if isinstance(node.slice, ast.Slice):
@@ -18507,7 +18514,8 @@ class JITScriptDetector:
                         if summary := self._function_summary_for_node(element):
                             resolved[(item,)] = summary[2]
                         for path, functions in self._resolve_function_container(element).items():
-                            resolved[(item, *path)] = functions
+                            nested_container_path: tuple[object, ...] = (item, *path)
+                            resolved[nested_container_path] = functions
                     return resolved
                 if isinstance(node, ast.Set):
                     resolved = {}
@@ -18516,7 +18524,8 @@ class JITScriptDetector:
                         if summary := self._function_summary_for_node(element):
                             resolved[(unordered_item,)] = summary[2]
                         for path, functions in self._resolve_function_container(element).items():
-                            resolved[(unordered_item, *path)] = functions
+                            nested_container_path = (unordered_item, *path)
+                            resolved[nested_container_path] = functions
                     return resolved
                 if isinstance(node, ast.Dict):
                     resolved = {}
@@ -18536,7 +18545,8 @@ class JITScriptDetector:
                         if summary := self._function_summary_for_node(value_node):
                             resolved[(key,)] = summary[2]
                         for path, functions in self._resolve_function_container(value_node).items():
-                            resolved[(key, *path)] = functions
+                            nested_container_path = (key, *path)
+                            resolved[nested_container_path] = functions
                     return resolved
                 if isinstance(node, ast.Call):
                     if popitem_binding := self._mapping_popitem_binding(node):
@@ -18569,7 +18579,8 @@ class JITScriptDetector:
                                         if binding[8]:
                                             dict_call_resolved[(key,)] = binding[8]
                                         for path, functions in binding[3].items():
-                                            dict_call_resolved[(key, *path)] = functions
+                                            nested_container_path = (key, *path)
+                                            dict_call_resolved[nested_container_path] = functions
                             else:
                                 dict_call_resolved = dict(self._resolve_function_container(first_argument))
                         for keyword in node.keywords:
@@ -18582,7 +18593,8 @@ class JITScriptDetector:
                             if summary := self._function_summary_for_node(keyword.value):
                                 dict_call_resolved[(keyword.arg,)] = summary[2]
                             for path, functions in self._resolve_function_container(keyword.value).items():
-                                dict_call_resolved[(keyword.arg, *path)] = functions
+                                nested_container_path = (keyword.arg, *path)
+                                dict_call_resolved[nested_container_path] = functions
                         return dict_call_resolved
                 if isinstance(node, ast.Subscript):
                     if isinstance(node.slice, ast.Slice):
@@ -19375,7 +19387,8 @@ class JITScriptDetector:
                         for prefix in prefixes:
                             container[prefix] = builtin
                             for path, nested_builtin in (container_aliases or {}).items():
-                                container[(*prefix, *path)] = nested_builtin
+                                nested_container_path: tuple[object, ...] = (*prefix, *path)
+                                container[nested_container_path] = nested_builtin
                         function_prefixes = self._container_access_prefixes(function_container, raw_prefix) or prefixes
                         function_container = {
                             path: functions
@@ -20583,11 +20596,13 @@ class JITScriptDetector:
                     item = self._sequence_index_element(index, len(bindings))
                     container[(item,)] = binding[0]
                     for path, builtin in binding[2].items():
-                        container[(item, *path)] = builtin
+                        nested_container_path: tuple[object, ...] = (item, *path)
+                        container[nested_container_path] = builtin
                     if binding[8]:
                         function_container[(item,)] = binding[8]
                     for path, functions in binding[3].items():
-                        function_container[(item, *path)] = functions
+                        nested_container_path = (item, *path)
+                        function_container[nested_container_path] = functions
                 return None, False, container, function_container, set(), {}, None, None, ()
 
             def _iterable_binding(self, bindings: list[_BuiltinAliasBinding]) -> _BuiltinAliasBinding:
@@ -20597,11 +20612,13 @@ class JITScriptDetector:
                     item = self._unordered_element(index)
                     container[(item,)] = binding[0]
                     for path, builtin in binding[2].items():
-                        container[(item, *path)] = builtin
+                        nested_container_path: tuple[object, ...] = (item, *path)
+                        container[nested_container_path] = builtin
                     if binding[8]:
                         function_container[(item,)] = binding[8]
                     for path, functions in binding[3].items():
-                        function_container[(item, *path)] = functions
+                        nested_container_path = (item, *path)
+                        function_container[nested_container_path] = functions
                 return None, False, container, function_container, set(), {}, None, None, ()
 
             def _sequence_function_container(
@@ -20616,11 +20633,13 @@ class JITScriptDetector:
                 for key, binding in bindings.items():
                     container[(key,)] = binding[0]
                     for path, builtin in binding[2].items():
-                        container[(key, *path)] = builtin
+                        nested_container_path: tuple[object, ...] = (key, *path)
+                        container[nested_container_path] = builtin
                     if binding[8]:
                         function_container[(key,)] = binding[8]
                     for path, functions in binding[3].items():
-                        function_container[(key, *path)] = functions
+                        nested_container_path = (key, *path)
+                        function_container[nested_container_path] = functions
                 return None, False, container, function_container, set(), {}, None, None, ()
 
             def _expanded_positional_bindings(self, node: ast.Call) -> list[_BuiltinAliasBinding]:
@@ -21592,7 +21611,8 @@ class JITScriptDetector:
                             if binding[8]:
                                 functions[(key,)] = binding[8]
                             for path, nested_functions in self._resolve_function_container(owner.value).items():
-                                functions[(key, *path)] = nested_functions
+                                nested_container_path: tuple[object, ...] = (key, *path)
+                                functions[nested_container_path] = nested_functions
                         if mapping_bindings:
                             self.comprehension_bindings[id(owner)] = self._mapping_binding(mapping_bindings)
                             self.comprehension_function_containers[id(owner)] = functions
@@ -21614,7 +21634,8 @@ class JITScriptDetector:
                         for index, nested_container in enumerate(nested_function_containers):
                             item = self._sequence_index_element(index, len(sequence_bindings))
                             for path, nested_functions in nested_container.items():
-                                functions[(item, *path)] = nested_functions
+                                nested_container_path = (item, *path)
+                                functions[nested_container_path] = nested_functions
                         self.comprehension_function_containers[id(owner)] = functions
                     else:
                         binding = self._binding_from_expression(result_nodes[0])
@@ -21622,7 +21643,8 @@ class JITScriptDetector:
                         functions = self._sequence_function_container([binding])
                         item = self._sequence_index_element(0, 1)
                         for path, nested_functions in self._resolve_function_container(result_nodes[0]).items():
-                            functions[(item, *path)] = nested_functions
+                            nested_container_path = (item, *path)
+                            functions[nested_container_path] = nested_functions
                         self.comprehension_function_containers[id(owner)] = functions
                     self._restore_alias_state(post_comprehension_state)
                 finally:
@@ -21870,11 +21892,13 @@ class JITScriptDetector:
                             continue
                         updates[(keyword.arg,)] = self._resolve_builtin(keyword.value)
                         for path, builtin in self._resolve_builtin_container(keyword.value).items():
-                            updates[(keyword.arg, *path)] = builtin
+                            nested_container_path: tuple[object, ...] = (keyword.arg, *path)
+                            updates[nested_container_path] = builtin
                         if summary := self._function_summary_for_node(keyword.value):
                             function_updates[(keyword.arg,)] = summary[2]
                         for path, functions in self._resolve_function_container(keyword.value).items():
-                            function_updates[(keyword.arg, *path)] = functions
+                            nested_container_path = (keyword.arg, *path)
+                            function_updates[nested_container_path] = functions
                     updated_roots = {path[0] for path in updates if path}
                     container = {
                         path: builtin for path, builtin in container.items() if not path or path[0] not in updated_roots
@@ -22136,7 +22160,8 @@ class JITScriptDetector:
             )
             if receiver_name is not None:
                 for path, builtin in (instance_aliases or {}).items():
-                    method_analysis.attribute_alias_scopes[-1][(receiver_name, *path)] = builtin
+                    nested_container_path: tuple[str, ...] = (receiver_name, *path)
+                    method_analysis.attribute_alias_scopes[-1][nested_container_path] = builtin
             method_analysis._visit_statements(node.body)
             return method_analysis, receiver_name
 
@@ -22488,7 +22513,7 @@ class JITScriptDetector:
         context: str,
         *,
         include_full_source: bool = False,
-        prioritized_snippets: list[_EmbeddedPythonCandidate] | None = None,
+        prioritized_snippets: list[_SelectedEmbeddedPythonCandidate] | None = None,
     ) -> list["JITScriptFinding"]:
         """Extract and analyze embedded Python code.
 
@@ -22508,6 +22533,7 @@ class JITScriptDetector:
             return findings
 
         bounded = data if include_full_source else data[:_EMBEDDED_PYTHON_EXTRACT_BYTE_LIMIT]
+        matches: Sequence[_EmbeddedPythonCandidate]
         if prioritized_snippets is None:
             matches = _candidate_embedded_python_snippets(bounded, include_full_source=include_full_source)
             prioritized_matches, omitted_budgeted_spans = _select_prioritized_embedded_python_snippets(
@@ -23368,7 +23394,7 @@ class JITScriptDetector:
         elif not dangerous_python_source and (
             not model_specific_embedded_python_fully_scanned or any(marker in data[2:] for marker in (b"\x00", b"\xff"))
         ):
-            prioritized_snippets_by_window: dict[int, list[_EmbeddedPythonCandidate]] = {}
+            prioritized_snippets_by_window: dict[int, list[_SelectedEmbeddedPythonCandidate]] = {}
             extraction_windows = _embedded_python_extraction_windows(data)
             if self._looks_like_framed_dangerous_python_source(
                 data,

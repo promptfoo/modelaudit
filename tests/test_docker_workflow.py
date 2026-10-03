@@ -4,10 +4,12 @@ import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import pytest
 import yaml
+
+from tests.helpers.workflows import _jobs, _step_by_name, _workflow_triggers
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _PINNED_PYTHON_IMAGE_RE = re.compile(r"^python:(?P<version>\d+\.\d+-slim)@sha256:(?P<digest>[0-9a-f]{64})$")
@@ -28,13 +30,6 @@ def _load_docker_publish_workflow() -> dict[str, Any]:
     return workflow
 
 
-def _workflow_triggers(workflow: dict[str, Any]) -> dict[str, Any]:
-    raw_workflow = cast(dict[Any, Any], workflow)
-    triggers = raw_workflow.get("on", raw_workflow.get(True))
-    assert isinstance(triggers, dict)
-    return triggers
-
-
 def _run_tag_validator(tag: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [sys.executable, str(_REPO_ROOT / "scripts" / "validate_docker_publish_tag.py"), tag],
@@ -45,7 +40,14 @@ def _run_tag_validator(tag: str) -> subprocess.CompletedProcess[str]:
 
 
 def _dockerfile_lines(path: str) -> list[str]:
-    return (_REPO_ROOT / path).read_text(encoding="utf-8").splitlines()
+    content = (_REPO_ROOT / path).read_text(encoding="utf-8")
+    source_command = "    && . ./docker-install-rust.sh \\"
+    if source_command in content:
+        copy_command = "COPY . ." if path == "Dockerfile.full" else "COPY docker-install-rust.sh ./"
+        assert content.index(copy_command) < content.index(source_command)
+        installer = (_REPO_ROOT / "docker-install-rust.sh").read_text(encoding="utf-8")
+        content = content.replace(source_command, installer)
+    return content.splitlines()
 
 
 def _python_image_from_arg(path: str) -> str:
@@ -67,25 +69,12 @@ def _assert_pinned_python_image(image: str, expected_version: str) -> None:
     assert match.group("version") == expected_version
 
 
-def _jobs(workflow: dict[str, Any]) -> dict[str, Any]:
-    jobs = workflow["jobs"]
-    assert isinstance(jobs, dict)
-    return jobs
-
-
 def _job_steps(workflow: dict[str, Any], job_name: str) -> list[dict[str, Any]]:
     job = _jobs(workflow)[job_name]
     assert isinstance(job, dict)
     steps = job["steps"]
     assert isinstance(steps, list)
     return steps
-
-
-def _step_by_name(steps: list[dict[str, Any]], name: str) -> dict[str, Any]:
-    for step in steps:
-        if step.get("name") == name:
-            return step
-    raise AssertionError(f"Step {name!r} not found")
 
 
 def test_dockerfiles_pin_python_base_images_by_digest() -> None:
@@ -293,7 +282,7 @@ def test_dockerfiles_verify_pinned_rustup_init_instead_of_streaming_shell() -> N
     assert _SHA256_RE.fullmatch(expected_arm64_sha256)
 
     for path in ("Dockerfile", "Dockerfile.full", "Dockerfile.tensorflow"):
-        content = (_REPO_ROOT / path).read_text(encoding="utf-8")
+        content = "\n".join(_dockerfile_lines(path))
         assert "https://sh.rustup.rs" not in content
         assert "| sh" not in content
         assert "sh -s --" not in content

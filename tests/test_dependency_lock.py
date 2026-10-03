@@ -5,6 +5,8 @@ import re
 from pathlib import Path
 
 import pytest
+from packaging.requirements import Requirement
+from packaging.version import Version
 
 try:
     import tomllib
@@ -19,7 +21,6 @@ PICKLESCAN_PYPROJECT = ROOT_DIR / "packages" / "modelaudit-picklescan" / "pyproj
 PATCHED_GITPYTHON_FLOOR = (3, 1, 60)
 PATCHED_ANYIO_FLOOR = (4, 14, 2)
 PINNED_MATURIN_BACKEND = "maturin===1.13.3"
-REQUIRED_PICKLESCAN_RELEASE = "modelaudit-picklescan>=0.1.10,<0.2.0"
 PATCHED_PY7ZR_REQUIREMENT = "py7zr>=1.1.3"
 PY7ZR_EXTRAS = ("sevenzip", "all-ci", "all")
 PATCHED_MLFLOW_CLIENT_REQUIREMENT = "mlflow-skinny>=3.13.0"
@@ -139,8 +140,21 @@ def test_picklescan_build_backend_is_exactly_pinned() -> None:
 
 def test_root_requires_hardened_picklescan_release() -> None:
     root_config = tomllib.loads(ROOT_PYPROJECT.read_text(encoding="utf-8"))
+    dependency = next(
+        requirement
+        for entry in root_config["project"]["dependencies"]
+        if (requirement := Requirement(entry)).name == "modelaudit-picklescan"
+    )
 
-    assert REQUIRED_PICKLESCAN_RELEASE in root_config["project"]["dependencies"]
+    assert dependency.marker is None
+    # Root upgrades must receive these fixes, while later floor increases remain valid.
+    bounds = {specifier.operator: specifier.version for specifier in dependency.specifier}
+    assert len(dependency.specifier) == 2
+    assert set(bounds) == {">=", "<"}
+    assert Version(bounds[">="]) >= Version("0.1.11")
+    assert Version(bounds["<"]) == Version("0.2.0")
+    locked_version = ".".join(str(part) for part in _locked_version(_lock_package_block("modelaudit-picklescan")))
+    assert dependency.specifier.contains(locked_version)
 
 
 def test_py7zr_extras_require_patched_release() -> None:

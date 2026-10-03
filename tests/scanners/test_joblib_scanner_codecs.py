@@ -39,6 +39,10 @@ from modelaudit.scanners.joblib_scanner import (
 )
 from modelaudit.scanners.pickle_scanner import PickleScanner
 from modelaudit.utils.file.detection import _LZ4_FRAME_MAGIC, validate_file_type_with_formats
+from tests.helpers.file_creators import SystemCommandPayload
+from tests.helpers.file_creators import (
+    joblib_numpy_raw_segment as _joblib_numpy_raw_segment,
+)
 
 
 class _FakeLz4FrameDecompressor:
@@ -84,13 +88,6 @@ def _install_fake_lz4(
 ) -> None:
     fake_lz4_frame = _FakeLz4FrameModule(payloads)
     monkeypatch.setattr(CompressedScanner, "_get_lz4_frame_module", staticmethod(lambda: fake_lz4_frame))
-
-
-class _Payload:
-    def __reduce__(self) -> tuple[object, tuple[str]]:
-        import os
-
-        return (os.system, ("echo owned",))
 
 
 def _has_system_reduce_failure(result: ScanResult) -> bool:
@@ -334,11 +331,6 @@ def _shared_structured_dtype_graph(*, depth: int = 7, fanout: int = 8) -> _Jobli
     return child
 
 
-def _joblib_numpy_raw_segment(prefix_length: int, raw_data: bytes) -> bytes:
-    padding_length = 16 - ((prefix_length + 1) % 16)
-    return bytes([padding_length]) + (b"\xff" * padding_length) + raw_data
-
-
 def _joblib_numpy_list_payload(
     *,
     leading_ops: bytes = b"",
@@ -461,7 +453,7 @@ def test_safe_parser_accepts_bounded_bytearray8_before_numpy_payload(tmp_path: P
 
 
 def test_scan_detects_raw_protocol0_pickle_joblib(tmp_path: Path) -> None:
-    payload = pickle.dumps(_Payload(), protocol=0)
+    payload = pickle.dumps(SystemCommandPayload("echo owned"), protocol=0)
 
     result = _scan_payload(tmp_path, payload, "raw_protocol0.joblib")
 
@@ -470,7 +462,7 @@ def test_scan_detects_raw_protocol0_pickle_joblib(tmp_path: Path) -> None:
 
 
 def test_scan_detects_truncated_raw_protocol0_pickle_joblib(tmp_path: Path) -> None:
-    payload = pickle.dumps(_Payload(), protocol=0)[:-1]
+    payload = pickle.dumps(SystemCommandPayload("echo owned"), protocol=0)[:-1]
 
     result = _scan_payload(tmp_path, payload, "truncated_raw_protocol0.joblib")
 
@@ -489,7 +481,7 @@ def test_scan_detects_truncated_raw_persistent_id_joblib(tmp_path: Path, payload
 
 
 def test_scan_detects_raw_protocol0_pickle_after_large_literal(tmp_path: Path) -> None:
-    payload = pickle.dumps(["A" * 5000, _Payload()], protocol=0)
+    payload = pickle.dumps(["A" * 5000, SystemCommandPayload("echo owned")], protocol=0)
 
     result = _scan_payload(tmp_path, payload, "large_prefix_raw_protocol0.joblib")
 
@@ -1239,7 +1231,7 @@ def test_scan_revalidates_dtype_when_python_object_ids_collide(
 ) -> None:
     first_prefix = b"\x80\x02](" + _joblib_numpy_wrapper_control(shape=1, dtype="i8")
     first_raw = _joblib_numpy_raw_segment(len(first_prefix), b"\x00" * 8)
-    nested_pickle = pickle.dumps(_Payload(), protocol=2).ljust(48, b"X")
+    nested_pickle = pickle.dumps(SystemCommandPayload("echo owned"), protocol=2).ljust(48, b"X")
     second_control = b"0" + _joblib_numpy_wrapper_control(shape=6, dtype="O8")
     second_prefix_length = len(first_prefix) + len(first_raw) + len(second_control)
     payload = (
@@ -1272,7 +1264,7 @@ def test_scan_revalidates_memoized_dtype_after_build_mutation(tmp_path: Path) ->
         + _binunicode("O8")
         + b"\x89\x88\x87RK\x00\x86sK\x08K\x01K\x1btb0"
     )
-    nested_pickle = pickle.dumps(_Payload(), protocol=2).ljust(48, b"X")
+    nested_pickle = pickle.dumps(SystemCommandPayload("echo owned"), protocol=2).ljust(48, b"X")
     second_wrapper = _joblib_numpy_wrapper_with_dtype_control(b"h\x1e", shape=6)
     payload = first_prefix + (b"\x00" * 8) + b"0" + dtype_mutation + second_wrapper + nested_pickle + b"e."
 
@@ -1284,7 +1276,7 @@ def test_scan_revalidates_memoized_dtype_after_build_mutation(tmp_path: Path) ->
 
 
 def test_scan_rejects_invalid_numpy_wrapper_constructor_hiding_nested_pickle(tmp_path: Path) -> None:
-    nested_pickle = pickle.dumps(_Payload(), protocol=2)
+    nested_pickle = pickle.dumps(SystemCommandPayload("echo owned"), protocol=2)
     wrapper = _joblib_numpy_wrapper_control(shape=len(nested_pickle), dtype="u1").replace(
         b"NumpyArrayWrapper\n)\x81",
         b"NumpyArrayWrapper\n)R",
@@ -1301,7 +1293,7 @@ def test_scan_rejects_invalid_numpy_wrapper_constructor_hiding_nested_pickle(tmp
 
 
 def test_scan_rejects_structured_object_dtype_hiding_nested_pickle(tmp_path: Path) -> None:
-    nested_pickle = pickle.dumps(_Payload(), protocol=2)
+    nested_pickle = pickle.dumps(SystemCommandPayload("echo owned"), protocol=2)
     dtype_control = _joblib_structured_object_dtype_control(len(nested_pickle))
     wrapper_control = _joblib_numpy_wrapper_with_dtype_control(dtype_control)
     payload = b"\x80\x02](" + wrapper_control + nested_pickle + b"e."
@@ -1586,7 +1578,7 @@ def test_scan_fails_closed_when_embedded_pickle_reports_success(
 
 def test_scan_detects_gzip_compressed_pickle_joblib(tmp_path: Path) -> None:
     path = tmp_path / "gzip_protocol4.joblib"
-    path.write_bytes(gzip.compress(pickle.dumps(_Payload(), protocol=4)))
+    path.write_bytes(gzip.compress(pickle.dumps(SystemCommandPayload("echo owned"), protocol=4)))
 
     result = JoblibScanner().scan(str(path))
 
@@ -1603,7 +1595,7 @@ def test_scan_detects_gzip_compressed_pickle_joblib(tmp_path: Path) -> None:
 
 
 def test_scan_detects_bz2_compressed_pickle_joblib(tmp_path: Path) -> None:
-    payload = bz2.compress(pickle.dumps(_Payload(), protocol=4))
+    payload = bz2.compress(pickle.dumps(SystemCommandPayload("echo owned"), protocol=4))
 
     result = _scan_payload(tmp_path, payload, "bz2_protocol4.joblib")
 
@@ -1612,7 +1604,7 @@ def test_scan_detects_bz2_compressed_pickle_joblib(tmp_path: Path) -> None:
 
 
 def test_scan_detects_lz4_compressed_pickle_joblib(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    _install_fake_lz4(monkeypatch, {b"M": pickle.dumps(_Payload(), protocol=4)})
+    _install_fake_lz4(monkeypatch, {b"M": pickle.dumps(SystemCommandPayload("echo owned"), protocol=4)})
 
     result = _scan_payload(tmp_path, _LZ4_FRAME_MAGIC + b"M", "lz4_malicious.joblib")
 
@@ -1676,7 +1668,7 @@ def test_lz4_compressed_malicious_joblib_produces_security_exit_code(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _install_fake_lz4(monkeypatch, {b"M": pickle.dumps(_Payload(), protocol=4)})
+    _install_fake_lz4(monkeypatch, {b"M": pickle.dumps(SystemCommandPayload("echo owned"), protocol=4)})
     path = tmp_path / "lz4_malicious.joblib"
     path.write_bytes(_LZ4_FRAME_MAGIC + b"M")
 
@@ -1739,7 +1731,7 @@ def test_lz4_compressed_joblib_honors_decompression_limits(
 def test_lz4_joblib_rejects_unscanned_pickle_trailer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _install_fake_lz4(monkeypatch, {b"S": pickle.dumps({"safe": True}, protocol=4)})
     path = tmp_path / "lz4_trailer.joblib"
-    path.write_bytes(_LZ4_FRAME_MAGIC + b"S" + pickle.dumps(_Payload(), protocol=0))
+    path.write_bytes(_LZ4_FRAME_MAGIC + b"S" + pickle.dumps(SystemCommandPayload("echo owned"), protocol=0))
 
     result = JoblibScanner().scan(str(path))
 
@@ -1757,7 +1749,7 @@ def test_lz4_joblib_does_not_accept_malicious_concatenated_frame(
         monkeypatch,
         {
             b"S": pickle.dumps({"safe": True}, protocol=4),
-            b"M": pickle.dumps(_Payload(), protocol=4),
+            b"M": pickle.dumps(SystemCommandPayload("echo owned"), protocol=4),
         },
     )
     path = tmp_path / "lz4_concatenated.joblib"
@@ -1773,7 +1765,7 @@ def test_zip_routes_nested_lz4_joblib_to_embedded_pickle_analysis(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _install_fake_lz4(monkeypatch, {b"M": pickle.dumps(_Payload(), protocol=4)})
+    _install_fake_lz4(monkeypatch, {b"M": pickle.dumps(SystemCommandPayload("echo owned"), protocol=4)})
     archive_path = tmp_path / "models.zip"
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.writestr("nested/model.joblib", _LZ4_FRAME_MAGIC + b"M")
@@ -1785,7 +1777,9 @@ def test_zip_routes_nested_lz4_joblib_to_embedded_pickle_analysis(
 
 
 def test_scan_detects_bz_prefixed_raw_pickle_joblib(tmp_path: Path) -> None:
-    payload = b"B" + struct.pack("<I", 90) + (b"X" * 90) + b"0" + pickle.dumps(_Payload(), protocol=0)
+    payload = (
+        b"B" + struct.pack("<I", 90) + (b"X" * 90) + b"0" + pickle.dumps(SystemCommandPayload("echo owned"), protocol=0)
+    )
     assert payload.startswith(b"BZ")
 
     result = _scan_payload(tmp_path, payload, "bz_prefixed_raw_pickle.joblib")
@@ -1796,7 +1790,9 @@ def test_scan_detects_bz_prefixed_raw_pickle_joblib(tmp_path: Path) -> None:
 
 
 def test_scan_detects_zlib_trailer_after_compressed_joblib_stream(tmp_path: Path) -> None:
-    payload = zlib.compress(pickle.dumps({"safe": [1, 2, 3]}, protocol=4)) + pickle.dumps(_Payload(), protocol=0)
+    payload = zlib.compress(pickle.dumps({"safe": [1, 2, 3]}, protocol=4)) + pickle.dumps(
+        SystemCommandPayload("echo owned"), protocol=0
+    )
 
     result = _scan_payload(tmp_path, payload, "zlib_trailer.joblib")
 
@@ -1823,7 +1819,7 @@ def test_scan_reports_plain_text_joblib_without_critical_pickle_noise(tmp_path: 
 
 def test_scan_file_routes_gzip_joblib_to_joblib_scanner(tmp_path: Path) -> None:
     path = tmp_path / "gzip_protocol4.joblib"
-    path.write_bytes(gzip.compress(pickle.dumps(_Payload(), protocol=4)))
+    path.write_bytes(gzip.compress(pickle.dumps(SystemCommandPayload("echo owned"), protocol=4)))
 
     result = scan_file(str(path), config={"cache_scan_results": False})
 

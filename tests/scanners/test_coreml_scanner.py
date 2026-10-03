@@ -14,23 +14,9 @@ from modelaudit.utils.file.detection import (
     detect_file_format,
     detect_format_from_extension,
 )
-
-
-def _encode_varint(value: int) -> bytes:
-    out = bytearray()
-    while value >= 0x80:
-        out.append((value & 0x7F) | 0x80)
-        value >>= 7
-    out.append(value)
-    return bytes(out)
-
-
-def _field_varint(field_number: int, value: int) -> bytes:
-    return _encode_varint((field_number << 3) | 0) + _encode_varint(value)
-
-
-def _field_bytes(field_number: int, value: bytes) -> bytes:
-    return _encode_varint((field_number << 3) | 2) + _encode_varint(len(value)) + value
+from tests.helpers.file_creators import _encode_protobuf_varint as _encode_varint
+from tests.helpers.file_creators import protobuf_bytes_field as _field_bytes
+from tests.helpers.file_creators import protobuf_varint_field as _field_varint
 
 
 def _build_user_metadata_entry(key: str, value: str) -> bytes:

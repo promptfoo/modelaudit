@@ -5,6 +5,7 @@ from pathlib import Path
 
 from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.scanners.skops_scanner import SkopsScanner
+from tests.helpers.scanners import assert_skops_cve_clean
 
 
 class TestSkopsScannerContentAnalysis:
@@ -12,50 +13,24 @@ class TestSkopsScannerContentAnalysis:
 
     def test_detects_malicious_operatorfuncnode_in_schema(self, tmp_path: Path) -> None:
         """Test detection of exploit-shaped OperatorFuncNode schema content."""
-        skops_file = tmp_path / "model.skops"
-        with zipfile.ZipFile(skops_file, "w") as zf:
-            zf.writestr(
-                "schema.json",
-                '{"__loader__": "OperatorFuncNode", "__module__": "builtins", "__class__": "eval"}',
-            )
-
-        scanner = SkopsScanner()
-        result = scanner.scan(str(skops_file))
-
-        cve_checks = [c for c in result.checks if "CVE-2025-54412" in c.name]
-        assert len(cve_checks) > 0
-        assert cve_checks[0].status == CheckStatus.FAILED
-        assert cve_checks[0].severity == IssueSeverity.CRITICAL
-
         # Verify it detected the structured loader, not a filename.
-        details = cve_checks[0].details
-        patterns_matched = details.get("patterns_matched", [])
-        assert any("loader:" in p for p in patterns_matched)
+        _assert_skops_malicious_schema_node(
+            tmp_path,
+            ('{"__loader__": "OperatorFuncNode", "__module__": "builtins", "__class__": "eval"}'),
+            ("CVE-2025-54412"),
+        )
 
     def test_detects_malicious_methodnode_in_schema(self, tmp_path: Path) -> None:
         """Test detection of exploit-shaped MethodNode schema content."""
-        skops_file = tmp_path / "model.skops"
-        with zipfile.ZipFile(skops_file, "w") as zf:
-            zf.writestr(
-                "schema.json",
-                (
-                    '{"__loader__": "MethodNode", "__module__": "builtins", "__class__": "str", '
-                    '"content": {"obj": {"__module__": "os", "__class__": "system"}}}'
-                ),
-            )
-
-        scanner = SkopsScanner()
-        result = scanner.scan(str(skops_file))
-
-        cve_checks = [c for c in result.checks if "CVE-2025-54413" in c.name]
-        assert len(cve_checks) > 0
-        assert cve_checks[0].status == CheckStatus.FAILED
-        assert cve_checks[0].severity == IssueSeverity.CRITICAL
-
         # Verify it detected the structured loader, not a filename.
-        details = cve_checks[0].details
-        patterns_matched = details.get("patterns_matched", [])
-        assert any("loader:" in p for p in patterns_matched)
+        _assert_skops_malicious_schema_node(
+            tmp_path,
+            (
+                '{"__loader__": "MethodNode", "__module__": "builtins", "__class__": "str", '
+                '"content": {"obj": {"__module__": "os", "__class__": "system"}}}'
+            ),
+            ("CVE-2025-54413"),
+        )
 
     def test_reduce_in_content_not_flagged(self, tmp_path: Path) -> None:
         """__reduce__ is a standard Python serialization method and should NOT trigger CVE-2025-54412."""
@@ -79,10 +54,7 @@ class TestSkopsScannerContentAnalysis:
             zf.writestr("schema.json", '{"version": "1.0"}')
 
         scanner = SkopsScanner()
-        result = scanner.scan(str(skops_file))
-
-        cve_checks = [c for c in result.checks if "CVE-2025-54413" in c.name]
-        assert not [c for c in cve_checks if c.status == CheckStatus.FAILED]
+        assert_skops_cve_clean(scanner, skops_file, "CVE-2025-54413")
 
     def test_clean_file_no_content_detection(self, tmp_path: Path) -> None:
         """Test that clean files without malicious content don't trigger."""
@@ -109,10 +81,7 @@ class TestSkopsScannerContentAnalysis:
             zf.writestr("schema.json", '{"version": "1.0"}')
 
         scanner = SkopsScanner()
-        result = scanner.scan(str(skops_file))
-
-        cve_checks = [c for c in result.checks if "CVE-2025-54412" in c.name]
-        assert not [c for c in cve_checks if c.status == CheckStatus.FAILED]
+        assert_skops_cve_clean(scanner, skops_file, "CVE-2025-54412")
 
     def test_valid_loader_nodes_are_not_flagged(self, tmp_path: Path) -> None:
         """Normal Skops loader nodes should not be treated as exploit payloads."""
@@ -136,3 +105,25 @@ class TestSkopsScannerContentAnalysis:
         cve_54413 = [c for c in result.checks if "CVE-2025-54413" in c.name and c.status == CheckStatus.FAILED]
         assert cve_54412 == []
         assert cve_54413 == []
+
+
+def _assert_skops_malicious_schema_node(tmp_path: Path, schema: str, check_name: str) -> None:
+    skops_file = tmp_path / "model.skops"
+    with zipfile.ZipFile(skops_file, "w") as zf:
+        zf.writestr(
+            "schema.json",
+            schema,
+        )
+
+    scanner = SkopsScanner()
+    result = scanner.scan(str(skops_file))
+
+    cve_checks = [c for c in result.checks if check_name in c.name]
+    assert len(cve_checks) > 0
+    assert cve_checks[0].status == CheckStatus.FAILED
+    assert cve_checks[0].severity == IssueSeverity.CRITICAL
+
+    # Verify it detected the structured loader, not a filename.
+    details = cve_checks[0].details
+    patterns_matched = details.get("patterns_matched", [])
+    assert any("loader:" in p for p in patterns_matched)

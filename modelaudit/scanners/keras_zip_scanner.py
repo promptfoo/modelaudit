@@ -2117,7 +2117,7 @@ class KerasZipScanner(BaseScanner):
         result: ScanResult,
         nested_layer_depth: int,
     ) -> None:
-        metadata_snapshot = {
+        metadata_snapshot: dict[str, Any] = {
             key: result.metadata[key] for key in ("model_class", "layer_counts") if key in result.metadata
         }
         missing_metadata_keys = {key for key in ("model_class", "layer_counts") if key not in result.metadata}

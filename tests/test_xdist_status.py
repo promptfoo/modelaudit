@@ -239,20 +239,21 @@ def test_check_framework_returns_false_when_package_import_fails(
     assert root_conftest._check_framework("broken_framework") is False
 
 
-def test_nodeid_sharding_is_stable_disjoint_and_exhaustive() -> None:
+@pytest.mark.parametrize("shard_count", [2, 3, 5])
+def test_nodeid_sharding_is_stable_disjoint_and_exhaustive(shard_count: int) -> None:
     root_conftest = _load_root_conftest()
     nodeids = [f"tests/test_example.py::test_case[{index}]" for index in range(1_000)]
 
-    first_assignment = [root_conftest._nodeid_shard(nodeid, 5) for nodeid in nodeids]
-    second_assignment = [root_conftest._nodeid_shard(nodeid, 5) for nodeid in nodeids]
+    first_assignment = [root_conftest._nodeid_shard(nodeid, shard_count) for nodeid in nodeids]
+    second_assignment = [root_conftest._nodeid_shard(nodeid, shard_count) for nodeid in nodeids]
 
     assert first_assignment == second_assignment
-    assert set(first_assignment) == set(range(5))
+    assert set(first_assignment) == set(range(shard_count))
     for nodeid in nodeids:
-        assert sum(root_conftest._nodeid_shard(nodeid, 5) == index for index in range(5)) == 1
+        assert sum(root_conftest._nodeid_shard(nodeid, shard_count) == index for index in range(shard_count)) == 1
 
 
-def test_nightly_correctness_matrix_uses_exhaustive_two_way_shards() -> None:
+def test_nightly_correctness_matrix_uses_exhaustive_three_way_shards() -> None:
     jobs = _load_nightly_workflow()["jobs"]
     correctness = jobs["correctness"]
 
@@ -263,7 +264,7 @@ def test_nightly_correctness_matrix_uses_exhaustive_two_way_shards() -> None:
     assert matrix == {
         "os": ["ubuntu-latest", "windows-latest"],
         "python-version": ["3.10", "3.11", "3.12", "3.13"],
-        "shard": [0, 1],
+        "shard": [0, 1, 2],
         "exclude": [
             {"os": "windows-latest", "python-version": "3.10"},
             {"os": "windows-latest", "python-version": "3.12"},
@@ -281,7 +282,7 @@ def test_nightly_correctness_matrix_uses_exhaustive_two_way_shards() -> None:
     assert run.count('-m "not performance"') == 1
     assert "-m performance" not in run
     assert "pytest -n auto" in run
-    assert "--modelaudit-shard-count 2" in run
+    assert "--modelaudit-shard-count 3" in run
     assert "--modelaudit-shard-index ${{ matrix.shard }}" in run
     assert "tests" not in run.split()
     for fail_fast_option in (" -x", "--maxfail", "--ignore", "--deselect"):
