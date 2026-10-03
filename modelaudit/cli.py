@@ -6151,7 +6151,7 @@ def _format_debug_output(debug_info: dict[str, Any], verbose: bool) -> str:
     lines.append(border)
     lines.append(
         style_text(
-            "Please include this output when reporting issues:",
+            "Inspect this output and remove sensitive values before sharing it in an issue report:",
             fg="yellow",
         )
     )
@@ -6235,6 +6235,9 @@ def _format_debug_output(debug_info: dict[str, Any], verbose: bool) -> str:
 @click.option("--verbose", "-v", is_flag=True, help="Include additional diagnostic details")
 def debug(output_json: bool, verbose: bool) -> None:
     """Display debug information for troubleshooting.
+
+    Output includes raw configuration values. Inspect it and remove sensitive
+    values before sharing it in an issue report.
 
     Outputs comprehensive diagnostic information useful for:
 

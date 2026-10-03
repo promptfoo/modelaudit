@@ -197,13 +197,15 @@ class TestDebugCommand:
         # Should mention scanners
         assert "scanners" in result.output
 
-    def test_debug_pretty_output_has_issue_url(self, runner):
-        """Pretty output should include GitHub issues URL."""
-        result = runner.invoke(cli, ["debug"])
+    def test_debug_pretty_output_requires_review_before_sharing(self, runner: CliRunner) -> None:
+        """Raw diagnostics should explain what to check before filing an issue."""
+        with patch.dict(os.environ, {"HTTP_PROXY": "http://user:secret@proxy:8080"}):
+            result = runner.invoke(cli, ["debug"])
         assert result.exit_code == 0
 
-        assert "github.com" in result.output
-        assert "issues" in result.output
+        assert "http://user:secret@proxy:8080" in result.output
+        assert "Inspect this output and remove sensitive values before sharing" in result.output
+        assert "https://github.com/promptfoo/modelaudit/issues" in result.output
 
     def test_debug_handles_missing_cache_gracefully(self, runner):
         """Debug should handle cache errors gracefully."""
@@ -323,12 +325,14 @@ class TestDebugCommand:
         assert "apiHost" not in auth_info
         assert "appUrl" not in auth_info
 
-    def test_debug_help_text(self, runner):
+    def test_debug_help_text(self, runner: CliRunner) -> None:
         """Debug command should have helpful description."""
         result = runner.invoke(cli, ["debug", "--help"])
         assert result.exit_code == 0
         assert "troubleshooting" in result.output.lower()
         assert "bug" in result.output.lower() or "issue" in result.output.lower()
+        assert "raw configuration values" in result.output
+        assert "remove sensitive values" in " ".join(result.output.split())
 
     def test_debug_dependencies_structure(self, runner):
         """Dependencies info should have expected structure."""
