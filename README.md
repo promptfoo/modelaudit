@@ -218,7 +218,7 @@ Common scan options:
 
 Reports retain raw source identifiers and credential-bearing evidence. Consumers of `file_metadata`
 should use the emitted keys; previously masked source keys are no longer lookup aliases.
-Oversized values use bounded previews with SHA-256 identifiers shared across keys and references within each report;
+Oversized source identifiers use bounded previews with SHA-256 identifiers shared across keys and references within each report;
 literal identifiers are reserved so distinct sources remain distinct.
 Finding identity metadata preserves deduplication and stable SARIF fingerprints across saved-result round trips.
 

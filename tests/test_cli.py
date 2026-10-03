@@ -9444,3 +9444,22 @@ def test_huggingface_stream_wrapper_renders_provider_error_once() -> None:
     assert error.calls == 1
     assert str(caught.value) == "403 Forbidden"
     assert caught.value.__cause__ is error
+
+
+@pytest.mark.parametrize("missing", ["revision", "size"])
+@pytest.mark.parametrize("suffix", ["?token='403'", '?token="forbidden"', "#note=synthetic unauthorized"])
+def test_huggingface_dry_run_source_does_not_change_access_classification(missing: str, suffix: str) -> None:
+    source = "https://huggingface.co/org/model/resolve/main/model.pkl" + suffix
+    metadata: dict[str, int | str | None] = {"size_bytes": None if missing == "size" else 4}
+    if missing == "size":
+        metadata["resolved_revision"] = "a" * 40
+    with patch("modelaudit.cli._get_huggingface_file_metadata", return_value=metadata):
+        invocation = CliRunner().invoke(
+            cli, ["scan", "--quiet", "--no-cache", "--format", "json", "--dry-run", "--max-size", "1MB", source]
+        )
+    assert invocation.exit_code == 2
+    result = json.loads(invocation.output[invocation.output.index("{") :])
+    details = result["issues"][0]["details"]
+    assert details["blocked"] is False
+    assert details["error_category"] == "acquisition_error"
+    assert details["scan_outcome_reason"] == "huggingface_acquisition_error"

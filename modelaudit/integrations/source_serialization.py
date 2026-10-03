@@ -18,11 +18,16 @@ def serialize_source_identifier(value: str) -> str:
 
 
 def serialize_source_text(value: str) -> str:
-    return serialize_source_identifier(value)
+    return value if len(value) <= _MAX_STRING_CHARS else "<redacted oversized value>"
 
 
 def serialize_source_value(value: Any) -> Any:
     """Preserve report shapes and JSON-compatible keys, bounding recursive values."""
+    return serialize_source_values([value])[0]
+
+
+def serialize_source_values(values: list[Any]) -> list[Any]:
+    """Share identifier allocation while retaining each value's depth budget."""
     identifiers: dict[str, str] = {}
     reserved: set[str] = set()
 
@@ -35,7 +40,7 @@ def serialize_source_value(value: Any) -> Any:
         return text
 
     # Materialize each model/key once; strings remain references until IDs are allocated.
-    converted = _serialize(value, set(), 0, reserve)
+    converted = [_serialize(value, set(), 0, reserve) for value in values]
     for text in sorted(identifiers, key=identifiers.__getitem__):
         base = candidate = identifiers[text]
         occurrence = 1
@@ -44,7 +49,7 @@ def serialize_source_value(value: Any) -> Any:
             candidate = f"{base}#{occurrence}"
         reserved.add(candidate)
         identifiers[text] = candidate
-    return _serialize(converted, set(), 0, lambda text: identifiers.get(text, text))
+    return [_serialize(value, set(), 0, lambda text: identifiers.get(text, text)) for value in converted]
 
 
 def _serialize(value: Any, seen: set[int], depth: int, transform: Callable[[str], str]) -> Any:

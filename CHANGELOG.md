@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Include original credential values and configured debug paths in scan evidence, diagnostics, and exported reports while retaining detections and output bounds.
-- Use emitted source keys for `file_metadata` lookups; ordinary keys remain raw, while oversized values use consistent bounded identifiers. Previously masked keys are no longer aliases. Metadata values and per-source associations remain intact.
+- Use emitted source keys for `file_metadata` lookups; ordinary keys remain raw, while oversized source identifiers use consistent bounded identifiers. Previously masked keys are no longer aliases. Metadata values and per-source associations remain intact.
 - Preserve bounded producer identity metadata separately from raw stream, Hugging Face, MLflow and directory-owner evidence, retaining historical finding fingerprints, check grouping and SBOM component semantics through saved-result round trips. Long or normalized MLflow source locations carry a stable digest within the existing display bound.
 
 ### Security

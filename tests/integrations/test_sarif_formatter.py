@@ -8,11 +8,13 @@ import sys
 import time
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
+from typing import Any
 from unittest.mock import Mock
 
 import pytest
 
 import modelaudit.integrations.sarif_formatter as sarif_formatter
+from modelaudit.cli import _format_scan_output
 from modelaudit.core import scan_model_directory_or_file
 from modelaudit.integrations._sarif_identity import redact_source_identifier, redact_source_text
 from modelaudit.models import (
@@ -1988,3 +1990,183 @@ def test_source_serialization_materializes_model_and_custom_key_once() -> None:
     converted = serialize_source_value({Key(): Details()})
     assert calls == ["key", "model"]
     assert len(converted["key"]["source"]) < 256 * 1024
+
+
+@pytest.mark.parametrize("field", ["message", "type", "rule_code", "evidence_fingerprint"])
+@pytest.mark.parametrize("matches_source", [False, True])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_oversized_finding_identity_survives_json_roundtrip(field: str, matches_source: bool, reverse: bool) -> None:
+    source = "https://example.test/model.pkl?token=" + "x" * (256 * 1024)
+    value = source if matches_source else "x" * (256 * 1024 + 1)
+    result = create_initial_audit_result()
+    first = Issue(message="Unsafe operation", type="unsafe", severity=IssueSeverity.WARNING, location="model.pkl")
+    if field == "evidence_fingerprint":
+        first.details[field] = value
+    else:
+        setattr(first, field, value)
+    result.issues = [first, Issue(message="Another operation", type="other", location="other.pkl")]
+    if reverse:
+        result.issues.reverse()
+    result.assets = [AssetModel(path=source, type="pickle")]
+    result.file_metadata = {source: FileMetadataModel(file_size=3)}
+    before = result.model_dump()
+    direct = json.loads(format_sarif_output(result, [source], verbose=True))["runs"][0]
+    saved = ModelAuditResultModel.model_validate_json(
+        _format_scan_output(result, [source], output_format="json", verbose=True)
+    )
+    restored = json.loads(format_sarif_output(saved, [], verbose=True))["runs"][0]
+    assert [r["partialFingerprints"] for r in restored["results"]] == [
+        r["partialFingerprints"] for r in direct["results"]
+    ]
+    assert [(r["id"], r["name"], r["properties"]["tags"]) for r in restored["tool"]["driver"]["rules"]] == [
+        (r["id"], r["name"], r["properties"]["tags"]) for r in direct["tool"]["driver"]["rules"]
+    ]
+    assert result.model_dump() == before
+    assert {asset.path for asset in saved.assets} == set(saved.file_metadata)
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("repeated", [False, True])
+def test_sarif_oversized_sources_cannot_alias_literal_artifacts(reverse: bool, repeated: bool) -> None:
+    source = "stream://https://bucket.s3.amazonaws.com/model.pkl?token=" + "x" * (256 * 1024)
+    literal = f"{source[:256]}...<source sha256:{hashlib.sha256(source.encode()).hexdigest()}>"
+    paths = [source, literal, literal + "#2"]
+    if reverse:
+        paths.reverse()
+    if repeated:
+        paths += paths
+    result = create_initial_audit_result()
+    result.assets = [AssetModel(path=path, type="pickle") for path in paths]
+    result.issues = [Issue(message=f"Finding {index}", location=path) for index, path in enumerate(paths)]
+    run = json.loads(format_sarif_output(result, paths, verbose=True))["runs"][0]
+    artifacts = [a["location"]["uri"] for a in run["artifacts"]]
+    findings = [r["locations"][0]["physicalLocation"]["artifactLocation"]["uri"] for r in run["results"]]
+    assert len(set(artifacts)) == 3
+    assert findings == artifacts
+    assert len(set(run["invocations"][0]["arguments"])) == 3
+    if repeated:
+        assert artifacts[:3] == artifacts[3:]
+
+
+@pytest.mark.parametrize("output_format", ["json", "text"])
+def test_saved_oversized_identity_fields_keep_historical_text_bounds(output_format: str) -> None:
+    oversized = "pickle " + "x" * (256 * 1024)
+    result = create_initial_audit_result()
+    producer: dict[str, Any] = {
+        "producer": "stream",
+        "fields": {"message": "Producer message", "location": "producer.pkl"},
+    }
+    result.issues = [Issue(message=oversized, location="raw.pkl", finding_identity=producer)]
+    result.checks = [
+        Check(name=oversized, message=oversized, status=CheckStatus.FAILED, severity=IssueSeverity.WARNING)
+    ]
+    output = _format_scan_output(result, [], output_format=output_format, verbose=True)
+    assert "source sha256:" not in output
+    assert "<redacted oversized value>" in output
+    if output_format == "json":
+        saved = ModelAuditResultModel.model_validate_json(output)
+        assert getattr(saved.issues[0], "finding_identity", {}) == producer
+        assert saved.checks[0].name == "<redacted oversized value>"
+        run = json.loads(format_sarif_output(saved, [], verbose=True))["runs"][0]
+        assert run["tool"]["driver"]["rules"][0]["properties"]["tags"] == ["security", "ml-model"]
+
+
+def test_sarif_two_source_literal_alias_regression() -> None:
+    source = "stream://https://bucket.s3.amazonaws.com/model.pkl?token=" + "x" * (256 * 1024)
+    literal = f"{source[:256]}...<source sha256:{hashlib.sha256(source.encode()).hexdigest()}>"
+    result = create_initial_audit_result()
+    result.assets = [AssetModel(path=path, type="pickle") for path in [source, literal]]
+    result.issues = [Issue(message="Finding", location=path) for path in [source, literal]]
+    run = json.loads(format_sarif_output(result, [source, literal], verbose=True))["runs"][0]
+    artifacts = [a["location"]["uri"] for a in run["artifacts"]]
+    assert len(set(artifacts)) == 2
+    assert [r["locations"][0]["physicalLocation"]["artifactLocation"]["uri"] for r in run["results"]] == artifacts
+
+
+@pytest.mark.parametrize("field", ["message", "type", "rule_code", "evidence_fingerprint"])
+def test_saved_oversized_producer_identity_keeps_fingerprints(field: str) -> None:
+    result = create_initial_audit_result()
+    fields: dict[str, Any] = {"location": "producer.pkl"}
+    if field == "evidence_fingerprint":
+        fields["details"] = {field: "x" * (256 * 1024 + 1), "zip_entry": "member.pkl"}
+    else:
+        fields[field] = "x" * (256 * 1024 + 1)
+    result.issues = [
+        Issue(message="Raw message", location="raw.pkl", finding_identity={"producer": "stream", "fields": fields})
+    ]
+    direct = json.loads(format_sarif_output(result, [], verbose=True))["runs"][0]
+    saved = ModelAuditResultModel.model_validate_json(
+        _format_scan_output(result, [], output_format="json", verbose=True)
+    )
+    restored = json.loads(format_sarif_output(saved, [], verbose=True))["runs"][0]
+    assert restored["results"][0]["partialFingerprints"] == direct["results"][0]["partialFingerprints"]
+    assert restored["results"][0]["ruleId"] == direct["results"][0]["ruleId"]
+    saved_identity = getattr(saved.issues[0], "finding_identity", {})
+    assert saved_identity["fields"]["location"] == "producer.pkl"
+    if field == "evidence_fingerprint":
+        assert saved_identity["fields"]["details"]["zip_entry"] == "member.pkl"
+    assert len(str(fields.get(field) or fields.get("details"))) > 256 * 1024
+
+
+@pytest.mark.parametrize("field", ["name", "zip_entry_id", "zip_entry", "check_consolidation_key"])
+def test_saved_oversized_check_identity_keeps_historical_groups(field: str) -> None:
+    from modelaudit.core_results import consolidate_checks
+
+    result = create_initial_audit_result()
+    for suffix in ["a", "b"]:
+        oversized = "x" * (256 * 1024) + suffix
+        check = Check(
+            name="Check",
+            message="Operation failed",
+            location="model.pkl",
+            status=CheckStatus.FAILED,
+            severity=IssueSeverity.WARNING,
+        )
+        if field == "name":
+            check.name = oversized
+        else:
+            check.details[field] = oversized
+        result.checks.append(check)
+    saved = ModelAuditResultModel.model_validate_json(
+        _format_scan_output(result, [], output_format="json", verbose=True)
+    )
+    consolidate_checks(saved)
+    assert len(saved.checks) == 1
+    assert saved.checks[0].details["component_count"] == 2
+
+
+@pytest.mark.parametrize("depth", [30, 31, 32, 33, 34])
+def test_sarif_shared_source_allocation_preserves_detail_depth_budget(depth: int) -> None:
+    from modelaudit.integrations.source_serialization import serialize_source_value
+
+    evidence: Any = "leaf"
+    for _ in range(depth):
+        evidence = [evidence]
+    details = {"evidence": evidence}
+    result = create_initial_audit_result()
+    result.issues = [Issue(message="Synthetic finding", location="model.pkl", details=details)]
+    run = json.loads(format_sarif_output(result, ["model.pkl"], verbose=True))["runs"][0]
+    assert run["results"][0]["properties"] == serialize_source_value(details)
+
+
+def test_sarif_shared_sources_preserve_property_references_and_materialize_once() -> None:
+    from pydantic import BaseModel, model_serializer
+
+    source = "https://example.test/model.pkl?token=" + "x" * (256 * 1024)
+    literal = f"{source[:256]}...<source sha256:{hashlib.sha256(source.encode()).hexdigest()}>"
+    calls: list[str] = []
+
+    class Details(BaseModel):
+        @model_serializer
+        def serialize(self) -> dict[str, str]:
+            calls.append("model")
+            return {"source": source}
+
+    result = create_initial_audit_result()
+    result.assets = [AssetModel(path=path, type="pickle") for path in [source, literal]]
+    result.issues = [Issue(message="Finding", location=source, details={"source": source, "model": Details()})]
+    run = json.loads(format_sarif_output(result, [source, literal], verbose=True))["runs"][0]
+    properties = run["results"][0]["properties"]
+    assert properties["source"] == properties["model"]["source"] == run["invocations"][0]["arguments"][0]
+    assert properties["source"] != literal
+    assert calls == ["model"]
