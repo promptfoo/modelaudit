@@ -61,6 +61,33 @@ from modelaudit.utils.sources.cloud_storage import (
 from tests.helpers import create_mock_coreml
 
 
+async def mock_analyze(_url: str) -> dict[str, object]:
+    return {
+        "type": "file",
+        "size": 1024,
+        "name": "model.pt",
+        "human_size": "1.0 KB",
+        "estimated_time": "1 second",
+    }
+
+
+def _optional_probe_failure_fs(payload: bytes, probe_failure: str) -> tuple[MagicMock, list[int]]:
+    transferred = [0]
+    open_count = [0]
+    fs = make_fs_mock()
+    fs.info.return_value = {"type": "file", "size": len(payload)}
+
+    def open_side_effect(_path: str, _mode: str = "rb") -> _CountingBytesIO:
+        open_count[0] += 1
+        if probe_failure == "prefix-extension" and open_count[0] == 3:
+            raise OSError("second ranged read is unavailable")
+        stream_type = _NoTailSeekCountingBytesIO if probe_failure == "size-proof" else _CountingBytesIO
+        return stream_type(payload, transferred)
+
+    fs.open.side_effect = open_side_effect
+    return fs, transferred
+
+
 def make_fs_mock() -> MagicMock:
     fs = MagicMock()
     fs.__enter__.return_value = fs
@@ -1846,17 +1873,7 @@ def test_filter_scannable_cloud_files_fails_closed_for_benign_near_match_without
 def test_filter_scannable_cloud_files_preserves_pickle_route_when_prefix_extension_fails() -> None:
     url = "s3://bucket/models/evil.payload"
     payload = make_incomplete_pickle_probe_payload(malicious=True)
-    transferred = [0]
-    open_count = [0]
-    fs = make_fs_mock()
-
-    def open_side_effect(_path: str, _mode: str = "rb") -> _CountingBytesIO:
-        open_count[0] += 1
-        if open_count[0] == 3:
-            raise OSError("second ranged read is unavailable")
-        return _CountingBytesIO(payload, transferred)
-
-    fs.open.side_effect = open_side_effect
+    fs, transferred, open_count = _prefix_extension_failure_fs(payload)
     files = [{"path": url, "name": "evil.payload", "size": len(payload), "human_size": f"{len(payload)} B"}]
 
     assert _filter_scannable_cloud_files(files, fs=fs, max_sniff_bytes=len(payload)) == [
@@ -1869,17 +1886,7 @@ def test_filter_scannable_cloud_files_preserves_pickle_route_when_prefix_extensi
 def test_filter_scannable_cloud_files_fails_closed_for_benign_near_match_when_prefix_extension_fails() -> None:
     url = "s3://bucket/models/preview.payload"
     payload = make_incomplete_pickle_probe_payload(malicious=False)
-    transferred = [0]
-    open_count = [0]
-    fs = make_fs_mock()
-
-    def open_side_effect(_path: str, _mode: str = "rb") -> _CountingBytesIO:
-        open_count[0] += 1
-        if open_count[0] == 3:
-            raise OSError("second ranged read is unavailable")
-        return _CountingBytesIO(payload, transferred)
-
-    fs.open.side_effect = open_side_effect
+    fs, transferred, open_count = _prefix_extension_failure_fs(payload)
     files = [{"path": url, "name": "preview.payload", "size": len(payload), "human_size": f"{len(payload)} B"}]
 
     with pytest.raises(ValueError, match="unable to inspect skipped object"):
@@ -2318,19 +2325,7 @@ def test_selective_cloud_download_preserves_prefix_only_pickle_route_after_optio
     url = "s3://bucket/models/"
     file_url = "s3://bucket/models/evil.payload"
     payload = make_incomplete_pickle_probe_payload(malicious=True)
-    transferred = [0]
-    open_count = [0]
-    fs = make_fs_mock()
-    fs.info.return_value = {"type": "file", "size": len(payload)}
-
-    def open_side_effect(_path: str, _mode: str = "rb") -> _CountingBytesIO:
-        open_count[0] += 1
-        if probe_failure == "prefix-extension" and open_count[0] == 3:
-            raise OSError("second ranged read is unavailable")
-        stream_type = _NoTailSeekCountingBytesIO if probe_failure == "size-proof" else _CountingBytesIO
-        return stream_type(payload, transferred)
-
-    fs.open.side_effect = open_side_effect
+    fs, transferred = _optional_probe_failure_fs(payload, probe_failure)
     mock_fs_class.return_value = fs
     mock_analyze.return_value = {
         "type": "directory",
@@ -2374,19 +2369,7 @@ def test_selective_cloud_download_fails_closed_for_benign_near_match_after_optio
     url = "s3://bucket/models/"
     file_url = "s3://bucket/models/preview.payload"
     payload = make_incomplete_pickle_probe_payload(malicious=False)
-    transferred = [0]
-    open_count = [0]
-    fs = make_fs_mock()
-    fs.info.return_value = {"type": "file", "size": len(payload)}
-
-    def open_side_effect(_path: str, _mode: str = "rb") -> _CountingBytesIO:
-        open_count[0] += 1
-        if probe_failure == "prefix-extension" and open_count[0] == 3:
-            raise OSError("second ranged read is unavailable")
-        stream_type = _NoTailSeekCountingBytesIO if probe_failure == "size-proof" else _CountingBytesIO
-        return stream_type(payload, transferred)
-
-    fs.open.side_effect = open_side_effect
+    fs, transferred = _optional_probe_failure_fs(payload, probe_failure)
     mock_fs_class.return_value = fs
     mock_analyze.return_value = {
         "type": "directory",
@@ -3436,15 +3419,6 @@ async def test_download_from_cloud_async_context(tmp_path: Path) -> None:
 
     fs.get.side_effect = mock_get
 
-    async def mock_analyze(_url: str) -> dict[str, object]:
-        return {
-            "type": "file",
-            "size": 1024,
-            "name": "model.pt",
-            "human_size": "1.0 KB",
-            "estimated_time": "1 second",
-        }
-
     await asyncio.sleep(0)
     with (
         patch("fsspec.filesystem", return_value=fs),
@@ -3574,15 +3548,6 @@ async def test_download_from_cloud_streaming_async_context(tmp_path: Path) -> No
     fs.info.return_value = {"type": "file", "size": 1024}
     fs.get.side_effect = lambda _src, dst: Path(dst).write_bytes(b"data")
     temp_dir = tmp_path / "streaming-tempdir"
-
-    async def mock_analyze(_url: str) -> dict[str, object]:
-        return {
-            "type": "file",
-            "size": 1024,
-            "name": "model.pt",
-            "human_size": "1.0 KB",
-            "estimated_time": "1 second",
-        }
 
     await asyncio.sleep(0)
     with (
@@ -4288,16 +4253,7 @@ class TestCloudPathSecurity:
             {"path": f"{base_url}/model.pkl"},
         ]
 
-        with (
-            patch("modelaudit.utils.sources.cloud_storage._is_case_sensitive_directory", return_value=True),
-            patch(
-                "modelaudit.utils.sources.cloud_storage._is_unicode_normalization_sensitive_directory",
-                return_value=True,
-            ),
-        ):
-            plan = _build_cloud_download_plan(base_url, files, tmp_path)
-
-        assert [local_path.name for _, _, local_path in plan] == ["Model.pkl", "model.pkl"]
+        _assert_distinct_cloud_names(tmp_path, base_url, files, True, "Model.pkl", "model.pkl")
 
     def test_download_plan_preserves_sharp_s_names_on_case_insensitive_filesystem(self, tmp_path: Path) -> None:
         base_url = "s3://bucket/models"
@@ -4306,16 +4262,7 @@ class TestCloudPathSecurity:
             {"path": f"{base_url}/strasse.pkl"},
         ]
 
-        with (
-            patch("modelaudit.utils.sources.cloud_storage._is_case_sensitive_directory", return_value=False),
-            patch(
-                "modelaudit.utils.sources.cloud_storage._is_unicode_normalization_sensitive_directory",
-                return_value=True,
-            ),
-        ):
-            plan = _build_cloud_download_plan(base_url, files, tmp_path)
-
-        assert [local_path.name for _, _, local_path in plan] == ["stra\u00dfe.pkl", "strasse.pkl"]
+        _assert_distinct_cloud_names(tmp_path, base_url, files, False, "stra\u00dfe.pkl", "strasse.pkl")
 
     @pytest.mark.parametrize(
         "paths",
@@ -4370,16 +4317,7 @@ class TestCloudPathSecurity:
             {"path": f"{base_url}/cafe\u0301.pkl"},
         ]
 
-        with (
-            patch("modelaudit.utils.sources.cloud_storage._is_case_sensitive_directory", return_value=True),
-            patch(
-                "modelaudit.utils.sources.cloud_storage._is_unicode_normalization_sensitive_directory",
-                return_value=True,
-            ),
-        ):
-            plan = _build_cloud_download_plan(base_url, files, tmp_path)
-
-        assert [local_path.name for _, _, local_path in plan] == ["caf\u00e9.pkl", "cafe\u0301.pkl"]
+        _assert_distinct_cloud_names(tmp_path, base_url, files, True, "caf\u00e9.pkl", "cafe\u0301.pkl")
 
     @pytest.mark.parametrize(
         "relative_path",
@@ -5701,3 +5639,37 @@ def test_filter_scannable_files_uses_registry_extensions():
 def test_filter_scannable_files_handles_tar_gz_and_tgz():
     files = [{"path": "archive.tar.gz"}, {"path": "weights.tgz"}]
     assert filter_scannable_files(files) == files
+
+
+def _directory_or_metadata_error(url: str, /, path: str) -> dict[str, object]:
+    if path == url:
+        return {"type": "directory"}
+    raise PermissionError(f"metadata denied for {path}")
+
+
+def _prefix_extension_failure_fs(payload: bytes) -> tuple[MagicMock, list[int], list[int]]:
+    transferred = [0]
+    open_count = [0]
+    fs = make_fs_mock()
+
+    def open_side_effect(_path: str, _mode: str = "rb") -> _CountingBytesIO:
+        open_count[0] += 1
+        if open_count[0] == 3:
+            raise OSError("second ranged read is unavailable")
+        return _CountingBytesIO(payload, transferred)
+
+    fs.open.side_effect = open_side_effect
+    return fs, transferred, open_count
+
+
+def _assert_distinct_cloud_names(
+    tmp_path: Path, base_url: str, files: list[dict[str, str]], case_sensitive: bool, first_name: str, second_name: str
+) -> None:
+    with (
+        patch("modelaudit.utils.sources.cloud_storage._is_case_sensitive_directory", return_value=case_sensitive),
+        patch(
+            "modelaudit.utils.sources.cloud_storage._is_unicode_normalization_sensitive_directory", return_value=True
+        ),
+    ):
+        plan = _build_cloud_download_plan(base_url, files, tmp_path)
+    assert [local_path.name for _, _, local_path in plan] == [first_name, second_name]

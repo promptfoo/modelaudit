@@ -16,20 +16,14 @@ from modelaudit.scanners import metadata_scanner
 from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.scanners.metadata_scanner import MetadataScanner
 from modelaudit.utils.helpers import cache_decorator
+from tests.helpers.text import LowerCountingText
 
 
 class TestMetadataScanner:
     """Test metadata scanner functionality."""
 
     def test_known_secret_format_reuses_lowered_description(self) -> None:
-        class CountingDescription(str):
-            lower_calls = 0
-
-            def lower(self) -> str:
-                self.lower_calls += 1
-                return super().lower()
-
-        description = CountingDescription("OpenAI API Key")
+        description = LowerCountingText("OpenAI API Key")
 
         assert MetadataScanner._is_known_secret_format(description) is True
         assert description.lower_calls == 1
@@ -252,20 +246,11 @@ class TestMetadataScanner:
 
     def test_scan_ignores_suspicious_domain_substrings(self) -> None:
         """Test URLs are matched by hostname, not generic substring."""
-        scanner = MetadataScanner()
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            readme_path = Path(temp_dir) / "README.md"
-            with open(readme_path, "w") as f:
-                f.write(
-                    "# Model Info\n\n"
-                    "- Docs: https://example.com/guide?redirect=bit.ly/suspicious-model\n"
-                    "- API: https://safe-ngrok.io/docs\n"
-                )
-
-            result = scanner.scan(str(readme_path))
-
-        assert len(result.issues) == 0
+        _assert_metadata_near_match_clean(
+            "# Model Info\n\n"
+            "- Docs: https://example.com/guide?redirect=bit.ly/suspicious-model\n"
+            "- API: https://safe-ngrok.io/docs\n"
+        )
 
     def test_scan_detects_suspicious_domains_hidden_in_userinfo(self, tmp_path: Path) -> None:
         """Shorteners and tunnel domains in userinfo should still be flagged."""
@@ -409,17 +394,10 @@ class TestMetadataScanner:
 
     def test_scan_ignores_placeholder_secrets(self) -> None:
         """Test that obvious placeholders are not flagged as secrets."""
-        scanner = MetadataScanner()
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            readme_path = Path(temp_dir) / "README.md"
-            with open(readme_path, "w") as f:
-                f.write("# Setup\n\nAPI Key: your_api_key_here\nToken: placeholder_token\nSecret: XXXXXXXXXX\n")
-
-            result = scanner.scan(str(readme_path))
-
         # Should not flag placeholders
-        assert len(result.issues) == 0
+        _assert_metadata_near_match_clean(
+            "# Setup\n\nAPI Key: your_api_key_here\nToken: placeholder_token\nSecret: XXXXXXXXXX\n"
+        )
 
     def test_scan_nonexistent_file(self):
         """Test handling of nonexistent files."""
@@ -552,3 +530,16 @@ class TestMetadataScanner:
         assert len(timeout_checks) == 1
         assert detected_domains == {"bit.ly"}
         assert not any(check.name == "Metadata Scan Error" for check in result.checks)
+
+
+def _assert_metadata_near_match_clean(contents: str) -> None:
+    scanner = MetadataScanner()
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        readme_path = Path(temp_dir) / "README.md"
+        with open(readme_path, "w") as f:
+            f.write(contents)
+
+        result = scanner.scan(str(readme_path))
+
+    assert len(result.issues) == 0

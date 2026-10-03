@@ -121,12 +121,7 @@ class TestCVE202510155PickleScanning:
         # Protocol 0 pickle: GLOBAL posix.system, then REDUCE
         bin_path.write_bytes(b"cposix\nsystem\n(S'echo pwned'\ntR.")
 
-        scanner = PickleScanner()
-        result = scanner.scan(str(bin_path))
-
-        assert self._has_critical_symbol_issue(result, "posix.system"), (
-            f"Expected CRITICAL issue for posix.system. Issues: {[i.message for i in result.issues]}"
-        )
+        _assert_bin_symbol(self, bin_path, "posix.system", "Expected CRITICAL issue for posix.system. Issues: ")
 
     def test_nt_system_in_bin_detected(self, tmp_path: Path) -> None:
         """nt.system payload in a .bin file should be caught."""
@@ -134,12 +129,7 @@ class TestCVE202510155PickleScanning:
         # Protocol 0 pickle: GLOBAL nt.system, then REDUCE
         bin_path.write_bytes(b"cnt\nsystem\n(S'cmd /c whoami'\ntR.")
 
-        scanner = PickleScanner()
-        result = scanner.scan(str(bin_path))
-
-        assert self._has_critical_symbol_issue(result, "nt.system"), (
-            f"Expected CRITICAL issue for nt.system. Issues: {[i.message for i in result.issues]}"
-        )
+        _assert_bin_symbol(self, bin_path, "nt.system", "Expected CRITICAL issue for nt.system. Issues: ")
 
     def test_protocol2_posix_in_bin_detected(self, tmp_path: Path) -> None:
         """Protocol 2 pickle with posix.system in .bin should also be caught."""
@@ -147,12 +137,8 @@ class TestCVE202510155PickleScanning:
         # Protocol 2 header + GLOBAL opcode for posix.system
         bin_path.write_bytes(b"\x80\x02cposix\nsystem\n(S'id'\ntR.")
 
-        scanner = PickleScanner()
-        result = scanner.scan(str(bin_path))
-
-        assert self._has_critical_symbol_issue(result, "posix.system"), (
-            f"Expected CRITICAL issue for posix.system in protocol 2 payload. "
-            f"Issues: {[i.message for i in result.issues]}"
+        _assert_bin_symbol(
+            self, bin_path, "posix.system", "Expected CRITICAL issue for posix.system in protocol 2 payload. Issues: "
         )
 
     def test_protocol1_posix_in_bin_detected(self, tmp_path: Path) -> None:
@@ -199,3 +185,9 @@ class TestCVE202510155BinaryPatterns:
     def test_nt_popen_in_patterns(self) -> None:
         """nt\\npopen should be in BINARY_CODE_PATTERNS."""
         assert b"nt\npopen" in BINARY_CODE_PATTERNS
+
+
+def _assert_bin_symbol(owner: TestCVE202510155PickleScanning, bin_path: Path, symbol: str, failure_prefix: str) -> None:
+    scanner = PickleScanner()
+    result = scanner.scan(str(bin_path))
+    assert owner._has_critical_symbol_issue(result, symbol), f"{failure_prefix}{[i.message for i in result.issues]}"

@@ -10,9 +10,11 @@ from modelaudit.analysis.unified_context import UnifiedMLContext
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.models import ModelAuditResultModel
 from modelaudit.scanners import get_scanner_for_file
-from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, Check, CheckStatus, IssueSeverity, ScanResult
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.lightgbm_scanner import LightGBMScanner
 from modelaudit.utils.file.detection import detect_file_format, detect_format_from_extension, validate_file_type
+from tests.helpers.cache import check_by_name as _check_by_name
+from tests.helpers.cache import scan_without_cache as _scan_without_cache
 
 
 def _build_lightgbm_text(extra_lines: list[str] | None = None) -> str:
@@ -38,14 +40,6 @@ def _build_lightgbm_text(extra_lines: list[str] | None = None) -> str:
     if extra_lines:
         base_lines.extend(extra_lines)
     return "\n".join(base_lines) + "\n"
-
-
-def _check_by_name(result: ScanResult, name: str) -> list[Check]:
-    return [check for check in result.checks if check.name == name]
-
-
-def _scan_without_cache(path: Path) -> ModelAuditResultModel:
-    return scan_model_directory_or_file(str(path), cache_scan_results=False)
 
 
 def _assert_lightgbm_read_failure(

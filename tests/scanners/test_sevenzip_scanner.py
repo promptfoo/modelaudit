@@ -16,7 +16,7 @@ import struct
 import tarfile
 import tempfile
 import zipfile
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -35,45 +35,49 @@ from modelaudit.scanners.sevenzip_scanner import (
 )
 from modelaudit.scanners.xgboost_scanner import XGBoostScanner
 from modelaudit.utils.file.detection import PICKLE_ROUTING_INCONCLUSIVE_FORMAT
+from tests.helpers.cache import assert_inconclusive_not_cached as _assert_inconclusive_aggregate_not_cached
+from tests.helpers.file_creators import EvalPayload, SystemCommandPayload
+from tests.helpers.file_creators import (
+    ubjson_key as _ubjson_key,
+)
+from tests.helpers.file_creators import (
+    ubjson_string as _ubjson_string,
+)
+from tests.helpers.file_creators import (
+    xgboost_ubjson_counted_null_array_probe as _xgboost_ubjson_counted_null_array_probe,
+)
+from tests.helpers.file_creators import (
+    xgboost_ubjson_noop_before_counted_root_header_probe as _xgboost_ubjson_noop_before_counted_root_header_probe,
+)
+from tests.helpers.file_creators import (
+    xgboost_ubjson_probe as _xgboost_ubjson_probe,
+)
+from tests.helpers.file_creators import (
+    xgboost_ubjson_uncounted_null_array_probe as _xgboost_ubjson_uncounted_null_array_probe,
+)
+from tests.helpers.scanners import scan_nested_critical_finding as nested_scan
 
 # Skip all tests if py7zr is not available for asset generation
 pytest_plugins: list[str] = []
 
 
-def _assert_inconclusive_aggregate_not_cached(
-    path: Path,
-    expected_reason: str,
-    cache_dir: Path,
-    **scan_kwargs: Any,
-) -> None:
-    reset_cache_manager()
-    try:
-        first = scan_model_directory_or_file(
-            str(path),
-            cache_enabled=True,
-            cache_dir=str(cache_dir),
-            min_cache_file_size=0,
-            **scan_kwargs,
-        )
-        second = scan_model_directory_or_file(
-            str(path),
-            cache_enabled=True,
-            cache_dir=str(cache_dir),
-            min_cache_file_size=0,
-            **scan_kwargs,
-        )
+@pytest.fixture
+def temp_7z_file() -> Generator[str, None, None]:
+    """Create a temporary file with .7z extension for testing."""
+    with tempfile.NamedTemporaryFile(suffix=".7z", delete=False) as f:
+        temp_path = f.name
+    yield temp_path
+    if os.path.exists(temp_path):
+        os.unlink(temp_path)
 
-        for aggregate in (first, second):
-            metadata = aggregate.file_metadata[str(path)]
-            assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-            assert expected_reason in metadata["scan_outcome_reasons"]
-            assert not [
-                issue for issue in aggregate.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
-            ]
-            assert determine_exit_code(aggregate) == 2
-        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
+
+def _nested_payload_extractor(payload: bytes) -> Callable[..., None]:
+    def fake_extract(*_args: Any, **kwargs: Any) -> None:
+        factory = kwargs.get("factory")
+        if factory is not None:
+            factory.create("nested_payload").write(payload)
+
+    return fake_extract
 
 
 def _mock_scan_result(
@@ -94,62 +98,6 @@ def _mock_scan_result(
         )
     result.finish(success=True)
     return result
-
-
-def _ubjson_key(key: bytes) -> bytes:
-    return b"U" + bytes([len(key)]) + key
-
-
-def _ubjson_string(value: bytes) -> bytes:
-    return b"SL" + len(value).to_bytes(8, byteorder="big", signed=True) + value
-
-
-def _xgboost_ubjson_probe(
-    *, root_padding: int = 0, learner_padding: int = 0, learner_noop: bool = False, malicious: bool = False
-) -> bytes:
-    root_body = b""
-    if root_padding:
-        root_body += _ubjson_key(b"metadata") + _ubjson_string(b"x" * root_padding)
-    learner_body = b""
-    if learner_padding:
-        learner_body += _ubjson_key(b"metadata") + _ubjson_string(b"x" * learner_padding)
-    learner_body += _ubjson_key(b"learner_model_param") + b"{}"
-    if malicious:
-        learner_body += _ubjson_key(b"malicious_code") + _ubjson_string(b"system(cpu)")
-    learner_value = (b"N" if learner_noop else b"") + b"{" + learner_body + b"}"
-    return b"{" + root_body + _ubjson_key(b"learner") + learner_value + _ubjson_key(b"version") + b"[]" + b"}"
-
-
-def _xgboost_ubjson_counted_null_array_probe() -> bytes:
-    max_count = ((1 << 63) - 1).to_bytes(8, byteorder="big", signed=True)
-    learner = b"{" + _ubjson_key(b"learner_model_param") + b"{}" + _ubjson_key(b"payload") + b"[$Z#L" + max_count + b"}"
-    return b"{" + _ubjson_key(b"learner") + learner + _ubjson_key(b"version") + b"[]" + b"}"
-
-
-def _xgboost_ubjson_uncounted_null_array_probe(item_count: int) -> bytes:
-    learner = (
-        b"{"
-        + _ubjson_key(b"learner_model_param")
-        + b"{}"
-        + _ubjson_key(b"payload")
-        + b"["
-        + (b"Z" * item_count)
-        + b"]}"
-    )
-    return b"{" + _ubjson_key(b"learner") + learner + b"}"
-
-
-def _xgboost_ubjson_noop_before_counted_root_header_probe() -> bytes:
-    return (
-        b"{N#U\x02"
-        + _ubjson_key(b"learner")
-        + b"{"
-        + _ubjson_key(b"learner_model_param")
-        + b"{}"
-        + b"}"
-        + _ubjson_key(b"version")
-        + b"[]"
-    )
 
 
 def _xgboost_ubjson_deep_before_counted_null_array_probe() -> bytes:
@@ -192,15 +140,6 @@ class TestSevenZipScanner:
     def scanner(self):
         """Create a SevenZipScanner instance for testing"""
         return SevenZipScanner()
-
-    @pytest.fixture
-    def temp_7z_file(self):
-        """Create a temporary file with .7z extension for testing"""
-        with tempfile.NamedTemporaryFile(suffix=".7z", delete=False) as f:
-            temp_path = f.name
-        yield temp_path
-        if os.path.exists(temp_path):
-            os.unlink(temp_path)
 
     def test_scanner_metadata(self, scanner):
         """Test basic scanner metadata and properties"""
@@ -357,12 +296,8 @@ class TestSevenZipScanner:
         import py7zr  # type: ignore[import-untyped]
 
         # Create malicious pickle that would execute code if unpickled
-        class MaliciousClass:
-            def __reduce__(self):
-                return (eval, ("print('malicious code executed')",))
-
         with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as temp_pickle:
-            pickle.dump(MaliciousClass(), temp_pickle)
+            pickle.dump(EvalPayload(("print('malicious code executed')",)), temp_pickle)
             temp_pickle_path = temp_pickle.name
 
         try:
@@ -436,15 +371,9 @@ class TestSevenZipScanner:
         """Extensionless nested 7z archives should recurse based on file content."""
         import py7zr  # type: ignore[import-untyped]
 
-        class MaliciousClass:
-            def __reduce__(self):
-                import os as os_module
-
-                return (os_module.system, ("echo extensionless_7z_nested",))
-
         inner_7z_path = Path(temp_7z_file).with_name("extensionless_inner.7z")
         with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as temp_pickle:
-            pickle.dump(MaliciousClass(), temp_pickle)
+            pickle.dump(SystemCommandPayload("echo extensionless_7z_nested"), temp_pickle)
             temp_pickle_path = temp_pickle.name
 
         try:
@@ -485,48 +414,15 @@ class TestSevenZipScanner:
         tmp_path: Path,
     ) -> None:
         """Nested 7z archives should recurse even when the member has a misleading extension."""
-        import py7zr  # type: ignore[import-untyped]
-
-        class MaliciousClass:
-            def __reduce__(self):
-                import os as os_module
-
-                return (os_module.system, ("echo disguised_7z_nested",))
-
-        inner_7z_path = tmp_path / "misnamed_inner.7z"
-        temp_pickle_path = tmp_path / "payload.pkl"
-        with temp_pickle_path.open("wb") as temp_pickle:
-            pickle.dump(MaliciousClass(), temp_pickle)
-
-        try:
-            with py7zr.SevenZipFile(inner_7z_path, "w") as archive:
-                archive.write(str(temp_pickle_path), "payload.pkl")
-
-            with py7zr.SevenZipFile(temp_7z_file, "w") as archive:
-                archive.write(str(inner_7z_path), "nested.jpg")
-
-            result = scanner.scan(temp_7z_file)
-
-            system_symbols = {
-                "os.system",
-                f"{os.system.__module__}.system",
-            }
-            nested_issues = [
-                issue
-                for issue in result.issues
-                if issue.location
-                and f"{temp_7z_file}:nested.jpg:payload.pkl" in issue.location
-                and any(symbol in issue.message.lower() for symbol in system_symbols)
-            ]
-            assert result.success is False
-            assert len(nested_issues) > 0
-            assert any(issue.severity == IssueSeverity.CRITICAL for issue in nested_issues)
-
-        finally:
-            if temp_pickle_path.exists():
-                temp_pickle_path.unlink()
-            if inner_7z_path.exists():
-                inner_7z_path.unlink()
+        _assert_misnamed_nested_archive(
+            scanner,
+            tmp_path,
+            temp_7z_file,
+            "misnamed_inner.7z",
+            "payload.pkl",
+            "echo disguised_7z_nested",
+            "nested.jpg",
+        )
 
     @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
     def test_scan_misnamed_nested_7z_archive_prioritizes_disguised_member_over_fillers(
@@ -537,17 +433,11 @@ class TestSevenZipScanner:
         """High-priority disguised members should still be probed ahead of low-value fillers."""
         import py7zr  # type: ignore[import-untyped]
 
-        class MaliciousClass:
-            def __reduce__(self):
-                import os as os_module
-
-                return (os_module.system, ("echo disguised_7z_nested",))
-
         scanner = SevenZipScanner(config={"max_7z_extensionless_probes": 1})
         inner_7z_path = tmp_path / "misnamed_inner.7z"
         temp_pickle_path = tmp_path / "payload.pkl"
         with temp_pickle_path.open("wb") as temp_pickle:
-            pickle.dump(MaliciousClass(), temp_pickle)
+            pickle.dump(SystemCommandPayload("echo disguised_7z_nested"), temp_pickle)
 
         try:
             with py7zr.SevenZipFile(inner_7z_path, "w") as archive:
@@ -591,47 +481,15 @@ class TestSevenZipScanner:
         tmp_path: Path,
     ) -> None:
         """Low-value suffixes like .txt should still be eligible for header probing."""
-        import py7zr  # type: ignore[import-untyped]
-
-        class MaliciousClass:
-            def __reduce__(self):
-                import os as os_module
-
-                return (os_module.system, ("echo disguised_7z_low_value",))
-
-        inner_7z_path = tmp_path / "misnamed_inner_low_value.7z"
-        temp_pickle_path = tmp_path / "payload_low_value.pkl"
-        with temp_pickle_path.open("wb") as temp_pickle:
-            pickle.dump(MaliciousClass(), temp_pickle)
-
-        try:
-            with py7zr.SevenZipFile(inner_7z_path, "w") as archive:
-                archive.write(str(temp_pickle_path), "payload.pkl")
-
-            with py7zr.SevenZipFile(temp_7z_file, "w") as archive:
-                archive.write(str(inner_7z_path), "nested.txt")
-
-            result = scanner.scan(temp_7z_file)
-
-            system_symbols = {
-                "os.system",
-                f"{os.system.__module__}.system",
-            }
-            nested_issues = [
-                issue
-                for issue in result.issues
-                if issue.location
-                and f"{temp_7z_file}:nested.txt:payload.pkl" in issue.location
-                and any(symbol in issue.message.lower() for symbol in system_symbols)
-            ]
-            assert result.success is False
-            assert len(nested_issues) > 0
-            assert any(issue.severity == IssueSeverity.CRITICAL for issue in nested_issues)
-        finally:
-            if temp_pickle_path.exists():
-                temp_pickle_path.unlink()
-            if inner_7z_path.exists():
-                inner_7z_path.unlink()
+        _assert_misnamed_nested_archive(
+            scanner,
+            tmp_path,
+            temp_7z_file,
+            "misnamed_inner_low_value.7z",
+            "payload_low_value.pkl",
+            "echo disguised_7z_low_value",
+            "nested.txt",
+        )
 
     @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
     def test_scan_safe_misnamed_nested_7z_archive_has_no_critical_findings(
@@ -813,15 +671,9 @@ class TestSevenZipScanner:
         """A malicious .joblib nested in .7z must produce the same critical findings as a top-level scan."""
         import py7zr  # type: ignore[import-untyped]
 
-        class MaliciousJoblib:
-            def __reduce__(self):
-                import os as os_module
-
-                return (os_module.system, ("echo nested_joblib_payload",))
-
         joblib_path = Path(temp_7z_file).with_name("payload.joblib")
         with joblib_path.open("wb") as handle:
-            pickle.dump(MaliciousJoblib(), handle)
+            pickle.dump(SystemCommandPayload("echo nested_joblib_payload"), handle)
 
         try:
             with py7zr.SevenZipFile(temp_7z_file, "w") as archive:
@@ -926,18 +778,6 @@ class TestSevenZipScanner:
         extracted_path.write_bytes(b"payload")
         archive_path = tmp_path / "model.7z"
         archive_result = ScanResult(scanner_name="sevenzip")
-
-        def nested_scan(path: str, _config: dict[str, Any]) -> ScanResult:
-            nested_result = ScanResult(scanner_name="test_nested")
-            nested_result.add_check(
-                name="Nested Critical Finding",
-                passed=False,
-                message="Nested member is malicious",
-                severity=IssueSeverity.CRITICAL,
-                location=path,
-            )
-            nested_result.finish(success=False)
-            return nested_result
 
         scanner = SevenZipScanner(config={NESTED_SCAN_CALLBACK_CONFIG_KEY: nested_scan})
         scan_complete = scanner._scan_extracted_file(
@@ -1396,15 +1236,6 @@ class TestSevenZipScannerConfiguration:
         """Create a SevenZipScanner instance for testing"""
         return SevenZipScanner()
 
-    @pytest.fixture
-    def temp_7z_file(self):
-        """Create a temporary file with .7z extension for testing"""
-        with tempfile.NamedTemporaryFile(suffix=".7z", delete=False) as f:
-            temp_path = f.name
-        yield temp_path
-        if os.path.exists(temp_path):
-            os.unlink(temp_path)
-
     def test_default_configuration(self):
         """Test default scanner configuration"""
         scanner = SevenZipScanner()
@@ -1511,15 +1342,6 @@ class TestSevenZipScannerConfiguration:
 
 class TestSevenZipScannerHardening:
     """Red-team tests for security hardening introduced in the review."""
-
-    @pytest.fixture
-    def temp_7z_file(self) -> Generator[str, None, None]:
-        """Create a temporary file with .7z extension for testing"""
-        with tempfile.NamedTemporaryFile(suffix=".7z", delete=False) as f:
-            temp_path = f.name
-        yield temp_path
-        if os.path.exists(temp_path):
-            os.unlink(temp_path)
 
     @pytest.fixture
     def scanner(self) -> SevenZipScanner:
@@ -1958,14 +1780,13 @@ class TestSevenZipScannerHardening:
         """An uninspected payload after the probe cap must not produce a clean or invented finding."""
         import py7zr  # type: ignore[import-untyped]
 
-        class DangerousPayload:
-            def __reduce__(self) -> tuple[object, tuple[str]]:
-                return (os.system, ("echo hidden_after_probe_cap",))
-
         archive_path = tmp_path / "hidden_probe_limit.7z"
         with py7zr.SevenZipFile(archive_path, "w") as archive:
             archive.writestr(b"ordinary notes", "first_payload")
-            archive.writestr(pickle.dumps(DangerousPayload(), protocol=0), "second_payload")
+            archive.writestr(
+                pickle.dumps(SystemCommandPayload("echo hidden_after_probe_cap", lambda: os.system), protocol=0),
+                "second_payload",
+            )
 
         config = {"max_7z_extensionless_probes": 1}
         result = SevenZipScanner(config=config).scan(str(archive_path))
@@ -1986,13 +1807,11 @@ class TestSevenZipScannerHardening:
         """An inspected malicious member must stay a security finding despite later incomplete coverage."""
         import py7zr  # type: ignore[import-untyped]
 
-        class DangerousPayload:
-            def __reduce__(self) -> tuple[object, tuple[str]]:
-                return (os.system, ("echo detected_before_probe_cap",))
-
         archive_path = tmp_path / "observed_probe_limit.7z"
         payload_path = tmp_path / "observed_payload"
-        payload_path.write_bytes(pickle.dumps(DangerousPayload(), protocol=0))
+        payload_path.write_bytes(
+            pickle.dumps(SystemCommandPayload("echo detected_before_probe_cap", lambda: os.system), protocol=0)
+        )
         with py7zr.SevenZipFile(archive_path, "w") as archive:
             archive.write(payload_path, "first_payload")
             archive.writestr(b"ordinary notes", "second_payload")
@@ -2184,16 +2003,10 @@ class TestSevenZipScannerHardening:
         """A ZIP payload hidden behind an image suffix inside 7z must still be scanned."""
         import py7zr  # type: ignore[import-untyped]
 
-        class MaliciousClass:
-            def __reduce__(self) -> tuple[Any, tuple[str]]:
-                import os as os_module
-
-                return (os_module.system, ("echo disguised_zip_in_7z",))
-
         pickle_path = tmp_path / "payload.pkl"
         nested_zip_path = tmp_path / "nested.zip"
         archive_path = tmp_path / "outer.7z"
-        self._write_pickle(pickle_path, MaliciousClass())
+        self._write_pickle(pickle_path, SystemCommandPayload("echo disguised_zip_in_7z"))
         with zipfile.ZipFile(nested_zip_path, "w") as archive:
             archive.write(pickle_path, "payload.pkl")
         with py7zr.SevenZipFile(archive_path, "w") as archive:
@@ -2211,24 +2024,7 @@ class TestSevenZipScannerHardening:
 
     @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
     def test_disguised_xgboost_member_detects_malicious_payload_end_to_end(self, tmp_path: Path) -> None:
-        pytest.importorskip("ubjson", reason="ubjson not installed")
-        import py7zr  # type: ignore[import-untyped]
-
-        payload_path = tmp_path / "model_payload"
-        payload_path.write_bytes(_xgboost_ubjson_probe(malicious=True))
-        archive_path = tmp_path / "disguised_xgboost.7z"
-        with py7zr.SevenZipFile(archive_path, "w") as archive:
-            archive.write(payload_path, "models/model.jpg")
-
-        result = scan_model_directory_or_file(str(archive_path), cache_enabled=False)
-
-        assert determine_exit_code(result) == 1
-        assert any(
-            issue.location
-            and f"{archive_path}:models/model.jpg" in issue.location
-            and "System call in JSON" in str(issue.message)
-            for issue in result.issues
-        )
+        _assert_xgboost_archive_suffix(tmp_path, "disguised_xgboost.7z", "models/model.jpg")
 
     @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
     def test_probe_limit_preserves_disguised_xgboost_security_finding(self, tmp_path: Path) -> None:
@@ -2260,40 +2056,17 @@ class TestSevenZipScannerHardening:
 
     @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
     def test_json_suffixed_xgboost_member_detects_malicious_payload_end_to_end(self, tmp_path: Path) -> None:
-        pytest.importorskip("ubjson", reason="ubjson not installed")
-        import py7zr  # type: ignore[import-untyped]
-
-        payload_path = tmp_path / "model_payload"
-        payload_path.write_bytes(_xgboost_ubjson_probe(malicious=True))
-        archive_path = tmp_path / "json_suffixed_xgboost.7z"
-        with py7zr.SevenZipFile(archive_path, "w") as archive:
-            archive.write(payload_path, "models/model.json")
-
-        result = scan_model_directory_or_file(str(archive_path), cache_enabled=False)
-
-        assert determine_exit_code(result) == 1
-        assert any(
-            issue.location
-            and f"{archive_path}:models/model.json" in issue.location
-            and "System call in JSON" in str(issue.message)
-            for issue in result.issues
-        )
+        _assert_xgboost_archive_suffix(tmp_path, "json_suffixed_xgboost.7z", "models/model.json")
 
     @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
     def test_disguised_nested_tar_member_detects_malicious_payload_end_to_end(self, tmp_path: Path) -> None:
         """A TAR payload hidden behind an opaque suffix inside 7z must still be scanned."""
         import py7zr  # type: ignore[import-untyped]
 
-        class MaliciousClass:
-            def __reduce__(self) -> tuple[Any, tuple[str]]:
-                import os as os_module
-
-                return (os_module.system, ("echo disguised_tar_in_7z",))
-
         pickle_path = tmp_path / "payload.pkl"
         nested_tar_path = tmp_path / "nested.tar"
         archive_path = tmp_path / "outer_tar.7z"
-        self._write_pickle(pickle_path, MaliciousClass())
+        self._write_pickle(pickle_path, SystemCommandPayload("echo disguised_tar_in_7z"))
         with tarfile.open(nested_tar_path, "w") as archive:
             archive.add(pickle_path, arcname="payload.pkl")
         with py7zr.SevenZipFile(archive_path, "w") as archive:
@@ -2353,15 +2126,9 @@ class TestSevenZipScannerHardening:
         """A pickle disguised as Python source must not stop at AST inspection."""
         import py7zr  # type: ignore[import-untyped]
 
-        class MaliciousClass:
-            def __reduce__(self) -> tuple[Any, tuple[str]]:
-                import os as os_module
-
-                return (os_module.system, ("echo disguised_python_pickle",))
-
         payload_path = tmp_path / "payload.pkl"
         archive_path = tmp_path / "python_named_pickle.7z"
-        self._write_pickle(payload_path, MaliciousClass())
+        self._write_pickle(payload_path, SystemCommandPayload("echo disguised_python_pickle"))
         with py7zr.SevenZipFile(archive_path, "w") as archive:
             archive.write(payload_path, "assets/payload.py")
 
@@ -2953,11 +2720,7 @@ class TestSevenZipScannerHardening:
             patch("os.path.islink", return_value=False),
             patch("os.path.getsize", return_value=32),
         ):
-
-            def fake_extract(*_args: Any, **kwargs: Any) -> None:
-                factory = kwargs.get("factory")
-                if factory is not None:
-                    factory.create("nested_payload").write(payload)
+            fake_extract = _nested_payload_extractor(payload)
 
             mock_archive = MagicMock()
             mock_archive.getnames.return_value = ["nested_payload"]
@@ -2991,11 +2754,7 @@ class TestSevenZipScannerHardening:
             patch("os.path.islink", return_value=False),
             patch("os.path.getsize", return_value=32),
         ):
-
-            def fake_extract(*_args: Any, **kwargs: Any) -> None:
-                factory = kwargs.get("factory")
-                if factory is not None:
-                    factory.create("nested_payload").write(payload)
+            fake_extract = _nested_payload_extractor(payload)
 
             mock_archive = MagicMock()
             mock_archive.getnames.return_value = ["nested_payload"]
@@ -3029,11 +2788,7 @@ class TestSevenZipScannerHardening:
             patch("os.path.islink", return_value=False),
             patch("os.path.getsize", return_value=32),
         ):
-
-            def fake_extract(*_args: Any, **kwargs: Any) -> None:
-                factory = kwargs.get("factory")
-                if factory is not None:
-                    factory.create("nested_payload").write(payload)
+            fake_extract = _nested_payload_extractor(payload)
 
             mock_archive = MagicMock()
             mock_archive.getnames.return_value = ["nested_payload"]
@@ -3067,11 +2822,7 @@ class TestSevenZipScannerHardening:
             patch("os.path.islink", return_value=False),
             patch("os.path.getsize", return_value=32),
         ):
-
-            def fake_extract(*_args: Any, **kwargs: Any) -> None:
-                factory = kwargs.get("factory")
-                if factory is not None:
-                    factory.create("nested_payload").write(payload)
+            fake_extract = _nested_payload_extractor(payload)
 
             mock_archive = MagicMock()
             mock_archive.getnames.return_value = ["nested_payload"]
@@ -3091,39 +2842,13 @@ class TestSevenZipScannerHardening:
 
     @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
     def test_extensionless_xgboost_late_model_key_in_7z_fails_closed_in_routing(self, tmp_path: Path) -> None:
-        import py7zr  # type: ignore[import-untyped]
-
-        payload_path = tmp_path / "model"
-        payload_path.write_bytes(
-            _xgboost_ubjson_probe(learner_padding=SevenZipScanner._XGBOOST_NESTED_MEMBER_PROBE_BYTES, malicious=True)
-        )
-        archive_path = tmp_path / "late_model.7z"
-        with py7zr.SevenZipFile(archive_path, "w") as archive:
-            archive.write(payload_path, arcname="models/model")
-
-        result = scan_model_directory_or_file(str(archive_path), cache_enabled=False)
-
-        assert determine_exit_code(result) == 2
-        assert any("routing was inconclusive" in str(issue.message) for issue in result.issues)
-        assert not any("System call in JSON" in str(issue.message) for issue in result.issues)
+        # type: ignore[import-untyped]
+        _assert_7z_late_xgboost_key_inconclusive(tmp_path, ("late_model.7z"), ("models/model"))
 
     @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
     def test_disguised_xgboost_late_model_key_in_7z_fails_closed_in_routing(self, tmp_path: Path) -> None:
-        import py7zr  # type: ignore[import-untyped]
-
-        payload_path = tmp_path / "model"
-        payload_path.write_bytes(
-            _xgboost_ubjson_probe(learner_padding=SevenZipScanner._XGBOOST_NESTED_MEMBER_PROBE_BYTES, malicious=True)
-        )
-        archive_path = tmp_path / "late_disguised.7z"
-        with py7zr.SevenZipFile(archive_path, "w") as archive:
-            archive.write(payload_path, arcname="models/model.jpg")
-
-        result = scan_model_directory_or_file(str(archive_path), cache_enabled=False)
-
-        assert determine_exit_code(result) == 2
-        assert any("routing was inconclusive" in str(issue.message) for issue in result.issues)
-        assert not any("System call in JSON" in str(issue.message) for issue in result.issues)
+        # type: ignore[import-untyped]
+        _assert_7z_late_xgboost_key_inconclusive(tmp_path, ("late_disguised.7z"), ("models/model.jpg"))
 
     @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
     def test_extensionless_xgboost_late_learner_in_7z_fails_closed_in_routing(self, tmp_path: Path) -> None:
@@ -3311,35 +3036,7 @@ class TestSevenZipScannerHardening:
         tmp_path: Path,
     ) -> None:
         """Duplicate archive members must be treated as ambiguous and fail closed."""
-        safe_pickle = tmp_path / "safe.pkl"
-        evil_pickle = tmp_path / "evil.pkl"
-        archive_path = tmp_path / "duplicate.7z"
-
-        self._write_pickle(safe_pickle, {"safe": True})
-
-        class MaliciousClass:
-            def __reduce__(self) -> tuple[Any, tuple[str]]:
-                import os as os_module
-
-                return (os_module.system, ("echo duplicate_7z_shadow",))
-
-        self._write_pickle(evil_pickle, MaliciousClass())
-
-        import py7zr  # type: ignore[import-untyped]
-
-        with py7zr.SevenZipFile(archive_path, "w") as archive:
-            archive.write(str(safe_pickle), "dup.pkl")
-            archive.write(str(evil_pickle), "dup.pkl")
-
-        result = scanner.scan(str(archive_path))
-
-        assert result.success is False
-        duplicate_checks = [check for check in result.checks if check.name == "7z Duplicate Entry Protection"]
-        assert len(duplicate_checks) == 1
-        assert duplicate_checks[0].status == CheckStatus.FAILED
-        assert duplicate_checks[0].severity == IssueSeverity.WARNING
-        assert duplicate_checks[0].details["first_entry"] == "dup.pkl"
-        assert duplicate_checks[0].details["entry"] == "dup.pkl"
+        _assert_duplicate_entries(scanner, self, tmp_path, "duplicate.7z", "echo duplicate_7z_shadow", "dup.pkl")
 
     @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
     def test_duplicate_archive_entry_aliases_fail_closed(
@@ -3348,35 +3045,9 @@ class TestSevenZipScannerHardening:
         tmp_path: Path,
     ) -> None:
         """Canonical path collisions such as subdir/../dup.pkl must fail closed."""
-        safe_pickle = tmp_path / "safe.pkl"
-        evil_pickle = tmp_path / "evil.pkl"
-        archive_path = tmp_path / "duplicate_alias.7z"
-
-        self._write_pickle(safe_pickle, {"safe": True})
-
-        class MaliciousClass:
-            def __reduce__(self) -> tuple[Any, tuple[str]]:
-                import os as os_module
-
-                return (os_module.system, ("echo duplicate_alias_7z_shadow",))
-
-        self._write_pickle(evil_pickle, MaliciousClass())
-
-        import py7zr  # type: ignore[import-untyped]
-
-        with py7zr.SevenZipFile(archive_path, "w") as archive:
-            archive.write(str(safe_pickle), "dup.pkl")
-            archive.write(str(evil_pickle), "subdir/../dup.pkl")
-
-        result = scanner.scan(str(archive_path))
-
-        assert result.success is False
-        duplicate_checks = [check for check in result.checks if check.name == "7z Duplicate Entry Protection"]
-        assert len(duplicate_checks) == 1
-        assert duplicate_checks[0].status == CheckStatus.FAILED
-        assert duplicate_checks[0].severity == IssueSeverity.WARNING
-        assert duplicate_checks[0].details["first_entry"] == "dup.pkl"
-        assert duplicate_checks[0].details["entry"] == "subdir/../dup.pkl"
+        _assert_duplicate_entries(
+            scanner, self, tmp_path, "duplicate_alias.7z", "echo duplicate_alias_7z_shadow", "subdir/../dup.pkl"
+        )
 
 
 # Integration test that requires actual test assets
@@ -3403,3 +3074,122 @@ class TestSevenZipScannerIntegration:
                 # Basic assertion - scan should complete
                 assert result is not None
                 assert hasattr(result, "success")
+
+
+def _assert_7z_late_xgboost_key_inconclusive(tmp_path: Path, filename: str, member_name: str) -> None:
+    import py7zr  # type: ignore[import-untyped]
+
+    payload_path = tmp_path / "model"
+    payload_path.write_bytes(
+        _xgboost_ubjson_probe(learner_padding=SevenZipScanner._XGBOOST_NESTED_MEMBER_PROBE_BYTES, malicious=True)
+    )
+    archive_path = tmp_path / filename
+    with py7zr.SevenZipFile(archive_path, "w") as archive:
+        archive.write(payload_path, arcname=member_name)
+
+    result = scan_model_directory_or_file(str(archive_path), cache_enabled=False)
+
+    assert determine_exit_code(result) == 2
+    assert any("routing was inconclusive" in str(issue.message) for issue in result.issues)
+    assert not any("System call in JSON" in str(issue.message) for issue in result.issues)
+
+
+def _assert_duplicate_entries(
+    scanner: SevenZipScanner,
+    self: TestSevenZipScannerHardening,
+    tmp_path: Path,
+    archive_name: str,
+    command: str,
+    duplicate_name: str,
+) -> None:
+    safe_pickle = tmp_path / "safe.pkl"
+    evil_pickle = tmp_path / "evil.pkl"
+    archive_path = tmp_path / archive_name
+
+    self._write_pickle(safe_pickle, {"safe": True})
+
+    self._write_pickle(evil_pickle, SystemCommandPayload(command))
+
+    import py7zr  # type: ignore[import-untyped]
+
+    with py7zr.SevenZipFile(archive_path, "w") as archive:
+        archive.write(str(safe_pickle), "dup.pkl")
+        archive.write(str(evil_pickle), duplicate_name)
+
+    result = scanner.scan(str(archive_path))
+
+    assert result.success is False
+    duplicate_checks = [check for check in result.checks if check.name == "7z Duplicate Entry Protection"]
+    assert len(duplicate_checks) == 1
+    assert duplicate_checks[0].status == CheckStatus.FAILED
+    assert duplicate_checks[0].severity == IssueSeverity.WARNING
+    assert duplicate_checks[0].details["first_entry"] == "dup.pkl"
+    assert duplicate_checks[0].details["entry"] == duplicate_name
+
+
+def _assert_misnamed_nested_archive(
+    scanner: SevenZipScanner,
+    tmp_path: Path,
+    temp_7z_file: str,
+    inner_name: str,
+    pickle_name: str,
+    command: str,
+    member_name: str,
+) -> None:
+    import py7zr  # type: ignore[import-untyped]
+
+    inner_7z_path = tmp_path / inner_name
+    temp_pickle_path = tmp_path / pickle_name
+    with temp_pickle_path.open("wb") as temp_pickle:
+        pickle.dump(SystemCommandPayload(command), temp_pickle)
+
+    try:
+        with py7zr.SevenZipFile(inner_7z_path, "w") as archive:
+            archive.write(str(temp_pickle_path), "payload.pkl")
+
+        with py7zr.SevenZipFile(temp_7z_file, "w") as archive:
+            archive.write(str(inner_7z_path), member_name)
+
+        result = scanner.scan(temp_7z_file)
+
+        system_symbols = {
+            "os.system",
+            f"{os.system.__module__}.system",
+        }
+        nested_issues = [
+            issue
+            for issue in result.issues
+            if issue.location
+            and f"{temp_7z_file}:{member_name}:payload.pkl" in issue.location
+            and any(symbol in issue.message.lower() for symbol in system_symbols)
+        ]
+        assert result.success is False
+        assert len(nested_issues) > 0
+        assert any(issue.severity == IssueSeverity.CRITICAL for issue in nested_issues)
+
+    finally:
+        if temp_pickle_path.exists():
+            temp_pickle_path.unlink()
+        if inner_7z_path.exists():
+            inner_7z_path.unlink()
+
+
+def _assert_xgboost_archive_suffix(tmp_path: Path, archive_name: str, member_name: str) -> None:
+    pytest.importorskip("ubjson", reason="ubjson not installed")
+    import py7zr  # type: ignore[import-untyped]
+
+    payload_path = tmp_path / "model_payload"
+    payload_path.write_bytes(_xgboost_ubjson_probe(malicious=True))
+    archive_path = tmp_path / archive_name
+    with py7zr.SevenZipFile(archive_path, "w") as archive:
+        archive.write(payload_path, member_name)
+
+    result = scan_model_directory_or_file(str(archive_path), cache_enabled=False)
+
+    assert determine_exit_code(result) == 1
+    assert any(
+        issue.location
+        and f"{archive_path}:{member_name}" in issue.location
+        and "System call in JSON" in str(issue.message)
+        for issue in result.issues
+    )

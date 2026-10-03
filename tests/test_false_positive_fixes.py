@@ -20,6 +20,7 @@ import pytest
 from modelaudit.cli import main as cli_main
 from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.weight_distribution_scanner import WeightDistributionScanner
+from tests.helpers.file_creators import SystemCommandPayload
 
 GPT2_TEST_VOCAB_SIZE = 12_000
 GPT2_TEST_EMBED_DIM = 64
@@ -343,14 +344,8 @@ class TestFalsePositiveFixes:
         # Create a simple malicious pickle that tries to execute system commands
         import pickle
 
-        class MaliciousClass:
-            def __reduce__(self):
-                import os
-
-                return (os.system, ("echo 'malicious code executed'",))
-
         with open(evil_pickle_path, "wb") as f:
-            pickle.dump(MaliciousClass(), f)
+            pickle.dump(SystemCommandPayload("echo 'malicious code executed'"), f)
 
         result = self._run_cli_scan(str(evil_pickle_path))
         assert result["exit_code"] == 1, "Malicious pickle should be detected"

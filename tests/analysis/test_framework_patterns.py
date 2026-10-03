@@ -102,6 +102,7 @@ class TestIsPatternSafeInFramework:
 
     def test_pytorch_model_eval_safe(self, knowledge_base):
         """Test model.eval() is recognized as safe."""
+        # Test ML operation patterns are recognized.
         is_safe, _explanation = knowledge_base.is_pattern_safe_in_framework("model.eval()", FrameworkType.PYTORCH, {})
         assert is_safe is True
 
@@ -128,11 +129,6 @@ class TestIsPatternSafeInFramework:
     def test_false_positive_variable_names(self, knowledge_base):
         """Test variable name patterns are recognized as false positives."""
         is_safe, _explanation = knowledge_base.is_pattern_safe_in_framework("eval_metrics", FrameworkType.PYTORCH, {})
-        assert is_safe is True
-
-    def test_ml_operations_model_eval(self, knowledge_base):
-        """Test ML operation patterns are recognized."""
-        is_safe, _explanation = knowledge_base.is_pattern_safe_in_framework("model.eval()", FrameworkType.PYTORCH, {})
         assert is_safe is True
 
 
@@ -281,31 +277,11 @@ class TestValidateContext:
 
     def test_lambda_with_safe_code(self, knowledge_base):
         """Test Lambda validation with safe code."""
-        pattern = FrameworkPattern(
-            pattern="Lambda",
-            pattern_type="layer",
-            is_safe=False,
-            context="layer_definition",
-            risk_level="low",
-            explanation="Lambda layer",
-        )
-        context = {"lambda_code": "lambda x: x * 0.5", "layer_definition": True}
-        result = knowledge_base._validate_context(pattern, context)
-        assert result is True
+        _assert_lambda_context_validation(knowledge_base, "low", "lambda x: x * 0.5", True)
 
     def test_lambda_with_unsafe_code(self, knowledge_base):
         """Test Lambda validation with unsafe code."""
-        pattern = FrameworkPattern(
-            pattern="Lambda",
-            pattern_type="layer",
-            is_safe=False,
-            context="layer_definition",
-            risk_level="high",
-            explanation="Lambda layer",
-        )
-        context = {"lambda_code": "lambda x: eval(x)", "layer_definition": True}
-        result = knowledge_base._validate_context(pattern, context)
-        assert result is False
+        _assert_lambda_context_validation(knowledge_base, "high", "lambda x: eval(x)", False)
 
     def test_wrong_context(self, knowledge_base):
         """Test validation fails with wrong context."""
@@ -320,3 +296,19 @@ class TestValidateContext:
         context = {"serialization": True}
         result = knowledge_base._validate_context(pattern, context)
         assert result is False
+
+
+def _assert_lambda_context_validation(
+    knowledge_base: FrameworkKnowledgeBase, case_risk_level: str, case_code: str, case_valid: bool
+) -> None:
+    pattern = FrameworkPattern(
+        pattern="Lambda",
+        pattern_type="layer",
+        is_safe=False,
+        context="layer_definition",
+        risk_level=case_risk_level,
+        explanation="Lambda layer",
+    )
+    context = {"lambda_code": case_code, "layer_definition": True}
+    result = knowledge_base._validate_context(pattern, context)
+    assert result is case_valid

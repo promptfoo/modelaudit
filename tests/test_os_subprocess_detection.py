@@ -1,9 +1,10 @@
 """Test detection of os and subprocess patterns for command execution."""
 
 import pickle
+from pathlib import Path
 
 from modelaudit.core import scan_file
-from modelaudit.scanners.base import IssueSeverity
+from modelaudit.scanners.base import IssueSeverity, ScanResult
 
 
 def create_test_pickle(code_str: str) -> bytes:
@@ -20,12 +21,7 @@ class TestOsSystemDetection:
         """Test detection of os.system command."""
         # Create pickle with os.system
         malicious_code = "import os; os.system('echo pwned')"
-        pickle_data = create_test_pickle(malicious_code)
-
-        test_file = tmp_path / "os_system.pkl"
-        test_file.write_bytes(pickle_data)
-
-        result = scan_file(str(test_file))
+        result = _scan_embedded_code(tmp_path, malicious_code, "os_system.pkl")
 
         # Should detect os.system as CRITICAL
         assert any(
@@ -36,12 +32,7 @@ class TestOsSystemDetection:
         """Test detection of os.popen command."""
         # Create pickle with os.popen
         malicious_code = "import os; os.popen('ls -la').read()"
-        pickle_data = create_test_pickle(malicious_code)
-
-        test_file = tmp_path / "os_popen.pkl"
-        test_file.write_bytes(pickle_data)
-
-        result = scan_file(str(test_file))
+        result = _scan_embedded_code(tmp_path, malicious_code, "os_popen.pkl")
 
         # Should detect os.popen as CRITICAL
         assert any(
@@ -52,12 +43,7 @@ class TestOsSystemDetection:
         """Test detection of os.spawn* variants."""
         # Create pickle with os.spawnv
         malicious_code = "import os; os.spawnv(os.P_WAIT, '/bin/echo', ['echo', 'pwned'])"
-        pickle_data = create_test_pickle(malicious_code)
-
-        test_file = tmp_path / "os_spawn.pkl"
-        test_file.write_bytes(pickle_data)
-
-        result = scan_file(str(test_file))
+        result = _scan_embedded_code(tmp_path, malicious_code, "os_spawn.pkl")
 
         # Should detect os.spawn as CRITICAL
         assert any(
@@ -72,12 +58,7 @@ class TestSubprocessDetection:
         """Test detection of subprocess.call."""
         # Create pickle with subprocess.call
         malicious_code = "import subprocess; subprocess.call(['echo', 'pwned'])"
-        pickle_data = create_test_pickle(malicious_code)
-
-        test_file = tmp_path / "subprocess_call.pkl"
-        test_file.write_bytes(pickle_data)
-
-        result = scan_file(str(test_file))
+        result = _scan_embedded_code(tmp_path, malicious_code, "subprocess_call.pkl")
 
         # Should detect subprocess.call as CRITICAL
         assert any(
@@ -89,12 +70,7 @@ class TestSubprocessDetection:
         """Test detection of subprocess.run."""
         # Create pickle with subprocess.run
         malicious_code = "import subprocess; subprocess.run(['ls', '-la'])"
-        pickle_data = create_test_pickle(malicious_code)
-
-        test_file = tmp_path / "subprocess_run.pkl"
-        test_file.write_bytes(pickle_data)
-
-        result = scan_file(str(test_file))
+        result = _scan_embedded_code(tmp_path, malicious_code, "subprocess_run.pkl")
 
         # Should detect subprocess.run as CRITICAL
         assert any(
@@ -106,12 +82,7 @@ class TestSubprocessDetection:
         """Test detection of subprocess.Popen."""
         # Create pickle with subprocess.Popen
         malicious_code = "import subprocess; p = subprocess.Popen(['echo', 'pwned'])"
-        pickle_data = create_test_pickle(malicious_code)
-
-        test_file = tmp_path / "subprocess_popen.pkl"
-        test_file.write_bytes(pickle_data)
-
-        result = scan_file(str(test_file))
+        result = _scan_embedded_code(tmp_path, malicious_code, "subprocess_popen.pkl")
 
         # Should detect subprocess.Popen as CRITICAL
         assert any(
@@ -127,12 +98,7 @@ class TestCommandsModuleDetection:
         """Test detection of commands.getoutput."""
         # Create pickle with commands.getoutput
         malicious_code = "import commands; output = commands.getoutput('ls -la')"
-        pickle_data = create_test_pickle(malicious_code)
-
-        test_file = tmp_path / "commands_getoutput.pkl"
-        test_file.write_bytes(pickle_data)
-
-        result = scan_file(str(test_file))
+        result = _scan_embedded_code(tmp_path, malicious_code, "commands_getoutput.pkl")
 
         # Should detect commands or getoutput as CRITICAL
         assert any(
@@ -145,12 +111,7 @@ class TestCommandsModuleDetection:
         """Test detection of commands.getstatusoutput."""
         # Create pickle with commands.getstatusoutput
         malicious_code = "import commands; status, output = commands.getstatusoutput('whoami')"
-        pickle_data = create_test_pickle(malicious_code)
-
-        test_file = tmp_path / "commands_getstatusoutput.pkl"
-        test_file.write_bytes(pickle_data)
-
-        result = scan_file(str(test_file))
+        result = _scan_embedded_code(tmp_path, malicious_code, "commands_getstatusoutput.pkl")
 
         # Should detect commands or getstatusoutput as CRITICAL
         assert any(
@@ -167,12 +128,7 @@ class TestPosixDetection:
         """Test detection of posix.system (equivalent to os.system on Unix)."""
         # Create pickle with posix.system reference
         malicious_code = "import posix; posix.system('echo pwned')"
-        pickle_data = create_test_pickle(malicious_code)
-
-        test_file = tmp_path / "posix_system.pkl"
-        test_file.write_bytes(pickle_data)
-
-        result = scan_file(str(test_file))
+        result = _scan_embedded_code(tmp_path, malicious_code, "posix_system.pkl")
 
         # Should detect posix as CRITICAL
         assert any(
@@ -225,3 +181,10 @@ subprocess.call(['whoami'])
         assert any(
             ("import" in issue.message.lower() or "system" in issue.message.lower()) for issue in result.issues
         ), f"Failed to detect dangerous patterns. Issues: {[i.message for i in result.issues]}"
+
+
+def _scan_embedded_code(tmp_path: Path, malicious_code: str, filename: str) -> ScanResult:
+    pickle_data = create_test_pickle(malicious_code)
+    test_file = tmp_path / filename
+    test_file.write_bytes(pickle_data)
+    return scan_file(str(test_file))

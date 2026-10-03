@@ -44,6 +44,28 @@ from modelaudit.utils.file.detection import (
 )
 from modelaudit.utils.helpers.file_iterator import iterate_files_streaming
 from tests.cli_output import parse_click_json_output
+from tests.helpers.file_creators import (
+    _encode_protobuf_varint as _proto_varint,
+)
+from tests.helpers.file_creators import (
+    ubjson_key as _ubjson_key,
+)
+from tests.helpers.file_creators import (
+    ubjson_string as _ubjson_string,
+)
+from tests.helpers.file_creators import (
+    xgboost_ubjson_counted_null_array_probe as _xgboost_ubjson_counted_null_array_probe,
+)
+from tests.helpers.file_creators import (
+    xgboost_ubjson_noop_before_counted_root_header_probe as _xgboost_ubjson_noop_before_counted_root_header_probe,
+)
+from tests.helpers.file_creators import (
+    xgboost_ubjson_probe as _xgboost_ubjson_probe,
+)
+from tests.helpers.file_creators import (
+    xgboost_ubjson_uncounted_null_array_probe as _xgboost_ubjson_uncounted_null_array_probe,
+)
+from tests.helpers.text import LowerCountingText
 
 
 class FakeBooster:
@@ -63,15 +85,6 @@ def temp_dir() -> Iterator[Path]:
 def _headerless_legacy_binary_header() -> bytes:
     """Create the older pre-`binf` learner header used by legacy XGBoost binaries."""
     return struct.pack("<fIiiiII27i", 0.5, 4, 0, 1, 0, 0, 90, *([0] * 27))
-
-
-def _proto_varint(value: int) -> bytes:
-    encoded = bytearray()
-    while value >= 0x80:
-        encoded.append((value & 0x7F) | 0x80)
-        value >>= 7
-    encoded.append(value)
-    return bytes(encoded)
 
 
 def _proto_field(field_number: int, wire_type: int, payload: bytes) -> bytes:
@@ -422,36 +435,6 @@ def _assert_xgboost_s1004(result: ModelAuditResultModel) -> None:
     assert any(issue.rule_code == "S1004" for issue in result.issues)
 
 
-def _ubjson_key(key: bytes) -> bytes:
-    return b"U" + bytes([len(key)]) + key
-
-
-def _ubjson_string(value: bytes) -> bytes:
-    return b"SL" + len(value).to_bytes(8, byteorder="big", signed=True) + value
-
-
-def _xgboost_ubjson_probe(
-    *, root_padding: int = 0, learner_padding: int = 0, learner_noop: bool = False, malicious: bool = False
-) -> bytes:
-    root_body = b""
-    if root_padding:
-        root_body += _ubjson_key(b"metadata") + _ubjson_string(b"x" * root_padding)
-    learner_body = b""
-    if learner_padding:
-        learner_body += _ubjson_key(b"metadata") + _ubjson_string(b"x" * learner_padding)
-    learner_body += _ubjson_key(b"learner_model_param") + b"{}"
-    if malicious:
-        learner_body += _ubjson_key(b"malicious_code") + _ubjson_string(b"system(cpu)")
-    learner_value = (b"N" if learner_noop else b"") + b"{" + learner_body + b"}"
-    return b"{" + root_body + _ubjson_key(b"learner") + learner_value + _ubjson_key(b"version") + b"[]" + b"}"
-
-
-def _xgboost_ubjson_counted_null_array_probe() -> bytes:
-    max_count = ((1 << 63) - 1).to_bytes(8, byteorder="big", signed=True)
-    learner = b"{" + _ubjson_key(b"learner_model_param") + b"{}" + _ubjson_key(b"payload") + b"[$Z#L" + max_count + b"}"
-    return b"{" + _ubjson_key(b"learner") + learner + _ubjson_key(b"version") + b"[]" + b"}"
-
-
 def _xgboost_ubjson_counted_null_array_before_learner_probe() -> bytes:
     max_count = ((1 << 63) - 1).to_bytes(8, byteorder="big", signed=True)
     return (
@@ -482,32 +465,6 @@ def _xgboost_ubjson_noops_before_counted_null_array_probe() -> bytes:
         + b"{}"
         + b"}"
         + b"}"
-    )
-
-
-def _xgboost_ubjson_uncounted_null_array_probe(item_count: int) -> bytes:
-    learner = (
-        b"{"
-        + _ubjson_key(b"learner_model_param")
-        + b"{}"
-        + _ubjson_key(b"payload")
-        + b"["
-        + (b"Z" * item_count)
-        + b"]}"
-    )
-    return b"{" + _ubjson_key(b"learner") + learner + b"}"
-
-
-def _xgboost_ubjson_noop_before_counted_root_header_probe() -> bytes:
-    return (
-        b"{N#U\x02"
-        + _ubjson_key(b"learner")
-        + b"{"
-        + _ubjson_key(b"learner_model_param")
-        + b"{}"
-        + b"}"
-        + _ubjson_key(b"version")
-        + b"[]"
     )
 
 
@@ -1264,14 +1221,7 @@ class TestXGBoostBinaryScanning:
     """Test XGBoost binary model scanning."""
 
     def test_legacy_header_pattern_search_reuses_lowered_header(self, xgboost_scanner: XGBoostScanner) -> None:
-        class CountingHeader(str):
-            lower_calls = 0
-
-            def lower(self) -> str:
-                self.lower_calls += 1
-                return super().lower()
-
-        header = CountingHeader("BINF GBTree REG:squarederror")
+        header = LowerCountingText("BINF GBTree REG:squarederror")
 
         assert xgboost_scanner._find_legacy_header_patterns(header) == ["gbtree", "reg:"]
         assert header.lower_calls == 1
