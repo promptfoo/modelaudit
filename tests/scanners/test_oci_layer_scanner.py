@@ -7,6 +7,8 @@ import pickle
 import shutil
 import tarfile
 import tempfile
+from collections.abc import Callable
+from functools import partial
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -19,7 +21,17 @@ from modelaudit.scanner_results import mark_inconclusive_scan_result
 from modelaudit.scanners import flax_msgpack_scanner
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, IssueSeverity, ScanResult
 from modelaudit.scanners.oci_layer_scanner import OciLayerScanner
-from modelaudit.utils.file.detection import FLAX_MSGPACK_STRUCTURE_READ_BYTES
+from tests.helpers.cache import assert_inconclusive_not_cached as _assert_inconclusive_aggregate_not_cached
+from tests.helpers.file_creators import SystemCommandPayload
+from tests.helpers.file_creators import write_delayed_flax_cntk_overlap as _write_delayed_flax_cntk_overlap
+
+
+def _record_onnx_payloads(payloads: list[bytes], scan_path: str, _config: dict[str, Any]) -> ScanResult:
+    if scan_path.endswith(".onnx"):
+        payloads.append(Path(scan_path).read_bytes())
+    nested_result = ScanResult(scanner_name="unknown")
+    nested_result.finish()
+    return nested_result
 
 
 def _gzip_with_comment(payload: bytes, comment: bytes) -> bytes:
@@ -47,52 +59,6 @@ def _tar_block(info: tarfile.TarInfo) -> bytes:
 def _pad_tar_payload(payload: bytes) -> bytes:
     """Pad a raw TAR payload to its next block boundary."""
     return payload + (b"\0" * ((-len(payload)) % tarfile.BLOCKSIZE))
-
-
-def _assert_inconclusive_aggregate_not_cached(
-    path: Path,
-    expected_reason: str,
-    cache_dir: Path,
-    **scan_kwargs: Any,
-) -> None:
-    reset_cache_manager()
-    try:
-        first = scan_model_directory_or_file(
-            str(path),
-            cache_enabled=True,
-            cache_dir=str(cache_dir),
-            min_cache_file_size=0,
-            **scan_kwargs,
-        )
-        second = scan_model_directory_or_file(
-            str(path),
-            cache_enabled=True,
-            cache_dir=str(cache_dir),
-            min_cache_file_size=0,
-            **scan_kwargs,
-        )
-
-        for aggregate in (first, second):
-            metadata = aggregate.file_metadata[str(path)]
-            assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-            assert expected_reason in metadata["scan_outcome_reasons"]
-            assert not [
-                issue for issue in aggregate.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
-            ]
-            assert determine_exit_code(aggregate) == 2
-        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
-
-
-def _write_delayed_flax_cntk_overlap(path: Path) -> None:
-    prefix = b"\x08\x01\x12\x11\x0a\x07version\x12\x06\x08\x01\x10\x03(\x02\x12\x09\x0a\x03uid\x12\x02ab"
-    structure = b" CompositeFunction primitive_functions "
-    delayed_flax_root = flax_msgpack_scanner.msgpack.packb(
-        {"params": {"w": [1, 2, 3]}, "__reduce__": "attacker_callable"},
-        use_bin_type=True,
-    )
-    path.write_bytes(prefix + structure + (b"\xc0" * (FLAX_MSGPACK_STRUCTURE_READ_BYTES + 1)) + delayed_flax_root)
 
 
 class TestOciLayerScanner:
@@ -700,106 +666,61 @@ class TestOciLayerScanner:
 
     def test_scan_layer_detects_extensionless_pickle_member(self, tmp_path: Path) -> None:
         """Extensionless pickle members should still be dispatched by content."""
-        evil_pickle = Path(__file__).parent.parent / "assets/samples/pickles/evil.pickle"
-
-        layer_path = tmp_path / "layer.tar.gz"
-        with tarfile.open(layer_path, "w:gz") as tar:
-            tar.add(evil_pickle, arcname="payload")
-
-        manifest = {"layers": ["layer.tar.gz"]}
-        manifest_path = tmp_path / "extensionless.manifest"
-        manifest_path.write_text(json.dumps(manifest))
-
-        result = OciLayerScanner().scan(str(manifest_path))
-
-        assert result.success is False
-        assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
-        assert any("extensionless.manifest:layer.tar.gz:payload" in (issue.location or "") for issue in result.issues)
+        _assert_extensionless_layer(
+            tmp_path,
+            ("layer.tar.gz"),
+            ("payload"),
+            ("layer.tar.gz"),
+            ("extensionless.manifest"),
+            ("extensionless.manifest:layer.tar.gz:payload"),
+        )
 
     def test_scan_layer_detects_extensionless_protocol0_pickle_member_with_non_magic_prefix(
         self,
         tmp_path: Path,
     ) -> None:
         """Extensionless protocol-0 pickles should still be scanned when the first 64-byte probe is inconclusive."""
-        protocol0_payload = tmp_path / "payload"
-        protocol0_payload.write_bytes(b"I1\n0cos\nsystem\n(S'echo oci-owned'\ntR.")
-
-        layer_path = tmp_path / "layer.tar.gz"
-        with tarfile.open(layer_path, "w:gz") as tar:
-            tar.add(protocol0_payload, arcname="payload")
-
-        manifest = {"layers": ["layer.tar.gz"]}
-        manifest_path = tmp_path / "extensionless-protocol0.manifest"
-        manifest_path.write_text(json.dumps(manifest))
-
-        result = OciLayerScanner().scan(str(manifest_path))
-
-        assert result.success is False
-        assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
-        assert any(
-            "extensionless-protocol0.manifest:layer.tar.gz:payload" in (issue.location or "") for issue in result.issues
+        _assert_extensionless_protocol0_layer(
+            tmp_path,
+            ("payload"),
+            ("payload"),
+            ("extensionless-protocol0.manifest"),
+            ("extensionless-protocol0.manifest:layer.tar.gz:payload"),
         )
 
     def test_scan_layer_detects_misnamed_pickle_member(self, tmp_path: Path) -> None:
         """Unsupported member suffixes should still be content-routed when payload bytes are model-like."""
-        evil_pickle = Path(__file__).parent.parent / "assets/samples/pickles/evil.pickle"
-
-        layer_path = tmp_path / "layer.tar.gz"
-        with tarfile.open(layer_path, "w:gz") as tar:
-            tar.add(evil_pickle, arcname="payload.jpg")
-
-        manifest = {"layers": ["layer.tar.gz"]}
-        manifest_path = tmp_path / "misnamed.manifest"
-        manifest_path.write_text(json.dumps(manifest))
-
-        result = OciLayerScanner().scan(str(manifest_path))
-
-        assert result.success is False
-        assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
-        assert any("misnamed.manifest:layer.tar.gz:payload.jpg" in (issue.location or "") for issue in result.issues)
+        _assert_extensionless_layer(
+            tmp_path,
+            ("layer.tar.gz"),
+            ("payload.jpg"),
+            ("layer.tar.gz"),
+            ("misnamed.manifest"),
+            ("misnamed.manifest:layer.tar.gz:payload.jpg"),
+        )
 
     def test_scan_layer_detects_misnamed_protocol0_pickle_member_with_non_magic_prefix(
         self,
         tmp_path: Path,
     ) -> None:
         """Misnamed protocol-0 pickle members should still be scanned when the first probe bytes are inconclusive."""
-        protocol0_payload = tmp_path / "payload.jpg"
-        protocol0_payload.write_bytes(b"I1\n0cos\nsystem\n(S'echo oci-owned'\ntR.")
-
-        layer_path = tmp_path / "layer.tar.gz"
-        with tarfile.open(layer_path, "w:gz") as tar:
-            tar.add(protocol0_payload, arcname="payload.jpg")
-
-        manifest = {"layers": ["layer.tar.gz"]}
-        manifest_path = tmp_path / "misnamed-protocol0.manifest"
-        manifest_path.write_text(json.dumps(manifest))
-
-        result = OciLayerScanner().scan(str(manifest_path))
-
-        assert result.success is False
-        assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
-        assert any(
-            "misnamed-protocol0.manifest:layer.tar.gz:payload.jpg" in (issue.location or "") for issue in result.issues
+        _assert_extensionless_protocol0_layer(
+            tmp_path,
+            ("payload.jpg"),
+            ("payload.jpg"),
+            ("misnamed-protocol0.manifest"),
+            ("misnamed-protocol0.manifest:layer.tar.gz:payload.jpg"),
         )
 
     def test_scan_manifest_normalizes_layer_refs_with_uppercase_and_trailing_space(self, tmp_path: Path) -> None:
         """Cosmetic layer-ref suffix changes should not hide a real .tar.gz payload."""
-        evil_pickle = Path(__file__).parent.parent / "assets/samples/pickles/evil.pickle"
-
-        layer_path = tmp_path / "  UPPER.TAR.GZ  "
-        with tarfile.open(layer_path, "w:gz") as tar:
-            tar.add(evil_pickle, arcname="malicious.pkl")
-
-        manifest = {"layers": ["  UPPER.TAR.GZ  "]}
-        manifest_path = tmp_path / "uppercase.manifest"
-        manifest_path.write_text(json.dumps(manifest))
-
-        result = OciLayerScanner().scan(str(manifest_path))
-
-        assert result.success is False
-        assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
-        assert any(
-            "uppercase.manifest:  UPPER.TAR.GZ  :malicious.pkl" in (issue.location or "") for issue in result.issues
+        _assert_extensionless_layer(
+            tmp_path,
+            ("  UPPER.TAR.GZ  "),
+            ("malicious.pkl"),
+            ("  UPPER.TAR.GZ  "),
+            ("uppercase.manifest"),
+            ("uppercase.manifest:  UPPER.TAR.GZ  :malicious.pkl"),
         )
 
     def test_scan_manifest_resolves_exact_dotted_layer_ref(self, tmp_path: Path) -> None:
@@ -831,22 +752,13 @@ class TestOciLayerScanner:
 
     def test_scan_layer_detects_member_with_trailing_space_extension(self, tmp_path: Path) -> None:
         """Trailing whitespace after a scannable extension should not bypass dispatch."""
-        evil_pickle = Path(__file__).parent.parent / "assets/samples/pickles/evil.pickle"
-
-        layer_path = tmp_path / "layer.tar.gz"
-        with tarfile.open(layer_path, "w:gz") as tar:
-            tar.add(evil_pickle, arcname="malicious.pkl ")
-
-        manifest = {"layers": ["layer.tar.gz"]}
-        manifest_path = tmp_path / "trailing-space.manifest"
-        manifest_path.write_text(json.dumps(manifest))
-
-        result = OciLayerScanner().scan(str(manifest_path))
-
-        assert result.success is False
-        assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
-        assert any(
-            "trailing-space.manifest:layer.tar.gz:malicious.pkl " in (issue.location or "") for issue in result.issues
+        _assert_extensionless_layer(
+            tmp_path,
+            ("layer.tar.gz"),
+            ("malicious.pkl "),
+            ("layer.tar.gz"),
+            ("trailing-space.manifest"),
+            ("trailing-space.manifest:layer.tar.gz:malicious.pkl "),
         )
 
     def test_scan_layer_prefers_model_extension_over_trailing_generic_suffix(self, tmp_path: Path) -> None:
@@ -2193,12 +2105,8 @@ class TestOciLayerScanner:
     def test_scan_layer_reports_member_path_traversal_metadata(self, tmp_path: Path) -> None:
         """Unsafe member names must not suppress scanning of their safely extracted bytes."""
 
-        class TraversalPayload:
-            def __reduce__(self) -> tuple[Any, tuple[str]]:
-                return (os.system, ("echo traversal-payload",))
-
         payload = tmp_path / "payload.pkl"
-        payload.write_bytes(pickle.dumps(TraversalPayload()))
+        payload.write_bytes(pickle.dumps(SystemCommandPayload("echo traversal-payload", lambda: os.system)))
 
         layer_path = tmp_path / "traversal.tar.gz"
         with tarfile.open(layer_path, "w:gz") as tar:
@@ -2332,13 +2240,7 @@ class TestOciLayerScanner:
         manifest_path = tmp_path / "absolute-hardlink.manifest"
         manifest_path.write_text(json.dumps({"layers": ["absolute-hardlink.tar.gz"]}))
 
-        result = OciLayerScanner().scan(str(manifest_path))
-
-        assert result.success is False
-        checks = [check for check in result.checks if check.name == "Symlink Safety Validation"]
-        assert len(checks) == 1
-        assert checks[0].severity == IssueSeverity.CRITICAL
-        assert checks[0].details["target"] == "/bin/target"
+        _assert_unsafe_layer_link(manifest_path, "/bin/target")
 
     def test_scan_layer_allows_safe_link_metadata(self, tmp_path: Path) -> None:
         """Benign relative link metadata should remain clean."""
@@ -2519,26 +2421,7 @@ class TestOciLayerScanner:
             members_by_name[link.name] = link
             links.append(link)
 
-        resolve_calls = 0
-        original_resolver = OciLayerScanner._resolve_link_target
-
-        def counted_resolver(
-            target: str,
-            *,
-            resolved_member_name: str,
-            extraction_root: str,
-            is_symlink: bool,
-        ) -> tuple[str, bool]:
-            nonlocal resolve_calls
-            resolve_calls += 1
-            return original_resolver(
-                target,
-                resolved_member_name=resolved_member_name,
-                extraction_root=extraction_root,
-                is_symlink=is_symlink,
-            )
-
-        monkeypatch.setattr(OciLayerScanner, "_resolve_link_target", staticmethod(counted_resolver))
+        resolve_calls = _count_link_resolutions(monkeypatch)
         resolved_payload_cache: dict[tarfile.TarInfo, tarfile.TarInfo | None] = {}
         resolved_member_path_cache: dict[str, tarfile.TarInfo | None] = {}
 
@@ -2553,7 +2436,7 @@ class TestOciLayerScanner:
                 is payload
             )
 
-        assert resolve_calls == chain_length
+        assert resolve_calls() == chain_length
 
     def test_resolve_link_payload_member_memoizes_component_symlink_chains(
         self,
@@ -2579,26 +2462,7 @@ class TestOciLayerScanner:
             alias.linkname = "d0/payload.bin"
             aliases.append(alias)
 
-        resolve_calls = 0
-        original_resolver = OciLayerScanner._resolve_link_target
-
-        def counted_resolver(
-            target: str,
-            *,
-            resolved_member_name: str,
-            extraction_root: str,
-            is_symlink: bool,
-        ) -> tuple[str, bool]:
-            nonlocal resolve_calls
-            resolve_calls += 1
-            return original_resolver(
-                target,
-                resolved_member_name=resolved_member_name,
-                extraction_root=extraction_root,
-                is_symlink=is_symlink,
-            )
-
-        monkeypatch.setattr(OciLayerScanner, "_resolve_link_target", staticmethod(counted_resolver))
+        resolve_calls = _count_link_resolutions(monkeypatch)
         resolved_payload_cache: dict[tarfile.TarInfo, tarfile.TarInfo | None] = {}
         resolved_member_path_cache: dict[str, tarfile.TarInfo | None] = {}
 
@@ -2613,7 +2477,7 @@ class TestOciLayerScanner:
                 is payload
             )
 
-        assert resolve_calls == chain_length + alias_count
+        assert resolve_calls() == chain_length + alias_count
         assert resolved_member_path_cache["d0/payload.bin"] is payload
 
     def test_resolve_link_payload_member_does_not_cache_suffix_specific_cycle(self) -> None:
@@ -2851,12 +2715,7 @@ class TestOciLayerScanner:
         manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
         routed_payloads: list[bytes] = []
 
-        def record_scan(scan_path: str, _config: dict[str, Any]) -> ScanResult:
-            if scan_path.endswith(".onnx"):
-                routed_payloads.append(Path(scan_path).read_bytes())
-            nested_result = ScanResult(scanner_name="unknown")
-            nested_result.finish()
-            return nested_result
+        record_scan = partial(_record_onnx_payloads, routed_payloads)
 
         with patch("modelaudit.core.scan_file", side_effect=record_scan):
             result = OciLayerScanner().scan(str(manifest_path))
@@ -2887,12 +2746,7 @@ class TestOciLayerScanner:
         manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
         routed_payloads: list[bytes] = []
 
-        def record_scan(scan_path: str, _config: dict[str, Any]) -> ScanResult:
-            if scan_path.endswith(".onnx"):
-                routed_payloads.append(Path(scan_path).read_bytes())
-            nested_result = ScanResult(scanner_name="unknown")
-            nested_result.finish()
-            return nested_result
+        record_scan = partial(_record_onnx_payloads, routed_payloads)
 
         with patch("modelaudit.core.scan_file", side_effect=record_scan):
             result = OciLayerScanner().scan(str(manifest_path))
@@ -2918,13 +2772,8 @@ class TestOciLayerScanner:
         manifest_path = tmp_path / "duplicate-linked-model.manifest"
         manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
 
-        def clean_scan(_path: str, _config: dict[str, Any]) -> ScanResult:
-            nested_result = ScanResult(scanner_name="unknown")
-            nested_result.finish()
-            return nested_result
-
         with (
-            patch("modelaudit.core.scan_file", side_effect=clean_scan),
+            patch("modelaudit.core.scan_file", side_effect=_scan_clean_nested_member),
             patch("modelaudit.scanners.oci_layer_scanner.shutil.copyfileobj", wraps=shutil.copyfileobj) as mock_copy,
         ):
             result = OciLayerScanner().scan(str(manifest_path))
@@ -3046,13 +2895,7 @@ class TestOciLayerScanner:
         manifest_path = tmp_path / "unsafe-hardlink.manifest"
         manifest_path.write_text(json.dumps({"layers": ["unsafe-hardlink.tar.gz"]}))
 
-        result = OciLayerScanner().scan(str(manifest_path))
-
-        assert result.success is False
-        checks = [check for check in result.checks if check.name == "Symlink Safety Validation"]
-        assert len(checks) == 1
-        assert checks[0].severity == IssueSeverity.CRITICAL
-        assert checks[0].details["target"] == "../dir/model.bin"
+        _assert_unsafe_layer_link(manifest_path, "../dir/model.bin")
 
     def test_scan_layer_allows_safe_hardlink_target_from_layer_root(self, tmp_path: Path) -> None:
         """Benign hardlink targets under the archive root should remain clean."""
@@ -3107,12 +2950,7 @@ class TestOciLayerScanner:
         manifest_path = tmp_path / "duplicate.manifest"
         manifest_path.write_text(json.dumps({"layers": [layer_path.name]}))
 
-        def clean_scan(_path: str, _config: dict[str, Any]) -> ScanResult:
-            nested_result = ScanResult(scanner_name="unknown")
-            nested_result.finish()
-            return nested_result
-
-        with patch("modelaudit.core.scan_file", side_effect=clean_scan) as mock_scan:
+        with patch("modelaudit.core.scan_file", side_effect=_scan_clean_nested_member) as mock_scan:
             result = OciLayerScanner().scan(str(manifest_path))
 
         checks = [check for check in result.checks if check.name == "OCI Layer Metadata Validation"]
@@ -3369,3 +3207,88 @@ def test_oci_layer_scanner_with_malicious_pickle(tmp_path: Path) -> None:
 
     assert result.success is False
     assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
+def _count_link_resolutions(monkeypatch: pytest.MonkeyPatch) -> Callable[[], int]:
+    resolve_calls = 0
+    original_resolver = OciLayerScanner._resolve_link_target
+
+    def counted_resolver(
+        target: str,
+        *,
+        resolved_member_name: str,
+        extraction_root: str,
+        is_symlink: bool,
+    ) -> tuple[str, bool]:
+        nonlocal resolve_calls
+        resolve_calls += 1
+        return original_resolver(
+            target,
+            resolved_member_name=resolved_member_name,
+            extraction_root=extraction_root,
+            is_symlink=is_symlink,
+        )
+
+    monkeypatch.setattr(OciLayerScanner, "_resolve_link_target", staticmethod(counted_resolver))
+    return lambda: resolve_calls
+
+
+def _scan_clean_nested_member(_path: str, _config: dict[str, Any]) -> ScanResult:
+    nested_result = ScanResult(scanner_name="unknown")
+    nested_result.finish()
+    return nested_result
+
+
+def _assert_extensionless_protocol0_layer(
+    tmp_path: Path, filename: str, member_name: str, manifest_name: str, expected_location: str
+) -> None:
+    protocol0_payload = tmp_path / filename
+    protocol0_payload.write_bytes(b"I1\n0cos\nsystem\n(S'echo oci-owned'\ntR.")
+
+    layer_path = tmp_path / "layer.tar.gz"
+    with tarfile.open(layer_path, "w:gz") as tar:
+        tar.add(protocol0_payload, arcname=member_name)
+
+    manifest = {"layers": ["layer.tar.gz"]}
+    manifest_path = tmp_path / manifest_name
+    manifest_path.write_text(json.dumps(manifest))
+
+    result = OciLayerScanner().scan(str(manifest_path))
+
+    assert result.success is False
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+    assert any(expected_location in (issue.location or "") for issue in result.issues)
+
+
+def _assert_extensionless_layer(
+    tmp_path: Path,
+    layer_filename: str,
+    member_name: str,
+    manifest_layer: str,
+    manifest_filename: str,
+    expected_location: str,
+) -> None:
+    evil_pickle = Path(__file__).parent.parent / "assets/samples/pickles/evil.pickle"
+
+    layer_path = tmp_path / layer_filename
+    with tarfile.open(layer_path, "w:gz") as tar:
+        tar.add(evil_pickle, arcname=member_name)
+
+    manifest = {"layers": [manifest_layer]}
+    manifest_path = tmp_path / manifest_filename
+    manifest_path.write_text(json.dumps(manifest))
+
+    result = OciLayerScanner().scan(str(manifest_path))
+
+    assert result.success is False
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+    assert any(expected_location in (issue.location or "") for issue in result.issues)
+
+
+def _assert_unsafe_layer_link(manifest_path: Path, expected_target: str) -> None:
+    result = OciLayerScanner().scan(str(manifest_path))
+    assert result.success is False
+    checks = [check for check in result.checks if check.name == "Symlink Safety Validation"]
+    assert len(checks) == 1
+    assert checks[0].severity == IssueSeverity.CRITICAL
+    assert checks[0].details["target"] == expected_target

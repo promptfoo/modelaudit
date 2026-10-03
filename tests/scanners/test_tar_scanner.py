@@ -7,7 +7,7 @@ import random
 import tarfile
 import tempfile
 import zipfile
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, BinaryIO, Literal, cast
@@ -35,6 +35,9 @@ from modelaudit.scanners.tar_scanner import (
     TarScanner,
 )
 from modelaudit.utils.file import detection as file_detection
+from tests.helpers.file_creators import SystemCommandPayload
+from tests.helpers.scanners import scan_nested_critical_finding as nested_scan
+from tests.helpers.scanners import scan_nested_unsuccessful
 
 
 def _tar_octal_field(value: int, width: int) -> bytes:
@@ -215,6 +218,14 @@ def _assert_inconclusive_aggregate_not_reused(
 class TestTarScanner:
     """Test the TAR scanner"""
 
+    def _scan_python_tar_member(self, archive_path: Path, payload: bytes | bytearray, member_name: str) -> ScanResult:
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo(member_name)
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+        result = self.scanner.scan(str(archive_path))
+        return result
+
     def setup_method(self):
         """Set up test fixtures"""
         self.scanner = TarScanner()
@@ -302,12 +313,7 @@ class TestTarScanner:
         archive_path = tmp_path / "model_bundle.tar"
         payload = b"import os\nos.system('echo hidden')\n"
 
-        with tarfile.open(archive_path, "w") as archive:
-            info = tarfile.TarInfo("handler.py")
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
-
-        result = self.scanner.scan(str(archive_path))
+        result = self._scan_python_tar_member(archive_path, payload, "handler.py")
 
         python_checks = [check for check in result.checks if check.name == "Python Archive Member Security"]
         assert len(python_checks) == 1
@@ -316,121 +322,86 @@ class TestTarScanner:
         assert python_checks[0].details["entry"] == "handler.py"
         assert result.success is True
 
-    def test_scan_tar_flags_aliased_dangerous_python_member(self, tmp_path: Path) -> None:
-        """Aliased high-risk calls should not bypass generic TAR Python member scanning."""
+    def _assert_tar_aliased_call(self, tmp_path: Path, source_bytes: bytes, reason: str) -> None:
         archive_path = tmp_path / "model_bundle.tar"
-        payload = b"from os import system as run_command\nrun_command('echo hidden')\n"
+        payload = source_bytes
 
-        with tarfile.open(archive_path, "w") as archive:
-            info = tarfile.TarInfo("handler.py")
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
-
-        result = self.scanner.scan(str(archive_path))
+        result = self._scan_python_tar_member(archive_path, payload, "handler.py")
 
         python_checks = [check for check in result.checks if check.name == "Python Archive Member Security"]
         assert len(python_checks) == 1
         assert python_checks[0].status == CheckStatus.FAILED
         assert python_checks[0].severity == IssueSeverity.WARNING
-        assert python_checks[0].details["reason"] == "high-risk calls: os.system"
+        assert python_checks[0].details["reason"] == reason
+
+    def test_scan_tar_flags_aliased_dangerous_python_member(self, tmp_path: Path) -> None:
+        """Aliased high-risk calls should not bypass generic TAR Python member scanning."""
+        self._assert_tar_aliased_call(
+            tmp_path,
+            (b"from os import system as run_command\nrun_command('echo hidden')\n"),
+            ("high-risk calls: os.system"),
+        )
 
     def test_scan_tar_flags_wildcard_import_dangerous_python_member(self, tmp_path: Path) -> None:
         """Wildcard imports should resolve known high-risk call names."""
+        self._assert_tar_aliased_call(
+            tmp_path,
+            (b"from subprocess import *\nrun(['echo', 'hidden'], check=False)\n"),
+            ("high-risk calls: subprocess.run"),
+        )
+
+    def _assert_tar_member_rule(self, tmp_path: Path, source_bytes: bytes, rule_code: str, reason: str) -> None:
         archive_path = tmp_path / "model_bundle.tar"
-        payload = b"from subprocess import *\nrun(['echo', 'hidden'], check=False)\n"
+        payload = source_bytes
 
-        with tarfile.open(archive_path, "w") as archive:
-            info = tarfile.TarInfo("handler.py")
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
-
-        result = self.scanner.scan(str(archive_path))
+        result = self._scan_python_tar_member(archive_path, payload, "handler.py")
 
         python_checks = [check for check in result.checks if check.name == "Python Archive Member Security"]
         assert len(python_checks) == 1
         assert python_checks[0].status == CheckStatus.FAILED
         assert python_checks[0].severity == IssueSeverity.WARNING
-        assert python_checks[0].details["reason"] == "high-risk calls: subprocess.run"
+        assert python_checks[0].rule_code == rule_code
+        assert python_checks[0].details["reason"] == reason
 
     def test_scan_tar_flags_builtins_getattr_call_dangerous_python_member(self, tmp_path: Path) -> None:
         """getattr indirection should still resolve to the risky call name."""
-        archive_path = tmp_path / "model_bundle.tar"
-        payload = b"import builtins as bi\nimport os\nbi.getattr(os, 'system').__call__('echo hidden')\n"
-
-        with tarfile.open(archive_path, "w") as archive:
-            info = tarfile.TarInfo("handler.py")
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
-
-        result = self.scanner.scan(str(archive_path))
-
-        python_checks = [check for check in result.checks if check.name == "Python Archive Member Security"]
-        assert len(python_checks) == 1
-        assert python_checks[0].status == CheckStatus.FAILED
-        assert python_checks[0].severity == IssueSeverity.WARNING
-        assert python_checks[0].rule_code == "S101"
-        assert python_checks[0].details["reason"] == "high-risk calls: os.system"
+        self._assert_tar_member_rule(
+            tmp_path,
+            (b"import builtins as bi\nimport os\nbi.getattr(os, 'system').__call__('echo hidden')\n"),
+            ("S101"),
+            ("high-risk calls: os.system"),
+        )
 
     def test_scan_tar_flags_aliased_getattr_helper_dangerous_python_member(self, tmp_path: Path) -> None:
         """Aliased getattr helpers and module aliases should still resolve risky calls."""
-        archive_path = tmp_path / "model_bundle.tar"
-        payload = (
-            b"from builtins import getattr as resolve\n"
-            b"import os as operating_system\n"
-            b"resolve(operating_system, 'system')('echo hidden')\n"
+        self._assert_tar_member_rule(
+            tmp_path,
+            (
+                b"from builtins import getattr as resolve\n"
+                b"import os as operating_system\n"
+                b"resolve(operating_system, 'system')('echo hidden')\n"
+            ),
+            ("S101"),
+            ("high-risk calls: os.system"),
         )
-
-        with tarfile.open(archive_path, "w") as archive:
-            info = tarfile.TarInfo("handler.py")
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
-
-        result = self.scanner.scan(str(archive_path))
-
-        python_checks = [check for check in result.checks if check.name == "Python Archive Member Security"]
-        assert len(python_checks) == 1
-        assert python_checks[0].status == CheckStatus.FAILED
-        assert python_checks[0].severity == IssueSeverity.WARNING
-        assert python_checks[0].rule_code == "S101"
-        assert python_checks[0].details["reason"] == "high-risk calls: os.system"
 
     def test_scan_tar_flags_concatenated_getattr_name_dangerous_python_member(self, tmp_path: Path) -> None:
         """Static string concatenation should not hide risky getattr targets."""
-        archive_path = tmp_path / "model_bundle.tar"
-        payload = b"import os\ngetattr(os, 'sys' + 'tem')('echo hidden')\n"
-
-        with tarfile.open(archive_path, "w") as archive:
-            info = tarfile.TarInfo("handler.py")
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
-
-        result = self.scanner.scan(str(archive_path))
-
-        python_checks = [check for check in result.checks if check.name == "Python Archive Member Security"]
-        assert len(python_checks) == 1
-        assert python_checks[0].status == CheckStatus.FAILED
-        assert python_checks[0].severity == IssueSeverity.WARNING
-        assert python_checks[0].rule_code == "S101"
-        assert python_checks[0].details["reason"] == "high-risk calls: os.system"
+        self._assert_tar_member_rule(
+            tmp_path,
+            (b"import os\ngetattr(os, 'sys' + 'tem')('echo hidden')\n"),
+            ("S101"),
+            ("high-risk calls: os.system"),
+        )
 
     def test_scan_tar_flags_namespace_mapping_dangerous_python_member(self, tmp_path: Path) -> None:
         """Module namespace dictionary lookup must not hide a risky call."""
-        archive_path = tmp_path / "model_bundle.tar"
-        payload = b"import subprocess as sp\nvars(sp)['r' + 'un'](['echo', 'hidden'], check=False)\n"
-
-        with tarfile.open(archive_path, "w") as archive:
-            info = tarfile.TarInfo("handler.py")
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
-
-        result = self.scanner.scan(str(archive_path))
-
-        python_checks = [check for check in result.checks if check.name == "Python Archive Member Security"]
-        assert len(python_checks) == 1
-        assert python_checks[0].status == CheckStatus.FAILED
-        assert python_checks[0].severity == IssueSeverity.WARNING
-        assert python_checks[0].rule_code == "S103"
-        assert python_checks[0].details["reason"] == "high-risk calls: subprocess.run"
+        self._assert_tar_member_rule(
+            tmp_path,
+            (b"import subprocess as sp\nvars(sp)['r' + 'un'](['echo', 'hidden'], check=False)\n"),
+            ("S103"),
+            ("high-risk calls: subprocess.run"),
+        )
 
     @pytest.mark.parametrize(
         "payload",
@@ -468,12 +439,7 @@ class TestTarScanner:
         """Static namespace indirection should retain high-risk callable identity."""
         archive_path = tmp_path / "model_bundle.tar"
 
-        with tarfile.open(archive_path, "w") as archive:
-            info = tarfile.TarInfo("handler.py")
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
-
-        result = self.scanner.scan(str(archive_path))
+        result = self._scan_python_tar_member(archive_path, payload, "handler.py")
 
         python_checks = [check for check in result.checks if check.name == "Python Archive Member Security"]
         assert len(python_checks) == 1
@@ -481,28 +447,45 @@ class TestTarScanner:
         assert python_checks[0].rule_code == "S101"
         assert python_checks[0].details["reason"] == "high-risk calls: os.system"
 
-    def test_scan_tar_flags_namespace_bound_os_process_launch(self, tmp_path: Path) -> None:
-        """Namespace-write tracking must also preserve newly modeled OS launch APIs."""
+    def _assert_tar_namespaced_call(
+        self, tmp_path: Path, source_bytes: bytes, member_name: str, rule_code: str, reason: str
+    ) -> None:
         archive_path = tmp_path / "model_bundle.tar"
-        payload = (
-            b"import os\n"
-            b"namespace = os.__dict__\n"
-            b"namespace['launch'] = os.posix_spawn\n"
-            b"namespace['launch']('/bin/sh', ['sh'], {})\n"
-        )
+        payload = source_bytes
 
-        with tarfile.open(archive_path, "w") as archive:
-            info = tarfile.TarInfo("handler.py")
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
-
-        result = self.scanner.scan(str(archive_path))
+        result = self._scan_python_tar_member(archive_path, payload, member_name)
 
         python_checks = [check for check in result.checks if check.name == "Python Archive Member Security"]
         assert len(python_checks) == 1
         assert python_checks[0].status == CheckStatus.FAILED
-        assert python_checks[0].rule_code == "S101"
-        assert python_checks[0].details["reason"] == "high-risk calls: os.posix_spawn"
+        assert python_checks[0].rule_code == rule_code
+        assert python_checks[0].details["reason"] == reason
+
+    def test_scan_tar_flags_namespace_bound_os_process_launch(self, tmp_path: Path) -> None:
+        """Namespace-write tracking must also preserve newly modeled OS launch APIs."""
+        self._assert_tar_namespaced_call(
+            tmp_path,
+            (
+                b"import os\n"
+                b"namespace = os.__dict__\n"
+                b"namespace['launch'] = os.posix_spawn\n"
+                b"namespace['launch']('/bin/sh', ['sh'], {})\n"
+            ),
+            ("handler.py"),
+            ("S101"),
+            ("high-risk calls: os.posix_spawn"),
+        )
+
+    def _assert_tar_python_primitive(self, tmp_path: Path, payload: bytes, dangerous_name: str, rule_code: str) -> None:
+        archive_path = tmp_path / "model_bundle.tar"
+
+        result = self._scan_python_tar_member(archive_path, payload, "handler.py")
+
+        python_checks = [check for check in result.checks if check.name == "Python Archive Member Security"]
+        assert len(python_checks) == 1
+        assert python_checks[0].status == CheckStatus.FAILED
+        assert python_checks[0].rule_code == rule_code
+        assert python_checks[0].details["reason"] == f"high-risk calls: {dangerous_name}"
 
     @pytest.mark.parametrize(
         ("payload", "dangerous_name"),
@@ -528,20 +511,7 @@ class TestTarScanner:
     def test_scan_tar_flags_asyncio_subprocess_python_member(
         self, tmp_path: Path, payload: bytes, dangerous_name: str
     ) -> None:
-        archive_path = tmp_path / "model_bundle.tar"
-
-        with tarfile.open(archive_path, "w") as archive:
-            info = tarfile.TarInfo("handler.py")
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
-
-        result = self.scanner.scan(str(archive_path))
-
-        python_checks = [check for check in result.checks if check.name == "Python Archive Member Security"]
-        assert len(python_checks) == 1
-        assert python_checks[0].status == CheckStatus.FAILED
-        assert python_checks[0].rule_code == "S103"
-        assert python_checks[0].details["reason"] == f"high-risk calls: {dangerous_name}"
+        self._assert_tar_python_primitive(tmp_path, payload, dangerous_name, ("S103"))
 
     @pytest.mark.parametrize(
         ("payload", "dangerous_name"),
@@ -554,144 +524,81 @@ class TestTarScanner:
     def test_scan_tar_flags_runpy_execution_python_member(
         self, tmp_path: Path, payload: bytes, dangerous_name: str
     ) -> None:
-        archive_path = tmp_path / "model_bundle.tar"
-
-        with tarfile.open(archive_path, "w") as archive:
-            info = tarfile.TarInfo("handler.py")
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
-
-        result = self.scanner.scan(str(archive_path))
-
-        python_checks = [check for check in result.checks if check.name == "Python Archive Member Security"]
-        assert len(python_checks) == 1
-        assert python_checks[0].status == CheckStatus.FAILED
-        assert python_checks[0].rule_code == "S108"
-        assert python_checks[0].details["reason"] == f"high-risk calls: {dangerous_name}"
+        self._assert_tar_python_primitive(tmp_path, payload, dangerous_name, ("S108"))
 
     def test_scan_tar_flags_extensionless_runpy_python_member(self, tmp_path: Path) -> None:
-        archive_path = tmp_path / "model_bundle.tar"
-        payload = b"import runpy\nrunpy.run_module('payload')\n"
-
-        with tarfile.open(archive_path, "w") as archive:
-            info = tarfile.TarInfo("handler")
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
-
-        result = self.scanner.scan(str(archive_path))
-
-        python_checks = [check for check in result.checks if check.name == "Python Archive Member Security"]
-        assert len(python_checks) == 1
-        assert python_checks[0].status == CheckStatus.FAILED
-        assert python_checks[0].rule_code == "S108"
-        assert python_checks[0].details["reason"] == "high-risk calls: runpy.run_module"
+        self._assert_tar_namespaced_call(
+            tmp_path,
+            (b"import runpy\nrunpy.run_module('payload')\n"),
+            ("handler"),
+            ("S108"),
+            ("high-risk calls: runpy.run_module"),
+        )
 
     def test_scan_tar_ignores_extensionless_runpy_near_match(self, tmp_path: Path) -> None:
         archive_path = tmp_path / "model_bundle.tar"
         payload = b"documentation mentions runpy.run_module('payload')\n"
 
-        with tarfile.open(archive_path, "w") as archive:
-            info = tarfile.TarInfo("notes")
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
-
-        result = self.scanner.scan(str(archive_path))
+        result = self._scan_python_tar_member(archive_path, payload, "notes")
 
         assert result.success is True
         assert not any(check.name == "Python Archive Member Security" for check in result.checks)
 
-    def test_scan_tar_allows_replaced_runpy_execution(self, tmp_path: Path) -> None:
+    def _assert_tar_python_without_finding(self, tmp_path: Path, source_bytes: bytes) -> None:
         archive_path = tmp_path / "model_bundle.tar"
-        payload = b"import runpy\nrunpy.run_path = len\nrunpy.run_path([])\n"
+        payload = source_bytes
 
-        with tarfile.open(archive_path, "w") as archive:
-            info = tarfile.TarInfo("handler.py")
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
-
-        result = self.scanner.scan(str(archive_path))
+        result = self._scan_python_tar_member(archive_path, payload, "handler.py")
 
         assert not any(check.name == "Python Archive Member Security" for check in result.checks)
+
+    def test_scan_tar_allows_replaced_runpy_execution(self, tmp_path: Path) -> None:
+        self._assert_tar_python_without_finding(tmp_path, (b"import runpy\nrunpy.run_path = len\nrunpy.run_path([])\n"))
 
     def test_scan_tar_ignores_runpy_member_after_module_alias_rebind(self, tmp_path: Path) -> None:
-        archive_path = tmp_path / "model_bundle.tar"
-        payload = b"class Safe:\n    run_path = len\nimport runpy as rp\nrp = Safe()\nrp.run_path([])\n"
-
-        with tarfile.open(archive_path, "w") as archive:
-            info = tarfile.TarInfo("handler.py")
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
-
-        result = self.scanner.scan(str(archive_path))
-
-        assert not any(check.name == "Python Archive Member Security" for check in result.checks)
+        self._assert_tar_python_without_finding(
+            tmp_path, (b"class Safe:\n    run_path = len\nimport runpy as rp\nrp = Safe()\nrp.run_path([])\n")
+        )
 
     def test_scan_tar_ignores_safe_namespace_slot_rebinding(self, tmp_path: Path) -> None:
         """A safe final callable bound through a module dictionary should remain clean."""
-        archive_path = tmp_path / "model_bundle.tar"
-        payload = (
-            b"import os\nnamespace = os.__dict__\nnamespace['runner'] = os.system\n"
-            b"namespace['runner'] = print\nnamespace['runner']('safe')\n"
+        self._assert_tar_python_without_finding(
+            tmp_path,
+            (
+                b"import os\nnamespace = os.__dict__\nnamespace['runner'] = os.system\n"
+                b"namespace['runner'] = print\nnamespace['runner']('safe')\n"
+            ),
         )
-
-        with tarfile.open(archive_path, "w") as archive:
-            info = tarfile.TarInfo("handler.py")
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
-
-        result = self.scanner.scan(str(archive_path))
-
-        assert not any(check.name == "Python Archive Member Security" for check in result.checks)
 
     def test_scan_tar_ignores_overwritten_module_namespace_import(self, tmp_path: Path) -> None:
         """A known module mapping overwrite should not retain a stale dangerous import."""
-        archive_path = tmp_path / "model_bundle.tar"
-        payload = (
-            b"import os\nclass Safe:\n    system = print\nnamespace = globals()\n"
-            b"namespace['os'] = Safe\nnamespace['os'].system('safe')\n"
+        self._assert_tar_python_without_finding(
+            tmp_path,
+            (
+                b"import os\nclass Safe:\n    system = print\nnamespace = globals()\n"
+                b"namespace['os'] = Safe\nnamespace['os'].system('safe')\n"
+            ),
         )
-
-        with tarfile.open(archive_path, "w") as archive:
-            info = tarfile.TarInfo("handler.py")
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
-
-        result = self.scanner.scan(str(archive_path))
-
-        assert not any(check.name == "Python Archive Member Security" for check in result.checks)
 
     def test_scan_tar_ignores_class_body_module_namespace_overwrite(self, tmp_path: Path) -> None:
         """A class-body globals write is an executed module namespace overwrite."""
-        archive_path = tmp_path / "model_bundle.tar"
-        payload = (
-            b"import os\nclass Safe:\n    system = print\nclass Replace:\n"
-            b"    globals()['os'] = Safe\nos.system('safe')\n"
+        self._assert_tar_python_without_finding(
+            tmp_path,
+            (
+                b"import os\nclass Safe:\n    system = print\nclass Replace:\n"
+                b"    globals()['os'] = Safe\nos.system('safe')\n"
+            ),
         )
-
-        with tarfile.open(archive_path, "w") as archive:
-            info = tarfile.TarInfo("handler.py")
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
-
-        result = self.scanner.scan(str(archive_path))
-
-        assert not any(check.name == "Python Archive Member Security" for check in result.checks)
 
     def test_scan_tar_ignores_definite_safe_module_namespace_overwrite(self, tmp_path: Path) -> None:
         """A definitely executed safe mapping overwrite should suppress a stale alias."""
-        archive_path = tmp_path / "model_bundle.tar"
-        payload = (
-            b"import os\nrunner = os.system\nif True:\n    globals()['runner'] = print\nglobals()['runner']('safe')\n"
+        self._assert_tar_python_without_finding(
+            tmp_path,
+            (
+                b"import os\nrunner = os.system\nif True:\n    globals()['runner'] = print\n"
+                b"globals()['runner']('safe')\n"
+            ),
         )
-
-        with tarfile.open(archive_path, "w") as archive:
-            info = tarfile.TarInfo("handler.py")
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
-
-        result = self.scanner.scan(str(archive_path))
-
-        assert not any(check.name == "Python Archive Member Security" for check in result.checks)
 
     @pytest.mark.parametrize(
         "payload",
@@ -711,128 +618,82 @@ class TestTarScanner:
         """Definite safe namespace values and nested comprehension locals should stay clean."""
         archive_path = tmp_path / "model_bundle.tar"
 
-        with tarfile.open(archive_path, "w") as archive:
-            info = tarfile.TarInfo("handler.py")
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
-
-        result = self.scanner.scan(str(archive_path))
+        result = self._scan_python_tar_member(archive_path, payload, "handler.py")
 
         assert not any(check.name == "Python Archive Member Security" for check in result.checks)
 
     def test_scan_tar_flags_implicit_builtins_mapping_dangerous_python_member(self, tmp_path: Path) -> None:
         """Implicit builtins mapping lookup must not hide a risky call."""
-        archive_path = tmp_path / "model_bundle.tar"
-        payload = b"__builtins__['ev' + 'al']('1 + 1')\n"
-
-        with tarfile.open(archive_path, "w") as archive:
-            info = tarfile.TarInfo("handler.py")
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
-
-        result = self.scanner.scan(str(archive_path))
-
-        python_checks = [check for check in result.checks if check.name == "Python Archive Member Security"]
-        assert len(python_checks) == 1
-        assert python_checks[0].status == CheckStatus.FAILED
-        assert python_checks[0].rule_code == "S104"
-        assert python_checks[0].details["reason"] == "high-risk calls: builtins.eval"
+        self._assert_tar_namespaced_call(
+            tmp_path,
+            (b"__builtins__['ev' + 'al']('1 + 1')\n"),
+            ("handler.py"),
+            ("S104"),
+            ("high-risk calls: builtins.eval"),
+        )
 
     def test_scan_tar_flags_rebound_dangerous_python_member(self, tmp_path: Path) -> None:
         """Callable rebindings should not bypass generic TAR Python member scanning."""
+        self._assert_tar_aliased_call(
+            tmp_path,
+            (b"import subprocess\nrunner = subprocess.run\nrunner(['echo', 'hidden'], check=False)\n"),
+            ("high-risk calls: subprocess.run"),
+        )
+
+    def _assert_tar_member_subprocess_call(self, tmp_path: Path, source_bytes: bytes) -> None:
         archive_path = tmp_path / "model_bundle.tar"
-        payload = b"import subprocess\nrunner = subprocess.run\nrunner(['echo', 'hidden'], check=False)\n"
+        payload = source_bytes
 
-        with tarfile.open(archive_path, "w") as archive:
-            info = tarfile.TarInfo("handler.py")
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
-
-        result = self.scanner.scan(str(archive_path))
+        result = self._scan_python_tar_member(archive_path, payload, "handler.py")
 
         python_checks = [check for check in result.checks if check.name == "Python Archive Member Security"]
         assert len(python_checks) == 1
         assert python_checks[0].status == CheckStatus.FAILED
-        assert python_checks[0].severity == IssueSeverity.WARNING
         assert python_checks[0].details["reason"] == "high-risk calls: subprocess.run"
 
     def test_scan_tar_import_aliases_are_scoped_per_python_member(self, tmp_path: Path) -> None:
         """Local imports in one scope should not hide dangerous calls in another scope."""
-        archive_path = tmp_path / "model_bundle.tar"
-        payload = (
-            b"import subprocess\n"
-            b"def helper() -> str:\n"
-            b"    import os as subprocess\n"
-            b"    return subprocess.getcwd()\n"
-            b"def handler() -> None:\n"
-            b"    subprocess.run(['echo', 'hidden'], check=False)\n"
+        # type: ignore[attr-defined]
+        self._assert_tar_member_subprocess_call(
+            tmp_path,
+            (
+                b"import subprocess\n"
+                b"def helper() -> str:\n"
+                b"    import os as subprocess\n"
+                b"    return subprocess.getcwd()\n"
+                b"def handler() -> None:\n"
+                b"    subprocess.run(['echo', 'hidden'], check=False)\n"
+            ),
         )
-
-        with tarfile.open(archive_path, "w") as archive:
-            info = tarfile.TarInfo("handler.py")
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
-
-        result = self.scanner.scan(str(archive_path))
-
-        python_checks = [check for check in result.checks if check.name == "Python Archive Member Security"]
-        assert len(python_checks) == 1
-        assert python_checks[0].status == CheckStatus.FAILED
-        assert python_checks[0].details["reason"] == "high-risk calls: subprocess.run"
 
     def test_scan_tar_method_does_not_capture_class_attribute_alias(self, tmp_path: Path) -> None:
         """Class attributes are not lexical aliases inside method bodies."""
-        archive_path = tmp_path / "model_bundle.tar"
-        payload = (
-            b"import subprocess\n"
-            b"class Handler:\n"
-            b"    subprocess = None\n"
-            b"    def run(self) -> None:\n"
-            b"        subprocess.run(['echo', 'hidden'], check=False)\n"
+        # type: ignore[attr-defined]
+        self._assert_tar_member_subprocess_call(
+            tmp_path,
+            (
+                b"import subprocess\n"
+                b"class Handler:\n"
+                b"    subprocess = None\n"
+                b"    def run(self) -> None:\n"
+                b"        subprocess.run(['echo', 'hidden'], check=False)\n"
+            ),
         )
-
-        with tarfile.open(archive_path, "w") as archive:
-            info = tarfile.TarInfo("handler.py")
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
-
-        result = self.scanner.scan(str(archive_path))
-
-        python_checks = [check for check in result.checks if check.name == "Python Archive Member Security"]
-        assert len(python_checks) == 1
-        assert python_checks[0].status == CheckStatus.FAILED
-        assert python_checks[0].details["reason"] == "high-risk calls: subprocess.run"
 
     def test_scan_tar_empty_loop_target_does_not_hide_later_dangerous_call(self, tmp_path: Path) -> None:
         """Loop targets should not unconditionally shadow imports after a maybe-empty loop."""
-        archive_path = tmp_path / "model_bundle.tar"
-        payload = (
-            b"import subprocess\nfor subprocess in ():\n    pass\nsubprocess.run(['echo', 'hidden'], check=False)\n"
+        # type: ignore[attr-defined]
+        self._assert_tar_member_subprocess_call(
+            tmp_path,
+            (b"import subprocess\nfor subprocess in ():\n    pass\nsubprocess.run(['echo', 'hidden'], check=False)\n"),
         )
-
-        with tarfile.open(archive_path, "w") as archive:
-            info = tarfile.TarInfo("handler.py")
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
-
-        result = self.scanner.scan(str(archive_path))
-
-        python_checks = [check for check in result.checks if check.name == "Python Archive Member Security"]
-        assert len(python_checks) == 1
-        assert python_checks[0].status == CheckStatus.FAILED
-        assert python_checks[0].details["reason"] == "high-risk calls: subprocess.run"
 
     def test_scan_tar_nonempty_loop_target_shadows_dangerous_import(self, tmp_path: Path) -> None:
         """Definitely assigned loop targets should shadow imports after the loop."""
         archive_path = tmp_path / "source_bundle.tar"
         payload = b"import subprocess\nfor subprocess in (object(),):\n    pass\nsubprocess.run()\n"
 
-        with tarfile.open(archive_path, "w") as archive:
-            info = tarfile.TarInfo("preprocess.py")
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
-
-        result = self.scanner.scan(str(archive_path))
+        result = self._scan_python_tar_member(archive_path, payload, "preprocess.py")
 
         assert result.success is True
         assert not any(check.name == "Python Archive Member Security" for check in result.checks)
@@ -840,74 +701,39 @@ class TestTarScanner:
 
     def test_scan_tar_conditional_target_does_not_hide_later_dangerous_call(self, tmp_path: Path) -> None:
         """Conditional assignments should not unconditionally shadow later imports."""
-        archive_path = tmp_path / "model_bundle.tar"
-        payload = (
-            b"import subprocess\nif False:\n    subprocess = None\nsubprocess.run(['echo', 'hidden'], check=False)\n"
+        # type: ignore[attr-defined]
+        self._assert_tar_member_subprocess_call(
+            tmp_path,
+            (b"import subprocess\nif False:\n    subprocess = None\nsubprocess.run(['echo', 'hidden'], check=False)\n"),
         )
-
-        with tarfile.open(archive_path, "w") as archive:
-            info = tarfile.TarInfo("handler.py")
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
-
-        result = self.scanner.scan(str(archive_path))
-
-        python_checks = [check for check in result.checks if check.name == "Python Archive Member Security"]
-        assert len(python_checks) == 1
-        assert python_checks[0].status == CheckStatus.FAILED
-        assert python_checks[0].details["reason"] == "high-risk calls: subprocess.run"
 
     def test_scan_tar_conditional_aliases_preserve_dangerous_branch(self, tmp_path: Path) -> None:
         """Ambiguous conditional aliases should preserve any high-risk branch."""
-        archive_path = tmp_path / "model_bundle.tar"
-        payload = (
-            b"if __name__:\n"
-            b"    import subprocess as sp\n"
-            b"else:\n"
-            b"    import os as sp\n"
-            b"sp.run(['echo', 'hidden'], check=False)\n"
+        # type: ignore[attr-defined]
+        self._assert_tar_member_subprocess_call(
+            tmp_path,
+            (
+                b"if __name__:\n"
+                b"    import subprocess as sp\n"
+                b"else:\n"
+                b"    import os as sp\n"
+                b"sp.run(['echo', 'hidden'], check=False)\n"
+            ),
         )
-
-        with tarfile.open(archive_path, "w") as archive:
-            info = tarfile.TarInfo("handler.py")
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
-
-        result = self.scanner.scan(str(archive_path))
-
-        python_checks = [check for check in result.checks if check.name == "Python Archive Member Security"]
-        assert len(python_checks) == 1
-        assert python_checks[0].status == CheckStatus.FAILED
-        assert python_checks[0].details["reason"] == "high-risk calls: subprocess.run"
 
     def test_scan_tar_loop_body_alias_survives_to_later_dangerous_call(self, tmp_path: Path) -> None:
         """Aliases imported in possible loop bodies should remain visible afterward."""
-        archive_path = tmp_path / "model_bundle.tar"
-        payload = b"for _ in (1,):\n    import subprocess as sp\nsp.run(['echo', 'hidden'], check=False)\n"
-
-        with tarfile.open(archive_path, "w") as archive:
-            info = tarfile.TarInfo("handler.py")
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
-
-        result = self.scanner.scan(str(archive_path))
-
-        python_checks = [check for check in result.checks if check.name == "Python Archive Member Security"]
-        assert len(python_checks) == 1
-        assert python_checks[0].status == CheckStatus.FAILED
-        assert python_checks[0].details["reason"] == "high-risk calls: subprocess.run"
+        # type: ignore[attr-defined]
+        self._assert_tar_member_subprocess_call(
+            tmp_path, (b"for _ in (1,):\n    import subprocess as sp\nsp.run(['echo', 'hidden'], check=False)\n")
+        )
 
     def test_scan_tar_marks_malformed_python_member_incomplete(self, tmp_path: Path) -> None:
         """Malformed Python source should fail closed instead of passing as benign."""
         archive_path = tmp_path / "model_bundle.tar"
         payload = b"def handler(:\n    pass\n"
 
-        with tarfile.open(archive_path, "w") as archive:
-            info = tarfile.TarInfo("handler.py")
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
-
-        result = self.scanner.scan(str(archive_path))
+        result = self._scan_python_tar_member(archive_path, payload, "handler.py")
 
         assert result.success is False
         assert result.metadata["analysis_incomplete"] is True
@@ -918,54 +744,40 @@ class TestTarScanner:
         assert python_checks[0].details["entry"] == "handler.py"
         assert python_checks[0].details["analysis_incomplete"] is True
 
-    def test_scan_tar_ignores_benign_python_member(self, tmp_path: Path) -> None:
-        """Benign Python source in generic TAR archives should not produce security findings."""
+    def _assert_benign_tar_python(self, tmp_path: Path, source_bytes: bytes) -> None:
         archive_path = tmp_path / "model_bundle.tar"
-        source = b"def preprocess(value: str) -> str:\n    return value.strip().lower()\n"
+        source = source_bytes
 
-        with tarfile.open(archive_path, "w") as archive:
-            info = tarfile.TarInfo("preprocess.py")
-            info.size = len(source)
-            archive.addfile(info, tarfile.io.BytesIO(source))  # type: ignore[attr-defined]
-
-        result = self.scanner.scan(str(archive_path))
+        result = self._scan_python_tar_member(archive_path, source, "preprocess.py")
 
         assert result.success is True
         assert not any(check.name == "Python Archive Member Security" for check in result.checks)
         assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+    def test_scan_tar_ignores_benign_python_member(self, tmp_path: Path) -> None:
+        """Benign Python source in generic TAR archives should not produce security findings."""
+        self._assert_benign_tar_python(
+            tmp_path, (b"def preprocess(value: str) -> str:\n    return value.strip().lower()\n")
+        )
 
     def test_scan_tar_ignores_benign_python_file_operations(self, tmp_path: Path) -> None:
         """Ordinary source file I/O should not be reported as active payload code."""
-        archive_path = tmp_path / "model_bundle.tar"
-        source = (
-            b"def load_config() -> tuple[str, str]:\n"
-            b"    left = open('config-a.json', encoding='utf-8').read()\n"
-            b"    right = open('config-b.json', encoding='utf-8').read()\n"
-            b"    return left, right\n"
+        self._assert_benign_tar_python(
+            tmp_path,
+            (
+                b"def load_config() -> tuple[str, str]:\n"
+                b"    left = open('config-a.json', encoding='utf-8').read()\n"
+                b"    right = open('config-b.json', encoding='utf-8').read()\n"
+                b"    return left, right\n"
+            ),
         )
-
-        with tarfile.open(archive_path, "w") as archive:
-            info = tarfile.TarInfo("preprocess.py")
-            info.size = len(source)
-            archive.addfile(info, tarfile.io.BytesIO(source))  # type: ignore[attr-defined]
-
-        result = self.scanner.scan(str(archive_path))
-
-        assert result.success is True
-        assert not any(check.name == "Python Archive Member Security" for check in result.checks)
-        assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
     def test_scan_tar_flags_executable_member(self, tmp_path: Path) -> None:
         """TAR archives must surface executable-suffix members for parity with ZIP."""
         archive_path = tmp_path / "model_bundle.tar"
         payload = b"#!/bin/sh\necho hidden\n"
 
-        with tarfile.open(archive_path, "w") as archive:
-            info = tarfile.TarInfo("bin/run.sh")
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
-
-        result = self.scanner.scan(str(archive_path))
+        result = self._scan_python_tar_member(archive_path, payload, "bin/run.sh")
 
         executable_checks = [
             check
@@ -981,12 +793,7 @@ class TestTarScanner:
         archive_path = tmp_path / "model_bundle.tar"
         payload = b"\x7fELF" + b"\x00" * 64
 
-        with tarfile.open(archive_path, "w") as archive:
-            info = tarfile.TarInfo("bin/runme")
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
-
-        result = self.scanner.scan(str(archive_path))
+        result = self._scan_python_tar_member(archive_path, payload, "bin/runme")
 
         executable_checks = [
             check
@@ -1004,12 +811,7 @@ class TestTarScanner:
         payload[:2] = b"MZ"
         payload[0x3C:0x40] = ((1024 * 1024) + 1).to_bytes(4, "little")
 
-        with tarfile.open(archive_path, "w") as archive:
-            info = tarfile.TarInfo("bin/runme")
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
-
-        result = self.scanner.scan(str(archive_path))
+        result = self._scan_python_tar_member(archive_path, payload, "bin/runme")
 
         assert result.success is False
         assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
@@ -1045,12 +847,7 @@ class TestTarScanner:
         archive_path = tmp_path / "model_bundle.tar"
         source = source.replace(b"LIBRARY_PATH", repr(str(tmp_path / "libpayload.so")).encode())
 
-        with tarfile.open(archive_path, "w") as archive:
-            info = tarfile.TarInfo("handler.py")
-            info.size = len(source)
-            archive.addfile(info, tarfile.io.BytesIO(source))  # type: ignore[attr-defined]
-
-        result = self.scanner.scan(str(archive_path))
+        result = self._scan_python_tar_member(archive_path, source, "handler.py")
 
         python_checks = [check for check in result.checks if check.name == "Python Archive Member Security"]
         assert len(python_checks) == 1
@@ -1071,12 +868,7 @@ class TestTarScanner:
         """Safe final bindings should not become ctypes or browser findings."""
         archive_path = tmp_path / "model_bundle.tar"
 
-        with tarfile.open(archive_path, "w") as archive:
-            info = tarfile.TarInfo("handler.py")
-            info.size = len(source)
-            archive.addfile(info, tarfile.io.BytesIO(source))  # type: ignore[attr-defined]
-
-        result = self.scanner.scan(str(archive_path))
+        result = self._scan_python_tar_member(archive_path, source, "handler.py")
 
         assert result.success is True
         assert not any(check.name == "Python Archive Member Security" for check in result.checks)
@@ -1392,12 +1184,7 @@ class TestTarScanner:
         archive_path = tmp_path / "proto0_payload.tar"
         payload = b'cos\nsystem\n(S"echo pwned"\ntR.'
 
-        with tarfile.open(archive_path, "w") as archive:
-            info = tarfile.TarInfo("payload.txt")
-            info.size = len(payload)
-            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
-
-        result = self.scanner.scan(str(archive_path))
+        result = self._scan_python_tar_member(archive_path, payload, "payload.txt")
 
         assert result.success is False
         assert result.has_errors is True
@@ -1413,12 +1200,7 @@ class TestTarScanner:
         payload = b'cos\nsystem\n(S"echo tar gzip payload"\ntR.'
         compressed_payload = gzip.compress(payload)
 
-        with tarfile.open(archive_path, "w") as archive:
-            info = tarfile.TarInfo("compressed_payload")
-            info.size = len(compressed_payload)
-            archive.addfile(info, tarfile.io.BytesIO(compressed_payload))  # type: ignore[attr-defined]
-
-        result = self.scanner.scan(str(archive_path))
+        result = self._scan_python_tar_member(archive_path, compressed_payload, "compressed_payload")
 
         assert result.success is False
         assert result.has_errors is True
@@ -1759,52 +1541,14 @@ class TestTarScanner:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        monkeypatch.setattr(file_detection, "_NEMO_ROUTE_MAX_BODY_SKIP_BYTES", 64)
-        archive_path = tmp_path / "large-archive.tar.gz"
-
-        with tarfile.open(archive_path, "w:gz") as archive:
-            first_payload = b"x" * 128
-            first_info = tarfile.TarInfo("large-weights.bin")
-            first_info.size = len(first_payload)
-            archive.addfile(first_info, tarfile.io.BytesIO(first_payload))  # type: ignore[attr-defined]
-
-            config_payload = b"model:\n  _target_: os.system\n"
-            config_info = tarfile.TarInfo("model_config.yaml")
-            config_info.size = len(config_payload)
-            archive.addfile(config_info, tarfile.io.BytesIO(config_payload))  # type: ignore[attr-defined]
-
-        result = core.scan_file(str(archive_path), config={"cache_enabled": False})
-
-        assert result.scanner_name == "tar"
-        assert result.success is False
-        assert any(check.name == "CVE-2025-23304: Dangerous Hydra _target_" for check in result.checks)
-        assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+        _assert_truncated_nemo_tar_route(tmp_path, monkeypatch, ("large-archive.tar.gz"))
 
     def test_compressed_tar_raw_suffix_truncated_nemo_route_scans_reachable_root_config(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        monkeypatch.setattr(file_detection, "_NEMO_ROUTE_MAX_BODY_SKIP_BYTES", 64)
-        archive_path = tmp_path / "large-archive.tar"
-
-        with tarfile.open(archive_path, "w:gz") as archive:
-            first_payload = b"x" * 128
-            first_info = tarfile.TarInfo("large-weights.bin")
-            first_info.size = len(first_payload)
-            archive.addfile(first_info, tarfile.io.BytesIO(first_payload))  # type: ignore[attr-defined]
-
-            config_payload = b"model:\n  _target_: os.system\n"
-            config_info = tarfile.TarInfo("model_config.yaml")
-            config_info.size = len(config_payload)
-            archive.addfile(config_info, tarfile.io.BytesIO(config_payload))  # type: ignore[attr-defined]
-
-        result = core.scan_file(str(archive_path), config={"cache_enabled": False})
-
-        assert result.scanner_name == "tar"
-        assert result.success is False
-        assert any(check.name == "CVE-2025-23304: Dangerous Hydra _target_" for check in result.checks)
-        assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+        _assert_truncated_nemo_tar_route(tmp_path, monkeypatch, ("large-archive.tar"))
 
     def test_compressed_tar_truncated_nemo_route_allows_benign_root_config(
         self,
@@ -1891,7 +1635,7 @@ class TestTarScanner:
         """Aggregate TAR budget should stop extraction without decompressing oversized member bodies."""
         archive_path = tmp_path / "bounded-body.tar.gz"
         payload = b"\0" * (32 * 1024 * 1024)
-        gzip_read_bytes = 0
+        gzip_read_bytes = [0]
         original_read = gzip.GzipFile.read
 
         with tarfile.open(archive_path, "w:gz") as archive:
@@ -1899,11 +1643,7 @@ class TestTarScanner:
             info.size = len(payload)
             archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
 
-        def tracked_read(self: gzip.GzipFile, size: int = -1) -> bytes:
-            nonlocal gzip_read_bytes
-            data = original_read(self, size)
-            gzip_read_bytes += len(data)
-            return data
+        tracked_read = _track_read_bytes(original_read, gzip_read_bytes)
 
         monkeypatch.setattr(gzip.GzipFile, "read", tracked_read)
 
@@ -1920,7 +1660,7 @@ class TestTarScanner:
 
         aggregate_checks = [check for check in result.checks if check.name == "TAR Aggregate Size Limit Check"]
         assert result.success is False
-        assert gzip_read_bytes <= 64 * 1024
+        assert gzip_read_bytes[0] <= 64 * 1024
         assert any(check.status == CheckStatus.FAILED for check in aggregate_checks)
         assert "tar_total_size_limit_exceeded" in result.metadata["scan_outcome_reasons"]
         assert "max_file_read_size_exceeded" not in result.metadata["scan_outcome_reasons"]
@@ -1931,7 +1671,7 @@ class TestTarScanner:
         """Large extension headers should fail closed before tarfile allocates their content."""
         archive_path = tmp_path / "oversized-pax.tar.gz"
         long_name = "pax-" + ("a" * (8 * 1024 * 1024))
-        gzip_read_bytes = 0
+        gzip_read_bytes = [0]
         original_read = gzip.GzipFile.read
 
         with tarfile.open(archive_path, "w:gz", format=tarfile.PAX_FORMAT) as archive:
@@ -1939,11 +1679,7 @@ class TestTarScanner:
             info.size = 0
             archive.addfile(info, tarfile.io.BytesIO(b""))  # type: ignore[attr-defined]
 
-        def tracked_read(self: gzip.GzipFile, size: int = -1) -> bytes:
-            nonlocal gzip_read_bytes
-            data = original_read(self, size)
-            gzip_read_bytes += len(data)
-            return data
+        tracked_read = _track_read_bytes(original_read, gzip_read_bytes)
 
         monkeypatch.setattr(gzip.GzipFile, "read", tracked_read)
 
@@ -1958,7 +1694,7 @@ class TestTarScanner:
 
         stream_checks = [check for check in result.checks if check.name == "TAR Stream Budget"]
         assert result.success is False
-        assert gzip_read_bytes <= 64 * 1024
+        assert gzip_read_bytes[0] <= 64 * 1024
         assert len(stream_checks) == 1
         assert stream_checks[0].status == CheckStatus.FAILED
         assert stream_checks[0].details["scan_outcome_reason"] == "tar_metadata_read_limit_exceeded"
@@ -2288,14 +2024,10 @@ class TestTarScanner:
             later_info.size = len(malicious_payload)
             archive.addfile(later_info, tarfile.io.BytesIO(malicious_payload))  # type: ignore[attr-defined]
 
-        bytes_read = 0
+        bytes_read = [0]
         original_read = tar_scanner_module._TarBoundedStream.read
 
-        def tracked_read(self: Any, size: int = -1) -> bytes:
-            nonlocal bytes_read
-            data = original_read(self, size)
-            bytes_read += len(data)
-            return data
+        tracked_read = _track_read_bytes(original_read, bytes_read)
 
         monkeypatch.setattr(tar_scanner_module._TarBoundedStream, "read", tracked_read)
 
@@ -2307,7 +2039,7 @@ class TestTarScanner:
         assert any(entry["path"].endswith("payload.bin") for entry in contents)
         assert any(entry["path"].endswith("payload.txt") for entry in contents)
         assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
-        assert len(payload) <= bytes_read <= max_decompressed_bytes
+        assert len(payload) <= bytes_read[0] <= max_decompressed_bytes
         aggregate_checks = [check for check in result.checks if check.name == "TAR Aggregate Size Limit Check"]
         assert any(check.status == CheckStatus.PASSED for check in aggregate_checks)
 
@@ -2691,20 +2423,7 @@ class TestTarScanner:
             while archive.next() is not None:
                 pass
 
-            class CountingReader:
-                def __init__(self, fileobj: BinaryIO) -> None:
-                    self.fileobj = fileobj
-                    self.bytes_read = 0
-
-                def read(self, size: int = -1) -> bytes:
-                    data = self.fileobj.read(size)
-                    self.bytes_read += len(data)
-                    return data
-
-                def __getattr__(self, name: str) -> Any:
-                    return getattr(self.fileobj, name)
-
-            fileobj = CountingReader(cast(BinaryIO, archive.fileobj))
+            fileobj = _CountingReader(cast(BinaryIO, archive.fileobj))
             archive.fileobj = cast(Any, fileobj)
             tail_end = archive_path.stat().st_size
 
@@ -3434,24 +3153,11 @@ class TestTarScanner:
             archive_file.seek(padding_size - 1, os.SEEK_CUR)
             archive_file.write(b"\0")
 
-        class CountingReader:
-            def __init__(self, fileobj: BinaryIO) -> None:
-                self.fileobj = fileobj
-                self.bytes_read = 0
-
-            def read(self, size: int = -1) -> bytes:
-                data = self.fileobj.read(size)
-                self.bytes_read += len(data)
-                return data
-
-            def __getattr__(self, name: str) -> Any:
-                return getattr(self.fileobj, name)
-
-        readers: list[CountingReader] = []
+        readers: list[_CountingReader] = []
         original_init = tar_scanner_module._StrictConcatenatedDecompressionReader.__init__
 
         def tracked_init(reader: Any, fileobj: BinaryIO, **kwargs: Any) -> None:
-            counting_reader = CountingReader(fileobj)
+            counting_reader = _CountingReader(fileobj)
             readers.append(counting_reader)
             original_init(reader, cast(BinaryIO, counting_reader), **kwargs)
 
@@ -3593,12 +3299,7 @@ class TestTarScanner:
             info.size = len(payload)
             archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
 
-        def nested_scan(_path: str, _config: dict[str, Any]) -> ScanResult:
-            nested_result = ScanResult(scanner_name="test_nested")
-            nested_result.finish(success=False)
-            return nested_result
-
-        scan_kwargs: dict[str, Any] = {NESTED_SCAN_CALLBACK_CONFIG_KEY: nested_scan}
+        scan_kwargs: dict[str, Any] = {NESTED_SCAN_CALLBACK_CONFIG_KEY: scan_nested_unsuccessful}
         audit_result = core.scan_model_directory_or_file(
             str(archive_path),
             cache_enabled=False,
@@ -3619,18 +3320,6 @@ class TestTarScanner:
             info = tarfile.TarInfo("model.pkl")
             info.size = len(payload)
             archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
-
-        def nested_scan(path: str, _config: dict[str, Any]) -> ScanResult:
-            nested_result = ScanResult(scanner_name="test_nested")
-            nested_result.add_check(
-                name="Nested Critical Finding",
-                passed=False,
-                message="Nested member is malicious",
-                severity=IssueSeverity.CRITICAL,
-                location=path,
-            )
-            nested_result.finish(success=False)
-            return nested_result
 
         result = TarScanner(config={NESTED_SCAN_CALLBACK_CONFIG_KEY: nested_scan}).scan(str(archive_path))
 
@@ -3732,14 +3421,10 @@ class TestTarScanner:
         archive_path.write_bytes(
             gzip.compress(_old_gnu_sparse_tar_bytes(extension_blocks=0, physical_size=physical_size))
         )
-        bytes_read = 0
+        bytes_read = [0]
         original_read = tar_scanner_module._TarBoundedStream.read
 
-        def tracked_read(self: Any, size: int = -1) -> bytes:
-            nonlocal bytes_read
-            data = original_read(self, size)
-            bytes_read += len(data)
-            return data
+        tracked_read = _track_read_bytes(original_read, bytes_read)
 
         monkeypatch.setattr(tar_scanner_module._TarBoundedStream, "read", tracked_read)
 
@@ -3756,7 +3441,7 @@ class TestTarScanner:
         assert any(check.status == CheckStatus.FAILED for check in aggregate_checks)
         assert not any(check.status == CheckStatus.PASSED for check in aggregate_checks)
         assert result.metadata["archive_uncompressed_size"] >= physical_size
-        assert bytes_read < physical_size
+        assert bytes_read[0] < physical_size
 
     def test_truncated_route_scans_config_reached_through_ancestor_symlink(
         self,
@@ -3863,13 +3548,9 @@ class TestTarScanner:
         assert "nemo_link_semantics_incomplete" in result.metadata["scan_outcome_reasons"]
 
     def test_empty_tar_prefix_does_not_hide_malicious_zip(self, tmp_path: Path) -> None:
-        class DangerousPayload:
-            def __reduce__(self) -> tuple[Any, tuple[str]]:
-                return (os.system, ("echo tar-prefix-zip",))
-
         zip_path = tmp_path / "payload.zip"
         with zipfile.ZipFile(zip_path, "w") as archive:
-            archive.writestr("data.pkl", pickle.dumps(DangerousPayload()))
+            archive.writestr("data.pkl", pickle.dumps(SystemCommandPayload("echo tar-prefix-zip", lambda: os.system)))
 
         polyglot_path = tmp_path / "payload.tar"
         payload = (b"\0" * 1024) + zip_path.read_bytes()
@@ -3918,3 +3599,49 @@ class TestTarScanner:
         assert result.scanner_name == "nemo"
         assert result.success is False
         assert any(check.name == "CVE-2025-23304: Dangerous Hydra _target_" for check in result.checks)
+
+
+def _track_read_bytes(original_read: Callable[..., bytes], bytes_read: list[int]) -> Callable[..., bytes]:
+    def tracked_read(self: Any, size: int = -1) -> bytes:
+        data = original_read(self, size)
+        bytes_read[0] += len(data)
+        return data
+
+    return tracked_read
+
+
+class _CountingReader:
+    def __init__(self, fileobj: BinaryIO) -> None:
+        self.fileobj = fileobj
+        self.bytes_read = 0
+
+    def read(self, size: int = -1) -> bytes:
+        data = self.fileobj.read(size)
+        self.bytes_read += len(data)
+        return data
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.fileobj, name)
+
+
+def _assert_truncated_nemo_tar_route(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, filename: str) -> None:
+    monkeypatch.setattr(file_detection, "_NEMO_ROUTE_MAX_BODY_SKIP_BYTES", 64)
+    archive_path = tmp_path / filename
+
+    with tarfile.open(archive_path, "w:gz") as archive:
+        first_payload = b"x" * 128
+        first_info = tarfile.TarInfo("large-weights.bin")
+        first_info.size = len(first_payload)
+        archive.addfile(first_info, tarfile.io.BytesIO(first_payload))  # type: ignore[attr-defined]
+
+        config_payload = b"model:\n  _target_: os.system\n"
+        config_info = tarfile.TarInfo("model_config.yaml")
+        config_info.size = len(config_payload)
+        archive.addfile(config_info, tarfile.io.BytesIO(config_payload))  # type: ignore[attr-defined]
+
+    result = core.scan_file(str(archive_path), config={"cache_enabled": False})
+
+    assert result.scanner_name == "tar"
+    assert result.success is False
+    assert any(check.name == "CVE-2025-23304: Dangerous Hydra _target_" for check in result.checks)
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)

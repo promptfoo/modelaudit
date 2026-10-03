@@ -1,10 +1,12 @@
 """Tests for weak hash algorithm detection (Requirement 28: Hash Collisions or Weak Hashes)."""
 
 import json
+from pathlib import Path
+from typing import cast
 
 import pytest
 
-from modelaudit.scanners.base import CheckStatus
+from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.scanners.manifest_scanner import HASH_INTEGRITY_KEYS, HEX_PATTERN, ManifestScanner
 
 
@@ -52,37 +54,13 @@ class TestWeakHashDetection:
 
     def test_md5_hash_detected(self, scanner, tmp_path):
         """Test that MD5 hashes are detected as weak."""
-        config_file = tmp_path / "config.json"
-        config_content = {
-            "model_type": "bert",
-            "checksum": "d41d8cd98f00b204e9800998ecf8427e",  # MD5 (32 chars)
-        }
-        config_file.write_text(json.dumps(config_content))
-
-        result = scanner.scan(str(config_file))
-
-        weak_hash_checks = [c for c in result.checks if c.name == "Weak Hash Detection"]
-        assert len(weak_hash_checks) == 1
-        assert weak_hash_checks[0].status == CheckStatus.FAILED
-        assert weak_hash_checks[0].severity.name == "WARNING"
-        assert weak_hash_checks[0].details["algorithm"] == "MD5"
+        # MD5 (32 chars)
+        _assert_weak_hash_algorithm(scanner, tmp_path, "checksum", "d41d8cd98f00b204e9800998ecf8427e", "MD5")
 
     def test_sha1_hash_detected(self, scanner, tmp_path):
         """Test that SHA1 hashes are detected as weak."""
-        config_file = tmp_path / "config.json"
-        config_content = {
-            "model_type": "bert",
-            "file_hash": "da39a3ee5e6b4b0d3255bfef95601890afd80709",  # SHA1 (40 chars)
-        }
-        config_file.write_text(json.dumps(config_content))
-
-        result = scanner.scan(str(config_file))
-
-        weak_hash_checks = [c for c in result.checks if c.name == "Weak Hash Detection"]
-        assert len(weak_hash_checks) == 1
-        assert weak_hash_checks[0].status == CheckStatus.FAILED
-        assert weak_hash_checks[0].severity.name == "WARNING"
-        assert weak_hash_checks[0].details["algorithm"] == "SHA1"
+        # SHA1 (40 chars)
+        _assert_weak_hash_algorithm(scanner, tmp_path, "file_hash", "da39a3ee5e6b4b0d3255bfef95601890afd80709", "SHA1")
 
     def test_sha256_hash_not_flagged_as_weak(self, scanner, tmp_path):
         """Test that SHA256 hashes are NOT flagged as weak."""
@@ -124,32 +102,12 @@ class TestWeakHashDetection:
 
     def test_non_hash_key_not_checked(self, scanner, tmp_path):
         """Test that non-hash keys with 32-char values are NOT flagged."""
-        config_file = tmp_path / "config.json"
-        config_content = {
-            "model_type": "bert",
-            # This is 32 chars but 'id' is not a hash key
-            "id": "d41d8cd98f00b204e9800998ecf8427e",
-        }
-        config_file.write_text(json.dumps(config_content))
-
-        result = scanner.scan(str(config_file))
-
-        weak_hash_checks = [c for c in result.checks if c.name == "Weak Hash Detection"]
-        assert len(weak_hash_checks) == 0
+        # This is 32 chars but 'id' is not a hash key
+        _assert_unrecognized_hash_value(scanner, tmp_path, "id", "d41d8cd98f00b204e9800998ecf8427e")
 
     def test_non_hex_value_not_checked(self, scanner, tmp_path):
         """Test that non-hex values in hash keys are not flagged."""
-        config_file = tmp_path / "config.json"
-        config_content = {
-            "model_type": "bert",
-            "checksum": "this-is-not-a-valid-hex-string!",
-        }
-        config_file.write_text(json.dumps(config_content))
-
-        result = scanner.scan(str(config_file))
-
-        weak_hash_checks = [c for c in result.checks if c.name == "Weak Hash Detection"]
-        assert len(weak_hash_checks) == 0
+        _assert_unrecognized_hash_value(scanner, tmp_path, "checksum", "this-is-not-a-valid-hex-string!")
 
     def test_nested_hash_detection(self, scanner, tmp_path):
         """Test that weak hashes in nested structures are detected."""
@@ -318,3 +276,36 @@ class TestEdgeCases:
         ]
         assert len(weak_hash_checks) == 1
         assert weak_hash_checks[0].details["algorithm"] == "MD5"
+
+
+def _assert_weak_hash_algorithm(
+    scanner: ManifestScanner, tmp_path: Path, case_key: str, case_value: str, case_algorithm: str
+) -> None:
+    config_file = tmp_path / "config.json"
+    config_content = {
+        "model_type": "bert",
+        case_key: case_value,
+    }
+    config_file.write_text(json.dumps(config_content))
+
+    result = scanner.scan(str(config_file))
+
+    weak_hash_checks = [c for c in result.checks if c.name == "Weak Hash Detection"]
+    assert len(weak_hash_checks) == 1
+    assert weak_hash_checks[0].status == CheckStatus.FAILED
+    assert cast(IssueSeverity, weak_hash_checks[0].severity).name == "WARNING"
+    assert weak_hash_checks[0].details["algorithm"] == case_algorithm
+
+
+def _assert_unrecognized_hash_value(scanner: ManifestScanner, tmp_path: Path, case_key: str, case_value: str) -> None:
+    config_file = tmp_path / "config.json"
+    config_content = {
+        "model_type": "bert",
+        case_key: case_value,
+    }
+    config_file.write_text(json.dumps(config_content))
+
+    result = scanner.scan(str(config_file))
+
+    weak_hash_checks = [c for c in result.checks if c.name == "Weak Hash Detection"]
+    assert len(weak_hash_checks) == 0

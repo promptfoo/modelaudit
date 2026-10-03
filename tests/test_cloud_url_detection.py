@@ -1,10 +1,13 @@
 """Tests for cloud storage URL detection (Requirement 19: External Resource References)."""
 
 import json
+from pathlib import Path
+from typing import cast
 
 import pytest
 
 from modelaudit.detectors.network_comm import NetworkCommDetector
+from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.manifest_scanner import CLOUD_STORAGE_PATTERNS, ManifestScanner
 
 
@@ -183,27 +186,11 @@ class TestManifestScannerCloudUrls:
 
     def test_cloud_url_detection_severity_info(self, scanner, tmp_path):
         """Test that normal cloud URLs get INFO severity."""
-        config_file = tmp_path / "config.json"
-        config_content = {"weights_url": "s3://legitimate-bucket/model.bin"}
-        config_file.write_text(json.dumps(config_content))
-
-        result = scanner.scan(str(config_file))
-
-        cloud_checks = [c for c in result.checks if c.name == "Cloud Storage URL Detection"]
-        assert len(cloud_checks) == 1
-        assert cloud_checks[0].severity.name == "INFO"
+        _assert_cloud_url_severity(scanner, tmp_path, "s3://legitimate-bucket/model.bin", "INFO")
 
     def test_suspicious_cloud_url_severity_warning(self, scanner, tmp_path):
         """Test that suspicious cloud URLs get WARNING severity."""
-        config_file = tmp_path / "config.json"
-        config_content = {"weights_url": "s3://malware-bucket/exploit.bin"}
-        config_file.write_text(json.dumps(config_content))
-
-        result = scanner.scan(str(config_file))
-
-        cloud_checks = [c for c in result.checks if c.name == "Cloud Storage URL Detection"]
-        assert len(cloud_checks) == 1
-        assert cloud_checks[0].severity.name == "WARNING"
+        _assert_cloud_url_severity(scanner, tmp_path, "s3://malware-bucket/exploit.bin", "WARNING")
 
     def test_no_cloud_urls_no_findings(self, scanner, tmp_path):
         """Test that configs without cloud URLs don't produce findings."""
@@ -258,3 +245,15 @@ class TestCloudStoragePatternsCompleteness:
 
         for pattern, description, _provider in CLOUD_STORAGE_PATTERNS:
             assert isinstance(pattern, re.Pattern), f"Pattern for {description} is not compiled"
+
+
+def _assert_cloud_url_severity(scanner: ManifestScanner, tmp_path: Path, case_url: str, case_severity: str) -> None:
+    config_file = tmp_path / "config.json"
+    config_content = {"weights_url": case_url}
+    config_file.write_text(json.dumps(config_content))
+
+    result = scanner.scan(str(config_file))
+
+    cloud_checks = [c for c in result.checks if c.name == "Cloud Storage URL Detection"]
+    assert len(cloud_checks) == 1
+    assert cast(IssueSeverity, cloud_checks[0].severity).name == case_severity

@@ -15,6 +15,7 @@ from modelaudit.scanners.keras_utils import (
     find_lambda_dangerous_patterns,
     is_known_safe_keras_layer_class,
 )
+from tests.helpers.text import LowerCountingText as _LowerCountingText
 
 
 @pytest.mark.parametrize(
@@ -125,19 +126,6 @@ def test_h5_lambda_module_reference_redaction_preserves_severity() -> None:
     assert safe_module_checks[0].severity == IssueSeverity.WARNING
     assert safe_module_checks[0].details["allowlist_status"] == "not_allowlisted"
     assert not any(check.severity == IssueSeverity.CRITICAL for check in safe_module_checks)
-
-
-class _LowerCountingText(str):
-    lower_calls: int
-
-    def __new__(cls, value: str) -> "_LowerCountingText":
-        instance = super().__new__(cls, value)
-        instance.lower_calls = 0
-        return instance
-
-    def lower(self) -> str:
-        self.lower_calls += 1
-        return super().lower()
 
 
 def test_find_case_insensitive_substrings_reuses_lowered_text() -> None:

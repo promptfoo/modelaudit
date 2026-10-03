@@ -1,51 +1,15 @@
 from pathlib import Path
-from typing import Any
 from unittest.mock import patch
 
 import pytest
 
-from modelaudit.cache import get_cache_manager, reset_cache_manager
+from modelaudit.cache import reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME
 from modelaudit.scanners import pmml_scanner as pmml_scanner_module
-from modelaudit.scanners.base import CheckStatus, IssueSeverity
+from modelaudit.scanners.base import CheckStatus, Issue, IssueSeverity, ScanResult
 from modelaudit.scanners.pmml_scanner import PmmlScanner
-
-
-def _assert_inconclusive_aggregate_not_cached(
-    path: Path,
-    expected_reason: str,
-    cache_dir: Path,
-    **scan_kwargs: Any,
-) -> None:
-    reset_cache_manager()
-    try:
-        first = scan_model_directory_or_file(
-            str(path),
-            cache_enabled=True,
-            cache_dir=str(cache_dir),
-            min_cache_file_size=0,
-            **scan_kwargs,
-        )
-        second = scan_model_directory_or_file(
-            str(path),
-            cache_enabled=True,
-            cache_dir=str(cache_dir),
-            min_cache_file_size=0,
-            **scan_kwargs,
-        )
-
-        for aggregate in (first, second):
-            metadata = aggregate.file_metadata[str(path)]
-            assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-            assert expected_reason in metadata["scan_outcome_reasons"]
-            assert not [
-                issue for issue in aggregate.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
-            ]
-            assert determine_exit_code(aggregate) == 2
-        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
+from tests.helpers.cache import assert_inconclusive_not_cached as _assert_inconclusive_aggregate_not_cached
 
 
 def test_pmml_scanner_basic(tmp_path: Path) -> None:
@@ -76,9 +40,7 @@ def test_pmml_scanner_xxe(tmp_path: Path) -> None:
   </Header>
 </PMML>"""
     path = tmp_path / "evil.pmml"
-    path.write_text(pmml, encoding="utf-8")
-
-    result = PmmlScanner().scan(str(path))
+    result = _scan_pmml_fixture(path, pmml)
     messages = [i.message.lower() for i in result.issues]
     assert result.success is False
     assert any("doctype" in m or "entity" in m for m in messages)
@@ -197,9 +159,7 @@ def test_pmml_scanner_suspicious_extension_content(tmp_path: Path) -> None:
   </Header>
 </PMML>"""
     path = tmp_path / "suspicious.pmml"
-    path.write_text(pmml, encoding="utf-8")
-
-    result = PmmlScanner().scan(str(path))
+    result = _scan_pmml_fixture(path, pmml)
     assert result.success
 
     # Should detect suspicious patterns
@@ -221,9 +181,7 @@ def test_pmml_scanner_benign_ecosystem_call_is_not_flagged(tmp_path: Path) -> No
   <DataDictionary numberOfFields='0'/>
 </PMML>"""
     path = tmp_path / "ecosystem.pmml"
-    path.write_text(pmml, encoding="utf-8")
-
-    result = PmmlScanner().scan(str(path))
+    result = _scan_pmml_fixture(path, pmml)
 
     assert result.success is True
     assert not any(issue.details.get("pattern") == r"\bsystem\s*\(" for issue in result.issues)
@@ -238,9 +196,7 @@ def test_pmml_scanner_system_call_is_flagged(tmp_path: Path) -> None:
   <DataDictionary numberOfFields='0'/>
 </PMML>"""
     path = tmp_path / "system_call.pmml"
-    path.write_text(pmml, encoding="utf-8")
-
-    result = PmmlScanner().scan(str(path))
+    result = _scan_pmml_fixture(path, pmml)
 
     assert result.success is True
     assert any(issue.details.get("pattern") == r"\bsystem\s*\(" for issue in result.issues)
@@ -255,9 +211,7 @@ def test_pmml_scanner_mixed_case_system_call_is_flagged(tmp_path: Path) -> None:
   <DataDictionary numberOfFields='0'/>
 </PMML>"""
     path = tmp_path / "mixed_case_system_call.pmml"
-    path.write_text(pmml, encoding="utf-8")
-
-    result = PmmlScanner().scan(str(path))
+    result = _scan_pmml_fixture(path, pmml)
 
     assert result.success is True
     assert any(issue.details.get("pattern") == r"\bsystem\s*\(" for issue in result.issues)
@@ -274,9 +228,7 @@ def test_pmml_scanner_namespaced_extension_content(tmp_path: Path) -> None:
   </Header>
 </PMML>"""
     path = tmp_path / "namespaced_suspicious.pmml"
-    path.write_text(pmml, encoding="utf-8")
-
-    result = PmmlScanner().scan(str(path))
+    result = _scan_pmml_fixture(path, pmml)
 
     assert result.success is True
     assert any("Suspicious XML element found" in issue.message for issue in result.issues)
@@ -292,9 +244,7 @@ def test_pmml_scanner_benign_subprocess_prose_is_not_flagged(tmp_path: Path) -> 
   <DataDictionary numberOfFields='0'/>
 </PMML>"""
     path = tmp_path / "subprocess_metrics.pmml"
-    path.write_text(pmml, encoding="utf-8")
-
-    result = PmmlScanner().scan(str(path))
+    result = _scan_pmml_fixture(path, pmml)
 
     assert result.success is True
     assert not any(
@@ -320,9 +270,7 @@ def test_pmml_scanner_code_shaped_subprocess_extension_is_flagged(tmp_path: Path
   <DataDictionary numberOfFields='0'/>
 </PMML>"""
     path = tmp_path / "subprocess_code.pmml"
-    path.write_text(pmml, encoding="utf-8")
-
-    result = PmmlScanner().scan(str(path))
+    result = _scan_pmml_fixture(path, pmml)
 
     assert result.success is True
     assert any(
@@ -348,9 +296,7 @@ def test_pmml_scanner_subprocess_getoutput_call_is_flagged_without_import(
   <DataDictionary numberOfFields='0'/>
 </PMML>"""
     path = tmp_path / "subprocess_getoutput.pmml"
-    path.write_text(pmml, encoding="utf-8")
-
-    result = PmmlScanner().scan(str(path))
+    result = _scan_pmml_fixture(path, pmml)
 
     assert result.success is True
     assert any(
@@ -370,9 +316,7 @@ def test_pmml_scanner_importlib_subprocess_call_is_flagged(tmp_path: Path) -> No
   <DataDictionary numberOfFields='0'/>
 </PMML>"""
     path = tmp_path / "importlib_subprocess.pmml"
-    path.write_text(pmml, encoding="utf-8")
-
-    result = PmmlScanner().scan(str(path))
+    result = _scan_pmml_fixture(path, pmml)
 
     assert result.success is True
     assert any(
@@ -396,9 +340,7 @@ def test_pmml_scanner_external_references(tmp_path: Path) -> None:
   </DataDictionary>
 </PMML>"""
     path = tmp_path / "external_refs.pmml"
-    path.write_text(pmml, encoding="utf-8")
-
-    result = PmmlScanner().scan(str(path))
+    result = _scan_pmml_fixture(path, pmml)
     assert result.success
 
     # Should detect external references
@@ -418,9 +360,7 @@ def test_pmml_scanner_documentation_urls_are_not_external_resources(tmp_path: Pa
   <DataDictionary numberOfFields='0'/>
 </PMML>"""
     path = tmp_path / "documented.pmml"
-    path.write_text(pmml, encoding="utf-8")
-
-    result = PmmlScanner().scan(str(path))
+    result = _scan_pmml_fixture(path, pmml)
 
     assert result.success is True
     assert not any(check.name == "External Resource Reference Check" for check in result.checks)
@@ -440,9 +380,7 @@ def test_pmml_scanner_standard_namespaced_documentation_urls_are_not_external_re
   <DataDictionary numberOfFields='0'/>
 </PMML>"""
     path = tmp_path / "namespaced_documented.pmml"
-    path.write_text(pmml, encoding="utf-8")
-
-    result = PmmlScanner().scan(str(path))
+    result = _scan_pmml_fixture(path, pmml)
 
     assert result.success is True
     assert not any(check.name == "External Resource Reference Check" for check in result.checks)
@@ -461,9 +399,7 @@ def test_pmml_scanner_mixed_case_documentation_attrs_are_not_external_resources(
   <DataDictionary numberOfFields='0'/>
 </PMML>"""
     path = tmp_path / "mixed_case_documentation_attrs.pmml"
-    path.write_text(pmml, encoding="utf-8")
-
-    result = PmmlScanner().scan(str(path))
+    result = _scan_pmml_fixture(path, pmml)
 
     assert result.success is True
     assert not any(check.name == "External Resource Reference Check" for check in result.checks)
@@ -480,13 +416,9 @@ def test_pmml_scanner_unrecognized_root_namespace_documentation_urls_warn(tmp_pa
   <DataDictionary numberOfFields='0'/>
 </PMML>"""
     path = tmp_path / "unrecognized_namespace_documented.pmml"
-    path.write_text(pmml, encoding="utf-8")
+    result = _scan_pmml_fixture(path, pmml)
 
-    result = PmmlScanner().scan(str(path))
-
-    external_issues = [issue for issue in result.issues if "external resource" in issue.message.lower()]
-    assert external_issues
-    assert all(issue.severity == IssueSeverity.WARNING for issue in external_issues)
+    external_issues = _external_resource_issues(result)
 
 
 def test_pmml_scanner_unrecognized_root_namespace_documentation_attributes_warn(tmp_path: Path) -> None:
@@ -497,13 +429,9 @@ def test_pmml_scanner_unrecognized_root_namespace_documentation_attributes_warn(
   <DataDictionary numberOfFields='0'/>
 </PMML>"""
     path = tmp_path / "unrecognized_namespace_documentation_attribute.pmml"
-    path.write_text(pmml, encoding="utf-8")
+    result = _scan_pmml_fixture(path, pmml)
 
-    result = PmmlScanner().scan(str(path))
-
-    external_issues = [issue for issue in result.issues if "external resource" in issue.message.lower()]
-    assert external_issues
-    assert all(issue.severity == IssueSeverity.WARNING for issue in external_issues)
+    external_issues = _external_resource_issues(result)
     assert any(str(issue.details.get("attribute", "")).endswith("description") for issue in external_issues)
 
 
@@ -517,13 +445,9 @@ def test_pmml_scanner_non_pmml_root_documentation_urls_warn(tmp_path: Path) -> N
   </Header>
 </ModelPackage>"""
     path = tmp_path / "non_pmml_root_documentation.pmml"
-    path.write_text(pmml, encoding="utf-8")
+    result = _scan_pmml_fixture(path, pmml)
 
-    result = PmmlScanner().scan(str(path))
-
-    external_issues = [issue for issue in result.issues if "external resource" in issue.message.lower()]
-    assert external_issues
-    assert all(issue.severity == IssueSeverity.WARNING for issue in external_issues)
+    external_issues = _external_resource_issues(result)
     assert any(issue.details.get("context") == "text" for issue in external_issues)
     assert any(str(issue.details.get("attribute", "")).endswith("description") for issue in external_issues)
     assert any(str(issue.details.get("attribute", "")).endswith("reference") for issue in external_issues)
@@ -539,13 +463,9 @@ def test_pmml_scanner_namespaced_application_reference_still_warns(tmp_path: Pat
   <DataDictionary numberOfFields='0'/>
 </PMML>"""
     path = tmp_path / "namespaced_application_reference.pmml"
-    path.write_text(pmml, encoding="utf-8")
+    result = _scan_pmml_fixture(path, pmml)
 
-    result = PmmlScanner().scan(str(path))
-
-    external_issues = [issue for issue in result.issues if "external resource" in issue.message.lower()]
-    assert external_issues
-    assert all(issue.severity == IssueSeverity.WARNING for issue in external_issues)
+    external_issues = _external_resource_issues(result)
     assert any(str(issue.details.get("attribute", "")).endswith("}reference") for issue in external_issues)
 
 
@@ -560,9 +480,7 @@ def test_pmml_scanner_documentation_file_urls_still_warn(tmp_path: Path) -> None
   <DataDictionary numberOfFields='0'/>
 </PMML>"""
     path = tmp_path / "documented_file_refs.pmml"
-    path.write_text(pmml, encoding="utf-8")
-
-    result = PmmlScanner().scan(str(path))
+    result = _scan_pmml_fixture(path, pmml)
 
     external_issues = [issue for issue in result.issues if "external resource" in issue.message.lower()]
     assert external_issues
@@ -580,13 +498,9 @@ def test_pmml_scanner_resource_url_attributes_still_warn(tmp_path: Path) -> None
   </DataDictionary>
 </PMML>"""
     path = tmp_path / "resource_attr.pmml"
-    path.write_text(pmml, encoding="utf-8")
+    result = _scan_pmml_fixture(path, pmml)
 
-    result = PmmlScanner().scan(str(path))
-
-    external_issues = [issue for issue in result.issues if "external resource" in issue.message.lower()]
-    assert external_issues
-    assert all(issue.severity == IssueSeverity.WARNING for issue in external_issues)
+    external_issues = _external_resource_issues(result)
     assert any(issue.details.get("attribute") == "source" for issue in external_issues)
 
 
@@ -600,13 +514,9 @@ def test_pmml_scanner_non_documentation_reference_attribute_still_warns(tmp_path
   </DataDictionary>
 </PMML>"""
     path = tmp_path / "reference_attr.pmml"
-    path.write_text(pmml, encoding="utf-8")
+    result = _scan_pmml_fixture(path, pmml)
 
-    result = PmmlScanner().scan(str(path))
-
-    external_issues = [issue for issue in result.issues if "external resource" in issue.message.lower()]
-    assert external_issues
-    assert all(issue.severity == IssueSeverity.WARNING for issue in external_issues)
+    external_issues = _external_resource_issues(result)
     assert any(issue.details.get("attribute") == "reference" for issue in external_issues)
 
 
@@ -622,13 +532,9 @@ def test_pmml_scanner_application_reference_outside_header_still_warns(tmp_path:
   </DataDictionary>
 </PMML>"""
     path = tmp_path / "application_reference_outside_header.pmml"
-    path.write_text(pmml, encoding="utf-8")
+    result = _scan_pmml_fixture(path, pmml)
 
-    result = PmmlScanner().scan(str(path))
-
-    external_issues = [issue for issue in result.issues if "external resource" in issue.message.lower()]
-    assert external_issues
-    assert all(issue.severity == IssueSeverity.WARNING for issue in external_issues)
+    external_issues = _external_resource_issues(result)
     assert any(issue.details.get("attribute") == "reference" for issue in external_issues)
 
 
@@ -642,13 +548,9 @@ def test_pmml_scanner_namespaced_resource_url_attributes_warn(tmp_path: Path) ->
   </DataDictionary>
 </PMML>"""
     path = tmp_path / "namespaced_resource_attr.pmml"
-    path.write_text(pmml, encoding="utf-8")
+    result = _scan_pmml_fixture(path, pmml)
 
-    result = PmmlScanner().scan(str(path))
-
-    external_issues = [issue for issue in result.issues if "external resource" in issue.message.lower()]
-    assert external_issues
-    assert all(issue.severity == IssueSeverity.WARNING for issue in external_issues)
+    external_issues = _external_resource_issues(result)
     assert any(str(issue.details.get("attribute", "")).endswith("}href") for issue in external_issues)
 
 
@@ -662,13 +564,9 @@ def test_pmml_scanner_schema_location_urls_warn(tmp_path: Path) -> None:
   <DataDictionary numberOfFields='0'/>
 </PMML>"""
     path = tmp_path / "schema_location.pmml"
-    path.write_text(pmml, encoding="utf-8")
+    result = _scan_pmml_fixture(path, pmml)
 
-    result = PmmlScanner().scan(str(path))
-
-    external_issues = [issue for issue in result.issues if "external resource" in issue.message.lower()]
-    assert external_issues
-    assert all(issue.severity == IssueSeverity.WARNING for issue in external_issues)
+    external_issues = _external_resource_issues(result)
     assert any(str(issue.details.get("attribute", "")).endswith("}schemaLocation") for issue in external_issues)
 
 
@@ -681,13 +579,9 @@ def test_pmml_scanner_namespaced_documentation_element_urls_warn(tmp_path: Path)
   <DataDictionary numberOfFields='0'/>
 </PMML>"""
     path = tmp_path / "namespaced_doc_element.pmml"
-    path.write_text(pmml, encoding="utf-8")
+    result = _scan_pmml_fixture(path, pmml)
 
-    result = PmmlScanner().scan(str(path))
-
-    external_issues = [issue for issue in result.issues if "external resource" in issue.message.lower()]
-    assert external_issues
-    assert all(issue.severity == IssueSeverity.WARNING for issue in external_issues)
+    external_issues = _external_resource_issues(result)
     assert any(str(issue.details.get("tag", "")).endswith("}annotation") for issue in external_issues)
 
 
@@ -699,13 +593,9 @@ def test_pmml_scanner_namespaced_documentation_attribute_urls_warn(tmp_path: Pat
   <DataDictionary numberOfFields='0'/>
 </PMML>"""
     path = tmp_path / "namespaced_doc_attribute.pmml"
-    path.write_text(pmml, encoding="utf-8")
+    result = _scan_pmml_fixture(path, pmml)
 
-    result = PmmlScanner().scan(str(path))
-
-    external_issues = [issue for issue in result.issues if "external resource" in issue.message.lower()]
-    assert external_issues
-    assert all(issue.severity == IssueSeverity.WARNING for issue in external_issues)
+    external_issues = _external_resource_issues(result)
     assert any(str(issue.details.get("attribute", "")).endswith("}label") for issue in external_issues)
 
 
@@ -878,9 +768,7 @@ def test_pmml_scanner_comment_doctype_is_not_xxe(tmp_path: Path) -> None:
   <Header/>
 </PMML>"""
     path = tmp_path / "commented_doctype.pmml"
-    path.write_text(pmml, encoding="utf-8")
-
-    result = PmmlScanner().scan(str(path))
+    result = _scan_pmml_fixture(path, pmml)
 
     assert result.success is True
     assert not any(
@@ -896,9 +784,7 @@ def test_pmml_scanner_cdata_doctype_is_not_xxe(tmp_path: Path) -> None:
   </Header>
 </PMML>"""
     path = tmp_path / "cdata_doctype.pmml"
-    path.write_text(pmml, encoding="utf-8")
-
-    result = PmmlScanner().scan(str(path))
+    result = _scan_pmml_fixture(path, pmml)
 
     assert result.success is True
     assert not any(
@@ -915,9 +801,7 @@ def test_pmml_scanner_deep_extension_tree_does_not_recurse_forever(tmp_path: Pat
   </Header>
 </PMML>"""
     path = tmp_path / "deep_extension.pmml"
-    path.write_text(pmml, encoding="utf-8")
-
-    result = PmmlScanner().scan(str(path))
+    result = _scan_pmml_fixture(path, pmml)
 
     assert result.success is True
     assert result.bytes_scanned > 0
@@ -931,9 +815,7 @@ def test_pmml_scanner_extension_text_truncation_with_hidden_payload_is_inconclus
   </Header>
 </PMML>"""
     path = tmp_path / "truncated_extension.pmml"
-    path.write_text(pmml, encoding="utf-8")
-
-    result = PmmlScanner().scan(str(path))
+    result = _scan_pmml_fixture(path, pmml)
 
     assert result.success is False
     assert any("exceeds the safe inspection node limit" in issue.message for issue in result.issues)
@@ -956,9 +838,7 @@ def test_pmml_scanner_benign_extension_truncation_is_not_a_security_finding(tmp_
   </Header>
 </PMML>"""
     path = tmp_path / "benign_padded_extension.pmml"
-    path.write_text(pmml, encoding="utf-8")
-
-    result = PmmlScanner().scan(str(path))
+    result = _scan_pmml_fixture(path, pmml)
 
     assert result.success is False
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
@@ -1030,9 +910,7 @@ def test_pmml_scanner_metadata_tracking(tmp_path: Path) -> None:
   <Header/>
 </PMML>"""
     path = tmp_path / "metadata_test.pmml"
-    path.write_text(pmml, encoding="utf-8")
-
-    result = PmmlScanner().scan(str(path))
+    result = _scan_pmml_fixture(path, pmml)
     assert result.success
 
     # Check metadata is properly set
@@ -1042,3 +920,15 @@ def test_pmml_scanner_metadata_tracking(tmp_path: Path) -> None:
     assert result.metadata["pmml_version"] == "4.4"
     assert isinstance(result.metadata["has_defusedxml"], bool)
     assert result.bytes_scanned > 0
+
+
+def _scan_pmml_fixture(path: Path, pmml: str) -> ScanResult:
+    path.write_text(pmml, encoding="utf-8")
+    return PmmlScanner().scan(str(path))
+
+
+def _external_resource_issues(result: ScanResult) -> list[Issue]:
+    external_issues = [issue for issue in result.issues if "external resource" in issue.message.lower()]
+    assert external_issues
+    assert all(issue.severity == IssueSeverity.WARNING for issue in external_issues)
+    return external_issues

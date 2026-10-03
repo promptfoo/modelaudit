@@ -3,14 +3,20 @@
 from __future__ import annotations
 
 import pickle
-import shlex
 import sys
 from importlib.util import find_spec
 from pathlib import Path
 
 import pytest
+from pickle_test_helpers import (
+    _global_operand,
+    _has_critical_call_graph_finding,
+    _shell_command,
+    _text_operand,
+    _tuple_payload_operands,
+)
 
-from modelaudit_picklescan import PickleReport, SafetyVerdict, Severity, scan_bytes
+from modelaudit_picklescan import SafetyVerdict, scan_bytes
 from modelaudit_picklescan.api import _RUST_EXTENSION_MODULE
 from modelaudit_picklescan.call_graph import _calls_for_function, _find_sink_path
 
@@ -24,35 +30,6 @@ pytestmark = [
         reason="_pytest._py.path is unavailable",
     ),
 ]
-
-
-def _short_binunicode(data: bytes) -> bytes:
-    if len(data) > 0xFF:
-        raise ValueError("SHORT_BINUNICODE helper accepts at most 255 bytes")
-    return b"\x8c" + bytes([len(data)]) + data
-
-
-def _binunicode(data: bytes) -> bytes:
-    return b"X" + len(data).to_bytes(4, "little") + data
-
-
-def _text_operand(value: str) -> bytes:
-    data = value.encode()
-    if len(data) <= 0xFF:
-        return _short_binunicode(data)
-    return _binunicode(data)
-
-
-def _global_operand(module: str, name: str) -> bytes:
-    return _text_operand(module) + _text_operand(name) + b"\x93"
-
-
-def _tuple_payload_operands(operands: list[bytes]) -> bytes:
-    return b"(" + b"".join(operands) + b"t"
-
-
-def _shell_command(marker: Path, marker_content: str) -> str:
-    return f"printf {shlex.quote(marker_content)} > {shlex.quote(str(marker))}"
 
 
 def _pytest_localpath_payload(executable: str) -> bytes:
@@ -81,17 +58,6 @@ def _pytest_localpath_sysexec_payload(marker: Path) -> tuple[bytes, str]:
         ]
     )
     return payload, marker_content
-
-
-def _has_critical_call_graph_finding(report: PickleReport, module: str, name: str, sink: str) -> bool:
-    return any(
-        finding.severity == Severity.CRITICAL
-        and finding.rule_code == "DANGEROUS_CALL_GRAPH"
-        and finding.details.get("module") == module
-        and finding.details.get("name") == name
-        and finding.details.get("sink") == sink
-        for finding in report.findings
-    )
 
 
 def test_call_graph_resolves_function_local_import_aliases() -> None:

@@ -15,6 +15,9 @@ from parity_corpus import (
     malicious_reduce_payload,
     prefix_truncation_payloads,
 )
+from pickle_test_helpers import (
+    _short_binunicode,
+)
 
 from modelaudit_picklescan import SafetyVerdict, ScanOptions, ScanStatus, scan_bytes, scan_file
 from modelaudit_picklescan.api import _RUST_EXTENSION_MODULE
@@ -72,12 +75,6 @@ pytestmark = pytest.mark.skipif(
 def _rust_source_text() -> str:
     rust_src = Path(__file__).resolve().parents[1] / "rust" / "src"
     return "\n".join(path.read_text() for path in sorted(rust_src.glob("*.rs")))
-
-
-def _short_binunicode(data: bytes) -> bytes:
-    if len(data) > 0xFF:
-        raise ValueError("SHORT_BINUNICODE helper accepts at most 255 bytes")
-    return b"\x8c" + bytes([len(data)]) + data
 
 
 def _binary_opcode_os_system_reduce_payload() -> bytes:

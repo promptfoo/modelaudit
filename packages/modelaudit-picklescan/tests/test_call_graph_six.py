@@ -6,22 +6,20 @@ import pickle
 import shlex
 import subprocess
 import sys
-from importlib.util import find_spec
 from pathlib import Path
 
 import pytest
+from pickle_test_helpers import (
+    _global_operand,
+    _has_critical_call_graph_finding,
+    _has_module,
+    _text_operand,
+    _tuple_payload_operands,
+)
 
-from modelaudit_picklescan import PickleReport, SafetyVerdict, Severity, scan_bytes
+from modelaudit_picklescan import SafetyVerdict, scan_bytes
 from modelaudit_picklescan.api import _RUST_EXTENSION_MODULE
 from modelaudit_picklescan.call_graph import _call_graph_entrypoints, _find_sink_path, _trusted_module_origin_kind
-
-
-def _has_module(module: str) -> bool:
-    try:
-        return find_spec(module) is not None
-    except ModuleNotFoundError:
-        return False
-
 
 pytestmark = [
     pytest.mark.skipif(
@@ -33,31 +31,6 @@ pytestmark = [
         reason="six is unavailable",
     ),
 ]
-
-
-def _short_binunicode(data: bytes) -> bytes:
-    if len(data) > 0xFF:
-        raise ValueError("SHORT_BINUNICODE helper accepts at most 255 bytes")
-    return b"\x8c" + bytes([len(data)]) + data
-
-
-def _binunicode(data: bytes) -> bytes:
-    return b"X" + len(data).to_bytes(4, "little") + data
-
-
-def _text_operand(value: str) -> bytes:
-    data = value.encode()
-    if len(data) <= 0xFF:
-        return _short_binunicode(data)
-    return _binunicode(data)
-
-
-def _global_operand(module: str, name: str) -> bytes:
-    return _text_operand(module) + _text_operand(name) + b"\x93"
-
-
-def _tuple_payload_operands(operands: list[bytes]) -> bytes:
-    return b"(" + b"".join(operands) + b"t"
 
 
 def _six_moves_getoutput_payload(module: str, name: str, marker: Path) -> tuple[bytes, str]:
@@ -136,17 +109,6 @@ def _constructed_bytes_control_payload(values: bytes) -> bytes:
     return b"\x80\x04" + _constructed_bytes_operand(values) + b"."
 
 
-def _has_critical_call_graph_finding(report: PickleReport, module: str, name: str, sink: str) -> bool:
-    return any(
-        finding.severity == Severity.CRITICAL
-        and finding.rule_code == "DANGEROUS_CALL_GRAPH"
-        and finding.details.get("module") == module
-        and finding.details.get("name") == name
-        and finding.details.get("sink") == sink
-        for finding in report.findings
-    )
-
-
 def _assert_pickle_payload_executes_in_subprocess(
     payload: bytes,
     marker: Path,
@@ -197,23 +159,12 @@ def test_call_graph_resolves_six_moves_getoutput_alias(reference: str) -> None:
 @pytest.mark.parametrize(
     ("reference", "sink"),
     [
+        # cPickle load and loads aliases.
         ("six.moves.cPickle.load", "pickle.load"),
         ("six.moves.cPickle.loads", "pickle.loads"),
         ("botocore.vendored.six.moves.cPickle.load", "pickle.load"),
         ("botocore.vendored.six.moves.cPickle.loads", "pickle.loads"),
-    ],
-)
-def test_call_graph_resolves_six_moves_cpickle_aliases(reference: str, sink: str) -> None:
-    assert _call_graph_entrypoints(reference) == (sink,)
-
-    path = _find_sink_path(reference)
-    assert path is not None
-    assert path[-1] == sink
-
-
-@pytest.mark.parametrize(
-    ("reference", "sink"),
-    [
+        # Dangerous builtins aliases.
         ("six.moves.builtins.__import__", "builtins.__import__"),
         ("six.moves.builtins.compile", "builtins.compile"),
         ("six.moves.builtins.eval", "builtins.eval"),
@@ -224,7 +175,7 @@ def test_call_graph_resolves_six_moves_cpickle_aliases(reference: str, sink: str
         ("botocore.vendored.six.moves.builtins.exec", "builtins.exec"),
     ],
 )
-def test_call_graph_resolves_six_moves_builtins_dangerous_aliases(reference: str, sink: str) -> None:
+def test_call_graph_resolves_six_moves_dangerous_aliases(reference: str, sink: str) -> None:
     assert _call_graph_entrypoints(reference) == (sink,)
 
     path = _find_sink_path(reference)

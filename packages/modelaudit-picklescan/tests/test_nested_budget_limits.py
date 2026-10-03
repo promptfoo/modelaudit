@@ -5,14 +5,9 @@ import os
 import pickle
 
 import pytest
+from framework_fixtures import SystemCommandPayload
 
 from modelaudit_picklescan import SafetyVerdict, ScanOptions, ScanStatus, scan_bytes
-
-
-class MaliciousPayload:
-    def __reduce__(self) -> tuple[object, tuple[str]]:
-        return os.system, ("echo pwned",)
-
 
 LONG_PROTOCOL0_LITERAL_PAYLOADS = [
     pytest.param(b"cattacker\nfactory\n(V" + (b"A" * 2000) + b"\ntR.", id="unicode"),
@@ -48,7 +43,7 @@ def test_minimum_nested_budget_fails_closed(
     encoding: str,
     expected_rule: str,
 ) -> None:
-    nested_payload = pickle.dumps(MaliciousPayload(), protocol=protocol)
+    nested_payload = pickle.dumps(SystemCommandPayload("echo pwned", lambda: os.system), protocol=protocol)
     nested_value: bytes | str
     if encoding == "raw":
         nested_value = nested_payload

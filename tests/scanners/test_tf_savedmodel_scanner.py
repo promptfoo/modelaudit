@@ -15,6 +15,9 @@ from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.utils.file.detection import PROTO0_1_MAX_PROBE_BYTES
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as has_tf_protos
+from tests.helpers.assertions import _assert_absent
+from tests.helpers.file_creators import EvalPayload, SystemCommandPayload
+from tests.helpers.file_creators import protobuf_bytes_field as _protobuf_bytes_field
 
 
 class _NodeCollection(Protocol):
@@ -32,30 +35,6 @@ class _NodeSpec(_RequiredNodeSpec, total=False):
     string_attrs: dict[str, str]
     string_list_attrs: dict[str, list[str]]
     function_ref: str
-
-
-# Defer TensorFlow check to avoid module-level imports
-def has_tensorflow():
-    try:
-        import tensorflow as tf
-
-        # Avoid treating vendored protobuf-only stubs as full TensorFlow runtime.
-        return bool(getattr(tf, "__version__", None)) and hasattr(tf, "constant")
-    except Exception:
-        return False
-
-
-def _protobuf_varint(value: int) -> bytes:
-    chunks: list[int] = []
-    while value > 0x7F:
-        chunks.append((value & 0x7F) | 0x80)
-        value >>= 7
-    chunks.append(value)
-    return bytes(chunks)
-
-
-def _protobuf_bytes_field(field_number: int, payload: bytes) -> bytes:
-    return _protobuf_varint((field_number << 3) | 2) + _protobuf_varint(len(payload)) + payload
 
 
 def _keras_metadata_with_malformed_saved_object(payload: bytes) -> bytes:
@@ -637,12 +616,7 @@ def create_tf_savedmodel(tmp_path: Path, *, malicious: bool = False) -> Path:
 
     # If malicious, add a malicious pickle file
     if malicious:
-
-        class MaliciousClass:
-            def __reduce__(self):
-                return (eval, ("print('malicious code')",))
-
-        malicious_data = {"malicious": MaliciousClass()}
+        malicious_data = {"malicious": EvalPayload(("print('malicious code')",))}
         malicious_pickle = pickle.dumps(malicious_data)
         (model_dir / "malicious.pkl").write_bytes(malicious_pickle)
 
@@ -652,11 +626,7 @@ def create_tf_savedmodel(tmp_path: Path, *, malicious: bool = False) -> Path:
 def _build_protocol1_pickle_payload() -> bytes:
     import os as os_module
 
-    class DangerousPayload:
-        def __reduce__(self) -> tuple[object, tuple[str]]:
-            return (os_module.system, ("echo savedmodel-asset-test",))
-
-    return pickle.dumps(DangerousPayload(), protocol=1)
+    return pickle.dumps(SystemCommandPayload("echo savedmodel-asset-test", lambda: os_module.system), protocol=1)
 
 
 def _build_minimal_pe_bytes() -> bytes:
@@ -1371,27 +1341,9 @@ def test_savedmodel_node_attribute_budget_marks_scan_inconclusive(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr("modelaudit.scanners.tf_savedmodel_scanner._MAX_SAVEDMODEL_NODE_ATTRIBUTES", 2)
-    model_path = Path(
-        _create_test_savedmodel_with_scoped_nodes(
-            tmp_path,
-            graph_nodes=[
-                {
-                    "op": "Const",
-                    "string_attrs": {"label_0": "safe_0", "label_1": "safe_1", "label_2": "safe_2"},
-                }
-            ],
-            model_name="oversized_node_attribute_budget",
-        )
+    _assert_savedmodel_attribute_budget(
+        tmp_path, "oversized_node_attribute_budget", "node_attribute_count", "node_attribute_limit_exceeded"
     )
-
-    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_path / "saved_model.pb"))
-    budget_checks = [check for check in result.checks if check.name == "SavedModel Graph Traversal Budget"]
-
-    assert result.success is False
-    assert result.metadata["node_attribute_count"] == 3
-    assert len(budget_checks) == 1
-    assert budget_checks[0].details["limit_reason"] == "node_attribute_limit_exceeded"
-    assert budget_checks[0].details["limit_name"] == "node_attribute_count"
 
 
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
@@ -1514,27 +1466,12 @@ def test_savedmodel_scalar_attribute_string_budget_marks_scan_inconclusive(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr("modelaudit.scanners.tf_savedmodel_scanner._MAX_SAVEDMODEL_ATTRIBUTE_STRING_VALUES", 2)
-    model_path = Path(
-        _create_test_savedmodel_with_scoped_nodes(
-            tmp_path,
-            graph_nodes=[
-                {
-                    "op": "Const",
-                    "string_attrs": {"label_0": "safe_0", "label_1": "safe_1", "label_2": "safe_2"},
-                }
-            ],
-            model_name="oversized_scalar_attribute_strings",
-        )
+    _assert_savedmodel_attribute_budget(
+        tmp_path,
+        "oversized_scalar_attribute_strings",
+        "attribute_string_value_count",
+        "attribute_string_value_limit_exceeded",
     )
-
-    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_path / "saved_model.pb"))
-    budget_checks = [check for check in result.checks if check.name == "SavedModel Graph Traversal Budget"]
-
-    assert result.success is False
-    assert result.metadata["attribute_string_value_count"] == 3
-    assert len(budget_checks) == 1
-    assert budget_checks[0].details["limit_reason"] == "attribute_string_value_limit_exceeded"
-    assert budget_checks[0].details["limit_name"] == "attribute_string_value_count"
 
 
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
@@ -2059,9 +1996,7 @@ def test_savedmodel_preview_redaction_removes_non_scalar_sensitive_values() -> N
         500,
     )
 
-    assert "ARRAYSECRET123" not in preview
-    assert "OBJECTSECRET456" not in preview
-    assert "BLOCKSECRET789" not in preview
+    _assert_absent(preview, "ARRAYSECRET123", "OBJECTSECRET456", "BLOCKSECRET789")
     assert '"api_key": <redacted>' in preview
     assert '"clientSecret": <redacted>' in preview
     assert "api_key: |\n  <redacted>" in preview
@@ -2077,9 +2012,7 @@ def test_savedmodel_preview_redaction_removes_parenthesized_secret_values() -> N
         500,
     )
 
-    assert "PARENSECRET123" not in preview
-    assert "HEADERSECRET456" not in preview
-    assert "MAPSECRET789" not in preview
+    _assert_absent(preview, "PARENSECRET123", "HEADERSECRET456", "MAPSECRET789")
     assert 'api_key = ("<redacted>")' in preview
     assert 'headers["Authorization"] = (\n  "<redacted>"\n)' in preview
     assert '"clientSecret": ("<redacted>")' in preview
@@ -3266,3 +3199,27 @@ def test_tf_scanner_no_explanation_for_safe_ops(tmp_path: Path) -> None:
         if issue.why and any(op in issue.why for op in ["TensorFlow", "operation", "graph"])
     ]
     assert len(tf_op_issues_with_explanations) == 0, "Safe operations should not have TF operation explanations"
+
+
+def _assert_savedmodel_attribute_budget(tmp_path: Path, model_name: str, limit_name: str, limit_reason: str) -> None:
+    model_path = Path(
+        _create_test_savedmodel_with_scoped_nodes(
+            tmp_path,
+            graph_nodes=[
+                {
+                    "op": "Const",
+                    "string_attrs": {"label_0": "safe_0", "label_1": "safe_1", "label_2": "safe_2"},
+                }
+            ],
+            model_name=model_name,
+        )
+    )
+
+    result = tf_savedmodel_module.TensorFlowSavedModelScanner().scan(str(model_path / "saved_model.pb"))
+    budget_checks = [check for check in result.checks if check.name == "SavedModel Graph Traversal Budget"]
+
+    assert result.success is False
+    assert result.metadata[limit_name] == 3
+    assert len(budget_checks) == 1
+    assert budget_checks[0].details["limit_reason"] == limit_reason
+    assert budget_checks[0].details["limit_name"] == limit_name

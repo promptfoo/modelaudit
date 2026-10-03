@@ -5,7 +5,6 @@ from __future__ import annotations
 import os
 import pickle
 from pathlib import Path
-from typing import Any
 
 import pytest
 
@@ -13,22 +12,43 @@ from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME
 from modelaudit.scanners import pickle_scanner as pickle_scanner_module
 from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.pickle_scanner import ML_SAFE_GLOBALS, PickleScanner, _is_legitimate_serialization_file
+from tests.helpers.file_creators import SystemCommandPayload
+from tests.helpers.file_creators import (
+    joblib_numpy_raw_segment as _joblib_numpy_raw_segment,
+)
+from tests.helpers.file_creators import (
+    pickle_binunicode_text as _binunicode,
+)
 
 
-class MaliciousPayload:
-    def __reduce__(self) -> tuple[Any, tuple[str]]:
-        return (os.system, ("id",))
+def requires_origin_review(module: str, name: str) -> bool:
+    return not trusted_joblib_reference(module, name)
+
+
+def trusted_joblib_invocation(module: str, name: str, reference: dict[str, object]) -> bool:
+    del reference
+    return trusted_joblib_reference(module, name)
+
+
+def trusted_joblib_reference(
+    module: str,
+    name: str,
+    *,
+    pickle_entrypoint_methods: tuple[str, ...] | None = None,
+    pickle_invokes_metaclass_call: bool | None = None,
+) -> bool:
+    del pickle_entrypoint_methods, pickle_invokes_metaclass_call
+    return (module, name) in {
+        ("joblib.numpy_pickle", "NumpyArrayWrapper"),
+        ("numpy", "ndarray"),
+        ("numpy", "dtype"),
+    }
 
 
 def _write_joblib_like_pickle(path: Path, *, padding: int = 0) -> None:
     path.write_bytes(
         b"\x80\x04cjoblib.numpy_pickle\nNumpyArrayWrapper\nq\x00not-joblib-raw-tail" + (b"\x00" * padding),
     )
-
-
-def _binunicode(value: str) -> bytes:
-    encoded = value.encode("utf-8")
-    return b"X" + len(encoded).to_bytes(4, "little") + encoded
 
 
 def _joblib_numpy_wrapper_control(*, shape: int = 4, dtype: str = "i8") -> bytes:
@@ -53,11 +73,6 @@ def _joblib_numpy_wrapper_control(*, shape: int = 4, dtype: str = "i8") -> bytes
     )
 
 
-def _joblib_numpy_raw_segment(prefix_length: int, raw_data: bytes) -> bytes:
-    padding_length = 16 - ((prefix_length + 1) % 16)
-    return bytes([padding_length]) + (b"\xff" * padding_length) + raw_data
-
-
 def _write_joblib_numpy_array_pickle(path: Path) -> None:
     prefix = b"\x80\x02](" + _joblib_numpy_wrapper_control()
     path.write_bytes(prefix + _joblib_numpy_raw_segment(len(prefix), b"\x00" * 32) + b"e.")
@@ -65,7 +80,7 @@ def _write_joblib_numpy_array_pickle(path: Path) -> None:
 
 def test_malicious_joblib_extension_cannot_bypass_rust_scan(tmp_path: Path) -> None:
     malicious_file = tmp_path / "evil.joblib"
-    malicious_file.write_bytes(pickle.dumps(MaliciousPayload(), protocol=4))
+    malicious_file.write_bytes(pickle.dumps(SystemCommandPayload("id", lambda: os.system), protocol=4))
 
     result = PickleScanner().scan(str(malicious_file))
 
@@ -76,7 +91,7 @@ def test_malicious_joblib_extension_cannot_bypass_rust_scan(tmp_path: Path) -> N
 
 def test_malicious_dill_extension_cannot_bypass_rust_scan(tmp_path: Path) -> None:
     malicious_file = tmp_path / "evil.dill"
-    malicious_file.write_bytes(pickle.dumps(MaliciousPayload(), protocol=4))
+    malicious_file.write_bytes(pickle.dumps(SystemCommandPayload("id", lambda: os.system), protocol=4))
 
     result = PickleScanner().scan(str(malicious_file))
 
@@ -95,27 +110,6 @@ def test_valid_joblib_like_pickle_has_serialization_span_proof(
 ) -> None:
     joblib_file = tmp_path / "numpy_arrays.joblib"
     _write_joblib_numpy_array_pickle(joblib_file)
-
-    def trusted_joblib_reference(
-        module: str,
-        name: str,
-        *,
-        pickle_entrypoint_methods: tuple[str, ...] | None = None,
-        pickle_invokes_metaclass_call: bool | None = None,
-    ) -> bool:
-        del pickle_entrypoint_methods, pickle_invokes_metaclass_call
-        return (module, name) in {
-            ("joblib.numpy_pickle", "NumpyArrayWrapper"),
-            ("numpy", "ndarray"),
-            ("numpy", "dtype"),
-        }
-
-    def trusted_joblib_invocation(module: str, name: str, reference: dict[str, object]) -> bool:
-        del reference
-        return trusted_joblib_reference(module, name)
-
-    def requires_origin_review(module: str, name: str) -> bool:
-        return not trusted_joblib_reference(module, name)
 
     monkeypatch.setattr(
         "modelaudit.scanners.pickle_scanner.import_only_reference_is_proven_trusted",
@@ -187,38 +181,17 @@ def test_valid_joblib_raw_array_tail_is_trusted(
     joblib_file = tmp_path / "numpy_arrays.joblib"
     _write_joblib_numpy_array_pickle(joblib_file)
 
-    def trusted_joblib_references(
-        module: str,
-        name: str,
-        *,
-        pickle_entrypoint_methods: tuple[str, ...] | None = None,
-        pickle_invokes_metaclass_call: bool | None = None,
-    ) -> bool:
-        del pickle_entrypoint_methods, pickle_invokes_metaclass_call
-        return (module, name) in {
-            ("joblib.numpy_pickle", "NumpyArrayWrapper"),
-            ("numpy", "ndarray"),
-            ("numpy", "dtype"),
-        }
-
-    def trusted_joblib_invocation(module: str, name: str, reference: dict[str, object]) -> bool:
-        del reference
-        return trusted_joblib_references(module, name)
-
-    def requires_origin_review(module: str, name: str) -> bool:
-        return not trusted_joblib_references(module, name)
-
     monkeypatch.setattr(
         "modelaudit.scanners.pickle_scanner.import_only_reference_is_proven_trusted",
-        trusted_joblib_references,
+        trusted_joblib_reference,
     )
     monkeypatch.setattr(
         "modelaudit.scanners.joblib_scanner.import_only_reference_is_proven_trusted",
-        trusted_joblib_references,
+        trusted_joblib_reference,
     )
     monkeypatch.setattr(
         "modelaudit_picklescan.api.import_only_reference_is_proven_trusted",
-        trusted_joblib_references,
+        trusted_joblib_reference,
     )
     monkeypatch.setattr(
         "modelaudit_picklescan.api.import_only_reference_is_proven_trusted_for_pickle_invocation",
@@ -226,7 +199,7 @@ def test_valid_joblib_raw_array_tail_is_trusted(
     )
     monkeypatch.setattr(
         "modelaudit_picklescan.call_graph.import_only_reference_is_proven_trusted",
-        trusted_joblib_references,
+        trusted_joblib_reference,
     )
     monkeypatch.setattr(
         "modelaudit_picklescan.call_graph.import_only_reference_is_proven_trusted_for_pickle_invocation",
