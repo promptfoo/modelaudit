@@ -31,7 +31,7 @@ from modelaudit.integrations.source_serialization import (
 )
 from modelaudit.models import ModelAuditResultModel
 from modelaudit.scanner_results import IssueSeverity
-from modelaudit.utils.sources.huggingface_paths import _huggingface_classification_url, is_huggingface_file_url
+from modelaudit.utils.helpers.finding_identity import finding_identity
 
 _JSON_VALUE_ADAPTER: TypeAdapter[Any] = TypeAdapter(Any)
 
@@ -73,7 +73,6 @@ def _create_run(
     if not verbose:
         issues = [i for i in issues if i.severity != IssueSeverity.DEBUG]
     issues = _primary_sarif_issues(issues)
-
     # Create rules from unique issue types
     rules = _create_rules(issues, prefiltered=True)
     rule_indices = {rule["id"]: idx for idx, rule in enumerate(rules)}
@@ -189,15 +188,16 @@ def _create_rules(issues: list, *, prefiltered: bool = False) -> list[dict[str, 
     seen_rules = set()
 
     for issue in issues:
+        identity_issue = finding_identity(issue)
         # Create a rule ID from the issue type or message
-        rule_id = _get_rule_id(issue)
+        rule_id = _get_rule_id(identity_issue)
 
         if rule_id not in seen_rules:
             seen_rules.add(rule_id)
 
             rule: dict[str, Any] = {
                 "id": rule_id,
-                "name": _get_rule_name(issue),
+                "name": _get_rule_name(identity_issue),
                 "shortDescription": {"text": _get_rule_short_description(issue)},
                 "fullDescription": {"text": _get_rule_full_description(issue)},
                 "defaultConfiguration": {
@@ -212,7 +212,7 @@ def _create_rules(issues: list, *, prefiltered: bool = False) -> list[dict[str, 
                 },
             }
 
-            rule_code = _get_issue_rule_code(issue)
+            rule_code = _get_issue_rule_code(identity_issue)
             if rule_code:
                 rule["properties"]["rule_code"] = rule_code
 
@@ -240,7 +240,8 @@ def _create_results(
         rule_indices = {rule["id"]: idx for idx, rule in enumerate(_create_rules(issues, prefiltered=prefiltered))}
 
     for issue in issues:
-        rule_id = _get_rule_id(issue)
+        identity_issue = finding_identity(issue)
+        rule_id = _get_rule_id(identity_issue)
         result = {
             "ruleId": rule_id,
             "ruleIndex": rule_indices[rule_id],
@@ -276,21 +277,11 @@ def _create_results(
         import hashlib
 
         fingerprint = ""
-        fingerprint_message = issue.message
-        fingerprint_location = issue.location or ""
-        # Acquisition identities historically append the revision after URL normalization.
-        if issue.type == "huggingface_acquisition_error" and fingerprint_location:
-            revision = (issue.details or {}).get("requested_revision")
-            if revision and not is_huggingface_file_url(fingerprint_location):
-                source = _huggingface_classification_url(fingerprint_location.removesuffix(f"@{revision}"))
-                source = f"{source}@{revision}"
-            else:
-                source = _huggingface_classification_url(fingerprint_location)
-            fingerprint_message = fingerprint_message.replace(fingerprint_location, source, 1)
-            fingerprint_location = source
+        fingerprint_message = identity_issue.message
+        fingerprint_location = identity_issue.location or ""
         fingerprint_location = _identity_location(fingerprint_location)
         if issue.details:
-            evidence_fingerprint = _identity_text(str(issue.details.get("evidence_fingerprint", "")))
+            evidence_fingerprint = _identity_text(str(identity_issue.details.get("evidence_fingerprint", "")))
             if evidence_fingerprint:
                 fingerprint = hashlib.sha256(
                     "\x1f".join((evidence_fingerprint, fingerprint_location, str(issue.severity))).encode()
@@ -306,7 +297,7 @@ def _create_results(
         properties = serialize_source_value(dict(issue.details or {}))
         properties.pop("rule_code", None)
         properties.pop("issue_type", None)
-        rule_code = _get_issue_rule_code(issue)
+        rule_code = _get_issue_rule_code(identity_issue)
         if rule_code:
             properties["rule_code"] = rule_code
         if hasattr(issue, "type") and issue.type:
@@ -426,7 +417,7 @@ def _get_rule_name(issue: Any) -> str:
 
 def _get_rule_short_description(issue: Any) -> str:
     """Get a short description for a rule."""
-    lowered_message = issue.message.lower()
+    lowered_message = finding_identity(issue).message.lower()
     if "pickle" in lowered_message:
         return "Potentially unsafe pickle operation detected"
     elif "import" in lowered_message:
@@ -481,7 +472,7 @@ def _get_tags_for_issue(issue: Any) -> list[str]:
     """Get relevant tags for an issue."""
     tags = ["security", "ml-model"]
 
-    message_lower = issue.message.lower()
+    message_lower = finding_identity(issue).message.lower()
 
     if "pickle" in message_lower:
         tags.append("pickle")

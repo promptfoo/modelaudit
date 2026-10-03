@@ -15,7 +15,7 @@ from cyclonedx.output import OutputFormat, SchemaVersion, make_outputter
 
 from ..models import FileMetadataModel, ModelAuditResultModel
 from ..scanner_results import Issue, IssueSeverity
-from ._sarif_identity import redact_source_identifier as _classification_identifier
+from ..utils.helpers.finding_identity import finding_identity
 from .source_serialization import serialize_source_identifier, serialize_source_value
 
 SCANNER_VERSION = f"v{_pkg_version('modelaudit')}"
@@ -114,9 +114,7 @@ def _get_component_type(path: str, metadata: dict[str, Any] | None) -> Component
         ".pmml",
     }
 
-    # Remote classification keeps its normalized identifier; deleted local filenames stay literal.
-    classification_path = _classification_identifier(path) if _is_non_filesystem_identifier(path) else path
-    file_ext = os.path.splitext(classification_path.lower())[1]
+    file_ext = os.path.splitext(path.lower())[1]
 
     # Check if it's a machine learning model
     if file_ext in ml_extensions:
@@ -136,6 +134,70 @@ def _get_component_type(path: str, metadata: dict[str, Any] | None) -> Component
 
     # Default to FILE for everything else
     return ComponentType.FILE
+
+
+def _source_identity_path(path: str, metadata: FileMetadataModel | dict[str, Any] | None) -> str:
+    """Keep the producer's component semantics while exporting its raw source."""
+    identity = metadata.get("source_identity") if isinstance(metadata, (dict, FileMetadataModel)) else None
+    if isinstance(identity, dict) and identity.get("producer") in ("stream", "huggingface_acquisition"):
+        identity_path = identity.get("path")
+        if isinstance(identity_path, str):
+            return identity_path
+    return path
+
+
+def _cli_source_classification_path(path: str) -> str:
+    """Preserve the CLI's historical type input without changing source evidence."""
+    from urllib.parse import urlparse, urlunparse
+
+    from ..utils.sources.cloud_storage import is_cleartext_cloud_url, is_cloud_url, is_stream_url
+    from ..utils.sources.huggingface_paths import _huggingface_classification_url
+    from ..utils.sources.jfrog import (
+        _get_configured_jfrog_hosts,
+        _is_jfrog_service_host,
+        _is_local_jfrog_host,
+        _normalize_hostname,
+    )
+    from ..utils.sources.pytorch_hub import is_cleartext_pytorch_hub_url, is_pytorch_hub_url
+    from ._sarif_identity_urls import redact_stream_url_for_display, redact_url_for_display
+
+    if path.startswith("models:/"):
+        from ._mlflow_identity import _redact_mlflow_error_for_display
+
+        return _redact_mlflow_error_for_display(path)
+    if is_stream_url(path):
+        return f"stream://{redact_stream_url_for_display(path[9:])}"
+    if (
+        is_cloud_url(path)
+        or is_cleartext_cloud_url(path)
+        or is_pytorch_hub_url(path)
+        or is_cleartext_pytorch_hub_url(path)
+    ):
+        return redact_url_for_display(path)
+    parsed = urlparse(path)
+    hostname = _normalize_hostname(parsed.hostname or "")
+    if (
+        parsed.scheme in {"http", "https"}
+        and hostname
+        and "/artifactory/" in parsed.path
+        and (
+            _is_jfrog_service_host(hostname)
+            or _is_local_jfrog_host(hostname)
+            or hostname in _get_configured_jfrog_hosts()
+        )
+    ):
+        netloc = parsed.netloc
+        if "@" in netloc:
+            netloc = parsed.hostname or ""
+            try:
+                port = parsed.port
+            except ValueError:
+                port = None
+            if port is not None:
+                netloc = f"{netloc}:{port}"
+            netloc = f"<credentials-redacted>@{netloc}"
+        return urlunparse((parsed.scheme, netloc, parsed.path, "", "", ""))
+    return _huggingface_classification_url(path)
 
 
 def _is_path_within_directory(path: str, directory: str) -> bool:
@@ -538,6 +600,7 @@ def _calculate_risk_score(path: str, issues: list[Issue]) -> int:
     """Calculate risk score for a file based on associated issues."""
     score = 0
     for issue in issues:
+        issue = finding_identity(issue)
         if issue.location == path:
             if issue.severity == IssueSeverity.CRITICAL:
                 score += 5
@@ -552,6 +615,7 @@ def _calculate_legacy_risk_score(path: str, issues: Iterable[dict[str, Any]]) ->
     """Calculate the legacy dict-based risk score for a component."""
     score = 0
     for issue in issues:
+        issue = finding_identity(issue)
         if issue.get("location") != path:
             continue
         severity = issue.get("severity")
@@ -671,6 +735,7 @@ def _component_for_file_pydantic(
     relative_path: str | None = None,
     require_stable_root: bool = False,
     bom_ref_state: _BomRefState | None = None,
+    classification_path: str | None = None,
 ) -> Component:
     """Create a CycloneDX component from Pydantic models (type-safe version)."""
     size, sha256 = _resolve_component_size_and_sha256(
@@ -687,7 +752,9 @@ def _component_for_file_pydantic(
     props = [Property(name="size", value=str(size))]
 
     # Calculate and add risk score
-    risk_score = _calculate_risk_score(path, issues)
+    if classification_path is None:
+        classification_path = _source_identity_path(path, metadata)
+    risk_score = _calculate_risk_score(classification_path, issues)
     props.append(Property(name="risk_score", value=str(risk_score)))
 
     # Add metadata-based properties if available
@@ -697,7 +764,7 @@ def _component_for_file_pydantic(
         props.extend(_create_metadata_properties(metadata))
 
     # Determine appropriate component type for CycloneDX v1.6
-    component_type = _get_component_type(path, metadata.model_dump() if metadata else None)
+    component_type = _get_component_type(classification_path, metadata.model_dump() if metadata else None)
     component_name, bom_ref = _component_identity(path, sha256, bom_ref_state)
 
     # Create the component
@@ -740,7 +807,8 @@ def _component_for_file(
     props = [Property(name="size", value=str(size))]
 
     # Compute risk score based on issues related to this file
-    score = _calculate_legacy_risk_score(path, issues)
+    classification_path = _source_identity_path(path, metadata)
+    score = _calculate_legacy_risk_score(classification_path, issues)
     props.append(Property(name="risk_score", value=str(score)))
 
     # Enhanced license handling
@@ -830,7 +898,7 @@ def _component_for_file(
     props.append(Property(name="security:scanner_version", value=SCANNER_VERSION))
 
     # Determine appropriate component type for CycloneDX v1.6
-    component_type = _get_component_type(path, metadata if isinstance(metadata, dict) else None)
+    component_type = _get_component_type(classification_path, metadata if isinstance(metadata, dict) else None)
     component_name, bom_ref = _component_identity(path, sha256, bom_ref_state)
 
     component = Component(
@@ -862,7 +930,11 @@ def generate_sbom(paths: Iterable[str], results: dict[str, Any] | Any) -> str:
     file_meta: dict[str, Any] = results.get("file_metadata", {})
     trusted_metadata_paths = _trusted_metadata_fallback_paths(results.get("assets", []))
 
-    ordered_paths = _source_order(paths, lambda path: _calculate_legacy_risk_score(path, issues_dicts), file_meta.get)
+    ordered_paths = _source_order(
+        paths,
+        lambda path: _calculate_legacy_risk_score(_source_identity_path(path, file_meta.get(path)), issues_dicts),
+        file_meta.get,
+    )
     bom_ref_state = _BomRefState(reserved={path for path in ordered_paths if serialize_source_identifier(path) == path})
     for input_path in ordered_paths:
         is_remote_identifier = _is_non_filesystem_identifier(input_path)
@@ -934,7 +1006,9 @@ def generate_sbom(paths: Iterable[str], results: dict[str, Any] | Any) -> str:
     return str(outputter.output_as_string(indent=2))
 
 
-def generate_sbom_pydantic(paths: Iterable[str], results: ModelAuditResultModel) -> str:
+def generate_sbom_pydantic(
+    paths: Iterable[str], results: ModelAuditResultModel, *, _classification_paths: dict[str, str] | None = None
+) -> str:
     """
     Generate SBOM directly from Pydantic models (type-safe version).
 
@@ -948,7 +1022,13 @@ def generate_sbom_pydantic(paths: Iterable[str], results: ModelAuditResultModel)
     file_metadata: dict[str, FileMetadataModel] = results.file_metadata or {}
     trusted_metadata_paths = _trusted_metadata_fallback_paths(results.assets)
 
-    ordered_paths = _source_order(paths, lambda path: _calculate_risk_score(path, issues), file_metadata.get)
+    ordered_paths = _source_order(
+        paths,
+        lambda path: _calculate_risk_score(
+            (_classification_paths or {}).get(path, _source_identity_path(path, file_metadata.get(path))), issues
+        ),
+        file_metadata.get,
+    )
     bom_ref_state = _BomRefState(reserved={path for path in ordered_paths if serialize_source_identifier(path) == path})
     for input_path in ordered_paths:
         is_remote_identifier = _is_non_filesystem_identifier(input_path)
@@ -1000,6 +1080,7 @@ def generate_sbom_pydantic(paths: Iterable[str], results: ModelAuditResultModel)
                     relative_path=(None if single_scan_root is None else os.path.relpath(input_path, input_directory)),
                     require_stable_root=require_stable_root,
                     bom_ref_state=bom_ref_state,
+                    classification_path=(_classification_paths or {}).get(input_path),
                 )
                 bom.components.add(component)
             finally:

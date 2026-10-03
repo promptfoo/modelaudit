@@ -28,6 +28,11 @@ except ImportError:
 
 
 import modelaudit.core_results as core_results
+from modelaudit.integrations._sarif_identity_urls import (
+    redact_cloud_error_for_display,
+    redact_stream_error_for_display,
+    redact_stream_url_for_display,
+)
 from modelaudit.integrations.license_checker import (
     LICENSE_FILES,
     check_commercial_use_warnings,
@@ -154,6 +159,7 @@ from modelaudit.utils.helpers.cache_decorator import (
     should_defer_hash_for_file_backed_onnx,
     should_defer_hash_for_pytorch_read_limit,
 )
+from modelaudit.utils.helpers.finding_identity import preserve_finding_identity
 from modelaudit.utils.helpers.interrupt_handler import check_interrupted
 from modelaudit.utils.helpers.types import (
     FilePath,
@@ -1029,6 +1035,29 @@ def _rebase_bound_directory_owner_value_for_reporting(value: Any, report_root: P
     return value
 
 
+def _preserve_scan_result_identity(scan_result: ScanResult, producer: str, source: str, identity_source: str) -> None:
+    """Retain producer normalization before aggregation consumes identity fields."""
+
+    def normalized(value: str) -> str:
+        return redact_cloud_error_for_display(value.replace(source, identity_source))
+
+    records: list[Issue | Check] = [*scan_result.issues, *scan_result.checks]
+    for record in records:
+        fields: dict[str, Any] = {
+            name: normalized(value)
+            for name in ("message", "location", "type", "rule_code", "name")
+            if isinstance(value := getattr(record, name, None), str)
+        }
+        details = {
+            name: normalized(value)
+            for name in ("evidence_fingerprint", "zip_entry_id", "zip_entry", "check_consolidation_key")
+            if isinstance(value := record.details.get(name), str)
+        }
+        if details:
+            fields["details"] = details
+        preserve_finding_identity(record, producer, **fields)
+
+
 def _normalize_directory_owner_scan_result_for_reporting(
     scan_result: ScanResult,
     owner_scan_path: str,
@@ -1037,6 +1066,7 @@ def _normalize_directory_owner_scan_result_for_reporting(
     """Rewrite descriptor-only owner scan paths before aggregate reporting."""
     if owner_scan_path != os.curdir:
         _replace_result_report_path(scan_result, owner_scan_path, report_path)
+        _preserve_scan_result_identity(scan_result, "directory_owner", report_path, report_path)
         return
 
     report_root = Path(report_path)
@@ -3539,6 +3569,9 @@ def scan_model_directory_or_file(
                     scan_result, analysis_complete = stream_analyze_file(stream_url, scanner)
                 if scan_result:
                     _replace_result_report_path(scan_result, stream_url, stream_url)
+                    identity_source = redact_stream_url_for_display(stream_url)
+                    _preserve_scan_result_identity(scan_result, "stream", stream_url, identity_source)
+                    scan_result.metadata["source_identity"] = {"producer": "stream", "path": identity_source}
                     if not analysis_complete:
                         _mark_inconclusive_scan_outcome(scan_result, "streaming_analysis_incomplete")
                     results.files_scanned += 1
@@ -3556,6 +3589,9 @@ def scan_model_directory_or_file(
                             severity=IssueSeverity.INFO.value,
                             location=report_url,
                             details={"analysis_complete": False},
+                        )
+                        preserve_finding_identity(
+                            results.issues[-1], "stream", location=redact_stream_url_for_display(stream_url)
                         )
                 else:
                     raise ValueError(f"Streaming analysis failed for {report_url}")
@@ -5720,6 +5756,17 @@ def scan_model_directory_or_file(
             severity=IssueSeverity.INFO.value,
             details={"exception_type": type(e).__name__},
         )
+        if is_stream_url(path):
+            from .models import FileMetadataModel
+
+            results.file_metadata[report_path] = FileMetadataModel(
+                source_identity={"producer": "stream", "path": f"stream://{redact_stream_url_for_display(path[9:])}"}
+            )
+            preserve_finding_identity(
+                results.issues[-1],
+                "stream",
+                message=f"Error during scan: {redact_stream_error_for_display(e, path[9:])}",
+            )
         _add_error_asset_to_results(results, report_path)
     finally:
         pickle_source_snapshot_stack.close()
