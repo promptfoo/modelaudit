@@ -22,6 +22,15 @@ from importlib.util import find_spec
 from pathlib import Path
 
 import pytest
+from pickle_test_helpers import (
+    _binunicode,
+    _binunicode8,
+    _bytes_operand,
+    _has_critical_call_graph_finding,
+    _short_binunicode,
+    _text_operand,
+)
+from pickle_test_helpers import _has_module as _module_available
 
 import modelaudit_picklescan.call_graph as call_graph
 from modelaudit_picklescan import PickleReport, SafetyVerdict, ScanOptions, ScanStatus, Severity, scan_bytes
@@ -43,6 +52,17 @@ OperandBuilder = Callable[[bytes], bytes]
 MemoOpcodeBuilder = Callable[[int], bytes]
 
 
+def _install_mailbox_entrypoint_gap(monkeypatch: pytest.MonkeyPatch, blocked_entrypoint: str, message: str) -> None:
+    original_entrypoints = call_graph._safe_call_graph_entrypoints
+
+    def flaky_entrypoints(function_name: str) -> tuple[str, ...]:
+        if function_name == blocked_entrypoint:
+            raise call_graph._CallGraphAnalysisLimitError(message)
+        return original_entrypoints(function_name)
+
+    monkeypatch.setattr(call_graph, "_safe_call_graph_entrypoints", flaky_entrypoints)
+
+
 def _runtime_before(version: tuple[int, int]) -> bool:
     return sys.version_info < version
 
@@ -54,32 +74,9 @@ class AdversarialCase:
     options: ScanOptions | None = None
 
 
-def _short_binunicode(data: bytes) -> bytes:
-    if len(data) > 0xFF:
-        raise ValueError("SHORT_BINUNICODE helper accepts at most 255 bytes")
-    return b"\x8c" + bytes([len(data)]) + data
-
-
-def _binunicode(data: bytes) -> bytes:
-    return b"X" + len(data).to_bytes(4, "little") + data
-
-
 def _encoded_probe_limit_decoy_literal() -> str:
     decoys = "".join(f"gAR9Lg==-decoy-{index}|" for index in range(64))
     return f"{decoys}Y29zCnN5c3RlbQopUi4={'A' * 65}"
-
-
-def _text_operand(value: str) -> bytes:
-    data = value.encode()
-    if len(data) <= 0xFF:
-        return _short_binunicode(data)
-    return _binunicode(data)
-
-
-def _bytes_operand(data: bytes) -> bytes:
-    if len(data) <= 0xFF:
-        return b"C" + bytes([len(data)]) + data
-    return b"B" + len(data).to_bytes(4, "little") + data
 
 
 def _int_operand(value: int) -> bytes:
@@ -88,10 +85,6 @@ def _int_operand(value: int) -> bytes:
     if -0x80000000 <= value <= 0x7FFFFFFF:
         return b"J" + value.to_bytes(4, "little", signed=True)
     raise ValueError("test pickle helper only supports BININT1/BININT operands")
-
-
-def _binunicode8(data: bytes) -> bytes:
-    return b"\x8d" + len(data).to_bytes(8, "little") + data
 
 
 def _unicode(data: bytes) -> bytes:
@@ -312,13 +305,6 @@ def _build_adversarial_cases() -> list[AdversarialCase]:
 ADVERSARIAL_CASES = _build_adversarial_cases()
 
 
-def _module_available(module_name: str) -> bool:
-    try:
-        return find_spec(module_name) is not None
-    except ModuleNotFoundError:
-        return False
-
-
 def _module_global_available(module_name: str, name: str) -> bool:
     try:
         module = import_module(module_name)
@@ -430,17 +416,6 @@ def _has_critical_global_finding(report: PickleReport, module: str, name: str) -
         finding.severity == Severity.CRITICAL
         and finding.details.get("module") == module
         and finding.details.get("name") == name
-        for finding in report.findings
-    )
-
-
-def _has_critical_call_graph_finding(report: PickleReport, module: str, name: str, sink: str) -> bool:
-    return any(
-        finding.severity == Severity.CRITICAL
-        and finding.rule_code == "DANGEROUS_CALL_GRAPH"
-        and finding.details.get("module") == module
-        and finding.details.get("name") == name
-        and finding.details.get("sink") == sink
         for finding in report.findings
     )
 
@@ -757,17 +732,7 @@ def _has_critical_concurrent_futures_finding(report: PickleReport, name: str) ->
 
 
 def _atexit_register_payload(marker: Path) -> bytes:
-    parts = [b"\x80\x04"]
-    parts += [_short_binunicode(b"atexit"), _short_binunicode(b"register"), b"\x93"]
-    parts += [_short_binunicode(b"pathlib"), _short_binunicode(b"Path.touch"), b"\x93"]
-    parts += [
-        _short_binunicode(b"pathlib"),
-        _short_binunicode(type(marker).__name__.encode()),
-        b"\x93(",
-    ]
-    parts.extend(_short_binunicode(part.encode()) for part in marker.parts)
-    parts += [b"tR", b"\x86R."]
-    return b"".join(parts)
+    return _touch_callback_payload(marker, module_name=b"atexit", callback_name=b"register")
 
 
 def _weakref_finalize_payload(marker: Path) -> bytes:
@@ -803,20 +768,13 @@ def _sched_scheduler_run_payload(marker: Path) -> bytes:
 
 
 def _contextlib_exitstack_close_payload(marker: Path) -> bytes:
-    parts = [b"\x80\x04"]
-    parts += [_short_binunicode(b"contextlib"), _short_binunicode(b"ExitStack"), b"\x93)R\x94"]
-    parts += [_short_binunicode(b"contextlib"), _short_binunicode(b"ExitStack.callback"), b"\x93("]
-    parts += [b"h\x00"]
-    parts += [_short_binunicode(b"pathlib"), _short_binunicode(b"Path.touch"), b"\x93"]
-    parts += [
-        _short_binunicode(b"pathlib"),
-        _short_binunicode(type(marker).__name__.encode()),
-        b"\x93(",
-    ]
-    parts.extend(_short_binunicode(part.encode()) for part in marker.parts)
-    parts += [b"tR", b"tR0"]
-    parts += [_short_binunicode(b"contextlib"), _short_binunicode(b"ExitStack.close"), b"\x93h\x00\x85R."]
-    return b"".join(parts)
+    return _callback_owner_payload(
+        marker,
+        module_name=b"contextlib",
+        class_name=b"ExitStack",
+        callback_name=b"ExitStack.callback",
+        close_name=b"ExitStack.close",
+    )
 
 
 def _contextlib_exitstack_enter_context_payload(marker: Path, *, include_call: bool) -> bytes:
@@ -874,24 +832,9 @@ def _types_methodtype_bound_method_payload(marker: Path, *, include_call: bool) 
 
 
 def _types_dynamicclassattribute_get_payload(marker: Path, *, include_call: bool) -> bytes:
-    parts = [b"\x80\x04"]
-    parts += [_short_binunicode(b"types"), _short_binunicode(b"DynamicClassAttribute"), b"\x93"]
-    parts += [_short_binunicode(b"pathlib"), _short_binunicode(b"Path.touch"), b"\x93"]
-    parts += [b"\x85R\x94"]
-    if include_call:
-        parts += [_short_binunicode(b"types"), _short_binunicode(b"DynamicClassAttribute.__get__"), b"\x93"]
-        parts += [b"h\x00"]
-        parts += [
-            _short_binunicode(b"pathlib"),
-            _short_binunicode(type(marker).__name__.encode()),
-            b"\x93(",
-        ]
-        parts.extend(_text_operand(part) for part in marker.parts)
-        parts += [b"tR", b"\x86R"]
-    else:
-        parts += [b"h\x00"]
-    parts += [b"."]
-    return b"".join(parts)
+    return _property_descriptor_payload(
+        marker, include_call=include_call, module_name=b"types", class_name=b"DynamicClassAttribute"
+    )
 
 
 def _functools_cached_property_get_payload(marker: Path, *, include_call: bool) -> bytes:
@@ -1291,22 +1234,14 @@ def _string_formatter_get_field_eval_payload(marker: Path, *, include_lookup: bo
         "]",
     ]
 
-    def join_fragments(fragments: list[str]) -> list[bytes]:
-        return [
-            _global_operand("builtins", "str.join"),
-            _text_operand(""),
-            _tuple_payload_operands([_text_operand(fragment) for fragment in fragments]),
-            b"\x86R",
-        ]
-
     parts = [b"\x80\x04"]
     if include_lookup:
         parts += [_global_operand("string", "Formatter"), b")R\x940"]
         parts += [_global_operand("string", "Formatter.get_field"), b"(", b"h\x00"]
-        parts += join_fragments(field_fragments)
+        parts += _join_fragment_operands(field_fragments)
         parts += [_tuple_payload_operands([_global_operand("statistics", "mean")]), b"}tR\x940"]
         parts += [_global_operand("operator", "getitem"), b"h\x01K\x00\x86R\x940"]
-    parts += join_fragments(code_fragments)
+    parts += _join_fragment_operands(code_fragments)
     if include_lookup:
         parts += [b"\x940h\x02h\x03\x85R"]
     parts += [b"."]
@@ -1318,22 +1253,14 @@ def _unittest_mock_get_target_eval_payload(marker: Path, *, include_lookup: bool
     code_fragments = [code[offset : offset + 18] for offset in range(0, len(code), 18)]
     target_fragments = ["builtins:ev", "al", ".x"]
 
-    def join_fragments(fragments: list[str]) -> list[bytes]:
-        return [
-            _global_operand("builtins", "str.join"),
-            _text_operand(""),
-            _tuple_payload_operands([_text_operand(fragment) for fragment in fragments]),
-            b"\x86R",
-        ]
-
     parts = [b"\x80\x04"]
     if include_lookup:
         parts += [_global_operand("unittest.mock", "_get_target")]
-        parts += join_fragments(target_fragments)
+        parts += _join_fragment_operands(target_fragments)
         parts += [b"\x85R\x940"]
         parts += [_global_operand("operator", "getitem"), b"h\x00K\x00\x86R\x940"]
         parts += [b"h\x01)R\x940"]
-    parts += join_fragments(code_fragments)
+    parts += _join_fragment_operands(code_fragments)
     if include_lookup:
         parts += [b"\x940h\x02h\x03\x85R"]
     parts += [b"."]
@@ -1344,27 +1271,19 @@ def _static_member_descriptor_builtins_eval_payload(marker: Path, *, include_loo
     code = f"open({str(marker)!r},'w').write('owned-by-descriptor-static')"
     code_fragments = [code[offset : offset + 18] for offset in range(0, len(code), 18)]
 
-    def join_fragments(fragments: list[str]) -> list[bytes]:
-        return [
-            _global_operand("builtins", "str.join"),
-            _text_operand(""),
-            _tuple_payload_operands([_text_operand(fragment) for fragment in fragments]),
-            b"\x86R",
-        ]
-
     parts = [b"\x80\x04"]
     if include_lookup:
         parts += [_global_operand("inspect", "getattr_static")]
         parts += [_global_operand("statistics", "mean")]
-        parts += join_fragments(["_", "_", "builtins", "_", "_"])
+        parts += _join_fragment_operands(["_", "_", "builtins", "_", "_"])
         parts += [b"\x86R\x940"]
         parts += [_global_operand("types", "MemberDescriptorType.__get__")]
         parts += [b"h\x00", _global_operand("statistics", "mean"), b"\x86R\x940"]
         parts += [_global_operand("builtins", "dict.get")]
         parts += [b"h\x01"]
-        parts += join_fragments(["ev", "al"])
+        parts += _join_fragment_operands(["ev", "al"])
         parts += [b"\x86R\x940"]
-    parts += join_fragments(code_fragments)
+    parts += _join_fragment_operands(code_fragments)
     if include_lookup:
         parts += [b"\x940h\x02h\x03\x85R"]
     parts += [b"."]
@@ -1375,30 +1294,22 @@ def _wrapper_descriptor_getattribute_eval_payload(marker: Path, *, include_looku
     code = f"open({str(marker)!r},'w').write('owned-by-wrapper-descriptor')"
     code_fragments = [code[offset : offset + 18] for offset in range(0, len(code), 18)]
 
-    def join_fragments(fragments: list[str]) -> list[bytes]:
-        return [
-            _global_operand("builtins", "str.join"),
-            _text_operand(""),
-            _tuple_payload_operands([_text_operand(fragment) for fragment in fragments]),
-            b"\x86R",
-        ]
-
     parts = [b"\x80\x04"]
     if include_lookup:
         parts += [_global_operand("inspect", "getattr_static")]
         parts += [_global_operand("statistics", "mean")]
-        parts += join_fragments(["_", "_", "getattribute", "_", "_"])
+        parts += _join_fragment_operands(["_", "_", "getattribute", "_", "_"])
         parts += [b"\x86R\x940"]
         parts += [_global_operand("types", "WrapperDescriptorType.__get__")]
         parts += [b"h\x00", _global_operand("statistics", "mean"), b"\x86R\x940"]
         parts += [b"h\x01"]
-        parts += join_fragments(["_", "_", "builtins", "_", "_"])
+        parts += _join_fragment_operands(["_", "_", "builtins", "_", "_"])
         parts += [b"\x85R\x940"]
         parts += [_global_operand("builtins", "dict.get")]
         parts += [b"h\x02"]
-        parts += join_fragments(["ev", "al"])
+        parts += _join_fragment_operands(["ev", "al"])
         parts += [b"\x86R\x940"]
-    parts += join_fragments(code_fragments)
+    parts += _join_fragment_operands(code_fragments)
     if include_lookup:
         parts += [b"\x940h\x03h\x04\x85R"]
     parts += [b"."]
@@ -1409,24 +1320,16 @@ def _legacy_bound_getattribute_eval_payload(marker: Path, *, include_lookup: boo
     code = f"open({str(marker)!r},'w').write('owned-by-bound-function-getattribute')"
     code_fragments = [code[offset : offset + 19] for offset in range(0, len(code), 19)]
 
-    def join_fragments(fragments: list[str]) -> list[bytes]:
-        return [
-            _global_operand("builtins", "str.join"),
-            _text_operand(""),
-            _tuple_payload_operands([_text_operand(fragment) for fragment in fragments]),
-            b"\x86R",
-        ]
-
     parts = [b"\x80\x04"]
     if include_lookup:
         parts += [_legacy_global_operand("statistics", "mean.__getattribute__")]
-        parts += join_fragments(["_", "_", "builtins", "_", "_"])
+        parts += _join_fragment_operands(["_", "_", "builtins", "_", "_"])
         parts += [b"\x85R\x940"]
         parts += [_global_operand("builtins", "dict.get")]
         parts += [b"h\x00"]
-        parts += join_fragments(["ev", "al"])
+        parts += _join_fragment_operands(["ev", "al"])
         parts += [b"\x86R\x940"]
-    parts += join_fragments(code_fragments)
+    parts += _join_fragment_operands(code_fragments)
     if include_lookup:
         parts += [b"\x940h\x01h\x02\x85R"]
     parts += [b"."]
@@ -1474,14 +1377,6 @@ def _gc_referents_eval_payload(marker: Path, *, include_lookup: bool) -> tuple[b
     code = f"open({str(marker)!r},'w').write('owned-by-gc-referents')"
     code_fragments = [code[offset : offset + 3] for offset in range(0, len(code), 3)]
 
-    def join_fragments(fragments: list[str]) -> list[bytes]:
-        return [
-            _global_operand("builtins", "str.join"),
-            _text_operand(""),
-            _tuple_payload_operands([_text_operand(fragment) for fragment in fragments]),
-            b"\x86R",
-        ]
-
     parts = [b"\x80\x04"]
     if include_lookup:
         parts += [_legacy_global_operand("gc", "get_referents")]
@@ -1491,9 +1386,9 @@ def _gc_referents_eval_payload(marker: Path, *, include_lookup: bool) -> tuple[b
         parts += [b"h\x00", _int_operand(referent_index), b"\x86R\x940"]
         parts += [_global_operand("builtins", "dict.get")]
         parts += [b"h\x01"]
-        parts += join_fragments(["ev", "al"])
+        parts += _join_fragment_operands(["ev", "al"])
         parts += [b"\x86R\x940"]
-    parts += join_fragments(code_fragments)
+    parts += _join_fragment_operands(code_fragments)
     if include_lookup:
         parts += [b"\x940h\x02h\x03\x85R"]
     parts += [b"."]
@@ -1502,114 +1397,39 @@ def _gc_referents_eval_payload(marker: Path, *, include_lookup: bool) -> tuple[b
 
 def _frame_builtins_descriptor_eval_payload(marker: Path, *, include_lookup: bool) -> tuple[bytes, str]:
     code = f"open({str(marker)!r},'w').write('owned-by-frame-f-builtins')"
-    code_fragments = [code[offset : offset + 3] for offset in range(0, len(code), 3)]
-
-    def join_fragments(fragments: list[str]) -> list[bytes]:
-        return [
-            _global_operand("builtins", "str.join"),
-            _text_operand(""),
-            _tuple_payload_operands([_text_operand(fragment) for fragment in fragments]),
-            b"\x86R",
-        ]
-
-    parts = [b"\x80\x04"]
-    if include_lookup:
-        parts += [_legacy_global_operand("inspect", "currentframe"), b")R\x940"]
-        parts += [_legacy_global_operand("types", "FrameType.f_builtins.__get__")]
-        parts += [b"h\x00\x85R\x940"]
-        parts += [_global_operand("builtins", "dict.get")]
-        parts += [b"h\x01"]
-        parts += join_fragments(["ev", "al"])
-        parts += [b"\x86R\x940"]
-    parts += join_fragments(code_fragments)
-    if include_lookup:
-        parts += [b"\x940h\x02h\x03\x85R"]
-    parts += [b"."]
-    return b"".join(parts), code
+    return _frame_builtins_lookup_eval_payload(
+        code, include_lookup=include_lookup, frame_name="currentframe", descriptor_name="FrameType.f_builtins.__get__"
+    )
 
 
 def _frame_builtins_call_suffix_eval_payload(marker: Path, *, include_lookup: bool) -> tuple[bytes, str]:
     code = f"open({str(marker)!r},'w').write('owned-by-call-suffix')"
-    code_fragments = [code[offset : offset + 3] for offset in range(0, len(code), 3)]
-
-    def join_fragments(fragments: list[str]) -> list[bytes]:
-        return [
-            _global_operand("builtins", "str.join"),
-            _text_operand(""),
-            _tuple_payload_operands([_text_operand(fragment) for fragment in fragments]),
-            b"\x86R",
-        ]
-
-    parts = [b"\x80\x04"]
-    if include_lookup:
-        parts += [_legacy_global_operand("inspect", "currentframe.__call__"), b")R\x940"]
-        parts += [_legacy_global_operand("types", "FrameType.f_builtins.__get__.__call__")]
-        parts += [b"h\x00\x85R\x940"]
-        parts += [_global_operand("builtins", "dict.get")]
-        parts += [b"h\x01"]
-        parts += join_fragments(["ev", "al"])
-        parts += [b"\x86R\x940"]
-    parts += join_fragments(code_fragments)
-    if include_lookup:
-        parts += [b"\x940h\x02h\x03\x85R"]
-    parts += [b"."]
-    return b"".join(parts), code
+    return _frame_builtins_lookup_eval_payload(
+        code,
+        include_lookup=include_lookup,
+        frame_name="currentframe.__call__",
+        descriptor_name="FrameType.f_builtins.__get__.__call__",
+    )
 
 
 def _frame_builtins_get_self_alias_eval_payload(marker: Path, *, include_lookup: bool) -> tuple[bytes, str]:
     code = f"open({str(marker)!r},'w').write('owned-by-get-self')"
-    code_fragments = [code[offset : offset + 3] for offset in range(0, len(code), 3)]
-
-    def join_fragments(fragments: list[str]) -> list[bytes]:
-        return [
-            _global_operand("builtins", "str.join"),
-            _text_operand(""),
-            _tuple_payload_operands([_text_operand(fragment) for fragment in fragments]),
-            b"\x86R",
-        ]
-
-    parts = [b"\x80\x04"]
-    if include_lookup:
-        parts += [_legacy_global_operand("inspect", "currentframe.__get__.__self__"), b")R\x940"]
-        parts += [_legacy_global_operand("types", "FrameType.f_builtins.__get__.__self__.__get__")]
-        parts += [b"h\x00\x85R\x940"]
-        parts += [_global_operand("builtins", "dict.get")]
-        parts += [b"h\x01"]
-        parts += join_fragments(["ev", "al"])
-        parts += [b"\x86R\x940"]
-    parts += join_fragments(code_fragments)
-    if include_lookup:
-        parts += [b"\x940h\x02h\x03\x85R"]
-    parts += [b"."]
-    return b"".join(parts), code
+    return _frame_builtins_lookup_eval_payload(
+        code,
+        include_lookup=include_lookup,
+        frame_name="currentframe.__get__.__self__",
+        descriptor_name="FrameType.f_builtins.__get__.__self__.__get__",
+    )
 
 
 def _frame_builtins_repr_self_alias_eval_payload(marker: Path, *, include_lookup: bool) -> tuple[bytes, str]:
     code = f"open({str(marker)!r},'w').write('owned-by-repr-self')"
-    code_fragments = [code[offset : offset + 3] for offset in range(0, len(code), 3)]
-
-    def join_fragments(fragments: list[str]) -> list[bytes]:
-        return [
-            _global_operand("builtins", "str.join"),
-            _text_operand(""),
-            _tuple_payload_operands([_text_operand(fragment) for fragment in fragments]),
-            b"\x86R",
-        ]
-
-    parts = [b"\x80\x04"]
-    if include_lookup:
-        parts += [_legacy_global_operand("inspect", "currentframe.__repr__.__self__"), b")R\x940"]
-        parts += [_legacy_global_operand("types", "FrameType.f_builtins.__get__.__repr__.__self__")]
-        parts += [b"h\x00\x85R\x940"]
-        parts += [_global_operand("builtins", "dict.get")]
-        parts += [b"h\x01"]
-        parts += join_fragments(["ev", "al"])
-        parts += [b"\x86R\x940"]
-    parts += join_fragments(code_fragments)
-    if include_lookup:
-        parts += [b"\x940h\x02h\x03\x85R"]
-    parts += [b"."]
-    return b"".join(parts), code
+    return _frame_builtins_lookup_eval_payload(
+        code,
+        include_lookup=include_lookup,
+        frame_name="currentframe.__repr__.__self__",
+        descriptor_name="FrameType.f_builtins.__get__.__repr__.__self__",
+    )
 
 
 def _site_os_system_payload(command: str, *, include_call: bool) -> bytes:
@@ -1682,22 +1502,8 @@ def _scipy_rv_continuous_setstate_payload(marker: Path) -> bytes:
         "def _parse_args_stats(*args):\n    return (), 0, 1\n"
         "def _parse_args_rvs(*args):\n    return (), 0, 1, None\n"
     )
-    state = b"".join(
-        [
-            b"}",
-            _dict_setitem("_parse_arg_template", _text_operand(parse_arg_template)),
-            _dict_setitem("numargs", _int_operand(0)),
-            _dict_setitem("moment_type", _int_operand(0)),
-        ]
-    )
-    return b"".join(
-        [
-            b"\x80\x04",
-            _global_operand("scipy.stats._distn_infrastructure", "rv_continuous"),
-            b")\x81",
-            state,
-            b"b.",
-        ]
+    return _scipy_setstate_payload(
+        parse_arg_template, module_name="scipy.stats._distn_infrastructure", class_name="rv_continuous"
     )
 
 
@@ -1708,22 +1514,8 @@ def _scipy_norm_gen_setstate_payload(marker: Path) -> bytes:
         "def _parse_args_stats(*args):\n    return (), 0, 1\n"
         "def _parse_args_rvs(*args):\n    return (), 0, 1, None\n"
     )
-    state = b"".join(
-        [
-            b"}",
-            _dict_setitem("_parse_arg_template", _text_operand(parse_arg_template)),
-            _dict_setitem("numargs", _int_operand(0)),
-            _dict_setitem("moment_type", _int_operand(0)),
-        ]
-    )
-    return b"".join(
-        [
-            b"\x80\x04",
-            _global_operand("scipy.stats._continuous_distns", "norm_gen"),
-            b")\x81",
-            state,
-            b"b.",
-        ]
+    return _scipy_setstate_payload(
+        parse_arg_template, module_name="scipy.stats._continuous_distns", class_name="norm_gen"
     )
 
 
@@ -1751,21 +1543,7 @@ def _scipy_stats_norm_singleton_setstate_payload(marker: Path) -> bytes:
 
 
 def _fsspec_registry_poisoning_payload(marker: Path, cache_dir: Path) -> bytes:
-    def join_fragments(fragments: list[str]) -> bytes:
-        return b"".join(
-            [
-                _global_operand("builtins", "str.join"),
-                _tuple_payload_operands(
-                    [
-                        _text_operand(""),
-                        _list_payload_operands([_text_operand(fragment) for fragment in fragments]),
-                    ]
-                ),
-                b"R",
-            ]
-        )
-
-    registry_value = b"}" + _dict_setitem("class", join_fragments(["sub", "process", ".P", "open"]))
+    registry_value = b"}" + _dict_setitem("class", _join_fragment_payload(["sub", "process", ".P", "open"]))
     command = f"printf fsspec-registry-owned > {shlex.quote(str(marker))}"
     target_options = b"}" + _dict_setitem(
         "args",
@@ -1800,27 +1578,14 @@ def _fsspec_registry_poisoning_payload(marker: Path, cache_dir: Path) -> bytes:
 
 
 def _pydantic_dynamic_imports_payload(marker: Path) -> bytes:
-    def join_fragments(fragments: list[str]) -> bytes:
-        return b"".join(
-            [
-                _global_operand("builtins", "str.join"),
-                _tuple_payload_operands(
-                    [
-                        _text_operand(""),
-                        _list_payload_operands([_text_operand(fragment) for fragment in fragments]),
-                    ]
-                ),
-                b"R",
-            ]
-        )
-
     command = f"printf pydantic-dynamic-import-owned > {shlex.quote(str(marker))}"
     return b"".join(
         [
             b"\x80\x04",
             _global_operand("pydantic", "_dynamic_imports"),
             _dict_setitem(
-                "Popen", _tuple_payload_operands([_text_operand("pydantic"), join_fragments(["sub", "process"])])
+                "Popen",
+                _tuple_payload_operands([_text_operand("pydantic"), _join_fragment_payload(["sub", "process"])]),
             ),
             b"0",
             _global_operand("pydantic", "Popen"),
@@ -2238,18 +2003,7 @@ def _builtins_type_del_finalizer_payload(marker: Path, *, drop_instance: bool) -
 
 
 def _builtins_type_dynamic_del_finalizer_payload(marker: Path, *, drop_instance: bool) -> bytes:
-    parts = [b"\x80\x04"]
-    parts += [_short_binunicode(b"builtins"), _short_binunicode(b"type"), b"\x93"]
-    parts += [b"(", _text_operand("DerivedPath")]
-    parts += [_short_binunicode(b"pathlib"), _short_binunicode(type(marker).__name__.encode()), b"\x93"]
-    parts += [b"\x85", b"}", _dynamic_dunder_name_payload("del")]
-    parts += [_short_binunicode(b"pathlib"), _short_binunicode(b"Path.touch"), b"\x93"]
-    parts += [b"s", b"tR\x940"]
-    parts += [b"h\x00", _text_operand(str(marker)), b"\x85R"]
-    if drop_instance:
-        parts += [b"0N"]
-    parts += [b"."]
-    return b"".join(parts)
+    return _type_finalizer_payload(marker, drop_instance=drop_instance, constructor_name=b"type")
 
 
 def _builtins_type_dynamic_del_finalizer_overflow_payload(marker: Path, *, drop_instance: bool) -> bytes:
@@ -2276,20 +2030,9 @@ def _builtins_type_new_dynamic_del_finalizer_payload(
     drop_instance: bool,
     type_value_name: bytes = b"type",
 ) -> bytes:
-    parts = [b"\x80\x04"]
-    parts += [_short_binunicode(b"builtins"), _short_binunicode(b"type.__new__"), b"\x93"]
-    parts += [b"("]
-    parts += [_short_binunicode(b"builtins"), _short_binunicode(type_value_name), b"\x93"]
-    parts += [_text_operand("DerivedPath")]
-    parts += [_short_binunicode(b"pathlib"), _short_binunicode(type(marker).__name__.encode()), b"\x93"]
-    parts += [b"\x85", b"}", _dynamic_dunder_name_payload("del")]
-    parts += [_short_binunicode(b"pathlib"), _short_binunicode(b"Path.touch"), b"\x93"]
-    parts += [b"s", b"tR\x940"]
-    parts += [b"h\x00", _text_operand(str(marker)), b"\x85R"]
-    if drop_instance:
-        parts += [b"0N"]
-    parts += [b"."]
-    return b"".join(parts)
+    return _type_constructor_finalizer_payload(
+        marker, drop_instance=drop_instance, type_value_name=type_value_name, constructor_name=b"type.__new__"
+    )
 
 
 def _builtins_type_call_dynamic_del_finalizer_payload(
@@ -2298,20 +2041,9 @@ def _builtins_type_call_dynamic_del_finalizer_payload(
     drop_instance: bool,
     type_value_name: bytes = b"type",
 ) -> bytes:
-    parts = [b"\x80\x04"]
-    parts += [_short_binunicode(b"builtins"), _short_binunicode(b"type.__call__"), b"\x93"]
-    parts += [b"("]
-    parts += [_short_binunicode(b"builtins"), _short_binunicode(type_value_name), b"\x93"]
-    parts += [_text_operand("DerivedPath")]
-    parts += [_short_binunicode(b"pathlib"), _short_binunicode(type(marker).__name__.encode()), b"\x93"]
-    parts += [b"\x85", b"}", _dynamic_dunder_name_payload("del")]
-    parts += [_short_binunicode(b"pathlib"), _short_binunicode(b"Path.touch"), b"\x93"]
-    parts += [b"s", b"tR\x940"]
-    parts += [b"h\x00", _text_operand(str(marker)), b"\x85R"]
-    if drop_instance:
-        parts += [b"0N"]
-    parts += [b"."]
-    return b"".join(parts)
+    return _type_constructor_finalizer_payload(
+        marker, drop_instance=drop_instance, type_value_name=type_value_name, constructor_name=b"type.__call__"
+    )
 
 
 def _builtins_type_dict_constructor_dynamic_del_finalizer_payload(marker: Path, *, drop_instance: bool) -> bytes:
@@ -2464,18 +2196,7 @@ def _builtins_type_dup_alias_mutated_namespace_dynamic_del_finalizer_payload(
 
 
 def _builtins_object_class_dynamic_del_finalizer_payload(marker: Path, *, drop_instance: bool) -> bytes:
-    parts = [b"\x80\x04"]
-    parts += [_short_binunicode(b"builtins"), _short_binunicode(b"object.__class__"), b"\x93"]
-    parts += [b"(", _text_operand("DerivedPath")]
-    parts += [_short_binunicode(b"pathlib"), _short_binunicode(type(marker).__name__.encode()), b"\x93"]
-    parts += [b"\x85", b"}", _dynamic_dunder_name_payload("del")]
-    parts += [_short_binunicode(b"pathlib"), _short_binunicode(b"Path.touch"), b"\x93"]
-    parts += [b"s", b"tR\x940"]
-    parts += [b"h\x00", _text_operand(str(marker)), b"\x85R"]
-    if drop_instance:
-        parts += [b"0N"]
-    parts += [b"."]
-    return b"".join(parts)
+    return _type_finalizer_payload(marker, drop_instance=drop_instance, constructor_name=b"object.__class__")
 
 
 def _builtins_type_setattr_dynamic_del_finalizer_payload(marker: Path, *, drop_instance: bool) -> bytes:
@@ -2497,21 +2218,7 @@ def _builtins_type_setattr_dynamic_del_finalizer_payload(marker: Path, *, drop_i
 
 
 def _builtins_type_eq_comparison_payload(marker: Path, *, include_call: bool) -> bytes:
-    parts = [b"\x80\x04"]
-    parts += [_short_binunicode(b"builtins"), _short_binunicode(b"type"), b"\x93"]
-    parts += [b"(", _text_operand("DerivedPath")]
-    parts += [_short_binunicode(b"pathlib"), _short_binunicode(type(marker).__name__.encode()), b"\x93"]
-    parts += [b"\x85", b"}", _text_operand("__eq__")]
-    parts += [_short_binunicode(b"pathlib"), _short_binunicode(b"Path.touch"), b"\x93"]
-    parts += [b"s", b"tR\x940"]
-    parts += [b"h\x00", _text_operand(str(marker)), b"\x85R\x940"]
-    if include_call:
-        parts += [_short_binunicode(b"operator"), _short_binunicode(b"eq"), b"\x93"]
-        parts += [b"h\x01", b"M" + (0o666).to_bytes(2, "little"), b"\x86R"]
-    else:
-        parts += [b"h\x01"]
-    parts += [b"."]
-    return b"".join(parts)
+    return _type_comparison_payload(marker, include_call=include_call, method_name="__eq__", operator_name=b"eq")
 
 
 def _builtins_type_ordering_comparison_payload(
@@ -2538,28 +2245,7 @@ def _builtins_type_ordering_comparison_payload(
     return b"".join(parts)
 
 
-def _builtins_type_item_protocol_payload(
-    marker: Path,
-    *,
-    method_name: str,
-    operator_name: str,
-    include_call: bool,
-) -> bytes:
-    parts = [b"\x80\x04"]
-    parts += [_short_binunicode(b"builtins"), _short_binunicode(b"type"), b"\x93"]
-    parts += [b"(", _text_operand("DerivedPath")]
-    parts += [_short_binunicode(b"pathlib"), _short_binunicode(type(marker).__name__.encode()), b"\x93"]
-    parts += [b"\x85", b"}", _text_operand(method_name)]
-    parts += [_short_binunicode(b"pathlib"), _short_binunicode(b"Path.touch"), b"\x93"]
-    parts += [b"s", b"tR\x940"]
-    parts += [b"h\x00", _text_operand(str(marker)), b"\x85R\x940"]
-    if include_call:
-        parts += [_short_binunicode(b"operator"), _short_binunicode(operator_name.encode()), b"\x93"]
-        parts += [b"h\x01", b"M" + (0o666).to_bytes(2, "little"), b"\x86R"]
-    else:
-        parts += [b"h\x01"]
-    parts += [b"."]
-    return b"".join(parts)
+_builtins_type_item_protocol_payload = _builtins_type_ordering_comparison_payload
 
 
 def _builtins_type_binary_operator_payload(
@@ -2810,21 +2496,9 @@ def _builtins_type_descriptor_set_name_payload(marker: Path, *, include_owner_cl
 
 
 def _builtins_type_contains_membership_payload(marker: Path, *, include_call: bool) -> bytes:
-    parts = [b"\x80\x04"]
-    parts += [_short_binunicode(b"builtins"), _short_binunicode(b"type"), b"\x93"]
-    parts += [b"(", _text_operand("DerivedPath")]
-    parts += [_short_binunicode(b"pathlib"), _short_binunicode(type(marker).__name__.encode()), b"\x93"]
-    parts += [b"\x85", b"}", _text_operand("__contains__")]
-    parts += [_short_binunicode(b"pathlib"), _short_binunicode(b"Path.touch"), b"\x93"]
-    parts += [b"s", b"tR\x940"]
-    parts += [b"h\x00", _text_operand(str(marker)), b"\x85R\x940"]
-    if include_call:
-        parts += [_short_binunicode(b"operator"), _short_binunicode(b"contains"), b"\x93"]
-        parts += [b"h\x01", b"M" + (0o666).to_bytes(2, "little"), b"\x86R"]
-    else:
-        parts += [b"h\x01"]
-    parts += [b"."]
-    return b"".join(parts)
+    return _type_comparison_payload(
+        marker, include_call=include_call, method_name="__contains__", operator_name=b"contains"
+    )
 
 
 def _builtins_type_setitem_assignment_payload(marker: Path, *, include_call: bool) -> bytes:
@@ -2866,24 +2540,9 @@ def _builtins_staticmethod_descriptor_payload(marker: Path, *, include_call: boo
 
 
 def _builtins_property_get_descriptor_payload(marker: Path, *, include_call: bool) -> bytes:
-    parts = [b"\x80\x04"]
-    parts += [_short_binunicode(b"builtins"), _short_binunicode(b"property"), b"\x93"]
-    parts += [_short_binunicode(b"pathlib"), _short_binunicode(b"Path.touch"), b"\x93"]
-    parts += [b"\x85R\x94"]
-    if include_call:
-        parts += [_short_binunicode(b"builtins"), _short_binunicode(b"property.__get__"), b"\x93"]
-        parts += [b"h\x00"]
-        parts += [
-            _short_binunicode(b"pathlib"),
-            _short_binunicode(type(marker).__name__.encode()),
-            b"\x93(",
-        ]
-        parts.extend(_text_operand(part) for part in marker.parts)
-        parts += [b"tR", b"\x86R"]
-    else:
-        parts += [b"h\x00"]
-    parts += [b"."]
-    return b"".join(parts)
+    return _property_descriptor_payload(
+        marker, include_call=include_call, module_name=b"builtins", class_name=b"property"
+    )
 
 
 def _builtins_classmethod_get_descriptor_payload(marker: Path, *, include_call: bool) -> bytes:
@@ -2982,45 +2641,23 @@ def _unittest_mock_side_effect_payload(marker: Path, class_name: bytes = b"Mock"
 
 
 def _threadpool_executor_submit_payload(marker: Path) -> bytes:
-    parts = [b"\x80\x04"]
-    parts += [_short_binunicode(b"concurrent.futures"), _short_binunicode(b"ThreadPoolExecutor"), b"\x93)R\x94"]
-    parts += [_short_binunicode(b"concurrent.futures"), _short_binunicode(b"ThreadPoolExecutor.submit"), b"\x93("]
-    parts += [b"h\x00"]
-    parts += [_short_binunicode(b"pathlib"), _short_binunicode(b"Path.touch"), b"\x93"]
-    parts += [
-        _short_binunicode(b"pathlib"),
-        _short_binunicode(type(marker).__name__.encode()),
-        b"\x93(",
-    ]
-    parts.extend(_short_binunicode(part.encode()) for part in marker.parts)
-    parts += [b"tR", b"tR0"]
-    parts += [
-        _short_binunicode(b"concurrent.futures"),
-        _short_binunicode(b"ThreadPoolExecutor.shutdown"),
-        b"\x93h\x00\x85R.",
-    ]
-    return b"".join(parts)
+    return _callback_owner_payload(
+        marker,
+        module_name=b"concurrent.futures",
+        class_name=b"ThreadPoolExecutor",
+        callback_name=b"ThreadPoolExecutor.submit",
+        close_name=b"ThreadPoolExecutor.shutdown",
+    )
 
 
 def _processpool_executor_submit_payload(marker: Path) -> bytes:
-    parts = [b"\x80\x04"]
-    parts += [_short_binunicode(b"concurrent.futures"), _short_binunicode(b"ProcessPoolExecutor"), b"\x93)R\x94"]
-    parts += [_short_binunicode(b"concurrent.futures"), _short_binunicode(b"ProcessPoolExecutor.submit"), b"\x93("]
-    parts += [b"h\x00"]
-    parts += [_short_binunicode(b"pathlib"), _short_binunicode(b"Path.touch"), b"\x93"]
-    parts += [
-        _short_binunicode(b"pathlib"),
-        _short_binunicode(type(marker).__name__.encode()),
-        b"\x93(",
-    ]
-    parts.extend(_short_binunicode(part.encode()) for part in marker.parts)
-    parts += [b"tR", b"tR0"]
-    parts += [
-        _short_binunicode(b"concurrent.futures"),
-        _short_binunicode(b"ProcessPoolExecutor.shutdown"),
-        b"\x93h\x00\x85R.",
-    ]
-    return b"".join(parts)
+    return _callback_owner_payload(
+        marker,
+        module_name=b"concurrent.futures",
+        class_name=b"ProcessPoolExecutor",
+        callback_name=b"ProcessPoolExecutor.submit",
+        close_name=b"ProcessPoolExecutor.shutdown",
+    )
 
 
 def _site_addsitedir_pth_payload(pth_path: Path, marker: Path, *, include_addsitedir: bool) -> bytes:
@@ -3183,49 +2820,15 @@ def _typing_get_type_hints_payload(marker: Path) -> bytes:
 
 
 def _operator_call_payload(marker: Path) -> bytes:
-    parts = [b"\x80\x04"]
-    parts += [_short_binunicode(b"operator"), _short_binunicode(b"call"), b"\x93"]
-    parts += [_short_binunicode(b"pathlib"), _short_binunicode(b"Path.touch"), b"\x93"]
-    parts += [
-        _short_binunicode(b"pathlib"),
-        _short_binunicode(type(marker).__name__.encode()),
-        b"\x93(",
-    ]
-    parts.extend(_short_binunicode(part.encode()) for part in marker.parts)
-    parts += [b"tR", b"\x86R."]
-    return b"".join(parts)
+    return _touch_callback_payload(marker, module_name=b"operator", callback_name=b"call")
 
 
 def _builtins_map_tuple_payload(marker: Path) -> bytes:
-    parts = [b"\x80\x04"]
-    parts += [_short_binunicode(b"builtins"), _short_binunicode(b"tuple"), b"\x93"]
-    parts += [_short_binunicode(b"builtins"), _short_binunicode(b"map"), b"\x93"]
-    parts += [_short_binunicode(b"pathlib"), _short_binunicode(b"Path.touch"), b"\x93"]
-    parts += [b"]"]
-    parts += [
-        _short_binunicode(b"pathlib"),
-        _short_binunicode(type(marker).__name__.encode()),
-        b"\x93(",
-    ]
-    parts.extend(_short_binunicode(part.encode()) for part in marker.parts)
-    parts += [b"tRa", b"\x86R", b"\x85R."]
-    return b"".join(parts)
+    return _iterator_tuple_payload(marker, module_name=b"builtins", iterator_name=b"map")
 
 
 def _builtins_filter_tuple_payload(marker: Path) -> bytes:
-    parts = [b"\x80\x04"]
-    parts += [_short_binunicode(b"builtins"), _short_binunicode(b"tuple"), b"\x93"]
-    parts += [_short_binunicode(b"builtins"), _short_binunicode(b"filter"), b"\x93"]
-    parts += [_short_binunicode(b"pathlib"), _short_binunicode(b"Path.touch"), b"\x93"]
-    parts += [b"]"]
-    parts += [
-        _short_binunicode(b"pathlib"),
-        _short_binunicode(type(marker).__name__.encode()),
-        b"\x93(",
-    ]
-    parts.extend(_short_binunicode(part.encode()) for part in marker.parts)
-    parts += [b"tRa", b"\x86R", b"\x85R."]
-    return b"".join(parts)
+    return _iterator_tuple_payload(marker, module_name=b"builtins", iterator_name=b"filter")
 
 
 def _itertools_accumulate_tuple_payload(marker: Path) -> bytes:
@@ -3246,35 +2849,11 @@ def _itertools_accumulate_tuple_payload(marker: Path) -> bytes:
 
 
 def _itertools_dropwhile_tuple_payload(marker: Path) -> bytes:
-    parts = [b"\x80\x04"]
-    parts += [_short_binunicode(b"builtins"), _short_binunicode(b"tuple"), b"\x93"]
-    parts += [_short_binunicode(b"itertools"), _short_binunicode(b"dropwhile"), b"\x93"]
-    parts += [_short_binunicode(b"pathlib"), _short_binunicode(b"Path.touch"), b"\x93"]
-    parts += [b"]"]
-    parts += [
-        _short_binunicode(b"pathlib"),
-        _short_binunicode(type(marker).__name__.encode()),
-        b"\x93(",
-    ]
-    parts.extend(_short_binunicode(part.encode()) for part in marker.parts)
-    parts += [b"tRa", b"\x86R", b"\x85R."]
-    return b"".join(parts)
+    return _iterator_tuple_payload(marker, module_name=b"itertools", iterator_name=b"dropwhile")
 
 
 def _itertools_filterfalse_tuple_payload(marker: Path) -> bytes:
-    parts = [b"\x80\x04"]
-    parts += [_short_binunicode(b"builtins"), _short_binunicode(b"tuple"), b"\x93"]
-    parts += [_short_binunicode(b"itertools"), _short_binunicode(b"filterfalse"), b"\x93"]
-    parts += [_short_binunicode(b"pathlib"), _short_binunicode(b"Path.touch"), b"\x93"]
-    parts += [b"]"]
-    parts += [
-        _short_binunicode(b"pathlib"),
-        _short_binunicode(type(marker).__name__.encode()),
-        b"\x93(",
-    ]
-    parts.extend(_short_binunicode(part.encode()) for part in marker.parts)
-    parts += [b"tRa", b"\x86R", b"\x85R."]
-    return b"".join(parts)
+    return _iterator_tuple_payload(marker, module_name=b"itertools", iterator_name=b"filterfalse")
 
 
 def _itertools_groupby_tuple_payload(marker: Path) -> bytes:
@@ -3311,19 +2890,7 @@ def _itertools_starmap_tuple_payload(marker: Path) -> bytes:
 
 
 def _itertools_takewhile_tuple_payload(marker: Path) -> bytes:
-    parts = [b"\x80\x04"]
-    parts += [_short_binunicode(b"builtins"), _short_binunicode(b"tuple"), b"\x93"]
-    parts += [_short_binunicode(b"itertools"), _short_binunicode(b"takewhile"), b"\x93"]
-    parts += [_short_binunicode(b"pathlib"), _short_binunicode(b"Path.touch"), b"\x93"]
-    parts += [b"]"]
-    parts += [
-        _short_binunicode(b"pathlib"),
-        _short_binunicode(type(marker).__name__.encode()),
-        b"\x93(",
-    ]
-    parts.extend(_short_binunicode(part.encode()) for part in marker.parts)
-    parts += [b"tRa", b"\x86R", b"\x85R."]
-    return b"".join(parts)
+    return _iterator_tuple_payload(marker, module_name=b"itertools", iterator_name=b"takewhile")
 
 
 def test_adversarial_oracle_corpus_is_large_enough() -> None:
@@ -5546,14 +5113,7 @@ def test_scan_bytes_preserves_mailbox_add_detection_when_constructor_analysis_un
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    original_entrypoints = call_graph._safe_call_graph_entrypoints
-
-    def flaky_entrypoints(function_name: str) -> tuple[str, ...]:
-        if function_name == "mailbox.mbox":
-            raise call_graph._CallGraphAnalysisLimitError("synthetic mailbox constructor source gap")
-        return original_entrypoints(function_name)
-
-    monkeypatch.setattr(call_graph, "_safe_call_graph_entrypoints", flaky_entrypoints)
+    _install_mailbox_entrypoint_gap(monkeypatch, "mailbox.mbox", "synthetic mailbox constructor source gap")
     pth_path = tmp_path / "mailbox_cleanup_exec.pth"
     marker = tmp_path / "mailbox_cleanup_pth_rce_marker"
     control_payload = _mailbox_singlefile_pth_payload(
@@ -5586,14 +5146,7 @@ def test_scan_bytes_keeps_mailbox_multi_arg_constructor_gap_inconclusive(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    original_entrypoints = call_graph._safe_call_graph_entrypoints
-
-    def flaky_entrypoints(function_name: str) -> tuple[str, ...]:
-        if function_name == "mailbox.mbox":
-            raise call_graph._CallGraphAnalysisLimitError("synthetic mailbox constructor source gap")
-        return original_entrypoints(function_name)
-
-    monkeypatch.setattr(call_graph, "_safe_call_graph_entrypoints", flaky_entrypoints)
+    _install_mailbox_entrypoint_gap(monkeypatch, "mailbox.mbox", "synthetic mailbox constructor source gap")
     pth_path = tmp_path / "mailbox_multi_arg_gap_exec.pth"
     marker = tmp_path / "mailbox_multi_arg_gap_pth_rce_marker"
     payload = b"".join(
@@ -5618,14 +5171,7 @@ def test_scan_bytes_keeps_mailbox_flush_analysis_gap_fail_closed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    original_entrypoints = call_graph._safe_call_graph_entrypoints
-
-    def flaky_entrypoints(function_name: str) -> tuple[str, ...]:
-        if function_name == "mailbox.mbox.flush":
-            raise call_graph._CallGraphAnalysisLimitError("synthetic mailbox flush source gap")
-        return original_entrypoints(function_name)
-
-    monkeypatch.setattr(call_graph, "_safe_call_graph_entrypoints", flaky_entrypoints)
+    _install_mailbox_entrypoint_gap(monkeypatch, "mailbox.mbox.flush", "synthetic mailbox flush source gap")
     pth_path = tmp_path / "mailbox_flush_gap_exec.pth"
     marker = tmp_path / "mailbox_flush_gap_pth_rce_marker"
     control_payload = _mailbox_singlefile_pth_payload(
@@ -6677,38 +6223,7 @@ def test_scan_bytes_blocks_builtins_type_binary_operator_rce(
     method_name: str,
     operator_name: str,
 ) -> None:
-    marker = tmp_path / f"builtins_type_{operator_name}_binary_operator_rce_marker"
-    control_payload = _builtins_type_binary_operator_payload(
-        marker,
-        method_name=method_name,
-        operator_name=operator_name,
-        include_call=False,
-    )
-    payload = _builtins_type_binary_operator_payload(
-        marker,
-        method_name=method_name,
-        operator_name=operator_name,
-        include_call=True,
-    )
-
-    control_report = scan_bytes(control_payload, source=f"builtins-type-{operator_name}-binary-control.pkl")
-    assert control_report.verdict == SafetyVerdict.SUSPICIOUS
-    assert _has_suspicious_magic_method_finding(control_report)
-
-    assert not marker.exists()
-    control_result = pickle.loads(control_payload)
-    assert type(control_result).__name__ == "DerivedPath"
-    assert not marker.exists()
-
-    report = scan_bytes(payload, source=f"builtins-type-{operator_name}-binary-rce.pkl")
-
-    assert report.verdict == SafetyVerdict.SUSPICIOUS
-    assert _has_suspicious_magic_method_finding(report)
-
-    assert not marker.exists()
-    result = pickle.loads(payload)
-    assert result is None
-    assert marker.exists()
+    _assert_binary_operator_rce(tmp_path, method_name, operator_name, "binary")
 
 
 @pytest.mark.parametrize(
@@ -6791,38 +6306,7 @@ def test_scan_bytes_blocks_builtins_type_inplace_binary_operator_rce(
     method_name: str,
     operator_name: str,
 ) -> None:
-    marker = tmp_path / f"builtins_type_{operator_name}_inplace_operator_rce_marker"
-    control_payload = _builtins_type_binary_operator_payload(
-        marker,
-        method_name=method_name,
-        operator_name=operator_name,
-        include_call=False,
-    )
-    payload = _builtins_type_binary_operator_payload(
-        marker,
-        method_name=method_name,
-        operator_name=operator_name,
-        include_call=True,
-    )
-
-    control_report = scan_bytes(control_payload, source=f"builtins-type-{operator_name}-inplace-control.pkl")
-    assert control_report.verdict == SafetyVerdict.SUSPICIOUS
-    assert _has_suspicious_magic_method_finding(control_report)
-
-    assert not marker.exists()
-    control_result = pickle.loads(control_payload)
-    assert type(control_result).__name__ == "DerivedPath"
-    assert not marker.exists()
-
-    report = scan_bytes(payload, source=f"builtins-type-{operator_name}-inplace-rce.pkl")
-
-    assert report.verdict == SafetyVerdict.SUSPICIOUS
-    assert _has_suspicious_magic_method_finding(report)
-
-    assert not marker.exists()
-    result = pickle.loads(payload)
-    assert result is None
-    assert marker.exists()
+    _assert_binary_operator_rce(tmp_path, method_name, operator_name, "inplace")
 
 
 @pytest.mark.parametrize(
@@ -7602,4 +7086,226 @@ def test_scan_bytes_blocks_setuptools_distutils_spawn_rce(tmp_path: Path) -> Non
 
     assert not marker.exists()
     pickle.loads(payload)
+    assert marker.exists()
+
+
+def _join_fragment_operands(fragments: list[str]) -> list[bytes]:
+    return [
+        _global_operand("builtins", "str.join"),
+        _text_operand(""),
+        _tuple_payload_operands([_text_operand(fragment) for fragment in fragments]),
+        b"\x86R",
+    ]
+
+
+def _join_fragment_payload(fragments: list[str]) -> bytes:
+    return b"".join(
+        [
+            _global_operand("builtins", "str.join"),
+            _tuple_payload_operands(
+                [
+                    _text_operand(""),
+                    _list_payload_operands([_text_operand(fragment) for fragment in fragments]),
+                ]
+            ),
+            b"R",
+        ]
+    )
+
+
+def _callback_owner_payload(
+    marker: Path, *, module_name: bytes, class_name: bytes, callback_name: bytes, close_name: bytes
+) -> bytes:
+    parts = [b"\x80\x04"]
+    parts += [_short_binunicode(module_name), _short_binunicode(class_name), b"\x93)R\x94"]
+    parts += [_short_binunicode(module_name), _short_binunicode(callback_name), b"\x93("]
+    parts += [b"h\x00"]
+    parts += [_short_binunicode(b"pathlib"), _short_binunicode(b"Path.touch"), b"\x93"]
+    parts += [
+        _short_binunicode(b"pathlib"),
+        _short_binunicode(type(marker).__name__.encode()),
+        b"\x93(",
+    ]
+    parts.extend(_short_binunicode(part.encode()) for part in marker.parts)
+    parts += [b"tR", b"tR0"]
+    parts += [_short_binunicode(module_name), _short_binunicode(close_name), b"\x93h\x00\x85R."]
+    return b"".join(parts)
+
+
+def _frame_builtins_lookup_eval_payload(
+    code: str, *, include_lookup: bool, frame_name: str, descriptor_name: str
+) -> tuple[bytes, str]:
+    code_fragments = [code[offset : offset + 3] for offset in range(0, len(code), 3)]
+
+    parts = [b"\x80\x04"]
+    if include_lookup:
+        parts += [_legacy_global_operand("inspect", frame_name), b")R\x940"]
+        parts += [_legacy_global_operand("types", descriptor_name)]
+        parts += [b"h\x00\x85R\x940"]
+        parts += [_global_operand("builtins", "dict.get")]
+        parts += [b"h\x01"]
+        parts += _join_fragment_operands(["ev", "al"])
+        parts += [b"\x86R\x940"]
+    parts += _join_fragment_operands(code_fragments)
+    if include_lookup:
+        parts += [b"\x940h\x02h\x03\x85R"]
+    parts += [b"."]
+    return b"".join(parts), code
+
+
+def _iterator_tuple_payload(marker: Path, *, module_name: bytes, iterator_name: bytes) -> bytes:
+    parts = [b"\x80\x04"]
+    parts += [_short_binunicode(b"builtins"), _short_binunicode(b"tuple"), b"\x93"]
+    parts += [_short_binunicode(module_name), _short_binunicode(iterator_name), b"\x93"]
+    parts += [_short_binunicode(b"pathlib"), _short_binunicode(b"Path.touch"), b"\x93"]
+    parts += [b"]"]
+    parts += [
+        _short_binunicode(b"pathlib"),
+        _short_binunicode(type(marker).__name__.encode()),
+        b"\x93(",
+    ]
+    parts.extend(_short_binunicode(part.encode()) for part in marker.parts)
+    parts += [b"tRa", b"\x86R", b"\x85R."]
+    return b"".join(parts)
+
+
+def _property_descriptor_payload(marker: Path, *, include_call: bool, module_name: bytes, class_name: bytes) -> bytes:
+    parts = [b"\x80\x04"]
+    parts += [_short_binunicode(module_name), _short_binunicode(class_name), b"\x93"]
+    parts += [_short_binunicode(b"pathlib"), _short_binunicode(b"Path.touch"), b"\x93"]
+    parts += [b"\x85R\x94"]
+    if include_call:
+        parts += [_short_binunicode(module_name), _short_binunicode(class_name + b".__get__"), b"\x93"]
+        parts += [b"h\x00"]
+        parts += [
+            _short_binunicode(b"pathlib"),
+            _short_binunicode(type(marker).__name__.encode()),
+            b"\x93(",
+        ]
+        parts.extend(_text_operand(part) for part in marker.parts)
+        parts += [b"tR", b"\x86R"]
+    else:
+        parts += [b"h\x00"]
+    parts += [b"."]
+    return b"".join(parts)
+
+
+def _scipy_setstate_payload(parse_arg_template: str, *, module_name: str, class_name: str) -> bytes:
+    state = b"".join(
+        [
+            b"}",
+            _dict_setitem("_parse_arg_template", _text_operand(parse_arg_template)),
+            _dict_setitem("numargs", _int_operand(0)),
+            _dict_setitem("moment_type", _int_operand(0)),
+        ]
+    )
+    return b"".join(
+        [
+            b"\x80\x04",
+            _global_operand(module_name, class_name),
+            b")\x81",
+            state,
+            b"b.",
+        ]
+    )
+
+
+def _touch_callback_payload(marker: Path, *, module_name: bytes, callback_name: bytes) -> bytes:
+    parts = [b"\x80\x04"]
+    parts += [_short_binunicode(module_name), _short_binunicode(callback_name), b"\x93"]
+    parts += [_short_binunicode(b"pathlib"), _short_binunicode(b"Path.touch"), b"\x93"]
+    parts += [
+        _short_binunicode(b"pathlib"),
+        _short_binunicode(type(marker).__name__.encode()),
+        b"\x93(",
+    ]
+    parts.extend(_short_binunicode(part.encode()) for part in marker.parts)
+    parts += [b"tR", b"\x86R."]
+    return b"".join(parts)
+
+
+def _type_comparison_payload(marker: Path, *, include_call: bool, method_name: str, operator_name: bytes) -> bytes:
+    parts = [b"\x80\x04"]
+    parts += [_short_binunicode(b"builtins"), _short_binunicode(b"type"), b"\x93"]
+    parts += [b"(", _text_operand("DerivedPath")]
+    parts += [_short_binunicode(b"pathlib"), _short_binunicode(type(marker).__name__.encode()), b"\x93"]
+    parts += [b"\x85", b"}", _text_operand(method_name)]
+    parts += [_short_binunicode(b"pathlib"), _short_binunicode(b"Path.touch"), b"\x93"]
+    parts += [b"s", b"tR\x940"]
+    parts += [b"h\x00", _text_operand(str(marker)), b"\x85R\x940"]
+    if include_call:
+        parts += [_short_binunicode(b"operator"), _short_binunicode(operator_name), b"\x93"]
+        parts += [b"h\x01", b"M" + (0o666).to_bytes(2, "little"), b"\x86R"]
+    else:
+        parts += [b"h\x01"]
+    parts += [b"."]
+    return b"".join(parts)
+
+
+def _type_constructor_finalizer_payload(
+    marker: Path, *, drop_instance: bool, type_value_name: bytes = b"type", constructor_name: bytes
+) -> bytes:
+    parts = [b"\x80\x04"]
+    parts += [_short_binunicode(b"builtins"), _short_binunicode(constructor_name), b"\x93"]
+    parts += [b"("]
+    parts += [_short_binunicode(b"builtins"), _short_binunicode(type_value_name), b"\x93"]
+    parts += [_text_operand("DerivedPath")]
+    parts += [_short_binunicode(b"pathlib"), _short_binunicode(type(marker).__name__.encode()), b"\x93"]
+    parts += [b"\x85", b"}", _dynamic_dunder_name_payload("del")]
+    parts += [_short_binunicode(b"pathlib"), _short_binunicode(b"Path.touch"), b"\x93"]
+    parts += [b"s", b"tR\x940"]
+    parts += [b"h\x00", _text_operand(str(marker)), b"\x85R"]
+    if drop_instance:
+        parts += [b"0N"]
+    parts += [b"."]
+    return b"".join(parts)
+
+
+def _type_finalizer_payload(marker: Path, *, drop_instance: bool, constructor_name: bytes) -> bytes:
+    parts = [b"\x80\x04"]
+    parts += [_short_binunicode(b"builtins"), _short_binunicode(constructor_name), b"\x93"]
+    parts += [b"(", _text_operand("DerivedPath")]
+    parts += [_short_binunicode(b"pathlib"), _short_binunicode(type(marker).__name__.encode()), b"\x93"]
+    parts += [b"\x85", b"}", _dynamic_dunder_name_payload("del")]
+    parts += [_short_binunicode(b"pathlib"), _short_binunicode(b"Path.touch"), b"\x93"]
+    parts += [b"s", b"tR\x940"]
+    parts += [b"h\x00", _text_operand(str(marker)), b"\x85R"]
+    if drop_instance:
+        parts += [b"0N"]
+    parts += [b"."]
+    return b"".join(parts)
+
+
+def _assert_binary_operator_rce(tmp_path: Path, method_name: str, operator_name: str, operator_kind: str) -> None:
+    marker = tmp_path / f"builtins_type_{operator_name}_{operator_kind}_operator_rce_marker"
+    control_payload = _builtins_type_binary_operator_payload(
+        marker,
+        method_name=method_name,
+        operator_name=operator_name,
+        include_call=False,
+    )
+    payload = _builtins_type_binary_operator_payload(
+        marker,
+        method_name=method_name,
+        operator_name=operator_name,
+        include_call=True,
+    )
+
+    control_report = scan_bytes(control_payload, source=f"builtins-type-{operator_name}-{operator_kind}-control.pkl")
+    assert control_report.verdict == SafetyVerdict.SUSPICIOUS
+    assert _has_suspicious_magic_method_finding(control_report)
+
+    assert not marker.exists()
+    control_result = pickle.loads(control_payload)
+    assert type(control_result).__name__ == "DerivedPath"
+    assert not marker.exists()
+
+    report = scan_bytes(payload, source=f"builtins-type-{operator_name}-{operator_kind}-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert _has_suspicious_magic_method_finding(report)
+
+    assert not marker.exists()
+    result = pickle.loads(payload)
+    assert result is None
     assert marker.exists()

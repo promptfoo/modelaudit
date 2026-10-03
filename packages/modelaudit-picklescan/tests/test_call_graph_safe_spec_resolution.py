@@ -34,15 +34,11 @@ from typing import Any, cast
 from zipimport import zipimporter
 
 import pytest
+from pickle_test_helpers import _clear_call_graph_caches
 
 import modelaudit_picklescan.api as package_api
 import modelaudit_picklescan.call_graph as call_graph
 from modelaudit_picklescan import PickleReport, SafetyVerdict, ScanStatus
-
-
-def _clear_call_graph_caches() -> None:
-    for function in call_graph._SOURCE_SENSITIVE_CACHED_FUNCTIONS:
-        function.cache_clear()
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Windows ctime differs across stat views")
@@ -203,31 +199,11 @@ def _has_source_unavailable_notice(report: PickleReport, module: str, name: str)
 
 
 def _fail_builtin_find_spec(calls: list[str]) -> Any:
-    def find_spec(
-        cls: type[object],
-        fullname: str,
-        path: object | None = None,
-        target: object | None = None,
-    ) -> ModuleSpec | None:
-        del cls, path, target
-        calls.append(fullname)
-        raise AssertionError(f"BuiltinImporter.find_spec called for {fullname!r}")
-
-    return classmethod(find_spec)
+    return _fail_importer_find_spec(calls, "BuiltinImporter.find_spec called for ")
 
 
 def _fail_frozen_find_spec(calls: list[str]) -> Any:
-    def find_spec(
-        cls: type[object],
-        fullname: str,
-        path: object | None = None,
-        target: object | None = None,
-    ) -> ModuleSpec | None:
-        del cls, path, target
-        calls.append(fullname)
-        raise AssertionError(f"FrozenImporter.find_spec called for {fullname!r}")
-
-    return classmethod(find_spec)
+    return _fail_importer_find_spec(calls, "FrozenImporter.find_spec called for ")
 
 
 def test_call_graph_enrichment_does_not_invoke_meta_path_finders_for_pickle_names(
@@ -802,12 +778,7 @@ for reconstruct_module in ("numpy._core.multiarray", "numpy.core.multiarray"):
 
 assert trusted_reconstruct_modules
 """
-    result = subprocess.run(
-        [sys.executable, "-c", script],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    result = _run_python_script(script)
     if result.returncode == 99:
         pytest.skip("NumPy is not installed")
     if result.returncode == 98:
@@ -988,12 +959,7 @@ for function in call_graph._SOURCE_SENSITIVE_CACHED_FUNCTIONS:
 assert call_graph._loaded_trusted_reference_matches_baseline("tempfile", "gettempdir") is False
 assert calls == []
 """
-    result = subprocess.run(
-        [sys.executable, "-c", script],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    result = _run_python_script(script)
     assert result.returncode == 0, result.stderr
 
 
@@ -1163,12 +1129,7 @@ assert any(
 )
 assert calls == []
 """
-    result = subprocess.run(
-        [sys.executable, "-c", script],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    result = _run_python_script(script)
     assert result.returncode == 0, result.stderr
 
 
@@ -1798,16 +1759,7 @@ def test_zipimporter_directory_validation_does_not_execute_mutated_reader_global
     files = _zipimporter_directory_files(finder)
     assert call_graph._zipimport_archive_files_match(str(archive_path), files)
 
-    zipimport_namespace = ModuleType.__getattribute__(zipimport, "__dict__")
-    original_unpack = dict.get(zipimport_namespace, "_unpack_uint32")
-    assert callable(original_unpack)
-    calls: list[bytes] = []
-
-    def poisoned_unpack(value: bytes) -> int:
-        calls.append(value)
-        return cast(Callable[[bytes], int], original_unpack)(value)
-
-    monkeypatch.setitem(zipimport_namespace, "_unpack_uint32", poisoned_unpack)
+    calls = _poison_zipimport_unpack(monkeypatch)
 
     assert call_graph._zipimport_archive_files_match(str(archive_path), files) is False
     with _standard_import_runtime(
@@ -1827,16 +1779,7 @@ def test_uncached_zip_path_does_not_construct_importer_with_mutated_runtime(
 ) -> None:
     archive_path = tmp_path / "uncached-mutated-runtime.zip"
     _write_zipimporter_archive(archive_path, "trusted_module", include_module=True)
-    zipimport_namespace = ModuleType.__getattribute__(zipimport, "__dict__")
-    original_unpack = dict.get(zipimport_namespace, "_unpack_uint32")
-    assert callable(original_unpack)
-    calls: list[bytes] = []
-
-    def poisoned_unpack(value: bytes) -> int:
-        calls.append(value)
-        return cast(Callable[[bytes], int], original_unpack)(value)
-
-    monkeypatch.setitem(zipimport_namespace, "_unpack_uint32", poisoned_unpack)
+    calls = _poison_zipimport_unpack(monkeypatch)
     with _standard_import_runtime(
         monkeypatch,
         module="trusted_module",
@@ -2986,12 +2929,7 @@ assert runtime_is_trusted is False
 assert origin_kind is None
 assert calls == []
 """
-    result = subprocess.run(
-        [sys.executable, "-c", script],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    result = _run_python_script(script)
     assert result.returncode == 0, result.stderr
 
 
@@ -3027,12 +2965,7 @@ assert source_reason == "source_unavailable"
 assert can_execute is True
 assert calls == []
 """
-    result = subprocess.run(
-        [sys.executable, "-c", script],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    result = _run_python_script(script)
     assert result.returncode == 0, result.stderr
 
 
@@ -3738,3 +3671,40 @@ def test_call_graph_error_details_do_not_read_arbitrary_exception_attributes() -
         "analysis": "python_call_graph",
         "analysis_incomplete": True,
     }
+
+
+def _fail_importer_find_spec(calls: list[str], message_prefix: str) -> Any:
+    def find_spec(
+        cls: type[object],
+        fullname: str,
+        path: object | None = None,
+        target: object | None = None,
+    ) -> ModuleSpec | None:
+        del cls, path, target
+        calls.append(fullname)
+        raise AssertionError(f"{message_prefix}{fullname!r}")
+
+    return classmethod(find_spec)
+
+
+def _run_python_script(script: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _poison_zipimport_unpack(monkeypatch: pytest.MonkeyPatch) -> list[bytes]:
+    zipimport_namespace = ModuleType.__getattribute__(zipimport, "__dict__")
+    original_unpack = dict.get(zipimport_namespace, "_unpack_uint32")
+    assert callable(original_unpack)
+    calls: list[bytes] = []
+
+    def poisoned_unpack(value: bytes) -> int:
+        calls.append(value)
+        return cast(Callable[[bytes], int], original_unpack)(value)
+
+    monkeypatch.setitem(zipimport_namespace, "_unpack_uint32", poisoned_unpack)
+    return calls

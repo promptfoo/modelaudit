@@ -16,11 +16,13 @@ import zipfile
 import zlib
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import pytest
 import yaml
 from packaging.requirements import Requirement
+
+from tests.helpers.workflows import _jobs, _step_by_name, _workflow_triggers
 
 try:
     import tomllib
@@ -47,13 +49,6 @@ def _load_release_workflow() -> dict[str, Any]:
     return workflow
 
 
-def _workflow_triggers(workflow: dict[str, Any]) -> dict[str, Any]:
-    raw_workflow = cast(dict[Any, Any], workflow)
-    triggers = raw_workflow.get("on", raw_workflow.get(True))
-    assert isinstance(triggers, dict)
-    return triggers
-
-
 def _job_steps(workflow: dict[str, Any], job_name: str) -> list[dict[str, Any]]:
     jobs = workflow["jobs"]
     assert isinstance(jobs, dict)
@@ -62,19 +57,6 @@ def _job_steps(workflow: dict[str, Any], job_name: str) -> list[dict[str, Any]]:
     steps = job["steps"]
     assert isinstance(steps, list)
     return steps
-
-
-def _step_by_name(steps: list[dict[str, Any]], name: str) -> dict[str, Any]:
-    for step in steps:
-        if step.get("name") == name:
-            return step
-    raise AssertionError(f"Step {name!r} not found")
-
-
-def _jobs(workflow: dict[str, Any]) -> dict[str, Any]:
-    jobs = workflow["jobs"]
-    assert isinstance(jobs, dict)
-    return jobs
 
 
 def _run_manual_release_step(
@@ -188,9 +170,28 @@ def test_standalone_type_check_uses_supported_mypy(workflow_name: str, job_name:
     standalone_requirement = next(requirement for requirement in requirements if requirement.name == "mypy")
 
     assert standalone_requirement.specifier == root_requirement.specifier
-    assert standalone_requirement.specifier.contains("2.3.1")
-    assert not standalone_requirement.specifier.contains("2.4.0")
+    assert not standalone_requirement.specifier.contains("2.3.1")
+    assert standalone_requirement.specifier.contains("2.4.0")
+    assert not standalone_requirement.specifier.contains("2.5.0")
     assert any(requirement.name == "pytest" for requirement in requirements)
+
+    for guide in (
+        root_dir / "packages/modelaudit-picklescan/AGENTS.md",
+        root_dir / "docs/agents/picklescan-package-split.md",
+    ):
+        guide_commands = [
+            shlex.split(line)
+            for line in guide.read_text(encoding="utf-8").splitlines()
+            if line.startswith("uv run --with ") and " mypy src tests" in line
+        ]
+        assert guide_commands, f"{guide.name} must document standalone Mypy validation"
+        for guide_command in guide_commands:
+            guide_requirements = [
+                Requirement(guide_command[index + 1]) for index, arg in enumerate(guide_command) if arg == "--with"
+            ]
+            guide_mypy = next(requirement for requirement in guide_requirements if requirement.name == "mypy")
+            assert guide_mypy.specifier == root_requirement.specifier
+            assert any(requirement.name == "pytest" for requirement in guide_requirements)
 
 
 def test_release_workflow_manual_dispatch_inputs_and_guardrails() -> None:
@@ -604,6 +605,7 @@ def test_release_workflow_verifies_published_picklescan_package() -> None:
 
     steps = _job_steps(workflow, "verify-picklescan-pypi")
     wait_step = _step_by_name(steps, "Wait for modelaudit-picklescan files on PyPI")
+    assert wait_step["env"] == {"PYPI_PROJECT": "modelaudit-picklescan"}
     wait_run = wait_step["run"]
     assert "https://pypi.org/pypi/modelaudit-picklescan/{version}/json" in wait_run
     assert "https://pypi.org/simple/modelaudit-picklescan/" in wait_run
@@ -711,6 +713,7 @@ def test_release_workflow_waits_for_compressed_pypi_simple_index(
 
     ticks = iter((0.0, 1.0, 2.0, 3.0))
     monkeypatch.setenv("EXPECTED_VERSION", version)
+    monkeypatch.setenv("PYPI_PROJECT", project)
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
     monkeypatch.setattr(time, "monotonic", lambda: next(ticks, 3.0))
     monkeypatch.setattr(time, "sleep", lambda _seconds: None)
@@ -860,6 +863,7 @@ def test_release_workflow_verifies_published_root_package_after_picklescan() -> 
 
     steps = _job_steps(workflow, "verify-pypi")
     wait_step = _step_by_name(steps, "Wait for modelaudit files on PyPI")
+    assert wait_step["env"] == {"PYPI_PROJECT": "modelaudit"}
     wait_run = wait_step["run"]
     assert "https://pypi.org/pypi/modelaudit/{version}/json" in wait_run
     assert "https://pypi.org/simple/modelaudit/" in wait_run

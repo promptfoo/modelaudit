@@ -9,21 +9,17 @@ import pickle
 import random
 import string
 
+from framework_fixtures import SystemCommandPayload
+
 from modelaudit_picklescan.options import ScanOptions
 
 ParityPayload = tuple[str, bytes, ScanOptions | None]
 
 
-class MaliciousReducePayload:
-    """Pickle fixture that reduces to a harmless shell command."""
-
-    def __reduce__(self) -> tuple[object, tuple[str]]:
-        return (os.system, ("echo rust parity",))
-
-
+# Pickle fixture reduces to a harmless shell command.
 def malicious_reduce_payload() -> bytes:
     """Return a malicious reduce payload without requiring pickle imports in callers."""
-    return pickle.dumps(MaliciousReducePayload(), protocol=4)
+    return pickle.dumps(SystemCommandPayload("echo rust parity", lambda: os.system), protocol=4)
 
 
 def raw_os_system_reduce_payload() -> bytes:

@@ -27,6 +27,22 @@ from modelaudit.utils.file.handlers import (
 )
 
 
+def _assert_suspect_shard_family_not_cacheable(tmp_path: Path, field: str, value: object) -> None:
+    shard = tmp_path / "checkpoint_1.pt"
+    shard.write_bytes(b"content")
+    family: dict[str, object] = {
+        "pattern": r"checkpoint_(\d+)\.pt",
+        "shards": [str(shard)],
+        "total_shards": 1,
+        field: value,
+    }
+
+    fingerprint, cacheable = _build_advanced_shard_family_cache_fingerprint(family, object())
+
+    assert fingerprint is None
+    assert cacheable is False
+
+
 class CompletingShardScanner:
     """Minimal scanner for shard-handler coverage tests."""
 
@@ -620,16 +636,7 @@ class TestShardedModelDetector:
         shard_two.symlink_to(inside_target)
         scanned_payloads: list[bytes] = []
 
-        class RecordingScanner:
-            name = "recording_scanner"
-
-            def scan(self, shard_path: str) -> ScanResult:
-                scanned_payloads.append(Path(shard_path).read_bytes())
-                result = ScanResult(scanner_name=self.name)
-                result.finish(success=True)
-                return result
-
-        handler = AdvancedFileHandler(str(shard_one), RecordingScanner())
+        handler = AdvancedFileHandler(str(shard_one), _recording_scanner(scanned_payloads)())
         shard_two.unlink()
         shard_two.symlink_to(outside_target)
 
@@ -647,16 +654,7 @@ class TestShardedModelDetector:
         shard_two.write_bytes(b"safe")
         scanned_payloads: list[bytes] = []
 
-        class RecordingScanner:
-            name = "recording_scanner"
-
-            def scan(self, shard_path: str) -> ScanResult:
-                scanned_payloads.append(Path(shard_path).read_bytes())
-                result = ScanResult(scanner_name=self.name)
-                result.finish(success=True)
-                return result
-
-        handler = AdvancedFileHandler(str(shard_one), RecordingScanner())
+        handler = AdvancedFileHandler(str(shard_one), _recording_scanner(scanned_payloads)())
         original_stat = shard_two.stat()
         shard_two.write_bytes(b"evil")
         os.utime(
@@ -1888,19 +1886,7 @@ class TestAdvancedFileHandler:
         value: object,
     ) -> None:
         """Any suspect or malformed family count must prevent cache reuse."""
-        shard = tmp_path / "checkpoint_1.pt"
-        shard.write_bytes(b"content")
-        family: dict[str, object] = {
-            "pattern": r"checkpoint_(\d+)\.pt",
-            "shards": [str(shard)],
-            "total_shards": 1,
-            field: value,
-        }
-
-        fingerprint, cacheable = _build_advanced_shard_family_cache_fingerprint(family, object())
-
-        assert fingerprint is None
-        assert cacheable is False
+        _assert_suspect_shard_family_not_cacheable(tmp_path, field, value)
 
     @pytest.mark.parametrize(
         ("field", "value"),
@@ -1922,19 +1908,7 @@ class TestAdvancedFileHandler:
         value: object,
     ) -> None:
         """Any suspect or malformed family member list must prevent cache reuse."""
-        shard = tmp_path / "checkpoint_1.pt"
-        shard.write_bytes(b"content")
-        family: dict[str, object] = {
-            "pattern": r"checkpoint_(\d+)\.pt",
-            "shards": [str(shard)],
-            "total_shards": 1,
-            field: value,
-        }
-
-        fingerprint, cacheable = _build_advanced_shard_family_cache_fingerprint(family, object())
-
-        assert fingerprint is None
-        assert cacheable is False
+        _assert_suspect_shard_family_not_cacheable(tmp_path, field, value)
 
     def test_duplicate_resolved_shard_family_members_are_not_cacheable(
         self,
@@ -2376,3 +2350,16 @@ class TestAdvancedFileHandler:
         assert result.has_errors is False
         assert "scan_outcome" not in result.metadata
         assert any(check.name == "Shard Parse Coverage" for check in result.checks)
+
+
+def _recording_scanner(scanned_payloads: list[bytes]) -> type[Any]:
+    class RecordingScanner:
+        name = "recording_scanner"
+
+        def scan(self, shard_path: str) -> ScanResult:
+            scanned_payloads.append(Path(shard_path).read_bytes())
+            result = ScanResult(scanner_name=self.name)
+            result.finish(success=True)
+            return result
+
+    return RecordingScanner

@@ -4877,8 +4877,11 @@ class PyTorchZipScanner(BaseScanner):
     @staticmethod
     def _raw_nested_proto0_name_operand_span(value: bytes, offset: int) -> tuple[int, int, int] | None:
         start = offset + 1
-        if start >= len(value) or value[start] not in _PROTO0_UTF8_NAME_START_BYTES:
+        if start >= len(value):
             return None
+        if value[start] not in _PROTO0_UTF8_NAME_START_BYTES:
+            end = PyTorchZipScanner._raw_nested_punctuation_name_operand_end(value, offset)
+            return (offset, start, end) if end > start else None
         # GLOBAL/INST own two newline-terminated fields even across probe windows.
         # Keep their contents visible, but do not let embedded headers mask them.
         module_end = value.find(b"\n", start)
@@ -4899,6 +4902,70 @@ class PyTorchZipScanner(BaseScanner):
             # The last overlapping name has the furthest newline boundary.
             search_start, end = end, nested_end
         return offset, start, end
+
+    @staticmethod
+    def _raw_nested_punctuation_name_operand_end(value: bytes, offset: int) -> int:
+        encoding = "utf-8" if value[offset] == ord("c") else "ascii"
+        cursor = offset + 1
+        text_newline = -1
+        text_no_newline_until = cursor
+        for _ in range(2):
+            field_start = cursor
+            decoder = codecs.getincrementaldecoder(encoding)()
+            while cursor < len(value):
+                chunk_limit = min(len(value), cursor + 64)
+                newline = value.find(b"\n", cursor, chunk_limit)
+                if newline == field_start:
+                    return newline
+                chunk_end = chunk_limit if newline < 0 else newline
+                pending = len(decoder.getstate()[0])
+                invalid = False
+                try:
+                    decoder.decode(value[cursor:chunk_end], final=newline >= 0)
+                except UnicodeDecodeError as exc:
+                    chunk_end = cursor - pending + exc.start
+                    invalid = True
+
+                # Decode only one chunk before looking for independent literals;
+                # repeated short literals must not repeatedly decode the entire tail.
+                for match in _PICKLE_OPERAND_OR_GLOBAL_START_RE.finditer(value, cursor - pending, chunk_end):
+                    candidate = match.start()
+                    marker = value[candidate]
+                    if marker in b"ci":
+                        if candidate + 1 < len(value) and value[candidate + 1] in _PROTO0_UTF8_NAME_START_BYTES:
+                            return candidate
+                        continue
+                    if 0x80 <= marker < 0xC0:
+                        continue
+                    if marker in b"SV":
+                        literal_start = candidate + (2 if marker == ord("S") else 1)
+                        if marker == ord("S") and (
+                            candidate + 1 >= len(value) or value[candidate + 1] not in {ord("'"), ord('"')}
+                        ):
+                            continue
+                        if literal_start < text_no_newline_until:
+                            continue
+                        if text_newline < literal_start:
+                            search_end = min(len(value), literal_start + _PICKLE_DISCOVERY_LONG_PROBE_BYTES + 1)
+                            text_newline = value.find(b"\n", literal_start, search_end)
+                            if text_newline < 0:
+                                text_no_newline_until = search_end
+                                continue
+                        if text_newline + 1 < len(value) and value[text_newline + 1] in _PICKLE_OPCODE_BYTES:
+                            return candidate
+                        continue
+                    span = PyTorchZipScanner._raw_nested_pickle_literal_span_starting_at(value, candidate)
+                    if span is not None and not PyTorchZipScanner._raw_nested_literal_span_is_mask_only(value, span):
+                        return candidate
+                if invalid:
+                    return chunk_end
+                if newline >= 0:
+                    cursor = newline + 1
+                    break
+                cursor = chunk_end
+            else:
+                return len(value)
+        return cursor
 
     @staticmethod
     def _raw_nested_proto0_text_literal_no_newline_until(value: bytes, literal_opcode_start: int) -> int | None:

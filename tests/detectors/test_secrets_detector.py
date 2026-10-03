@@ -59,38 +59,28 @@ class TestSecretsDetector:
 
     def test_detect_openai_keys(self):
         """Test detection of OpenAI API keys."""
-        detector = SecretsDetector()
-
         # Test OpenAI API key (48 chars after sk-)
-        text = "OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJ12"
-        findings = detector.scan_text(text)
-        assert len(findings) > 0
-        assert any("OpenAI" in f["secret_type"] for f in findings)
+        _assert_secret_type_detection(
+            ("OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJ12"), ("OpenAI")
+        )
 
     def test_detect_github_tokens(self):
         """Test detection of GitHub tokens."""
-        detector = SecretsDetector()
-
         # Test GitHub personal token
-        text = "github_token=ghp_abcdefghijklmnopqrstuvwxyz0123456789"
-        findings = detector.scan_text(text)
-        assert len(findings) > 0
-        assert any("GitHub" in f["secret_type"] for f in findings)
+        _assert_secret_type_detection(("github_token=ghp_abcdefghijklmnopqrstuvwxyz0123456789"), ("GitHub"))
 
     def test_detect_jwt_tokens(self):
         """Test detection of JWT tokens."""
-        detector = SecretsDetector()
-
         # Test a non-example JWT-shaped token. The well-known JWT.io sample is
         # intentionally suppressed as documentation/test data.
-        text = (
-            "token=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
-            "eyJzdWIiOiJ1c2VyMTIzIiwic2NvcGUiOiJhZG1pbiIsImlhdCI6MTcwMDAwMDAwMH0."
-            "q1w2e3r4t5y6u7i8o9p0asdfghjklzxcvbnmQWERty"
+        _assert_secret_type_detection(
+            (
+                "token=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+                "eyJzdWIiOiJ1c2VyMTIzIiwic2NvcGUiOiJhZG1pbiIsImlhdCI6MTcwMDAwMDAwMH0."
+                "q1w2e3r4t5y6u7i8o9p0asdfghjklzxcvbnmQWERty"
+            ),
+            ("JWT"),
         )
-        findings = detector.scan_text(text)
-        assert len(findings) > 0
-        assert any("JWT" in f["secret_type"] for f in findings)
 
     def test_known_example_jwt_is_suppressed_by_default(self) -> None:
         """The JWT.io example token should not produce warning-level noise."""
@@ -1250,13 +1240,8 @@ class TestSecretsDetector:
 
     def test_detect_private_keys(self):
         """Test detection of private keys."""
-        detector = SecretsDetector()
-
         # Test RSA private key header
-        text = "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA..."
-        findings = detector.scan_text(text)
-        assert len(findings) > 0
-        assert any("Private Key" in f["secret_type"] for f in findings)
+        _assert_secret_type_detection(("-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA..."), ("Private Key"))
 
     def test_high_entropy_detection(self):
         """Test detection of high-entropy regions."""
@@ -1606,6 +1591,15 @@ def test_secret_finding_limit_is_explicit() -> None:
     assert findings[-1]["type"] == "detector_finding_limit"
     assert findings[-1]["max_findings"] == 2
     assert findings[-1]["analysis_incomplete"] is True
+
+
+def _assert_secret_type_detection(case_text: str, case_secret_type: str) -> None:
+    detector = SecretsDetector()
+
+    text = case_text
+    findings = detector.scan_text(text)
+    assert len(findings) > 0
+    assert any(case_secret_type in f["secret_type"] for f in findings)
 
 
 def test_basic_auth_finding_limit_is_explicit_and_redacted() -> None:

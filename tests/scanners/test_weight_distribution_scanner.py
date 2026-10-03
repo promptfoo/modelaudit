@@ -7,7 +7,7 @@ import types
 import zipfile
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 import pytest
 
@@ -19,6 +19,43 @@ from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, IssueSeverity
 from modelaudit.scanners.weight_distribution_scanner import WeightDistributionScanner
 from modelaudit.utils.tensorflow_compat import DataType, tensor_proto_to_ndarray
 from tests.helpers import create_mock_pytorch_zip
+from tests.helpers.frameworks import has_tensorflow_runtime as has_tensorflow
+from tests.helpers.scanners import install_zip_open_failure
+
+
+class _RecordingAnyTorchLoad:
+    def __init__(self) -> None:
+        self.called = False
+
+    def __call__(self, *_args: object, **_kwargs: object) -> dict[str, object]:
+        self.called = True
+        return {}
+
+
+class _RecordingTorchLoad:
+    def __init__(self) -> None:
+        self.called = False
+
+    def __call__(
+        self,
+        _path: str,
+        *,
+        map_location: object,
+        weights_only: bool = False,
+    ) -> dict[str, object]:
+        del map_location, weights_only
+        self.called = True
+        return {}
+
+
+def fail_load(
+    _path: str,
+    *,
+    map_location: object,
+    weights_only: bool = False,
+) -> object:
+    del map_location, weights_only
+    raise RuntimeError("force restricted fallback")
 
 
 def _make_mock_tensor_proto(
@@ -193,16 +230,6 @@ def has_h5py():
 
         return True
     except ImportError:
-        return False
-
-
-def has_tensorflow():
-    try:
-        import tensorflow as tf
-
-        # Vendored protobuf stubs are not sufficient for weight-distribution tests.
-        return bool(getattr(tf, "__version__", None)) and hasattr(tf, "constant")
-    except Exception:
         return False
 
 
@@ -489,11 +516,7 @@ def test_hdf5_unrelated_external_link_does_not_make_weight_analysis_incomplete(t
         metadata = hdf5_file.create_group("metadata")
         metadata["asset"] = h5py.ExternalLink("missing-assets.h5", "/asset")
 
-    scanner = WeightDistributionScanner()
-    weights = scanner._extract_keras_weights(str(path))
-
-    assert list(weights) == ["model_weights/dense/kernel:0"]
-    assert scanner.extraction_incomplete is False
+    _assert_keras_weight_names(path, ["model_weights/dense/kernel:0"])
 
 
 @pytest.mark.skipif(not HAS_NUMPY or not has_h5py(), reason="numpy and h5py required")
@@ -506,11 +529,7 @@ def test_hdf5_internal_soft_link_is_resolved(tmp_path: Path) -> None:
         hdf5_file.create_dataset("storage/dense_values", data=np.ones((2, 2), dtype=np.float32))
         hdf5_file["model_weights/dense/kernel:0"] = h5py.SoftLink("/storage/dense_values")
 
-    scanner = WeightDistributionScanner()
-    weights = scanner._extract_keras_weights(str(path))
-
-    assert list(weights) == ["model_weights/dense/kernel:0"]
-    assert scanner.extraction_incomplete is False
+    _assert_keras_weight_names(path, ["model_weights/dense/kernel:0"])
 
 
 @pytest.mark.skipif(not HAS_NUMPY or not has_h5py(), reason="numpy and h5py required")
@@ -523,11 +542,7 @@ def test_hdf5_group_soft_link_preserves_weight_alias_path(tmp_path: Path) -> Non
         hdf5_file.create_dataset("z_storage/dense_values", data=np.ones((2, 2), dtype=np.float32))
         hdf5_file["a_model_weights"] = h5py.SoftLink("/z_storage")
 
-    scanner = WeightDistributionScanner()
-    weights = scanner._extract_keras_weights(str(path))
-
-    assert list(weights) == ["a_model_weights/dense_values"]
-    assert scanner.extraction_incomplete is False
+    _assert_keras_weight_names(path, ["a_model_weights/dense_values"])
 
 
 @pytest.mark.skipif(not HAS_NUMPY or not has_h5py(), reason="numpy and h5py required")
@@ -635,18 +650,7 @@ def test_pytorch_primary_load_is_blocked_by_archive_budget(
 
     fake_torch.Tensor = FakeTensor
     fake_torch.device = lambda value: value
-    load_called = False
-
-    def fake_load(
-        _path: str,
-        *,
-        map_location: object,
-        weights_only: bool = False,
-    ) -> dict[str, object]:
-        del map_location, weights_only
-        nonlocal load_called
-        load_called = True
-        return {}
+    fake_load = _RecordingTorchLoad()
 
     fake_torch.load = fake_load
     monkeypatch.setitem(sys.modules, "torch", fake_torch)
@@ -666,7 +670,7 @@ def test_pytorch_primary_load_is_blocked_by_archive_budget(
     weights = scanner._extract_pytorch_weights(str(path))
 
     assert weights == {}
-    assert load_called is False
+    assert fake_load.called is False
     assert scanner.extraction_incomplete_reasons == ["pytorch_load_size_limit"]
 
 
@@ -725,18 +729,7 @@ def test_pytorch_load_budget_ignores_unrelated_archive_members(
 
     fake_torch.Tensor = FakeTensor
     fake_torch.device = lambda value: value
-    load_called = False
-
-    def fake_load(
-        _path: str,
-        *,
-        map_location: object,
-        weights_only: bool = False,
-    ) -> dict[str, object]:
-        del map_location, weights_only
-        nonlocal load_called
-        load_called = True
-        return {}
+    fake_load = _RecordingTorchLoad()
 
     fake_torch.load = fake_load
     monkeypatch.setitem(sys.modules, "torch", fake_torch)
@@ -757,7 +750,7 @@ def test_pytorch_load_budget_ignores_unrelated_archive_members(
     weights = scanner._extract_pytorch_weights(str(path))
 
     assert weights == {}
-    assert load_called is True
+    assert fake_load.called is True
     assert scanner.extraction_incomplete is False
 
 
@@ -828,20 +821,13 @@ def test_pytorch_blocked_load_fallback_honors_remaining_metadata_budget(
 
     original_open = zipfile.ZipFile.open
 
-    def fail_if_data_pkl_is_opened(
-        archive: zipfile.ZipFile,
-        name: str | zipfile.ZipInfo,
-        mode: Literal["r", "w"] = "r",
-        pwd: bytes | None = None,
-        *,
-        force_zip64: bool = False,
-    ) -> Any:
-        member_name = name.filename if isinstance(name, zipfile.ZipInfo) else name
-        if member_name == "data.pkl":
-            raise AssertionError("over-budget data.pkl should not be opened")
-        return original_open(archive, name, mode=mode, pwd=pwd, force_zip64=force_zip64)
-
-    monkeypatch.setattr(zipfile.ZipFile, "open", fail_if_data_pkl_is_opened)
+    install_zip_open_failure(
+        monkeypatch,
+        original_open,
+        lambda name: (name.filename if isinstance(name, zipfile.ZipInfo) else name) == "data.pkl",
+        lambda: AssertionError("over-budget data.pkl should not be opened"),
+        positional_mode=False,
+    )
 
     scanner = WeightDistributionScanner({"max_array_size": 1024, "max_weight_distribution_total_bytes": 32})
     weights = scanner._extract_pytorch_weights(str(path))
@@ -982,15 +968,6 @@ def test_pytorch_zip_alias_expansion_is_rejected_before_numpy(
 
     fake_torch.Tensor = FakeTensor
     fake_torch.device = lambda value: value
-
-    def fail_load(
-        _path: str,
-        *,
-        map_location: object,
-        weights_only: bool = False,
-    ) -> object:
-        del map_location, weights_only
-        raise RuntimeError("force restricted fallback")
 
     fake_torch.load = fail_load
     monkeypatch.setitem(sys.modules, "torch", fake_torch)
@@ -1148,15 +1125,6 @@ def test_pytorch_zip_discarded_vector_does_not_consume_retained_budget(
     fake_torch.Tensor = FakeTensor
     fake_torch.device = lambda value: value
 
-    def fail_load(
-        _path: str,
-        *,
-        map_location: object,
-        weights_only: bool = False,
-    ) -> object:
-        del map_location, weights_only
-        raise RuntimeError("force restricted fallback")
-
     fake_torch.load = fail_load
     monkeypatch.setitem(sys.modules, "torch", fake_torch)
 
@@ -1188,15 +1156,6 @@ def test_pytorch_zip_ignores_large_non_weight_metadata(
 
     fake_torch.Tensor = FakeTensor
     fake_torch.device = lambda value: value
-
-    def fail_load(
-        _path: str,
-        *,
-        map_location: object,
-        weights_only: bool = False,
-    ) -> object:
-        del map_location, weights_only
-        raise RuntimeError("force restricted fallback")
 
     fake_torch.load = fail_load
     monkeypatch.setitem(sys.modules, "torch", fake_torch)
@@ -1698,40 +1657,10 @@ class TestWeightDistributionScanner:
         assert extreme["details"]["per_output_evidence"][0]["detection_path"] == "robust_small_tensor_fallback"
 
     def test_extreme_value_check_ignores_nonqualifying_decoy_output(self) -> None:
-        import numpy as np
-
-        scanner = WeightDistributionScanner()
-        weights = np.zeros((100, 10), dtype=np.float32)
-        weights[50:55, 3] = 10.0
-        weights[0, 4] = 3.0
-
-        anomalies = scanner._analyze_layer_weights(
-            "decoy_output",
-            weights,
-            self._create_mock_architecture_analysis(is_llm=False),
-        )
-
-        extreme = next(anomaly for anomaly in anomalies if "extremely large weight values" in anomaly["description"])
-        assert extreme["details"]["affected_neurons"] == [3]
-        assert extreme["details"]["num_extreme_weights"] == 5
+        self._assert_extreme_value_with_decoy((3.0), ("decoy_output"), ("num_extreme_weights"), (5))
 
     def test_extreme_value_check_detects_target_despite_larger_decoy_output(self) -> None:
-        import numpy as np
-
-        scanner = WeightDistributionScanner()
-        weights = np.zeros((100, 10), dtype=np.float32)
-        weights[50:55, 3] = 10.0
-        weights[0, 4] = 1_000_000.0
-
-        anomalies = scanner._analyze_layer_weights(
-            "large_decoy_output",
-            weights,
-            self._create_mock_architecture_analysis(is_llm=False),
-        )
-
-        extreme = next(anomaly for anomaly in anomalies if "extremely large weight values" in anomaly["description"])
-        assert extreme["details"]["affected_neurons"] == [3]
-        assert extreme["details"]["total_affected"] == 1
+        self._assert_extreme_value_with_decoy((1_000_000.0), ("large_decoy_output"), ("total_affected"), (1))
 
     def test_extreme_value_check_detects_target_despite_two_value_decoy_output(self) -> None:
         import numpy as np
@@ -2071,16 +2000,7 @@ class TestWeightDistributionScanner:
         scanner = WeightDistributionScanner()
         weights = np.zeros((1024, 4096), dtype=np.float32)
         weights[:5, 3] = 1_000_000.0
-        original_absolute = np.absolute
-        work_buffer_sizes: list[int] = []
-
-        def tracked_absolute(value: Any, *args: Any, **kwargs: Any) -> Any:
-            output = kwargs.get("out")
-            if output is not None:
-                work_buffer_sizes.append(int(getattr(output, "nbytes", 0)))
-            return original_absolute(value, *args, **kwargs)
-
-        monkeypatch.setattr(np, "absolute", tracked_absolute)
+        work_buffer_sizes = _track_absolute_work_buffers(monkeypatch, np)
         anomalies = scanner._analyze_tensor_weight_extremes("large_tensor", weights, output_axes=(1,))
 
         assert any("extremely large weight values" in anomaly["description"] for anomaly in anomalies)
@@ -2092,16 +2012,7 @@ class TestWeightDistributionScanner:
         scanner = WeightDistributionScanner()
         weights = np.zeros((1_100_000, 1), dtype=np.float32)
         weights[:5, 0] = 1_000_000.0
-        original_absolute = np.absolute
-        work_buffer_sizes: list[int] = []
-
-        def tracked_absolute(value: Any, *args: Any, **kwargs: Any) -> Any:
-            output = kwargs.get("out")
-            if output is not None:
-                work_buffer_sizes.append(int(getattr(output, "nbytes", 0)))
-            return original_absolute(value, *args, **kwargs)
-
-        monkeypatch.setattr(np, "absolute", tracked_absolute)
+        work_buffer_sizes = _track_absolute_work_buffers(monkeypatch, np)
         anomalies = scanner._analyze_tensor_weight_extremes("wide_output", weights, output_axes=(1,))
 
         assert any("extremely large weight values" in anomaly["description"] for anomaly in anomalies)
@@ -2247,24 +2158,20 @@ class TestWeightDistributionScanner:
         tmp_path: Path,
     ) -> None:
         """Ensure safe pickle in PyTorch ZIP can be parsed without code execution"""
-        load_called = False
         data = {"layer.weight": [[1.0, 2.0], [3.0, 4.0]]}
         data_bytes = pickle.dumps(data, protocol=4)
         zip_path = tmp_path / "model.pt"
         with zipfile.ZipFile(zip_path, "w") as z:
             z.writestr("data.pkl", data_bytes)
 
-        def fake_load(*_args: object, **_kwargs: object) -> dict[str, object]:
-            nonlocal load_called
-            load_called = True
-            return {}
+        fake_load = _RecordingAnyTorchLoad()
 
         _install_fake_torch(monkeypatch, fake_load)
         scanner = WeightDistributionScanner()
         weights = scanner._extract_pytorch_weights(str(zip_path))
         assert not scanner.extraction_unsafe
         assert not scanner.extraction_incomplete
-        assert load_called is False
+        assert fake_load.called is False
         assert "layer.weight" in weights
         assert weights["layer.weight"].shape == (2, 2)
 
@@ -2294,20 +2201,13 @@ class TestWeightDistributionScanner:
 
         original_open = zipfile.ZipFile.open
 
-        def fail_if_data_pkl_is_opened(
-            archive: zipfile.ZipFile,
-            name: str | zipfile.ZipInfo,
-            mode: Literal["r", "w"] = "r",
-            pwd: bytes | None = None,
-            *,
-            force_zip64: bool = False,
-        ) -> Any:
-            member_name = name.filename if isinstance(name, zipfile.ZipInfo) else name
-            if member_name == "data.pkl":
-                raise AssertionError("oversized data.pkl should not be opened")
-            return original_open(archive, name, mode=mode, pwd=pwd, force_zip64=force_zip64)
-
-        monkeypatch.setattr(zipfile.ZipFile, "open", fail_if_data_pkl_is_opened)
+        install_zip_open_failure(
+            monkeypatch,
+            original_open,
+            lambda name: (name.filename if isinstance(name, zipfile.ZipInfo) else name) == "data.pkl",
+            lambda: AssertionError("oversized data.pkl should not be opened"),
+            positional_mode=False,
+        )
 
         scanner = WeightDistributionScanner({"max_array_size": 1})
         weights = scanner._extract_pytorch_weights(str(zip_path))
@@ -3053,12 +2953,7 @@ class TestWeightDistributionScanner:
         tmp_path: Path,
         torch_version: str,
     ) -> None:
-        load_called = False
-
-        def fake_load(*_args: object, **_kwargs: object) -> dict[str, object]:
-            nonlocal load_called
-            load_called = True
-            return {}
+        fake_load = _RecordingAnyTorchLoad()
 
         _install_fake_torch(monkeypatch, fake_load, version=torch_version)
         model_path = tmp_path / "blocked.pt"
@@ -3072,7 +2967,7 @@ class TestWeightDistributionScanner:
         assert scanner.extraction_unsafe_reason is not None
         assert "Blocked torch.load" in scanner.extraction_unsafe_reason
         assert "not a trust boundary" in scanner.extraction_unsafe_reason
-        assert load_called is False
+        assert fake_load.called is False
 
     @pytest.mark.parametrize("unsafe_value", [1, "true", "false", {"enabled": True}])
     def test_torch_load_opt_in_requires_literal_true(
@@ -3081,12 +2976,7 @@ class TestWeightDistributionScanner:
         tmp_path: Path,
         unsafe_value: Any,
     ) -> None:
-        load_called = False
-
-        def fake_load(*_args: object, **_kwargs: object) -> dict[str, object]:
-            nonlocal load_called
-            load_called = True
-            return {}
+        fake_load = _RecordingAnyTorchLoad()
 
         _install_fake_torch(monkeypatch, fake_load)
         model_path = tmp_path / "strict-opt-in.pt"
@@ -3097,7 +2987,7 @@ class TestWeightDistributionScanner:
 
         assert weights == {}
         assert scanner.extraction_unsafe
-        assert load_called is False
+        assert fake_load.called is False
 
     def test_explicit_torch_load_opt_in_retains_weights_only(
         self,
@@ -3149,12 +3039,7 @@ class TestWeightDistributionScanner:
         monkeypatch: pytest.MonkeyPatch,
         tmp_path: Path,
     ) -> None:
-        load_called = False
-
-        def fake_load(*_args: object, **_kwargs: object) -> dict[str, object]:
-            nonlocal load_called
-            load_called = True
-            return {}
+        fake_load = _RecordingAnyTorchLoad()
 
         _install_fake_torch(monkeypatch, fake_load)
         model_path = create_mock_pytorch_zip(tmp_path / "blocked.pt", with_pickle=False)
@@ -3170,7 +3055,7 @@ class TestWeightDistributionScanner:
         assert analysis_check.details["extraction_incomplete_reasons"] == ["unsafe_pytorch_weight_extraction"]
         assert "not a trust boundary" in analysis_check.details["unsafe_reason"]
         assert not any(check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for check in direct.checks)
-        assert load_called is False
+        assert fake_load.called is False
 
         cache_dir = tmp_path / "cache"
         reset_cache_manager()
@@ -3201,6 +3086,48 @@ class TestWeightDistributionScanner:
                 )
                 assert all(issue.rule_code != "S801" for issue in aggregate.issues)
             assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-            assert load_called is False
+            assert fake_load.called is False
         finally:
             reset_cache_manager()
+
+    def _assert_extreme_value_with_decoy(
+        self, decoy_weight: float, layer_name: str, detail_key: str, expected_count: int
+    ) -> None:
+        import numpy as np
+
+        scanner = WeightDistributionScanner()
+        weights = np.zeros((100, 10), dtype=np.float32)
+        weights[50:55, 3] = 10.0
+        weights[0, 4] = decoy_weight
+
+        anomalies = scanner._analyze_layer_weights(
+            layer_name,
+            weights,
+            self._create_mock_architecture_analysis(is_llm=False),
+        )
+
+        extreme = next(anomaly for anomaly in anomalies if "extremely large weight values" in anomaly["description"])
+        assert extreme["details"]["affected_neurons"] == [3]
+        assert extreme["details"][detail_key] == expected_count
+
+
+def _track_absolute_work_buffers(monkeypatch: pytest.MonkeyPatch, np: Any) -> list[int]:
+    original_absolute = np.absolute
+    work_buffer_sizes: list[int] = []
+
+    def tracked_absolute(value: Any, *args: Any, **kwargs: Any) -> Any:
+        output = kwargs.get("out")
+        if output is not None:
+            work_buffer_sizes.append(int(getattr(output, "nbytes", 0)))
+        return original_absolute(value, *args, **kwargs)
+
+    monkeypatch.setattr(np, "absolute", tracked_absolute)
+    return work_buffer_sizes
+
+
+def _assert_keras_weight_names(path: Path, expected_names: list[str]) -> None:
+    scanner = WeightDistributionScanner()
+    weights = scanner._extract_keras_weights(str(path))
+
+    assert list(weights) == expected_names
+    assert scanner.extraction_incomplete is False

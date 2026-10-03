@@ -12,12 +12,9 @@ from modelaudit.scanners import _registry
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, IssueSeverity
 from modelaudit.scanners.tflite_scanner import _MAX_COUNT, TFLiteScanner
 from modelaudit.utils.file.detection import detect_file_format
+from tests.helpers.cache import single_file_metadata as _single_file_metadata
 
 HAS_TFLITE = importlib.util.find_spec("tflite") is not None
-
-
-def _single_file_metadata(aggregate: Any) -> Any:
-    return next(iter(aggregate.file_metadata.values()))
 
 
 def _assert_tflite_inconclusive_exit2(aggregate: Any, reason: str) -> None:
@@ -85,29 +82,11 @@ def test_core_scan_file_preserves_tflite_bin_analysis_with_pytorch_binary_primar
 
 
 def test_renamed_tflite_with_skipped_suffix_routes_through_directory_scan(tmp_path: Path) -> None:
-    path = tmp_path / "model.jpg"
-    path.write_bytes(b"\x0c\x00\x00\x00TFL3" + b"\x00" * 100)
-
-    assert TFLiteScanner.can_handle(str(path))
-    assert detect_file_format(str(path)) == "tflite"
-    assert core.scan_file(str(path)).scanner_name == "tflite"
-
-    directory = core.scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
-    assert directory.files_scanned == 1
-    assert "tflite" in directory.scanner_names
+    _assert_tflite_directory_route(tmp_path, ("model.jpg"))
 
 
 def test_extensionless_tflite_routes_through_directory_scan(tmp_path: Path) -> None:
-    path = tmp_path / "model"
-    path.write_bytes(b"\x0c\x00\x00\x00TFL3" + b"\x00" * 100)
-
-    assert TFLiteScanner.can_handle(str(path))
-    assert detect_file_format(str(path)) == "tflite"
-    assert core.scan_file(str(path)).scanner_name == "tflite"
-
-    directory = core.scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
-    assert directory.files_scanned == 1
-    assert "tflite" in directory.scanner_names
+    _assert_tflite_directory_route(tmp_path, ("model"))
 
 
 def test_renamed_tflite_near_match_with_skipped_suffix_remains_skipped(tmp_path: Path) -> None:
@@ -537,3 +516,16 @@ def test_tflite_mmap_caps_at_validated_size(tmp_path: Path) -> None:
 
     # Mapped only the validated size, not the 1 MB now on disk.
     assert result.bytes_scanned == validated_size
+
+
+def _assert_tflite_directory_route(tmp_path: Path, filename: str) -> None:
+    path = tmp_path / filename
+    path.write_bytes(b"\x0c\x00\x00\x00TFL3" + b"\x00" * 100)
+
+    assert TFLiteScanner.can_handle(str(path))
+    assert detect_file_format(str(path)) == "tflite"
+    assert core.scan_file(str(path)).scanner_name == "tflite"
+
+    directory = core.scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+    assert directory.files_scanned == 1
+    assert "tflite" in directory.scanner_names
