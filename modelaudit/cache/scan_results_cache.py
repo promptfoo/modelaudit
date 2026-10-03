@@ -53,6 +53,18 @@ _UNAVAILABLE_PICKLESCAN_RESOLUTION_CONTEXT = (
 )
 
 
+def _file_stat_identity(file_stat: os.stat_result) -> tuple[int, ...]:
+    """Capture all same-view file identity fields in their original read order."""
+    return (
+        file_stat.st_dev,
+        file_stat.st_ino,
+        file_stat.st_mode,
+        file_stat.st_size,
+        file_stat.st_mtime_ns,
+        file_stat.st_ctime_ns,
+    )
+
+
 def _unavailable_source_resolution_context() -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
     unavailable = _UNAVAILABLE_PICKLESCAN_RESOLUTION_CONTEXT
     return unavailable, unavailable, unavailable
@@ -408,11 +420,6 @@ ScannedFileIdentity = tuple[os.stat_result, str, int, AncestorIdentity]
 _MAX_CHANGE_CLOCK_ADVANCE_WAIT_SECONDS = 2.1
 _MAX_IDENTITY_BARRIER_ATTEMPTS = 3
 _MAX_IDENTITY_CAPTURE_ATTEMPTS = 5
-
-
-def _is_sampled_fingerprint(value: object) -> bool:
-    """Return whether a stored hash represents sampled, incomplete file content."""
-    return isinstance(value, str) and value.startswith("fingerprint:")
 
 
 def _source_resolution_context() -> dict[str, list[str]]:
@@ -809,7 +816,9 @@ class ScanResultsCache:
             with open(cache_file_path, encoding="utf-8") as f:
                 cache_entry = json.load(f)
 
-            if _is_sampled_fingerprint(cache_entry.get("file_info", {}).get("hash")):
+            # Sampled fingerprints do not identify complete file content.
+            cached_hash = cache_entry.get("file_info", {}).get("hash")
+            if isinstance(cached_hash, str) and cached_hash.startswith("fingerprint:"):
                 cache_file_path.unlink()
                 self._record_cache_miss("invalid")
                 return None
@@ -1720,7 +1729,7 @@ class ScanResultsCache:
                 file_stat,
                 content_hash=content_hash,
             )
-            if _is_sampled_fingerprint(content_hash):
+            if isinstance(content_hash, str) and content_hash.startswith("fingerprint:"):
                 logger.debug(
                     "Skipping scan-result cache key for %s: sampled large-file fingerprints are not cacheable",
                     file_path,
@@ -1889,17 +1898,7 @@ class ScanResultsCache:
 
     @staticmethod
     def _regular_file_identity_fingerprint(file_stat: os.stat_result) -> str:
-        identity = "\0".join(
-            str(value)
-            for value in (
-                file_stat.st_dev,
-                file_stat.st_ino,
-                file_stat.st_mode,
-                file_stat.st_size,
-                file_stat.st_mtime_ns,
-                file_stat.st_ctime_ns,
-            )
-        )
+        identity = "\0".join(str(value) for value in _file_stat_identity(file_stat))
         digest = hashlib.sha256(identity.encode()).hexdigest()
         return f"{_CALL_GRAPH_REGULAR_FILE_FINGERPRINT}:{digest}"
 
@@ -1948,22 +1947,8 @@ class ScanResultsCache:
                 remaining -= len(chunk)
             source = b"".join(chunks)
             after = os.fstat(file_descriptor)
-            before_identity = (
-                before.st_dev,
-                before.st_ino,
-                before.st_mode,
-                before.st_size,
-                before.st_mtime_ns,
-                before.st_ctime_ns,
-            )
-            after_identity = (
-                after.st_dev,
-                after.st_ino,
-                after.st_mode,
-                after.st_size,
-                after.st_mtime_ns,
-                after.st_ctime_ns,
-            )
+            before_identity = _file_stat_identity(before)
+            after_identity = _file_stat_identity(after)
             try:
                 path_stat = path.stat()
             except OSError as error:
@@ -1998,22 +1983,8 @@ class ScanResultsCache:
                         raise ValueError("read fingerprint directory budget exceeded")
                     entries.append(entry_name)
                 path_after = path.stat()
-                before_identity = (
-                    path_before.st_dev,
-                    path_before.st_ino,
-                    path_before.st_mode,
-                    path_before.st_size,
-                    path_before.st_mtime_ns,
-                    path_before.st_ctime_ns,
-                )
-                after_identity = (
-                    path_after.st_dev,
-                    path_after.st_ino,
-                    path_after.st_mode,
-                    path_after.st_size,
-                    path_after.st_mtime_ns,
-                    path_after.st_ctime_ns,
-                )
+                before_identity = _file_stat_identity(path_before)
+                after_identity = _file_stat_identity(path_after)
                 if before_identity != after_identity:
                     raise ValueError("read fingerprint directory changed while being read")
                 return hashlib.sha256(b"directory\0" + b"\0".join(sorted(entries))).hexdigest()
@@ -2041,42 +2012,14 @@ class ScanResultsCache:
                 remaining -= len(chunk)
             source = b"".join(chunks)
             after = os.fstat(file_descriptor)
-            before_identity = (
-                before.st_dev,
-                before.st_ino,
-                before.st_mode,
-                before.st_size,
-                before.st_mtime_ns,
-                before.st_ctime_ns,
-            )
-            after_identity = (
-                after.st_dev,
-                after.st_ino,
-                after.st_mode,
-                after.st_size,
-                after.st_mtime_ns,
-                after.st_ctime_ns,
-            )
+            before_identity = _file_stat_identity(before)
+            after_identity = _file_stat_identity(after)
             try:
                 path_stat = path.stat()
             except OSError as error:
                 raise ValueError("read fingerprint candidate path changed while being read") from error
-            path_identity = (
-                path_stat.st_dev,
-                path_stat.st_ino,
-                path_stat.st_mode,
-                path_stat.st_size,
-                path_stat.st_mtime_ns,
-                path_stat.st_ctime_ns,
-            )
-            initial_path_identity = (
-                path_before.st_dev,
-                path_before.st_ino,
-                path_before.st_mode,
-                path_before.st_size,
-                path_before.st_mtime_ns,
-                path_before.st_ctime_ns,
-            )
+            path_identity = _file_stat_identity(path_stat)
+            initial_path_identity = _file_stat_identity(path_before)
             if (
                 before_identity != after_identity
                 or initial_path_identity != path_identity

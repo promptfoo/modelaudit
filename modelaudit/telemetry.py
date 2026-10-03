@@ -13,6 +13,7 @@ import os
 import re
 import sys
 import uuid
+from collections import Counter
 from collections.abc import Callable
 from contextlib import contextmanager
 from enum import Enum
@@ -386,7 +387,6 @@ class TelemetryClient:
         self._user_config = UserConfig()
         self._posthog_client = None
         self._session_id = str(uuid.uuid4())
-        self._telemetry_disabled_recorded = False
         self._atexit_flush_registered = False
         self._flush_immediately = _env_truthy("MODELAUDIT_TELEMETRY_FLUSH_IMMEDIATELY")
 
@@ -450,12 +450,6 @@ class TelemetryClient:
             logger.debug(f"Failed to initialize PostHog client: {e}")
             self._posthog_client = None
 
-    def _record_telemetry_disabled(self) -> None:
-        """Mark that telemetry was disabled (no network calls for true decoupling)."""
-        if not self._telemetry_disabled_recorded:
-            # Just mark that we've acknowledged telemetry is disabled - no actual recording
-            self._telemetry_disabled_recorded = True
-
     def _parse_url_reference(self, path: str) -> ParseResult | None:
         """Parse URL-like model references without treating local paths as URLs."""
         if "://" not in path:
@@ -511,12 +505,7 @@ class TelemetryClient:
 
     def _count_values(self, values: list[str]) -> dict[str, int]:
         """Count values in a list, skipping empty items."""
-        counts: dict[str, int] = {}
-        for value in values:
-            if not value:
-                continue
-            counts[value] = counts.get(value, 0) + 1
-        return counts
+        return dict(Counter(value for value in values if value))
 
     @staticmethod
     def _issue_text_rule_or_cve(value: Any) -> str | None:
@@ -641,8 +630,6 @@ class TelemetryClient:
             properties = {}
 
         if self._is_disabled():
-            # Record that telemetry is disabled, but only once per session
-            self._record_telemetry_disabled()
             return
 
         try:
@@ -728,10 +715,7 @@ class TelemetryClient:
                 )
 
         scanner_names = [str(name) for name in results.get("scanner_names", []) if name]
-        file_types: dict[str, int] = {}
-        for asset in assets:
-            file_type = str(asset.get("type", "unknown"))
-            file_types[file_type] = file_types.get(file_type, 0) + 1
+        file_types = dict(Counter(str(asset.get("type", "unknown")) for asset in assets))
 
         self.record_event(
             TelemetryEvent.SCAN_COMPLETED,
@@ -949,11 +933,7 @@ class TelemetryClient:
 
     def _count_issue_severities(self, results: dict[str, Any]) -> dict[str, int]:
         """Count issues by severity."""
-        severities: dict[str, int] = {}
-        for issue in self._iter_result_issues(results):
-            severity = str(issue.get("severity", "unknown"))
-            severities[severity] = severities.get(severity, 0) + 1
-        return severities
+        return dict(Counter(str(issue.get("severity", "unknown")) for issue in self._iter_result_issues(results)))
 
 
 # Global telemetry client instance

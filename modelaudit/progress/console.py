@@ -53,7 +53,6 @@ class ConsoleProgressReporter(ProgressReporter):
 
         self._byte_pbar: tqdm | None = None
         self._item_pbar: tqdm | None = None
-        self._current_phase = ProgressPhase.INITIALIZING
 
     def _create_byte_progress_bar(self, stats: ProgressStats) -> "tqdm | None":
         """Create byte-level progress bar."""
@@ -185,7 +184,6 @@ class ConsoleProgressReporter(ProgressReporter):
 
     def report_phase_change(self, old_phase: ProgressPhase, new_phase: ProgressPhase) -> None:
         """Report phase change."""
-        self._current_phase = new_phase
 
         if not self.use_tqdm:
             print(f"\nPhase changed: {old_phase.value} → {new_phase.value}")
@@ -193,19 +191,13 @@ class ConsoleProgressReporter(ProgressReporter):
     def report_completion(self, stats: ProgressStats) -> None:
         """Report scan completion."""
         # Close and finalize progress bars
-        if self._byte_pbar is not None:
-            # Ensure we show 100% completion
-            self._byte_pbar.n = self._byte_pbar.total
-            self._byte_pbar.set_description("Completed")
-            self._byte_pbar.close()
-            self._byte_pbar = None
-
-        if self._item_pbar is not None:
-            # Ensure we show 100% completion
-            self._item_pbar.n = self._item_pbar.total
-            self._item_pbar.set_description("Completed")
-            self._item_pbar.close()
-            self._item_pbar = None
+        for bar_name in ("_byte_pbar", "_item_pbar"):
+            if getattr(self, bar_name) is not None:
+                # Ensure we show 100% completion
+                getattr(self, bar_name).n = getattr(self, bar_name).total
+                getattr(self, bar_name).set_description("Completed")
+                getattr(self, bar_name).close()
+                setattr(self, bar_name, None)
 
         # Print completion message
         elapsed_str = stats.format_time(stats.elapsed_time)
@@ -221,27 +213,20 @@ class ConsoleProgressReporter(ProgressReporter):
     def report_error(self, error: Exception, stats: ProgressStats) -> None:
         """Report an error during scanning."""
         # Close progress bars on error
-        if self._byte_pbar is not None:
-            self._byte_pbar.set_description(f"Error: {str(error)[:50]}")
-            self._byte_pbar.close()
-            self._byte_pbar = None
-
-        if self._item_pbar is not None:
-            self._item_pbar.set_description(f"Error: {str(error)[:50]}")
-            self._item_pbar.close()
-            self._item_pbar = None
+        for bar_name in ("_byte_pbar", "_item_pbar"):
+            if getattr(self, bar_name) is not None:
+                getattr(self, bar_name).set_description(f"Error: {str(error)[:50]}")
+                getattr(self, bar_name).close()
+                setattr(self, bar_name, None)
 
         print(f"\nError during scan: {error}")
 
     def cleanup(self) -> None:
         """Clean up resources."""
-        if self._byte_pbar is not None:
-            self._byte_pbar.close()
-            self._byte_pbar = None
-
-        if self._item_pbar is not None:
-            self._item_pbar.close()
-            self._item_pbar = None
+        for bar_name in ("_byte_pbar", "_item_pbar"):
+            if getattr(self, bar_name) is not None:
+                getattr(self, bar_name).close()
+                setattr(self, bar_name, None)
 
 
 class SimpleConsoleReporter(ProgressReporter):
