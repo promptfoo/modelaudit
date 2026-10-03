@@ -826,3 +826,42 @@ def test_sbom_local_query_filename_keeps_literal_classification(tmp_path: Path) 
     path.write_bytes(b"model")
     bom = json.loads(generate_sbom_pydantic([str(path)], create_initial_audit_result()))
     assert bom["components"][0]["type"] == "file"
+
+
+@pytest.mark.parametrize("generator", ["legacy", "pydantic", "cli"])
+@pytest.mark.parametrize("relative", [False, True])
+@pytest.mark.parametrize(
+    "name, expected",
+    [
+        ("session=training/model.pkl", "machine-learning-model"),
+        ("token=public/model.zip", "container"),
+        ("password=x/data.json", "data"),
+        pytest.param(
+            "session=training/model.pkl?version=1",
+            "file",
+            marks=pytest.mark.skipif(os.name == "nt", reason="Windows filenames cannot contain a question mark"),
+        ),
+    ],
+)
+def test_sbom_deleted_local_paths_keep_literal_classification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, generator: str, relative: bool, name: str, expected: str
+) -> None:
+    from modelaudit.cli import _ScanPathState, _write_scan_sbom
+
+    monkeypatch.chdir(tmp_path)
+    path = Path(name) if relative else tmp_path / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"model")
+    path.unlink()
+    result = create_initial_audit_result()
+    result.assets = [AssetModel(path=str(path), type="pickle", size=5, is_streamed=True)]
+    result.file_metadata[str(path)] = FileMetadataModel(file_size=5, scanner="pickle")
+    if generator == "legacy":
+        output = generate_sbom([str(path)], result.model_dump(mode="python"))
+    elif generator == "pydantic":
+        output = generate_sbom_pydantic([str(path)], result)
+    else:
+        target = tmp_path / "scan.sbom.json"
+        _write_scan_sbom(str(target), result, [str(path)], _ScanPathState(), scan_and_delete=True)
+        output = target.read_text()
+    assert json.loads(output)["components"][0]["type"] == expected

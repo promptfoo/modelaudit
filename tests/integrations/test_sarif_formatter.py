@@ -1527,3 +1527,50 @@ def test_existing_local_credential_shaped_filename_is_preserved(tmp_path: Path) 
 )
 def test_bare_and_protocol_relative_opaque_source_text_redaction(text: str, expected: str) -> None:
     assert redact_source_text(text) == expected
+
+
+@pytest.mark.parametrize(
+    "source, expected",
+    [
+        (
+            "https://huggingface.co/synthetic/model?revision=v1&token=first-secret",
+            ("4acb9afec8e4ca09", "c88940f6ed1f1e27"),
+        ),
+        (
+            "https://huggingface.co/synthetic/model?revision=v2&token=rotated-secret",
+            ("c41158d2c9a49cc2", "e1aaaf3843a01e19"),
+        ),
+        (
+            "https://user:password@hf.co/synthetic/model?revision=refs%2Fpr%2F1#fragment",
+            ("df9f6c632af59190", "c8f6914b602735fb"),
+        ),
+        ("hf://synthetic/model?revision=v1&token=first-secret", ("cb66d14a78b3ffa6", "296551dd1511bcb4")),
+        pytest.param(
+            "https://huggingface.co/synthetic/model?revision=v%3F1",
+            ("da65abb18e99561b", "f8bd949293f4aad7"),
+            marks=pytest.mark.skipif(os.name == "nt", reason="Windows revision paths cannot contain a question mark"),
+        ),
+        (
+            "https://huggingface.co/synthetic/model/resolve/refs%2Fpr%2F1/model.pkl?token=first-secret",
+            ("cbd09adff61aa463", "669223b82696b1ec"),
+        ),
+        ("https://huggingface.co/synthetic/model?token=first-secret", ("02bbb8268098d7b7", "09a5413822fb3085")),
+    ],
+)
+@pytest.mark.parametrize("scanned_artifact_count", [0, 2])
+def test_huggingface_acquisition_fingerprints_match_baseline(
+    source: str, expected: tuple[str, str], scanned_artifact_count: int
+) -> None:
+    from modelaudit.cli import _record_huggingface_acquisition_error, _ScanPathState
+    from modelaudit.models import ModelAuditResultModel, create_initial_audit_result
+
+    # Captured from the parent before raw output changes, including punctuation.
+    result = create_initial_audit_result()
+    _record_huggingface_acquisition_error(
+        result, _ScanPathState(), path=source, error_msg="HTTP 503", scanned_artifact_count=scanned_artifact_count
+    )
+    for converted in [result, ModelAuditResultModel.model_validate_json(result.model_dump_json())]:
+        sarif_result = _create_results(converted.issues)[0]
+        assert sarif_result["partialFingerprints"]["primaryLocationLineHash"] == expected[scanned_artifact_count // 2]
+        assert sarif_result["message"]["text"] == converted.issues[0].message
+        assert sarif_result["properties"]["source_url"] == converted.issues[0].location
