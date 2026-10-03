@@ -3539,6 +3539,8 @@ def scan_model_directory_or_file(
                     scan_result, analysis_complete = stream_analyze_file(stream_url, scanner)
                 if scan_result:
                     _replace_result_report_path(scan_result, stream_url, stream_url)
+                    for issue in scan_result.issues:
+                        issue.details.setdefault("source_url", stream_url)
                     if not analysis_complete:
                         _mark_inconclusive_scan_outcome(scan_result, "streaming_analysis_incomplete")
                     results.files_scanned += 1
@@ -3555,7 +3557,7 @@ def scan_model_directory_or_file(
                             "Streaming analysis incomplete - full scanner coverage was not available",
                             severity=IssueSeverity.INFO.value,
                             location=report_url,
-                            details={"analysis_complete": False},
+                            details={"analysis_complete": False, "source_url": stream_url},
                         )
                 else:
                     raise ValueError(f"Streaming analysis failed for {report_url}")
@@ -5720,6 +5722,8 @@ def scan_model_directory_or_file(
             severity=IssueSeverity.INFO.value,
             details={"exception_type": type(e).__name__},
         )
+        if is_stream_url(path):
+            results.issues[-1].details["source_url"] = path[9:]
         _add_error_asset_to_results(results, report_path)
     finally:
         pickle_source_snapshot_stack.close()

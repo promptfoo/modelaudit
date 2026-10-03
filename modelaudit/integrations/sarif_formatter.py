@@ -14,6 +14,7 @@ from pydantic import TypeAdapter
 
 from modelaudit import __version__
 from modelaudit.core_results import (
+    _location_matches_file_path,
     determine_exit_code,
     results_have_inconclusive_outcome,
     results_have_operational_error,
@@ -23,6 +24,11 @@ from modelaudit.integrations._sarif_identity import (
 )
 from modelaudit.integrations._sarif_identity import (
     redact_source_text as _identity_text,
+)
+from modelaudit.integrations._sarif_identity_urls import (
+    is_stream_url,
+    redact_cloud_error_for_display,
+    redact_stream_url_for_display,
 )
 from modelaudit.integrations.source_serialization import (
     serialize_source_identifier,
@@ -73,13 +79,24 @@ def _create_run(
     if not verbose:
         issues = [i for i in issues if i.severity != IssueSeverity.DEBUG]
     issues = _primary_sarif_issues(issues)
+    stream_sources = {
+        path for path, metadata in audit_result.file_metadata.items() if getattr(metadata, "streaming_analysis", False)
+    }
+    stream_sources.update(asset.path for asset in audit_result.assets if asset.type == "streaming")
+    stream_sources.update(path[9:] for path in scan_paths if is_stream_url(path))
+    stream_sources.update(asset.path[9:] for asset in audit_result.assets if is_stream_url(asset.path))
+    identity_sources = {
+        source: redact_stream_url_for_display(source)
+        for source in sorted(stream_sources, key=len, reverse=True)
+        if source
+    }
 
     # Create rules from unique issue types
-    rules = _create_rules(issues, prefiltered=True)
+    rules = _create_rules(issues, prefiltered=True, identity_sources=identity_sources)
     rule_indices = {rule["id"]: idx for idx, rule in enumerate(rules)}
 
     # Create results from issues
-    results = _create_results(issues, rule_indices, prefiltered=True)
+    results = _create_results(issues, rule_indices, prefiltered=True, identity_sources=identity_sources)
 
     # Create artifacts from scanned files
     artifacts = _create_artifacts(audit_result)
@@ -181,7 +198,43 @@ def _exit_code_description(audit_result: ModelAuditResultModel, exit_code: int) 
     return "Errors occurred during scanning"
 
 
-def _create_rules(issues: list, *, prefiltered: bool = False) -> list[dict[str, Any]]:
+def _stream_identity_issue(issue: Any, sources: dict[str, str]) -> Any:
+    """Reproduce producer normalization using the exact source, never a parsed location suffix."""
+    source = (issue.details or {}).get("source_url")
+    if not isinstance(source, str) or source not in sources:
+        source = (issue.details or {}).get("pickle_source")
+    if not isinstance(source, str) or source not in sources:
+        source = next(
+            (
+                path
+                for path in sources
+                if _location_matches_file_path(issue.location or "", path)
+                or (not issue.location and path in issue.message)
+            ),
+            None,
+        )
+    if source is None:
+        return issue
+
+    def normalized(value: str) -> str:
+        return redact_cloud_error_for_display(value.replace(source, sources[source]))
+
+    updates: dict[str, Any] = {
+        name: normalized(value)
+        for name in ("message", "location", "type", "rule_code")
+        if isinstance(value := getattr(issue, name, None), str)
+    }
+    if "evidence_fingerprint" in issue.details:
+        updates["details"] = {
+            **issue.details,
+            "evidence_fingerprint": normalized(str(issue.details["evidence_fingerprint"])),
+        }
+    return issue.model_copy(update=updates)
+
+
+def _create_rules(
+    issues: list, *, prefiltered: bool = False, identity_sources: dict[str, str] | None = None
+) -> list[dict[str, Any]]:
     """Create SARIF rules from unique issue types."""
     if not prefiltered:
         issues = _primary_sarif_issues(issues)
@@ -189,15 +242,16 @@ def _create_rules(issues: list, *, prefiltered: bool = False) -> list[dict[str, 
     seen_rules = set()
 
     for issue in issues:
+        identity_issue = _stream_identity_issue(issue, identity_sources or {})
         # Create a rule ID from the issue type or message
-        rule_id = _get_rule_id(issue)
+        rule_id = _get_rule_id(identity_issue)
 
         if rule_id not in seen_rules:
             seen_rules.add(rule_id)
 
             rule: dict[str, Any] = {
                 "id": rule_id,
-                "name": _get_rule_name(issue),
+                "name": _get_rule_name(identity_issue),
                 "shortDescription": {"text": _get_rule_short_description(issue)},
                 "fullDescription": {"text": _get_rule_full_description(issue)},
                 "defaultConfiguration": {
@@ -212,7 +266,7 @@ def _create_rules(issues: list, *, prefiltered: bool = False) -> list[dict[str, 
                 },
             }
 
-            rule_code = _get_issue_rule_code(issue)
+            rule_code = _get_issue_rule_code(identity_issue)
             if rule_code:
                 rule["properties"]["rule_code"] = rule_code
 
@@ -231,16 +285,23 @@ def _create_results(
     rule_indices: dict[str, int] | None = None,
     *,
     prefiltered: bool = False,
+    identity_sources: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     """Create SARIF results from issues."""
     if not prefiltered:
         issues = _primary_sarif_issues(issues)
     results = []
     if rule_indices is None:
-        rule_indices = {rule["id"]: idx for idx, rule in enumerate(_create_rules(issues, prefiltered=prefiltered))}
+        rule_indices = {
+            rule["id"]: idx
+            for idx, rule in enumerate(
+                _create_rules(issues, prefiltered=prefiltered, identity_sources=identity_sources)
+            )
+        }
 
     for issue in issues:
-        rule_id = _get_rule_id(issue)
+        identity_issue = _stream_identity_issue(issue, identity_sources or {})
+        rule_id = _get_rule_id(identity_issue)
         result = {
             "ruleId": rule_id,
             "ruleIndex": rule_indices[rule_id],
@@ -276,8 +337,8 @@ def _create_results(
         import hashlib
 
         fingerprint = ""
-        fingerprint_message = issue.message
-        fingerprint_location = issue.location or ""
+        fingerprint_message = identity_issue.message
+        fingerprint_location = identity_issue.location or ""
         # Acquisition identities historically append the revision after URL normalization.
         if issue.type == "huggingface_acquisition_error" and fingerprint_location:
             revision = (issue.details or {}).get("requested_revision")
@@ -290,7 +351,7 @@ def _create_results(
             fingerprint_location = source
         fingerprint_location = _identity_location(fingerprint_location)
         if issue.details:
-            evidence_fingerprint = _identity_text(str(issue.details.get("evidence_fingerprint", "")))
+            evidence_fingerprint = _identity_text(str(identity_issue.details.get("evidence_fingerprint", "")))
             if evidence_fingerprint:
                 fingerprint = hashlib.sha256(
                     "\x1f".join((evidence_fingerprint, fingerprint_location, str(issue.severity))).encode()
@@ -306,7 +367,7 @@ def _create_results(
         properties = serialize_source_value(dict(issue.details or {}))
         properties.pop("rule_code", None)
         properties.pop("issue_type", None)
-        rule_code = _get_issue_rule_code(issue)
+        rule_code = _get_issue_rule_code(identity_issue)
         if rule_code:
             properties["rule_code"] = rule_code
         if hasattr(issue, "type") and issue.type:

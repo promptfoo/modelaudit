@@ -1,19 +1,27 @@
 """Tests for SARIF formatter module."""
 
 import hashlib
+import io
 import json
 import os
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
 import modelaudit.integrations.sarif_formatter as sarif_formatter
 from modelaudit.core import scan_model_directory_or_file
 from modelaudit.integrations._sarif_identity import redact_source_identifier, redact_source_text
-from modelaudit.models import AssetModel, FileHashesModel, FileMetadataModel, create_initial_audit_result
-from modelaudit.scanners.base import Check, CheckStatus, Issue, IssueSeverity
+from modelaudit.models import (
+    AssetModel,
+    FileHashesModel,
+    FileMetadataModel,
+    ModelAuditResultModel,
+    create_initial_audit_result,
+)
+from modelaudit.scanners.base import Check, CheckStatus, Issue, IssueSeverity, ScanResult
 
 _create_artifacts = sarif_formatter._create_artifacts
 _create_results = sarif_formatter._create_results
@@ -1574,3 +1582,110 @@ def test_huggingface_acquisition_fingerprints_match_baseline(
         assert sarif_result["partialFingerprints"]["primaryLocationLineHash"] == expected[scanned_artifact_count // 2]
         assert sarif_result["message"]["text"] == converted.issues[0].message
         assert sarif_result["properties"]["source_url"] == converted.issues[0].location
+
+
+@pytest.mark.parametrize("query", ["?token=synthetic", "?token=synthetic (pos 2)", "%253Ftoken%253Dsynthetic"])
+@pytest.mark.parametrize(
+    "suffix, mode, evidence, rule, fingerprint",
+    [
+        (" (pos 2)", "default", False, "MAUNSAFE_PICKLE", "fa5b7bc43ae2af24"),
+        (" (pos 17)", "default", False, "MAUNSAFE_PICKLE", "d75b755d8cd36d92"),
+        (":archive/data.pkl (pos 2)", "default", False, "MAUNSAFE_PICKLE", "19aa36e2e9eddac1"),
+        ("#member (pos 2)", "default", True, "MAUNSAFE_PICKLE", "433b3f275ec02f61"),
+        ("[member]:4", "type", False, "MAHTTPS://BUCKET.S3.AMAZONAWS.COM/MODEL.PKL[MEMBER]:4", "de3055da08d1ede8"),
+        (" (pos 2)", "rule_code", False, "https://bucket.s3.amazonaws.com/model.pkl (pos 2)", "fa5b7bc43ae2af24"),
+    ],
+)
+def test_stream_fingerprints_preserve_baseline_suffixes(
+    monkeypatch: pytest.MonkeyPatch, query: str, suffix: str, mode: str, evidence: bool, rule: str, fingerprint: str
+) -> None:
+    # Frozen outputs from the parent, where core normalized the source before appending scanner positions.
+    source = "https://bucket.s3.amazonaws.com/model.pkl" + query
+    scanned = ScanResult(scanner_name="streaming")
+    scanned.metadata["streaming_analysis"] = True
+    issue = Issue(
+        message=f"Unsafe pickle from {source}{suffix}; another URL https://user:password@other/model.pkl?token=second.",
+        severity=IssueSeverity.WARNING,
+        location=source + suffix,
+        details={"evidence_fingerprint": "evidence at " + source + suffix if evidence else "", "custom": "retained"},
+        type=source + suffix if mode == "type" else "unsafe_pickle",
+        rule_code=source + suffix if mode == "rule_code" else None,
+    )
+    scanned.issues.append(issue)
+    scanned.finish(success=False)
+    monkeypatch.setattr("modelaudit.core.stream_analyze_file", lambda *args, **kwargs: (scanned, True))
+    monkeypatch.setattr("modelaudit.scanners.get_scanner_for_file", lambda *args, **kwargs: object())
+    result = scan_model_directory_or_file("stream://" + source)
+    before = result.model_dump_json()
+    for converted in [result, ModelAuditResultModel.model_validate_json(before)]:
+        run = _create_run(converted, [], False)
+        finding = run["results"][0]
+        assert finding["ruleId"] == run["tool"]["driver"]["rules"][0]["id"] == rule
+        assert finding["partialFingerprints"]["primaryLocationLineHash"] == fingerprint
+        assert finding["message"]["text"] == issue.message
+        assert converted.issues[0].location == source + suffix
+        assert converted.issues[0].details == {**issue.details, "source_url": source}
+        assert finding["properties"]["custom"] == "retained"
+    assert result.model_dump_json() == before
+
+
+def test_overlapping_signed_stream_sources_preserve_baseline_identities(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Exercise the real stream scanner; signed query text can itself look like a scanner position.
+    payload = b"\x80\x04N.\x7fELFsynthetic"
+    merged = create_initial_audit_result()
+    for source in [
+        "https://bucket.s3.amazonaws.com/model.pkl?token=synthetic",
+        "https://bucket.s3.amazonaws.com/model.pkl?token=synthetic (pos 4)",
+    ]:
+        filesystem = Mock()
+        filesystem.info.return_value = {"size": len(payload)}
+        filesystem.open.side_effect = lambda *args: io.BytesIO(payload)
+        transport = Mock(return_value=filesystem)
+        monkeypatch.setattr("fsspec.filesystem", transport)
+        result = scan_model_directory_or_file("stream://" + source)
+        transport.assert_called_once_with("https")
+        filesystem.info.assert_called_once_with(source)
+        filesystem.open.assert_called_once_with(source, "rb")
+        assert all(issue.details["source_url"] == source for issue in result.issues)
+        assert result.issues[0].location == source + " (pos 4)"
+        merged.issues.extend(result.issues)
+        merged.assets.extend(result.assets)
+        merged.file_metadata.update(result.file_metadata)
+    expected = [
+        ("S902", "4a206c4a5abbf137"),
+        ("S901", "44b7255a71502074"),
+        ("MA-STREAMING-ANALYSIS-INCOMPLETE-", "81fb33e77d7f4ab9"),
+    ] * 2
+    for converted in [merged, ModelAuditResultModel.model_validate_json(merged.model_dump_json())]:
+        findings = _create_run(converted, [], False)["results"]
+        assert [
+            (item["ruleId"], item["partialFingerprints"]["primaryLocationLineHash"]) for item in findings
+        ] == expected
+
+
+def test_stream_failure_fingerprint_survives_saved_results(monkeypatch: pytest.MonkeyPatch) -> None:
+    source = "https://user:password@bucket.s3.amazonaws.com/model.pkl?token=synthetic (pos 2)"
+    monkeypatch.setattr("modelaudit.core.stream_analyze_file", lambda *args, **kwargs: (None, False))
+    monkeypatch.setattr("modelaudit.scanners.get_scanner_for_file", lambda *args, **kwargs: object())
+    result = scan_model_directory_or_file("stream://" + source)
+    for converted in [result, ModelAuditResultModel.model_validate_json(result.model_dump_json())]:
+        finding = _create_run(converted, [], False)["results"][0]
+        assert finding["partialFingerprints"]["primaryLocationLineHash"] == "5386d5566b6f8146"
+        assert source in finding["message"]["text"]
+        assert converted.issues[0].details["source_url"] == source
+
+
+def test_stream_identity_context_excludes_local_and_huggingface_downloads() -> None:
+    source = "https://bucket/model.pkl?token=synthetic"
+    result = create_initial_audit_result()
+    result.issues = [
+        Issue(message=f"Local pickle references {source} (pos 2)", location="local.pkl (pos 2)", type="pickle_ref")
+    ]
+    expected = _create_run(result, [], False)["results"]
+    result.file_metadata[source] = FileMetadataModel(streaming_analysis=True)
+    assert _create_run(result, [], False)["results"] == expected
+    result.file_metadata.clear()
+    result.issues[0].location = source + " (pos 2)"
+    expected = _create_run(result, [], False)["results"]
+    result.assets = [AssetModel(path=source, type="pickle", is_streamed=True)]
+    assert _create_run(result, [], False)["results"] == expected
