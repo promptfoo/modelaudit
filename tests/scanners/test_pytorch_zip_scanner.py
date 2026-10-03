@@ -14,10 +14,12 @@ import warnings
 import zipfile
 import zlib
 from collections.abc import Iterator
+from functools import partial
 from importlib import metadata as importlib_metadata
 from pathlib import Path
 from types import ModuleType
 from typing import IO, Any, BinaryIO, cast
+from unittest.mock import create_autospec
 
 import pytest
 from modelaudit_picklescan.api import _source_backed_import_requires_initialization_proof
@@ -35,7 +37,6 @@ from modelaudit.detectors import jit_script as jit_script_module
 from modelaudit.detectors import network_comm as network_comm_module
 from modelaudit.detectors.suspicious_symbols import CVE_COMBINED_PATTERNS
 from modelaudit.scanner_results import (
-    ACTIONABLE_FAILED_CHECKS_METADATA_KEY,
     INCONCLUSIVE_SCAN_OUTCOME,
     MEMBER_FILE_HASHES_METADATA_KEY,
     MEMBER_FILE_HASHES_OMITTED_METADATA_KEY,
@@ -56,6 +57,45 @@ from modelaudit.utils.repository_context import (
     RepositoryFileInventory,
 )
 from tests.helpers import create_mock_pytorch_zip
+from tests.helpers.cache import private_actionable_failed_checks as _private_actionable_failed_checks
+from tests.helpers.file_creators import EvalPayload
+from tests.helpers.file_creators import (
+    pickle_binunicode as _pickle_binunicode,
+)
+from tests.helpers.file_creators import pickle_binunicode as _pickle_binunicode_bytes
+from tests.helpers.file_creators import pickle_short_binunicode as _pickle_short_binunicode
+from tests.helpers.file_creators import pickle_short_binunicode as _pickle_short_binunicode_bytes
+from tests.helpers.pickle_framework import (
+    _assert_shadow_framework_unpickle_executes,
+    _binary_magic_tensor_storage_bytes,
+    _clear_ultralytics_modules,
+    _float_storage_element_count_for_bytes,
+    _force_framework_metadata_unresolved,
+    _frame_first_large_malicious_eval_pickle_payload,
+    _frame_first_raw_storage_bytes,
+    _large_proto0_system_payload,
+    _pickle_binint,
+    _pickle_int_tuple,
+    _pickleish_tensor_storage_bytes,
+    _pytorch_storage_protocol0_persistent_id_payload,
+    _pytorch_storage_then_arbitrary_protocol0_persistent_id_payload,
+    _require_torch_distribution,
+    _shadow_framework_divergence_cases,
+    _shadow_newobj_build_payload,
+    _shadow_slot_state_build_payload,
+    _static_getattr_protocol0_unicode_payload,
+    _write_cross_module_rebind_target_package,
+    _write_enum_trusted_transformers_package,
+    _write_import_side_effect_transformers_package,
+    _write_init_heavy_trusted_transformers_package,
+    _write_init_inert_setstate_transformers_package,
+    _write_rebindable_trusted_torch_utils_package,
+    _write_rebindable_trusted_transformers_package,
+    _write_runtime_mutable_trusted_transformers_package,
+    _write_sitecustomize_trusting_site_packages,
+    _yolov5n6_tensor_storage_prefix_bytes,
+)
+from tests.helpers.scanners import track_bytesio_close
 
 _ASSETS_DIR = Path(__file__).resolve().parents[1] / "assets"
 _HF_T10_REPO_ID = "nvidia/LocateAnything-3B"
@@ -94,24 +134,8 @@ def _pickle_global(module: str, name: str) -> bytes:
     return b"c" + module.encode("ascii") + b"\n" + name.encode("ascii") + b"\n"
 
 
-def _pickle_binunicode(value: bytes) -> bytes:
-    return b"X" + len(value).to_bytes(4, "little") + value
-
-
 def _pickle_binunicode8(value: bytes) -> bytes:
     return b"\x8d" + len(value).to_bytes(8, "little") + value
-
-
-def _pickle_short_binunicode(value: bytes) -> bytes:
-    if len(value) > 0xFF:
-        raise ValueError("SHORT_BINUNICODE helper accepts at most 255 bytes")
-    return b"\x8c" + bytes([len(value)]) + value
-
-
-def _pickle_binint(value: int) -> bytes:
-    if 0 <= value <= 0xFF:
-        return b"K" + bytes([value])
-    return b"J" + value.to_bytes(4, "little", signed=True)
 
 
 def _proto0_string_literal(value: bytes) -> bytes:
@@ -127,29 +151,11 @@ def _pickle_frame(payload: bytes) -> bytes:
     return b"\x95" + struct.pack("<Q", len(payload)) + payload
 
 
-def _float_storage_element_count_for_bytes(data: bytes) -> int:
-    assert len(data) % 4 == 0
-    return len(data) // 4
-
-
 def _float_storage_persistent_id_payload_for_bytes(key: str | bytes, data: bytes) -> bytes:
     return _pytorch_storage_persistent_id_payload(
         key,
         size_opcode=_pickle_binint(_float_storage_element_count_for_bytes(data)),
     )
-
-
-def _pickle_int_tuple(values: tuple[int, ...]) -> bytes:
-    payload = b"".join(_pickle_binint(value) for value in values)
-    if len(values) == 0:
-        return b")"
-    if len(values) == 1:
-        return payload + b"\x85"
-    if len(values) == 2:
-        return payload + b"\x86"
-    if len(values) == 3:
-        return payload + b"\x87"
-    return b"(" + payload + b"t"
 
 
 def _metadata_reduce_payload(module: str, name: str, value: bytes = b"metadata") -> bytes:
@@ -250,286 +256,6 @@ def _write_training_args_bin(path: Path, payload: bytes) -> None:
         zip_file.writestr("training_args/.data/serialization_id", "0" * 40)
 
 
-_SHADOW_FRAMEWORK_MODULE = "transformers.training_args"
-_SHADOW_FRAMEWORK_NAME = "TrainingArguments"
-
-
-def _force_framework_metadata_unresolved(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        "modelaudit_picklescan.call_graph._trusted_module_origin_kind",
-        lambda _module_name: "unresolved",
-    )
-    monkeypatch.setattr("modelaudit_picklescan.call_graph._resolve_module_source", lambda _module_name: None)
-    monkeypatch.setattr(
-        "modelaudit_picklescan.call_graph._find_module_spec_without_imports",
-        lambda _module_name: None,
-    )
-
-
-def _stack_global_reference_payload(protocol: int) -> bytes:
-    return (
-        bytes((0x80, protocol))
-        + _pickle_short_binunicode(_SHADOW_FRAMEWORK_MODULE.encode("ascii"))
-        + b"\x94"
-        + _pickle_short_binunicode(_SHADOW_FRAMEWORK_NAME.encode("ascii"))
-        + b"\x94\x93"
-    )
-
-
-def _shadow_newobj_build_payload(protocol: int = 4) -> bytes:
-    return _stack_global_reference_payload(protocol) + b")\x81}b."
-
-
-def _shadow_memo_alias_payload() -> bytes:
-    return _stack_global_reference_payload(4) + b"\x94" + b"0" + b"h\x02)\x81}b."
-
-
-def _shadow_newobj_ex_payload() -> bytes:
-    return _stack_global_reference_payload(4) + b")}\x92}b."
-
-
-def _shadow_slot_state_build_payload() -> bytes:
-    return (
-        _stack_global_reference_payload(4)
-        + b")\x81N}"
-        + _pickle_short_binunicode(b"payload")
-        + _pickle_short_binunicode(b"owned")
-        + b"s\x86b."
-    )
-
-
-def _bytes_literal_payload(payload: bytes) -> bytes:
-    return b"\x80\x04B" + len(payload).to_bytes(4, "little") + payload + b"."
-
-
-def _extension_reconstruction_payload(opcode: bytes, encoded_code: bytes) -> bytes:
-    return b"\x80\x04" + opcode + encoded_code + b")\x81}b."
-
-
-def _shadow_framework_divergence_cases() -> tuple[object, ...]:
-    nested = _shadow_newobj_build_payload(4)
-    return (
-        pytest.param("protocol4_stack_global", _shadow_newobj_build_payload(4), "single", None, id="protocol4"),
-        pytest.param("protocol5_stack_global", _shadow_newobj_build_payload(5), "single", None, id="protocol5"),
-        pytest.param("memo_alias", _shadow_memo_alias_payload(), "single", None, id="memo-alias"),
-        pytest.param("newobj_ex", _shadow_newobj_ex_payload(), "single", None, id="newobj-ex"),
-        pytest.param("slot_state_build", _shadow_slot_state_build_payload(), "single", None, id="slot-state-build"),
-        pytest.param("nested_stream", _bytes_literal_payload(nested), "nested", None, id="nested"),
-        pytest.param("concatenated_stream", b"\x80\x04N." + nested, "concatenated", None, id="concatenated"),
-        pytest.param("ext1_control", _extension_reconstruction_payload(b"\x82", b"\x01"), "single", 1, id="ext1"),
-        pytest.param(
-            "ext2_control",
-            _extension_reconstruction_payload(b"\x83", (256).to_bytes(2, "little")),
-            "single",
-            256,
-            id="ext2",
-        ),
-        pytest.param(
-            "ext4_control",
-            _extension_reconstruction_payload(b"\x84", (70_000).to_bytes(4, "little")),
-            "single",
-            70_000,
-            id="ext4",
-        ),
-    )
-
-
-def _write_shadow_transformers_package(package_root: Path, marker: Path) -> None:
-    package_dir = package_root / "transformers"
-    package_dir.mkdir(parents=True, exist_ok=True)
-    (package_dir / "__init__.py").write_text("", encoding="utf-8")
-    (package_dir / "training_args.py").write_text(
-        "\n".join(
-            [
-                "from pathlib import Path",
-                f"_MARKER = Path({str(marker)!r})",
-                "class TrainingArguments:",
-                "    __slots__ = ('payload',)",
-                "    def __new__(cls, *args, **kwargs):",
-                "        return object.__new__(cls)",
-                "    def __setstate__(self, state):",
-                "        _MARKER.write_text('setstate', encoding='utf-8')",
-                "    def __setattr__(self, name, value):",
-                "        _MARKER.write_text(f'setattr:{name}', encoding='utf-8')",
-                "        object.__setattr__(self, name, value)",
-                "",
-            ]
-        ),
-        encoding="utf-8",
-    )
-
-
-def _write_init_inert_setstate_transformers_package(site_packages: Path, marker: Path) -> None:
-    package_dir = site_packages / "transformers"
-    package_dir.mkdir(parents=True, exist_ok=True)
-    (package_dir / "__init__.py").write_text("", encoding="utf-8")
-    (package_dir / "training_args.py").write_text(
-        "\n".join(
-            [
-                f"MARKER = {str(marker)!r}",
-                "class TrainingArguments:",
-                "    def __new__(cls, *args, **kwargs):",
-                "        return object.__new__(cls)",
-                "    def __setstate__(self, state):",
-                "        with open(MARKER, 'w', encoding='utf-8') as handle:",
-                "            handle.write('setstate')",
-                "",
-            ]
-        ),
-        encoding="utf-8",
-    )
-
-
-def _write_import_side_effect_transformers_package(site_packages: Path, marker: Path) -> None:
-    package_dir = site_packages / "transformers"
-    package_dir.mkdir(parents=True, exist_ok=True)
-    (package_dir / "__init__.py").write_text("", encoding="utf-8")
-    (package_dir / "training_args.py").write_text(
-        "\n".join(
-            [
-                f"MARKER = {str(marker)!r}",
-                "with open(MARKER, 'w', encoding='utf-8') as handle:",
-                "    handle.write('import')",
-                "class OptimizerNames:",
-                "    pass",
-                "",
-            ]
-        ),
-        encoding="utf-8",
-    )
-
-
-def _write_rebindable_trusted_transformers_package(site_packages: Path) -> None:
-    package_dir = site_packages / "transformers"
-    package_dir.mkdir(parents=True, exist_ok=True)
-    (package_dir / "__init__.py").write_text("", encoding="utf-8")
-    (package_dir / "training_args.py").write_text(
-        "\n".join(
-            [
-                "class TrainingArguments:",
-                "    def __new__(cls):",
-                "        return object.__new__(cls)",
-                "",
-                "class OptimizerNames:",
-                "    def __new__(cls, value=''):",
-                "        return object.__new__(cls)",
-                "",
-            ]
-        ),
-        encoding="utf-8",
-    )
-
-
-def _write_init_heavy_trusted_transformers_package(site_packages: Path) -> None:
-    package_dir = site_packages / "transformers"
-    package_dir.mkdir(parents=True, exist_ok=True)
-    (package_dir / "__init__.py").write_text("", encoding="utf-8")
-    (package_dir / "training_args.py").write_text(
-        "\n".join(
-            [
-                "HELPER = object()",
-                "class TrainingArguments:",
-                "    def __new__(cls):",
-                "        return object.__new__(cls)",
-                "    def __init__(self):",
-                "        self.helper = HELPER",
-                "    def __setstate__(self, state):",
-                "        self.__dict__.update(state)",
-                "",
-            ]
-        ),
-        encoding="utf-8",
-    )
-
-
-def _write_enum_trusted_transformers_package(site_packages: Path) -> None:
-    package_dir = site_packages / "transformers"
-    package_dir.mkdir(parents=True, exist_ok=True)
-    (package_dir / "__init__.py").write_text("", encoding="utf-8")
-    (package_dir / "trainer_utils.py").write_text(
-        "\n".join(
-            [
-                "from enum import Enum",
-                "class IntervalStrategy(str, Enum):",
-                "    STEPS = 'steps'",
-                "",
-            ]
-        ),
-        encoding="utf-8",
-    )
-
-
-def _write_rebindable_trusted_torch_utils_package(site_packages: Path) -> None:
-    package_dir = site_packages / "torch"
-    package_dir.mkdir(parents=True, exist_ok=True)
-    (package_dir / "__init__.py").write_text("", encoding="utf-8")
-    (package_dir / "_utils.py").write_text(
-        "\n".join(
-            [
-                "def _rebuild_tensor(arg):",
-                "    return None",
-                "",
-            ]
-        ),
-        encoding="utf-8",
-    )
-
-
-def _write_cross_module_rebind_target_package(site_packages: Path) -> None:
-    (site_packages / "trusted_target.py").write_text(
-        "\n".join(
-            [
-                "from pathlib import Path",
-                "def rebound_optimizer(path):",
-                "    Path(path).write_text('cross-module', encoding='utf-8')",
-                "    return None",
-                "",
-            ]
-        ),
-        encoding="utf-8",
-    )
-
-
-def _write_runtime_mutable_trusted_transformers_package(site_packages: Path) -> None:
-    package_dir = site_packages / "transformers"
-    package_dir.mkdir(parents=True, exist_ok=True)
-    (package_dir / "__init__.py").write_text("", encoding="utf-8")
-    (package_dir / "training_args.py").write_text(
-        "\n".join(
-            [
-                "def OptimizerNames(value, callback=None):",
-                "    if callback is not None:",
-                "        return callback(value)",
-                "    return None",
-                "",
-            ]
-        ),
-        encoding="utf-8",
-    )
-
-
-def _write_sitecustomize_trusting_site_packages(customize_dir: Path, site_packages: Path) -> None:
-    customize_dir.mkdir(parents=True, exist_ok=True)
-    (customize_dir / "sitecustomize.py").write_text(
-        "\n".join(
-            [
-                "import sysconfig",
-                f"_TRUSTED_SITE_PACKAGES = {str(site_packages)!r}",
-                "_ORIGINAL_GET_PATH = sysconfig.get_path",
-                "def _patched_get_path(name, scheme=None, vars=None, expand=True):",
-                "    if name in {'purelib', 'platlib'}:",
-                "        return _TRUSTED_SITE_PACKAGES",
-                "    if scheme is None and vars is None and expand is True:",
-                "        return _ORIGINAL_GET_PATH(name)",
-                "    return _ORIGINAL_GET_PATH(name, scheme=scheme, vars=vars, expand=expand)",
-                "sysconfig.get_path = _patched_get_path",
-                "",
-            ]
-        ),
-        encoding="utf-8",
-    )
-
-
 def _preimport_rebound_subprocess_env(tmp_path: Path, site_packages: Path) -> dict[str, str]:
     customize_dir = tmp_path / "sitecustomize"
     _write_sitecustomize_trusting_site_packages(customize_dir, site_packages)
@@ -547,45 +273,6 @@ def _preimport_rebound_subprocess_env(tmp_path: Path, site_packages: Path) -> di
         if entry
     )
     return {**os.environ, "PYTHONPATH": pythonpath}
-
-
-def _assert_shadow_framework_unpickle_executes(
-    payload_path: Path,
-    tmp_path: Path,
-    *,
-    mode: str,
-    extension_code: int | None,
-) -> None:
-    marker = tmp_path / f"{payload_path.stem}.marker"
-    package_root = tmp_path / f"{payload_path.stem}.shadow"
-    _write_shadow_transformers_package(package_root, marker)
-    code_arg = "none" if extension_code is None else str(extension_code)
-    script = (
-        "import copyreg, io, pickle, sys\n"
-        "from pathlib import Path\n"
-        "payload = Path(sys.argv[1]).read_bytes()\n"
-        "mode = sys.argv[2]\n"
-        "code_arg = sys.argv[3]\n"
-        "if code_arg != 'none':\n"
-        "    copyreg.add_extension('transformers.training_args', 'TrainingArguments', int(code_arg))\n"
-        "if mode == 'nested':\n"
-        "    pickle.loads(pickle.loads(payload))\n"
-        "elif mode == 'concatenated':\n"
-        "    stream = io.BytesIO(payload)\n"
-        "    while stream.tell() < len(payload):\n"
-        "        pickle.load(stream)\n"
-        "else:\n"
-        "    pickle.loads(payload)\n"
-    )
-    completed = subprocess.run(
-        [sys.executable, "-c", script, str(payload_path), mode, code_arg],
-        check=False,
-        env={**os.environ, "PYTHONPATH": str(package_root)},
-        capture_output=True,
-        text=True,
-    )
-    assert completed.returncode == 0, completed.stderr
-    assert marker.exists()
 
 
 def _download_hf_file(
@@ -675,19 +362,11 @@ def _corrupt_zip_member_crc(zip_path: Path, member_name: str) -> None:
 
 
 def _malicious_eval_pickle_payload() -> bytes:
-    class MaliciousClass:
-        def __reduce__(self) -> tuple[object, tuple[str]]:
-            return (eval, ("print('pwned')",))
-
-    return pickle.dumps({"payload": MaliciousClass()})
+    return pickle.dumps({"payload": EvalPayload()})
 
 
 def _large_framed_malicious_eval_pickle_payload() -> bytes:
-    class MaliciousClass:
-        def __reduce__(self) -> tuple[object, tuple[str]]:
-            return (eval, ("print('pwned')",))
-
-    return pickle.dumps({"pad": b"A" * 10_000, "payload": MaliciousClass()}, protocol=4)
+    return pickle.dumps({"pad": b"A" * 10_000, "payload": EvalPayload()}, protocol=4)
 
 
 def _large_length_prefixed_malicious_eval_pickle_payload() -> bytes:
@@ -702,28 +381,8 @@ def _malicious_proto0_system_payload() -> bytes:
     return b"cposix\nsystem\n(S'echo hidden'\ntR."
 
 
-def _large_proto0_system_payload() -> bytes:
-    return b"cposix\nsystem\n(S'" + (b"A" * 10_000) + b"'\ntR."
-
-
 def _protocol_less_framed_malicious_storage_payload() -> bytes:
     return b"cposix\nsystem\n(S'echo hidden'\ntR" + b"\x95" + struct.pack("<Q", 100) + b"abc"
-
-
-def _frame_first_large_malicious_eval_pickle_payload() -> bytes:
-    benign_prefix = b"N0" * 2100
-    dangerous_suffix = b"cbuiltins\neval\n(S'print(1)'\ntR."
-    body = benign_prefix + dangerous_suffix
-    payload = b"\x95" + len(body).to_bytes(8, "little") + body
-    assert payload[0] == 0x95
-    assert int.from_bytes(payload[1:9], "little") > 4 * 1024
-    assert payload.find(b"cbuiltins\neval\n") > 4 * 1024
-    assert payload.rfind(b".") > 4 * 1024
-    return payload
-
-
-def _frame_first_raw_storage_bytes() -> bytes:
-    return b"\x95" + (10_000).to_bytes(8, "little") + (b"\x00" * 4095)
 
 
 def _short_binunicode(data: bytes) -> bytes:
@@ -797,31 +456,6 @@ def _pytorch_rebuild_tensor_v2_payload() -> bytes:
         + _pytorch_empty_ordered_dict_reduce_expr()
         + b"tR."
     )
-
-
-def _pytorch_storage_protocol0_persistent_id_payload(
-    key: str,
-    *,
-    storage_qualname: str = "torch.FloatStorage",
-    size: int | str = 1,
-) -> bytes:
-    return f"(dp0\nVx\np1\nP('storage', <class '{storage_qualname}'>, '{key}', 'cpu', {size})\ns.".encode("ascii")
-
-
-def _pytorch_storage_then_arbitrary_protocol0_persistent_id_payload(key: str) -> bytes:
-    payload = _pytorch_storage_protocol0_persistent_id_payload(key)
-    assert payload.endswith(b".")
-    return payload[:-1] + b"Parbitrary-storage-key\n0."
-
-
-def _private_actionable_failed_checks(scan_result: dict[str, Any]) -> list[dict[str, Any]]:
-    private_metadata = scan_result.get("_private_metadata")
-    if not isinstance(private_metadata, dict):
-        return []
-    actionable_failed_checks = private_metadata.get(ACTIONABLE_FAILED_CHECKS_METADATA_KEY)
-    if not isinstance(actionable_failed_checks, list):
-        return []
-    return [entry for entry in actionable_failed_checks if isinstance(entry, dict)]
 
 
 def _pytorch_storage_persistent_id_sequence_payload(
@@ -1062,24 +696,6 @@ def _fake_byte_storage_persistent_id_payload(key: str) -> bytes:
     )
 
 
-def _pickleish_tensor_storage_bytes() -> bytes:
-    # Minimal prefix from pinned PiD raw tensor storage that looks like a pickle FRAME crossing STOP.
-    return bytes.fromhex("478727be61f70dbd70953cbd09b996bd5c7a2ebe") + (b"\x00" * 128)
-
-
-def _yolov5n6_tensor_storage_prefix_bytes() -> bytes:
-    # First 64 bytes of Ultralytics/YOLOv5 yolov5n6.pt archive/data/195 at
-    # revision 5bca797074771ecdfd6267d6e9be32ee201d937b.
-    return bytes.fromhex(
-        "4dae5b2ed9a78527072fd82ac529db2d822f181d76258832bd2f39a63527ad2e"
-        "ba2d3eacd9247fb0a32b1525682aa0253831dc2c4c3085296c2cbcb1f52bea31"
-    )
-
-
-def _binary_magic_tensor_storage_bytes() -> bytes:
-    return b"\x80\x04\x00" + (b"\x00" * 129)
-
-
 def _writestr_preserving_member_name(zip_file: zipfile.ZipFile, member_name: str, data: bytes) -> None:
     info = zipfile.ZipInfo("placeholder")
     info.filename = member_name
@@ -1093,13 +709,6 @@ def _write_zip_with_duplicate_data_pkl(zip_path: Path, first_payload: bytes, sec
             zipf.writestr("version", "3")
             zipf.writestr("data.pkl", first_payload)
             zipf.writestr("data.pkl", second_payload)
-
-
-def _require_torch_distribution() -> None:
-    try:
-        importlib_metadata.distribution("torch")
-    except importlib_metadata.PackageNotFoundError:
-        pytest.skip("torch distribution not installed")
 
 
 def _write_rebuild_tensor_v2_zip(zip_path: Path) -> None:
@@ -1639,24 +1248,8 @@ def test_pytorch_zip_warns_when_trusted_framework_reference_is_rebound_before_sc
         "}))\n"
     )
 
-    completed = subprocess.run(
-        [sys.executable, "-c", script, str(model_path), str(marker)],
-        check=False,
-        env=_preimport_rebound_subprocess_env(tmp_path, site_packages),
-        capture_output=True,
-        text=True,
-    )
-
-    assert completed.returncode == 0, completed.stderr
-    output = json.loads(completed.stdout)
-    assert output["marker_before_unpickle"] is False
-    assert output["marker_after_unpickle"] is True
-    assert output["pickle_verdict"] in {"suspicious", "malicious"}
-    assert not (output["success"] is True and output["pickle_verdict"] == "clean" and not output["issues"])
-    assert any(
-        issue["rule_code"] == "NON_ALLOWLISTED_GLOBAL"
-        and issue["import_reference"] == "transformers.training_args.TrainingArguments"
-        for issue in output["issues"]
+    _assert_rebound_framework_subprocess(
+        tmp_path, model_path, marker, site_packages, script, "transformers.training_args.TrainingArguments"
     )
 
 
@@ -1702,24 +1295,8 @@ def test_pytorch_zip_warns_when_framework_metadata_rebound_to_buildable_instance
         "}))\n"
     )
 
-    completed = subprocess.run(
-        [sys.executable, "-c", script, str(model_path), str(marker)],
-        check=False,
-        env=_preimport_rebound_subprocess_env(tmp_path, site_packages),
-        capture_output=True,
-        text=True,
-    )
-
-    assert completed.returncode == 0, completed.stderr
-    output = json.loads(completed.stdout)
-    assert output["marker_before_unpickle"] is False
-    assert output["marker_after_unpickle"] is True
-    assert output["pickle_verdict"] in {"suspicious", "malicious"}
-    assert not (output["success"] is True and output["pickle_verdict"] == "clean" and not output["issues"])
-    assert any(
-        issue["rule_code"] == "NON_ALLOWLISTED_GLOBAL"
-        and issue["import_reference"] == "transformers.training_args.OptimizerNames"
-        for issue in output["issues"]
+    _assert_rebound_framework_subprocess(
+        tmp_path, model_path, marker, site_packages, script, "transformers.training_args.OptimizerNames"
     )
 
 
@@ -1757,24 +1334,8 @@ def test_pytorch_zip_warns_when_unloaded_source_backed_metadata_import_is_not_in
         "}))\n"
     )
 
-    completed = subprocess.run(
-        [sys.executable, "-c", script, str(model_path), str(marker)],
-        check=False,
-        env=_preimport_rebound_subprocess_env(tmp_path, site_packages),
-        capture_output=True,
-        text=True,
-    )
-
-    assert completed.returncode == 0, completed.stderr
-    output = json.loads(completed.stdout)
-    assert output["marker_before_unpickle"] is False
-    assert output["marker_after_unpickle"] is True
-    assert output["pickle_verdict"] in {"suspicious", "malicious"}
-    assert not (output["success"] is True and output["pickle_verdict"] == "clean" and not output["issues"])
-    assert any(
-        issue["rule_code"] == "NON_ALLOWLISTED_GLOBAL"
-        and issue["import_reference"] == "transformers.training_args.OptimizerNames"
-        for issue in output["issues"]
+    _assert_rebound_framework_subprocess(
+        tmp_path, model_path, marker, site_packages, script, "transformers.training_args.OptimizerNames"
     )
 
 
@@ -1812,24 +1373,8 @@ def test_pytorch_zip_warns_when_source_backed_framework_reference_is_unloaded_be
         "}))\n"
     )
 
-    completed = subprocess.run(
-        [sys.executable, "-c", script, str(model_path), str(marker)],
-        check=False,
-        env=_preimport_rebound_subprocess_env(tmp_path, site_packages),
-        capture_output=True,
-        text=True,
-    )
-
-    assert completed.returncode == 0, completed.stderr
-    output = json.loads(completed.stdout)
-    assert output["marker_before_unpickle"] is False
-    assert output["marker_after_unpickle"] is True
-    assert output["pickle_verdict"] in {"suspicious", "malicious"}
-    assert not (output["success"] is True and output["pickle_verdict"] == "clean" and not output["issues"])
-    assert any(
-        issue["rule_code"] == "NON_ALLOWLISTED_GLOBAL"
-        and issue["import_reference"] == "transformers.training_args.TrainingArguments"
-        for issue in output["issues"]
+    _assert_rebound_framework_subprocess(
+        tmp_path, model_path, marker, site_packages, script, "transformers.training_args.TrainingArguments"
     )
 
 
@@ -1972,24 +1517,8 @@ def test_pytorch_zip_warns_when_late_loaded_framework_metadata_is_rebound_to_ins
         "}))\n"
     )
 
-    completed = subprocess.run(
-        [sys.executable, "-c", script, str(model_path), str(marker)],
-        check=False,
-        env=_preimport_rebound_subprocess_env(tmp_path, site_packages),
-        capture_output=True,
-        text=True,
-    )
-
-    assert completed.returncode == 0, completed.stderr
-    output = json.loads(completed.stdout)
-    assert output["marker_before_unpickle"] is False
-    assert output["marker_after_unpickle"] is True
-    assert output["pickle_verdict"] in {"suspicious", "malicious"}
-    assert not (output["success"] is True and output["pickle_verdict"] == "clean" and not output["issues"])
-    assert any(
-        issue["rule_code"] == "NON_ALLOWLISTED_GLOBAL"
-        and issue["import_reference"] == "transformers.training_args.TrainingArguments"
-        for issue in output["issues"]
+    _assert_rebound_framework_subprocess(
+        tmp_path, model_path, marker, site_packages, script, "transformers.training_args.TrainingArguments"
     )
 
 
@@ -2131,24 +1660,8 @@ def test_pytorch_zip_warns_when_rebound_framework_class_uses_descriptor_new_befo
         "}))\n"
     )
 
-    completed = subprocess.run(
-        [sys.executable, "-c", script, str(model_path), str(marker)],
-        check=False,
-        env=_preimport_rebound_subprocess_env(tmp_path, site_packages),
-        capture_output=True,
-        text=True,
-    )
-
-    assert completed.returncode == 0, completed.stderr
-    output = json.loads(completed.stdout)
-    assert output["marker_before_unpickle"] is False
-    assert output["marker_after_unpickle"] is True
-    assert output["pickle_verdict"] in {"suspicious", "malicious"}
-    assert not (output["success"] is True and output["pickle_verdict"] == "clean" and not output["issues"])
-    assert any(
-        issue["rule_code"] == "NON_ALLOWLISTED_GLOBAL"
-        and issue["import_reference"] == "transformers.training_args.TrainingArguments"
-        for issue in output["issues"]
+    _assert_rebound_framework_subprocess(
+        tmp_path, model_path, marker, site_packages, script, "transformers.training_args.TrainingArguments"
     )
 
 
@@ -2197,24 +1710,8 @@ def test_pytorch_zip_warns_when_rebound_framework_class_uses_data_descriptor_bef
         "}))\n"
     )
 
-    completed = subprocess.run(
-        [sys.executable, "-c", script, str(model_path), str(marker)],
-        check=False,
-        env=_preimport_rebound_subprocess_env(tmp_path, site_packages),
-        capture_output=True,
-        text=True,
-    )
-
-    assert completed.returncode == 0, completed.stderr
-    output = json.loads(completed.stdout)
-    assert output["marker_before_unpickle"] is False
-    assert output["marker_after_unpickle"] is True
-    assert output["pickle_verdict"] in {"suspicious", "malicious"}
-    assert not (output["success"] is True and output["pickle_verdict"] == "clean" and not output["issues"])
-    assert any(
-        issue["rule_code"] == "NON_ALLOWLISTED_GLOBAL"
-        and issue["import_reference"] == "transformers.training_args.TrainingArguments"
-        for issue in output["issues"]
+    _assert_rebound_framework_subprocess(
+        tmp_path, model_path, marker, site_packages, script, "transformers.training_args.TrainingArguments"
     )
 
 
@@ -2264,24 +1761,8 @@ def test_pytorch_zip_warns_when_rebound_framework_class_uses_metaclass_call_befo
         "}))\n"
     )
 
-    completed = subprocess.run(
-        [sys.executable, "-c", script, str(model_path), str(marker)],
-        check=False,
-        env=_preimport_rebound_subprocess_env(tmp_path, site_packages),
-        capture_output=True,
-        text=True,
-    )
-
-    assert completed.returncode == 0, completed.stderr
-    output = json.loads(completed.stdout)
-    assert output["marker_before_unpickle"] is False
-    assert output["marker_after_unpickle"] is True
-    assert output["pickle_verdict"] in {"suspicious", "malicious"}
-    assert not (output["success"] is True and output["pickle_verdict"] == "clean" and not output["issues"])
-    assert any(
-        issue["rule_code"] == "NON_ALLOWLISTED_GLOBAL"
-        and issue["import_reference"] == "transformers.training_args.OptimizerNames"
-        for issue in output["issues"]
+    _assert_rebound_framework_subprocess(
+        tmp_path, model_path, marker, site_packages, script, "transformers.training_args.OptimizerNames"
     )
 
 
@@ -2391,24 +1872,8 @@ def test_pytorch_zip_warns_when_framework_metadata_rebound_to_cross_module_sourc
         "}))\n"
     )
 
-    completed = subprocess.run(
-        [sys.executable, "-c", script, str(model_path), str(marker)],
-        check=False,
-        env=_preimport_rebound_subprocess_env(tmp_path, site_packages),
-        capture_output=True,
-        text=True,
-    )
-
-    assert completed.returncode == 0, completed.stderr
-    output = json.loads(completed.stdout)
-    assert output["marker_before_unpickle"] is False
-    assert output["marker_after_unpickle"] is True
-    assert output["pickle_verdict"] in {"suspicious", "malicious"}
-    assert not (output["success"] is True and output["pickle_verdict"] == "clean" and not output["issues"])
-    assert any(
-        issue["rule_code"] == "NON_ALLOWLISTED_GLOBAL"
-        and issue["import_reference"] == "transformers.training_args.OptimizerNames"
-        for issue in output["issues"]
+    _assert_rebound_framework_subprocess(
+        tmp_path, model_path, marker, site_packages, script, "transformers.training_args.OptimizerNames"
     )
 
 
@@ -2453,24 +1918,8 @@ def test_pytorch_zip_warns_when_framework_function_default_mutated_before_scanne
         "}))\n"
     )
 
-    completed = subprocess.run(
-        [sys.executable, "-c", script, str(model_path), str(marker)],
-        check=False,
-        env=_preimport_rebound_subprocess_env(tmp_path, site_packages),
-        capture_output=True,
-        text=True,
-    )
-
-    assert completed.returncode == 0, completed.stderr
-    output = json.loads(completed.stdout)
-    assert output["marker_before_unpickle"] is False
-    assert output["marker_after_unpickle"] is True
-    assert output["pickle_verdict"] in {"suspicious", "malicious"}
-    assert not (output["success"] is True and output["pickle_verdict"] == "clean" and not output["issues"])
-    assert any(
-        issue["rule_code"] == "NON_ALLOWLISTED_GLOBAL"
-        and issue["import_reference"] == "transformers.training_args.OptimizerNames"
-        for issue in output["issues"]
+    _assert_rebound_framework_subprocess(
+        tmp_path, model_path, marker, site_packages, script, "transformers.training_args.OptimizerNames"
     )
 
 
@@ -2700,37 +2149,15 @@ def test_pytorch_zip_discovery_scans_only_real_extensionless_pickle_near_text(tm
 
 def test_pytorch_zip_discovery_finds_hidden_extensionless_pickle_with_data_pkl(tmp_path: Path) -> None:
     """A normal data.pkl must not short-circuit hidden member pickle discovery."""
-    model_path = tmp_path / "hidden_extensionless_pickle.pt"
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}, protocol=4))
-        zip_file.writestr("archive/payload", _malicious_proto0_system_payload())
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert result.metadata["pickle_files"] == ["archive/data.pkl", "archive/payload"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/payload"
-        for issue in result.issues
+    _assert_extensionless_pickle_selected(
+        tmp_path, ("hidden_extensionless_pickle.pt"), ("archive/payload"), ("archive/payload"), ("archive/payload")
     )
 
 
 def test_pytorch_zip_discovery_finds_hidden_storage_pickle_with_data_pkl(tmp_path: Path) -> None:
     """Bounded storage-prefix sniffing should catch pickles hidden under data/<n>."""
-    model_path = tmp_path / "hidden_storage_pickle.pt"
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}, protocol=4))
-        zip_file.writestr("archive/data/0", _malicious_proto0_system_payload())
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert result.metadata["pickle_files"] == ["archive/data.pkl", "archive/data/0"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
-        for issue in result.issues
+    _assert_extensionless_pickle_selected(
+        tmp_path, ("hidden_storage_pickle.pt"), ("archive/data/0"), ("archive/data/0"), ("archive/data/0")
     )
 
 
@@ -2794,39 +2221,13 @@ def test_pytorch_zip_discovery_skips_referenced_yolov5n6_storage_prefix(tmp_path
 def test_pytorch_zip_discovery_scans_trailing_pickle_after_yolov5n6_scalar_prefix(tmp_path: Path) -> None:
     model_path = tmp_path / "referenced_yolov5n6_prefix_trailing_pickle.pt"
     storage_blob = _yolov5n6_tensor_storage_prefix_bytes()[:4] + _malicious_proto0_system_payload()
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert "archive/data/0" in result.metadata["pickle_files"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
-        for issue in result.issues
-    )
+    _assert_referenced_storage_critical(model_path, storage_blob)
 
 
 def test_pytorch_zip_discovery_scans_binary_pickle_after_trivial_scalar_prefix(tmp_path: Path) -> None:
     model_path = tmp_path / "referenced_scalar_prefix_trailing_binary_pickle.pt"
     storage_blob = b"N." + _malicious_eval_pickle_payload()
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert "archive/data/0" in result.metadata["pickle_files"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
-        for issue in result.issues
-    )
+    _assert_referenced_storage_critical(model_path, storage_blob)
 
 
 def test_pytorch_zip_discovery_scans_binary_pickle_opcode_crossing_trusted_probe_boundary(
@@ -2834,20 +2235,7 @@ def test_pytorch_zip_discovery_scans_binary_pickle_opcode_crossing_trusted_probe
 ) -> None:
     model_path = tmp_path / "referenced_scalar_prefix_binary_opcode_boundary.pt"
     storage_blob = b"N." + (b" " * 4093) + _malicious_eval_pickle_payload()
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert "archive/data/0" in result.metadata["pickle_files"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
-        for issue in result.issues
-    )
+    _assert_referenced_storage_critical(model_path, storage_blob)
 
 
 def test_pytorch_zip_discovery_scans_binary_pickle_after_mixed_padding_trivial_prefix(
@@ -2878,20 +2266,7 @@ def test_pytorch_zip_discovery_scans_short_binunicode_crossing_trusted_probe_bou
 ) -> None:
     model_path = tmp_path / "referenced_scalar_prefix_short_binunicode_boundary.pt"
     storage_blob = b"N." + (b" " * 4093) + b"\x8c\x03abc" + _malicious_proto0_system_payload()
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert "archive/data/0" in result.metadata["pickle_files"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
-        for issue in result.issues
-    )
+    _assert_referenced_storage_critical(model_path, storage_blob)
 
 
 def test_pytorch_zip_discovery_scans_binint_crossing_trusted_probe_boundary(
@@ -2899,20 +2274,7 @@ def test_pytorch_zip_discovery_scans_binint_crossing_trusted_probe_boundary(
 ) -> None:
     model_path = tmp_path / "referenced_scalar_prefix_binint_boundary.pt"
     storage_blob = b"N." + (b" " * 4093) + b"J" + (1).to_bytes(4, "little") + _malicious_proto0_system_payload()
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert "archive/data/0" in result.metadata["pickle_files"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
-        for issue in result.issues
-    )
+    _assert_referenced_storage_critical(model_path, storage_blob)
 
 
 def test_pytorch_zip_discovery_scans_binbytes_literal_after_trivial_stream(
@@ -2921,20 +2283,7 @@ def test_pytorch_zip_discovery_scans_binbytes_literal_after_trivial_stream(
     model_path = tmp_path / "referenced_binbytes_literal_after_trivial_stream.pt"
     encoded_payload = base64.b64encode(_malicious_proto0_system_payload())
     storage_blob = b"N." + _pickle_binbytes(encoded_payload)
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert "archive/data/0" in result.metadata["pickle_files"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
-        for issue in result.issues
-    )
+    _assert_referenced_storage_critical(model_path, storage_blob)
 
 
 def test_pytorch_zip_discovery_scans_malformed_separator_run_in_expanded_probe(
@@ -2943,20 +2292,7 @@ def test_pytorch_zip_discovery_scans_malformed_separator_run_in_expanded_probe(
     model_path = tmp_path / "referenced_malformed_separator_run_expanded.pt"
     encoded_payload = base64.b64encode(_malicious_proto0_system_payload())
     storage_blob = b"N." + (b"!" * 5000) + _proto0_string_literal(encoded_payload)
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert "archive/data/0" in result.metadata["pickle_files"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
-        for issue in result.issues
-    )
+    _assert_referenced_storage_critical(model_path, storage_blob)
 
 
 def test_pytorch_zip_discovery_expands_frame_without_stop_at_trusted_probe_boundary(
@@ -2968,20 +2304,7 @@ def test_pytorch_zip_discovery_expands_frame_without_stop_at_trusted_probe_bound
         pytorch_zip_scanner_module._TRUSTED_STORAGE_PICKLE_PROBE_BYTES - len(b"N.") - len(_pickle_frame(frame_payload))
     )
     storage_blob = b"N." + padding + _pickle_frame(frame_payload) + _malicious_proto0_system_payload()
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert "archive/data/0" in result.metadata["pickle_files"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
-        for issue in result.issues
-    )
+    _assert_referenced_storage_critical(model_path, storage_blob)
 
 
 def test_pytorch_zip_literal_route_bounds_long_base64_without_size_only_signal(
@@ -3008,20 +2331,7 @@ def test_pytorch_zip_discovery_scans_protocol0_int_crossing_trusted_probe_bounda
 ) -> None:
     model_path = tmp_path / "referenced_scalar_prefix_protocol0_int_boundary.pt"
     storage_blob = b"N." + (b" " * 4092) + b"I1\n." + _malicious_proto0_system_payload()
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert "archive/data/0" in result.metadata["pickle_files"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
-        for issue in result.issues
-    )
+    _assert_referenced_storage_critical(model_path, storage_blob)
 
 
 def test_pytorch_zip_discovery_scans_extension_opcode_crossing_trusted_probe_boundary(
@@ -3051,35 +2361,13 @@ def test_pytorch_zip_discovery_scans_extension_opcode_crossing_trusted_probe_bou
 
 
 def test_pytorch_zip_discovery_routes_encoded_extension_with_truncated_operand(tmp_path: Path) -> None:
-    model_path = tmp_path / "referenced_truncated_extension_operand.pt"
-    storage_blob = b"S'ggFxAIwFeA=='\n."
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert result.success is False
-    assert "archive/data/0" in result.metadata["pickle_files"]
+    _assert_truncated_encoded_extension(
+        tmp_path, ("referenced_truncated_extension_operand.pt"), (b"S'ggFxAIwFeA=='\n.")
+    )
 
 
 def test_pytorch_zip_discovery_routes_encoded_extension_with_live_mark_context(tmp_path: Path) -> None:
-    model_path = tmp_path / "referenced_live_mark_extension.pt"
-    storage_blob = b"S'KE4wggEpb/8='\n."
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert result.success is False
-    assert "archive/data/0" in result.metadata["pickle_files"]
+    _assert_truncated_encoded_extension(tmp_path, ("referenced_live_mark_extension.pt"), (b"S'KE4wggEpb/8='\n."))
 
 
 def test_pytorch_zip_discovery_routes_encoded_extension_operand_cut_after_recovered_mark(tmp_path: Path) -> None:
@@ -3202,39 +2490,13 @@ def test_pytorch_zip_discovery_scans_repeated_trivial_prefix_crossing_trusted_pr
 ) -> None:
     model_path = tmp_path / "referenced_repeated_scalar_prefix_global_boundary.pt"
     storage_blob = b"N.N." + (b" " * (4096 - 4 - 5)) + _malicious_proto0_system_payload()
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert "archive/data/0" in result.metadata["pickle_files"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
-        for issue in result.issues
-    )
+    _assert_referenced_storage_critical(model_path, storage_blob)
 
 
 def test_pytorch_zip_discovery_skips_padding_only_expanded_probe(
     tmp_path: Path,
 ) -> None:
-    model_path = tmp_path / "referenced_scalar_prefix_padding_only_expanded.pt"
-    storage_blob = b"N." + (b"\x00" * 70_002)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert result.success is True
-    assert result.metadata.get("pickle_verdict") == "clean"
-    assert result.metadata["pickle_files"] == ["archive/data.pkl"]
-    assert not any(issue.details.get("pickle_filename") == "archive/data/0" for issue in result.issues)
+    _assert_storage_padding_clean(tmp_path, ("referenced_scalar_prefix_padding_only_expanded.pt"), (b"\x00"), (70_002))
 
 
 def test_pytorch_zip_discovery_checks_long_window_before_padding_budget(tmp_path: Path) -> None:
@@ -3757,20 +3019,7 @@ def test_pytorch_zip_discovery_scans_length_operand_crossing_trusted_probe_bound
     storage_blob = (
         b"N." + (b" " * 4093) + b"X" + (3).to_bytes(4, "little") + b"abc" + _malicious_proto0_system_payload()
     )
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert "archive/data/0" in result.metadata["pickle_files"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
-        for issue in result.issues
-    )
+    _assert_referenced_storage_critical(model_path, storage_blob)
 
 
 def test_pytorch_zip_discovery_marks_oversized_length_operand_incomplete(
@@ -3802,20 +3051,7 @@ def test_pytorch_zip_discovery_scans_frame_header_crossing_trusted_probe_boundar
     frame_body = _malicious_proto0_system_payload()
     frame = b"\x95" + len(frame_body).to_bytes(8, "little") + frame_body
     storage_blob = b"N." + (b" " * 4086) + frame
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert "archive/data/0" in result.metadata["pickle_files"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
-        for issue in result.issues
-    )
+    _assert_referenced_storage_critical(model_path, storage_blob)
 
 
 def test_pytorch_zip_discovery_scans_frame_payload_crossing_trusted_probe_boundary(
@@ -3825,20 +3061,7 @@ def test_pytorch_zip_discovery_scans_frame_payload_crossing_trusted_probe_bounda
     frame_body = _malicious_proto0_system_payload()
     frame = b"\x95" + len(frame_body).to_bytes(8, "little") + frame_body
     storage_blob = b"N." + (b" " * (4096 - 2 - 9)) + frame
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert "archive/data/0" in result.metadata["pickle_files"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
-        for issue in result.issues
-    )
+    _assert_referenced_storage_critical(model_path, storage_blob)
 
 
 def test_pytorch_zip_discovery_scans_second_frame_header_crossing_trusted_probe_boundary(
@@ -3850,20 +3073,7 @@ def test_pytorch_zip_discovery_scans_second_frame_header_crossing_trusted_probe_
     second_frame = _pickle_frame(second_frame_body)
     padding = b" " * (4096 - len(b"N.") - len(first_frame) - 1)
     storage_blob = b"N." + padding + first_frame + second_frame
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert "archive/data/0" in result.metadata["pickle_files"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
-        for issue in result.issues
-    )
+    _assert_referenced_storage_critical(model_path, storage_blob)
 
 
 def test_pytorch_zip_discovery_scans_frame_first_trivial_pickle_before_large_padding(
@@ -3873,20 +3083,7 @@ def test_pytorch_zip_discovery_scans_frame_first_trivial_pickle_before_large_pad
     storage_blob = b"\x95" + (2).to_bytes(8, "little") + b"N."
     storage_blob += b" " * 5000
     storage_blob += _malicious_proto0_system_payload()
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert "archive/data/0" in result.metadata["pickle_files"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
-        for issue in result.issues
-    )
+    _assert_referenced_storage_critical(model_path, storage_blob)
 
 
 def test_pytorch_zip_discovery_marks_oversized_frame_payload_incomplete(
@@ -3917,20 +3114,7 @@ def test_pytorch_zip_discovery_scans_security_opcode_ending_at_trusted_probe_bou
     model_path = tmp_path / "referenced_scalar_prefix_global_opcode_boundary.pt"
     global_opcode = b"cbuiltins\neval\n"
     storage_blob = b"N." + (b" " * (4096 - 2 - len(global_opcode))) + global_opcode + b"(S'echo hidden'\ntR."
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert "archive/data/0" in result.metadata["pickle_files"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
-        for issue in result.issues
-    )
+    _assert_referenced_storage_critical(model_path, storage_blob)
 
 
 def test_pytorch_zip_discovery_scans_after_second_trivial_stream_crossing_trusted_probe_boundary(
@@ -3938,20 +3122,7 @@ def test_pytorch_zip_discovery_scans_after_second_trivial_stream_crossing_truste
 ) -> None:
     model_path = tmp_path / "referenced_scalar_prefix_second_trivial_global_boundary.pt"
     storage_blob = b"N.I1\n." + (b" " * (4096 - len(b"N.I1\n.") - 5)) + _malicious_proto0_system_payload()
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert "archive/data/0" in result.metadata["pickle_files"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
-        for issue in result.issues
-    )
+    _assert_referenced_storage_critical(model_path, storage_blob)
 
 
 def test_pytorch_zip_discovery_scans_long_string_trailing_pickle_after_trivial_scalar_prefix(
@@ -3959,20 +3130,7 @@ def test_pytorch_zip_discovery_scans_long_string_trailing_pickle_after_trivial_s
 ) -> None:
     model_path = tmp_path / "referenced_scalar_prefix_long_string_trailing_pickle.pt"
     storage_blob = b"N.S'" + (b"A" * 4200) + b"'\n" + _malicious_proto0_system_payload()
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert "archive/data/0" in result.metadata["pickle_files"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
-        for issue in result.issues
-    )
+    _assert_referenced_storage_critical(model_path, storage_blob)
 
 
 def test_pytorch_zip_discovery_scans_long_global_operand_crossing_trusted_probe_boundary(
@@ -3980,20 +3138,7 @@ def test_pytorch_zip_discovery_scans_long_global_operand_crossing_trusted_probe_
 ) -> None:
     model_path = tmp_path / "referenced_scalar_prefix_long_global_operand_pickle.pt"
     storage_blob = b"N." + (b"c" * 4094) + b"\nignored\n." + _malicious_proto0_system_payload()
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert "archive/data/0" in result.metadata["pickle_files"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
-        for issue in result.issues
-    )
+    _assert_referenced_storage_critical(model_path, storage_blob)
 
 
 def test_pytorch_zip_discovery_scans_pickle_after_padding_at_trusted_probe_boundary(
@@ -4001,20 +3146,7 @@ def test_pytorch_zip_discovery_scans_pickle_after_padding_at_trusted_probe_bound
 ) -> None:
     model_path = tmp_path / "referenced_scalar_prefix_padding_boundary_pickle.pt"
     storage_blob = b"N." + (b" " * 4094) + _malicious_proto0_system_payload()
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert "archive/data/0" in result.metadata["pickle_files"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
-        for issue in result.issues
-    )
+    _assert_referenced_storage_critical(model_path, storage_blob)
 
 
 def test_pytorch_zip_discovery_scans_pickle_after_large_padding_past_trusted_probe_boundary(
@@ -4022,20 +3154,7 @@ def test_pytorch_zip_discovery_scans_pickle_after_large_padding_past_trusted_pro
 ) -> None:
     model_path = tmp_path / "referenced_scalar_prefix_large_padding_pickle.pt"
     storage_blob = b"N." + (b" " * 50000) + _malicious_proto0_system_payload()
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert "archive/data/0" in result.metadata["pickle_files"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
-        for issue in result.issues
-    )
+    _assert_referenced_storage_critical(model_path, storage_blob)
 
 
 def test_pytorch_zip_discovery_scans_pickle_after_expanded_text_padding_prefix(
@@ -4043,20 +3162,7 @@ def test_pytorch_zip_discovery_scans_pickle_after_expanded_text_padding_prefix(
 ) -> None:
     model_path = tmp_path / "referenced_scalar_prefix_expanded_text_padding_pickle.pt"
     storage_blob = b"N." + (b" " * 65536) + _malicious_proto0_system_payload()
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert "archive/data/0" in result.metadata["pickle_files"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
-        for issue in result.issues
-    )
+    _assert_referenced_storage_critical(model_path, storage_blob)
 
 
 def test_pytorch_zip_discovery_scans_pickle_after_expanded_nul_padding_prefix(
@@ -4064,20 +3170,7 @@ def test_pytorch_zip_discovery_scans_pickle_after_expanded_nul_padding_prefix(
 ) -> None:
     model_path = tmp_path / "referenced_scalar_prefix_expanded_nul_padding_pickle.pt"
     storage_blob = b"N." + (b"\x00" * 65536) + _malicious_proto0_system_payload()
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert "archive/data/0" in result.metadata["pickle_files"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
-        for issue in result.issues
-    )
+    _assert_referenced_storage_critical(model_path, storage_blob)
 
 
 def test_pytorch_zip_discovery_scans_pickle_after_nul_padding_with_bad_storage_crc(
@@ -4109,20 +3202,7 @@ def test_pytorch_zip_discovery_scans_pickle_after_nul_padding_with_bad_storage_c
 
 
 def test_pytorch_zip_discovery_skips_complete_text_padding_prefix(tmp_path: Path) -> None:
-    model_path = tmp_path / "referenced_scalar_prefix_complete_text_padding.pt"
-    storage_blob = b"N." + (b" " * 5002)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert result.success is True
-    assert result.metadata.get("pickle_verdict") == "clean"
-    assert result.metadata["pickle_files"] == ["archive/data.pkl"]
-    assert not any(issue.details.get("pickle_filename") == "archive/data/0" for issue in result.issues)
+    _assert_storage_padding_clean(tmp_path, ("referenced_scalar_prefix_complete_text_padding.pt"), (b" "), (5002))
 
 
 def test_pytorch_zip_discovery_scans_pickle_after_unfinished_trivial_opcode_run(
@@ -4130,20 +3210,7 @@ def test_pytorch_zip_discovery_scans_pickle_after_unfinished_trivial_opcode_run(
 ) -> None:
     model_path = tmp_path / "referenced_scalar_prefix_unfinished_trivial_run_pickle.pt"
     storage_blob = b"N." + (b"N" * 4094) + _malicious_proto0_system_payload()
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert "archive/data/0" in result.metadata["pickle_files"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
-        for issue in result.issues
-    )
+    _assert_referenced_storage_critical(model_path, storage_blob)
 
 
 def test_pytorch_zip_discovery_scans_pickle_after_repeated_trivial_streams(
@@ -4151,20 +3218,7 @@ def test_pytorch_zip_discovery_scans_pickle_after_repeated_trivial_streams(
 ) -> None:
     model_path = tmp_path / "referenced_scalar_prefix_repeated_trivial_streams_pickle.pt"
     storage_blob = (b"N." * 600) + _malicious_proto0_system_payload()
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert "archive/data/0" in result.metadata["pickle_files"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
-        for issue in result.issues
-    )
+    _assert_referenced_storage_critical(model_path, storage_blob)
 
 
 def test_pytorch_zip_discovery_scans_pickle_after_repeated_trivial_streams_past_trusted_probe(
@@ -4172,20 +3226,7 @@ def test_pytorch_zip_discovery_scans_pickle_after_repeated_trivial_streams_past_
 ) -> None:
     model_path = tmp_path / "referenced_scalar_prefix_long_repeated_trivial_streams_pickle.pt"
     storage_blob = (b"N." * 2048) + _malicious_proto0_system_payload()
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert "archive/data/0" in result.metadata["pickle_files"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
-        for issue in result.issues
-    )
+    _assert_referenced_storage_critical(model_path, storage_blob)
 
 
 def test_pytorch_zip_discovery_scans_pickle_after_many_trivial_int_streams(
@@ -4193,20 +3234,7 @@ def test_pytorch_zip_discovery_scans_pickle_after_many_trivial_int_streams(
 ) -> None:
     model_path = tmp_path / "referenced_scalar_prefix_many_trivial_int_streams_pickle.pt"
     storage_blob = b"N." + (b"I1\n." * 1200) + _malicious_proto0_system_payload()
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert "archive/data/0" in result.metadata["pickle_files"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
-        for issue in result.issues
-    )
+    _assert_referenced_storage_critical(model_path, storage_blob)
 
 
 def test_pytorch_zip_discovery_scans_proto0_string_operand_split_at_trusted_probe_boundary(
@@ -4220,20 +3248,7 @@ def test_pytorch_zip_discovery_scans_proto0_string_operand_split_at_trusted_prob
     )
     assert len(storage_prefix) == pytorch_zip_scanner_module._TRUSTED_STORAGE_PICKLE_PROBE_BYTES
     storage_blob = storage_prefix + b"'tensor-name'\n." + _malicious_proto0_system_payload()
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert "archive/data/0" in result.metadata["pickle_files"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
-        for issue in result.issues
-    )
+    _assert_referenced_storage_critical(model_path, storage_blob)
 
 
 def test_pytorch_zip_discovery_skips_benign_proto0_string_operand_split_at_trusted_probe_boundary(
@@ -4283,20 +3298,7 @@ def test_pytorch_zip_discovery_scans_truncated_memo_operand_after_trivial_stream
     )
     assert len(storage_prefix) == pytorch_zip_scanner_module._TRUSTED_STORAGE_PICKLE_PROBE_BYTES
     storage_blob = storage_prefix + memo_suffix + _malicious_proto0_system_payload()
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert "archive/data/0" in result.metadata["pickle_files"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
-        for issue in result.issues
-    )
+    _assert_referenced_storage_critical(model_path, storage_blob)
 
 
 def test_pytorch_zip_discovery_scans_truncated_inst_operand_after_trivial_stream_at_trusted_probe_boundary(
@@ -4420,20 +3422,7 @@ def test_pytorch_zip_discovery_scans_malformed_separator_at_trusted_probe_bounda
     )
     assert len(storage_prefix) == pytorch_zip_scanner_module._TRUSTED_STORAGE_PICKLE_PROBE_BYTES
     storage_blob = storage_prefix + b"S'AAAAAAcos\\x0asystem\\x0a)R.BBBB'\n."
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert "archive/data/0" in result.metadata["pickle_files"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
-        for issue in result.issues
-    )
+    _assert_referenced_storage_critical(model_path, storage_blob)
 
 
 def test_pytorch_zip_discovery_does_not_route_benign_getattr_literal_storage(tmp_path: Path) -> None:
@@ -4458,39 +3447,13 @@ def test_pytorch_zip_discovery_does_not_route_benign_getattr_literal_storage(tmp
 def test_pytorch_zip_discovery_scans_scalar_literal_with_raw_nested_pickle(tmp_path: Path) -> None:
     model_path = tmp_path / "referenced_scalar_literal_raw_nested_pickle.pt"
     storage_blob = b"S'AAAAAAcos\\x0asystem\\x0a)R.BBBB'\n."
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert "archive/data/0" in result.metadata["pickle_files"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
-        for issue in result.issues
-    )
+    _assert_referenced_storage_critical(model_path, storage_blob)
 
 
 def test_pytorch_zip_discovery_scans_scalar_literal_with_encoded_nested_pickle(tmp_path: Path) -> None:
     model_path = tmp_path / "referenced_scalar_literal_encoded_nested_pickle.pt"
     storage_blob = b"S'" + base64.b64encode(_malicious_proto0_system_payload()) + b"'\n."
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert "archive/data/0" in result.metadata["pickle_files"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
-        for issue in result.issues
-    )
+    _assert_referenced_storage_critical(model_path, storage_blob)
 
 
 def test_pytorch_zip_discovery_routes_binunicode8_literal_after_trivial_prefix(tmp_path: Path) -> None:
@@ -4572,20 +3535,7 @@ def test_pytorch_zip_discovery_scans_shifted_base64_scalar_literal_nested_pickle
     model_path = tmp_path / "referenced_scalar_literal_shifted_encoded_nested_pickle.pt"
     nested_payload = _malicious_proto0_system_payload()
     storage_blob = b"S'" + (b"A" * 65) + base64.b64encode(nested_payload) + (b"A" * 64) + b"'\n."
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert "archive/data/0" in result.metadata["pickle_files"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
-        for issue in result.issues
-    )
+    _assert_referenced_storage_critical(model_path, storage_blob)
 
 
 def test_pytorch_zip_discovery_scans_padded_base64_scalar_before_following_token(tmp_path: Path) -> None:
@@ -4593,20 +3543,7 @@ def test_pytorch_zip_discovery_scans_padded_base64_scalar_before_following_token
     malicious = base64.b64encode(b"cposix\nsystem\n)R.")
     assert malicious.endswith(b"=")
     storage_blob = b"S'" + malicious + base64.b64encode(b"benign") + b"'\n."
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert "archive/data/0" in result.metadata["pickle_files"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
-        for issue in result.issues
-    )
+    _assert_referenced_storage_critical(model_path, storage_blob)
 
 
 def test_pytorch_zip_discovery_scans_padded_base64_scalar_before_short_suffix(tmp_path: Path) -> None:
@@ -4614,20 +3551,7 @@ def test_pytorch_zip_discovery_scans_padded_base64_scalar_before_short_suffix(tm
     malicious = base64.b64encode(b"cposix\nsystem\n)R.")
     assert malicious.endswith(b"=")
     storage_blob = b"S'" + malicious + b"AAAA" + b"'\n."
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert "archive/data/0" in result.metadata["pickle_files"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
-        for issue in result.issues
-    )
+    _assert_referenced_storage_critical(model_path, storage_blob)
 
 
 def test_pytorch_zip_discovery_scans_padded_base64_scalar_between_following_tokens(tmp_path: Path) -> None:
@@ -4637,20 +3561,7 @@ def test_pytorch_zip_discovery_scans_padded_base64_scalar_between_following_toke
     assert safe_prefix.endswith(b"=")
     assert malicious.endswith(b"=")
     storage_blob = b"S'" + safe_prefix + malicious + base64.b64encode(b"benign") + b"'\n."
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert "archive/data/0" in result.metadata["pickle_files"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
-        for issue in result.issues
-    )
+    _assert_referenced_storage_critical(model_path, storage_blob)
 
 
 def test_pytorch_zip_discovery_skips_padded_base64_scalar_near_match(tmp_path: Path) -> None:
@@ -4713,60 +3624,21 @@ def test_pytorch_zip_discovery_scans_scalar_literal_before_trailing_trivial_stre
     model_path = tmp_path / "referenced_scalar_literal_before_trailing_trivial_stream.pt"
     nested_payload = _malicious_proto0_system_payload()
     storage_blob = b"S'" + base64.b64encode(nested_payload) + b"'\n.N."
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert "archive/data/0" in result.metadata["pickle_files"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
-        for issue in result.issues
-    )
+    _assert_referenced_storage_critical(model_path, storage_blob)
 
 
 def test_pytorch_zip_discovery_scans_scalar_literal_after_trivial_stream(tmp_path: Path) -> None:
     model_path = tmp_path / "referenced_scalar_literal_after_trivial_stream.pt"
     nested_payload = _malicious_proto0_system_payload()
     storage_blob = b"N.S'" + base64.b64encode(nested_payload) + b"'\n."
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert "archive/data/0" in result.metadata["pickle_files"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
-        for issue in result.issues
-    )
+    _assert_referenced_storage_critical(model_path, storage_blob)
 
 
 def test_pytorch_zip_discovery_scans_scalar_literal_after_clean_nontrivial_stream(tmp_path: Path) -> None:
     model_path = tmp_path / "referenced_scalar_literal_after_clean_nontrivial_stream.pt"
     nested_payload = _malicious_proto0_system_payload()
     storage_blob = b"N.]\x85.S'" + base64.b64encode(nested_payload) + b"'\n."
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert "archive/data/0" in result.metadata["pickle_files"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
-        for issue in result.issues
-    )
+    _assert_referenced_storage_critical(model_path, storage_blob)
 
 
 def test_pytorch_zip_discovery_preserves_suspicious_literal_after_trivial_stream(
@@ -4794,39 +3666,13 @@ def test_pytorch_zip_discovery_preserves_suspicious_literal_after_trivial_stream
 def test_pytorch_zip_discovery_scans_scalar_literal_after_benign_binary_prefix(tmp_path: Path) -> None:
     model_path = tmp_path / "referenced_scalar_literal_after_benign_binary_prefix.pt"
     storage_blob = _proto0_string_literal(b"\x80\x04N.\xff" + _malicious_proto0_system_payload())
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert "archive/data/0" in result.metadata["pickle_files"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
-        for issue in result.issues
-    )
+    _assert_referenced_storage_critical(model_path, storage_blob)
 
 
 def test_pytorch_zip_discovery_scans_scalar_literal_with_escaped_binary_nested_pickle(tmp_path: Path) -> None:
     model_path = tmp_path / "referenced_scalar_literal_escaped_binary_nested_pickle.pt"
     storage_blob = _proto0_string_literal(_malicious_eval_pickle_payload())
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert "archive/data/0" in result.metadata["pickle_files"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
-        for issue in result.issues
-    )
+    _assert_referenced_storage_critical(model_path, storage_blob)
 
 
 def test_pytorch_zip_discovery_scans_scalar_literal_with_suspicious_string(tmp_path: Path) -> None:
@@ -4941,20 +3787,7 @@ def test_pytorch_zip_discovery_scans_initial_scalar_literal_split_at_probe_bound
     storage_prefix = b"S'" + (b"A" * (pytorch_zip_scanner_module._TRUSTED_STORAGE_PICKLE_PROBE_BYTES - len(b"S'")))
     assert len(storage_prefix) == pytorch_zip_scanner_module._TRUSTED_STORAGE_PICKLE_PROBE_BYTES
     storage_blob = storage_prefix + base64.b64encode(nested_payload) + b"'\n."
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert "archive/data/0" in result.metadata["pickle_files"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
-        for issue in result.issues
-    )
+    _assert_referenced_storage_critical(model_path, storage_blob)
 
 
 def test_pytorch_zip_discovery_scans_frame_first_scalar_literal_with_encoded_nested_pickle(
@@ -4964,20 +3797,7 @@ def test_pytorch_zip_discovery_scans_frame_first_scalar_literal_with_encoded_nes
     nested_payload = base64.b64encode(b"cposix\nsystem\n(S'echo hidden'\ntR.")
     frame_payload = b"\x8c" + bytes([len(nested_payload)]) + nested_payload + b"."
     storage_blob = b"\x95" + len(frame_payload).to_bytes(8, "little") + frame_payload
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert "archive/data/0" in result.metadata["pickle_files"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
-        for issue in result.issues
-    )
+    _assert_referenced_storage_critical(model_path, storage_blob)
 
 
 def test_pytorch_zip_discovery_scans_headerless_binary_nested_pickle_literal(
@@ -4986,37 +3806,12 @@ def test_pytorch_zip_discovery_scans_headerless_binary_nested_pickle_literal(
     model_path = tmp_path / "referenced_headerless_binary_literal_nested_pickle.pt"
     nested_payload = base64.b64encode(b"\x8c\x02os\x8c\x06system\x93)R.")
     storage_blob = b"S'" + nested_payload + b"'\n."
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert "archive/data/0" in result.metadata["pickle_files"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
-        for issue in result.issues
-    )
+    _assert_referenced_storage_critical(model_path, storage_blob)
 
 
 def test_pytorch_zip_discovery_skips_headerless_binary_literal_near_match(tmp_path: Path) -> None:
-    model_path = tmp_path / "referenced_headerless_binary_literal_near_match.pt"
-    storage_blob = b"S'\x8c\x02ok\x94.'\n."
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert not any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
-        for issue in result.issues
+    _assert_binary_literal_near_match(
+        tmp_path, ("referenced_headerless_binary_literal_near_match.pt"), (b"S'\x8c\x02ok\x94.'\n.")
     )
 
 
@@ -5062,20 +3857,7 @@ def test_pytorch_zip_discovery_routes_binary_pickle_after_raw_candidate_budget_g
     nested_pickle = b"\x80\x04cbuiltins\neval\n(S'1+1'\ntR."
     literal = (b"c" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)) + b"ZZZZ" + nested_pickle
     storage_blob = _proto0_string_literal(literal)
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert "archive/data/0" in result.metadata["pickle_files"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
-        for issue in result.issues
-    )
+    _assert_referenced_storage_critical(model_path, storage_blob)
 
 
 def test_pytorch_zip_discovery_routes_binary_pickle_after_long_raw_candidate_budget_gap(tmp_path: Path) -> None:
@@ -5085,20 +3867,7 @@ def test_pytorch_zip_discovery_routes_binary_pickle_after_long_raw_candidate_bud
         (b"c" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)) + (b"!" * 9_000) + nested_pickle
     )
     storage_blob = _proto0_string_literal(literal)
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert "archive/data/0" in result.metadata["pickle_files"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
-        for issue in result.issues
-    )
+    _assert_referenced_storage_critical(model_path, storage_blob)
 
 
 def test_pytorch_zip_discovery_routes_global_after_malformed_global_candidate(tmp_path: Path) -> None:
@@ -5109,40 +3878,14 @@ def test_pytorch_zip_discovery_routes_global_after_malformed_global_candidate(tm
         + b"cctypes\nCDLL\n(S'evil.so'\ntR."
     )
     storage_blob = _proto0_string_literal(literal)
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert "archive/data/0" in result.metadata["pickle_files"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
-        for issue in result.issues
-    )
+    _assert_referenced_storage_critical(model_path, storage_blob)
 
 
 def test_pytorch_zip_discovery_preserves_embedded_bytes_in_mixed_unicode_literal(tmp_path: Path) -> None:
     model_path = tmp_path / "referenced_mixed_unicode_embedded_bytes.pt"
     nested_pickle = b"\x80\x04\x8c\x02os\x94\x8c\x06system\x94\x93\x8c\x04true\x94\x85R."
     storage_blob = pickle.dumps("\u2603" + nested_pickle.decode("latin-1"), protocol=0)
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert "archive/data/0" in result.metadata["pickle_files"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
-        for issue in result.issues
-    )
+    _assert_referenced_storage_critical(model_path, storage_blob)
 
 
 def test_pytorch_zip_discovery_routes_later_binary_pickle_after_benign_binary_decoy(tmp_path: Path) -> None:
@@ -5157,20 +3900,7 @@ def test_pytorch_zip_discovery_routes_later_binary_pickle_after_benign_binary_de
         + nested_pickle
     )
     storage_blob = _proto0_string_literal(literal)
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert "archive/data/0" in result.metadata["pickle_files"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
-        for issue in result.issues
-    )
+    _assert_referenced_storage_critical(model_path, storage_blob)
 
 
 def test_pytorch_zip_discovery_routes_headerless_binary_pickle_after_budget_noise(tmp_path: Path) -> None:
@@ -5178,20 +3908,7 @@ def test_pytorch_zip_discovery_routes_headerless_binary_pickle_after_budget_nois
     nested_pickle = b"\x8c\x02os\x8c\x06system\x93)R."
     literal = (b"c" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)) + (b"!" * 100) + nested_pickle
     storage_blob = _proto0_string_literal(literal)
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert "archive/data/0" in result.metadata["pickle_files"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
-        for issue in result.issues
-    )
+    _assert_referenced_storage_critical(model_path, storage_blob)
 
 
 def _budget_exhausted_headerless_extension_literal() -> bytes:
@@ -5235,20 +3952,7 @@ def test_pytorch_zip_discovery_routes_bytearray8_literal_after_trivial_prefix(tm
     model_path = tmp_path / "referenced_bytearray8_after_trivial_prefix.pt"
     encoded = base64.b64encode(b"cposix\nsystem\n)R.")
     storage_blob = b"N.\x96" + len(encoded).to_bytes(8, "little") + encoded + b"."
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert "archive/data/0" in result.metadata["pickle_files"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
-        for issue in result.issues
-    )
+    _assert_referenced_storage_critical(model_path, storage_blob)
 
 
 def test_pytorch_zip_discovery_routes_extension_opcode_after_raw_candidate_budget_gap(tmp_path: Path) -> None:
@@ -5277,40 +3981,15 @@ def test_pytorch_zip_discovery_routes_extension_opcode_after_raw_candidate_budge
 
 
 def test_pytorch_zip_discovery_skips_stack_global_without_operands_near_match(tmp_path: Path) -> None:
-    model_path = tmp_path / "referenced_stack_global_without_operands_near_match.pt"
-    storage_blob = b"N.\x93.\x00\x00"
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert not any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
-        for issue in result.issues
+    _assert_binary_literal_near_match(
+        tmp_path, ("referenced_stack_global_without_operands_near_match.pt"), (b"N.\x93.\x00\x00")
     )
 
 
 def test_pytorch_zip_discovery_scans_malformed_separator_before_security_pickle(tmp_path: Path) -> None:
     model_path = tmp_path / "referenced_malformed_separator_before_security_pickle.pt"
     storage_blob = b"N.!cposix\nsystem\n(S'echo hidden'\ntR."
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert "archive/data/0" in result.metadata["pickle_files"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
-        for issue in result.issues
-    )
+    _assert_referenced_storage_critical(model_path, storage_blob)
 
 
 def test_pytorch_zip_discovery_scans_malformed_separator_after_security_opcode_prefix(tmp_path: Path) -> None:
@@ -5337,40 +4016,14 @@ def test_pytorch_zip_discovery_scans_encoded_pickle_after_malformed_separator(tm
     model_path = tmp_path / "referenced_encoded_pickle_after_malformed_separator.pt"
     nested_payload = base64.b64encode(b"cposix\nsystem\n(S'echo hidden'\ntR.")
     storage_blob = b"N.!S'" + nested_payload + b"'\n."
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert "archive/data/0" in result.metadata["pickle_files"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
-        for issue in result.issues
-    )
+    _assert_referenced_storage_critical(model_path, storage_blob)
 
 
 def test_pytorch_zip_discovery_scans_encoded_pickle_after_repeated_malformed_separator(tmp_path: Path) -> None:
     model_path = tmp_path / "referenced_encoded_pickle_after_repeated_malformed_separator.pt"
     nested_payload = base64.b64encode(b"cposix\nsystem\n(S'echo hidden'\ntR.")
     storage_blob = b"N.ZZS'" + nested_payload + b"'\n."
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert "archive/data/0" in result.metadata["pickle_files"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
-        for issue in result.issues
-    )
+    _assert_referenced_storage_critical(model_path, storage_blob)
 
 
 def test_pytorch_zip_discovery_scans_encoded_pickle_after_mixed_malformed_separators(tmp_path: Path) -> None:
@@ -5457,20 +4110,7 @@ def test_pytorch_zip_discovery_scans_malformed_separator_after_benign_binary_can
 ) -> None:
     model_path = tmp_path / "referenced_malformed_separator_after_benign_binary_candidates.pt"
     storage_blob = b"N." + tail
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert "archive/data/0" in result.metadata["pickle_files"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
-        for issue in result.issues
-    )
+    _assert_referenced_storage_critical(model_path, storage_blob)
 
 
 def test_pytorch_zip_discovery_scans_after_long_malformed_separator_trusted_probe_prefix(
@@ -5478,39 +4118,13 @@ def test_pytorch_zip_discovery_scans_after_long_malformed_separator_trusted_prob
 ) -> None:
     model_path = tmp_path / "referenced_long_malformed_separator_prefix_pickle.pt"
     storage_blob = b"N." + (b"\xff" * 4094) + _malicious_proto0_system_payload()
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert "archive/data/0" in result.metadata["pickle_files"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
-        for issue in result.issues
-    )
+    _assert_referenced_storage_critical(model_path, storage_blob)
 
 
 def test_pytorch_zip_discovery_scans_after_expanded_malformed_separator_prefix(tmp_path: Path) -> None:
     model_path = tmp_path / "referenced_expanded_malformed_separator_prefix_pickle.pt"
     storage_blob = b"N." + (b"\xff" * 65_536) + _malicious_proto0_system_payload()
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert "archive/data/0" in result.metadata["pickle_files"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
-        for issue in result.issues
-    )
+    _assert_referenced_storage_critical(model_path, storage_blob)
 
 
 def test_pytorch_zip_discovery_reports_large_malformed_separator_tensor_noise_incomplete(tmp_path: Path) -> None:
@@ -5554,39 +4168,11 @@ def test_pytorch_zip_discovery_routes_binunicode_literal_with_repeated_line_cont
 
 
 def test_pytorch_zip_discovery_skips_malformed_separator_tensor_noise_near_match(tmp_path: Path) -> None:
-    model_path = tmp_path / "referenced_malformed_separator_tensor_noise.pt"
-    storage_blob = b"N." + (b"c" * 100)
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert result.success is True
-    assert result.metadata.get("pickle_verdict") == "clean"
-    assert result.metadata["pickle_files"] == ["archive/data.pkl"]
-    assert not any(issue.details.get("pickle_filename") == "archive/data/0" for issue in result.issues)
+    _assert_malformed_separator_noise(tmp_path, ("referenced_malformed_separator_tensor_noise.pt"), (100))
 
 
 def test_pytorch_zip_discovery_skips_large_proto0_global_like_tensor_noise(tmp_path: Path) -> None:
-    model_path = tmp_path / "referenced_large_proto0_global_like_tensor_noise.pt"
-    storage_blob = b"N." + (b"c" * 100_000)
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert result.success is True
-    assert result.metadata.get("pickle_verdict") == "clean"
-    assert result.metadata["pickle_files"] == ["archive/data.pkl"]
-    assert not any(issue.details.get("pickle_filename") == "archive/data/0" for issue in result.issues)
+    _assert_malformed_separator_noise(tmp_path, ("referenced_large_proto0_global_like_tensor_noise.pt"), (100_000))
 
 
 def test_pytorch_zip_discovery_skips_encoded_marker_density_scalar_tensor_noise(tmp_path: Path) -> None:
@@ -5610,13 +4196,9 @@ def test_pytorch_zip_discovery_skips_encoded_marker_density_scalar_tensor_noise(
 def test_pytorch_zip_trailing_candidate_raw_scan_bounds_invalid_marker_attempts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    call_count = 0
     original = PyTorchZipScanner._has_security_relevant_pickle_opcode
 
-    def counted_has_security_relevant_pickle_opcode(sample: bytes) -> bool:
-        nonlocal call_count
-        call_count += 1
-        return original(sample)
+    counted_has_security_relevant_pickle_opcode = create_autospec(original, side_effect=original)
 
     monkeypatch.setattr(
         PyTorchZipScanner,
@@ -5631,7 +4213,10 @@ def test_pytorch_zip_trailing_candidate_raw_scan_bounds_invalid_marker_attempts(
         )
         is False
     )
-    assert call_count <= pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES
+    assert (
+        counted_has_security_relevant_pickle_opcode.call_count
+        <= pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES
+    )
 
 
 def test_pytorch_zip_trailing_candidate_raw_scan_fails_closed_after_candidate_budget() -> None:
@@ -5990,59 +4575,20 @@ def test_pytorch_zip_discovery_routes_long_headerless_binbytes_storage(tmp_path:
 def test_pytorch_zip_discovery_routes_padded_headerless_byte_literal_storage(tmp_path: Path) -> None:
     model_path = tmp_path / "referenced_padded_headerless_byte_literal_storage.pt"
     storage_blob = b"C\x06benign." + (b" " * 5000) + b"cposix\nsystem\n)R."
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert "archive/data/0" in result.metadata["pickle_files"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
-        for issue in result.issues
-    )
+    _assert_referenced_storage_critical(model_path, storage_blob)
 
 
 def test_pytorch_zip_discovery_routes_redundantly_padded_base64_literal_storage(tmp_path: Path) -> None:
     model_path = tmp_path / "referenced_redundantly_padded_base64_literal_storage.pt"
     encoded = base64.b64encode(b"cposix\nsystem\n)R.") + b"="
     storage_blob = b"S'" + encoded + b"'\n."
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert "archive/data/0" in result.metadata["pickle_files"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
-        for issue in result.issues
-    )
+    _assert_referenced_storage_critical(model_path, storage_blob)
 
 
 def test_pytorch_zip_discovery_skips_direct_headerless_byte_literal_near_match(tmp_path: Path) -> None:
-    model_path = tmp_path / "referenced_headerless_byte_literal_near_match.pt"
-    storage_blob = b"C\x06benign."
-    storage_blob += b"\x00" * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert result.success is True
-    assert result.metadata.get("pickle_verdict") == "clean"
-    assert result.metadata["pickle_files"] == ["archive/data.pkl"]
-    assert not any(issue.details.get("pickle_filename") == "archive/data/0" for issue in result.issues)
-    assert not any(check.details.get("pickle_filename") == "archive/data/0" for check in result.checks)
+    _assert_headerless_byte_near_match(
+        tmp_path, ("referenced_headerless_byte_literal_near_match.pt"), (b"C\x06benign."), (b"\x00")
+    )
 
 
 def test_pytorch_zip_discovery_skips_impossible_headerless_binbytes_length(tmp_path: Path) -> None:
@@ -6097,38 +4643,13 @@ def test_pytorch_zip_discovery_skips_headerless_binary_second_opcode_near_match(
     tmp_path: Path,
     storage_blob: bytes,
 ) -> None:
-    model_path = tmp_path / "referenced_headerless_binary_second_opcode_near_match.pt"
-    storage_blob += b"\x00" * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert result.success is True
-    assert result.metadata.get("pickle_verdict") == "clean"
-    assert result.metadata["pickle_files"] == ["archive/data.pkl"]
-    assert not any(issue.details.get("pickle_filename") == "archive/data/0" for issue in result.issues)
-    assert not any(check.details.get("pickle_filename") == "archive/data/0" for check in result.checks)
+    _assert_headerless_opcode_near_match(
+        tmp_path, storage_blob, ("referenced_headerless_binary_second_opcode_near_match.pt")
+    )
 
 
 def test_pytorch_zip_discovery_skips_oversized_nul_padding_storage_near_match(tmp_path: Path) -> None:
-    model_path = tmp_path / "referenced_oversized_nul_padding_tensor_noise.pt"
-    storage_blob = b"N." + (b"\x00" * 300_002)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert result.success is True
-    assert result.metadata.get("pickle_verdict") == "clean"
-    assert result.metadata["pickle_files"] == ["archive/data.pkl"]
-    assert not any(issue.details.get("pickle_filename") == "archive/data/0" for issue in result.issues)
+    _assert_storage_padding_clean(tmp_path, ("referenced_oversized_nul_padding_tensor_noise.pt"), (b"\x00"), (300_002))
 
 
 def test_pytorch_zip_discovery_scans_malicious_pickle_after_oversized_nul_padding(tmp_path: Path) -> None:
@@ -6383,20 +4904,7 @@ def test_pytorch_zip_discovery_scans_whitespace_hex_nested_pickle_literal(tmp_pa
     model_path = tmp_path / "referenced_scalar_literal_hex_nested_pickle.pt"
     encoded = binascii.hexlify(b"cposix\nsystem\n)R.")
     storage_blob = _proto0_string_literal(encoded[:8] + b" " + encoded[8:])
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert "archive/data/0" in result.metadata["pickle_files"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
-        for issue in result.issues
-    )
+    _assert_referenced_storage_critical(model_path, storage_blob)
 
 
 @pytest.mark.parametrize("separator", [b"!", b"@"], ids=["bang", "at"])
@@ -6408,38 +4916,20 @@ def test_pytorch_zip_discovery_scans_punctuation_base64_nested_pickle_literal(
     encoded = base64.b64encode(b"cposix\nsystem\n)R.")
     punctuated = separator.join(encoded[index : index + 4] for index in range(0, len(encoded), 4))
     storage_blob = _proto0_string_literal(punctuated)
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert "archive/data/0" in result.metadata["pickle_files"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
-        for issue in result.issues
-    )
+    _assert_referenced_storage_critical(model_path, storage_blob)
 
 
 def test_pytorch_zip_discovery_raw_nested_literal_candidates_fail_closed_after_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls = 0
-
-    def no_security_opcode(_candidate: bytes) -> bool:
-        nonlocal calls
-        calls += 1
-        return False
+    no_security_opcode = create_autospec(lambda _candidate: False, return_value=False)
 
     monkeypatch.setattr(PyTorchZipScanner, "_has_security_relevant_pickle_opcode", staticmethod(no_security_opcode))
 
     value = b"c" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 1)
 
     assert PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(value) is False
-    assert calls == pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES
+    assert no_security_opcode.call_count == pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES
 
 
 def test_pytorch_zip_raw_nested_literal_routes_extension_operand_after_budget_exhaustion() -> None:
@@ -6459,12 +4949,7 @@ def test_pytorch_zip_raw_nested_literal_preserves_text_marker_after_budget_exhau
 def test_pytorch_zip_structural_fallback_bounds_binary_opcode_candidates(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls = 0
-
-    def no_binary_signal(_candidate: bytes, *, candidate_is_prefix: bool) -> bool:
-        nonlocal calls
-        calls += 1
-        return False
+    no_binary_signal = create_autospec(lambda _candidate, *, candidate_is_prefix: False, return_value=False)
 
     monkeypatch.setattr(
         PyTorchZipScanner,
@@ -6475,26 +4960,16 @@ def test_pytorch_zip_structural_fallback_bounds_binary_opcode_candidates(
     value = b"\x8c\x00" * (pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES + 10)
 
     assert PyTorchZipScanner._raw_nested_security_pickle_candidate_has_structural_signal(value) is True
-    assert calls == pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES
+    assert no_binary_signal.call_count == pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES
 
 
 def test_pytorch_zip_discovery_skips_scalar_literal_raw_nested_near_match(tmp_path: Path) -> None:
-    model_path = tmp_path / "referenced_scalar_literal_raw_nested_near_match.pt"
-    storage_blob = b"S'AAAAAAco\\x0asafe\\x0a)X.BBBB'\n."
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert result.success is True
-    assert result.metadata.get("pickle_verdict") == "clean"
-    assert result.metadata["pickle_files"] == ["archive/data.pkl"]
-    assert not any(issue.details.get("pickle_filename") == "archive/data/0" for issue in result.issues)
-    assert not any(check.details.get("pickle_filename") == "archive/data/0" for check in result.checks)
+    _assert_headerless_byte_near_match(
+        tmp_path,
+        ("referenced_scalar_literal_raw_nested_near_match.pt"),
+        (b"S'AAAAAAco\\x0asafe\\x0a)X.BBBB'\n."),
+        (b" "),
+    )
 
 
 def test_pytorch_zip_discovery_scans_malformed_separator_unicode_literal_nested_pickle(
@@ -6530,20 +5005,7 @@ def test_pytorch_zip_discovery_scans_comment_marker_split_at_trusted_probe_bound
     )
     assert len(storage_prefix) == pytorch_zip_scanner_module._TRUSTED_STORAGE_PICKLE_PROBE_BYTES
     storage_blob = storage_prefix + _malicious_proto0_system_payload()
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert "archive/data/0" in result.metadata["pickle_files"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
-        for issue in result.issues
-    )
+    _assert_referenced_storage_critical(model_path, storage_blob)
 
 
 def test_pytorch_zip_discovery_marks_repeated_trivial_streams_filling_expanded_probe_incomplete(
@@ -6582,13 +5044,9 @@ def test_pytorch_zip_complete_stream_check_bounds_repeated_trivial_streams_after
 def test_pytorch_zip_trailing_candidate_consumes_repeated_trivial_streams_before_suffix_parse(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls = 0
     original = PyTorchZipScanner._trivial_complete_pickle_prefix_trailing
 
-    def counted_trivial_prefix_trailing(sample: bytes) -> bytes | None:
-        nonlocal calls
-        calls += 1
-        return original(sample)
+    counted_trivial_prefix_trailing = create_autospec(original, side_effect=original)
 
     monkeypatch.setattr(
         PyTorchZipScanner,
@@ -6597,7 +5055,7 @@ def test_pytorch_zip_trailing_candidate_consumes_repeated_trivial_streams_before
     )
 
     assert PyTorchZipScanner._trailing_pickle_candidate_needs_more_bytes(b"N." * 32768) is False
-    assert calls == 0
+    assert counted_trivial_prefix_trailing.call_count == 0
 
 
 def test_pytorch_zip_discovery_scans_comment_prefixed_pickle_after_trivial_scalar_prefix(
@@ -6605,20 +5063,7 @@ def test_pytorch_zip_discovery_scans_comment_prefixed_pickle_after_trivial_scala
 ) -> None:
     model_path = tmp_path / "referenced_scalar_prefix_comment_prefixed_pickle.pt"
     storage_blob = b"N.#" + _malicious_proto0_system_payload()
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert "archive/data/0" in result.metadata["pickle_files"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
-        for issue in result.issues
-    )
+    _assert_referenced_storage_critical(model_path, storage_blob)
 
 
 def test_pytorch_zip_discovery_scans_comment_prefixed_pickle_after_many_trivial_streams(
@@ -6626,20 +5071,7 @@ def test_pytorch_zip_discovery_scans_comment_prefixed_pickle_after_many_trivial_
 ) -> None:
     model_path = tmp_path / "referenced_scalar_prefix_comment_many_trivial_streams_pickle.pt"
     storage_blob = b"N.#" + (b"N." * 1200) + _malicious_proto0_system_payload()
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert "archive/data/0" in result.metadata["pickle_files"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
-        for issue in result.issues
-    )
+    _assert_referenced_storage_critical(model_path, storage_blob)
 
 
 def test_pytorch_zip_discovery_scans_comment_prefixed_pickle_after_many_proto0_int_streams(
@@ -6647,20 +5079,7 @@ def test_pytorch_zip_discovery_scans_comment_prefixed_pickle_after_many_proto0_i
 ) -> None:
     model_path = tmp_path / "referenced_scalar_prefix_comment_many_int_streams_pickle.pt"
     storage_blob = b"N." + (b"I1\n." * 1200) + b"#" + _malicious_proto0_system_payload()
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert "archive/data/0" in result.metadata["pickle_files"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
-        for issue in result.issues
-    )
+    _assert_referenced_storage_critical(model_path, storage_blob)
 
 
 def test_pytorch_zip_discovery_scans_persid_after_trivial_prefix_crossing_probe_boundary(
@@ -6707,20 +5126,7 @@ def test_pytorch_zip_discovery_scans_frame_first_pickle_after_trivial_scalar_pre
     model_path = tmp_path / "referenced_scalar_prefix_frame_first_pickle.pt"
     payload = b"cbuiltins\neval\n(S'print(1)'\ntR."
     storage_blob = b"N." + b"\x95" + len(payload).to_bytes(8, "little") + payload
-    storage_blob += b" " * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert "archive/data/0" in result.metadata["pickle_files"]
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
-        for issue in result.issues
-    )
+    _assert_referenced_storage_critical(model_path, storage_blob)
 
 
 @pytest.mark.parametrize(
@@ -6742,21 +5148,7 @@ def test_pytorch_zip_discovery_skips_trivial_prefix_tensor_noise(
     tmp_path: Path,
     storage_blob: bytes,
 ) -> None:
-    model_path = tmp_path / "referenced_scalar_prefix_tensor_noise.pt"
-    storage_blob += b"\x00" * (-len(storage_blob) % 4)
-    with zipfile.ZipFile(model_path, "w") as zip_file:
-        zip_file.writestr("archive/version", "3\n")
-        zip_file.writestr("archive/byteorder", "little")
-        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
-        zip_file.writestr("archive/data/0", storage_blob)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert result.success is True
-    assert result.metadata.get("pickle_verdict") == "clean"
-    assert result.metadata["pickle_files"] == ["archive/data.pkl"]
-    assert not any(issue.details.get("pickle_filename") == "archive/data/0" for issue in result.issues)
-    assert not any(check.details.get("pickle_filename") == "archive/data/0" for check in result.checks)
+    _assert_headerless_opcode_near_match(tmp_path, storage_blob, ("referenced_scalar_prefix_tensor_noise.pt"))
 
 
 def test_pytorch_zip_discovery_skips_large_nul_padding_storage_blob(tmp_path: Path) -> None:
@@ -8024,16 +6416,7 @@ def test_pytorch_pickle_file_unsupported(tmp_path):
 
 def test_pytorch_zip_scanner_closes_bytesio(tmp_path, monkeypatch):
     """Ensure BytesIO objects are properly closed after scanning."""
-    import io
-
-    closed = {}
-
-    class TrackedBytesIO(io.BytesIO):
-        def close(self) -> None:
-            closed["closed"] = True
-            super().close()
-
-    monkeypatch.setattr(io, "BytesIO", TrackedBytesIO)
+    closed = track_bytesio_close(monkeypatch)
 
     model_path = create_mock_pytorch_zip(tmp_path / "model.pt")
     scanner = PyTorchZipScanner()
@@ -9216,58 +7599,22 @@ def test_pytorch_zip_keeps_callback_license_urls_actionable(tmp_path: Path) -> N
     ],
 )
 def test_pytorch_zip_scans_os_process_launch_source_conservatively(tmp_path: Path, payload: bytes) -> None:
-    zip_path = tmp_path / "model.pt"
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        zipf.writestr("archive/version", "3")
-        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
-        zipf.writestr("archive/data/payload.bin", payload)
-
-    result = PyTorchZipScanner().scan(str(zip_path))
-
-    jit_failures = [
-        check
-        for check in result.checks
-        if check.name == "JIT/Script Code Execution Detection" and check.status == CheckStatus.FAILED
-    ]
-    assert any(
-        check.location == f"{zip_path}:archive/data/payload.bin" and "OS command execution detected" in check.message
-        for check in jit_failures
-    )
+    _assert_conservative_process_source(tmp_path, payload, ("OS command execution detected"))
 
 
 def test_pytorch_zip_allows_framed_benign_dict_literal_os_accessor(tmp_path: Path) -> None:
-    zip_path = tmp_path / "model.pt"
-    payload = b"\x00\xffdef payload():\n    import os\n    return {'cwd': getattr(os, 'getcwd')()}\n}"
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        zipf.writestr("archive/version", "3")
-        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
-        zipf.writestr("archive/data/payload.bin", payload)
-
-    result = PyTorchZipScanner().scan(str(zip_path))
-
-    assert not any(
-        check.name == "JIT/Script Code Execution Detection"
-        and check.status == CheckStatus.FAILED
-        and "OS command execution detected" in check.message
-        for check in result.checks
+    _assert_framed_pickle_without_pattern(
+        tmp_path,
+        (b"\x00\xffdef payload():\n    import os\n    return {'cwd': getattr(os, 'getcwd')()}\n}"),
+        ("OS command execution detected"),
     )
 
 
 def test_pytorch_zip_ignores_binary_framed_string_literal_os_process_launch(tmp_path: Path) -> None:
-    zip_path = tmp_path / "model.pt"
-    payload = b"\x00\xffdef payload():\n    return \"os.posix_spawn('/bin/sh', ['sh'], {})\"\n}"
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        zipf.writestr("archive/version", "3")
-        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
-        zipf.writestr("archive/data/payload.bin", payload)
-
-    result = PyTorchZipScanner().scan(str(zip_path))
-
-    assert not any(
-        check.name == "JIT/Script Code Execution Detection"
-        and check.status == CheckStatus.FAILED
-        and "OS command execution detected" in check.message
-        for check in result.checks
+    _assert_framed_pickle_without_pattern(
+        tmp_path,
+        (b"\x00\xffdef payload():\n    return \"os.posix_spawn('/bin/sh', ['sh'], {})\"\n}"),
+        ("OS command execution detected"),
     )
 
 
@@ -9289,23 +7636,7 @@ def test_pytorch_zip_ignores_binary_framed_string_literal_os_process_launch(tmp_
     ],
 )
 def test_pytorch_zip_scans_asyncio_subprocess_launch_source_conservatively(tmp_path: Path, payload: bytes) -> None:
-    zip_path = tmp_path / "model.pt"
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        zipf.writestr("archive/version", "3")
-        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
-        zipf.writestr("archive/data/payload.bin", payload)
-
-    result = PyTorchZipScanner().scan(str(zip_path))
-
-    jit_failures = [
-        check
-        for check in result.checks
-        if check.name == "JIT/Script Code Execution Detection" and check.status == CheckStatus.FAILED
-    ]
-    assert any(
-        check.location == f"{zip_path}:archive/data/payload.bin" and "Subprocess execution detected" in check.message
-        for check in jit_failures
-    )
+    _assert_conservative_process_source(tmp_path, payload, ("Subprocess execution detected"))
 
 
 @pytest.mark.parametrize(
@@ -9800,23 +8131,7 @@ def test_pytorch_zip_preserves_definitely_safe_late_conditional_alias_state(tmp_
     ],
 )
 def test_pytorch_zip_detects_late_alias_after_uncertain_safe_overwrite(tmp_path: Path, late_state: bytes) -> None:
-    zip_path = tmp_path / "model.pt"
-    padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
-    payload = b"\x00\xffimport runpy as rp\n" + padding + late_state + padding
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        zipf.writestr("archive/version", "3")
-        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
-        zipf.writestr("archive/data/payload.bin", payload)
-
-    result = PyTorchZipScanner().scan(str(zip_path))
-
-    assert any(
-        check.name == "JIT/Script Code Execution Detection"
-        and check.status == CheckStatus.FAILED
-        and check.location == f"{zip_path}:archive/data/payload.bin"
-        and check.rule_code == "S108"
-        for check in result.checks
-    )
+    _assert_pytorch_late_typed_rule(tmp_path, b"import runpy as rp\n", late_state, "S108")
 
 
 @pytest.mark.parametrize(
@@ -9841,23 +8156,7 @@ def test_pytorch_zip_detects_late_alias_after_uncertain_safe_overwrite(tmp_path:
     ],
 )
 def test_pytorch_zip_detects_late_alias_after_non_executed_safe_shadow(tmp_path: Path, late_state: bytes) -> None:
-    zip_path = tmp_path / "model.pt"
-    padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
-    payload = b"\x00\xffimport runpy as rp\n" + padding + late_state + padding
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        zipf.writestr("archive/version", "3")
-        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
-        zipf.writestr("archive/data/payload.bin", payload)
-
-    result = PyTorchZipScanner().scan(str(zip_path))
-
-    assert any(
-        check.name == "JIT/Script Code Execution Detection"
-        and check.status == CheckStatus.FAILED
-        and check.location == f"{zip_path}:archive/data/payload.bin"
-        and check.rule_code == "S108"
-        for check in result.checks
-    )
+    _assert_pytorch_late_typed_rule(tmp_path, b"import runpy as rp\n", late_state, "S108")
 
 
 def test_pytorch_zip_detects_retained_alias_after_raising_late_with_shadow(tmp_path: Path) -> None:
@@ -9887,23 +8186,7 @@ def test_pytorch_zip_detects_retained_alias_after_raising_late_with_shadow(tmp_p
 
 
 def test_pytorch_zip_detects_forwarded_late_ctypes_attribute_load(tmp_path: Path) -> None:
-    zip_path = tmp_path / "model.pt"
-    padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
-    payload = b"\x00\xffimport ctypes as c\n" + padding + b"loader = c.cdll\nloader.msvcrt\n" + padding
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        zipf.writestr("archive/version", "3")
-        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
-        zipf.writestr("archive/data/payload.bin", payload)
-
-    result = PyTorchZipScanner().scan(str(zip_path))
-
-    assert any(
-        check.name == "JIT/Script Code Execution Detection"
-        and check.status == CheckStatus.FAILED
-        and check.location == f"{zip_path}:archive/data/payload.bin"
-        and check.rule_code == "S110"
-        for check in result.checks
-    )
+    _assert_forwarded_native_load(tmp_path, (b"\x00\xffimport ctypes as c\n"), (b"loader = c.cdll\nloader.msvcrt\n"))
 
 
 @pytest.mark.parametrize(
@@ -9973,23 +8256,7 @@ def test_pytorch_zip_detects_forwarded_late_ctypes_attribute_load(tmp_path: Path
 def test_pytorch_zip_detects_boolean_fallback_after_builtin_mapping_mutation(
     tmp_path: Path, prefix: bytes, late_state: bytes, rule_code: str
 ) -> None:
-    zip_path = tmp_path / "model.pt"
-    padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
-    payload = b"\x00\xff" + prefix + padding + late_state + padding
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        zipf.writestr("archive/version", "3")
-        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
-        zipf.writestr("archive/data/payload.bin", payload)
-
-    result = PyTorchZipScanner().scan(str(zip_path))
-
-    assert any(
-        check.name == "JIT/Script Code Execution Detection"
-        and check.status == CheckStatus.FAILED
-        and check.location == f"{zip_path}:archive/data/payload.bin"
-        and check.rule_code == rule_code
-        for check in result.checks
-    )
+    _assert_pytorch_late_typed_rule(tmp_path, prefix, late_state, rule_code)
 
 
 @pytest.mark.parametrize(
@@ -11670,47 +9937,12 @@ def test_pytorch_zip_preserves_safe_late_typed_member_overwrite(
 def test_pytorch_zip_preserves_dangerous_typed_member_captured_before_safe_overwrite(
     tmp_path: Path, prefix: bytes, late_state: bytes, rule_code: str
 ) -> None:
-    zip_path = tmp_path / "model.pt"
-    padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
-    payload = b"\x00\xff" + prefix + padding + late_state + padding
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        zipf.writestr("archive/version", "3")
-        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
-        zipf.writestr("archive/data/payload.bin", payload)
-
-    result = PyTorchZipScanner().scan(str(zip_path))
-
-    assert any(
-        check.name == "JIT/Script Code Execution Detection"
-        and check.status == CheckStatus.FAILED
-        and check.location == f"{zip_path}:archive/data/payload.bin"
-        and check.rule_code == rule_code
-        for check in result.checks
-    )
+    _assert_pytorch_late_typed_rule(tmp_path, prefix, late_state, rule_code)
 
 
 def test_pytorch_zip_detects_native_load_in_rebound_typed_member_self_write(tmp_path: Path) -> None:
-    zip_path = tmp_path / "model.pt"
-    padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
-    payload = (
-        b"\x00\xffimport ctypes as c\nimport webbrowser as wb\n"
-        + padding
-        + b"wb = c.cdll\nwb.open = wb.open\n"
-        + padding
-    )
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        zipf.writestr("archive/version", "3")
-        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
-        zipf.writestr("archive/data/payload.bin", payload)
-
-    result = PyTorchZipScanner().scan(str(zip_path))
-
-    assert any(
-        check.name == "JIT/Script Code Execution Detection"
-        and check.status == CheckStatus.FAILED
-        and check.location == f"{zip_path}:archive/data/payload.bin"
-        and check.rule_code == "S110"
-        for check in result.checks
+    _assert_forwarded_native_load(
+        tmp_path, (b"\x00\xffimport ctypes as c\nimport webbrowser as wb\n"), (b"wb = c.cdll\nwb.open = wb.open\n")
     )
 
 
@@ -13195,20 +11427,10 @@ def test_pytorch_zip_scans_webbrowser_and_ctypes_execution_in_archive_data(tmp_p
 
 
 def test_pytorch_zip_ignores_certain_replaced_runpy_execution_in_archive_data(tmp_path: Path) -> None:
-    zip_path = tmp_path / "model.pt"
-    payload = b"\x00\xffimport runpy\nrunpy.run_path = len\nrunpy.run_path([])\n\x00MODEL-FRAMING"
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        zipf.writestr("archive/version", "3")
-        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
-        zipf.writestr("archive/data/payload.bin", payload)
-
-    result = PyTorchZipScanner().scan(str(zip_path))
-
-    assert not any(
-        check.name == "JIT/Script Code Execution Detection"
-        and check.status == CheckStatus.FAILED
-        and "Dynamic module execution detected" in check.message
-        for check in result.checks
+    _assert_framed_pickle_without_pattern(
+        tmp_path,
+        (b"\x00\xffimport runpy\nrunpy.run_path = len\nrunpy.run_path([])\n\x00MODEL-FRAMING"),
+        ("Dynamic module execution detected"),
     )
 
 
@@ -13233,25 +11455,15 @@ def test_pytorch_zip_ignores_framed_runpy_call_inside_multiline_literal(tmp_path
 def test_pytorch_zip_ignores_string_literal_asyncio_subprocess_launch_with_unrelated_risk(
     tmp_path: Path,
 ) -> None:
-    zip_path = tmp_path / "model.pt"
-    payload = (
-        b"import pickle\n\n"
-        b"def payload(data):\n"
-        b"    pickle.loads(data)\n"
-        b"    return \"asyncio.create_subprocess_shell('id')\"\n"
-    )
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        zipf.writestr("archive/version", "3")
-        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
-        zipf.writestr("archive/data/payload.bin", payload)
-
-    result = PyTorchZipScanner().scan(str(zip_path))
-
-    assert not any(
-        check.name == "JIT/Script Code Execution Detection"
-        and check.status == CheckStatus.FAILED
-        and "Subprocess execution detected" in check.message
-        for check in result.checks
+    _assert_framed_pickle_without_pattern(
+        tmp_path,
+        (
+            b"import pickle\n\n"
+            b"def payload(data):\n"
+            b"    pickle.loads(data)\n"
+            b"    return \"asyncio.create_subprocess_shell('id')\"\n"
+        ),
+        ("Subprocess execution detected"),
     )
 
 
@@ -13563,72 +11775,20 @@ def test_pytorch_zip_torchscript_member_does_not_mask_critical_sidecar_pickle(tm
 
 
 def test_pytorch_zip_requires_exact_case_torchscript_debug_pair(tmp_path: Path) -> None:
-    model_path = create_mock_pytorch_zip(tmp_path / "scripted_case_mismatch.pt", prefix="archive")
-    source_path = "archive/code/__torch__/PAYLOAD.py"
-    debug_pkl = b"\x80\x02X\x18\x00\x00\x00FORMAT_WITH_STRING_TABLEq\x00."
-    with zipfile.ZipFile(model_path, "a") as zip_file:
-        zip_file.writestr(
-            source_path,
-            "\n".join(
-                [
-                    "class Payload(Module):",
-                    "  __parameters__ = []",
-                    "  __buffers__ = []",
-                    "  def forward(self: __torch__.Payload,",
-                    "    x: Tensor) -> Tensor:",
-                    "    return x",
-                    "",
-                ]
-            ),
-        )
-        zip_file.writestr("archive/code/__torch__/payload.py.debug_pkl", debug_pkl)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    python_failures = [
-        check
-        for check in result.checks
-        if check.name == "Python Code File Detection" and check.status == CheckStatus.FAILED
-    ]
-    assert any(check.details.get("file") == source_path for check in python_failures)
-    assert any(
-        issue.location == f"{model_path}:{source_path}" and issue.severity == IssueSeverity.WARNING
-        for issue in result.issues
+    _assert_inexact_torchscript_pair(
+        tmp_path,
+        ("scripted_case_mismatch.pt"),
+        ("archive/code/__torch__/PAYLOAD.py"),
+        ("archive/code/__torch__/payload.py.debug_pkl"),
     )
 
 
 def test_pytorch_zip_requires_exact_case_torchscript_tree(tmp_path: Path) -> None:
-    model_path = create_mock_pytorch_zip(tmp_path / "scripted_tree_case_mismatch.pt", prefix="archive")
-    source_path = "archive/code/__TORCH__/payload.py"
-    debug_pkl = b"\x80\x02X\x18\x00\x00\x00FORMAT_WITH_STRING_TABLEq\x00."
-    with zipfile.ZipFile(model_path, "a") as zip_file:
-        zip_file.writestr(
-            source_path,
-            "\n".join(
-                [
-                    "class Payload(Module):",
-                    "  __parameters__ = []",
-                    "  __buffers__ = []",
-                    "  def forward(self: __torch__.Payload,",
-                    "    x: Tensor) -> Tensor:",
-                    "    return x",
-                    "",
-                ]
-            ),
-        )
-        zip_file.writestr("archive/code/__TORCH__/payload.py.debug_pkl", debug_pkl)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    python_failures = [
-        check
-        for check in result.checks
-        if check.name == "Python Code File Detection" and check.status == CheckStatus.FAILED
-    ]
-    assert any(check.details.get("file") == source_path for check in python_failures)
-    assert any(
-        issue.location == f"{model_path}:{source_path}" and issue.severity == IssueSeverity.WARNING
-        for issue in result.issues
+    _assert_inexact_torchscript_pair(
+        tmp_path,
+        ("scripted_tree_case_mismatch.pt"),
+        ("archive/code/__TORCH__/payload.py"),
+        ("archive/code/__TORCH__/payload.py.debug_pkl"),
     )
 
 
@@ -13722,105 +11882,22 @@ def test_pytorch_zip_warns_on_forged_torchscript_debug_pair(tmp_path: Path) -> N
 
 
 def test_pytorch_zip_warns_on_torchscript_stub_with_builtins_indirection(tmp_path: Path) -> None:
-    model_path = create_mock_pytorch_zip(tmp_path / "model.pt", prefix="archive")
-    source_path = "archive/code/__torch__/payload.py"
-    with zipfile.ZipFile(model_path, "a") as zip_file:
-        zip_file.writestr(
-            source_path,
-            "\n".join(
-                [
-                    "class Payload(Module):",
-                    "  __parameters__ = []",
-                    "  __buffers__ = []",
-                    "  def forward(self: __torch__.Payload,",
-                    "    x: Tensor) -> Tensor:",
-                    "    return __globals__['__builtins__']['__import__']('os').system('id')",
-                    "",
-                ]
-            ),
-        )
-        zip_file.writestr(
-            "archive/code/__torch__/payload.py.debug_pkl",
-            b"\x80\x02X\x18\x00\x00\x00FORMAT_WITH_STRING_TABLEq\x00.",
-        )
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    python_failures = [
-        check
-        for check in result.checks
-        if check.name == "Python Code File Detection" and check.status == CheckStatus.FAILED
-    ]
-    assert any(check.details.get("file") == source_path for check in python_failures)
-    assert all(check.severity == IssueSeverity.WARNING for check in python_failures)
+    _assert_torchscript_stub_warning(
+        tmp_path,
+        ("  __parameters__ = []"),
+        ("  __buffers__ = []"),
+        ("    return __globals__['__builtins__']['__import__']('os').system('id')"),
+    )
 
 
 def test_pytorch_zip_warns_on_torchscript_stub_with_markers_only_in_comments(tmp_path: Path) -> None:
-    model_path = create_mock_pytorch_zip(tmp_path / "model.pt", prefix="archive")
-    source_path = "archive/code/__torch__/payload.py"
-    with zipfile.ZipFile(model_path, "a") as zip_file:
-        zip_file.writestr(
-            source_path,
-            "\n".join(
-                [
-                    "class Payload(Module):",
-                    "  # __parameters__ = []",
-                    "  # __buffers__ = []",
-                    "  def forward(self: __torch__.Payload,",
-                    "    x: Tensor) -> Tensor:",
-                    "    return x",
-                    "",
-                ]
-            ),
-        )
-        zip_file.writestr(
-            "archive/code/__torch__/payload.py.debug_pkl",
-            b"\x80\x02X\x18\x00\x00\x00FORMAT_WITH_STRING_TABLEq\x00.",
-        )
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    python_failures = [
-        check
-        for check in result.checks
-        if check.name == "Python Code File Detection" and check.status == CheckStatus.FAILED
-    ]
-    assert any(check.details.get("file") == source_path for check in python_failures)
-    assert all(check.severity == IssueSeverity.WARNING for check in python_failures)
+    _assert_torchscript_stub_warning(tmp_path, ("  # __parameters__ = []"), ("  # __buffers__ = []"), ("    return x"))
 
 
 def test_pytorch_zip_warns_on_torchscript_stub_with_breakpoint_body_call(tmp_path: Path) -> None:
-    model_path = create_mock_pytorch_zip(tmp_path / "model.pt", prefix="archive")
-    source_path = "archive/code/__torch__/payload.py"
-    with zipfile.ZipFile(model_path, "a") as zip_file:
-        zip_file.writestr(
-            source_path,
-            "\n".join(
-                [
-                    "class Payload(Module):",
-                    "  __parameters__ = []",
-                    "  __buffers__ = []",
-                    "  def forward(self: __torch__.Payload,",
-                    "    x: Tensor) -> Tensor:",
-                    "    return breakpoint()",
-                    "",
-                ]
-            ),
-        )
-        zip_file.writestr(
-            "archive/code/__torch__/payload.py.debug_pkl",
-            b"\x80\x02X\x18\x00\x00\x00FORMAT_WITH_STRING_TABLEq\x00.",
-        )
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    python_failures = [
-        check
-        for check in result.checks
-        if check.name == "Python Code File Detection" and check.status == CheckStatus.FAILED
-    ]
-    assert any(check.details.get("file") == source_path for check in python_failures)
-    assert all(check.severity == IssueSeverity.WARNING for check in python_failures)
+    _assert_torchscript_stub_warning(
+        tmp_path, ("  __parameters__ = []"), ("  __buffers__ = []"), ("    return breakpoint()")
+    )
 
 
 def test_pytorch_zip_warns_on_torchscript_stub_with_print_body_call(tmp_path: Path) -> None:
@@ -13892,73 +11969,23 @@ def test_pytorch_zip_warns_on_torchscript_stub_with_nul_byte(tmp_path: Path) -> 
 
 
 def test_pytorch_zip_warns_on_torchscript_stub_with_class_decorator_call(tmp_path: Path) -> None:
-    model_path = create_mock_pytorch_zip(tmp_path / "model.pt", prefix="archive")
-    source_path = "archive/code/__torch__/payload.py"
-    with zipfile.ZipFile(model_path, "a") as zip_file:
-        zip_file.writestr(
-            source_path,
-            "\n".join(
-                [
-                    "@torch.classes.load_library('libpayload.so')",
-                    "class Payload(Module):",
-                    "  __parameters__ = []",
-                    "  __buffers__ = []",
-                    "  def forward(self: __torch__.Payload,",
-                    "    x: Tensor) -> Tensor:",
-                    "    return x",
-                    "",
-                ]
-            ),
-        )
-        zip_file.writestr(
-            "archive/code/__torch__/payload.py.debug_pkl",
-            b"\x80\x02X\x18\x00\x00\x00FORMAT_WITH_STRING_TABLEq\x00.",
-        )
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    python_failures = [
-        check
-        for check in result.checks
-        if check.name == "Python Code File Detection" and check.status == CheckStatus.FAILED
-    ]
-    assert any(check.details.get("file") == source_path for check in python_failures)
-    assert all(check.severity == IssueSeverity.WARNING for check in python_failures)
+    _assert_decorated_torchscript_stub(
+        tmp_path,
+        ("@torch.classes.load_library('libpayload.so')"),
+        ("class Payload(Module):"),
+        ("  __parameters__ = []"),
+        ("  __buffers__ = []"),
+    )
 
 
 def test_pytorch_zip_warns_on_torchscript_stub_with_class_assignment_call(tmp_path: Path) -> None:
-    model_path = create_mock_pytorch_zip(tmp_path / "model.pt", prefix="archive")
-    source_path = "archive/code/__torch__/payload.py"
-    with zipfile.ZipFile(model_path, "a") as zip_file:
-        zip_file.writestr(
-            source_path,
-            "\n".join(
-                [
-                    "class Payload(Module):",
-                    "  __parameters__ = []",
-                    "  __buffers__ = []",
-                    "  payload = torch.classes.load_library('libpayload.so')",
-                    "  def forward(self: __torch__.Payload,",
-                    "    x: Tensor) -> Tensor:",
-                    "    return x",
-                    "",
-                ]
-            ),
-        )
-        zip_file.writestr(
-            "archive/code/__torch__/payload.py.debug_pkl",
-            b"\x80\x02X\x18\x00\x00\x00FORMAT_WITH_STRING_TABLEq\x00.",
-        )
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    python_failures = [
-        check
-        for check in result.checks
-        if check.name == "Python Code File Detection" and check.status == CheckStatus.FAILED
-    ]
-    assert any(check.details.get("file") == source_path for check in python_failures)
-    assert all(check.severity == IssueSeverity.WARNING for check in python_failures)
+    _assert_decorated_torchscript_stub(
+        tmp_path,
+        ("class Payload(Module):"),
+        ("  __parameters__ = []"),
+        ("  __buffers__ = []"),
+        ("  payload = torch.classes.load_library('libpayload.so')"),
+    )
 
 
 def test_pytorch_zip_warns_on_torchscript_stub_with_class_keyword_call(tmp_path: Path) -> None:
@@ -14105,11 +12132,7 @@ def test_pytorch_zip_scanner_detects_malicious_zip_pkl(tmp_path):
         zipf.writestr("version", "3")
 
         # Create a malicious pickle that would execute code
-        class MaliciousClass:
-            def __reduce__(self):
-                return (eval, ("print('pwned')",))
-
-        data = {"malicious": MaliciousClass()}
+        data = {"malicious": EvalPayload()}
         pickled_data = pickle.dumps(data)
         zipf.writestr("data.pkl", pickled_data)
 
@@ -14468,33 +12491,13 @@ def test_pytorch_zip_scanner_does_not_trust_storage_persistent_ids_with_only_dat
 def test_pytorch_zip_scanner_does_not_trust_storage_persistent_ids_with_non_ascii_digit_blob(
     tmp_path: Path,
 ) -> None:
-    payload = _pytorch_storage_persistent_id_payload("0")
-    model_path = create_mock_pytorch_zip(tmp_path / "storage_persistent_id_non_ascii_digit.pt", with_pickle=False)
-    with zipfile.ZipFile(model_path, "a") as zipf:
-        zipf.writestr("version", "3")
-        zipf.writestr("data.pkl", payload)
-        zipf.writestr("data/\uff10", b"\x00" * 8)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert any(issue.details.get("pickle_rule_code") == "PERSISTENT_ID" for issue in result.issues)
-    assert not any(check.details.get("trusted_pytorch_archive_context") is True for check in result.checks)
+    _assert_non_ascii_storage_key(tmp_path, ("0"), ("storage_persistent_id_non_ascii_digit.pt"), ("data/\uff10"))
 
 
 def test_pytorch_zip_scanner_does_not_trust_storage_persistent_ids_with_unrelated_blob(
     tmp_path: Path,
 ) -> None:
-    payload = _pytorch_storage_persistent_id_payload("1")
-    model_path = create_mock_pytorch_zip(tmp_path / "storage_persistent_id_unrelated_blob.pt", with_pickle=False)
-    with zipfile.ZipFile(model_path, "a") as zipf:
-        zipf.writestr("version", "3")
-        zipf.writestr("data.pkl", payload)
-        zipf.writestr("data/0", b"\x00" * 8)
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert any(issue.details.get("pickle_rule_code") == "PERSISTENT_ID" for issue in result.issues)
-    assert not any(check.details.get("trusted_pytorch_archive_context") is True for check in result.checks)
+    _assert_non_ascii_storage_key(tmp_path, ("1"), ("storage_persistent_id_unrelated_blob.pt"), ("data/0"))
 
 
 def test_pytorch_zip_scanner_scopes_storage_persistent_id_trust_by_prefix(tmp_path: Path) -> None:
@@ -14881,28 +12884,14 @@ def test_pytorch_zip_scanner_recurses_into_zip_members_named_like_pickles(tmp_pa
 
 def test_pytorch_zip_scanner_bounds_nested_zip_member_copy(tmp_path: Path) -> None:
     """Oversized nested ZIP members should fail closed before rescanning."""
-    nested_zip = tmp_path / "nested.zip"
-    with zipfile.ZipFile(nested_zip, "w") as archive:
-        archive.writestr("payload.pkl", _malicious_eval_pickle_payload())
-
-    zip_path = tmp_path / "nested_payload.pt"
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        zipf.writestr("version", "3")
-        zipf.writestr("data.pkl", pickle.dumps({"weights": [1, 2, 3]}, protocol=4))
-        zipf.write(nested_zip, "archive/nested.zip")
+    nested_zip, zip_path = _nested_zip_fixture(tmp_path)
 
     nested_scan_calls: list[str] = []
-
-    def scan_nested_member(path: str, config: dict[str, object] | None = None) -> ScanResult:
-        nested_scan_calls.append(path)
-        nested_result = ScanResult(scanner_name="zip")
-        nested_result.finish(success=True)
-        return nested_result
 
     result = PyTorchZipScanner(
         config={
             "max_nested_zip_member_bytes": nested_zip.stat().st_size - 1,
-            NESTED_SCAN_CALLBACK_CONFIG_KEY: scan_nested_member,
+            NESTED_SCAN_CALLBACK_CONFIG_KEY: partial(_record_nested_zip_scan, nested_scan_calls),
         }
     ).scan(str(zip_path))
 
@@ -14918,29 +12907,15 @@ def test_pytorch_zip_scanner_bounds_nested_zip_member_copy(tmp_path: Path) -> No
 
 def test_pytorch_zip_scanner_enforces_nested_zip_depth_limit(tmp_path: Path) -> None:
     """Nested ZIP recursion should stop once the shared archive depth cap is reached."""
-    nested_zip = tmp_path / "nested.zip"
-    with zipfile.ZipFile(nested_zip, "w") as archive:
-        archive.writestr("payload.pkl", _malicious_eval_pickle_payload())
-
-    zip_path = tmp_path / "nested_payload.pt"
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        zipf.writestr("version", "3")
-        zipf.writestr("data.pkl", pickle.dumps({"weights": [1, 2, 3]}, protocol=4))
-        zipf.write(nested_zip, "archive/nested.zip")
+    _nested_zip, zip_path = _nested_zip_fixture(tmp_path)
 
     nested_scan_calls: list[str] = []
-
-    def scan_nested_member(path: str, config: dict[str, object] | None = None) -> ScanResult:
-        nested_scan_calls.append(path)
-        nested_result = ScanResult(scanner_name="zip")
-        nested_result.finish(success=True)
-        return nested_result
 
     result = PyTorchZipScanner(
         config={
             "max_zip_depth": 1,
             "_archive_depth": 1,
-            NESTED_SCAN_CALLBACK_CONFIG_KEY: scan_nested_member,
+            NESTED_SCAN_CALLBACK_CONFIG_KEY: partial(_record_nested_zip_scan, nested_scan_calls),
         }
     ).scan(str(zip_path))
 
@@ -15862,13 +13837,9 @@ def test_get_installed_pytorch_version_returns_none_when_metadata_unavailable_wi
 ) -> None:
     scanner = PyTorchZipScanner()
 
-    def unavailable_distributions(*args: object, **kwargs: object) -> Iterator[object]:
-        del args, kwargs
-        raise RuntimeError("metadata unavailable")
-
     monkeypatch.delitem(sys.modules, "torch", raising=False)
     monkeypatch.setattr(scanner, "_trusted_python_package_roots", lambda: (tmp_path / "site-packages",))
-    monkeypatch.setattr(importlib_metadata, "distributions", unavailable_distributions)
+    monkeypatch.setattr(importlib_metadata, "distributions", _unavailable_distributions)
     import_calls = _forbid_torch_import(monkeypatch)
 
     assert scanner._get_installed_pytorch_version() is None
@@ -15957,14 +13928,10 @@ def test_get_installed_pytorch_version_falls_back_to_trusted_already_imported_to
     fake_torch.__version__ = "2.4.1+cpu"
     fake_torch.__file__ = str(torch_package / "__init__.py")
 
-    def fail_metadata_lookup(*args: object, **kwargs: object) -> Iterator[object]:
-        del args, kwargs
-        raise RuntimeError("metadata unavailable")
-
     monkeypatch.setitem(sys.modules, "torch", fake_torch)
     monkeypatch.setattr(scanner, "_trusted_python_package_roots", lambda: (trusted_root,))
     monkeypatch.setattr(scanner, "_resolve_torch_import_origin", lambda: torch_package / "__init__.py")
-    monkeypatch.setattr(importlib_metadata, "distributions", fail_metadata_lookup)
+    monkeypatch.setattr(importlib_metadata, "distributions", _unavailable_distributions)
     import_calls = _forbid_torch_import(monkeypatch)
 
     assert scanner._get_installed_pytorch_version() == "2.4.1+cpu"
@@ -16391,16 +14358,6 @@ def _pickle_global_bytes(module: bytes, name: bytes) -> bytes:
     return b"c" + module + b"\n" + name + b"\n"
 
 
-def _pickle_binunicode_bytes(data: bytes) -> bytes:
-    return b"X" + len(data).to_bytes(4, "little") + data
-
-
-def _pickle_short_binunicode_bytes(data: bytes) -> bytes:
-    if len(data) > 0xFF:
-        raise ValueError("SHORT_BINUNICODE helper accepts at most 255 bytes")
-    return b"\x8c" + bytes([len(data)]) + data
-
-
 def _static_getattr_reduce_payload(
     *,
     attribute: bytes = b"forward",
@@ -16472,16 +14429,6 @@ def _static_getattr_with_memo_read_args_tuple_payload() -> bytes:
         _pickle_global_bytes(b"ultralytics.nn.modules.head", b"Detect") + _pickle_binunicode_bytes(b"forward") + b"\x86"
     )
     return b"\x80\x04" + _pickle_global_bytes(b"__builtin__", b"getattr") + args_tuple + b"q\x000h\x00R."
-
-
-def _static_getattr_protocol0_unicode_payload() -> bytes:
-    return b"c__builtin__\ngetattr\ncultralytics.nn.modules.head\nDetect\nVforward\n\x86R."
-
-
-def _clear_ultralytics_modules() -> None:
-    for module_name in tuple(sys.modules):
-        if module_name == "ultralytics" or module_name.startswith("ultralytics."):
-            sys.modules.pop(module_name, None)
 
 
 def _write_ultralytics_head_source(
@@ -16694,32 +14641,18 @@ def test_pytorch_zip_static_getattr_source_backed_method_sink_keeps_s115(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _write_ultralytics_head_source(
-        tmp_path,
-        monkeypatch,
-        "import os\n\nclass Detect:\n    def forward(self):\n        os.system('id')\n",
+    _assert_static_getattr_source_s115(
+        tmp_path, monkeypatch, ("import os\n\nclass Detect:\n    def forward(self):\n        os.system('id')\n")
     )
-    model_path = _write_getattr_reconstruction_zip(tmp_path, _static_getattr_reduce_payload())
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert _critical_s115_getattr_issues(result)
 
 
 def test_pytorch_zip_static_getattr_decorated_method_descriptor_keeps_s115(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _write_ultralytics_head_source(
-        tmp_path,
-        monkeypatch,
-        "class Detect:\n    @property\n    def forward(self):\n        return None\n",
+    _assert_static_getattr_source_s115(
+        tmp_path, monkeypatch, ("class Detect:\n    @property\n    def forward(self):\n        return None\n")
     )
-    model_path = _write_getattr_reconstruction_zip(tmp_path, _static_getattr_reduce_payload())
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert _critical_s115_getattr_issues(result)
 
 
 def test_pytorch_zip_static_getattr_module_initialization_side_effect_keeps_s115(
@@ -16727,16 +14660,11 @@ def test_pytorch_zip_static_getattr_module_initialization_side_effect_keeps_s115
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     marker = tmp_path / "import-side-effect.txt"
-    _write_ultralytics_head_source(
+    _assert_static_getattr_source_s115(
         tmp_path,
         monkeypatch,
         f"open({str(marker)!r}, 'w').write('loaded')\n\nclass Detect:\n    def forward(self):\n        return None\n",
     )
-    model_path = _write_getattr_reconstruction_zip(tmp_path, _static_getattr_reduce_payload())
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert _critical_s115_getattr_issues(result)
 
 
 def test_pytorch_zip_static_getattr_executable_class_body_keeps_s115(
@@ -16744,277 +14672,228 @@ def test_pytorch_zip_static_getattr_executable_class_body_keeps_s115(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     marker = tmp_path / "class-body-side-effect.txt"
-    _write_ultralytics_head_source(
+    _assert_static_getattr_source_s115(
         tmp_path,
         monkeypatch,
-        "class Detect:\n"
-        f"    open({str(marker)!r}, 'w').write('loaded')\n\n"
-        "    def forward(self):\n"
-        "        return None\n",
+        f"class Detect:\n    open({str(marker)!r}, 'w').write('loaded')\n\n"
+        "    def forward(self):\n        return None\n",
     )
-    model_path = _write_getattr_reconstruction_zip(tmp_path, _static_getattr_reduce_payload())
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert _critical_s115_getattr_issues(result)
 
 
 def test_pytorch_zip_static_getattr_class_namespace_write_keeps_s115(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _write_ultralytics_head_source(
+    _assert_static_getattr_source_s115(
         tmp_path,
         monkeypatch,
-        "def evil(self):\n"
-        "    return None\n\n"
-        "class Detect:\n"
-        "    def forward(self):\n"
-        "        return None\n"
-        "    locals()['forward'] = evil\n",
+        (
+            "def evil(self):\n"
+            "    return None\n\n"
+            "class Detect:\n"
+            "    def forward(self):\n"
+            "        return None\n"
+            "    locals()['forward'] = evil\n"
+        ),
     )
-    model_path = _write_getattr_reconstruction_zip(tmp_path, _static_getattr_reduce_payload())
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert _critical_s115_getattr_issues(result)
 
 
 def test_pytorch_zip_static_getattr_decorated_class_keeps_s115(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _write_ultralytics_head_source(
+    _assert_static_getattr_source_s115(
         tmp_path,
         monkeypatch,
-        "import os\n\n"
-        "def replace(_cls):\n"
-        "    class Replacement:\n"
-        "        def forward(self):\n"
-        "            os.system('id')\n"
-        "    return Replacement\n\n"
-        "@replace\n"
-        "class Detect:\n"
-        "    def forward(self):\n"
-        "        return None\n",
+        (
+            "import os\n\n"
+            "def replace(_cls):\n"
+            "    class Replacement:\n"
+            "        def forward(self):\n"
+            "            os.system('id')\n"
+            "    return Replacement\n\n"
+            "@replace\n"
+            "class Detect:\n"
+            "    def forward(self):\n"
+            "        return None\n"
+        ),
     )
-    model_path = _write_getattr_reconstruction_zip(tmp_path, _static_getattr_reduce_payload())
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert _critical_s115_getattr_issues(result)
 
 
 def test_pytorch_zip_static_getattr_post_class_method_rewrite_keeps_s115(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _write_ultralytics_head_source(
+    _assert_static_getattr_source_s115(
         tmp_path,
         monkeypatch,
-        "class Detect:\n"
-        "    def forward(self):\n"
-        "        return None\n\n"
-        "def evil(self):\n"
-        "    return None\n\n"
-        "Detect.forward = evil\n",
+        (
+            "class Detect:\n"
+            "    def forward(self):\n"
+            "        return None\n\n"
+            "def evil(self):\n"
+            "    return None\n\n"
+            "Detect.forward = evil\n"
+        ),
     )
-    model_path = _write_getattr_reconstruction_zip(tmp_path, _static_getattr_reduce_payload())
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert _critical_s115_getattr_issues(result)
 
 
 def test_pytorch_zip_static_getattr_control_flow_post_class_rewrite_keeps_s115(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _write_ultralytics_head_source(
+    _assert_static_getattr_source_s115(
         tmp_path,
         monkeypatch,
-        "class Detect:\n"
-        "    def forward(self):\n"
-        "        return None\n\n"
-        "def evil(self):\n"
-        "    return None\n\n"
-        "if True:\n"
-        "    Detect.forward = evil\n",
+        (
+            "class Detect:\n"
+            "    def forward(self):\n"
+            "        return None\n\n"
+            "def evil(self):\n"
+            "    return None\n\n"
+            "if True:\n"
+            "    Detect.forward = evil\n"
+        ),
     )
-    model_path = _write_getattr_reconstruction_zip(tmp_path, _static_getattr_reduce_payload())
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert _critical_s115_getattr_issues(result)
 
 
 def test_pytorch_zip_static_getattr_post_class_binding_target_keeps_s115(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _write_ultralytics_head_source(
+    _assert_static_getattr_source_s115(
         tmp_path,
         monkeypatch,
-        "class Evil:\n"
-        "    def forward(self):\n"
-        "        return None\n\n"
-        "class Detect:\n"
-        "    def forward(self):\n"
-        "        return None\n\n"
-        "for Detect in [Evil]:\n"
-        "    pass\n",
+        (
+            "class Evil:\n"
+            "    def forward(self):\n"
+            "        return None\n\n"
+            "class Detect:\n"
+            "    def forward(self):\n"
+            "        return None\n\n"
+            "for Detect in [Evil]:\n"
+            "    pass\n"
+        ),
     )
-    model_path = _write_getattr_reconstruction_zip(tmp_path, _static_getattr_reduce_payload())
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert _critical_s115_getattr_issues(result)
 
 
 def test_pytorch_zip_static_getattr_class_body_import_rebinding_keeps_s115(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _write_ultralytics_head_source(
+    _assert_static_getattr_source_s115(
         tmp_path,
         monkeypatch,
-        "class Detect:\n    def forward(self):\n        return None\n    from os import system as forward\n",
+        ("class Detect:\n    def forward(self):\n        return None\n    from os import system as forward\n"),
     )
-    model_path = _write_getattr_reconstruction_zip(tmp_path, _static_getattr_reduce_payload())
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert _critical_s115_getattr_issues(result)
 
 
 def test_pytorch_zip_static_getattr_post_class_helper_call_keeps_s115(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _write_ultralytics_head_source(
+    _assert_static_getattr_source_s115(
         tmp_path,
         monkeypatch,
-        "class Detect:\n"
-        "    def forward(self):\n"
-        "        return None\n\n"
-        "def evil(self):\n"
-        "    return None\n\n"
-        "def patch(cls):\n"
-        "    cls.forward = evil\n\n"
-        "patch(Detect)\n",
+        (
+            "class Detect:\n"
+            "    def forward(self):\n"
+            "        return None\n\n"
+            "def evil(self):\n"
+            "    return None\n\n"
+            "def patch(cls):\n"
+            "    cls.forward = evil\n\n"
+            "patch(Detect)\n"
+        ),
     )
-    model_path = _write_getattr_reconstruction_zip(tmp_path, _static_getattr_reduce_payload())
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert _critical_s115_getattr_issues(result)
 
 
 def test_pytorch_zip_static_getattr_conditional_class_body_method_keeps_s115(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _write_ultralytics_head_source(
+    _assert_static_getattr_source_s115(
         tmp_path,
         monkeypatch,
-        "import os\n\n"
-        "class Base:\n"
-        "    def forward(self):\n"
-        "        os.system('id')\n\n"
-        "class Detect(Base):\n"
-        "    if False:\n"
-        "        def forward(self):\n"
-        "            return None\n",
+        (
+            "import os\n\n"
+            "class Base:\n"
+            "    def forward(self):\n"
+            "        os.system('id')\n\n"
+            "class Detect(Base):\n"
+            "    if False:\n"
+            "        def forward(self):\n"
+            "            return None\n"
+        ),
     )
-    model_path = _write_getattr_reconstruction_zip(tmp_path, _static_getattr_reduce_payload())
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert _critical_s115_getattr_issues(result)
 
 
 def test_pytorch_zip_static_getattr_dynamic_metaclass_keyword_lookup_keeps_s115(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _write_ultralytics_head_source(
+    _assert_static_getattr_source_s115(
         tmp_path,
         monkeypatch,
-        "import os\n\n"
-        "class DetectMeta(type):\n"
-        "    def __getattribute__(cls, name):\n"
-        "        os.system('id')\n"
-        "        return super().__getattribute__(name)\n\n"
-        "class Detect(**{'metaclass': DetectMeta}):\n"
-        "    def forward(self):\n"
-        "        return None\n",
+        (
+            "import os\n\n"
+            "class DetectMeta(type):\n"
+            "    def __getattribute__(cls, name):\n"
+            "        os.system('id')\n"
+            "        return super().__getattribute__(name)\n\n"
+            "class Detect(**{'metaclass': DetectMeta}):\n"
+            "    def forward(self):\n"
+            "        return None\n"
+        ),
     )
-    model_path = _write_getattr_reconstruction_zip(tmp_path, _static_getattr_reduce_payload())
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert _critical_s115_getattr_issues(result)
 
 
 def test_pytorch_zip_static_getattr_dynamic_base_lookup_keeps_s115(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _write_ultralytics_head_source(
+    _assert_static_getattr_source_s115(
         tmp_path,
         monkeypatch,
-        "def make_base():\n"
-        "    class Base:\n"
-        "        pass\n"
-        "    return Base\n\n"
-        "class Detect(make_base()):\n"
-        "    def forward(self):\n"
-        "        return None\n",
+        (
+            "def make_base():\n"
+            "    class Base:\n"
+            "        pass\n"
+            "    return Base\n\n"
+            "class Detect(make_base()):\n"
+            "    def forward(self):\n"
+            "        return None\n"
+        ),
     )
-    model_path = _write_getattr_reconstruction_zip(tmp_path, _static_getattr_reduce_payload())
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert _critical_s115_getattr_issues(result)
 
 
 def test_pytorch_zip_static_getattr_unresolved_base_lookup_keeps_s115(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _write_ultralytics_head_source(
-        tmp_path,
-        monkeypatch,
-        "class Detect(ExternalBase):\n    def forward(self):\n        return None\n",
+    _assert_static_getattr_source_s115(
+        tmp_path, monkeypatch, ("class Detect(ExternalBase):\n    def forward(self):\n        return None\n")
     )
-    model_path = _write_getattr_reconstruction_zip(tmp_path, _static_getattr_reduce_payload())
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert _critical_s115_getattr_issues(result)
 
 
 def test_pytorch_zip_static_getattr_inherited_metaclass_lookup_keeps_s115(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _write_ultralytics_head_source(
+    _assert_static_getattr_source_s115(
         tmp_path,
         monkeypatch,
-        "class DetectMeta(type):\n"
-        "    def __getattribute__(cls, name):\n"
-        "        return super().__getattribute__(name)\n\n"
-        "class Base(metaclass=DetectMeta):\n"
-        "    pass\n\n"
-        "class Detect(Base):\n"
-        "    def forward(self):\n"
-        "        return None\n",
+        (
+            "class DetectMeta(type):\n"
+            "    def __getattribute__(cls, name):\n"
+            "        return super().__getattribute__(name)\n\n"
+            "class Base(metaclass=DetectMeta):\n"
+            "    pass\n\n"
+            "class Detect(Base):\n"
+            "    def forward(self):\n"
+            "        return None\n"
+        ),
     )
-    model_path = _write_getattr_reconstruction_zip(tmp_path, _static_getattr_reduce_payload())
-
-    result = PyTorchZipScanner().scan(str(model_path))
-
-    assert _critical_s115_getattr_issues(result)
 
 
 def test_pytorch_zip_repository_inventory_marks_safetensors_available_without_local_file(tmp_path: Path) -> None:
@@ -18269,20 +16148,7 @@ def test_pytorch_zip_cve_2022_45907_version_check(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A vulnerable local runtime should trigger CVE-2022-45907."""
-    model_path = _create_pytorch_zip_with_framework_version(tmp_path / "model.pt", "2.10.0")
-    scanner = PyTorchZipScanner()
-    monkeypatch.setattr(scanner, "_get_installed_pytorch_version", lambda: "1.13.0")
-    result = scanner.scan(str(model_path))
-
-    cve_checks = [c for c in result.checks if "CVE-2022-45907" in c.name]
-    failed_checks = [c for c in cve_checks if c.status == CheckStatus.FAILED]
-    assert len(failed_checks) > 0, (
-        f"Should flag PyTorch 1.13.0 as vulnerable to CVE-2022-45907. "
-        f"Checks: {[(c.name, c.status) for c in result.checks]}"
-    )
-    assert failed_checks[0].details.get("detected_pytorch_version") == "1.13.0"
-    assert failed_checks[0].details.get("pytorch_version_source") == "local_environment"
-    _assert_standard_cve_details(failed_checks[0].details, "CVE-2022-45907", "1.13.0")
+    _assert_runtime_cve_version(tmp_path, monkeypatch, "1.13.0", "CVE-2022-45907")
 
 
 def test_pytorch_zip_cve_2022_45907_fixed_version(
@@ -18290,15 +16156,7 @@ def test_pytorch_zip_cve_2022_45907_fixed_version(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Fixed producer metadata should not trigger CVE-2022-45907."""
-    model_path = _create_pytorch_zip_with_framework_version(tmp_path / "model.pt", "1.13.1")
-    scanner = PyTorchZipScanner()
-    monkeypatch.setattr(scanner, "_get_installed_pytorch_version", lambda: None)
-    result = scanner.scan(str(model_path))
-
-    cve_failed = [c for c in result.checks if "CVE-2022-45907" in c.name and c.status == CheckStatus.FAILED]
-    assert len(cve_failed) == 0, (
-        f"PyTorch 1.13.1 should NOT trigger CVE-2022-45907. Failed checks: {[(c.name, c.message) for c in cve_failed]}"
-    )
+    _assert_fixed_cve_metadata(tmp_path, monkeypatch, "1.13.1", "CVE-2022-45907")
 
 
 # --- CVE-2024-5480 version check tests ---
@@ -18309,20 +16167,7 @@ def test_pytorch_zip_cve_2024_5480_version_check(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A vulnerable local runtime should trigger CVE-2024-5480."""
-    model_path = _create_pytorch_zip_with_framework_version(tmp_path / "model.pt", "2.10.0")
-    scanner = PyTorchZipScanner()
-    monkeypatch.setattr(scanner, "_get_installed_pytorch_version", lambda: "2.2.2")
-    result = scanner.scan(str(model_path))
-
-    cve_checks = [c for c in result.checks if "CVE-2024-5480" in c.name]
-    failed_checks = [c for c in cve_checks if c.status == CheckStatus.FAILED]
-    assert len(failed_checks) > 0, (
-        f"Should flag PyTorch 2.2.2 as vulnerable to CVE-2024-5480. "
-        f"Checks: {[(c.name, c.status) for c in result.checks]}"
-    )
-    assert failed_checks[0].details.get("detected_pytorch_version") == "2.2.2"
-    assert failed_checks[0].details.get("pytorch_version_source") == "local_environment"
-    _assert_standard_cve_details(failed_checks[0].details, "CVE-2024-5480", "2.2.2")
+    _assert_runtime_cve_version(tmp_path, monkeypatch, "2.2.2", "CVE-2024-5480")
 
 
 def test_pytorch_zip_cve_2024_5480_fixed_version(
@@ -18330,15 +16175,7 @@ def test_pytorch_zip_cve_2024_5480_fixed_version(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Fixed producer metadata should not trigger CVE-2024-5480."""
-    model_path = _create_pytorch_zip_with_framework_version(tmp_path / "model.pt", "2.2.3")
-    scanner = PyTorchZipScanner()
-    monkeypatch.setattr(scanner, "_get_installed_pytorch_version", lambda: None)
-    result = scanner.scan(str(model_path))
-
-    cve_failed = [c for c in result.checks if "CVE-2024-5480" in c.name and c.status == CheckStatus.FAILED]
-    assert len(cve_failed) == 0, (
-        f"PyTorch 2.2.3 should NOT trigger CVE-2024-5480. Failed checks: {[(c.name, c.message) for c in cve_failed]}"
-    )
+    _assert_fixed_cve_metadata(tmp_path, monkeypatch, "2.2.3", "CVE-2024-5480")
 
 
 # --- CVE-2024-48063 version check tests ---
@@ -18349,20 +16186,7 @@ def test_pytorch_zip_cve_2024_48063_version_check(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A vulnerable local runtime should trigger CVE-2024-48063."""
-    model_path = _create_pytorch_zip_with_framework_version(tmp_path / "model.pt", "2.10.0")
-    scanner = PyTorchZipScanner()
-    monkeypatch.setattr(scanner, "_get_installed_pytorch_version", lambda: "2.4.1")
-    result = scanner.scan(str(model_path))
-
-    cve_checks = [c for c in result.checks if "CVE-2024-48063" in c.name]
-    failed_checks = [c for c in cve_checks if c.status == CheckStatus.FAILED]
-    assert len(failed_checks) > 0, (
-        f"Should flag PyTorch 2.4.1 as vulnerable to CVE-2024-48063. "
-        f"Checks: {[(c.name, c.status) for c in result.checks]}"
-    )
-    assert failed_checks[0].details.get("detected_pytorch_version") == "2.4.1"
-    assert failed_checks[0].details.get("pytorch_version_source") == "local_environment"
-    _assert_standard_cve_details(failed_checks[0].details, "CVE-2024-48063", "2.4.1")
+    _assert_runtime_cve_version(tmp_path, monkeypatch, "2.4.1", "CVE-2024-48063")
 
 
 def test_pytorch_zip_cve_2024_48063_fixed_version(
@@ -18370,15 +16194,7 @@ def test_pytorch_zip_cve_2024_48063_fixed_version(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Fixed producer metadata should not trigger CVE-2024-48063."""
-    model_path = _create_pytorch_zip_with_framework_version(tmp_path / "model.pt", "2.5.0")
-    scanner = PyTorchZipScanner()
-    monkeypatch.setattr(scanner, "_get_installed_pytorch_version", lambda: None)
-    result = scanner.scan(str(model_path))
-
-    cve_failed = [c for c in result.checks if "CVE-2024-48063" in c.name and c.status == CheckStatus.FAILED]
-    assert len(cve_failed) == 0, (
-        f"PyTorch 2.5.0 should NOT trigger CVE-2024-48063. Failed checks: {[(c.name, c.message) for c in cve_failed]}"
-    )
+    _assert_fixed_cve_metadata(tmp_path, monkeypatch, "2.5.0", "CVE-2024-48063")
 
 
 def test_version_suffix_handling_for_cve_checks() -> None:
@@ -18410,3 +16226,435 @@ def test_version_suffix_handling_for_cve_checks() -> None:
 
     # Unknown suffix semantics -> conservative vulnerable
     assert scanner._is_vulnerable_pytorch_version_for("2.2.3foobar", 2, 2, 3) is True
+
+
+def _nested_zip_fixture(tmp_path: Path) -> tuple[Path, Path]:
+    nested_zip = tmp_path / "nested.zip"
+    with zipfile.ZipFile(nested_zip, "w") as archive:
+        archive.writestr("payload.pkl", _malicious_eval_pickle_payload())
+
+    zip_path = tmp_path / "nested_payload.pt"
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("version", "3")
+        zipf.writestr("data.pkl", pickle.dumps({"weights": [1, 2, 3]}, protocol=4))
+        zipf.write(nested_zip, "archive/nested.zip")
+    return nested_zip, zip_path
+
+
+def _assert_pytorch_late_typed_rule(tmp_path: Path, prefix: bytes, late_state: bytes, rule_code: str) -> None:
+    zip_path = tmp_path / "model.pt"
+    padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+    payload = b"\x00\xff" + prefix + padding + late_state + padding
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/payload.bin", payload)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    assert any(
+        check.name == "JIT/Script Code Execution Detection"
+        and check.status == CheckStatus.FAILED
+        and check.location == f"{zip_path}:archive/data/payload.bin"
+        and check.rule_code == rule_code
+        for check in result.checks
+    )
+
+
+def _record_nested_zip_scan(calls: list[str], /, path: str, config: dict[str, object] | None = None) -> ScanResult:
+    calls.append(path)
+    nested_result = ScanResult(scanner_name="zip")
+    nested_result.finish(success=True)
+    return nested_result
+
+
+def _assert_referenced_storage_critical(model_path: Path, storage_blob: bytes) -> None:
+    storage_blob += b" " * (-len(storage_blob) % 4)
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        zip_file.writestr("archive/data/0", storage_blob)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert "archive/data/0" in result.metadata["pickle_files"]
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
+        for issue in result.issues
+    )
+
+
+def _assert_static_getattr_source_s115(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source_text: str) -> None:
+    _write_ultralytics_head_source(
+        tmp_path,
+        monkeypatch,
+        source_text,
+    )
+    model_path = _write_getattr_reconstruction_zip(tmp_path, _static_getattr_reduce_payload())
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert _critical_s115_getattr_issues(result)
+
+
+def _assert_rebound_framework_subprocess(
+    tmp_path: Path,
+    model_path: Path,
+    marker: Path,
+    site_packages: Path,
+    script: str,
+    import_reference: str,
+) -> None:
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(model_path), str(marker)],
+        check=False,
+        env=_preimport_rebound_subprocess_env(tmp_path, site_packages),
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    output = json.loads(completed.stdout)
+    assert output["marker_before_unpickle"] is False
+    assert output["marker_after_unpickle"] is True
+    assert output["pickle_verdict"] in {"suspicious", "malicious"}
+    assert not (output["success"] is True and output["pickle_verdict"] == "clean" and not output["issues"])
+    assert any(
+        issue["rule_code"] == "NON_ALLOWLISTED_GLOBAL" and issue["import_reference"] == import_reference
+        for issue in output["issues"]
+    )
+
+
+def _assert_non_ascii_storage_key(tmp_path: Path, storage_key: str, filename: str, member_name: str) -> None:
+    payload = _pytorch_storage_persistent_id_payload(storage_key)
+    model_path = create_mock_pytorch_zip(tmp_path / filename, with_pickle=False)
+    with zipfile.ZipFile(model_path, "a") as zipf:
+        zipf.writestr("version", "3")
+        zipf.writestr("data.pkl", payload)
+        zipf.writestr(member_name, b"\x00" * 8)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert any(issue.details.get("pickle_rule_code") == "PERSISTENT_ID" for issue in result.issues)
+    assert not any(check.details.get("trusted_pytorch_archive_context") is True for check in result.checks)
+
+
+def _assert_truncated_encoded_extension(tmp_path: Path, filename: str, payload: bytes) -> None:
+    model_path = tmp_path / filename
+    storage_blob = payload
+    storage_blob += b" " * (-len(storage_blob) % 4)
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        zip_file.writestr("archive/data/0", storage_blob)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert result.success is False
+    assert "archive/data/0" in result.metadata["pickle_files"]
+
+
+def _assert_malformed_separator_noise(tmp_path: Path, filename: str, repetitions: int) -> None:
+    model_path = tmp_path / filename
+    storage_blob = b"N." + (b"c" * repetitions)
+    storage_blob += b" " * (-len(storage_blob) % 4)
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        zip_file.writestr("archive/data/0", storage_blob)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert result.success is True
+    assert result.metadata.get("pickle_verdict") == "clean"
+    assert result.metadata["pickle_files"] == ["archive/data.pkl"]
+    assert not any(issue.details.get("pickle_filename") == "archive/data/0" for issue in result.issues)
+
+
+def _assert_binary_literal_near_match(tmp_path: Path, filename: str, payload: bytes) -> None:
+    model_path = tmp_path / filename
+    storage_blob = payload
+    storage_blob += b" " * (-len(storage_blob) % 4)
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        zip_file.writestr("archive/data/0", storage_blob)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert not any(
+        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
+        for issue in result.issues
+    )
+
+
+def _assert_extensionless_pickle_selected(
+    tmp_path: Path, filename: str, member_name: str, expected_member: str, finding_member: str
+) -> None:
+    model_path = tmp_path / filename
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}, protocol=4))
+        zip_file.writestr(member_name, _malicious_proto0_system_payload())
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert result.metadata["pickle_files"] == ["archive/data.pkl", expected_member]
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == finding_member
+        for issue in result.issues
+    )
+
+
+def _assert_headerless_byte_near_match(tmp_path: Path, filename: str, payload: bytes, padding: bytes) -> None:
+    model_path = tmp_path / filename
+    storage_blob = payload
+    storage_blob += padding * (-len(storage_blob) % 4)
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        zip_file.writestr("archive/data/0", storage_blob)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert result.success is True
+    assert result.metadata.get("pickle_verdict") == "clean"
+    assert result.metadata["pickle_files"] == ["archive/data.pkl"]
+    assert not any(issue.details.get("pickle_filename") == "archive/data/0" for issue in result.issues)
+    assert not any(check.details.get("pickle_filename") == "archive/data/0" for check in result.checks)
+
+
+def _assert_conservative_process_source(tmp_path: Path, payload: bytes, pattern: str) -> None:
+    zip_path = tmp_path / "model.pt"
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/payload.bin", payload)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    jit_failures = [
+        check
+        for check in result.checks
+        if check.name == "JIT/Script Code Execution Detection" and check.status == CheckStatus.FAILED
+    ]
+    assert any(
+        check.location == f"{zip_path}:archive/data/payload.bin" and pattern in check.message for check in jit_failures
+    )
+
+
+def _assert_headerless_opcode_near_match(tmp_path: Path, storage_blob: bytes, filename: str) -> None:
+    model_path = tmp_path / filename
+    storage_blob += b"\x00" * (-len(storage_blob) % 4)
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        zip_file.writestr("archive/data/0", storage_blob)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert result.success is True
+    assert result.metadata.get("pickle_verdict") == "clean"
+    assert result.metadata["pickle_files"] == ["archive/data.pkl"]
+    assert not any(issue.details.get("pickle_filename") == "archive/data/0" for issue in result.issues)
+    assert not any(check.details.get("pickle_filename") == "archive/data/0" for check in result.checks)
+
+
+def _assert_forwarded_native_load(tmp_path: Path, prefix: bytes, suffix: bytes) -> None:
+    zip_path = tmp_path / "model.pt"
+    padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+    payload = prefix + padding + suffix + padding
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/payload.bin", payload)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    assert any(
+        check.name == "JIT/Script Code Execution Detection"
+        and check.status == CheckStatus.FAILED
+        and check.location == f"{zip_path}:archive/data/payload.bin"
+        and check.rule_code == "S110"
+        for check in result.checks
+    )
+
+
+def _assert_storage_padding_clean(tmp_path: Path, filename: str, padding: bytes, padding_size: int) -> None:
+    model_path = tmp_path / filename
+    storage_blob = b"N." + (padding * padding_size)
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage_blob))
+        zip_file.writestr("archive/data/0", storage_blob)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert result.success is True
+    assert result.metadata.get("pickle_verdict") == "clean"
+    assert result.metadata["pickle_files"] == ["archive/data.pkl"]
+    assert not any(issue.details.get("pickle_filename") == "archive/data/0" for issue in result.issues)
+
+
+def _assert_decorated_torchscript_stub(
+    tmp_path: Path, decorator_line: str, class_line: str, parameters_line: str, buffers_line: str
+) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "model.pt", prefix="archive")
+    source_path = "archive/code/__torch__/payload.py"
+    with zipfile.ZipFile(model_path, "a") as zip_file:
+        zip_file.writestr(
+            source_path,
+            "\n".join(
+                [
+                    decorator_line,
+                    class_line,
+                    parameters_line,
+                    buffers_line,
+                    "  def forward(self: __torch__.Payload,",
+                    "    x: Tensor) -> Tensor:",
+                    "    return x",
+                    "",
+                ]
+            ),
+        )
+        zip_file.writestr(
+            "archive/code/__torch__/payload.py.debug_pkl",
+            b"\x80\x02X\x18\x00\x00\x00FORMAT_WITH_STRING_TABLEq\x00.",
+        )
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    python_failures = [
+        check
+        for check in result.checks
+        if check.name == "Python Code File Detection" and check.status == CheckStatus.FAILED
+    ]
+    assert any(check.details.get("file") == source_path for check in python_failures)
+    assert all(check.severity == IssueSeverity.WARNING for check in python_failures)
+
+
+def _assert_inexact_torchscript_pair(tmp_path: Path, filename: str, case_source_path: str, debug_path: str) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / filename, prefix="archive")
+    source_path = case_source_path
+    debug_pkl = b"\x80\x02X\x18\x00\x00\x00FORMAT_WITH_STRING_TABLEq\x00."
+    with zipfile.ZipFile(model_path, "a") as zip_file:
+        zip_file.writestr(
+            source_path,
+            "\n".join(
+                [
+                    "class Payload(Module):",
+                    "  __parameters__ = []",
+                    "  __buffers__ = []",
+                    "  def forward(self: __torch__.Payload,",
+                    "    x: Tensor) -> Tensor:",
+                    "    return x",
+                    "",
+                ]
+            ),
+        )
+        zip_file.writestr(debug_path, debug_pkl)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    python_failures = [
+        check
+        for check in result.checks
+        if check.name == "Python Code File Detection" and check.status == CheckStatus.FAILED
+    ]
+    assert any(check.details.get("file") == source_path for check in python_failures)
+    assert any(
+        issue.location == f"{model_path}:{source_path}" and issue.severity == IssueSeverity.WARNING
+        for issue in result.issues
+    )
+
+
+def _assert_framed_pickle_without_pattern(tmp_path: Path, payload_source: bytes, pattern: str) -> None:
+    zip_path = tmp_path / "model.pt"
+    payload = payload_source
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/payload.bin", payload)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    assert not any(
+        check.name == "JIT/Script Code Execution Detection"
+        and check.status == CheckStatus.FAILED
+        and pattern in check.message
+        for check in result.checks
+    )
+
+
+def _assert_torchscript_stub_warning(tmp_path: Path, parameters_line: str, buffers_line: str, return_line: str) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "model.pt", prefix="archive")
+    source_path = "archive/code/__torch__/payload.py"
+    with zipfile.ZipFile(model_path, "a") as zip_file:
+        zip_file.writestr(
+            source_path,
+            "\n".join(
+                [
+                    "class Payload(Module):",
+                    parameters_line,
+                    buffers_line,
+                    "  def forward(self: __torch__.Payload,",
+                    "    x: Tensor) -> Tensor:",
+                    return_line,
+                    "",
+                ]
+            ),
+        )
+        zip_file.writestr(
+            "archive/code/__torch__/payload.py.debug_pkl",
+            b"\x80\x02X\x18\x00\x00\x00FORMAT_WITH_STRING_TABLEq\x00.",
+        )
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    python_failures = [
+        check
+        for check in result.checks
+        if check.name == "Python Code File Detection" and check.status == CheckStatus.FAILED
+    ]
+    assert any(check.details.get("file") == source_path for check in python_failures)
+    assert all(check.severity == IssueSeverity.WARNING for check in python_failures)
+
+
+def _assert_fixed_cve_metadata(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version: str, cve_id: str) -> None:
+    model_path = _create_pytorch_zip_with_framework_version(tmp_path / "model.pt", version)
+    scanner = PyTorchZipScanner()
+    monkeypatch.setattr(scanner, "_get_installed_pytorch_version", lambda: None)
+    result = scanner.scan(str(model_path))
+    cve_failed = [c for c in result.checks if cve_id in c.name and c.status == CheckStatus.FAILED]
+    assert len(cve_failed) == 0, (
+        f"PyTorch {version} should NOT trigger {cve_id}. Failed checks: {[(c.name, c.message) for c in cve_failed]}"
+    )
+
+
+def _assert_runtime_cve_version(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version: str, cve_id: str) -> None:
+    model_path = _create_pytorch_zip_with_framework_version(tmp_path / "model.pt", "2.10.0")
+    scanner = PyTorchZipScanner()
+    monkeypatch.setattr(scanner, "_get_installed_pytorch_version", lambda: version)
+    result = scanner.scan(str(model_path))
+    cve_checks = [c for c in result.checks if cve_id in c.name]
+    failed_checks = [c for c in cve_checks if c.status == CheckStatus.FAILED]
+    assert len(failed_checks) > 0, (
+        f"Should flag PyTorch {version} as vulnerable to {cve_id}. "
+        f"Checks: {[(c.name, c.status) for c in result.checks]}"
+    )
+    assert failed_checks[0].details.get("detected_pytorch_version") == version
+    assert failed_checks[0].details.get("pytorch_version_source") == "local_environment"
+    _assert_standard_cve_details(failed_checks[0].details, cve_id, version)
+
+
+def _unavailable_distributions(*args: object, **kwargs: object) -> Iterator[object]:
+    del args, kwargs
+    raise RuntimeError("metadata unavailable")

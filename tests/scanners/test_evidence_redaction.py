@@ -17,6 +17,7 @@ from modelaudit.scanners._evidence_redaction import (
     redact_evidence_value,
     redact_untrusted_error_message,
 )
+from tests.helpers.assertions import _assert_absent, _assert_present
 
 
 @pytest.mark.parametrize(
@@ -126,8 +127,7 @@ def test_redacts_multiline_secret_assignments() -> None:
     redacted = redact_evidence_string(text, max_chars=None)
 
     assert "MULTILINESECRET123" not in redacted
-    assert f'private_key = """{REDACTED_EVIDENCE_VALUE}"""' in redacted
-    assert "os.system" in redacted
+    _assert_present(redacted, f'private_key = """{REDACTED_EVIDENCE_VALUE}"""', "os.system")
 
 
 def test_redacts_escaped_quote_secret_assignments() -> None:
@@ -137,8 +137,7 @@ def test_redacts_escaped_quote_secret_assignments() -> None:
     redacted = redact_evidence_string(text, max_chars=None)
 
     assert "ESCAPEDSECRET123" not in redacted
-    assert f'api_key = "{REDACTED_EVIDENCE_VALUE}"' in redacted
-    assert "os.system" in redacted
+    _assert_present(redacted, f'api_key = "{REDACTED_EVIDENCE_VALUE}"', "os.system")
 
 
 def test_redacts_prefixed_string_literal_secret_assignments() -> None:
@@ -147,9 +146,7 @@ def test_redacts_prefixed_string_literal_secret_assignments() -> None:
 
     redacted = redact_evidence_string(text, max_chars=None)
 
-    assert "RAWSECRET123" not in redacted
-    assert "BYTESECRET456" not in redacted
-    assert "MAPSECRET789" not in redacted
+    _assert_absent(redacted, "RAWSECRET123", "BYTESECRET456", "MAPSECRET789")
     assert f'api_key = r"{REDACTED_EVIDENCE_VALUE}"' in redacted
     assert f'headers["Authorization"] = b"{REDACTED_EVIDENCE_VALUE}"' in redacted
     assert f'"client_secret": f"{REDACTED_EVIDENCE_VALUE}"' in redacted
@@ -188,7 +185,8 @@ def test_redacts_proxy_and_camel_case_auth_scheme_assignments() -> None:
 
     redacted = redact_evidence_string(text, max_chars=None)
 
-    for secret in (
+    _assert_absent(
+        redacted,
         "PROXYAUTHSECRET1234567890",
         "PASCALPROXYSECRET1234567890",
         "XAPIKEYSECRET1234567890",
@@ -196,8 +194,7 @@ def test_redacts_proxy_and_camel_case_auth_scheme_assignments() -> None:
         "HEADERPROXYSECRET1234567890",
         "SPACEDPROXYSECRET1234567890",
         "MAPPINGPROXYSECRET1234567890",
-    ):
-        assert secret not in redacted
+    )
     assert "proxyAuthorization: <redacted>" in redacted
     assert "ProxyAuthorization = <redacted>" in redacted
     assert "XApiKey: <redacted>" in redacted
@@ -218,9 +215,7 @@ def test_redacts_punctuated_auth_scheme_credentials() -> None:
 
     redacted = redact_evidence_string(text, max_chars=None)
 
-    assert "COLON:SECRET123456" not in redacted
-    assert "BANG!SECRET123456" not in redacted
-    assert "PERCENT%SECRET123456" not in redacted
+    _assert_absent(redacted, "COLON:SECRET123456", "BANG!SECRET123456", "PERCENT%SECRET123456")
     assert f"apiKey = {REDACTED_EVIDENCE_VALUE}" in redacted
     assert f"customToken = {REDACTED_EVIDENCE_VALUE}" in redacted
     assert f"authToken = {REDACTED_EVIDENCE_VALUE}" in redacted
@@ -496,8 +491,7 @@ def test_redacts_parameterized_authorization_inside_python_string() -> None:
     redacted = redact_evidence_string(text, max_chars=None)
 
     assert "DIGESTSECRET123456" not in redacted
-    assert "Authorization: <redacted>" in redacted
-    assert 'eval("payload")' in redacted
+    _assert_present(redacted, "Authorization: <redacted>", 'eval("payload")')
     ast.parse(redacted)
 
 
@@ -527,8 +521,7 @@ def test_redacts_parameterized_authorization_split_across_explicit_string_concat
     redacted = redact_evidence_string(text, max_chars=None)
 
     assert "CONCATSECRET123456" not in redacted
-    assert f"Authorization: {REDACTED_EVIDENCE_VALUE}" in redacted
-    assert 'eval("payload")' in redacted
+    _assert_present(redacted, f"Authorization: {REDACTED_EVIDENCE_VALUE}", 'eval("payload")')
     ast.parse(redacted)
 
 
@@ -629,8 +622,7 @@ def test_redacts_parameterized_authorization_dynamic_fstring_without_hiding_suff
     redacted = redact_evidence_string(text, max_chars=None)
 
     assert "{secret}" not in redacted
-    assert "{eval(" in redacted
-    assert 'print("done")' in redacted
+    _assert_present(redacted, "{eval(", 'print("done")')
     ast.parse(redacted)
 
 
@@ -640,8 +632,7 @@ def test_redacts_parameterized_authorization_in_fstring_with_escaped_braces() ->
     redacted = redact_evidence_string(text, max_chars=None)
 
     assert "secret" not in redacted
-    assert f"Authorization: {REDACTED_EVIDENCE_VALUE}" in redacted
-    assert 'eval("payload")' in redacted
+    _assert_present(redacted, f"Authorization: {REDACTED_EVIDENCE_VALUE}", 'eval("payload")')
     ast.parse(redacted)
 
 
@@ -655,8 +646,7 @@ def test_redacts_multiple_python_authorization_literals_in_source_order() -> Non
 
     redacted = redact_evidence_string(text, max_chars=None)
 
-    for secret in ("KEYSECRET111111", "VALUESECRET222222", "KEYSECRET333333", "VALUESECRET444444"):
-        assert secret not in redacted
+    _assert_absent(redacted, "KEYSECRET111111", "VALUESECRET222222", "KEYSECRET333333", "VALUESECRET444444")
     assert redacted.count("Authorization: <redacted>") == 4
     assert 'eval("payload")' in redacted
     ast.parse(redacted)
@@ -664,15 +654,13 @@ def test_redacts_multiple_python_authorization_literals_in_source_order() -> Non
 
 def test_preserves_camel_case_credential_control_near_matches() -> None:
     """Credential-looking counters and controls should not be treated as secrets."""
-    text = (
+    _assert_evidence_unchanged(
         "xApiKeyCount = 2; xApiKeyCounter = 3; xApiKeyCount2 = 4; apiKeyTimeout = 30; "
         "myApiKeyTimeoutMs = 60; clientSecretStatus = 'present'; sessionTokenEnabled = True; "
         "sessionTokenEnabledFlag = False; proxyAuthorizationEnabled = True; "
         "ModelAccessTokenEndpoint = https://evil.example/token; "
         "RequestSignatureAlgorithm = https://evil.example/payload.sh; tokenizer = 'visible'; eval('1')"
     )
-
-    assert redact_evidence_string(text, max_chars=None) == text
 
 
 def test_redacts_escaped_json_mapping_secret_values() -> None:
@@ -682,8 +670,7 @@ def test_redacts_escaped_json_mapping_secret_values() -> None:
     redacted = redact_evidence_string(text, max_chars=None)
 
     assert "ESCAPEDJSONSECRET123" not in redacted
-    assert r"\"api_key\":\"<redacted>\"" in redacted
-    assert r"\"safe\":\"ok\"" in redacted
+    _assert_present(redacted, r"\"api_key\":\"<redacted>\"", r"\"safe\":\"ok\"")
 
 
 def test_redacts_camel_case_secret_assignments() -> None:
@@ -718,9 +705,7 @@ def test_redacts_non_scalar_sensitive_mapping_values() -> None:
 
     redacted = redact_evidence_string(text, max_chars=None)
 
-    assert "ARRAYSECRET123" not in redacted
-    assert "OBJECTSECRET456" not in redacted
-    assert "BLOCKSECRET789" not in redacted
+    _assert_absent(redacted, "ARRAYSECRET123", "OBJECTSECRET456", "BLOCKSECRET789")
     assert f'"api_key": {REDACTED_EVIDENCE_VALUE}' in redacted
     assert f'"clientSecret": {REDACTED_EVIDENCE_VALUE}' in redacted
     assert f"api_key: |\n  {REDACTED_EVIDENCE_VALUE}" in redacted
@@ -737,9 +722,7 @@ def test_redacts_parenthesized_quoted_secret_assignments() -> None:
 
     redacted = redact_evidence_string(text, max_chars=None)
 
-    assert "PARENSECRET123" not in redacted
-    assert "HEADERSECRET456" not in redacted
-    assert "MAPSECRET789" not in redacted
+    _assert_absent(redacted, "PARENSECRET123", "HEADERSECRET456", "MAPSECRET789")
     assert f'api_key = ("{REDACTED_EVIDENCE_VALUE}")' in redacted
     assert f'headers["Authorization"] = (\n  "{REDACTED_EVIDENCE_VALUE}"\n)' in redacted
     assert f'"clientSecret": ("{REDACTED_EVIDENCE_VALUE}")' in redacted
@@ -765,9 +748,7 @@ def test_redacts_subscripted_and_mapping_secret_assignments() -> None:
 
     redacted = redact_evidence_string(text, max_chars=None)
 
-    assert "ENVSECRET123" not in redacted
-    assert "HEADERSECRET456" not in redacted
-    assert "MAPSECRET789" not in redacted
+    _assert_absent(redacted, "ENVSECRET123", "HEADERSECRET456", "MAPSECRET789")
     assert 'os.environ["API_KEY"] = "<redacted>"' in redacted
     assert 'headers["Authorization"] = "<redacted>"' in redacted
     assert '"client_secret": "<redacted>"' in redacted
@@ -863,10 +844,8 @@ def test_redacts_nested_bracketed_and_json_sensitive_query_parameters() -> None:
 
     redacted = redact_evidence_string(text, max_chars=None)
 
-    assert "NESTEDARRAYSECRET123" not in redacted
-    assert "JSONSECRET456" not in redacted
-    assert "redirect=<redacted>" in redacted
-    assert "payload=<redacted>" in redacted
+    _assert_absent(redacted, "NESTEDARRAYSECRET123", "JSONSECRET456")
+    _assert_present(redacted, "redirect=<redacted>", "payload=<redacted>")
 
 
 def test_redacts_credentials_inside_nested_redirect_urls() -> None:
@@ -905,11 +884,8 @@ def test_redacts_bracketed_sensitive_query_parameters() -> None:
 
     redacted = redact_evidence_string(text, max_chars=None)
 
-    assert "ARRAYSECRET123" not in redacted
-    assert "INDEXSECRET456" not in redacted
-    assert "api_key%5B%5D=<redacted>" in redacted
-    assert "token%5B0%5D=<redacted>" in redacted
-    assert "ok=1" in redacted
+    _assert_absent(redacted, "ARRAYSECRET123", "INDEXSECRET456")
+    _assert_present(redacted, "api_key%5B%5D=<redacted>", "token%5B0%5D=<redacted>", "ok=1")
 
 
 def test_redacts_malformed_userinfo_url() -> None:
@@ -975,10 +951,8 @@ def test_redacts_encoded_assignments_used_as_query_keys() -> None:
 
     redacted = redact_evidence_string(text, max_chars=None)
 
-    assert "QUERYKEYSECRET123" not in redacted
-    assert "AUTHKEYSECRET456" not in redacted
-    assert "?token=<redacted>" in redacted
-    assert "?authorization=<redacted>" in redacted
+    _assert_absent(redacted, "QUERYKEYSECRET123", "AUTHKEYSECRET456")
+    _assert_present(redacted, "?token=<redacted>", "?authorization=<redacted>")
 
 
 def test_redacts_prefixed_iteratively_encoded_query_assignments() -> None:
@@ -1149,10 +1123,8 @@ def test_redacts_legacy_access_identifier_assignments() -> None:
 
     redacted = redact_evidence_string(text, max_chars=None)
 
-    assert "AKIAEXAMPLEACCESSKEY" not in redacted
-    assert "service-account" not in redacted
-    assert "AWSAccessKeyId=<redacted>" in redacted
-    assert "google_access_id=<redacted>" in redacted
+    _assert_absent(redacted, "AKIAEXAMPLEACCESSKEY", "service-account")
+    _assert_present(redacted, "AWSAccessKeyId=<redacted>", "google_access_id=<redacted>")
 
 
 @pytest.mark.parametrize(
@@ -1259,9 +1231,7 @@ def test_preserves_deeply_percent_encoded_benign_value_within_decode_budget() ->
     ],
 )
 def test_preserves_standalone_secret_near_matches(near_match: str) -> None:
-    text = f"prefix {near_match} suffix"
-
-    assert redact_evidence_string(text, max_chars=None) == text
+    _assert_evidence_unchanged(f"prefix {near_match} suffix")
 
 
 def test_existing_token_assignment_redaction_still_applies() -> None:
@@ -1279,10 +1249,8 @@ def test_redacts_r_assignment_operators() -> None:
         max_chars=500,
     )
 
-    assert "R_TOKEN_SECRET" not in redacted
-    assert "R_PASSWORD_SECRET" not in redacted
-    assert f"token <- '{REDACTED_EVIDENCE_VALUE}'" in redacted
-    assert f"password <<- {REDACTED_EVIDENCE_VALUE}" in redacted
+    _assert_absent(redacted, "R_TOKEN_SECRET", "R_PASSWORD_SECRET")
+    _assert_present(redacted, f"token <- '{REDACTED_EVIDENCE_VALUE}'", f"password <<- {REDACTED_EVIDENCE_VALUE}")
 
 
 def test_redacts_access_identifier_r_assignments() -> None:
@@ -1341,10 +1309,8 @@ def test_redacts_r_equals_assignments_for_quoted_identifiers_and_raw_values() ->
         max_chars=500,
     )
 
-    assert "BACKTICK_EQUALS_SECRET" not in redacted
-    assert "RAW_EQUALS_SECRET" not in redacted
-    assert f'`access token` = "{REDACTED_EVIDENCE_VALUE}"' in redacted
-    assert f"token = {REDACTED_EVIDENCE_VALUE}" in redacted
+    _assert_absent(redacted, "BACKTICK_EQUALS_SECRET", "RAW_EQUALS_SECRET")
+    _assert_present(redacted, f'`access token` = "{REDACTED_EVIDENCE_VALUE}"', f"token = {REDACTED_EVIDENCE_VALUE}")
 
 
 def test_redacts_prefixed_camel_case_r_assignments() -> None:
@@ -1356,14 +1322,14 @@ def test_redacts_prefixed_camel_case_r_assignments() -> None:
         max_chars=500,
     )
 
-    for secret in (
+    _assert_absent(
+        redacted,
         "DB_PASSWORD_SECRET",
         "SESSION_TOKEN_SECRET",
         "GITHUB_TOKEN_SECRET",
         "BACKTICK_CAMEL_SECRET",
         "PWD_SECRET",
-    ):
-        assert secret not in redacted
+    )
     assert f'dbPassword <- "{REDACTED_EVIDENCE_VALUE}"' in redacted
     assert f'sessionToken <<- "{REDACTED_EVIDENCE_VALUE}"' in redacted
     assert f'githubToken <- "{REDACTED_EVIDENCE_VALUE}"' in redacted
@@ -1381,15 +1347,15 @@ def test_redacts_dotted_r_assignments_and_raw_strings() -> None:
         max_chars=700,
     )
 
-    for secret in (
+    _assert_absent(
+        redacted,
         "DOT_LEFT_SECRET",
         "DOT_RIGHT_SECRET",
         "RAW_LEFT_SECRET",
         "RAW_RIGHT_SECRET",
         "QUOTED_NAME_SECRET",
         "QUOTED_RAW_SECRET",
-    ):
-        assert secret not in redacted
+    )
     assert "raw values may contain" not in redacted
     assert f'api.key <- "{REDACTED_EVIDENCE_VALUE}"' in redacted
     assert f'"{REDACTED_EVIDENCE_VALUE}" -> access.token' in redacted
@@ -1409,14 +1375,9 @@ def test_redacts_r_indexed_member_and_slot_assignment_targets() -> None:
         max_chars=700,
     )
 
-    for secret in (
-        "INDEXED_SECRET",
-        "MEMBER_SECRET",
-        "SLOT_SECRET",
-        "SUBSCRIPT_SECRET",
-        "RIGHT_MEMBER_SECRET",
-    ):
-        assert secret not in redacted
+    _assert_absent(
+        redacted, "INDEXED_SECRET", "MEMBER_SECRET", "SLOT_SECRET", "SUBSCRIPT_SECRET", "RIGHT_MEMBER_SECRET"
+    )
     assert f'token[1] <- "{REDACTED_EVIDENCE_VALUE}"' in redacted
     assert f'config$token <- "{REDACTED_EVIDENCE_VALUE}"' in redacted
     assert f'config@password <- "{REDACTED_EVIDENCE_VALUE}"' in redacted
@@ -1572,9 +1533,7 @@ def test_long_python_return_annotation_is_not_treated_as_r_assignment() -> None:
 
 def test_python_raw_default_is_not_treated_as_r_assignment() -> None:
     """Parseable Python containing a raw string should retain its return annotation."""
-    text = 'def handler(value=r"(VISIBLE)") -> token:\n    return value'
-
-    assert redact_evidence_string(text, max_chars=None) == text
+    _assert_evidence_unchanged('def handler(value=r"(VISIBLE)") -> token:\n    return value')
 
 
 def test_large_rightward_assignment_evidence_avoids_pathological_backtracking() -> None:
@@ -1594,8 +1553,7 @@ def test_many_raw_assignments_are_redacted_in_one_pass() -> None:
 
     redacted = redact_evidence_string(text, max_chars=len(text) * 2)
 
-    assert "RAW_SECRET_0000" not in redacted
-    assert "RAW_SECRET_1999" not in redacted
+    _assert_absent(redacted, "RAW_SECRET_0000", "RAW_SECRET_1999")
     assert redacted.count(REDACTED_EVIDENCE_VALUE) == 2_000
 
 
@@ -1605,8 +1563,7 @@ def test_many_rightward_assignments_are_redacted_in_one_pass() -> None:
 
     redacted = redact_evidence_string(text, max_chars=len(text) * 2)
 
-    assert "RIGHTWARD_SECRET_0000" not in redacted
-    assert "RIGHTWARD_SECRET_1999" not in redacted
+    _assert_absent(redacted, "RIGHTWARD_SECRET_0000", "RIGHTWARD_SECRET_1999")
     assert redacted.count(REDACTED_EVIDENCE_VALUE) == 2_000
 
 
@@ -1833,8 +1790,7 @@ def test_redacts_authorization_aliases_in_specialized_string_contexts() -> None:
 
     redacted = redact_evidence_string(text, max_chars=None)
 
-    for secret in (subscript_secret, r_left_secret, r_right_secret, unterminated_secret):
-        assert secret not in redacted
+    _assert_absent(redacted, subscript_secret, r_left_secret, r_right_secret, unterminated_secret)
     assert 'headers["proxyAuthorization"] = "<redacted>"' in redacted
     assert 'headers$proxyAuthorization <- "<redacted>"' in redacted
     assert '"<redacted>" -> headers$proxyAuthorization' in redacted
@@ -2579,10 +2535,8 @@ def test_redacts_python_container_secret_assignments() -> None:
 
     redacted = redact_evidence_string(text, max_chars=500)
 
-    assert "ENVSECRET123" not in redacted
-    assert "DICTSECRET456" not in redacted
-    assert 'os.environ["AWS_SECRET_ACCESS_KEY"] = "<redacted>"' in redacted
-    assert '{"client_secret": "<redacted>"}' in redacted
+    _assert_absent(redacted, "ENVSECRET123", "DICTSECRET456")
+    _assert_present(redacted, 'os.environ["AWS_SECRET_ACCESS_KEY"] = "<redacted>"', '{"client_secret": "<redacted>"}')
 
 
 def test_redacts_expression_and_authorization_assignments_without_losing_code_context() -> None:
@@ -2627,8 +2581,7 @@ def test_unparseable_expression_assignment_redacts_complete_rhs() -> None:
     redacted = redact_evidence_string(text, max_chars=500)
 
     assert secret not in redacted
-    assert "client_secret = <redacted>" in redacted
-    assert 'eval("1 + 1")' in redacted
+    _assert_present(redacted, "client_secret = <redacted>", 'eval("1 + 1")')
 
 
 def test_expression_redaction_preserves_annotations_and_argument_boundaries() -> None:
@@ -2656,9 +2609,7 @@ def test_expression_redaction_preserves_annotations_and_argument_boundaries() ->
 
 def test_preserves_python_return_annotation_named_token() -> None:
     """Python return annotations must not be mistaken for R rightward assignments."""
-    text = "def build() -> token:\n    return visible"
-
-    assert redact_evidence_string(text, max_chars=None) == text
+    _assert_evidence_unchanged("def build() -> token:\n    return visible")
 
 
 def test_unparseable_continued_sensitive_assignment_redacts_complete_rhs() -> None:
@@ -2669,8 +2620,7 @@ def test_unparseable_continued_sensitive_assignment_redacts_complete_rhs() -> No
     redacted = redact_evidence_string(text, max_chars=500)
 
     assert secret not in redacted
-    assert "client_secret = <redacted>" in redacted
-    assert 'eval("1 + 1")' in redacted
+    _assert_present(redacted, "client_secret = <redacted>", 'eval("1 + 1")')
 
 
 def test_unparseable_annotated_sensitive_assignment_redacts_literal() -> None:
@@ -2712,8 +2662,7 @@ def test_unparseable_compound_sensitive_assignment_redacts_literal() -> None:
     redacted = redact_evidence_string(text, max_chars=500)
 
     assert secret not in redacted
-    assert "token += <redacted>" in redacted
-    assert 'eval("1 + 1")' in redacted
+    _assert_present(redacted, "token += <redacted>", 'eval("1 + 1")')
 
 
 def test_redacts_bytes_keyed_and_walrus_sensitive_assignments() -> None:
@@ -2727,9 +2676,7 @@ def test_redacts_bytes_keyed_and_walrus_sensitive_assignments() -> None:
 
     redacted = redact_evidence_string(text, max_chars=None)
 
-    assert "BYTESECRET1234567890" not in redacted
-    assert "AUTHSECRET1234567890" not in redacted
-    assert "WALRUSSECRET1234567890" not in redacted
+    _assert_absent(redacted, "BYTESECRET1234567890", "AUTHSECRET1234567890", "WALRUSSECRET1234567890")
     assert 'os.environb[b"AWS_SECRET_ACCESS_KEY"] = <redacted>' in redacted
     assert 'headers[b"Authorization"] = <redacted>' in redacted
     assert "token := <redacted>" in redacted
@@ -2746,8 +2693,7 @@ def test_redacts_prefixed_camel_case_secret_assignments() -> None:
 
     redacted = redact_evidence_string(text, max_chars=None)
 
-    assert "AWSSECRET1234567890" not in redacted
-    assert "AZURESECRET1234567890" not in redacted
+    _assert_absent(redacted, "AWSSECRET1234567890", "AZURESECRET1234567890")
     assert 'awsSecretAccessKey = "<redacted>"' in redacted
     assert 'azureClientSecret = "<redacted>"' in redacted
     assert 'awsSecretsManagerRegion = "us-east-1"' in redacted
@@ -2763,8 +2709,7 @@ def test_redacts_unpacking_assignments_and_preserves_lambda_context() -> None:
 
     redacted = redact_evidence_string(text, max_chars=None)
 
-    assert "UNPACKSECRET1234567890" not in redacted
-    assert "LAMBDASECRET1234567890" not in redacted
+    _assert_absent(redacted, "UNPACKSECRET1234567890", "LAMBDASECRET1234567890")
     assert "api_key, other = <redacted>" in redacted
     assert 'safe, visible = "left", "right"' in redacted
     assert 'lambda api_key="<redacted>": eval("1 + 1")' in redacted
@@ -2782,9 +2727,7 @@ def test_redacts_sensitive_setter_call_values() -> None:
 
     redacted = redact_evidence_string(text, max_chars=None)
 
-    assert "PUTENVSECRET1234567890" not in redacted
-    assert "SETATTRSECRET1234567890" not in redacted
-    assert "DEFAULTSECRET1234567890" not in redacted
+    _assert_absent(redacted, "PUTENVSECRET1234567890", "SETATTRSECRET1234567890", "DEFAULTSECRET1234567890")
     assert 'os.putenv("AWS_SECRET_ACCESS_KEY", <redacted>)' in redacted
     assert 'setattr(config, "api_key", <redacted>)' in redacted
     assert 'headers.setdefault("Authorization", <redacted>)' in redacted
@@ -2806,13 +2749,9 @@ def test_redacts_embedded_name_value_credentials_and_generic_calls() -> None:
 
     redacted = redact_evidence_string(text, max_chars=None)
 
-    for secret in (
-        "DICTSECRET1234567890",
-        "KEYDICTSECRET1234567890",
-        "CALLSECRET1234567890",
-        "KEYCALLSECRET1234567890",
-    ):
-        assert secret not in redacted
+    _assert_absent(
+        redacted, "DICTSECRET1234567890", "KEYDICTSECRET1234567890", "CALLSECRET1234567890", "KEYCALLSECRET1234567890"
+    )
     assert '"name": "api_key", "value": <redacted>' in redacted
     assert '"key": "client_secret", "value": <redacted>' in redacted
     assert 'Credential(name="api_key", value=<redacted>)' in redacted
@@ -2913,8 +2852,7 @@ def test_redacts_acronym_prefixed_sensitive_assignments() -> None:
 
     redacted = redact_evidence_string(text, max_chars=None)
 
-    assert "AWSACRONYMSECRET1234567890" not in redacted
-    assert "DBACRONYMSECRET1234567890" not in redacted
+    _assert_absent(redacted, "AWSACRONYMSECRET1234567890", "DBACRONYMSECRET1234567890")
     assert "AWSAccessKeyId = <redacted>" in redacted
     assert "DBPassword = <redacted>" in redacted
     assert 'DBPasswordlessMode = "enabled"' in redacted
@@ -2967,13 +2905,13 @@ def test_sensitive_keyed_calls_preserve_dangerous_value_operations() -> None:
 
     redacted = redact_evidence_string(text, max_chars=None)
 
-    for secret in (
+    _assert_absent(
+        redacted,
         "GETTERSECRET1234567890",
         "SETTERSECRET1234567890",
         "COMPILESECRET1234567890",
         "OPTIONSECRET1234567890",
-    ):
-        assert secret not in redacted
+    )
     assert 'os.getenv("CLIENT_SECRET", eval("<redacted>"))' in redacted
     assert 'headers.setdefault("api_key", exec("<redacted>"))' in redacted
     assert 'Field(key="client_secret", value=compile("<redacted>", "<redacted>", "<redacted>"))' in redacted
@@ -3045,13 +2983,13 @@ def test_redacts_non_operator_sensitive_comparisons_without_losing_context() -> 
 
     redacted = redact_evidence_string(text, max_chars=None)
 
-    for secret in (
+    _assert_absent(
+        redacted,
         "DIGESTSECRET1234567890",
         "REVERSEDIGESTSECRET1234567890",
         "PREFIXSECRET1234567890",
         "MATCHSECRET1234567890",
-    ):
-        assert secret not in redacted
+    )
     assert 'hmac.compare_digest(api_key, "<redacted>")' in redacted
     assert 'hmac.compare_digest("<redacted>", client_secret)' in redacted
     assert 'api_key.startswith("<redacted>")' in redacted
@@ -3096,15 +3034,13 @@ def test_redacts_sensitive_fstring_interpolations_without_losing_calls() -> None
 
 def test_python_annotations_and_block_headers_are_not_assignments() -> None:
     """Credential-shaped Python targets must not erase annotations or block bodies."""
-    text = (
+    _assert_evidence_unchanged(
         'api_key: str\ncredentials: "CredentialStore"\n'
         'def handle(api_key: str, authorization: "Header"):\n    eval("1")\n'
         'with open("visible") as api_key:\n    exec("2")\n'
         'class credentials:\n    marker = "visible"\n'
         'for api_key in values:\n    compile("3", "visible", "exec")'
     )
-
-    assert redact_evidence_string(text, max_chars=None) == text
 
 
 def test_redacts_generic_python_credential_keys_and_framed_variants() -> None:
@@ -3140,9 +3076,7 @@ def test_unparseable_sensitive_comparison_and_keyed_calls_fail_closed() -> None:
 
     redacted = redact_evidence_string(text, max_chars=None)
 
-    assert "FRAMEDGETSECRET1234567890" not in redacted
-    assert "FRAMEDSETSECRET1234567890" not in redacted
-    assert "FRAMEDCOMPARESECRET1234567890" not in redacted
+    _assert_absent(redacted, "FRAMEDGETSECRET1234567890", "FRAMEDSETSECRET1234567890", "FRAMEDCOMPARESECRET1234567890")
     assert 'os.getenv(key="CLIENT_SECRET", default=<redacted>)' in redacted
     assert 'os.putenv(key="AWS_SECRET_ACCESS_KEY", value=<redacted>)' in redacted
     assert "api_key == <redacted>" in redacted
@@ -3187,13 +3121,13 @@ def test_auth_and_cookie_expressions_preserve_executable_call_context() -> None:
 
     redacted = redact_evidence_string(text, max_chars=None)
 
-    for secret in (
+    _assert_absent(
+        redacted,
         "AUTHCALLSECRET1234567890",
         "COOKIECALLSECRET1234567890",
         "COOKIECOMPILESECRET1234567890",
         "BASICAUTHSECRET1234567890",
-    ):
-        assert secret not in redacted
+    )
     assert 'auth=eval("<redacted>")' in redacted
     assert 'cookie=exec("<redacted>")' in redacted
     assert 'compile("<redacted>", "<redacted>", "<redacted>")' in redacted
@@ -3264,8 +3198,7 @@ def test_unparseable_literal_credential_pairs_fail_closed() -> None:
     redacted = redact_evidence_string(text, max_chars=None)
 
     assert "FRAMEDPAIRSECRET1234567890" not in redacted
-    assert '("api_key", <redacted>)' in redacted
-    assert '("region", "visible")' in redacted
+    _assert_present(redacted, '("api_key", <redacted>)', '("region", "visible")')
 
 
 def test_redacts_sensitive_membership_comparisons() -> None:
@@ -3280,9 +3213,7 @@ def test_redacts_sensitive_membership_comparisons() -> None:
 
     redacted = redact_evidence_string(text, max_chars=None)
 
-    assert "MEMBERSHIPSECRET1234567890" not in redacted
-    assert "NOTINSECRET1234567890" not in redacted
-    assert "REVERSEMEMBERSHIPSECRET1234567890" not in redacted
+    _assert_absent(redacted, "MEMBERSHIPSECRET1234567890", "NOTINSECRET1234567890", "REVERSEMEMBERSHIPSECRET1234567890")
     assert "api_key in <redacted>" in redacted
     assert "client_secret not in <redacted>" in redacted
     assert "<redacted> in api_keys" in redacted
@@ -3303,9 +3234,7 @@ def test_redacts_affixed_sensitive_targets_without_control_false_positives() -> 
 
     redacted = redact_evidence_string(text, max_chars=None)
 
-    assert "PRIVATESECRET1234567890" not in redacted
-    assert "NUMBEREDSECRET1234567890" not in redacted
-    assert "PLURALSECRET1234567890" not in redacted
+    _assert_absent(redacted, "PRIVATESECRET1234567890", "NUMBEREDSECRET1234567890", "PLURALSECRET1234567890")
     assert '_api_key = "<redacted>"' in redacted
     assert "api_key2 = <redacted>" in redacted
     assert "api_keys = <redacted>" in redacted
@@ -3380,20 +3309,13 @@ def test_redacts_sensitive_identifier_subscript_targets() -> None:
 
     redacted = redact_evidence_string(text, max_chars=None)
 
-    assert "ENVSECRET1234567890" not in redacted
-    assert "CONFIGSECRET1234567890" not in redacted
-    assert "AUTHSECRET1234567890" not in redacted
-    assert "visible-count" in redacted
-    assert "visible-timeout" in redacted
-    assert "visible-tokenizer" in redacted
-    assert 'eval("1 + 1")' in redacted
+    _assert_absent(redacted, "ENVSECRET1234567890", "CONFIGSECRET1234567890", "AUTHSECRET1234567890")
+    _assert_present(redacted, "visible-count", "visible-timeout", "visible-tokenizer", 'eval("1 + 1")')
 
 
 def test_dynamic_sensitive_named_subscript_preserves_dangerous_context() -> None:
     """A dynamic index named token is not a literal credential key on arbitrary containers."""
-    text = 'handlers[token] = eval("MALICIOUS_CONTEXT")'
-
-    assert redact_evidence_string(text, max_chars=None) == text
+    _assert_evidence_unchanged('handlers[token] = eval("MALICIOUS_CONTEXT")')
 
 
 def test_redacts_exact_auth_targets_without_auth_control_false_positives() -> None:
@@ -3407,9 +3329,7 @@ def test_redacts_exact_auth_targets_without_auth_control_false_positives() -> No
 
     redacted = redact_evidence_string(text, max_chars=None)
 
-    assert "AUTHSECRET1234567890" not in redacted
-    assert "BASICAUTHSECRET1234567890" not in redacted
-    assert "MAPPINGAUTHSECRET1234567890" not in redacted
+    _assert_absent(redacted, "AUTHSECRET1234567890", "BASICAUTHSECRET1234567890", "MAPPINGAUTHSECRET1234567890")
     assert "auth = <redacted>" in redacted
     assert "basic_auth = <redacted>" in redacted
     assert 'config["auth"] = "<redacted>"' in redacted
@@ -3469,11 +3389,8 @@ def test_indented_python_snippets_use_code_aware_comparison_redaction() -> None:
 
     redacted = redact_evidence_string(text, max_chars=None)
 
-    assert "COMPARESECRET1234567890" not in redacted
-    assert "MEMBERSHIPSECRET1234567890" not in redacted
-    assert "visible" in redacted
-    assert 'eval("1")' in redacted
-    assert 'exec("2")' in redacted
+    _assert_absent(redacted, "COMPARESECRET1234567890", "MEMBERSHIPSECRET1234567890")
+    _assert_present(redacted, "visible", 'eval("1")', 'exec("2")')
 
 
 def test_indented_embedded_name_value_dict_is_redacted() -> None:
@@ -3483,8 +3400,7 @@ def test_indented_embedded_name_value_dict_is_redacted() -> None:
     redacted = redact_evidence_string(text, max_chars=None)
 
     assert "INDENTED_DICT_SECRET" not in redacted
-    assert '"value": <redacted>' in redacted
-    assert 'eval("1")' in redacted
+    _assert_present(redacted, '"value": <redacted>', 'eval("1")')
 
 
 def test_single_line_indented_comparison_preserves_dangerous_call_context() -> None:
@@ -3499,9 +3415,7 @@ def test_single_line_indented_comparison_preserves_dangerous_call_context() -> N
 
 def test_indented_python_return_annotation_is_not_treated_as_r_assignment() -> None:
     """Dedented routing should preserve Python annotations named like credentials."""
-    text = "    def build() -> token:\n        return visible"
-
-    assert redact_evidence_string(text, max_chars=None) == text
+    _assert_evidence_unchanged("    def build() -> token:\n        return visible")
 
 
 def test_redacts_triple_quoted_and_escaped_quote_secret_assignments() -> None:
@@ -3510,10 +3424,8 @@ def test_redacts_triple_quoted_and_escaped_quote_secret_assignments() -> None:
 
     redacted = redact_evidence_string(text, max_chars=500)
 
-    assert "TRIPLESECRET123" not in redacted
-    assert "TAILSECRET456" not in redacted
-    assert 'TOKEN = """<redacted>"""' in redacted
-    assert 'os.environ["AWS_SECRET_ACCESS_KEY"] = "<redacted>"' in redacted
+    _assert_absent(redacted, "TRIPLESECRET123", "TAILSECRET456")
+    _assert_present(redacted, 'TOKEN = """<redacted>"""', 'os.environ["AWS_SECRET_ACCESS_KEY"] = "<redacted>"')
 
 
 def test_redacts_detail_sensitive_container_assignments() -> None:
@@ -3522,9 +3434,7 @@ def test_redacts_detail_sensitive_container_assignments() -> None:
     redacted = redact_evidence_string(text, max_chars=None)
 
     assert "CONTAINERSECRET1234567890" not in redacted
-    assert "credentials = <redacted>" in redacted
-    assert 'credentials_map = {"value": "visible"}' in redacted
-    assert 'eval("1")' in redacted
+    _assert_present(redacted, "credentials = <redacted>", 'credentials_map = {"value": "visible"}', 'eval("1")')
 
 
 def test_redacts_sensitive_string_annotations() -> None:
@@ -3533,9 +3443,7 @@ def test_redacts_sensitive_string_annotations() -> None:
     redacted = redact_evidence_string(text, max_chars=None)
 
     assert "ANNOTATIONSECRET1234567890" not in redacted
-    assert 'api_key: "<redacted>"' in redacted
-    assert 'api_key_count: "visible"' in redacted
-    assert 'eval("1")' in redacted
+    _assert_present(redacted, 'api_key: "<redacted>"', 'api_key_count: "visible"', 'eval("1")')
 
 
 def test_sensitive_assignments_preserve_dangerous_rhs_calls() -> None:
@@ -3555,9 +3463,7 @@ def test_redacts_simple_cookie_and_session_assignments() -> None:
 
     redacted = redact_evidence_string(text, max_chars=None)
 
-    assert "COOKIESECRET1234567890" not in redacted
-    assert "COOKIESSECRET1234567890" not in redacted
-    assert "SESSIONSECRET1234567890" not in redacted
+    _assert_absent(redacted, "COOKIESECRET1234567890", "COOKIESSECRET1234567890", "SESSIONSECRET1234567890")
     assert "cookie = <redacted>" in redacted
     assert "cookies = <redacted>" in redacted
     assert "session_id = <redacted>" in redacted
@@ -3646,3 +3552,7 @@ def test_untrusted_error_message_discards_mixed_secret_shapes() -> None:
 
     assert redacted == REDACTED_EVIDENCE_VALUE
     assert leaked_secret not in redacted
+
+
+def _assert_evidence_unchanged(text: str) -> None:
+    assert redact_evidence_string(text, max_chars=None) == text

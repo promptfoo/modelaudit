@@ -16,6 +16,7 @@ import zipfile
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from functools import partial
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -51,6 +52,10 @@ from modelaudit.utils.repository_context import (
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
 from tests.cli_output import parse_click_json_output
 from tests.helpers import create_mock_pytorch_zip
+from tests.helpers.file_creators import SystemCommandPayload
+from tests.helpers.file_creators import (
+    write_ordered_hf_tokenizer_json as _write_ordered_hf_tokenizer_json,
+)
 
 
 def test_local_txt_zip_prefilter_uses_bounded_zip_probe(
@@ -176,23 +181,6 @@ def _make_trusted_shard_parent(path: Path, *, parents: bool = False) -> None:
     """Create a shard parent without inheriting group-write test umasks."""
     path.mkdir(parents=parents)
     path.chmod(0o755)
-
-
-def _write_ordered_hf_tokenizer_json(
-    path: Path,
-    *,
-    late_fields: str = "",
-    padding_size: int = 0,
-) -> Path:
-    padding = f',"padding":"{"x" * padding_size}"' if padding_size else ""
-    path.write_text(
-        (
-            '{"version":"1.0","added_tokens":[],'
-            f'"model":{{"type":"BPE","vocab":{{"hello":0}},"merges":[]}}{padding}{late_fields}}}'
-        ),
-        encoding="utf-8",
-    )
-    return path
 
 
 def _bert_like_multilingual_vocab_bytes(*tail_tokens: str) -> bytes:
@@ -474,41 +462,17 @@ def test_scan_command_help():
 
 def test_scan_invalid_severity_level_option(tmp_path):
     """Invalid severity override values should fail fast."""
-    test_file = tmp_path / "test_file.dat"
-    test_file.write_bytes(b"test content")
-
-    runner = CliRunner()
-    result = runner.invoke(cli, ["scan", str(test_file), "--severity", "S101=SEVERE"])
-
-    assert result.exit_code == 2
-    assert "Invalid severity level" in result.output
-    assert "CRITICAL" in result.output
+    _assert_invalid_cli_rule_option(tmp_path, "--severity", "S101=SEVERE", "Invalid severity level", "CRITICAL")
 
 
 def test_scan_unknown_rule_code_in_severity_option(tmp_path):
     """Unknown rule codes in --severity should fail fast."""
-    test_file = tmp_path / "test_file.dat"
-    test_file.write_bytes(b"test content")
-
-    runner = CliRunner()
-    result = runner.invoke(cli, ["scan", str(test_file), "--severity", "S9999=CRITICAL"])
-
-    assert result.exit_code == 2
-    assert "Unknown rule code" in result.output
-    assert "S9999" in result.output
+    _assert_invalid_cli_rule_option(tmp_path, "--severity", "S9999=CRITICAL", "Unknown rule code", "S9999")
 
 
 def test_scan_unknown_rule_code_in_suppress_option(tmp_path):
     """Unknown rule codes in --suppress should fail fast."""
-    test_file = tmp_path / "test_file.dat"
-    test_file.write_bytes(b"test content")
-
-    runner = CliRunner()
-    result = runner.invoke(cli, ["scan", str(test_file), "--suppress", "S9999"])
-
-    assert result.exit_code == 2
-    assert "Unknown rule code" in result.output
-    assert "S9999" in result.output
+    _assert_invalid_cli_rule_option(tmp_path, "--suppress", "S9999", "Unknown rule code", "S9999")
 
 
 def test_scan_does_not_auto_load_untrusted_local_config(tmp_path: Path) -> None:
@@ -1207,6 +1171,7 @@ def test_scan_with_blacklist(tmp_path):
     # Just check that the command ran and produced some output
     assert result.output  # Should have some output
     assert result.exit_code == 0  # Command should complete successfully
+
     # With automatic defaults, the specific output format may vary
 
 
@@ -2537,35 +2502,12 @@ def test_windows_existing_output_open_checks_dacl_write_and_metadata_access(
     """Existing reports need DACL-enforced write, replace, and metadata access."""
     captured: dict[str, object] = {}
 
-    class CreateFileW:
-        argtypes: tuple[object, ...] | None = None
-        restype: object | None = None
-
-        def __call__(
-            self,
-            path: str,
-            desired_access: int,
-            share_mode: int,
-            _security_attributes: object,
-            creation_disposition: int,
-            flags: int,
-            _template: object,
-        ) -> int:
-            captured.update(
-                path=path,
-                desired_access=desired_access,
-                share_mode=share_mode,
-                creation_disposition=creation_disposition,
-                flags=flags,
-            )
-            return 321
-
     def open_osfhandle(handle: int, flags: int) -> int:
         captured["handle"] = handle
         captured["os_flags"] = flags
         return 7
 
-    create_file = CreateFileW()
+    create_file = _create_file_w_mock(captured)
     kernel32 = types.SimpleNamespace(CreateFileW=create_file)
     monkeypatch.setattr(ctypes, "WinDLL", lambda *_args, **_kwargs: kernel32, raising=False)
     monkeypatch.setitem(sys.modules, "msvcrt", types.SimpleNamespace(open_osfhandle=open_osfhandle))
@@ -2597,30 +2539,7 @@ def test_windows_output_temp_file_uses_minimum_access_and_normal_attributes(
     """Published Windows reports must not retain FILE_ATTRIBUTE_TEMPORARY."""
     captured: dict[str, object] = {}
 
-    class CreateFileW:
-        argtypes: tuple[object, ...] | None = None
-        restype: object | None = None
-
-        def __call__(
-            self,
-            path: str,
-            desired_access: int,
-            share_mode: int,
-            _security_attributes: object,
-            creation_disposition: int,
-            flags: int,
-            _template: object,
-        ) -> int:
-            captured.update(
-                path=path,
-                desired_access=desired_access,
-                share_mode=share_mode,
-                creation_disposition=creation_disposition,
-                flags=flags,
-            )
-            return 321
-
-    create_file = CreateFileW()
+    create_file = _create_file_w_mock(captured)
     kernel32 = types.SimpleNamespace(CreateFileW=create_file)
     monkeypatch.setattr(ctypes, "WinDLL", lambda *_args, **_kwargs: kernel32, raising=False)
     monkeypatch.setitem(
@@ -3098,6 +3017,7 @@ def test_scan_verbose_mode(tmp_path):
     # With automatic defaults and new output format, check for successful completion
     assert result.output  # Should have some output
     assert result.exit_code == 0  # Should complete successfully
+
     # New output format may not contain "Scanning" text
 
 
@@ -3195,6 +3115,7 @@ def test_format_text_output():
     assert "Files:" in clean_output and "5" in clean_output
     assert "Test issue" in clean_output
     assert "warning" in clean_output.lower()
+
     # Verbose might include details, but we can't guarantee it
 
 
@@ -3579,35 +3500,9 @@ def test_format_text_output_check_only_incomplete_coverage_without_findings_is_n
 
 def test_format_text_output_skipped_check_bare_analysis_incomplete_remains_clean() -> None:
     """Skipped applicability checks without outcome markers should not render coverage incomplete."""
-    results = {
-        "files_scanned": 1,
-        "bytes_scanned": 10,
-        "duration": 0.1,
-        "issues": [],
-        "checks": [
-            {
-                "name": "PyTorch Runtime Version",
-                "status": "skipped",
-                "message": "PyTorch runtime version not available; CVE applicability unknown",
-                "severity": "info",
-                "location": "model.pt",
-                "details": {
-                    "analysis_incomplete": True,
-                    "runtime_version_known": False,
-                    "runtime_cve_applicability": "unknown",
-                    "runtime_cve_version_gate": "local_environment_only",
-                },
-            },
-        ],
-        "file_metadata": {},
-        "has_errors": False,
-    }
-
-    output = format_text_output(results, verbose=False)
-    clean_output = strip_ansi(output)
-    assert "Incomplete security coverage" not in clean_output
-    assert "SCAN COVERAGE INCOMPLETE" not in clean_output
-    assert "NO ISSUES FOUND" in clean_output
+    _assert_skipped_runtime_check_clean_output(
+        ("PyTorch Runtime Version"), ("PyTorch runtime version not available; CVE applicability unknown"), ("model.pt")
+    )
 
 
 def test_format_text_output_consolidated_check_incomplete_coverage_is_not_clean() -> None:
@@ -3675,35 +3570,9 @@ def test_format_text_output_issue_only_incomplete_coverage_with_security_finding
 
 def test_format_text_output_runtime_version_skip_does_not_report_incomplete_coverage() -> None:
     """Expected runtime-version applicability skips should not print incomplete coverage."""
-    results = {
-        "files_scanned": 1,
-        "bytes_scanned": 10,
-        "duration": 0.1,
-        "issues": [],
-        "checks": [
-            {
-                "name": "CVE PyTorch Version Check",
-                "status": "skipped",
-                "message": "PyTorch runtime version unavailable",
-                "severity": "info",
-                "location": "weights.pt",
-                "details": {
-                    "analysis_incomplete": True,
-                    "runtime_version_known": False,
-                    "runtime_cve_applicability": "unknown",
-                    "runtime_cve_version_gate": "local_environment_only",
-                },
-            }
-        ],
-        "file_metadata": {},
-        "has_errors": False,
-    }
-
-    output = format_text_output(results, verbose=False)
-    clean_output = strip_ansi(output)
-    assert "Incomplete security coverage" not in clean_output
-    assert "SCAN COVERAGE INCOMPLETE" not in clean_output
-    assert "NO ISSUES FOUND" in clean_output
+    _assert_skipped_runtime_check_clean_output(
+        ("CVE PyTorch Version Check"), ("PyTorch runtime version unavailable"), ("weights.pt")
+    )
 
 
 def test_format_text_output_skipped_bare_analysis_incomplete_reports_coverage() -> None:
@@ -3807,22 +3676,9 @@ def test_format_text_output_debug_and_info_issues():
 
 def test_format_text_output_fast_scan_duration():
     """Test duration formatting for very fast scans (< 0.01 seconds)."""
-    results = {
-        "path": "/path/to/model",
-        "files_scanned": 1,
-        "bytes_scanned": 512,
-        "duration": 0.005,  # Very fast scan < 0.01 seconds
-        "issues": [],
-        "has_errors": False,
-    }
-
-    output = format_text_output(results, verbose=False)
-    clean_output = strip_ansi(output)
-
+    # Very fast scan < 0.01 seconds
     # Should show 3 decimal places for very fast scans
-    assert "Duration:" in clean_output and "0.005s" in clean_output
-    assert "Files:" in clean_output and "1" in clean_output
-    assert "No security issues detected" in clean_output
+    _assert_short_scan_duration_output((1), (512), (0.005), ("0.005s"), ("1"))
 
 
 def test_scan_huggingface_url_help():
@@ -3995,76 +3851,29 @@ def test_scan_huggingface_preview_matches_final_recursive_inventory(tmp_path: Pa
 
 
 def test_scan_huggingface_preview_reports_gated_and_unknown_access(tmp_path: Path) -> None:
-    downloaded_dir = tmp_path / "downloaded"
-    downloaded_dir.mkdir()
-    (downloaded_dir / "config.json").write_text("{}")
-
-    with (
-        patch("modelaudit.cli.is_huggingface_url", return_value=True),
-        patch(
-            "modelaudit.cli.get_model_info",
-            return_value={
-                "model_id": "org/gated-model",
-                "total_size": 4096,
-                "file_count": 3,
-                "inventory_status": "partial_unknown_size",
-                "inaccessible_gated_bytes": 2048,
-                "inaccessible_gated_file_count": 1,
-                "unknown_size_count": 1,
-            },
-        ),
-        patch("modelaudit.cli.download_model", return_value=downloaded_dir),
-        patch(
-            "modelaudit.cli.scan_model_directory_or_file",
-            return_value=create_mock_scan_result(files_scanned=1, issues=[]),
-        ),
-        patch("shutil.rmtree"),
-    ):
-        result = CliRunner().invoke(cli, ["scan", "--no-cache", "--format", "text", "hf://org/gated-model"])
-
-    output = strip_ansi(result.output)
-    assert result.exit_code == 0, output
-    assert "Size: At least 4.00 KB (3 files)" in output
-    assert "Access: 1 selected file(s) are gated/inaccessible" in output
-    assert "Access: 1 selected file size(s) unavailable" in output
+    _assert_huggingface_preview_access(
+        tmp_path,
+        ("org/gated-model"),
+        (4096),
+        (3),
+        ("partial_unknown_size"),
+        (2048),
+        ("hf://org/gated-model"),
+        ("Size: At least 4.00 KB (3 files)"),
+    )
 
 
 def test_scan_huggingface_preview_reports_unknown_size_gated_access(tmp_path: Path) -> None:
-    downloaded_dir = tmp_path / "downloaded"
-    downloaded_dir.mkdir()
-    (downloaded_dir / "config.json").write_text("{}")
-
-    with (
-        patch("modelaudit.cli.is_huggingface_url", return_value=True),
-        patch(
-            "modelaudit.cli.get_model_info",
-            return_value={
-                "model_id": "org/unknown-size-gated-model",
-                "total_size": 0,
-                "file_count": 1,
-                "inventory_status": "gated_inaccessible",
-                "inaccessible_gated_bytes": 0,
-                "inaccessible_gated_file_count": 1,
-                "unknown_size_count": 1,
-            },
-        ),
-        patch("modelaudit.cli.download_model", return_value=downloaded_dir),
-        patch(
-            "modelaudit.cli.scan_model_directory_or_file",
-            return_value=create_mock_scan_result(files_scanned=1, issues=[]),
-        ),
-        patch("shutil.rmtree"),
-    ):
-        result = CliRunner().invoke(
-            cli,
-            ["scan", "--no-cache", "--format", "text", "hf://org/unknown-size-gated-model"],
-        )
-
-    output = strip_ansi(result.output)
-    assert result.exit_code == 0, output
-    assert "Size: Unknown size (1 files)" in output
-    assert "Access: 1 selected file(s) are gated/inaccessible" in output
-    assert "Access: 1 selected file size(s) unavailable" in output
+    _assert_huggingface_preview_access(
+        tmp_path,
+        ("org/unknown-size-gated-model"),
+        (0),
+        (1),
+        ("gated_inaccessible"),
+        (0),
+        ("hf://org/unknown-size-gated-model"),
+        ("Size: Unknown size (1 files)"),
+    )
 
 
 def test_scan_huggingface_metadata_preflight_verbose_log_is_sanitized(
@@ -7530,13 +7339,7 @@ def test_scan_huggingface_streaming_routes_unknown_suffix_by_content(
     """Bounded unknown-suffix files should preserve benign and malicious content routing."""
     model_path = create_mock_pytorch_zip(tmp_path / "model.unknown", malicious=malicious)
 
-    def fake_hf_hub_download(**download_kwargs: Any) -> str:
-        local_path = Path(download_kwargs["local_dir"]) / str(download_kwargs["filename"])
-        local_path.parent.mkdir(parents=True, exist_ok=True)
-        local_path.write_bytes(model_path.read_bytes())
-        return str(local_path)
-
-    mock_hf_hub_download.side_effect = fake_hf_hub_download
+    mock_hf_hub_download.side_effect = partial(_copy_hf_fixture, model_path)
     mock_run_download.side_effect = lambda _operation, download_kwargs, _deadline, _repo_id, *, direct_download: str(
         direct_download(**download_kwargs)
     )
@@ -7584,13 +7387,7 @@ def test_scan_huggingface_streaming_selected_pickle_scans_shard_shaped_renamed_p
     model_path.write_bytes(payload)
     mock_requests_get.return_value = _FakeRangeResponse(payload)
 
-    def fake_hf_hub_download(**download_kwargs: Any) -> str:
-        local_path = Path(download_kwargs["local_dir"]) / str(download_kwargs["filename"])
-        local_path.parent.mkdir(parents=True, exist_ok=True)
-        local_path.write_bytes(model_path.read_bytes())
-        return str(local_path)
-
-    mock_hf_hub_download.side_effect = fake_hf_hub_download
+    mock_hf_hub_download.side_effect = partial(_copy_hf_fixture, model_path)
     mock_run_download.side_effect = lambda _operation, download_kwargs, _deadline, _repo_id, *, direct_download: str(
         direct_download(**download_kwargs)
     )
@@ -8850,42 +8647,16 @@ def test_is_mlflow_uri():
 
 def test_format_text_output_normal_scan_duration():
     """Test duration formatting for normal scans (>= 0.01 seconds)."""
-    results = {
-        "path": "/path/to/model",
-        "files_scanned": 2,
-        "bytes_scanned": 2048,
-        "duration": 0.25,  # Normal scan >= 0.01 seconds
-        "issues": [],
-        "has_errors": False,
-    }
-
-    output = format_text_output(results, verbose=False)
-    clean_output = strip_ansi(output)
-
+    # Normal scan >= 0.01 seconds
     # Should show 2 decimal places for normal scans
-    assert "Duration:" in clean_output and "0.25s" in clean_output
-    assert "Files:" in clean_output and "2" in clean_output
-    assert "No security issues detected" in clean_output
+    _assert_short_scan_duration_output((2), (2048), (0.25), ("0.25s"), ("2"))
 
 
 def test_format_text_output_edge_case_duration():
     """Test duration formatting for edge case exactly at 0.01 seconds."""
-    results = {
-        "path": "/path/to/model",
-        "files_scanned": 1,
-        "bytes_scanned": 1024,
-        "duration": 0.01,  # Edge case exactly at threshold
-        "issues": [],
-        "has_errors": False,
-    }
-
-    output = format_text_output(results, verbose=False)
-    clean_output = strip_ansi(output)
-
+    # Edge case exactly at threshold
     # Should show 2 decimal places (>= 0.01 branch)
-    assert "Duration:" in clean_output and "0.01s" in clean_output
-    assert "Files:" in clean_output and "1" in clean_output
-    assert "No security issues detected" in clean_output
+    _assert_short_scan_duration_output((1), (1024), (0.01), ("0.01s"), ("1"))
 
 
 def test_format_text_output_very_fast_scan_with_issues():
@@ -8947,12 +8718,8 @@ def test_exit_code_security_issues(tmp_path):
     # Create a malicious pickle file
     evil_pickle_path = tmp_path / "malicious.pkl"
 
-    class MaliciousClass:
-        def __reduce__(self):
-            return (os.system, ('echo "This is a malicious pickle"',))
-
     with evil_pickle_path.open("wb") as f:
-        pickle.dump(MaliciousClass(), f)
+        pickle.dump(SystemCommandPayload('echo "This is a malicious pickle"', lambda: os.system), f)
 
     runner = CliRunner()
     result = runner.invoke(cli, ["scan", "--format", "text", str(evil_pickle_path)])
@@ -8973,12 +8740,8 @@ def test_exit_code_security_issues_streaming_local_directory(tmp_path: Path) -> 
     evil_pickle_path = tmp_path / "malicious.pkl"
     expected_global = f"{os.system.__module__}.system"
 
-    class MaliciousClass:
-        def __reduce__(self):
-            return (os.system, ('echo "This is a malicious pickle"',))
-
     with evil_pickle_path.open("wb") as f:
-        pickle.dump(MaliciousClass(), f)
+        pickle.dump(SystemCommandPayload('echo "This is a malicious pickle"', lambda: os.system), f)
 
     runner = CliRunner()
     result = runner.invoke(cli, ["scan", "--stream", "--format", "text", str(tmp_path)])
@@ -9315,3 +9078,153 @@ class TestScanGlobFailFast:
         assert sensitive_max_size not in repr(mock_record_command.call_args)
         assert sensitive_max_size not in repr(mock_record_started.call_args)
         mock_flush.assert_called_once()
+
+
+def _create_file_w_mock(captured: dict[str, object]) -> Any:
+    class CreateFileW:
+        argtypes: tuple[object, ...] | None = None
+        restype: object | None = None
+
+        def __call__(
+            self,
+            path: str,
+            desired_access: int,
+            share_mode: int,
+            _security_attributes: object,
+            creation_disposition: int,
+            flags: int,
+            _template: object,
+        ) -> int:
+            captured.update(
+                path=path,
+                desired_access=desired_access,
+                share_mode=share_mode,
+                creation_disposition=creation_disposition,
+                flags=flags,
+            )
+            return 321
+
+    return CreateFileW()
+
+
+def _copy_hf_fixture(model_path: Path, /, **download_kwargs: Any) -> str:
+    local_path = Path(download_kwargs["local_dir"]) / str(download_kwargs["filename"])
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    local_path.write_bytes(model_path.read_bytes())
+    return str(local_path)
+
+
+def _assert_huggingface_preview_access(
+    tmp_path: Path,
+    case_model_id: str,
+    case_total_size: int,
+    case_file_count: int,
+    case_inventory_status: str,
+    case_gated_bytes: int,
+    case_model_uri: str,
+    case_expected_size: str,
+) -> None:
+    downloaded_dir = tmp_path / "downloaded"
+    downloaded_dir.mkdir()
+    (downloaded_dir / "config.json").write_text("{}")
+
+    with (
+        patch("modelaudit.cli.is_huggingface_url", return_value=True),
+        patch(
+            "modelaudit.cli.get_model_info",
+            return_value={
+                "model_id": case_model_id,
+                "total_size": case_total_size,
+                "file_count": case_file_count,
+                "inventory_status": case_inventory_status,
+                "inaccessible_gated_bytes": case_gated_bytes,
+                "inaccessible_gated_file_count": 1,
+                "unknown_size_count": 1,
+            },
+        ),
+        patch("modelaudit.cli.download_model", return_value=downloaded_dir),
+        patch(
+            "modelaudit.cli.scan_model_directory_or_file",
+            return_value=create_mock_scan_result(files_scanned=1, issues=[]),
+        ),
+        patch("shutil.rmtree"),
+    ):
+        result = CliRunner().invoke(cli, ["scan", "--no-cache", "--format", "text", case_model_uri])
+
+    output = strip_ansi(result.output)
+    assert result.exit_code == 0, output
+    assert case_expected_size in output
+    assert "Access: 1 selected file(s) are gated/inaccessible" in output
+    assert "Access: 1 selected file size(s) unavailable" in output
+
+
+def _assert_skipped_runtime_check_clean_output(
+    case_check_name: str, case_check_message: str, case_location: str
+) -> None:
+    results = {
+        "files_scanned": 1,
+        "bytes_scanned": 10,
+        "duration": 0.1,
+        "issues": [],
+        "checks": [
+            {
+                "name": case_check_name,
+                "status": "skipped",
+                "message": case_check_message,
+                "severity": "info",
+                "location": case_location,
+                "details": {
+                    "analysis_incomplete": True,
+                    "runtime_version_known": False,
+                    "runtime_cve_applicability": "unknown",
+                    "runtime_cve_version_gate": "local_environment_only",
+                },
+            },
+        ],
+        "file_metadata": {},
+        "has_errors": False,
+    }
+
+    output = format_text_output(results, verbose=False)
+    clean_output = strip_ansi(output)
+    assert "Incomplete security coverage" not in clean_output
+    assert "SCAN COVERAGE INCOMPLETE" not in clean_output
+    assert "NO ISSUES FOUND" in clean_output
+
+
+def _assert_short_scan_duration_output(
+    case_file_count: int,
+    case_byte_count: int,
+    case_duration: float,
+    case_expected_duration: str,
+    case_expected_files: str,
+) -> None:
+    results = {
+        "path": "/path/to/model",
+        "files_scanned": case_file_count,
+        "bytes_scanned": case_byte_count,
+        "duration": case_duration,
+        "issues": [],
+        "has_errors": False,
+    }
+
+    output = format_text_output(results, verbose=False)
+    clean_output = strip_ansi(output)
+
+    assert "Duration:" in clean_output and case_expected_duration in clean_output
+    assert "Files:" in clean_output and case_expected_files in clean_output
+    assert "No security issues detected" in clean_output
+
+
+def _assert_invalid_cli_rule_option(
+    tmp_path: Path, case_option: str, case_argument: str, case_message: str, case_detail: str
+) -> None:
+    test_file = tmp_path / "test_file.dat"
+    test_file.write_bytes(b"test content")
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["scan", str(test_file), case_option, case_argument])
+
+    assert result.exit_code == 2
+    assert case_message in result.output
+    assert case_detail in result.output

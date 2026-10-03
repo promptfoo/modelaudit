@@ -135,39 +135,21 @@ class TestSecureFileHasher:
 
     def test_get_hash_info_secure(self):
         """Test parsing secure hash info."""
-        hasher = SecureFileHasher()
-        hash_string = "secure:abcd1234ef567890"
-
-        info = hasher.get_hash_info(hash_string)
-
-        assert info["method"] == "full_hash"
-        assert info["algorithm"] == "blake2b"
-        assert info["security_level"] == "high"
-        assert info["hash"] == "abcd1234ef567890"
+        _assert_secure_hash_metadata(
+            ("secure:abcd1234ef567890"), ("full_hash"), ("blake2b"), ("high"), ("abcd1234ef567890")
+        )
 
     def test_get_hash_info_fingerprint(self):
         """Test parsing fingerprint hash info."""
-        hasher = SecureFileHasher()
-        hash_string = "fingerprint:1234abcd5678ef90"
-
-        info = hasher.get_hash_info(hash_string)
-
-        assert info["method"] == "enhanced_fingerprint"
-        assert info["algorithm"] == "blake2b"
-        assert info["security_level"] == "medium"
-        assert info["hash"] == "1234abcd5678ef90"
+        _assert_secure_hash_metadata(
+            ("fingerprint:1234abcd5678ef90"), ("enhanced_fingerprint"), ("blake2b"), ("medium"), ("1234abcd5678ef90")
+        )
 
     def test_get_hash_info_unknown(self):
         """Test parsing unknown hash format."""
-        hasher = SecureFileHasher()
-        hash_string = "unknown_format:hash_value"
-
-        info = hasher.get_hash_info(hash_string)
-
-        assert info["method"] == "unknown"
-        assert info["algorithm"] == "unknown"
-        assert info["security_level"] == "unknown"
-        assert info["hash"] == "unknown_format:hash_value"
+        _assert_secure_hash_metadata(
+            ("unknown_format:hash_value"), ("unknown"), ("unknown"), ("unknown"), ("unknown_format:hash_value")
+        )
 
 
 class TestConvenienceFunctions:
@@ -298,3 +280,17 @@ def test_integration_with_pickle_file(tmp_path):
 
     # Verify verification works
     assert hasher.verify_hash(str(pickle_file), result) is True
+
+
+def _assert_secure_hash_metadata(
+    case_hash_string: str, case_method: str, case_algorithm: str, case_security_level: str, case_hash_value: str
+) -> None:
+    hasher = SecureFileHasher()
+    hash_string = case_hash_string
+
+    info = hasher.get_hash_info(hash_string)
+
+    assert info["method"] == case_method
+    assert info["algorithm"] == case_algorithm
+    assert info["security_level"] == case_security_level
+    assert info["hash"] == case_hash_value

@@ -11,12 +11,11 @@ from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.rknn_scanner import RknnScanner
 from modelaudit.utils.file.detection import detect_file_format
+from tests.helpers.file_creators import write_binary_fixture
 
 
 def _write_rknn_file(tmp_path: Path, payload: bytes, filename: str = "model.rknn") -> Path:
-    path = tmp_path / filename
-    path.write_bytes(payload)
-    return path
+    return write_binary_fixture(tmp_path, filename, payload)
 
 
 def test_can_handle_valid_rknn_file(tmp_path: Path) -> None:

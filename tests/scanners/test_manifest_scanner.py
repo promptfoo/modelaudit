@@ -1,6 +1,7 @@
 import builtins
 import json
 import logging
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,22 @@ from modelaudit.scanners import manifest_scanner
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.manifest_scanner import _PARSE_FAILED, ManifestScanner, _is_trusted_url_domain
 from modelaudit.utils.helpers import cache_decorator
+
+
+def _cloud_read_failure(
+    original_read: Callable[[ManifestScanner, str], str],
+    message: str = "simulated cloud storage URL read failure",
+) -> Callable[[ManifestScanner, str], str]:
+    read_counts: dict[int, int] = {}
+
+    def fail_cloud_url_read_once(self: ManifestScanner, path: str) -> str:
+        scanner_id = id(self)
+        read_counts[scanner_id] = read_counts.get(scanner_id, 0) + 1
+        if read_counts[scanner_id] == 1:
+            raise OSError(message)
+        return original_read(self, path)
+
+    return fail_cloud_url_read_once
 
 
 def _https_url(host: str, path: str = "/model.bin") -> str:
@@ -334,15 +351,7 @@ def test_manifest_cloud_storage_read_failure_is_inconclusive_after_parse_retry(
         json.dumps({"model_type": "bert", "weights": "https://bucket.s3.amazonaws.com/malware/model.bin"}),
         encoding="utf-8",
     )
-    original_read = ManifestScanner._read_manifest_text
-    read_counts: dict[int, int] = {}
-
-    def fail_cloud_url_read_once(self: ManifestScanner, path: str) -> str:
-        scanner_id = id(self)
-        read_counts[scanner_id] = read_counts.get(scanner_id, 0) + 1
-        if read_counts[scanner_id] == 1:
-            raise OSError("simulated cloud storage URL read failure")
-        return original_read(self, path)
+    fail_cloud_url_read_once = _cloud_read_failure(ManifestScanner._read_manifest_text)
 
     monkeypatch.setattr(ManifestScanner, "_read_manifest_text", fail_cloud_url_read_once)
 
@@ -379,15 +388,7 @@ def test_manifest_cloud_storage_read_failure_remains_unsuccessful_with_recovered
         ),
         encoding="utf-8",
     )
-    original_read = ManifestScanner._read_manifest_text
-    read_counts: dict[int, int] = {}
-
-    def fail_cloud_url_read_once(self: ManifestScanner, path: str) -> str:
-        scanner_id = id(self)
-        read_counts[scanner_id] = read_counts.get(scanner_id, 0) + 1
-        if read_counts[scanner_id] == 1:
-            raise OSError("simulated cloud storage URL read failure")
-        return original_read(self, path)
+    fail_cloud_url_read_once = _cloud_read_failure(ManifestScanner._read_manifest_text)
 
     monkeypatch.setattr(ManifestScanner, "_read_manifest_text", fail_cloud_url_read_once)
 
@@ -441,15 +442,9 @@ def test_manifest_cloud_storage_read_failure_bypasses_stale_clean_cache(
         cached_entries = get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"]
         assert cached_entries > 0
 
-        original_read = ManifestScanner._read_manifest_text
-        read_counts: dict[int, int] = {}
-
-        def fail_cloud_url_read_once(self: ManifestScanner, path: str) -> str:
-            scanner_id = id(self)
-            read_counts[scanner_id] = read_counts.get(scanner_id, 0) + 1
-            if read_counts[scanner_id] == 1:
-                raise OSError("simulated cloud storage URL read failure after cache warm")
-            return original_read(self, path)
+        fail_cloud_url_read_once = _cloud_read_failure(
+            ManifestScanner._read_manifest_text, "simulated cloud storage URL read failure after cache warm"
+        )
 
         monkeypatch.setattr(ManifestScanner, "_read_manifest_text", fail_cloud_url_read_once)
 
@@ -1860,56 +1855,32 @@ def test_manifest_scanner_inconclusive_parse_preserves_security_exit(tmp_path: P
 
 def test_manifest_scanner_parses_toml_manifest_for_weak_hash(tmp_path: Path) -> None:
     """Supported TOML manifests should receive structured weak-hash checks."""
-    test_file = tmp_path / "model_config.toml"
-    test_file.write_text('model_type = "bert"\nchecksum = "0000000000000000000000000000000000000000"\n')
-
-    scanner = ManifestScanner()
-    result = scanner.scan(str(test_file))
-
-    failed_hash_checks = [
-        check for check in result.checks if check.name == "Weak Hash Detection" and check.status == CheckStatus.FAILED
-    ]
-    assert result.success is True
-    assert result.metadata["root_type"] == "dict"
-    assert len(failed_hash_checks) == 1
-    assert failed_hash_checks[0].details["key"] == "checksum"
-    assert failed_hash_checks[0].details["algorithm"] == "SHA1"
+    _assert_manifest_weak_hash(
+        tmp_path,
+        ("model_config.toml"),
+        ('model_type = "bert"\nchecksum = "0000000000000000000000000000000000000000"\n'),
+        ("checksum"),
+    )
 
 
 def test_manifest_scanner_parses_ini_manifest_for_weak_hash(tmp_path: Path) -> None:
     """Supported INI manifests should receive structured weak-hash checks."""
-    test_file = tmp_path / "model_config.ini"
-    test_file.write_text("[model]\nmodel_type = bert\nchecksum = 0000000000000000000000000000000000000000\n")
-
-    scanner = ManifestScanner()
-    result = scanner.scan(str(test_file))
-
-    failed_hash_checks = [
-        check for check in result.checks if check.name == "Weak Hash Detection" and check.status == CheckStatus.FAILED
-    ]
-    assert result.success is True
-    assert result.metadata["root_type"] == "dict"
-    assert len(failed_hash_checks) == 1
-    assert failed_hash_checks[0].details["key"] == "model.checksum"
-    assert failed_hash_checks[0].details["algorithm"] == "SHA1"
+    _assert_manifest_weak_hash(
+        tmp_path,
+        ("model_config.ini"),
+        ("[model]\nmodel_type = bert\nchecksum = 0000000000000000000000000000000000000000\n"),
+        ("model.checksum"),
+    )
 
 
 def test_manifest_scanner_parses_config_ini_manifest_for_weak_hash(tmp_path: Path) -> None:
     """INI-style .config manifests should not be mistaken for JSON arrays."""
-    test_file = tmp_path / "model.config"
-    test_file.write_text("[model]\nmodel_type = bert\nchecksum = 0000000000000000000000000000000000000000\n")
-
-    scanner = ManifestScanner()
-    result = scanner.scan(str(test_file))
-
-    failed_hash_checks = [
-        check for check in result.checks if check.name == "Weak Hash Detection" and check.status == CheckStatus.FAILED
-    ]
-    assert result.success is True
-    assert result.metadata["root_type"] == "dict"
-    assert len(failed_hash_checks) == 1
-    assert failed_hash_checks[0].details["key"] == "model.checksum"
-    assert failed_hash_checks[0].details["algorithm"] == "SHA1"
+    _assert_manifest_weak_hash(
+        tmp_path,
+        ("model.config"),
+        ("[model]\nmodel_type = bert\nchecksum = 0000000000000000000000000000000000000000\n"),
+        ("model.checksum"),
+    )
 
 
 def test_manifest_scanner_parses_config_json_array_for_weak_hash(tmp_path: Path) -> None:
@@ -2069,13 +2040,7 @@ def test_manifest_scanner_timeout_preserves_weak_hash_finding_and_is_not_cached(
     test_file.write_text(json.dumps({"model_type": "bert", "checksum": "e3b0c44298fc1c149afbf4c8996fb924"}))
     cache_dir = tmp_path / "cache"
 
-    original_check_weak_hashes = ManifestScanner._check_weak_hashes
-
-    def detect_then_expire(self: ManifestScanner, content: object, result: ScanResult) -> None:
-        original_check_weak_hashes(self, content, result)
-        self.scan_start_time = 0
-
-    monkeypatch.setattr(ManifestScanner, "_check_weak_hashes", detect_then_expire)
+    _expire_after_weak_hashes(monkeypatch)
     scanner = ManifestScanner(config={"timeout": 1})
 
     result = scanner.scan(str(test_file))
@@ -2126,13 +2091,7 @@ def test_manifest_scanner_timeout_keeps_strong_hash_near_match_clean(
 ) -> None:
     test_file = tmp_path / "config.json"
     test_file.write_text(json.dumps({"model_type": "bert", "checksum": "0" * 64}))
-    original_check_weak_hashes = ManifestScanner._check_weak_hashes
-
-    def detect_then_expire(self: ManifestScanner, content: object, result: ScanResult) -> None:
-        original_check_weak_hashes(self, content, result)
-        self.scan_start_time = 0
-
-    monkeypatch.setattr(ManifestScanner, "_check_weak_hashes", detect_then_expire)
+    _expire_after_weak_hashes(monkeypatch)
 
     result = ManifestScanner(config={"timeout": 1}).scan(str(test_file))
 
@@ -2260,3 +2219,30 @@ def test_manifest_scanner_expanded_exact_domains_flagged(tmp_path: Path) -> None
     assert "https://evil.readthedocs.io/payload" in detected_urls
     assert "https://evil.fastly.net/payload" in detected_urls
     assert "https://evil.streamlit.io/payload" in detected_urls
+
+
+def _assert_manifest_weak_hash(tmp_path: Path, filename: str, contents: str, hash_key: str) -> None:
+    test_file = tmp_path / filename
+    test_file.write_text(contents)
+
+    scanner = ManifestScanner()
+    result = scanner.scan(str(test_file))
+
+    failed_hash_checks = [
+        check for check in result.checks if check.name == "Weak Hash Detection" and check.status == CheckStatus.FAILED
+    ]
+    assert result.success is True
+    assert result.metadata["root_type"] == "dict"
+    assert len(failed_hash_checks) == 1
+    assert failed_hash_checks[0].details["key"] == hash_key
+    assert failed_hash_checks[0].details["algorithm"] == "SHA1"
+
+
+def _expire_after_weak_hashes(monkeypatch: pytest.MonkeyPatch) -> None:
+    original_check_weak_hashes = ManifestScanner._check_weak_hashes
+
+    def detect_then_expire(self: ManifestScanner, content: object, result: ScanResult) -> None:
+        original_check_weak_hashes(self, content, result)
+        self.scan_start_time = 0
+
+    monkeypatch.setattr(ManifestScanner, "_check_weak_hashes", detect_then_expire)

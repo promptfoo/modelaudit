@@ -7,6 +7,7 @@ import pickle
 import tarfile
 import zlib
 from collections.abc import Callable
+from functools import partial
 from pathlib import Path
 from typing import Literal
 
@@ -25,13 +26,12 @@ from modelaudit.scanners.compressed_scanner import (
     _CompressedPaddingLimitExceeded,
     _MissingOptionalDependencyError,
 )
+from tests.helpers.file_creators import EvalPayload
 
 TarWriteMode = Literal["w:gz", "w:bz2", "w:xz"]
 
 
-class _MaliciousPayload:
-    def __reduce__(self) -> tuple[object, tuple[str]]:
-        return (eval, ("print('owned')",))
+_MaliciousPayload = partial(EvalPayload, ("print('owned')",))
 
 
 _LZ4_FRAME_MAGIC = b"\x04\x22\x4d\x18"

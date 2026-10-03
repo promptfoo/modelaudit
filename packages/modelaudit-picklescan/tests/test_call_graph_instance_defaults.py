@@ -11,8 +11,14 @@ from importlib.util import find_spec
 from pathlib import Path
 
 import pytest
+from pickle_test_helpers import (
+    _global_operand,
+    _has_critical_call_graph_finding,
+    _text_operand,
+    _tuple_payload_operands,
+)
 
-from modelaudit_picklescan import PickleReport, SafetyVerdict, Severity, scan_bytes
+from modelaudit_picklescan import SafetyVerdict, scan_bytes
 from modelaudit_picklescan.api import _RUST_EXTENSION_MODULE
 from modelaudit_picklescan.call_graph import _calls_for_function, _find_sink_path
 
@@ -28,44 +34,8 @@ pytestmark = [
 ]
 
 
-def _short_binunicode(data: bytes) -> bytes:
-    if len(data) > 0xFF:
-        raise ValueError("SHORT_BINUNICODE helper accepts at most 255 bytes")
-    return b"\x8c" + bytes([len(data)]) + data
-
-
-def _binunicode(data: bytes) -> bytes:
-    return b"X" + len(data).to_bytes(4, "little") + data
-
-
-def _text_operand(value: str) -> bytes:
-    data = value.encode()
-    if len(data) <= 0xFF:
-        return _short_binunicode(data)
-    return _binunicode(data)
-
-
-def _global_operand(module: str, name: str) -> bytes:
-    return _text_operand(module) + _text_operand(name) + b"\x93"
-
-
-def _tuple_payload_operands(operands: list[bytes]) -> bytes:
-    return b"(" + b"".join(operands) + b"t"
-
-
 def _botocore_process_provider_operand() -> bytes:
-    return b"".join(
-        [
-            _global_operand("botocore.credentials", "ProcessProvider"),
-            _tuple_payload_operands(
-                [
-                    _text_operand("default"),
-                    _global_operand("builtins", "dict"),
-                ]
-            ),
-            b"R",
-        ]
-    )
+    return _process_provider_operand(module_name="botocore.credentials", class_name="ProcessProvider")
 
 
 def _botocore_process_provider_control_payload() -> bytes:
@@ -96,18 +66,7 @@ def _botocore_process_provider_rce_payload(marker: Path) -> tuple[bytes, str]:
 
 
 def _aiobotocore_process_provider_operand() -> bytes:
-    return b"".join(
-        [
-            _global_operand("aiobotocore.credentials", "AioProcessProvider"),
-            _tuple_payload_operands(
-                [
-                    _text_operand("default"),
-                    _global_operand("builtins", "dict"),
-                ]
-            ),
-            b"R",
-        ]
-    )
+    return _process_provider_operand(module_name="aiobotocore.credentials", class_name="AioProcessProvider")
 
 
 def _aiobotocore_process_provider_control_payload() -> bytes:
@@ -176,17 +135,6 @@ def _assert_pickle_payload_executes_in_subprocess(
 
     assert marker.exists(), f"pickle payload did not execute: {stderr.strip()}"
     assert marker.read_text() == marker_content
-
-
-def _has_critical_call_graph_finding(report: PickleReport, module: str, name: str, sink: str) -> bool:
-    return any(
-        finding.severity == Severity.CRITICAL
-        and finding.rule_code == "DANGEROUS_CALL_GRAPH"
-        and finding.details.get("module") == module
-        and finding.details.get("name") == name
-        and finding.details.get("sink") == sink
-        for finding in report.findings
-    )
 
 
 def test_call_graph_resolves_constructor_default_instance_aliases() -> None:
@@ -270,3 +218,18 @@ def test_scan_bytes_blocks_aiobotocore_anyio_backend_rce(tmp_path: Path) -> None
 
     assert not marker.exists()
     _assert_pickle_payload_executes_in_subprocess(payload, marker, marker_content, tmp_path)
+
+
+def _process_provider_operand(*, module_name: str, class_name: str) -> bytes:
+    return b"".join(
+        [
+            _global_operand(module_name, class_name),
+            _tuple_payload_operands(
+                [
+                    _text_operand("default"),
+                    _global_operand("builtins", "dict"),
+                ]
+            ),
+            b"R",
+        ]
+    )

@@ -7,6 +7,7 @@ from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.models import ModelAuditResultModel
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.cntk_scanner import DISCOVERY_ASSUMPTIONS, CntkScanner
+from tests.helpers.cache import scan_without_cache as _scan_without_cache
 
 
 def _write_legacy_cntk(path: Path, payload: bytes = b"") -> None:
@@ -18,10 +19,6 @@ def _write_cntkv2(path: Path, payload: bytes = b"", include_structure: bool = Tr
     prefix = b"\x08\x01\x12\x11\x0a\x07version\x12\x06\x08\x01\x10\x03(\x02\x12\x09\x0a\x03uid\x12\x02ab"
     structure = b" CompositeFunction primitive_functions " if include_structure else b""
     path.write_bytes(prefix + structure + payload)
-
-
-def _scan_without_cache(path: Path) -> ModelAuditResultModel:
-    return scan_model_directory_or_file(str(path), cache_scan_results=False)
 
 
 def _assert_cntk_read_failure(

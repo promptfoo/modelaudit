@@ -23,7 +23,6 @@ from modelaudit.cache.cache_policy import should_cache_scan_result
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.core_results import merge_scan_result
 from modelaudit.models import create_initial_audit_result
-from modelaudit.scanner_results import ACTIONABLE_FAILED_CHECKS_METADATA_KEY
 from modelaudit.scanners import pickle_scanner
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.joblib_scanner import JoblibScanner
@@ -47,6 +46,18 @@ from modelaudit.scanners.pickle_scanner import (
     is_suspicious_global,
 )
 from tests.helpers import create_mock_pytorch_zip
+from tests.helpers.cache import private_actionable_failed_checks as _private_actionable_failed_checks
+from tests.helpers.file_creators import ReadTrackingBuffer, SystemCommandPayload
+from tests.helpers.file_creators import (
+    joblib_numpy_raw_segment as _joblib_test_numpy_raw_segment,
+)
+from tests.helpers.file_creators import pickle_binunicode as _binunicode
+from tests.helpers.file_creators import pickle_short_binunicode as _short_binunicode
+from tests.helpers.pickle_framework import (
+    _make_dup_heavy_pickle,
+    _make_memo_expansion_pickle,
+    _make_pre_memoized_post_budget_stack_global_payload,
+)
 
 EXPECTED_SYSTEM_GLOBAL = "nt.system" if os.name == "nt" else "posix.system"
 BYPASS_V4_REFERENCES_TEST_CASES: tuple[tuple[str, str, IssueSeverity], ...] = (
@@ -63,25 +74,15 @@ BYPASS_V4_REFERENCES_TEST_CASES: tuple[tuple[str, str, IssueSeverity], ...] = (
 )
 
 
-class MaliciousPayload:
-    def __reduce__(self) -> tuple[Any, tuple[str]]:
-        return (os.system, ("id",))
-
-
 class NonSeekableBytesIO(io.BytesIO):
     def seekable(self) -> bool:
         return False
 
 
-class CountingNonSeekableBytesIO(NonSeekableBytesIO):
+class CountingNonSeekableBytesIO(NonSeekableBytesIO, ReadTrackingBuffer):
     def __init__(self, initial_bytes: bytes) -> None:
         super().__init__(initial_bytes)
         self.bytes_read = 0
-
-    def read(self, size: int | None = -1) -> bytes:
-        data = super().read(size)
-        self.bytes_read += len(data)
-        return data
 
 
 class BrokenTellStream(io.BytesIO):
@@ -147,16 +148,6 @@ class BrokenNativeReadStream(io.BytesIO):
         raise OSError("native read failed")
 
 
-def _short_binunicode(data: bytes) -> bytes:
-    if len(data) > 0xFF:
-        raise ValueError("SHORT_BINUNICODE helper accepts at most 255 bytes")
-    return b"\x8c" + bytes([len(data)]) + data
-
-
-def _binunicode(data: bytes) -> bytes:
-    return b"X" + len(data).to_bytes(4, "little") + data
-
-
 def _joblib_test_binunicode(value: str) -> bytes:
     return _binunicode(value.encode("utf-8"))
 
@@ -181,11 +172,6 @@ def _joblib_test_numpy_wrapper_control(*, shape: int = 4, dtype: str = "i8") -> 
         + _joblib_test_binunicode("numpy_array_alignment_bytes")
         + b"K\x10ub"
     )
-
-
-def _joblib_test_numpy_raw_segment(prefix_length: int, raw_data: bytes) -> bytes:
-    padding_length = 16 - ((prefix_length + 1) % 16)
-    return bytes([padding_length]) + (b"\xff" * padding_length) + raw_data
 
 
 def _joblib_test_numpy_array_payload() -> bytes:
@@ -274,44 +260,6 @@ def _make_opcode_padding_stream(opcode_pairs: int) -> bytes:
     return b"\x80\x02" + (b"K\x010" * opcode_pairs) + b"."
 
 
-def _make_pre_memoized_post_budget_stack_global_payload(tail: bytes) -> bytes:
-    payload = bytearray(b"\x80\x04")
-    payload += _short_binunicode(b"subprocess") + b"\x94"
-    payload += _short_binunicode(b"run") + b"\x94"
-    payload += b"\x880" * 4
-    payload += tail
-    return bytes(payload)
-
-
-def _make_memo_expansion_pickle(iterations: int, *, inert_writes: int = 0) -> bytes:
-    total_writes = iterations + inert_writes
-    if not 1 <= iterations <= 255 or total_writes > 255:
-        raise ValueError("iterations + inert_writes must fit in BINPUT/BINGET opcodes")
-
-    payload = bytearray(b"\x80\x02)q\x000")
-    for memo_index in range(1, iterations + 1):
-        previous_index = memo_index - 1
-        payload += b"h" + bytes([previous_index])
-        payload += b"h" + bytes([previous_index])
-        payload += b"\x86"
-        payload += b"q" + bytes([memo_index])
-        payload += b"0"
-    for memo_index in range(iterations + 1, total_writes + 1):
-        payload += b"K\x01"
-        payload += b"q" + bytes([memo_index])
-        payload += b"0"
-    payload += b"h" + bytes([iterations]) + b"."
-    return bytes(payload)
-
-
-def _make_dup_heavy_pickle(iterations: int) -> bytes:
-    payload = bytearray(b"\x80\x02]q\x00")
-    for _ in range(iterations):
-        payload += b"h\x002a0"
-    payload += b"."
-    return bytes(payload)
-
-
 def _legacy_pytorch_object_stream(
     storage_keys: tuple[str, ...],
     storage_size: int,
@@ -327,7 +275,7 @@ def _legacy_pytorch_object_stream(
         object_stream += pickle.dumps(storage_size, protocol=2)[2:-1]
         object_stream += b"NtQa"
     if malicious_object:
-        malicious_pickle = pickle.dumps(MaliciousPayload(), protocol=2)
+        malicious_pickle = pickle.dumps(SystemCommandPayload("id", lambda: os.system), protocol=2)
         object_stream += malicious_pickle[2:-1] + b"a"
     object_stream += b"."
     return bytes(object_stream)
@@ -451,16 +399,6 @@ def _trusted_legacy_storage_pid_checks(result: ScanResult) -> list[Any]:
         if check.details.get("trusted_legacy_pytorch_context") is True
         and check.details.get("pytorch_storage_persistent_id") is True
     ]
-
-
-def _private_actionable_failed_checks(scan_result: dict[str, Any]) -> list[dict[str, Any]]:
-    private_metadata = scan_result.get("_private_metadata")
-    if not isinstance(private_metadata, dict):
-        return []
-    actionable_failed_checks = private_metadata.get(ACTIONABLE_FAILED_CHECKS_METADATA_KEY)
-    if not isinstance(actionable_failed_checks, list):
-        return []
-    return [entry for entry in actionable_failed_checks if isinstance(entry, dict)]
 
 
 def _assert_critical_explicit_url(
@@ -1003,7 +941,7 @@ def test_expensive_raw_prefilters_preserve_serialized_cc_terms(tmp_path: Path, t
 
 def test_scan_malicious_pickle_reports_rust_finding(tmp_path: Path) -> None:
     path = tmp_path / "evil.pkl"
-    path.write_bytes(pickle.dumps(MaliciousPayload(), protocol=4))
+    path.write_bytes(pickle.dumps(SystemCommandPayload("id", lambda: os.system), protocol=4))
 
     result = PickleScanner().scan(str(path))
 
@@ -2552,19 +2490,7 @@ def test_post_budget_scan_detects_prememoized_stack_global_tail(tmp_path: Path) 
     ids=["memo-module-inline-name", "inline-module-memo-name"],
 )
 def test_post_budget_scan_detects_mixed_prememoized_stack_global_tail(tmp_path: Path, tail: bytes) -> None:
-    path = tmp_path / "post-budget-prememo-mixed-stack-global.pkl"
-    path.write_bytes(_make_pre_memoized_post_budget_stack_global_payload(tail))
-
-    result = PickleScanner({"max_opcodes": 7, "post_budget_global_scan_limit_bytes": 4096}).scan(str(path))
-
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL
-        and issue.details.get("pickle_rule_code") == "POST_BUDGET_GLOBAL"
-        and issue.details.get("module") == "subprocess"
-        and issue.details.get("name") == "run"
-        for issue in result.issues
-    ), result.issues
-    assert result.success is False
+    _assert_post_budget_stack_global_tail(tmp_path, tail, ("post-budget-prememo-mixed-stack-global.pkl"))
 
 
 @pytest.mark.parametrize(
@@ -2580,19 +2506,7 @@ def test_post_budget_scan_detects_interleaved_prememoized_stack_global_tail(
     tmp_path: Path,
     tail: bytes,
 ) -> None:
-    path = tmp_path / "post-budget-prememo-interleaved-stack-global.pkl"
-    path.write_bytes(_make_pre_memoized_post_budget_stack_global_payload(tail))
-
-    result = PickleScanner({"max_opcodes": 7, "post_budget_global_scan_limit_bytes": 4096}).scan(str(path))
-
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL
-        and issue.details.get("pickle_rule_code") == "POST_BUDGET_GLOBAL"
-        and issue.details.get("module") == "subprocess"
-        and issue.details.get("name") == "run"
-        for issue in result.issues
-    ), result.issues
-    assert result.success is False
+    _assert_post_budget_stack_global_tail(tmp_path, tail, ("post-budget-prememo-interleaved-stack-global.pkl"))
 
 
 @pytest.mark.parametrize(
@@ -2882,7 +2796,7 @@ def test_scan_stream_fails_closed_when_supplemental_raw_analysis_cannot_read() -
 
 
 def test_scan_stream_marks_supplemental_read_failure_operational_with_security_finding() -> None:
-    payload = pickle.dumps(MaliciousPayload(), protocol=4)
+    payload = pickle.dumps(SystemCommandPayload("id", lambda: os.system), protocol=4)
 
     result = PickleScanner().scan_stream(
         BrokenSupplementalReadStream(payload),
@@ -5580,7 +5494,7 @@ def test_non_seekable_legacy_pytorch_stream_omits_only_raw_storage() -> None:
 def test_non_seekable_legacy_pytorch_stream_keeps_unread_suffix_inconclusive() -> None:
     payload, _pickle_end = _make_legacy_pytorch_container(b"A" * 512)
     storage_end = len(payload)
-    appended_pickle = pickle.dumps(MaliciousPayload(), protocol=4)
+    appended_pickle = pickle.dumps(SystemCommandPayload("id", lambda: os.system), protocol=4)
     combined_payload = payload + appended_pickle
 
     result = PickleScanner(config={"max_known_stream_read_bytes": 256}).scan_stream(
@@ -5686,7 +5600,7 @@ def test_seekable_legacy_pytorch_stream_scans_suffix_beyond_storage_window() -> 
     prefix = b"WRAPPED:"
     payload, pickle_end = _make_legacy_pytorch_container(b"A" * 4096)
     storage_end = len(payload)
-    appended_pickle = pickle.dumps(MaliciousPayload(), protocol=4)
+    appended_pickle = pickle.dumps(SystemCommandPayload("id", lambda: os.system), protocol=4)
     global_position = next(
         position
         for opcode, _arg, position in pickletools.genops(appended_pickle)
@@ -5754,7 +5668,7 @@ def test_legacy_pytorch_storage_bytes_do_not_trigger_pickle_cve_patterns(tmp_pat
 def test_legacy_pytorch_container_scans_pickle_after_large_storage(tmp_path: Path) -> None:
     payload, pickle_end = _make_legacy_pytorch_container(b"A" * 4096)
     storage_end = len(payload)
-    appended_pickle = pickle.dumps(MaliciousPayload(), protocol=4)
+    appended_pickle = pickle.dumps(SystemCommandPayload("id", lambda: os.system), protocol=4)
     global_position = next(
         position
         for opcode, _arg, position in pickletools.genops(appended_pickle)
@@ -6411,7 +6325,7 @@ def test_legitimate_serialization_file_rejects_bare_joblib_wrapper_without_span_
     bare_path = tmp_path / "bare.joblib"
     bare_path.write_bytes(b"\x80\x04cjoblib.numpy_pickle\nNumpyArrayWrapper\nq\x00not-joblib-raw-tail")
     malicious_path = tmp_path / "evil.joblib"
-    malicious_path.write_bytes(pickle.dumps(MaliciousPayload(), protocol=4))
+    malicious_path.write_bytes(pickle.dumps(SystemCommandPayload("id", lambda: os.system), protocol=4))
     text_path = tmp_path / "not-pickle.joblib"
     text_path.write_text("not a pickle", encoding="utf-8")
     monkeypatch.setattr(
@@ -6520,3 +6434,19 @@ def test_scan_missing_path_fails_closed(tmp_path: Path) -> None:
 
     assert result.success is False
     assert any(check.name == "Path Exists" for check in result.checks)
+
+
+def _assert_post_budget_stack_global_tail(tmp_path: Path, tail: bytes, filename: str) -> None:
+    path = tmp_path / filename
+    path.write_bytes(_make_pre_memoized_post_budget_stack_global_payload(tail))
+
+    result = PickleScanner({"max_opcodes": 7, "post_budget_global_scan_limit_bytes": 4096}).scan(str(path))
+
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL
+        and issue.details.get("pickle_rule_code") == "POST_BUDGET_GLOBAL"
+        and issue.details.get("module") == "subprocess"
+        and issue.details.get("name") == "run"
+        for issue in result.issues
+    ), result.issues
+    assert result.success is False

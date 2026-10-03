@@ -32,7 +32,7 @@ from modelaudit.utils.file.filtering import (
     should_skip_file,
 )
 from modelaudit.utils.file.hdf5 import HDF5_MAGIC, hdf5_metadata_checksum
-from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
+from tests.helpers.file_creators import corrupt_zip_member_crc as _corrupt_zip_member_crc
 from tests.helpers.file_creators import (
     create_mock_mxnet_symbol,
     create_mock_onnx,
@@ -41,12 +41,12 @@ from tests.helpers.file_creators import (
     prefix_mock_onnx_with_unknown_field,
     valid_jpeg_bytes,
     valid_png_bytes,
+    write_sparse_safetensors_framing,
 )
-
-
-def _require_tf_protos() -> None:
-    if not _has_tf_protos():
-        pytest.skip("TensorFlow protobuf stubs unavailable")
+from tests.helpers.file_creators import (
+    printable_unknown_proto_prefix as _printable_unknown_proto_prefix,
+)
+from tests.helpers.tensorflow import _require_tf_protos, build_tf_savedmodel
 
 
 def _build_tf_metagraph_bytes() -> bytes:
@@ -62,25 +62,11 @@ def _build_tf_metagraph_bytes() -> bytes:
 
 
 def _build_tf_savedmodel_bytes() -> bytes:
-    _require_tf_protos()
-    import modelaudit.protos  # noqa: F401
-
-    saved_model_pb2 = importlib.import_module("tensorflow.core.protobuf.saved_model_pb2")
-    saved_model = saved_model_pb2.SavedModel()
-    saved_model.saved_model_schema_version = 1
-    metagraph = saved_model.meta_graphs.add()
-    node = metagraph.graph_def.node.add()
-    node.name = "const_node"
-    node.op = "Const"
-    return cast(bytes, saved_model.SerializeToString())
+    return build_tf_savedmodel("const_node", "Const")
 
 
 def _write_sparse_oversized_safetensors_candidate(path: Path) -> None:
-    header_len = SAFETENSORS_ROUTING_HEADER_PARSE_BYTES + 1
-    with path.open("wb") as handle:
-        handle.write(struct.pack("<Q", header_len))
-        handle.write(b"{")
-        handle.truncate(8 + header_len + 1)
+    write_sparse_safetensors_framing(path, SAFETENSORS_ROUTING_HEADER_PARSE_BYTES + 1)
 
 
 def _write_hdf5_userblock_candidate(path: Path, *, valid_checksum: bool) -> None:
@@ -98,11 +84,6 @@ def _write_hdf5_userblock_candidate(path: Path, *, valid_checksum: bool) -> None
     path.write_bytes(
         bytes(signature_offset) + bytes(superblock) + bytes(file_size - signature_offset - len(superblock))
     )
-
-
-def _printable_unknown_proto_prefix(min_bytes: int) -> bytes:
-    field = b"z " + (b"x" * 32)
-    return field * ((min_bytes // len(field)) + 1)
 
 
 def _build_lightgbm_text() -> str:
@@ -126,35 +107,6 @@ def _write_cntkv2(path: Path, include_structure: bool = True) -> None:
     prefix = b"\x08\x01\x12\x11\x0a\x07version\x12\x06\x08\x01\x10\x03(\x02\x12\x09\x0a\x03uid\x12\x02ab"
     structure = b" CompositeFunction primitive_functions " if include_structure else b""
     path.write_bytes(prefix + structure + b" inputs outputs ")
-
-
-def _corrupt_zip_member_crc(path: Path, member_name: str) -> None:
-    """Patch a ZIP member CRC so reading the member raises BadZipFile."""
-    with zipfile.ZipFile(path) as archive:
-        info = archive.getinfo(member_name)
-        bad_crc = ((info.CRC + 1) & 0xFFFFFFFF).to_bytes(4, "little")
-        local_offset = info.header_offset
-
-    data = bytearray(path.read_bytes())
-    assert data[local_offset : local_offset + 4] == b"PK\x03\x04"
-    data[local_offset + 14 : local_offset + 18] = bad_crc
-
-    member_name_bytes = member_name.encode("utf-8")
-    central_offset = 0
-    while True:
-        central_offset = data.find(b"PK\x01\x02", central_offset)
-        assert central_offset >= 0
-        name_length = int.from_bytes(data[central_offset + 28 : central_offset + 30], "little")
-        extra_length = int.from_bytes(data[central_offset + 30 : central_offset + 32], "little")
-        comment_length = int.from_bytes(data[central_offset + 32 : central_offset + 34], "little")
-        name_start = central_offset + 46
-        name_end = name_start + name_length
-        if data[name_start:name_end] == member_name_bytes:
-            data[central_offset + 16 : central_offset + 20] = bad_crc
-            break
-        central_offset = name_end + extra_length + comment_length
-
-    path.write_bytes(data)
 
 
 class TestFileFilter:
@@ -909,23 +861,11 @@ class TestFileFilter:
 
     def test_docx_with_embedded_ole_bin_remains_skipped(self, tmp_path: Path) -> None:
         """Office ZIPs with embedded OLE binaries should not be treated as model archives."""
-        docx_path = tmp_path / "embedded.docx"
-        with zipfile.ZipFile(docx_path, "w") as archive:
-            archive.writestr("[Content_Types].xml", "<Types></Types>")
-            archive.writestr("word/document.xml", "<w:document></w:document>")
-            archive.writestr("word/embeddings/oleObject1.bin", b"embedded-ole")
-
-        assert should_skip_file(str(docx_path))
+        _assert_embedded_ole_docx_skipped(tmp_path, ("embedded.docx"), (b"embedded-ole"))
 
     def test_docx_with_embedded_pk_near_match_bin_remains_skipped(self, tmp_path: Path) -> None:
         """PK-prefixed non-ZIP OLE binaries must not promote Office documents."""
-        docx_path = tmp_path / "embedded-pk-near-match.docx"
-        with zipfile.ZipFile(docx_path, "w") as archive:
-            archive.writestr("[Content_Types].xml", "<Types></Types>")
-            archive.writestr("word/document.xml", "<w:document></w:document>")
-            archive.writestr("word/embeddings/oleObject1.bin", b"PKNOPE embedded-ole")
-
-        assert should_skip_file(str(docx_path))
+        _assert_embedded_ole_docx_skipped(tmp_path, ("embedded-pk-near-match.docx"), (b"PKNOPE embedded-ole"))
 
     def test_docx_with_unreadable_embedded_pickle_bin_is_preserved(self, tmp_path: Path) -> None:
         """Unreadable model-like .bin members must preserve Office ZIPs for full scanning."""
@@ -1018,3 +958,13 @@ class TestFileFilter:
         monkeypatch.setattr("modelaudit.utils.file.detection.detect_file_format_for_skip_filter", raise_os_error)
 
         assert not should_skip_file(str(disguised_payload))
+
+
+def _assert_embedded_ole_docx_skipped(tmp_path: Path, case_filename: str, case_payload: bytes) -> None:
+    docx_path = tmp_path / case_filename
+    with zipfile.ZipFile(docx_path, "w") as archive:
+        archive.writestr("[Content_Types].xml", "<Types></Types>")
+        archive.writestr("word/document.xml", "<w:document></w:document>")
+        archive.writestr("word/embeddings/oleObject1.bin", case_payload)
+
+    assert should_skip_file(str(docx_path))

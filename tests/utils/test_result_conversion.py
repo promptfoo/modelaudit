@@ -181,15 +181,7 @@ class TestScanResultFromDict:
 
     def test_check_status_normalization_ok(self) -> None:
         """Test 'ok' is normalized to 'passed'."""
-        result_dict = {
-            "scanner": "test",
-            "issues": [],
-            "checks": [{"name": "test", "status": "ok", "message": "", "timestamp": FIXED_TIMESTAMP}],
-        }
-
-        result = scan_result_from_dict(result_dict)
-
-        assert result.checks[0].status == CheckStatus.PASSED
+        _assert_normalized_passed_check_status("ok")
 
     def test_check_status_normalization_fail(self) -> None:
         """Test 'fail' is normalized to 'failed'."""
@@ -205,15 +197,7 @@ class TestScanResultFromDict:
 
     def test_check_status_normalization_invalid(self) -> None:
         """Test invalid status defaults to PASSED."""
-        result_dict = {
-            "scanner": "test",
-            "issues": [],
-            "checks": [{"name": "test", "status": "invalid", "message": "", "timestamp": FIXED_TIMESTAMP}],
-        }
-
-        result = scan_result_from_dict(result_dict)
-
-        assert result.checks[0].status == CheckStatus.PASSED
+        _assert_normalized_passed_check_status("invalid")
 
     def test_end_time_from_duration(self) -> None:
         """Test end_time is calculated from duration."""
@@ -346,3 +330,15 @@ class TestRoundTrip:
 
         assert restored.issues[0].rule_code == "S201"
         assert restored.checks[0].rule_code == "S201"
+
+
+def _assert_normalized_passed_check_status(case_status: str) -> None:
+    result_dict = {
+        "scanner": "test",
+        "issues": [],
+        "checks": [{"name": "test", "status": case_status, "message": "", "timestamp": FIXED_TIMESTAMP}],
+    }
+
+    result = scan_result_from_dict(result_dict)
+
+    assert result.checks[0].status == CheckStatus.PASSED

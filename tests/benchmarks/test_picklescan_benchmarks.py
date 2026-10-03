@@ -10,17 +10,14 @@ from typing import Any
 import pytest
 from modelaudit_picklescan import PickleScanner, SafetyVerdict, ScanStatus, scan_bytes
 
+from tests.helpers.file_creators import SystemCommandPayload
+
 pytest.importorskip("pytest_benchmark")
 
 pytestmark = pytest.mark.performance
 
 SCAN_ROUNDS = 6
 WARMUP_ROUNDS = 2
-
-
-class MaliciousReduce:
-    def __reduce__(self) -> tuple[object, tuple[str]]:
-        return (os.system, ("echo benchmark",))
 
 
 class ChunkedReadStream(io.BytesIO):
@@ -61,7 +58,7 @@ def _build_large_safe_model() -> dict[str, Any]:
 def standalone_pickle_payloads() -> dict[str, bytes]:
     safe_small = pickle.dumps({"weights": [1, 2, 3], "metadata": {"format": "pickle"}}, protocol=4)
     safe_large = pickle.dumps(_build_large_safe_model(), protocol=4)
-    malicious_reduce = pickle.dumps(MaliciousReduce(), protocol=4)
+    malicious_reduce = pickle.dumps(SystemCommandPayload("echo benchmark", lambda: os.system), protocol=4)
     nested_payload = malicious_reduce
     multi_stream_padded = safe_small + (b"\x00" * 4096) + malicious_reduce
 
