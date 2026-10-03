@@ -159,6 +159,7 @@ from modelaudit.utils.helpers.cache_decorator import (
     should_defer_hash_for_file_backed_onnx,
     should_defer_hash_for_pytorch_read_limit,
 )
+from modelaudit.utils.helpers.evidence import format_evidence_string
 from modelaudit.utils.helpers.finding_identity import preserve_finding_identity
 from modelaudit.utils.helpers.interrupt_handler import check_interrupted
 from modelaudit.utils.helpers.types import (
@@ -5745,7 +5746,7 @@ def scan_model_directory_or_file(
         report_path = path
         report_error = str(e)
         if is_stream_url(path):
-            logger.error(f"Error during scan: {report_error}")
+            logger.error(f"Error during scan: {format_evidence_string(report_error, max_chars=None)}")
         else:
             logger.exception(f"Error during scan: {report_error}")
         scan_metadata["success"] = False

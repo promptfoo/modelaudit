@@ -1719,7 +1719,10 @@ def test_mlflow_acquisition_identity_survives_bounded_raw_output(
     monkeypatch.setenv("MODELAUDIT_MLFLOW_ALLOWED_ARTIFACT_URIS", "s3://trusted-bucket" if mode == "path" else "")
     monkeypatch.setattr("modelaudit.integrations.mlflow.tempfile.mkdtemp", lambda **kwargs: str(tmp_path / "missing"))
     result = scan_mlflow_model(source, max_file_size=1 if mode == "budget" else 0)
-    expected_location = source if len(source) <= 512 else source[:509] + "..."
+    expected_location = source
+    if len(source) > 512:
+        suffix = "#modelaudit-source-sha256-" + hashlib.sha256(source.encode()).hexdigest()
+        expected_location = source[: 512 - len(suffix)] + suffix
     assert result.issues[0].location == result.checks[0].location == expected_location
     assert len(getattr(result.issues[0], "finding_identity", {})["fields"]["location"]) <= 512
     aggregate = create_initial_audit_result()
