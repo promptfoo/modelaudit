@@ -762,7 +762,8 @@ def test_oversized_source_refs_preserve_risk_and_content_identity(legacy: bool, 
         ),
     }
     identifiers = [
-        f"{path[:256]}...<source sha256:{hashlib.sha256(path.encode()).hexdigest()}>" for path in [first, second]
+        f"modelaudit-source:{path[:256]}...<source sha256:{hashlib.sha256(path.encode()).hexdigest()}>"
+        for path in [first, second]
     ]
     names = [os.path.basename(identifier) for identifier in identifiers]
     expected = {
