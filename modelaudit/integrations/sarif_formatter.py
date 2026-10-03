@@ -6,6 +6,7 @@ integration with security tools and CI/CD pipelines.
 
 import contextlib
 import json
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -29,6 +30,7 @@ from modelaudit.integrations.source_serialization import (
     serialize_source_identifier,
     serialize_source_text,
     serialize_source_value,
+    serialize_source_values,
 )
 from modelaudit.models import ModelAuditResultModel
 from modelaudit.scanner_results import IssueSeverity
@@ -66,22 +68,35 @@ def _create_run(
     verbose: bool,
 ) -> dict[str, Any]:
     """Create a SARIF run object from ModelAudit results."""
-    safe_scan_paths = [serialize_source_identifier(path) for path in scan_paths]
-
     # Filter issues based on verbosity
     issues = audit_result.issues
     if not verbose:
         issues = [i for i in issues if i.severity != IssueSeverity.DEBUG]
     issues = _primary_sarif_issues(issues)
+    source_identifiers, serialized_properties = _serialize_sarif_sources(
+        [
+            *scan_paths,
+            *(asset.path for asset in audit_result.assets),
+            *(issue.location for issue in issues if issue.location),
+        ],
+        issues,
+    )
+    safe_scan_paths = [source_identifiers[path] for path in scan_paths]
     # Create rules from unique issue types
     rules = _create_rules(issues, prefiltered=True)
     rule_indices = {rule["id"]: idx for idx, rule in enumerate(rules)}
 
     # Create results from issues
-    results = _create_results(issues, rule_indices, prefiltered=True)
+    results = _create_results(
+        issues,
+        rule_indices,
+        prefiltered=True,
+        source_identifiers=source_identifiers,
+        serialized_properties=serialized_properties,
+    )
 
     # Create artifacts from scanned files
-    artifacts = _create_artifacts(audit_result)
+    artifacts = _create_artifacts(audit_result, source_identifiers=source_identifiers)
     exit_code = determine_exit_code(audit_result)
     has_operational_errors = results_have_operational_error(audit_result)
     has_incomplete_coverage = results_have_inconclusive_outcome(audit_result)
@@ -226,20 +241,39 @@ def _create_rules(issues: list, *, prefiltered: bool = False) -> list[dict[str, 
     return rules
 
 
+def _sarif_source_identifier_key(paths: Iterable[str]) -> Callable[[str], str] | None:
+    """Reserve URI equivalences only when a source needs an artificial identifier."""
+    return _normalize_path_to_uri if any(serialize_source_identifier(path) != path for path in paths) else None
+
+
+def _serialize_sarif_sources(paths: list[str], issues: list) -> tuple[dict[str, str], list[dict[str, Any]]]:
+    """Allocate source references together with the evidence that refers to them."""
+    serialized = serialize_source_values(
+        [paths, *(dict(issue.details or {}) for issue in issues)], identifier_key=_sarif_source_identifier_key(paths)
+    )
+    return dict(zip(paths, serialized[0], strict=True)), serialized[1:]
+
+
 def _create_results(
     issues: list,
     rule_indices: dict[str, int] | None = None,
     *,
     prefiltered: bool = False,
+    source_identifiers: dict[str, str] | None = None,
+    serialized_properties: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Create SARIF results from issues."""
     if not prefiltered:
         issues = _primary_sarif_issues(issues)
+    if source_identifiers is None or serialized_properties is None:
+        source_identifiers, serialized_properties = _serialize_sarif_sources(
+            [issue.location for issue in issues if issue.location], issues
+        )
     results = []
     if rule_indices is None:
         rule_indices = {rule["id"]: idx for idx, rule in enumerate(_create_rules(issues, prefiltered=prefiltered))}
 
-    for issue in issues:
+    for issue, properties in zip(issues, serialized_properties, strict=True):
         identity_issue = finding_identity(issue)
         rule_id = _get_rule_id(identity_issue)
         result = {
@@ -260,7 +294,10 @@ def _create_results(
         if issue.location:
             location = {
                 "physicalLocation": {
-                    "artifactLocation": {"uri": _normalize_path_to_uri(issue.location), "uriBaseId": "%SRCROOT%"}
+                    "artifactLocation": {
+                        "uri": _normalize_path_to_uri(issue.location, source_identifiers),
+                        "uriBaseId": "%SRCROOT%",
+                    }
                 }
             }
 
@@ -294,7 +331,6 @@ def _create_results(
         result["partialFingerprints"]["primaryLocationLineHash"] = fingerprint  # type: ignore[index]
 
         # Add properties with additional details
-        properties = serialize_source_value(dict(issue.details or {}))
         properties.pop("rule_code", None)
         properties.pop("issue_type", None)
         rule_code = _get_issue_rule_code(identity_issue)
@@ -314,13 +350,17 @@ def _create_results(
     return results
 
 
-def _create_artifacts(audit_result: ModelAuditResultModel) -> list[dict[str, Any]]:
+def _create_artifacts(
+    audit_result: ModelAuditResultModel, *, source_identifiers: dict[str, str] | None = None
+) -> list[dict[str, Any]]:
     """Create SARIF artifacts from scanned files."""
     artifacts: list[dict[str, Any]] = []
+    if source_identifiers is None:
+        source_identifiers, _ = _serialize_sarif_sources([asset.path for asset in audit_result.assets], [])
 
     for asset in audit_result.assets:
         artifact: dict[str, Any] = {
-            "location": {"uri": _normalize_path_to_uri(asset.path), "uriBaseId": "%SRCROOT%"},
+            "location": {"uri": _normalize_path_to_uri(asset.path, source_identifiers), "uriBaseId": "%SRCROOT%"},
             "mimeType": _get_mime_type(asset.type),
             "properties": {"type": asset.type},
         }
@@ -491,9 +531,9 @@ def _get_tags_for_issue(issue: Any) -> list[str]:
     return tags
 
 
-def _normalize_path_to_uri(path: str) -> str:
+def _normalize_path_to_uri(path: str, source_identifiers: dict[str, str] | None = None) -> str:
     """Normalize a file path to a URI format."""
-    path = serialize_source_identifier(path)
+    path = source_identifiers[path] if source_identifiers is not None else serialize_source_identifier(path)
     # Convert to Path object for normalization
     p = Path(path)
 

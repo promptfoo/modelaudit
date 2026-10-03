@@ -543,10 +543,12 @@ def test_streaming_signed_url_routing_exception_log_is_preserved(caplog: pytest.
     assert "X-Amz-Signature" in caplog.text
 
 
+@pytest.mark.parametrize("control", ["\x1b", "\x07", "\r", "\n", "\t", "\r\n"])
 def test_streaming_failure_filters_terminal_controls_but_preserves_saved_evidence(
     caplog: pytest.LogCaptureFixture,
+    control: str,
 ) -> None:
-    source = "s3://synthetic-bucket/model.pkl?token=\x1b]52;c;U1lOVEhFVElD\x07"
+    source = f"s3://synthetic-bucket/model.pkl?token=synthetic-secret{control}FORGED"
     with (
         caplog.at_level(logging.ERROR, logger="modelaudit.core"),
         patch("fsspec.filesystem", side_effect=AssertionError("unsupported source must not access network")) as fs,
@@ -554,8 +556,11 @@ def test_streaming_failure_filters_terminal_controls_but_preserves_saved_evidenc
         result = scan_model_directory_or_file("stream://" + source, cache_scan_results=False)
     fs.assert_not_called()
     assert determine_exit_code(result) == 2
-    assert "Error during scan" in caplog.text
-    assert "\x1b" not in caplog.text and "\x07" not in caplog.text
+    message = next(record.message for record in caplog.records if record.name == "modelaudit.core")
+    assert message.startswith("Error during scan: ")
+    assert len(message.splitlines()) == 1
+    assert control + "FORGED" not in message
+    assert "synthetic-secret" in message
     saved = json.loads(result.model_dump_json())
     assert any(source in issue["message"] for issue in saved["issues"])
 

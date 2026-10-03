@@ -9274,8 +9274,9 @@ def _assert_invalid_cli_rule_option(
     assert case_detail in result.output
 
 
-def test_verbose_streaming_failure_filters_terminal_controls_only(tmp_path: Path) -> None:
-    source = "https://bucket.s3.amazonaws.com/model.pkl?token=\x1b]52;c;U1lOVEhFVElD\x07"
+@pytest.mark.parametrize("control", ["\x1b", "\x07", "\r", "\n", "\t", "\r\n"])
+def test_verbose_streaming_failure_filters_terminal_controls_only(tmp_path: Path, control: str) -> None:
+    source = f"https://bucket.s3.amazonaws.com/model.pkl?token=synthetic-secret{control}FORGED"
     filesystem = MagicMock()
     filesystem.info.side_effect = OSError("Cannot read " + source)
     output = tmp_path / "result.json"
@@ -9288,7 +9289,177 @@ def test_verbose_streaming_failure_filters_terminal_controls_only(tmp_path: Path
         )
     filesystem.info.assert_called_once()
     assert invocation.exit_code == 2
-    assert "Streaming analysis failed" in invocation.output
-    assert "\x1b" not in invocation.output and "\x07" not in invocation.output
+    lines = [line for line in invocation.output.splitlines() if line.startswith("Streaming analysis failed: ")]
+    assert len(lines) == 1 and "synthetic-secret" in lines[0]
+    assert control + "FORGED" not in invocation.output
+    assert "\nFORGED" not in invocation.output
     saved = json.loads(output.read_text())
     assert any(source in issue["message"] for issue in saved["issues"])
+
+
+@pytest.mark.parametrize(
+    "tail,provider_blocked",
+    [
+        ("?token='403'", True),
+        ('?token="forbidden"', True),
+        ("?note=synthetic forbidden", True),
+        ("#note=synthetic unauthorized", True),
+        ("?token=%27403%27", False),
+        ("?token=403", False),
+        ("#403", False),
+    ],
+)
+@pytest.mark.parametrize("error_kind", ["transport", "auth", "provider-url"])
+def test_huggingface_file_source_text_preserves_acquisition_classification(
+    tail: str, provider_blocked: bool, error_kind: str
+) -> None:
+    source = "https://huggingface.co/org/model/resolve/main/model.pkl" + tail
+    error = {
+        "transport": "synthetic connection reset",
+        "auth": "403 Forbidden",
+        "provider-url": "provider rejected " + source,
+    }[error_kind]
+    with (
+        patch(
+            "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+            return_value=(["model.pkl"], "a" * 40, None),
+        ),
+        patch(
+            "modelaudit.utils.sources.huggingface._get_huggingface_path_sizes",
+            return_value=({"model.pkl": 4}, "a" * 40),
+        ),
+        patch(
+            "modelaudit.utils.sources.huggingface._run_huggingface_download_with_deadline",
+            side_effect=RuntimeError(error),
+        ),
+    ):
+        invocation = CliRunner().invoke(cli, ["scan", "--quiet", "--no-cache", "--format", "json", source])
+    assert invocation.exit_code == 2
+    result = json.loads(invocation.output[invocation.output.index("{") :])
+    issue = result["issues"][0]
+    blocked = error_kind == "auth" or (error_kind == "provider-url" and provider_blocked)
+    assert issue["details"]["blocked"] is blocked
+    assert issue["details"]["error_category"] == ("blocked" if blocked else "acquisition_error")
+    assert issue["details"]["scan_outcome_reason"] == (
+        "huggingface_acquisition_blocked" if blocked else "huggingface_acquisition_error"
+    )
+
+
+@pytest.mark.parametrize("route", ["snapshot", "stream", "disk", "inventory", "size", "missing-file", "worker"])
+def test_huggingface_owned_source_classification_survives_nested_failures(route: str) -> None:
+    from contextlib import ExitStack, redirect_stdout
+    from io import StringIO
+
+    from modelaudit.utils.sources import _huggingface_download_worker as worker
+
+    file_route = route in {"inventory", "size", "missing-file", "worker"}
+    source = "https://huggingface.co/org/model" + ("/resolve/main/model.pkl" if file_route else "") + "?token='403'"
+    args = ["scan", "--quiet", "--no-cache", "--format", "json", "--max-size", "1MB", source]
+    if route == "stream":
+        args.append("--stream")
+    if route == "worker":
+        args.extend(["--timeout", "60"])
+    error = "synthetic connection reset"
+    with ExitStack() as stack:
+        stack.enter_context(
+            patch(
+                "modelaudit.utils.sources.huggingface._get_model_size_with_deadline",
+                return_value=1 if route == "disk" else None,
+            )
+        )
+        if route in {"snapshot", "stream"}:
+            planner = "streaming" if route == "stream" else "model"
+            stack.enter_context(
+                patch(
+                    f"modelaudit.utils.sources.huggingface.plan_huggingface_{planner}_download",
+                    side_effect=RuntimeError(error),
+                )
+            )
+        if route == "disk":
+            stack.enter_context(
+                patch("modelaudit.utils.sources.huggingface.check_disk_space", return_value=(False, error))
+            )
+        if file_route:
+            listing = (None, None, error) if route == "inventory" else (["model.pkl"], "a" * 40, None)
+            stack.enter_context(
+                patch("modelaudit.utils.sources.huggingface._list_repo_files_with_timeout", return_value=listing)
+            )
+            stack.enter_context(
+                patch(
+                    "modelaudit.utils.sources.huggingface._get_huggingface_path_sizes",
+                    return_value=({"model.pkl": None if route == "size" else 4}, "a" * 40),
+                )
+            )
+            if route == "missing-file":
+                stack.enter_context(
+                    patch(
+                        "modelaudit.utils.sources.huggingface._run_huggingface_download_with_deadline",
+                        return_value="/nonexistent-synthetic-model.pkl",
+                    )
+                )
+            if route == "worker":
+                output = StringIO()
+                payload = {
+                    "operation": "hf_hub_download",
+                    "operation_kwargs": {"repo_id": "org/model", "filename": "model.pkl"},
+                }
+                with (
+                    patch.object(sys, "stdin", StringIO(json.dumps(payload))),
+                    patch("huggingface_hub.hf_hub_download", side_effect=RuntimeError(error)),
+                    redirect_stdout(output),
+                ):
+                    assert worker.main() == 0
+                process = MagicMock()
+                process.communicate.return_value = (output.getvalue(), "")
+                stack.enter_context(
+                    patch("modelaudit.utils.sources.huggingface.subprocess.Popen", return_value=process)
+                )
+        invocation = CliRunner().invoke(cli, args)
+    assert invocation.exit_code == 2
+    result = json.loads(invocation.output[invocation.output.index("{") :])
+    details = result["issues"][0]["details"]
+    assert details["blocked"] is False
+    assert details["error_category"] == "acquisition_error"
+    assert details["scan_outcome_reason"] == "huggingface_acquisition_error"
+
+
+def test_huggingface_stream_wrapper_renders_provider_error_once() -> None:
+    from modelaudit.cli import _track_huggingface_stream_acquisition
+
+    class RenderedError(RuntimeError):
+        calls = 0
+
+        def __str__(self) -> str:
+            self.calls += 1
+            return "403 Forbidden" if self.calls == 1 else "synthetic connection reset"
+
+    error = RenderedError()
+
+    def files() -> Iterator[tuple[Path, bool]]:
+        yield from ()
+        raise error
+
+    with pytest.raises(RuntimeError) as caught:
+        list(_track_huggingface_stream_acquisition(files()))
+    assert error.calls == 1
+    assert str(caught.value) == "403 Forbidden"
+    assert caught.value.__cause__ is error
+
+
+@pytest.mark.parametrize("missing", ["revision", "size"])
+@pytest.mark.parametrize("suffix", ["?token='403'", '?token="forbidden"', "#note=synthetic unauthorized"])
+def test_huggingface_dry_run_source_does_not_change_access_classification(missing: str, suffix: str) -> None:
+    source = "https://huggingface.co/org/model/resolve/main/model.pkl" + suffix
+    metadata: dict[str, int | str | None] = {"size_bytes": None if missing == "size" else 4}
+    if missing == "size":
+        metadata["resolved_revision"] = "a" * 40
+    with patch("modelaudit.cli._get_huggingface_file_metadata", return_value=metadata):
+        invocation = CliRunner().invoke(
+            cli, ["scan", "--quiet", "--no-cache", "--format", "json", "--dry-run", "--max-size", "1MB", source]
+        )
+    assert invocation.exit_code == 2
+    result = json.loads(invocation.output[invocation.output.index("{") :])
+    details = result["issues"][0]["details"]
+    assert details["blocked"] is False
+    assert details["error_category"] == "acquisition_error"
+    assert details["scan_outcome_reason"] == "huggingface_acquisition_error"

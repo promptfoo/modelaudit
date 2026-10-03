@@ -32,10 +32,11 @@ from ..file.detection import detect_file_format_for_skip_filter
 from ..file.streaming import StreamedSourceByteAccounting
 from ..helpers.assets import asset_from_scan_result
 from ..helpers.disk_space import check_disk_space
-from ..helpers.evidence import format_evidence_string
+from ..helpers.evidence import format_terminal_text
 from ..helpers.interrupt_handler import check_interrupted
 from .huggingface_paths import (
     _huggingface_classification_error,
+    _huggingface_classification_url,
     extract_model_id_from_path,
     is_huggingface_cache_path,
     is_huggingface_file_url,
@@ -3211,7 +3212,7 @@ def _select_huggingface_model_files(
                     "Skipping inaccessible gated Hugging Face content probe for %s/%s: %s",
                     repo_id,
                     filename,
-                    format_evidence_string(str(exc), max_chars=None),
+                    format_terminal_text(str(exc)),
                 )
                 if inaccessible_probe_files is not None and filename not in inaccessible_probe_files:
                     inaccessible_probe_files.append(filename)
@@ -5147,6 +5148,19 @@ def _build_huggingface_model_info(
     }
 
 
+def _huggingface_source_error(
+    template: str, source: str, error: object = "", error_type: type[Exception] = Exception
+) -> Exception:
+    """Retain the historical classifier input separately from raw source evidence."""
+    message = str(error)
+    result = error_type(template.format(source=source, error=message))
+    cast(Any, result)._modelaudit_classification_text = template.format(
+        source=_huggingface_classification_url(source),
+        error=_huggingface_classification_error(getattr(error, "_modelaudit_classification_text", message)),
+    )
+    return result
+
+
 def get_model_info(
     url: str,
     *,
@@ -5219,7 +5233,7 @@ def get_model_info(
             include_all_files=include_all_files,
         )
     except Exception as e:
-        raise Exception(f"Failed to get model info for {display_url}: {e!s}") from e
+        raise _huggingface_source_error("Failed to get model info for {source}: {error}", display_url, e) from e
 
 
 def get_model_size(
@@ -5351,7 +5365,7 @@ def download_model(
     if model_size and disk_check_path is not None:
         has_space, message = check_disk_space(disk_check_path, model_size)
         if not has_space:
-            raise Exception(f"Cannot download model from {display_url}: {message}")
+            raise _huggingface_source_error("Cannot download model from {source}: {error}", display_url, message)
 
     try:
         # Configure progress display based on environment
@@ -5429,7 +5443,7 @@ def download_model(
             import shutil
 
             shutil.rmtree(download_path)
-        raise Exception(f"Failed to download model from {display_url}: {e!s}") from e
+        raise _huggingface_source_error("Failed to download model from {source}: {error}", display_url, e) from e
 
 
 def plan_huggingface_model_download(
@@ -6411,7 +6425,7 @@ def download_model_streaming(
     except _HfStreamingStagingCleanupError:
         raise
     except Exception as e:
-        raise Exception(f"Failed to download model from {display_url}: {e!s}") from e
+        raise _huggingface_source_error("Failed to download model from {source}: {error}", display_url, e) from e
 
 
 def download_file_from_hf(
@@ -6485,8 +6499,11 @@ def download_file_from_hf(
         if size_limit is not None:
             if repository_file_inventory is not None and not _is_huggingface_commit_sha(repo_revision):
                 error_suffix = f": {repo_listing_error}" if repo_listing_error else ""
-                raise ValueError(
-                    f"Unable to determine immutable revision for {display_url}; refusing capped download{error_suffix}"
+                raise _huggingface_source_error(
+                    "Unable to determine immutable revision for {source}; refusing capped download{error}",
+                    display_url,
+                    error_suffix,
+                    ValueError,
                 )
             pinned_revision = repo_revision if repository_file_inventory is not None else None
 
@@ -6500,15 +6517,25 @@ def download_file_from_hf(
                 )
             except Exception as exc:
                 if "repository revision unavailable" in str(exc):
-                    raise ValueError(
-                        f"Unable to determine immutable revision for {display_url}; refusing capped download"
+                    raise _huggingface_source_error(
+                        "Unable to determine immutable revision for {source}; refusing capped download",
+                        display_url,
+                        error_type=ValueError,
                     ) from exc
                 raise
             if not _is_huggingface_commit_sha(resolved_revision):
-                raise ValueError(f"Unable to determine immutable revision for {display_url}; refusing capped download")
+                raise _huggingface_source_error(
+                    "Unable to determine immutable revision for {source}; refusing capped download",
+                    display_url,
+                    error_type=ValueError,
+                )
             file_size = path_sizes.get(filename)
             if not isinstance(file_size, int) or isinstance(file_size, bool) or file_size < 0:
-                raise ValueError(f"Unable to determine file size for {display_url}; refusing capped download")
+                raise _huggingface_source_error(
+                    "Unable to determine file size for {source}; refusing capped download",
+                    display_url,
+                    error_type=ValueError,
+                )
             if file_size > size_limit:
                 raise ValueError(
                     f"File size ({_format_size(file_size)}) exceeds maximum allowed size ({_format_size(size_limit)})"
@@ -6533,8 +6560,10 @@ def download_file_from_hf(
             try:
                 downloaded_size = downloaded_path.stat().st_size
             except OSError as exc:
-                raise ValueError(
-                    f"Unable to verify downloaded file size for {display_url}; refusing capped download"
+                raise _huggingface_source_error(
+                    "Unable to verify downloaded file size for {source}; refusing capped download",
+                    display_url,
+                    error_type=ValueError,
                 ) from exc
             if downloaded_size > size_limit:
                 raise ValueError(
@@ -6543,4 +6572,4 @@ def download_file_from_hf(
                 )
         return downloaded_path
     except Exception as e:
-        raise Exception(f"Failed to download file from {display_url}: {e!s}") from e
+        raise _huggingface_source_error("Failed to download file from {source}: {error}", display_url, e) from e

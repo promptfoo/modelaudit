@@ -55,10 +55,10 @@ from .core_results import (
     results_have_incomplete_coverage_under_directory,
     results_have_inconclusive_outcome,
 )
-from .finding_identity import preserve_finding_identity
+from .finding_identity import finding_identity, preserve_finding_identity
 from .integrations.jfrog import scan_jfrog_artifact
-from .integrations.sarif_formatter import format_sarif_output
-from .integrations.source_serialization import serialize_source_value
+from .integrations.sarif_formatter import _sarif_source_identifier_key, format_sarif_output
+from .integrations.source_serialization import serialize_source_text, serialize_source_value
 from .models import FileMetadataModel, ModelAuditResultModel
 from .rules import Rule, RuleRegistry, Severity
 from .scanner_results import (
@@ -128,7 +128,7 @@ from .utils.sources.pytorch_hub import (
 )
 
 logger = logging.getLogger("modelaudit")
-_JSON_VALUE_ADAPTER = TypeAdapter(Any)
+_JSON_VALUE_ADAPTER: TypeAdapter[Any] = TypeAdapter(Any)
 
 
 def _display_path(path: str) -> str:
@@ -425,7 +425,12 @@ def _get_huggingface_file_metadata(
 
 def _build_huggingface_file_dry_run_preview(path: str, runtime: "_ScanRuntimeConfig") -> dict[str, Any]:
     """Preview a direct Hugging Face file scan without downloading it."""
-    from .utils.sources.huggingface import _format_size, _is_huggingface_commit_sha, parse_huggingface_file_url
+    from .utils.sources.huggingface import (
+        _format_size,
+        _huggingface_source_error,
+        _is_huggingface_commit_sha,
+        parse_huggingface_file_url,
+    )
 
     repo_id, revision, filename = parse_huggingface_file_url(path)
     file_metadata = _get_huggingface_file_metadata(repo_id, revision, filename, timeout_seconds=runtime.timeout)
@@ -435,9 +440,17 @@ def _build_huggingface_file_dry_run_preview(path: str, runtime: "_ScanRuntimeCon
         resolved_revision = file_metadata.get("resolved_revision")
         checked_revision = resolved_revision if isinstance(resolved_revision, str) else revision
         if not _is_huggingface_commit_sha(checked_revision):
-            raise ValueError(f"Unable to determine immutable revision for {path}; refusing capped download")
+            raise _huggingface_source_error(
+                "Unable to determine immutable revision for {source}; refusing capped download",
+                path,
+                error_type=ValueError,
+            )
         if not isinstance(size_bytes, int) or isinstance(size_bytes, bool) or size_bytes < 0:
-            raise ValueError(f"Unable to determine file size for {path}; refusing capped download")
+            raise _huggingface_source_error(
+                "Unable to determine file size for {source}; refusing capped download",
+                path,
+                error_type=ValueError,
+            )
         if size_bytes > size_limit:
             raise ValueError(
                 f"File size ({_format_size(size_bytes)}) exceeds maximum allowed size ({_format_size(size_limit)})"
@@ -1946,9 +1959,14 @@ def _track_huggingface_stream_acquisition(
             yielded_artifact = True
             yield streamed_item
     except Exception as exc:
-        if yielded_artifact:
-            raise _HuggingFaceStreamInterruptedError(str(exc)) from exc
-        raise _HuggingFaceAcquisitionError(str(exc)) from exc
+        message = str(exc)
+        error = (
+            _HuggingFaceStreamInterruptedError(message) if yielded_artifact else _HuggingFaceAcquisitionError(message)
+        )
+        cast(Any, error)._modelaudit_classification_text = _huggingface_classification_error(
+            getattr(exc, "_modelaudit_classification_text", message)
+        )
+        raise error from exc
     finally:
         close_generator = getattr(file_generator, "close", None)
         if callable(close_generator):
@@ -2025,7 +2043,7 @@ def _record_huggingface_acquisition_error(
     requested_revision = _huggingface_requested_revision(path)
     source_key = _huggingface_acquisition_source_key(path, requested_revision)
     classification_message = (
-        _escape_terminal_text(_huggingface_classification_error(str(classification_error)))
+        _escape_terminal_text(_huggingface_classification_error(classification_error))
         if classification_error is not None
         else error_msg
     )
@@ -2836,6 +2854,36 @@ def _write_scan_sbom(
     _write_output_text_file(sbom, sbom_text)
 
 
+def _bound_report_finding_text(record: dict[str, Any], *, identity: bool = False) -> None:
+    """Retain historical text bounds before allocating source identifiers."""
+    fields = ("message", "name", "type", "rule_code") + (() if identity else ("why", "recommendation"))
+    for field_name in fields:
+        value = record.get(field_name)
+        if isinstance(value, str):
+            record[field_name] = serialize_source_text(value)
+    details = record.get("details")
+    if isinstance(details, dict):
+        for field_name in ("evidence_fingerprint", "zip_entry_id", "zip_entry", "check_consolidation_key"):
+            value = details.get(field_name)
+            if isinstance(value, str):
+                details[field_name] = serialize_source_text(value)
+
+
+def _serialize_scan_report(audit_result: ModelAuditResultModel, *, exclude_none: bool = False) -> dict[str, Any]:
+    result = audit_result.model_dump(mode="python", exclude_none=exclude_none)
+    for record in [*result["issues"], *result["checks"]]:
+        if finding_identity(record) is not record:
+            _bound_report_finding_text(record["finding_identity"]["fields"], identity=True)
+        _bound_report_finding_text(record)
+    sources = [
+        *(asset.path for asset in audit_result.assets),
+        *(issue.location for issue in audit_result.issues if issue.location),
+        *(check.location for check in audit_result.checks if check.location),
+        *audit_result.file_metadata,
+    ]
+    return cast(dict[str, Any], serialize_source_value(result, identifier_key=_sarif_source_identifier_key(sources)))
+
+
 def _format_scan_output(
     audit_result: ModelAuditResultModel,
     expanded_paths: list[str],
@@ -2848,13 +2896,13 @@ def _format_scan_output(
         if not verbose:
             audit_result.issues = [issue for issue in audit_result.issues if issue.severity != IssueSeverity.DEBUG]
             audit_result.checks = [check for check in audit_result.checks if check.severity != IssueSeverity.DEBUG]
-        serialized_result = serialize_source_value(audit_result.model_dump(mode="python", exclude_none=True))
+        serialized_result = _serialize_scan_report(audit_result, exclude_none=True)
         return json.dumps(_JSON_VALUE_ADAPTER.dump_python(serialized_result, mode="json"), indent=2)
 
     if output_format == "sarif":
         return format_sarif_output(audit_result, expanded_paths, verbose)
 
-    serialized_result = serialize_source_value(audit_result.model_dump(mode="python"))
+    serialized_result = _serialize_scan_report(audit_result)
     output_text = format_text_output(serialized_result if isinstance(serialized_result, dict) else {}, verbose)
     previews = getattr(audit_result, "previews", None)
     if isinstance(previews, list) and previews:
@@ -3333,7 +3381,7 @@ def _resolve_scan_source_for_path(
                     path_state,
                     path=path,
                     error_msg=error_msg,
-                    classification_error=raw_error,
+                    classification_error=getattr(exc, "_modelaudit_classification_text", raw_error),
                 )
                 return None
 
@@ -3400,7 +3448,7 @@ def _resolve_scan_source_for_path(
                 path_state,
                 path=path,
                 error_msg=error_msg,
-                classification_error=raw_error,
+                classification_error=getattr(exc, "_modelaudit_classification_text", raw_error),
             )
             path_state.defer_temp_cleanup(
                 temp_dir,
@@ -3432,7 +3480,7 @@ def _resolve_scan_source_for_path(
                     path_state,
                     path=path,
                     error_msg=error_msg,
-                    classification_error=raw_error,
+                    classification_error=getattr(exc, "_modelaudit_classification_text", raw_error),
                 )
                 return None
 
@@ -3690,7 +3738,7 @@ def _resolve_scan_source_for_path(
                 path_state,
                 path=path,
                 error_msg=error_msg,
-                classification_error=raw_error,
+                classification_error=getattr(exc, "_modelaudit_classification_text", raw_error),
                 scanned_artifact_count=(
                     streaming_result.files_scanned
                     if streaming_result_aggregated and streaming_result is not None

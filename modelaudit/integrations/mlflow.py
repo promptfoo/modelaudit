@@ -24,7 +24,7 @@ from ..models import (
     ModelAuditResultModel,
     create_initial_audit_result,
 )
-from ..utils.helpers.evidence import format_evidence_string, format_evidence_value
+from ..utils.helpers.evidence import format_evidence_string, format_evidence_value, format_terminal_text
 from ._mlflow_identity import mlflow_source_identity
 
 logger = logging.getLogger(__name__)
@@ -2474,7 +2474,9 @@ def scan_mlflow_model(
             return captured_download_root
         download_root_identity = captured_download_root
 
-        logger.debug(f"Downloading MLflow model {_format_mlflow_error(model_uri)} to {download_dir}")
+        logger.debug(
+            f"Downloading MLflow model {format_terminal_text(_format_mlflow_error(model_uri))} to {download_dir}"
+        )
         local_path: str | None
         if isinstance(download_plan, _MlflowDownloadPlan):
             download_result = _download_preflighted_mlflow_artifacts(

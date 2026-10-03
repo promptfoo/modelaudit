@@ -761,23 +761,22 @@ def test_oversized_source_refs_preserve_risk_and_content_identity(legacy: bool, 
             file_size=2, file_hashes=FileHashesModel(sha256="b" * 64) if content_hashes else None
         ),
     }
-    expected = (
-        {
-            f"<source redacted>#modelaudit-content-sha256-{'a' * 64}": {"risk_score": "0", "size": "1"},
-            f"<source redacted>#modelaudit-content-sha256-{'b' * 64}": {"risk_score": "5", "size": "2"},
-        }
-        if content_hashes
-        else {
-            "<source redacted>": {"risk_score": "5", "size": "2"},
-            "<source redacted>#modelaudit-component-2": {"risk_score": "0", "size": "1"},
-        }
-    )
+    identifiers = [
+        f"{path[:256]}...<source sha256:{hashlib.sha256(path.encode()).hexdigest()}>" for path in [first, second]
+    ]
+    names = [os.path.basename(identifier) for identifier in identifiers]
+    expected = {
+        name + (f"#modelaudit-content-sha256-{letter * 64}" if content_hashes else ""): values
+        for name, letter, values in zip(
+            identifiers, ["a", "b"], [{"risk_score": "0", "size": "1"}, {"risk_score": "5", "size": "2"}], strict=True
+        )
+    }
     for paths in ([first, second], [second, first]):
         output = (
             generate_sbom(paths, result.model_dump(mode="python")) if legacy else generate_sbom_pydantic(paths, result)
         )
         components = json.loads(output)["components"]
-        assert {component["name"] for component in components} == {"<source redacted>"}
+        assert {component["name"] for component in components} == set(names)
         assert {
             component["bom-ref"]: {
                 prop["name"]: prop["value"]
@@ -786,6 +785,24 @@ def test_oversized_source_refs_preserve_risk_and_content_identity(legacy: bool, 
             }
             for component in components
         } == expected
+    from modelaudit.integrations.source_serialization import serialize_source_value
+
+    saved = ModelAuditResultModel.model_validate(serialize_source_value(result.model_dump()))
+    output = (
+        generate_sbom(saved.file_metadata, saved.model_dump())
+        if legacy
+        else generate_sbom_pydantic(saved.file_metadata, saved)
+    )
+    components = json.loads(output)["components"]
+    assert len(components) == 2
+    assert {
+        (
+            next(p["value"] for p in c["properties"] if p["name"] == "size"),
+            next(p["value"] for p in c["properties"] if p["name"] == "risk_score"),
+            tuple(h["content"] for h in c.get("hashes", [])),
+        )
+        for c in components
+    } == {("1", "0", ("a" * 64,) if content_hashes else ()), ("2", "5", ("b" * 64,) if content_hashes else ())}
 
 
 def _sbom_property_values(
@@ -1231,3 +1248,39 @@ def test_mlflow_source_preview_cannot_alias_a_literal_uri(monkeypatch: pytest.Mo
         assert location == result.checks[0].location
         locations.append(location)
     assert len(set(locations)) == 3
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_sbom_saved_oversized_streams_keep_source_associations(legacy: bool) -> None:
+    from modelaudit.cli import _format_scan_output
+
+    records = [("malicious", b"cos\nsystem\n(S'printf sample'\ntR.", "6"), ("benign", b"\x80\x04N.", "3")]
+    exports = []
+    for ordered in [records, list(reversed(records)), records + records]:
+        aggregate = create_initial_audit_result()
+        for name, payload, _risk in ordered:
+            source = f"https://bucket.s3.amazonaws.com/{name}.pkl?token=" + "x" * (256 * 1024)
+            aggregate.aggregate_scan_result(_scan_sbom_stream(payload, source).model_dump())
+        aggregate.finalize_statistics()
+        aggregate.deduplicate_issues()
+        exported = _format_scan_output(aggregate, [], output_format="json", verbose=True)
+        saved = ModelAuditResultModel.model_validate_json(exported)
+        paths = [asset.path for asset in saved.assets]
+        assert len(set(paths)) == 2
+        assert set(paths) == set(saved.file_metadata)
+        assert all(len(path) <= 256 * 1024 for path in paths)
+        output = generate_sbom(paths, saved.model_dump()) if legacy else generate_sbom_pydantic(paths, saved)
+        components = json.loads(output)["components"]
+        assert len(components) == len({c["bom-ref"] for c in components}) == 2
+        # These oversized names use the historical incomplete-stream fallback, without content hashes.
+        assert {
+            (
+                c["type"],
+                next(p["value"] for p in c["properties"] if p["name"] == "size"),
+                next(p["value"] for p in c["properties"] if p["name"] == "risk_score"),
+            )
+            for c in components
+        } == {("machine-learning-model", str(len(payload)), risk) for _name, payload, risk in records}
+        assert all(not c.get("hashes") for c in components)
+        exports.append(components)
+    assert exports[0] == exports[1] == exports[2]
