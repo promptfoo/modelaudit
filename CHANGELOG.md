@@ -5,7 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
 ## [0.2.53](https://github.com/promptfoo/modelaudit/compare/v0.2.52...v0.2.53) (2026-10-03)
+
+### Security
+
+- Upgrade gzip, PCRE2, SQLite, and Perl in Docker runtime images to pick up Debian security fixes.
+- Upgrade locked AnyIO to 4.15.1 and GitPython to 3.1.62 to address dependency audit advisories.
+- Inspect hidden ZIP archives and malicious pickle payloads in legacy GGML model variants.
+- Stop reporting a ZIP polyglot for GGUF/GGML files whose tensor data merely contains an end-of-central-directory signature.
+- Upgrade Debian util-linux packages in all Docker runtime images to remediate CVE-2026-53615.
+- Preserve model-card network alerts when documented image examples contain code outside the reviewed generated forms.
 
 ### Bug Fixes
 
@@ -53,21 +64,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - treat CoreML license references as informational ([#1852](https://github.com/promptfoo/modelaudit/issues/1852)) ([604bed5](https://github.com/promptfoo/modelaudit/commit/604bed57db2352116ff9099933e560e301d1ef11))
 - trust complete legacy PyTorch storage layout ([#1850](https://github.com/promptfoo/modelaudit/issues/1850)) ([08d9fee](https://github.com/promptfoo/modelaudit/commit/08d9fee29cf671705b892ed8bb20d9e5625f742b))
 - validate manual release versions before outputs ([#1794](https://github.com/promptfoo/modelaudit/issues/1794)) ([13431f6](https://github.com/promptfoo/modelaudit/commit/13431f61124178250e79552a3770de024b796a54))
-
-## [Unreleased]
-
-### Security
-
-- Upgrade gzip, PCRE2, SQLite, and Perl in Docker runtime images to pick up Debian security fixes.
-- Upgrade locked GitPython to 3.1.59 to address four dependency audit advisories.
-- Upgrade locked GitPython to 3.1.60 to address newly disclosed dependency audit advisories.
-- Inspect hidden ZIP archives and malicious pickle payloads in legacy GGML model variants.
-- Stop reporting a ZIP polyglot for GGUF/GGML files whose tensor data merely contains an end-of-central-directory signature.
-- Upgrade Debian util-linux packages in all Docker runtime images to remediate CVE-2026-53615.
-- Preserve model-card network alerts when documented image examples contain code outside the reviewed generated forms.
-
-### Bug Fixes
-
 - Avoid incomplete ONNX weight analysis when Gather nodes read dimensions from Shape outputs.
 - Avoid incomplete ONNX weight analysis when large runtime-activation fanout only adds dynamic bookkeeping lineage.
 - Treat documentation, license, and repository links in verified pickle and ONNX metadata as informational across supported Python versions while preserving active and unknown network destinations.
@@ -98,6 +94,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Avoid command-and-control false positives for generated TorchScript `_check_input_dim` identifiers while preserving actionable `check_in` detections.
 - Avoid incomplete legacy PyTorch storage-layout findings after validating storage bytes when separate source-backed rebuild warnings remain.
 - Treat passive built-in CoreML license-reference URLs as informational while preserving active metadata URL and command detections.
+- Require `modelaudit-picklescan>=0.1.11` so root upgrades receive the released scanner fixes.
 
 ## [0.2.52](https://github.com/promptfoo/modelaudit/compare/v0.2.51...v0.2.52) (2026-07-22)
 
@@ -2637,7 +2634,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **style**: improve code formatting and documentation standards (#12, #23)
 - **fix**: improve core scanner functionality and comprehensive test coverage (#11)
 
-[unreleased]: https://github.com/promptfoo/modelaudit/compare/v0.2.52...HEAD
+[unreleased]: https://github.com/promptfoo/modelaudit/compare/v0.2.53...HEAD
 [0.2.25]: https://github.com/promptfoo/modelaudit/compare/v0.2.24...v0.2.25
 [0.2.24]: https://github.com/promptfoo/modelaudit/compare/v0.2.23...v0.2.24
 [0.2.23]: https://github.com/promptfoo/modelaudit/compare/v0.2.22...v0.2.23
