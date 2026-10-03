@@ -10,7 +10,7 @@ from modelaudit.analysis.framework_patterns import (
 
 
 @pytest.fixture
-def knowledge_base():
+def knowledge_base() -> FrameworkKnowledgeBase:
     """Create a knowledge base instance."""
     return FrameworkKnowledgeBase()
 
@@ -275,11 +275,11 @@ class TestShouldSkipPatternForFramework:
 class TestValidateContext:
     """Tests for _validate_context method."""
 
-    def test_lambda_with_safe_code(self, knowledge_base):
+    def test_lambda_with_safe_code(self, knowledge_base: FrameworkKnowledgeBase) -> None:
         """Test Lambda validation with safe code."""
         _assert_lambda_context_validation(knowledge_base, "low", "lambda x: x * 0.5", True)
 
-    def test_lambda_with_unsafe_code(self, knowledge_base):
+    def test_lambda_with_unsafe_code(self, knowledge_base: FrameworkKnowledgeBase) -> None:
         """Test Lambda validation with unsafe code."""
         _assert_lambda_context_validation(knowledge_base, "high", "lambda x: eval(x)", False)
 

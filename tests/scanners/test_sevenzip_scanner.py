@@ -62,13 +62,11 @@ pytest_plugins: list[str] = []
 
 
 @pytest.fixture
-def temp_7z_file() -> Generator[str, None, None]:
+def temp_7z_file(tmp_path: Path) -> str:
     """Create a temporary file with .7z extension for testing."""
-    with tempfile.NamedTemporaryFile(suffix=".7z", delete=False) as f:
-        temp_path = f.name
-    yield temp_path
-    if os.path.exists(temp_path):
-        os.unlink(temp_path)
+    temp_path = tmp_path / "archive.7z"
+    temp_path.touch()
+    return str(temp_path)
 
 
 def _nested_payload_extractor(payload: bytes) -> Callable[..., None]:
