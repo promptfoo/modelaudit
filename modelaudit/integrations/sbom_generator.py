@@ -114,8 +114,8 @@ def _get_component_type(path: str, metadata: dict[str, Any] | None) -> Component
         ".pmml",
     }
 
-    # Classification keeps the historical normalized identifier; exports retain the raw source.
-    classification_path = _classification_identifier(path)
+    # Remote classification keeps its normalized identifier; deleted local filenames stay literal.
+    classification_path = _classification_identifier(path) if _is_non_filesystem_identifier(path) else path
     file_ext = os.path.splitext(classification_path.lower())[1]
 
     # Check if it's a machine learning model
