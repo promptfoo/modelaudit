@@ -18,6 +18,12 @@ from modelaudit.core_results import (
     results_have_inconclusive_outcome,
     results_have_operational_error,
 )
+from modelaudit.integrations._sarif_identity import (
+    redact_source_identifier as _identity_location,
+)
+from modelaudit.integrations._sarif_identity import (
+    redact_source_text as _identity_text,
+)
 from modelaudit.integrations.source_serialization import (
     serialize_source_identifier,
     serialize_source_text,
@@ -269,15 +275,15 @@ def _create_results(
         import hashlib
 
         fingerprint = ""
-        fingerprint_location = serialize_source_identifier(issue.location or "")
+        fingerprint_location = _identity_location(issue.location or "")
         if issue.details:
-            evidence_fingerprint = serialize_source_text(str(issue.details.get("evidence_fingerprint", "")))
+            evidence_fingerprint = _identity_text(str(issue.details.get("evidence_fingerprint", "")))
             if evidence_fingerprint:
                 fingerprint = hashlib.sha256(
                     "\x1f".join((evidence_fingerprint, fingerprint_location, str(issue.severity))).encode()
                 ).hexdigest()[:16]
         if not fingerprint:
-            fingerprint_message = serialize_source_text(issue.message)
+            fingerprint_message = _identity_text(issue.message)
             fingerprint = hashlib.sha256(
                 f"{fingerprint_message}{fingerprint_location}{issue.severity}".encode()
             ).hexdigest()[:16]
@@ -376,11 +382,11 @@ def _get_rule_id(issue: Any) -> str:
         return rule_code
 
     if hasattr(issue, "type") and issue.type:
-        redacted_type = serialize_source_text(str(issue.type))
+        redacted_type = _identity_text(str(issue.type))
         return f"MA{redacted_type.replace(' ', '-').upper()}"
 
     # Generate from message if no type
-    redacted_message = serialize_source_text(issue.message)
+    redacted_message = _identity_text(issue.message)
     base = redacted_message[:30].replace(" ", "-").replace(":", "").upper()
     # Remove special characters
     base = "".join(c if c.isalnum() or c == "-" else "" for c in base)
@@ -391,17 +397,17 @@ def _get_issue_rule_code(issue: Any) -> str | None:
     """Return the stable ModelAudit rule code for an issue when available."""
     rule_code = getattr(issue, "rule_code", None)
     if isinstance(rule_code, str) and rule_code:
-        return serialize_source_text(rule_code)
+        return _identity_text(rule_code)
     return None
 
 
 def _get_rule_name(issue: Any) -> str:
     """Get a human-readable rule name from an issue."""
     if hasattr(issue, "type") and issue.type:
-        return serialize_source_text(str(issue.type)).replace("_", " ").title()
+        return _identity_text(str(issue.type)).replace("_", " ").title()
 
     # Extract from message
-    redacted_message = serialize_source_text(issue.message)
+    redacted_message = _identity_text(issue.message)
     return str(redacted_message.split(":")[0] if ":" in redacted_message else redacted_message[:50])
 
 

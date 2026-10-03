@@ -15,6 +15,7 @@ from cyclonedx.output import OutputFormat, SchemaVersion, make_outputter
 
 from ..models import FileMetadataModel, ModelAuditResultModel
 from ..scanner_results import Issue, IssueSeverity
+from ._sarif_identity import redact_source_identifier as _classification_identifier
 from .source_serialization import serialize_source_identifier, serialize_source_value
 
 SCANNER_VERSION = f"v{_pkg_version('modelaudit')}"
@@ -113,7 +114,9 @@ def _get_component_type(path: str, metadata: dict[str, Any] | None) -> Component
         ".pmml",
     }
 
-    file_ext = os.path.splitext(path.lower())[1]
+    # Classification keeps the historical normalized identifier; exports retain the raw source.
+    classification_path = _classification_identifier(path)
+    file_ext = os.path.splitext(classification_path.lower())[1]
 
     # Check if it's a machine learning model
     if file_ext in ml_extensions:

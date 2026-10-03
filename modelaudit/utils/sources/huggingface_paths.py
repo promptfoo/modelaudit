@@ -5,7 +5,7 @@ import os
 import re
 import unicodedata
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote, urlparse, urlunparse
 
 from ._huggingface_cache import _find_hf_cache_root, _resolve_hf_cache_path
 
@@ -322,3 +322,57 @@ def extract_model_id_from_path(path: str) -> tuple[str | None, str | None]:
         current_path = current_path.parent
 
     return None, None
+
+
+# Classification historically consumed normalized transport errors. Keep that
+# input independent of raw report evidence so token text cannot imply auth failure.
+_HF_CLASSIFICATION_URL_PATTERN = re.compile(
+    r"(?i)\b(?:https?://(?:[^\s\"'<>/@]+(?::[^\s\"'<>/@]*)?@)?(?:huggingface\.co|hf\.co)|hf://)"
+    r"[^\s\"'<>]*"
+)
+
+_HF_CLASSIFICATION_QUERY_PATTERN = re.compile(
+    (
+        r"([?&][^=\s&]*(?:signature|credential|security-token|access-key|access_key|token|"
+        r"secret|api-key|api_key|apikey|sig|sas)[^=\s&]*=)[^\s&#]+"
+    ),
+    re.IGNORECASE,
+)
+
+_HF_CLASSIFICATION_USERINFO_PATTERN = re.compile(r"([a-z][a-z0-9+.-]*://)([^/@\s]+)@", re.IGNORECASE)
+
+
+def _huggingface_classification_url(url: str) -> str:
+    """Normalize transport URL content for acquisition error classification."""
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        redacted = _HF_CLASSIFICATION_USERINFO_PATTERN.sub(r"\1<credentials-redacted>@", url)
+        if "://" in redacted:
+            scheme, remainder = redacted.split("://", 1)
+            _, separator, path = remainder.partition("/")
+            redacted = f"{scheme}://<invalid-authority>"
+            if separator:
+                redacted = f"{redacted}/{path}"
+        return redacted.split("#", 1)[0].split("?", 1)[0]
+    if not parsed.netloc:
+        if parsed.scheme in {"ftp", "hf", "http", "https"}:
+            redacted = _HF_CLASSIFICATION_USERINFO_PATTERN.sub(r"\1<credentials-redacted>@", url)
+            return redacted.split("#", 1)[0].split("?", 1)[0]
+        return url
+
+    netloc = parsed.netloc
+    if "@" in netloc:
+        netloc = netloc.rsplit("@", 1)[1]
+
+    return urlunparse((parsed.scheme, netloc, parsed.path, "", "", ""))
+
+
+def _huggingface_classification_error(text: str) -> str:
+    """Keep credential text from changing acquisition error categories."""
+    redacted = _HF_CLASSIFICATION_URL_PATTERN.sub(
+        lambda match: _huggingface_classification_url(match.group(0)),
+        text,
+    )
+    redacted = _HF_CLASSIFICATION_USERINFO_PATTERN.sub(r"\1<credentials-redacted>@", redacted)
+    return _HF_CLASSIFICATION_QUERY_PATTERN.sub(r"\1<redacted>", redacted)

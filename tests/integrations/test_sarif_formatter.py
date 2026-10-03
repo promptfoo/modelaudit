@@ -1,6 +1,8 @@
 """Tests for SARIF formatter module."""
 
+import hashlib
 import json
+import os
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,6 +11,7 @@ import pytest
 
 import modelaudit.integrations.sarif_formatter as sarif_formatter
 from modelaudit.core import scan_model_directory_or_file
+from modelaudit.integrations._sarif_identity import redact_source_identifier, redact_source_text
 from modelaudit.models import AssetModel, FileHashesModel, FileMetadataModel, create_initial_audit_result
 from modelaudit.scanners.base import Check, CheckStatus, Issue, IssueSeverity
 
@@ -979,3 +982,548 @@ def test_report_value_serialization_preserves_shapes_and_bounds() -> None:
         "(1, 2)": "tuple",
         "(1, 2)#modelaudit-redacted-key-2": "text",
     }
+
+
+@pytest.mark.parametrize("evidence", ["", "stable-evidence"])
+@pytest.mark.parametrize(
+    "source,normalized",
+    [
+        ("https://user:{secret}@bucket.example/model.pkl?token={secret}", "https://bucket.example/model.pkl"),
+        ("//user:{secret}@bucket.example/model.pkl?token={secret}", "//bucket.example/model.pkl"),
+        (
+            "stream://https://user:{secret}@bucket.example/model.pkl?token={secret}",
+            "stream://https://bucket.example/model.pkl",
+        ),
+    ],
+)
+def test_sarif_credential_rotation_preserves_baseline_identity(source: str, normalized: str, evidence: str) -> None:
+    for secret in ["first-password", "rotated-password"]:
+        raw = source.format(secret=secret)
+        issue = Issue(
+            message=f"Unsafe model from {raw}",
+            severity=IssueSeverity.WARNING,
+            location=raw,
+            details={"evidence_fingerprint": evidence},
+            timestamp=1,
+        )
+        result = _create_results([issue])[0]
+        preimage = (
+            "\x1f".join((evidence, normalized, str(issue.severity)))
+            if evidence
+            else f"Unsafe model from {normalized}{normalized}{issue.severity}"
+        )
+        assert (
+            result["partialFingerprints"]["primaryLocationLineHash"]
+            == hashlib.sha256(preimage.encode()).hexdigest()[:16]
+        )
+
+
+def test_sarif_rotating_assignments_preserve_derived_rule_grouping() -> None:
+    issues = [
+        Issue(
+            message=f"password={secret} unsafe model", severity=IssueSeverity.WARNING, location="model.pkl", timestamp=1
+        )
+        for secret in ["first-token", "rotated-token"]
+    ]
+    assert [rule["id"] for rule in _create_rules(issues)] == ["MA-PASSWORDREDACTED"]
+    assert [_get_rule_name(issue) for issue in issues] == ["password=<redacted>"] * 2
+    assert [r["partialFingerprints"]["primaryLocationLineHash"] for r in _create_results(issues)] == [
+        "dd9a19a60e1407fa"
+    ] * 2
+
+
+def test_sarif_existing_local_assignment_paths_keep_distinct_identity(tmp_path: Path) -> None:
+    fingerprints = []
+    for name in ["session=training", "session=evaluation"]:
+        path = tmp_path / name / "model.pkl"
+        path.parent.mkdir()
+        path.write_bytes(b"model")
+        issue = Issue(message="Unsafe local model", severity=IssueSeverity.WARNING, location=str(path), timestamp=1)
+        fingerprints.append(_create_results([issue])[0]["partialFingerprints"]["primaryLocationLineHash"])
+    assert fingerprints[0] != fingerprints[1]
+
+
+@pytest.mark.parametrize(
+    "source,normalized_message,normalized_location",
+    [
+        ("https://host/model.pkl?version=1", "Unsafe model from https://host/model.pkl", "https://host/model.pkl"),
+        (
+            "https://host/model.pkl?token=first-secret",
+            "Unsafe model from https://host/model.pkl",
+            "https://host/model.pkl",
+        ),
+        (
+            "https://host/token%253Dpath-secret/model.pkl?visible=yes",
+            "Unsafe model from https://host/token=<redacted>/model.pkl?visible=yes",
+            "https://host/token=<redacted>/model.pkl",
+        ),
+        (
+            "//user:first-password@bucket.example/model.pkl?token=secret",
+            "Unsafe model from //bucket.example/model.pkl",
+            "//bucket.example/model.pkl",
+        ),
+        (
+            "https:/user:first-password@bucket.example/model.pkl?token=secret",
+            "Unsafe model from https://bucket.example/model.pkl",
+            "https://bucket.example/model.pkl",
+        ),
+        (
+            "bucket.example/model.pkl?OPAQUE-SECRET",
+            "Unsafe model from bucket.example/model.pkl",
+            "bucket.example/model.pkl",
+        ),
+        (
+            "bucket.example/model.pkl%3FOPAQUE-SECRET",
+            "Unsafe model from bucket.example/model.pkl",
+            "bucket.example/model.pkl",
+        ),
+        ("file:///tmp/model%3Fv1.pkl", "Unsafe model from file:///tmp/model%3Fv1.pkl", "file:///tmp/model%3Fv1.pkl"),
+        ("file://host/tmp/model.pkl", "Unsafe model from file://host/tmp/model.pkl", "file://host/tmp/model.pkl"),
+        (
+            "./artifacts/user@example.com/model.pkl?version=1",
+            "Unsafe model from ./artifacts/user@example.com/model.pkl?version=1",
+            "./artifacts/user@example.com/model.pkl?version=1",
+        ),
+        ("Authorization Bearer first-secret", "Unsafe model from Authorization Bearer <redacted>", "<source redacted>"),
+        ("Unsafe token_count=128", "Unsafe model from Unsafe token_count=128", "Unsafe token_count=128"),
+    ],
+)
+@pytest.mark.parametrize("evidence", ["", "stable-evidence"])
+def test_sarif_historical_normalization_preserves_fingerprint(
+    source: str,
+    normalized_message: str,
+    normalized_location: str,
+    evidence: str,
+) -> None:
+    # These expectations were captured from the parent implementation, including
+    # encoded, malformed, schemeless, and local-looking source identifiers.
+    issue = Issue(
+        message=f"Unsafe model from {source}",
+        severity=IssueSeverity.WARNING,
+        location=source,
+        details={"evidence_fingerprint": evidence},
+        timestamp=1,
+    )
+    result = _create_results([issue])[0]
+    preimage = (
+        "\x1f".join((evidence, normalized_location, str(issue.severity)))
+        if evidence
+        else f"{normalized_message}{normalized_location}{issue.severity}"
+    )
+    assert (
+        result["partialFingerprints"]["primaryLocationLineHash"] == hashlib.sha256(preimage.encode()).hexdigest()[:16]
+    )
+
+
+@pytest.mark.parametrize(
+    "local_path",
+    [
+        r"C:\users\user:password@folder\model.pkl",
+        r"\\server\share\user:password@folder\model.pkl",
+    ],
+)
+def test_windows_and_unc_local_paths_are_preserved(local_path: str) -> None:
+    assert redact_source_identifier(local_path) == local_path
+
+
+@pytest.mark.parametrize(
+    "local_path",
+    [
+        r"C:\models\sessionTokenCache=public\model.pkl",
+        r"\\host\share\password_policy=public\model.pkl",
+    ],
+)
+def test_nonexistent_windows_and_unc_near_matches_are_preserved(local_path: str) -> None:
+    assert redact_source_identifier(local_path) == local_path
+
+
+def test_existing_windows_assignment_filename_is_preserved(monkeypatch: pytest.MonkeyPatch) -> None:
+    local_path = r"C:\models\token=literal-filename\model.pkl"
+    monkeypatch.setattr(
+        "modelaudit.integrations._sarif_identity._local_path_exists",
+        lambda source: source == local_path,
+    )
+
+    assert redact_source_identifier(local_path) == local_path
+
+
+@pytest.mark.parametrize(
+    ("local_path", "safe_path"),
+    [
+        (r"C:\models\model.pkl?token=windows-secret", r"C:\models\model.pkl"),
+        (r"\\server\share\model.pkl?token=unc-secret", r"\\server\share\model.pkl"),
+    ],
+)
+def test_nonexistent_windows_and_unc_credential_suffixes_are_redacted(local_path: str, safe_path: str) -> None:
+    assert redact_source_identifier(local_path) == safe_path
+
+
+@pytest.mark.parametrize(
+    "local_path",
+    [
+        "./api-key@bucket.example/model.pkl?token=secret",
+        r"C:\models\user:password@bucket.example\model.pkl?token=secret",
+    ],
+)
+def test_nonexistent_local_userinfo_with_credential_suffix_fails_closed(local_path: str) -> None:
+    assert redact_source_identifier(local_path) == "<source redacted>"
+    redacted_text = redact_source_text(local_path)
+    assert "<source redacted>" in redacted_text
+    assert "api-key" not in redacted_text
+    assert "password" not in redacted_text
+    assert "secret" not in redacted_text
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "file:///tmp/model%3Fv1.pkl",
+        "file:///tmp/model.pkl%3Fversion%3D1",
+        "user@example.com",
+    ],
+)
+def test_encoded_file_names_and_email_near_matches_are_preserved(source: str) -> None:
+    assert redact_source_identifier(source) == source
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "file://host/tmp/model.pkl",
+        "model.pkl;version=v1",
+        "bucket/model.pkl;version=v1",
+    ],
+)
+def test_authority_and_semicolon_near_matches_are_preserved(source: str) -> None:
+    assert redact_source_identifier(source) == source
+    assert redact_source_text(f"source {source}") == f"source {source}"
+
+
+def test_percent_encoded_at_in_file_path_is_not_treated_as_authority() -> None:
+    source = "file:///tmp/api-key%40host/model.pkl"
+
+    assert redact_source_identifier(source) == source
+
+
+@pytest.mark.parametrize(
+    "raw_path",
+    [
+        "token=scheme-less-secret?revision=v1",
+        "sessionToken=scheme-less-secret?revision=v1",
+        "session%54oken=scheme-less-secret?revision=v1",
+        "bucket/token=path-secret/model.pkl?revision=v1",
+        "bucket/token%3Dpath-secret/model.pkl?revision=v1",
+        "Authorization: Bearer source-secret?revision=v1",
+        "dbPassword: source-secret#tag=v1",
+    ],
+)
+def test_safe_provenance_does_not_restore_sensitive_prefixes(raw_path: str) -> None:
+    assert redact_source_identifier(raw_path) == "<source redacted>"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        'payload={"token":"EXPORT-SECRET-123"}',
+        "token[]=EXPORT-SECRET-123",
+        "headers[token]=EXPORT-SECRET-123",
+        'headers["token"]=EXPORT-SECRET-123',
+        'headers[ "token" ]=EXPORT-SECRET-123',
+        "headers[ token]=EXPORT-SECRET-123",
+        "headers[token ]=EXPORT-SECRET-123",
+        r'payload={"\u0074oken":"EXPORT-SECRET-123"}',
+        r'payload={"to\u006ben":"EXPORT-SECRET-123"}',
+        '"token"=EXPORT-SECRET-123',
+        r"payload={\"token\":\"EXPORT-SECRET-123\"}",
+        "Authorization Bearer EXPORT-SECRET-123",
+        "Authorization Digest EXPORT-SECRET-123",
+        "Authorization ApiKey EXPORT-SECRET-123",
+        "Authorization DPoP EXPORT-SECRET-123",
+        "Authorization Hawk EXPORT-SECRET-123",
+        "Proxy-Authorization NTLM EXPORT-SECRET-123",
+        "Proxy-Authorization ApiKey EXPORT-SECRET-123",
+        "--token EXPORT-SECRET-123 --verbose",
+        "token <- EXPORT-SECRET-123; visible=yes",
+    ],
+)
+def test_serialized_and_argument_credentials_are_redacted(text: str) -> None:
+    redacted = redact_source_text(text)
+
+    assert "EXPORT-SECRET-123" not in redacted
+
+
+def test_redact_source_text_handles_dense_credential_assignments() -> None:
+    text = "token=EXPORT-SECRET-123;" * 5_000
+
+    redacted = redact_source_text(text)
+
+    assert "EXPORT-SECRET-123" not in redacted
+    assert redacted.count("<redacted>") == 5_000
+
+
+@pytest.mark.parametrize("operator", ["!=", ">=", "<="])
+def test_sensitive_key_ordering_comparisons_are_not_treated_as_assignments(operator: str) -> None:
+    text = f'config={{"client_secret" {operator} "public": "os.system(15)"}}'
+
+    assert redact_source_text(text) == text
+
+
+def test_sensitive_key_equality_comparisons_redact_value_and_preserve_context() -> None:
+    text = 'config={"client_secret" == "public": "os.system(15)"}'
+
+    redacted = redact_source_text(text)
+
+    assert redacted == 'config={"client_secret" == <redacted>: "os.system(15)"}'
+
+
+def test_benign_comparisons_are_preserved_in_generic_exports() -> None:
+    text = "status == 200 and count == 5"
+
+    assert redact_source_text(text) == text
+
+
+def test_comparison_marker_tail_is_redacted_in_generic_exports() -> None:
+    text = 'client_secret == <redacted> + "RAW-MARKER-TAIL-SECRET-123456"'
+
+    redacted = redact_source_text(text)
+
+    assert "RAW-MARKER-TAIL-SECRET-123456" not in redacted
+    assert redacted == "client_secret == <redacted>"
+
+
+def test_exactly_redacted_comparison_value_is_preserved() -> None:
+    text = "client_secret == <redacted>"
+
+    assert redact_source_text(text) == text
+
+
+def test_reversed_literal_key_comparison_redacts_value_in_generic_exports() -> None:
+    text = '"OPAQUE-VALUE-CRED-123456" == "client_secret"; os.system("id")'
+
+    redacted = redact_source_text(text)
+
+    assert "OPAQUE-VALUE-CRED-123456" not in redacted
+    assert '<redacted> == "client_secret"' in redacted
+    assert 'os.system("id")' in redacted
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        'label == "client_secret"; os.system("id")',
+        '"OPAQUE-VALUE" == "tokenizer"',
+    ],
+)
+def test_reversed_comparison_near_matches_are_preserved_in_generic_exports(text: str) -> None:
+    assert redact_source_text(text) == text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "https://host/model,Authorization: Bearer URL-ADJACENT-SECRET",
+        "https://host/model;password: URL-ADJACENT-SECRET",
+        "metadata token%3DENCODED-SECRET visible=yes",
+        "metadata token%253DDOUBLE-ENCODED-SECRET",
+        "Authorization%3A%20Bearer%20ENCODED-HEADER-SECRET",
+        r"password\u003aESCAPED-SECRET",
+        '{"token":"QUOTED-SECRET"}',
+        '{"Authorization":"Bearer QUOTED-HEADER-SECRET"}',
+        "token%3DCHAINED-SECRET%26visible%3Dyes",
+        "token%253DDOUBLE-CHAINED-SECRET%2526visible%253Dyes",
+        "Authorization%3A%20Bearer%20HEADER-SECRET%3Btoken%3DSECOND-SECRET",
+    ],
+)
+def test_encoded_quoted_and_url_adjacent_assignments_are_redacted(text: str) -> None:
+    redacted = redact_source_text(text)
+
+    assert "SECRET" not in redacted
+    assert "<redacted>" in redacted
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ('--token "EXPORT SECRET 123" --verbose', "--token <redacted> --verbose"),
+        ('Authorization Bearer "EXPORT SECRET 123" tail', "Authorization Bearer <redacted> tail"),
+        ("payload=[token=EXPORT-SECRET-123] tail", "payload=[token=<redacted>] tail"),
+        ("--token=EXPORT-SECRET-123 --verbose", "--token=<redacted> --verbose"),
+        ("token: |\n  EXPORT-SECRET-123\nnext=safe", "token: <redacted>\nnext=safe"),
+        ("token: >\n  EXPORT SECRET 123\nnext=safe", "token: <redacted>\nnext=safe"),
+    ],
+)
+def test_credential_redaction_preserves_surrounding_context(text: str, expected: str) -> None:
+    assert redact_source_text(text) == expected
+
+
+def test_oversized_export_text_fails_closed() -> None:
+    assert redact_source_text("a" * (256 * 1024 + 1)) == "<redacted oversized value>"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "request_signature_algorithm=rsa",
+        "authorization_method=oauth2",
+        "Authorization method oauth2",
+        "Authorization status disabled",
+        "password_policy=strong",
+        "my_secret_ingredient=salt",
+        "token_count=42",
+        "token_type_ids=[1, 2]",
+        "signature_algorithm=rsa",
+    ],
+)
+def test_export_credential_near_matches_are_preserved(text: str) -> None:
+    assert redact_source_text(text) == text
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("bucket/user:EXPORT-SECRET-123@host/model.pkl", "bucket/host/model.pkl"),
+        ("bucket/user%3AEXPORT-SECRET-123%40host/model.pkl", "bucket/host/model.pkl"),
+        ("bucket/user%253AEXPORT-SECRET-123%2540host/model.pkl", "bucket/host/model.pkl"),
+        ("///user:EXPORT-SECRET-123@host/model.pkl", "<source redacted>"),
+        ("stream://jdbc:postgresql://user:EXPORT-SECRET-123@host/db", "stream://jdbc:postgresql://host/db"),
+    ],
+)
+def test_nested_userinfo_is_redacted_from_direct_identifiers(source: str, expected: str) -> None:
+    assert redact_source_identifier(source) == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "token_count=128",
+        "signature_algorithm=RSA",
+        "auth_method=oauth",
+        "session_duration=10",
+        "password_length=12",
+        "version%3D1",
+        "tokenizer%3Dpublic",
+    ],
+)
+def test_benign_metric_and_encoded_near_matches_are_preserved(text: str) -> None:
+    assert redact_source_text(text) == text
+
+
+def test_escaped_quote_does_not_end_credential_redaction_early() -> None:
+    redacted = redact_source_text('refreshToken="abc\\"quoted-secret"; visible=yes')
+
+    assert "quoted-secret" not in redacted
+    assert "visible=yes" in redacted
+
+
+def test_redacted_url_path_assignment_preserves_safe_path_and_query() -> None:
+    raw_url = "https://example.com/token%253Dpath-secret/model.pkl?visible=yes"
+
+    assert redact_source_text(raw_url) == "https://example.com/token=<redacted>/model.pkl?visible=yes"
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        (
+            "https://example.com/token:URL-SECRET/model.pkl",
+            "https://example.com/token=<redacted>/model.pkl",
+        ),
+        (
+            "https://example.com/sessionToken%253AURL-SECRET/model.pkl",
+            "https://example.com/sessionToken=<redacted>/model.pkl",
+        ),
+        ("bucket/token:PATH-SECRET/model.pkl", "<source redacted>"),
+        ("/tmp/token:PATH-SECRET/model.pkl", "<source redacted>"),
+        (r"C:\models\token:PATH-SECRET\model.pkl", "<source redacted>"),
+    ],
+)
+def test_colon_path_credentials_are_redacted(source: str, expected: str) -> None:
+    assert redact_source_identifier(source) == expected
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "https://example.com/version:1/model.pkl",
+        "bucket/version:1/model.pkl",
+        "/tmp/version:1/model.pkl",
+        r"C:\models\version:1\model.pkl",
+    ],
+)
+def test_benign_colon_path_segments_are_preserved(source: str) -> None:
+    assert redact_source_identifier(source) == source
+
+
+def test_nonexistent_local_suffix_is_redacted_but_literal_filename_is_preserved(tmp_path: Path) -> None:
+    missing_path = tmp_path / "missing.pkl?token=source-secret"
+
+    assert redact_source_identifier(str(missing_path)) == str(tmp_path / "missing.pkl")
+    if os.name != "nt":
+        literal_path = tmp_path / "literal.pkl?token=filename-text"
+        literal_path.write_bytes(b"model")
+        assert redact_source_identifier(str(literal_path)) == str(literal_path)
+    assert redact_source_identifier("./missing.pkl%3Ftoken%3Dsource-secret") == "./missing.pkl"
+
+
+@pytest.mark.parametrize(
+    "raw_path",
+    [
+        "./user:password@bucket.example/model.pkl",
+        "./bucket/token=path-secret/model.pkl?revision=v1",
+        "./bucket/token%3Dpath-secret/model.pkl?revision=v1",
+    ],
+)
+def test_nonexistent_posix_local_credential_prefixes_fail_closed(raw_path: str) -> None:
+    assert redact_source_identifier(raw_path) == "<source redacted>"
+
+
+@pytest.mark.parametrize(
+    "local_path",
+    [
+        "/tmp/build@2026/model.pkl",
+        "./artifacts/user@example.com/model.pkl",
+        "./artifacts/user@example.com/model.pkl?version=1",
+    ],
+)
+def test_nonexistent_posix_at_paths_are_preserved(local_path: str) -> None:
+    assert redact_source_identifier(local_path) == local_path
+    assert redact_source_text(f"source {local_path}") == f"source {local_path}"
+
+
+@pytest.mark.parametrize(
+    ("raw_path", "safe_path"),
+    [
+        ("/bucket/model.pkl;token=source-secret", "/bucket/model.pkl"),
+        ("./bucket/model.pkl%3Btoken%3Dsource-secret", "./bucket/model.pkl"),
+    ],
+)
+def test_nonexistent_local_semicolon_credentials_are_redacted(raw_path: str, safe_path: str) -> None:
+    assert redact_source_identifier(raw_path) == safe_path
+
+
+def test_existing_local_credential_shaped_filename_is_preserved(tmp_path: Path) -> None:
+    literal_path = tmp_path / "model.pkl;token=filename-text"
+    literal_path.write_bytes(b"model")
+
+    assert redact_source_identifier(str(literal_path)) == str(literal_path)
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("model.pkl?OPAQUE-SECRET", "model.pkl"),
+        ("model.pkl%3FOPAQUE-SECRET", "model.pkl"),
+        ("model.pkl;OPAQUE-SECRET", "model.pkl"),
+        ("bucket/model.pkl;OPAQUE-SECRET", "bucket/model.pkl"),
+        (r"bucket/model.pkl\u003btoken\u003descaped-secret", "bucket/model.pkl"),
+        ("source //bucket.example/model.pkl?OPAQUE-SECRET", "source //bucket.example/model.pkl"),
+        ("model.pkl?version=1", "model.pkl?version=1"),
+        ("model.pkl%3Fversion%3D1", "model.pkl%3Fversion%3D1"),
+        ("./bucket/model.pkl;version=1", "./bucket/model.pkl;version=1"),
+        ("release 1.2.3? maybe", "release 1.2.3? maybe"),
+        ("email user@example.com?subject=safe", "email user@example.com?subject=safe"),
+        ("email user@example.com?token=secret", "email user@example.com"),
+    ],
+)
+def test_bare_and_protocol_relative_opaque_source_text_redaction(text: str, expected: str) -> None:
+    assert redact_source_text(text) == expected
