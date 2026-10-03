@@ -1939,11 +1939,19 @@ def test_cache_identity_selects_darwin_path_monitor(
     assert monitor.closed is True
 
 
+@pytest.mark.parametrize("retry_capture", [False, True], ids=["initial-capture", "retried-capture"])
 def test_identity_capture_closes_darwin_monitor_on_retained_keyboard_interrupt(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    retry_capture: bool,
 ) -> None:
     created_monitors: list[Any] = []
+    stat_comparisons = 0
+
+    def stat_matches(_left: os.stat_result, _right: os.stat_result) -> bool:
+        nonlocal stat_comparisons
+        stat_comparisons += 1
+        return not retry_capture or stat_comparisons > 1
 
     class StubDarwinPathMonitor:
         def __init__(self, _file_path: str, _ancestor_identity: tuple[Any, ...]) -> None:
@@ -1961,16 +1969,25 @@ def test_identity_capture_closes_darwin_monitor_on_retained_keyboard_interrupt(
 
     file_path = _make_cacheable_file(tmp_path)
     cache = ScanResultsCache(str(tmp_path / "cache"))
+    ancestor_identity = cache._capture_ancestor_identity(str(file_path))
+    barrier_token = max(1, *(entry[-1] for entry in ancestor_identity)) + 1
+    monkeypatch.setattr(cache, "_get_file_change_token", lambda _path, _stat: 1)
+    monkeypatch.setattr(cache, "_capture_ancestor_identity", lambda _path: ancestor_identity)
+    monkeypatch.setattr(cache, "_advance_change_clock", lambda *_args: barrier_token)
+    monkeypatch.setattr(cache, "_stat_matches", stat_matches)
     monkeypatch.setattr(scan_results_cache_module.sys, "platform", "darwin")
     monkeypatch.setattr(scan_results_cache_module, "_DarwinPathMonitor", StubDarwinPathMonitor)
     monkeypatch.setattr(cache.hasher, "hash_file_with_stat", interrupt_hash)
 
-    with pytest.raises(KeyboardInterrupt, match="identity hashing interrupted") as interruption:
-        cache.capture_file_identity(str(file_path))
+    with tempfile.TemporaryFile(mode="w+b", dir=tmp_path) as probe:
+        monkeypatch.setattr(cache, "_get_change_clock_probe", lambda _path, _device: probe)
+        with pytest.raises(KeyboardInterrupt, match="identity hashing interrupted") as interruption:
+            cache.capture_file_identity(str(file_path))
 
     assert interruption.traceback is not None
-    assert created_monitors
-    assert all(monitor.closed is True for monitor in created_monitors)
+    assert stat_comparisons == (2 if retry_capture else 1)
+    assert len(created_monitors) == stat_comparisons
+    assert all(monitor.closed for monitor in created_monitors)
 
 
 @pytest.mark.parametrize("retry_capture", [False, True], ids=["initial-capture", "retried-capture"])

@@ -3464,6 +3464,36 @@ def test_zlib_shaped_header_keeps_safetensors_security_routing(tmp_path: Path) -
     assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
 
 
+@pytest.mark.parametrize(
+    ("description", "expected_critical"),
+    [("<script>alert('xss')</script>", True), ("Model weights", False)],
+)
+def test_fdict_shaped_native_safetensors_keeps_security_routing(
+    tmp_path: Path, description: str, expected_critical: bool
+) -> None:
+    file_path = tmp_path / "fdict-shaped-header.safetensors"
+    header_len = 0x2078
+    header = json.dumps(
+        {
+            "__metadata__": {"description": description},
+            "tensor": {
+                "dtype": "U8",
+                "shape": [1],
+                "data_offsets": [0, 1],
+            },
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+    write_raw_safetensors_header(file_path, header + b" " * (header_len - len(header)), b"\x00")
+
+    result = scan_file(str(file_path))
+
+    assert file_path.read_bytes()[:2] == b"\x78\x20"
+    assert result.scanner_name == "safetensors"
+    assert result.success is (not expected_critical)
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues) is expected_critical
+
+
 def test_zlib_shaped_deep_header_fails_closed(tmp_path: Path) -> None:
     file_path = tmp_path / "deep-zlib-shaped.unknown"
     header_len = 0x9C78

@@ -14,6 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Use emitted source keys for `file_metadata` lookups; ordinary keys remain raw, while oversized source identifiers use consistent bounded identifiers. Previously masked keys are no longer aliases. Metadata values and per-source associations remain intact.
 - Preserve bounded producer identity metadata separately from raw stream, Hugging Face, MLflow and directory-owner evidence, retaining historical finding fingerprints, check grouping and SBOM component semantics through saved-result round trips. Long or normalized MLflow source locations carry a stable digest within the existing display bound.
 
+### Fixed
+
+- Preserve native SafeTensors routing when a valid bounded header also resembles an FDICT zlib stream.
+
 ## [0.2.53](https://github.com/promptfoo/modelaudit/compare/v0.2.52...v0.2.53) (2026-10-03)
 
 ### Security
