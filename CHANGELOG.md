@@ -7,10 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.2.54](https://github.com/promptfoo/modelaudit/compare/v0.2.53...v0.2.54) (2026-10-03)
 
-
 ### Bug Fixes
 
-* **safetensors:** preserve native FDICT-shaped headers ([#1863](https://github.com/promptfoo/modelaudit/issues/1863)) ([2a5185a](https://github.com/promptfoo/modelaudit/commit/2a5185a32a3993ac6188b20a04fe6cec7cc2eddc))
+- **safetensors:** preserve native FDICT-shaped headers ([#1863](https://github.com/promptfoo/modelaudit/issues/1863)) ([2a5185a](https://github.com/promptfoo/modelaudit/commit/2a5185a32a3993ac6188b20a04fe6cec7cc2eddc))
 
 ## [Unreleased]
 
