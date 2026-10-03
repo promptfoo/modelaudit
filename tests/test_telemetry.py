@@ -209,77 +209,23 @@ class TestTelemetryClient:
 
     def test_telemetry_disabled_in_development(self):
         """Test that telemetry is disabled by default in development (editable install)."""
-        with (
-            tempfile.TemporaryDirectory() as temp_dir,
-            patch("modelaudit.telemetry.Path.home") as mock_home,
-            patch("modelaudit.telemetry._IS_DEVELOPMENT", True),  # Simulate development
-            patch.dict(
-                os.environ,
-                {
-                    "CI": "",
-                    "IS_TESTING": "",
-                    "PROMPTFOO_DISABLE_TELEMETRY": "",
-                    "NO_ANALYTICS": "",
-                    "MODELAUDIT_TELEMETRY_DEV": "",
-                },
-                clear=False,
-            ),
-        ):
-            mock_home.return_value = Path(temp_dir)
-            client = TelemetryClient()
-
-            # Telemetry should be disabled by default in development
-            assert client._is_disabled() is True
+        # Simulate development
+        # Telemetry should be disabled by default in development
+        _assert_development_telemetry_policy((""), (True))
 
     def test_telemetry_can_be_enabled_in_development(self):
         """Test that telemetry can be explicitly enabled in development."""
-        with (
-            tempfile.TemporaryDirectory() as temp_dir,
-            patch("modelaudit.telemetry.Path.home") as mock_home,
-            patch("modelaudit.telemetry._IS_DEVELOPMENT", True),  # Simulate development
-            patch.dict(
-                os.environ,
-                {
-                    "CI": "",
-                    "IS_TESTING": "",
-                    "PROMPTFOO_DISABLE_TELEMETRY": "",
-                    "NO_ANALYTICS": "",
-                    "MODELAUDIT_TELEMETRY_DEV": "1",
-                },
-                clear=False,
-            ),
-        ):
-            mock_home.return_value = Path(temp_dir)
-            client = TelemetryClient()
-
-            # Telemetry should be enabled when explicitly opted in during development
-            assert client._is_disabled() is False
+        # Simulate development
+        # Telemetry should be enabled when explicitly opted in during development
+        _assert_development_telemetry_policy(("1"), (False))
 
     def test_promptfoo_disable_env_var(self):
         """Test that PROMPTFOO_DISABLE_TELEMETRY works."""
-        with (
-            patch.dict(os.environ, {"PROMPTFOO_DISABLE_TELEMETRY": "1"}),
-            patch("modelaudit.telemetry._IS_DEVELOPMENT", False),
-            tempfile.TemporaryDirectory() as temp_dir,
-            patch("modelaudit.telemetry.Path.home") as mock_home,
-        ):
-            mock_home.return_value = Path(temp_dir)
-            client = TelemetryClient()
-
-            assert client._is_disabled() is True
+        _assert_telemetry_disable_environment("PROMPTFOO_DISABLE_TELEMETRY")
 
     def test_ci_environment_disables_telemetry(self):
         """Test that CI environment disables telemetry."""
-        with (
-            patch.dict(os.environ, {"CI": "1"}),
-            patch("modelaudit.telemetry._IS_DEVELOPMENT", False),
-            tempfile.TemporaryDirectory() as temp_dir,
-            patch("modelaudit.telemetry.Path.home") as mock_home,
-        ):
-            mock_home.return_value = Path(temp_dir)
-            client = TelemetryClient()
-
-            assert client._is_disabled() is True
+        _assert_telemetry_disable_environment("CI")
 
     def test_promptfoo_truthy_aliases_disable_telemetry(self, tmp_path: Path) -> None:
         """Promptfoo truthy env aliases should use the same disable path as true/1."""
@@ -1184,6 +1130,42 @@ class TestTelemetryIntegration:
 
         assert len(result.issues) > 0
         assert mock_core_record_issue_found.call_count + mock_results_record_issue_found.call_count > 0
+
+
+def _assert_development_telemetry_policy(case_dev_override: str, case_disabled: bool) -> None:
+    with (
+        tempfile.TemporaryDirectory() as temp_dir,
+        patch("modelaudit.telemetry.Path.home") as mock_home,
+        patch("modelaudit.telemetry._IS_DEVELOPMENT", True),
+        patch.dict(
+            os.environ,
+            {
+                "CI": "",
+                "IS_TESTING": "",
+                "PROMPTFOO_DISABLE_TELEMETRY": "",
+                "NO_ANALYTICS": "",
+                "MODELAUDIT_TELEMETRY_DEV": case_dev_override,
+            },
+            clear=False,
+        ),
+    ):
+        mock_home.return_value = Path(temp_dir)
+        client = TelemetryClient()
+
+        assert client._is_disabled() is case_disabled
+
+
+def _assert_telemetry_disable_environment(case_environment_key: str) -> None:
+    with (
+        patch.dict(os.environ, {case_environment_key: "1"}),
+        patch("modelaudit.telemetry._IS_DEVELOPMENT", False),
+        tempfile.TemporaryDirectory() as temp_dir,
+        patch("modelaudit.telemetry.Path.home") as mock_home,
+    ):
+        mock_home.return_value = Path(temp_dir)
+        client = TelemetryClient()
+
+        assert client._is_disabled() is True
 
 
 if __name__ == "__main__":

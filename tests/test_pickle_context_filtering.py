@@ -9,16 +9,12 @@ from typing import Any
 
 from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.pickle_scanner import PickleScanner
+from tests.helpers.file_creators import SystemCommandPayload
 
 
 class SafeStateDict:
     def __reduce__(self) -> tuple[Any, tuple[list[tuple[str, str]]]]:
         return (OrderedDict, ([("layer.weight", "tensor_data"), ("layer.bias", "bias_data")],))
-
-
-class MaliciousPayload:
-    def __reduce__(self) -> tuple[Any, tuple[str]]:
-        return (os.system, ("id",))
 
 
 def _short_binunicode(value: bytes) -> bytes:
@@ -31,7 +27,7 @@ def _alternate_platform_system_payload() -> tuple[bytes, str]:
     payload = pickle.dumps(
         {
             "state_dict": OrderedDict([("layer.weight", "tensor_data")]),
-            "payload": MaliciousPayload(),
+            "payload": SystemCommandPayload("id", lambda: os.system),
         },
         protocol=4,
     )
@@ -55,7 +51,7 @@ def test_rust_pickle_scanner_does_not_let_ml_context_hide_dangerous_reduce(tmp_p
     path = tmp_path / "mixed.pkl"
     payload = {
         "state_dict": OrderedDict([("layer.weight", "tensor_data")]),
-        "payload": MaliciousPayload(),
+        "payload": SystemCommandPayload("id", lambda: os.system),
     }
     path.write_bytes(pickle.dumps(payload, protocol=4))
 

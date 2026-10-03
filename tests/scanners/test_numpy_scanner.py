@@ -24,6 +24,7 @@ from modelaudit.scanners.numpy_scanner import (
     _numpy_object_reconstruction_reference_is_trusted,
     _read_numpy_array_header,
 )
+from tests.helpers.file_creators import ExecPayload
 
 _MALFORMED_NUMPY_RECONSTRUCT_PAYLOAD = b"cnumpy._core.multiarray\n_reconstruct\n(NtR."
 
@@ -280,11 +281,6 @@ class TestCVE20196446ObjectDtype:
         assert result.success is True
         cve_checks = [c for c in result.checks if "CVE-2019-6446" in (c.name + c.message)]
         assert len(cve_checks) > 0, "Structured dtype with object field should trigger CVE"
-
-
-class _ExecPayload:
-    def __reduce__(self) -> tuple[Callable[..., Any], tuple[Any, ...]]:
-        return (exec, ("print('owned')",))
 
 
 def _write_metadata_marker(path: str) -> None:
@@ -619,7 +615,7 @@ def _inject_comment_token_into_npz_member(path: Path, member_name: str) -> None:
 
 
 def test_object_dtype_numpy_recurses_into_pickle_exec(tmp_path: Path) -> None:
-    arr = np.array([_ExecPayload()], dtype=object)
+    arr = np.array([ExecPayload()], dtype=object)
     path = tmp_path / "malicious_object.npy"
     np.save(path, arr, allow_pickle=True)
 
@@ -667,7 +663,7 @@ def test_numeric_npz_has_no_pickle_recursion_findings(tmp_path: Path) -> None:
 
 def test_object_npz_member_recurses_into_pickle_exec_with_member_context(tmp_path: Path) -> None:
     safe = np.array([1, 2, 3], dtype=np.int64)
-    malicious = np.array([_ExecPayload()], dtype=object)
+    malicious = np.array([ExecPayload()], dtype=object)
     npz_path = tmp_path / "mixed_object.npz"
     np.savez(npz_path, safe=safe, payload=malicious)
 
@@ -681,7 +677,7 @@ def test_object_npz_member_recurses_into_pickle_exec_with_member_context(tmp_pat
 
 
 def test_object_dtype_numpy_comment_token_bypass_still_detected(tmp_path: Path) -> None:
-    arr = np.array([_ExecPayload()], dtype=object)
+    arr = np.array([ExecPayload()], dtype=object)
     path = tmp_path / "comment_token.npy"
     np.save(path, arr, allow_pickle=True)
     _inject_comment_token_into_npy_payload(path)
@@ -696,7 +692,7 @@ def test_object_dtype_numpy_comment_token_bypass_still_detected(tmp_path: Path) 
 
 def test_object_npz_member_comment_token_bypass_still_detected(tmp_path: Path) -> None:
     npz_path = tmp_path / "comment_token.npz"
-    np.savez(npz_path, payload=np.array([_ExecPayload()], dtype=object))
+    np.savez(npz_path, payload=np.array([ExecPayload()], dtype=object))
     _inject_comment_token_into_npz_member(npz_path, "payload.npy")
 
     from modelaudit.scanners.zip_scanner import ZipScanner
@@ -1201,7 +1197,7 @@ def test_numpy_object_dtype_direct_scan_preserves_info_downgraded_embedded_priva
 
 
 def test_numpy_object_dtype_malicious_exit1(tmp_path: Path) -> None:
-    arr = np.array([_ExecPayload()], dtype=object)
+    arr = np.array([ExecPayload()], dtype=object)
     path = tmp_path / "malicious_object.npy"
     np.save(path, arr, allow_pickle=True)
 
@@ -1217,7 +1213,7 @@ def test_numpy_object_dtype_malicious_exit1(tmp_path: Path) -> None:
 
 
 def test_numpy_object_dtype_pickle_selection_skip_is_inconclusive(tmp_path: Path) -> None:
-    arr = np.array([_ExecPayload()], dtype=object)
+    arr = np.array([ExecPayload()], dtype=object)
     path = tmp_path / "malicious_object_numpy_only.npy"
     np.save(path, arr, allow_pickle=True)
 
@@ -1254,7 +1250,7 @@ def test_numpy_object_dtype_pickle_selection_skip_is_inconclusive(tmp_path: Path
 
 
 def test_numpy_object_dtype_pickle_exclusion_is_inconclusive_and_not_cached(tmp_path: Path) -> None:
-    arr = np.array([_ExecPayload()], dtype=object)
+    arr = np.array([ExecPayload()], dtype=object)
     path = tmp_path / "malicious_object_pickle_excluded.npy"
     cache_dir = tmp_path / "cache"
     np.save(path, arr, allow_pickle=True)
@@ -1296,7 +1292,7 @@ def test_numpy_object_dtype_pickle_exclusion_is_inconclusive_and_not_cached(tmp_
 
 def test_numpy_structured_object_field_pickle_selection_skip_is_inconclusive(tmp_path: Path) -> None:
     dtype = np.dtype([("payload", object), ("score", np.int64)])
-    arr = np.array([(_ExecPayload(), 7)], dtype=dtype)
+    arr = np.array([(ExecPayload(), 7)], dtype=dtype)
     path = tmp_path / "structured_object_numpy_only.npy"
     np.save(path, arr, allow_pickle=True)
 
@@ -1347,7 +1343,7 @@ def test_numpy_numeric_dtype_numpy_only_remains_conclusive(tmp_path: Path) -> No
 
 
 def test_numpy_object_dtype_pickle_selection_control_detects_exec(tmp_path: Path) -> None:
-    arr = np.array([_ExecPayload()], dtype=object)
+    arr = np.array([ExecPayload()], dtype=object)
     path = tmp_path / "malicious_object_numpy_and_pickle.npy"
     np.save(path, arr, allow_pickle=True)
 
@@ -1370,7 +1366,7 @@ def test_numpy_object_dtype_pickle_selection_control_detects_exec(tmp_path: Path
 
 def test_numpy_object_npz_pickle_selection_skip_is_inconclusive(tmp_path: Path) -> None:
     path = tmp_path / "malicious_object_numpy_only.npz"
-    np.savez(path, payload=np.array([_ExecPayload()], dtype=object))
+    np.savez(path, payload=np.array([ExecPayload()], dtype=object))
 
     result = scan_model_directory_or_file(
         str(path),
@@ -1408,7 +1404,7 @@ def test_benign_object_dtype_npz_no_nested_critical(tmp_path: Path) -> None:
 
 
 def test_truncated_npy_fails_safely(tmp_path: Path) -> None:
-    arr = np.array([_ExecPayload()], dtype=object)
+    arr = np.array([ExecPayload()], dtype=object)
     path = tmp_path / "truncated.npy"
     np.save(path, arr, allow_pickle=True)
     path.write_bytes(path.read_bytes()[:-8])
@@ -1470,7 +1466,7 @@ def test_object_dtype_numpy_trailing_bytes_exit2_not_security_finding(tmp_path: 
 
 
 def test_object_dtype_numpy_trailing_bytes_malicious_exit1(tmp_path: Path) -> None:
-    arr = np.array([_ExecPayload()], dtype=object)
+    arr = np.array([ExecPayload()], dtype=object)
     path = tmp_path / "malicious_trailing.npy"
     np.save(path, arr, allow_pickle=True)
     path.write_bytes(path.read_bytes() + b"TRAILINGJUNK")

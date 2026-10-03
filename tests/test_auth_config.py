@@ -1,5 +1,6 @@
 import os
 import stat
+from collections.abc import Callable
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -683,13 +684,9 @@ def test_auth_login_accepts_explicit_enterprise_https_host(monkeypatch: pytest.M
     fake_config = _FakeCloudConfig()
     requested_urls: list[str] = []
 
-    def fake_fetch(url: str, **_kwargs: Any) -> _FakeResponse:
-        requested_urls.append(url)
-        return _FakeResponse()
-
     monkeypatch.setenv("MODELAUDIT_API_ALLOWED_HOSTS", "enterprise.example")
     monkeypatch.setattr(auth_client_module, "cloud_config", fake_config)
-    monkeypatch.setattr(auth_client_module, "fetch_with_proxy", fake_fetch)
+    monkeypatch.setattr(auth_client_module, "fetch_with_proxy", _recording_fetch(requested_urls))
     monkeypatch.setattr("modelaudit.cli.get_user_email", lambda: None)
     monkeypatch.setattr("modelaudit.cli.set_user_email", lambda _email: None)
 
@@ -712,13 +709,9 @@ def test_auth_login_uses_environment_host_instead_of_persisted_host(monkeypatch:
     fake_config = _FakeCloudConfig(api_host="https://old.promptfoo.app")
     requested_urls: list[str] = []
 
-    def fake_fetch(url: str, **_kwargs: Any) -> _FakeResponse:
-        requested_urls.append(url)
-        return _FakeResponse()
-
     monkeypatch.setenv("MODELAUDIT_API_HOST", "https://enterprise.example:8443")
     monkeypatch.setattr(auth_client_module, "cloud_config", fake_config)
-    monkeypatch.setattr(auth_client_module, "fetch_with_proxy", fake_fetch)
+    monkeypatch.setattr(auth_client_module, "fetch_with_proxy", _recording_fetch(requested_urls))
     monkeypatch.setattr("modelaudit.cli.get_user_email", lambda: None)
     monkeypatch.setattr("modelaudit.cli.set_user_email", lambda _email: None)
 
@@ -749,14 +742,9 @@ def test_validate_and_set_api_token_accepts_configured_host_and_stores_normalize
     requested_urls: list[str] = []
     requested_kwargs: list[dict[str, Any]] = []
 
-    def fake_fetch(url: str, **kwargs: Any) -> _FakeResponse:
-        requested_urls.append(url)
-        requested_kwargs.append(kwargs)
-        return _FakeResponse()
-
     monkeypatch.setenv("MODELAUDIT_API_ALLOWED_HOSTS", "enterprise.example")
     monkeypatch.setattr(auth_client_module, "cloud_config", fake_config)
-    monkeypatch.setattr(auth_client_module, "fetch_with_proxy", fake_fetch)
+    monkeypatch.setattr(auth_client_module, "fetch_with_proxy", _recording_fetch(requested_urls, requested_kwargs))
 
     result = auth_client_module.AuthClient().validate_and_set_api_token(
         "secret-token",
@@ -776,13 +764,9 @@ def test_validate_and_set_api_token_uses_environment_host_instead_of_persisted_h
     fake_config = _FakeCloudConfig(api_host="https://old.promptfoo.app")
     requested_urls: list[str] = []
 
-    def fake_fetch(url: str, **_kwargs: Any) -> _FakeResponse:
-        requested_urls.append(url)
-        return _FakeResponse()
-
     monkeypatch.setenv("MODELAUDIT_API_HOST", "https://enterprise.example:8443")
     monkeypatch.setattr(auth_client_module, "cloud_config", fake_config)
-    monkeypatch.setattr(auth_client_module, "fetch_with_proxy", fake_fetch)
+    monkeypatch.setattr(auth_client_module, "fetch_with_proxy", _recording_fetch(requested_urls))
 
     auth_client_module.AuthClient().validate_and_set_api_token("enterprise-token")
 
@@ -901,33 +885,11 @@ def test_validate_and_set_api_token_rejects_redirect_response_without_persisting
 
 
 def test_get_user_info_rejects_non_https_config_host_before_request(monkeypatch: pytest.MonkeyPatch) -> None:
-    fake_config = _FakeCloudConfig(api_host="http://attacker.example", api_key="secret-token")
-
-    def fail_fetch(_url: str, **_kwargs: Any) -> _FakeResponse:
-        raise AssertionError("fetch_with_proxy must not be called for untrusted API hosts")
-
-    monkeypatch.setattr(auth_client_module, "cloud_config", fake_config)
-    monkeypatch.setattr(auth_client_module.config, "cloud_config", fake_config)
-    monkeypatch.setattr(auth_client_module, "get_user_email", lambda: "user@example.com")
-    monkeypatch.setattr(auth_client_module, "fetch_with_proxy", fail_fetch)
-
-    with pytest.raises(ValueError, match="must use HTTPS"):
-        auth_client_module.AuthClient().get_user_info()
+    _assert_untrusted_config_host_rejection(monkeypatch, "http://attacker.example", "must use HTTPS")
 
 
 def test_get_user_info_rejects_attacker_https_config_host_before_request(monkeypatch: pytest.MonkeyPatch) -> None:
-    fake_config = _FakeCloudConfig(api_host="https://attacker.example", api_key="secret-token")
-
-    def fail_fetch(_url: str, **_kwargs: Any) -> _FakeResponse:
-        raise AssertionError("fetch_with_proxy must not be called for untrusted API hosts")
-
-    monkeypatch.setattr(auth_client_module, "cloud_config", fake_config)
-    monkeypatch.setattr(auth_client_module.config, "cloud_config", fake_config)
-    monkeypatch.setattr(auth_client_module, "get_user_email", lambda: "user@example.com")
-    monkeypatch.setattr(auth_client_module, "fetch_with_proxy", fail_fetch)
-
-    with pytest.raises(ValueError, match="trusted Promptfoo API host"):
-        auth_client_module.AuthClient().get_user_info()
+    _assert_untrusted_config_host_rejection(monkeypatch, "https://attacker.example", "trusted Promptfoo API host")
 
 
 def test_get_user_info_accepts_persisted_enterprise_https_host(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -935,16 +897,11 @@ def test_get_user_info_accepts_persisted_enterprise_https_host(monkeypatch: pyte
     requested_urls: list[str] = []
     requested_kwargs: list[dict[str, Any]] = []
 
-    def fake_fetch(url: str, **kwargs: Any) -> _FakeResponse:
-        requested_urls.append(url)
-        requested_kwargs.append(kwargs)
-        return _FakeResponse()
-
     monkeypatch.setenv("MODELAUDIT_API_ALLOWED_HOSTS", "enterprise.example")
     monkeypatch.setattr(auth_client_module, "cloud_config", fake_config)
     monkeypatch.setattr(auth_client_module.config, "cloud_config", fake_config)
     monkeypatch.setattr(auth_client_module, "get_user_email", lambda: "user@example.com")
-    monkeypatch.setattr(auth_client_module, "fetch_with_proxy", fake_fetch)
+    monkeypatch.setattr(auth_client_module, "fetch_with_proxy", _recording_fetch(requested_urls, requested_kwargs))
 
     auth_client_module.AuthClient().get_user_info()
 
@@ -956,15 +913,41 @@ def test_get_user_info_uses_environment_host_instead_of_persisted_host(monkeypat
     fake_config = _FakeCloudConfig(api_host="https://old.promptfoo.app", api_key="enterprise-token")
     requested_urls: list[str] = []
 
-    def fake_fetch(url: str, **_kwargs: Any) -> _FakeResponse:
-        requested_urls.append(url)
-        return _FakeResponse()
-
     monkeypatch.setenv("MODELAUDIT_API_HOST", "https://enterprise.example:8443")
     monkeypatch.setattr(auth_client_module, "cloud_config", fake_config)
     monkeypatch.setattr(auth_client_module, "get_user_email", lambda: "user@example.com")
-    monkeypatch.setattr(auth_client_module, "fetch_with_proxy", fake_fetch)
+    monkeypatch.setattr(auth_client_module, "fetch_with_proxy", _recording_fetch(requested_urls))
 
     auth_client_module.AuthClient().get_user_info()
 
     assert requested_urls == ["https://enterprise.example:8443/api/v1/users/me"]
+
+
+def _assert_untrusted_config_host_rejection(
+    monkeypatch: pytest.MonkeyPatch, case_host: str, case_error_match: str
+) -> None:
+    fake_config = _FakeCloudConfig(api_host=case_host, api_key="secret-token")
+
+    def fail_fetch(_url: str, **_kwargs: Any) -> _FakeResponse:
+        raise AssertionError("fetch_with_proxy must not be called for untrusted API hosts")
+
+    monkeypatch.setattr(auth_client_module, "cloud_config", fake_config)
+    monkeypatch.setattr(auth_client_module.config, "cloud_config", fake_config)
+    monkeypatch.setattr(auth_client_module, "get_user_email", lambda: "user@example.com")
+    monkeypatch.setattr(auth_client_module, "fetch_with_proxy", fail_fetch)
+
+    with pytest.raises(ValueError, match=case_error_match):
+        auth_client_module.AuthClient().get_user_info()
+
+
+def _recording_fetch(
+    requested_urls: list[str],
+    requested_kwargs: list[dict[str, Any]] | None = None,
+) -> Callable[..., _FakeResponse]:
+    def fake_fetch(url: str, **kwargs: Any) -> _FakeResponse:
+        requested_urls.append(url)
+        if requested_kwargs is not None:
+            requested_kwargs.append(kwargs)
+        return _FakeResponse()
+
+    return fake_fetch

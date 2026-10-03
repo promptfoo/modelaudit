@@ -9,20 +9,15 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from framework_fixtures import SystemCommandPayload
 
 import modelaudit_picklescan.api as package_api
 from modelaudit_picklescan import PickleScanner, SafetyVerdict, ScanStatus, scan_file
 
 
-class MaliciousPayload:
-    def __reduce__(self) -> tuple[object, tuple[str]]:
-        # Deliberately unsafe reducer used to verify malicious pickle handling.
-        return (os.system, ("echo pwned",))
-
-
 def test_scan_stream_declared_size_trailing_payload_fails_closed() -> None:
     benign_prefix = pickle.dumps({"safe": True}, protocol=4)
-    payload = benign_prefix + pickle.dumps(MaliciousPayload(), protocol=4)
+    payload = benign_prefix + pickle.dumps(SystemCommandPayload("echo pwned", lambda: os.system), protocol=4)
     stream = io.BytesIO(payload)
 
     report = PickleScanner().scan_stream(
@@ -114,7 +109,7 @@ def test_scan_stream_nonseekable_declared_boundary_fails_closed_without_probe() 
 
 
 def test_scan_stream_probe_error_preserves_malicious_declared_payload() -> None:
-    payload = pickle.dumps(MaliciousPayload(), protocol=4)
+    payload = pickle.dumps(SystemCommandPayload("echo pwned", lambda: os.system), protocol=4)
 
     class ProbeErrorStream(io.BytesIO):
         def read(self, size: int | None = -1) -> bytes:
@@ -140,7 +135,9 @@ def test_scan_file_uses_open_descriptor_size_after_path_replacement(
 ) -> None:
     payload_path = tmp_path / "race.pkl"
     benign_prefix = pickle.dumps({"safe": True}, protocol=4)
-    replacement_payload = benign_prefix + pickle.dumps(MaliciousPayload(), protocol=4)
+    replacement_payload = benign_prefix + pickle.dumps(
+        SystemCommandPayload("echo pwned", lambda: os.system), protocol=4
+    )
     payload_path.write_bytes(benign_prefix)
     original_open = Path.open
     replaced = False
@@ -169,7 +166,7 @@ def test_scan_file_keeps_plain_descriptor_after_path_replacement(
 ) -> None:
     payload_path = tmp_path / "descriptor.pkl"
     replacement_path = tmp_path / "replacement.pkl"
-    malicious_payload = pickle.dumps(MaliciousPayload(), protocol=4)
+    malicious_payload = pickle.dumps(SystemCommandPayload("echo pwned", lambda: os.system), protocol=4)
     payload_path.write_bytes(malicious_payload)
     replacement_path.write_bytes(pickle.dumps({"safe": True}, protocol=4))
     original_is_zipfile = package_api.zipfile.is_zipfile
@@ -198,7 +195,7 @@ def test_scan_file_keeps_zip_descriptor_after_path_replacement(
 ) -> None:
     archive_path = tmp_path / "descriptor.pt"
     replacement_path = tmp_path / "replacement.pkl"
-    malicious_payload = pickle.dumps(MaliciousPayload(), protocol=4)
+    malicious_payload = pickle.dumps(SystemCommandPayload("echo pwned", lambda: os.system), protocol=4)
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.writestr("data.pkl", malicious_payload)
         archive.writestr("version", "3\n")

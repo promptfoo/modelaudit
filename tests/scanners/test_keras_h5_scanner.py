@@ -12,6 +12,8 @@ from typing import Any
 
 import pytest
 
+from tests.helpers.cache import assert_inconclusive_not_cached as _assert_inconclusive_keras_h5_scan_not_cached
+
 # Skip if h5py is not available before importing it
 pytest.importorskip("h5py")
 
@@ -2268,36 +2270,6 @@ def _assert_inconclusive_keras_h5_scan(
     assert core_module.determine_exit_code(audit_result) == 2
 
 
-def _assert_inconclusive_keras_h5_scan_not_cached(model_path: Path, reason: str, cache_dir: Path) -> None:
-    reset_cache_manager()
-    try:
-        first_result = core_module.scan_model_directory_or_file(
-            str(model_path),
-            cache_enabled=True,
-            cache_dir=str(cache_dir),
-            min_cache_file_size=0,
-        )
-        second_result = core_module.scan_model_directory_or_file(
-            str(model_path),
-            cache_enabled=True,
-            cache_dir=str(cache_dir),
-            min_cache_file_size=0,
-        )
-
-        for audit_result in (first_result, second_result):
-            metadata = audit_result.file_metadata[str(model_path)]
-            assert core_module.determine_exit_code(audit_result) == 2
-            assert metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
-            assert reason in metadata.get("scan_outcome_reasons")
-            assert not any(
-                issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in audit_result.issues
-            )
-
-        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
-
-
 @pytest.mark.parametrize(
     ("model_config", "reason", "expected_check_name", "expected_message_substring"),
     [
@@ -3452,33 +3424,9 @@ def test_lambda_whitespace_padded_safe_source_still_passes(tmp_path: Path) -> No
 
 def test_lambda_safe_prefix_with_injected_code_is_flagged(tmp_path: Path) -> None:
     """Semicolon-appended payloads must not bypass Lambda code safety checks."""
-    model_path = create_custom_h5_file(
-        tmp_path,
-        {
-            "class_name": "Sequential",
-            "config": {
-                "name": "unsafe_lambda_model",
-                "layers": [
-                    {
-                        "class_name": "Lambda",
-                        "config": {"function": 'lambda x: x / 255; __import__("os").system("evil")'},
-                    }
-                ],
-            },
-        },
-    )
-
-    result = KerasH5Scanner().scan(str(model_path))
-
     # The injected payload must be flagged as dangerous, not allowlisted
-    assert any(
-        check.name == "Lambda Layer Code Analysis" and check.status == CheckStatus.FAILED for check in result.checks
-    ), f"Expected failed Lambda check but got: {[(c.name, c.status) for c in result.checks]}"
-    assert not any(
-        check.name == "Lambda Layer Code Analysis"
-        and check.status == CheckStatus.PASSED
-        and check.details.get("pattern_type") == "safe_normalization"
-        for check in result.checks
+    _assert_unsafe_lambda_expression(
+        tmp_path, ("unsafe_lambda_model"), ('lambda x: x / 255; __import__("os").system("evil")')
     )
 
 
@@ -3520,34 +3468,8 @@ def test_lambda_additional_safe_prefixes_with_injected_code_are_flagged(
 
 def test_lambda_tf_safe_prefix_with_exec_is_not_allowlisted(tmp_path: Path) -> None:
     """Safe tf.nn prefix should not match when arbitrary executable code is appended."""
-    model_path = create_custom_h5_file(
-        tmp_path,
-        {
-            "class_name": "Sequential",
-            "config": {
-                "name": "unsafe_tf_lambda_model",
-                "layers": [
-                    {
-                        "class_name": "Lambda",
-                        "config": {"function": 'lambda x: tf.nn.softmax(x); exec("bad")'},
-                    }
-                ],
-            },
-        },
-    )
-
-    result = KerasH5Scanner().scan(str(model_path))
-
     # The injected payload must be flagged as dangerous, not allowlisted
-    assert any(
-        check.name == "Lambda Layer Code Analysis" and check.status == CheckStatus.FAILED for check in result.checks
-    ), f"Expected failed Lambda check but got: {[(c.name, c.status) for c in result.checks]}"
-    assert not any(
-        check.name == "Lambda Layer Code Analysis"
-        and check.status == CheckStatus.PASSED
-        and check.details.get("pattern_type") == "safe_normalization"
-        for check in result.checks
-    )
+    _assert_unsafe_lambda_expression(tmp_path, ("unsafe_tf_lambda_model"), ('lambda x: tf.nn.softmax(x); exec("bad")'))
 
 
 @pytest.mark.parametrize(
@@ -5398,82 +5320,19 @@ def test_lambda_serialized_auxiliary_callback_is_scanned(tmp_path: Path, callbac
 
 
 def test_lambda_dict_output_shape_is_scanned_without_legacy_type_marker(tmp_path: Path) -> None:
-    encoded_code = base64.b64encode(b"import os\nos.system('id')").decode()
-    model_path = create_custom_h5_file(
+    _assert_lambda_output_shape(
         tmp_path,
-        {
-            "class_name": "Sequential",
-            "config": {
-                "name": "dict_output_shape_model",
-                "layers": [
-                    {
-                        "class_name": "Lambda",
-                        "config": {
-                            "name": "dict_output_shape",
-                            "function": "relu",
-                            "function_type": "function",
-                            "module": "keras.activations",
-                            "output_shape": {
-                                "class_name": "__lambda__",
-                                "config": {"code": encoded_code},
-                            },
-                        },
-                    }
-                ],
-            },
-        },
-        keras_version="3.11.3",
-        file_name="dict_output_shape.h5",
-    )
-
-    result = KerasH5Scanner().scan(str(model_path))
-
-    assert any(
-        check.name == "Lambda Layer Code Analysis"
-        and check.status == CheckStatus.FAILED
-        and check.severity == IssueSeverity.CRITICAL
-        and check.details.get("layer_name") == "lambda_1.output_shape"
-        for check in result.checks
+        ("dict_output_shape_model"),
+        ("dict_output_shape"),
+        ("output_shape"),
+        ("dict_output_shape.h5"),
+        ("lambda_1.output_shape"),
     )
 
 
 def test_lambda_dict_mask_without_legacy_type_marker_is_scanned(tmp_path: Path) -> None:
-    encoded_code = base64.b64encode(b"import os\nos.system('id')").decode()
-    model_path = create_custom_h5_file(
-        tmp_path,
-        {
-            "class_name": "Sequential",
-            "config": {
-                "name": "dict_mask_model",
-                "layers": [
-                    {
-                        "class_name": "Lambda",
-                        "config": {
-                            "name": "dict_mask",
-                            "function": "relu",
-                            "function_type": "function",
-                            "module": "keras.activations",
-                            "mask": {
-                                "class_name": "__lambda__",
-                                "config": {"code": encoded_code},
-                            },
-                        },
-                    }
-                ],
-            },
-        },
-        keras_version="3.11.3",
-        file_name="dict_mask.h5",
-    )
-
-    result = KerasH5Scanner().scan(str(model_path))
-
-    assert any(
-        check.name == "Lambda Layer Code Analysis"
-        and check.status == CheckStatus.FAILED
-        and check.severity == IssueSeverity.CRITICAL
-        and check.details.get("layer_name") == "lambda_1.mask"
-        for check in result.checks
+    _assert_lambda_output_shape(
+        tmp_path, ("dict_mask_model"), ("dict_mask"), ("mask"), ("dict_mask.h5"), ("lambda_1.mask")
     )
 
 
@@ -7186,50 +7045,12 @@ class TestCVE20251550H5ModuleReferences:
         assert cve_issues[0].details["module"] == "posix"
 
     def test_safe_keras_layer_module_is_not_flagged(self, tmp_path: Path) -> None:
-        model_path = create_custom_h5_file(
-            tmp_path,
-            {
-                "class_name": "Sequential",
-                "config": {
-                    "name": "h5_safe_module",
-                    "layers": [
-                        {
-                            "class_name": "Dense",
-                            "name": "dense_safe",
-                            "module": "keras.layers",
-                            "config": {"units": 1},
-                        }
-                    ],
-                },
-            },
-        )
-
-        result = KerasH5Scanner().scan(str(model_path))
-
-        assert not any(issue.details.get("cve_id") == "CVE-2025-1550" for issue in result.issues)
+        _assert_safe_h5_module(tmp_path, ("h5_safe_module"), ("dense_safe"), ("keras.layers"))
 
     def test_non_callable_unknown_dense_module_is_not_flagged(self, tmp_path: Path) -> None:
-        model_path = create_custom_h5_file(
-            tmp_path,
-            {
-                "class_name": "Sequential",
-                "config": {
-                    "name": "h5_unknown_dense_module",
-                    "layers": [
-                        {
-                            "class_name": "Dense",
-                            "name": "dense_custom_module",
-                            "module": "custom_project.layers",
-                            "config": {"units": 1},
-                        }
-                    ],
-                },
-            },
+        _assert_safe_h5_module(
+            tmp_path, ("h5_unknown_dense_module"), ("dense_custom_module"), ("custom_project.layers")
         )
-
-        result = KerasH5Scanner().scan(str(model_path))
-
-        assert not any(issue.details.get("cve_id") == "CVE-2025-1550" for issue in result.issues)
 
 
 class TestCVE20259905H5SafeMode:
@@ -7586,3 +7407,100 @@ class TestCVE20259905H5SafeMode:
             assert len(cve_issues) >= 1, f"Expected CVE attribution for version {version}"
             assert all(i.severity == IssueSeverity.CRITICAL for i in cve_issues)
             assert all(i.details.get("parse_status") != "unknown" for i in cve_issues)
+
+
+def _assert_safe_h5_module(tmp_path: Path, model_name: str, layer_name: str, module_name: str) -> None:
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": model_name,
+                "layers": [
+                    {
+                        "class_name": "Dense",
+                        "name": layer_name,
+                        "module": module_name,
+                        "config": {"units": 1},
+                    }
+                ],
+            },
+        },
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    assert not any(issue.details.get("cve_id") == "CVE-2025-1550" for issue in result.issues)
+
+
+def _assert_unsafe_lambda_expression(tmp_path: Path, model_name: str, expression: str) -> None:
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": model_name,
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "config": {"function": expression},
+                    }
+                ],
+            },
+        },
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    # The injected payload must be flagged as dangerous, not allowlisted
+    assert any(
+        check.name == "Lambda Layer Code Analysis" and check.status == CheckStatus.FAILED for check in result.checks
+    ), f"Expected failed Lambda check but got: {[(c.name, c.status) for c in result.checks]}"
+    assert not any(
+        check.name == "Lambda Layer Code Analysis"
+        and check.status == CheckStatus.PASSED
+        and check.details.get("pattern_type") == "safe_normalization"
+        for check in result.checks
+    )
+
+
+def _assert_lambda_output_shape(
+    tmp_path: Path, model_name: str, layer_name: str, field_name: str, filename: str, location: str
+) -> None:
+    encoded_code = base64.b64encode(b"import os\nos.system('id')").decode()
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {
+            "class_name": "Sequential",
+            "config": {
+                "name": model_name,
+                "layers": [
+                    {
+                        "class_name": "Lambda",
+                        "config": {
+                            "name": layer_name,
+                            "function": "relu",
+                            "function_type": "function",
+                            "module": "keras.activations",
+                            field_name: {
+                                "class_name": "__lambda__",
+                                "config": {"code": encoded_code},
+                            },
+                        },
+                    }
+                ],
+            },
+        },
+        keras_version="3.11.3",
+        file_name=filename,
+    )
+
+    result = KerasH5Scanner().scan(str(model_path))
+
+    assert any(
+        check.name == "Lambda Layer Code Analysis"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        and check.details.get("layer_name") == location
+        for check in result.checks
+    )

@@ -19,7 +19,7 @@ from modelaudit.scanners.pickle_scanner import (
     _is_legitimate_serialization_file,
     _joblib_numpy_array_validated_raw_span_control_references,
 )
-from tests.helpers.file_creators import create_malicious_pickle, create_safe_pickle
+from tests.helpers.file_creators import SystemCommandPayload, create_malicious_pickle, create_safe_pickle
 
 
 def _create_safe_pickle_payload() -> bytes:
@@ -27,11 +27,7 @@ def _create_safe_pickle_payload() -> bytes:
 
 
 def _create_malicious_pickle_payload() -> bytes:
-    class MaliciousReduce:
-        def __reduce__(self) -> tuple[Any, tuple[str]]:
-            return (os.system, ("echo benchmark",))
-
-    return pickle.dumps(MaliciousReduce(), protocol=4)
+    return pickle.dumps(SystemCommandPayload("echo benchmark", lambda: os.system), protocol=4)
 
 
 def test_nightly_inputs_are_complete_and_security_positive(tmp_path: Path) -> None:

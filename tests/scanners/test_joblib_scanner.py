@@ -16,6 +16,7 @@ pytest.importorskip("joblib")
 import joblib
 
 from modelaudit.scanners.joblib_scanner import JoblibScanner
+from tests.helpers.scanners import track_bytesio_close
 
 _ASSETS_DIR = Path(__file__).resolve().parents[1] / "assets"
 
@@ -177,16 +178,7 @@ def test_joblib_scanner_fails_before_large_decompression_allocation(tmp_path: Pa
 
 def test_joblib_scanner_closes_bytesio(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Ensure BytesIO objects used for pickles are closed."""
-    import io
-
-    closed = {}
-
-    class TrackedBytesIO(io.BytesIO):
-        def close(self) -> None:
-            closed["closed"] = True
-            super().close()
-
-    monkeypatch.setattr(io, "BytesIO", TrackedBytesIO)
+    closed = track_bytesio_close(monkeypatch)
 
     path = tmp_path / "model.joblib"
     joblib.dump({"a": np.arange(5)}, path, compress=3)

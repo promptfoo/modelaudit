@@ -15,6 +15,7 @@ from modelaudit.config.explanations import (
 )
 from modelaudit.scanners.base import Issue, IssueSeverity, ScanResult
 from modelaudit.scanners.pickle_scanner import PickleScanner
+from tests.helpers.file_creators import SystemCommandPayload
 
 
 def test_issue_with_why_field():
@@ -133,13 +134,8 @@ def test_pickle_scanner_includes_why():
     # Create a pickle with os.system call
     with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
         # Create a malicious pickle
-        class Evil:
-            def __reduce__(self):
-                import os
 
-                return (os.system, ("echo pwned",))
-
-        pickle.dump(Evil(), f)
+        pickle.dump(SystemCommandPayload("echo pwned"), f)
         f.flush()  # Ensure data is written
         temp_path = f.name
         f.close()  # Close before scanning (required on Windows)
