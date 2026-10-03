@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import ipaddress
 import os
 import re
 from typing import Any, ClassVar
 
 from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
 from ._evidence_redaction import redact_evidence_string
+from ._network_indicators import _is_public_ip
 from ._string_extraction import extract_bounded_printable_strings
 from .base import BaseScanner, IssueSeverity, ScanResult
 
@@ -281,13 +281,7 @@ class RknnScanner(BaseScanner):
             self.max_extracted_strings,
         )
 
-    @staticmethod
-    def _is_public_ip(candidate: str) -> bool:
-        try:
-            ip = ipaddress.ip_address(candidate)
-        except ValueError:
-            return False
-        return not (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast)
+    _is_public_ip = staticmethod(_is_public_ip)
 
     @staticmethod
     def _metadata_value_for_scanning(text: str) -> str:

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import bz2
 import gzip
-import ipaddress
 import lzma
 import os
 import re
@@ -24,6 +23,7 @@ from ._evidence_redaction import (
     _unfinished_r_assignment_literal_closing_sequence,
     redact_evidence_string,
 )
+from ._network_indicators import _is_public_ip
 from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
 
 _DECODE_INCONCLUSIVE_REASON = "r_serialized_decode_incomplete"
@@ -3420,11 +3420,7 @@ class RSerializedScanner(BaseScanner):
         return documentation_lines / len(lines) > 0.5
 
     def _is_valid_public_ip(self, candidate: str) -> bool:
-        try:
-            value = ipaddress.ip_address(candidate)
-        except ValueError:
-            return False
-        return not (value.is_private or value.is_loopback or value.is_link_local or value.is_multicast)
+        return _is_public_ip(candidate)
 
     def _add_symbol_and_payload_checks(self, result: ScanResult, strings: list[_ExtractedString], path: str) -> None:
         critical_symbol_hits: list[dict[str, object]] = []

@@ -1317,3 +1317,37 @@ class TestRebuildModels:
         """Test that rebuild_models doesn't raise errors."""
         # Should not raise
         rebuild_models()
+
+
+@pytest.mark.parametrize("kind", ["issue", "check"])
+def test_finding_converters_copy_dicts_and_use_current_clock(kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    class TransformingDict(dict[str, object]):
+        def copy(self) -> dict[str, object]:
+            return {**self, "message": "copied"}
+
+    monkeypatch.setattr(time, "time", lambda: 123.0)
+    fields = {"severity": "warning"} if kind == "issue" else {"name": "test", "status": "passed"}
+    record = TransformingDict(message="original", **fields)
+    converter = convert_issues_to_models if kind == "issue" else convert_checks_to_models
+    result = converter([record])[0]
+    assert result.message == "copied"
+    assert result.timestamp == 123.0
+    assert record["message"] == "original"
+    assert "timestamp" not in record
+
+
+@pytest.mark.parametrize("field", ["issues", "checks"])
+def test_aggregate_findings_keep_direct_construction(field: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    class NoCopyDict(dict[str, object]):
+        def copy(self) -> dict[str, object]:
+            raise AssertionError("aggregate records must be constructed directly")
+
+    def unexpected_clock() -> float:
+        raise AssertionError("aggregate records must retain the model timestamp default")
+
+    monkeypatch.setattr(time, "time", unexpected_clock)
+    fields = {"severity": "warning"} if field == "issues" else {"name": "test", "status": "passed"}
+    result = create_audit_result_model({field: [NoCopyDict(message="original", **fields)]})
+    record = getattr(result, field)[0]
+    assert record.message == "original"
+    assert record.timestamp > 0
