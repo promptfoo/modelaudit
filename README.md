@@ -219,6 +219,7 @@ Common scan options:
 Reports retain raw source identifiers and credential-bearing evidence. Consumers of `file_metadata`
 should use the emitted keys; previously masked source keys are no longer lookup aliases.
 Very long source identifiers are shortened consistently within each report.
+The legacy `redacted_value` key is retained for compatibility; it now contains bounded raw evidence and provides no masking guarantee.
 
 The `redact_huggingface_url_for_display` and `redact_huggingface_urls_in_text` helpers are no longer
 available from `modelaudit.utils.sources.huggingface` or `huggingface_paths`. Remove these imports to
