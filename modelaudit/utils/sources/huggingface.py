@@ -34,6 +34,7 @@ from ..helpers.assets import asset_from_scan_result
 from ..helpers.disk_space import check_disk_space
 from ..helpers.interrupt_handler import check_interrupted
 from .huggingface_paths import (
+    _huggingface_classification_error,
     extract_model_id_from_path,
     is_huggingface_cache_path,
     is_huggingface_file_url,
@@ -4150,7 +4151,11 @@ def _run_huggingface_worker_with_deadline(
     if not result.get("ok"):
         error_type = result.get("error_type", "Exception")
         error_message = str(result.get("error", "download failed"))
-        raise RuntimeError(f"{error_type}: {error_message}")
+        error: Any = RuntimeError(f"{error_type}: {error_message}")
+        # Worker diagnostics historically reached access classification normalized.
+        # Keep that input separate from the raw exception displayed to the caller.
+        error._modelaudit_classification_text = _huggingface_classification_error(str(error))
+        raise error
 
     return result
 
@@ -4981,7 +4986,7 @@ def _is_huggingface_gated_or_auth_error(error: BaseException) -> bool:
             continue
         seen.add(id(current))
         error_type = type(current).__name__.lower()
-        error_text = str(current).lower()
+        error_text = getattr(current, "_modelaudit_classification_text", str(current)).lower()
         if any(marker in error_type or marker in error_text for marker in markers):
             return True
         response = getattr(current, "response", None)

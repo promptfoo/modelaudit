@@ -6,6 +6,7 @@ downloaded from URLs (HuggingFace, cloud storage, etc.).
 
 import hashlib
 import json
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -16,7 +17,7 @@ from click.testing import CliRunner
 
 from modelaudit.cli import cli
 from modelaudit.integrations.sbom_generator import generate_sbom, generate_sbom_pydantic
-from modelaudit.models import AssetModel, FileMetadataModel, ModelAuditResultModel
+from modelaudit.models import AssetModel, FileMetadataModel, ModelAuditResultModel, create_initial_audit_result
 from modelaudit.scanners.base import Issue, IssueSeverity
 from tests.helpers.file_creators import create_malicious_pickle
 from tests.helpers.file_creators import (
@@ -795,3 +796,33 @@ def _sbom_property_values(
         component["bom-ref"]: next(prop["value"] for prop in component["properties"] if prop["name"] == property_name)
         for component in json.loads(sbom_json)["components"]
     }
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "https://bucket.s3.amazonaws.com/model.pkl?X-Amz-Signature=synthetic",
+        "stream://https://bucket.s3.amazonaws.com/model.pkl?X-Amz-Signature=synthetic",
+        "https://bucket.s3.amazonaws.com/model.pkl%3Ftoken%3Dsynthetic",
+        "https://bucket.s3.amazonaws.com/model.pkl%253Ftoken%253Dsynthetic",
+        "stream://https://bucket.s3.amazonaws.com/model.pkl%3Ftoken%3Dsynthetic",
+    ],
+)
+def test_cli_signed_stream_sbom_preserves_model_classification(source: str, tmp_path: Path) -> None:
+    from modelaudit.cli import _ScanPathState, _write_scan_sbom
+
+    result = create_initial_audit_result()
+    result.assets = [AssetModel(path=source, type="pickle", size=3)]
+    output = tmp_path / "scan.sbom.json"
+    _write_scan_sbom(str(output), result, [source], _ScanPathState(), scan_and_delete=True)
+    assert json.loads(output.read_text())["components"][0]["type"] == "machine-learning-model"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows filenames cannot contain a question mark")
+def test_sbom_local_query_filename_keeps_literal_classification(tmp_path: Path) -> None:
+    from modelaudit.integrations.sbom_generator import generate_sbom_pydantic
+
+    path = tmp_path / "model.pkl?version=1"
+    path.write_bytes(b"model")
+    bom = json.loads(generate_sbom_pydantic([str(path)], create_initial_audit_result()))
+    assert bom["components"][0]["type"] == "file"

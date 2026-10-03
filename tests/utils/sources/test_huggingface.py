@@ -13918,3 +13918,54 @@ def _assert_streamed_pickle_control(
         filename=case_filename,
         revision=_HF_TEST_REVISION,
     )
+
+
+@pytest.mark.parametrize(
+    "status,expected,unknown",
+    [(503, "partial_unknown_size", 1), (401, "gated_inaccessible", 0), (403, "gated_inaccessible", 0)],
+)
+def test_hf_worker_endpoint_credentials_do_not_change_access_classification(
+    status: int, expected: str, unknown: int
+) -> None:
+    from modelaudit.utils.sources import huggingface
+
+    # SDK HTTP errors include the configured HF_ENDPOINT authority in the URL.
+    endpoint = "https://user:synthetic403value@hub.example"
+    import requests
+    from huggingface_hub import HfApi
+    from huggingface_hub.utils import HfHubHTTPError, hf_raise_for_status
+
+    # Build the real SDK diagnostic in both supported requests and httpx SDKs.
+    url = HfApi(endpoint=endpoint).endpoint + "/api/models/test/model/paths-info/revision"
+    response: Any
+    if issubclass(HfHubHTTPError, requests.HTTPError):
+        response = requests.Response()
+        response.status_code = status
+        response.url = url
+    else:
+        # Resolve the HTTP client supplied by the installed Hub SDK.
+        http_client = importlib.import_module(HfHubHTTPError.__mro__[1].__module__.split(".")[0])
+        response = http_client.Response(status, request=http_client.Request("POST", url))
+    with pytest.raises(HfHubHTTPError) as caught:
+        hf_raise_for_status(response)
+    error = str(caught.value)
+    process = MagicMock()
+    process.communicate.return_value = (
+        "MODELAUDIT_HF_DOWNLOAD_RESULT="
+        + json.dumps({"ok": False, "error_type": "HfHubHTTPError", "error": error})
+        + "\n",
+        "",
+    )
+    repo = SimpleNamespace(gated=False, siblings=[SimpleNamespace(rfilename="model.safetensors", size=32)])
+    with patch.object(huggingface.subprocess, "Popen", return_value=process):
+        info = huggingface._build_huggingface_model_info(
+            "test/model",
+            repo,
+            ["model.safetensors"],
+            "a" * 40,
+            deadline=time.monotonic() + 20,
+            allow_content_probes=False,
+        )
+    assert info["inventory_status"] == expected
+    assert info["unknown_size_count"] == unknown
+    assert info["inaccessible_gated_bytes"] == (0 if status == 503 else 32)

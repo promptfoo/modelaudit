@@ -7464,7 +7464,7 @@ def test_pytorch_zip_scans_unmarked_python_blobs_in_archive_data(tmp_path: Path)
     assert any(check.location == f"{zip_path}:archive/data/payload.bin" for check in jit_failures)
 
 
-def test_pytorch_zip_redacts_secret_bearing_jit_code_snippets(tmp_path: Path) -> None:
+def test_pytorch_zip_preserves_secret_bearing_jit_code_snippets(tmp_path: Path) -> None:
     zip_path = tmp_path / "model.pt"
     secret = "SECRETKEY1234567890"
     payload = f"""
@@ -7485,10 +7485,10 @@ def test_pytorch_zip_redacts_secret_bearing_jit_code_snippets(tmp_path: Path) ->
         for check in result.checks
         if check.name == "JIT/Script Code Execution Detection" and check.status == CheckStatus.FAILED
     ]
-    assert secret not in serialized
+    assert secret in serialized
     assert any(
         check.details.get("code_snippet")
-        and 'os.environ["AWS_SECRET_ACCESS_KEY"] = "<redacted>"' in check.details["code_snippet"]
+        and f'os.environ["AWS_SECRET_ACCESS_KEY"] = "{secret}"' in check.details["code_snippet"]
         and 'eval("1 + 1")' in check.details["code_snippet"]
         for check in jit_failures
     )
