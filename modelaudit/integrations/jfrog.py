@@ -13,6 +13,7 @@ from typing import Any
 
 from ..models import ModelAuditResultModel
 from ..scanner_selection import SCANNER_SELECTION_CONFIG_KEY
+from ..utils.helpers.evidence import format_evidence_string
 from ..utils.sources.jfrog import (
     _positive_limit,
     detect_jfrog_target_type,
@@ -106,10 +107,11 @@ def scan_jfrog_artifact(
     download_dir = _prepare_download_dir(url, scan_cache_dir)
     start_time = time.time()
     display_url = url
+    log_url = format_evidence_string(url, max_chars=None)
 
     try:
         # Detect if URL points to a file or folder
-        logger.debug(f"Analyzing JFrog target {display_url}")
+        logger.debug(f"Analyzing JFrog target {log_url}")
         target_info = detect_jfrog_target_type(
             url,
             api_token=api_token,
@@ -135,7 +137,7 @@ def scan_jfrog_artifact(
                     )
                 # Release metadata temporaries before the download begins.
                 del size
-            logger.debug(f"Downloading JFrog file {display_url} to {download_dir}")
+            logger.debug(f"Downloading JFrog file {log_url} to {download_dir}")
             download_path = download_artifact(
                 url,
                 cache_dir=download_dir,
@@ -145,7 +147,7 @@ def scan_jfrog_artifact(
                 max_size=file_download_limit,
             )
         else:
-            logger.debug(f"Downloading JFrog folder {display_url} to {download_dir}")
+            logger.debug(f"Downloading JFrog folder {log_url} to {download_dir}")
             folder_download_kwargs: dict[str, Any] = {}
             if scannable_extensions is not None:
                 folder_download_kwargs["scannable_extensions"] = scannable_extensions
