@@ -32,6 +32,7 @@ from ..file.detection import detect_file_format_for_skip_filter
 from ..file.streaming import StreamedSourceByteAccounting
 from ..helpers.assets import asset_from_scan_result
 from ..helpers.disk_space import check_disk_space
+from ..helpers.evidence import format_evidence_string
 from ..helpers.interrupt_handler import check_interrupted
 from .huggingface_paths import (
     _huggingface_classification_error,
@@ -3210,7 +3211,7 @@ def _select_huggingface_model_files(
                     "Skipping inaccessible gated Hugging Face content probe for %s/%s: %s",
                     repo_id,
                     filename,
-                    str(exc),
+                    format_evidence_string(str(exc), max_chars=None),
                 )
                 if inaccessible_probe_files is not None and filename not in inaccessible_probe_files:
                     inaccessible_probe_files.append(filename)
