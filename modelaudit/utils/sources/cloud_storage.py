@@ -15,7 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path, PurePosixPath
 from typing import Any, TypeVar
-from urllib.parse import unquote, unquote_plus, urlparse, urlsplit, urlunsplit
+from urllib.parse import unquote, urlparse, urlsplit, urlunsplit
 
 import click
 from yaspin import yaspin
@@ -28,6 +28,7 @@ from modelaudit.scanner_selection import (
     scanner_ids_for_detected_format,
     scanner_ids_for_extension,
 )
+from modelaudit.utils.helpers.evidence import format_terminal_text
 from modelaudit.utils.helpers.retry import retry_with_backoff
 
 from ..helpers.disk_space import check_disk_space
@@ -38,83 +39,6 @@ _CLOUD_DOWNLOAD_CHUNK_BYTES = 1024 * 1024
 _CLEARTEXT_CLOUD_ERROR = "Cleartext cloud storage URL is not supported"
 _CACHE_ENTRY_NAMESPACE = ".entries-v2"
 
-_QUERY_PARAM_RE = re.compile(r"(?P<prefix>[?&#;])(?P<key>[^=\s&#;]+)=(?P<value>[^\s&#;]*)")
-_BARE_ASSIGNMENT_RE = re.compile(
-    r"""(?<![0-9A-Za-z_%.-])(?P<key>[0-9A-Za-z_%.-]+)(?P<separator>\s*=\s*)(?![=])"""
-    r"""(?P<value>"[^"\r\n]*"|'[^'\r\n]*'|"[^"\r\n]*|'[^'\r\n]*|"""
-    r"""(?:(?:bearer|basic|digest|negotiate|token|aws4-hmac-sha256)\s+)?[^\s&#;,)}\]]+)""",
-    re.IGNORECASE,
-)
-_HEADER_KEY_RE = re.compile(
-    r"(?<![0-9A-Za-z_%.-])(?P<key>[0-9A-Za-z_%.-]+)\s*:",
-    re.IGNORECASE,
-)
-_URL_USERINFO_RE = re.compile(r"([a-z][a-z0-9+.-]*://)([^/@\s]+)@", re.IGNORECASE)
-_URL_TEXT_CHARACTER = r'(?:[^\s"\'<>]|<redacted>|<credentials-redacted>)'
-_URL_TOKEN_RE = re.compile(
-    rf"(?<![0-9A-Za-z+._%-])"
-    rf"(stream://[a-z][a-z0-9+.-]*://{_URL_TEXT_CHARACTER}+|[a-z][a-z0-9+.-]*://{_URL_TEXT_CHARACTER}+)",
-    re.IGNORECASE,
-)
-_ESCAPED_URL_DELIMITER_RE = re.compile(
-    r"\\(?P<delimiter>/|u002f|u003a|u003f|u003d|u0026|u0023|u003b|x2f|x3a|x3f|x3d|x26|x23|x3b)",
-    re.IGNORECASE,
-)
-_PERCENT_ENCODED_URL_DELIMITER_RE = re.compile(
-    r"%(?:25)*(?P<delimiter>3f|3d|26|23|3b)",
-    re.IGNORECASE,
-)
-_PERCENT_ENCODED_URL_BOUNDARY_RE = re.compile(r"%(?:25)*(?:3f|23|3b)", re.IGNORECASE)
-_PERCENT_ENCODED_URL_PREFIX_RE = re.compile(
-    r"(?<![0-9A-Za-z+._%-])"
-    r"(?P<scheme>[a-z][a-z0-9+.-]*)(?:%(?:25)*3a|:)(?:%(?:25)*2f|/)(?:%(?:25)*2f|/)",
-    re.IGNORECASE,
-)
-_PERCENT_ENCODED_AUTHORITY_DELIMITER_RE = re.compile(
-    r"%(?:25)*(?P<delimiter>3a|40|5b|5d)",
-    re.IGNORECASE,
-)
-_PERCENT_ENCODED_SLASH_RE = re.compile(r"%(?:25)*2f", re.IGNORECASE)
-_SAFE_DISPLAY_QUERY_KEYS = frozenset(
-    {
-        "campaign",
-        "download",
-        "lang",
-        "language",
-        "locale",
-        "page",
-        "section",
-        "tokenizer",
-        "visible",
-    }
-)
-_MAX_QUERY_VALUE_DECODE_PASSES = 4
-_SENSITIVE_ASSIGNMENT_KEY_TOKENS = frozenset(
-    {
-        "auth",
-        "authorization",
-        "credential",
-        "credentials",
-        "password",
-        "passwd",
-        "sas",
-        "secret",
-        "session",
-        "sig",
-        "signature",
-        "token",
-    }
-)
-_SENSITIVE_ASSIGNMENT_KEY_MARKERS = (
-    "accesskey",
-    "accesstoken",
-    "apikey",
-    "authkey",
-    "authtoken",
-    "clientsecret",
-    "privatekey",
-    "securitytoken",
-)
 _CLOUD_CONTENT_SNIFF_BYTES = 8 * 1024
 _TFLITE_MAGIC_OFFSET = 4
 _TFLITE_MAGIC_BYTES = b"TFL3"
@@ -266,272 +190,6 @@ def is_stream_url(url: str) -> bool:
     return url[:9].casefold() == "stream://"
 
 
-def redact_url_for_display(url: str) -> str:
-    """Remove credentials, query strings, and fragments from a URL for display."""
-    try:
-        normalized_url = _normalize_percent_encoded_url_delimiters_for_display(
-            normalize_escaped_url_delimiters_for_display(url)
-        )
-        normalized_url = _normalize_percent_encoded_url_authority_for_display(normalized_url)
-        parts = urlsplit(normalized_url)
-        if not parts.scheme:
-            return url
-
-        hostname = parts.hostname or ""
-        netloc = f"[{hostname}]" if ":" in hostname else hostname
-        if parts.port is not None:
-            netloc = f"{netloc}:{parts.port}"
-
-        safe_path = _strip_url_path_assignments_for_display(parts.path)
-        return urlunsplit((parts.scheme, netloc, safe_path, "", ""))
-    except Exception:
-        return "<cloud URL redacted>"
-
-
-def redact_cloud_error_for_display(message: object, source_url: str | None = None) -> str:
-    """Remove signed URL credentials from provider exception text."""
-    redacted = _normalize_percent_encoded_url_delimiters_for_display(
-        normalize_escaped_url_delimiters_for_display(str(message))
-    )
-    if source_url:
-        normalized_source_url = normalize_escaped_url_delimiters_for_display(source_url)
-        redacted = redacted.replace(normalized_source_url, redact_url_for_display(normalized_source_url))
-    redacted = _URL_TOKEN_RE.sub(lambda match: _redact_embedded_url_for_display(match.group(0)), redacted)
-    redacted = _URL_USERINFO_RE.sub(r"\1<credentials-redacted>@", redacted)
-    redacted = _BARE_ASSIGNMENT_RE.sub(_redact_bare_sensitive_assignment, redacted)
-    redacted = _QUERY_PARAM_RE.sub(_redact_sensitive_query_param, redacted)
-    return _redact_sensitive_header_assignments(redacted)
-
-
-def normalize_escaped_url_delimiters_for_display(value: str) -> str:
-    """Expose backslash-escaped URL structure so reporting redactors can inspect it."""
-    replacements = {
-        "/": "/",
-        "u002f": "/",
-        "u003a": ":",
-        "u003f": "?",
-        "u003d": "=",
-        "u0026": "&",
-        "u0023": "#",
-        "u003b": ";",
-        "x2f": "/",
-        "x3a": ":",
-        "x3f": "?",
-        "x3d": "=",
-        "x26": "&",
-        "x23": "#",
-        "x3b": ";",
-    }
-    normalized = _ESCAPED_URL_DELIMITER_RE.sub(
-        lambda match: replacements[match.group("delimiter").lower()],
-        value,
-    )
-    return _PERCENT_ENCODED_URL_PREFIX_RE.sub(lambda match: f"{match.group('scheme')}://", normalized)
-
-
-def _normalize_percent_encoded_url_delimiters_for_display(url: str) -> str:
-    """Expose encoded query structure without decoding ordinary path escapes."""
-    percent_replacements = {
-        "3f": "?",
-        "3d": "=",
-        "26": "&",
-        "23": "#",
-        "3b": ";",
-    }
-
-    def normalize_token(match: re.Match[str]) -> str:
-        token = match.group(0)
-        for boundary in _PERCENT_ENCODED_URL_BOUNDARY_RE.finditer(token):
-            decoded_suffix = _PERCENT_ENCODED_URL_DELIMITER_RE.sub(
-                lambda delimiter_match: percent_replacements[delimiter_match.group("delimiter").lower()],
-                token[boundary.start() :],
-            )
-            next_major_boundary = len(decoded_suffix)
-            for delimiter in "?#":
-                delimiter_index = decoded_suffix.find(delimiter, 1)
-                if delimiter_index >= 0:
-                    next_major_boundary = min(next_major_boundary, delimiter_index)
-            if _QUERY_PARAM_RE.search(decoded_suffix[:next_major_boundary]):
-                return f"{token[: boundary.start()]}{decoded_suffix}"
-        return token
-
-    return re.sub(r"""[^\s"'<>]+""", normalize_token, url)
-
-
-def _normalize_percent_encoded_url_authority_for_display(url: str) -> str:
-    """Expose encoded authority separators without decoding ordinary path escapes."""
-    scheme_end = url.find("://")
-    if scheme_end < 0:
-        return url
-
-    authority_start = scheme_end + 3
-    authority_end = len(url)
-    for delimiter in "/?#":
-        delimiter_index = url.find(delimiter, authority_start)
-        if delimiter_index >= 0:
-            authority_end = min(authority_end, delimiter_index)
-
-    authority = url[authority_start:authority_end]
-    replacements = {"3a": ":", "40": "@", "5b": "[", "5d": "]"}
-    normalized_authority = _PERCENT_ENCODED_AUTHORITY_DELIMITER_RE.sub(
-        lambda match: replacements[match.group("delimiter").lower()],
-        authority,
-    )
-    if "@" in normalized_authority:
-        userinfo, host_and_path = normalized_authority.rsplit("@", 1)
-        normalized_authority = f"{userinfo}@{_PERCENT_ENCODED_SLASH_RE.sub('/', host_and_path)}"
-    else:
-        normalized_authority = _PERCENT_ENCODED_SLASH_RE.sub("/", normalized_authority)
-    return f"{url[:authority_start]}{normalized_authority}{url[authority_end:]}"
-
-
-def _redact_embedded_url_for_display(url: str) -> str:
-    if is_stream_url(url):
-        return f"stream://{redact_stream_url_for_display(url[9:])}"
-    url = _normalize_percent_encoded_url_delimiters_for_display(url)
-    url = _normalize_percent_encoded_url_authority_for_display(url)
-    try:
-        parts = urlsplit(url)
-        safe_base = redact_url_for_display(url)
-        if safe_base == "<cloud URL redacted>":
-            return safe_base
-        safe_parts = urlsplit(safe_base)
-    except Exception:
-        return "<cloud URL redacted>"
-
-    safe_query = _redact_url_component_for_display(parts.query)
-    safe_fragment = _redact_url_component_for_display(parts.fragment)
-    return urlunsplit((safe_parts.scheme, safe_parts.netloc, safe_parts.path, safe_query, safe_fragment))
-
-
-def _redact_url_component_for_display(value: str) -> str:
-    safe_parts: list[str] = []
-    for part in re.split(r"[&;]", value):
-        if "=" not in part:
-            continue
-        key, parameter_value = part.split("=", 1)
-        if _is_safe_display_query_param(key, parameter_value):
-            safe_parts.append(part)
-        else:
-            safe_parts.append(f"{key}=<redacted>")
-    return "&".join(safe_parts)
-
-
-def _redact_bare_sensitive_assignment(match: re.Match[str]) -> str:
-    key = match.group("key")
-    if not _is_sensitive_assignment_key(key):
-        return match.group(0)
-    return f"{key}{match.group('separator')}<redacted>"
-
-
-def _redact_sensitive_header_assignments(value: str) -> str:
-    matches = [match for match in _HEADER_KEY_RE.finditer(value) if _is_sensitive_assignment_key(match.group("key"))]
-    for match in reversed(matches):
-        value_end = len(value)
-        for delimiter in ("\r", "\n", ",", ";"):
-            delimiter_index = value.find(delimiter, match.end())
-            if delimiter_index >= 0:
-                value_end = min(value_end, delimiter_index)
-        value = f"{value[: match.start()]}{match.group('key')}: <redacted>{value[value_end:]}"
-    return value
-
-
-def _strip_url_path_assignments_for_display(path: str) -> str:
-    safe_segments: list[str] = []
-    for segment in path.split("/"):
-        base, *parameters = segment.split(";")
-        safe_parameters = [parameter for parameter in parameters if "=" not in parameter]
-        safe_segments.append(";".join((base, *safe_parameters)))
-    return "/".join(safe_segments)
-
-
-def _is_sensitive_assignment_key(key: str) -> bool:
-    decoded_key = key
-    for _ in range(_MAX_QUERY_VALUE_DECODE_PASSES):
-        next_key = unquote_plus(decoded_key)
-        if next_key == decoded_key:
-            break
-        decoded_key = next_key
-    else:
-        if unquote_plus(decoded_key) != decoded_key:
-            return True
-
-    normalized_key = decoded_key.casefold()
-    key_tokens = {token for token in re.split(r"[^a-z0-9]+", normalized_key) if token}
-    if key_tokens & _SENSITIVE_ASSIGNMENT_KEY_TOKENS:
-        return True
-    collapsed_key = re.sub(r"[^a-z0-9]+", "", normalized_key)
-    return any(marker in collapsed_key for marker in _SENSITIVE_ASSIGNMENT_KEY_MARKERS)
-
-
-def is_sensitive_credential_key(key: object) -> bool:
-    """Return whether a structured metadata key identifies credential material."""
-    if isinstance(key, bytes):
-        try:
-            key = key.decode("utf-8")
-        except UnicodeDecodeError:
-            return False
-    return isinstance(key, str) and _is_sensitive_assignment_key(key)
-
-
-def _redact_sensitive_query_param(match: re.Match[str]) -> str:
-    if _is_safe_display_query_param(match.group("key"), match.group("value")):
-        return match.group(0)
-    return f"{match.group('prefix')}{match.group('key')}=<redacted>"
-
-
-def _is_safe_display_query_param(key: str, value: str) -> bool:
-    decoded_key = unquote_plus(key).lower()
-    if decoded_key not in _SAFE_DISPLAY_QUERY_KEYS:
-        return False
-
-    decoded_value = value
-    for _ in range(_MAX_QUERY_VALUE_DECODE_PASSES):
-        if _has_unsafe_display_query_value_structure(decoded_value):
-            return False
-        next_value = unquote_plus(decoded_value)
-        if next_value == decoded_value:
-            return True
-        decoded_value = next_value
-
-    # Values that remain encoded after the bounded pass may conceal nested
-    # query structure under additional encoding layers.
-    return not _has_unsafe_display_query_value_structure(decoded_value) and unquote_plus(decoded_value) == decoded_value
-
-
-def _has_unsafe_display_query_value_structure(value: str) -> bool:
-    return any(delimiter in value for delimiter in "?&#;=") or any(
-        ord(character) < 0x20 or ord(character) == 0x7F for character in value
-    )
-
-
-def redact_stream_url_for_display(url: str) -> str:
-    """Return a fail-closed display identifier for a stream source URL."""
-    try:
-        if not urlsplit(url).scheme:
-            return "<cloud URL redacted>"
-    except Exception:
-        return "<cloud URL redacted>"
-    return redact_url_for_display(url)
-
-
-def redact_stream_error_for_display(message: object, source_url: str) -> str:
-    """Remove a stream source URL from exception text, including malformed identifiers."""
-    safe_url = redact_stream_url_for_display(source_url)
-    redacted = str(message)
-    if not source_url:
-        return redact_cloud_error_for_display(redacted.replace("stream://", f"stream://{safe_url}"))
-    redacted = redacted.replace(f"stream://{source_url}", f"stream://{safe_url}")
-    redacted = redacted.replace(source_url, safe_url)
-    return redact_cloud_error_for_display(redacted)
-
-
-def _redact_cloud_path_for_display(path: object) -> str:
-    """Redact credentials from cloud paths even when providers strip the protocol."""
-    path_text = str(path)
-    return redact_cloud_error_for_display(path_text, path_text)
-
-
 def _bound_cloud_metadata_error_display(message: str) -> str:
     """Limit model-controlled cloud metadata diagnostics retained in memory."""
     if len(message) <= _MAX_CLOUD_METADATA_ERROR_DISPLAY_CHARS:
@@ -540,19 +198,12 @@ def _bound_cloud_metadata_error_display(message: str) -> str:
 
 
 def _cloud_metadata_error_sample(path: object, error: object) -> dict[str, str]:
-    """Return a bounded, credential-safe metadata failure sample."""
+    """Return a bounded metadata failure sample."""
     path_text = str(path)
     return {
-        "path": _bound_cloud_metadata_error_display(_redact_cloud_path_for_display(path_text)),
-        "error": _bound_cloud_metadata_error_display(redact_cloud_error_for_display(error, path_text)),
+        "path": _bound_cloud_metadata_error_display(str(path_text)),
+        "error": _bound_cloud_metadata_error_display(str(error)),
     }
-
-
-def _cloud_error_sanitizer(source_url: str) -> Callable[[Exception], str]:
-    def sanitize(exc: Exception) -> str:
-        return redact_cloud_error_for_display(exc, source_url)
-
-    return sanitize
 
 
 def _cloud_url_basename(url: str) -> str:
@@ -710,11 +361,11 @@ def _cloud_object_relative_path(base_url: str, file_url: str) -> str:
             file_scheme in {"http", "https"} and _http_cloud_protocol(file_url) is not None
         )
         if structured_file_url or file_parts.netloc or "://" in normalized_file_url:
-            raise ValueError(f"Cloud object path is outside requested target: {redact_url_for_display(file_url)}")
+            raise ValueError(f"Cloud object path is outside requested target: {file_url}")
         relative_path = _protocol_less_cloud_relative_path(normalized_base, file_url)
 
     if not relative_path:
-        raise ValueError(f"Invalid cloud object basename: {redact_url_for_display(file_url)}")
+        raise ValueError(f"Invalid cloud object basename: {file_url}")
     return relative_path
 
 
@@ -814,21 +465,21 @@ def get_fs_protocol(url: str) -> str:
     try:
         parsed = urlparse(url)
     except ValueError as exc:
-        raise ValueError(f"Unsupported cloud storage URL: {redact_url_for_display(url)}") from exc
+        raise ValueError(f"Unsupported cloud storage URL: {url}") from exc
     scheme = parsed.scheme.casefold()
     if scheme in {"http", "https"}:
         protocol = _http_cloud_protocol(url)
         if protocol is None:
-            raise ValueError(f"Unsupported cloud storage URL: {redact_url_for_display(url)}")
+            raise ValueError(f"Unsupported cloud storage URL: {url}")
         if scheme == "http":
-            raise ValueError(f"{_CLEARTEXT_CLOUD_ERROR}: {redact_url_for_display(url)}")
+            raise ValueError(f"{_CLEARTEXT_CLOUD_ERROR}: {url}")
         return protocol
     elif scheme == "gcs" or scheme == "gs":
         return "gcs"
     elif scheme in {"s3", "r2"}:
         return "s3"
     else:
-        raise ValueError(f"Unsupported cloud storage URL: {redact_url_for_display(url)}")
+        raise ValueError(f"Unsupported cloud storage URL: {url}")
 
 
 def get_cloud_filesystem_config(url: str) -> tuple[str, str, dict[str, Any]]:
@@ -840,7 +491,7 @@ def get_cloud_filesystem_config(url: str) -> tuple[str, str, dict[str, Any]]:
         scheme = parsed.scheme.casefold()
         hostname = (parsed.hostname or "").casefold().rstrip(".")
     except ValueError as exc:
-        raise ValueError(f"Unsupported cloud storage URL: {redact_url_for_display(url)}") from exc
+        raise ValueError(f"Unsupported cloud storage URL: {url}") from exc
 
     if scheme in {"s3", "gs", "gcs"}:
         canonical_scheme = "gcs" if protocol == "gcs" else "s3"
@@ -891,7 +542,7 @@ def get_cloud_filesystem_config(url: str) -> tuple[str, str, dict[str, Any]]:
         bucket, _, key = path.partition("/")
 
     if not bucket:
-        raise ValueError(f"Unsupported cloud storage URL: {redact_url_for_display(url)}")
+        raise ValueError(f"Unsupported cloud storage URL: {url}")
     if endpoint_host is not None and endpoint_host != "s3.amazonaws.com":
         fs_args["client_kwargs"] = {"endpoint_url": f"https://{endpoint_host}"}
         if "s3-accelerate" in endpoint_host:
@@ -983,10 +634,8 @@ def get_cloud_object_size(fs: Any, url: str, strict: bool = False) -> int | None
         info = fs.info(url)
     except Exception as exc:
         if strict:
-            redacted_error = _bound_cloud_metadata_error_display(redact_cloud_error_for_display(exc, url))
-            raise ValueError(
-                f"Unable to read cloud object info for {redact_url_for_display(url)}: {redacted_error}"
-            ) from exc
+            display_error = _bound_cloud_metadata_error_display(str(exc))
+            raise ValueError(f"Unable to read cloud object info for {url}: {display_error}") from exc
         return None
 
     top_level_size_error: Exception | None = None
@@ -1039,15 +688,11 @@ def get_cloud_object_size(fs: Any, url: str, strict: bool = False) -> int | None
                         raise ValueError("cloud provider did not return file size")
                 except Exception as exc:
                     if strict:
-                        safe_path = _bound_cloud_metadata_error_display(
-                            _redact_cloud_path_for_display(resolved_file_path)
-                        )
-                        safe_error = _bound_cloud_metadata_error_display(
-                            redact_cloud_error_for_display(exc, resolved_file_path)
-                        )
+                        safe_path = _bound_cloud_metadata_error_display(str(resolved_file_path))
+                        safe_error = _bound_cloud_metadata_error_display(str(exc))
                         raise _CloudObjectMetadataSizeError(
                             "Unable to determine cloud object size for "
-                            f"{redact_url_for_display(url)}: metadata lookup failed for listed object "
+                            f"{url}: metadata lookup failed for listed object "
                             f"{safe_path}: {safe_error}"
                         ) from exc
                     continue
@@ -1071,8 +716,8 @@ def get_cloud_object_size(fs: Any, url: str, strict: bool = False) -> int | None
             if strict:
                 raise ValueError(
                     "Unable to determine cloud object size for "
-                    f"{redact_url_for_display(url)}: duplicate or cyclic directory listing at "
-                    f"{_bound_cloud_metadata_error_display(_redact_cloud_path_for_display(path))}"
+                    f"{url}: duplicate or cyclic directory listing at "
+                    f"{_bound_cloud_metadata_error_display(str(path))}"
                 )
             return
         visited_listing_paths.add(path)
@@ -1089,7 +734,7 @@ def get_cloud_object_size(fs: Any, url: str, strict: bool = False) -> int | None
                 if strict:
                     raise ValueError(
                         "Unable to determine cloud object size for "
-                        f"{redact_url_for_display(url)}: cloud provider returned an invalid detailed listing entry"
+                        f"{url}: cloud provider returned an invalid detailed listing entry"
                     )
                 continue
             name = entry.get("name") or entry.get("path")
@@ -1097,7 +742,7 @@ def get_cloud_object_size(fs: Any, url: str, strict: bool = False) -> int | None
                 if strict:
                     raise ValueError(
                         "Unable to determine cloud object size for "
-                        f"{redact_url_for_display(url)}: cloud provider returned a listed object without a valid path"
+                        f"{url}: cloud provider returned a listed object without a valid path"
                     )
                 continue
             if entry.get("type") == "directory" or (name and name.endswith("/")):
@@ -1109,16 +754,16 @@ def get_cloud_object_size(fs: Any, url: str, strict: bool = False) -> int | None
                     if strict:
                         raise ValueError(
                             "Unable to determine cloud object size for "
-                            f"{redact_url_for_display(url)}: invalid size metadata for listed object "
-                            f"{_bound_cloud_metadata_error_display(_redact_cloud_path_for_display(name))}: "
-                            f"{_bound_cloud_metadata_error_display(redact_cloud_error_for_display(exc, str(name)))}"
+                            f"{url}: invalid size metadata for listed object "
+                            f"{_bound_cloud_metadata_error_display(str(name))}: "
+                            f"{_bound_cloud_metadata_error_display(str(exc))}"
                         ) from exc
                     continue
             elif strict and name:
                 raise ValueError(
                     "Unable to determine cloud object size for "
-                    f"{redact_url_for_display(url)}: missing size metadata for listed object "
-                    f"{_bound_cloud_metadata_error_display(_redact_cloud_path_for_display(name))}"
+                    f"{url}: missing size metadata for listed object "
+                    f"{_bound_cloud_metadata_error_display(str(name))}"
                 )
 
     _collect(url)
@@ -1134,17 +779,14 @@ def get_cloud_object_size(fs: Any, url: str, strict: bool = False) -> int | None
         if top_level_size_error is not None:
             error_parts.append(f"invalid size from info(): {top_level_size_error}")
         if walk_error:
-            error_parts.append(f"walk() failed: {redact_cloud_error_for_display(walk_error, url)}")
+            error_parts.append(f"walk() failed: {walk_error!s}")
         if ls_error:
-            safe_path = _bound_cloud_metadata_error_display(_redact_cloud_path_for_display(ls_error_path or url))
-            error_parts.append(
-                f"recursive listing failed for {safe_path}: "
-                f"{redact_cloud_error_for_display(ls_error, ls_error_path or url)}"
-            )
+            safe_path = _bound_cloud_metadata_error_display(str(ls_error_path or url))
+            error_parts.append(f"recursive listing failed for {safe_path}: {ls_error!s}")
         if not error_parts:
             error_parts.append("cloud provider did not return file sizes")
         bounded_errors = _bound_cloud_metadata_error_display("; ".join(error_parts))
-        raise ValueError(f"Unable to determine cloud object size for {redact_url_for_display(url)}: {bounded_errors}")
+        raise ValueError(f"Unable to determine cloud object size for {url}: {bounded_errors}")
 
     return None
 
@@ -1196,7 +838,6 @@ async def analyze_cloud_target(
         @retry_with_backoff(
             max_retries=3,
             verbose=True,
-            sanitize_error=_cloud_error_sanitizer(url),
         )
         def get_info():
             return fs.info(fs_url)
@@ -1227,10 +868,7 @@ async def analyze_cloud_target(
         for item in _iter_cloud_directory_items(fs, fs_url):
             listed_object_count += 1
             if listed_object_count > max_objects:
-                raise ValueError(
-                    "Cloud directory analysis exceeds the maximum object count "
-                    f"({max_objects}) for {redact_url_for_display(url)}"
-                )
+                raise ValueError(f"Cloud directory analysis exceeds the maximum object count ({max_objects}) for {url}")
             item_url = _normalize_cloud_listing_path(fs_url, item)
             try:
                 item_info = fs.info(item_url)
@@ -1273,7 +911,7 @@ async def analyze_cloud_target(
                 "metadata_errors": metadata_errors,
                 "error": (
                     "Cloud directory analysis incomplete: metadata lookup failed for "
-                    f"{metadata_error_count} object(s) under {redact_url_for_display(url)}: "
+                    f"{metadata_error_count} object(s) under {url}: "
                     f"{sample_errors}"
                 ),
             }
@@ -1292,7 +930,7 @@ async def analyze_cloud_target(
         return directory_metadata
     except Exception as e:
         # If we can't get info, assume it's a file
-        return {"type": "unknown", "error": redact_cloud_error_for_display(e, url)}
+        return {"type": "unknown", "error": str(e)}
 
 
 def prompt_for_large_download(metadata: dict[str, Any]) -> bool:
@@ -1336,7 +974,7 @@ class GCSCache:
                     if not isinstance(data, dict):
                         return {}
                     return {
-                        str(cache_key): self._sanitize_metadata_entry(entry)
+                        str(cache_key): self._normalize_metadata_entry(entry)
                         for cache_key, entry in data.items()
                         if isinstance(entry, dict)
                     }
@@ -1345,29 +983,29 @@ class GCSCache:
         return {}
 
     def _url_metadata(self, url: str) -> dict[str, str]:
-        """Return non-secret URL metadata safe to persist."""
+        """Return URL metadata with a query-sensitive cache identity."""
         parsed = urlsplit(url)
         return {
             "url_sha256": self.get_cache_key(url),
-            "url_display": redact_url_for_display(url),
+            "url_display": url,
             "url_scheme": parsed.scheme,
             "url_host": parsed.hostname or "",
             "url_path": parsed.path,
         }
 
-    def _sanitize_metadata_entry(self, entry: dict[str, Any]) -> dict[str, Any]:
-        """Remove legacy raw URL fields before metadata is persisted again."""
-        sanitized = dict(entry)
-        raw_url = sanitized.pop("url", None)
+    def _normalize_metadata_entry(self, entry: dict[str, Any]) -> dict[str, Any]:
+        """Migrate legacy URL metadata to the current field schema."""
+        normalized = dict(entry)
+        raw_url = normalized.pop("url", None)
         if isinstance(raw_url, str):
             for key, value in self._url_metadata(raw_url).items():
-                sanitized.setdefault(key, value)
-        return sanitized
+                normalized.setdefault(key, value)
+        return normalized
 
     def _save_metadata(self) -> None:
         """Save cache metadata to disk."""
         self.metadata = {
-            str(cache_key): self._sanitize_metadata_entry(entry)
+            str(cache_key): self._normalize_metadata_entry(entry)
             for cache_key, entry in self.metadata.items()
             if isinstance(entry, dict)
         }
@@ -1410,7 +1048,7 @@ class GCSCache:
             if not _is_within_directory(self.cache_dir, cached_path):
                 logger.warning(
                     "Dropping cache entry for %s because cached path %s is outside cache dir %s",
-                    redact_url_for_display(url),
+                    format_terminal_text(url),
                     cached_path,
                     self.cache_dir,
                 )
@@ -1721,11 +1359,11 @@ class _CloudContentSniffBudget:
         return self._prefixes.get(file_url, b"")
 
     def classification_error(self, file_url: str) -> ValueError:
-        """Build a redacted error for an inconclusive budget-limited probe."""
+        """Build an error for an inconclusive budget-limited probe."""
         return ValueError(
             "Cloud directory selective filtering incomplete: maximum content inspection budget "
             f"({format_size(self.max_bytes)}) exhausted while classifying skipped object "
-            f"{_redact_cloud_path_for_display(file_url)}"
+            f"{file_url!s}"
         )
 
     def require_classification_capacity(self, file_url: str) -> None:
@@ -1850,7 +1488,7 @@ def _read_cloud_content_prefix(
     max_bytes: int,
     sniff_budget: _CloudContentSniffBudget | None = None,
 ) -> bytes:
-    """Read a bounded remote prefix or fail closed with a redacted error."""
+    """Read a bounded remote prefix or fail closed with an error."""
     try:
         if sniff_budget is not None:
             return sniff_budget.read_prefix(fs, file_url, max_bytes)
@@ -1858,8 +1496,7 @@ def _read_cloud_content_prefix(
             return _read_bounded_cloud_content(remote_file, max_bytes)
     except Exception as exc:
         raise ValueError(
-            "Cloud directory selective filtering incomplete: unable to inspect skipped object "
-            f"{_redact_cloud_path_for_display(file_url)}: {redact_cloud_error_for_display(exc, file_url)}"
+            f"Cloud directory selective filtering incomplete: unable to inspect skipped object {file_url!s}: {exc!s}"
         ) from exc
 
 
@@ -1870,7 +1507,7 @@ def _read_cloud_content_range(
     max_bytes: int,
     sniff_budget: _CloudContentSniffBudget | None = None,
 ) -> bytes:
-    """Read a bounded remote byte range or fail closed with a redacted error."""
+    """Read a bounded remote byte range or fail closed with an error."""
     try:
         if sniff_budget is not None:
             return sniff_budget.read_range(fs, file_url, offset, max_bytes)
@@ -1879,8 +1516,7 @@ def _read_cloud_content_range(
             return _read_bounded_cloud_content(remote_file, max_bytes)
     except Exception as exc:
         raise ValueError(
-            "Cloud directory selective filtering incomplete: unable to inspect skipped object "
-            f"{_redact_cloud_path_for_display(file_url)}: {redact_cloud_error_for_display(exc, file_url)}"
+            f"Cloud directory selective filtering incomplete: unable to inspect skipped object {file_url!s}: {exc!s}"
         ) from exc
 
 
@@ -1892,8 +1528,7 @@ def _get_cloud_content_size_for_routing(fs: Any, file_url: str) -> int:
             return _parse_size_value(remote_file.tell())
     except Exception as exc:
         raise ValueError(
-            "Cloud directory selective filtering incomplete: unable to inspect skipped object "
-            f"{_redact_cloud_path_for_display(file_url)}: {redact_cloud_error_for_display(exc, file_url)}"
+            f"Cloud directory selective filtering incomplete: unable to inspect skipped object {file_url!s}: {exc!s}"
         ) from exc
 
 
@@ -2219,7 +1854,7 @@ def _detect_cloud_content_route_format(
                 raise sniff_budget.classification_error(file_url) from exc
             raise ValueError(
                 "Cloud directory selective filtering incomplete: unable to classify skipped ZIP object "
-                f"{_redact_cloud_path_for_display(file_url)}: {redact_cloud_error_for_display(exc, file_url)}"
+                f"{file_url!s}: {exc!s}"
             ) from exc
     if detected_format != "unknown":
         return detected_format
@@ -2388,7 +2023,7 @@ def _validate_cloud_local_path(relative_path: str, file_url: str) -> None:
             and any(_is_unsafe_windows_cloud_filename(component) for component in components if component)
         )
     ):
-        raise ValueError(f"Invalid cloud object basename: {redact_url_for_display(file_url)}")
+        raise ValueError(f"Invalid cloud object basename: {file_url}")
 
 
 _WINDOWS_RESERVED_FILE_STEMS = {
@@ -2526,9 +2161,7 @@ def _build_cloud_download_plan(
             )
         if previous_url is not None:
             raise ValueError(
-                "Cloud object path alias collision: "
-                f"{_redact_cloud_path_for_display(previous_url)} and "
-                f"{_redact_cloud_path_for_display(file_url)} overlap at {local_path.name}"
+                f"Cloud object path alias collision: {previous_url!s} and {file_url!s} overlap at {local_path.name}"
             )
         destinations[destination_key] = file_url
         for ancestor_key in ancestor_keys:
@@ -2587,12 +2220,12 @@ def _selected_cloud_download_size(
         except ValueError as exc:
             raise ValueError(
                 "Unable to enforce maximum cloud download size for selected object "
-                f"{redact_url_for_display(file_url)} because its size could not be determined"
+                f"{file_url} because its size could not be determined"
             ) from exc
         if file_size is None:
             raise ValueError(
                 "Unable to enforce maximum cloud download size for selected object "
-                f"{redact_url_for_display(file_url)} because its size could not be determined"
+                f"{file_url} because its size could not be determined"
             )
         selected_size += file_size
         if acquired_bytes + selected_size > max_size:
@@ -2723,8 +2356,8 @@ def download_from_cloud(
 
     # Ensure target was analyzed successfully
     if "error" in metadata or metadata.get("type") == "unknown":
-        error_msg = redact_cloud_error_for_display(metadata.get("error", "Unknown cloud target type"), url)
-        raise ValueError(f"Failed to analyze cloud target {redact_url_for_display(url)}: {error_msg}")
+        error_msg = str(metadata.get("error", "Unknown cloud target type"))
+        raise ValueError(f"Failed to analyze cloud target {url}: {error_msg}")
 
     etag = _metadata_etag(metadata)
     cache_scope = _cloud_directory_cache_scope(
@@ -2741,7 +2374,7 @@ def download_from_cloud(
                 logger.warning(
                     "Ignoring cached version for %s because its local size exceeds or cannot be validated against "
                     "the maximum download size",
-                    redact_url_for_display(url),
+                    format_terminal_text(url),
                 )
             else:
                 if show_progress:
@@ -2753,10 +2386,7 @@ def download_from_cloud(
         size = _parse_size_value(metadata.get("total_size", metadata.get("size", 0)))
     except (TypeError, ValueError) as exc:
         if max_size and not (metadata["type"] == "directory" and selective):
-            raise ValueError(
-                "Unable to enforce maximum cloud download size for "
-                f"{redact_url_for_display(url)}: invalid size metadata"
-            ) from exc
+            raise ValueError(f"Unable to enforce maximum cloud download size for {url}: invalid size metadata") from exc
         size = 0
     if max_size and size > max_size and not (metadata["type"] == "directory" and selective):
         raise ValueError(f"File size ({format_size(size)}) exceeds maximum allowed size ({format_size(max_size)})")
@@ -2779,12 +2409,12 @@ def download_from_cloud(
             except ValueError as exc:
                 raise ValueError(
                     "Unable to enforce maximum cloud download size for "
-                    f"{redact_url_for_display(url)} because the object size could not be determined"
+                    f"{url} because the object size could not be determined"
                 ) from exc
             if stream_object_size is None:
                 raise ValueError(
                     "Unable to enforce maximum cloud download size for "
-                    f"{redact_url_for_display(url)} because the object size could not be determined"
+                    f"{url} because the object size could not be determined"
                 )
             if stream_object_size > max_size:
                 raise ValueError(
@@ -2868,20 +2498,23 @@ def download_from_cloud(
                 if max_size:
                     raise ValueError(
                         "Unable to enforce maximum cloud download size for "
-                        f"{redact_url_for_display(url)} because the object size could not be determined"
+                        f"{url} because the object size could not be determined"
                     ) from exc
                 # Fall back to metadata-derived size when available. If no reliable size is
                 # available, continue without a pre-download disk check (legacy behavior).
                 if size > 0:
                     object_size = int(size)
                     if show_progress:
-                        click.echo(f"⚠️  Falling back to metadata size estimate for disk check: {exc}")
+                        click.echo(
+                            format_terminal_text(f"⚠️  Falling back to metadata size estimate for disk check: {exc}")
+                        )
                 else:
                     object_size = None
                     if show_progress:
                         click.echo(
-                            "⚠️  Unable to determine download size for "
-                            f"{redact_url_for_display(url)}; continuing without disk check: {exc}"
+                            format_terminal_text(
+                                f"⚠️  Unable to determine download size for {url}; continuing without disk check: {exc}",
+                            )
                         )
 
         if object_size is not None:
@@ -2891,11 +2524,11 @@ def download_from_cloud(
                 )
             has_space, message = check_disk_space(download_path, object_size)
             if not has_space:
-                raise Exception(f"Cannot download from {redact_url_for_display(url)}: {message}")
+                raise Exception(f"Cannot download from {url}: {message}")
         elif max_size:
             raise ValueError(
                 "Unable to enforce maximum cloud download size for "
-                f"{redact_url_for_display(url)} because the object size could not be determined"
+                f"{url} because the object size could not be determined"
             )
 
         # Download based on type
@@ -2927,7 +2560,6 @@ def download_from_cloud(
                     max_retries=3,
                     do_not_retry_on=(_CloudDownloadBudgetExceeded, _UnsafeCloudDownloadDestination),
                     verbose=show_progress,
-                    sanitize_error=_cloud_error_sanitizer(file_url),
                 )
                 def download_file(url=file_url, path=local_path, budget=download_budget):
                     return _download_cloud_object(fs, url, path, budget, download_path)
@@ -2947,7 +2579,6 @@ def download_from_cloud(
                 max_retries=3,
                 do_not_retry_on=(_CloudDownloadBudgetExceeded, _UnsafeCloudDownloadDestination),
                 verbose=show_progress,
-                sanitize_error=_cloud_error_sanitizer(url),
             )
             def download_single_file():
                 return _download_cloud_object(fs, fs_url, local_file, download_budget, download_path)
@@ -3018,7 +2649,7 @@ def download_from_cloud_streaming(
 
     if "error" in metadata or metadata.get("type") == "unknown":
         error_msg = metadata.get("error", "Unknown cloud target type")
-        raise ValueError(f"Failed to analyze cloud target {redact_url_for_display(url)}: {error_msg}")
+        raise ValueError(f"Failed to analyze cloud target {url}: {error_msg}")
 
     # Check size limits. Selective directory downloads are capped after filtering
     # so unrelated prefix contents do not reject a bounded acquisition.
@@ -3026,10 +2657,7 @@ def download_from_cloud_streaming(
         size = _parse_size_value(metadata.get("total_size", metadata.get("size", 0)))
     except (TypeError, ValueError) as exc:
         if max_size and not (metadata["type"] == "directory" and selective):
-            raise ValueError(
-                "Unable to enforce maximum cloud download size for "
-                f"{redact_url_for_display(url)}: invalid size metadata"
-            ) from exc
+            raise ValueError(f"Unable to enforce maximum cloud download size for {url}: invalid size metadata") from exc
         size = 0
     if max_size and size > max_size and not (metadata["type"] == "directory" and selective):
         raise ValueError(f"Total size ({format_size(size)}) exceeds maximum allowed size ({format_size(max_size)})")
@@ -3103,7 +2731,6 @@ def download_from_cloud_streaming(
                 max_retries=3,
                 do_not_retry_on=(_CloudDownloadBudgetExceeded, _UnsafeCloudDownloadDestination),
                 verbose=show_progress,
-                sanitize_error=_cloud_error_sanitizer(file_url),
             )
             def download_file(url=file_url, path=local_path, budget=download_budget):
                 return _download_cloud_object(fs, url, path, budget, temp_dir)

@@ -13,12 +13,12 @@ from typing import Any
 
 from ..models import ModelAuditResultModel
 from ..scanner_selection import SCANNER_SELECTION_CONFIG_KEY
+from ..utils.helpers.evidence import format_terminal_text
 from ..utils.sources.jfrog import (
     detect_jfrog_target_type,
     download_artifact,
     download_jfrog_folder,
     format_size,
-    redact_jfrog_url_for_display,
 )
 
 logger = logging.getLogger(__name__)
@@ -144,11 +144,12 @@ def scan_jfrog_artifact(
     scan_cache_dir = str(Path(raw_cache_dir).expanduser()) if cache_enabled and raw_cache_dir else None
     download_dir, cleanup_download_dir = _prepare_download_dir(url, scan_cache_dir)
     start_time = time.time()
-    display_url = redact_jfrog_url_for_display(url)
+    display_url = url
+    log_url = format_terminal_text(url)
 
     try:
         # Detect if URL points to a file or folder
-        logger.debug(f"Analyzing JFrog target {display_url}")
+        logger.debug(f"Analyzing JFrog target {log_url}")
         target_info = detect_jfrog_target_type(
             url,
             api_token=api_token,
@@ -159,7 +160,7 @@ def scan_jfrog_artifact(
         if target_info["type"] == "file":
             file_download_limit = _positive_limit(max_download_size, max_file_size, max_total_size)
             _require_known_file_size_within_limit(target_info, limit=file_download_limit, display_url=display_url)
-            logger.debug(f"Downloading JFrog file {display_url} to {download_dir}")
+            logger.debug(f"Downloading JFrog file {log_url} to {download_dir}")
             download_path = download_artifact(
                 url,
                 cache_dir=download_dir,
@@ -169,7 +170,7 @@ def scan_jfrog_artifact(
                 max_size=file_download_limit,
             )
         else:
-            logger.debug(f"Downloading JFrog folder {display_url} to {download_dir}")
+            logger.debug(f"Downloading JFrog folder {log_url} to {download_dir}")
             folder_download_kwargs: dict[str, Any] = {}
             if scannable_extensions is not None:
                 folder_download_kwargs["scannable_extensions"] = scannable_extensions

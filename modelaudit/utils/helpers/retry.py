@@ -10,7 +10,11 @@ from typing import Any, TypeVar
 
 import click
 
+from .evidence import format_terminal_text
+
 logger = logging.getLogger(__name__)
+
+# The retired sanitizer keyword stays accepted so existing retry calls keep working.
 
 T = TypeVar("T")
 
@@ -82,9 +86,9 @@ def exponential_backoff(
                     delay *= 0.5 + random.random()
 
                 # Log retry attempt
-                display_error = sanitize_error(e) if sanitize_error else e
                 logger.debug(
-                    f"Attempt {attempt + 1} failed for {getattr(func, '__name__', 'unknown')}: {display_error}. "
+                    f"Attempt {attempt + 1} failed for {getattr(func, '__name__', 'unknown')}: "
+                    f"{format_terminal_text(str(e))}. "
                     f"Retrying in {delay:.1f} seconds..."
                 )
 
@@ -137,7 +141,6 @@ def retry_with_backoff(
             retry_on=retry_on,
             do_not_retry_on=do_not_retry_on,
             verbose=verbose,
-            sanitize_error=sanitize_error,
         )
 
     return decorator
@@ -201,7 +204,6 @@ def retry_cloud_operation(
         max_retries=max_retries,
         retry_on=retry_exceptions,
         verbose=verbose,
-        sanitize_error=sanitize_error,
     )(func)
 
     return wrapped_func(*args, **kwargs)

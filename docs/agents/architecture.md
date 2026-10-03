@@ -95,6 +95,12 @@ result.add_check(
 )
 ```
 
+### Source Identity and Evidence
+
+Oversized source identifiers use bounded previews with SHA-256 identifiers shared across keys and references within each report;
+literal identifiers are reserved so distinct sources remain distinct.
+Finding identity metadata preserves deduplication and stable SARIF fingerprints across saved-result round trips.
+
 ## Issue Severity Levels
 
 - `DEBUG`: Diagnostic information
