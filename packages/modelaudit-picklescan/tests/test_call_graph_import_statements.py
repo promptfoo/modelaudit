@@ -28,9 +28,17 @@ from importlib.util import find_spec
 from pathlib import Path
 from types import FunctionType
 from typing import Any
+from unittest.mock import create_autospec
 from zipimport import zipimporter
 
 import pytest
+from pickle_test_helpers import (
+    _bytes_operand,
+    _clear_call_graph_caches,
+    _global_operand,
+    _has_critical_call_graph_finding,
+)
+from pickle_test_helpers import _text_operand as _unicode_operand
 
 import modelaudit_picklescan.api as api_module
 import modelaudit_picklescan.call_graph as call_graph
@@ -40,29 +48,6 @@ pytestmark = pytest.mark.skipif(
     find_spec(api_module._RUST_EXTENSION_MODULE) is None,
     reason="Rust picklescan extension is not built",
 )
-
-
-def _short_binunicode(data: bytes) -> bytes:
-    if len(data) > 0xFF:
-        raise ValueError("SHORT_BINUNICODE helper accepts at most 255 bytes")
-    return b"\x8c" + bytes([len(data)]) + data
-
-
-def _unicode_operand(value: str) -> bytes:
-    data = value.encode()
-    if len(data) <= 0xFF:
-        return _short_binunicode(data)
-    return b"X" + len(data).to_bytes(4, "little") + data
-
-
-def _bytes_operand(value: bytes) -> bytes:
-    if len(value) <= 0xFF:
-        return b"C" + bytes([len(value)]) + value
-    return b"B" + len(value).to_bytes(4, "little") + value
-
-
-def _global_operand(module: str, name: str) -> bytes:
-    return _unicode_operand(module) + _unicode_operand(name) + b"\x93"
 
 
 def _args_tuple(*arg_operands: bytes) -> bytes:
@@ -81,11 +66,6 @@ def _singleton_small_int_tuple_operand(value: int) -> bytes:
 
 def _global_call_payload(module: str, name: str, *arg_operands: bytes) -> bytes:
     return b"".join([b"\x80\x04", _global_operand(module, name), _args_tuple(*arg_operands), b"R."])
-
-
-def _clear_call_graph_caches() -> None:
-    for function in call_graph._SOURCE_SENSITIVE_CACHED_FUNCTIONS:
-        function.cache_clear()
 
 
 def test_wildcard_summary_and_analysis_share_module_parse(
@@ -114,11 +94,7 @@ def test_wildcard_summary_and_analysis_share_module_parse(
 
 
 def test_shared_source_sensitive_caches_clears_once_per_scope(monkeypatch: pytest.MonkeyPatch) -> None:
-    clear_count = 0
-
-    def fake_clear() -> None:
-        nonlocal clear_count
-        clear_count += 1
+    fake_clear = create_autospec(lambda: None, return_value=None)
 
     monkeypatch.setattr(call_graph, "_clear_source_sensitive_caches_now", fake_clear)
 
@@ -127,10 +103,10 @@ def test_shared_source_sensitive_caches_clears_once_per_scope(monkeypatch: pytes
         call_graph._clear_source_sensitive_caches()
         call_graph._clear_source_sensitive_caches()
 
-    assert clear_count == 1
+    assert fake_clear.call_count == 1
 
     call_graph._clear_source_sensitive_caches()
-    assert clear_count == 2
+    assert fake_clear.call_count == 2
 
 
 def test_shared_source_snapshot_tracks_large_extension_candidates_by_presence(
@@ -379,12 +355,8 @@ def test_unresolved_framework_reconstruction_reference_requires_origin_review(
 def test_shared_source_sensitive_caches_allows_inherited_worker_scopes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    clear_count = 0
+    fake_clear = create_autospec(lambda: None, return_value=None)
     worker_entered = threading.Event()
-
-    def fake_clear() -> None:
-        nonlocal clear_count
-        clear_count += 1
 
     def enter_worker_scope() -> None:
         with call_graph.shared_source_sensitive_caches():
@@ -400,12 +372,12 @@ def test_shared_source_sensitive_caches_allows_inherited_worker_scopes(
         assert worker_entered.wait(timeout=1)
         worker.join(timeout=1)
         assert not worker.is_alive()
-        assert clear_count == 1
+        assert fake_clear.call_count == 1
 
     with call_graph.shared_source_sensitive_caches():
         pass
 
-    assert clear_count == 2
+    assert fake_clear.call_count == 2
 
 
 def test_shared_source_sensitive_caches_serializes_inherited_worker_work() -> None:
@@ -444,13 +416,9 @@ def test_shared_source_sensitive_caches_serializes_inherited_worker_work() -> No
 def test_shared_source_sensitive_caches_serializes_independent_scopes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    clear_count = 0
+    fake_clear = create_autospec(lambda: None, return_value=None)
     worker_started = threading.Event()
     worker_entered = threading.Event()
-
-    def fake_clear() -> None:
-        nonlocal clear_count
-        clear_count += 1
 
     def enter_worker_scope() -> None:
         worker_started.set()
@@ -468,7 +436,7 @@ def test_shared_source_sensitive_caches_serializes_independent_scopes(
     assert worker_entered.wait(timeout=1)
     worker.join(timeout=1)
     assert not worker.is_alive()
-    assert clear_count == 2
+    assert fake_clear.call_count == 2
 
 
 def test_shared_source_sensitive_caches_refreshes_between_outer_scopes(
@@ -1675,25 +1643,7 @@ def _chainmap_defaultdict_str_format_payload(*, key: str, format_string: str) ->
 
 
 def _nested_defaultdict_str_format_payload() -> bytes:
-    return b"".join(
-        [
-            b"\x80\x04",
-            _global_operand("collections", "defaultdict"),
-            _global_operand("builtins", "help"),
-            b"\x85R",
-            b"\x94",
-            b"0",
-            b"}",
-            b"\x94",
-            _unicode_operand("present"),
-            b"h\x00",
-            b"s",
-            b"0",
-            _global_operand("builtins", "str.format"),
-            _args_tuple(_unicode_operand("{0[present][missing]}"), b"h\x01"),
-            b"R.",
-        ]
-    )
+    return _nested_defaultdict_format_payload(method_name="str.format", template="{0[present][missing]}")
 
 
 def _nested_setitems_defaultdict_str_format_payload() -> bytes:
@@ -1720,25 +1670,7 @@ def _nested_setitems_defaultdict_str_format_payload() -> bytes:
 
 
 def _nested_defaultdict_format_map_payload() -> bytes:
-    return b"".join(
-        [
-            b"\x80\x04",
-            _global_operand("collections", "defaultdict"),
-            _global_operand("builtins", "help"),
-            b"\x85R",
-            b"\x94",
-            b"0",
-            b"}",
-            b"\x94",
-            _unicode_operand("present"),
-            b"h\x00",
-            b"s",
-            b"0",
-            _global_operand("builtins", "str.format_map"),
-            _args_tuple(_unicode_operand("{present[missing]}"), b"h\x01"),
-            b"R.",
-        ]
-    )
+    return _nested_defaultdict_format_payload(method_name="str.format_map", template="{present[missing]}")
 
 
 def _nested_defaultdict_formatter_payload(method_name: str) -> bytes:
@@ -1910,17 +1842,6 @@ def _typing_extensions_get_type_hints_payload(marker: Path) -> bytes:
             b"\x85",
             b"R.",
         ]
-    )
-
-
-def _has_critical_call_graph_finding(report: PickleReport, module: str, name: str, sink: str) -> bool:
-    return any(
-        finding.severity == Severity.CRITICAL
-        and finding.rule_code == "DANGEROUS_CALL_GRAPH"
-        and finding.details.get("module") == module
-        and finding.details.get("name") == name
-        and finding.details.get("sink") == sink
-        for finding in report.findings
     )
 
 
@@ -2207,22 +2128,11 @@ def test_call_graph_fails_closed_when_custom_finder_can_shadow_frozen_function_b
         pytest.skip("ntpath is not frozen on this interpreter")
     marker = tmp_path / "meta_path_called"
 
-    class CustomMetaPathFinder:
-        @staticmethod
-        def find_spec(
-            fullname: str,
-            path: object | None = None,
-            target: object | None = None,
-        ) -> ModuleSpec | None:
-            del path, target
-            if fullname == "ntpath":
-                marker.write_text(fullname, encoding="utf-8")
-                return ModuleSpec(fullname, loader=None, origin="custom://module")
-            return None
+    finder = _custom_meta_path_finder("ntpath", marker)
 
     with monkeypatch.context() as context:
         context.delitem(sys.modules, "ntpath", raising=False)
-        context.setattr(sys, "meta_path", [CustomMetaPathFinder(), *sys.meta_path])
+        context.setattr(sys, "meta_path", [finder, *sys.meta_path])
         _clear_call_graph_caches()
 
         try:
@@ -2389,21 +2299,10 @@ def test_scan_bytes_fails_closed_when_custom_meta_path_finder_can_shadow_source(
     (module_dir / f"{module_name}.py").write_text("def invoke(command):\n    return command\n", encoding="utf-8")
     marker = tmp_path / "meta_path_called"
 
-    class CustomMetaPathFinder:
-        @staticmethod
-        def find_spec(
-            fullname: str,
-            path: object | None = None,
-            target: object | None = None,
-        ) -> ModuleSpec | None:
-            del path, target
-            if fullname == module_name:
-                marker.write_text(fullname, encoding="utf-8")
-                return ModuleSpec(fullname, loader=None, origin="custom://module")
-            return None
+    finder = _custom_meta_path_finder(module_name, marker)
 
     monkeypatch.syspath_prepend(str(module_dir))
-    monkeypatch.setattr(sys, "meta_path", [CustomMetaPathFinder(), *sys.meta_path])
+    monkeypatch.setattr(sys, "meta_path", [finder, *sys.meta_path])
     importlib.invalidate_caches()
     _clear_call_graph_caches()
 
@@ -2542,20 +2441,9 @@ def test_scan_bytes_keeps_frozen_stdlib_globals_clean_without_custom_meta_path_f
     module_name = "_frozen_importlib"
     marker = tmp_path / "meta_path_called"
 
-    class CustomMetaPathFinder:
-        @staticmethod
-        def find_spec(
-            fullname: str,
-            path: object | None = None,
-            target: object | None = None,
-        ) -> ModuleSpec | None:
-            del path, target
-            if fullname == module_name:
-                marker.write_text(fullname, encoding="utf-8")
-                return ModuleSpec(fullname, loader=None, origin="custom://module")
-            return None
+    finder = _custom_meta_path_finder(module_name, marker)
 
-    monkeypatch.setattr(sys, "meta_path", [CustomMetaPathFinder(), *sys.meta_path])
+    monkeypatch.setattr(sys, "meta_path", [finder, *sys.meta_path])
     _clear_call_graph_caches()
 
     try:
@@ -2584,21 +2472,10 @@ def test_call_graph_fails_closed_when_custom_meta_path_finder_can_shadow_frozen_
     module_name = "__hello__"
     marker = tmp_path / "meta_path_called"
 
-    class CustomMetaPathFinder:
-        @staticmethod
-        def find_spec(
-            fullname: str,
-            path: object | None = None,
-            target: object | None = None,
-        ) -> ModuleSpec | None:
-            del path, target
-            if fullname == module_name:
-                marker.write_text(fullname, encoding="utf-8")
-                return ModuleSpec(fullname, loader=None, origin="custom://module")
-            return None
+    finder = _custom_meta_path_finder(module_name, marker)
 
     monkeypatch.delitem(sys.modules, module_name, raising=False)
-    monkeypatch.setattr(sys, "meta_path", [CustomMetaPathFinder(), *sys.meta_path])
+    monkeypatch.setattr(sys, "meta_path", [finder, *sys.meta_path])
     _clear_call_graph_caches()
 
     try:
@@ -2633,20 +2510,9 @@ def test_scan_bytes_marks_custom_meta_path_specs_as_unanalyzable_without_invokin
     module_name = "modelaudit_tp_meta_path_spec_probe"
     marker = tmp_path / "meta_path_called"
 
-    class CustomMetaPathFinder:
-        @staticmethod
-        def find_spec(
-            fullname: str,
-            path: object | None = None,
-            target: object | None = None,
-        ) -> ModuleSpec | None:
-            del path, target
-            if fullname == module_name:
-                marker.write_text(fullname, encoding="utf-8")
-                return ModuleSpec(fullname, loader=None, origin="custom://module")
-            return None
+    finder = _custom_meta_path_finder(module_name, marker)
 
-    monkeypatch.setattr(sys, "meta_path", [CustomMetaPathFinder(), *sys.meta_path])
+    monkeypatch.setattr(sys, "meta_path", [finder, *sys.meta_path])
     _clear_call_graph_caches()
 
     try:
@@ -2973,64 +2839,30 @@ def test_scan_bytes_refreshes_call_graph_after_source_rewrite(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    module_name = "modelaudit_tp_rewritten_call_graph_source"
-    module_path = module_dir / f"{module_name}.py"
-    module_path.write_text("def invoke(command):\n    return command\n", encoding="utf-8")
-    monkeypatch.syspath_prepend(str(module_dir))
-    importlib.invalidate_caches()
-    _clear_call_graph_caches()
-    payload = _global_call_payload(module_name, "invoke", _unicode_operand("echo rewritten"))
-
-    try:
-        safe_report = scan_bytes(payload, source="rewritten-call-graph-safe.pkl")
-
-        module_path.write_text(
-            "import os\n\ndef invoke(command):\n    return os.system(command)\n",
-            encoding="utf-8",
-        )
-        importlib.invalidate_caches()
-        dangerous_report = scan_bytes(payload, source="rewritten-call-graph-dangerous.pkl")
-    finally:
-        _clear_call_graph_caches()
-
-    assert safe_report.verdict == SafetyVerdict.SUSPICIOUS
-    assert not _has_critical_call_graph_finding(safe_report, module_name, "invoke", "os.system")
-    assert dangerous_report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_call_graph_finding(dangerous_report, module_name, "invoke", "os.system")
+    _assert_rewritten_call_graph(
+        tmp_path,
+        monkeypatch,
+        "modelaudit_tp_rewritten_call_graph_source",
+        "rewritten-call-graph-safe.pkl",
+        "import os\n\ndef invoke(command):\n    return os.system(command)\n",
+        "rewritten-call-graph-dangerous.pkl",
+        "os.system",
+    )
 
 
 def test_scan_bytes_refreshes_invoked_import_fallback_after_source_rewrite(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    module_name = "modelaudit_tp_rewritten_invoked_import_source"
-    module_path = module_dir / f"{module_name}.py"
-    module_path.write_text("def invoke(command):\n    return command\n", encoding="utf-8")
-    monkeypatch.syspath_prepend(str(module_dir))
-    importlib.invalidate_caches()
-    _clear_call_graph_caches()
-    payload = _global_call_payload(module_name, "invoke", _unicode_operand("echo rewritten"))
-
-    try:
-        safe_report = scan_bytes(payload, source="rewritten-invoked-import-safe.pkl")
-
-        module_path.write_text(
-            "def invoke(command):\n    import modelaudit_tp_invoked_import_dependency\n    return command\n",
-            encoding="utf-8",
-        )
-        importlib.invalidate_caches()
-        dangerous_report = scan_bytes(payload, source="rewritten-invoked-import-dangerous.pkl")
-    finally:
-        _clear_call_graph_caches()
-
-    assert safe_report.verdict == SafetyVerdict.SUSPICIOUS
-    assert not _has_critical_call_graph_finding(safe_report, module_name, "invoke", "builtins.__import__")
-    assert dangerous_report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_call_graph_finding(dangerous_report, module_name, "invoke", "builtins.__import__")
+    _assert_rewritten_call_graph(
+        tmp_path,
+        monkeypatch,
+        "modelaudit_tp_rewritten_invoked_import_source",
+        "rewritten-invoked-import-safe.pkl",
+        "def invoke(command):\n    import modelaudit_tp_invoked_import_dependency\n    return command\n",
+        "rewritten-invoked-import-dangerous.pkl",
+        "builtins.__import__",
+    )
 
 
 def test_startup_hook_write_call_graph_refreshes_after_source_rewrite(
@@ -3080,14 +2912,7 @@ def test_startup_hook_write_call_graph_refreshes_after_source_rewrite(
 
 
 def test_call_graph_propagates_wrapper_import_execution_fallbacks() -> None:
-    calls = call_graph._calls_for_function("platform.mac_ver") or ()
-
-    assert "platform._mac_ver_xml" in calls
-    assert call_graph._find_sink_path("platform.mac_ver") == (
-        "platform.mac_ver",
-        "platform._mac_ver_xml",
-        "builtins.__import__",
-    )
+    _assert_wrapper_import_fallback("platform.mac_ver", "platform._mac_ver_xml", "builtins.__import__")
 
 
 def test_call_graph_ignores_imports_inside_nested_functions_until_called() -> None:
@@ -3098,29 +2923,13 @@ def test_call_graph_ignores_imports_inside_nested_functions_until_called() -> No
 
 
 def test_call_graph_models_getattr_default_callable_fallbacks() -> None:
-    calls = call_graph._calls_for_function("platform._Processor.get") or ()
-
-    assert "platform._Processor.from_subprocess" in calls
-    assert call_graph._find_sink_path("platform._Processor.get") == (
-        "platform._Processor.get",
-        "platform._Processor.from_subprocess",
-        "subprocess.check_output",
+    _assert_wrapper_import_fallback(
+        "platform._Processor.get", "platform._Processor.from_subprocess", "subprocess.check_output"
     )
 
 
 def _is_typing_readonly_guard(statement: ast.stmt) -> bool:
-    if not isinstance(statement, ast.If) or not isinstance(statement.test, ast.Call):
-        return False
-    test = statement.test
-    return (
-        isinstance(test.func, ast.Name)
-        and test.func.id == "hasattr"
-        and len(test.args) == 2
-        and isinstance(test.args[0], ast.Name)
-        and test.args[0].id == "typing"
-        and isinstance(test.args[1], ast.Constant)
-        and test.args[1].value == "ReadOnly"
-    )
+    return _is_module_attribute_guard(statement, module_name="typing", attribute_name="ReadOnly")
 
 
 def _is_typing_get_type_hints_guard(statement: ast.stmt) -> bool:
@@ -3142,18 +2951,7 @@ def _is_typing_get_type_hints_guard(statement: ast.stmt) -> bool:
 
 
 def _is_builtin_sentinel_guard(statement: ast.stmt) -> bool:
-    if not isinstance(statement, ast.If) or not isinstance(statement.test, ast.Call):
-        return False
-    test = statement.test
-    return (
-        isinstance(test.func, ast.Name)
-        and test.func.id == "hasattr"
-        and len(test.args) == 2
-        and isinstance(test.args[0], ast.Name)
-        and test.args[0].id == "builtins"
-        and isinstance(test.args[1], ast.Constant)
-        and test.args[1].value == "sentinel"
-    )
+    return _is_module_attribute_guard(statement, module_name="builtins", attribute_name="sentinel")
 
 
 def test_runtime_guard_selects_live_typing_extensions_export() -> None:
@@ -4084,93 +3882,11 @@ def test_scan_bytes_uses_torch_module_lifecycle_entrypoints_for_newobj() -> None
 
 
 def test_call_graph_models_builtin_format_protocol_dispatch_invocations() -> None:
-    import_references = [
-        {
-            "module": "ipaddress",
-            "name": "IPv4Address",
-            "import_reference": "ipaddress.IPv4Address",
-        },
-        {
-            "module": "builtins",
-            "name": "format",
-            "import_reference": "builtins.format",
-        },
-    ]
-    direct_invocations = [
-        {
-            "module": "ipaddress",
-            "name": "IPv4Address",
-            "positional_arg_count": 1,
-        },
-        {
-            "module": "builtins",
-            "name": "format",
-            "positional_arg_count": 2,
-        },
-    ]
-    protocol_invocations = [
-        *direct_invocations,
-        {
-            "module": "ipaddress",
-            "name": "IPv4Address.__format__",
-            "positional_arg_count": 1,
-        },
-    ]
-
-    assert call_graph.find_dangerous_call_graphs(import_references, direct_invocations) == ()
-
-    findings = call_graph.find_dangerous_call_graphs(import_references, protocol_invocations)
-
-    assert len(findings) == 1
-    assert findings[0].module == "ipaddress"
-    assert findings[0].name == "IPv4Address.__format__"
-    assert findings[0].sink == "builtins.__import__"
-    assert findings[0].call_path == ("ipaddress.IPv4Address.__format__", "builtins.__import__")
+    _assert_format_protocol_dispatch("format")
 
 
 def test_call_graph_models_str_format_protocol_dispatch_invocations() -> None:
-    import_references = [
-        {
-            "module": "ipaddress",
-            "name": "IPv4Address",
-            "import_reference": "ipaddress.IPv4Address",
-        },
-        {
-            "module": "builtins",
-            "name": "str.format",
-            "import_reference": "builtins.str.format",
-        },
-    ]
-    direct_invocations = [
-        {
-            "module": "ipaddress",
-            "name": "IPv4Address",
-            "positional_arg_count": 1,
-        },
-        {
-            "module": "builtins",
-            "name": "str.format",
-            "positional_arg_count": 2,
-        },
-    ]
-    protocol_invocations = [
-        *direct_invocations,
-        {
-            "module": "ipaddress",
-            "name": "IPv4Address.__format__",
-            "positional_arg_count": 1,
-        },
-    ]
-
-    assert call_graph.find_dangerous_call_graphs(import_references, direct_invocations) == ()
-
-    findings = call_graph.find_dangerous_call_graphs(import_references, protocol_invocations)
-
-    assert len(findings) == 1
-    assert findings[0].module == "ipaddress"
-    assert findings[0].name == "IPv4Address.__format__"
-    assert findings[0].sink == "builtins.__import__"
-    assert findings[0].call_path == ("ipaddress.IPv4Address.__format__", "builtins.__import__")
+    _assert_format_protocol_dispatch("str.format")
 
 
 @pytest.mark.parametrize(
@@ -4224,16 +3940,10 @@ if not marker.exists():
 if marker.read_text() != marker_content:
     raise SystemExit("marker content mismatch")
 """
-    result = subprocess.run(
+    _assert_isolated_python(
+        tmp_path,
         [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), module_name, marker_content],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
     )
-    assert result.returncode == 0, result.stderr
     assert marker.read_text() == marker_content
 
 
@@ -4290,16 +4000,9 @@ if not marker.exists():
 if marker.read_text() != marker_content:
     raise SystemExit("marker content mismatch")
 """
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
+    _assert_isolated_python(
+        tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content]
     )
-    assert result.returncode == 0, result.stderr
     assert marker.read_text() == marker_content
 
 
@@ -4359,16 +4062,9 @@ if not marker.exists():
 if marker.read_text() != marker_content:
     raise SystemExit("marker content mismatch")
 """
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
+    _assert_isolated_python(
+        tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content]
     )
-    assert result.returncode == 0, result.stderr
     assert marker.read_text() == marker_content
 
 
@@ -4591,16 +4287,7 @@ pickle.loads(payload)
 if not marker.exists():
     raise SystemExit("setstate import did not execute")
 """
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(tmp_path), str(marker), payload.hex()],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    assert result.returncode == 0, result.stderr
+    _assert_isolated_python(tmp_path, [sys.executable, "-c", child_code, str(tmp_path), str(marker), payload.hex()])
 
 
 def test_scan_bytes_blocks_iter_callable_sentinel_consumption_rce(tmp_path: Path) -> None:
@@ -4661,16 +4348,9 @@ if not marker.exists():
 if marker.read_text() != marker_content:
     raise SystemExit("marker content mismatch")
 """
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
+    _assert_isolated_python(
+        tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content]
     )
-    assert result.returncode == 0, result.stderr
     assert marker.read_text() == marker_content
 
 
@@ -4737,16 +4417,9 @@ if not marker.exists():
 if marker.read_text() != marker_content:
     raise SystemExit("marker content mismatch")
 """
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
+    _assert_isolated_python(
+        tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content]
     )
-    assert result.returncode == 0, result.stderr
     assert marker.read_text() == marker_content
 
 
@@ -4819,7 +4492,8 @@ if marker.read_text() != marker_content:
     raise SystemExit("marker content mismatch")
 """
     expected_maxlen = "0" if with_maxlen else "None"
-    result = subprocess.run(
+    _assert_isolated_python(
+        tmp_path,
         [
             sys.executable,
             "-c",
@@ -4830,14 +4504,7 @@ if marker.read_text() != marker_content:
             marker_content,
             expected_maxlen,
         ],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
     )
-    assert result.returncode == 0, result.stderr
     assert marker.read_text() == marker_content
 
 
@@ -4921,16 +4588,10 @@ if not marker.exists():
 if marker.read_text() != marker_content:
     raise SystemExit("marker content mismatch")
 """
-    result = subprocess.run(
+    _assert_isolated_python(
+        tmp_path,
         [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content, expected_repr],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
     )
-    assert result.returncode == 0, result.stderr
     assert marker.read_text() == marker_content
 
 
@@ -5013,16 +4674,10 @@ if not marker.exists():
 if marker.read_text() != marker_content:
     raise SystemExit("marker content mismatch")
 """
-    result = subprocess.run(
+    _assert_isolated_python(
+        tmp_path,
         [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content, expected_repr],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
     )
-    assert result.returncode == 0, result.stderr
     assert marker.read_text() == marker_content
 
 
@@ -5086,16 +4741,9 @@ if not marker.exists():
 if marker.read_text() != marker_content:
     raise SystemExit("marker content mismatch")
 """
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
+    _assert_isolated_python(
+        tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content]
     )
-    assert result.returncode == 0, result.stderr
     assert marker.read_text() == marker_content
 
 
@@ -5161,16 +4809,10 @@ if not marker.exists():
 if marker.read_text() != marker_content:
     raise SystemExit("marker content mismatch")
 """
-    result = subprocess.run(
+    _assert_isolated_python(
+        tmp_path,
         [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content, consumer],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
     )
-    assert result.returncode == 0, result.stderr
     assert marker.read_text() == marker_content
 
 
@@ -5253,16 +4895,9 @@ if not marker.exists():
 if marker.read_text() != marker_content:
     raise SystemExit("marker content mismatch")
 """
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
+    _assert_isolated_python(
+        tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content]
     )
-    assert result.returncode == 0, result.stderr
     assert marker.read_text() == marker_content
 
 
@@ -5348,16 +4983,9 @@ if not marker.exists():
 if marker.read_text() != marker_content:
     raise SystemExit("marker content mismatch")
 """
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
+    _assert_isolated_python(
+        tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content]
     )
-    assert result.returncode == 0, result.stderr
     assert marker.read_text() == marker_content
 
 
@@ -5366,14 +4994,7 @@ def test_scan_bytes_blocks_itertools_product_call_iterator_materialization_rce(t
     module_dir.mkdir()
     marker = tmp_path / "itertools_product_call_iterator_marker"
     marker_content = "pydoc-owned"
-    (module_dir / "pydoc.py").write_text(
-        "from pathlib import Path\n"
-        f"Path({str(marker)!r}).write_text({marker_content!r})\n"
-        "_values = ['owned-value', 'stop']\n"
-        "def help(*args, **kwargs):\n"
-        "    return _values.pop(0) if _values else 'stop'\n",
-        encoding="utf-8",
-    )
+    _write_iterator_pydoc(module_dir, marker, marker_content, "['owned-value', 'stop']")
 
     payload = _builtins_help_call_iterator_itertools_product_payload()
     report = scan_bytes(payload, source="itertools-product-call-iterator-rce.pkl")
@@ -5415,16 +5036,9 @@ if not marker.exists():
 if marker.read_text() != marker_content:
     raise SystemExit("marker content mismatch")
 """
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
+    _assert_isolated_python(
+        tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content]
     )
-    assert result.returncode == 0, result.stderr
     assert marker.read_text() == marker_content
 
 
@@ -5459,14 +5073,7 @@ def test_scan_bytes_blocks_itertools_adapter_next_call_iterator_consumption_rce(
     module_dir.mkdir()
     marker = tmp_path / "itertools_adapter_call_iterator_marker"
     marker_content = "pydoc-owned"
-    (module_dir / "pydoc.py").write_text(
-        "from pathlib import Path\n"
-        f"Path({str(marker)!r}).write_text({marker_content!r})\n"
-        "_values = ['owned-value', 'b', 'stop']\n"
-        "def help(*args, **kwargs):\n"
-        "    return _values.pop(0) if _values else 'stop'\n",
-        encoding="utf-8",
-    )
+    _write_iterator_pydoc(module_dir, marker, marker_content, "['owned-value', 'b', 'stop']")
 
     report = scan_bytes(payload, source="itertools-adapter-next-call-iterator-rce.pkl")
 
@@ -5514,16 +5121,10 @@ if not marker.exists():
 if marker.read_text() != marker_content:
     raise SystemExit("marker content mismatch")
 """
-    result = subprocess.run(
+    _assert_isolated_python(
+        tmp_path,
         [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content, expected_repr],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
     )
-    assert result.returncode == 0, result.stderr
     assert marker.read_text() == marker_content
 
 
@@ -5747,38 +5348,6 @@ def test_scan_bytes_blocks_stdlib_eager_call_iterator_consumption_rce(
     expected_repr: str,
     requires_python_3_11_plus: bool,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "stdlib_eager_call_iterator_marker"
-    marker_content = "pydoc-owned"
-    (module_dir / "pydoc.py").write_text(
-        "from pathlib import Path\n"
-        f"Path({str(marker)!r}).write_text({marker_content!r})\n"
-        f"_values = {values_literal}\n"
-        "def help(*args, **kwargs):\n"
-        "    return _values.pop(0) if _values else 'stop'\n",
-        encoding="utf-8",
-    )
-
-    report = scan_bytes(payload, source="stdlib-eager-call-iterator-rce.pkl")
-
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_call_graph_finding(
-        report,
-        "_sitebuiltins",
-        "_Helper.__call__",
-        "builtins.__import__",
-    )
-    assert any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 0
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
-
-    assert not marker.exists()
-    if requires_python_3_11_plus and sys.version_info < (3, 11):
-        return
     child_code = """
 import ast
 import pickle
@@ -5817,17 +5386,16 @@ if not marker.exists():
 if marker.read_text() != marker_content:
     raise SystemExit("marker content mismatch")
 """
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content, expected_repr],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
+    _assert_eager_call_iterator(
+        tmp_path,
+        payload,
+        values_literal,
+        expected_repr,
+        "stdlib_eager_call_iterator_marker",
+        "stdlib-eager-call-iterator-rce.pkl",
+        child_code,
+        requires_python_3_11_plus,
     )
-    assert result.returncode == 0, result.stderr
-    assert marker.read_text() == marker_content
 
 
 @pytest.mark.parametrize(
@@ -5864,39 +5432,6 @@ def test_scan_bytes_blocks_weighted_statistics_call_iterator_consumption_rce(
     expected_repr: str,
     requires_python_3_11_plus: bool,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "weighted_statistics_call_iterator_marker"
-    marker_content = "pydoc-owned"
-    (module_dir / "pydoc.py").write_text(
-        "from pathlib import Path\n"
-        f"Path({str(marker)!r}).write_text({marker_content!r})\n"
-        f"_values = {values_literal}\n"
-        "def help(*args, **kwargs):\n"
-        "    return _values.pop(0) if _values else 'stop'\n",
-        encoding="utf-8",
-    )
-
-    report = scan_bytes(payload, source="weighted-statistics-call-iterator-rce.pkl")
-
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_call_graph_finding(
-        report,
-        "_sitebuiltins",
-        "_Helper.__call__",
-        "builtins.__import__",
-    )
-    assert any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 0
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
-
-    assert not marker.exists()
-    if requires_python_3_11_plus and sys.version_info < (3, 11):
-        return
-
     child_code = """
 import pickle
 import sys
@@ -5920,17 +5455,16 @@ if not marker.exists():
 if marker.read_text() != marker_content:
     raise SystemExit("marker content mismatch")
 """
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content, expected_repr],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
+    _assert_eager_call_iterator(
+        tmp_path,
+        payload,
+        values_literal,
+        expected_repr,
+        "weighted_statistics_call_iterator_marker",
+        "weighted-statistics-call-iterator-rce.pkl",
+        child_code,
+        requires_python_3_11_plus,
     )
-    assert result.returncode == 0, result.stderr
-    assert marker.read_text() == marker_content
 
 
 @pytest.mark.parametrize(
@@ -6019,7 +5553,8 @@ if not marker.exists():
 if marker.read_text() != marker_content:
     raise SystemExit("marker content mismatch")
 """
-    result = subprocess.run(
+    _assert_isolated_python(
+        tmp_path,
         [
             sys.executable,
             "-c",
@@ -6031,14 +5566,7 @@ if marker.read_text() != marker_content:
             expected_type,
             str(expected_len),
         ],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
     )
-    assert result.returncode == 0, result.stderr
     assert marker.read_text() == marker_content
 
 
@@ -6324,76 +5852,15 @@ def test_scan_bytes_blocks_method_descriptor_call_iterator_consumption_rce(
     values_literal: str,
     expected_repr: str,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "method_descriptor_call_iterator_marker"
-    marker_content = "pydoc-owned"
-    (module_dir / "pydoc.py").write_text(
-        "from pathlib import Path\n"
-        f"Path({str(marker)!r}).write_text({marker_content!r})\n"
-        f"_values = {values_literal}\n"
-        "def help(*args, **kwargs):\n"
-        "    return _values.pop(0) if _values else 'stop'\n",
-        encoding="utf-8",
+    _assert_eager_call_iterator(
+        tmp_path,
+        payload,
+        values_literal,
+        expected_repr,
+        "method_descriptor_call_iterator_marker",
+        "method-descriptor-call-iterator-rce.pkl",
+        _EAGER_CALL_ITERATOR_ORACLE,
     )
-
-    report = scan_bytes(payload, source="method-descriptor-call-iterator-rce.pkl")
-
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_call_graph_finding(
-        report,
-        "_sitebuiltins",
-        "_Helper.__call__",
-        "builtins.__import__",
-    )
-    assert any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 0
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
-
-    assert not marker.exists()
-    child_code = """
-import pickle
-import sys
-from pathlib import Path
-
-module_dir = Path(sys.argv[1])
-marker = Path(sys.argv[2])
-payload = bytes.fromhex(sys.argv[3])
-marker_content = sys.argv[4]
-expected_repr = sys.argv[5]
-
-if marker.exists():
-    raise SystemExit("marker already exists before pickle execution")
-sys.path.insert(0, str(module_dir))
-sys.modules.pop("pydoc", None)
-result = pickle.loads(payload)
-result_repr = repr(result)
-expected_ordered_dict_repr = None
-if expected_repr.startswith("OrderedDict(") and expected_repr.endswith(")"):
-    expected_ordered_dict_repr = expected_repr[len("OrderedDict(") : -1]
-if result_repr != expected_repr and not (
-    type(result).__name__ == "OrderedDict" and repr(dict(result)) == expected_ordered_dict_repr
-):
-    raise SystemExit(f"expected {expected_repr}, got {result!r}")
-if not marker.exists():
-    raise SystemExit("marker was not written")
-if marker.read_text() != marker_content:
-    raise SystemExit("marker content mismatch")
-"""
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content, expected_repr],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    assert result.returncode == 0, result.stderr
-    assert marker.read_text() == marker_content
 
 
 def test_scan_bytes_keeps_defaultdict_init_factory_call_iterator_lazy(tmp_path: Path) -> None:
@@ -6401,14 +5868,7 @@ def test_scan_bytes_keeps_defaultdict_init_factory_call_iterator_lazy(tmp_path: 
     module_dir.mkdir()
     marker = tmp_path / "defaultdict_init_factory_call_iterator_marker"
     marker_content = "pydoc-owned"
-    (module_dir / "pydoc.py").write_text(
-        "from pathlib import Path\n"
-        f"Path({str(marker)!r}).write_text({marker_content!r})\n"
-        "_values = [('owned-key', 'owned-value'), 'stop']\n"
-        "def help(*args, **kwargs):\n"
-        "    return _values.pop(0) if _values else 'stop'\n",
-        encoding="utf-8",
-    )
+    _write_iterator_pydoc(module_dir, marker, marker_content, "[('owned-key', 'owned-value'), 'stop']")
     payload = _builtins_help_call_iterator_method_descriptor_payload(
         "collections",
         "defaultdict.__init__",
@@ -6448,16 +5908,7 @@ else:
 if marker.exists():
     raise SystemExit("marker was written")
 """
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex()],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    assert result.returncode == 0, result.stderr
+    _assert_isolated_python(tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex()])
     assert not marker.exists()
 
 
@@ -6550,16 +6001,9 @@ if not marker.exists():
 if marker.read_text() != marker_content:
     raise SystemExit("marker content mismatch")
 """
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
+    _assert_isolated_python(
+        tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content]
     )
-    assert result.returncode == 0, result.stderr
     assert marker.read_text() == marker_content
 
 
@@ -6568,14 +6012,7 @@ def test_scan_bytes_keeps_non_consuming_method_descriptor_call_iterator_lazy(tmp
     module_dir.mkdir()
     marker = tmp_path / "method_descriptor_lazy_call_iterator_marker"
     marker_content = "pydoc-owned"
-    (module_dir / "pydoc.py").write_text(
-        "from pathlib import Path\n"
-        f"Path({str(marker)!r}).write_text({marker_content!r})\n"
-        "_values = ['owned-key', 'stop']\n"
-        "def help(*args, **kwargs):\n"
-        "    return _values.pop(0) if _values else 'stop'\n",
-        encoding="utf-8",
-    )
+    _write_iterator_pydoc(module_dir, marker, marker_content, "['owned-key', 'stop']")
     payload = _builtins_help_call_iterator_method_descriptor_payload("builtins", "dict.setdefault", b"}", b"h\x00")
 
     report = scan_bytes(payload, source="method-descriptor-lazy-call-iterator.pkl")
@@ -6607,16 +6044,7 @@ if result is not None:
 if marker.exists():
     raise SystemExit("marker was written")
 """
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex()],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    assert result.returncode == 0, result.stderr
+    _assert_isolated_python(tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex()])
     assert not marker.exists()
 
 
@@ -6646,76 +6074,15 @@ def test_scan_bytes_blocks_operator_sequence_search_call_iterator_consumption_rc
     values_literal: str,
     expected_repr: str,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "operator_sequence_search_call_iterator_marker"
-    marker_content = "pydoc-owned"
-    (module_dir / "pydoc.py").write_text(
-        "from pathlib import Path\n"
-        f"Path({str(marker)!r}).write_text({marker_content!r})\n"
-        f"_values = {values_literal}\n"
-        "def help(*args, **kwargs):\n"
-        "    return _values.pop(0) if _values else 'stop'\n",
-        encoding="utf-8",
+    _assert_eager_call_iterator(
+        tmp_path,
+        payload,
+        values_literal,
+        expected_repr,
+        "operator_sequence_search_call_iterator_marker",
+        "operator-sequence-search-call-iterator-rce.pkl",
+        _EAGER_CALL_ITERATOR_ORACLE,
     )
-
-    report = scan_bytes(payload, source="operator-sequence-search-call-iterator-rce.pkl")
-
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_call_graph_finding(
-        report,
-        "_sitebuiltins",
-        "_Helper.__call__",
-        "builtins.__import__",
-    )
-    assert any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 0
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
-
-    assert not marker.exists()
-    child_code = """
-import pickle
-import sys
-from pathlib import Path
-
-module_dir = Path(sys.argv[1])
-marker = Path(sys.argv[2])
-payload = bytes.fromhex(sys.argv[3])
-marker_content = sys.argv[4]
-expected_repr = sys.argv[5]
-
-if marker.exists():
-    raise SystemExit("marker already exists before pickle execution")
-sys.path.insert(0, str(module_dir))
-sys.modules.pop("pydoc", None)
-result = pickle.loads(payload)
-result_repr = repr(result)
-expected_ordered_dict_repr = None
-if expected_repr.startswith("OrderedDict(") and expected_repr.endswith(")"):
-    expected_ordered_dict_repr = expected_repr[len("OrderedDict(") : -1]
-if result_repr != expected_repr and not (
-    type(result).__name__ == "OrderedDict" and repr(dict(result)) == expected_ordered_dict_repr
-):
-    raise SystemExit(f"expected {expected_repr}, got {result!r}")
-if not marker.exists():
-    raise SystemExit("marker was not written")
-if marker.read_text() != marker_content:
-    raise SystemExit("marker content mismatch")
-"""
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content, expected_repr],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    assert result.returncode == 0, result.stderr
-    assert marker.read_text() == marker_content
 
 
 def test_scan_bytes_keeps_operator_length_hint_call_iterator_lazy(tmp_path: Path) -> None:
@@ -6723,14 +6090,7 @@ def test_scan_bytes_keeps_operator_length_hint_call_iterator_lazy(tmp_path: Path
     module_dir.mkdir()
     marker = tmp_path / "operator_length_hint_call_iterator_marker"
     marker_content = "pydoc-owned"
-    (module_dir / "pydoc.py").write_text(
-        "from pathlib import Path\n"
-        f"Path({str(marker)!r}).write_text({marker_content!r})\n"
-        "_values = ['owned-value', 'stop']\n"
-        "def help(*args, **kwargs):\n"
-        "    return _values.pop(0) if _values else 'stop'\n",
-        encoding="utf-8",
-    )
+    _write_iterator_pydoc(module_dir, marker, marker_content, "['owned-value', 'stop']")
     payload = _builtins_help_call_iterator_operator_payload("length_hint", b"h\x00")
 
     report = scan_bytes(payload, source="operator-length-hint-call-iterator.pkl")
@@ -6762,16 +6122,7 @@ if result != 0:
 if marker.exists():
     raise SystemExit("marker was written")
 """
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex()],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    assert result.returncode == 0, result.stderr
+    _assert_isolated_python(tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex()])
     assert not marker.exists()
 
 
@@ -6894,76 +6245,15 @@ def test_scan_bytes_blocks_operator_protocol_call_iterator_consumption_rce(
     values_literal: str,
     expected_repr: str,
 ) -> None:
-    module_dir = tmp_path / "modules"
-    module_dir.mkdir()
-    marker = tmp_path / "operator_protocol_call_iterator_marker"
-    marker_content = "pydoc-owned"
-    (module_dir / "pydoc.py").write_text(
-        "from pathlib import Path\n"
-        f"Path({str(marker)!r}).write_text({marker_content!r})\n"
-        f"_values = {values_literal}\n"
-        "def help(*args, **kwargs):\n"
-        "    return _values.pop(0) if _values else 'stop'\n",
-        encoding="utf-8",
+    _assert_eager_call_iterator(
+        tmp_path,
+        payload,
+        values_literal,
+        expected_repr,
+        "operator_protocol_call_iterator_marker",
+        "operator-protocol-call-iterator-rce.pkl",
+        _EAGER_CALL_ITERATOR_ORACLE,
     )
-
-    report = scan_bytes(payload, source="operator-protocol-call-iterator-rce.pkl")
-
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_call_graph_finding(
-        report,
-        "_sitebuiltins",
-        "_Helper.__call__",
-        "builtins.__import__",
-    )
-    assert any(
-        invocation.get("module") == "builtins"
-        and invocation.get("name") == "help"
-        and invocation.get("positional_arg_count") == 0
-        for invocation in report.metadata.get("callable_invocations", [])
-    )
-
-    assert not marker.exists()
-    child_code = """
-import pickle
-import sys
-from pathlib import Path
-
-module_dir = Path(sys.argv[1])
-marker = Path(sys.argv[2])
-payload = bytes.fromhex(sys.argv[3])
-marker_content = sys.argv[4]
-expected_repr = sys.argv[5]
-
-if marker.exists():
-    raise SystemExit("marker already exists before pickle execution")
-sys.path.insert(0, str(module_dir))
-sys.modules.pop("pydoc", None)
-result = pickle.loads(payload)
-result_repr = repr(result)
-expected_ordered_dict_repr = None
-if expected_repr.startswith("OrderedDict(") and expected_repr.endswith(")"):
-    expected_ordered_dict_repr = expected_repr[len("OrderedDict(") : -1]
-if result_repr != expected_repr and not (
-    type(result).__name__ == "OrderedDict" and repr(dict(result)) == expected_ordered_dict_repr
-):
-    raise SystemExit(f"expected {expected_repr}, got {result!r}")
-if not marker.exists():
-    raise SystemExit("marker was not written")
-if marker.read_text() != marker_content:
-    raise SystemExit("marker content mismatch")
-"""
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content, expected_repr],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    assert result.returncode == 0, result.stderr
-    assert marker.read_text() == marker_content
 
 
 def test_scan_bytes_keeps_operator_iadd_numeric_receiver_call_iterator_lazy(tmp_path: Path) -> None:
@@ -6971,14 +6261,7 @@ def test_scan_bytes_keeps_operator_iadd_numeric_receiver_call_iterator_lazy(tmp_
     module_dir.mkdir()
     marker = tmp_path / "operator_iadd_numeric_receiver_marker"
     marker_content = "pydoc-owned"
-    (module_dir / "pydoc.py").write_text(
-        "from pathlib import Path\n"
-        f"Path({str(marker)!r}).write_text({marker_content!r})\n"
-        "_values = ['owned-value', 'stop']\n"
-        "def help(*args, **kwargs):\n"
-        "    return _values.pop(0) if _values else 'stop'\n",
-        encoding="utf-8",
-    )
+    _write_iterator_pydoc(module_dir, marker, marker_content, "['owned-value', 'stop']")
     payload = _builtins_help_call_iterator_operator_payload("iadd", b"K\x01", b"h\x00")
 
     report = scan_bytes(payload, source="operator-iadd-numeric-receiver-call-iterator.pkl")
@@ -7013,16 +6296,7 @@ else:
 if marker.exists():
     raise SystemExit("marker was written")
 """
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex()],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    assert result.returncode == 0, result.stderr
+    _assert_isolated_python(tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex()])
     assert not marker.exists()
 
 
@@ -7031,14 +6305,7 @@ def test_scan_bytes_keeps_operator_iadd_bytearray_receiver_call_iterator_lazy(tm
     module_dir.mkdir()
     marker = tmp_path / "operator_iadd_bytearray_receiver_marker"
     marker_content = "pydoc-owned"
-    (module_dir / "pydoc.py").write_text(
-        "from pathlib import Path\n"
-        f"Path({str(marker)!r}).write_text({marker_content!r})\n"
-        "_values = [65, 'stop']\n"
-        "def help(*args, **kwargs):\n"
-        "    return _values.pop(0) if _values else 'stop'\n",
-        encoding="utf-8",
-    )
+    _write_iterator_pydoc(module_dir, marker, marker_content, "[65, 'stop']")
     payload = _builtins_help_call_iterator_operator_payload(
         "iadd",
         _constructed_call_operand("builtins", "bytearray", b"C\x00"),
@@ -7077,16 +6344,7 @@ else:
 if marker.exists():
     raise SystemExit("marker was written")
 """
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex()],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    assert result.returncode == 0, result.stderr
+    _assert_isolated_python(tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex()])
     assert not marker.exists()
 
 
@@ -7095,14 +6353,7 @@ def test_scan_bytes_keeps_operator_iconcat_userlist_receiver_call_iterator_lazy(
     module_dir.mkdir()
     marker = tmp_path / "operator_iconcat_userlist_receiver_marker"
     marker_content = "pydoc-owned"
-    (module_dir / "pydoc.py").write_text(
-        "from pathlib import Path\n"
-        f"Path({str(marker)!r}).write_text({marker_content!r})\n"
-        "_values = ['owned-value', 'stop']\n"
-        "def help(*args, **kwargs):\n"
-        "    return _values.pop(0) if _values else 'stop'\n",
-        encoding="utf-8",
-    )
+    _write_iterator_pydoc(module_dir, marker, marker_content, "['owned-value', 'stop']")
     payload = _builtins_help_call_iterator_operator_payload(
         "iconcat",
         _constructed_call_operand("collections", "UserList"),
@@ -7141,16 +6392,7 @@ else:
 if marker.exists():
     raise SystemExit("marker was written")
 """
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex()],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    assert result.returncode == 0, result.stderr
+    _assert_isolated_python(tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex()])
     assert not marker.exists()
 
 
@@ -7159,14 +6401,7 @@ def test_scan_bytes_keeps_operator_ior_counter_receiver_call_iterator_lazy(tmp_p
     module_dir.mkdir()
     marker = tmp_path / "operator_ior_counter_receiver_marker"
     marker_content = "pydoc-owned"
-    (module_dir / "pydoc.py").write_text(
-        "from pathlib import Path\n"
-        f"Path({str(marker)!r}).write_text({marker_content!r})\n"
-        "_values = [('owned-key', 1), 'stop']\n"
-        "def help(*args, **kwargs):\n"
-        "    return _values.pop(0) if _values else 'stop'\n",
-        encoding="utf-8",
-    )
+    _write_iterator_pydoc(module_dir, marker, marker_content, "[('owned-key', 1), 'stop']")
     payload = _builtins_help_call_iterator_operator_payload(
         "ior",
         _constructed_call_operand("collections", "Counter"),
@@ -7205,16 +6440,7 @@ else:
 if marker.exists():
     raise SystemExit("marker was written")
 """
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex()],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    assert result.returncode == 0, result.stderr
+    _assert_isolated_python(tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex()])
     assert not marker.exists()
 
 
@@ -7223,14 +6449,7 @@ def test_scan_bytes_blocks_heapq_merge_call_iterator_consumption_rce(tmp_path: P
     module_dir.mkdir()
     marker = tmp_path / "heapq_merge_call_iterator_marker"
     marker_content = "pydoc-owned"
-    (module_dir / "pydoc.py").write_text(
-        "from pathlib import Path\n"
-        f"Path({str(marker)!r}).write_text({marker_content!r})\n"
-        "_values = ['owned-value', 'stop']\n"
-        "def help(*args, **kwargs):\n"
-        "    return _values.pop(0) if _values else 'stop'\n",
-        encoding="utf-8",
-    )
+    _write_iterator_pydoc(module_dir, marker, marker_content, "['owned-value', 'stop']")
 
     payload = _builtins_help_call_iterator_heapq_merge_next_payload()
     report = scan_bytes(payload, source="heapq-merge-call-iterator-rce.pkl")
@@ -7272,16 +6491,9 @@ if not marker.exists():
 if marker.read_text() != marker_content:
     raise SystemExit("marker content mismatch")
 """
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
+    _assert_isolated_python(
+        tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content]
     )
-    assert result.returncode == 0, result.stderr
     assert marker.read_text() == marker_content
 
 
@@ -7342,16 +6554,9 @@ if not marker.exists():
 if marker.read_text() != marker_content:
     raise SystemExit("marker content mismatch")
 """
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
+    _assert_isolated_python(
+        tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content]
     )
-    assert result.returncode == 0, result.stderr
     assert marker.read_text() == marker_content
 
 
@@ -7399,16 +6604,7 @@ if result != []:
 if marker.exists():
     raise SystemExit("marker was written")
 """
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex()],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    assert result.returncode == 0, result.stderr
+    _assert_isolated_python(tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex()])
     assert not marker.exists()
 
 
@@ -7482,16 +6678,9 @@ if not marker.exists():
 if marker.read_text() != marker_content:
     raise SystemExit("marker content mismatch")
 """
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content, name],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
+    _assert_isolated_python(
+        tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content, name]
     )
-    assert result.returncode == 0, result.stderr
     assert marker.read_text() == marker_content
 
 
@@ -7560,16 +6749,9 @@ if result != expected:
 if marker.exists():
     raise SystemExit("marker was written")
 """
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), name, expected_value],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
+    _assert_isolated_python(
+        tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), name, expected_value]
     )
-    assert result.returncode == 0, result.stderr
     assert not marker.exists()
 
 
@@ -7643,16 +6825,9 @@ if not marker.exists():
 if marker.read_text() != marker_content:
     raise SystemExit("marker content mismatch")
 """
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content, name],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
+    _assert_isolated_python(
+        tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content, name]
     )
-    assert result.returncode == 0, result.stderr
     assert marker.read_text() == marker_content
 
 
@@ -7717,16 +6892,9 @@ if result != expected:
 if marker.exists():
     raise SystemExit("marker was written")
 """
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), name, expected_value],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
+    _assert_isolated_python(
+        tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), name, expected_value]
     )
-    assert result.returncode == 0, result.stderr
     assert not marker.exists()
 
 
@@ -7799,7 +6967,8 @@ if not marker.exists():
 if marker.read_text() != marker_content:
     raise SystemExit("marker content mismatch")
 """
-    result = subprocess.run(
+    _assert_isolated_python(
+        tmp_path,
         [
             sys.executable,
             "-c",
@@ -7811,14 +6980,7 @@ if marker.read_text() != marker_content:
             expected_result[0][0],
             expected_result[1],
         ],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
     )
-    assert result.returncode == 0, result.stderr
     assert marker.read_text() == marker_content
 
 
@@ -7879,16 +7041,9 @@ if result != ([], expected_remainder):
 if marker.exists():
     raise SystemExit("marker was written")
 """
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), expected_result[1]],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
+    _assert_isolated_python(
+        tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), expected_result[1]]
     )
-    assert result.returncode == 0, result.stderr
     assert not marker.exists()
 
 
@@ -7945,16 +7100,9 @@ if not marker.exists():
 if marker.read_text() != marker_content:
     raise SystemExit("marker content mismatch")
 """
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
+    _assert_isolated_python(
+        tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content]
     )
-    assert result.returncode == 0, result.stderr
     assert marker.read_text() == marker_content
 
 
@@ -8011,16 +7159,9 @@ if not marker.exists():
 if marker.read_text() != marker_content:
     raise SystemExit("marker content mismatch")
 """
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
+    _assert_isolated_python(
+        tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content]
     )
-    assert result.returncode == 0, result.stderr
     assert marker.read_text() == marker_content
 
 
@@ -8094,16 +7235,7 @@ if result is not None:
 if marker.exists():
     raise SystemExit("marker was written")
 """
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex()],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    assert result.returncode == 0, result.stderr
+    _assert_isolated_python(tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex()])
     assert not marker.exists()
 
 
@@ -8159,16 +7291,9 @@ if not marker.exists():
 if marker.read_text() != marker_content:
     raise SystemExit("marker content mismatch")
 """
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
+    _assert_isolated_python(
+        tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content]
     )
-    assert result.returncode == 0, result.stderr
     assert marker.read_text() == marker_content
 
 
@@ -8242,16 +7367,9 @@ if not marker.exists():
 if marker.read_text() != marker_content:
     raise SystemExit("marker content mismatch")
 """
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
+    _assert_isolated_python(
+        tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content]
     )
-    assert result.returncode == 0, result.stderr
     assert marker.read_text() == marker_content
 
 
@@ -8339,7 +7457,8 @@ if not marker.exists():
 if marker.read_text() != marker_content:
     raise SystemExit("marker content mismatch")
 """
-    result = subprocess.run(
+    _assert_isolated_python(
+        tmp_path,
         [
             sys.executable,
             "-c",
@@ -8350,14 +7469,7 @@ if marker.read_text() != marker_content:
             marker_content,
             str(expected_len),
         ],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
     )
-    assert result.returncode == 0, result.stderr
     assert marker.read_text() == marker_content
 
 
@@ -8416,16 +7528,7 @@ if type(result).__name__ != "generator":
 if marker.exists():
     raise SystemExit("marker was written")
 """
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex()],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    assert result.returncode == 0, result.stderr
+    _assert_isolated_python(tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex()])
     assert not marker.exists()
 
 
@@ -8487,16 +7590,9 @@ if not marker.exists():
 if marker.read_text() != marker_content:
     raise SystemExit("marker content mismatch")
 """
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
+    _assert_isolated_python(
+        tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content]
     )
-    assert result.returncode == 0, result.stderr
     assert marker.read_text() == marker_content
 
 
@@ -8570,16 +7666,9 @@ if not marker.exists():
 if marker.read_text() != marker_content:
     raise SystemExit("marker content mismatch")
 """
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
+    _assert_isolated_python(
+        tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content]
     )
-    assert result.returncode == 0, result.stderr
     assert marker.read_text() == marker_content
 
 
@@ -8652,16 +7741,9 @@ if not marker.exists():
 if marker.read_text() != marker_content:
     raise SystemExit("marker content mismatch")
 """
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
+    _assert_isolated_python(
+        tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content]
     )
-    assert result.returncode == 0, result.stderr
     assert marker.read_text() == marker_content
 
 
@@ -8757,16 +7839,7 @@ if result != "safe":
 if marker.exists():
     raise SystemExit("default factory unexpectedly imported pydoc")
 """
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex()],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    assert result.returncode == 0, result.stderr
+    _assert_isolated_python(tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex()])
     assert not marker.exists()
 
 
@@ -8823,16 +7896,9 @@ if not marker.exists():
 if marker.read_text() != marker_content:
     raise SystemExit("marker content mismatch")
 """
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
+    _assert_isolated_python(
+        tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content]
     )
-    assert result.returncode == 0, result.stderr
     assert marker.read_text() == marker_content
 
 
@@ -8894,16 +7960,9 @@ if not marker.exists():
 if marker.read_text() != marker_content:
     raise SystemExit("marker content mismatch")
 """
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
+    _assert_isolated_python(
+        tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content]
     )
-    assert result.returncode == 0, result.stderr
     assert marker.read_text() == marker_content
 
 
@@ -9021,16 +8080,7 @@ if result != "safe":
 if marker.exists():
     raise SystemExit("default factory unexpectedly imported pydoc")
 """
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex()],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    assert result.returncode == 0, result.stderr
+    _assert_isolated_python(tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex()])
     assert not marker.exists()
 
 
@@ -9087,16 +8137,9 @@ if not marker.exists():
 if marker.read_text() != marker_content:
     raise SystemExit("marker content mismatch")
 """
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
+    _assert_isolated_python(
+        tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content]
     )
-    assert result.returncode == 0, result.stderr
     assert marker.read_text() == marker_content
 
 
@@ -9153,16 +8196,9 @@ if not marker.exists():
 if marker.read_text() != marker_content:
     raise SystemExit("marker content mismatch")
 """
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
+    _assert_isolated_python(
+        tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content]
     )
-    assert result.returncode == 0, result.stderr
     assert marker.read_text() == marker_content
 
 
@@ -9219,16 +8255,9 @@ if not marker.exists():
 if marker.read_text() != marker_content:
     raise SystemExit("marker content mismatch")
 """
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
+    _assert_isolated_python(
+        tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content]
     )
-    assert result.returncode == 0, result.stderr
     assert marker.read_text() == marker_content
 
 
@@ -9288,7 +8317,8 @@ if not marker.exists():
 if marker.read_text() != marker_content:
     raise SystemExit("marker content mismatch")
 """
-    result = subprocess.run(
+    _assert_isolated_python(
+        tmp_path,
         [
             sys.executable,
             "-c",
@@ -9299,14 +8329,7 @@ if marker.read_text() != marker_content:
             marker_content,
             expected_result,
         ],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
     )
-    assert result.returncode == 0, result.stderr
     assert marker.read_text() == marker_content
 
 
@@ -9371,16 +8394,9 @@ if not marker.exists():
 if marker.read_text() != marker_content:
     raise SystemExit("marker content mismatch")
 """
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
+    _assert_isolated_python(
+        tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content]
     )
-    assert result.returncode == 0, result.stderr
     assert marker.read_text() == marker_content
 
 
@@ -9437,16 +8453,9 @@ if not marker.exists():
 if marker.read_text() != marker_content:
     raise SystemExit("marker content mismatch")
 """
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
+    _assert_isolated_python(
+        tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content]
     )
-    assert result.returncode == 0, result.stderr
     assert marker.read_text() == marker_content
 
 
@@ -9503,16 +8512,9 @@ if not marker.exists():
 if marker.read_text() != marker_content:
     raise SystemExit("marker content mismatch")
 """
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
+    _assert_isolated_python(
+        tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content]
     )
-    assert result.returncode == 0, result.stderr
     assert marker.read_text() == marker_content
 
 
@@ -9565,16 +8567,7 @@ else:
 if marker.exists():
     raise SystemExit("default factory unexpectedly imported pydoc")
 """
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex()],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    assert result.returncode == 0, result.stderr
+    _assert_isolated_python(tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex()])
     assert not marker.exists()
 
 
@@ -9661,16 +8654,7 @@ if result != "safe":
 if marker.exists():
     raise SystemExit("default factory unexpectedly imported pydoc")
 """
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex()],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    assert result.returncode == 0, result.stderr
+    _assert_isolated_python(tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex()])
     assert not marker.exists()
 
 
@@ -9714,16 +8698,9 @@ if not marker.exists():
 if marker.read_text() != marker_content:
     raise SystemExit("marker content mismatch")
 """
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
+    _assert_isolated_python(
+        tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content]
     )
-    assert result.returncode == 0, result.stderr
     assert marker.read_text() == marker_content
 
 
@@ -9803,16 +8780,9 @@ if not marker.exists():
 if marker.read_text() != marker_content:
     raise SystemExit("marker content mismatch")
 """
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
+    _assert_isolated_python(
+        tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content]
     )
-    assert result.returncode == 0, result.stderr
     assert marker.read_text() == marker_content
 
 
@@ -9889,16 +8859,9 @@ if not marker.exists():
 if marker.read_text() != marker_content:
     raise SystemExit("marker content mismatch")
 """
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
+    _assert_isolated_python(
+        tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content]
     )
-    assert result.returncode == 0, result.stderr
     assert marker.read_text() == marker_content
 
 
@@ -9975,16 +8938,9 @@ if not marker.exists():
 if marker.read_text() != marker_content:
     raise SystemExit("marker content mismatch")
 """
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
+    _assert_isolated_python(
+        tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content]
     )
-    assert result.returncode == 0, result.stderr
     assert marker.read_text() == marker_content
 
 
@@ -10060,16 +9016,9 @@ if not marker.exists():
 if marker.read_text() != marker_content:
     raise SystemExit("marker content mismatch")
 """
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
+    _assert_isolated_python(
+        tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content]
     )
-    assert result.returncode == 0, result.stderr
     assert marker.read_text() == marker_content
 
 
@@ -10148,16 +9097,9 @@ if not marker.exists():
 if marker.read_text() != marker_content:
     raise SystemExit("marker content mismatch")
 """
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
+    _assert_isolated_python(
+        tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content]
     )
-    assert result.returncode == 0, result.stderr
     assert marker.read_text() == marker_content
 
 
@@ -10221,16 +9163,9 @@ if not marker.exists():
 if marker.read_text() != marker_content:
     raise SystemExit("marker content mismatch")
 """
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
+    _assert_isolated_python(
+        tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content]
     )
-    assert result.returncode == 0, result.stderr
     assert marker.read_text() == marker_content
 
 
@@ -10318,16 +9253,9 @@ if not marker.exists():
 if marker.read_text() != marker_content:
     raise SystemExit("marker content mismatch")
 """
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
+    _assert_isolated_python(
+        tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content]
     )
-    assert result.returncode == 0, result.stderr
     assert marker.read_text() == marker_content
 
 
@@ -10406,16 +9334,9 @@ if not marker.exists():
 if marker.read_text() != marker_content:
     raise SystemExit("marker content mismatch")
 """
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
+    _assert_isolated_python(
+        tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content]
     )
-    assert result.returncode == 0, result.stderr
     assert marker.read_text() == marker_content
 
 
@@ -10461,16 +9382,7 @@ if not marker.exists():
 if marker.read_text() != marker_content:
     raise SystemExit("marker content mismatch")
 """
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(marker), payload.hex(), marker_content],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    assert result.returncode == 0, result.stderr
+    _assert_isolated_python(tmp_path, [sys.executable, "-c", child_code, str(marker), payload.hex(), marker_content])
     assert marker.read_text() == marker_content
 
 
@@ -10544,16 +9456,9 @@ if not marker.exists():
 if marker.read_text() != marker_content:
     raise SystemExit("marker content mismatch")
 """
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
+    _assert_isolated_python(
+        tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content]
     )
-    assert result.returncode == 0, result.stderr
     assert marker.read_text() == marker_content
 
 
@@ -10601,16 +9506,9 @@ if not marker.exists():
 if marker.read_text() != marker_content:
     raise SystemExit("marker content mismatch")
 """
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
+    _assert_isolated_python(
+        tmp_path, [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content]
     )
-    assert result.returncode == 0, result.stderr
     assert marker.read_text() == marker_content
 
 
@@ -10691,3 +9589,244 @@ def bridge(target, command):
 
     assert "benchmod.Runner.execute" in resolved_calls
     assert calls == 1
+
+
+def _custom_meta_path_finder(module_name: str, marker: Path) -> Any:
+    class CustomMetaPathFinder:
+        @staticmethod
+        def find_spec(
+            fullname: str,
+            path: object | None = None,
+            target: object | None = None,
+        ) -> ModuleSpec | None:
+            del path, target
+            if fullname == module_name:
+                marker.write_text(fullname, encoding="utf-8")
+                return ModuleSpec(fullname, loader=None, origin="custom://module")
+            return None
+
+    return CustomMetaPathFinder()
+
+
+_EAGER_CALL_ITERATOR_ORACLE = """
+import pickle
+import sys
+from pathlib import Path
+
+module_dir = Path(sys.argv[1])
+marker = Path(sys.argv[2])
+payload = bytes.fromhex(sys.argv[3])
+marker_content = sys.argv[4]
+expected_repr = sys.argv[5]
+
+if marker.exists():
+    raise SystemExit("marker already exists before pickle execution")
+sys.path.insert(0, str(module_dir))
+sys.modules.pop("pydoc", None)
+result = pickle.loads(payload)
+result_repr = repr(result)
+expected_ordered_dict_repr = None
+if expected_repr.startswith("OrderedDict(") and expected_repr.endswith(")"):
+    expected_ordered_dict_repr = expected_repr[len("OrderedDict(") : -1]
+if result_repr != expected_repr and not (
+    type(result).__name__ == "OrderedDict" and repr(dict(result)) == expected_ordered_dict_repr
+):
+    raise SystemExit(f"expected {expected_repr}, got {result!r}")
+if not marker.exists():
+    raise SystemExit("marker was not written")
+if marker.read_text() != marker_content:
+    raise SystemExit("marker content mismatch")
+"""
+
+
+def _assert_eager_call_iterator(
+    tmp_path: Path,
+    payload: bytes,
+    values_literal: str,
+    expected_repr: str,
+    marker_name: str,
+    source: str,
+    child_code: str,
+    requires_python_3_11_plus: bool = False,
+) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    marker = tmp_path / marker_name
+    marker_content = "pydoc-owned"
+    _write_iterator_pydoc(module_dir, marker, marker_content, values_literal)
+
+    report = scan_bytes(payload, source=source)
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_call_graph_finding(
+        report,
+        "_sitebuiltins",
+        "_Helper.__call__",
+        "builtins.__import__",
+    )
+    assert any(
+        invocation.get("module") == "builtins"
+        and invocation.get("name") == "help"
+        and invocation.get("positional_arg_count") == 0
+        for invocation in report.metadata.get("callable_invocations", [])
+    )
+
+    assert not marker.exists()
+    if requires_python_3_11_plus and sys.version_info < (3, 11):
+        return
+
+    _assert_isolated_python(
+        tmp_path,
+        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content, expected_repr],
+    )
+    assert marker.read_text() == marker_content
+
+
+def _assert_format_protocol_dispatch(name: str) -> None:
+    import_references = [
+        {
+            "module": "ipaddress",
+            "name": "IPv4Address",
+            "import_reference": "ipaddress.IPv4Address",
+        },
+        {
+            "module": "builtins",
+            "name": name,
+            "import_reference": f"builtins.{name}",
+        },
+    ]
+    direct_invocations = [
+        {
+            "module": "ipaddress",
+            "name": "IPv4Address",
+            "positional_arg_count": 1,
+        },
+        {
+            "module": "builtins",
+            "name": name,
+            "positional_arg_count": 2,
+        },
+    ]
+    protocol_invocations = [
+        *direct_invocations,
+        {
+            "module": "ipaddress",
+            "name": "IPv4Address.__format__",
+            "positional_arg_count": 1,
+        },
+    ]
+
+    assert call_graph.find_dangerous_call_graphs(import_references, direct_invocations) == ()
+
+    findings = call_graph.find_dangerous_call_graphs(import_references, protocol_invocations)
+
+    assert len(findings) == 1
+    assert findings[0].module == "ipaddress"
+    assert findings[0].name == "IPv4Address.__format__"
+    assert findings[0].sink == "builtins.__import__"
+    assert findings[0].call_path == ("ipaddress.IPv4Address.__format__", "builtins.__import__")
+
+
+def _assert_isolated_python(tmp_path: Path, command: list[str]) -> None:
+    result = subprocess.run(
+        command,
+        cwd=str(tmp_path.parent),
+        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def _assert_wrapper_import_fallback(entrypoint: str, wrapper: str, sink: str) -> None:
+    calls = call_graph._calls_for_function(entrypoint) or ()
+
+    assert wrapper in calls
+    assert call_graph._find_sink_path(entrypoint) == (
+        entrypoint,
+        wrapper,
+        sink,
+    )
+
+
+def _is_module_attribute_guard(statement: ast.stmt, *, module_name: str, attribute_name: str) -> bool:
+    if not isinstance(statement, ast.If) or not isinstance(statement.test, ast.Call):
+        return False
+    test = statement.test
+    return (
+        isinstance(test.func, ast.Name)
+        and test.func.id == "hasattr"
+        and len(test.args) == 2
+        and isinstance(test.args[0], ast.Name)
+        and test.args[0].id == module_name
+        and isinstance(test.args[1], ast.Constant)
+        and test.args[1].value == attribute_name
+    )
+
+
+def _nested_defaultdict_format_payload(*, method_name: str, template: str) -> bytes:
+    return b"".join(
+        [
+            b"\x80\x04",
+            _global_operand("collections", "defaultdict"),
+            _global_operand("builtins", "help"),
+            b"\x85R",
+            b"\x94",
+            b"0",
+            b"}",
+            b"\x94",
+            _unicode_operand("present"),
+            b"h\x00",
+            b"s",
+            b"0",
+            _global_operand("builtins", method_name),
+            _args_tuple(_unicode_operand(template), b"h\x01"),
+            b"R.",
+        ]
+    )
+
+
+def _write_iterator_pydoc(module_dir: Path, marker: Path, marker_content: str, values_literal: str) -> None:
+    (module_dir / "pydoc.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text({marker_content!r})\n"
+        f"_values = {values_literal}\n"
+        "def help(*args, **kwargs):\n"
+        "    return _values.pop(0) if _values else 'stop'\n",
+        encoding="utf-8",
+    )
+
+
+def _assert_rewritten_call_graph(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    module_name: str,
+    safe_source: str,
+    updated_source: str,
+    dangerous_source: str,
+    sink: str,
+) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    module_path = module_dir / f"{module_name}.py"
+    module_path.write_text("def invoke(command):\n    return command\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(module_dir))
+    importlib.invalidate_caches()
+    _clear_call_graph_caches()
+    payload = _global_call_payload(module_name, "invoke", _unicode_operand("echo rewritten"))
+
+    try:
+        safe_report = scan_bytes(payload, source=safe_source)
+
+        module_path.write_text(updated_source, encoding="utf-8")
+        importlib.invalidate_caches()
+        dangerous_report = scan_bytes(payload, source=dangerous_source)
+    finally:
+        _clear_call_graph_caches()
+
+    assert safe_report.verdict == SafetyVerdict.SUSPICIOUS
+    assert not _has_critical_call_graph_finding(safe_report, module_name, "invoke", sink)
+    assert dangerous_report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_call_graph_finding(dangerous_report, module_name, "invoke", sink)

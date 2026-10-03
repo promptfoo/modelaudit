@@ -381,12 +381,7 @@ def test_openvino_scanner_detects_layer_in_namespace_distinct_from_root(tmp_path
         """,
         encoding="utf-8",
     )
-    (tmp_path / "mixed-namespaces.bin").write_bytes(b"\x00")
-
-    result = OpenVinoScanner().scan(str(xml_path))
-
-    assert any(check.name == "Suspicious Layer Type Detection" for check in result.checks)
-    assert any(check.name == "External Library Reference Check" for check in result.checks)
+    _assert_namespaced_layer(tmp_path, xml_path, "mixed-namespaces.bin")
 
 
 def test_openvino_scanner_detects_mixed_case_namespaced_layer(tmp_path: Path) -> None:
@@ -401,12 +396,7 @@ def test_openvino_scanner_detects_mixed_case_namespaced_layer(tmp_path: Path) ->
         """,
         encoding="utf-8",
     )
-    (tmp_path / "mixed-case-layer.bin").write_bytes(b"\x00")
-
-    result = OpenVinoScanner().scan(str(xml_path))
-
-    assert any(check.name == "Suspicious Layer Type Detection" for check in result.checks)
-    assert any(check.name == "External Library Reference Check" for check in result.checks)
+    _assert_namespaced_layer(tmp_path, xml_path, "mixed-case-layer.bin")
 
 
 def test_openvino_scanner_respects_configured_file_size_limit(tmp_path: Path) -> None:
@@ -481,12 +471,7 @@ def test_openvino_scanner_detects_nested_external_library_references(tmp_path: P
         """,
         encoding="utf-8",
     )
-    (tmp_path / "model.bin").write_bytes(b"\x00")
-
-    result = OpenVinoScanner().scan(str(xml_path))
-
-    assert result.success is False
-    assert any("external library 'evil.so'" in issue.message for issue in result.issues)
+    _assert_external_library(tmp_path, xml_path, "external library 'evil.so'")
 
 
 def test_openvino_scanner_symbolic_implementation_metadata_is_not_external_library(tmp_path: Path) -> None:
@@ -504,12 +489,7 @@ def test_openvino_scanner_symbolic_implementation_metadata_is_not_external_libra
         """,
         encoding="utf-8",
     )
-    (tmp_path / "model.bin").write_bytes(b"\x00")
-
-    result = OpenVinoScanner().scan(str(xml_path))
-
-    assert result.success is True
-    assert not any(check.name == "External Library Reference Check" for check in result.checks)
+    _assert_openvino_metadata_control(tmp_path, xml_path, "External Library Reference Check")
 
 
 def test_openvino_scanner_detects_versioned_native_library_reference(tmp_path: Path) -> None:
@@ -527,12 +507,7 @@ def test_openvino_scanner_detects_versioned_native_library_reference(tmp_path: P
         """,
         encoding="utf-8",
     )
-    (tmp_path / "model.bin").write_bytes(b"\x00")
-
-    result = OpenVinoScanner().scan(str(xml_path))
-
-    assert result.success is False
-    assert any("external library 'libcustom_op.so.1'" in issue.message for issue in result.issues)
+    _assert_external_library(tmp_path, xml_path, "external library 'libcustom_op.so.1'")
 
 
 def test_openvino_scanner_detects_path_external_library_reference(tmp_path: Path) -> None:
@@ -550,12 +525,7 @@ def test_openvino_scanner_detects_path_external_library_reference(tmp_path: Path
         """,
         encoding="utf-8",
     )
-    (tmp_path / "model.bin").write_bytes(b"\x00")
-
-    result = OpenVinoScanner().scan(str(xml_path))
-
-    assert result.success is False
-    assert any("external library '../plugins/custom_op'" in issue.message for issue in result.issues)
+    _assert_external_library(tmp_path, xml_path, "external library '../plugins/custom_op'")
 
 
 def test_openvino_scanner_redacts_external_library_url_secrets(tmp_path: Path) -> None:
@@ -602,12 +572,7 @@ def test_openvino_scanner_layer_attribute_importlib_false_positive_control(tmp_p
         """,
         encoding="utf-8",
     )
-    (tmp_path / "model.bin").write_bytes(b"\x00")
-
-    result = OpenVinoScanner().scan(str(xml_path))
-
-    assert result.success is True
-    assert not any(check.name == "Layer Attribute Security Check" for check in result.checks)
+    _assert_openvino_metadata_control(tmp_path, xml_path, "Layer Attribute Security Check")
 
 
 def test_openvino_scanner_layer_attribute_detects_direct_importlib_reference(tmp_path: Path) -> None:
@@ -629,3 +594,30 @@ def test_openvino_scanner_layer_attribute_detects_direct_importlib_reference(tmp
 
     assert result.success is False
     assert any(check.name == "Layer Attribute Security Check" for check in result.checks)
+
+
+def _assert_external_library(tmp_path: Path, xml_path: Path, message: str) -> None:
+    (tmp_path / "model.bin").write_bytes(b"\x00")
+
+    result = OpenVinoScanner().scan(str(xml_path))
+
+    assert result.success is False
+    assert any(message in issue.message for issue in result.issues)
+
+
+def _assert_openvino_metadata_control(tmp_path: Path, xml_path: Path, check_name: str) -> None:
+    (tmp_path / "model.bin").write_bytes(b"\x00")
+
+    result = OpenVinoScanner().scan(str(xml_path))
+
+    assert result.success is True
+    assert not any(check.name == check_name for check in result.checks)
+
+
+def _assert_namespaced_layer(tmp_path: Path, xml_path: Path, weights_filename: str) -> None:
+    (tmp_path / weights_filename).write_bytes(b"\x00")
+
+    result = OpenVinoScanner().scan(str(xml_path))
+
+    assert any(check.name == "Suspicious Layer Type Detection" for check in result.checks)
+    assert any(check.name == "External Library Reference Check" for check in result.checks)

@@ -704,19 +704,11 @@ def mock_cli_scan_command():
         yield mock_scan
 
 
-@pytest.fixture(autouse=True)
-def cleanup_test_files():
-    """Ensure test temp files are cleaned up after each test.
-
-    Tests should use tmp_path for any temporary files;
-    pytest handles tmp_path cleanup automatically.
-    """
-    yield
-
-
 # =============================================================================
 # Common file creation fixtures
 # =============================================================================
+# Tests should use tmp_path for temporary files;
+# pytest handles tmp_path cleanup automatically.
 @pytest.fixture
 def safe_pickle_file(tmp_path):
     """Create a safe pickle file for testing."""

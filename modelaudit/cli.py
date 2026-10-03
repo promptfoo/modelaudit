@@ -342,7 +342,7 @@ def _build_huggingface_model_dry_run_preview(path: str, runtime: "_ScanRuntimeCo
         model_info_kwargs["include_all_files"] = runtime.hf_stream_include_all_files
     model_info = get_model_info(path, **model_info_kwargs)
     total_size = model_info.get("total_size")
-    preserved_metadata = {
+    preserved_metadata: dict[str, Any] = {
         key: model_info[key]
         for key in (
             "inaccessible_gated_file_count",
@@ -1297,15 +1297,17 @@ def _copy_posix_output_metadata(output_path: str, source_fd: int, target_fd: int
         if (source_stat.st_uid, source_stat.st_gid) != (target_stat.st_uid, target_stat.st_gid):
             os.fchown(target_fd, source_stat.st_uid, source_stat.st_gid)
         os.fchmod(target_fd, stat.S_IMODE(source_stat.st_mode))
-        if all(hasattr(os, name) for name in ("listxattr", "getxattr", "setxattr")):
+        xattr_names = ("listxattr", "getxattr", "setxattr")
+        if all(hasattr(os, name) for name in xattr_names):
+            list_xattrs, get_xattr, set_xattr = (getattr(os, name) for name in xattr_names)
             try:
-                attribute_names = os.listxattr(source_fd)
+                attribute_names = list_xattrs(source_fd)
             except OSError as exc:
                 if exc.errno not in {errno.ENOTSUP, errno.EOPNOTSUPP}:
                     raise
                 attribute_names = []
             for name in attribute_names:
-                os.setxattr(target_fd, name, os.getxattr(source_fd, name))
+                set_xattr(target_fd, name, get_xattr(source_fd, name))
     except OSError as exc:
         raise _OutputWriteError(
             f"Unable to preserve output metadata for {_display_path(output_path)}: {exc.strerror or exc}"

@@ -45,16 +45,13 @@ from tests.helpers import (
     create_mock_pytorch_zip,
     prefix_mock_onnx_with_unknown_field,
 )
+from tests.helpers.file_creators import SystemCommandPayload
 
 
 def _build_malicious_pickle() -> bytes:
     """Build a deterministic pickle payload with an unsafe reducer target."""
 
-    class DangerousPayload:
-        def __reduce__(self) -> tuple[Any, tuple[str]]:
-            return (os.system, ("echo scanner-selection-test",))
-
-    return pickle.dumps(DangerousPayload())
+    return pickle.dumps(SystemCommandPayload("echo scanner-selection-test", lambda: os.system))
 
 
 def _build_malicious_skops_schema() -> bytes:

@@ -63,25 +63,11 @@ class TestAnalysisModules:
 
     def test_semantic_analyzer_resolves_import_aliases(self) -> None:
         """Dangerous calls made through imported aliases should remain visible."""
-        from modelaudit.analysis import CodeRiskLevel, SemanticAnalyzer
-
-        analyzer = SemanticAnalyzer()
-
-        risk_level, details = analyzer.analyze_code_behavior("import os as o\no.system('id')", {})
-
-        assert risk_level != CodeRiskLevel.SAFE
-        assert "os.system" in details["function_calls"]
+        _assert_semantic_import_alias_risk(("import os as o\no.system('id')"), ("os.system"))
 
     def test_semantic_analyzer_preserves_bare_builtin_aliases(self) -> None:
         """Dangerous builtins imported from builtins should keep their dangerous names."""
-        from modelaudit.analysis import CodeRiskLevel, SemanticAnalyzer
-
-        analyzer = SemanticAnalyzer()
-
-        risk_level, details = analyzer.analyze_code_behavior("from builtins import eval\neval(user_input)", {})
-
-        assert risk_level != CodeRiskLevel.SAFE
-        assert "eval" in details["function_calls"]
+        _assert_semantic_import_alias_risk(("from builtins import eval\neval(user_input)"), ("eval"))
 
     def test_semantic_analyzer_scopes_safe_patterns_to_operation(self) -> None:
         """A safe eval should not pardon an unrelated dangerous operation."""
@@ -97,16 +83,9 @@ class TestAnalysisModules:
 
     def test_semantic_analyzer_updates_aliases_after_rebinding(self) -> None:
         """Assignments should update imported aliases before later calls are normalized."""
-        from modelaudit.analysis import CodeRiskLevel, SemanticAnalyzer
-
-        analyzer = SemanticAnalyzer()
-        risk_level, details = analyzer.analyze_code_behavior(
-            "import math as os\nimport os as real_os\nos = real_os\nos.system('id')",
-            {},
+        _assert_semantic_import_alias_risk(
+            ("import math as os\nimport os as real_os\nos = real_os\nos.system('id')"), ("os.system")
         )
-
-        assert risk_level != CodeRiskLevel.SAFE
-        assert "os.system" in details["function_calls"]
 
     def test_semantic_analyzer_drops_aliases_after_shadowing(self) -> None:
         """Reassigned names should no longer be treated as imported call targets."""
@@ -155,48 +134,14 @@ class TestAnalysisModules:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """The final suspiciousness flag should agree with the safety-confidence scale."""
-        from modelaudit.analysis import IntegratedAnalyzer
-        from modelaudit.analysis.unified_context import UnifiedMLContext
-
-        context = UnifiedMLContext(Path("test.pkl"), 1024, "pickle")
-        analyzer = IntegratedAnalyzer()
-        monkeypatch.setattr(analyzer, "_analyze_ml_context", lambda *_args: {"confidence": 0.9, "reasoning": []})
-        monkeypatch.setattr(analyzer, "_analyze_anomalies", lambda *_args: {"confidence": 0.9, "reasoning": []})
-        monkeypatch.setattr(
-            analyzer,
-            "_analyze_framework_patterns",
-            lambda *_args: {"confidence": 0.9, "reasoning": []},
-        )
-
-        result = analyzer.analyze_suspicious_pattern("x", "token", context)
-
-        assert result.confidence == pytest.approx(0.9)
-        assert result.risk_level == "safe"
-        assert result.is_suspicious is False
+        _assert_integrated_analysis_safety_confidence(monkeypatch, (0.9), (0.9), (0.9), (0.9), ("safe"), (False))
 
     def test_integrated_analyzer_treats_low_safety_confidence_as_suspicious(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Low confidence in safety should remain suspicious."""
-        from modelaudit.analysis import IntegratedAnalyzer
-        from modelaudit.analysis.unified_context import UnifiedMLContext
-
-        context = UnifiedMLContext(Path("test.pkl"), 1024, "pickle")
-        analyzer = IntegratedAnalyzer()
-        monkeypatch.setattr(analyzer, "_analyze_ml_context", lambda *_args: {"confidence": 0.1, "reasoning": []})
-        monkeypatch.setattr(analyzer, "_analyze_anomalies", lambda *_args: {"confidence": 0.1, "reasoning": []})
-        monkeypatch.setattr(
-            analyzer,
-            "_analyze_framework_patterns",
-            lambda *_args: {"confidence": 0.1, "reasoning": []},
-        )
-
-        result = analyzer.analyze_suspicious_pattern("x", "token", context)
-
-        assert result.confidence == pytest.approx(0.1)
-        assert result.risk_level == "critical"
-        assert result.is_suspicious is True
+        _assert_integrated_analysis_safety_confidence(monkeypatch, (0.1), (0.1), (0.1), (0.1), ("critical"), (True))
 
     def test_integrated_analyzer_uses_adjusted_risk_for_suspiciousness(
         self,
@@ -282,3 +227,47 @@ class TestAnalysisModules:
         spoofed = analyzer._analyze_framework_patterns("eval", "code_execution", spoofed_context)
 
         assert spoofed == normal
+
+
+def _assert_integrated_analysis_safety_confidence(
+    monkeypatch: pytest.MonkeyPatch,
+    case_ml_confidence: float,
+    case_anomaly_confidence: float,
+    case_framework_confidence: float,
+    case_confidence: float,
+    case_risk_level: str,
+    case_suspicious: bool,
+) -> None:
+    from modelaudit.analysis import IntegratedAnalyzer
+    from modelaudit.analysis.unified_context import UnifiedMLContext
+
+    context = UnifiedMLContext(Path("test.pkl"), 1024, "pickle")
+    analyzer = IntegratedAnalyzer()
+    monkeypatch.setattr(
+        analyzer, "_analyze_ml_context", lambda *_args: {"confidence": case_ml_confidence, "reasoning": []}
+    )
+    monkeypatch.setattr(
+        analyzer, "_analyze_anomalies", lambda *_args: {"confidence": case_anomaly_confidence, "reasoning": []}
+    )
+    monkeypatch.setattr(
+        analyzer,
+        "_analyze_framework_patterns",
+        lambda *_args: {"confidence": case_framework_confidence, "reasoning": []},
+    )
+
+    result = analyzer.analyze_suspicious_pattern("x", "token", context)
+
+    assert result.confidence == pytest.approx(case_confidence)
+    assert result.risk_level == case_risk_level
+    assert result.is_suspicious is case_suspicious
+
+
+def _assert_semantic_import_alias_risk(case_source: str, case_call_name: str) -> None:
+    from modelaudit.analysis import CodeRiskLevel, SemanticAnalyzer
+
+    analyzer = SemanticAnalyzer()
+
+    risk_level, details = analyzer.analyze_code_behavior(case_source, {})
+
+    assert risk_level != CodeRiskLevel.SAFE
+    assert case_call_name in details["function_calls"]

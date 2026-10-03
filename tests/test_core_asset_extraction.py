@@ -4,9 +4,7 @@ import ntpath
 import pickle
 import sys
 import zipfile
-from collections.abc import Callable
 from pathlib import Path
-from typing import Any
 from unittest.mock import patch
 
 import numpy as np
@@ -20,6 +18,7 @@ from modelaudit.core import (
 from modelaudit.core_results import _extract_primary_asset_from_location
 from modelaudit.scanners import _registry
 from modelaudit.utils.file import detection
+from tests.helpers.file_creators import ExecPayload
 
 
 def test_extract_primary_asset_windows_path_with_archive() -> None:
@@ -107,12 +106,8 @@ def test_duplicate_metadata_handles_newline_paths(tmp_path: Path) -> None:
 
 
 def test_npz_member_checks_keep_archive_member_locations(tmp_path: Path) -> None:
-    class _ExecPayload:
-        def __reduce__(self) -> tuple[Callable[..., Any], tuple[Any, ...]]:
-            return (exec, ("print('owned')",))
-
     archive_path = tmp_path / "payload.npz"
-    np.savez(archive_path, safe=np.arange(3), payload=np.array([_ExecPayload()], dtype=object))
+    np.savez(archive_path, safe=np.arange(3), payload=np.array([ExecPayload()], dtype=object))
 
     result = scan_model_directory_or_file(str(archive_path))
     payload_checks = [
@@ -132,10 +127,6 @@ def test_npz_member_checks_keep_archive_member_locations(tmp_path: Path) -> None
 
 
 def test_check_consolidation_keeps_distinct_npz_member_findings(tmp_path: Path) -> None:
-    class ExecPayload:
-        def __reduce__(self) -> tuple[Callable[..., Any], tuple[Any, ...]]:
-            return (exec, ("print('owned')",))
-
     archive_path = tmp_path / "payload.npz"
     np.savez(archive_path, safe=np.arange(3), payload=np.array([ExecPayload()], dtype=object))
 
@@ -150,10 +141,6 @@ def test_check_consolidation_keeps_distinct_npz_member_findings(tmp_path: Path) 
 
 
 def test_check_consolidation_keeps_nested_npz_member_findings_distinct(tmp_path: Path) -> None:
-    class ExecPayload:
-        def __reduce__(self) -> tuple[Callable[..., Any], tuple[Any, ...]]:
-            return (exec, ("print('owned')",))
-
     inner_npz = tmp_path / "inner.npz"
     np.savez(
         inner_npz,

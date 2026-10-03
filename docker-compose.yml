@@ -3,7 +3,7 @@ version: "3"
 services:
   modelaudit-base:
     build: .
-    volumes:
+    volumes: &model-volume
       - ./models:/models
     command: scan --help
 
@@ -11,14 +11,12 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.tensorflow
-    volumes:
-      - ./models:/models
+    volumes: *model-volume
     command: scan --help
 
   modelaudit-full:
     build:
       context: .
       dockerfile: Dockerfile.full
-    volumes:
-      - ./models:/models
+    volumes: *model-volume
     command: scan --help

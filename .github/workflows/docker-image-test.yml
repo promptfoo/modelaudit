@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - "Dockerfile*"
+      - "docker-install-rust.sh"
       - ".dockerignore"
       - "modelaudit/**"
       - "packages/modelaudit-picklescan/**"
@@ -37,6 +38,7 @@ jobs:
           filters: |
             docker:
               - 'Dockerfile*'
+              - 'docker-install-rust.sh'
               - '.dockerignore'
               - 'modelaudit/**'
               - 'packages/modelaudit-picklescan/**'
@@ -45,10 +47,12 @@ jobs:
               - '.github/workflows/docker-image-test.yml'
             full-image:
               - 'Dockerfile.full'
+              - 'docker-install-rust.sh'
               - 'packages/modelaudit-picklescan/**'
               - '.github/workflows/docker-image-test.yml'
             tensorflow-image:
               - 'Dockerfile.tensorflow'
+              - 'docker-install-rust.sh'
               - 'requirements-tensorflow.txt'
               - 'modelaudit/**'
               - 'packages/modelaudit-picklescan/**'
@@ -65,7 +69,8 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
-      - name: Set up Docker Buildx
+      - &shared-set-up-docker-buildx
+        name: Set up Docker Buildx
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4
 
       - name: Build lightweight image
@@ -77,7 +82,7 @@ jobs:
           load: true
           cache-from: type=gha,scope=lightweight
           cache-to: type=gha,mode=max,scope=lightweight
-          build-args: |
+          build-args: &inline-cache-build-args |
             BUILDKIT_INLINE_CACHE=1
 
       - name: Test lightweight container help command
@@ -130,8 +135,7 @@ jobs:
       - name: Set up QEMU
         uses: docker/setup-qemu-action@ce360397dd3f832beb865e1373c09c0e9f86d70a # v4
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4
+      - *shared-set-up-docker-buildx
 
       - name: Build full image
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
@@ -142,8 +146,7 @@ jobs:
           load: true
           cache-from: type=gha,scope=full
           cache-to: type=gha,mode=max,scope=full
-          build-args: |
-            BUILDKIT_INLINE_CACHE=1
+          build-args: *inline-cache-build-args
         timeout-minutes: 60 # Increased timeout for ML dependency build
 
       - name: Test full container help command
@@ -195,8 +198,7 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4
+      - *shared-set-up-docker-buildx
 
       - name: Build TensorFlow image
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7

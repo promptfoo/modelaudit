@@ -1,6 +1,5 @@
 """Tests for SkopsScanner covering CVE-2025-54412, CVE-2025-54413, CVE-2025-54886."""
 
-import builtins
 import os
 import stat
 import textwrap
@@ -16,6 +15,12 @@ from modelaudit.models import ModelAuditResultModel
 from modelaudit.scanners import zip_scanner as zip_scanner_module
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.skops_scanner import SkopsScanner
+from tests.helpers.scanners import (
+    assert_preflighted_archive_survives_replacement,
+    assert_skops_cve_clean,
+    install_zip_open_failure,
+)
+from tests.helpers.text import LowerCountingText
 
 SAMPLES_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "assets", "samples")
 
@@ -67,13 +72,6 @@ def _assert_inconclusive_reason(metadata: Any, reason: str) -> None:
 def test_protocol_probe_reuses_lowered_member_names() -> None:
     """Keep ZIP member normalization linear while probing large archives."""
 
-    class CountingMemberName(str):
-        lower_calls = 0
-
-        def lower(self) -> str:
-            self.lower_calls += 1
-            return super().lower()
-
     class FakeZipFile:
         def __init__(self, member_name: str) -> None:
             self.member_name = member_name
@@ -81,7 +79,7 @@ def test_protocol_probe_reuses_lowered_member_names() -> None:
         def namelist(self) -> list[str]:
             return [self.member_name]
 
-    member_name = CountingMemberName("archive/member.txt")
+    member_name = LowerCountingText("archive/member.txt")
 
     SkopsScanner()._check_protocol_version(
         FakeZipFile(member_name),  # type: ignore[arg-type]
@@ -127,21 +125,11 @@ class TestSkopsScannerCVE2025_54412:
 
     def test_detects_malicious_operatorfuncnode_loader(self, tmp_path: Path) -> None:
         """OperatorFuncNode nodes outside the operator module should be detected."""
-        skops_file = tmp_path / "malicious.skops"
-        with zipfile.ZipFile(skops_file, "w") as zf:
-            zf.writestr(
-                "schema.json",
-                '{"__loader__": "OperatorFuncNode", "__module__": "builtins", "__class__": "eval"}',
-            )
-
-        scanner = SkopsScanner()
-        result = scanner.scan(str(skops_file))
-
-        assert result.success is False
-        cve_checks = [c for c in result.checks if "CVE-2025-54412" in c.name]
-        assert len(cve_checks) > 0
-        assert cve_checks[0].status == CheckStatus.FAILED
-        assert cve_checks[0].severity == IssueSeverity.CRITICAL
+        _assert_skops_malicious_loader_node(
+            tmp_path,
+            ('{"__loader__": "OperatorFuncNode", "__module__": "builtins", "__class__": "eval"}'),
+            ("CVE-2025-54412"),
+        )
 
     def test_reduce_pattern_no_false_positive(self, tmp_path: Path) -> None:
         """Test that __reduce__ filenames do NOT trigger CVE-2025-54412.
@@ -189,10 +177,7 @@ class TestSkopsScannerCVE2025_54412:
                 '{"__loader__": "OperatorFuncNode", "__module__": "operator", "__class__": "methodcaller"}',
             )
 
-        result = SkopsScanner().scan(str(skops_file))
-
-        cve_checks = [c for c in result.checks if "CVE-2025-54412" in c.name]
-        assert not [c for c in cve_checks if c.status == CheckStatus.FAILED]
+        assert_skops_cve_clean(SkopsScanner(), skops_file, "CVE-2025-54412")
 
 
 class TestSkopsScannerCVE2025_54413:
@@ -200,24 +185,14 @@ class TestSkopsScannerCVE2025_54413:
 
     def test_detects_malicious_methodnode_loader(self, tmp_path: Path) -> None:
         """MethodNode nodes whose wrapped object type disagrees should be detected."""
-        skops_file = tmp_path / "malicious.skops"
-        with zipfile.ZipFile(skops_file, "w") as zf:
-            zf.writestr(
-                "schema.json",
-                (
-                    '{"__loader__": "MethodNode", "__module__": "builtins", "__class__": "str", '
-                    '"content": {"obj": {"__module__": "os", "__class__": "system"}}}'
-                ),
-            )
-
-        scanner = SkopsScanner()
-        result = scanner.scan(str(skops_file))
-
-        assert result.success is False
-        cve_checks = [c for c in result.checks if "CVE-2025-54413" in c.name]
-        assert len(cve_checks) > 0
-        assert cve_checks[0].status == CheckStatus.FAILED
-        assert cve_checks[0].severity == IssueSeverity.CRITICAL
+        _assert_skops_malicious_loader_node(
+            tmp_path,
+            (
+                '{"__loader__": "MethodNode", "__module__": "builtins", "__class__": "str", '
+                '"content": {"obj": {"__module__": "os", "__class__": "system"}}}'
+            ),
+            ("CVE-2025-54413"),
+        )
 
     def test_getattr_filename_without_methodnode_loader_is_not_flagged(self, tmp_path: Path) -> None:
         """Plain filenames should not stand in for structured MethodNode entries."""
@@ -227,10 +202,7 @@ class TestSkopsScannerCVE2025_54413:
             zf.writestr("schema.json", '{"version": "1.0"}')
 
         scanner = SkopsScanner()
-        result = scanner.scan(str(skops_file))
-
-        cve_checks = [c for c in result.checks if "CVE-2025-54413" in c.name]
-        assert not [c for c in cve_checks if c.status == CheckStatus.FAILED]
+        assert_skops_cve_clean(scanner, skops_file, "CVE-2025-54413")
 
     def test_valid_methodnode_loader_is_not_flagged(self, tmp_path: Path) -> None:
         """Legitimate bound-method nodes keep their wrapped object type aligned."""
@@ -245,10 +217,7 @@ class TestSkopsScannerCVE2025_54413:
                 ),
             )
 
-        result = SkopsScanner().scan(str(skops_file))
-
-        cve_checks = [c for c in result.checks if "CVE-2025-54413" in c.name]
-        assert not [c for c in cve_checks if c.status == CheckStatus.FAILED]
+        assert_skops_cve_clean(SkopsScanner(), skops_file, "CVE-2025-54413")
 
 
 class TestSkopsScannerCVE2025_54886:
@@ -319,33 +288,11 @@ class TestSkopsScannerJoblibFallback:
 
     def test_detects_joblib_load_pattern(self, tmp_path: Path) -> None:
         """Test detection of joblib.load patterns in file content."""
-        skops_file = tmp_path / "malicious.skops"
-        with zipfile.ZipFile(skops_file, "w") as zf:
-            zf.writestr("model.pkl", b"joblib.load(model_path)")
-            zf.writestr("schema.json", '{"version": "1.0"}')
-
-        scanner = SkopsScanner()
-        result = scanner.scan(str(skops_file))
-
-        joblib_checks = [c for c in result.checks if "Joblib" in c.name]
-        assert len(joblib_checks) > 0
-        assert joblib_checks[0].status == CheckStatus.FAILED
-        assert joblib_checks[0].severity == IssueSeverity.WARNING
+        _assert_skops_unsafe_load_pattern(tmp_path, ("model.pkl"), (b"joblib.load(model_path)"))
 
     def test_detects_pickle_load_pattern(self, tmp_path: Path) -> None:
         """Test detection of pickle.load patterns."""
-        skops_file = tmp_path / "malicious.skops"
-        with zipfile.ZipFile(skops_file, "w") as zf:
-            zf.writestr("loader.py", b"import pickle\npickle.load(f)")
-            zf.writestr("schema.json", '{"version": "1.0"}')
-
-        scanner = SkopsScanner()
-        result = scanner.scan(str(skops_file))
-
-        joblib_checks = [c for c in result.checks if "Joblib" in c.name]
-        assert len(joblib_checks) > 0
-        assert joblib_checks[0].status == CheckStatus.FAILED
-        assert joblib_checks[0].severity == IssueSeverity.WARNING
+        _assert_skops_unsafe_load_pattern(tmp_path, ("loader.py"), (b"import pickle\npickle.load(f)"))
 
     def test_no_false_positive_sklearn_in_schema_json(self, tmp_path: Path) -> None:
         """Regression: schema.json with sklearn type refs must NOT trigger joblib fallback.
@@ -632,19 +579,12 @@ class TestSkopsScannerEdgeCases:
 
         original_open = zipfile.ZipFile.open
 
-        def open_with_failure(
-            archive: zipfile.ZipFile,
-            name: str | zipfile.ZipInfo,
-            mode: str = "r",
-            pwd: bytes | None = None,
-            *,
-            force_zip64: bool = False,
-        ) -> Any:
-            if isinstance(name, zipfile.ZipInfo) and name.filename == "step/0/content/0.npy":
-                raise zipfile.BadZipFile("CRC mismatch")
-            return original_open(archive, name, mode, pwd, force_zip64=force_zip64)
-
-        monkeypatch.setattr(zipfile.ZipFile, "open", open_with_failure)
+        install_zip_open_failure(
+            monkeypatch,
+            original_open,
+            lambda name: isinstance(name, zipfile.ZipInfo) and name.filename == "step/0/content/0.npy",
+            lambda: zipfile.BadZipFile("CRC mismatch"),
+        )
 
         result = scan_model_directory_or_file(str(skops_file), cache_enabled=False)
 
@@ -775,20 +715,12 @@ class TestSkopsScannerEdgeCases:
 
         original_open = zipfile.ZipFile.open
 
-        def open_with_failure(
-            archive: zipfile.ZipFile,
-            name: str | zipfile.ZipInfo,
-            mode: str = "r",
-            pwd: bytes | None = None,
-            *,
-            force_zip64: bool = False,
-        ) -> Any:
-            filename = name.filename if isinstance(name, zipfile.ZipInfo) else name
-            if filename == "README.md":
-                raise exception_type(message)
-            return original_open(archive, name, mode, pwd, force_zip64=force_zip64)
-
-        monkeypatch.setattr(zipfile.ZipFile, "open", open_with_failure)
+        install_zip_open_failure(
+            monkeypatch,
+            original_open,
+            lambda name: (name.filename if isinstance(name, zipfile.ZipInfo) else name) == "README.md",
+            lambda: exception_type(message),
+        )
 
         cache_dir = tmp_path / f"unreadable-cache-{exception_type.__name__}"
         reset_cache_manager()
@@ -823,20 +755,12 @@ class TestSkopsScannerEdgeCases:
 
         original_open = zipfile.ZipFile.open
 
-        def open_with_failure(
-            archive: zipfile.ZipFile,
-            name: str | zipfile.ZipInfo,
-            mode: str = "r",
-            pwd: bytes | None = None,
-            *,
-            force_zip64: bool = False,
-        ) -> Any:
-            filename = name.filename if isinstance(name, zipfile.ZipInfo) else name
-            if filename == "bin/run.sh":
-                raise zipfile.BadZipFile("CRC mismatch")
-            return original_open(archive, name, mode, pwd, force_zip64=force_zip64)
-
-        monkeypatch.setattr(zipfile.ZipFile, "open", open_with_failure)
+        install_zip_open_failure(
+            monkeypatch,
+            original_open,
+            lambda name: (name.filename if isinstance(name, zipfile.ZipInfo) else name) == "bin/run.sh",
+            lambda: zipfile.BadZipFile("CRC mismatch"),
+        )
 
         result = scan_model_directory_or_file(str(skops_file), cache_enabled=False)
 
@@ -864,19 +788,12 @@ class TestSkopsScannerEdgeCases:
 
         original_open = zipfile.ZipFile.open
 
-        def open_with_failure(
-            archive: zipfile.ZipFile,
-            name: str | zipfile.ZipInfo,
-            mode: str = "r",
-            pwd: bytes | None = None,
-            *,
-            force_zip64: bool = False,
-        ) -> Any:
-            if isinstance(name, zipfile.ZipInfo) and name.filename == "./payload.pkl":
-                raise zipfile.BadZipFile("CRC mismatch")
-            return original_open(archive, name, mode, pwd, force_zip64=force_zip64)
-
-        monkeypatch.setattr(zipfile.ZipFile, "open", open_with_failure)
+        install_zip_open_failure(
+            monkeypatch,
+            original_open,
+            lambda name: isinstance(name, zipfile.ZipInfo) and name.filename == "./payload.pkl",
+            lambda: zipfile.BadZipFile("CRC mismatch"),
+        )
 
         result = scan_model_directory_or_file(str(skops_file), cache_enabled=False)
 
@@ -906,20 +823,12 @@ class TestSkopsScannerEdgeCases:
 
         original_open = zipfile.ZipFile.open
 
-        def open_with_failure(
-            archive: zipfile.ZipFile,
-            name: str | zipfile.ZipInfo,
-            mode: str = "r",
-            pwd: bytes | None = None,
-            *,
-            force_zip64: bool = False,
-        ) -> Any:
-            filename = name.filename if isinstance(name, zipfile.ZipInfo) else name
-            if filename == "weights_link":
-                raise zipfile.BadZipFile("CRC mismatch")
-            return original_open(archive, name, mode, pwd, force_zip64=force_zip64)
-
-        monkeypatch.setattr(zipfile.ZipFile, "open", open_with_failure)
+        install_zip_open_failure(
+            monkeypatch,
+            original_open,
+            lambda name: (name.filename if isinstance(name, zipfile.ZipInfo) else name) == "weights_link",
+            lambda: zipfile.BadZipFile("CRC mismatch"),
+        )
 
         result = scan_model_directory_or_file(str(skops_file), cache_enabled=False)
 
@@ -948,19 +857,12 @@ class TestSkopsScannerEdgeCases:
 
         original_open = zipfile.ZipFile.open
 
-        def open_with_failure(
-            archive: zipfile.ZipFile,
-            name: str | zipfile.ZipInfo,
-            mode: str = "r",
-            pwd: bytes | None = None,
-            *,
-            force_zip64: bool = False,
-        ) -> Any:
-            if isinstance(name, zipfile.ZipInfo) and name.filename == "./weights_link":
-                raise zipfile.BadZipFile("CRC mismatch")
-            return original_open(archive, name, mode, pwd, force_zip64=force_zip64)
-
-        monkeypatch.setattr(zipfile.ZipFile, "open", open_with_failure)
+        install_zip_open_failure(
+            monkeypatch,
+            original_open,
+            lambda name: isinstance(name, zipfile.ZipInfo) and name.filename == "./weights_link",
+            lambda: zipfile.BadZipFile("CRC mismatch"),
+        )
 
         result = scan_model_directory_or_file(str(skops_file), cache_enabled=False)
 
@@ -1066,49 +968,20 @@ class TestSkopsScannerEdgeCases:
 
     def test_not_zip_core_exits_one_and_avoids_cache_reuse(self, tmp_path: Path) -> None:
         """A non-ZIP .skops path is incomplete Skops coverage, not a cacheable clean result."""
-        skops_file = tmp_path / "not_zip.skops"
-        skops_file.write_bytes(b"not a zip archive")
-
-        cache_dir = tmp_path / "cache"
-        reset_cache_manager()
-        try:
-            first, second = _scan_twice_with_cache(skops_file, cache_dir)
-
-            for result in (first, second):
-                assert result.success is False
-                assert determine_exit_code(result) == 1
-                metadata = result.file_metadata[str(skops_file)]
-                _assert_inconclusive_reason(metadata, "skops_not_zip_archive")
-                assert any("not a ZIP archive" in str(issue.message) for issue in result.issues)
-
-            stats = get_cache_manager(str(cache_dir), enabled=True).get_stats()
-            assert stats["cache_hits"] == 0
-            assert stats["total_entries"] == 0
-        finally:
-            reset_cache_manager()
+        _assert_skops_core_error_without_cache(
+            tmp_path, ("not_zip.skops"), (b"not a zip archive"), (1), ("skops_not_zip_archive"), ("not a ZIP archive")
+        )
 
     def test_bad_zip_core_exits_two_and_avoids_cache_reuse(self, tmp_path: Path) -> None:
         """A corrupt ZIP-like .skops path should also fail closed and stay uncached."""
-        skops_file = tmp_path / "bad_zip.skops"
-        skops_file.write_bytes(b"PK\x03\x04not a complete zip")
-
-        cache_dir = tmp_path / "cache"
-        reset_cache_manager()
-        try:
-            first, second = _scan_twice_with_cache(skops_file, cache_dir)
-
-            for result in (first, second):
-                assert result.success is False
-                assert determine_exit_code(result) == 2
-                metadata = result.file_metadata[str(skops_file)]
-                _assert_inconclusive_reason(metadata, "skops_bad_zip_file")
-                assert any("Invalid ZIP file" in str(issue.message) for issue in result.issues)
-
-            stats = get_cache_manager(str(cache_dir), enabled=True).get_stats()
-            assert stats["cache_hits"] == 0
-            assert stats["total_entries"] == 0
-        finally:
-            reset_cache_manager()
+        _assert_skops_core_error_without_cache(
+            tmp_path,
+            ("bad_zip.skops"),
+            (b"PK\x03\x04not a complete zip"),
+            (2),
+            ("skops_bad_zip_file"),
+            ("Invalid ZIP file"),
+        )
 
     def test_unexpected_scan_failure_core_exits_two_and_avoids_cache_reuse(
         self,
@@ -1162,35 +1035,9 @@ class TestSkopsScannerEdgeCases:
             archive.writestr("schema.json", '{"version": "1.0"}')
             archive.writestr("payload.pkl", b'cos\nsystem\n(S"echo replacement"\ntR.')
 
-        original_scan_archive_members = zip_scanner_module.ZipScanner.scan_archive_members
-        original_open = builtins.open
-        path_reopened = False
-
-        def redirect_path_open(file: Any, *args: Any, **kwargs: Any) -> Any:
-            nonlocal path_reopened
-            if str(file) == str(skops_path):
-                path_reopened = True
-                file = replacement_path
-            return original_open(file, *args, **kwargs)
-
-        def replace_then_scan(
-            scanner: zip_scanner_module.ZipScanner,
-            path: str,
-            archive: zipfile.ZipFile | None = None,
-        ) -> ScanResult:
-            assert archive is not None
-            with monkeypatch.context() as path_swap:
-                path_swap.setattr(builtins, "open", redirect_path_open)
-                return original_scan_archive_members(scanner, path, archive=archive)
-
-        monkeypatch.setattr(zip_scanner_module.ZipScanner, "scan_archive_members", replace_then_scan)
-
-        result = SkopsScanner().scan(str(skops_path))
-
-        assert path_reopened is False
-        assert not any(issue.details.get("zip_entry") == "payload.pkl" for issue in result.issues)
-        assert any(entry.get("path", "").endswith(":safe.txt") for entry in result.metadata["contents"])
-        assert not any(entry.get("path", "").endswith(":payload.pkl") for entry in result.metadata["contents"])
+        assert_preflighted_archive_survives_replacement(
+            monkeypatch, skops_path, replacement_path, SkopsScanner, zip_scanner_module.ZipScanner
+        )
 
     def test_oversized_numpy_payload_core_exits_zero_and_still_caches(self, tmp_path: Path) -> None:
         """Oversized numeric arrays should not become Skops CVE false positives in aggregate scans."""
@@ -1374,3 +1221,61 @@ class TestSkopsScannerRealModel:
 
         assert result.metadata.get("file_size", 0) > 0
         assert result.metadata.get("file_count", 0) > 0
+
+
+def _assert_skops_core_error_without_cache(
+    tmp_path: Path, filename: str, payload: bytes, exit_code: int, reason: str, message: str
+) -> None:
+    skops_file = tmp_path / filename
+    skops_file.write_bytes(payload)
+
+    cache_dir = tmp_path / "cache"
+    reset_cache_manager()
+    try:
+        first, second = _scan_twice_with_cache(skops_file, cache_dir)
+
+        for result in (first, second):
+            assert result.success is False
+            assert determine_exit_code(result) == exit_code
+            metadata = result.file_metadata[str(skops_file)]
+            _assert_inconclusive_reason(metadata, reason)
+            assert any(message in str(issue.message) for issue in result.issues)
+
+        stats = get_cache_manager(str(cache_dir), enabled=True).get_stats()
+        assert stats["cache_hits"] == 0
+        assert stats["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
+def _assert_skops_malicious_loader_node(tmp_path: Path, schema: str, check_name: str) -> None:
+    skops_file = tmp_path / "malicious.skops"
+    with zipfile.ZipFile(skops_file, "w") as zf:
+        zf.writestr(
+            "schema.json",
+            schema,
+        )
+
+    scanner = SkopsScanner()
+    result = scanner.scan(str(skops_file))
+
+    assert result.success is False
+    cve_checks = [c for c in result.checks if check_name in c.name]
+    assert len(cve_checks) > 0
+    assert cve_checks[0].status == CheckStatus.FAILED
+    assert cve_checks[0].severity == IssueSeverity.CRITICAL
+
+
+def _assert_skops_unsafe_load_pattern(tmp_path: Path, member_name: str, payload: bytes) -> None:
+    skops_file = tmp_path / "malicious.skops"
+    with zipfile.ZipFile(skops_file, "w") as zf:
+        zf.writestr(member_name, payload)
+        zf.writestr("schema.json", '{"version": "1.0"}')
+
+    scanner = SkopsScanner()
+    result = scanner.scan(str(skops_file))
+
+    joblib_checks = [c for c in result.checks if "Joblib" in c.name]
+    assert len(joblib_checks) > 0
+    assert joblib_checks[0].status == CheckStatus.FAILED
+    assert joblib_checks[0].severity == IssueSeverity.WARNING

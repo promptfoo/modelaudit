@@ -11,6 +11,8 @@ from typing import Any, cast
 
 import pytest
 
+from tests.helpers.cache import assert_inconclusive_not_cached as _assert_inconclusive_aggregate_not_cached
+
 # Skip if msgpack is not available before importing it
 pytest.importorskip("msgpack")
 
@@ -31,6 +33,7 @@ from modelaudit.scanners.flax_msgpack_scanner import (
     _pattern_has_stream_unsafe_repeat,
 )
 from modelaudit.utils.file.detection import FLAX_MSGPACK_STRUCTURE_READ_BYTES
+from tests.helpers.text import LowerCountingText as _LowerCountingText
 
 
 def create_msgpack_file(path: Path, data: Any) -> None:
@@ -161,42 +164,6 @@ def _write_sparse_large_flax_ndarray_ext(
         output.write(trailing_body)
 
 
-def _assert_inconclusive_aggregate_not_cached(
-    path: Path,
-    expected_reason: str,
-    cache_dir: Path,
-    **scan_kwargs: Any,
-) -> None:
-    reset_cache_manager()
-    try:
-        first = scan_model_directory_or_file(
-            str(path),
-            cache_enabled=True,
-            cache_dir=str(cache_dir),
-            min_cache_file_size=0,
-            **scan_kwargs,
-        )
-        second = scan_model_directory_or_file(
-            str(path),
-            cache_enabled=True,
-            cache_dir=str(cache_dir),
-            min_cache_file_size=0,
-            **scan_kwargs,
-        )
-
-        for aggregate in (first, second):
-            metadata = aggregate.file_metadata[str(path)]
-            assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-            assert expected_reason in metadata["scan_outcome_reasons"]
-            assert not [
-                issue for issue in aggregate.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
-            ]
-            assert determine_exit_code(aggregate) == 2
-        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
-    finally:
-        reset_cache_manager()
-
-
 def create_malicious_msgpack_file(path):
     """Create a msgpack file with suspicious content."""
     malicious_data = {
@@ -206,19 +173,6 @@ def create_malicious_msgpack_file(path):
         "suspicious_blob": b"eval(compile('malicious code', 'string', 'exec'))" * 1000,
     }
     create_msgpack_file(path, malicious_data)
-
-
-class _LowerCountingText(str):
-    lower_calls: int
-
-    def __new__(cls, value: str) -> "_LowerCountingText":
-        instance = super().__new__(cls, value)
-        instance.lower_calls = 0
-        return instance
-
-    def lower(self) -> str:
-        self.lower_calls += 1
-        return super().lower()
 
 
 def test_matching_jax_transforms_reuses_lowered_value_text() -> None:
@@ -325,31 +279,14 @@ def test_flax_msgpack_suspicious_content(tmp_path):
 def test_flax_msgpack_malicious_content_marks_scan_unsuccessful(tmp_path: Path) -> None:
     """CRITICAL msgpack findings should make the scan unsuccessful."""
     path = tmp_path / "malicious.msgpack"
-    create_msgpack_file(path, {"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"})
-
-    result = FlaxMsgpackScanner().scan(str(path))
-
-    assert result.success is False
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL and issue.message == "Suspicious object attribute detected: __reduce__"
-        for issue in result.issues
-    )
+    _assert_flax_malicious_content(path, "__reduce__", "os.system", "Suspicious object attribute detected: __reduce__")
 
 
 def test_flax_msgpack_byte_encoded_dangerous_key_is_critical(tmp_path: Path) -> None:
     path = tmp_path / "byte_reduce_key.msgpack"
     create_msgpack_file(path, {"params": {"w": [1, 2, 3]}, b"__reduce__": "os.system"})
 
-    result = FlaxMsgpackScanner().scan(str(path))
-
-    assert result.success is False
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL
-        and issue.message == "Suspicious object attribute detected: __reduce__"
-        and issue.location == "root/__reduce__"
-        and issue.details["suspicious_key"] == "__reduce__"
-        for issue in result.issues
-    )
+    _assert_flax_key(path, "Suspicious object attribute detected: __reduce__", "root/__reduce__", "__reduce__")
 
 
 def test_flax_msgpack_byte_encoded_dangerous_top_level_key_is_critical(tmp_path: Path) -> None:
@@ -399,16 +336,7 @@ def test_flax_msgpack_byte_encoded_function_metadata_key_is_value_aware(tmp_path
     path = tmp_path / "byte_restore_fn_key.msgpack"
     create_msgpack_file(path, {"params": {"w": [1, 2, 3]}, b"restore_fn": "eval"})
 
-    result = FlaxMsgpackScanner().scan(str(path))
-
-    assert result.success is False
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL
-        and issue.message == "Suspicious object attribute value detected: restore_fn"
-        and issue.location == "root/restore_fn"
-        and issue.details["suspicious_key"] == "restore_fn"
-        for issue in result.issues
-    )
+    _assert_flax_key(path, "Suspicious object attribute value detected: restore_fn", "root/restore_fn", "restore_fn")
 
 
 def test_flax_msgpack_byte_encoded_function_metadata_value_is_checked(tmp_path: Path) -> None:
@@ -468,16 +396,7 @@ def test_flax_msgpack_restore_fn_custom_value_no_critical(tmp_path: Path) -> Non
 def test_flax_msgpack_restore_fn_dangerous_value_still_critical(tmp_path: Path) -> None:
     """Function metadata that directly names dangerous callables should stay critical."""
     path = tmp_path / "dangerous_restore_fn.msgpack"
-    create_msgpack_file(path, {"params": {"w": [1, 2, 3]}, "restore_fn": "eval"})
-
-    result = FlaxMsgpackScanner().scan(str(path))
-
-    assert result.success is False
-    assert any(
-        issue.severity == IssueSeverity.CRITICAL
-        and issue.message == "Suspicious object attribute value detected: restore_fn"
-        for issue in result.issues
-    )
+    _assert_flax_malicious_content(path, "restore_fn", "eval", "Suspicious object attribute value detected: restore_fn")
 
 
 def test_flax_msgpack_over_budget_padded_restore_fn_dangerous_value_is_critical(tmp_path: Path) -> None:
@@ -2579,36 +2498,15 @@ def test_flax_msgpack_redacts_url_path_capability_token_sample(tmp_path: Path) -
 
 
 def test_flax_msgpack_redacts_standalone_secret_shaped_metadata_key(tmp_path: Path) -> None:
-    path = tmp_path / "standalone_secret_key.msgpack"
-    token = "ghp_" + "a" * 36
-    create_msgpack_file(path, {token: b"0" * 4096})
-
-    result = FlaxMsgpackScanner().scan(str(path))
-
-    assert result.metadata["top_level_keys"] == ["<redacted>"]
-    assert token not in result.to_json()
+    _assert_flax_secret_metadata_key(tmp_path, ("standalone_secret_key.msgpack"), ("ghp_"), ("a"), (36))
 
 
 def test_flax_msgpack_redacts_huggingface_token_metadata_key(tmp_path: Path) -> None:
-    path = tmp_path / "huggingface_token_key.msgpack"
-    token = "hf_" + "a" * 34
-    create_msgpack_file(path, {token: b"0" * 4096})
-
-    result = FlaxMsgpackScanner().scan(str(path))
-
-    assert result.metadata["top_level_keys"] == ["<redacted>"]
-    assert token not in result.to_json()
+    _assert_flax_secret_metadata_key(tmp_path, ("huggingface_token_key.msgpack"), ("hf_"), ("a"), (34))
 
 
 def test_flax_msgpack_redacts_url_safe_openai_project_key(tmp_path: Path) -> None:
-    path = tmp_path / "openai_project_key.msgpack"
-    token = "sk-proj-" + "abc_def-" * 4
-    create_msgpack_file(path, {token: b"0" * 4096})
-
-    result = FlaxMsgpackScanner().scan(str(path))
-
-    assert result.metadata["top_level_keys"] == ["<redacted>"]
-    assert token not in result.to_json()
+    _assert_flax_secret_metadata_key(tmp_path, ("openai_project_key.msgpack"), ("sk-proj-"), ("abc_def-"), (4))
 
 
 def test_flax_msgpack_redacts_percent_encoded_secret_metadata_key(tmp_path: Path) -> None:
@@ -3284,3 +3182,38 @@ def test_flax_msgpack_deduplicates_configured_suspicious_patterns(tmp_path: Path
         if check.name == "Code Pattern Security Check" and check.details["pattern"] == r"import\s+subprocess"
     ]
     assert len(findings) == 1
+
+
+def _assert_flax_secret_metadata_key(
+    tmp_path: Path, filename: str, token_prefix: str, token_char: str, token_length: int
+) -> None:
+    path = tmp_path / filename
+    token = token_prefix + token_char * token_length
+    create_msgpack_file(path, {token: b"0" * 4096})
+
+    result = FlaxMsgpackScanner().scan(str(path))
+
+    assert result.metadata["top_level_keys"] == ["<redacted>"]
+    assert token not in result.to_json()
+
+
+def _assert_flax_key(path: Path, message: str, location: str, key: str) -> None:
+    result = FlaxMsgpackScanner().scan(str(path))
+
+    assert result.success is False
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL
+        and issue.message == message
+        and issue.location == location
+        and issue.details["suspicious_key"] == key
+        for issue in result.issues
+    )
+
+
+def _assert_flax_malicious_content(path: Path, key: str, value: str, message: str) -> None:
+    create_msgpack_file(path, {"params": {"w": [1, 2, 3]}, key: value})
+
+    result = FlaxMsgpackScanner().scan(str(path))
+
+    assert result.success is False
+    assert any(issue.severity == IssueSeverity.CRITICAL and issue.message == message for issue in result.issues)

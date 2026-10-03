@@ -34,6 +34,21 @@ from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as 
 pytestmark = pytest.mark.skipif(not _has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
 
 
+def _fail_cached_meta_reads(monkeypatch: pytest.MonkeyPatch, cached_clean: Path) -> None:
+    real_open = open
+
+    def fail_cached_meta_read(
+        candidate: str | bytes | os.PathLike[str],
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        if str(candidate) == str(cached_clean):
+            raise OSError("simulated transient MetaGraph read failure")
+        return real_open(candidate, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", fail_cached_meta_read)
+
+
 def test_attribute_context_name_handles_many_generated_suffixes() -> None:
     attr_name = "Authorization" + (".func.name" * 20_000)
 
@@ -293,18 +308,7 @@ def test_tf_metagraph_single_file_scan_bypasses_stale_cache_when_read_fails(
         cached_entries = get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"]
         assert cached_entries > 0
 
-        real_open = open
-
-        def fail_cached_meta_read(
-            candidate: str | bytes | os.PathLike[str],
-            *args: Any,
-            **kwargs: Any,
-        ) -> Any:
-            if str(candidate) == str(cached_clean):
-                raise OSError("simulated transient MetaGraph read failure")
-            return real_open(candidate, *args, **kwargs)
-
-        monkeypatch.setattr("builtins.open", fail_cached_meta_read)
+        _fail_cached_meta_reads(monkeypatch, cached_clean)
 
         second = scan_model_directory_or_file(
             str(cached_clean),
@@ -350,18 +354,7 @@ def test_tf_metagraph_directory_scan_bypasses_stale_cache_when_read_fails_with_s
         assert determine_exit_code(first) == 0
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] > 0
 
-        real_open = open
-
-        def fail_cached_meta_read(
-            candidate: str | bytes | os.PathLike[str],
-            *args: Any,
-            **kwargs: Any,
-        ) -> Any:
-            if str(candidate) == str(cached_clean):
-                raise OSError("simulated transient MetaGraph read failure")
-            return real_open(candidate, *args, **kwargs)
-
-        monkeypatch.setattr("builtins.open", fail_cached_meta_read)
+        _fail_cached_meta_reads(monkeypatch, cached_clean)
 
         result = scan_model_directory_or_file(
             str(model_dir),

@@ -188,13 +188,7 @@ def test_tensorrt_scanner_detects_uppercase_and_shared_library_paths(tmp_path: P
 
 def test_tensorrt_scanner_detects_windows_dll_plugin_markers(tmp_path: Path) -> None:
     path = tmp_path / "malicious.engine"
-    path.write_bytes(b"plugin=malicious_plugin.dll\x00LoadLibraryExW\x00")
-
-    result = TensorRTScanner().scan(str(path))
-
-    assert result.success is False
-    matched_patterns = {issue.details.get("pattern") for issue in result.issues}
-    assert {".dll", "LoadLibrary"}.issubset(matched_patterns)
+    _assert_tensorrt_markers(path, b"plugin=malicious_plugin.dll\x00LoadLibraryExW\x00", ".dll", "LoadLibrary")
 
 
 def test_tensorrt_scanner_detects_embedded_pe_header(tmp_path: Path) -> None:
@@ -333,13 +327,7 @@ def test_tensorrt_scanner_avoids_elf_and_plugin_entry_point_near_match_false_pos
 
 def test_tensorrt_scanner_detects_exec_and_eval_tokens_with_arguments(tmp_path: Path) -> None:
     path = tmp_path / "malicious.engine"
-    path.write_bytes(b"execve /bin/sh\nexecvp /bin/sh\nexecvpe /bin/sh\nEVAL payload\n")
-
-    result = TensorRTScanner().scan(str(path))
-
-    assert result.success is False
-    matched_patterns = {issue.details.get("pattern") for issue in result.issues}
-    assert {"exec", "eval"}.issubset(matched_patterns)
+    _assert_tensorrt_markers(path, b"execve /bin/sh\nexecvp /bin/sh\nexecvpe /bin/sh\nEVAL payload\n", "exec", "eval")
 
 
 def test_tensorrt_scanner_detects_tmp_tokens_after_colon_and_windows_drive_prefix(tmp_path: Path) -> None:
@@ -354,26 +342,12 @@ def test_tensorrt_scanner_detects_tmp_tokens_after_colon_and_windows_drive_prefi
 
 def test_tensorrt_scanner_detects_tmp_tokens_after_punctuation_delimiters(tmp_path: Path) -> None:
     path = tmp_path / "punctuated_tmp.engine"
-    path.write_bytes(b"load(/tmp/evil.so)\ncmd;/tmp/payload\nload(/tmp/libc.so.6)\n")
-
-    result = TensorRTScanner().scan(str(path))
-
-    assert result.success is False
-    matched_patterns = {issue.details.get("pattern") for issue in result.issues}
-    assert "/tmp/" in matched_patterns
-    assert ".so" in matched_patterns
+    _assert_tensorrt_patterns(path, b"load(/tmp/evil.so)\ncmd;/tmp/payload\nload(/tmp/libc.so.6)\n", "/tmp/")
 
 
 def test_tensorrt_scanner_detects_standalone_three_byte_markers(tmp_path: Path) -> None:
     path = tmp_path / "standalone_markers.engine"
-    path.write_bytes(b"\x00../\x00.so\x00")
-
-    result = TensorRTScanner().scan(str(path))
-
-    assert result.success is False
-    matched_patterns = {issue.details.get("pattern") for issue in result.issues}
-    assert "../" in matched_patterns
-    assert ".so" in matched_patterns
+    _assert_tensorrt_patterns(path, b"\x00../\x00.so\x00", "../")
 
 
 def test_tensorrt_scanner_safe_file(tmp_path: Path) -> None:
@@ -382,3 +356,24 @@ def test_tensorrt_scanner_safe_file(tmp_path: Path) -> None:
     result = TensorRTScanner().scan(str(path))
     assert result.success
     assert not result.issues
+
+
+def _assert_tensorrt_patterns(path: Path, payload: bytes, pattern: str) -> None:
+    path.write_bytes(payload)
+
+    result = TensorRTScanner().scan(str(path))
+
+    assert result.success is False
+    matched_patterns = {issue.details.get("pattern") for issue in result.issues}
+    assert pattern in matched_patterns
+    assert ".so" in matched_patterns
+
+
+def _assert_tensorrt_markers(path: Path, payload: bytes, first_marker: str, second_marker: str) -> None:
+    path.write_bytes(payload)
+
+    result = TensorRTScanner().scan(str(path))
+
+    assert result.success is False
+    matched_patterns = {issue.details.get("pattern") for issue in result.issues}
+    assert {first_marker, second_marker}.issubset(matched_patterns)

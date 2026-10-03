@@ -33,6 +33,103 @@ class _CountingAliasMapping(Mapping[str, str]):
         return len(self._aliases)
 
 
+def _assert_typed_call_detected(source: bytes, expected_pattern: str) -> None:
+    detector = JITScriptDetector()
+
+    findings = detector.scan_model(source, "pytorch", "payload.py")
+
+    assert any(finding.type == "code_execution_pattern" and finding.pattern == expected_pattern for finding in findings)
+
+
+def _assert_late_alias_rebind_detection(late_state: bytes, expect_finding: bool) -> None:
+    detector = JITScriptDetector()
+    leading_blocks = b"".join(
+        f"def benign_{index}():\n    return {index}\n}}\x00".encode()
+        for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
+    )
+    padding_line = b"# pad\n"
+    padding = padding_line * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(padding_line) + 8)
+    source = b"\x00\xff" + leading_blocks + b"from runpy import run_path as runner\n" + padding + late_state + padding
+
+    findings = detector.scan_model(source, "pytorch", "payload.bin")
+    has_dynamic_finding = any(
+        f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+    )
+
+    assert has_dynamic_finding is expect_finding
+
+
+def _assert_eval_builtin_detected(data: bytes) -> None:
+    detector = JITScriptDetector()
+
+    findings = detector.scan_model(data, "pytorch", "payload.bin")
+
+    assert any(finding.type == "dangerous_builtin" and finding.builtin == "eval" for finding in findings)
+
+
+def _assert_typed_member_detected(source: bytes, expected_pattern: str) -> None:
+    findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
+
+    assert any(finding.type == "code_execution_pattern" and finding.pattern == expected_pattern for finding in findings)
+
+
+def _assert_late_typed_member_detected(prefix: bytes, late_state: bytes, expected_pattern: str) -> None:
+    detector = JITScriptDetector()
+    padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+    source = b"\x00\xff" + prefix + padding + late_state + padding
+
+    findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+    assert any(finding.type == "code_execution_pattern" and finding.pattern == expected_pattern for finding in findings)
+
+
+def _assert_eval_body_detected(body: str) -> None:
+    detector = JITScriptDetector()
+    data = f"\x00\xffdef payload(value):\n    {body}\n".encode()
+
+    findings = detector.scan_model(data, "pytorch", "payload.bin")
+
+    assert any(finding.type == "dangerous_builtin" and finding.builtin == "eval" for finding in findings)
+
+
+def _assert_no_critical_builtin_findings(data: bytes) -> None:
+    detector = JITScriptDetector()
+
+    findings = detector.scan_model(data, "pytorch", "payload.bin")
+
+    assert not any(finding.type == "dangerous_builtin" for finding in findings)
+    assert not any(finding.severity == "CRITICAL" for finding in findings)
+
+
+def _assert_late_runpy_alias_detected(late_state: bytes) -> None:
+    detector = JITScriptDetector()
+    padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
+    source = b"\x00\xffimport runpy as rp\n" + padding + late_state + padding
+
+    findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+    assert any(
+        f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+    )
+
+
+def _assert_no_dangerous_builtin(data: bytes) -> None:
+    detector = JITScriptDetector()
+
+    findings = detector.scan_model(data, "pytorch", "payload.bin")
+
+    assert not any(finding.type == "dangerous_builtin" for finding in findings)
+
+
+def _assert_benign_body_no_builtin(body: str) -> None:
+    detector = JITScriptDetector()
+    data = f"\x00\xffdef benign(value):\n    {body}\n".encode()
+
+    findings = detector.scan_model(data, "pytorch", "payload.bin")
+
+    assert not any(finding.type == "dangerous_builtin" for finding in findings)
+
+
 class TestJITScriptDetector:
     """Test the JITScriptDetector class."""
 
@@ -563,7 +660,9 @@ class TestJITScriptDetector:
     def test_prioritized_rescan_fails_closed_when_source_start_budget_is_exceeded(self) -> None:
         line_count = jit_script_module._MAX_EMBEDDED_PYTHON_SOURCE_START_PROBES + 2
         source = b"}\x00\n".join(f"if True: import webbrowser as wb_{index}".encode() for index in range(line_count))
-        prioritized = jit_script_module._candidate_embedded_python_snippets(source)
+        prioritized = jit_script_module._prioritized_embedded_python_snippets(
+            jit_script_module._candidate_embedded_python_snippets(source), bounded=source
+        )
 
         findings = JITScriptDetector()._extract_and_check_python_code(
             source,
@@ -662,11 +761,7 @@ class TestJITScriptDetector:
         detector = JITScriptDetector()
         source = b"\x00\xffdef payload():\n    return \"os.posix_spawn('/bin/sh', ['sh'], {})\"\n}"
 
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert not any(
-            f.type == "code_execution_pattern" and f.pattern == "OS command execution detected" for f in findings
-        )
+        _assert_jit_scan_without_pattern(detector, source, "payload.bin", "OS command execution detected")
 
     def test_scan_model_ignores_string_literal_os_process_launch_with_unrelated_risk(self) -> None:
         detector = JITScriptDetector()
@@ -677,11 +772,7 @@ class TestJITScriptDetector:
             b"    return \"os.posix_spawn('/bin/sh', ['sh'], {})\"\n"
         )
 
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert not any(
-            f.type == "code_execution_pattern" and f.pattern == "OS command execution detected" for f in findings
-        )
+        _assert_jit_scan_without_pattern(detector, source, "payload.bin", "OS command execution detected")
 
     @pytest.mark.parametrize(
         "source",
@@ -720,11 +811,7 @@ class TestJITScriptDetector:
             b"}"
         )
 
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            f.type == "code_execution_pattern" and f.pattern == "OS command execution detected" for f in findings
-        )
+        _assert_jit_scan_pattern(detector, source, "payload.bin", "OS command execution detected")
 
     def test_scan_model_detects_embedded_snippet_alias_aware_os_process_launch_before_binary_tail(self) -> None:
         detector = JITScriptDetector()
@@ -735,11 +822,7 @@ class TestJITScriptDetector:
             b"\x00\xffMODEL-FRAMING"
         )
 
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            f.type == "code_execution_pattern" and f.pattern == "OS command execution detected" for f in findings
-        )
+        _assert_jit_scan_pattern(detector, source, "payload.bin", "OS command execution detected")
 
     def test_scan_model_detects_framed_module_import_alias_aware_os_process_launch(self) -> None:
         detector = JITScriptDetector()
@@ -747,21 +830,13 @@ class TestJITScriptDetector:
             b"\x00\xffimport os\ndef payload():\n    return getattr(os, 'posix_' + 'spawn')('/bin/sh', ['sh'], {})\n}"
         )
 
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            f.type == "code_execution_pattern" and f.pattern == "OS command execution detected" for f in findings
-        )
+        _assert_jit_scan_pattern(detector, source, "payload.bin", "OS command execution detected")
 
     def test_scan_model_allows_framed_benign_dict_literal_os_accessor(self) -> None:
         detector = JITScriptDetector()
         source = b"\x00\xffdef payload():\n    import os\n    return {'cwd': getattr(os, 'getcwd')()}\n}"
 
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert not any(
-            f.type == "code_execution_pattern" and f.pattern == "OS command execution detected" for f in findings
-        )
+        _assert_jit_scan_without_pattern(detector, source, "payload.bin", "OS command execution detected")
 
     @pytest.mark.parametrize(
         "source",
@@ -802,21 +877,13 @@ class TestJITScriptDetector:
             b"    return \"asyncio.create_subprocess_shell('id')\"\n"
         )
 
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert not any(
-            f.type == "code_execution_pattern" and f.pattern == "Subprocess execution detected" for f in findings
-        )
+        _assert_jit_scan_without_pattern(detector, source, "payload.bin", "Subprocess execution detected")
 
     def test_scan_model_ignores_binary_framed_string_literal_asyncio_subprocess_launch(self) -> None:
         detector = JITScriptDetector()
         source = b"\x00\xffdef payload():\n    return \"asyncio.create_subprocess_shell('id')\"\n\x00\xffMODEL-FRAMING"
 
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert not any(
-            f.type == "code_execution_pattern" and f.pattern == "Subprocess execution detected" for f in findings
-        )
+        _assert_jit_scan_without_pattern(detector, source, "payload.bin", "Subprocess execution detected")
 
     def test_scan_model_ignores_lossy_decoded_string_literal_asyncio_subprocess_launch(self) -> None:
         detector = JITScriptDetector()
@@ -827,11 +894,7 @@ class TestJITScriptDetector:
             + b"\n    return \"asyncio.create_subprocess_shell('id')\"\n\x00\xffMODEL-FRAMING"
         )
 
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert not any(
-            f.type == "code_execution_pattern" and f.pattern == "Subprocess execution detected" for f in findings
-        )
+        _assert_jit_scan_without_pattern(detector, source, "payload.bin", "Subprocess execution detected")
 
     def test_parse_embedded_python_snippet_caps_trim_attempts(self, monkeypatch: pytest.MonkeyPatch) -> None:
         parse_calls = 0
@@ -860,22 +923,14 @@ class TestJITScriptDetector:
             b"\x00" + tail
         )
 
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            f.type == "code_execution_pattern" and f.pattern == "Subprocess execution detected" for f in findings
-        )
+        _assert_jit_scan_pattern(detector, source, "payload.bin", "Subprocess execution detected")
 
     def test_scan_model_detects_binary_framed_long_tail_alias_aware_os_process_launch(self) -> None:
         detector = JITScriptDetector()
         tail = b"\n".join(b"tail" for _ in range(jit_script_module._MAX_SNIPPET_PARSE_TRIM_ATTEMPTS + 20))
         source = b"\x00\xffdef payload():\n    import os as o\n    return getattr(o, 'system')('id')\n\x00" + tail
 
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            f.type == "code_execution_pattern" and f.pattern == "OS command execution detected" for f in findings
-        )
+        _assert_jit_scan_pattern(detector, source, "payload.bin", "OS command execution detected")
 
     def test_scan_model_preserves_raw_asyncio_match_in_unparsed_snippet_after_benign_parse(self) -> None:
         detector = JITScriptDetector()
@@ -888,11 +943,7 @@ class TestJITScriptDetector:
             b"asyncio.create_subprocess_shell('id')\n"
         )
 
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            f.type == "code_execution_pattern" and f.pattern == "Subprocess execution detected" for f in findings
-        )
+        _assert_jit_scan_pattern(detector, source, "payload.bin", "Subprocess execution detected")
 
     def test_scan_model_detects_embedded_snippet_alias_aware_asyncio_subprocess_launch(self) -> None:
         detector = JITScriptDetector()
@@ -903,11 +954,7 @@ class TestJITScriptDetector:
             b"}"
         )
 
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            f.type == "code_execution_pattern" and f.pattern == "Subprocess execution detected" for f in findings
-        )
+        _assert_jit_scan_pattern(detector, source, "payload.bin", "Subprocess execution detected")
 
     @pytest.mark.parametrize(
         "source",
@@ -945,11 +992,7 @@ class TestJITScriptDetector:
             b"    return rp.run_path([])\n"
         )
 
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert not any(
-            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
-        )
+        _assert_jit_scan_without_pattern(detector, source, "payload.bin", "Dynamic module execution detected")
 
     def test_scan_model_preserves_possible_runpy_execution_after_conditional_replacement(self) -> None:
         detector = JITScriptDetector()
@@ -957,31 +1000,19 @@ class TestJITScriptDetector:
             b"def payload():\n    if replace:\n        runpy.run_path = len\n    return runpy.run_path('payload.py')\n"
         )
 
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
-        )
+        _assert_jit_scan_pattern(detector, source, "payload.bin", "Dynamic module execution detected")
 
     def test_scan_model_detects_binary_prefixed_aliased_runpy_execution(self) -> None:
         detector = JITScriptDetector()
         source = b"\x00\xffdef payload():\n    from runpy import run_path as run\n    return run('payload.py')\n"
 
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
-        )
+        _assert_jit_scan_pattern(detector, source, "payload.bin", "Dynamic module execution detected")
 
     def test_scan_model_detects_binary_framed_top_level_runpy_execution(self) -> None:
         detector = JITScriptDetector()
         source = b"\x00\xfffrom runpy import run_path as run\nrun('payload.py')\n\x00MODEL-FRAMING"
 
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
-        )
+        _assert_jit_scan_pattern(detector, source, "payload.bin", "Dynamic module execution detected")
 
     def test_scan_model_detects_tail_window_runpy_execution(self) -> None:
         detector = JITScriptDetector()
@@ -1001,22 +1032,14 @@ class TestJITScriptDetector:
         leading_imports = b"".join(f"import harmless_{index}\n\x00".encode() for index in range(12))
         source = b"\x00\xff" + leading_imports + b"from runpy import run_path as run\nrun('payload.py')\n"
 
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
-        )
+        _assert_jit_scan_pattern(detector, source, "payload.bin", "Dynamic module execution detected")
 
     def test_scan_model_detects_late_priority_runpy_import_list_alias(self) -> None:
         detector = JITScriptDetector()
         leading_imports = b"".join(f"import harmless_{index}\n\x00".encode() for index in range(12))
         source = b"\x00\xff" + leading_imports + b"import harmless as h, runpy as rp\nrp.run_path('payload.py')\n"
 
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
-        )
+        _assert_jit_scan_pattern(detector, source, "payload.bin", "Dynamic module execution detected")
 
     def test_scan_model_detects_late_priority_runpy_continued_import_list_alias(self) -> None:
         detector = JITScriptDetector()
@@ -1025,11 +1048,7 @@ class TestJITScriptDetector:
             b"\x00\xff" + leading_imports + b"import harmless as h, \\\n    runpy as rp\nrp.run_path('payload.py')\n"
         )
 
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
-        )
+        _assert_jit_scan_pattern(detector, source, "payload.bin", "Dynamic module execution detected")
 
     @pytest.mark.parametrize(
         "continued_import",
@@ -1074,18 +1093,8 @@ class TestJITScriptDetector:
         )
 
     def test_scan_model_reports_tail_runpy_after_prefix_overwrite_across_gap(self) -> None:
-        detector = JITScriptDetector()
-        filler_line = b"# filler\n"
-        filler = filler_line * (2 * jit_script_module._EMBEDDED_PYTHON_SCAN_WINDOW_BYTES // len(filler_line) + 1)
-        source = (
-            b"\x00\xffimport runpy\n"
-            b"runpy.run_path = len\n" + filler + b"def payload():\n    return runpy.run_path([])\n"
-        )
-
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        _assert_runpy_across_gap(
+            (b"\x00\xffimport runpy\nrunpy.run_path = len\n"), (b"def payload():\n    return runpy.run_path([])\n")
         )
 
     def test_scan_model_reports_tail_runpy_when_omitted_middle_may_restore_overwrite(self) -> None:
@@ -1101,11 +1110,7 @@ class TestJITScriptDetector:
             + b"def payload():\n    return runpy.run_path('payload.py')\n"
         )
 
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
-        )
+        _assert_jit_scan_pattern(detector, source, "payload.bin", "Dynamic module execution detected")
 
     def test_scan_model_reports_tail_runpy_when_safe_middle_state_is_omitted(self) -> None:
         detector = JITScriptDetector()
@@ -1119,52 +1124,21 @@ class TestJITScriptDetector:
             + b"def payload():\n    return runpy.run_path([])\n"
         )
 
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
-        )
+        _assert_jit_scan_pattern(detector, source, "payload.bin", "Dynamic module execution detected")
 
     def test_scan_model_detects_tail_runpy_alias_from_framed_prefix_import_context(self) -> None:
-        detector = JITScriptDetector()
-        filler_line = b"# filler\n"
-        filler = filler_line * (2 * jit_script_module._EMBEDDED_PYTHON_SCAN_WINDOW_BYTES // len(filler_line) + 1)
-        source = b"\x00\xffimport runpy as rp\n" + filler + b"def payload():\n    return rp.run_path('payload.py')\n"
-
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        _assert_runpy_across_gap(
+            (b"\x00\xffimport runpy as rp\n"), (b"def payload():\n    return rp.run_path('payload.py')\n")
         )
 
     def test_scan_model_detects_tail_alias_call_with_comment_parenthesis_in_prefix_import(self) -> None:
-        detector = JITScriptDetector()
-        filler_line = b"# filler\n"
-        filler = filler_line * (2 * jit_script_module._EMBEDDED_PYTHON_SCAN_WINDOW_BYTES // len(filler_line) + 1)
-        source = (
-            b"\x00\xffimport runpy as rp  # (\n" + filler + b"def payload():\n    return rp.run_path('payload.py')\n"
-        )
-
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        _assert_runpy_across_gap(
+            (b"\x00\xffimport runpy as rp  # (\n"), (b"def payload():\n    return rp.run_path('payload.py')\n")
         )
 
     def test_scan_model_detects_tail_alias_call_with_string_parenthesis_in_prefix_import(self) -> None:
-        detector = JITScriptDetector()
-        filler_line = b"# filler\n"
-        filler = filler_line * (2 * jit_script_module._EMBEDDED_PYTHON_SCAN_WINDOW_BYTES // len(filler_line) + 1)
-        source = (
-            b'\x00\xffimport runpy as rp; marker = "("\n'
-            + filler
-            + b"def payload():\n    return rp.run_path('payload.py')\n"
-        )
-
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        _assert_runpy_across_gap(
+            (b'\x00\xffimport runpy as rp; marker = "("\n'), (b"def payload():\n    return rp.run_path('payload.py')\n")
         )
 
     def test_scan_model_detects_deep_priority_import_in_function_context(self) -> None:
@@ -1204,11 +1178,7 @@ class TestJITScriptDetector:
         )
         source = b"\x00\xff" + leading_blocks + b"import runpy as rp\n" + padding + b"rp.run_path('payload.py')\n"
 
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
-        )
+        _assert_jit_scan_pattern(detector, source, "payload.bin", "Dynamic module execution detected")
 
     def test_scan_model_does_not_report_safe_late_priority_overwrite_from_compact_span(self) -> None:
         detector = JITScriptDetector()
@@ -1254,11 +1224,7 @@ class TestJITScriptDetector:
             b"    return 1\n"
         )
 
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert not any(
-            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
-        )
+        _assert_jit_scan_without_pattern(detector, source, "payload.bin", "Dynamic module execution detected")
 
     def test_scan_model_detects_late_rebound_alias_call_after_priority_window(self) -> None:
         detector = JITScriptDetector()
@@ -1275,11 +1241,7 @@ class TestJITScriptDetector:
             b"rp.run_path('payload')\n"
         )
 
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
-        )
+        _assert_jit_scan_pattern(detector, source, "payload.bin", "Dynamic module execution detected")
 
     def test_scan_model_preserves_raw_runpy_call_between_compact_priority_segments(self) -> None:
         detector = JITScriptDetector()
@@ -1343,11 +1305,7 @@ class TestJITScriptDetector:
             b"\x00\xff" + leading_blocks + b"import runpy\nrun = runpy.run_path\n" + padding + b"run('payload.py')\n"
         )
 
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
-        )
+        _assert_jit_scan_pattern(detector, source, "payload.bin", "Dynamic module execution detected")
 
     def test_scan_model_ignores_shadowed_late_assignment_alias_call_after_priority_window(self) -> None:
         detector = JITScriptDetector()
@@ -1429,11 +1387,7 @@ class TestJITScriptDetector:
             + b"rp.run_path('payload.py')\n"
         )
 
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert not any(
-            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
-        )
+        _assert_jit_scan_without_pattern(detector, source, "payload.bin", "Dynamic module execution detected")
 
     def test_priority_import_offsets_ignore_non_executable_import_text(self) -> None:
         source = (
@@ -1467,24 +1421,14 @@ class TestJITScriptDetector:
         )
         source = b"\x00\xff" + import_decoys + b"import os as alias\nalias.system('payload')\n"
 
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            finding.type == "code_execution_pattern" and finding.pattern == "OS command execution detected"
-            for finding in findings
-        )
+        _assert_jit_scan_pattern(detector, source, "payload.bin", "OS command execution detected")
 
     def test_scan_model_ignores_priority_import_decoys_before_late_dangerous_import(self) -> None:
         detector = JITScriptDetector()
         import_decoys = b"# import os\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPETS + 2)
         source = b"\x00\xff" + import_decoys + b"import os as alias\nalias.system('payload')\n"
 
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            finding.type == "code_execution_pattern" and finding.pattern == "OS command execution detected"
-            for finding in findings
-        )
+        _assert_jit_scan_pattern(detector, source, "payload.bin", "OS command execution detected")
 
     def test_scan_model_keeps_late_semicolon_priority_import(self) -> None:
         detector = JITScriptDetector()
@@ -1570,12 +1514,7 @@ class TestJITScriptDetector:
             b"else: from webbrowser import open as opener; opener('https://example.invalid')\n"
         )
 
-        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
-            for finding in findings
-        )
+        _assert_jit_scan_pattern(JITScriptDetector(), source, "payload.bin", "Web browser launch detected")
 
     def test_scan_model_probes_import_after_duplicate_else_header(self) -> None:
         source = (
@@ -1586,12 +1525,7 @@ class TestJITScriptDetector:
             b"else: from webbrowser import open as opener; opener('https://example.invalid')\n"
         )
 
-        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
-            for finding in findings
-        )
+        _assert_jit_scan_pattern(JITScriptDetector(), source, "payload.bin", "Web browser launch detected")
 
     @pytest.mark.parametrize(("condition", "should_detect"), [(b"True", False), (b"False", True)])
     def test_scan_model_preserves_context_for_same_line_continuation_import(
@@ -2036,11 +1970,7 @@ class TestJITScriptDetector:
             + b"b('payload.py')\n"
         )
 
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
-        )
+        _assert_jit_scan_pattern(detector, source, "payload.bin", "Dynamic module execution detected")
 
     def test_scan_model_ignores_unrelated_assignment_alias_before_delayed_priority_call(self) -> None:
         detector = JITScriptDetector()
@@ -2085,11 +2015,7 @@ class TestJITScriptDetector:
             b"    run = runpy.run_path\n" + padding + b"    return run('payload.py')\n"
         )
 
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
-        )
+        _assert_jit_scan_pattern(detector, source, "payload.bin", "Dynamic module execution detected")
 
     @pytest.mark.parametrize(
         "call_line",
@@ -2407,11 +2333,7 @@ class TestJITScriptDetector:
             b"\x00\xffimport runpy as rp\n" + padding + b"(rp.run_path if True else print)('payload.py')\n" + padding
         )
 
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
-        )
+        _assert_jit_scan_pattern(detector, source, "payload.bin", "Dynamic module execution detected")
 
     def test_scan_model_ignores_late_statically_safe_conditional_expression_alias_call(self) -> None:
         detector = JITScriptDetector()
@@ -2429,11 +2351,7 @@ class TestJITScriptDetector:
         padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
         source = b"\x00\xffimport runpy as rp\n" + padding + b"for f in [rp.run_path]: f('payload.py')\n" + padding
 
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
-        )
+        _assert_jit_scan_pattern(detector, source, "payload.bin", "Dynamic module execution detected")
 
     def test_scan_model_detects_late_compound_alias_call(self) -> None:
         detector = JITScriptDetector()
@@ -2445,33 +2363,21 @@ class TestJITScriptDetector:
             + padding
         )
 
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
-        )
+        _assert_jit_scan_pattern(detector, source, "payload.bin", "Dynamic module execution detected")
 
     def test_scan_model_detects_late_same_line_assignment_alias_call(self) -> None:
         detector = JITScriptDetector()
         padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
         source = b"\x00\xffimport runpy as rp\n" + padding + b"x = 0; rp.run_path('payload.py')\n" + padding
 
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
-        )
+        _assert_jit_scan_pattern(detector, source, "payload.bin", "Dynamic module execution detected")
 
     def test_scan_model_detects_late_vars_alias_lookup_call(self) -> None:
         detector = JITScriptDetector()
         padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
         source = b"\x00\xffimport ctypes as c\n" + padding + b"vars(c)['CDLL']('payload')\n" + padding
 
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            f.type == "code_execution_pattern" and f.pattern == "Native library loading detected" for f in findings
-        )
+        _assert_jit_scan_pattern(detector, source, "payload.bin", "Native library loading detected")
 
     def test_scan_model_ignores_long_chain_after_safe_module_rebind(self) -> None:
         detector = JITScriptDetector()
@@ -2739,25 +2645,7 @@ class TestJITScriptDetector:
     def test_scan_model_resolves_late_parenthesized_alias_dependencies_at_rebind_time(
         self, late_state: bytes, expect_finding: bool
     ) -> None:
-        detector = JITScriptDetector()
-        leading_blocks = b"".join(
-            f"def benign_{index}():\n    return {index}\n}}\x00".encode()
-            for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
-        )
-        padding_line = b"# pad\n"
-        padding = padding_line * (
-            jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(padding_line) + 8
-        )
-        source = (
-            b"\x00\xff" + leading_blocks + b"from runpy import run_path as runner\n" + padding + late_state + padding
-        )
-
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-        has_dynamic_finding = any(
-            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
-        )
-
-        assert has_dynamic_finding is expect_finding
+        _assert_late_alias_rebind_detection(late_state, expect_finding)
 
     def test_scan_model_ignores_passive_alias_members_before_late_parenthesized_call(self) -> None:
         detector = JITScriptDetector()
@@ -2827,25 +2715,7 @@ class TestJITScriptDetector:
     def test_scan_model_handles_constant_guarded_late_alias_rebindings(
         self, late_state: bytes, expect_finding: bool
     ) -> None:
-        detector = JITScriptDetector()
-        leading_blocks = b"".join(
-            f"def benign_{index}():\n    return {index}\n}}\x00".encode()
-            for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS + 2)
-        )
-        padding_line = b"# pad\n"
-        padding = padding_line * (
-            jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(padding_line) + 8
-        )
-        source = (
-            b"\x00\xff" + leading_blocks + b"from runpy import run_path as runner\n" + padding + late_state + padding
-        )
-
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-        has_dynamic_finding = any(
-            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
-        )
-
-        assert has_dynamic_finding is expect_finding
+        _assert_late_alias_rebind_detection(late_state, expect_finding)
 
     @pytest.mark.parametrize(
         ("guard", "expect_finding"),
@@ -2987,15 +2857,7 @@ class TestJITScriptDetector:
         ],
     )
     def test_scan_model_detects_late_alias_after_uncertain_safe_overwrite(self, late_state: bytes) -> None:
-        detector = JITScriptDetector()
-        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
-        source = b"\x00\xffimport runpy as rp\n" + padding + late_state + padding
-
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
-        )
+        _assert_late_runpy_alias_detected(late_state)
 
     @pytest.mark.parametrize(
         "late_state",
@@ -3020,15 +2882,7 @@ class TestJITScriptDetector:
         ],
     )
     def test_scan_model_detects_late_alias_after_non_executed_safe_shadow(self, late_state: bytes) -> None:
-        detector = JITScriptDetector()
-        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
-        source = b"\x00\xffimport runpy as rp\n" + padding + late_state + padding
-
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
-        )
+        _assert_late_runpy_alias_detected(late_state)
 
     def test_scan_model_detects_retained_alias_after_raising_late_with_shadow(self) -> None:
         detector = JITScriptDetector()
@@ -3052,12 +2906,7 @@ class TestJITScriptDetector:
         padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
         source = b"\x00\xffimport ctypes as c\n" + padding + b"loader = c.cdll\nloader.msvcrt\n" + padding
 
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Native library loading detected"
-            for finding in findings
-        )
+        _assert_jit_scan_pattern(detector, source, "payload.bin", "Native library loading detected")
 
     @pytest.mark.parametrize(
         ("prefix", "late_state", "expected_pattern"),
@@ -3103,15 +2952,7 @@ class TestJITScriptDetector:
     def test_scan_model_detects_boolean_fallback_after_static_builtin_mapping_mutation(
         self, prefix: bytes, late_state: bytes, expected_pattern: str
     ) -> None:
-        detector = JITScriptDetector()
-        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
-        source = b"\x00\xff" + prefix + padding + late_state + padding
-
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            finding.type == "code_execution_pattern" and finding.pattern == expected_pattern for finding in findings
-        )
+        _assert_late_typed_member_detected(prefix, late_state, expected_pattern)
 
     @pytest.mark.parametrize(
         ("prefix", "late_state", "unexpected_pattern"),
@@ -4910,15 +4751,7 @@ class TestJITScriptDetector:
     def test_scan_model_preserves_dangerous_typed_member_captured_before_safe_overwrite(
         self, prefix: bytes, late_state: bytes, expected_pattern: str
     ) -> None:
-        detector = JITScriptDetector()
-        padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
-        source = b"\x00\xff" + prefix + padding + late_state + padding
-
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            finding.type == "code_execution_pattern" and finding.pattern == expected_pattern for finding in findings
-        )
+        _assert_late_typed_member_detected(prefix, late_state, expected_pattern)
 
     def test_scan_model_detects_native_load_in_rebound_typed_member_self_write(self) -> None:
         detector = JITScriptDetector()
@@ -4930,12 +4763,7 @@ class TestJITScriptDetector:
             + padding
         )
 
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Native library loading detected"
-            for finding in findings
-        )
+        _assert_jit_scan_pattern(detector, source, "payload.bin", "Native library loading detected")
 
     def test_scan_model_detects_typed_member_restore_after_state_overflow(self) -> None:
         detector = JITScriptDetector()
@@ -6508,11 +6336,7 @@ class TestJITScriptDetector:
         )
         source = b"\x00\xff" + leading_blocks + b"from runpy import *\n" + padding + b"run_path('payload.py')\n"
 
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
-        )
+        _assert_jit_scan_pattern(detector, source, "payload.bin", "Dynamic module execution detected")
 
     def test_scan_model_preserves_raw_runpy_hit_in_compacted_priority_gap(self) -> None:
         detector = JITScriptDetector()
@@ -6551,11 +6375,7 @@ class TestJITScriptDetector:
             + b"    return rp.run_path('payload.py')\n"
         )
 
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
-        )
+        _assert_jit_scan_pattern(detector, source, "payload.bin", "Dynamic module execution detected")
 
     def test_embedded_python_prefix_context_tail_starts_are_bounded(self) -> None:
         prefix = b"\x00\xffimport runpy as rp\n" + b"# prefix\n" * 1024
@@ -6665,12 +6485,7 @@ class TestJITScriptDetector:
         ],
     )
     def test_scan_model_detects_dangerous_dunder_builtins_access(self, body: str) -> None:
-        detector = JITScriptDetector()
-        data = f"\x00\xffdef payload(value):\n    {body}\n".encode()
-
-        findings = detector.scan_model(data, "pytorch", "payload.bin")
-
-        assert any(finding.type == "dangerous_builtin" and finding.builtin == "eval" for finding in findings)
+        _assert_eval_body_detected(body)
 
     @pytest.mark.parametrize(
         "body",
@@ -6738,11 +6553,7 @@ class TestJITScriptDetector:
         ],
     )
     def test_scan_model_detects_dangerous_builtins_across_extended_alias_transfers(self, data: bytes) -> None:
-        detector = JITScriptDetector()
-
-        findings = detector.scan_model(data, "pytorch", "payload.bin")
-
-        assert any(finding.type == "dangerous_builtin" and finding.builtin == "eval" for finding in findings)
+        _assert_eval_builtin_detected(data)
 
     @pytest.mark.parametrize(
         "data",
@@ -6790,12 +6601,7 @@ class TestJITScriptDetector:
         ],
     )
     def test_scan_model_avoids_false_positives_across_extended_alias_transfers(self, data: bytes) -> None:
-        detector = JITScriptDetector()
-
-        findings = detector.scan_model(data, "pytorch", "payload.bin")
-
-        assert not any(finding.type == "dangerous_builtin" for finding in findings)
-        assert not any(finding.severity == "CRITICAL" for finding in findings)
+        _assert_no_critical_builtin_findings(data)
 
     @pytest.mark.parametrize(
         "data",
@@ -6997,11 +6803,7 @@ class TestJITScriptDetector:
         ],
     )
     def test_scan_model_detects_dangerous_builtins_across_callable_summaries(self, data: bytes) -> None:
-        detector = JITScriptDetector()
-
-        findings = detector.scan_model(data, "pytorch", "payload.bin")
-
-        assert any(finding.type == "dangerous_builtin" and finding.builtin == "eval" for finding in findings)
+        _assert_eval_builtin_detected(data)
 
     @pytest.mark.parametrize(
         "source",
@@ -7482,12 +7284,7 @@ class TestJITScriptDetector:
         ],
     )
     def test_scan_model_avoids_false_positives_across_callable_summaries(self, data: bytes) -> None:
-        detector = JITScriptDetector()
-
-        findings = detector.scan_model(data, "pytorch", "payload.bin")
-
-        assert not any(finding.type == "dangerous_builtin" for finding in findings)
-        assert not any(finding.severity == "CRITICAL" for finding in findings)
+        _assert_no_critical_builtin_findings(data)
 
     @pytest.mark.parametrize(
         ("data", "expected"),
@@ -7586,12 +7383,7 @@ class TestJITScriptDetector:
         detector = JITScriptDetector()
         data = b"\x00\xffimport runpy\nrunpy.run_path = print\nimport ctypes\nctypes.CDLL('libpayload.so')\n"
 
-        findings = detector.scan_model(data, "pytorch", "payload.bin")
-
-        assert any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Native library loading detected"
-            for finding in findings
-        )
+        _assert_jit_scan_pattern(detector, data, "payload.bin", "Native library loading detected")
 
     def test_scan_model_keeps_other_runpy_member_after_safe_deferred_overwrite(self) -> None:
         """Call-specific runpy suppression must not erase a different dangerous member."""
@@ -7604,12 +7396,7 @@ class TestJITScriptDetector:
             b"alias.run_module('payload')\n"
         )
 
-        findings = detector.scan_model(data, "pytorch", "payload.py")
-
-        assert any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
-            for finding in findings
-        )
+        _assert_jit_scan_pattern(detector, data, "payload.py", "Dynamic module execution detected")
 
     def test_scan_model_does_not_decode_unbounded_binary_for_suppression(
         self,
@@ -7676,12 +7463,7 @@ class TestJITScriptDetector:
     def test_scan_model_keeps_dangerous_typed_call_when_safe_overwrite_is_unproven(self, data: bytes) -> None:
         detector = JITScriptDetector()
 
-        findings = detector.scan_model(data, "pytorch", "payload.py")
-
-        assert any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
-            for finding in findings
-        )
+        _assert_jit_scan_pattern(detector, data, "payload.py", "Web browser launch detected")
 
     @pytest.mark.parametrize(
         ("data", "expected_pattern"),
@@ -7719,27 +7501,340 @@ class TestJITScriptDetector:
             finding.type == "code_execution_pattern" and finding.pattern == expected_pattern for finding in findings
         )
 
-    def test_scan_model_keeps_original_alias_after_uncertain_try_rebind(self) -> None:
-        source = (
-            b"import webbrowser as wb\nactual = wb\ntry:\n    wb = object()\n"
-            b"except Exception:\n    pass\nwb.open = print\nactual.open('https://example.invalid')\n"
-        )
+    @pytest.mark.parametrize(
+        ("source", "expected_pattern"),
+        [
+            pytest.param(
+                b"import webbrowser as wb\nactual = wb\ntry:\n    wb = object()\n"
+                b"except Exception:\n    pass\nwb.open = print\nactual.open('https://example.invalid')\n",
+                "Web browser launch detected",
+                id="test_scan_model_keeps_original_alias_after_uncertain_try_rebind",
+            ),
+            pytest.param(
+                b"import builtins, webbrowser as wb\n"
+                b"class Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n        pass\n"
+                b"(mapping := builtins.__dict__).update(dict=Safe)\n"
+                b"dict.update(wb.__dict__, open=print)\nwb.open('https://example.invalid')\n",
+                "Web browser launch detected",
+                id="test_scan_model_rejects_dict_update_after_walrus_builtin_dict_shadow",
+            ),
+            pytest.param(
+                b"import webbrowser as wb\nclass Safe:\n"
+                b"    @staticmethod\n    def update(*args, **kwargs):\n        pass\n"
+                b"dict = Safe\nupdate: object = dict.update\n"
+                b"update(wb.__dict__, open=print)\nwb.open('https://example.invalid')\n",
+                "Web browser launch detected",
+                id="test_scan_model_rejects_annotated_dict_update_alias_after_shadow",
+            ),
+            pytest.param(
+                b"import sys, webbrowser as wb\nwb.open = print\n"
+                b"sys.modules.__setitem__('webbrowser', object())\n"
+                b"import webbrowser as wb2\nwb2.open('https://example.invalid')\n",
+                "Web browser launch detected",
+                id="test_scan_model_invalidates_safe_overwrite_across_sys_modules_setitem",
+            ),
+            pytest.param(
+                b"import runpy as rp\nprint = eval\nrp.run_path = print\nrp.run_path('payload.py')\n",
+                "Dynamic module execution detected",
+                id="test_scan_model_rejects_runpy_overwrite_after_print_shadow",
+            ),
+            pytest.param(
+                b"import webbrowser as wb\noriginal = wb.open\nwb.open = print\n"
+                b"if flag:\n    wb.open = original\n"
+                b"((wb).open)('https://collector.evil')\n",
+                "Web browser launch detected",
+                id="test_scan_model_invalidates_safe_member_in_uncertain_branch",
+            ),
+            pytest.param(
+                b"from webbrowser import open as opener\n"
+                b"import webbrowser as wb\n"
+                b"wb.open = print\n"
+                b"opener('https://example.invalid')\n",
+                "Web browser launch detected",
+                id="test_scan_model_keeps_typed_call_imported_before_safe_overwrite",
+            ),
+            pytest.param(
+                b"import builtins\nimport webbrowser as wb\n"
+                b"class Holder:\n    print = input\n"
+                b"builtins = Holder\nwb.open = builtins.print\n"
+                b"wb.open('https://example.invalid')\n",
+                "Web browser launch detected",
+                id="test_scan_model_rejects_print_attribute_on_rebound_builtins_name",
+            ),
+            pytest.param(
+                b"import builtins as bi\nimport ctypes as c\n"
+                b"class Lazy:\n    @staticmethod\n    def list(values):\n        return values\n"
+                b"((bi := Lazy), bi.list(c.__dict__.update(CDLL=print) for _ in [0]))\n"
+                b"loader = c.CDLL\nloader('libpayload.so')\n",
+                "Native library loading detected",
+                id="test_scan_model_rejects_lazy_consumer_after_same_expression_builtins_rebind",
+            ),
+            pytest.param(
+                b"import builtins as bi\nimport ctypes as c\nloader = c.CDLL\n"
+                b"bi.list((loader := print) for _ in [0] for __ in [])\n"
+                b"loader('libpayload.so')\n",
+                "Native library loading detected",
+                id="test_scan_model_keeps_alias_when_eager_generator_inner_iterable_is_empty",
+            ),
+            pytest.param(
+                b"import webbrowser as wb\noriginal = wb.open\nwb.open = print\n"
+                b"from webbrowser import open as opener\n"
+                b"if condition:\n    wb.open = original\n    from webbrowser import open as opener\n"
+                b"opener('https://example.invalid')\n",
+                "Web browser launch detected",
+                id="test_scan_model_keeps_dangerous_import_after_uncertain_member_restore",
+            ),
+            pytest.param(
+                b"import builtins\nimport webbrowser as wb\noriginal = wb.open\n"
+                b"if condition:\n    setattr(builtins, 'print', original)\n"
+                b"wb.open = builtins.print\nwb.open('https://example.invalid')\n",
+                "Web browser launch detected",
+                id="test_scan_model_rejects_uncertain_builtin_print_helper_mutation",
+            ),
+            pytest.param(
+                b"import builtins\nimport webbrowser as wb\noriginal = wb.open\n"
+                b"builtins.print = builtins = original\n"
+                b"wb.open = print\nwb.open('https://example.invalid')\n",
+                "Web browser launch detected",
+                id="test_scan_model_tracks_builtin_mutation_before_chained_rebind",
+            ),
+            pytest.param(
+                b"import builtins\nimport webbrowser as wb\n"
+                b"original = wb.open\nbuiltins.print = original\n"
+                b"mutated_print = builtins.print\n"
+                b"builtins.print = mutated_print\n"
+                b"wb.open = builtins.print\nwb.open('https://example.invalid')\n",
+                "Web browser launch detected",
+                id="test_scan_model_rejects_restored_mutated_builtin_print_alias",
+            ),
+            pytest.param(
+                b"import builtins\nimport webbrowser as wb\n"
+                b"original = wb.open\nmember = 'print'\n"
+                b"builtins.__dict__[member] = original\n"
+                b"wb.open = builtins.print\nwb.open('https://example.invalid')\n",
+                "Web browser launch detected",
+                id="test_scan_model_rejects_dynamic_builtin_print_mapping_mutation",
+            ),
+            pytest.param(
+                b"import webbrowser as wb\n"
+                b"original = wb.open\n"
+                b"wb.open = print\n"
+                b"from webbrowser import open as opener\n"
+                b"if condition:\n    opener = original\n"
+                b"opener('https://example.invalid')\n",
+                "Web browser launch detected",
+                id="test_scan_model_keeps_maybe_dangerous_imported_callable_rebinding",
+            ),
+            pytest.param(
+                b"from webbrowser import open as opener\n"
+                b"import webbrowser as wb\n"
+                b"wb.open = print\n"
+                b"if condition:\n    from webbrowser import open as opener\n"
+                b"opener('https://example.invalid')\n",
+                "Web browser launch detected",
+                id="test_scan_model_keeps_dangerous_callable_across_uncertain_reimport",
+            ),
+            pytest.param(
+                b"import webbrowser as wb\nwb.open = print\n"
+                b"if condition:\n    print = input\n    wb.open = print\n"
+                b"wb.open('https://example.invalid')\n",
+                "Web browser launch detected",
+                id="test_scan_model_rejects_uncertain_member_write_after_branch_print_shadow",
+            ),
+            pytest.param(
+                b"import webbrowser as wb\n"
+                b"[wb.__dict__.update(open=print) for _ in values]\n"
+                b"wb.open('https://example.invalid')\n",
+                "Web browser launch detected",
+                id="test_scan_model_treats_comprehension_typed_write_as_conditional",
+            ),
+            pytest.param(
+                b"import webbrowser as wb\noriginal = wb.open\nwb.open = print\n"
+                b"getattr(wb, '__dict__')['open'] = original\nwb.open('https://example.invalid')\n",
+                "Web browser launch detected",
+                id="test_scan_model_tracks_getattr_typed_mapping_restore",
+            ),
+        ],
+    )
+    def test_scan_model_retains_unproven_typed_member_overwrites(self, source: bytes, expected_pattern: str) -> None:
+        _assert_typed_member_detected(source, expected_pattern)
 
-        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
-
-        assert any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
-            for finding in findings
-        )
-
-    def test_scan_model_allows_safe_overwrite_after_non_raising_try(self) -> None:
-        source = b"import webbrowser as wb\ntry:\n    wb.open = print\nexcept Exception:\n    pass\nwb.open('safe')\n"
-
+    @pytest.mark.parametrize(
+        ("source", "expected_pattern"),
+        [
+            pytest.param(
+                b"import webbrowser as wb\ntry:\n    wb.open = print\nexcept Exception:\n    pass\nwb.open('safe')\n",
+                "Web browser launch detected",
+                id="test_scan_model_allows_safe_overwrite_after_non_raising_try",
+            ),
+            pytest.param(
+                b"import webbrowser as wb\n(mapping := wb.__dict__).update(open=print)\nwb.open('safe')\n",
+                "Web browser launch detected",
+                id="test_scan_model_allows_safe_update_through_walrus_mapping_receiver",
+            ),
+            pytest.param(
+                b"import sys, webbrowser as wb\nwb.open = print\n"
+                b"sys.modules.setdefault('webbrowser', object())\n"
+                b"import webbrowser as wb2\nwb2.open('safe')\n",
+                "Web browser launch detected",
+                id="test_scan_model_preserves_safe_overwrite_across_sys_modules_setdefault",
+            ),
+            pytest.param(
+                b"import webbrowser as wb\nclass C:\n    wb = object()\n    wb.open = print\n    wb.open('safe')\n",
+                "Web browser launch detected",
+                id="test_scan_model_ignores_safe_class_local_module_alias_call",
+            ),
+            pytest.param(
+                b"import webbrowser as wb\nclass Base:\n    pass\nclass Trap(Base):\n    pass\n"
+                b"holder = Base()\nholder.__class__ = Trap\nwb.open = print\nwb.open('safe')\n",
+                "Web browser launch detected",
+                id="test_scan_model_ignores_unrelated_object_class_mutation_before_safe_overwrite",
+            ),
+            pytest.param(
+                b"import webbrowser as old, types, sys\nclass Trap(types.ModuleType):\n    pass\n"
+                b"old.__class__ = Trap\ndel sys.modules['webbrowser']\nimport webbrowser as fresh\n"
+                b"fresh.open = print\nfresh.open('safe')\n",
+                "Web browser launch detected",
+                id="test_scan_model_allows_safe_overwrite_on_fresh_module_generation_after_class_mutation",
+            ),
+            pytest.param(
+                b"import runpy as rp\nrp.run_path = print\nprint = eval\nrp.run_path('safe')\n",
+                "Dynamic module execution detected",
+                id="test_scan_model_preserves_safe_runpy_overwrite_before_print_shadow",
+            ),
+            pytest.param(
+                b"import webbrowser as wb\noriginal = wb.open\nwb.open = print\n"
+                b"other = {}\nother['open'] = original\nwb.open('safe')\n",
+                "Web browser launch detected",
+                id="test_scan_model_ignores_unrelated_mapping_assignment_after_typed_safe_overwrite",
+            ),
+            pytest.param(
+                b"import webbrowser as wb\nwb.open = print\nfrom webbrowser import open as opener\nopener('safe')\n",
+                "Web browser launch detected",
+                id="test_scan_model_suppresses_typed_call_imported_after_safe_overwrite",
+            ),
+            pytest.param(
+                b"import webbrowser as wb\n"
+                b"list(x for _ in [0] for __ in (setattr(wb, 'open', print),))\nwb.open('safe')\n",
+                "Web browser launch detected",
+                id="test_scan_model_suppresses_safe_eager_nested_generator_iterable_mutation",
+            ),
+            pytest.param(
+                b"import ctypes as c\nunused = ((print := eval) for _ in [])\nc.CDLL = print\nc.CDLL('safe')\n",
+                "Native library loading detected",
+                id="test_scan_model_accepts_builtin_print_after_statically_empty_generator_walrus",
+            ),
+            pytest.param(
+                b"import builtins\nimport webbrowser as wb\n"
+                b"builtins.print = builtins.print\n"
+                b"wb.open = builtins.print\n"
+                b"wb.open('safe')\n",
+                "Web browser launch detected",
+                id="test_scan_model_accepts_self_assignment_of_builtin_print",
+            ),
+            pytest.param(
+                b"import webbrowser as wb\nwb.open = print\n"
+                b"if condition:\n    wb = Holder\nelse:\n    wb.open = print\n"
+                b"wb.open('safe')\n",
+                "Web browser launch detected",
+                id="test_scan_model_accepts_safe_else_after_uncertain_typed_alias_rebind",
+            ),
+            pytest.param(
+                b"import builtins\nimport webbrowser as wb\noriginal = wb.open\n"
+                b"try:\n    setattr(builtins.__dict__, 'print', original)\n"
+                b"except AttributeError:\n    pass\nwb.open = builtins.print\nwb.open('safe')\n",
+                "Web browser launch detected",
+                id="test_scan_model_ignores_failed_dangerous_setattr_on_builtin_mapping",
+            ),
+            pytest.param(
+                b"import builtins\nimport webbrowser as wb\n"
+                b"(builtins, wb.open) = (object(), builtins.print)\n"
+                b"wb.open('safe')\n",
+                "Web browser launch detected",
+                id="test_scan_model_uses_preassignment_builtin_value_in_destructuring",
+            ),
+            pytest.param(
+                b"from webbrowser import open as opener\n"
+                b"if condition:\n    opener = print\nelse:\n    opener = print\n"
+                b"opener('safe')\n",
+                "Web browser launch detected",
+                id="test_scan_model_clears_callable_alias_overwritten_in_all_branches",
+            ),
+            pytest.param(
+                b"import builtins\nimport webbrowser as wb\n"
+                b"original_print = builtins.print\n"
+                b"builtins.print = input\n"
+                b"builtins.print = original_print\n"
+                b"wb.open = builtins.print\nwb.open('safe')\n",
+                "Web browser launch detected",
+                id="test_scan_model_accepts_restored_original_builtin_print",
+            ),
+            pytest.param(
+                b"import builtins\nimport builtins as bi\nimport webbrowser as wb\n"
+                b"if condition:\n    bi = builtins\n"
+                b"wb.open = bi.print\nwb.open('safe')\n",
+                "Web browser launch detected",
+                id="test_scan_model_accepts_uncertain_builtin_to_builtin_alias_rebinding",
+            ),
+            pytest.param(
+                b"import builtins\nimport webbrowser as wb\n"
+                b"if condition:\n    print = input\n    print = builtins.print\n"
+                b"wb.open = print\nwb.open('safe')\n",
+                "Web browser launch detected",
+                id="test_scan_model_accepts_branch_local_builtin_print_restoration",
+            ),
+            pytest.param(
+                b"import builtins\nimport webbrowser as wb\n"
+                b"if condition:\n    captured = builtins.print\n"
+                b"else:\n    captured = builtins.print\n"
+                b"wb.open = captured\nwb.open('safe')\n",
+                "Web browser launch detected",
+                id="test_scan_model_accepts_safe_print_alias_assigned_on_every_branch",
+            ),
+            pytest.param(
+                b"import webbrowser as wb\n"
+                b"put = dict.setdefault\n"
+                b"del wb.open\n"
+                b"put(wb.__dict__, 'open', print)\n"
+                b"wb.open('safe')\n",
+                "Web browser launch detected",
+                id="test_scan_model_tracks_dict_setdefault_alias_for_typed_member_restore",
+            ),
+            pytest.param(
+                b"import runpy as rp\n[rp.__dict__.update(run_path=print) for _ in [0]]\nrp.run_path('payload.py')\n",
+                "Dynamic module execution detected",
+                id="test_scan_model_replays_definitely_executed_comprehension_runpy_write",
+            ),
+            pytest.param(
+                b"import webbrowser as wb\noriginal = wb.open\nwb.open = print\n"
+                b"delattr = lambda *args: None\ndelattr(wb, 'open')\n"
+                b"wb.__dict__.setdefault('open', original)\nwb.open('safe')\n",
+                "Web browser launch detected",
+                id="test_scan_model_ignores_shadowed_typed_delattr_before_setdefault",
+            ),
+            pytest.param(
+                b"import webbrowser as wb\noriginal = wb.open\nwb.open = print\n"
+                b"getattr = lambda *_args: {}\ngetattr(wb, '__dict__')['open'] = original\nwb.open('safe')\n",
+                "Web browser launch detected",
+                id="test_scan_model_ignores_shadowed_getattr_typed_mapping_restore",
+            ),
+            pytest.param(
+                b"import runpy as rp\nflag = False\n"
+                b"rp.__dict__.pop('run_path', None)\n"
+                b"flag and rp.__dict__.setdefault('run_path', print)\n"
+                b"rp.run_path('payload.py')\n",
+                "Dynamic module execution detected",
+                id="test_scan_model_ignores_conditional_safe_setdefault_after_unconditional_delete",
+            ),
+        ],
+    )
+    def test_scan_model_suppresses_proven_safe_typed_member_overwrites(
+        self, source: bytes, expected_pattern: str
+    ) -> None:
         findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
 
         assert not any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
-            for finding in findings
+            finding.type == "code_execution_pattern" and finding.pattern == expected_pattern for finding in findings
         )
 
     def test_scan_model_keeps_original_alias_after_uncertain_try_star_rebind(self) -> None:
@@ -7775,31 +7870,6 @@ class TestJITScriptDetector:
         findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
 
         assert any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
-            for finding in findings
-        )
-
-    def test_scan_model_rejects_dict_update_after_walrus_builtin_dict_shadow(self) -> None:
-        source = (
-            b"import builtins, webbrowser as wb\n"
-            b"class Safe:\n    @staticmethod\n    def update(*args, **kwargs):\n        pass\n"
-            b"(mapping := builtins.__dict__).update(dict=Safe)\n"
-            b"dict.update(wb.__dict__, open=print)\nwb.open('https://example.invalid')\n"
-        )
-
-        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
-
-        assert any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
-            for finding in findings
-        )
-
-    def test_scan_model_allows_safe_update_through_walrus_mapping_receiver(self) -> None:
-        source = b"import webbrowser as wb\n(mapping := wb.__dict__).update(open=print)\nwb.open('safe')\n"
-
-        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
-
-        assert not any(
             finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
             for finding in findings
         )
@@ -7840,49 +7910,6 @@ class TestJITScriptDetector:
         findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
 
         assert not any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
-            for finding in findings
-        )
-
-    def test_scan_model_rejects_annotated_dict_update_alias_after_shadow(self) -> None:
-        source = (
-            b"import webbrowser as wb\nclass Safe:\n"
-            b"    @staticmethod\n    def update(*args, **kwargs):\n        pass\n"
-            b"dict = Safe\nupdate: object = dict.update\n"
-            b"update(wb.__dict__, open=print)\nwb.open('https://example.invalid')\n"
-        )
-
-        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
-
-        assert any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
-            for finding in findings
-        )
-
-    def test_scan_model_preserves_safe_overwrite_across_sys_modules_setdefault(self) -> None:
-        source = (
-            b"import sys, webbrowser as wb\nwb.open = print\n"
-            b"sys.modules.setdefault('webbrowser', object())\n"
-            b"import webbrowser as wb2\nwb2.open('safe')\n"
-        )
-
-        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
-
-        assert not any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
-            for finding in findings
-        )
-
-    def test_scan_model_invalidates_safe_overwrite_across_sys_modules_setitem(self) -> None:
-        source = (
-            b"import sys, webbrowser as wb\nwb.open = print\n"
-            b"sys.modules.__setitem__('webbrowser', object())\n"
-            b"import webbrowser as wb2\nwb2.open('https://example.invalid')\n"
-        )
-
-        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
-
-        assert any(
             finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
             for finding in findings
         )
@@ -7932,16 +7959,6 @@ class TestJITScriptDetector:
 
         assert detected is should_detect
 
-    def test_scan_model_ignores_safe_class_local_module_alias_call(self) -> None:
-        source = b"import webbrowser as wb\nclass C:\n    wb = object()\n    wb.open = print\n    wb.open('safe')\n"
-
-        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
-
-        assert not any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
-            for finding in findings
-        )
-
     @pytest.mark.parametrize(
         ("source", "expected_pattern"),
         [
@@ -7981,38 +7998,7 @@ class TestJITScriptDetector:
         source: bytes,
         expected_pattern: str,
     ) -> None:
-        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
-
-        assert any(
-            finding.type == "code_execution_pattern" and finding.pattern == expected_pattern for finding in findings
-        )
-
-    def test_scan_model_ignores_unrelated_object_class_mutation_before_safe_overwrite(self) -> None:
-        source = (
-            b"import webbrowser as wb\nclass Base:\n    pass\nclass Trap(Base):\n    pass\n"
-            b"holder = Base()\nholder.__class__ = Trap\nwb.open = print\nwb.open('safe')\n"
-        )
-
-        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
-
-        assert not any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
-            for finding in findings
-        )
-
-    def test_scan_model_allows_safe_overwrite_on_fresh_module_generation_after_class_mutation(self) -> None:
-        source = (
-            b"import webbrowser as old, types, sys\nclass Trap(types.ModuleType):\n    pass\n"
-            b"old.__class__ = Trap\ndel sys.modules['webbrowser']\nimport webbrowser as fresh\n"
-            b"fresh.open = print\nfresh.open('safe')\n"
-        )
-
-        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
-
-        assert not any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
-            for finding in findings
-        )
+        _assert_typed_member_detected(source, expected_pattern)
 
     def test_scan_model_keeps_cross_candidate_webbrowser_member_after_safe_call(self) -> None:
         detector = JITScriptDetector()
@@ -8042,12 +8028,7 @@ class TestJITScriptDetector:
             + padding
         )
 
-        findings = detector.scan_model(data, "pytorch", "payload.bin")
-
-        assert any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
-            for finding in findings
-        )
+        _assert_jit_scan_pattern(detector, data, "payload.bin", "Dynamic module execution detected")
 
     def test_scan_model_keeps_runpy_alias_captured_before_safe_overwrite(self) -> None:
         detector = JITScriptDetector()
@@ -8090,12 +8071,7 @@ class TestJITScriptDetector:
     def test_scan_model_keeps_runpy_calls_when_safe_overwrite_helpers_are_shadowed(self, data: bytes) -> None:
         detector = JITScriptDetector()
 
-        findings = detector.scan_model(data, "pytorch", "payload.py")
-
-        assert any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
-            for finding in findings
-        )
+        _assert_jit_scan_pattern(detector, data, "payload.py", "Dynamic module execution detected")
 
     @pytest.mark.parametrize("method", [b"pop", b"__delitem__"])
     def test_scan_model_keeps_runpy_call_after_shadowed_dict_descriptor_delete(self, method: bytes) -> None:
@@ -8236,12 +8212,7 @@ class TestJITScriptDetector:
             b"import runpy as rp\nif True:\n    captured = rp.run_path\nrp.run_path = print\ncaptured('payload.py')\n"
         )
 
-        findings = detector.scan_model(data, "pytorch", "payload.py")
-
-        assert any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
-            for finding in findings
-        )
+        _assert_jit_scan_pattern(detector, data, "payload.py", "Dynamic module execution detected")
 
     def test_scan_model_keeps_runpy_call_after_destructured_member_restore(self) -> None:
         detector = JITScriptDetector()
@@ -8250,23 +8221,13 @@ class TestJITScriptDetector:
             b"(rp.run_path,) = (original,)\nrp.run_path('payload.py')\n"
         )
 
-        findings = detector.scan_model(data, "pytorch", "payload.py")
-
-        assert any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
-            for finding in findings
-        )
+        _assert_jit_scan_pattern(detector, data, "payload.py", "Dynamic module execution detected")
 
     def test_scan_model_ignores_destructured_safe_runpy_overwrite(self) -> None:
         detector = JITScriptDetector()
         data = b"import runpy as rp\nrp.run_path = print\n(rp.run_path,) = (print,)\nrp.run_path('safe')\n"
 
-        findings = detector.scan_model(data, "pytorch", "payload.py")
-
-        assert not any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
-            for finding in findings
-        )
+        _assert_jit_scan_without_pattern(detector, data, "payload.py", "Dynamic module execution detected")
 
     def test_scan_model_uses_explicit_builtins_setattr_after_local_shadow(self) -> None:
         detector = JITScriptDetector()
@@ -8275,23 +8236,13 @@ class TestJITScriptDetector:
             b"builtins.setattr(rp, 'run_path', print)\nrp.run_path('safe')\n"
         )
 
-        findings = detector.scan_model(data, "pytorch", "payload.py")
-
-        assert not any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
-            for finding in findings
-        )
+        _assert_jit_scan_without_pattern(detector, data, "payload.py", "Dynamic module execution detected")
 
     def test_scan_model_ignores_overwritten_runpy_capture(self) -> None:
         detector = JITScriptDetector()
         data = b"import runpy as rp\ncaptured = rp.run_path\ncaptured = print\nrp.run_path = print\ncaptured('safe')\n"
 
-        findings = detector.scan_model(data, "pytorch", "payload.py")
-
-        assert not any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
-            for finding in findings
-        )
+        _assert_jit_scan_without_pattern(detector, data, "payload.py", "Dynamic module execution detected")
 
     def test_scan_model_keeps_propagated_runpy_capture_before_safe_overwrite(self) -> None:
         detector = JITScriptDetector()
@@ -8299,23 +8250,13 @@ class TestJITScriptDetector:
             b"import runpy as rp\ncaptured = rp.run_path\nrelay = captured\nrp.run_path = print\nrelay('payload.py')\n"
         )
 
-        findings = detector.scan_model(data, "pytorch", "payload.py")
-
-        assert any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
-            for finding in findings
-        )
+        _assert_jit_scan_pattern(detector, data, "payload.py", "Dynamic module execution detected")
 
     def test_annotation_only_preserves_runpy_capture(self) -> None:
         detector = JITScriptDetector()
         data = b"import runpy as rp\nrunner = rp.run_path\nrunner: object\nrp.run_path = print\nrunner('payload.py')\n"
 
-        findings = detector.scan_model(data, "pytorch", "payload.py")
-
-        assert any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
-            for finding in findings
-        )
+        _assert_jit_scan_pattern(detector, data, "payload.py", "Dynamic module execution detected")
 
     @pytest.mark.parametrize(
         "data",
@@ -8340,16 +8281,6 @@ class TestJITScriptDetector:
         assert not jit_script_module._compact_snippet_has_shadowed_print(source)
         assert jit_script_module._compact_snippet_runpy_print_overwrite_calls(source) == {("runpy.run_path", "S108")}
 
-    def test_scan_model_preserves_safe_runpy_overwrite_before_print_shadow(self) -> None:
-        source = b"import runpy as rp\nrp.run_path = print\nprint = eval\nrp.run_path('safe')\n"
-
-        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
-
-        assert not any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
-            for finding in findings
-        )
-
     @pytest.mark.parametrize(
         "print_shadow",
         [
@@ -8367,16 +8298,6 @@ class TestJITScriptDetector:
         findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
 
         assert not any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
-            for finding in findings
-        )
-
-    def test_scan_model_rejects_runpy_overwrite_after_print_shadow(self) -> None:
-        source = b"import runpy as rp\nprint = eval\nrp.run_path = print\nrp.run_path('payload.py')\n"
-
-        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
-
-        assert any(
             finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
             for finding in findings
         )
@@ -8453,13 +8374,7 @@ class TestJITScriptDetector:
         source: bytes,
         expected_pattern: str,
     ) -> None:
-        detector = JITScriptDetector()
-
-        findings = detector.scan_model(source, "pytorch", "payload.py")
-
-        assert any(
-            finding.type == "code_execution_pattern" and finding.pattern == expected_pattern for finding in findings
-        )
+        _assert_typed_call_detected(source, expected_pattern)
 
     @pytest.mark.parametrize(
         "binding",
@@ -8492,7 +8407,7 @@ class TestJITScriptDetector:
         dangerous = b"import webbrowser as wb\nwb.open('https://example.invalid')\n"
         dangerous_start = len(safe) + 1
         data = safe + b"\x00" + dangerous
-        candidates: list[jit_script_module._EmbeddedPythonCandidate] = [
+        candidates: list[jit_script_module._SelectedEmbeddedPythonCandidate] = [
             (safe, (0, len(safe)), ((0, len(safe)),)),
             (
                 dangerous,
@@ -8533,35 +8448,19 @@ class TestJITScriptDetector:
         source: bytes,
         expected_pattern: str,
     ) -> None:
-        detector = JITScriptDetector()
-
-        findings = detector.scan_model(source, "pytorch", "payload.py")
-
-        assert any(
-            finding.type == "code_execution_pattern" and finding.pattern == expected_pattern for finding in findings
-        )
+        _assert_typed_call_detected(source, expected_pattern)
 
     def test_scan_model_keeps_runpy_call_after_module_alias_reassignment(self) -> None:
         detector = JITScriptDetector()
         data = b"import runpy as rp\nactual = rp\nrp = object()\nrp.run_path = print\nactual.run_path('payload.py')\n"
 
-        findings = detector.scan_model(data, "pytorch", "payload.py")
-
-        assert any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
-            for finding in findings
-        )
+        _assert_jit_scan_pattern(detector, data, "payload.py", "Dynamic module execution detected")
 
     def test_scan_model_preserves_safe_runpy_alias_after_other_alias_reassignment(self) -> None:
         detector = JITScriptDetector()
         data = b"import runpy as rp\nactual = rp\nactual.run_path = print\nrp = object()\nactual.run_path('safe')\n"
 
-        findings = detector.scan_model(data, "pytorch", "payload.py")
-
-        assert not any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
-            for finding in findings
-        )
+        _assert_jit_scan_without_pattern(detector, data, "payload.py", "Dynamic module execution detected")
 
     def test_scan_model_keeps_runpy_call_after_possible_alias_reassignment(self) -> None:
         detector = JITScriptDetector()
@@ -8570,12 +8469,7 @@ class TestJITScriptDetector:
             b"rp.run_path = print\nrunpy.run_path('payload.py')\n"
         )
 
-        findings = detector.scan_model(data, "pytorch", "payload.py")
-
-        assert any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
-            for finding in findings
-        )
+        _assert_jit_scan_pattern(detector, data, "payload.py", "Dynamic module execution detected")
 
     def test_scan_model_keeps_runpy_call_after_import_context_alias_reassignment(self) -> None:
         detector = JITScriptDetector()
@@ -8587,12 +8481,7 @@ class TestJITScriptDetector:
             + padding
         )
 
-        findings = detector.scan_model(data, "pytorch", "payload.bin")
-
-        assert any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
-            for finding in findings
-        )
+        _assert_jit_scan_pattern(detector, data, "payload.bin", "Dynamic module execution detected")
 
     @pytest.mark.parametrize(
         ("source", "expected_pattern"),
@@ -8612,13 +8501,7 @@ class TestJITScriptDetector:
         source: bytes,
         expected_pattern: str,
     ) -> None:
-        detector = JITScriptDetector()
-
-        findings = detector.scan_model(source, "pytorch", "payload.py")
-
-        assert any(
-            finding.type == "code_execution_pattern" and finding.pattern == expected_pattern for finding in findings
-        )
+        _assert_typed_call_detected(source, expected_pattern)
 
     @pytest.mark.parametrize(
         ("source", "expected_pattern"),
@@ -8645,35 +8528,19 @@ class TestJITScriptDetector:
         source: bytes,
         expected_pattern: str,
     ) -> None:
-        detector = JITScriptDetector()
-
-        findings = detector.scan_model(source, "pytorch", "payload.py")
-
-        assert any(
-            finding.type == "code_execution_pattern" and finding.pattern == expected_pattern for finding in findings
-        )
+        _assert_typed_call_detected(source, expected_pattern)
 
     def test_scan_model_preserves_safe_runpy_member_after_trailing_static_update(self) -> None:
         detector = JITScriptDetector()
         data = b"import runpy as rp\nupdates = {}\nrp.__dict__.update(updates, run_path=print)\nrp.run_path('safe')\n"
 
-        findings = detector.scan_model(data, "pytorch", "payload.py")
-
-        assert not any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
-            for finding in findings
-        )
+        _assert_jit_scan_without_pattern(detector, data, "payload.py", "Dynamic module execution detected")
 
     def test_scan_model_ignores_restored_runpy_member_without_call(self) -> None:
         detector = JITScriptDetector()
         data = b"import runpy\noriginal = runpy.run_path\nrunpy.run_path = print\nrunpy.run_path = original\n"
 
-        findings = detector.scan_model(data, "pytorch", "payload.py")
-
-        assert not any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
-            for finding in findings
-        )
+        _assert_jit_scan_without_pattern(detector, data, "payload.py", "Dynamic module execution detected")
 
     def test_scan_model_ignores_stale_runpy_mapping_alias_reassignment(self) -> None:
         detector = JITScriptDetector()
@@ -8682,12 +8549,7 @@ class TestJITScriptDetector:
             b"namespace = rp.__dict__\nnamespace = {}\nnamespace.update(run_path=original)\nrp.run_path('safe')\n"
         )
 
-        findings = detector.scan_model(data, "pytorch", "payload.py")
-
-        assert not any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
-            for finding in findings
-        )
+        _assert_jit_scan_without_pattern(detector, data, "payload.py", "Dynamic module execution detected")
 
     @pytest.mark.parametrize(
         ("source", "expected_pattern"),
@@ -8760,13 +8622,7 @@ class TestJITScriptDetector:
         source: bytes,
         expected_pattern: str,
     ) -> None:
-        detector = JITScriptDetector()
-
-        findings = detector.scan_model(source, "pytorch", "payload.py")
-
-        assert any(
-            finding.type == "code_execution_pattern" and finding.pattern == expected_pattern for finding in findings
-        )
+        _assert_typed_call_detected(source, expected_pattern)
 
     @pytest.mark.parametrize(
         "source",
@@ -8954,13 +8810,7 @@ class TestJITScriptDetector:
         source: bytes,
         expected_pattern: str,
     ) -> None:
-        detector = JITScriptDetector()
-
-        findings = detector.scan_model(source, "pytorch", "payload.py")
-
-        assert any(
-            finding.type == "code_execution_pattern" and finding.pattern == expected_pattern for finding in findings
-        )
+        _assert_typed_call_detected(source, expected_pattern)
 
     @pytest.mark.parametrize(
         ("future_import", "should_detect"),
@@ -9010,20 +8860,6 @@ class TestJITScriptDetector:
         suppressed = jit_script_module._compact_snippet_runpy_print_overwrite_calls(source)
 
         assert ("runpy.run_path", "S108") in suppressed
-
-    def test_scan_model_invalidates_safe_member_in_uncertain_branch(self) -> None:
-        source = (
-            b"import webbrowser as wb\noriginal = wb.open\nwb.open = print\n"
-            b"if flag:\n    wb.open = original\n"
-            b"((wb).open)('https://collector.evil')\n"
-        )
-
-        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
-
-        assert any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
-            for finding in findings
-        )
 
     @pytest.mark.parametrize(
         ("restored_value", "should_detect"),
@@ -9093,44 +8929,6 @@ class TestJITScriptDetector:
         )
         assert detected is should_detect
 
-    def test_scan_model_ignores_unrelated_mapping_assignment_after_typed_safe_overwrite(self) -> None:
-        source = (
-            b"import webbrowser as wb\noriginal = wb.open\nwb.open = print\n"
-            b"other = {}\nother['open'] = original\nwb.open('safe')\n"
-        )
-
-        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
-
-        assert not any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
-            for finding in findings
-        )
-
-    def test_scan_model_keeps_typed_call_imported_before_safe_overwrite(self) -> None:
-        source = (
-            b"from webbrowser import open as opener\n"
-            b"import webbrowser as wb\n"
-            b"wb.open = print\n"
-            b"opener('https://example.invalid')\n"
-        )
-
-        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
-
-        assert any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
-            for finding in findings
-        )
-
-    def test_scan_model_suppresses_typed_call_imported_after_safe_overwrite(self) -> None:
-        source = b"import webbrowser as wb\nwb.open = print\nfrom webbrowser import open as opener\nopener('safe')\n"
-
-        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
-
-        assert not any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
-            for finding in findings
-        )
-
     @pytest.mark.parametrize("safe_print", [b"builtins.print", b"bi.print"])
     def test_scan_model_accepts_builtin_print_typed_overwrite(self, safe_print: bytes) -> None:
         source = (
@@ -9143,50 +8941,6 @@ class TestJITScriptDetector:
 
         assert not any(
             finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
-            for finding in findings
-        )
-
-    def test_scan_model_rejects_print_attribute_on_rebound_builtins_name(self) -> None:
-        source = (
-            b"import builtins\nimport webbrowser as wb\n"
-            b"class Holder:\n    print = input\n"
-            b"builtins = Holder\nwb.open = builtins.print\n"
-            b"wb.open('https://example.invalid')\n"
-        )
-
-        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
-
-        assert any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
-            for finding in findings
-        )
-
-    def test_scan_model_rejects_lazy_consumer_after_same_expression_builtins_rebind(self) -> None:
-        source = (
-            b"import builtins as bi\nimport ctypes as c\n"
-            b"class Lazy:\n    @staticmethod\n    def list(values):\n        return values\n"
-            b"((bi := Lazy), bi.list(c.__dict__.update(CDLL=print) for _ in [0]))\n"
-            b"loader = c.CDLL\nloader('libpayload.so')\n"
-        )
-
-        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
-
-        assert any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Native library loading detected"
-            for finding in findings
-        )
-
-    def test_scan_model_keeps_alias_when_eager_generator_inner_iterable_is_empty(self) -> None:
-        source = (
-            b"import builtins as bi\nimport ctypes as c\nloader = c.CDLL\n"
-            b"bi.list((loader := print) for _ in [0] for __ in [])\n"
-            b"loader('libpayload.so')\n"
-        )
-
-        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
-
-        assert any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Native library loading detected"
             for finding in findings
         )
 
@@ -9236,57 +8990,6 @@ class TestJITScriptDetector:
             for finding in findings
         )
 
-    def test_scan_model_suppresses_safe_eager_nested_generator_iterable_mutation(self) -> None:
-        source = (
-            b"import webbrowser as wb\nlist(x for _ in [0] for __ in (setattr(wb, 'open', print),))\nwb.open('safe')\n"
-        )
-
-        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
-
-        assert not any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
-            for finding in findings
-        )
-
-    def test_scan_model_accepts_builtin_print_after_statically_empty_generator_walrus(self) -> None:
-        source = b"import ctypes as c\nunused = ((print := eval) for _ in [])\nc.CDLL = print\nc.CDLL('safe')\n"
-
-        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
-
-        assert not any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Native library loading detected"
-            for finding in findings
-        )
-
-    def test_scan_model_keeps_dangerous_import_after_uncertain_member_restore(self) -> None:
-        source = (
-            b"import webbrowser as wb\noriginal = wb.open\nwb.open = print\n"
-            b"from webbrowser import open as opener\n"
-            b"if condition:\n    wb.open = original\n    from webbrowser import open as opener\n"
-            b"opener('https://example.invalid')\n"
-        )
-
-        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
-
-        assert any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
-            for finding in findings
-        )
-
-    def test_scan_model_rejects_uncertain_builtin_print_helper_mutation(self) -> None:
-        source = (
-            b"import builtins\nimport webbrowser as wb\noriginal = wb.open\n"
-            b"if condition:\n    setattr(builtins, 'print', original)\n"
-            b"wb.open = builtins.print\nwb.open('https://example.invalid')\n"
-        )
-
-        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
-
-        assert any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
-            for finding in findings
-        )
-
     @pytest.mark.parametrize(
         "mutation",
         [
@@ -9303,27 +9006,7 @@ class TestJITScriptDetector:
             b"wb.open('https://example.invalid')\n"
         )
 
-        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
-
-        assert any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
-            for finding in findings
-        )
-
-    def test_scan_model_accepts_self_assignment_of_builtin_print(self) -> None:
-        source = (
-            b"import builtins\nimport webbrowser as wb\n"
-            b"builtins.print = builtins.print\n"
-            b"wb.open = builtins.print\n"
-            b"wb.open('safe')\n"
-        )
-
-        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
-
-        assert not any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
-            for finding in findings
-        )
+        _assert_jit_scan_pattern(JITScriptDetector(), source, "payload.py", "Web browser launch detected")
 
     @pytest.mark.parametrize(
         ("setup", "default"),
@@ -9341,20 +9024,6 @@ class TestJITScriptDetector:
             + default
             + b")\n"
             b"wb.open = builtins.print\nwb.open('safe')\n"
-        )
-
-        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
-
-        assert not any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
-            for finding in findings
-        )
-
-    def test_scan_model_accepts_safe_else_after_uncertain_typed_alias_rebind(self) -> None:
-        source = (
-            b"import webbrowser as wb\nwb.open = print\n"
-            b"if condition:\n    wb = Holder\nelse:\n    wb.open = print\n"
-            b"wb.open('safe')\n"
         )
 
         findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
@@ -9386,20 +9055,6 @@ class TestJITScriptDetector:
         findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
 
         assert any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
-            for finding in findings
-        )
-
-    def test_scan_model_ignores_failed_dangerous_setattr_on_builtin_mapping(self) -> None:
-        source = (
-            b"import builtins\nimport webbrowser as wb\noriginal = wb.open\n"
-            b"try:\n    setattr(builtins.__dict__, 'print', original)\n"
-            b"except AttributeError:\n    pass\nwb.open = builtins.print\nwb.open('safe')\n"
-        )
-
-        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
-
-        assert not any(
             finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
             for finding in findings
         )
@@ -9445,12 +9100,7 @@ class TestJITScriptDetector:
             b"wb.open = print\nwb.open('safe')\n"
         )
 
-        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
-
-        assert not any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
-            for finding in findings
-        )
+        _assert_jit_scan_without_pattern(JITScriptDetector(), source, "payload.py", "Web browser launch detected")
 
     @pytest.mark.parametrize(
         ("setup", "assignment"),
@@ -9479,20 +9129,6 @@ class TestJITScriptDetector:
             for finding in findings
         )
 
-    def test_scan_model_uses_preassignment_builtin_value_in_destructuring(self) -> None:
-        source = (
-            b"import builtins\nimport webbrowser as wb\n"
-            b"(builtins, wb.open) = (object(), builtins.print)\n"
-            b"wb.open('safe')\n"
-        )
-
-        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
-
-        assert not any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
-            for finding in findings
-        )
-
     @pytest.mark.parametrize(
         "target",
         [
@@ -9506,26 +9142,7 @@ class TestJITScriptDetector:
             b"wb.open = print\nwb.open('safe')\n"
         )
 
-        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
-
-        assert not any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
-            for finding in findings
-        )
-
-    def test_scan_model_tracks_builtin_mutation_before_chained_rebind(self) -> None:
-        source = (
-            b"import builtins\nimport webbrowser as wb\noriginal = wb.open\n"
-            b"builtins.print = builtins = original\n"
-            b"wb.open = print\nwb.open('https://example.invalid')\n"
-        )
-
-        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
-
-        assert any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
-            for finding in findings
-        )
+        _assert_jit_scan_without_pattern(JITScriptDetector(), source, "payload.py", "Web browser launch detected")
 
     def test_prefix_typed_member_aliases_ignore_scoped_capture(self) -> None:
         prefix = b"import webbrowser as wb\ndef unused():\n    alias = wb.open\n"
@@ -9617,14 +9234,7 @@ class TestJITScriptDetector:
         assert "wb" not in typed_aliases
 
     def test_prefix_typed_aliases_discover_module_import_in_tail(self) -> None:
-        padding = b"# pad\n" * (jit_script_module._MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES // len(b"# pad\n") + 1)
-        prefix = padding + b"import webbrowser as wb\nalias = wb.open\n"
-
-        typed_aliases = jit_script_module._typed_import_aliases(prefix)
-        aliases = jit_script_module._unsafe_typed_member_aliases(prefix, typed_aliases)
-
-        assert typed_aliases["wb"] == "webbrowser"
-        assert aliases["alias"] == frozenset({("webbrowser", "open", False)})
+        _assert_late_prefix_typed_alias(b"import webbrowser as wb\nalias = wb.open\n")
 
     def test_prefix_typed_aliases_ignore_scoped_import_in_tail(self) -> None:
         padding = b"# pad\n" * (jit_script_module._MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES // len(b"# pad\n") + 1)
@@ -9854,20 +9464,6 @@ class TestJITScriptDetector:
 
         assert aliases["alias"] == frozenset({("webbrowser", "open", False)})
 
-    def test_scan_model_clears_callable_alias_overwritten_in_all_branches(self) -> None:
-        source = (
-            b"from webbrowser import open as opener\n"
-            b"if condition:\n    opener = print\nelse:\n    opener = print\n"
-            b"opener('safe')\n"
-        )
-
-        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
-
-        assert not any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
-            for finding in findings
-        )
-
     @pytest.mark.parametrize(
         ("prefix", "expected"),
         [
@@ -9906,14 +9502,7 @@ class TestJITScriptDetector:
         assert detected is expected
 
     def test_prefix_typed_aliases_discover_deterministic_indented_tail_import(self) -> None:
-        padding = b"# pad\n" * (jit_script_module._MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES // len(b"# pad\n") + 1)
-        prefix = padding + b"if True:\n    import webbrowser as wb\nalias = wb.open\n"
-
-        typed_aliases = jit_script_module._typed_import_aliases(prefix)
-        aliases = jit_script_module._unsafe_typed_member_aliases(prefix, typed_aliases)
-
-        assert typed_aliases["wb"] == "webbrowser"
-        assert aliases["alias"] == frozenset({("webbrowser", "open", False)})
+        _assert_late_prefix_typed_alias(b"if True:\n    import webbrowser as wb\nalias = wb.open\n")
 
     @pytest.mark.parametrize(
         ("initial_state", "class_body", "expected"),
@@ -9997,14 +9586,7 @@ class TestJITScriptDetector:
         assert "alias" not in aliases
 
     def test_prefix_typed_aliases_keep_deterministic_tail_import_before_malformed_line(self) -> None:
-        padding = b"# pad\n" * (jit_script_module._MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES // len(b"# pad\n") + 1)
-        prefix = padding + b"if True:\n    import webbrowser as wb\nalias = wb.open\nif True print(\n"
-
-        typed_aliases = jit_script_module._typed_import_aliases(prefix)
-        aliases = jit_script_module._unsafe_typed_member_aliases(prefix, typed_aliases)
-
-        assert typed_aliases["wb"] == "webbrowser"
-        assert aliases["alias"] == frozenset({("webbrowser", "open", False)})
+        _assert_late_prefix_typed_alias(b"if True:\n    import webbrowser as wb\nalias = wb.open\nif True print(\n")
 
     def test_prefix_typed_aliases_drop_with_item_rebind_before_capture(self) -> None:
         padding = b"# pad\n" * (jit_script_module._MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES // len(b"# pad\n") + 1)
@@ -10163,11 +9745,7 @@ class TestJITScriptDetector:
         source: bytes,
         expected_pattern: str,
     ) -> None:
-        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
-
-        assert any(
-            finding.type == "code_execution_pattern" and finding.pattern == expected_pattern for finding in findings
-        )
+        _assert_typed_member_detected(source, expected_pattern)
 
     @pytest.mark.parametrize(
         ("source", "unexpected_pattern"),
@@ -10231,12 +9809,7 @@ class TestJITScriptDetector:
             b"(bi.list((opener := original) for _ in [0]), opener('safe'))\n" + padding
         )
 
-        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.bin")
-
-        assert not any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
-            for finding in findings
-        )
+        _assert_jit_scan_without_pattern(JITScriptDetector(), source, "payload.bin", "Web browser launch detected")
 
     def test_scan_model_ignores_rebound_inherited_typed_alias(self) -> None:
         padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
@@ -10247,44 +9820,7 @@ class TestJITScriptDetector:
             b"(bi.list((opener := original) for _ in [0]), opener('safe'))\n" + padding
         )
 
-        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.bin")
-
-        assert not any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
-            for finding in findings
-        )
-
-    def test_scan_model_accepts_restored_original_builtin_print(self) -> None:
-        source = (
-            b"import builtins\nimport webbrowser as wb\n"
-            b"original_print = builtins.print\n"
-            b"builtins.print = input\n"
-            b"builtins.print = original_print\n"
-            b"wb.open = builtins.print\nwb.open('safe')\n"
-        )
-
-        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
-
-        assert not any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
-            for finding in findings
-        )
-
-    def test_scan_model_rejects_restored_mutated_builtin_print_alias(self) -> None:
-        source = (
-            b"import builtins\nimport webbrowser as wb\n"
-            b"original = wb.open\nbuiltins.print = original\n"
-            b"mutated_print = builtins.print\n"
-            b"builtins.print = mutated_print\n"
-            b"wb.open = builtins.print\nwb.open('https://example.invalid')\n"
-        )
-
-        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
-
-        assert any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
-            for finding in findings
-        )
+        _assert_jit_scan_without_pattern(JITScriptDetector(), source, "payload.bin", "Web browser launch detected")
 
     @pytest.mark.parametrize("target", [b"(captured,)", b"[captured]"])
     def test_scan_model_rejects_destructured_rebind_of_safe_print_alias(self, target: bytes) -> None:
@@ -10294,12 +9830,7 @@ class TestJITScriptDetector:
             b"wb.open = captured\nwb.open('https://example.invalid')\n"
         )
 
-        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
-
-        assert any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
-            for finding in findings
-        )
+        _assert_jit_scan_pattern(JITScriptDetector(), source, "payload.py", "Web browser launch detected")
 
     @pytest.mark.parametrize(
         "mutation",
@@ -10316,12 +9847,7 @@ class TestJITScriptDetector:
             b"builtins = Holder\n" + mutation + b"\nwb.open = bi.print\nwb.open('safe')\n"
         )
 
-        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
-
-        assert not any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
-            for finding in findings
-        )
+        _assert_jit_scan_without_pattern(JITScriptDetector(), source, "payload.py", "Web browser launch detected")
 
     @pytest.mark.parametrize(
         "target",
@@ -10338,27 +9864,7 @@ class TestJITScriptDetector:
             b"wb.open = builtins.print\nwb.open('https://example.invalid')\n"
         )
 
-        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
-
-        assert any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
-            for finding in findings
-        )
-
-    def test_scan_model_rejects_dynamic_builtin_print_mapping_mutation(self) -> None:
-        source = (
-            b"import builtins\nimport webbrowser as wb\n"
-            b"original = wb.open\nmember = 'print'\n"
-            b"builtins.__dict__[member] = original\n"
-            b"wb.open = builtins.print\nwb.open('https://example.invalid')\n"
-        )
-
-        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
-
-        assert any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
-            for finding in findings
-        )
+        _assert_jit_scan_pattern(JITScriptDetector(), source, "payload.py", "Web browser launch detected")
 
     @pytest.mark.parametrize(
         "mutation",
@@ -10375,12 +9881,7 @@ class TestJITScriptDetector:
             + b"\nwb.open = builtins.print\nwb.open('https://example.invalid')\n"
         )
 
-        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
-
-        assert any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
-            for finding in findings
-        )
+        _assert_jit_scan_pattern(JITScriptDetector(), source, "payload.py", "Web browser launch detected")
 
     @pytest.mark.parametrize(
         "rebind",
@@ -10395,53 +9896,6 @@ class TestJITScriptDetector:
         source = (
             b"import builtins as bi\nimport webbrowser as wb\n"
             b"class Holder:\n    print = input\n" + rebind + b"wb.open = bi.print\nwb.open('https://example.invalid')\n"
-        )
-
-        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
-
-        assert any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
-            for finding in findings
-        )
-
-    def test_scan_model_accepts_uncertain_builtin_to_builtin_alias_rebinding(self) -> None:
-        source = (
-            b"import builtins\nimport builtins as bi\nimport webbrowser as wb\n"
-            b"if condition:\n    bi = builtins\n"
-            b"wb.open = bi.print\nwb.open('safe')\n"
-        )
-
-        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
-
-        assert not any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
-            for finding in findings
-        )
-
-    def test_scan_model_keeps_maybe_dangerous_imported_callable_rebinding(self) -> None:
-        source = (
-            b"import webbrowser as wb\n"
-            b"original = wb.open\n"
-            b"wb.open = print\n"
-            b"from webbrowser import open as opener\n"
-            b"if condition:\n    opener = original\n"
-            b"opener('https://example.invalid')\n"
-        )
-
-        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
-
-        assert any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
-            for finding in findings
-        )
-
-    def test_scan_model_keeps_dangerous_callable_across_uncertain_reimport(self) -> None:
-        source = (
-            b"from webbrowser import open as opener\n"
-            b"import webbrowser as wb\n"
-            b"wb.open = print\n"
-            b"if condition:\n    from webbrowser import open as opener\n"
-            b"opener('https://example.invalid')\n"
         )
 
         findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
@@ -10482,34 +9936,6 @@ class TestJITScriptDetector:
     )
     def test_scan_model_preserves_safe_member_after_uncertain_safe_write(self, safe_write: bytes) -> None:
         source = b"import webbrowser as wb\nwb.open = print\nif condition:\n    " + safe_write + b"\nwb.open('safe')\n"
-
-        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
-
-        assert not any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
-            for finding in findings
-        )
-
-    def test_scan_model_rejects_uncertain_member_write_after_branch_print_shadow(self) -> None:
-        source = (
-            b"import webbrowser as wb\nwb.open = print\n"
-            b"if condition:\n    print = input\n    wb.open = print\n"
-            b"wb.open('https://example.invalid')\n"
-        )
-
-        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
-
-        assert any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
-            for finding in findings
-        )
-
-    def test_scan_model_accepts_branch_local_builtin_print_restoration(self) -> None:
-        source = (
-            b"import builtins\nimport webbrowser as wb\n"
-            b"if condition:\n    print = input\n    print = builtins.print\n"
-            b"wb.open = print\nwb.open('safe')\n"
-        )
 
         findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
 
@@ -10561,21 +9987,6 @@ class TestJITScriptDetector:
             for finding in findings
         )
 
-    def test_scan_model_accepts_safe_print_alias_assigned_on_every_branch(self) -> None:
-        source = (
-            b"import builtins\nimport webbrowser as wb\n"
-            b"if condition:\n    captured = builtins.print\n"
-            b"else:\n    captured = builtins.print\n"
-            b"wb.open = captured\nwb.open('safe')\n"
-        )
-
-        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
-
-        assert not any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
-            for finding in findings
-        )
-
     def test_scan_model_keeps_all_uncertain_imported_callable_identities(self) -> None:
         source = (
             b"from webbrowser import open as opener\n"
@@ -10592,22 +10003,6 @@ class TestJITScriptDetector:
         assert "Web browser launch detected" in patterns
         assert "Native library loading detected" in patterns
 
-    def test_scan_model_tracks_dict_setdefault_alias_for_typed_member_restore(self) -> None:
-        source = (
-            b"import webbrowser as wb\n"
-            b"put = dict.setdefault\n"
-            b"del wb.open\n"
-            b"put(wb.__dict__, 'open', print)\n"
-            b"wb.open('safe')\n"
-        )
-
-        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
-
-        assert not any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
-            for finding in findings
-        )
-
     @pytest.mark.parametrize(
         "restore",
         [
@@ -10619,20 +10014,6 @@ class TestJITScriptDetector:
     )
     def test_scan_model_keeps_typed_calls_after_order_sensitive_restores(self, restore: bytes) -> None:
         source = b"import webbrowser as wb\noriginal = wb.open\nwb.open = print\n" + restore
-
-        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
-
-        assert any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
-            for finding in findings
-        )
-
-    def test_scan_model_treats_comprehension_typed_write_as_conditional(self) -> None:
-        source = (
-            b"import webbrowser as wb\n"
-            b"[wb.__dict__.update(open=print) for _ in values]\n"
-            b"wb.open('https://example.invalid')\n"
-        )
 
         findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
 
@@ -10663,16 +10044,6 @@ class TestJITScriptDetector:
             for finding in findings
         )
         assert detected is should_detect
-
-    def test_scan_model_replays_definitely_executed_comprehension_runpy_write(self) -> None:
-        source = b"import runpy as rp\n[rp.__dict__.update(run_path=print) for _ in [0]]\nrp.run_path('payload.py')\n"
-
-        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
-
-        assert not any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
-            for finding in findings
-        )
 
     @pytest.mark.parametrize(("restored_attribute", "should_detect"), [(b"print", False), (b"input", True)])
     def test_scan_model_tracks_direct_builtin_print_restoration(
@@ -10712,12 +10083,7 @@ class TestJITScriptDetector:
             + b"import webbrowser as fresh\nfresh.open('https://example.invalid')\n"
         )
 
-        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
-
-        assert any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
-            for finding in findings
-        )
+        _assert_jit_scan_pattern(JITScriptDetector(), source, "payload.py", "Web browser launch detected")
 
     @pytest.mark.parametrize(
         "replacement",
@@ -10738,12 +10104,7 @@ class TestJITScriptDetector:
             + b"import runpy as fresh\nfresh.run_path('payload.py')\n"
         )
 
-        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
-
-        assert any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
-            for finding in findings
-        )
+        _assert_jit_scan_pattern(JITScriptDetector(), source, "payload.py", "Dynamic module execution detected")
 
     @pytest.mark.parametrize(
         "mutation",
@@ -10761,12 +10122,7 @@ class TestJITScriptDetector:
             + b"import runpy as fresh\nfresh.run_path('safe')\n"
         )
 
-        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
-
-        assert not any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
-            for finding in findings
-        )
+        _assert_jit_scan_without_pattern(JITScriptDetector(), source, "payload.py", "Dynamic module execution detected")
 
     @pytest.mark.parametrize(
         ("middle", "should_detect"),
@@ -10783,19 +10139,13 @@ class TestJITScriptDetector:
         middle: bytes,
         should_detect: bool,
     ) -> None:
-        source = (
-            b"import webbrowser as wb\noriginal = wb.open\ndel wb.open\n"
-            + middle
-            + b"wb.__dict__.setdefault('open', print)\nwb.open('https://example.invalid')\n"
+        _assert_jit_mapping_update_detection(
+            middle,
+            should_detect,
+            (b"import webbrowser as wb\noriginal = wb.open\ndel wb.open\n"),
+            (b"wb.__dict__.setdefault('open', print)\nwb.open('https://example.invalid')\n"),
+            ("Web browser launch detected"),
         )
-
-        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
-
-        detected = any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
-            for finding in findings
-        )
-        assert detected is should_detect
 
     @pytest.mark.parametrize(
         ("middle", "should_detect"),
@@ -10812,19 +10162,13 @@ class TestJITScriptDetector:
         middle: bytes,
         should_detect: bool,
     ) -> None:
-        source = (
-            b"import runpy as rp\noriginal = rp.run_path\ndel rp.run_path\n"
-            + middle
-            + b"rp.__dict__.setdefault('run_path', print)\nrp.run_path('payload.py')\n"
+        _assert_jit_mapping_update_detection(
+            middle,
+            should_detect,
+            (b"import runpy as rp\noriginal = rp.run_path\ndel rp.run_path\n"),
+            (b"rp.__dict__.setdefault('run_path', print)\nrp.run_path('payload.py')\n"),
+            ("Dynamic module execution detected"),
         )
-
-        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
-
-        detected = any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
-            for finding in findings
-        )
-        assert detected is should_detect
 
     @pytest.mark.parametrize(
         ("expression", "should_detect"),
@@ -10897,20 +10241,6 @@ class TestJITScriptDetector:
             for finding in findings
         )
 
-    def test_scan_model_ignores_shadowed_typed_delattr_before_setdefault(self) -> None:
-        source = (
-            b"import webbrowser as wb\noriginal = wb.open\nwb.open = print\n"
-            b"delattr = lambda *args: None\ndelattr(wb, 'open')\n"
-            b"wb.__dict__.setdefault('open', original)\nwb.open('safe')\n"
-        )
-
-        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
-
-        assert not any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
-            for finding in findings
-        )
-
     @pytest.mark.parametrize(
         ("prefix", "member", "expected_pattern"),
         [
@@ -10941,32 +10271,6 @@ class TestJITScriptDetector:
 
         assert any(
             finding.type == "code_execution_pattern" and finding.pattern == expected_pattern for finding in findings
-        )
-
-    def test_scan_model_tracks_getattr_typed_mapping_restore(self) -> None:
-        source = (
-            b"import webbrowser as wb\noriginal = wb.open\nwb.open = print\n"
-            b"getattr(wb, '__dict__')['open'] = original\nwb.open('https://example.invalid')\n"
-        )
-
-        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
-
-        assert any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
-            for finding in findings
-        )
-
-    def test_scan_model_ignores_shadowed_getattr_typed_mapping_restore(self) -> None:
-        source = (
-            b"import webbrowser as wb\noriginal = wb.open\nwb.open = print\n"
-            b"getattr = lambda *_args: {}\ngetattr(wb, '__dict__')['open'] = original\nwb.open('safe')\n"
-        )
-
-        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
-
-        assert not any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
-            for finding in findings
         )
 
     @pytest.mark.parametrize(
@@ -11020,21 +10324,6 @@ class TestJITScriptDetector:
             for finding in findings
         )
         assert detected is should_detect
-
-    def test_scan_model_ignores_conditional_safe_setdefault_after_unconditional_delete(self) -> None:
-        source = (
-            b"import runpy as rp\nflag = False\n"
-            b"rp.__dict__.pop('run_path', None)\n"
-            b"flag and rp.__dict__.setdefault('run_path', print)\n"
-            b"rp.run_path('payload.py')\n"
-        )
-
-        findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
-
-        assert not any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
-            for finding in findings
-        )
 
     @pytest.mark.parametrize(
         "source",
@@ -11375,11 +10664,7 @@ class TestJITScriptDetector:
         ],
     )
     def test_scan_model_avoids_stale_indirect_builtin_aliases(self, data: bytes) -> None:
-        detector = JITScriptDetector()
-
-        findings = detector.scan_model(data, "pytorch", "payload.bin")
-
-        assert not any(finding.type == "dangerous_builtin" for finding in findings)
+        _assert_no_dangerous_builtin(data)
 
     @pytest.mark.parametrize(
         "data",
@@ -11389,11 +10674,7 @@ class TestJITScriptDetector:
         ],
     )
     def test_scan_model_detects_dangerous_builtins_in_default_containers(self, data: bytes) -> None:
-        detector = JITScriptDetector()
-
-        findings = detector.scan_model(data, "pytorch", "payload.bin")
-
-        assert any(finding.type == "dangerous_builtin" and finding.builtin == "eval" for finding in findings)
+        _assert_eval_builtin_detected(data)
 
     @pytest.mark.parametrize(
         "body",
@@ -11433,11 +10714,7 @@ class TestJITScriptDetector:
         ],
     )
     def test_scan_model_avoids_noninvoking_or_shadowed_callback_lookalikes(self, data: bytes) -> None:
-        detector = JITScriptDetector()
-
-        findings = detector.scan_model(data, "pytorch", "payload.bin")
-
-        assert not any(finding.type == "dangerous_builtin" for finding in findings)
+        _assert_no_dangerous_builtin(data)
 
     @pytest.mark.parametrize(
         "body",
@@ -11449,12 +10726,7 @@ class TestJITScriptDetector:
         ],
     )
     def test_scan_model_resolves_dangerous_builtins_from_tracked_sequence_state(self, body: str) -> None:
-        detector = JITScriptDetector()
-        data = f"\x00\xffdef payload(value):\n    {body}\n".encode()
-
-        findings = detector.scan_model(data, "pytorch", "payload.bin")
-
-        assert any(finding.type == "dangerous_builtin" and finding.builtin == "eval" for finding in findings)
+        _assert_eval_body_detected(body)
 
     @pytest.mark.parametrize(
         "body",
@@ -11466,12 +10738,7 @@ class TestJITScriptDetector:
         ],
     )
     def test_scan_model_avoids_stale_tracked_sequence_state(self, body: str) -> None:
-        detector = JITScriptDetector()
-        data = f"\x00\xffdef benign(value):\n    {body}\n".encode()
-
-        findings = detector.scan_model(data, "pytorch", "payload.bin")
-
-        assert not any(finding.type == "dangerous_builtin" for finding in findings)
+        _assert_benign_body_no_builtin(body)
 
     @pytest.mark.parametrize(
         "body",
@@ -11485,12 +10752,7 @@ class TestJITScriptDetector:
         ],
     )
     def test_scan_model_resolves_constant_string_aliases_for_builtin_lookup(self, body: str) -> None:
-        detector = JITScriptDetector()
-        data = f"\x00\xffdef payload(value):\n    {body}\n".encode()
-
-        findings = detector.scan_model(data, "pytorch", "payload.bin")
-
-        assert any(finding.type == "dangerous_builtin" and finding.builtin == "eval" for finding in findings)
+        _assert_eval_body_detected(body)
 
     @pytest.mark.parametrize(
         "body",
@@ -11511,12 +10773,7 @@ class TestJITScriptDetector:
         ],
     )
     def test_scan_model_avoids_stale_constant_string_aliases(self, body: str) -> None:
-        detector = JITScriptDetector()
-        data = f"\x00\xffdef benign(value):\n    {body}\n".encode()
-
-        findings = detector.scan_model(data, "pytorch", "payload.bin")
-
-        assert not any(finding.type == "dangerous_builtin" for finding in findings)
+        _assert_benign_body_no_builtin(body)
 
     @pytest.mark.parametrize(
         "data",
@@ -11539,11 +10796,7 @@ class TestJITScriptDetector:
         ],
     )
     def test_scan_model_detects_dangerous_instance_aliases_across_methods(self, data: bytes) -> None:
-        detector = JITScriptDetector()
-
-        findings = detector.scan_model(data, "pytorch", "payload.bin")
-
-        assert any(finding.type == "dangerous_builtin" and finding.builtin == "eval" for finding in findings)
+        _assert_eval_builtin_detected(data)
 
     @pytest.mark.parametrize(
         "data",
@@ -11576,11 +10829,7 @@ class TestJITScriptDetector:
         ],
     )
     def test_scan_model_avoids_stale_instance_aliases_across_methods(self, data: bytes) -> None:
-        detector = JITScriptDetector()
-
-        findings = detector.scan_model(data, "pytorch", "payload.bin")
-
-        assert not any(finding.type == "dangerous_builtin" for finding in findings)
+        _assert_no_dangerous_builtin(data)
 
     def test_scan_model_preserves_builtin_alias_across_dead_rebind_branch(self) -> None:
         detector = JITScriptDetector()
@@ -11676,11 +10925,7 @@ class TestJITScriptDetector:
         ],
     )
     def test_scan_model_preserves_builtin_alias_across_dead_control_flow(self, data: bytes) -> None:
-        detector = JITScriptDetector()
-
-        findings = detector.scan_model(data, "pytorch", "payload.bin")
-
-        assert any(finding.type == "dangerous_builtin" and finding.builtin == "eval" for finding in findings)
+        _assert_eval_builtin_detected(data)
 
     @pytest.mark.parametrize(
         "data",
@@ -11874,12 +11119,7 @@ class TestJITScriptDetector:
         ],
     )
     def test_scan_model_does_not_retain_shadowed_builtin_aliases(self, data: bytes) -> None:
-        detector = JITScriptDetector()
-
-        findings = detector.scan_model(data, "pytorch", "payload.bin")
-
-        assert not any(finding.type == "dangerous_builtin" for finding in findings)
-        assert not any(finding.severity == "CRITICAL" for finding in findings)
+        _assert_no_critical_builtin_findings(data)
 
     @pytest.mark.parametrize(
         "data",
@@ -11949,19 +11189,8 @@ class TestJITScriptDetector:
         )
 
     def test_scan_model_detects_tail_alias_from_compound_prefix_import(self) -> None:
-        detector = JITScriptDetector()
-        filler_line = b"# filler\n"
-        filler = filler_line * (2 * jit_script_module._EMBEDDED_PYTHON_SCAN_WINDOW_BYTES // len(filler_line) + 1)
-        source = (
-            b"\x00\xffif True: import runpy as rp\n"
-            + filler
-            + b"def payload():\n    return rp.run_path('payload.py')\n"
-        )
-
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        _assert_runpy_across_gap(
+            (b"\x00\xffif True: import runpy as rp\n"), (b"def payload():\n    return rp.run_path('payload.py')\n")
         )
 
     def test_scan_model_preserves_full_prefixed_tail_context(self) -> None:
@@ -11997,70 +11226,27 @@ class TestJITScriptDetector:
             b'"""\n' + filler + b"def payload():\n    return rp.run_path('payload.py')\n"
         )
 
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert not any(
-            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
-        )
+        _assert_jit_scan_without_pattern(detector, source, "payload.bin", "Dynamic module execution detected")
 
     def test_scan_model_detects_tail_runpy_alias_from_framed_prefix_assignment_context(self) -> None:
-        detector = JITScriptDetector()
-        filler_line = b"# filler\n"
-        filler = filler_line * (2 * jit_script_module._EMBEDDED_PYTHON_SCAN_WINDOW_BYTES // len(filler_line) + 1)
-        source = (
-            b"\x00\xffimport runpy\nrun = runpy.run_path\n" + filler + b"def payload():\n    return run('payload.py')\n"
-        )
-
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        _assert_runpy_across_gap(
+            (b"\x00\xffimport runpy\nrun = runpy.run_path\n"), (b"def payload():\n    return run('payload.py')\n")
         )
 
     def test_scan_model_detects_framed_tail_alias_with_prefix_context(self) -> None:
-        detector = JITScriptDetector()
-        filler_line = b"# filler\n"
-        filler = filler_line * (2 * jit_script_module._EMBEDDED_PYTHON_SCAN_WINDOW_BYTES // len(filler_line) + 1)
-        source = (
-            b"\x00\xffimport runpy as rp\n" + filler + b"\x00\xffdef payload():\n    return rp.run_path('payload.py')\n"
-        )
-
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        _assert_runpy_across_gap(
+            (b"\x00\xffimport runpy as rp\n"), (b"\x00\xffdef payload():\n    return rp.run_path('payload.py')\n")
         )
 
     def test_scan_model_detects_parenthesized_tail_alias_with_prefix_context(self) -> None:
-        detector = JITScriptDetector()
-        filler_line = b"# filler\n"
-        filler = filler_line * (2 * jit_script_module._EMBEDDED_PYTHON_SCAN_WINDOW_BYTES // len(filler_line) + 1)
-        source = (
-            b"\x00\xffimport runpy as rp\n"
-            + filler
-            + b"\x00\xffdef payload():\n    return ((rp).run_path)('payload.py')\n"
-        )
-
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        _assert_runpy_across_gap(
+            (b"\x00\xffimport runpy as rp\n"), (b"\x00\xffdef payload():\n    return ((rp).run_path)('payload.py')\n")
         )
 
     def test_scan_model_detects_multiline_parenthesized_tail_alias_with_prefix_context(self) -> None:
-        detector = JITScriptDetector()
-        filler_line = b"# filler\n"
-        filler = filler_line * (2 * jit_script_module._EMBEDDED_PYTHON_SCAN_WINDOW_BYTES // len(filler_line) + 1)
-        source = (
-            b"\x00\xffimport runpy as rp\n"
-            + filler
-            + b"\x00\xffdef payload():\n    return (\n        rp.run_path\n    )('payload.py')\n"
-        )
-
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        _assert_runpy_across_gap(
+            (b"\x00\xffimport runpy as rp\n"),
+            (b"\x00\xffdef payload():\n    return (\n        rp.run_path\n    )('payload.py')\n"),
         )
 
     def test_scan_model_detects_tail_alias_after_noisy_prefix_context_budget(
@@ -12087,49 +11273,19 @@ class TestJITScriptDetector:
         )
 
     def test_scan_model_detects_tail_alias_call_from_prefix_annotated_assignment_context(self) -> None:
-        detector = JITScriptDetector()
-        filler_line = b"# filler\n"
-        filler = filler_line * (2 * jit_script_module._EMBEDDED_PYTHON_SCAN_WINDOW_BYTES // len(filler_line) + 1)
-        source = (
-            b"\x00\xffimport runpy\nrun: object = runpy.run_path\n"
-            + filler
-            + b"def payload():\n    return run('payload.py')\n"
-        )
-
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        _assert_runpy_across_gap(
+            (b"\x00\xffimport runpy\nrun: object = runpy.run_path\n"),
+            (b"def payload():\n    return run('payload.py')\n"),
         )
 
     def test_scan_model_detects_tail_module_alias_from_prefix_assignment_context(self) -> None:
-        detector = JITScriptDetector()
-        filler_line = b"# filler\n"
-        filler = filler_line * (2 * jit_script_module._EMBEDDED_PYTHON_SCAN_WINDOW_BYTES // len(filler_line) + 1)
-        source = (
-            b"\x00\xffimport runpy\nrp = runpy\n" + filler + b"def payload():\n    return rp.run_path('payload.py')\n"
-        )
-
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        _assert_runpy_across_gap(
+            (b"\x00\xffimport runpy\nrp = runpy\n"), (b"def payload():\n    return rp.run_path('payload.py')\n")
         )
 
     def test_scan_model_detects_tail_alias_call_from_prefix_unpack_assignment_context(self) -> None:
-        detector = JITScriptDetector()
-        filler_line = b"# filler\n"
-        filler = filler_line * (2 * jit_script_module._EMBEDDED_PYTHON_SCAN_WINDOW_BYTES // len(filler_line) + 1)
-        source = (
-            b"\x00\xffimport runpy\n(run,) = (runpy.run_path,)\n"
-            + filler
-            + b"def payload():\n    return run('payload.py')\n"
-        )
-
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        _assert_runpy_across_gap(
+            (b"\x00\xffimport runpy\n(run,) = (runpy.run_path,)\n"), (b"def payload():\n    return run('payload.py')\n")
         )
 
     @pytest.mark.parametrize(
@@ -12166,64 +11322,10 @@ class TestJITScriptDetector:
 
         assert not any(finding.type == "dangerous_builtin" for finding in findings)
 
-    def test_scan_model_detects_tail_call_from_prefix_module_alias_context(self) -> None:
-        detector = JITScriptDetector()
-        filler_line = b"# filler\n"
-        filler = filler_line * (2 * jit_script_module._EMBEDDED_PYTHON_SCAN_WINDOW_BYTES // len(filler_line) + 1)
-        source = (
-            b"\x00\xffimport runpy\nrp = runpy\n" + filler + b"def payload():\n    return rp.run_path('payload.py')\n"
-        )
-
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
-        )
-
-    def test_scan_model_detects_tail_call_from_literal_true_compound_import_context(self) -> None:
-        detector = JITScriptDetector()
-        filler_line = b"# filler\n"
-        filler = filler_line * (2 * jit_script_module._EMBEDDED_PYTHON_SCAN_WINDOW_BYTES // len(filler_line) + 1)
-        source = (
-            b"\x00\xffif True: import runpy as rp\n"
-            + filler
-            + b"def payload():\n    return rp.run_path('payload.py')\n"
-        )
-
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
-        )
-
     def test_scan_model_detects_tail_one_hop_alias_after_prefix_from_import(self) -> None:
-        detector = JITScriptDetector()
-        filler_line = b"# filler\n"
-        filler = filler_line * (2 * jit_script_module._EMBEDDED_PYTHON_SCAN_WINDOW_BYTES // len(filler_line) + 1)
-        source = (
-            b"\x00\xfffrom runpy import run_path\nrun = run_path\n"
-            + filler
-            + b"def payload():\n    return run('payload.py')\n"
-        )
-
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
-        )
-
-    def test_scan_model_detects_framed_tail_snippet_with_prefix_alias_context(self) -> None:
-        detector = JITScriptDetector()
-        filler_line = b"# filler\n"
-        filler = filler_line * (2 * jit_script_module._EMBEDDED_PYTHON_SCAN_WINDOW_BYTES // len(filler_line) + 1)
-        source = (
-            b"\x00\xffimport runpy as rp\n" + filler + b"\x00\xffdef payload():\n    return rp.run_path('payload.py')\n"
-        )
-
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        _assert_runpy_across_gap(
+            (b"\x00\xfffrom runpy import run_path\nrun = run_path\n"),
+            (b"def payload():\n    return run('payload.py')\n"),
         )
 
     def test_scan_model_detects_prefix_alias_call_after_middle_tail_start(self) -> None:
@@ -12258,11 +11360,7 @@ class TestJITScriptDetector:
             b"    return rp.run_path('payload.py')\n"
         )
 
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert not any(
-            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
-        )
+        _assert_jit_scan_without_pattern(detector, source, "payload.bin", "Dynamic module execution detected")
 
     def test_scan_model_does_not_use_commented_prefix_import_as_tail_context(self) -> None:
         detector = JITScriptDetector()
@@ -12270,11 +11368,7 @@ class TestJITScriptDetector:
         filler = filler_line * (2 * jit_script_module._EMBEDDED_PYTHON_SCAN_WINDOW_BYTES // len(filler_line) + 1)
         source = b"\x00\xff# import runpy as rp\n" + filler + b"def payload():\n    return rp.run_path('payload.py')\n"
 
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert not any(
-            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
-        )
+        _assert_jit_scan_without_pattern(detector, source, "payload.bin", "Dynamic module execution detected")
 
     def test_scan_model_does_not_parse_docstring_priority_import_as_statement(self) -> None:
         detector = JITScriptDetector()
@@ -12315,11 +11409,7 @@ class TestJITScriptDetector:
             + b"def payload():\n    return rp.run_path('payload.py')\n"
         )
 
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert not any(
-            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
-        )
+        _assert_jit_scan_without_pattern(detector, source, "payload.bin", "Dynamic module execution detected")
 
     def test_scan_model_does_not_hoist_prefix_import_after_escaped_triple_quote(self) -> None:
         detector = JITScriptDetector()
@@ -12331,42 +11421,18 @@ class TestJITScriptDetector:
             + b"def payload():\n    return rp.run_path('payload.py')\n"
         )
 
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert not any(
-            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
-        )
+        _assert_jit_scan_without_pattern(detector, source, "payload.bin", "Dynamic module execution detected")
 
     def test_scan_model_detects_real_prefix_import_after_single_quoted_triple_marker(self) -> None:
-        detector = JITScriptDetector()
-        filler_line = b"# filler\n"
-        filler = filler_line * (2 * jit_script_module._EMBEDDED_PYTHON_SCAN_WINDOW_BYTES // len(filler_line) + 1)
-        source = (
-            b'\x00\xffmarker = \'"""\'\nimport runpy as rp\n'
-            + filler
-            + b"def payload():\n    return rp.run_path('payload.py')\n"
-        )
-
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        _assert_runpy_across_gap(
+            (b'\x00\xffmarker = \'"""\'\nimport runpy as rp\n'),
+            (b"def payload():\n    return rp.run_path('payload.py')\n"),
         )
 
     def test_scan_model_detects_tail_import_after_comment_line_closes_triple_quote(self) -> None:
-        detector = JITScriptDetector()
-        filler_line = b"# filler\n"
-        filler = filler_line * (2 * jit_script_module._EMBEDDED_PYTHON_SCAN_WINDOW_BYTES // len(filler_line) + 1)
-        source = (
-            b'\x00\xfftext = """\n# closes """\nimport runpy as rp\n'
-            + filler
-            + b"def payload():\n    return rp.run_path('payload.py')\n"
-        )
-
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        _assert_runpy_across_gap(
+            (b'\x00\xfftext = """\n# closes """\nimport runpy as rp\n'),
+            (b"def payload():\n    return rp.run_path('payload.py')\n"),
         )
 
     def test_scan_model_detects_restored_runpy_execution_after_static_overwrite(self) -> None:
@@ -12379,11 +11445,7 @@ class TestJITScriptDetector:
             b"    return runpy.run_path('payload.py')\n"
         )
 
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
-        )
+        _assert_jit_scan_pattern(detector, source, "payload.bin", "Dynamic module execution detected")
 
     def test_priority_snippets_require_import_boundaries_after_cap(self) -> None:
         def candidate(
@@ -12486,11 +11548,7 @@ class TestJITScriptDetector:
         detector = JITScriptDetector()
         source = b"\x00\xffimport runpy\nrunpy.run_path = len\nrunpy.run_path([])\n\x00MODEL-FRAMING"
 
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert not any(
-            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
-        )
+        _assert_jit_scan_without_pattern(detector, source, "payload.bin", "Dynamic module execution detected")
 
     def test_scan_model_detects_binary_framed_long_tail_alias_aware_runpy_execution(self) -> None:
         detector = JITScriptDetector()
@@ -12499,11 +11557,7 @@ class TestJITScriptDetector:
             b"\x00\xffdef payload():\n    from runpy import run_path as run\n    return run('payload.py')\n\x00" + tail
         )
 
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
-        )
+        _assert_jit_scan_pattern(detector, source, "payload.bin", "Dynamic module execution detected")
 
     def test_scan_model_ignores_binary_prefixed_replaced_runpy_execution(self) -> None:
         detector = JITScriptDetector()
@@ -12522,21 +11576,13 @@ class TestJITScriptDetector:
             + b"\n    return \"runpy.run_path('payload.py')\"\n\x00\xffMODEL-FRAMING"
         )
 
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert not any(
-            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
-        )
+        _assert_jit_scan_without_pattern(detector, source, "payload.bin", "Dynamic module execution detected")
 
     def test_scan_model_ignores_framed_runpy_call_inside_multiline_literal(self) -> None:
         detector = JITScriptDetector()
         source = b"\x00\xffimport runpy as rp\npayload = '''\n\x00\xff((rp).run_path)('safe')\n'''\n"
 
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert not any(
-            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
-        )
+        _assert_jit_scan_without_pattern(detector, source, "payload.bin", "Dynamic module execution detected")
 
     def test_scan_model_preserves_raw_runpy_match_after_benign_parsed_snippet(self) -> None:
         detector = JITScriptDetector()
@@ -12549,11 +11595,7 @@ class TestJITScriptDetector:
             b"runpy.run_path('payload.py')\n"
         )
 
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
-        )
+        _assert_jit_scan_pattern(detector, source, "payload.bin", "Dynamic module execution detected")
 
     def test_scan_model_detects_binary_framed_webbrowser_and_ctypes_calls(self) -> None:
         detector = JITScriptDetector()
@@ -12617,11 +11659,7 @@ class TestJITScriptDetector:
             b"\x00MODEL-FRAMING"
         )
 
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        patterns = {finding.pattern for finding in findings if finding.type == "code_execution_pattern"}
-        assert "Web browser launch detected" in patterns
-        assert "Native library loading detected" in patterns
+        _assert_jit_browser_and_native_findings(detector, source)
 
     def test_scan_model_preserves_dynamic_member_risk_after_conditional_overwrite(self) -> None:
         detector = JITScriptDetector()
@@ -12638,11 +11676,7 @@ class TestJITScriptDetector:
             b"\x00MODEL-FRAMING"
         )
 
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        patterns = {finding.pattern for finding in findings if finding.type == "code_execution_pattern"}
-        assert "Web browser launch detected" in patterns
-        assert "Native library loading detected" in patterns
+        _assert_jit_browser_and_native_findings(detector, source)
 
     def test_scan_model_keeps_webbrowser_member_overwrites_controller_local(self) -> None:
         detector = JITScriptDetector()
@@ -12656,12 +11690,7 @@ class TestJITScriptDetector:
             b"\x00MODEL-FRAMING"
         )
 
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
-            for finding in findings
-        )
+        _assert_jit_scan_pattern(detector, source, "payload.bin", "Web browser launch detected")
 
     def test_scan_model_keeps_library_loader_member_overwrites_instance_local(self) -> None:
         detector = JITScriptDetector()
@@ -12675,12 +11704,7 @@ class TestJITScriptDetector:
             b"\x00MODEL-FRAMING"
         )
 
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Native library loading detected"
-            for finding in findings
-        )
+        _assert_jit_scan_pattern(detector, source, "payload.bin", "Native library loading detected")
 
     def test_scan_model_detects_hasattr_ctypes_load_and_local_init_alias(self) -> None:
         detector = JITScriptDetector()
@@ -12709,12 +11733,7 @@ class TestJITScriptDetector:
             b"\x00MODEL-FRAMING"
         )
 
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Native library loading detected"
-            for finding in findings
-        )
+        _assert_jit_scan_pattern(detector, source, "payload.bin", "Native library loading detected")
 
     def test_scan_model_preserves_dynamic_member_risk_after_reassignment_and_delete(self) -> None:
         detector = JITScriptDetector()
@@ -12744,11 +11763,7 @@ class TestJITScriptDetector:
             b"\x00MODEL-FRAMING"
         )
 
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        patterns = {finding.pattern for finding in findings if finding.type == "code_execution_pattern"}
-        assert "Web browser launch detected" in patterns
-        assert "Native library loading detected" in patterns
+        _assert_jit_browser_and_native_findings(detector, source)
 
     def test_scan_model_detects_ctypes_cdll_subclass_class_local_initializer_alias(self) -> None:
         detector = JITScriptDetector()
@@ -12763,12 +11778,7 @@ class TestJITScriptDetector:
             b"\x00MODEL-FRAMING"
         )
 
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Native library loading detected"
-            for finding in findings
-        )
+        _assert_jit_scan_pattern(detector, source, "payload.bin", "Native library loading detected")
 
     def test_scan_model_ignores_unreachable_ctypes_cdll_subclass_initializer(self) -> None:
         detector = JITScriptDetector()
@@ -12783,12 +11793,7 @@ class TestJITScriptDetector:
             b"\x00MODEL-FRAMING"
         )
 
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert not any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Native library loading detected"
-            for finding in findings
-        )
+        _assert_jit_scan_without_pattern(detector, source, "payload.bin", "Native library loading detected")
 
     @pytest.mark.parametrize(
         ("payload", "expected_pattern"),
@@ -12827,12 +11832,7 @@ class TestJITScriptDetector:
             b"\x00MODEL-FRAMING"
         )
 
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert not any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Web browser launch detected"
-            for finding in findings
-        )
+        _assert_jit_scan_without_pattern(detector, source, "payload.bin", "Web browser launch detected")
 
     def test_scan_model_ignores_non_loading_ctypes_subclass_initializers(self) -> None:
         detector = JITScriptDetector()
@@ -12872,12 +11872,7 @@ class TestJITScriptDetector:
             b"\x00MODEL-FRAMING"
         )
 
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert not any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Native library loading detected"
-            for finding in findings
-        )
+        _assert_jit_scan_without_pattern(detector, source, "payload.bin", "Native library loading detected")
 
     def test_scan_model_ignores_safe_webbrowser_method_overwrite_and_invalid_libraryloader(self) -> None:
         detector = JITScriptDetector()
@@ -12984,12 +11979,7 @@ class TestJITScriptDetector:
             b"    runpy.run_path('payload.py')\n"
         )
 
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
-            for finding in findings
-        )
+        _assert_jit_scan_pattern(detector, source, "payload.bin", "Dynamic module execution detected")
 
     def test_scan_model_ignores_independent_inert_libraryloader_after_other_rebound(self) -> None:
         detector = JITScriptDetector()
@@ -13002,12 +11992,7 @@ class TestJITScriptDetector:
             b"    second.payload.printf(b'x')\n"
         )
 
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert not any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Native library loading detected"
-            for finding in findings
-        )
+        _assert_jit_scan_without_pattern(detector, source, "payload.bin", "Native library loading detected")
 
     def test_scan_model_ignores_inert_libraryloader_metadata_assignment(self) -> None:
         detector = JITScriptDetector()
@@ -13019,12 +12004,7 @@ class TestJITScriptDetector:
             b"    loader.payload.printf(b'x')\n"
         )
 
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert not any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Native library loading detected"
-            for finding in findings
-        )
+        _assert_jit_scan_without_pattern(detector, source, "payload.bin", "Native library loading detected")
 
     def test_scan_model_detects_inert_libraryloader_dlltype_mapping_rebound(self) -> None:
         detector = JITScriptDetector()
@@ -13036,12 +12016,7 @@ class TestJITScriptDetector:
             b"    loader.payload\n"
         )
 
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Native library loading detected"
-            for finding in findings
-        )
+        _assert_jit_scan_pattern(detector, source, "payload.bin", "Native library loading detected")
 
     @pytest.mark.parametrize(
         "mutation",
@@ -13112,24 +12087,14 @@ class TestJITScriptDetector:
             b"    alias.payload('/missing')\n"
         )
 
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Native library loading detected"
-            for finding in findings
-        )
+        _assert_jit_scan_pattern(detector, source, "payload.bin", "Native library loading detected")
 
     def test_scan_model_detects_late_ctypes_subscript_alias_after_priority_window(self) -> None:
         detector = JITScriptDetector()
         padding = b"# pad\n" * (jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES // len(b"# pad\n") + 8)
         source = b"\x00\xfffrom ctypes import cdll\n" + padding + b"cdll['payload']\n" + padding
 
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Native library loading detected"
-            for finding in findings
-        )
+        _assert_jit_scan_pattern(detector, source, "payload.bin", "Native library loading detected")
 
     @pytest.mark.parametrize(
         ("helper_import", "endpoint"),
@@ -13331,12 +12296,7 @@ class TestJITScriptDetector:
             b"    runpy.run_path('payload.py')\n"
         )
 
-        findings = detector.scan_model(source, "pytorch", "payload.bin")
-
-        assert any(
-            finding.type == "code_execution_pattern" and finding.pattern == "Dynamic module execution detected"
-            for finding in findings
-        )
+        _assert_jit_scan_pattern(detector, source, "payload.bin", "Dynamic module execution detected")
 
     @pytest.mark.parametrize(
         "source",
@@ -13619,3 +12579,58 @@ def test_first_body_statement_segment_bounds_nested_recursion() -> None:
     candidate = header + b"".join(b" " * (depth + 1) + b"if 1:\n" for depth in range(3000)) + b" " * 3001 + b"x = 1\n"
     segment = jit_script_module._first_body_statement_segment(candidate, len(header), 0)
     assert segment is not None
+
+
+def _assert_runpy_across_gap(prefix: bytes, suffix: bytes) -> None:
+    detector = JITScriptDetector()
+    filler_line = b"# filler\n"
+    filler = filler_line * (2 * jit_script_module._EMBEDDED_PYTHON_SCAN_WINDOW_BYTES // len(filler_line) + 1)
+    source = prefix + filler + suffix
+
+    findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+    assert any(
+        f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+    )
+
+
+def _assert_jit_scan_pattern(detector: JITScriptDetector, source: bytes, filename: str, pattern: str) -> None:
+    findings = detector.scan_model(source, "pytorch", filename)
+
+    assert any(finding.type == "code_execution_pattern" and finding.pattern == pattern for finding in findings)
+
+
+def _assert_jit_scan_without_pattern(detector: JITScriptDetector, source: bytes, filename: str, pattern: str) -> None:
+    findings = detector.scan_model(source, "pytorch", filename)
+
+    assert not any(finding.type == "code_execution_pattern" and finding.pattern == pattern for finding in findings)
+
+
+def _assert_jit_browser_and_native_findings(detector: JITScriptDetector, source: bytes) -> None:
+    findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+    patterns = {finding.pattern for finding in findings if finding.type == "code_execution_pattern"}
+    assert "Web browser launch detected" in patterns
+    assert "Native library loading detected" in patterns
+
+
+def _assert_jit_mapping_update_detection(
+    middle: bytes, should_detect: bool, case_prefix: bytes, case_suffix: bytes, case_pattern: str
+) -> None:
+    source = case_prefix + middle + case_suffix
+
+    findings = JITScriptDetector().scan_model(source, "pytorch", "payload.py")
+
+    detected = any(finding.type == "code_execution_pattern" and finding.pattern == case_pattern for finding in findings)
+    assert detected is should_detect
+
+
+def _assert_late_prefix_typed_alias(case_alias_source: bytes) -> None:
+    padding = b"# pad\n" * (jit_script_module._MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES // len(b"# pad\n") + 1)
+    prefix = padding + case_alias_source
+
+    typed_aliases = jit_script_module._typed_import_aliases(prefix)
+    aliases = jit_script_module._unsafe_typed_member_aliases(prefix, typed_aliases)
+
+    assert typed_aliases["wb"] == "webbrowser"
+    assert aliases["alias"] == frozenset({("webbrowser", "open", False)})

@@ -50,17 +50,12 @@ requires_joblib = _make_requires_decorator("joblib")
 requires_dill = _make_requires_decorator("dill")
 
 
-def skip_if_slow(reason: str = "Test is slow") -> pytest.MarkDecorator:
-    """Skip test in fast mode (when running with -m 'not slow')."""
-    return pytest.mark.slow
+def has_tensorflow_runtime() -> bool:
+    try:
+        import tensorflow as tf
 
-
-def skip_in_ci(
-    reason: str = "Test not suitable for CI",
-) -> Callable[[Callable[..., Any]], Callable[..., Any]] | pytest.MarkDecorator:
-    """Skip test in CI environment."""
-    import os
-
-    if os.environ.get("CI"):
-        return pytest.mark.skip(reason=reason)
-    return lambda f: f
+        # Avoid treating vendored protobuf-only stubs as full TensorFlow runtime.
+        # Those stubs are not sufficient for weight-distribution tests.
+        return bool(getattr(tf, "__version__", None)) and hasattr(tf, "constant")
+    except Exception:
+        return False
