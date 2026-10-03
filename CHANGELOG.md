@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- Require patched GitPython and AnyIO releases in published package dependencies as well as the lockfile.
+
 ### Fixed
 
 - Preserve native SafeTensors routing when a valid bounded header also resembles an FDICT zlib stream.

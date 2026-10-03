@@ -20,6 +20,8 @@ RENOVATE_CONFIG = ROOT_DIR / "renovate.json"
 PICKLESCAN_PYPROJECT = ROOT_DIR / "packages" / "modelaudit-picklescan" / "pyproject.toml"
 PATCHED_GITPYTHON_FLOOR = (3, 1, 60)
 PATCHED_ANYIO_FLOOR = (4, 14, 2)
+PATCHED_GITPYTHON_REQUIREMENT = "gitpython>=3.1.60"
+PATCHED_ANYIO_REQUIREMENT = "anyio>=4.14.2"
 PINNED_MATURIN_BACKEND = "maturin===1.13.3"
 PATCHED_PY7ZR_REQUIREMENT = "py7zr>=1.1.3"
 PY7ZR_EXTRAS = ("sevenzip", "all-ci", "all")
@@ -109,6 +111,13 @@ def test_mlflow_extras_use_the_hardened_tracking_client() -> None:
 
     for extra in MLFLOW_EXTRAS:
         assert PATCHED_MLFLOW_CLIENT_REQUIREMENT in optional_dependencies[extra]
+        assert PATCHED_GITPYTHON_REQUIREMENT in optional_dependencies[extra]
+
+
+def test_base_install_requires_patched_anyio() -> None:
+    root_config = tomllib.loads(ROOT_PYPROJECT.read_text(encoding="utf-8"))
+
+    assert PATCHED_ANYIO_REQUIREMENT in root_config["project"]["dependencies"]
 
 
 @pytest.mark.parametrize("extra", MLFLOW_EXTRAS)
