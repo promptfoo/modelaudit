@@ -21,10 +21,5 @@ if [[ "$1" == "-c" ]] || [[ "$1" == "-m" ]]; then
     exec python "$@"
 fi
 
-# If no arguments or first argument looks like a modelaudit option, run modelaudit
-if [[ $# -eq 0 ]] || [[ "$1" == "--"* ]] || [[ "$1" == "-"* ]] || [[ "$1" == "scan" ]]; then
-    exec modelaudit "$@"
-fi
-
-# For file paths or other arguments, assume it's a scan command
+# Run ModelAudit for every other invocation.
 exec modelaudit "$@"

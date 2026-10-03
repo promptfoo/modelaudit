@@ -2,7 +2,7 @@ name: Performance Benchmarks
 
 on:
   pull_request:
-    paths:
+    paths: &benchmark-trigger-paths
       - "modelaudit/**"
       - "packages/modelaudit-picklescan/**"
       - "tests/benchmarks/**"
@@ -17,18 +17,7 @@ on:
   push:
     branches:
       - main
-    paths:
-      - "modelaudit/**"
-      - "packages/modelaudit-picklescan/**"
-      - "tests/benchmarks/**"
-      - "tests/helpers/**"
-      - "tests/conftest.py"
-      - "tests/test_benchmark_report.py"
-      - "tests/test_performance_benchmarks.py"
-      - "scripts/benchmark_report.py"
-      - "pyproject.toml"
-      - "uv.lock"
-      - ".github/workflows/perf.yml"
+    paths: *benchmark-trigger-paths
   workflow_dispatch:
 
 permissions:

@@ -440,10 +440,6 @@ TOOL_SPECS: dict[str, ToolSpec] = {
 }
 
 
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
-
 def _json_default(value: Any) -> Any:
     if isinstance(value, Path):
         return str(value)
@@ -547,32 +543,12 @@ def _tool_path(spec: ToolSpec, tools_root: Path) -> Path:
     return tools_root / default_path
 
 
-def _tool_dirty_status(path: Path) -> str:
-    return _repo_git(["status", "--short"], cwd=path).stdout.strip()
-
-
-def _git_describe(path: Path) -> str:
-    return _repo_git(["describe", "--tags", "--always", "--dirty"], cwd=path).stdout.strip()
-
-
-def _git_branch(path: Path) -> str:
-    return _repo_git(["branch", "--show-current"], cwd=path).stdout.strip()
-
-
-def _git_remote(path: Path) -> str:
-    return _repo_git(["remote", "get-url", "origin"], cwd=path).stdout.strip()
-
-
-def _git_head(path: Path) -> str:
-    return _repo_git(["rev-parse", "HEAD"], cwd=path).stdout.strip()
-
-
 def _git_default_branch(path: Path) -> str:
     result = _repo_git(["symbolic-ref", "refs/remotes/origin/HEAD"], cwd=path, check=False)
     ref = result.stdout.strip()
     if ref.startswith("refs/remotes/origin/"):
         return ref.removeprefix("refs/remotes/origin/")
-    return _git_branch(path) or "main"
+    return _repo_git(["branch", "--show-current"], cwd=path).stdout.strip() or "main"
 
 
 def _sync_tool(spec: ToolSpec, *, tools_root: Path, allow_dirty: bool, skip_pull: bool) -> dict[str, Any]:
@@ -583,18 +559,18 @@ def _sync_tool(spec: ToolSpec, *, tools_root: Path, allow_dirty: bool, skip_pull
     if not (path / ".git").exists():
         raise ValueError(f"{path} exists but is not a Git repository")
 
-    remote = _git_remote(path)
+    remote = _repo_git(["remote", "get-url", "origin"], cwd=path).stdout.strip()
     if remote != spec.repo_url:
         raise ValueError(f"{spec.name} remote mismatch: expected {spec.repo_url}, got {remote}")
 
-    dirty = _tool_dirty_status(path)
+    dirty = _repo_git(["status", "--short"], cwd=path).stdout.strip()
     if dirty and not allow_dirty:
         raise ValueError(f"{spec.name} worktree is dirty:\n{dirty}")
 
     if not skip_pull:
         _repo_git(["fetch", "--tags", "origin"], cwd=path)
         default_branch = _git_default_branch(path)
-        current_branch = _git_branch(path)
+        current_branch = _repo_git(["branch", "--show-current"], cwd=path).stdout.strip()
         if not dirty and current_branch and current_branch != default_branch:
             _repo_git(["checkout", default_branch], cwd=path)
         _repo_git(["pull", "--ff-only"], cwd=path)
@@ -603,12 +579,12 @@ def _sync_tool(spec: ToolSpec, *, tools_root: Path, allow_dirty: bool, skip_pull
         "name": spec.name,
         "path": str(path),
         "repo_url": spec.repo_url,
-        "remote": _git_remote(path),
-        "branch": _git_branch(path),
-        "commit": _git_head(path),
-        "describe": _git_describe(path),
-        "dirty": _tool_dirty_status(path),
-        "synced_at": _now_iso(),
+        "remote": _repo_git(["remote", "get-url", "origin"], cwd=path).stdout.strip(),
+        "branch": _repo_git(["branch", "--show-current"], cwd=path).stdout.strip(),
+        "commit": _repo_git(["rev-parse", "HEAD"], cwd=path).stdout.strip(),
+        "describe": _repo_git(["describe", "--tags", "--always", "--dirty"], cwd=path).stdout.strip(),
+        "dirty": _repo_git(["status", "--short"], cwd=path).stdout.strip(),
+        "synced_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     }
 
 
@@ -632,10 +608,6 @@ def _select_entries(
             continue
         entries.append(entry)
     return entries
-
-
-def _entry_local_path(corpus_root: Path, entry: CorpusEntry) -> Path:
-    return corpus_root / "raw" / entry.id / entry.path
 
 
 def _validated_artifact_id(value: object) -> str:
@@ -673,26 +645,6 @@ def _contained_output_path(root: Path, *parts: str | Path) -> Path:
     if candidate != resolved_root and resolved_root not in candidate.parents:
         raise ValueError(f"corpus path escapes output root: {candidate}")
     return candidate
-
-
-def _validated_lock_entry_path(entry: Mapping[str, Any]) -> tuple[str, Path]:
-    return _validated_artifact_id(entry["id"]), _validated_remote_path(entry["path"])
-
-
-def _entry_to_lock(entry: CorpusEntry, *, corpus_root: Path) -> dict[str, Any]:
-    return {
-        **asdict(entry),
-        "revision": "main",
-        "remote_size_bytes": None,
-        "sha256": None,
-        "etag": None,
-        "license": None,
-        "source_url": f"https://huggingface.co/{entry.repo_id}/tree/main",
-        "downloaded_at": None,
-        "local_path": str(_entry_local_path(corpus_root, entry)),
-        "preflight_status": "pending",
-        "preflight_error": None,
-    }
 
 
 def _hf_file_metadata(repo_id: str, filename: str, *, revision: str) -> dict[str, Any]:
@@ -739,10 +691,6 @@ def _load_lock_entries(lock_path: Path) -> list[dict[str, Any]]:
 LOCK_CORE_KEYS = {"schema_version", "created_at", "tier", "entry_count", "entries"}
 
 
-def _lock_extra_metadata(payload: Mapping[str, Any]) -> dict[str, Any]:
-    return {str(key): value for key, value in payload.items() if key not in LOCK_CORE_KEYS}
-
-
 def _write_lock(
     lock_path: Path,
     entries: list[dict[str, Any]],
@@ -752,7 +700,7 @@ def _write_lock(
 ) -> None:
     payload = {
         "schema_version": 1,
-        "created_at": _now_iso(),
+        "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "tier": tier,
         "entry_count": len(entries),
         "entries": entries,
@@ -765,7 +713,7 @@ def _write_lock(
 def _finalize_downloaded_entry(entry: dict[str, Any], local_path: Path) -> dict[str, Any]:
     entry["local_path"] = str(local_path)
     entry["sha256"] = _sha256_file(local_path)
-    entry["downloaded_at"] = _now_iso()
+    entry["downloaded_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     entry["downloaded_size_bytes"] = local_path.stat().st_size
     return entry
 
@@ -815,7 +763,7 @@ def _download_entry(
     direct_fallback: bool,
     direct_only: bool,
 ) -> dict[str, Any]:
-    artifact_id, relative_path = _validated_lock_entry_path(entry)
+    artifact_id, relative_path = (_validated_artifact_id(entry["id"]), _validated_remote_path(entry["path"]))
 
     try:
         from huggingface_hub import hf_hub_download
@@ -895,24 +843,18 @@ def _legacy_verdict(result: ScanResult) -> str:
     return "unknown"
 
 
-def _normalize_scan_result(result: ScanResult, *, engine: str) -> NormalizedResult:
-    return NormalizedResult(
-        engine=engine,
-        status=_legacy_status(result),
-        verdict=_legacy_verdict(result),
-        success=bool(result.success),
-        warning_count=sum(1 for issue in result.issues if issue.severity == IssueSeverity.WARNING),
-        critical_count=sum(1 for issue in result.issues if issue.severity == IssueSeverity.CRITICAL),
-        info_count=sum(1 for issue in result.issues if issue.severity == IssueSeverity.INFO),
-        rule_codes=tuple(sorted(issue.rule_code for issue in result.issues if issue.rule_code)),
-        messages=tuple(sorted(issue.message for issue in result.issues)),
-        metadata=_json_clean(dict(result.metadata)),
-    )
-
-
-def _normalize_package_report(report: PickleReport, *, engine: str) -> NormalizedResult:
-    return NormalizedResult(
-        engine=engine,
+def _scan_package(path: Path, *, engine: str, artifact_id: str) -> dict[str, Any]:
+    if engine != "rust":
+        raise ValueError(f"unsupported picklescan engine after Rust migration: {engine}")
+    started = time.monotonic()
+    if artifact_id == "V10":
+        report = StandalonePickleScanner(options=ScanOptions(max_opcodes=1)).scan_file(path)
+    else:
+        report = package_scan_file(path)
+    duration = time.monotonic() - started
+    normalized_engine = f"package:{engine}"
+    normalized = NormalizedResult(
+        engine=normalized_engine,
         status=report.status.value,
         verdict=report.verdict.value,
         success=report.status == ScanStatus.COMPLETE
@@ -924,18 +866,6 @@ def _normalize_package_report(report: PickleReport, *, engine: str) -> Normalize
         messages=tuple(sorted(finding.message for finding in report.findings)),
         metadata=_json_clean(dict(report.metadata)),
     )
-
-
-def _scan_package(path: Path, *, engine: str, artifact_id: str) -> dict[str, Any]:
-    if engine != "rust":
-        raise ValueError(f"unsupported picklescan engine after Rust migration: {engine}")
-    started = time.monotonic()
-    if artifact_id == "V10":
-        report = StandalonePickleScanner(options=ScanOptions(max_opcodes=1)).scan_file(path)
-    else:
-        report = package_scan_file(path)
-    duration = time.monotonic() - started
-    normalized = _normalize_package_report(report, engine=f"package:{engine}")
     return {
         "artifact_id": artifact_id,
         "scanner": "modelaudit-picklescan",
@@ -960,7 +890,19 @@ def _scan_root(path: Path, *, engine: str, root_mode: str, artifact_id: str) -> 
     else:
         raise ValueError(f"unsupported root mode: {root_mode}")
     duration = time.monotonic() - started
-    normalized = _normalize_scan_result(result, engine=f"root:{root_mode}:{engine}")
+    normalized_engine = f"root:{root_mode}:{engine}"
+    normalized = NormalizedResult(
+        engine=normalized_engine,
+        status=_legacy_status(result),
+        verdict=_legacy_verdict(result),
+        success=bool(result.success),
+        warning_count=sum(1 for issue in result.issues if issue.severity == IssueSeverity.WARNING),
+        critical_count=sum(1 for issue in result.issues if issue.severity == IssueSeverity.CRITICAL),
+        info_count=sum(1 for issue in result.issues if issue.severity == IssueSeverity.INFO),
+        rule_codes=tuple(sorted(issue.rule_code for issue in result.issues if issue.rule_code)),
+        messages=tuple(sorted(issue.message for issue in result.issues)),
+        metadata=_json_clean(dict(result.metadata)),
+    )
     return {
         "artifact_id": artifact_id,
         "scanner": "modelaudit-root",
@@ -977,13 +919,6 @@ def _stable_report_dict(report: PickleReport) -> dict[str, Any]:
     if not isinstance(cleaned, dict):
         raise TypeError(f"expected report dict, got {type(cleaned).__name__}")
     return cleaned
-
-
-def _tool_command(spec: ToolSpec, *, tool_path: Path, artifact_path: Path, output_path: Path) -> list[str]:
-    return [
-        part.format(path=str(tool_path), artifact=str(artifact_path), output=str(output_path))
-        for part in spec.invocation
-    ]
 
 
 def _third_party_verdict(tool: str, exit_code: int, stdout: str, stderr: str, output_json: Path) -> str:
@@ -1042,7 +977,9 @@ def _scan_third_party(
     tool_path = _tool_path(spec, tools_root)
     output_path = _contained_output_path(run_dir, "third-party-raw", artifact_id, f"{spec.name}.json")
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    command = _tool_command(spec, tool_path=tool_path, artifact_path=path, output_path=output_path)
+    command = [
+        part.format(path=str(tool_path), artifact=str(path), output=str(output_path)) for part in spec.invocation
+    ]
     try:
         completed, duration = _run_command(command, timeout_s=timeout_s)
         status = "complete"
@@ -1066,7 +1003,9 @@ def _scan_third_party(
         "artifact_id": artifact_id,
         "tool": spec.name,
         "tool_path": str(tool_path),
-        "tool_commit": _git_head(tool_path) if (tool_path / ".git").exists() else None,
+        "tool_commit": _repo_git(["rev-parse", "HEAD"], cwd=tool_path).stdout.strip()
+        if (tool_path / ".git").exists()
+        else None,
         "command": command,
         "status": status,
         "verdict": _third_party_verdict(spec.name, exit_code, stdout, stderr, output_path),
@@ -1116,14 +1055,6 @@ def _member_file_path(run_dir: Path, artifact_id: str, member_name: str, *, memb
     return _contained_output_path(run_dir, "members", artifact_id, safe_member_name)
 
 
-def _malicious_reduce_payload() -> bytes:
-    return raw_os_system_reduce_payload()
-
-
-def _stack_global_payload() -> bytes:
-    return raw_stack_global_eval_reduce_payload()
-
-
 def raw_os_system_reduce_payload() -> bytes:
     return b"\x80\x04cos\nsystem\n\x8c\x0cecho qa-noop\x85R."
 
@@ -1134,8 +1065,8 @@ def raw_stack_global_eval_reduce_payload() -> bytes:
 
 def _write_synthetic_variants(output_dir: Path) -> list[dict[str, Any]]:
     output_dir.mkdir(parents=True, exist_ok=True)
-    malicious = _malicious_reduce_payload()
-    stack_global = _stack_global_payload()
+    malicious = raw_os_system_reduce_payload()
+    stack_global = raw_stack_global_eval_reduce_payload()
     nested = pickle.dumps({"outer": malicious}, protocol=4)
     base64_payload = __import__("base64").b64encode(malicious).decode("ascii")
     hex_payload = malicious.hex()
@@ -1179,7 +1110,7 @@ def _write_synthetic_variants(output_dir: Path) -> list[dict[str, Any]]:
                 "path": str(path),
                 "size_bytes": path.stat().st_size,
                 "sha256": _sha256_file(path),
-                "created_at": _now_iso(),
+                "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             }
         )
 
@@ -1195,7 +1126,7 @@ def _write_synthetic_variants(output_dir: Path) -> list[dict[str, Any]]:
             "path": str(zip_variant),
             "size_bytes": zip_variant.stat().st_size,
             "sha256": _sha256_file(zip_variant),
-            "created_at": _now_iso(),
+            "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         }
     )
 
@@ -1208,7 +1139,7 @@ def _write_synthetic_variants(output_dir: Path) -> list[dict[str, Any]]:
             "path": str(malformed),
             "size_bytes": malformed.stat().st_size,
             "sha256": _sha256_file(malformed),
-            "created_at": _now_iso(),
+            "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         }
     )
     _write_json(output_dir / "synthetic-manifest.json", {"entries": records})
@@ -1218,7 +1149,7 @@ def _write_synthetic_variants(output_dir: Path) -> list[dict[str, Any]]:
 def _environment_payload(*, tools: Sequence[dict[str, Any]] | None = None) -> dict[str, Any]:
     git_status = _repo_git(["status", "--short"], cwd=REPO_ROOT, check=False).stdout.strip()
     return {
-        "created_at": _now_iso(),
+        "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "repo_root": str(REPO_ROOT),
         "git_commit": _repo_git(["rev-parse", "HEAD"], cwd=REPO_ROOT, check=False).stdout.strip(),
         "git_branch": _repo_git(["branch", "--show-current"], cwd=REPO_ROOT, check=False).stdout.strip(),
@@ -1277,7 +1208,19 @@ def cmd_preflight(args: argparse.Namespace) -> int:
         tier=args.tier,
         include_replacements=args.include_replacements,
     ):
-        record = _entry_to_lock(entry, corpus_root=corpus_root)
+        record = {
+            **asdict(entry),
+            "revision": "main",
+            "remote_size_bytes": None,
+            "sha256": None,
+            "etag": None,
+            "license": None,
+            "source_url": f"https://huggingface.co/{entry.repo_id}/tree/main",
+            "downloaded_at": None,
+            "local_path": str(corpus_root / "raw" / entry.id / entry.path),
+            "preflight_status": "pending",
+            "preflight_error": None,
+        }
         if not args.offline:
             try:
                 record.update(_hf_file_metadata(entry.repo_id, entry.path, revision=args.revision))
@@ -1348,7 +1291,7 @@ def cmd_download(args: argparse.Namespace) -> int:
             updated.append(entry)
             continue
         try:
-            _validated_lock_entry_path(entry)
+            (_validated_artifact_id(entry["id"]), _validated_remote_path(entry["path"]))
             remote_size = entry.get("remote_size_bytes")
             if (
                 budget_bytes is not None
@@ -1378,7 +1321,7 @@ def cmd_download(args: argparse.Namespace) -> int:
         lock_path,
         updated,
         tier=str(lock_payload.get("tier", "custom")),
-        extra=_lock_extra_metadata(lock_payload),
+        extra={str(key): value for key, value in lock_payload.items() if key not in LOCK_CORE_KEYS},
     )
     print(f"Updated {lock_path}; downloaded {downloaded_bytes} bytes")
     return 1 if download_failed else 0
@@ -1394,7 +1337,7 @@ def cmd_classify(args: argparse.Namespace) -> int:
         lock_path,
         entries,
         tier=str(lock_payload.get("tier", "custom")),
-        extra=_lock_extra_metadata(lock_payload),
+        extra={str(key): value for key, value in lock_payload.items() if key not in LOCK_CORE_KEYS},
     )
     print(f"Classified {len(entries)} entries in {lock_path}")
     return 0
@@ -1575,15 +1518,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
     finally:
         logging.disable(previous_logging_disable_level)
 
-    _write_json(run_dir / "parity-drift.json", _build_parity_drift(all_scan_rows))
-    _write_json(
-        run_dir / "third-party-differential.json",
-        _build_third_party_differential(all_third_party_rows, scan_rows=all_scan_rows),
-    )
-    _write_json(run_dir / "coverage-matrix.json", _build_coverage_matrix(all_scan_rows))
-    _write_json(run_dir / "benchmark-results.json", _build_benchmark_results(all_scan_rows, all_third_party_rows))
-    _write_benchmark_csv(run_dir / "benchmark-summary.csv", all_scan_rows, all_third_party_rows)
-    _write_report(run_dir, all_scan_rows, all_third_party_rows)
+    _write_qa_outputs(run_dir, all_scan_rows, all_third_party_rows)
     print(f"Wrote QA run to {run_dir}")
     scan_error_count = sum(1 for row in all_scan_rows if _scan_row_has_error(row))
     if scan_error_count:
@@ -1600,17 +1535,6 @@ def _scan_row_has_error(row: Mapping[str, Any]) -> bool:
         return True
     result = row.get("result")
     return isinstance(result, Mapping) and result.get("status") == "error"
-
-
-def _rows_by_artifact_and_scanner(rows: Iterable[Mapping[str, Any]]) -> dict[tuple[str, str], dict[str, Any]]:
-    indexed: dict[tuple[str, str], dict[str, Any]] = {}
-    for row in rows:
-        result = row.get("result")
-        if not isinstance(result, Mapping):
-            continue
-        key = (str(row.get("artifact_id")), f"{row.get('scanner')}:{row.get('mode')}")
-        indexed[key] = dict(row)
-    return indexed
 
 
 def _result_rank(result: Mapping[str, Any]) -> int:
@@ -1884,7 +1808,7 @@ def _write_report(
     lines = [
         "# PickleScan Rust Large-Corpus QA Report",
         "",
-        f"Generated: {_now_iso()}",
+        f"Generated: {datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')}",
         "",
         "## Summary",
         "",
@@ -1894,38 +1818,31 @@ def _write_report(
         f"- Third-party failure count: {third_party['failure_count']}",
         f"- Coverage missing: {', '.join(coverage['missing']) if coverage['missing'] else 'none'}",
         "",
-        "## Parity Drift",
-        "",
-        "```json",
-        json.dumps(drift, indent=2, sort_keys=True, default=_json_default),
-        "```",
-        "",
-        "## Third-Party Differential",
-        "",
-        "```json",
-        json.dumps(third_party, indent=2, sort_keys=True, default=_json_default),
-        "```",
-        "",
-        "## Coverage Matrix",
-        "",
-        "```json",
-        json.dumps(coverage, indent=2, sort_keys=True, default=_json_default),
-        "```",
-        "",
-        "## Benchmark Summary",
-        "",
-        "```json",
-        json.dumps(benchmark, indent=2, sort_keys=True, default=_json_default),
-        "```",
-        "",
     ]
+    for title, payload in (
+        ("Parity Drift", drift),
+        ("Third-Party Differential", third_party),
+        ("Coverage Matrix", coverage),
+        ("Benchmark Summary", benchmark),
+    ):
+        lines.extend(
+            [
+                f"## {title}",
+                "",
+                "```json",
+                json.dumps(payload, indent=2, sort_keys=True, default=_json_default),
+                "```",
+                "",
+            ]
+        )
     (run_dir / "qa-report.md").write_text("\n".join(lines), encoding="utf-8")
 
 
-def cmd_report(args: argparse.Namespace) -> int:
-    run_dir = Path(args.run)
-    scan_rows = _read_jsonl(run_dir / "scan-results.jsonl")
-    third_party_rows = _read_jsonl(run_dir / "third-party-results.jsonl")
+def _write_qa_outputs(
+    run_dir: Path,
+    scan_rows: Sequence[Mapping[str, Any]],
+    third_party_rows: Sequence[Mapping[str, Any]],
+) -> None:
     _write_json(run_dir / "parity-drift.json", _build_parity_drift(scan_rows))
     _write_json(
         run_dir / "third-party-differential.json",
@@ -1935,6 +1852,13 @@ def cmd_report(args: argparse.Namespace) -> int:
     _write_json(run_dir / "benchmark-results.json", _build_benchmark_results(scan_rows, third_party_rows))
     _write_benchmark_csv(run_dir / "benchmark-summary.csv", scan_rows, third_party_rows)
     _write_report(run_dir, scan_rows, third_party_rows)
+
+
+def cmd_report(args: argparse.Namespace) -> int:
+    run_dir = Path(args.run)
+    scan_rows = _read_jsonl(run_dir / "scan-results.jsonl")
+    third_party_rows = _read_jsonl(run_dir / "third-party-results.jsonl")
+    _write_qa_outputs(run_dir, scan_rows, third_party_rows)
     print(f"Wrote report files in {run_dir}")
     return 0
 
