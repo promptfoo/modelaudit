@@ -7707,9 +7707,12 @@ def _compression_route_precedes_safetensors(
         return True
     if not _has_structurally_valid_compression_header(prefix, compression_format):
         return False
-    if compression_format == "zlib" and len(prefix) >= 2 and prefix[1] & 0x20:
-        return True
     header_len, header = validated_header
+    if compression_format == "zlib" and len(prefix) >= 2 and prefix[1] & 0x20:
+        # FDICT streams cannot be decoder-probed without their preset dictionary.
+        # Prefer them unless a native SafeTensors file has a fully parsed bounded header.
+        native_safetensors = get_extension_format_map().get(path.suffix.lower()) == "safetensors"
+        return not native_safetensors or header is None
     if header is None:
         probe_limit = PROTO0_1_MAX_PROBE_BYTES
     else:
