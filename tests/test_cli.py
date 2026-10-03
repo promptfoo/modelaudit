@@ -8125,7 +8125,9 @@ def test_scan_jfrog_url_download_failure(mock_scan_jfrog, mock_is_jfrog):
 
 @patch("modelaudit.cli.is_jfrog_url")
 @patch("modelaudit.cli.scan_jfrog_artifact")
-def test_scan_jfrog_url_download_failure_preserves_sensitive_url(mock_scan_jfrog, mock_is_jfrog):
+def test_scan_jfrog_url_download_failure_preserves_sensitive_url(
+    mock_scan_jfrog: MagicMock, mock_is_jfrog: MagicMock
+) -> None:
     """JFrog CLI errors preserve the failed source URL."""
     raw_url = "https://user:leaky-pass@company.jfrog.io/artifactory/repo/model.bin?token=leaky-token"
     mock_is_jfrog.return_value = True
