@@ -222,6 +222,10 @@ Oversized source identifiers use bounded previews with SHA-256 identifiers share
 literal identifiers are reserved so distinct sources remain distinct.
 Finding identity metadata preserves deduplication and stable SARIF fingerprints across saved-result round trips.
 
+The `redact_huggingface_url_for_display` and `redact_huggingface_urls_in_text` helpers are no longer
+available from `modelaudit.utils.sources.huggingface` or `huggingface_paths`. Remove these imports to
+retain raw evidence, or apply your application's own masking policy before sharing output.
+
 Targeted scanner selection:
 
 ```bash
@@ -301,7 +305,7 @@ modelaudit model.pkl --format sarif --output results.sarif
 ## Troubleshooting
 
 - Run `modelaudit doctor --show-failed` to list unavailable scanners and missing optional deps.
-- Run `modelaudit debug --json` to collect environment/config diagnostics for bug reports.
+- Run `modelaudit debug --json` to collect environment/config diagnostics for bug reports. Inspect the raw output and remove sensitive values before sharing it.
 - Use `modelaudit cache cleanup --max-age 30` to remove stale cache entries safely.
 - If `pip` installs an older release, verify Python is supported (`python --version`; ModelAudit supports Python 3.10-3.13).
 - For additional troubleshooting and cloud auth guidance, see:

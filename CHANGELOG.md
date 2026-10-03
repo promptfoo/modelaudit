@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Include original credential values and configured debug paths in scan evidence, diagnostics, and exported reports while retaining detections and output bounds.
+- Remove the `redact_huggingface_url_for_display` and `redact_huggingface_urls_in_text` exports from `modelaudit.utils.sources.huggingface` and `huggingface_paths`. Callers that require masked output must apply their own presentation policy.
 - Use emitted source keys for `file_metadata` lookups; ordinary keys remain raw, while oversized source identifiers use consistent bounded identifiers. Previously masked keys are no longer aliases. Metadata values and per-source associations remain intact.
 - Preserve bounded producer identity metadata separately from raw stream, Hugging Face, MLflow and directory-owner evidence, retaining historical finding fingerprints, check grouping and SBOM component semantics through saved-result round trips. Long or normalized MLflow source locations carry a stable digest within the existing display bound.
 
