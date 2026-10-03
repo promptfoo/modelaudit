@@ -30,13 +30,7 @@ impl DetailValue {
                 }
                 Ok(list.into_any().unbind())
             }
-            DetailValue::Dict(values) => {
-                let dict = PyDict::new(py);
-                for (key, value) in values {
-                    dict.set_item(key, value.to_py_object(py)?)?;
-                }
-                Ok(dict.into_any().unbind())
-            }
+            DetailValue::Dict(values) => Ok(detail_dict_to_py(py, values)?.into_any()),
         }
     }
 }
