@@ -19,7 +19,7 @@ from modelaudit.utils.helpers.evidence import (
         ("abcdef", 3, "abc"),
         ("abcdef", 4, "a..."),
         ("abcdef", 6, "abcdef"),
-        ("x" * 100_000, 160, "x" * 157 + "..."),
+        pytest.param("x" * 100_000, 160, "x" * 157 + "...", id="large-evidence"),
         ("api_key=SECRET", None, "api_key=SECRET"),
         ("a\x00\x1b\x7f\u202e\ud800\u2028\u2029b\r\n\t", None, "ab\r\n\t"),
         ("\x00" * 5000 + "hidden tail", 4, "..."),

@@ -36,6 +36,7 @@ class TestSecretsDetector:
             ("password=" + "abCDef12345_" * 25000, "Hardcoded Password", 300000, "abCDef12345_"),
             ("Authorization: Basic" + " " * 300000 + "dXNlcjpwYXNz", "Basic Auth Credentials", 12, "Basic "),
         ],
+        ids=["long-password", "padded-basic-auth"],
     )
     def test_raw_secret_preview_is_bounded(self, text: str, secret_type: str, secret_length: int, prefix: str) -> None:
         findings = SecretsDetector().scan_text(text)
