@@ -985,8 +985,10 @@ def test_report_value_serialization_preserves_shapes_and_bounds() -> None:
         converted = converted[0]
     assert converted == "<redacted>"
     assert serialize_source_value("x" * (256 * 1024)) == "x" * (256 * 1024)
-    assert serialize_source_value("x" * (256 * 1024 + 1)) == "<redacted oversized value>"
-    assert serialize_source_identifier("x" * (256 * 1024 + 1)) == "<source redacted>"
+    oversized = "x" * (256 * 1024 + 1)
+    expected = f"{oversized[:256]}...<source sha256:{hashlib.sha256(oversized.encode()).hexdigest()}>"
+    assert serialize_source_value(oversized) == expected
+    assert serialize_source_identifier(oversized) == expected
     assert serialize_source_value({(1, 2): "tuple", "(1, 2)": "text"}) == {
         "(1, 2)": "tuple",
         "(1, 2)#modelaudit-redacted-key-2": "text",
@@ -1945,3 +1947,44 @@ def test_sarif_exports_stream_results_with_surrogates_in_query(
     assert run["results"]
     assert run["artifacts"][0]["location"]["uri"].isascii()
     assert exported.encode("utf-8")
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_source_serialization_keeps_joined_identifiers_and_literal_markers(reverse: bool) -> None:
+    from modelaudit.integrations.source_serialization import serialize_source_value
+
+    source = "https://example.test/model.pkl?token=" + "x" * (256 * 1024) + "\udcff"
+    literal = f"{source[:256]}...<source sha256:{hashlib.sha256(source.encode(errors='surrogatepass')).hexdigest()}>"
+    paths = [source, literal, literal + "#2"]
+    if reverse:
+        paths.reverse()
+    value = {"paths": [*paths, source], "metadata": {path: {"source": path} for path in paths}}
+    saved = serialize_source_value(value)
+    assert len(saved["metadata"]) == 3
+    assert set(saved["paths"]) == {literal, literal + "#2", literal + "#3"}
+    assert saved["paths"][-1] == literal + "#3"
+    assert all(saved["metadata"][path]["source"] == path for path in saved["paths"])
+    assert serialize_source_value(saved) == saved
+
+
+def test_source_serialization_materializes_model_and_custom_key_once() -> None:
+    from pydantic import BaseModel, model_serializer
+
+    from modelaudit.integrations.source_serialization import serialize_source_value
+
+    calls = []
+
+    class Key:
+        def __str__(self) -> str:
+            calls.append("key")
+            return "key"
+
+    class Details(BaseModel):
+        @model_serializer
+        def serialize(self) -> dict[str, str]:
+            calls.append("model")
+            return {"source": "x" * (256 * 1024 + 1)}
+
+    converted = serialize_source_value({Key(): Details()})
+    assert calls == ["key", "model"]
+    assert len(converted["key"]["source"]) < 256 * 1024

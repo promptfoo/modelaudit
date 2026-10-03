@@ -13,7 +13,7 @@ from typing import Any
 
 from ..models import ModelAuditResultModel
 from ..scanner_selection import SCANNER_SELECTION_CONFIG_KEY
-from ..utils.helpers.evidence import format_evidence_string
+from ..utils.helpers.evidence import format_terminal_text
 from ..utils.sources.jfrog import (
     detect_jfrog_target_type,
     download_artifact,
@@ -145,7 +145,7 @@ def scan_jfrog_artifact(
     download_dir, cleanup_download_dir = _prepare_download_dir(url, scan_cache_dir)
     start_time = time.time()
     display_url = url
-    log_url = format_evidence_string(url, max_chars=None)
+    log_url = format_terminal_text(url)
 
     try:
         # Detect if URL points to a file or folder

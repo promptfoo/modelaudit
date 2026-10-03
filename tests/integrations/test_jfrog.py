@@ -3852,12 +3852,18 @@ def test_jfrog_auth_warnings_filter_controls(probe: bool, caplog: pytest.LogCapt
     from modelaudit.utils.sources import jfrog
 
     caplog.set_level(logging.WARNING, logger="modelaudit.utils.sources.jfrog")
-    url = "https://company.jfrog.io/artifactory/repo/model.pkl?token=\x1b]52;c;U1lOVEhFVElD\x07"
+    url = "https://company.jfrog.io/artifactory/repo/model.pkl?token=\x1b]52;c;U1lOVEhFVElD\r\n\tFORGED\x07"
     with patch.object(jfrog, "_is_trusted_jfrog_auth_target", side_effect=[True, False] if probe else [False]):
         builder = jfrog._build_jfrog_probe_auth_headers if probe else jfrog._build_jfrog_auth_headers
         assert builder(url, api_token="synthetic", access_token=None) == {}
     assert "Skipping JFrog" in caplog.text
     assert "\x1b" not in caplog.text and "\x07" not in caplog.text
+    assert "\tFORGED" not in caplog.text
+    assert all(
+        len(record.message.splitlines()) == 1
+        for record in caplog.records
+        if record.name == "modelaudit.utils.sources.jfrog"
+    )
 
 
 @pytest.mark.parametrize("download", [False, True])
@@ -3868,7 +3874,7 @@ def test_jfrog_folder_error_logs_filter_controls(
 
     caplog.set_level(logging.WARNING, logger="modelaudit.utils.sources.jfrog")
     source = "https://company.jfrog.io/artifactory/repo/models"
-    error = OSError("Cannot read " + source + "?token=\x1b]52;c;U1lOVEhFVElD\x07")
+    error = OSError("Cannot read " + source + "?token=\x1b]52;c;U1lOVEhFVElD\r\n\tFORGED\x07")
     if download:
         files = [{"name": "model.pkl", "path": source + "/model.pkl", "size": 4, "human_size": "4 B"}]
         with (
@@ -3884,3 +3890,9 @@ def test_jfrog_folder_error_logs_filter_controls(
         assert len(files) == 1 and not files[0]["size_known"]
     assert "Failed to" in caplog.text
     assert "\x1b" not in caplog.text and "\x07" not in caplog.text
+    assert "\tFORGED" not in caplog.text
+    assert all(
+        len(record.message.splitlines()) == 1
+        for record in caplog.records
+        if record.name == "modelaudit.utils.sources.jfrog"
+    )

@@ -6,6 +6,7 @@ from modelaudit.utils.helpers.evidence import (
     format_evidence_mapping_key,
     format_evidence_string,
     format_evidence_value,
+    format_terminal_text,
 )
 
 
@@ -69,3 +70,9 @@ def test_evidence_traversal_stops_at_existing_depth_limit(cyclic: bool) -> None:
         assert isinstance(formatted, list) and len(formatted) == 1
         formatted = formatted[0]
     assert formatted == "<redacted>"
+
+
+def test_terminal_text_escapes_line_controls_without_changing_evidence_preview() -> None:
+    text = "token=raw-secret\r\n\tEND\x1b\x07" + "x" * 300
+    assert format_terminal_text(text) == r"token=raw-secret\r\n\tEND" + "x" * 300
+    assert format_evidence_string(text, max_chars=None) == "token=raw-secret\r\n\tEND" + "x" * 300
