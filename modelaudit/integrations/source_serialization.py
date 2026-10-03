@@ -14,19 +14,20 @@ def serialize_source_identifier(value: str) -> str:
     if len(value) <= _MAX_STRING_CHARS:
         return value
     digest = hashlib.sha256(value.encode("utf-8", errors="surrogatepass")).hexdigest()
-    return f"{value[:256]}...<source sha256:{digest}>"
+    preview = value[:256].encode("utf-8", errors="backslashreplace").decode("utf-8")
+    return f"{preview}...<source sha256:{digest}>"
 
 
 def serialize_source_text(value: str) -> str:
     return value if len(value) <= _MAX_STRING_CHARS else "<redacted oversized value>"
 
 
-def serialize_source_value(value: Any) -> Any:
+def serialize_source_value(value: Any, *, identifier_key: Callable[[str], str] | None = None) -> Any:
     """Preserve report shapes and JSON-compatible keys, bounding recursive values."""
-    return serialize_source_values([value])[0]
+    return serialize_source_values([value], identifier_key=identifier_key)[0]
 
 
-def serialize_source_values(values: list[Any]) -> list[Any]:
+def serialize_source_values(values: list[Any], *, identifier_key: Callable[[str], str] | None = None) -> list[Any]:
     """Share identifier allocation while retaining each value's depth budget."""
     identifiers: dict[str, str] = {}
     reserved: set[str] = set()
@@ -41,13 +42,20 @@ def serialize_source_values(values: list[Any]) -> list[Any]:
 
     # Materialize each model/key once; strings remain references until IDs are allocated.
     converted = [_serialize(value, set(), 0, reserve) for value in values]
+    reserved_identifiers = (
+        {identifier_key(text) for text in reserved} if identifiers and identifier_key is not None else set()
+    )
     for text in sorted(identifiers, key=identifiers.__getitem__):
         base = candidate = identifiers[text]
         occurrence = 1
-        while candidate in reserved:
+        while candidate in reserved or (
+            identifier_key is not None and identifier_key(candidate) in reserved_identifiers
+        ):
             occurrence += 1
             candidate = f"{base}#{occurrence}"
         reserved.add(candidate)
+        if identifier_key is not None:
+            reserved_identifiers.add(identifier_key(candidate))
         identifiers[text] = candidate
     return [_serialize(value, set(), 0, lambda text: identifiers.get(text, text)) for value in converted]
 

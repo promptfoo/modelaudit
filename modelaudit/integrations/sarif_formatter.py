@@ -6,6 +6,7 @@ integration with security tools and CI/CD pipelines.
 
 import contextlib
 import json
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -240,9 +241,16 @@ def _create_rules(issues: list, *, prefiltered: bool = False) -> list[dict[str, 
     return rules
 
 
+def _sarif_source_identifier_key(paths: Iterable[str]) -> Callable[[str], str] | None:
+    """Reserve URI equivalences only when a source needs an artificial identifier."""
+    return _normalize_path_to_uri if any(serialize_source_identifier(path) != path for path in paths) else None
+
+
 def _serialize_sarif_sources(paths: list[str], issues: list) -> tuple[dict[str, str], list[dict[str, Any]]]:
     """Allocate source references together with the evidence that refers to them."""
-    serialized = serialize_source_values([paths, *(dict(issue.details or {}) for issue in issues)])
+    serialized = serialize_source_values(
+        [paths, *(dict(issue.details or {}) for issue in issues)], identifier_key=_sarif_source_identifier_key(paths)
+    )
     return dict(zip(paths, serialized[0], strict=True)), serialized[1:]
 
 

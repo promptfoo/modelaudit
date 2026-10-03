@@ -56,7 +56,7 @@ from .core_results import (
     results_have_inconclusive_outcome,
 )
 from .integrations.jfrog import scan_jfrog_artifact
-from .integrations.sarif_formatter import format_sarif_output
+from .integrations.sarif_formatter import _sarif_source_identifier_key, format_sarif_output
 from .integrations.source_serialization import serialize_source_text, serialize_source_value
 from .models import FileMetadataModel, ModelAuditResultModel
 from .rules import Rule, RuleRegistry, Severity
@@ -2875,7 +2875,13 @@ def _serialize_scan_report(audit_result: ModelAuditResultModel, *, exclude_none:
         if finding_identity(record) is not record:
             _bound_report_finding_text(record["finding_identity"]["fields"], identity=True)
         _bound_report_finding_text(record)
-    return cast(dict[str, Any], serialize_source_value(result))
+    sources = [
+        *(asset.path for asset in audit_result.assets),
+        *(issue.location for issue in audit_result.issues if issue.location),
+        *(check.location for check in audit_result.checks if check.location),
+        *audit_result.file_metadata,
+    ]
+    return cast(dict[str, Any], serialize_source_value(result, identifier_key=_sarif_source_identifier_key(sources)))
 
 
 def _format_scan_output(
