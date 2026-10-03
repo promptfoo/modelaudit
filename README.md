@@ -218,9 +218,7 @@ Common scan options:
 
 Reports retain raw source identifiers and credential-bearing evidence. Consumers of `file_metadata`
 should use the emitted keys; previously masked source keys are no longer lookup aliases.
-Oversized source identifiers use bounded previews with SHA-256 identifiers shared across keys and references within each report;
-literal identifiers are reserved so distinct sources remain distinct.
-Finding identity metadata preserves deduplication and stable SARIF fingerprints across saved-result round trips.
+Very long source identifiers are shortened consistently within each report.
 
 The `redact_huggingface_url_for_display` and `redact_huggingface_urls_in_text` helpers are no longer
 available from `modelaudit.utils.sources.huggingface` or `huggingface_paths`. Remove these imports to
