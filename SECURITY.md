@@ -65,7 +65,7 @@ A good report helps us confirm and fix the issue quickly. Include as much of the
 - **Python version** (`python --version`).
 - **Operating system and architecture** (e.g., Ubuntu 22.04 x86_64, macOS 15 arm64).
 - **Installation method** (pip, uv, Docker, source).
-- **Verbose scan output** (`modelaudit scan <file> --verbose`), shared through private reporting or an agreed secure transfer channel. Redaction is not required for privately submitted evidence.
+- **Verbose scan output** (`modelaudit scan <file> --verbose`), shared through GitHub private advisory reporting or an agreed secure transfer channel. Redaction is not required for privately submitted evidence.
 - **Fuzzer details**, if the issue was found through fuzzing — include the fuzzer name, configuration, and corpus entry.
 
 If you cannot share the triggering file, describe how to generate a file that reproduces the issue.
