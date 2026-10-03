@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.10, <3.14"
 resolution-markers = [
     "python_full_version >= '3.13'",
@@ -1982,7 +1982,7 @@ wheels = [
 
 [[package]]
 name = "modelaudit"
-version = "0.2.52"
+version = "0.2.53"
 source = { editable = "." }
 dependencies = [
     { name = "click" },
@@ -2269,7 +2269,7 @@ dev = [
 
 [[package]]
 name = "modelaudit-picklescan"
-version = "0.1.10"
+version = "0.1.11"
 source = { editable = "packages/modelaudit-picklescan" }
 
 [[package]]
