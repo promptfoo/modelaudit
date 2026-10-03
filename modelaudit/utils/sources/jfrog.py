@@ -23,6 +23,9 @@ import click
 import requests
 from requests.auth import AuthBase
 
+from modelaudit._size_format import _format_size_absolute
+from modelaudit.scanner_selection import _matching_path_extensions
+
 from ...config.constants import SCANNABLE_MODEL_EXTENSIONS
 
 logger = logging.getLogger(__name__)
@@ -184,7 +187,10 @@ def is_jfrog_url(url: str) -> bool:
         return False
     if "/artifactory/" not in parsed.path:
         return False
-    return _is_jfrog_service_host(hostname) or hostname in _get_trusted_jfrog_hosts()
+    # Configured JFrog hosts are trusted credential targets.
+    return (hostname == "jfrog.io" or hostname.endswith(".jfrog.io")) or hostname in {
+        host for host in _get_configured_jfrog_hosts() if not _is_local_jfrog_host(host)
+    }
 
 
 def _normalize_hostname(hostname: str) -> str:
@@ -211,11 +217,6 @@ def _get_configured_jfrog_hosts() -> set[str]:
     """
     raw_hosts = os.getenv("MODELAUDIT_JFROG_ALLOWED_HOSTS", "")
     return {host for host in (_host_from_config_value(value) for value in raw_hosts.split(",")) if host}
-
-
-def _get_trusted_jfrog_hosts() -> set[str]:
-    """Return configured JFrog hosts that are safe credential targets."""
-    return {host for host in _get_configured_jfrog_hosts() if not _is_local_jfrog_host(host)}
 
 
 def _get_allowed_jfrog_redirect_hosts() -> set[str]:
@@ -246,10 +247,6 @@ def _is_local_jfrog_host(hostname: str) -> bool:
         return True
     mapped_ip = getattr(parsed_ip, "ipv4_mapped", None)
     return mapped_ip is not None and (mapped_ip.is_loopback or mapped_ip.is_unspecified)
-
-
-def _is_jfrog_service_host(hostname: str) -> bool:
-    return hostname == "jfrog.io" or hostname.endswith(".jfrog.io")
 
 
 def _parse_jfrog_host_ip(hostname: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
@@ -420,8 +417,8 @@ def _is_safe_jfrog_download_target(url: str) -> bool:
 
     hostname = origin[1]
     if (
-        _is_jfrog_service_host(hostname)
-        or hostname in _get_trusted_jfrog_hosts()
+        (hostname == "jfrog.io" or hostname.endswith(".jfrog.io"))
+        or hostname in {host for host in _get_configured_jfrog_hosts() if not _is_local_jfrog_host(host)}
         or hostname in _get_allowed_jfrog_redirect_hosts()
     ):
         return True
@@ -444,13 +441,8 @@ def _is_trusted_jfrog_auth_target(url: str) -> bool:
         hostname
         and not _is_local_jfrog_host(hostname)
         and hostname == prepared_hostname
-        and hostname in _get_trusted_jfrog_hosts()
+        and hostname in {host for host in _get_configured_jfrog_hosts() if not _is_local_jfrog_host(host)}
     )
-
-
-def _is_trusted_jfrog_probe_auth_target(url: str) -> bool:
-    """Return True when bounded probe credentials may be sent to this effective JFrog URL."""
-    return _is_trusted_jfrog_auth_target(url)
 
 
 def _build_jfrog_auth_headers(
@@ -512,11 +504,17 @@ def _require_size_within_limit(
     limit: int | None,
     display_url: str,
     description: str,
+    require_known: bool = False,
 ) -> None:
     if limit is None:
         return
 
     if size is None:
+        if require_known:
+            raise ValueError(
+                f"Cannot verify JFrog {description} size for {display_url}; refusing to download with maximum "
+                f"allowed size {format_size(limit)}"
+            )
         return
 
     if size > limit:
@@ -524,25 +522,6 @@ def _require_size_within_limit(
             f"JFrog {description} size ({format_size(size)}) exceeds maximum allowed size "
             f"({format_size(limit)}) for {display_url}"
         )
-
-
-def _require_known_size_within_limit(
-    *,
-    size: int | None,
-    limit: int | None,
-    display_url: str,
-    description: str,
-) -> None:
-    if limit is None:
-        return
-
-    if size is None:
-        raise ValueError(
-            f"Cannot verify JFrog {description} size for {display_url}; refusing to download with maximum "
-            f"allowed size {format_size(limit)}"
-        )
-
-    _require_size_within_limit(size=size, limit=limit, display_url=display_url, description=description)
 
 
 def _read_bounded_jfrog_json_response(response: requests.Response, *, display_url: str) -> dict[str, Any]:
@@ -594,7 +573,6 @@ def _get_with_jfrog_redirect_policy(
     *,
     headers: dict[str, str],
     timeout: int,
-    stream: bool = False,
 ) -> requests.Response:
     """GET a JFrog URL while isolating credentials from untrusted redirects."""
     current_url = url
@@ -613,7 +591,7 @@ def _get_with_jfrog_redirect_policy(
             cookies=current_cookies,
             auth=_JFROG_NO_NETRC_AUTH,
             timeout=timeout,
-            stream=stream,
+            stream=True,
             allow_redirects=False,
         )
         if response.status_code not in _JFROG_REDIRECT_STATUS_CODES:
@@ -726,7 +704,6 @@ def download_artifact(
                 url,
                 headers=headers,
                 timeout=timeout,
-                stream=True,
             )
 
         # Raise an exception for HTTP error responses
@@ -827,13 +804,7 @@ def get_storage_api_url(url: str) -> str:
 
 def format_size(size_bytes: int) -> str:
     """Format size in human-readable format."""
-    units = ["B", "KB", "MB", "GB", "TB", "PB"]
-    absolute_size = abs(size_bytes)
-    for index, unit in enumerate(units):
-        divisor = 1024**index
-        if absolute_size < divisor * 1024:
-            return f"{size_bytes / divisor:.1f} {unit}"
-    return f"{size_bytes} B"
+    return _format_size_absolute(size_bytes)
 
 
 def filter_scannable_files(
@@ -872,19 +843,6 @@ def filter_scannable_files(
     return scannable
 
 
-def _matching_scannable_extensions(file_path: str, extensions: Collection[str]) -> frozenset[str]:
-    path = PurePosixPath(urlparse(file_path).path) if file_path.startswith(("http://", "https://")) else Path(file_path)
-    suffixes = [suffix.lower() for suffix in path.suffixes]
-    normalized_extensions = frozenset(str(extension).lower() for extension in extensions)
-    if not suffixes:
-        return frozenset({""}) if "" in normalized_extensions else frozenset()
-    return frozenset(
-        candidate
-        for index in range(1, len(suffixes) + 1)
-        if (candidate := "".join(suffixes[-index:])) in normalized_extensions
-    )
-
-
 def _selected_suffix_needs_content_validation(
     file_path: str,
     extensions: Collection[str] | None,
@@ -900,7 +858,12 @@ def _selected_suffix_needs_content_validation(
         return False
     owners = {
         scanner_id
-        for extension in _matching_scannable_extensions(file_path, extensions)
+        for extension in _matching_path_extensions(
+            PurePosixPath(urlparse(file_path).path)
+            if file_path.startswith(("http://", "https://"))
+            else Path(file_path),
+            extensions,
+        )
         for scanner_id in scanner_ids_for_extension(extension)
     }
     return (
@@ -918,7 +881,7 @@ def _build_jfrog_probe_auth_headers(
 ) -> dict[str, str]:
     """Build JFrog auth headers for bounded probes only when Requests' effective host is trusted."""
     headers = _build_jfrog_auth_headers(url, api_token=api_token, access_token=access_token)
-    if not headers or _is_trusted_jfrog_probe_auth_target(url):
+    if not headers or _is_trusted_jfrog_auth_target(url):
         return headers
     logger.warning(
         "Skipping JFrog probe credentials for parser-confused or untrusted URL %s",
@@ -1484,7 +1447,7 @@ def detect_jfrog_target_type(
 
     response: requests.Response | None = None
     try:
-        response = _get_with_jfrog_redirect_policy(storage_api_url, headers=headers, timeout=timeout, stream=True)
+        response = _get_with_jfrog_redirect_policy(storage_api_url, headers=headers, timeout=timeout)
         response.raise_for_status()
 
         data = _read_bounded_jfrog_json_response(response, display_url=display_storage_api_url)
@@ -1747,13 +1710,15 @@ def download_jfrog_folder(
         file_url = str(file_info["path"])
         display_file_url = file_url
         file_size = _listed_file_known_size(file_info)
-        _require_known_size_within_limit(
+        _require_size_within_limit(
+            require_known=True,
             size=file_size,
             limit=per_file_limit,
             display_url=display_file_url,
             description="artifact",
         )
-        _require_known_size_within_limit(
+        _require_size_within_limit(
+            require_known=True,
             size=file_size,
             limit=total_limit,
             display_url=display_file_url,

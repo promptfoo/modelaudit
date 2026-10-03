@@ -785,6 +785,42 @@ def test_oversized_source_refs_preserve_risk_and_content_identity(legacy: bool, 
         } == expected
 
 
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("case", ["missing", "copyright", "members", "serializer"])
+def test_sbom_entrypoint_metadata_contracts(legacy: bool, case: str) -> None:
+    from pydantic import field_serializer
+
+    class SerializedMetadata(FileMetadataModel):
+        @field_serializer("license")
+        def serialize_license(self, value: str | None) -> str:
+            return "Apache-2.0"
+
+    path = "https://models.example/model.pkl"
+    result = create_mock_scan_result()
+    metadata: dict[str, FileMetadataModel] = {
+        "copyright": FileMetadataModel(copyright_notices=[{"holder": ""}, {"holder": "Example"}]),
+        "members": FileMetadataModel(member_file_hashes={"weights": {"file_size": 1}}),
+        "serializer": SerializedMetadata(license="MIT"),
+    }
+    if case != "missing":
+        result.file_metadata[path] = metadata[case]
+    output = generate_sbom([path], result) if legacy else generate_sbom_pydantic([path], result)
+    component: dict[str, Any] = json.loads(output)["components"][0]
+    props = {prop["name"]: prop["value"] for prop in component["properties"]}
+    if case == "missing":
+        assert props.get("security:scanned") == ("true" if legacy else None)
+    elif case == "copyright":
+        assert props["copyright_holders"] == (", Example" if legacy else "Example")
+    elif case == "serializer":
+        assert component["licenses"] == [{"expression": "Apache-2.0" if legacy else "MIT"}]
+    else:
+        record = json.loads(props["modelaudit:member_file_hashes"])["weights"]
+        assert record["file_size"] == 1
+        assert record["path_segments"] == []
+        assert ("file_hashes" in record) is legacy
+        assert ("hash_complete" in record) is legacy
+
+
 def _sbom_property_values(
     input_paths: Any, result: ModelAuditResultModel, legacy_generator: bool, property_name: str
 ) -> dict[str, str]:

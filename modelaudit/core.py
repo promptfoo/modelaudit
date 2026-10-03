@@ -173,11 +173,11 @@ from modelaudit.utils.repository_context import (
     normalize_repository_member_path,
     repository_file_inventory_context_from_config,
 )
+from modelaudit.utils.sources import _huggingface_cache as _hf_cache
 from modelaudit.utils.sources._huggingface_cache import (
     _find_hf_cache_root,
     _get_hf_cache_root_spellings,
     _get_hf_cache_roots,
-    _is_hf_cache_snapshot_alias,
     _path_has_part,
     _resolve_hf_cache_path,
     _trusted_hf_blobs_root,
@@ -3062,9 +3062,9 @@ def _resolve_directory_scan_target(
         )
         return None, False, True
 
-    # Check if this is a HuggingFace cache symlink scenario
+    # Allow only lexical aliases below snapshots/<revision>/... in the HuggingFace cache.
     is_hf_cache_symlink = False
-    if is_symlink and is_hf_cache and _is_hf_cache_snapshot_alias(file_path, hf_cache_root):
+    if is_symlink and is_hf_cache and _hf_cache._hf_cache_snapshot_revision(file_path, hf_cache_root) is not None:
         # Reuse the canonical target resolved above. On Windows, os.readlink()
         # may expose a device-path spelling that cannot safely be rejoined.
         resolved_target = resolved_file

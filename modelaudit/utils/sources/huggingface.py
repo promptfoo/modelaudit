@@ -28,6 +28,8 @@ from pathlib import Path, PurePath, PurePosixPath
 from typing import Any, Literal, cast, overload
 from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlparse, urlsplit, urlunsplit
 
+from modelaudit._size_format import _format_size_scaled as _format_size
+
 from ..file.detection import detect_file_format_for_skip_filter
 from ..file.streaming import StreamedSourceByteAccounting
 from ..helpers.assets import asset_from_scan_result
@@ -315,10 +317,6 @@ class _DuplicateAwareJsonObject(dict[str, Any]):
         self.overwritten_items = overwritten_items
 
 
-def _remote_safetensors_source_path(repo_id: str, revision: str, filename: str) -> str:
-    return f"hf://{repo_id}@{revision}/{filename}"
-
-
 def _replace_remote_temp_path(value: Any, temp_path: str, source_path: str) -> Any:
     """Rewrite source-local temporary paths before records leave remote scanning."""
     if isinstance(value, str):
@@ -582,7 +580,7 @@ def _remote_safetensors_failure_result(
     from ...scanner_results import ScanResult, mark_inconclusive_scan_result
     from ...scanners.base import IssueSeverity
 
-    source_path = _remote_safetensors_source_path(repo_id, revision, filename)
+    source_path = f"hf://{repo_id}@{revision}/{filename}"
     result = ScanResult(scanner_name="safetensors")
     result.metadata.update(
         {
@@ -710,7 +708,7 @@ def _remote_safetensors_result_budget_failure_result(
             passed=False,
             message="Security findings were preserved as a bounded summary after result-budget exhaustion",
             severity=summary_severity,
-            location=_remote_safetensors_source_path(repo_id, revision, filename),
+            location=f"hf://{repo_id}@{revision}/{filename}",
             details={
                 "candidate_security_record_count": len(security_severities),
                 "candidate_max_security_severity": summary_severity.value,
@@ -826,7 +824,7 @@ def _scan_remote_huggingface_safetensors_header(
         SafeTensorsScanner,
     )
 
-    source_path = _remote_safetensors_source_path(repo_id, revision, filename)
+    source_path = f"hf://{repo_id}@{revision}/{filename}"
     caller_scanner_config = dict(scanner_config or {})
     max_header_bytes = int(caller_scanner_config.get("max_safetensors_header_bytes", MAX_HEADER_BYTES))
     total_bytes_transferred = 0
@@ -1225,10 +1223,6 @@ def _remote_safetensors_filename_shard_details_by_file(
     return details_by_file
 
 
-def _is_safetensors_index_file(filename: str) -> bool:
-    return PurePosixPath(filename).name.lower().endswith(".safetensors.index.json")
-
-
 def _remote_index_parent_prefix(index_filename: str) -> str:
     parent = PurePosixPath(index_filename).parent
     return "" if parent.as_posix() == "." else f"{parent.as_posix().rstrip('/')}/"
@@ -1246,7 +1240,7 @@ def _remote_safetensors_index_filename_family(
         filename
         for filename in selected_safetensors
         if filename.casefold() == standalone_name
-        or (filename.casefold().startswith(shard_prefix) and _has_hf_safetensors_shard_shape(filename))
+        or (filename.casefold().startswith(shard_prefix) and (_parse_hf_safetensors_shard_shape(filename) is not None))
     }
 
 
@@ -1362,7 +1356,7 @@ def _remote_safetensors_index_failure_result(
     from ...scanner_results import ScanResult, mark_inconclusive_scan_result
     from ...scanners.base import IssueSeverity
 
-    source_path = _remote_safetensors_source_path(repo_id, revision, index_filename)
+    source_path = f"hf://{repo_id}@{revision}/{index_filename}"
     bytes_transferred = details.get("index_bytes_transferred", 0)
     if not isinstance(bytes_transferred, int) or isinstance(bytes_transferred, bool) or bytes_transferred < 0:
         bytes_transferred = 0
@@ -1489,7 +1483,9 @@ def _remote_safetensors_index_details_by_file(
 
     total_index_bytes = 0
     acquired_index_bytes: dict[str, bytes] = {}
-    for index_filename in sorted(filename for filename in repo_files if _is_safetensors_index_file(filename)):
+    for index_filename in sorted(
+        filename for filename in repo_files if PurePosixPath(filename).name.lower().endswith(".safetensors.index.json")
+    ):
         filename_family = _remote_safetensors_index_filename_family(index_filename, selected_files)
         if deadline is not None and time.monotonic() >= deadline:
             failure = _index_failure_details(index_filename, "index_reconciliation_timed_out")
@@ -2163,26 +2159,23 @@ def _read_huggingface_range(
         ) from exc
 
 
-def _detect_huggingface_png_media_route(
+def _detect_huggingface_media_route(
     repo_id: str,
     filename: str,
     revision: str,
     budget: _HuggingFaceProbeBudget,
     prefix: bytes,
+    find_media_end: Callable[[int, Callable[[int, int], bytes]], int | None],
 ) -> str | None:
-    """Return a PNG media route by walking chunk framing with sparse range reads."""
+    """Route media using a structural reader with shared bounded remote ranges."""
     from modelaudit.utils.file.detection import (
-        _PNG_SIGNATURE,
         MEDIA_ROUTE_READ_BYTES,
         MEDIA_ROUTE_TAIL_READ_BYTES,
         PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
         VALID_MEDIA_ROUTING_FORMAT,
         _detect_complete_media_route_from_trailing,
-        _find_png_end_with_reader,
     )
 
-    if not prefix.startswith(_PNG_SIGNATURE):
-        return None
     file_size = budget.file_sizes.get(filename)
     if file_size is None:
         return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
@@ -2222,10 +2215,7 @@ def _detect_huggingface_png_media_route(
         return window[:size]
 
     try:
-        media_end = _find_png_end_with_reader(
-            file_size,
-            read_at,
-        )
+        media_end = find_media_end(file_size, read_at)
     except ValueError:
         return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
     if media_end is None:
@@ -2240,6 +2230,21 @@ def _detect_huggingface_png_media_route(
     except ValueError:
         return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
     return _detect_complete_media_route_from_trailing(trailing, sample_is_prefix=trailing_size > len(trailing))
+
+
+def _detect_huggingface_png_media_route(
+    repo_id: str,
+    filename: str,
+    revision: str,
+    budget: _HuggingFaceProbeBudget,
+    prefix: bytes,
+) -> str | None:
+    """Return a PNG media route by walking chunk framing with sparse range reads."""
+    from modelaudit.utils.file.detection import _PNG_SIGNATURE, _find_png_end_with_reader
+
+    if not prefix.startswith(_PNG_SIGNATURE):
+        return None
+    return _detect_huggingface_media_route(repo_id, filename, revision, budget, prefix, _find_png_end_with_reader)
 
 
 def _detect_huggingface_jpeg_media_route(
@@ -2250,71 +2255,11 @@ def _detect_huggingface_jpeg_media_route(
     prefix: bytes,
 ) -> str | None:
     """Return a JPEG media route by walking marker structure with sparse range reads."""
-    from modelaudit.utils.file.detection import (
-        MEDIA_ROUTE_READ_BYTES,
-        MEDIA_ROUTE_TAIL_READ_BYTES,
-        PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
-        VALID_MEDIA_ROUTING_FORMAT,
-        _detect_complete_media_route_from_trailing,
-        _find_jpeg_end_with_reader,
-    )
+    from modelaudit.utils.file.detection import _find_jpeg_end_with_reader
 
     if not prefix.startswith(b"\xff\xd8"):
         return None
-    file_size = budget.file_sizes.get(filename)
-    if file_size is None:
-        return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
-
-    tail: bytes | None = None
-    tail_start = file_size
-    range_windows: list[tuple[int, bytes]] = []
-
-    def read_at(offset: int, size: int) -> bytes:
-        nonlocal tail, tail_start
-        end_offset = offset + size
-        if end_offset <= len(prefix):
-            return prefix[offset:end_offset]
-        if tail is None:
-            tail = _read_huggingface_tail(
-                repo_id,
-                filename,
-                revision,
-                budget,
-                prefix,
-                MEDIA_ROUTE_TAIL_READ_BYTES,
-            )
-            tail_start = file_size - len(tail)
-        if tail_start <= offset and end_offset <= tail_start + len(tail):
-            return tail[offset - tail_start : end_offset - tail_start]
-        if offset < len(prefix) and len(prefix) >= tail_start and end_offset <= tail_start + len(tail):
-            prefix_part = prefix[offset : min(end_offset, len(prefix))]
-            tail_part_start = max(len(prefix), tail_start)
-            tail_part = tail[tail_part_start - tail_start : end_offset - tail_start]
-            return prefix_part + tail_part
-        for window_start, window in range_windows:
-            if window_start <= offset and end_offset <= window_start + len(window):
-                return window[offset - window_start : end_offset - window_start]
-        window_size = min(MEDIA_ROUTE_TAIL_READ_BYTES, file_size - offset)
-        window = _read_huggingface_range(repo_id, filename, revision, budget, prefix, offset, window_size)
-        range_windows.append((offset, window))
-        return window[:size]
-
-    try:
-        media_end = _find_jpeg_end_with_reader(file_size, read_at)
-    except ValueError:
-        return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
-    if media_end is None:
-        return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
-
-    trailing_size = file_size - media_end
-    if trailing_size <= 0:
-        return VALID_MEDIA_ROUTING_FORMAT
-    read_size = min(trailing_size, MEDIA_ROUTE_READ_BYTES + 1)
-    try:
-        trailing = read_at(media_end, read_size)
-    except ValueError:
-        return PICKLE_ROUTING_INCONCLUSIVE_FORMAT
-    return _detect_complete_media_route_from_trailing(trailing, sample_is_prefix=trailing_size > len(trailing))
+    return _detect_huggingface_media_route(repo_id, filename, revision, budget, prefix, _find_jpeg_end_with_reader)
 
 
 def _looks_like_safetensors_prefix(
@@ -2467,7 +2412,7 @@ def _detect_huggingface_xgboost_ubjson_route(
     prefix: bytes,
 ) -> str | None:
     """Return a bounded XGBoost UBJSON route for a suffix-skipped remote file."""
-    if Path(filename).suffix and not _has_hf_safetensors_shard_shape(filename):
+    if Path(filename).suffix and _parse_hf_safetensors_shard_shape(filename) is None:
         return None
 
     from modelaudit.utils.file.detection import (
@@ -3194,7 +3139,8 @@ def _select_huggingface_model_files(
     for filename in repo_files:
         if filename in selected_files:
             continue
-        if _is_huggingface_repo_bookkeeping_file(filename):
+        # Fixed Hub repository metadata is not model payload.
+        if PurePosixPath(filename).name.lower() in _HF_REPO_BOOKKEEPING_FILENAMES:
             continue
         if inspected_files >= _HF_CONTENT_SNIFF_MAX_FILES:
             raise ValueError(
@@ -3231,7 +3177,8 @@ def _metadata_only_hf_content_probe_candidates(repo_files: list[str], selected_f
         dict.fromkeys(
             filename
             for filename in repo_files
-            if filename not in selected_file_set and not _is_huggingface_repo_bookkeeping_file(filename)
+            if filename not in selected_file_set
+            and PurePosixPath(filename).name.lower() not in _HF_REPO_BOOKKEEPING_FILENAMES
         )
     )
 
@@ -3251,15 +3198,6 @@ def _raise_metadata_only_hf_selection_incomplete(repo_id: str, candidate_files: 
     )
 
 
-def _build_literal_allow_patterns(filenames: list[str]) -> list[str]:
-    """Escape repository filenames before passing them to the Hub glob filter."""
-    return [escape_glob(filename) for filename in filenames]
-
-
-def _remote_companion_path_key(filename: str) -> str:
-    return unicodedata.normalize("NFC", filename).casefold()
-
-
 def _openvino_bin_companion_name(filename: str, repo_files: Collection[str] | None = None) -> str | None:
     """Return the exact same-stem OpenVINO weights filename for a repo XML path."""
     remote_path = PurePosixPath(filename)
@@ -3269,8 +3207,10 @@ def _openvino_bin_companion_name(filename: str, repo_files: Collection[str] | No
     if repo_files is None or expected_companion in repo_files:
         return expected_companion
 
-    expected_key = _remote_companion_path_key(expected_companion)
-    candidates = [repo_file for repo_file in repo_files if _remote_companion_path_key(repo_file) == expected_key]
+    expected_key = unicodedata.normalize("NFC", expected_companion).casefold()
+    candidates = [
+        repo_file for repo_file in repo_files if unicodedata.normalize("NFC", repo_file).casefold() == expected_key
+    ]
     if len(candidates) == 1:
         return candidates[0]
     return expected_companion
@@ -3390,11 +3330,6 @@ def _is_scannable_hf_file(filename: str, extensions: Collection[str]) -> bool:
     """Return whether a listed Hugging Face file has a supported suffix."""
     filename_lower = filename.lower()
     return any(filename_lower.endswith(ext.lower()) for ext in extensions if ext)
-
-
-def _is_huggingface_repo_bookkeeping_file(filename: str) -> bool:
-    """Return whether a Hub repo entry is fixed metadata, not model payload."""
-    return PurePosixPath(filename).name.lower() in _HF_REPO_BOOKKEEPING_FILENAMES
 
 
 def _raise_no_scannable_hf_files(repo_id: str) -> None:
@@ -3550,10 +3485,6 @@ def _parse_hf_safetensors_shard_shape(filename: str) -> tuple[str, int, int] | N
     return match.group("stem"), int(match.group("index")), int(match.group("total"))
 
 
-def _has_hf_safetensors_shard_shape(filename: str) -> bool:
-    return _parse_hf_safetensors_shard_shape(filename) is not None
-
-
 def _complete_hf_safetensors_shard_files(repo_files: Collection[str]) -> frozenset[str]:
     """Return canonical SafeTensors shards whose directory-scoped family is complete."""
     families: dict[tuple[str, int], dict[int, set[str]]] = {}
@@ -3681,7 +3612,7 @@ def _streamable_hf_content_probe_candidates(
         if file_name in processed_files:
             continue
         processed_files.add(file_name)
-        if _is_huggingface_repo_bookkeeping_file(file_name):
+        if PurePosixPath(file_name).name.lower() in _HF_REPO_BOOKKEEPING_FILENAMES:
             continue
         if file_name in exact_openvino_companion_candidate_set:
             continue
@@ -3758,7 +3689,7 @@ def _select_streamable_hf_files(
             model_files.append(file_name)
             continue
 
-        if _is_huggingface_repo_bookkeeping_file(file_name):
+        if PurePosixPath(file_name).name.lower() in _HF_REPO_BOOKKEEPING_FILENAMES:
             continue
 
         if include_all_files:
@@ -3820,7 +3751,7 @@ def _select_streamable_hf_files(
             selected_route_formats,
             exact_openvino_companion_candidates,
         ):
-            if _is_safetensors_index_file(file_name):
+            if PurePosixPath(file_name).name.lower().endswith(".safetensors.index.json"):
                 continue
             if inspected_files >= _HF_CONTENT_SNIFF_MAX_FILES:
                 raise ValueError(
@@ -3835,14 +3766,14 @@ def _select_streamable_hf_files(
                 from ...scanner_selection import scanner_ids_for_detected_format
 
                 if not selected_route_scanner_ids.intersection(scanner_ids_for_detected_format(detected_format)):
-                    if detected_format == "safetensors" and _has_hf_safetensors_shard_shape(file_name):
+                    if detected_format == "safetensors" and (_parse_hf_safetensors_shard_shape(file_name) is not None):
                         unskippable_detected_safetensors_shards.append(file_name)
                     continue
             elif selected_route_formats is not None and _hf_detected_format_excluded_by_selected_route_formats(
                 detected_format,
                 selected_route_formats,
             ):
-                if detected_format == "safetensors" and _has_hf_safetensors_shard_shape(file_name):
+                if detected_format == "safetensors" and (_parse_hf_safetensors_shard_shape(file_name) is not None):
                     unskippable_detected_safetensors_shards.append(file_name)
                 continue
             model_files.append(file_name)
@@ -3861,11 +3792,6 @@ def _select_streamable_hf_files(
         _raise_no_scannable_hf_files(repo_id)
 
     return _HuggingFaceStreamingSelection(model_files, content_route_formats)
-
-
-def _is_hf_streaming_onnx_candidate(filename: str, *, content_route_format: str | None = None) -> bool:
-    """Return whether a selected remote file should be checked for ONNX sidecars."""
-    return PurePosixPath(filename).suffix.lower() == ".onnx" or content_route_format == "onnx"
 
 
 def _resolve_hf_onnx_external_data_path(onnx_filename: str, location: str) -> str | None:
@@ -3986,16 +3912,6 @@ def _get_hf_cache_root() -> Path:
         return Path(HF_HUB_CACHE)
     except Exception:
         return Path.home() / ".cache" / "huggingface" / "hub"
-
-
-def _format_size(size_bytes: int) -> str:
-    """Format a byte count for user-facing download budget errors."""
-    size = float(size_bytes)
-    for unit in ["B", "KB", "MB", "GB", "TB"]:
-        if size < 1024.0:
-            return f"{size:.1f} {unit}"
-        size /= 1024.0
-    return f"{size:.1f} PB"
 
 
 def _normalize_download_size_limit(max_size: int | None) -> int | None:
@@ -4632,10 +4548,6 @@ def _staging_directory_open_flags() -> int:
     return flags
 
 
-def _new_hf_staging_name(prefix: str) -> str:
-    return f"{prefix}{secrets.token_hex(12)}"
-
-
 def _create_identity_bound_staging_directory(
     *,
     prefix: str,
@@ -4676,7 +4588,7 @@ def _create_identity_bound_staging_directory(
 
             attempts = 1 if fixed_name is not None else 128
             for _ in range(attempts):
-                name = fixed_name if fixed_name is not None else _new_hf_staging_name(prefix)
+                name = fixed_name if fixed_name is not None else f"{prefix}{secrets.token_hex(12)}"
                 try:
                     os.mkdir(name, mode=0o700, dir_fd=parent_fd)
                 except FileExistsError:
@@ -4733,19 +4645,16 @@ def _create_identity_bound_staging_directory(
             identity=identity,
             parent_identity=parent_identity,
         )
-    except OSError as exc:
+    except Exception as exc:
+        is_os_error = issubclass(type(exc), OSError)
         if directory_fd is not None:
             os.close(directory_fd)
         if parent_fd is not None:
             os.close(parent_fd)
-        raise _HfStreamingStagingCleanupError(
-            f"Hugging Face streaming staging identity changed during setup: {parent_path}"
-        ) from exc
-    except Exception:
-        if directory_fd is not None:
-            os.close(directory_fd)
-        if parent_fd is not None:
-            os.close(parent_fd)
+        if is_os_error:
+            raise _HfStreamingStagingCleanupError(
+                f"Hugging Face streaming staging identity changed during setup: {parent_path}"
+            ) from exc
         raise
 
 
@@ -4765,7 +4674,7 @@ def _remove_hf_staging_directory_contents(directory_fd: int) -> None:
 
 def _quarantine_hf_staging_directory(state: _IdentityBoundStagingDirectory) -> tuple[str, Path]:
     """Atomically detach a staging root from its caller-visible name."""
-    quarantine_name = _new_hf_staging_name(".modelaudit_hf_cleanup_")
+    quarantine_name = f"{'.modelaudit_hf_cleanup_'}{secrets.token_hex(12)}"
     quarantine_path = state.parent_path / quarantine_name
 
     if state.parent_fd is not None and state.directory_fd is not None:
@@ -5391,7 +5300,8 @@ def download_model(
             # This is safer as it doesn't risk deleting user's global cache
             pass
 
-        download_kwargs["allow_patterns"] = _build_literal_allow_patterns(model_files)
+        # Escape repository filenames before passing them to the Hub glob filter.
+        download_kwargs["allow_patterns"] = [escape_glob(filename) for filename in model_files]
 
         local_path = _run_huggingface_download_with_deadline(
             "snapshot_download",
@@ -5819,7 +5729,7 @@ def download_model_streaming(
             {
                 filename
                 for filename in repo_files
-                if _is_safetensors_index_file(filename)
+                if PurePosixPath(filename).name.lower().endswith(".safetensors.index.json")
                 and any(
                     not _remote_index_parent_prefix(filename)
                     or selected_file.startswith(_remote_index_parent_prefix(filename))
@@ -6022,7 +5932,7 @@ def download_model_streaming(
                     else source_bytes_preaccounted
                 ),
                 source_path=(
-                    _remote_safetensors_source_path(repo_id, download_revision, filename)
+                    f"hf://{repo_id}@{download_revision}/{filename}"
                     if precomputed_result is None and filename in preaccounted_acquired_index_bytes
                     else None
                 ),
@@ -6208,9 +6118,9 @@ def download_model_streaming(
                     if detected_format == "onnx":
                         content_route_format = detected_format
                         selection.content_route_formats[filename] = detected_format
-            if onnx_external_data_enabled and _is_hf_streaming_onnx_candidate(
-                filename,
-                content_route_format=content_route_format,
+            # Check selected remote ONNX candidates for required sidecars.
+            if onnx_external_data_enabled and (
+                PurePosixPath(filename).suffix.lower() == ".onnx" or content_route_format == "onnx"
             ):
 
                 def check_onnx_sidecar_discovery_interrupted() -> None:

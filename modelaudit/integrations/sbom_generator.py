@@ -5,7 +5,7 @@ import stat
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from importlib.metadata import version as _pkg_version
-from typing import Any
+from typing import Any, cast
 
 from cyclonedx.model import HashType, Property
 from cyclonedx.model.bom import Bom
@@ -660,66 +660,10 @@ def _create_metadata_properties(metadata: FileMetadataModel) -> list[Property]:
     return props
 
 
-def _component_for_file_pydantic(
-    path: str,
-    metadata: FileMetadataModel | None,
-    issues: list[Issue],
-    scan_root: str | None = None,
-    *,
-    allow_metadata_fallback: bool = True,
-    scan_root_fd: int | None = None,
-    relative_path: str | None = None,
-    require_stable_root: bool = False,
-    bom_ref_state: _BomRefState | None = None,
-) -> Component:
-    """Create a CycloneDX component from Pydantic models (type-safe version)."""
-    size, sha256 = _resolve_component_size_and_sha256(
-        path,
-        metadata,
-        scan_root,
-        allow_metadata_fallback=allow_metadata_fallback,
-        scan_root_fd=scan_root_fd,
-        relative_path=relative_path,
-        require_stable_root=require_stable_root,
-    )
-
-    # Start with basic properties
-    props = [Property(name="size", value=str(size))]
-
-    # Calculate and add risk score
-    risk_score = _calculate_risk_score(path, issues)
-    props.append(Property(name="risk_score", value=str(risk_score)))
-
-    # Add metadata-based properties if available
-    license_expressions: list[LicenseExpression] = []
-    if metadata:
-        license_expressions = _extract_license_expressions(metadata)
-        props.extend(_create_metadata_properties(metadata))
-
-    # Determine appropriate component type for CycloneDX v1.6
-    component_type = _get_component_type(path, metadata.model_dump() if metadata else None)
-    component_name, bom_ref = _component_identity(path, sha256, bom_ref_state)
-
-    # Create the component
-    component = Component(
-        name=component_name,
-        bom_ref=bom_ref,
-        type=component_type,
-        hashes=[HashType.from_hashlib_alg("sha256", sha256)] if sha256 else [],
-        properties=props,
-    )
-
-    # Add license expressions
-    for license_expr in license_expressions:
-        component.licenses.add(license_expr)
-
-    return component
-
-
 def _component_for_file(
     path: str,
-    metadata: dict[str, Any],
-    issues: Iterable[dict[str, Any]],
+    metadata: FileMetadataModel | dict[str, Any] | None,
+    issues: Iterable[Any],
     scan_root: str | None = None,
     *,
     allow_metadata_fallback: bool = True,
@@ -727,6 +671,7 @@ def _component_for_file(
     relative_path: str | None = None,
     require_stable_root: bool = False,
     bom_ref_state: _BomRefState | None = None,
+    typed: bool = False,
 ) -> Component:
     size, sha256 = _resolve_component_size_and_sha256(
         path,
@@ -740,12 +685,19 @@ def _component_for_file(
     props = [Property(name="size", value=str(size))]
 
     # Compute risk score based on issues related to this file
-    score = _calculate_legacy_risk_score(path, issues)
+    score = (
+        _calculate_risk_score(path, cast(list[Issue], issues)) if typed else _calculate_legacy_risk_score(path, issues)
+    )
     props.append(Property(name="risk_score", value=str(score)))
 
     # Enhanced license handling
     license_expressions = []
-    if isinstance(metadata, dict):
+    if typed:
+        if metadata:
+            typed_metadata = cast(FileMetadataModel, metadata)
+            license_expressions = _extract_license_expressions(typed_metadata)
+            props.extend(_create_metadata_properties(typed_metadata))
+    elif isinstance(metadata, dict):
         # Collect all license identifiers
         license_identifiers = []
 
@@ -824,13 +776,21 @@ def _component_for_file(
             )
         _append_member_file_hash_summary_properties_from_dict(props, metadata)
 
-    # Security and compliance properties (added for all files)
-    props.append(Property(name="security:scanned", value="true"))
-    props.append(Property(name="security:scanner", value="ModelAudit"))
-    props.append(Property(name="security:scanner_version", value=SCANNER_VERSION))
+    # The legacy entrypoint also marks files without metadata as scanned.
+    if not typed:
+        props.append(Property(name="security:scanned", value="true"))
+        props.append(Property(name="security:scanner", value="ModelAudit"))
+        props.append(Property(name="security:scanner_version", value=SCANNER_VERSION))
 
     # Determine appropriate component type for CycloneDX v1.6
-    component_type = _get_component_type(path, metadata if isinstance(metadata, dict) else None)
+    component_metadata = (
+        (cast(FileMetadataModel, metadata).model_dump() if metadata else None)
+        if typed
+        else metadata
+        if isinstance(metadata, dict)
+        else None
+    )
+    component_type = _get_component_type(path, component_metadata)
     component_name, bom_ref = _component_identity(path, sha256, bom_ref_state)
 
     component = Component(
@@ -848,21 +808,25 @@ def _component_for_file(
     return component
 
 
-def generate_sbom(paths: Iterable[str], results: dict[str, Any] | Any) -> str:
+def _generate_sbom(paths: Iterable[str], results: Any, *, typed: bool) -> str:
     bom = Bom()
-    issues = results.get("issues", [])
-    # Convert issues to dicts if they are Pydantic models
-    issues_dicts = []
-    for issue in issues:
-        if hasattr(issue, "model_dump"):
-            issues_dicts.append(issue.model_dump())
-        else:
-            issues_dicts.append(issue)
+    issues = results.issues or [] if typed else results.get("issues", [])
+    if not typed:
+        issues = [issue.model_dump() if hasattr(issue, "model_dump") else issue for issue in issues]
+    file_meta = results.file_metadata or {} if typed else results.get("file_metadata", {})
+    trusted_metadata_paths = _trusted_metadata_fallback_paths(results.assets if typed else results.get("assets", []))
 
-    file_meta: dict[str, Any] = results.get("file_metadata", {})
-    trusted_metadata_paths = _trusted_metadata_fallback_paths(results.get("assets", []))
+    def metadata_for(path: str) -> Any:
+        metadata = file_meta.get(path)
+        if typed:
+            return metadata
+        return metadata.model_dump() if metadata is not None and hasattr(metadata, "model_dump") else metadata or {}
 
-    ordered_paths = _source_order(paths, lambda path: _calculate_legacy_risk_score(path, issues_dicts), file_meta.get)
+    ordered_paths = _source_order(
+        paths,
+        lambda path: _calculate_risk_score(path, issues) if typed else _calculate_legacy_risk_score(path, issues),
+        file_meta.get,
+    )
     bom_ref_state = _BomRefState(reserved={path for path in ordered_paths if serialize_source_identifier(path) == path})
     for input_path in ordered_paths:
         is_remote_identifier = _is_non_filesystem_identifier(input_path)
@@ -878,22 +842,17 @@ def generate_sbom(paths: Iterable[str], results: dict[str, Any] | Any) -> str:
                 ):
                     if _should_skip_sbom_file(fp):
                         continue
-                    meta_model = file_meta.get(fp)
-                    # Convert Pydantic model to dict if needed
-                    if meta_model is not None and hasattr(meta_model, "model_dump"):
-                        meta = meta_model.model_dump()
-                    else:
-                        meta = meta_model or {}
                     component = _component_for_file(
                         fp,
-                        meta,
-                        issues_dicts,
+                        metadata_for(fp),
+                        issues,
                         scan_root,
                         allow_metadata_fallback=False,
                         scan_root_fd=scan_root_fd,
                         relative_path=relative_path,
                         require_stable_root=require_stable_root,
                         bom_ref_state=bom_ref_state,
+                        typed=typed,
                     )
                     bom.components.add(component)
             finally:
@@ -904,34 +863,32 @@ def generate_sbom(paths: Iterable[str], results: dict[str, Any] | Any) -> str:
                 is_remote_identifier or not os.path.lexists(input_path)
             )
             input_directory = os.path.dirname(input_path) or "."
-            single_scan_root: str | None = None if allow_metadata_fallback else os.path.realpath(input_directory)
+            single_scan_root = None if allow_metadata_fallback else os.path.realpath(input_directory)
             require_stable_root = single_scan_root is not None and _supports_descriptor_walk()
             scan_root_fd = _open_scan_root_fd(single_scan_root) if single_scan_root is not None else None
             try:
-                meta_model = file_meta.get(input_path)
-                # Convert Pydantic model to dict if needed
-                if meta_model is not None and hasattr(meta_model, "model_dump"):
-                    meta = meta_model.model_dump()
-                else:
-                    meta = meta_model or {}
                 component = _component_for_file(
                     input_path,
-                    meta,
-                    issues_dicts,
+                    metadata_for(input_path),
+                    issues,
                     single_scan_root,
                     allow_metadata_fallback=allow_metadata_fallback,
                     scan_root_fd=scan_root_fd,
                     relative_path=(None if single_scan_root is None else os.path.relpath(input_path, input_directory)),
                     require_stable_root=require_stable_root,
                     bom_ref_state=bom_ref_state,
+                    typed=typed,
                 )
                 bom.components.add(component)
             finally:
                 if scan_root_fd is not None:
                     os.close(scan_root_fd)
-
     outputter = make_outputter(bom, OutputFormat.JSON, SchemaVersion.V1_6)
     return str(outputter.output_as_string(indent=2))
+
+
+def generate_sbom(paths: Iterable[str], results: dict[str, Any] | Any) -> str:
+    return _generate_sbom(paths, results, typed=False)
 
 
 def generate_sbom_pydantic(paths: Iterable[str], results: ModelAuditResultModel) -> str:
@@ -941,70 +898,4 @@ def generate_sbom_pydantic(paths: Iterable[str], results: ModelAuditResultModel)
     This is the preferred method that works directly with Pydantic models
     without any dict conversions, providing full type safety.
     """
-    bom = Bom()
-
-    # Use Pydantic models directly
-    issues: list[Issue] = results.issues or []
-    file_metadata: dict[str, FileMetadataModel] = results.file_metadata or {}
-    trusted_metadata_paths = _trusted_metadata_fallback_paths(results.assets)
-
-    ordered_paths = _source_order(paths, lambda path: _calculate_risk_score(path, issues), file_metadata.get)
-    bom_ref_state = _BomRefState(reserved={path for path in ordered_paths if serialize_source_identifier(path) == path})
-    for input_path in ordered_paths:
-        is_remote_identifier = _is_non_filesystem_identifier(input_path)
-        if not is_remote_identifier and os.path.isdir(input_path):
-            scan_root = os.path.realpath(input_path)
-            require_stable_root = _supports_descriptor_walk()
-            scan_root_fd = _open_scan_root_fd(scan_root, readable=True)
-            try:
-                for fp, relative_path in _iter_scan_root_files(
-                    input_path,
-                    scan_root_fd,
-                    require_stable_root=require_stable_root,
-                ):
-                    if _should_skip_sbom_file(fp):
-                        continue
-                    metadata = file_metadata.get(fp)
-                    component = _component_for_file_pydantic(
-                        fp,
-                        metadata,
-                        issues,
-                        scan_root,
-                        allow_metadata_fallback=False,
-                        scan_root_fd=scan_root_fd,
-                        relative_path=relative_path,
-                        require_stable_root=require_stable_root,
-                        bom_ref_state=bom_ref_state,
-                    )
-                    bom.components.add(component)
-            finally:
-                if scan_root_fd is not None:
-                    os.close(scan_root_fd)
-        else:
-            allow_metadata_fallback = (is_remote_identifier or input_path in trusted_metadata_paths) and (
-                is_remote_identifier or not os.path.lexists(input_path)
-            )
-            input_directory = os.path.dirname(input_path) or "."
-            single_scan_root: str | None = None if allow_metadata_fallback else os.path.realpath(input_directory)
-            require_stable_root = single_scan_root is not None and _supports_descriptor_walk()
-            scan_root_fd = _open_scan_root_fd(single_scan_root) if single_scan_root is not None else None
-            try:
-                metadata = file_metadata.get(input_path)
-                component = _component_for_file_pydantic(
-                    input_path,
-                    metadata,
-                    issues,
-                    single_scan_root,
-                    allow_metadata_fallback=allow_metadata_fallback,
-                    scan_root_fd=scan_root_fd,
-                    relative_path=(None if single_scan_root is None else os.path.relpath(input_path, input_directory)),
-                    require_stable_root=require_stable_root,
-                    bom_ref_state=bom_ref_state,
-                )
-                bom.components.add(component)
-            finally:
-                if scan_root_fd is not None:
-                    os.close(scan_root_fd)
-
-    outputter = make_outputter(bom, OutputFormat.JSON, SchemaVersion.V1_6)
-    return str(outputter.output_as_string(indent=2))
+    return _generate_sbom(paths, results, typed=True)
