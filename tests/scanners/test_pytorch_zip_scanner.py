@@ -20662,7 +20662,7 @@ def test_pytorch_zip_malformed_name_cannot_supply_numeric_mask_header(
         assert result.metadata.get("pickle_verdict") == "clean"
 
 
-@pytest.mark.parametrize("unit", [b"c!C\x00", b"c!S'", b"c!V"])
+@pytest.mark.parametrize("unit", [b"c!C\x00", b"c!S'", b"c!V", b"c!JP\x00\x00\x00"])
 @pytest.mark.parametrize("size", [1024, 4096])
 @pytest.mark.parametrize("tail", [b".", b"\n!"])
 def test_pytorch_zip_punctuation_name_operand_work_is_linear(unit: bytes, size: int, tail: bytes) -> None:

@@ -4589,7 +4589,11 @@ class PyTorchZipScanner(BaseScanner):
                     # A later literal cannot supply delimiters for an earlier decoy GLOBAL.
                     span_at = PyTorchZipScanner._raw_nested_literal_span_lookup(source, search_end=name_end + 1)
                     module_end = source.find(b"\n", original_offset + offset + 1, name_end)
-                    if span_at(module_end) is not None or span_at(name_end) is not None:
+                    delimiter_spans = (span_at(module_end), span_at(name_end))
+                    if any(
+                        span is not None and not PyTorchZipScanner._raw_nested_literal_span_is_mask_only(source, span)
+                        for span in delimiter_spans
+                    ):
                         continue
                 return True
             if truncated and name_limit < len(source):
@@ -4955,7 +4959,7 @@ class PyTorchZipScanner(BaseScanner):
                             return candidate
                         continue
                     span = PyTorchZipScanner._raw_nested_pickle_literal_span_starting_at(value, candidate)
-                    if span is not None and not PyTorchZipScanner._raw_nested_literal_span_is_mask_only(value, span):
+                    if span is not None:
                         return candidate
                 if invalid:
                     return chunk_end
