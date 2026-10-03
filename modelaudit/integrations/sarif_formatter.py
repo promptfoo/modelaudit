@@ -243,7 +243,17 @@ def _create_rules(issues: list, *, prefiltered: bool = False) -> list[dict[str, 
 
 def _sarif_source_identifier_key(paths: Iterable[str]) -> Callable[[str], str] | None:
     """Reserve URI equivalences only when a source needs an artificial identifier."""
-    return _normalize_path_to_uri if any(serialize_source_identifier(path) != path for path in paths) else None
+    return (
+        _source_identifier_comparison_key if any(serialize_source_identifier(path) != path for path in paths) else None
+    )
+
+
+def _source_identifier_comparison_key(path: str) -> str:
+    """Keep report allocation available when the working directory is unavailable."""
+    try:
+        return _normalize_path_to_uri(path)
+    except OSError:
+        return quote(Path(path).as_posix(), safe="/", errors="backslashreplace")
 
 
 def _serialize_sarif_sources(paths: list[str], issues: list) -> tuple[dict[str, str], list[dict[str, Any]]]:

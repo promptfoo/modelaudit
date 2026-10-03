@@ -2329,3 +2329,44 @@ def test_sarif_oversized_properties_without_sources_do_not_normalize_paths(monke
     assert len(findings[0]["properties"]["evidence"]) < 256 * 1024
     assert findings[0]["locations"] == []
     assert _format_scan_output(result, [], output_format="json", verbose=True)
+
+
+@pytest.mark.parametrize("error_type", [FileNotFoundError, PermissionError])
+def test_json_oversized_sources_do_not_require_working_directory(
+    monkeypatch: pytest.MonkeyPatch, error_type: type[OSError]
+) -> None:
+    source = "stream://https://bucket.s3.amazonaws.com/model.pkl?token=" + "x" * (256 * 1024)
+    result = create_initial_audit_result()
+    result.assets = [AssetModel(path=source, type="pickle")]
+    result.issues = [Issue(message="Finding", location=source, severity=IssueSeverity.WARNING)]
+    unavailable_cwd = Mock(side_effect=error_type("working directory unavailable"))
+    monkeypatch.setattr(Path, "cwd", unavailable_cwd)
+
+    saved = json.loads(_format_scan_output(result, [], output_format="json", verbose=True))
+    assert len(saved["assets"]) == len(saved["issues"]) == 1
+    assert len(saved["assets"][0]["path"]) < 256 * 1024
+    assert saved["issues"][0]["message"] == "Finding"
+
+    with pytest.raises(error_type, match="working directory unavailable"):
+        format_sarif_output(result, [source], verbose=True)
+
+
+def test_json_without_working_directory_reserves_uri_equivalent_source_aliases(monkeypatch: pytest.MonkeyPatch) -> None:
+    source = "stream://https://bucket.s3.amazonaws.com/model.pkl?token=" + "x" * (256 * 1024)
+    marker = f"{source[:256]}...<source sha256:{hashlib.sha256(source.encode()).hexdigest()}>"
+    literal = Path(marker).as_posix()
+    result = create_initial_audit_result()
+    result.assets = [AssetModel(path=path, type="pickle") for path in [source, literal]]
+    result.issues = [Issue(message="Finding", location=path, details={"source": path}) for path in [source, literal]]
+    with monkeypatch.context() as context:
+        context.setattr(Path, "cwd", Mock(side_effect=FileNotFoundError("working directory unavailable")))
+        output = _format_scan_output(result, [], output_format="json", verbose=True)
+
+    saved = ModelAuditResultModel.model_validate_json(output)
+    run = json.loads(format_sarif_output(saved, [], verbose=True))["runs"][0]
+    uris = [artifact["location"]["uri"] for artifact in run["artifacts"]]
+    assert len(set(uris)) == 2
+    assert [
+        finding["locations"][0]["physicalLocation"]["artifactLocation"]["uri"] for finding in run["results"]
+    ] == uris
+    assert [finding["properties"]["source"] for finding in run["results"]] == [asset.path for asset in saved.assets]
