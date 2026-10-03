@@ -205,7 +205,9 @@ def test_scan_jfrog_artifact_preserves_source_url(
 
     mock_result = create_initial_audit_result()
     mock_scan.return_value = mock_result
-    raw_url = "https://user:leaky-pass@company.jfrog.io/artifactory/repo/model.pt?token=\x1b]52;c;leaky-token\x07"
+    raw_url = (
+        "https://user:leaky-pass@company.jfrog.io/artifactory/repo/model.pt?token=\x1b]52;c;leaky-token\r\n\tFORGED\x07"
+    )
 
     with caplog.at_level(logging.DEBUG, logger="modelaudit.integrations.jfrog"):
         results = scan_jfrog_artifact(raw_url, api_token="token")
@@ -216,6 +218,12 @@ def test_scan_jfrog_artifact_preserves_source_url(
     assert "user:leaky-pass" in caplog.text
     assert "leaky-token" in caplog.text
     assert "\x1b" not in caplog.text and "\x07" not in caplog.text
+    assert "\tFORGED" not in caplog.text
+    assert all(
+        len(record.message.splitlines()) == 1
+        for record in caplog.records
+        if record.name == "modelaudit.integrations.jfrog"
+    )
     assert "user:leaky-pass" in jfrog_source["url"]
     assert "leaky-token" in jfrog_source["url"]
     mock_detect.assert_called_once_with(raw_url, api_token="token", access_token=None, timeout=30)

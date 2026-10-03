@@ -936,6 +936,10 @@ def test_scan_mlflow_model_import_error(monkeypatch):
         scan_mlflow_model("models:/dummy/1")
 
 
+@pytest.mark.parametrize(
+    ("quote", "control"),
+    [("", "")] + [(quote, control) for quote in ["'", '"'] for control in ["\r", "\n", "\t", "\r\n"]],
+)
 @patch("modelaudit.integrations.mlflow.shutil.rmtree")
 @patch("modelaudit.integrations.mlflow.tempfile.mkdtemp")
 @patch("modelaudit.core.scan_model_directory_or_file")
@@ -944,8 +948,15 @@ def test_scan_mlflow_model_success(
     mock_mkdtemp: MagicMock,
     mock_rmtree: MagicMock,
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    quote: str,
+    control: str,
 ) -> None:
     """Test successful MLflow model scanning."""
+    caplog.set_level(logging.DEBUG, logger="modelaudit.integrations.mlflow")
+    source = "models:/TestModel/1"
+    if control:
+        source += f"?token={quote}synthetic-secret{control}FORGED{quote}"
     # Mock MLflow
     mock_mlflow = MagicMock()
     mock_mlflow.artifacts.download_artifacts.return_value = "/tmp/test_model"
@@ -978,7 +989,7 @@ def test_scan_mlflow_model_success(
         patch.dict(sys.modules, {"mlflow": mock_mlflow}),
     ):
         results = scan_mlflow_model(
-            "models:/TestModel/1",
+            source,
             registry_uri="http://localhost:5000",
             timeout=300,
             blacklist_patterns=["malicious"],
@@ -988,7 +999,7 @@ def test_scan_mlflow_model_success(
 
     # Verify MLflow interactions
     mock_mlflow.set_registry_uri.assert_called_once_with("http://localhost:5000")
-    mock_mlflow.artifacts.get_artifact_repository.assert_called_once_with("models:/TestModel/1")
+    mock_mlflow.artifacts.get_artifact_repository.assert_called_once_with(source)
     mock_repo.list_artifacts.assert_called_once_with(None)
     mock_repo._download_file.assert_not_called()
     mock_repo.download_artifacts.assert_not_called()
@@ -1010,6 +1021,12 @@ def test_scan_mlflow_model_success(
 
     # Verify results
     assert results == mock_scan.return_value  # Verify the mock was called correctly
+
+    messages = [record.message for record in caplog.records if record.message.startswith("Downloading MLflow model ")]
+    assert len(messages) == 1 and len(messages[0].splitlines()) == 1
+    if control:
+        assert control + "FORGED" not in messages[0]
+        assert "synthetic-secret" in messages[0]
 
 
 @patch("modelaudit.integrations.mlflow.shutil.rmtree")

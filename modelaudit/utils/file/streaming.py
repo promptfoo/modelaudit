@@ -12,7 +12,7 @@ import click
 if TYPE_CHECKING:
     from modelaudit.scanner_results import ScanResult
     from modelaudit.scanners.base import BaseScanner
-from modelaudit.utils.helpers.evidence import format_evidence_string
+from modelaudit.utils.helpers.evidence import format_terminal_text
 from modelaudit.utils.sources.cloud_storage import (
     get_cloud_filesystem_config,
     get_fs_protocol,
@@ -417,7 +417,7 @@ def stream_analyze_file(
         try:
             ctx = click.get_current_context(silent=True)
             if ctx and ctx.params.get("verbose"):
-                click.echo(f"Streaming analysis failed: {format_evidence_string(str(e), max_chars=None)}")
+                click.echo(f"Streaming analysis failed: {format_terminal_text(str(e))}")
         except Exception:
             # Not in a Click context, just log silently
             pass

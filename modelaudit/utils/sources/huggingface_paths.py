@@ -368,8 +368,9 @@ def _huggingface_classification_url(url: str) -> str:
     return urlunparse((parsed.scheme, netloc, parsed.path, "", "", ""))
 
 
-def _huggingface_classification_error(text: str) -> str:
+def _huggingface_classification_error(text: object) -> str:
     """Keep credential text from changing acquisition error categories."""
+    text = str(getattr(text, "_modelaudit_classification_text", text))
     redacted = _HF_CLASSIFICATION_URL_PATTERN.sub(
         lambda match: _huggingface_classification_url(match.group(0)),
         text,

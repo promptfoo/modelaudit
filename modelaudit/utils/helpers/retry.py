@@ -10,7 +10,7 @@ from typing import Any, TypeVar
 
 import click
 
-from .evidence import format_evidence_string
+from .evidence import format_terminal_text
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +88,7 @@ def exponential_backoff(
                 # Log retry attempt
                 logger.debug(
                     f"Attempt {attempt + 1} failed for {getattr(func, '__name__', 'unknown')}: "
-                    f"{format_evidence_string(str(e), max_chars=None)}. "
+                    f"{format_terminal_text(str(e))}. "
                     f"Retrying in {delay:.1f} seconds..."
                 )
 
