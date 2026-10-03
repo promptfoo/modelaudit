@@ -7,12 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- Require patched GitPython and AnyIO releases in published package dependencies as well as the lockfile.
+
 ## [0.2.53](https://github.com/promptfoo/modelaudit/compare/v0.2.52...v0.2.53) (2026-10-03)
 
 ### Security
 
 - Upgrade gzip, PCRE2, SQLite, and Perl in Docker runtime images to pick up Debian security fixes.
-- Require patched GitPython and AnyIO releases in published package dependencies as well as the lockfile.
 - Upgrade locked AnyIO to 4.15.1 and GitPython to 3.1.62 to address dependency audit advisories.
 - Inspect hidden ZIP archives and malicious pickle payloads in legacy GGML model variants.
 - Stop reporting a ZIP polyglot for GGUF/GGML files whose tensor data merely contains an end-of-central-directory signature.
