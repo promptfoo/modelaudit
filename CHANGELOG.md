@@ -24,6 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- Detect invoked class constructors returned by source-backed module compatibility hooks, including Click 8.5's legacy LazyFile export.
+- Preserve annotated and conditional compatibility aliases and use consistent, depth-bounded constant-branch analysis. Check metaclasses during returned-class member lookup with a bounded traversal that reuses shared ancestors, and retain dangerous paths across incomplete alternatives and separate pickle invocations. Report incomplete analysis for export deletion, class-method compatibility hooks, returned functions or function-local classes, unresolved member paths, loop or context-manager bindings, and unproven metaclasses. Skip provably unreachable deletions and retain existing possible paths for uncertain export bindings. Preserve resolved hooks and independent findings when source or metaclass analysis reaches a limit. Continue supplemental stream checks after call-graph coverage gaps, and keep operational failures unsuccessful even with trusted padding.
 - avoid C&C signal for check_input_dim identifiers ([#1847](https://github.com/promptfoo/modelaudit/issues/1847)) ([f906f9a](https://github.com/promptfoo/modelaudit/commit/f906f9a90a0dc692a4d1dd5af69bf267aa47b04c))
 - **cache:** ignore macOS file access-time events ([#1821](https://github.com/promptfoo/modelaudit/issues/1821)) ([b5341b5](https://github.com/promptfoo/modelaudit/commit/b5341b5a35c86edba3b315af92ea2a431700156b))
 - **cache:** isolate Windows probes and stabilize nightly checks ([#1782](https://github.com/promptfoo/modelaudit/issues/1782)) ([47f94ee](https://github.com/promptfoo/modelaudit/commit/47f94eef3feba8e74c517114094e035c7ea837e8))

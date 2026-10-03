@@ -11,6 +11,7 @@ import os
 import re
 import stat
 import struct
+import symtable
 import sys
 import sysconfig
 import threading
@@ -145,6 +146,8 @@ _BYTECODE_CACHE_OPTIMIZATIONS = (("", 0), ("1", 1), ("2", 2))
 _MAX_CALL_GRAPH_DEPTH = 4
 _MAX_VISITED_FUNCTIONS = 64
 _MAX_CALLS_PER_FUNCTION = 128
+_MAX_CONDITION_DEPTH = 64
+_MAX_METACLASS_BASES = 128
 _MAX_ASSIGNMENT_ALIASES = 128
 _MAX_ASSIGNMENT_ALIAS_PASSES = 256
 _MAX_FUNCTION_INSTANCE_ALIASES = 32
@@ -1658,12 +1661,14 @@ class _CallGraphAnalysisLimitError(RuntimeError):
         partial_findings: tuple[CallGraphFinding, ...] = (),
         partial_startup_hook_write_findings: tuple[StartupHookWriteFinding, ...] = (),
         partial_path: tuple[str, ...] | None = None,
+        partial_entrypoints: tuple[str, ...] = (),
         stability_reason: str | None = None,
     ) -> None:
         super().__init__(message)
         self.partial_findings = partial_findings
         self.partial_startup_hook_write_findings = partial_startup_hook_write_findings
         self.partial_path = partial_path
+        self.partial_entrypoints = partial_entrypoints
         # Which snapshot gate invalidated the run, reported without changing the message text.
         self.stability_reason = stability_reason
 
@@ -1953,8 +1958,10 @@ class _WildcardExportSummary:
 @dataclass(frozen=True)
 class _ModuleSourceContext:
     source_path: Path
+    module_body: tuple[ast.stmt, ...]
     module_statements: tuple[ast.stmt, ...]
     is_package: bool
+    deleted_names: frozenset[str]
 
 
 @dataclass(frozen=True)
@@ -2013,7 +2020,7 @@ def find_dangerous_call_graphs(
         except _CallGraphAnalysisLimitError as error:
             if analysis_limit_error is None:
                 analysis_limit_error = error
-            continue
+            entrypoints = error.partial_entrypoints
         if not entrypoints:
             continue
         allow_invoked_non_lifecycle_entrypoint = _is_explicit_method_import_reference(name)
@@ -2159,26 +2166,21 @@ def find_startup_hook_write_call_graphs(
         ):
             continue
         seen.add((module, name))
-        try:
-            entrypoints = (
-                _dedupe_calls(
-                    tuple(
-                        entrypoint
-                        for invocation_reference in invocation_references
-                        for entrypoint in _call_graph_entrypoints_for_reference(
-                            module,
-                            name,
-                            invocation_reference,
-                        )
-                    )
+        selected_entrypoints: dict[str, None] = {}
+        references: Iterable[Mapping[str, object] | None] = invocation_references if require_invocations else (None,)
+        for candidate_reference in references:
+            try:
+                resolved_entrypoints = (
+                    _call_graph_entrypoints_for_reference(module, name, candidate_reference)
+                    if candidate_reference is not None
+                    else _safe_call_graph_entrypoints(f"{module}.{name}")
                 )
-                if require_invocations
-                else _safe_call_graph_entrypoints(f"{module}.{name}")
-            )
-        except _CallGraphAnalysisLimitError as error:
-            if analysis_limit_error is None:
-                analysis_limit_error = error
-            continue
+            except _CallGraphAnalysisLimitError as error:
+                if analysis_limit_error is None:
+                    analysis_limit_error = error
+                resolved_entrypoints = error.partial_entrypoints
+            selected_entrypoints.update(dict.fromkeys(resolved_entrypoints))
+        entrypoints = tuple(selected_entrypoints)
         if not entrypoints:
             continue
         try:
@@ -3429,26 +3431,68 @@ def _call_graph_entrypoints_for_reference(
     name: str,
     reference: Mapping[str, object],
 ) -> tuple[str, ...]:
+    analysis_limit_error = None
+    try:
+        entrypoints = _resolved_call_graph_entrypoints_for_reference(module, name, reference)
+    except _CallGraphAnalysisLimitError as error:
+        analysis_limit_error = error
+        entrypoints = error.partial_entrypoints
+    try:
+        context = _module_source_context(module)
+        if context is not None:
+            export_name, separator, _member_path = name.partition(".")
+            deleted = export_name in context.deleted_names
+            if "__getattr__" in context.deleted_names:
+                analysis = _analyze_module(module)
+                if analysis is not None:
+                    getter = _resolve_module_getattr_target(
+                        module, export_name, analysis, allow_loaded_extension_bypass=not separator
+                    )
+                    deleted |= getter is not None and getter in entrypoints
+            if deleted and analysis_limit_error is None:
+                # Keep existing possible paths; later namespace mutations can restore deleted exports.
+                analysis_limit_error = _CallGraphAnalysisLimitError("module export deletion is not fully analyzed")
+    except (_CallGraphAnalysisLimitError, RecursionError) as error:
+        raise _CallGraphAnalysisLimitError(
+            str(analysis_limit_error or error), partial_entrypoints=entrypoints
+        ) from error
+    if analysis_limit_error is not None:
+        raise _CallGraphAnalysisLimitError(
+            str(analysis_limit_error), partial_entrypoints=entrypoints
+        ) from analysis_limit_error
+    return entrypoints
+
+
+def _resolved_call_graph_entrypoints_for_reference(
+    module: str,
+    name: str,
+    reference: Mapping[str, object],
+) -> tuple[str, ...]:
     entrypoints = _safe_call_graph_entrypoints(f"{module}.{name}")
     if not entrypoints:
         return ()
-    if _is_explicit_method_import_reference(name):
-        return entrypoints
-    if _resolve_class_target(f"{module}.{name}") is None:
-        return entrypoints
-    opcode = str(reference.get("opcode", ""))
-    if opcode in _NEWOBJ_OPCODES:
-        if not isinstance(reference.get("positional_arg_count"), int):
-            return _filter_class_entrypoints(entrypoints, (*_PICKLE_LIFECYCLE_ENTRYPOINT_METHODS, "__new__"))
-        return _filter_class_entrypoints(entrypoints, ("__new__",))
-    if opcode in _BUILD_OPCODES:
-        methods: tuple[str, ...] = _PICKLE_BUILD_ENTRYPOINT_METHODS
-        if reference.get("build_uses_slot_state") is False:
-            methods = tuple(method for method in methods if method != "__setattr__")
-        return _filter_class_entrypoints(entrypoints, methods)
-    if opcode in _CONSTRUCTOR_OPCODES:
-        return _filter_class_entrypoints(entrypoints, _PICKLE_CONSTRUCTOR_ENTRYPOINT_METHODS)
-    return entrypoints
+    methods = None
+    if not _is_explicit_method_import_reference(name):
+        methods, _ = _pickle_owner_proof_for_reference(reference)
+        if methods is None:
+            return entrypoints
+        if _resolve_class_target(f"{module}.{name}") is not None:
+            return _filter_class_entrypoints(entrypoints, methods)
+    analysis_limit_error = None
+    try:
+        returned_entrypoints = _module_getattr_returned_class_entrypoints(f"{module}.{name}", methods=methods)
+    except (_CallGraphAnalysisLimitError, RecursionError) as error:
+        analysis_limit_error = error
+        returned_entrypoints = error.partial_entrypoints if isinstance(error, _CallGraphAnalysisLimitError) else ()
+    if methods is not None:
+        returned_entrypoints = _filter_class_entrypoints(returned_entrypoints, methods)
+    # Resolving an export still executes the hook before invoking its returned class.
+    combined = _dedupe_calls((*entrypoints, *returned_entrypoints))
+    if analysis_limit_error is not None:
+        raise _CallGraphAnalysisLimitError(
+            str(analysis_limit_error), partial_entrypoints=combined
+        ) from analysis_limit_error
+    return combined
 
 
 def _pickle_entrypoint_positional_arg_count(
@@ -6237,6 +6281,614 @@ def _resolve_class_target(function_name: str) -> str | None:
     return None
 
 
+def _module_getattr_condition_value(
+    test: ast.expr, parameter_name: str, export_name: object, *, depth: int = 0
+) -> bool | None:
+    if depth >= _MAX_CONDITION_DEPTH:
+        return None
+    if isinstance(test, ast.Constant):
+        return bool(test.value)
+    if isinstance(test, ast.Name) and test.id == parameter_name:
+        return bool(export_name)
+    if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
+        value = _module_getattr_condition_value(test.operand, parameter_name, export_name, depth=depth + 1)
+        return not value if value is not None else None
+    if isinstance(test, ast.BoolOp):
+        values = [
+            _module_getattr_condition_value(value, parameter_name, export_name, depth=depth + 1)
+            for value in test.values
+        ]
+        decisive = isinstance(test.op, ast.Or)
+        if decisive in values:
+            return decisive
+        return None if None in values else not decisive
+    if not isinstance(test, ast.Compare) or len(test.ops) != 1:
+        return None
+    left, right = test.left, test.comparators[0]
+    operator = test.ops[0]
+    if isinstance(operator, ast.Eq | ast.NotEq):
+        if isinstance(right, ast.Name) and right.id == parameter_name:
+            left, right = right, left
+        if isinstance(left, ast.Name) and left.id == parameter_name and isinstance(right, ast.Constant):
+            matches = export_name == right.value
+            return matches if isinstance(operator, ast.Eq) else not matches
+    if (
+        isinstance(operator, ast.In | ast.NotIn)
+        and isinstance(left, ast.Name)
+        and left.id == parameter_name
+        and isinstance(right, ast.Tuple | ast.List | ast.Set)
+        and all(isinstance(item, ast.Constant) for item in right.elts)
+    ):
+        matches = any(export_name == item.value for item in right.elts if isinstance(item, ast.Constant))
+        return matches if isinstance(operator, ast.In) else not matches
+    return None
+
+
+def _module_getattr_loop_body_is_unreachable(
+    statement: ast.For | ast.While, parameter_name: str, export_name: object
+) -> bool:
+    if isinstance(statement, ast.While):
+        return _module_getattr_condition_value(statement.test, parameter_name, export_name) is False
+    iterable = statement.iter
+    if isinstance(iterable, ast.Tuple | ast.List | ast.Set):
+        return not iterable.elts
+    if isinstance(iterable, ast.Dict):
+        return not iterable.keys
+    return isinstance(iterable, ast.Constant) and isinstance(iterable.value, str | bytes) and not iterable.value
+
+
+def _module_getattr_return_statements(
+    getter: ast.FunctionDef, parameter_name: str, export_name: object
+) -> tuple[ast.Return, ...]:
+    def visit(statements: Iterable[ast.stmt]) -> tuple[list[ast.Return], bool]:
+        returns: list[ast.Return] = []
+        for statement in statements:
+            if isinstance(statement, ast.Return):
+                returns.append(statement)
+                return returns, True
+            if isinstance(statement, ast.Raise):
+                return returns, True
+            if isinstance(statement, ast.For | ast.While) and _module_getattr_loop_body_is_unreachable(
+                statement, parameter_name, export_name
+            ):
+                loop_returns, loop_terminated = visit(statement.orelse)
+                returns.extend(loop_returns)
+                if loop_terminated:
+                    return returns, True
+            elif isinstance(statement, ast.If):
+                condition = _module_getattr_condition_value(statement.test, parameter_name, export_name)
+                branches: tuple[list[ast.stmt], ...]
+                if condition is None:
+                    branches = (statement.body, statement.orelse)
+                else:
+                    branches = (statement.body if condition else statement.orelse,)
+                terminated = []
+                for branch in branches:
+                    branch_returns, branch_terminated = visit(branch)
+                    returns.extend(branch_returns)
+                    terminated.append(branch_terminated)
+                if all(terminated):
+                    return returns, True
+            elif isinstance(statement, ast.Try):
+                final_returns, final_terminated = visit(statement.finalbody)
+                if final_terminated:
+                    returns.extend(final_returns)
+                    return returns, True
+                body_returns, body_terminated = visit(statement.body)
+                returns.extend(body_returns)
+                if not body_terminated:
+                    else_returns, body_terminated = visit(statement.orelse)
+                    returns.extend(else_returns)
+                handlers_terminated = []
+                for handler in statement.handlers:
+                    handler_returns, handler_terminated = visit(handler.body)
+                    returns.extend(handler_returns)
+                    handlers_terminated.append(handler_terminated)
+                returns.extend(final_returns)
+                if body_terminated and all(handlers_terminated):
+                    return returns, True
+            else:
+                for body in _definition_scope_child_bodies(statement):
+                    body_returns, _ = visit(body)
+                    returns.extend(body_returns)
+        return returns, False
+
+    return tuple(visit(getter.body)[0])
+
+
+def _module_getattr_binding_statements(
+    statements: Iterable[ast.stmt],
+    name: str,
+    *,
+    parameter_name: str = "",
+    export_name: object = "",
+    before: ast.stmt | None = None,
+    initial_bindings: tuple[ast.stmt, ...] = (),
+) -> tuple[ast.stmt, ...]:
+    matched: list[ast.stmt] = []
+
+    def bounded(nodes: Iterable[ast.stmt]) -> tuple[ast.stmt, ...]:
+        bindings = tuple(dict.fromkeys(nodes))
+        if len(bindings) > _MAX_CALLS_PER_FUNCTION:
+            raise _CallGraphAnalysisLimitError("module __getattr__ definitions exceed analysis limit")
+        return bindings
+
+    def visit(body: Iterable[ast.stmt], bindings: tuple[ast.stmt, ...]) -> tuple[tuple[ast.stmt, ...], bool]:
+        for statement in body:
+            if statement is before:
+                matched.extend(bindings)
+                matched[:] = bounded(matched)
+                return bindings, True
+            if isinstance(statement, ast.Return | ast.Raise):
+                return bindings, True
+            if isinstance(statement, ast.AnnAssign) and statement.value is None:
+                continue
+            if isinstance(statement, ast.Delete) and any(
+                _assignment_target_binds_name(target, name) for target in statement.targets
+            ):
+                bindings = ()
+            elif _module_statement_binds_name(statement, name):
+                bindings = (statement,)
+            elif isinstance(statement, ast.For | ast.While) and _module_getattr_loop_body_is_unreachable(
+                statement, parameter_name, export_name
+            ):
+                bindings, terminated = visit(statement.orelse, bindings)
+                if terminated:
+                    return bindings, True
+            elif isinstance(statement, ast.For):
+                loop_bindings = (statement,) if _assignment_target_binds_name(statement.target, name) else bindings
+                body_bindings, _ = visit(statement.body, loop_bindings)
+                loop_continuing = bounded((*bindings, *body_bindings))
+                else_bindings, _ = visit(statement.orelse, loop_continuing)
+                bindings = bounded((*loop_continuing, *else_bindings))
+            elif isinstance(statement, ast.If):
+                condition = _module_getattr_condition_value(statement.test, parameter_name, export_name)
+                branches = (
+                    (statement.body, statement.orelse)
+                    if condition is None
+                    else (statement.body if condition else statement.orelse,)
+                )
+                paths = [visit(branch, bindings) for branch in branches]
+                if all(terminated for _, terminated in paths):
+                    return (), True
+                bindings = bounded(node for path, terminated in paths if not terminated for node in path)
+            elif isinstance(statement, ast.Try):
+                body_bindings, body_terminated = visit(statement.body, bindings)
+                handler_bindings = bounded((*bindings, *body_bindings))
+                paths = [
+                    (body_bindings, True) if body_terminated else visit(statement.orelse, body_bindings),
+                    *(visit(handler.body, handler_bindings) for handler in statement.handlers),
+                ]
+                if before is not None and any(
+                    node is before for final_statement in statement.finalbody for node in ast.walk(final_statement)
+                ):
+                    visit(statement.finalbody, bounded(node for path, _ in paths for node in path))
+                    return (), True
+                continuing = [path for path, terminated in paths if not terminated]
+                if not continuing:
+                    return (), True
+                bindings, terminated = visit(statement.finalbody, bounded(node for path in continuing for node in path))
+                if terminated:
+                    return (), True
+            elif isinstance(statement, ast.With | ast.AsyncWith):
+                if any(
+                    item.optional_vars is not None and _assignment_target_binds_name(item.optional_vars, name)
+                    for item in statement.items
+                ):
+                    bindings = bounded((*bindings, statement))
+                bindings, terminated = visit(statement.body, bindings)
+                if terminated:
+                    return (), True
+            else:
+                bindings = bounded(
+                    (
+                        *bindings,
+                        *(
+                            node
+                            for child in _definition_scope_child_bodies(statement)
+                            for node in visit(child, bindings)[0]
+                        ),
+                    )
+                )
+        return bindings, False
+
+    bindings, _ = visit(statements, bounded(initial_bindings))
+    return bounded(matched) if before is not None else bindings
+
+
+def _module_getattr_hook_binding_error(bindings: Iterable[ast.stmt]) -> _CallGraphAnalysisLimitError | None:
+    for binding in bindings:
+        if isinstance(binding, ast.With | ast.AsyncWith):
+            return _CallGraphAnalysisLimitError("module __getattr__ has an unresolved context-manager binding")
+        if isinstance(binding, ast.For):
+            return _CallGraphAnalysisLimitError("module __getattr__ has an unresolved loop-target binding")
+    return None
+
+
+@_register_source_sensitive_cache
+@lru_cache(maxsize=4096)
+def _module_getattr_returned_class_entrypoints(
+    function_name: str, *, methods: tuple[str, ...] | None = None
+) -> tuple[str, ...]:
+    module_name, qualified_name = _split_function_name(function_name)
+    if module_name is None:
+        return ()
+    export_name, _separator, member_path = qualified_name.partition(".")
+    exporting_analysis = _analyze_module(module_name)
+    if exporting_analysis is None:
+        return ()
+    getter_target = _resolve_module_getattr_target(
+        module_name, export_name, exporting_analysis, allow_loaded_extension_bypass=not member_path
+    )
+    if getter_target is None or _safe_call_graph_entrypoints(function_name) != (getter_target,):
+        return ()
+    analysis_limit_error = None
+    exporting_context = _module_source_context(module_name)
+    if exporting_context is not None:
+        analysis_limit_error = _module_getattr_hook_binding_error(
+            _module_getattr_binding_statements(exporting_context.module_body, "__getattr__")
+        )
+    module_name, getter_name = _split_function_name(getter_target)
+    if module_name is None:
+        if analysis_limit_error is not None:
+            raise analysis_limit_error
+        return ()
+    if "." in getter_name:
+        if _find_sink_path(getter_target) is not None and analysis_limit_error is None:
+            return ()
+        raise _CallGraphAnalysisLimitError("module __getattr__ uses a class-method hook whose returns are not analyzed")
+    context = _module_source_context(module_name)
+    analysis = _analyze_module(module_name)
+    if context is None or analysis is None:
+        if analysis_limit_error is not None:
+            raise analysis_limit_error
+        return ()
+    getter_bindings = _module_getattr_binding_statements(context.module_body, getter_name)
+    analysis_limit_error = analysis_limit_error or _module_getattr_hook_binding_error(getter_bindings)
+    if _find_sink_path(getter_target) is not None and analysis_limit_error is None:
+        return ()
+    entrypoints: dict[str, None] = {}
+    for getter in getter_bindings:
+        if not isinstance(getter, ast.FunctionDef):
+            continue
+        try:
+            returned_entrypoints = _returned_class_entrypoints_for_getter(
+                module_name, export_name, getter, context, analysis, member_path=member_path, methods=methods
+            )
+        except _CallGraphAnalysisLimitError as error:
+            if analysis_limit_error is None:
+                analysis_limit_error = error
+            returned_entrypoints = error.partial_entrypoints
+        entrypoints.update(dict.fromkeys(returned_entrypoints))
+        if len(entrypoints) > _MAX_CALLS_PER_FUNCTION:
+            raise _CallGraphAnalysisLimitError("module __getattr__ returned-class entrypoints exceed analysis limit")
+    if analysis_limit_error is not None:
+        raise _CallGraphAnalysisLimitError(
+            str(analysis_limit_error), partial_entrypoints=tuple(entrypoints)
+        ) from analysis_limit_error
+    return tuple(entrypoints)
+
+
+def _module_getattr_decorators_preserve_returns(
+    getter: ast.FunctionDef, module_name: str, context: _ModuleSourceContext
+) -> bool:
+    for decorator in getter.decorator_list:
+        expression = decorator.func if isinstance(decorator, ast.Call) else decorator
+        name = _resolve_expr(expression, module_name, {}, set())
+        if name is None:
+            return False
+        root, separator, remainder = name.partition(".")
+        bindings = _module_getattr_binding_statements(context.module_body, root, before=getter)
+        targets: set[str] = set()
+        if not bindings and name == "staticmethod":
+            targets.add("builtins.staticmethod")
+        for binding in bindings:
+            imported = _collect_import_aliases((binding,), module_name, context.is_package).get(root)
+            if imported is None:
+                return False
+            targets.add(f"{imported}.{remainder}" if separator else imported)
+        if not targets or not targets <= {"builtins.staticmethod", "functools.cache", "functools.lru_cache"}:
+            return False
+        if isinstance(decorator, ast.Call):
+            if targets != {"functools.lru_cache"} or len(decorator.args) > 1:
+                return False
+            arguments: list[tuple[str | None, ast.expr]] = [("maxsize", argument) for argument in decorator.args]
+            arguments.extend((keyword.arg, keyword.value) for keyword in decorator.keywords)
+            if len({name for name, _value in arguments}) != len(arguments):
+                return False
+            for argument_name, value in arguments:
+                if not isinstance(value, ast.Constant):
+                    return False
+                if argument_name == "maxsize" and (value.value is None or type(value.value) is int):
+                    continue
+                if argument_name == "typed" and type(value.value) is bool:
+                    continue
+                return False
+    return True
+
+
+def _returned_class_entrypoints_for_getter(
+    module_name: str,
+    export_name: str,
+    getter: ast.FunctionDef,
+    context: _ModuleSourceContext,
+    analysis: _ModuleAnalysis,
+    *,
+    member_path: str = "",
+    methods: tuple[str, ...] | None = None,
+) -> tuple[str, ...]:
+    if not _module_getattr_decorators_preserve_returns(getter, module_name, context):
+        return ()
+    scope_nodes = [(node, True) for node in ast.iter_child_nodes(getter)]
+    runtime_assignments: set[str] = set()
+    while scope_nodes:
+        node, runtime_context = scope_nodes.pop()
+        if isinstance(node, ast.Yield | ast.YieldFrom):
+            return ()
+        if isinstance(node, ast.AnnAssign) and node.value is None:
+            scope_nodes.append((node.annotation, False))
+            continue
+        if runtime_context and isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store | ast.Del):
+            runtime_assignments.add(node.id)
+        elif runtime_context and isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+            runtime_assignments.add(node.name)
+        if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef | ast.Lambda):
+            scope_nodes.extend((child, runtime_context) for child in ast.iter_child_nodes(node))
+    parameters = (*getter.args.posonlyargs, *getter.args.args)
+    if (
+        (not parameters and getter.args.vararg is None)
+        or len(parameters) - len(getter.args.defaults) > 1
+        or any(default is None for default in getter.args.kw_defaults)
+    ):
+        return ()
+    parameter_name = parameters[0].arg if parameters else ""
+    scope = symtable.symtable(ast.unparse(getter), str(context.source_path), "exec")
+    while scope.get_type() != "function":
+        children = [child for child in scope.get_children() if child.get_name() == getter.name]
+        if not children:
+            return ()
+        scope = children[0]
+    symbols = {symbol.get_name(): symbol for symbol in scope.get_symbols()}
+    parameter_symbol = symbols.get(parameter_name)
+    condition_parameter = parameter_name
+    condition_value: object = export_name
+    parameter_assigned = parameter_name in runtime_assignments
+    if parameter_symbol is not None and (parameter_assigned or parameter_symbol.is_imported()):
+        parameter_name = ""
+        if parameter_assigned:
+            condition_parameter = ""
+        else:
+            condition_value = object()
+    globals_is_builtin = "globals" not in analysis.direct_names and parameter_name != "globals"
+    globals_symbol = symbols.get("globals")
+    globals_is_builtin &= globals_symbol is None or not (
+        not globals_symbol.is_global() or globals_symbol.is_assigned() or globals_symbol.is_imported()
+    )
+    remaining_values = _MAX_CALLS_PER_FUNCTION
+
+    def export_key(expression: ast.expr) -> str | None:
+        if isinstance(expression, ast.Constant) and isinstance(expression.value, str):
+            return expression.value
+        if isinstance(expression, ast.Name) and expression.id == parameter_name:
+            return export_name
+        if isinstance(expression, ast.JoinedStr):
+            parts: list[str] = []
+            key_length = 0
+            for part in expression.values:
+                if isinstance(part, ast.Constant) and isinstance(part.value, str):
+                    parts.append(part.value)
+                elif (
+                    isinstance(part, ast.FormattedValue)
+                    and isinstance(part.value, ast.Name)
+                    and part.value.id == parameter_name
+                    and part.conversion == -1
+                    and part.format_spec is None
+                ):
+                    parts.append(export_name)
+                else:
+                    return None
+                key_length += len(parts[-1])
+                if key_length > _MAX_SOURCE_MODULE_NAME_CHARS:
+                    raise _CallGraphAnalysisLimitError("module __getattr__ export name exceeds analysis limit")
+            return "".join(parts)
+        return None
+
+    def values(
+        expression: ast.expr,
+        before: ast.stmt | None,
+        in_function: bool,
+        *,
+        force_global: bool = False,
+    ) -> Iterator[tuple[str | ast.Dict | _CallGraphAnalysisLimitError, ast.stmt | None, bool]]:
+        nonlocal remaining_values
+        remaining_values -= 1
+        if remaining_values < 0:
+            raise _CallGraphAnalysisLimitError("module __getattr__ returned-value resolution exceeds analysis limit")
+        if isinstance(expression, ast.IfExp):
+            condition = _module_getattr_condition_value(
+                expression.test, condition_parameter if in_function else "", condition_value
+            )
+            branches = (
+                (expression.body, expression.orelse)
+                if condition is None
+                else (expression.body if condition else expression.orelse,)
+            )
+            for branch in branches:
+                yield from values(branch, before, in_function, force_global=force_global)
+            return
+        if isinstance(expression, ast.Dict):
+            if len(expression.keys) > _MAX_CALLS_PER_FUNCTION:
+                raise _CallGraphAnalysisLimitError("module __getattr__ mapping exceeds analysis limit")
+            yield expression, before, in_function
+            return
+        if isinstance(expression, ast.Subscript):
+            key = export_key(expression.slice)
+            if (
+                globals_is_builtin
+                and isinstance(expression.value, ast.Call)
+                and isinstance(expression.value.func, ast.Name)
+                and expression.value.func.id == "globals"
+                and not expression.value.args
+                and not expression.value.keywords
+            ):
+                if key is not None:
+                    yield from values(ast.Name(id=key), before, in_function, force_global=True)
+                return
+            for mapping, mapping_before, mapping_in_function in values(expression.value, before, in_function):
+                if isinstance(mapping, _CallGraphAnalysisLimitError):
+                    yield mapping, mapping_before, mapping_in_function
+                    continue
+                if not isinstance(mapping, ast.Dict):
+                    continue
+                for entry_key, entry_value in reversed(tuple(zip(mapping.keys, mapping.values, strict=True))):
+                    if entry_key is None:
+                        yield (
+                            _CallGraphAnalysisLimitError("module __getattr__ mapping has unresolved unpacking"),
+                            mapping_before,
+                            mapping_in_function,
+                        )
+                        continue
+                    if key is None or not isinstance(entry_key, ast.Constant) or entry_key.value == key:
+                        yield from values(entry_value, mapping_before, mapping_in_function)
+                        if key is not None and isinstance(entry_key, ast.Constant):
+                            break
+            return
+        target_name = _resolve_expr(expression, module_name, {}, set())
+        if target_name is None:
+            return
+        if len(target_name) > _MAX_SOURCE_MODULE_NAME_CHARS:
+            raise _CallGraphAnalysisLimitError("module __getattr__ export name exceeds analysis limit")
+        root_name, separator, remainder = target_name.partition(".")
+        symbol = symbols.get(root_name) if in_function else None
+        function_binding = symbol is not None and (
+            symbol.is_assigned() or symbol.is_imported() or not symbol.is_global()
+        )
+        if force_global and symbol is not None and not symbol.is_global():
+            function_binding = False
+        module_bindings = (
+            _module_getattr_binding_statements(context.module_body, root_name)
+            if function_binding and symbol is not None and symbol.is_global()
+            else ()
+        )
+        bindings = _module_getattr_binding_statements(
+            getter.body if function_binding else context.module_body,
+            root_name,
+            parameter_name=condition_parameter if function_binding else "",
+            export_name=condition_value,
+            before=before if function_binding or not in_function else None,
+            initial_bindings=module_bindings,
+        )
+        for binding in bindings:
+            binding_in_function = function_binding and binding not in module_bindings
+            imported = _collect_import_aliases((binding,), module_name, context.is_package).get(root_name)
+            if imported is not None:
+                yield (f"{imported}.{remainder}" if separator else imported), before, in_function
+            elif isinstance(binding, ast.ClassDef):
+                if binding_in_function:
+                    yield (
+                        _CallGraphAnalysisLimitError(
+                            "module __getattr__ returns a function-local class whose closure is not analyzed"
+                        ),
+                        before,
+                        in_function,
+                    )
+                else:
+                    yield f"{module_name}.{target_name}", before, in_function
+            elif isinstance(binding, ast.FunctionDef | ast.AsyncFunctionDef):
+                yield (
+                    _CallGraphAnalysisLimitError("module __getattr__ returned function invocation is not analyzed"),
+                    before,
+                    in_function,
+                )
+            elif isinstance(binding, ast.For):
+                yield (
+                    _CallGraphAnalysisLimitError("module __getattr__ returns an unresolved loop-target binding"),
+                    before,
+                    in_function,
+                )
+            elif isinstance(binding, ast.With | ast.AsyncWith):
+                yield (
+                    _CallGraphAnalysisLimitError("module __getattr__ returns an unresolved context-manager binding"),
+                    before,
+                    in_function,
+                )
+            elif isinstance(binding, ast.Assign | ast.AnnAssign) and binding.value is not None:
+                if root_name not in _assignment_alias_target_names(binding):
+                    continue
+                for value, value_before, value_in_function in values(binding.value, binding, binding_in_function):
+                    if separator:
+                        if isinstance(value, str):
+                            yield f"{value}.{remainder}", value_before, value_in_function
+                        elif isinstance(value, _CallGraphAnalysisLimitError):
+                            yield value, value_before, value_in_function
+                    else:
+                        yield value, value_before, value_in_function
+        if not bindings and not function_binding and root_name not in analysis.direct_names:
+            yield f"{module_name}.{target_name}", before, in_function
+
+    entrypoints: dict[str, None] = {}
+    analysis_limit_error = None
+    returns = _module_getattr_return_statements(getter, condition_parameter, condition_value)
+    if len(returns) > _MAX_CALLS_PER_FUNCTION:
+        raise _CallGraphAnalysisLimitError("module __getattr__ return statements exceed analysis limit")
+    for statement in returns:
+        if statement.value is None:
+            continue
+        try:
+            for target, _before, _in_function in values(statement.value, statement, True):
+                try:
+                    if isinstance(target, _CallGraphAnalysisLimitError):
+                        raise target
+                    if not isinstance(target, str):
+                        continue
+                    returned_entrypoints = _returned_class_target_entrypoints(target, member_path, methods)
+                except _CallGraphAnalysisLimitError as error:
+                    if analysis_limit_error is None:
+                        analysis_limit_error = error
+                    returned_entrypoints = error.partial_entrypoints
+                entrypoints.update(dict.fromkeys(returned_entrypoints))
+                if len(entrypoints) > _MAX_CALLS_PER_FUNCTION:
+                    raise _CallGraphAnalysisLimitError(
+                        "module __getattr__ returned-class entrypoints exceed analysis limit"
+                    )
+        except _CallGraphAnalysisLimitError as error:
+            if analysis_limit_error is None:
+                analysis_limit_error = error
+        if len(entrypoints) > _MAX_CALLS_PER_FUNCTION:
+            raise _CallGraphAnalysisLimitError("module __getattr__ returned-class entrypoints exceed analysis limit")
+    if analysis_limit_error is not None:
+        raise _CallGraphAnalysisLimitError(
+            str(analysis_limit_error), partial_entrypoints=tuple(entrypoints)
+        ) from analysis_limit_error
+    return tuple(entrypoints)
+
+
+def _returned_class_target_entrypoints(
+    target: str, member_path: str, methods: tuple[str, ...] | None
+) -> tuple[str, ...]:
+    class_target = _resolve_class_target(target)
+    if class_target is None:
+        if _resolve_alias_function_target(target) is not None:
+            raise _CallGraphAnalysisLimitError("module __getattr__ returned function invocation is not analyzed")
+        return ()
+    entrypoints = (
+        _call_graph_entrypoints(f"{class_target}.{member_path}") if member_path else _class_entrypoints(class_target)
+    )
+    try:
+        class_context = _source_class_context(class_target)
+        if class_context is None or not _class_lookup_has_source_backed_plain_metaclass(class_context):
+            selected = (
+                entrypoints if member_path or methods is None else _filter_class_entrypoints(entrypoints, methods)
+            )
+            if not any(_find_sink_path(entrypoint) is not None for entrypoint in selected):
+                raise _CallGraphAnalysisLimitError("module __getattr__ returns a class with an unproven metaclass")
+    except (_CallGraphAnalysisLimitError, RecursionError) as error:
+        raise _CallGraphAnalysisLimitError(str(error), partial_entrypoints=entrypoints) from error
+    if member_path and not entrypoints:
+        raise _CallGraphAnalysisLimitError("module __getattr__ returns a class with an unresolved member path")
+    return entrypoints
+
+
 def _class_entrypoints(class_name: str) -> tuple[str, ...]:
     module_name, qualified_name = _split_function_name(class_name)
     if module_name is None:
@@ -6337,8 +6989,31 @@ def _module_source_context(module_name: str) -> _ModuleSourceContext | None:
         return None
 
     is_package = source_path.name == "__init__.py"
-    module_statements = _module_level_statements(tree, module_name)
-    return _ModuleSourceContext(source_path=source_path, module_statements=module_statements, is_package=is_package)
+    module_body = _runtime_selected_module_statements(tree.body, module_name)
+    module_statements = _definition_scope_statements(module_body)
+    return _ModuleSourceContext(
+        source_path=source_path,
+        module_body=module_body,
+        module_statements=module_statements,
+        is_package=is_package,
+        deleted_names=_module_deleted_export_names(module_body),
+    )
+
+
+def _module_deleted_export_names(nodes: Iterable[ast.stmt]) -> frozenset[str]:
+    deleted_names: set[str] = set()
+    pending = list(nodes)
+    while pending:
+        statement = pending.pop()
+        if isinstance(statement, ast.Delete):
+            for target in statement.targets:
+                deleted_names.update(_assignment_target_names(target))
+        elif isinstance(statement, ast.For | ast.While) and _module_getattr_loop_body_is_unreachable(statement, "", ""):
+            pending.extend(statement.orelse)
+        else:
+            for body in _definition_scope_child_bodies(statement):
+                pending.extend(body)
+    return frozenset(deleted_names)
 
 
 def _source_has_importable_untrusted_cache(source_path: Path, source: str) -> bool:
@@ -6716,6 +7391,13 @@ def _definition_scope_statements(nodes: Iterable[ast.stmt]) -> tuple[ast.stmt, .
 
 def _definition_scope_child_bodies(statement: ast.stmt) -> tuple[Iterable[ast.stmt], ...]:
     if isinstance(statement, ast.If):
+        if all(
+            isinstance(node, ast.Constant | ast.UnaryOp | ast.Not | ast.BoolOp | ast.And | ast.Or)
+            for node in ast.walk(statement.test)
+        ):
+            condition = _module_getattr_condition_value(statement.test, "", "")
+            if condition is not None:
+                return (statement.body if condition else statement.orelse,)
         return (statement.body, statement.orelse)
     if isinstance(statement, ast.Try):
         return (
@@ -6899,32 +7581,38 @@ def _class_body_statement_or_nested_statement_binds_name(statement: ast.stmt, na
     )
 
 
-def _class_lookup_has_source_backed_plain_metaclass(
-    context: _ClassSourceContext,
-    visited: frozenset[str] = frozenset(),
-) -> bool:
-    class_key = f"{context.module_name}.{context.class_node.name}"
-    if class_key in visited:
-        return True
-    if _class_definition_has_dynamic_lookup_context(context.class_node):
-        return False
-    next_visited = visited | {class_key}
-    base_targets = _class_base_targets_for_static_lookup(
-        context.class_node, context.module_name, context.aliases, context.local_defs
-    )
-    if base_targets is None:
-        return False
-    for base in base_targets:
-        base_context = _class_source_context_for_target(
-            base,
-            context.module_name,
-            context.aliases,
-            context.local_defs,
-            context.local_class_nodes,
-            context.module_statements,
-        )
-        if base_context is None or not _class_lookup_has_source_backed_plain_metaclass(base_context, next_visited):
+def _class_lookup_has_source_backed_plain_metaclass(context: _ClassSourceContext) -> bool:
+    pending = [context]
+    visited: set[tuple[str, int, int]] = set()
+    remaining_bases = _MAX_METACLASS_BASES
+    while pending:
+        current = pending.pop()
+        class_node = current.class_node
+        # Imported class contexts may parse the same definition into distinct AST nodes.
+        class_key = (current.module_name, class_node.lineno, class_node.col_offset)
+        if class_key in visited:
+            continue
+        visited.add(class_key)
+        if _class_definition_has_dynamic_lookup_context(class_node) or len(class_node.bases) > remaining_bases:
             return False
+        remaining_bases -= len(class_node.bases)
+        base_targets = _class_base_targets_for_static_lookup(
+            class_node, current.module_name, current.aliases, current.local_defs
+        )
+        if base_targets is None:
+            return False
+        for base in base_targets:
+            base_context = _class_source_context_for_target(
+                base,
+                current.module_name,
+                current.aliases,
+                current.local_defs,
+                current.local_class_nodes,
+                current.module_statements,
+            )
+            if base_context is None:
+                return False
+            pending.append(base_context)
     return True
 
 
@@ -7344,7 +8032,7 @@ def _conditionally_rebound_assignment_nodes(
         terminating_bodies: tuple[Iterable[ast.stmt], ...]
         deterministic_terminal_bodies: tuple[Iterable[ast.stmt], ...] | None = None
         if isinstance(node, ast.If):
-            alternate_bodies = (node.body, node.orelse)
+            alternate_bodies = _definition_scope_child_bodies(node)
             terminating_bodies = tuple(
                 branch_body for branch_body in alternate_bodies if not _can_complete_normally(branch_body)
             )

@@ -11,6 +11,8 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- Detect invoked class constructors returned by source-backed module compatibility hooks, including Click 8.5's legacy LazyFile export.
+- Preserve annotated and conditional compatibility aliases and use consistent, depth-bounded constant-branch analysis. Check metaclasses during returned-class member lookup with a bounded traversal that reuses shared ancestors, and retain dangerous paths across incomplete alternatives and separate pickle invocations. Report incomplete analysis for export deletion, class-method compatibility hooks, returned functions or function-local classes, unresolved member paths, loop or context-manager bindings, and unproven metaclasses. Skip provably unreachable deletions and retain existing possible paths for uncertain export bindings. Preserve resolved hooks and independent findings when source or metaclass analysis reaches a limit.
 - **picklescan:** avoid scalar storage pickle false positives ([#1842](https://github.com/promptfoo/modelaudit/issues/1842)) ([7408ed1](https://github.com/promptfoo/modelaudit/commit/7408ed1ac48a202ba931a2d6efc5ac79dde4d8ed))
 - **picklescan:** diagnose Windows call-graph source-stability failures ([#1789](https://github.com/promptfoo/modelaudit/issues/1789)) ([89b5024](https://github.com/promptfoo/modelaudit/commit/89b50246fc9226770d46b26e8582a6d161dc0244))
 - **picklescan:** preserve nested storage probe coverage ([#1846](https://github.com/promptfoo/modelaudit/issues/1846)) ([28ad1c9](https://github.com/promptfoo/modelaudit/commit/28ad1c9b5c7b98d76b4b3db466f5c55526fd3fa7))
