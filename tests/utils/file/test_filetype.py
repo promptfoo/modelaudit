@@ -1085,6 +1085,57 @@ def test_detect_preset_dictionary_zlib_safetensors_overlap_retains_compression(t
     assert detect_file_format(str(polyglot)) == "zlib"
 
 
+@pytest.mark.parametrize("header_length", [8312, 16248, 32120, 47992, 63864])
+def test_detect_native_safetensors_fdict_header_prefers_safetensors(tmp_path: Path, header_length: int) -> None:
+    metadata = b'{"tensor":{"dtype":"U8","shape":[1],"data_offsets":[0,1]}}'
+    metadata += b" " * (header_length - len(metadata))
+    safetensors_path = tmp_path / "model.safetensors"
+    safetensors_path.write_bytes(struct.pack("<Q", header_length) + metadata + b"\x00")
+
+    assert safetensors_path.read_bytes()[0] == 0x78
+    assert safetensors_path.read_bytes()[1] & 0x20
+    assert detect_file_format_from_magic(str(safetensors_path)) == "safetensors"
+    assert detect_file_format_for_skip_filter(str(safetensors_path)) == "safetensors"
+    assert detect_file_format(str(safetensors_path)) == "safetensors"
+
+
+@pytest.mark.parametrize("header_kind", ["oversized", "too_deep"])
+def test_detect_inconclusive_native_safetensors_fdict_header_retains_compression(
+    tmp_path: Path, header_kind: str
+) -> None:
+    path = tmp_path / "inconclusive.safetensors"
+    if header_kind == "oversized":
+        header_length = SAFETENSORS_ROUTING_HEADER_PARSE_BYTES + 0x2078
+        _write_sparse_oversized_safetensors_candidate(path, header_length)
+    else:
+        header_length = 0xF978
+        depth = 10_000
+        header = b'{"a":' + b"[" * depth + b"0" + b"]" * depth + b"}"
+        path.write_bytes(struct.pack("<Q", header_length) + header.ljust(header_length) + b"\x00")
+
+    with path.open("rb") as handle:
+        prefix = handle.read(2)
+    assert prefix[0] == 0x78
+    assert prefix[1] & 0x20
+    assert detect_file_format_from_magic(str(path)) == "zlib"
+    assert detect_file_format_for_skip_filter(str(path)) == "zlib"
+    assert detect_file_format(str(path)) == "zlib"
+
+
+def test_detect_genuine_fdict_zlib_named_safetensors_remains_zlib(tmp_path: Path) -> None:
+    zdict = b"modelaudit-preset-dictionary"
+    compressor = zlib.compressobj(level=6, zdict=zdict)
+    payload = compressor.compress(b'{"tensor":{"dtype":"U8"}}') + compressor.flush()
+    zlib_path = tmp_path / "compressed.safetensors"
+    zlib_path.write_bytes(payload)
+
+    assert zlib_path.read_bytes()[0] == 0x78
+    assert zlib_path.read_bytes()[1] & 0x20
+    assert detect_file_format_from_magic(str(zlib_path)) == "zlib"
+    assert detect_file_format_for_skip_filter(str(zlib_path)) == "zlib"
+    assert detect_file_format(str(zlib_path)) == "zlib"
+
+
 def test_oversized_safetensors_compression_probe_keeps_small_bound(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

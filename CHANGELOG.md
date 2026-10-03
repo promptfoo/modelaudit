@@ -7,11 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Bug Fixes
+### Fixed
 
 - Avoid incomplete PyTorch ZIP storage discovery for impossible length-prefixed tensor bytes when no hidden payload is present.
 - Preserve hidden-pickle detection across storage probe limits, nested literals, long global names, and memoized operands; report incomplete coverage when inspection limits are reached.
 - Preserve benign Unicode metadata when checking line continuations without retaining a per-character copy.
+- Preserve native SafeTensors routing when a valid bounded header also resembles an FDICT zlib stream.
 
 ## [0.2.53](https://github.com/promptfoo/modelaudit/compare/v0.2.52...v0.2.53) (2026-10-03)
 
