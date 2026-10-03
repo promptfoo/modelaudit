@@ -13,6 +13,7 @@ from typing import Any, ClassVar, Final, Literal
 
 from ..analysis.unified_context import UnifiedMLContext
 from ..scanner_results import (
+    ACTIONABLE_FAILED_CHECKS_METADATA_KEY,
     INCONCLUSIVE_SCAN_OUTCOME,
     OPERATIONAL_ERROR_METADATA_KEY,
     RAW_DETECTOR_ANALYSIS_INCOMPLETE_REASON,
@@ -26,6 +27,7 @@ from ..scanner_results import (
     ScanResult,
     mark_inconclusive_scan_result,
 )
+from ..utils import is_absolute_archive_path, sanitize_archive_path
 from ..utils.helpers.interrupt_handler import check_interrupted
 from ._evidence_redaction import redact_evidence_string, redact_untrusted_error_message
 from .rule_mapper import get_embedded_code_rule_code, get_network_rule_code, get_secret_rule_code
@@ -229,6 +231,80 @@ class BaseScanner(ABC):
         # Progress tracking setup
         self.progress_tracker: Any | None = None
         self._enable_progress = self.config.get("enable_progress", False) and PROGRESS_AVAILABLE
+
+    @staticmethod
+    def _resolve_symlink_target(
+        target: str,
+        *,
+        resolved_name: str,
+        extraction_root: str,
+    ) -> tuple[str, bool]:
+        """Resolve a relative symlink target while enforcing the archive extraction root."""
+        if is_absolute_archive_path(target):
+            return target, False
+
+        normalized_target = target.replace("\\", os.sep).replace("/", os.sep)
+        target_base = os.path.dirname(resolved_name)
+        target_resolved = os.path.normpath(os.path.join(target_base, normalized_target))
+        try:
+            target_from_root = os.path.relpath(target_resolved, extraction_root)
+        except ValueError:
+            return target_resolved, False
+        return sanitize_archive_path(target_from_root, extraction_root)
+
+    @staticmethod
+    def _mark_inconclusive_metadata_first(result: ScanResult, reason: str, outcome: str) -> None:
+        result.metadata["analysis_incomplete"] = True
+        result.metadata["scan_outcome"] = outcome
+
+        reasons = result.metadata.get("scan_outcome_reasons")
+        if not isinstance(reasons, list):
+            reasons = []
+            result.metadata["scan_outcome_reasons"] = reasons
+        if reason not in reasons:
+            reasons.append(reason)
+
+    @staticmethod
+    def _mark_inconclusive_reason_first(result: ScanResult, reason: str, outcome: str) -> None:
+        existing_reasons = result.metadata.get("scan_outcome_reasons")
+        reasons = existing_reasons if isinstance(existing_reasons, list) else []
+        if reason not in reasons:
+            reasons.append(reason)
+
+        result.metadata["scan_outcome"] = outcome
+        result.metadata["scan_outcome_reasons"] = reasons
+        result.metadata["analysis_incomplete"] = True
+
+    @staticmethod
+    def _remove_private_actionable_failed_check_entries(
+        result: ScanResult,
+        entries_to_remove: list[dict[str, str]],
+    ) -> None:
+        private_failed_checks = result._private_metadata.get(ACTIONABLE_FAILED_CHECKS_METADATA_KEY)
+        if not entries_to_remove or not isinstance(private_failed_checks, list):
+            return
+
+        unmatched_entries = list(entries_to_remove)
+        filtered_entries: list[Any] = []
+        for entry in private_failed_checks:
+            if isinstance(entry, dict):
+                matched_index = next(
+                    (
+                        index
+                        for index, candidate in enumerate(unmatched_entries)
+                        if entry.get("name") == candidate["name"] and entry.get("rule_code") == candidate["rule_code"]
+                    ),
+                    None,
+                )
+                if matched_index is not None:
+                    del unmatched_entries[matched_index]
+                    continue
+            filtered_entries.append(entry)
+
+        if filtered_entries:
+            result._private_metadata[ACTIONABLE_FAILED_CHECKS_METADATA_KEY] = filtered_entries
+        else:
+            result._private_metadata.pop(ACTIONABLE_FAILED_CHECKS_METADATA_KEY, None)
 
     @staticmethod
     def _normalize_positive_int_config(value: Any, default: int) -> int:
@@ -1693,3 +1769,31 @@ class BaseScanner(ABC):
             "description": getattr(self, "description", ""),
             "file_size": self.get_file_size(file_path),
         }
+
+
+def _scanner_int_config(self: BaseScanner, key: str, default: int, minimum: int = 0) -> int:
+    """Return a bounded integer config value with safe fallback."""
+    raw_value = self.config.get(key, default)
+    try:
+        parsed = int(raw_value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(parsed, minimum)
+
+
+def _scanner_stat_identity(stat_result: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        stat_result.st_dev,
+        stat_result.st_ino,
+        stat_result.st_size,
+        stat_result.st_mtime_ns,
+        stat_result.st_ctime_ns,
+    )
+
+
+def _scanner_positive_int_config(self: BaseScanner, key: str, default: int) -> int:
+    try:
+        value = int(self.config.get(key, default))
+    except (OverflowError, TypeError, ValueError):
+        return default
+    return value if value > 0 else default

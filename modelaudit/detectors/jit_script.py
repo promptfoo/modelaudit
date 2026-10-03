@@ -11,6 +11,7 @@ Part of ModelAudit's critical security validation suite.
 
 import ast
 import builtins
+import codecs
 import codeop
 import json
 import re
@@ -42,6 +43,7 @@ _FunctionAliasSummary = tuple[
     tuple[tuple[str, int], ...],
 ]
 _ContainerValue = TypeVar("_ContainerValue")
+_ScopeKey = TypeVar("_ScopeKey")
 _TypedMemberCallableValue = frozenset[tuple[str, str, bool]]
 
 
@@ -664,7 +666,7 @@ def _priority_import_sites(bounded: bytes) -> list[tuple[int, int | None]]:
             match = next(matches, None)
         if match is None:
             break
-        multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
+        multiline_quote = _triple_quote_state_after_line(line, multiline_quote)
         line_start = line_end
     return sites
 
@@ -942,11 +944,6 @@ def _builtins_import_alias_state(candidate: bytes) -> tuple[frozenset[str], froz
             _update_compact_builtins_aliases(statement, aliases)
     canonical_aliases = {"builtins", "__builtins__"}
     return frozenset(aliases - canonical_aliases), frozenset(canonical_aliases - aliases)
-
-
-def _builtins_import_aliases(candidate: bytes) -> frozenset[str]:
-    aliases, _shadowed_canonical_aliases = _builtins_import_alias_state(candidate)
-    return aliases
 
 
 def _update_compact_typed_import_aliases(statement: ast.stmt, aliases: dict[str, str]) -> None:
@@ -1958,6 +1955,26 @@ def _priority_alias_usage_lines(
             return None
         return late_definitions[name][definition_index]
 
+    def mapping_owner(node: ast.AST) -> str | None:
+        if isinstance(node, ast.Name):
+            return typed_member_mapping_aliases.get(node.id)
+        if (
+            isinstance(node, ast.Attribute)
+            and node.attr == "__dict__"
+            and isinstance(node.value, ast.Name)
+            and node.value.id in retained_alias_names
+        ):
+            return node.value.id
+        if (
+            isinstance(node, ast.Call)
+            and is_active_builtin_helper(_simple_reference_name(node.func), "vars")
+            and len(node.args) == 1
+            and isinstance(node.args[0], ast.Name)
+            and node.args[0].id in retained_alias_names
+        ):
+            return node.args[0].id
+        return None
+
     def typed_member_write_keys(statement: bytes, deleted_members: set[str]) -> set[str]:
         structural_statement = statement.lstrip(b"\x00\xff")
         tracked_keys: set[str] = set()
@@ -2020,26 +2037,6 @@ def _priority_alias_usage_lines(
         tree = _parse_late_replay_tree(source)
         if tree is None:
             return tracked_keys
-
-        def mapping_owner(node: ast.AST) -> str | None:
-            if isinstance(node, ast.Name):
-                return typed_member_mapping_aliases.get(node.id)
-            if (
-                isinstance(node, ast.Attribute)
-                and node.attr == "__dict__"
-                and isinstance(node.value, ast.Name)
-                and node.value.id in retained_alias_names
-            ):
-                return node.value.id
-            if (
-                isinstance(node, ast.Call)
-                and is_active_builtin_helper(_simple_reference_name(node.func), "vars")
-                and len(node.args) == 1
-                and isinstance(node.args[0], ast.Name)
-                and node.args[0].id in retained_alias_names
-            ):
-                return node.args[0].id
-            return None
 
         def static_member_reference(owner: str | None, key: ast.AST | None) -> str | None:
             if owner is None or key is None:
@@ -2187,26 +2184,6 @@ def _priority_alias_usage_lines(
         if tree is None:
             return set()
         deleted_keys: set[str] = set()
-
-        def mapping_owner(node: ast.AST) -> str | None:
-            if isinstance(node, ast.Name):
-                return typed_member_mapping_aliases.get(node.id)
-            if (
-                isinstance(node, ast.Attribute)
-                and node.attr == "__dict__"
-                and isinstance(node.value, ast.Name)
-                and node.value.id in retained_alias_names
-            ):
-                return node.value.id
-            if (
-                isinstance(node, ast.Call)
-                and is_active_builtin_helper(_simple_reference_name(node.func), "vars")
-                and len(node.args) == 1
-                and isinstance(node.args[0], ast.Name)
-                and node.args[0].id in retained_alias_names
-            ):
-                return node.args[0].id
-            return None
 
         def record_mapping_key(owner: str | None, key: ast.AST | None) -> None:
             if owner is None or key is None:
@@ -3114,7 +3091,7 @@ def _priority_alias_usage_lines(
             update_pre_replay_deletion_state(context_line, (context_line_start, context_line_start + len(context_line)))
         context_line_start += len(context_line)
     line_start = context_start
-    multiline_quote: bytes | None = _multiline_string_state_after_line(candidate[:context_start], None)
+    multiline_quote: bytes | None = _triple_quote_state_after_line(candidate[:context_start], None)
     continued_expression_start: int | None = None
     continued_parenthesis_depth = 0
     continued_has_priority_piece = False
@@ -3127,7 +3104,7 @@ def _priority_alias_usage_lines(
             line_end += 1
         line = candidate[line_start:line_end]
         if multiline_quote is not None:
-            multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
+            multiline_quote = _triple_quote_state_after_line(line, multiline_quote)
             line_start = line_end
             continue
         code_start = 0
@@ -3142,7 +3119,7 @@ def _priority_alias_usage_lines(
             code_line = target_name.encode("utf-8") + b" = " + expression
         structural_code_line = code_line.strip()
         if not structural_code_line and continued_expression_start is None:
-            multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
+            multiline_quote = _triple_quote_state_after_line(line, multiline_quote)
             line_start = line_end
             continue
         line_indent = len(line) - len(line.lstrip())
@@ -3250,7 +3227,7 @@ def _priority_alias_usage_lines(
                 else:
                     forwarded_state_sizes[fast_binding_name] = fast_forwarded_size
                     add_late_definition(fast_binding_name, line[code_start : line_end - line_start], fast_span)
-                multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
+                multiline_quote = _triple_quote_state_after_line(line, multiline_quote)
                 line_start = line_end
                 continue
         if fast_forwarding is not None and not skips_state_neutral_forwarding:
@@ -3573,9 +3550,11 @@ def _priority_alias_usage_lines(
                                     typed_member_statement.lstrip(b"\x00\xff"),
                                 )
                                 is not None
-                                or _statement_executes_eager_generator_expression(
-                                    typed_member_statement,
-                                    eager_generator_consumers=canonical_eager_generator_consumer_aliases,
+                                or bool(
+                                    _statement_eager_generator_consumers(
+                                        typed_member_statement,
+                                        eager_generator_consumers=canonical_eager_generator_consumer_aliases,
+                                    )
                                 )
                                 or restores_deleted_member
                                 or len(typed_member_keys) > 1
@@ -3680,7 +3659,7 @@ def _priority_alias_usage_lines(
                         continued_expression_start = None
                         continued_parenthesis_depth = 0
                         continued_has_priority_piece = False
-                        multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
+                        multiline_quote = _triple_quote_state_after_line(line, multiline_quote)
                         line_start = line_end
                         continue
                     if not root_names.isdisjoint(fail_closed_dangerous_names):
@@ -3740,7 +3719,7 @@ def _priority_alias_usage_lines(
             )
             forwarded_state_sizes[fast_binding_name] = _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES + 1
             forwarded_safe_names.discard(fast_binding_name)
-            multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
+            multiline_quote = _triple_quote_state_after_line(line, multiline_quote)
             line_start = line_end
             continue
         is_simple_forwarding_binding = False
@@ -3792,7 +3771,7 @@ def _priority_alias_usage_lines(
                     candidate, line_start, line, enclosing_headers, exception_type_aliases
                 )
                 if guard_value is False:
-                    multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
+                    multiline_quote = _triple_quote_state_after_line(line, multiline_quote)
                     line_start = line_end
                     continue
                 if update_alias is not None:
@@ -3833,14 +3812,23 @@ def _priority_alias_usage_lines(
                     forwarded_rule_codes.pop(binding_name, None)
                     typed_rule_source_names.discard(binding_name)
                 if binding_name not in relevant_binding_names and _is_inert_scalar_late_binding(code_line):
-                    multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
+                    multiline_quote = _triple_quote_state_after_line(line, multiline_quote)
                     line_start = line_end
                     continue
                 statement_start = (
                     line_start
                     if guard_value is True
-                    and _is_reachable_late_else_binding(
-                        candidate, line_start, line, enclosing_headers, exception_type_aliases
+                    and any(
+                        (
+                            header == b"else:"
+                            and _constant_late_header_value(candidate, header, header_start, exception_type_aliases)
+                            is True
+                            for header, header_start in (
+                                enclosing_headers
+                                if enclosing_headers is not None
+                                else _late_binding_enclosing_headers(candidate, line_start, line)
+                            )
+                        )
                     )
                     else _late_binding_statement_start(candidate, line_start, line, enclosing_headers)
                 )
@@ -4392,7 +4380,7 @@ def _priority_alias_usage_lines(
                         fail_closed_dangerous_names.discard(binding_name)
                         forwarded_state_sizes.pop(binding_name, None)
                         forwarded_safe_names.add(binding_name)
-                    multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
+                    multiline_quote = _triple_quote_state_after_line(line, multiline_quote)
                     line_start = line_end
                     continue
                 if (
@@ -4419,7 +4407,7 @@ def _priority_alias_usage_lines(
                         forwarded_state_sizes[binding_name] = conditional_state_size
                         forwarded_safe_names.discard(binding_name)
                     if not same_line_priority_endpoint:
-                        multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
+                        multiline_quote = _triple_quote_state_after_line(line, multiline_quote)
                         line_start = line_end
                         continue
                 if (
@@ -4432,7 +4420,7 @@ def _priority_alias_usage_lines(
                     forwarded_state_sizes[binding_name] = _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES + 1
                     forwarded_safe_names.discard(binding_name)
                     if not same_line_priority_endpoint:
-                        multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
+                        multiline_quote = _triple_quote_state_after_line(line, multiline_quote)
                         line_start = line_end
                         continue
                 if forwarded_dependency is not None:
@@ -4442,7 +4430,7 @@ def _priority_alias_usage_lines(
                         forwarded_state_sizes[binding_name] = _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES + 1
                         forwarded_safe_names.discard(binding_name)
                         if not has_evaluated_annotation and not same_line_priority_endpoint:
-                            multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
+                            multiline_quote = _triple_quote_state_after_line(line, multiline_quote)
                             line_start = line_end
                             continue
                     source_size = forwarded_state_sizes.get(forwarded_dependency)
@@ -4454,7 +4442,7 @@ def _priority_alias_usage_lines(
                             forwarded_state_sizes[binding_name] = forwarded_size
                             forwarded_safe_names.discard(binding_name)
                             if not has_evaluated_annotation and not same_line_priority_endpoint:
-                                multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
+                                multiline_quote = _triple_quote_state_after_line(line, multiline_quote)
                                 line_start = line_end
                                 continue
                         forwarded_state_sizes[binding_name] = forwarded_size
@@ -4472,7 +4460,7 @@ def _priority_alias_usage_lines(
                             and not same_line_priority_endpoint
                         ):
                             relevant_binding_names.discard(binding_name)
-                            multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
+                            multiline_quote = _triple_quote_state_after_line(line, multiline_quote)
                             line_start = line_end
                             continue
                 elif not alias_dependencies:
@@ -4484,7 +4472,7 @@ def _priority_alias_usage_lines(
                         and not same_line_priority_endpoint
                     ):
                         relevant_binding_names.discard(binding_name)
-                        multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
+                        multiline_quote = _triple_quote_state_after_line(line, multiline_quote)
                         line_start = line_end
                         continue
                 if (
@@ -4899,7 +4887,7 @@ def _priority_alias_usage_lines(
                 is not None
             )
             if not has_member_endpoint and not has_getattr_endpoint:
-                multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
+                multiline_quote = _triple_quote_state_after_line(line, multiline_quote)
                 line_start = line_end
                 continue
         has_priority_reference_syntax = not is_simple_forwarding_binding and any(
@@ -4976,7 +4964,7 @@ def _priority_alias_usage_lines(
                 if not root_names and not _python_identifier_names(code_line).isdisjoint(namespace_update_names):
                     root_names = _callable_root_names(member_statement.lstrip(b"\x00\xff"))
                 if root_names and root_names.issubset(namespace_update_names):
-                    multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
+                    multiline_quote = _triple_quote_state_after_line(line, multiline_quote)
                     line_start = line_end
                     continue
                 if not root_names.isdisjoint(definite_shadowed_names):
@@ -4987,7 +4975,7 @@ def _priority_alias_usage_lines(
                     )
                     usage_lines.append(usage_span)
                     del usage_lines[:prior_usage_count]
-                    multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
+                    multiline_quote = _triple_quote_state_after_line(line, multiline_quote)
                     line_start = line_end
                     continue
                 if not root_names.isdisjoint(fail_closed_dangerous_names):
@@ -4998,7 +4986,7 @@ def _priority_alias_usage_lines(
                     usage_lines.append(usage_span)
                     return usage_lines, frozenset({"S108"})
                 if overflowed and not reaches_retained_alias:
-                    multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
+                    multiline_quote = _triple_quote_state_after_line(line, multiline_quote)
                     line_start = line_end
                     continue
                 usage_lines.extend(truthy_builtin_state_spans)
@@ -5029,7 +5017,7 @@ def _priority_alias_usage_lines(
                 if needs_proof:
                     return usage_lines, proof_rule_codes(root_names, conservative=True)
                 del usage_lines[:prior_usage_count]
-                multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
+                multiline_quote = _triple_quote_state_after_line(line, multiline_quote)
                 line_start = line_end
                 continue
             member_load_line = line[code_start:]
@@ -5079,13 +5067,13 @@ def _priority_alias_usage_lines(
                     and not loader_protocol_spans
                     and not loader_protocol_overflowed
                 ):
-                    multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
+                    multiline_quote = _triple_quote_state_after_line(line, multiline_quote)
                     line_start = line_end
                     continue
                 resolved_rule_codes = _snippet_resolved_high_risk_rule_codes(resolved_context)
                 replay_rule_codes = attribute_rule_codes or resolved_rule_codes
                 if not replay_rule_codes.intersection(resolved_rule_codes):
-                    multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
+                    multiline_quote = _triple_quote_state_after_line(line, multiline_quote)
                     line_start = line_end
                     continue
                 if not root_names.isdisjoint(definite_shadowed_names):
@@ -5096,11 +5084,11 @@ def _priority_alias_usage_lines(
                     )
                     usage_lines.append(usage_span)
                     del usage_lines[:prior_usage_count]
-                    multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
+                    multiline_quote = _triple_quote_state_after_line(line, multiline_quote)
                     line_start = line_end
                     continue
                 if overflowed and not reaches_retained_alias:
-                    multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
+                    multiline_quote = _triple_quote_state_after_line(line, multiline_quote)
                     line_start = line_end
                     continue
                 usage_lines.extend(
@@ -5114,7 +5102,7 @@ def _priority_alias_usage_lines(
                 if (overflowed and reaches_retained_alias) or loader_protocol_overflowed:
                     return usage_lines, replay_rule_codes
                 del usage_lines[:prior_usage_count]
-                multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
+                multiline_quote = _triple_quote_state_after_line(line, multiline_quote)
                 line_start = line_end
                 continue
         elif line_end > search_start and b"(" in code_line:
@@ -5148,7 +5136,7 @@ def _priority_alias_usage_lines(
                         (line_start, min(line_end, line_start + _MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPET_BYTES))
                     )
                     del usage_lines[:prior_usage_count]
-                    multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
+                    multiline_quote = _triple_quote_state_after_line(line, multiline_quote)
                     line_start = line_end
                     continue
                 if not root_names.isdisjoint(fail_closed_dangerous_names):
@@ -5169,10 +5157,10 @@ def _priority_alias_usage_lines(
                     if needs_proof:
                         return usage_lines, proof_rule_codes(root_names, conservative=True)
                     del usage_lines[:prior_usage_count]
-                    multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
+                    multiline_quote = _triple_quote_state_after_line(line, multiline_quote)
                     line_start = line_end
                     continue
-        multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
+        multiline_quote = _triple_quote_state_after_line(line, multiline_quote)
         line_start = line_end
     return usage_lines, frozenset()
 
@@ -6218,12 +6206,6 @@ def _statement_eager_generator_consumers(
     }
 
 
-def _statement_executes_eager_generator_expression(
-    statement: bytes, *, eager_generator_consumers: dict[str, str] | None = None
-) -> bool:
-    return bool(_statement_eager_generator_consumers(statement, eager_generator_consumers=eager_generator_consumers))
-
-
 def _is_contextlib_nullcontext_call(node: ast.AST) -> bool:
     return isinstance(node, ast.Call) and _simple_reference_name(node.func) in {
         "contextlib.nullcontext",
@@ -6390,24 +6372,6 @@ def _is_nested_late_state_statement(
     return any(
         re.match(rb"\s*(?:async\s+def|def)\b", header) is not None
         for header, _header_start in (
-            enclosing_headers
-            if enclosing_headers is not None
-            else _late_binding_enclosing_headers(candidate, line_start, line)
-        )
-    )
-
-
-def _is_reachable_late_else_binding(
-    candidate: bytes,
-    line_start: int,
-    line: bytes,
-    enclosing_headers: list[tuple[bytes, int]] | None = None,
-    exception_type_aliases: dict[str, str] | None = None,
-) -> bool:
-    return any(
-        header == b"else:"
-        and _constant_late_header_value(candidate, header, header_start, exception_type_aliases) is True
-        for header, header_start in (
             enclosing_headers
             if enclosing_headers is not None
             else _late_binding_enclosing_headers(candidate, line_start, line)
@@ -8008,12 +7972,6 @@ def _member_load_root_names(fragment: bytes) -> set[str]:
     return root_names
 
 
-def _snippet_loads_native_library_member(source_bytes: bytes) -> bool:
-    if not any(loader_name in source_bytes for loader_name in (b"cdll", b"oledll", b"pydll", b"windll")):
-        return False
-    return "S110" in _snippet_resolved_high_risk_rule_codes(source_bytes)
-
-
 def _snippet_resolved_high_risk_rule_codes(source_bytes: bytes) -> frozenset[str]:
     source, _byte_offsets = _decode_utf8_with_byte_offsets(source_bytes)
     parsed_snippet = _parse_embedded_python_snippet(textwrap.dedent(source))
@@ -9359,112 +9317,6 @@ def _line_calls_priority_alias(code_line: bytes, aliases: frozenset[bytes]) -> b
     )
 
 
-def _line_live_priority_aliases(code_line: bytes, aliases: frozenset[bytes]) -> frozenset[bytes]:
-    try:
-        tree = ast.parse(textwrap.dedent(code_line.decode("utf-8", errors="ignore")))
-    except SyntaxError:
-        return frozenset()
-
-    live_aliases: set[bytes] = set()
-    shadowed_aliases: set[bytes] = set()
-    for statement in tree.body:
-        for event, event_aliases in _statement_priority_alias_runtime_events(statement, aliases):
-            if event == "use":
-                live_aliases.update(event_aliases - shadowed_aliases)
-            else:
-                shadowed_aliases.update(event_aliases)
-    return frozenset(live_aliases)
-
-
-def _statement_priority_alias_runtime_events(
-    statement: ast.stmt,
-    aliases: frozenset[bytes],
-) -> Iterator[tuple[str, frozenset[bytes]]]:
-    if isinstance(statement, ast.Assign):
-        yield from _node_priority_alias_use_events(statement.value, aliases)
-        yield (
-            "bind",
-            frozenset(
-                alias for target in statement.targets for alias in _target_bound_priority_aliases(target, aliases)
-            ),
-        )
-        return
-    if isinstance(statement, ast.AnnAssign):
-        if statement.value is not None:
-            yield from _node_priority_alias_use_events(statement.value, aliases)
-        yield "bind", _target_bound_priority_aliases(statement.target, aliases)
-        return
-    if isinstance(statement, ast.AugAssign):
-        yield from _node_priority_alias_use_events(statement.target, aliases)
-        yield from _node_priority_alias_use_events(statement.value, aliases)
-        yield "bind", _target_bound_priority_aliases(statement.target, aliases)
-        return
-    if isinstance(statement, (ast.Import, ast.ImportFrom)):
-        yield "bind", _statement_bound_priority_aliases(statement, aliases)
-        return
-    if isinstance(statement, ast.If):
-        yield from _node_priority_alias_use_events(statement.test, aliases)
-        for child_statement in [*statement.body, *statement.orelse]:
-            yield from _statement_priority_alias_runtime_events(child_statement, aliases)
-        return
-    yield from _node_priority_alias_use_events(statement, aliases)
-    if bound_aliases := _statement_bound_priority_aliases(statement, aliases):
-        yield "bind", bound_aliases
-
-
-def _node_priority_alias_use_events(node: ast.AST, aliases: frozenset[bytes]) -> Iterator[tuple[str, frozenset[bytes]]]:
-    alias_names = {alias.decode("utf-8", errors="ignore"): alias for alias in aliases}
-    pending = [node]
-    while pending:
-        child = pending.pop()
-        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
-            continue
-        if isinstance(child, ast.NamedExpr):
-            yield from _node_priority_alias_use_events(child.value, aliases)
-            yield "bind", _target_bound_priority_aliases(child.target, aliases)
-            continue
-        if isinstance(child, ast.Call):
-            called_aliases = _call_priority_aliases(child, alias_names)
-            if called_aliases:
-                yield "use", called_aliases
-                continue
-        expression_aliases = _expression_priority_aliases(child, alias_names)
-        if expression_aliases:
-            yield "use", expression_aliases
-            continue
-        pending.extend(reversed(list(ast.iter_child_nodes(child))))
-
-
-def _call_priority_aliases(call: ast.Call, alias_names: dict[str, bytes]) -> frozenset[bytes]:
-    if isinstance(call.func, ast.Name):
-        alias = alias_names.get(call.func.id)
-        return frozenset({alias}) if alias is not None else frozenset()
-    if isinstance(call.func, ast.Attribute):
-        return _expression_priority_aliases(call.func.value, alias_names)
-    if (
-        isinstance(call.func, ast.Call)
-        and _simple_reference_name(call.func.func) in {"getattr", "builtins.getattr"}
-        and call.func.args
-    ):
-        return _expression_priority_aliases(call.func.args[0], alias_names)
-    return frozenset()
-
-
-def _expression_priority_aliases(node: ast.AST, alias_names: dict[str, bytes]) -> frozenset[bytes]:
-    if isinstance(node, ast.Name):
-        alias = alias_names.get(node.id)
-        return frozenset({alias}) if alias is not None else frozenset()
-    if isinstance(node, (ast.Attribute, ast.Subscript)):
-        return _expression_priority_aliases(node.value, alias_names)
-    if (
-        isinstance(node, ast.Call)
-        and _simple_reference_name(node.func) in {"getattr", "builtins.getattr"}
-        and node.args
-    ):
-        return _expression_priority_aliases(node.args[0], alias_names)
-    return frozenset()
-
-
 def _target_bound_priority_aliases(target: ast.AST, aliases: frozenset[bytes]) -> frozenset[bytes]:
     if isinstance(target, ast.Name):
         name = target.id.encode()
@@ -9508,17 +9360,6 @@ def _statement_bound_priority_aliases(statement: ast.stmt, aliases: frozenset[by
             alias for target in statement.targets for alias in _target_bound_priority_aliases(target, aliases)
         )
     return frozenset()
-
-
-def _line_shadowed_priority_aliases(code_line: bytes, aliases: frozenset[bytes]) -> frozenset[bytes]:
-    shadowed_aliases = set(_line_assigned_priority_aliases(code_line, aliases))
-    shadowed_aliases.update(
-        alias
-        for alias in aliases
-        if re.search(rb"^\s*(?:async\s+)?def\s+" + re.escape(alias) + rb"\b", code_line)
-        or re.search(rb"^\s*class\s+" + re.escape(alias) + rb"\b", code_line)
-    )
-    return frozenset(shadowed_aliases)
 
 
 def _definitely_executed_late_shadow_aliases(
@@ -9579,47 +9420,6 @@ def _with_target_late_shadow_aliases(code_line: bytes, aliases: frozenset[bytes]
         if item.optional_vars is not None
         for alias in _target_bound_priority_aliases(item.optional_vars, aliases)
     )
-
-
-def _line_assigned_priority_aliases(code_line: bytes, aliases: frozenset[bytes]) -> frozenset[bytes]:
-    decoded_line = textwrap.dedent(code_line.decode("utf-8", errors="ignore"))
-    try:
-        tree = ast.parse(decoded_line)
-    except SyntaxError:
-        if not decoded_line.rstrip().endswith(":"):
-            return frozenset()
-        try:
-            tree = ast.parse(f"{decoded_line.rstrip()}\n    pass\n")
-        except (SyntaxError, ValueError):
-            return frozenset()
-    except ValueError:
-        return frozenset()
-
-    pending = list(reversed(tree.body))
-    assigned_aliases: set[bytes] = set()
-    while pending:
-        statement = pending.pop()
-        assigned_aliases.update(_statement_bound_priority_aliases(statement, aliases))
-        assigned_aliases.update(_named_expression_bound_priority_aliases(statement, aliases))
-        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            continue
-        pending.extend(
-            child for child in reversed(list(ast.iter_child_nodes(statement))) if isinstance(child, ast.stmt)
-        )
-    return frozenset(assigned_aliases)
-
-
-def _named_expression_bound_priority_aliases(node: ast.AST, aliases: frozenset[bytes]) -> frozenset[bytes]:
-    assigned_aliases: set[bytes] = set()
-    pending = [node]
-    while pending:
-        child = pending.pop()
-        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
-            continue
-        if isinstance(child, ast.NamedExpr):
-            assigned_aliases.update(_target_bound_priority_aliases(child.target, aliases))
-        pending.extend(reversed(list(ast.iter_child_nodes(child))))
-    return frozenset(assigned_aliases)
 
 
 def _line_indent_width(line: bytes) -> int:
@@ -9985,14 +9785,6 @@ def _select_prioritized_embedded_python_snippets(
     return selected, omitted_budgeted_spans
 
 
-def _prioritized_embedded_python_snippets(
-    candidates: list[_EmbeddedPythonCandidate],
-    bounded: bytes | None = None,
-) -> list[_SelectedEmbeddedPythonCandidate]:
-    selected, _omitted_budgeted_spans = _select_prioritized_embedded_python_snippets(candidates, bounded)
-    return selected
-
-
 def _complete_brace_truncated_line_candidate(
     bounded: bytes,
     span: tuple[int, int],
@@ -10137,10 +9929,6 @@ def _line_parenthesis_delta(line: bytes) -> int:
         - structural.count(b"]")
         - structural.count(b"}")
     )
-
-
-def _multiline_string_state_after_line(line: bytes, quote: bytes | None) -> bytes | None:
-    return _triple_quote_state_after_line(line, quote)
 
 
 def _is_embedded_top_level_prefix(prefix: bytes) -> bool:
@@ -10292,12 +10080,10 @@ def _canonical_builtins_member_import_aliases(statement: bytes, member_names: fr
     return selected_member_imports(tree.body) or []
 
 
-def _canonical_builtins_dict_import_aliases(statement: bytes) -> list[ast.alias]:
-    return _canonical_builtins_member_import_aliases(statement, frozenset({"dict"}))
-
-
 def _builtins_dict_import_alias_names(statement: bytes) -> set[str]:
-    return {alias.asname or "dict" for alias in _canonical_builtins_dict_import_aliases(statement)}
+    return {
+        alias.asname or "dict" for alias in _canonical_builtins_member_import_aliases(statement, frozenset({"dict"}))
+    }
 
 
 def _builtins_helper_import_alias_bindings(statement: bytes) -> dict[str, str]:
@@ -10544,15 +10330,15 @@ def _priority_prefix_contexts_at_offsets(data: bytes, offsets: list[int]) -> dic
             return contexts
         start = _context_statement_start(lines[index])
         if start is None:
-            multiline_quote = _multiline_string_state_after_line(lines[index], multiline_quote)
+            multiline_quote = _triple_quote_state_after_line(lines[index], multiline_quote)
             index += 1
             continue
         if multiline_quote is not None:
-            multiline_quote = _multiline_string_state_after_line(lines[index], multiline_quote)
+            multiline_quote = _triple_quote_state_after_line(lines[index], multiline_quote)
             index += 1
             continue
 
-        statement_line_quote = _multiline_string_state_after_line(lines[index], None)
+        statement_line_quote = _triple_quote_state_after_line(lines[index], None)
         statement_lines = [lines[index][start:]]
         paren_depth = _line_parenthesis_delta(statement_lines[0])
         while (_line_has_explicit_continuation(statement_lines[-1]) or paren_depth > 0) and index + 1 < len(lines):
@@ -10686,17 +10472,13 @@ def _append_single_window_prefix_context_windows(
             extraction_windows.append((context + b"\n" + bounded[start:], True))
 
 
-def _deduplicated_extraction_windows(windows: list[tuple[bytes, bool]]) -> list[tuple[bytes, bool]]:
-    """Preserve the first copy of each exact analysis window."""
-    return list(dict.fromkeys(windows))
-
-
 def _embedded_python_extraction_windows(data: bytes) -> list[tuple[bytes, bool]]:
+    """Build analysis windows, preserving the first copy of each exact window."""
     windows = _embedded_python_scan_windows(data)
     if len(windows) == 1:
         extraction_windows = [(windows[0], False), *_contextual_priority_framed_windows(windows[0])]
         _append_single_window_prefix_context_windows(extraction_windows, windows[0])
-        return _deduplicated_extraction_windows(extraction_windows)
+        return list(dict.fromkeys(extraction_windows))
 
     prefix, tail = windows
     extraction_windows = [(prefix, False), *_contextual_priority_framed_windows(prefix), (tail, False)]
@@ -10770,7 +10552,7 @@ def _embedded_python_extraction_windows(data: bytes) -> list[tuple[bytes, bool]]
         contextual_windows = [] if proved_rule_codes else _contextual_priority_framed_windows(contextual_source)
         fallback_contextual_windows = [] if proved_rule_codes else [*contextual_windows, (contextual_source, True)]
         extraction_windows[0:0] = [*targeted_contextual_windows, *fallback_contextual_windows]
-    return _deduplicated_extraction_windows(extraction_windows)
+    return list(dict.fromkeys(extraction_windows))
 
 
 def _contextual_priority_framed_windows(data: bytes) -> list[tuple[bytes, bool]]:
@@ -10798,7 +10580,7 @@ def _contextual_priority_framed_windows(data: bytes) -> list[tuple[bytes, bool]]
             )
         ):
             potential_framed_calls.append((offset + code_start, line[code_start:], structural_line))
-        multiline_quote = _multiline_string_state_after_line(line, multiline_quote)
+        multiline_quote = _triple_quote_state_after_line(line, multiline_quote)
         offset += len(line)
     if not potential_framed_calls:
         return []
@@ -11269,17 +11051,9 @@ def _is_compact_module_scope_node(
     return statement is not None and id(statement) in executed_statement_ids
 
 
-def _compact_builtins_mutation_alias_state(
-    tree: ast.Module,
-) -> tuple[set[str], set[str], set[str], set[str], set[str], set[str]]:
-    builtins_aliases = {"builtins", "__builtins__"}
-    vars_helper_aliases = {"vars", "builtins.vars", "__builtins__.vars"}
-    dict_descriptor_aliases = {"dict", "builtins.dict", "__builtins__.dict"}
-    mapping_aliases = {"__builtins__"}
-    mapping_update_aliases: set[str] = set()
-    mapping_setitem_aliases: set[str] = set()
-    parents, executed_statement_ids = _compact_module_scope_context(tree)
-
+def _compact_builtins_mapping_predicate(
+    mapping_aliases: set[str], builtins_aliases: set[str], vars_helper_aliases: set[str]
+) -> Callable[[ast.AST], bool]:
     def is_builtins_mapping(node: ast.AST) -> bool:
         return (
             (isinstance(node, ast.Name) and node.id in mapping_aliases)
@@ -11298,6 +11072,22 @@ def _compact_builtins_mutation_alias_state(
                 and node.args[0].id in builtins_aliases
             )
         )
+
+    return is_builtins_mapping
+
+
+def _compact_builtins_mutation_alias_state(
+    tree: ast.Module,
+) -> tuple[set[str], set[str], set[str], set[str], set[str], set[str]]:
+    builtins_aliases = {"builtins", "__builtins__"}
+    vars_helper_aliases = {"vars", "builtins.vars", "__builtins__.vars"}
+    dict_descriptor_aliases = {"dict", "builtins.dict", "__builtins__.dict"}
+    mapping_aliases = {"__builtins__"}
+    mapping_update_aliases: set[str] = set()
+    mapping_setitem_aliases: set[str] = set()
+    parents, executed_statement_ids = _compact_module_scope_context(tree)
+
+    is_builtins_mapping = _compact_builtins_mapping_predicate(mapping_aliases, builtins_aliases, vars_helper_aliases)
 
     def clear_name(name: str) -> None:
         builtins_aliases.discard(name)
@@ -11588,24 +11378,7 @@ def _compact_snippet_shadowed_setattr_references(tree: ast.AST) -> set[str]:
         mapping_setitem_aliases,
     ) = _compact_builtins_mutation_alias_state(tree)
 
-    def is_builtins_mapping(node: ast.AST) -> bool:
-        return (
-            (isinstance(node, ast.Name) and node.id in mapping_aliases)
-            or (
-                isinstance(node, ast.Attribute)
-                and node.attr == "__dict__"
-                and isinstance(node.value, ast.Name)
-                and node.value.id in builtins_aliases
-            )
-            or (
-                isinstance(node, ast.Call)
-                and _simple_reference_name(node.func) in vars_helper_aliases
-                and len(node.args) == 1
-                and not node.keywords
-                and isinstance(node.args[0], ast.Name)
-                and node.args[0].id in builtins_aliases
-            )
-        )
+    is_builtins_mapping = _compact_builtins_mapping_predicate(mapping_aliases, builtins_aliases, vars_helper_aliases)
 
     def update_writes_setattr(arguments: Sequence[ast.AST], keywords: Sequence[ast.keyword]) -> bool:
         if any(keyword.arg == "setattr" for keyword in keywords):
@@ -11769,10 +11542,6 @@ def _compact_snippet_shadowed_delattr_references_by_statement(
     return shadowed_by_statement
 
 
-def _compact_snippet_has_shadowed_setattr(tree: ast.AST) -> bool:
-    return bool(_compact_snippet_shadowed_setattr_references(tree))
-
-
 def _compact_snippet_deleted_print_setdefault_members(
     code_str: str,
     inherited_runpy_aliases: frozenset[str] = frozenset(),
@@ -11812,6 +11581,16 @@ def _compact_snippet_deleted_print_setdefault_members(
                 and node.args[0].id in runpy_aliases
             )
         )
+
+    def record_item(key_node: ast.AST, _value_node: ast.AST) -> None:
+        member_name = _runpy_static_member_key(key_node)
+        if member_name in _RUNPY_PRIORITY_MEMBER_NAMES:
+            deleted_members.discard(member_name)
+            safe_members.discard(member_name)
+
+    def invalidate_all() -> None:
+        deleted_members.clear()
+        safe_members.clear()
 
     def record_call(call: ast.Call) -> None:
         method: str | None = None
@@ -11855,17 +11634,6 @@ def _compact_snippet_deleted_print_setdefault_members(
                 deleted_members.discard(member_name)
                 safe_members.discard(member_name)
         elif method in {"update", "__ior__"}:
-
-            def record_item(key_node: ast.AST, _value_node: ast.AST) -> None:
-                member_name = _runpy_static_member_key(key_node)
-                if member_name in _RUNPY_PRIORITY_MEMBER_NAMES:
-                    deleted_members.discard(member_name)
-                    safe_members.discard(member_name)
-
-            def invalidate_all() -> None:
-                deleted_members.clear()
-                safe_members.clear()
-
             for argument in arguments:
                 _replay_static_update_items(argument, record_item, invalidate_all)
             for keyword in call.keywords:
@@ -11939,17 +11707,6 @@ def _compact_snippet_deleted_print_setdefault_members(
                         safe_members.discard(member_name)
         elif isinstance(statement, ast.AugAssign) and isinstance(statement.op, ast.BitOr):
             if mapping_targets_runpy(statement.target):
-
-                def record_item(key_node: ast.AST, _value_node: ast.AST) -> None:
-                    member_name = _runpy_static_member_key(key_node)
-                    if member_name in _RUNPY_PRIORITY_MEMBER_NAMES:
-                        deleted_members.discard(member_name)
-                        safe_members.discard(member_name)
-
-                def invalidate_all() -> None:
-                    deleted_members.clear()
-                    safe_members.clear()
-
                 _replay_static_update_items(statement.value, record_item, invalidate_all)
         elif isinstance(statement, ast.Delete):
             for target in statement.targets:
@@ -12102,6 +11859,65 @@ def _compact_snippet_shadowed_delattr_runpy_print_overwrite_calls(
     return {(f"runpy.{member_name}", "S108") for member_name in preserved_members - called_unsafe_members}
 
 
+def _is_sys_modules_mapping(
+    node: ast.AST,
+    active_sys_aliases: Collection[str],
+    active_modules_aliases: Collection[str],
+) -> bool:
+    return (isinstance(node, ast.Name) and node.id in active_modules_aliases) or (
+        isinstance(node, ast.Attribute)
+        and node.attr == "modules"
+        and isinstance(node.value, ast.Name)
+        and node.value.id in active_sys_aliases
+    )
+
+
+def _module_alias_clearer(*aliases: set[str]) -> Callable[[ast.AST], None]:
+    def clear_target(target: ast.AST) -> None:
+        if isinstance(target, ast.Name):
+            for alias_set in aliases:
+                alias_set.discard(target.id)
+        elif isinstance(target, ast.Starred):
+            clear_target(target.value)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            for element in target.elts:
+                clear_target(element)
+
+    return clear_target
+
+
+def _reload_target_handlers(
+    reload_aliases: set[str],
+) -> tuple[Callable[[ast.AST], None], Callable[[ast.AST, ast.AST, frozenset[str], frozenset[str]], None]]:
+    clear_reload_target = _module_alias_clearer(reload_aliases)
+
+    def bind_reload_target(
+        target: ast.AST,
+        value: ast.AST,
+        aliases_before: frozenset[str],
+        importlib_before: frozenset[str],
+    ) -> None:
+        if isinstance(target, ast.Name):
+            reference = _simple_reference_name(value)
+            reload_aliases.discard(target.id)
+            if reference in aliases_before or (
+                reference is not None
+                and reference.endswith(".reload")
+                and reference.removesuffix(".reload") in importlib_before
+            ):
+                reload_aliases.add(target.id)
+        elif isinstance(target, ast.Starred):
+            clear_reload_target(target.value)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            if isinstance(value, (ast.Tuple, ast.List)) and len(target.elts) == len(value.elts):
+                for target_item, value_item in zip(target.elts, value.elts, strict=True):
+                    bind_reload_target(target_item, value_item, aliases_before, importlib_before)
+            else:
+                clear_reload_target(target)
+
+    return clear_reload_target, bind_reload_target
+
+
 def _compact_snippet_runpy_print_overwrite_calls(
     code_str: str,
     inherited_runpy_aliases: frozenset[str] = frozenset(),
@@ -12130,51 +11946,11 @@ def _compact_snippet_runpy_print_overwrite_calls(
     current_print_is_shadowed = False
     parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
 
-    def clear_reload_target(target: ast.AST) -> None:
-        if isinstance(target, ast.Name):
-            reload_aliases.discard(target.id)
-        elif isinstance(target, ast.Starred):
-            clear_reload_target(target.value)
-        elif isinstance(target, (ast.Tuple, ast.List)):
-            for element in target.elts:
-                clear_reload_target(element)
+    clear_reload_target, bind_reload_target = _reload_target_handlers(reload_aliases)
 
-    def bind_reload_target(
-        target: ast.AST,
-        value: ast.AST,
-        aliases_before: frozenset[str],
-        importlib_before: frozenset[str],
-    ) -> None:
-        if isinstance(target, ast.Name):
-            reference = _simple_reference_name(value)
-            reload_aliases.discard(target.id)
-            if reference in aliases_before or (
-                reference is not None
-                and reference.endswith(".reload")
-                and reference.removesuffix(".reload") in importlib_before
-            ):
-                reload_aliases.add(target.id)
-        elif isinstance(target, ast.Starred):
-            clear_reload_target(target.value)
-        elif isinstance(target, (ast.Tuple, ast.List)):
-            if isinstance(value, (ast.Tuple, ast.List)) and len(target.elts) == len(value.elts):
-                for target_item, value_item in zip(target.elts, value.elts, strict=True):
-                    bind_reload_target(target_item, value_item, aliases_before, importlib_before)
-            else:
-                clear_reload_target(target)
-
-    def clear_module_helper_target(target: ast.AST) -> None:
-        if isinstance(target, ast.Name):
-            sys_aliases.discard(target.id)
-            sys_modules_aliases.discard(target.id)
-            sys_modules_pop_aliases.discard(target.id)
-            sys_modules_clear_aliases.discard(target.id)
-            importlib_aliases.discard(target.id)
-        elif isinstance(target, ast.Starred):
-            clear_module_helper_target(target.value)
-        elif isinstance(target, (ast.Tuple, ast.List)):
-            for element in target.elts:
-                clear_module_helper_target(element)
+    clear_module_helper_target = _module_alias_clearer(
+        sys_aliases, sys_modules_aliases, sys_modules_pop_aliases, sys_modules_clear_aliases, importlib_aliases
+    )
 
     def bind_module_helper_target(
         target: ast.AST,
@@ -12299,18 +12075,6 @@ def _compact_snippet_runpy_print_overwrite_calls(
             else:
                 record_member_value(module_id, keyword.arg, keyword.value, conditional=conditional)
 
-    def is_sys_modules_mapping(
-        node: ast.AST,
-        active_sys_aliases: Collection[str],
-        active_modules_aliases: Collection[str],
-    ) -> bool:
-        return (isinstance(node, ast.Name) and node.id in active_modules_aliases) or (
-            isinstance(node, ast.Attribute)
-            and node.attr == "modules"
-            and isinstance(node.value, ast.Name)
-            and node.value.id in active_sys_aliases
-        )
-
     def invalidate_cached_runpy_name(module_name: str | None) -> None:
         nonlocal cached_runpy_id
         if module_name in {"runpy", None}:
@@ -12321,7 +12085,7 @@ def _compact_snippet_runpy_print_overwrite_calls(
         active_sys_aliases: Collection[str],
         active_modules_aliases: Collection[str],
     ) -> None:
-        if isinstance(target, ast.Subscript) and is_sys_modules_mapping(
+        if isinstance(target, ast.Subscript) and _is_sys_modules_mapping(
             target.value,
             active_sys_aliases,
             active_modules_aliases,
@@ -12334,7 +12098,7 @@ def _compact_snippet_runpy_print_overwrite_calls(
         active_modules_aliases: Collection[str],
     ) -> bool:
         nonlocal cached_runpy_id
-        if not isinstance(call.func, ast.Attribute) or not is_sys_modules_mapping(
+        if not isinstance(call.func, ast.Attribute) or not _is_sys_modules_mapping(
             call.func.value,
             active_sys_aliases,
             active_modules_aliases,
@@ -12539,7 +12303,7 @@ def _compact_snippet_runpy_print_overwrite_calls(
                 if statement.module == "importlib" and alias.name == "reload":
                     reload_aliases.add(local_name)
         elif isinstance(statement, ast.AugAssign) and isinstance(statement.op, ast.BitOr):
-            if is_sys_modules_mapping(statement.target, sys_aliases_before, sys_modules_aliases_before):
+            if _is_sys_modules_mapping(statement.target, sys_aliases_before, sys_modules_aliases_before):
                 _replay_static_update_items(
                     statement.value,
                     lambda key, _value: invalidate_cached_runpy_name(_static_getattr_member_name(key)),
@@ -13494,51 +13258,11 @@ def _compact_snippet_typed_print_overwrite_replay(
             cached_typed_identities[module_name] = identity
         return identity
 
-    def clear_reload_target(target: ast.AST) -> None:
-        if isinstance(target, ast.Name):
-            reload_aliases.discard(target.id)
-        elif isinstance(target, ast.Starred):
-            clear_reload_target(target.value)
-        elif isinstance(target, (ast.Tuple, ast.List)):
-            for element in target.elts:
-                clear_reload_target(element)
+    _clear_reload_target, bind_reload_target = _reload_target_handlers(reload_aliases)
 
-    def bind_reload_target(
-        target: ast.AST,
-        value: ast.AST,
-        aliases_before: frozenset[str],
-        importlib_before: frozenset[str],
-    ) -> None:
-        if isinstance(target, ast.Name):
-            reference = _simple_reference_name(value)
-            reload_aliases.discard(target.id)
-            if reference in aliases_before or (
-                reference is not None
-                and reference.endswith(".reload")
-                and reference.removesuffix(".reload") in importlib_before
-            ):
-                reload_aliases.add(target.id)
-        elif isinstance(target, ast.Starred):
-            clear_reload_target(target.value)
-        elif isinstance(target, (ast.Tuple, ast.List)):
-            if isinstance(value, (ast.Tuple, ast.List)) and len(target.elts) == len(value.elts):
-                for target_item, value_item in zip(target.elts, value.elts, strict=True):
-                    bind_reload_target(target_item, value_item, aliases_before, importlib_before)
-            else:
-                clear_reload_target(target)
-
-    def clear_module_helper_target(target: ast.AST) -> None:
-        if isinstance(target, ast.Name):
-            sys_aliases.discard(target.id)
-            sys_modules_aliases.discard(target.id)
-            sys_modules_pop_aliases.discard(target.id)
-            sys_modules_clear_aliases.discard(target.id)
-            importlib_aliases.discard(target.id)
-        elif isinstance(target, ast.Starred):
-            clear_module_helper_target(target.value)
-        elif isinstance(target, (ast.Tuple, ast.List)):
-            for element in target.elts:
-                clear_module_helper_target(element)
+    clear_module_helper_target = _module_alias_clearer(
+        sys_aliases, sys_modules_aliases, sys_modules_pop_aliases, sys_modules_clear_aliases, importlib_aliases
+    )
 
     def bind_module_helper_target(
         target: ast.AST,
@@ -14034,18 +13758,6 @@ def _compact_snippet_typed_print_overwrite_replay(
             else:
                 _replay_static_update_items(keyword.value, record_item, lambda: invalidate_owner_state(owner))
 
-    def is_sys_modules_mapping(
-        node: ast.AST,
-        active_sys_aliases: Collection[str],
-        active_modules_aliases: Collection[str],
-    ) -> bool:
-        return (isinstance(node, ast.Name) and node.id in active_modules_aliases) or (
-            isinstance(node, ast.Attribute)
-            and node.attr == "modules"
-            and isinstance(node.value, ast.Name)
-            and node.value.id in active_sys_aliases
-        )
-
     def invalidate_cached_module_name(module_name: str | None) -> None:
         if module_name is None:
             cached_typed_identities.clear()
@@ -14057,7 +13769,7 @@ def _compact_snippet_typed_print_overwrite_replay(
         active_sys_aliases: Collection[str],
         active_modules_aliases: Collection[str],
     ) -> None:
-        if isinstance(target, ast.Subscript) and is_sys_modules_mapping(
+        if isinstance(target, ast.Subscript) and _is_sys_modules_mapping(
             target.value,
             active_sys_aliases,
             active_modules_aliases,
@@ -14069,7 +13781,7 @@ def _compact_snippet_typed_print_overwrite_replay(
         active_sys_aliases: Collection[str],
         active_modules_aliases: Collection[str],
     ) -> bool:
-        if not isinstance(call.func, ast.Attribute) or not is_sys_modules_mapping(
+        if not isinstance(call.func, ast.Attribute) or not _is_sys_modules_mapping(
             call.func.value,
             active_sys_aliases,
             active_modules_aliases,
@@ -14889,21 +14601,16 @@ def _compact_snippet_typed_print_overwrite_replay(
                 ):
                     record_builtins_helper_delete(_static_getattr_member_name(node.args[1]))
 
-            def visit_For(self, node: ast.For) -> None:
+            def visit_For(self, node: ast.For | ast.AsyncFor) -> None:
                 self.visit(node.iter)
                 if _static_late_iter_truth(node.iter) is not False:
                     invalidate_rebound_target(node.target)
                 for child in [*node.body, *node.orelse]:
                     self.visit(child)
 
-            def visit_AsyncFor(self, node: ast.AsyncFor) -> None:
-                self.visit(node.iter)
-                if _static_late_iter_truth(node.iter) is not False:
-                    invalidate_rebound_target(node.target)
-                for child in [*node.body, *node.orelse]:
-                    self.visit(child)
+            visit_AsyncFor = visit_For
 
-            def visit_With(self, node: ast.With) -> None:
+            def visit_With(self, node: ast.With | ast.AsyncWith) -> None:
                 for item in node.items:
                     self.visit(item.context_expr)
                     if item.optional_vars is not None:
@@ -14911,13 +14618,7 @@ def _compact_snippet_typed_print_overwrite_replay(
                 for child in node.body:
                     self.visit(child)
 
-            def visit_AsyncWith(self, node: ast.AsyncWith) -> None:
-                for item in node.items:
-                    self.visit(item.context_expr)
-                    if item.optional_vars is not None:
-                        invalidate_rebound_target(item.optional_vars)
-                for child in node.body:
-                    self.visit(child)
+            visit_AsyncWith = visit_With
 
             def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:
                 if node.type is not None:
@@ -14936,7 +14637,7 @@ def _compact_snippet_typed_print_overwrite_replay(
                     for child in case.body:
                         self.visit(child)
 
-            def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            def visit_FunctionDef(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
                 invalidate_rebound_target(ast.Name(id=node.name, ctx=ast.Store()))
                 for decorator in node.decorator_list:
                     self.visit(decorator)
@@ -14944,13 +14645,7 @@ def _compact_snippet_typed_print_overwrite_replay(
                     if default is not None:
                         self.visit(default)
 
-            def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
-                invalidate_rebound_target(ast.Name(id=node.name, ctx=ast.Store()))
-                for decorator in node.decorator_list:
-                    self.visit(decorator)
-                for default in [*node.args.defaults, *node.args.kw_defaults]:
-                    if default is not None:
-                        self.visit(default)
+            visit_AsyncFunctionDef = visit_FunctionDef
 
             def visit_ClassDef(self, node: ast.ClassDef) -> None:
                 nonlocal class_scope_depth
@@ -14966,10 +14661,7 @@ def _compact_snippet_typed_print_overwrite_replay(
                 finally:
                     class_scope_depth -= 1
 
-            def visit_Lambda(self, node: ast.Lambda) -> None:
-                for default in [*node.args.defaults, *node.args.kw_defaults]:
-                    if default is not None:
-                        self.visit(default)
+            visit_Lambda = _visit_lambda_defaults
 
         BindingVisitor().visit(statement)
 
@@ -15313,7 +15005,7 @@ def _compact_snippet_typed_print_overwrite_replay(
                 ):
                     cached_typed_identities.pop(module_name, None)
         elif isinstance(statement, ast.AugAssign) and isinstance(statement.op, ast.BitOr):
-            if is_sys_modules_mapping(statement.target, sys_aliases_before, sys_modules_aliases_before):
+            if _is_sys_modules_mapping(statement.target, sys_aliases_before, sys_modules_aliases_before):
                 _replay_static_update_items(
                     statement.value,
                     lambda key, _value: invalidate_cached_module_name(_static_getattr_member_name(key)),
@@ -15850,11 +15542,6 @@ def _compact_snippet_typed_print_overwrite_replay(
     return suppressed_calls, high_risk_calls
 
 
-def _compact_snippet_typed_print_overwrite_calls(code_str: str) -> set[tuple[str, str]]:
-    suppressed_calls, _high_risk_calls = _compact_snippet_typed_print_overwrite_replay(code_str)
-    return suppressed_calls
-
-
 def _compact_snippet_inactive_restore_high_risk_calls(
     code_str: str,
     inherited_runpy_aliases: frozenset[str] = frozenset(),
@@ -15995,12 +15682,7 @@ def _compact_snippet_inactive_restore_high_risk_calls(
         return mapping_owner_name(node) is not None
 
     def is_sys_modules_mapping(node: ast.AST) -> bool:
-        return (isinstance(node, ast.Name) and node.id in sys_modules_names) or (
-            isinstance(node, ast.Attribute)
-            and node.attr == "modules"
-            and isinstance(node.value, ast.Name)
-            and node.value.id in sys_aliases
-        )
+        return _is_sys_modules_mapping(node, sys_aliases, sys_modules_names)
 
     def mark_runpy_cache_replaced(module_name: str | None) -> None:
         nonlocal runpy_cache_evicted
@@ -16870,37 +16552,17 @@ def _decode_utf8_with_byte_offsets(data: bytes) -> tuple[str, list[int]]:
     """Decode UTF-8 like errors='ignore' while mapping decoded character offsets to byte offsets."""
     chars: list[str] = []
     byte_offsets = [0]
-    index = 0
-    while index < len(data):
-        byte = data[index]
-        if byte < 0x80:
-            chars.append(chr(byte))
-            index += 1
-            byte_offsets.append(index)
-            continue
-
-        if 0xC2 <= byte <= 0xDF:
-            length = 2
-        elif 0xE0 <= byte <= 0xEF:
-            length = 3
-        elif 0xF0 <= byte <= 0xF4:
-            length = 4
-        else:
-            index += 1
-            continue
-
-        chunk = data[index : index + length]
-        if len(chunk) != length or any((continuation & 0xC0) != 0x80 for continuation in chunk[1:]):
-            index += 1
-            continue
-        try:
-            chars.append(chunk.decode("utf-8"))
-        except UnicodeDecodeError:
-            index += 1
-            continue
-        index += length
-        byte_offsets.append(index)
-
+    offset = 0
+    # Surrogate escapes preserve invalid-byte widths within bounded decoded chunks.
+    chunks = (data[index : index + 4096] for index in range(0, len(data), 4096))
+    for text in codecs.iterdecode(chunks, "utf-8", errors="surrogateescape"):
+        for char in text:
+            if "\udc80" <= char <= "\udcff":
+                offset += 1
+            else:
+                offset += len(char.encode("utf-8"))
+                chars.append(char)
+                byte_offsets.append(offset)
     return "".join(chars), byte_offsets
 
 
@@ -16946,6 +16608,25 @@ _CODE_EXECUTION_PATTERN_BUILTINS = {
     "compile() call detected": "compile",
     "__import__() call detected": "__import__",
 }
+
+
+def _visit_lambda_defaults(self: ast.NodeVisitor, node: ast.Lambda) -> None:
+    for default in [*node.args.defaults, *node.args.kw_defaults]:
+        if default is not None:
+            self.visit(default)
+
+
+def _visit_comprehension_expressions(
+    self: ast.NodeVisitor,
+    generators: list[ast.comprehension],
+    result_nodes: tuple[ast.AST, ...],
+) -> None:
+    for generator in generators:
+        self.visit(generator.iter)
+        for condition in generator.ifs:
+            self.visit(condition)
+    for result_node in result_nodes:
+        self.visit(result_node)
 
 
 class JITScriptDetector:
@@ -17001,7 +16682,7 @@ class JITScriptDetector:
         for window_index, (window, include_full_source) in enumerate(windows):
             bounded = window if include_full_source else window[:1000000]
             candidates = _candidate_embedded_python_snippets(bounded, include_full_source=include_full_source)
-            prioritized_snippets = _prioritized_embedded_python_snippets(candidates, bounded=bounded)
+            prioritized_snippets = _select_prioritized_embedded_python_snippets(candidates, bounded)[0]
             if prioritized_snippets_by_window is not None:
                 prioritized_snippets_by_window[window_index] = prioritized_snippets
             for candidate, span, real_ranges in prioritized_snippets:
@@ -19954,7 +19635,9 @@ class JITScriptDetector:
                 return None
 
             @staticmethod
-            def _copy_alias_scopes(scopes: list[dict[str, str | None]]) -> list[dict[str, str | None]]:
+            def _copy_alias_scopes(
+                scopes: list[dict[_ScopeKey, _ContainerValue]],
+            ) -> list[dict[_ScopeKey, _ContainerValue]]:
                 return [dict(scope) for scope in scopes]
 
             @staticmethod
@@ -19971,17 +19654,9 @@ class JITScriptDetector:
             ) -> list[dict[str, dict[tuple[object, ...], str | None]]]:
                 return [{name: dict(values) for name, values in scope.items()} for scope in scopes]
 
-            @staticmethod
-            def _copy_container_identity_scopes(
-                scopes: list[dict[str, int | None]],
-            ) -> list[dict[str, int | None]]:
-                return [dict(scope) for scope in scopes]
+            _copy_container_identity_scopes = _copy_alias_scopes
 
-            @staticmethod
-            def _copy_attribute_alias_scopes(
-                scopes: list[dict[tuple[str, ...], str | None]],
-            ) -> list[dict[tuple[str, ...], str | None]]:
-                return [dict(scope) for scope in scopes]
+            _copy_attribute_alias_scopes = _copy_alias_scopes
 
             def _snapshot_alias_state(
                 self,
@@ -20331,17 +20006,13 @@ class JITScriptDetector:
                         if isinstance(node.ctx, (ast.Store, ast.Del)):
                             self.local_names.add(node.id)
 
-                    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+                    def visit_FunctionDef(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
                         self.local_names.add(node.name)
                         for decorator in node.decorator_list:
                             self.visit(decorator)
                         self._visit_function_signature(node)
 
-                    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
-                        self.local_names.add(node.name)
-                        for decorator in node.decorator_list:
-                            self.visit(decorator)
-                        self._visit_function_signature(node)
+                    visit_AsyncFunctionDef = visit_FunctionDef
 
                     def visit_ClassDef(self, node: ast.ClassDef) -> None:
                         self.local_names.add(node.name)
@@ -20352,10 +20023,7 @@ class JITScriptDetector:
                         for decorator in node.decorator_list:
                             self.visit(decorator)
 
-                    def visit_Lambda(self, node: ast.Lambda) -> None:
-                        for default in [*node.args.defaults, *node.args.kw_defaults]:
-                            if default is not None:
-                                self.visit(default)
+                    visit_Lambda = _visit_lambda_defaults
 
                     def _visit_function_signature(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
                         for argument in [
@@ -20387,15 +20055,12 @@ class JITScriptDetector:
                     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
                         self.local_names.update(alias.asname or alias.name for alias in node.names)
 
-                    def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:
+                    def visit_ExceptHandler(self, node: ast.ExceptHandler | ast.MatchAs) -> None:
                         if node.name is not None:
                             self.local_names.add(node.name)
                         self.generic_visit(node)
 
-                    def visit_MatchAs(self, node: ast.MatchAs) -> None:
-                        if node.name is not None:
-                            self.local_names.add(node.name)
-                        self.generic_visit(node)
+                    visit_MatchAs = visit_ExceptHandler
 
                     def visit_MatchStar(self, node: ast.MatchStar) -> None:
                         if node.name is not None:
@@ -20406,17 +20071,7 @@ class JITScriptDetector:
                             self.local_names.add(node.rest)
                         self.generic_visit(node)
 
-                    def _visit_comprehension(
-                        self,
-                        generators: list[ast.comprehension],
-                        result_nodes: tuple[ast.AST, ...],
-                    ) -> None:
-                        for generator in generators:
-                            self.visit(generator.iter)
-                            for condition in generator.ifs:
-                                self.visit(condition)
-                        for result_node in result_nodes:
-                            self.visit(result_node)
+                    _visit_comprehension = _visit_comprehension_expressions
 
                     def visit_ListComp(self, node: ast.ListComp) -> None:
                         self._visit_comprehension(node.generators, (node.elt,))
@@ -21231,13 +20886,11 @@ class JITScriptDetector:
                         if isinstance(node.ctx, (ast.Store, ast.Del)) and node.id in target_names:
                             self.found = True
 
-                    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+                    def visit_FunctionDef(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
                         self.found = self.found or node.name in target_names
                         self._visit_function_definition_expressions(node)
 
-                    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
-                        self.found = self.found or node.name in target_names
-                        self._visit_function_definition_expressions(node)
+                    visit_AsyncFunctionDef = visit_FunctionDef
 
                     def visit_ClassDef(self, node: ast.ClassDef) -> None:
                         self.found = self.found or node.name in target_names
@@ -21248,10 +20901,7 @@ class JITScriptDetector:
                         for decorator in node.decorator_list:
                             self.visit(decorator)
 
-                    def visit_Lambda(self, node: ast.Lambda) -> None:
-                        for default in [*node.args.defaults, *node.args.kw_defaults]:
-                            if default is not None:
-                                self.visit(default)
+                    visit_Lambda = _visit_lambda_defaults
 
                     def _visit_function_definition_expressions(
                         self,
@@ -21274,17 +20924,7 @@ class JITScriptDetector:
                             if default is not None:
                                 self.visit(default)
 
-                    def _visit_comprehension(
-                        self,
-                        generators: list[ast.comprehension],
-                        result_nodes: tuple[ast.AST, ...],
-                    ) -> None:
-                        for generator in generators:
-                            self.visit(generator.iter)
-                            for condition in generator.ifs:
-                                self.visit(condition)
-                        for result_node in result_nodes:
-                            self.visit(result_node)
+                    _visit_comprehension = _visit_comprehension_expressions
 
                     def visit_ListComp(self, node: ast.ListComp) -> None:
                         self._visit_comprehension(node.generators, (node.elt,))

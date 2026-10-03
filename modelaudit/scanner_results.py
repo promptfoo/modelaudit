@@ -105,16 +105,8 @@ def _member_file_hashes_from_metadata(metadata: Mapping[str, Any], scanner_name:
     return record
 
 
-def _member_path_segments_key(path_segments: list[str]) -> str:
-    return json.dumps(path_segments, separators=(",", ":"), sort_keys=True)
-
-
 def _member_path_segments_size(path_segments: list[str]) -> int:
-    return len(_member_path_segments_key(path_segments).encode("utf-8", errors="surrogatepass"))
-
-
-def _member_file_hash_identity_key(path_segments: list[str], occurrence: int) -> str:
-    return json.dumps({"occurrence": occurrence, "path": path_segments}, separators=(",", ":"), sort_keys=True)
+    return len(json.dumps(path_segments, separators=(",", ":"), sort_keys=True).encode("utf-8", errors="surrogatepass"))
 
 
 def _logical_member_path(path_segments: list[str]) -> str:
@@ -666,7 +658,7 @@ class ScanResult:
                 if not isinstance(member_key, str) or not isinstance(record, Mapping):
                     continue
                 path_segments = _member_path_segments_from_record(member_key, record)
-                path_key = _member_path_segments_key(path_segments)
+                path_key = json.dumps(path_segments, separators=(",", ":"), sort_keys=True)
                 occurrences[path_key] = max(occurrences.get(path_key, 0), _member_occurrence_from_record(record))
                 stored_path_bytes += _member_path_segments_size(path_segments)
             stored_count = len(raw_member_hashes)
@@ -709,7 +701,7 @@ class ScanResult:
         if stored_path_bytes + path_size > MAX_MEMBER_FILE_HASH_PATH_BYTES:
             self._record_member_file_hash_omission()
             return
-        path_key = _member_path_segments_key(normalized_segments)
+        path_key = json.dumps(normalized_segments, separators=(",", ":"), sort_keys=True)
         occurrence = occurrences.get(path_key, 0) + 1
         occurrences[path_key] = occurrence
 
@@ -717,7 +709,9 @@ class ScanResult:
         stored_record["path_segments"] = normalized_segments
         stored_record["logical_path"] = _logical_member_path(normalized_segments)
         stored_record["occurrence"] = occurrence
-        member_hashes[_member_file_hash_identity_key(normalized_segments, occurrence)] = stored_record
+        member_hashes[
+            json.dumps({"occurrence": occurrence, "path": normalized_segments}, separators=(",", ":"), sort_keys=True)
+        ] = stored_record
         self._private_metadata[_MEMBER_FILE_HASH_STORED_COUNT_PRIVATE_KEY] = stored_count + 1
         self._private_metadata[_MEMBER_FILE_HASH_PATH_BYTES_PRIVATE_KEY] = stored_path_bytes + path_size
 
@@ -743,7 +737,7 @@ class ScanResult:
             path_segments = _member_path_segments_from_record(member_key, record)
             sortable_records.append(
                 (
-                    _member_path_segments_key(path_segments),
+                    json.dumps(path_segments, separators=(",", ":"), sort_keys=True),
                     _member_occurrence_from_record(record),
                     member_key,
                     path_segments,

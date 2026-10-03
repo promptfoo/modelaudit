@@ -396,36 +396,6 @@ class CompressedScanner(BaseScanner):
         return wrapper_path.name
 
     @staticmethod
-    def _copy_stream_with_limits(
-        source: Any,
-        destination: Any,
-        max_decompressed_bytes: int,
-        max_ratio: float,
-        compressed_size: int,
-        chunk_size: int,
-    ) -> int:
-        total_out = 0
-        while True:
-            chunk = source.read(chunk_size)
-            if not chunk:
-                break
-
-            total_out += len(chunk)
-            if total_out > max_decompressed_bytes:
-                raise _DecompressionLimitExceeded(
-                    f"Decompressed size exceeded limit ({total_out} > {max_decompressed_bytes})",
-                )
-
-            if compressed_size > 0 and (total_out / compressed_size) > max_ratio:
-                raise _DecompressionLimitExceeded(
-                    f"Decompression ratio exceeded limit ({total_out / compressed_size:.1f}x > {max_ratio:.1f}x)",
-                )
-
-            destination.write(chunk)
-
-        return total_out
-
-    @staticmethod
     def _write_decompressed_output_with_limits(
         output: bytes,
         destination: Any,

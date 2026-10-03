@@ -36,6 +36,7 @@ from ._evidence_redaction import (
 )
 from .base import DEFAULT_MAX_FILE_READ_SIZE, INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 from .keras_utils import (
+    _keras_exact_module_policy,
     check_custom_loss_config,
     check_custom_metric_config,
     check_lambda_dict_function,
@@ -284,28 +285,7 @@ _DANGEROUS_CONFIG_MODULE_ROOTS = frozenset(
         "distutils",
     }
 )
-_DANGEROUS_EXACT_MODULE_SYMBOLS: dict[str, frozenset[str]] = {
-    "_ctypes": frozenset({"dlopen"}),
-    "_frozen_importlib": frozenset({"__import__", "_find_and_load", "_find_and_load_unlocked"}),
-    "_imp": frozenset({"create_builtin", "create_dynamic", "exec_builtin", "exec_dynamic", "load_dynamic"}),
-    "_interpreters": frozenset({"call", "exec"}),
-    "_io": frozenset({"open"}),
-    "_operator": frozenset({"attrgetter", "methodcaller"}),
-    "_pickle": frozenset({"load", "loads"}),
-    "_posixsubprocess": frozenset({"fork_exec"}),
-    "_socket": frozenset({"socket"}),
-    "_thread": frozenset({"start_new", "start_new_thread"}),
-    "_winapi": frozenset({"CreateProcess", "ShellExecute"}),
-    "_xxsubinterpreters": frozenset({"run_string"}),
-    "io": frozenset({"open"}),
-    "nt": frozenset({"popen", "startfile", "system"}),
-    "operator": frozenset({"attrgetter", "methodcaller"}),
-    "posix": frozenset({"popen", "system"}),
-}
-_DANGEROUS_EXACT_MODULE_SYMBOL_PREFIXES: dict[str, tuple[str, ...]] = {
-    "nt": ("exec", "spawn"),
-    "posix": ("exec", "spawn"),
-}
+_DANGEROUS_EXACT_MODULE_SYMBOLS, _DANGEROUS_EXACT_MODULE_SYMBOL_PREFIXES = _keras_exact_module_policy()
 _NESTED_SERIALIZED_OBJECT_KEYS = frozenset(
     {
         "activation",
@@ -811,14 +791,7 @@ class KerasH5Scanner(BaseScanner):
     @staticmethod
     def _mark_inconclusive_scan_result(result: ScanResult, reason: str) -> None:
         """Mark the scan as incomplete without converting it into a security finding."""
-        existing_reasons = result.metadata.get("scan_outcome_reasons")
-        reasons = existing_reasons if isinstance(existing_reasons, list) else []
-        if reason not in reasons:
-            reasons.append(reason)
-
-        result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
-        result.metadata["scan_outcome_reasons"] = reasons
-        result.metadata["analysis_incomplete"] = True
+        BaseScanner._mark_inconclusive_reason_first(result, reason, INCONCLUSIVE_SCAN_OUTCOME)
 
     @staticmethod
     def _scan_result_has_security_findings(result: ScanResult) -> bool:
@@ -1233,18 +1206,6 @@ class KerasH5Scanner(BaseScanner):
             return self._HDF5_ATTRIBUTE_READ_SKIPPED
 
         return attr_value
-
-    def _load_json_hdf5_attribute(self, attrs: Any, attr_name: str, result: ScanResult) -> Any:
-        attr_value = self._read_bounded_hdf5_attribute(
-            attrs,
-            attr_name,
-            result,
-            max_bytes=self.max_hdf5_json_attribute_bytes,
-            fail_closed=True,
-        )
-        if attr_value is self._HDF5_ATTRIBUTE_MISSING or attr_value is self._HDF5_ATTRIBUTE_READ_SKIPPED:
-            return self._JSON_ATTRIBUTE_PARSE_FAILED
-        return self._load_json_attribute(attr_value, result, attr_name)
 
     def _load_json_attribute(self, attr_value: Any, result: ScanResult, attr_name: str) -> Any:
         """Load a Keras JSON attribute, marking the scan incomplete on malformed metadata."""

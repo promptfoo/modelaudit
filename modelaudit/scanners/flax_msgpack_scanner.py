@@ -33,7 +33,6 @@ _MAX_STREAMED_VALUE_IDENTITY_CHARS = _EVIDENCE_REDACTION_INPUT_CHARS
 _MIN_SHORT_BINARY_TEXT_PERCENT = 85
 _MAX_STREAM_TENSOR_SAMPLES = 64
 _MAX_STREAM_SEQUENCE_EVIDENCE = 64
-_STREAM_MARKER_CHUNK_BYTES = 64 * 1024
 _STREAM_TEXT_CHUNK_BYTES = 64 * 1024
 _STREAM_TEXT_OVERLAP_CHARS = 4096
 _DEFAULT_MAX_STREAM_KEY_LENGTH = 1024 * 1024
@@ -126,31 +125,6 @@ class _StreamTraversalState:
 
 
 @dataclass
-class _StreamMarkerReader:
-    source: BinaryIO
-    chunk_start: int = -1
-    chunk: bytes = b""
-
-    def read(self, offset: int, max_bytes: int) -> bytes:
-        chunk_offset = offset - self.chunk_start
-        if chunk_offset >= 0 and chunk_offset + max_bytes <= len(self.chunk):
-            return self.chunk[chunk_offset : chunk_offset + max_bytes]
-
-        source_offset = self.source.tell()
-        try:
-            self.source.seek(offset)
-            self.chunk_start = offset
-            self.chunk = self.source.read(_STREAM_MARKER_CHUNK_BYTES)
-        finally:
-            self.source.seek(source_offset)
-        return self.chunk[:max_bytes]
-
-    def peek(self, offset: int) -> int | None:
-        prefix = self.read(offset, 1)
-        return prefix[0] if prefix else None
-
-
-@dataclass
 class _MsgpackStreamCursor:
     source: BinaryIO
     stream_size: int
@@ -189,7 +163,7 @@ class _MsgpackStreamCursor:
         marker = self.peek_marker()
         if marker is None:
             return None
-        header_bytes = _msgpack_marker_header_bytes(marker)
+        header_bytes = _MSGPACK_MARKER_HEADER_BYTES.get(marker, 1)
         prefix = self._peek_bytes(header_bytes)
         if len(prefix) < header_bytes:
             return None
@@ -367,10 +341,6 @@ _MSGPACK_MARKER_HEADER_BYTES = {
 }
 
 
-def _msgpack_marker_header_bytes(marker: int) -> int:
-    return _MSGPACK_MARKER_HEADER_BYTES.get(marker, 1)
-
-
 def _msgpack_declared_data_bytes(marker: int, prefix: bytes) -> int | None:
     if 0xA0 <= marker <= 0xBF:
         return marker & 0x1F
@@ -438,10 +408,6 @@ def _find_getattr_call_end(value: str) -> int | None:
             return open_index + 1
         search_offset = getattr_index + len("getattr")
     return None
-
-
-def _contains_getattr_call_anchor(value: str) -> bool:
-    return _find_getattr_call_end(value) is not None
 
 
 def _contains_quoted_dunder_attribute_after_comma(value: str, start: int = 0) -> bool:
@@ -743,18 +709,10 @@ def _redact_evidence_fragment(value: Any, max_chars: int) -> str:
     return redacted.replace("\r", " ").replace("\n", " ").replace("\t", " ")
 
 
-def _redact_evidence_location(location: Any) -> str:
-    return _redact_evidence_fragment(location, _EVIDENCE_LOCATION_CHARS)
-
-
-def _redact_evidence_sample(value: Any) -> str:
-    return _redact_evidence_fragment(value, _EVIDENCE_SAMPLE_CHARS)
-
-
 def _redact_evidence_key(key: Any) -> Any:
     if key is None or isinstance(key, bool | int | float):
         return key
-    return _redact_evidence_location(key)
+    return _redact_evidence_fragment(key, _EVIDENCE_LOCATION_CHARS)
 
 
 class FlaxMsgpackScanner(BaseScanner):
@@ -1194,7 +1152,7 @@ class FlaxMsgpackScanner(BaseScanner):
 
     @staticmethod
     def _add_jax_transform_check(transform: str, context: str, location: str, result: ScanResult) -> None:
-        safe_location = _redact_evidence_location(location)
+        safe_location = _redact_evidence_fragment(location, _EVIDENCE_LOCATION_CHARS)
         seen_findings = result._private_metadata.get(_JAX_TRANSFORM_DEDUP_METADATA_KEY)
         if not isinstance(seen_findings, set):
             seen_findings = set()
@@ -1211,7 +1169,7 @@ class FlaxMsgpackScanner(BaseScanner):
             location=safe_location,
             details={
                 "transform": transform,
-                "context": _redact_evidence_sample(context),
+                "context": _redact_evidence_fragment(context, _EVIDENCE_SAMPLE_CHARS),
             },
             rule_code="S1105",
         )
@@ -1225,7 +1183,7 @@ class FlaxMsgpackScanner(BaseScanner):
                 passed=False,
                 message="Suspicious JAX array metadata detected",
                 severity=IssueSeverity.WARNING,
-                location=_redact_evidence_location(location),
+                location=_redact_evidence_fragment(location, _EVIDENCE_LOCATION_CHARS),
                 details={"suspicious_key": "__jax_array__"},
                 rule_code="S905",
             )
@@ -1240,7 +1198,7 @@ class FlaxMsgpackScanner(BaseScanner):
                 passed=False,
                 message="Invalid tensor shape with negative dimensions",
                 severity=IssueSeverity.INFO,
-                location=_redact_evidence_location(location),
+                location=_redact_evidence_fragment(location, _EVIDENCE_LOCATION_CHARS),
                 details={"shape": shape_evidence},
                 rule_code="S902",
             )
@@ -1250,7 +1208,7 @@ class FlaxMsgpackScanner(BaseScanner):
                 passed=False,
                 message="Suspiciously large tensor dimensions",
                 severity=IssueSeverity.WARNING,
-                location=_redact_evidence_location(location),
+                location=_redact_evidence_fragment(location, _EVIDENCE_LOCATION_CHARS),
                 details={"shape": shape_evidence, "max_safe_dimension": 10**9},
                 rule_code="S804",
             )
@@ -1280,7 +1238,7 @@ class FlaxMsgpackScanner(BaseScanner):
                 passed=False,
                 message="Invalid tensor shape with negative dimensions",
                 severity=IssueSeverity.INFO,
-                location=_redact_evidence_location(location),
+                location=_redact_evidence_fragment(location, _EVIDENCE_LOCATION_CHARS),
                 details={
                     **common_details,
                     "dimension_index": dimension_index,
@@ -1295,7 +1253,7 @@ class FlaxMsgpackScanner(BaseScanner):
                 passed=False,
                 message="Suspiciously large tensor dimensions",
                 severity=IssueSeverity.WARNING,
-                location=_redact_evidence_location(location),
+                location=_redact_evidence_fragment(location, _EVIDENCE_LOCATION_CHARS),
                 details={
                     **common_details,
                     "dimension_index": dimension_index,
@@ -1349,10 +1307,10 @@ class FlaxMsgpackScanner(BaseScanner):
             passed=False,
             message=f"Suspicious code pattern detected: {pattern}",
             severity=IssueSeverity.CRITICAL,
-            location=_redact_evidence_location(location),
+            location=_redact_evidence_fragment(location, _EVIDENCE_LOCATION_CHARS),
             details={
                 "pattern": pattern,
-                "sample": _redact_evidence_sample(sample_value),
+                "sample": _redact_evidence_fragment(sample_value, _EVIDENCE_SAMPLE_CHARS),
                 "full_length": full_length,
             },
             rule_code=self._suspicious_pattern_rule_code(lowered_pattern),
@@ -1371,14 +1329,14 @@ class FlaxMsgpackScanner(BaseScanner):
         if key in self.suspicious_keys:
             # Determine appropriate rule code based on key
             rule_code = "S201" if key.lower() == "__reduce__" else "S999"
-            safe_key = _redact_evidence_location(key)
+            safe_key = _redact_evidence_fragment(key, _EVIDENCE_LOCATION_CHARS)
 
             result.add_check(
                 name="Object Attribute Security Check",
                 passed=False,
                 message=f"Suspicious object attribute detected: {safe_key}",
                 severity=IssueSeverity.CRITICAL,
-                location=_redact_evidence_location(location),
+                location=_redact_evidence_fragment(location, _EVIDENCE_LOCATION_CHARS),
                 details={"suspicious_key": safe_key},
                 rule_code=rule_code,
             )
@@ -1394,10 +1352,10 @@ class FlaxMsgpackScanner(BaseScanner):
                 passed=False,
                 message=f"Suspicious object attribute value detected: {key}",
                 severity=IssueSeverity.CRITICAL,
-                location=_redact_evidence_location(location),
+                location=_redact_evidence_fragment(location, _EVIDENCE_LOCATION_CHARS),
                 details={
                     "suspicious_key": key,
-                    "value_sample": _redact_evidence_sample(sample_value),
+                    "value_sample": _redact_evidence_fragment(sample_value, _EVIDENCE_SAMPLE_CHARS),
                 },
                 rule_code="S999",
             )
@@ -1439,7 +1397,7 @@ class FlaxMsgpackScanner(BaseScanner):
             passed=False,
             message=message,
             severity=IssueSeverity.INFO,
-            location=_redact_evidence_location(location),
+            location=_redact_evidence_fragment(location, _EVIDENCE_LOCATION_CHARS),
             details=check_details,
             rule_code="S902",
         )
@@ -1465,72 +1423,6 @@ class FlaxMsgpackScanner(BaseScanner):
                 "max_allowed": maximum,
             },
         )
-
-    def _check_preanalysis_structure_budget(
-        self,
-        obj: Any,
-        result: ScanResult,
-        *,
-        location: str,
-        max_nodes: int | None = None,
-    ) -> bool:
-        """Bound helper-analysis traversal before running ML/JAX metadata prechecks."""
-        stack: list[tuple[Any, str, int]] = [(obj, location, 0)]
-        visited_nodes = 0
-        node_limit = self.max_structure_nodes if max_nodes is None else max_nodes
-
-        while stack:
-            value, value_location, depth = stack.pop()
-            visited_nodes += 1
-            if visited_nodes > node_limit:
-                self._add_structure_budget_check(
-                    result,
-                    location=value_location,
-                    budget="node_count",
-                    observed=visited_nodes,
-                    maximum=node_limit,
-                )
-                return False
-            if depth > self.max_recursion_depth:
-                self._add_incomplete_check(
-                    result,
-                    reason=self.RECURSION_LIMIT_INCONCLUSIVE_REASON,
-                    name="Flax MessagePack Preanalysis Depth Limit",
-                    message=f"Maximum preanalysis recursion depth exceeded: {depth}",
-                    location=value_location,
-                    details={
-                        "depth": depth,
-                        "max_allowed": self.max_recursion_depth,
-                    },
-                )
-                return False
-
-            if isinstance(value, dict):
-                if len(value) > self.max_items_per_container:
-                    self._add_structure_budget_check(
-                        result,
-                        location=value_location,
-                        budget="dict_items",
-                        observed=len(value),
-                        maximum=self.max_items_per_container,
-                    )
-                    return False
-                for key, nested_value in value.items():
-                    stack.append((nested_value, _join_evidence_path(value_location, key), depth + 1))
-            elif isinstance(value, list | tuple):
-                if len(value) > self.max_items_per_container:
-                    self._add_structure_budget_check(
-                        result,
-                        location=value_location,
-                        budget="sequence_items",
-                        observed=len(value),
-                        maximum=self.max_items_per_container,
-                    )
-                    return False
-                for index, nested_value in enumerate(value):
-                    stack.append((nested_value, f"{value_location}[{index}]", depth + 1))
-
-        return True
 
     def _bounded_structure_text(self, obj: Any) -> str:
         """Return a bounded lowercase text view for architecture heuristics."""
@@ -1603,7 +1495,7 @@ class FlaxMsgpackScanner(BaseScanner):
                 passed=False,
                 message=f"Maximum recursion depth exceeded: {depth}",
                 severity=IssueSeverity.INFO,
-                location=_redact_evidence_location(location),
+                location=_redact_evidence_fragment(location, _EVIDENCE_LOCATION_CHARS),
                 details={
                     "depth": depth,
                     "max_allowed": self.max_recursion_depth,
@@ -1622,7 +1514,7 @@ class FlaxMsgpackScanner(BaseScanner):
                     passed=False,
                     message=f"Suspiciously large binary blob: {size:,} bytes",
                     severity=IssueSeverity.INFO,
-                    location=_redact_evidence_location(location),
+                    location=_redact_evidence_fragment(location, _EVIDENCE_LOCATION_CHARS),
                     details={"size": size, "max_allowed": self.max_blob_bytes},
                     rule_code="S902",
                 )
@@ -1656,7 +1548,7 @@ class FlaxMsgpackScanner(BaseScanner):
                     message=f"Extremely long string found: {len(value):,} characters",
                     rule_code="S902",
                     severity=IssueSeverity.INFO,
-                    location=_redact_evidence_location(location),
+                    location=_redact_evidence_fragment(location, _EVIDENCE_LOCATION_CHARS),
                     details={"length": len(value), "threshold": 100000},
                 )
 
@@ -1677,7 +1569,7 @@ class FlaxMsgpackScanner(BaseScanner):
                     message=f"Dictionary with excessive items: {len(value):,}",
                     rule_code="S902",
                     severity=IssueSeverity.INFO,
-                    location=_redact_evidence_location(location),
+                    location=_redact_evidence_fragment(location, _EVIDENCE_LOCATION_CHARS),
                     details={
                         "item_count": len(value),
                         "max_allowed": self.max_items_per_container,
@@ -1733,7 +1625,7 @@ class FlaxMsgpackScanner(BaseScanner):
                     message=f"Array with excessive items: {len(value):,}",
                     rule_code="S902",
                     severity=IssueSeverity.INFO,
-                    location=_redact_evidence_location(location),
+                    location=_redact_evidence_fragment(location, _EVIDENCE_LOCATION_CHARS),
                     details={
                         "item_count": len(value),
                         "max_allowed": self.max_items_per_container,
@@ -1755,7 +1647,7 @@ class FlaxMsgpackScanner(BaseScanner):
                     passed=False,
                     message=f"Extremely large integer value: {value}",
                     severity=IssueSeverity.INFO,
-                    location=_redact_evidence_location(location),
+                    location=_redact_evidence_fragment(location, _EVIDENCE_LOCATION_CHARS),
                     details={"value": value},
                     rule_code="S902",
                 )
@@ -1829,7 +1721,7 @@ class FlaxMsgpackScanner(BaseScanner):
                 # Check if binary data could be a serialized tensor
                 tensors.append(
                     {
-                        "path": _redact_evidence_location(path),
+                        "path": _redact_evidence_fragment(path, _EVIDENCE_LOCATION_CHARS),
                         "size": len(data),
                         "type": "binary_blob",
                         "potential_elements": len(data) // 4,  # Assume float32
@@ -2139,28 +2031,6 @@ class FlaxMsgpackScanner(BaseScanner):
                 rule_code="S902",
             )
 
-    def _msgpack_unpacker_kwargs(self) -> dict[str, Any]:
-        return {
-            "raw": False,
-            "strict_map_key": False,
-            "max_buffer_size": self.max_msgpack_decode_bytes,
-            "max_str_len": self.max_msgpack_decode_bytes,
-            "max_bin_len": self.max_msgpack_decode_bytes,
-            "max_array_len": self.max_items_per_container,
-            "max_map_len": self.max_items_per_container,
-        }
-
-    def _msgpack_stream_read_size(self) -> int:
-        """Leave decoder-buffer headroom for an object split across filesystem reads."""
-        return min(self.chunk_size, max(self.max_msgpack_decode_bytes // 2, 1))
-
-    def _msgpack_event_unpacker_kwargs(self) -> dict[str, Any]:
-        """Allow container headers through; the event walker enforces their budgets."""
-        kwargs = self._msgpack_unpacker_kwargs()
-        kwargs["max_array_len"] = 2**32 - 1
-        kwargs["max_map_len"] = 2**32 - 1
-        return kwargs
-
     def _record_stream_text(self, value: str, summary: _FlaxStreamSummary) -> None:
         remaining = self.max_bounded_text_chars - summary.bounded_text_chars
         if remaining <= 0:
@@ -2188,7 +2058,7 @@ class FlaxMsgpackScanner(BaseScanner):
             passed=False,
             message=f"Suspiciously large binary blob: {size:,} bytes",
             severity=IssueSeverity.INFO,
-            location=_redact_evidence_location(location),
+            location=_redact_evidence_fragment(location, _EVIDENCE_LOCATION_CHARS),
             details={"size": size, "max_allowed": self.max_blob_bytes},
             rule_code="S902",
         )
@@ -2251,7 +2121,7 @@ class FlaxMsgpackScanner(BaseScanner):
                 summary.compatible_tensor_samples.append(
                     {
                         "tensor": {
-                            "path": _redact_evidence_location(location),
+                            "path": _redact_evidence_fragment(location, _EVIDENCE_LOCATION_CHARS),
                             "size": size,
                             "type": "binary_blob",
                             "potential_elements": elements,
@@ -2494,7 +2364,7 @@ class FlaxMsgpackScanner(BaseScanner):
                     message=f"Extremely long string found: {len(value):,} characters",
                     rule_code="S902",
                     severity=IssueSeverity.INFO,
-                    location=_redact_evidence_location(location),
+                    location=_redact_evidence_fragment(location, _EVIDENCE_LOCATION_CHARS),
                     details={"length": len(value), "threshold": 100000},
                 )
             self._record_stream_text(value, summary)
@@ -2506,7 +2376,7 @@ class FlaxMsgpackScanner(BaseScanner):
                 passed=False,
                 message=f"Extremely large integer value: {value}",
                 severity=IssueSeverity.INFO,
-                location=_redact_evidence_location(location),
+                location=_redact_evidence_fragment(location, _EVIDENCE_LOCATION_CHARS),
                 details={"value": value},
                 rule_code="S902",
             )
@@ -2546,23 +2416,10 @@ class FlaxMsgpackScanner(BaseScanner):
                 message=f"Extremely long string found: {length:,} characters",
                 rule_code="S902",
                 severity=IssueSeverity.INFO,
-                location=_redact_evidence_location(location),
+                location=_redact_evidence_fragment(location, _EVIDENCE_LOCATION_CHARS),
                 details={"length": length, "threshold": 100000},
             )
         return normalized_identity.value()
-
-    def _analyze_streamed_binary_sample(
-        self,
-        sample: bytes,
-        length: int,
-        location: str,
-        result: ScanResult,
-    ) -> None:
-        if not sample or not _is_text_like_short_binary(sample):
-            return
-        decoded = sample.decode("utf-8", errors="replace")
-        self._check_jax_transform("", decoded, location, result)
-        self._check_suspicious_strings(decoded, f"{location}[decoded_binary]", result)
 
     def _analyze_streamed_binary_chunks(
         self,
@@ -3332,7 +3189,7 @@ class FlaxMsgpackScanner(BaseScanner):
     ) -> tuple[str, str]:
         key_str = _stringify_evidence_fragment(key)
         safe_key_str = _stringify_safe_evidence_fragment(key)
-        location_key = _redact_evidence_location(key)
+        location_key = _redact_evidence_fragment(key, _EVIDENCE_LOCATION_CHARS)
         key_value_location = f"{location}/{location_key}" if location else location_key
         key_evidence_location = f"{location}[key:{location_key}]"
         if len(key_str) > _STREAM_TEXT_CHUNK_BYTES:
@@ -3392,7 +3249,7 @@ class FlaxMsgpackScanner(BaseScanner):
             passed=False,
             message="Duplicate MessagePack map key detected",
             severity=IssueSeverity.INFO,
-            location=_redact_evidence_location(location),
+            location=_redact_evidence_fragment(location, _EVIDENCE_LOCATION_CHARS),
             details={"key": _redact_evidence_key(key)},
             rule_code="S902",
         )
@@ -3430,7 +3287,7 @@ class FlaxMsgpackScanner(BaseScanner):
         return "exceeds max_" in message or "max_buffer_size" in message or "recursion" in message
 
     def _add_msgpack_decode_limit_check(self, result: ScanResult, path: str, error: Exception) -> None:
-        error_message = _redact_evidence_sample(error)
+        error_message = _redact_evidence_fragment(error, _EVIDENCE_SAMPLE_CHARS)
         self._add_incomplete_check(
             result,
             reason=self.DECODE_LIMIT_INCONCLUSIVE_REASON,
@@ -3448,7 +3305,7 @@ class FlaxMsgpackScanner(BaseScanner):
         result.finish(success=False)
 
     def _add_msgpack_parse_failure_check(self, result: ScanResult, path: str, error: Exception) -> None:
-        error_message = _redact_evidence_sample(error)
+        error_message = _redact_evidence_fragment(error, _EVIDENCE_SAMPLE_CHARS)
         result.add_check(
             name="Msgpack Parse Check",
             passed=False,
@@ -3838,7 +3695,7 @@ class FlaxMsgpackScanner(BaseScanner):
                         if previous_offset == stream_size:
                             break
                         marker = cursor.peek_marker()
-                        required_header_bytes = 1 if marker is None else _msgpack_marker_header_bytes(marker)
+                        required_header_bytes = 1 if marker is None else _MSGPACK_MARKER_HEADER_BYTES.get(marker, 1)
                         remaining_bytes = stream_size - previous_offset
                         marker_prefix = cursor._peek_bytes(required_header_bytes)
                         declared_data_bytes = (
@@ -4005,7 +3862,7 @@ class FlaxMsgpackScanner(BaseScanner):
             result.finish(success=False)
             return result
         except Exception as e:
-            error_message = _redact_evidence_sample(e)
+            error_message = _redact_evidence_fragment(e, _EVIDENCE_SAMPLE_CHARS)
             result.add_check(
                 name="Flax Msgpack Processing",
                 passed=False,

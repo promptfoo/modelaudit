@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import ipaddress
 import os
 import re
 from typing import Any, ClassVar
@@ -10,6 +9,7 @@ from urllib.parse import urlparse
 
 from ..core_results import mark_operational_scan_error
 from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
+from ._network_indicators import _is_public_ip
 from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
 
 _LIGHTGBM_HEADER_MARKERS: tuple[str, ...] = (
@@ -180,13 +180,7 @@ class LightGBMScanner(BaseScanner):
             return True
         return any(host.endswith(f".{domain}") for domain in _TRUSTED_URL_DOMAINS)
 
-    @staticmethod
-    def _is_public_ip(candidate: str) -> bool:
-        try:
-            value = ipaddress.ip_address(candidate)
-        except ValueError:
-            return False
-        return not (value.is_private or value.is_loopback or value.is_link_local or value.is_multicast)
+    _is_public_ip = staticmethod(_is_public_ip)
 
     @staticmethod
     def _is_binary_like(data: bytes) -> bool:

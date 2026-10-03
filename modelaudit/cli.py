@@ -55,6 +55,7 @@ from .core_results import (
     results_have_incomplete_coverage_under_directory,
     results_have_inconclusive_outcome,
 )
+from .finding_identity import finding_identity, preserve_finding_identity
 from .integrations.jfrog import scan_jfrog_artifact
 from .integrations.sarif_formatter import _sarif_source_identifier_key, format_sarif_output
 from .integrations.source_serialization import serialize_source_text, serialize_source_value
@@ -95,7 +96,6 @@ from .utils.helpers.auto_defaults import (
     generate_auto_defaults,
     parse_size_string,
 )
-from .utils.helpers.finding_identity import finding_identity, preserve_finding_identity
 from .utils.helpers.interrupt_handler import interruptible_scan
 from .utils.repository_context import (
     REPOSITORY_CURRENT_FILE_CONFIG_KEY,

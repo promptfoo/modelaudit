@@ -1004,13 +1004,6 @@ class TextScanner(BaseScanner):
             for statement in cls._documentation_python_statements(line)
         )
 
-    @classmethod
-    def _documentation_line_has_definition(cls, line: bytes) -> bool:
-        return any(
-            isinstance(statement, (ast.AsyncFunctionDef, ast.ClassDef, ast.FunctionDef))
-            for statement in cls._documentation_python_statements(line)
-        )
-
     @staticmethod
     def _documentation_without_closed_inline_code_spans(source: bytes) -> bytes:
         if b"`" not in source:

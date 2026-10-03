@@ -55,6 +55,7 @@ from ..utils.repository_context import (
 from ._archive_config import get_archive_depth
 from ._archive_locations import rewrite_extracted_member_location
 from ._evidence_redaction import redact_evidence_string, redact_untrusted_error_message
+from ._pickle_memo import _coerce_memo_key
 from .archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY, scan_nested_file
 from .archive_member_security import (
     executable_archive_member_content_rule_code_from_bytes,
@@ -1065,26 +1066,6 @@ class PyTorchZipScanner(BaseScanner):
             return (crc, compressed_size, file_size) == (info.CRC, info.compress_size, info.file_size)
         finally:
             archive.seek(original_position)
-
-    @staticmethod
-    def _resolve_symlink_target(
-        target: str,
-        *,
-        resolved_name: str,
-        extraction_root: str,
-    ) -> tuple[str, bool]:
-        """Resolve a relative symlink target while enforcing the archive extraction root."""
-        if is_absolute_archive_path(target):
-            return target, False
-
-        normalized_target = target.replace("\\", os.sep).replace("/", os.sep)
-        target_base = os.path.dirname(resolved_name)
-        target_resolved = os.path.normpath(os.path.join(target_base, normalized_target))
-        try:
-            target_from_root = os.path.relpath(target_resolved, extraction_root)
-        except ValueError:
-            return target_resolved, False
-        return sanitize_archive_path(target_from_root, extraction_root)
 
     def _read_member_to_spooled_file(
         self,
@@ -3709,8 +3690,6 @@ class PyTorchZipScanner(BaseScanner):
     @staticmethod
     def _raw_nested_security_pickle_candidate_has_structural_signal(
         value: bytes,
-        *,
-        fail_closed_on_truncated_extension: bool = True,
     ) -> bool:
         parse_budget_remaining = [_MAX_RAW_NESTED_PICKLE_CANDIDATES]
         if PyTorchZipScanner._raw_nested_proto0_global_ref_seen(value):
@@ -3723,7 +3702,6 @@ class PyTorchZipScanner(BaseScanner):
         if PyTorchZipScanner._raw_nested_extension_opcode_candidate_has_structural_signal(
             value,
             parse_budget_remaining,
-            fail_closed_on_truncated_extension=fail_closed_on_truncated_extension,
         ):
             return True
         if PyTorchZipScanner._raw_nested_binary_opcode_candidate_has_structural_signal(
@@ -3738,9 +3716,7 @@ class PyTorchZipScanner(BaseScanner):
             return False
         marker = candidate[0]
         if marker in _BINARY_EXTENSION_SECURITY_OPCODE_BYTES:
-            return fail_closed_on_truncated_extension or PyTorchZipScanner._has_complete_extension_opcode_stream(
-                candidate
-            )
+            return True
         if not PyTorchZipScanner._consume_raw_nested_structural_parse_budget(parse_budget_remaining):
             return True
         if marker == 0x80 and PyTorchZipScanner._looks_like_binary_pickle_prefix(
@@ -3845,7 +3821,6 @@ class PyTorchZipScanner(BaseScanner):
         value: bytes,
         parse_budget_remaining: list[int],
         *,
-        fail_closed_on_truncated_extension: bool = True,
         fail_closed_on_unknown_after_extension: bool = False,
     ) -> bool:
         search_limit = min(len(value), _PICKLE_DISCOVERY_LONG_PROBE_BYTES)
@@ -3879,7 +3854,7 @@ class PyTorchZipScanner(BaseScanner):
                 return True
             if PyTorchZipScanner._has_executable_extension_opcode_before_stop(
                 candidate,
-                fail_closed_on_truncated_extension=fail_closed_on_truncated_extension,
+                fail_closed_on_truncated_extension=True,
                 fail_closed_on_unknown_after_extension=fail_closed_on_unknown_after_extension,
             ):
                 return True
@@ -4579,21 +4554,6 @@ class PyTorchZipScanner(BaseScanner):
             for storage_key in storage_keys
         }
 
-    def _trusted_pytorch_storage_blob_members_from_data_pickle(
-        self,
-        zip_file: zipfile.ZipFile,
-        safe_entries: list[zipfile.ZipInfo],
-        result: ScanResult,
-    ) -> set[str]:
-        """Return tensor storage blobs referenced by same-prefix ``data.pkl`` before pickle discovery."""
-        return self._storage_blob_members_from_data_pkl_members(
-            self._validated_pytorch_storage_data_pkl_members_from_data_pickle(
-                zip_file,
-                safe_entries,
-                result,
-            ).storage_keys_by_data_pkl
-        )
-
     def _validated_pytorch_storage_data_pkl_members_from_data_pickle(
         self,
         zip_file: zipfile.ZipFile,
@@ -4961,12 +4921,6 @@ class PyTorchZipScanner(BaseScanner):
                 and len(referenced_keys) <= _PYTORCH_STORAGE_TRUST_MAX_REFERENCED_KEYS
             )
 
-        def memo_key(value: Any) -> int | None:
-            try:
-                return int(value)
-            except (TypeError, ValueError):
-                return None
-
         def storage_ref_from_pid(pid: Any) -> tuple[str, _PytorchStorageRef] | None:
             if not isinstance(pid, tuple) or len(pid) != 5:
                 return None
@@ -5084,14 +5038,14 @@ class PyTorchZipScanner(BaseScanner):
                 elif opcode_name == "NEWFALSE":
                     stack.append(False)
                 elif opcode_name in {"BINPUT", "LONG_BINPUT", "PUT"}:
-                    key = memo_key(arg)
+                    key = _coerce_memo_key(arg)
                     if key is not None and stack:
                         memo[key] = stack[-1]
                 elif opcode_name == "MEMOIZE":
                     if stack:
                         memo[len(memo)] = stack[-1]
                 elif opcode_name in {"BINGET", "LONG_BINGET", "GET"}:
-                    key = memo_key(arg)
+                    key = _coerce_memo_key(arg)
                     stack.append(memo.get(key) if key is not None else None)
                 elif opcode_name == "POP":
                     if stack:
@@ -5312,37 +5266,6 @@ class PyTorchZipScanner(BaseScanner):
         if clean_trusted_storage_downgrade:
             cls._remove_private_actionable_failed_check_entries(result, downgraded_private_entries)
             result.metadata["pickle_verdict"] = "clean"
-
-    @staticmethod
-    def _remove_private_actionable_failed_check_entries(
-        result: ScanResult,
-        entries_to_remove: list[dict[str, str]],
-    ) -> None:
-        private_failed_checks = result._private_metadata.get(ACTIONABLE_FAILED_CHECKS_METADATA_KEY)
-        if not entries_to_remove or not isinstance(private_failed_checks, list):
-            return
-
-        unmatched_entries = list(entries_to_remove)
-        filtered_entries: list[Any] = []
-        for entry in private_failed_checks:
-            if isinstance(entry, dict):
-                matched_index = next(
-                    (
-                        index
-                        for index, candidate in enumerate(unmatched_entries)
-                        if entry.get("name") == candidate["name"] and entry.get("rule_code") == candidate["rule_code"]
-                    ),
-                    None,
-                )
-                if matched_index is not None:
-                    del unmatched_entries[matched_index]
-                    continue
-            filtered_entries.append(entry)
-
-        if filtered_entries:
-            result._private_metadata[ACTIONABLE_FAILED_CHECKS_METADATA_KEY] = filtered_entries
-        else:
-            result._private_metadata.pop(ACTIONABLE_FAILED_CHECKS_METADATA_KEY, None)
 
     def _scan_for_jit_patterns(
         self,

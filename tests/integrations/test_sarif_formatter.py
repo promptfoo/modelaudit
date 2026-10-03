@@ -1781,7 +1781,7 @@ def test_directory_owner_preserves_parent_finding_and_check_identities(tmp_path:
 @pytest.mark.parametrize("owner_path", ["/proc/self/fd/11", "/synthetic/staged-owner", "."])
 def test_directory_owner_identity_keeps_message_rules_and_evidence(tmp_path: Path, owner_path: str) -> None:
     from modelaudit.core import _normalize_directory_owner_scan_result_for_reporting
-    from modelaudit.utils.helpers.finding_identity import finding_identity
+    from modelaudit.finding_identity import finding_identity
 
     report_path = str(tmp_path / "owner")
     scanned = ScanResult(scanner_name="jax_checkpoint")
@@ -1812,7 +1812,7 @@ def test_directory_owner_identity_keeps_message_rules_and_evidence(tmp_path: Pat
     ],
 )
 def test_malformed_or_evidence_owned_identity_metadata_is_ignored(metadata: object) -> None:
-    from modelaudit.utils.helpers.finding_identity import finding_identity
+    from modelaudit.finding_identity import finding_identity
 
     issue = Issue(
         message="original",

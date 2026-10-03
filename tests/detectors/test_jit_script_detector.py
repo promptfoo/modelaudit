@@ -661,9 +661,9 @@ class TestJITScriptDetector:
     def test_prioritized_rescan_fails_closed_when_source_start_budget_is_exceeded(self) -> None:
         line_count = jit_script_module._MAX_EMBEDDED_PYTHON_SOURCE_START_PROBES + 2
         source = b"}\x00\n".join(f"if True: import webbrowser as wb_{index}".encode() for index in range(line_count))
-        prioritized = jit_script_module._prioritized_embedded_python_snippets(
-            jit_script_module._candidate_embedded_python_snippets(source), bounded=source
-        )
+        prioritized = jit_script_module._select_prioritized_embedded_python_snippets(
+            jit_script_module._candidate_embedded_python_snippets(source), source
+        )[0]
 
         findings = JITScriptDetector()._extract_and_check_python_code(
             source,
@@ -8185,7 +8185,7 @@ class TestJITScriptDetector:
         source = "import runpy as rp\n" + inactive_shadow + "setattr(rp, 'run_path', print)\nrp.run_path('safe')\n"
         tree = ast.parse(source)
 
-        assert not jit_script_module._compact_snippet_has_shadowed_setattr(tree)
+        assert not bool(jit_script_module._compact_snippet_shadowed_setattr_references(tree))
         assert jit_script_module._compact_snippet_runpy_print_overwrite_calls(source) == {("runpy.run_path", "S108")}
 
     @pytest.mark.parametrize(
@@ -8635,14 +8635,16 @@ class TestJITScriptDetector:
         ],
     )
     def test_typed_safe_overwrite_rejects_rebound_mapping_alias(self, source: str) -> None:
-        assert jit_script_module._compact_snippet_typed_print_overwrite_calls(source) == set()
+        assert jit_script_module._compact_snippet_typed_print_overwrite_replay(source)[0] == set()
 
     def test_typed_safe_overwrite_preserves_forwarded_mapping_alias(self) -> None:
         source = (
             "import webbrowser as wb\nmapping = wb.__dict__\nalias = mapping\nmapping = {}\nalias.update(open=print)\n"
         )
 
-        assert jit_script_module._compact_snippet_typed_print_overwrite_calls(source) == {("webbrowser.open", "S109")}
+        assert jit_script_module._compact_snippet_typed_print_overwrite_replay(source)[0] == {
+            ("webbrowser.open", "S109")
+        }
 
     @pytest.mark.parametrize(
         ("source", "expected_pattern"),
@@ -9176,7 +9178,7 @@ class TestJITScriptDetector:
         padding = b"# pad\n" * (jit_script_module._MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES // len(b"# pad\n") + 1)
         prefix = padding + b"def unused():\n    import builtins as bi\n"
 
-        aliases = jit_script_module._builtins_import_aliases(prefix)
+        aliases = jit_script_module._builtins_import_alias_state(prefix)[0]
 
         assert "bi" not in aliases
 
@@ -9184,7 +9186,7 @@ class TestJITScriptDetector:
         padding = b"# pad\n" * (jit_script_module._MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES // len(b"# pad\n") + 1)
         prefix = b"import builtins as bi\n" + padding + b"(bi,) = (holder,)\n"
 
-        aliases = jit_script_module._builtins_import_aliases(prefix)
+        aliases = jit_script_module._builtins_import_alias_state(prefix)[0]
 
         assert "bi" not in aliases
 
@@ -9192,7 +9194,7 @@ class TestJITScriptDetector:
         padding = b"# pad\n" * (jit_script_module._MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES // len(b"# pad\n") + 1)
         prefix = padding + b"(bi,) = (builtins,)\n"
 
-        aliases = jit_script_module._builtins_import_aliases(prefix)
+        aliases = jit_script_module._builtins_import_alias_state(prefix)[0]
 
         assert "bi" in aliases
 
@@ -9200,7 +9202,7 @@ class TestJITScriptDetector:
         padding = b"# pad\n" * (jit_script_module._MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES // len(b"# pad\n") + 1)
         prefix = b"import builtins as bi\n" + padding + b"def unused():\n    (bi,) = (holder,)\n"
 
-        aliases = jit_script_module._builtins_import_aliases(prefix)
+        aliases = jit_script_module._builtins_import_alias_state(prefix)[0]
 
         assert "bi" in aliases
 
@@ -9217,7 +9219,7 @@ class TestJITScriptDetector:
 
         monkeypatch.setattr(jit_script_module, "_has_late_alias_rebinding", track_fallback)
 
-        builtins_aliases = jit_script_module._builtins_import_aliases(prefix)
+        builtins_aliases = jit_script_module._builtins_import_alias_state(prefix)[0]
         typed_aliases = jit_script_module._typed_import_aliases(prefix)
 
         assert "bi" not in builtins_aliases
@@ -9228,7 +9230,7 @@ class TestJITScriptDetector:
         padding = b"# pad\n" * (jit_script_module._MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES // len(b"# pad\n") + 1)
         prefix = b"import builtins as bi\nimport webbrowser as wb\n" + padding + b"bi = holder +\nwb = holder +\n"
 
-        builtins_aliases = jit_script_module._builtins_import_aliases(prefix)
+        builtins_aliases = jit_script_module._builtins_import_alias_state(prefix)[0]
         typed_aliases = jit_script_module._typed_import_aliases(prefix)
 
         assert "bi" not in builtins_aliases
@@ -9603,7 +9605,7 @@ class TestJITScriptDetector:
         padding = b"# pad\n" * (jit_script_module._MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES // len(b"# pad\n") + 1)
         prefix = b"import builtins as bi\n" + padding + b"for (bi,) in items:\n    pass\n"
 
-        aliases = jit_script_module._builtins_import_aliases(prefix)
+        aliases = jit_script_module._builtins_import_alias_state(prefix)[0]
 
         assert "bi" not in aliases
 
@@ -9611,7 +9613,7 @@ class TestJITScriptDetector:
         padding = b"# pad\n" * (jit_script_module._MAX_EMBEDDED_PYTHON_IMPORT_CONTEXT_BYTES // len(b"# pad\n") + 1)
         prefix = b"import builtins as bi\n" + padding + b"for (bi,) in items:\n    pass\nif True print(\n"
 
-        aliases = jit_script_module._builtins_import_aliases(prefix)
+        aliases = jit_script_module._builtins_import_alias_state(prefix)[0]
 
         assert "bi" not in aliases
 
@@ -9624,7 +9626,7 @@ class TestJITScriptDetector:
     def test_prefix_builtins_aliases_ignore_lazy_walrus_rebind(self) -> None:
         prefix = b"import builtins as bi\ncallback = lambda: (bi := None)\n"
 
-        aliases = jit_script_module._builtins_import_aliases(prefix)
+        aliases = jit_script_module._builtins_import_alias_state(prefix)[0]
 
         assert "bi" in aliases
 
@@ -10479,7 +10481,7 @@ class TestJITScriptDetector:
             "alias, mapping = mapping, alias\nmapping.update(open=print)\n"
         )
 
-        assert jit_script_module._compact_snippet_typed_print_overwrite_calls(source) == set()
+        assert jit_script_module._compact_snippet_typed_print_overwrite_replay(source)[0] == set()
 
     @pytest.mark.parametrize(
         "unrelated_delete",
@@ -11449,24 +11451,19 @@ class TestJITScriptDetector:
         _assert_jit_scan_pattern(detector, source, "payload.bin", "Dynamic module execution detected")
 
     def test_priority_snippets_require_import_boundaries_after_cap(self) -> None:
-        def candidate(
-            value: tuple[bytes, tuple[int, int]],
-        ) -> tuple[bytes, tuple[int, int], tuple[tuple[int, int], ...]]:
-            return value[0], value[1], (value[1],)
-
         leading_candidates = [
-            candidate((f"import harmless_{index}\n".encode(), (index, index + 1)))
+            _snippet_candidate((f"import harmless_{index}\n".encode(), (index, index + 1)))
             for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS)
         ]
-        host_candidate = candidate((b"import host_123\n", (100, 101)))
-        system_candidate = candidate((b"class System:\n    pass\n", (200, 201)))
-        os_candidate = candidate((b"import os\n", (300, 301)))
-        aliased_runpy_candidate = candidate((b"import harmless as h, runpy as rp\n", (350, 351)))
-        continued_runpy_candidate = candidate((b"import harmless as h, \\\n    runpy as rp\n", (375, 376)))
-        continued_from_runpy_candidate = candidate((b"from runpy\\\n import run_path\n", (400, 401)))
-        runpy_candidate = candidate((b"from runpy import run_path\n", (425, 426)))
+        host_candidate = _snippet_candidate((b"import host_123\n", (100, 101)))
+        system_candidate = _snippet_candidate((b"class System:\n    pass\n", (200, 201)))
+        os_candidate = _snippet_candidate((b"import os\n", (300, 301)))
+        aliased_runpy_candidate = _snippet_candidate((b"import harmless as h, runpy as rp\n", (350, 351)))
+        continued_runpy_candidate = _snippet_candidate((b"import harmless as h, \\\n    runpy as rp\n", (375, 376)))
+        continued_from_runpy_candidate = _snippet_candidate((b"from runpy\\\n import run_path\n", (400, 401)))
+        runpy_candidate = _snippet_candidate((b"from runpy import run_path\n", (425, 426)))
 
-        selected = jit_script_module._prioritized_embedded_python_snippets(
+        selected = jit_script_module._select_prioritized_embedded_python_snippets(
             [
                 *leading_candidates,
                 host_candidate,
@@ -11476,8 +11473,9 @@ class TestJITScriptDetector:
                 continued_runpy_candidate,
                 continued_from_runpy_candidate,
                 runpy_candidate,
-            ]
-        )
+            ],
+            None,
+        )[0]
 
         selected_candidates = {candidate for candidate, _span, _real_ranges in selected}
         assert host_candidate[0] not in selected_candidates
@@ -11500,18 +11498,13 @@ class TestJITScriptDetector:
         assert omitted_spans == []
 
     def test_priority_snippets_are_budgeted_and_bounded_after_default_cap(self) -> None:
-        def candidate(
-            value: tuple[bytes, tuple[int, int]],
-        ) -> tuple[bytes, tuple[int, int], tuple[tuple[int, int], ...]]:
-            return value[0], value[1], (value[1],)
-
         leading_candidates = [
-            candidate((f"import harmless_{index}\n".encode(), (index, index + 1)))
+            _snippet_candidate((f"import harmless_{index}\n".encode(), (index, index + 1)))
             for index in range(jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS)
         ]
         priority_payload = b"import os\n" + (b"# pad\n" * 4000)
         priority_candidates = [
-            candidate(
+            _snippet_candidate(
                 (
                     priority_payload,
                     (
@@ -11523,7 +11516,9 @@ class TestJITScriptDetector:
             for index in range(jit_script_module._MAX_PRIORITY_EMBEDDED_PYTHON_SNIPPETS + 4)
         ]
 
-        selected = jit_script_module._prioritized_embedded_python_snippets([*leading_candidates, *priority_candidates])
+        selected = jit_script_module._select_prioritized_embedded_python_snippets(
+            [*leading_candidates, *priority_candidates], None
+        )[0]
 
         assert len(selected) == (
             jit_script_module._MAX_DEFAULT_EMBEDDED_PYTHON_SNIPPETS
@@ -12582,6 +12577,12 @@ def test_first_body_statement_segment_bounds_nested_recursion() -> None:
     assert segment is not None
 
 
+def _snippet_candidate(
+    value: tuple[bytes, tuple[int, int]],
+) -> tuple[bytes, tuple[int, int], tuple[tuple[int, int], ...]]:
+    return value[0], value[1], (value[1],)
+
+
 def _assert_runpy_across_gap(prefix: bytes, suffix: bytes) -> None:
     detector = JITScriptDetector()
     filler_line = b"# filler\n"
@@ -12613,6 +12614,14 @@ def _assert_jit_browser_and_native_findings(detector: JITScriptDetector, source:
     patterns = {finding.pattern for finding in findings if finding.type == "code_execution_pattern"}
     assert "Web browser launch detected" in patterns
     assert "Native library loading detected" in patterns
+
+
+@pytest.mark.parametrize("prefix", [b"a" * 4095, b"\xff" * 4095, b"\xe2" * 4095])
+def test_utf8_offset_decoder_keeps_multibyte_chunk_boundaries(prefix: bytes) -> None:
+    """Decoded offsets include malformed bytes before and after a split UTF-8 character."""
+    decoded, offsets = jit_script_module._decode_utf8_with_byte_offsets(prefix + b"\xe2\x82\xac\xffz")
+    assert decoded == prefix.decode("utf-8", errors="ignore") + "€z"
+    assert offsets[-2:] == [4098, 4100]
 
 
 def _assert_jit_mapping_update_detection(
