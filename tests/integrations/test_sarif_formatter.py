@@ -1918,3 +1918,27 @@ def test_stream_rule_classification_uses_identity_but_keeps_raw_description(monk
         assert rule["properties"]["tags"] == ["security", "ml-model"]
         assert rule["shortDescription"]["text"] == converted.issues[0].message[:100]
         assert "pickle-exec-secret-license-cve-network" in converted.issues[0].message
+
+
+@pytest.mark.parametrize("surrogate", ["\udcff", "\ud800", "\udc00", "\udfff"])
+@pytest.mark.parametrize("transport_failure", [False, True])
+def test_sarif_exports_stream_results_with_surrogates_in_query(
+    monkeypatch: pytest.MonkeyPatch, surrogate: str, transport_failure: bool
+) -> None:
+    source = "stream://https://bucket.s3.amazonaws.com/model.pkl?token=" + surrogate
+    filesystem = Mock()
+    if transport_failure:
+        filesystem.info.side_effect = OSError("synthetic transport error")
+    else:
+        filesystem.info.return_value = {"size": 4}
+        filesystem.open.side_effect = lambda *args, **kwargs: io.BytesIO(b"\x80\x04N.")
+    monkeypatch.setattr("fsspec.filesystem", Mock(return_value=filesystem))
+    result = scan_model_directory_or_file(source, cache_scan_results=False)
+    exported = format_sarif_output(result, [source])
+    run = json.loads(exported)["runs"][0]
+    from modelaudit.core_results import determine_exit_code
+
+    assert run["invocations"][0]["exitCode"] == determine_exit_code(result)
+    assert run["results"]
+    assert run["artifacts"][0]["location"]["uri"].isascii()
+    assert exported.encode("utf-8")
