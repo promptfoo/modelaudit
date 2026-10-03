@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 from packaging.requirements import Requirement
+from packaging.version import Version
 
 try:
     import tomllib
@@ -145,9 +146,11 @@ def test_root_requires_hardened_picklescan_release() -> None:
 
     assert dependency.marker is None
     # Root upgrades must receive these fixes, while later floor increases remain valid.
-    assert not dependency.specifier.contains("0.1.10", prereleases=True)
-    assert not dependency.specifier.contains("0.1.11rc1", prereleases=True)
-    assert not dependency.specifier.contains("0.2.0", prereleases=True)
+    bounds = {specifier.operator: specifier.version for specifier in dependency.specifier}
+    assert len(dependency.specifier) == 2
+    assert set(bounds) == {">=", "<"}
+    assert Version(bounds[">="]) >= Version("0.1.11")
+    assert Version(bounds["<"]) == Version("0.2.0")
     locked_version = ".".join(str(part) for part in _locked_version(_lock_package_block("modelaudit-picklescan")))
     assert dependency.specifier.contains(locked_version)
 
