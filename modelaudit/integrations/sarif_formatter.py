@@ -249,11 +249,8 @@ def _sarif_source_identifier_key(paths: Iterable[str]) -> Callable[[str], str] |
 
 
 def _source_identifier_comparison_key(path: str) -> str:
-    """Keep report allocation available when the working directory is unavailable."""
-    try:
-        return _normalize_path_to_uri(path)
-    except OSError:
-        return quote(Path(path).as_posix(), safe="/", errors="backslashreplace")
+    """Reserve URI-equivalent names independently of the working directory."""
+    return quote(Path(path).name, safe="/", errors="backslashreplace")
 
 
 def _serialize_sarif_sources(paths: list[str], issues: list) -> tuple[dict[str, str], list[dict[str, Any]]]:
