@@ -3988,7 +3988,7 @@ class PyTorchZipScanner(BaseScanner):
                     return True
                 if PyTorchZipScanner._has_executable_extension_opcode_before_stop(
                     candidate,
-                    fail_closed_on_unknown_after_extension=True,
+                    fail_closed_on_unknown_after_extension=candidate_start < offset,
                 ) or PyTorchZipScanner._raw_nested_binary_candidate_should_scan(
                     candidate,
                     candidate_is_prefix=candidate_is_prefix,

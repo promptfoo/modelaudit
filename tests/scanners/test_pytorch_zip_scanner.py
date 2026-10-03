@@ -4075,9 +4075,11 @@ def test_pytorch_zip_raw_nested_extension_scan_shares_candidate_budget(monkeypat
         *,
         fail_closed_on_unknown_after_extension: bool = False,
         nested_literal_depth: int = 0,
+        search_end: int | None = None,
     ) -> bool:
         assert fail_closed_on_unknown_after_extension is True
         assert nested_literal_depth == 0
+        assert search_end is None
         remaining_budget_seen.append(parse_budget_remaining[0])
         PyTorchZipScanner._consume_raw_nested_structural_parse_budget(parse_budget_remaining)
         return False
@@ -6071,12 +6073,14 @@ def test_pytorch_zip_later_raw_scan_starts_after_scanned_suffix(
         fail_closed_on_truncated_extension: bool = True,
         parse_budget_remaining: list[int] | None = None,
         nested_literal_depth: int = 0,
+        search_end: int | None = None,
         original_value: bytes | None = None,
         original_offset: int = 0,
     ) -> bool:
         del fail_closed_on_truncated_extension, parse_budget_remaining
         assert nested_literal_depth == 0
         assert original_value is not None
+        assert search_end == len(original_value) - original_offset
         assert original_value[original_offset : original_offset + len(window)] == window
         calls.append(window)
         return False
@@ -21037,3 +21041,22 @@ def test_pytorch_zip_literal_boundary_exhausted_payload_retains_continuation(
         result = PyTorchZipScanner._raw_nested_window_has_literal_security_stream(value, 0, len(value))
 
     assert result is security_signal
+
+
+@pytest.mark.parametrize(
+    "extension_opcode",
+    [
+        pytest.param(b"\x82\x01", id="ext1"),
+        pytest.param(b"\x83\x01\x00", id="ext2"),
+        pytest.param(b"\x84\x01\x00\x00\x00", id="ext4"),
+    ],
+)
+def test_pytorch_zip_context_unknown_extension_bytes_are_tensor_noise(tmp_path: Path, extension_opcode: bytes) -> None:
+    storage_blob = b"X\xff\xff\xff\x7f" + b"!" * 128 + extension_opcode + b"\xff" + b"!" * (65536 + 16)
+
+    result = _scan_referenced_float_storage_blob(tmp_path, "context-unknown-extension.pt", storage_blob)
+
+    assert result.success is True
+    assert result.metadata.get("pickle_verdict") == "clean"
+    assert result.metadata["pickle_files"] == ["archive/data.pkl"]
+    assert not any(issue.details.get("pickle_filename") == "archive/data/0" for issue in result.issues)
