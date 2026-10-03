@@ -18,6 +18,13 @@ def format_evidence_string(text: str, max_chars: int | None = 180) -> str:
     return safe_text[:limit] if limit <= 3 else safe_text[: limit - 3] + "..."
 
 
+def format_terminal_text(text: str) -> str:
+    """Keep untrusted diagnostics on one line without changing saved evidence."""
+    return format_evidence_string(text, max_chars=None).translate(
+        {ord("\r"): r"\r", ord("\n"): r"\n", ord("\t"): r"\t"}
+    )
+
+
 def format_evidence_mapping_key(
     key: object,
     existing_keys: Collection[object],

@@ -12720,7 +12720,7 @@ class TestGetModelInfo:
         with patch(
             "modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format",
             side_effect=PermissionError(
-                "401 Unauthorized: gated file https://huggingface.co/test/model?token=\x1b]52;c;secret\x07"
+                "401 Unauthorized: gated file https://huggingface.co/test/model?token=\x1b]52;c;secret\r\n\tFORGED\x07"
             ),
         ) as mock_detect_content:
             info = get_model_info("https://huggingface.co/test/model")
@@ -12745,6 +12745,12 @@ class TestGetModelInfo:
 
         assert "Skipping inaccessible gated" in caplog.text
         assert "\x1b" not in caplog.text and "\x07" not in caplog.text
+        assert "\tFORGED" not in caplog.text
+        assert all(
+            len(record.message.splitlines()) == 1
+            for record in caplog.records
+            if record.name == "modelaudit.utils.sources.huggingface"
+        )
 
     @patch("huggingface_hub.HfApi")
     def test_get_model_info_counts_unknown_size_for_gated_selected_file(
@@ -13977,3 +13983,24 @@ def test_hf_worker_endpoint_credentials_do_not_change_access_classification(
     assert info["inventory_status"] == expected
     assert info["unknown_size_count"] == unknown
     assert info["inaccessible_gated_bytes"] == (0 if status == 503 else 32)
+
+
+@pytest.mark.parametrize("message,blocked", [("synthetic connection reset", False), ("403 Forbidden", True)])
+def test_huggingface_info_source_text_keeps_access_classification(message: str, blocked: bool) -> None:
+    from modelaudit.utils.sources.huggingface import _is_huggingface_gated_or_auth_error, get_model_info
+
+    class RenderedError(RuntimeError):
+        calls = 0
+
+        def __str__(self) -> str:
+            self.calls += 1
+            return message
+
+    error = RenderedError(message)
+    with patch("huggingface_hub.HfApi") as api:
+        api.return_value.repo_info.side_effect = error
+        with pytest.raises(Exception) as caught:
+            get_model_info("https://huggingface.co/org/model?token='403'")
+    assert error.calls == 1
+    assert caught.value.__cause__ is error
+    assert _is_huggingface_gated_or_auth_error(caught.value) is blocked

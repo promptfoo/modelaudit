@@ -1946,9 +1946,14 @@ def _track_huggingface_stream_acquisition(
             yielded_artifact = True
             yield streamed_item
     except Exception as exc:
-        if yielded_artifact:
-            raise _HuggingFaceStreamInterruptedError(str(exc)) from exc
-        raise _HuggingFaceAcquisitionError(str(exc)) from exc
+        message = str(exc)
+        error = (
+            _HuggingFaceStreamInterruptedError(message) if yielded_artifact else _HuggingFaceAcquisitionError(message)
+        )
+        cast(Any, error)._modelaudit_classification_text = _huggingface_classification_error(
+            getattr(exc, "_modelaudit_classification_text", message)
+        )
+        raise error from exc
     finally:
         close_generator = getattr(file_generator, "close", None)
         if callable(close_generator):
@@ -2025,7 +2030,7 @@ def _record_huggingface_acquisition_error(
     requested_revision = _huggingface_requested_revision(path)
     source_key = _huggingface_acquisition_source_key(path, requested_revision)
     classification_message = (
-        _escape_terminal_text(_huggingface_classification_error(str(classification_error)))
+        _escape_terminal_text(_huggingface_classification_error(classification_error))
         if classification_error is not None
         else error_msg
     )
@@ -3333,7 +3338,7 @@ def _resolve_scan_source_for_path(
                     path_state,
                     path=path,
                     error_msg=error_msg,
-                    classification_error=raw_error,
+                    classification_error=getattr(exc, "_modelaudit_classification_text", raw_error),
                 )
                 return None
 
@@ -3400,7 +3405,7 @@ def _resolve_scan_source_for_path(
                 path_state,
                 path=path,
                 error_msg=error_msg,
-                classification_error=raw_error,
+                classification_error=getattr(exc, "_modelaudit_classification_text", raw_error),
             )
             path_state.defer_temp_cleanup(
                 temp_dir,
@@ -3432,7 +3437,7 @@ def _resolve_scan_source_for_path(
                     path_state,
                     path=path,
                     error_msg=error_msg,
-                    classification_error=raw_error,
+                    classification_error=getattr(exc, "_modelaudit_classification_text", raw_error),
                 )
                 return None
 
@@ -3690,7 +3695,7 @@ def _resolve_scan_source_for_path(
                 path_state,
                 path=path,
                 error_msg=error_msg,
-                classification_error=raw_error,
+                classification_error=getattr(exc, "_modelaudit_classification_text", raw_error),
                 scanned_artifact_count=(
                     streaming_result.files_scanned
                     if streaming_result_aggregated and streaming_result is not None
