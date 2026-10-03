@@ -15,7 +15,7 @@ def serialize_source_identifier(value: str) -> str:
         return value
     digest = hashlib.sha256(value.encode("utf-8", errors="surrogatepass")).hexdigest()
     preview = value[:256].encode("utf-8", errors="backslashreplace").decode("utf-8")
-    return f"{preview}...<source sha256:{digest}>"
+    return f"modelaudit-source:{preview}...<source sha256:{digest}>"
 
 
 def serialize_source_text(value: str) -> str:
