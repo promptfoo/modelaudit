@@ -8,8 +8,10 @@ import hashlib
 import io
 import json
 import os
+import sys
 import time
 from pathlib import Path
+from types import ModuleType, SimpleNamespace
 from typing import Any
 from unittest.mock import Mock, patch
 
@@ -1092,4 +1094,91 @@ def test_sbom_emitted_huggingface_metadata_paths_keep_producer_type_and_risk(leg
     output = generate_sbom(paths, result.model_dump()) if legacy else generate_sbom_pydantic(paths, result)
     component = json.loads(output)["components"][0]
     assert component["type"] == "machine-learning-model"
+    assert next(prop["value"] for prop in component["properties"] if prop["name"] == "risk_score") == "1"
+
+
+def _refuse_mlflow_acquisition(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = ModuleType("mlflow")
+    module.__dict__["artifacts"] = SimpleNamespace(
+        get_artifact_repository=Mock(side_effect=RuntimeError("synthetic unavailable repository"))
+    )
+    monkeypatch.setitem(sys.modules, "mlflow", module)
+    monkeypatch.setenv("MODELAUDIT_MLFLOW_ALLOWED_ARTIFACT_URIS", "")
+
+
+@pytest.mark.parametrize(
+    "artifact",
+    [
+        "access_token={token}&version=actual",
+        "access_token={token};version=actual",
+        "access_token={token}/model.pkl",
+        "access_token='{token}'/model.pkl",
+        "access_token={token}%26version%3Dactual",
+    ],
+)
+def test_cli_mlflow_sbom_classifies_source_before_display_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, artifact: str
+) -> None:
+    _refuse_mlflow_acquisition(monkeypatch)
+    source = "models:/PublicModel/1/" + artifact.format(token="x" * 700)
+    sbom = tmp_path / "scan.sbom.json"
+    invocation = CliRunner().invoke(
+        cli, ["scan", source, "--quiet", "--no-cache", "--max-size", "1MB", "--sbom", str(sbom)]
+    )
+    assert invocation.exit_code == 2
+    component = json.loads(sbom.read_text())["components"][0]
+    assert component["type"] == "file"
+    assert next(prop["value"] for prop in component["properties"] if prop["name"] == "risk_score") == "1"
+    assert len(component["name"]) <= 512
+    assert len(component["bom-ref"]) <= 512
+
+
+def test_cli_mlflow_sbom_keeps_sources_with_the_same_bounded_prefix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _refuse_mlflow_acquisition(monkeypatch)
+    prefix = "models:/PublicModel/1/access_token=" + "x" * 700
+    sources = [prefix + tail for tail in ["&version=actual", "&revision=actual"]]
+    exports = []
+    for index, paths in enumerate([sources, list(reversed(sources))]):
+        sbom = tmp_path / f"scan-{index}.sbom.json"
+        invocation = CliRunner().invoke(
+            cli, ["scan", *paths, "--quiet", "--no-cache", "--max-size", "1MB", "--sbom", str(sbom)]
+        )
+        assert invocation.exit_code == 2
+        components = json.loads(sbom.read_text())["components"]
+        assert len(components) == len({component["bom-ref"] for component in components}) == 2
+        assert all(len(component["name"]) <= 512 for component in components)
+        assert all(
+            next(prop["value"] for prop in c["properties"] if prop["name"] == "risk_score") == "1" for c in components
+        )
+        exports.append(components)
+    assert exports[0] == exports[1]
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_mlflow_direct_sbom_keeps_literal_input_association(monkeypatch: pytest.MonkeyPatch, legacy: bool) -> None:
+    from modelaudit.integrations.mlflow import scan_mlflow_model
+
+    _refuse_mlflow_acquisition(monkeypatch)
+    source = "models:/PublicModel/1?code=" + "x" * 700 + "&version=actual"
+    result = scan_mlflow_model(source, max_file_size=1)
+    output = generate_sbom([source], result.model_dump()) if legacy else generate_sbom_pydantic([source], result)
+    component = json.loads(output)["components"][0]
+    assert next(prop["value"] for prop in component["properties"] if prop["name"] == "risk_score") == "0"
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_mlflow_emitted_finding_paths_keep_original_sbom_association(
+    monkeypatch: pytest.MonkeyPatch, legacy: bool
+) -> None:
+    from modelaudit.integrations.mlflow import scan_mlflow_model
+
+    _refuse_mlflow_acquisition(monkeypatch)
+    source = "models:/PublicModel/1/access_token=" + "x" * 700 + "&version=actual"
+    scanned = scan_mlflow_model(source, max_file_size=1)
+    result = ModelAuditResultModel.model_validate_json(scanned.model_dump_json())
+    paths = [issue.location for issue in result.issues if issue.location]
+    output = generate_sbom(paths, result.model_dump()) if legacy else generate_sbom_pydantic(paths, result)
+    component = json.loads(output)["components"][0]
     assert next(prop["value"] for prop in component["properties"] if prop["name"] == "risk_score") == "1"

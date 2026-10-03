@@ -1731,18 +1731,18 @@ class _ScanPathState:
         added_path = False
         for asset in streaming_result.assets:
             if asset.path:
-                self.scanned_paths.append(_report_source_path(asset.path))
+                self.scanned_paths.append(asset.path)
                 added_path = True
 
         if not added_path and fallback_path is not None and not os.path.exists(fallback_path):
-            self.scanned_paths.append(_report_source_path(fallback_path))
+            self.scanned_paths.append(fallback_path)
 
     def track_directory_paths_for_sbom(self, scan_result: ModelAuditResultModel) -> None:
         """Track completed directory scan assets, including an authoritative empty set."""
         self.sbom_paths_resolved = True
         for asset in scan_result.assets:
             if asset.path:
-                self.scanned_paths.append(_report_source_path(asset.path))
+                self.scanned_paths.append(asset.path)
 
     def defer_temp_cleanup(self, temp_path: str | None, *, cache_enabled: bool, verbose: bool) -> None:
         """Track temporary artifacts for post-SBOM cleanup."""
@@ -2816,23 +2816,22 @@ def _write_scan_sbom(
         dict.fromkeys(asset.path for asset in audit_result.assets if asset.path and asset.type != "skipped")
     )
     if asset_paths and (scan_and_delete or not path_state.sbom_paths_resolved):
-        paths_for_sbom = [_report_source_path(path) for path in asset_paths]
+        paths_for_sbom = asset_paths
     elif path_state.sbom_paths_resolved:
         paths_for_sbom = path_state.scanned_paths
     else:
-        paths_for_sbom = (
-            path_state.scanned_paths
-            if path_state.scanned_paths
-            else [_report_source_path(path) for path in expanded_paths]
-        )
+        paths_for_sbom = path_state.scanned_paths if path_state.scanned_paths else expanded_paths
 
     sbom_text = generate_sbom_pydantic(
         paths_for_sbom,
         audit_result,
         _classification_paths={
-            path: _cli_source_classification_path(_source_identity_path(path, audit_result.file_metadata.get(path)))
+            path: _cli_source_classification_path(
+                path if is_mlflow_uri(path) else _source_identity_path(path, audit_result.file_metadata.get(path))
+            )
             for path in paths_for_sbom
         },
+        _reported_paths={path: _report_source_path(path) for path in paths_for_sbom},
     )
     _write_output_text_file(sbom, sbom_text)
 
@@ -3222,7 +3221,7 @@ def _scan_local_or_downloaded_path(
         elif os.path.isdir(actual_path):
             path_state.track_directory_paths_for_sbom(scan_results)
         else:
-            path_state.scanned_paths.append(_report_source_path(actual_path))
+            path_state.scanned_paths.append(actual_path)
 
         visible_issues = [
             issue for issue in list(scan_results.issues) if verbose or issue.severity != IssueSeverity.DEBUG
@@ -3284,7 +3283,7 @@ def _scan_local_or_downloaded_path(
         logger.error(f"Error during scan of {display_path}: {display_error}")
         click.echo(f"Error scanning {display_path}: {display_error}", err=True)
         path_state.mark_non_shard_error(audit_result)
-        path_state.scanned_paths.append(_report_source_path(actual_path))
+        path_state.scanned_paths.append(actual_path)
 
         if progress_tracker:
             progress_tracker.report_error(Exception(display_error))
@@ -4841,7 +4840,7 @@ def scan_command(
                 display_error = _display_error(exc, path)
                 logger.error(f"Unexpected error processing {display_path}: {display_error}")
                 click.echo(f"Unexpected error processing {display_path}: {display_error}", err=True)
-                path_state.scanned_paths.append(_report_source_path(source_result.actual_path))
+                path_state.scanned_paths.append(source_result.actual_path)
                 path_state.mark_non_shard_error(audit_result)
 
                 if progress_tracker:
