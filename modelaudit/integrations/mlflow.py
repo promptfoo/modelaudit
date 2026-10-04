@@ -14,6 +14,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import unquote, urlparse
 
+from ..finding_identity import preserve_finding_identity
 from ..models import (
     Check,
     CheckStatus,
@@ -24,7 +25,6 @@ from ..models import (
     create_initial_audit_result,
 )
 from ..utils.helpers.evidence import format_evidence_string, format_evidence_value, format_terminal_text
-from ..utils.helpers.finding_identity import preserve_finding_identity
 from ._mlflow_identity import mlflow_source_identity
 
 logger = logging.getLogger(__name__)

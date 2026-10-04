@@ -13,9 +13,9 @@ from cyclonedx.model.component import Component, ComponentType
 from cyclonedx.model.license import LicenseExpression
 from cyclonedx.output import OutputFormat, SchemaVersion, make_outputter
 
+from ..finding_identity import finding_identity
 from ..models import FileMetadataModel, ModelAuditResultModel
 from ..scanner_results import Issue, IssueSeverity
-from ..utils.helpers.finding_identity import finding_identity
 from .source_serialization import serialize_source_identifier, serialize_source_value
 
 SCANNER_VERSION = f"v{_pkg_version('modelaudit')}"
