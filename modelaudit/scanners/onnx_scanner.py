@@ -2576,7 +2576,7 @@ def _build_onnx_weight_analysis_plan(
         return False
 
     cache_fingerprints: dict[int, tuple[Any, tuple[str, str]]] = {}
-    rank_reentry_constant_name_cache: dict[tuple[int, int], frozenset[str]] = {}
+    rank_reentry_constant_name_cache: dict[tuple[Any, ...], frozenset[str]] = {}
 
     def semantic_cache_fingerprint(value: Any) -> tuple[str, str]:
         return semantic_cache_fingerprint_with_owner(value, retain_owner=True)
@@ -2724,50 +2724,15 @@ def _build_onnx_weight_analysis_plan(
                 bindings[graph_input_name] = parent_name
         return bindings
 
-    def rank_reentry_constant_names(subgraph: Any, *, depth: int = 0) -> frozenset[str]:
-        cache_key = (id(subgraph), depth)
+    def rank_reentry_constant_names(subgraph: Any, attribute_bindings: dict[str, Any] | None = None) -> frozenset[str]:
+        cache_key = (id(subgraph), attribute_binding_cache_key(attribute_bindings))
         if cache_key in rank_reentry_constant_name_cache:
             return rank_reentry_constant_name_cache[cache_key]
-        if depth > 6:
-            return frozenset()
+        # Immutable body-local tensors are fixed by graph identity. Every
+        # caller-dependent value enters through a formal input or capture.
         names: set[str] = set()
-        for body_node in getattr(subgraph, "node", ()):
-            if getattr(body_node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS and (
-                body_node.op_type in {"Expand", "Gather", "GatherND", "Reshape", "Squeeze", "Unsqueeze"}
-                or body_node.op_type in _SAME_TYPE_ELEMENTWISE_OPERATORS
-                or body_node.op_type in {"Pow", "OneHot", "MatMul", "Einsum", "GatherElements"}
-            ):
-                input_indexes = (
-                    range(1, len(getattr(body_node, "input", ())))
-                    if body_node.op_type in {"Expand", "Gather", "GatherND", "Reshape", "Squeeze", "Unsqueeze"}
-                    else range(len(getattr(body_node, "input", ())))
-                )
-                names.update(
-                    str(body_node.input[input_index]) for input_index in input_indexes if body_node.input[input_index]
-                )
-            function_key = (
-                str(getattr(body_node, "domain", "")),
-                str(getattr(body_node, "op_type", "")),
-                str(getattr(body_node, "overload", "")),
-            )
-            function = functions.get(function_key)
-            if function is not None:
-                function_names = rank_reentry_constant_names(function, depth=depth + 1)
-                if function_names:
-                    input_bindings = {
-                        _onnx_value_name(function.input[input_index]): str(actual_name)
-                        for input_index, actual_name in enumerate(getattr(body_node, "input", ()))
-                        if input_index < len(getattr(function, "input", ()))
-                    }
-                    names.update(input_bindings.get(name, name) for name in function_names)
-            for attribute in getattr(body_node, "attribute", ()):
-                for nested_graph in _iter_attribute_graphs(attribute):
-                    if body_node.op_type == "Loop":
-                        names.update(
-                            str(input_name) for input_name in getattr(body_node, "input", ())[:2] if input_name
-                        )
-                        names.update(graph_external_reference_names(nested_graph))
-                    names.update(rank_reentry_constant_names(nested_graph, depth=depth + 1))
+        merge_dependency_names(names, (_onnx_value_name(value) for value in getattr(subgraph, "input", ())))
+        merge_dependency_names(names, graph_external_reference_names(subgraph, attribute_bindings))
         result = frozenset(names)
         rank_reentry_constant_name_cache[cache_key] = result
         return result
@@ -2777,7 +2742,7 @@ def _build_onnx_weight_analysis_plan(
     reentry_promotion_in_progress: set[tuple[Any, ...]] = set()
     reentry_external_context_shape_cache: dict[tuple[Any, ...], dict[str, tuple[int, ...]]] = {}
     graph_output_dependency_cache: dict[
-        tuple[int, tuple[int, ...] | None, tuple[tuple[str, str, str], ...]], frozenset[str]
+        tuple[int, tuple[int, ...], tuple[tuple[str, str, str], ...]], frozenset[str]
     ] = {}
     graph_value_dependency_cache: dict[
         tuple[int, tuple[str, ...], tuple[tuple[str, str, str], ...]], tuple[Any, frozenset[str]]
@@ -2792,6 +2757,8 @@ def _build_onnx_weight_analysis_plan(
     graph_node_order_cache: dict[int, dict[int, tuple[int, Any]]] = {}
     graph_nodes_cache: dict[int, tuple[Any, tuple[Any, ...]]] = {}
     dependency_collection_limit_marker = "\0modelaudit_dependency_collection_limit\0"
+    dependency_collection_limit = frozenset({dependency_collection_limit_marker})
+    dependency_closure_work_remaining = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
 
     def graph_nodes_once(subgraph: Any) -> tuple[Any, ...]:
         cached = graph_nodes_cache.get(id(subgraph))
@@ -2899,7 +2866,14 @@ def _build_onnx_weight_analysis_plan(
         value_names: Iterable[str],
         local_attribute_bindings: dict[str, Any],
     ) -> frozenset[str]:
-        dependencies = {str(value_name) for value_name in value_names if value_name}
+        nonlocal dependency_closure_work_remaining
+        dependencies: set[str] = set()
+        for value_name in value_names:
+            if dependency_closure_work_remaining <= 0:
+                return dependency_collection_limit
+            dependency_closure_work_remaining -= 1
+            if value_name:
+                dependencies.add(str(value_name))
         pending = list(dependencies)
         producer_nodes = graph_output_producer_nodes_by_name(subgraph)
         visited_node_ids: set[int] = set()
@@ -2911,16 +2885,12 @@ def _build_onnx_weight_analysis_plan(
                     continue
                 visited_node_ids.add(node_id)
                 for dependency_name in graph_node_direct_dependency_names(producer_node, local_attribute_bindings):
-                    if dependency_name:
-                        dependency_name = str(dependency_name)
-                        if dependency_name not in dependencies:
-                            dependencies.add(dependency_name)
-                            pending.append(dependency_name)
-                    if len(dependencies) > _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK:
-                        dependencies.add(dependency_collection_limit_marker)
-                        return frozenset(dependencies)
-                    if dependency_name == dependency_collection_limit_marker:
-                        return frozenset(dependencies)
+                    if dependency_closure_work_remaining <= 0 or dependency_name == dependency_collection_limit_marker:
+                        return dependency_collection_limit
+                    dependency_closure_work_remaining -= 1
+                    if dependency_name and dependency_name not in dependencies:
+                        dependencies.add(dependency_name)
+                        pending.append(dependency_name)
         return frozenset(dependencies)
 
     def graph_output_dependency_names(
@@ -2929,25 +2899,21 @@ def _build_onnx_weight_analysis_plan(
         attribute_bindings: dict[str, Any] | None = None,
     ) -> frozenset[str]:
         graph_outputs = getattr(subgraph, "output", ())
-        output_index_key = None if output_indexes is None else tuple(sorted(set(output_indexes)))
-        cache_key = (id(subgraph), output_index_key, attribute_binding_cache_key(attribute_bindings))
+        if len(graph_outputs) > _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_OUTPUTS:
+            return dependency_collection_limit
+        output_index_key = (
+            None
+            if output_indexes is None
+            else tuple(sorted({index for index in output_indexes if 0 <= index < len(graph_outputs)}))
+        )
+        cache_output_indexes = tuple(range(len(graph_outputs))) if output_index_key is None else output_index_key
+        cache_key = (id(subgraph), cache_output_indexes, attribute_binding_cache_key(attribute_bindings))
         if cache_key in graph_output_dependency_cache:
             return graph_output_dependency_cache[cache_key]
-        local_attribute_bindings = attribute_bindings or {}
-        if output_index_key is None and len(graph_outputs) > _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_OUTPUTS:
-            result = frozenset({dependency_collection_limit_marker})
-            graph_output_dependency_cache[cache_key] = result
-            return result
-        if output_index_key is None:
-            initial_outputs = {output_name for output in graph_outputs if (output_name := _onnx_value_name(output))}
-        else:
-            initial_outputs = {
-                output_name
-                for index in output_index_key
-                if 0 <= index < len(graph_outputs)
-                if (output_name := _onnx_value_name(graph_outputs[index]))
-            }
-        result = graph_dependency_closure_names(subgraph, initial_outputs, local_attribute_bindings)
+        initial_outputs = {
+            output_name for index in cache_output_indexes if (output_name := _onnx_value_name(graph_outputs[index]))
+        }
+        result = graph_dependency_closure_names(subgraph, initial_outputs, attribute_bindings or {})
         graph_output_dependency_cache[cache_key] = result
         return result
 
@@ -3140,6 +3106,9 @@ def _build_onnx_weight_analysis_plan(
         related_graph_input_shapes = related_graph_input_shapes or {}
         if related_graph_input_shapes_cache_key is None:
             related_graph_input_shapes_cache_key = tuple(sorted(related_graph_input_shapes.items()))
+        constant_names = rank_reentry_constant_names(subgraph, attribute_bindings)
+        if dependency_names_exceeded_limit(constant_names):
+            return True
         cache_key = (
             id(subgraph),
             graph_input_name,
@@ -3150,7 +3119,8 @@ def _build_onnx_weight_analysis_plan(
             related_graph_input_shapes_cache_key,
             opset_cache_key(opset_versions),
             attribute_binding_cache_key(attribute_bindings),
-            constant_binding_cache_key(constants, rank_reentry_constant_names(subgraph)),
+            constant_binding_cache_key(constants, constant_names),
+            constant_binding_cache_key(bound_input_constants or {}, constant_names),
             depth,
         )
         if cache_key in reentry_promotion_cache:
@@ -3912,13 +3882,16 @@ def _build_onnx_weight_analysis_plan(
         graph_outputs = getattr(subgraph, "output", ())
         if depth > 6 or graph_taint_work_remaining <= 0:
             return set(range(len(graph_outputs)))
+        constant_names = rank_reentry_constant_names(subgraph, attribute_bindings)
+        if dependency_names_exceeded_limit(constant_names):
+            return set(range(len(graph_outputs)))
         cache_key = (
             id(subgraph),
             tuple(sorted(graph_input_names)),
             opset_cache_key(opset_versions),
             attribute_binding_cache_key(attribute_bindings),
             depth,
-            constant_binding_cache_key(inherited_constants or {}, rank_reentry_constant_names(subgraph)),
+            constant_binding_cache_key(inherited_constants or {}, constant_names),
         )
         if cache_key in graph_taint_cache:
             return set(graph_taint_cache[cache_key])
@@ -4066,6 +4039,9 @@ def _build_onnx_weight_analysis_plan(
             reference_name = str(getattr(attribute, "ref_attr_name", ""))
             return (attribute_bindings or {}).get(reference_name) if reference_name else attribute
 
+        constant_names = rank_reentry_constant_names(subgraph, attribute_bindings)
+        if dependency_names_exceeded_limit(constant_names):
+            return set(range(len(subgraph.output))), {_onnx_value_name(value) for value in subgraph.input} | input_names
         key = (
             id(node),
             id(subgraph),
@@ -4073,9 +4049,7 @@ def _build_onnx_weight_analysis_plan(
             opset_cache_key(opset_versions),
             attribute_binding_cache_key(attribute_bindings),
             depth,
-            constant_binding_cache_key(
-                constants, rank_reentry_constant_names(subgraph) | frozenset(node_input_slots(node)[:2])
-            ),
+            constant_binding_cache_key(constants, constant_names | frozenset(node_input_slots(node)[:2])),
         )
         if key in control_flow_taint_cache:
             cached_outputs, cached_names = control_flow_taint_cache[key]
@@ -4334,13 +4308,16 @@ def _build_onnx_weight_analysis_plan(
             return False
         if depth > 6:
             return True
+        constant_names = rank_reentry_constant_names(subgraph, attribute_bindings)
+        if dependency_names_exceeded_limit(constant_names):
+            return True
         cache_key = (
             id(subgraph),
             graph_input_name,
             opset_cache_key(opset_versions),
             attribute_binding_cache_key(attribute_bindings),
             depth,
-            constant_binding_cache_key(inherited_constants or {}, rank_reentry_constant_names(subgraph)),
+            constant_binding_cache_key(inherited_constants or {}, constant_names),
         )
         if cache_key in weight_reachability_cache:
             return weight_reachability_cache[cache_key]
@@ -5374,7 +5351,7 @@ def _build_onnx_weight_analysis_plan(
             output_shape = resolved_shape
             transform = _OnnxWeightTransform("Reshape", output_shape)
 
-        if output_shape == lineage.shape:
+        if output_shape == lineage.shape and transform.kind != "Transpose":
             return lineage
 
         return _OnnxWeightLineage(
@@ -5701,6 +5678,76 @@ def _build_onnx_weight_analysis_plan(
                 )
             )
         return summarize_weight_lineage_gap(promoted_lineages, truncated=summary.truncated)
+
+    stack_invariance_work_remaining = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
+
+    def control_flow_stack_values_are_invariant(
+        node: Any,
+        subgraph: Any,
+        graph_output_index: int,
+        graph_output_lineages: list[dict[int, _OnnxWeightLineage]],
+        parent_lineages: dict[str, dict[int, _OnnxWeightLineage]],
+        opset_versions: dict[str, int],
+        attribute_bindings: dict[str, Any],
+    ) -> bool:
+        nonlocal stack_invariance_work_remaining
+        input_offset = 2 if node.op_type == "Loop" else 0
+        output_offset = 1 if node.op_type == "Loop" else 0
+        parent_offset = 2 if node.op_type == "Loop" else scan_sequence_lens_input_offset(node, opset_versions)
+        state_count = (
+            len(node.input) - 2
+            if node.op_type == "Loop"
+            else scan_stacked_output_start(
+                node,
+                opset_versions,
+                resolve_attribute=lambda attribute: (
+                    attribute_bindings.get(str(attribute.ref_attr_name))
+                    if getattr(attribute, "ref_attr_name", "")
+                    else attribute
+                ),
+            )
+        )
+        graph_inputs = getattr(subgraph, "input", ())
+        if len(graph_inputs) > stack_invariance_work_remaining:
+            return False
+        stack_invariance_work_remaining -= len(graph_inputs)
+        state_inputs = {
+            _onnx_value_name(graph_inputs[index + input_offset]): (
+                index + output_offset,
+                str(node.input[index + parent_offset]),
+            )
+            for index in range(max(state_count, 0))
+            if index + input_offset < len(graph_inputs) and index + parent_offset < len(node.input)
+        }
+        varying_inputs = {_onnx_value_name(value) for value in graph_inputs} - state_inputs.keys()
+        pending = [graph_output_index]
+        visited: set[int] = set()
+        while pending:
+            output_index = pending.pop()
+            if output_index in visited:
+                continue
+            visited.add(output_index)
+            dependencies = graph_output_dependency_names(subgraph, (output_index,), attribute_bindings)
+            if dependency_names_exceeded_limit(dependencies) or len(dependencies) > stack_invariance_work_remaining:
+                return False
+            stack_invariance_work_remaining -= len(dependencies)
+            if varying_inputs.intersection(dependencies):
+                return False
+            for name in dependencies:
+                binding = state_inputs.get(name)
+                if binding is None:
+                    continue
+                next_index, parent_name = binding
+                initial = parent_lineages.get(parent_name, {})
+                if (
+                    not initial
+                    or any(lineage.unresolved_reason is not None for lineage in initial.values())
+                    or next_index >= len(graph_output_lineages)
+                    or graph_output_lineages[next_index] != initial
+                ):
+                    return False
+                pending.append(next_index)
+        return True
 
     def lineages_after_control_flow_rank_increase(
         lineages: dict[int, _OnnxWeightLineage],
@@ -6916,7 +6963,9 @@ def _build_onnx_weight_analysis_plan(
                         condition_input = (
                             str(current_node.input[1]) if len(current_node.input) > 1 and current_node.input[1] else ""
                         )
-                        if trip_input in graph_input_names or condition_input in graph_input_names:
+                        if graph_input_is_runtime_overridable(trip_input, graph_input_names, constants) or (
+                            graph_input_is_runtime_overridable(condition_input, graph_input_names, constants)
+                        ):
                             return None
                         trip_count = (
                             constant_scalar_value(constants.get(trip_input), int(onnx.TensorProto.INT64))
@@ -9889,6 +9938,32 @@ def _build_onnx_weight_analysis_plan(
                             graph_output_rank_proven = (
                                 graph_output_rank_proven and state_input_name in proven_value_ranks
                             )
+                    if (
+                        graph_output_parent_lineages
+                        and stacked_scan_output
+                        and not (node.op_type == "Loop" and loop_exact_iteration_count(max_count=1) is not None)
+                        and not control_flow_stack_values_are_invariant(
+                            node,
+                            subgraph,
+                            graph_output_index,
+                            graph_output_lineages,
+                            value_lineages,
+                            opset_versions,
+                            attribute_bindings,
+                        )
+                    ):
+                        # Shape invariance does not imply value invariance. A
+                        # later iteration can carry a different initializer.
+                        graph_output_parent_lineages = {
+                            initializer_index: _OnnxWeightLineage(
+                                initializer_index=lineage.initializer_index,
+                                shape=lineage.shape,
+                                data_type=lineage.data_type,
+                                transforms=lineage.transforms,
+                                unresolved_reason=lineage.unresolved_reason or "unresolved_control_flow_stack_lineage",
+                            )
+                            for initializer_index, lineage in graph_output_parent_lineages.items()
+                        }
                     if graph_output_parent_lineages and (
                         stacked_scan_output
                         or (
@@ -11176,95 +11251,115 @@ def _build_onnx_weight_analysis_plan(
 
             transformed_views: dict[tuple[_OnnxWeightTransform, ...], Any] = {(): array}
             for consumer_group in accepted_groups:
-                transformed = transformed_views.get(consumer_group.lineage.transforms)
-                if transformed is None:
-                    transformed = array
-                    for transform in consumer_group.lineage.transforms:
-                        if transform.kind == "Identity":
-                            continue
-                        if transform.kind == "Transpose":
-                            transformed = np.transpose(transformed, axes=transform.parameters)
-                        elif transform.kind == "Reshape":
-                            transformed = np.reshape(transformed, transform.parameters)
-                        elif transform.kind == "Expand":
-                            transformed = np.broadcast_to(transformed, transform.parameters)
-                        if transformed.size and not np.shares_memory(array, transformed):
-                            raise RuntimeError("ONNX weight lineage transform requires a full-tensor copy")
-                    transformed_views[consumer_group.lineage.transforms] = transformed
+                try:
+                    transformed = transformed_views.get(consumer_group.lineage.transforms)
+                    if transformed is None:
+                        transformed = array
+                        for transform in consumer_group.lineage.transforms:
+                            if transform.kind == "Identity":
+                                continue
+                            if transform.kind == "Transpose":
+                                transformed = np.transpose(transformed, axes=transform.parameters)
+                            elif transform.kind == "Reshape":
+                                transformed = np.reshape(transformed, transform.parameters)
+                            elif transform.kind == "Expand":
+                                transformed = np.broadcast_to(transformed, transform.parameters)
+                            if transformed.size and not np.shares_memory(array, transformed):
+                                raise RuntimeError("ONNX weight lineage transform requires a full-tensor copy")
+                        transformed_views[consumer_group.lineage.transforms] = transformed
 
-                output_axes = consumer_group.output_axes
-                tensor_weights = transformed
-                conceptual_output_axes = output_axes
-                if consumer_group.node.op_type == "ConvTranspose":
-                    group_value = consumer_group.group
-                    if group_value <= 0 or int(transformed.shape[0]) % group_value != 0:
-                        raise ValueError("ConvTranspose initializer has an incompatible group")
-                    tensor_weights = transformed.reshape(
-                        group_value,
-                        int(transformed.shape[0]) // group_value,
-                        *transformed.shape[1:],
+                    expected_shape = consumer_group.lineage.shape
+                    if expected_shape is not None and (
+                        len(transformed.shape) != len(expected_shape)
+                        or any(
+                            expected >= 0 and actual != expected
+                            for actual, expected in zip(transformed.shape, expected_shape, strict=True)
+                        )
+                    ):
+                        raise ValueError("ONNX weight view does not match its proven lineage shape")
+
+                    output_axes = consumer_group.output_axes
+                    tensor_weights = transformed
+                    conceptual_output_axes = output_axes
+                    if consumer_group.node.op_type == "ConvTranspose":
+                        group_value = consumer_group.group
+                        if group_value <= 0 or int(transformed.shape[0]) % group_value != 0:
+                            raise ValueError("ConvTranspose initializer has an incompatible group")
+                        tensor_weights = transformed.reshape(
+                            group_value,
+                            int(transformed.shape[0]) // group_value,
+                            *transformed.shape[1:],
+                        )
+                        conceptual_output_axes = (0, 2)
+                    if tensor_weights.size and not np.shares_memory(array, tensor_weights):
+                        raise RuntimeError("ONNX weight analysis requires a full-tensor copy")
+
+                    matrix_analysis = consumer_group.analysis_kind == "matrix"
+                    analysis_weights = tensor_weights
+                    if matrix_analysis:
+                        if len(output_axes) != 1 or transformed.ndim != 2:
+                            raise ValueError("Matrix weight analysis requires exactly one output axis")
+                        analysis_weights = np.moveaxis(transformed, output_axes[0], -1)
+                        conceptual_output_axes = (analysis_weights.ndim - 1,)
+                    input_axes = tuple(
+                        axis for axis in range(analysis_weights.ndim) if axis not in conceptual_output_axes
                     )
-                    conceptual_output_axes = (0, 2)
-                if tensor_weights.size and not np.shares_memory(array, tensor_weights):
-                    raise RuntimeError("ONNX weight analysis requires a full-tensor copy")
-
-                matrix_analysis = consumer_group.analysis_kind == "matrix"
-                analysis_weights = tensor_weights
-                if matrix_analysis:
-                    if len(output_axes) != 1 or transformed.ndim != 2:
-                        raise ValueError("Matrix weight analysis requires exactly one output axis")
-                    analysis_weights = np.moveaxis(transformed, output_axes[0], -1)
-                    conceptual_output_axes = (analysis_weights.ndim - 1,)
-                input_axes = tuple(axis for axis in range(analysis_weights.ndim) if axis not in conceptual_output_axes)
-                analysis_shape = [
-                    math.prod(int(analysis_weights.shape[axis]) for axis in input_axes),
-                    math.prod(int(analysis_weights.shape[axis]) for axis in conceptual_output_axes),
-                ]
-                first_consumer = consumer_group.consumers[0]
-                context = {
-                    "analysis_id": analysis_id,
-                    **_bounded_onnx_metadata_fields(plan, "initializer", initializer.name),
-                    "initializer_graph_index": initializer_graph_indexes[initializer_index],
-                    "consumer_op": first_consumer["op"],
-                    "consumer_op_length": first_consumer["op_length"],
-                    "consumer_op_truncated": first_consumer["op_truncated"],
-                    "consumer_node": first_consumer["node"],
-                    "consumer_node_length": first_consumer["node_length"],
-                    "consumer_node_truncated": first_consumer["node_truncated"],
-                    "consumer_node_index": consumer_group.node_index,
-                    "consumer_input_index": consumer_group.input_index,
-                    "output_axis": output_axes[-1],
-                    **_bounded_onnx_integer_sequence("output_axes", output_axes),
-                    "analysis_kind": consumer_group.analysis_kind,
-                    "group": consumer_group.group,
-                    **_bounded_onnx_integer_sequence("stored_shape", initializer.dims),
-                    **_bounded_onnx_integer_sequence("transformed_shape", transformed.shape),
-                    "analysis_shape": analysis_shape,
-                    **_bounded_onnx_integer_sequence("conceptual_output_axes", conceptual_output_axes),
-                    "analysis_storage_shares_memory": bool(
-                        array.size == 0 or np.shares_memory(array, analysis_weights)
-                    ),
-                    "analysis_materialization": "zero_copy_view_chunked_reduction",
-                    "lineage": [transform.kind for transform in consumer_group.lineage.transforms],
-                    "lineage_transform_count": len(consumer_group.lineage.transforms),
-                    "consumer_count": consumer_group.consumer_count,
-                    "consumers": consumer_group.consumers,
-                    "consumers_truncated": consumer_group.consumer_count > len(consumer_group.consumers),
-                }
-                plan.specs.append(
-                    _OnnxWeightAnalysisSpec(
-                        initializer_index=initializer_index,
-                        analysis_id=analysis_id,
-                        weights=analysis_weights,
-                        output_axes=conceptual_output_axes,
-                        matrix_analysis=matrix_analysis,
-                        context=context,
-                    ),
-                )
-                analysis_id += 1
-                analyzed_initializer_indexes.add(initializer_index)
-                if len(eligible_metadata) < _ONNX_WEIGHT_METADATA_SAMPLE_LIMIT:
-                    eligible_metadata.append(context)
+                    analysis_shape = [
+                        math.prod(int(analysis_weights.shape[axis]) for axis in input_axes),
+                        math.prod(int(analysis_weights.shape[axis]) for axis in conceptual_output_axes),
+                    ]
+                    first_consumer = consumer_group.consumers[0]
+                    context = {
+                        "analysis_id": analysis_id,
+                        **_bounded_onnx_metadata_fields(plan, "initializer", initializer.name),
+                        "initializer_graph_index": initializer_graph_indexes[initializer_index],
+                        "consumer_op": first_consumer["op"],
+                        "consumer_op_length": first_consumer["op_length"],
+                        "consumer_op_truncated": first_consumer["op_truncated"],
+                        "consumer_node": first_consumer["node"],
+                        "consumer_node_length": first_consumer["node_length"],
+                        "consumer_node_truncated": first_consumer["node_truncated"],
+                        "consumer_node_index": consumer_group.node_index,
+                        "consumer_input_index": consumer_group.input_index,
+                        "output_axis": output_axes[-1],
+                        **_bounded_onnx_integer_sequence("output_axes", output_axes),
+                        "analysis_kind": consumer_group.analysis_kind,
+                        "group": consumer_group.group,
+                        **_bounded_onnx_integer_sequence("stored_shape", initializer.dims),
+                        **_bounded_onnx_integer_sequence("transformed_shape", transformed.shape),
+                        "analysis_shape": analysis_shape,
+                        **_bounded_onnx_integer_sequence("conceptual_output_axes", conceptual_output_axes),
+                        "analysis_storage_shares_memory": bool(
+                            array.size == 0 or np.shares_memory(array, analysis_weights)
+                        ),
+                        "analysis_materialization": "zero_copy_view_chunked_reduction",
+                        "lineage": [transform.kind for transform in consumer_group.lineage.transforms],
+                        "lineage_transform_count": len(consumer_group.lineage.transforms),
+                        "consumer_count": consumer_group.consumer_count,
+                        "consumers": consumer_group.consumers,
+                        "consumers_truncated": consumer_group.consumer_count > len(consumer_group.consumers),
+                    }
+                    plan.specs.append(
+                        _OnnxWeightAnalysisSpec(
+                            initializer_index=initializer_index,
+                            analysis_id=analysis_id,
+                            weights=analysis_weights,
+                            output_axes=conceptual_output_axes,
+                            matrix_analysis=matrix_analysis,
+                            context=context,
+                        ),
+                    )
+                    analysis_id += 1
+                    analyzed_initializer_indexes.add(initializer_index)
+                    if len(eligible_metadata) < _ONNX_WEIGHT_METADATA_SAMPLE_LIMIT:
+                        eligible_metadata.append(context)
+                except Exception as exc:
+                    plan.extraction_failures += 1
+                    logger.warning(
+                        "Failed to prepare ONNX weight view for initializer '%s' (%s)",
+                        bounded_name,
+                        type(exc).__name__,
+                    )
         except Exception as exc:
             plan.extraction_failures += 1
             bounded_name, _, _ = _bounded_onnx_metadata_text(plan, initializer.name)
