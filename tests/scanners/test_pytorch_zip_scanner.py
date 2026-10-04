@@ -21916,8 +21916,8 @@ def test_pytorch_zip_context_round5_numeric_memo_validation_aliases(
     normalized: list[bytes] = []
     original_dis = pickletools.dis
 
-    def capture_dis(sample: bytes, **kwargs: Any) -> None:
-        normalized.append(sample)
+    def capture_dis(sample: bytes | io.BytesIO, **kwargs: Any) -> None:
+        normalized.append(sample.getvalue() if isinstance(sample, io.BytesIO) else sample)
         original_dis(sample, **kwargs)
 
     monkeypatch.setattr(pickletools, "dis", capture_dis)
@@ -24133,6 +24133,7 @@ def test_pytorch_zip_native7_p2_backward_mark_recovery_reserves_full_input(
             False,
         ),
     ],
+    ids=["237a081b", "6ecc80d9", "951fbd16"],
 )
 def test_pytorch_zip_native7_p2_distinct_inst_archive_controls(
     tmp_path: Path, native_case: str, value: bytes, clean: bool
@@ -24953,6 +24954,9 @@ def test_pytorch_zip_native8_header_rejection_preserves_later_security(stream: b
         (b"(im\xc3\xb3dulo\nx\n.", False),
         (b"(imodule\nth\xc3\xadng\n.", False),
         (b"cm\xc3\xb3dulo\nx\n.", True),
+        (b"cmodule\nth\xc3\xadng\n.", True),
+        (b"\x80\x04cm\xc3\xb3dulo\nx\n.", True),
+        (b"cm\xffodulo\nx\n.", False),
         (b"\x80\x04cos\nabort\n0(im\xc3\xb3dulo\nx\n.", True),
         (b"\x80\x04(im\xc3\xb3dulo\nx\ncos\nabort\n.", False),
         (b"\x80\x04Nq\x00q\x000cos\nabort\n0(im\xc3\xb3dulo\nx\n.", True),

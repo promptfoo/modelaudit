@@ -325,6 +325,29 @@ class _ValidatedPytorchStorageDataPklMembers:
     storage_member_sizes_by_data_pkl: dict[str, dict[str, int]]
 
 
+class _NumericPickleProofReader(io.BytesIO):
+    """Let older pickletools validate UTF-8 GLOBAL names without changing offsets."""
+
+    def __init__(self, value: bytes) -> None:
+        super().__init__(value)
+        self._global_lines_remaining = 0
+
+    def read(self, size: int | None = -1) -> bytes:
+        value = super().read(size)
+        self._global_lines_remaining = 2 if size == 1 and value == b"c" else 0
+        return value
+
+    def readline(self, size: int | None = -1) -> bytes:
+        value = super().readline(size)
+        if self._global_lines_remaining:
+            self._global_lines_remaining -= 1
+            if value.endswith(b"\n"):
+                # Only stack structure matters here. Preserve the underlying
+                # byte positions and validate UTF-8 before supplying ASCII names.
+                return value.decode("utf-8").encode("ascii", errors="replace")
+        return value
+
+
 class _PickleLiteralPreservationBudgetExceeded(ValueError):
     """Raised when suspicious-literal preservation cannot finish boundedly."""
 
@@ -6105,7 +6128,7 @@ class PyTorchZipScanner(BaseScanner):
                 ):
                     return True
                 candidate = value[offset:probe_end]
-                reader = io.BytesIO(candidate)
+                reader = _NumericPickleProofReader(candidate)
                 stop_end = None
                 security_seen = False
                 security_prefix_end = None
@@ -6200,7 +6223,7 @@ class PyTorchZipScanner(BaseScanner):
                         if not validation_has_stop:
                             validation.extend(b"N.")
                         try:
-                            pickletools.dis(bytes(validation), out=DiscardDisassembly())
+                            pickletools.dis(_NumericPickleProofReader(bytes(validation)), out=DiscardDisassembly())
                         except Exception as exc:
                             # The unpickler permits unused stack items after its result.
                             if not str(exc).startswith("stack not empty after STOP"):
