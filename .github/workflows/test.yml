@@ -813,6 +813,8 @@ jobs:
           # Exercise the release platform where scalar-probe timing regressed.
           - os: macos-15-intel
             python-version: "3.11"
+          - os: macos-15-intel
+            python-version: "3.12"
     defaults:
       run:
         working-directory: packages/modelaudit-picklescan
