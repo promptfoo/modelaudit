@@ -25913,7 +25913,10 @@ def test_pytorch_zip_complete_proto_encoded_literal_preserves_archive_outcomes(
             ("archive/data.pkl", metadata),
             ("archive/data/0", storage),
         ):
-            archive.writestr(zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0)), content)
+            zip_info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+            # Keep the fixture hash independent of the host ZIP creator platform.
+            zip_info.create_system = 3
+            archive.writestr(zip_info, content)
     if encoded_security and referenced:
         assert (
             hashlib.sha256(metadata).hexdigest() == "cf30fd494ae74ba923c751fb50557a3df9374d3d088211eb4b52c88ddbac4c1b"
