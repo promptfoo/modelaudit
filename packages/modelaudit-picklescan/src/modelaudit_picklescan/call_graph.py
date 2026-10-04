@@ -17,7 +17,7 @@ import threading
 import zipimport
 from collections import deque
 from collections.abc import Callable, Iterable, Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -561,14 +561,6 @@ def _runtime_module_attribute_without_hooks(module_name: str, attribute: str) ->
     return dict.get(namespace, attribute)
 
 
-def _runtime_meta_path_without_hooks() -> tuple[object, ...] | None:
-    return _exact_list_items_without_hooks(sys.meta_path)
-
-
-def _runtime_path_hooks_without_hooks() -> tuple[object, ...] | None:
-    return _exact_list_items_without_hooks(sys.path_hooks)
-
-
 def _runtime_search_path_without_hooks() -> tuple[str, ...] | None:
     entries = _exact_list_items_without_hooks(sys.path)
     if entries is None or any(type(entry) is not str for entry in entries):
@@ -586,22 +578,10 @@ def _runtime_path_importer_cache_without_hooks() -> dict[str, object] | None:
 def _runtime_import_containers_are_safe() -> bool:
     return (
         _runtime_sys_modules_without_hooks() is not None
-        and _runtime_meta_path_without_hooks() is not None
-        and _runtime_path_hooks_without_hooks() is not None
+        and _exact_list_items_without_hooks(sys.meta_path) is not None
+        and _exact_list_items_without_hooks(sys.path_hooks) is not None
         and _runtime_search_path_without_hooks() is not None
         and _runtime_path_importer_cache_without_hooks() is not None
-    )
-
-
-def _namespace_matches_snapshot(
-    namespace: Mapping[str, object],
-    expected: Mapping[str, _RuntimeValueSnapshot],
-) -> bool:
-    return all(
-        key in namespace
-        and namespace[key] is expected_value[0]
-        and _runtime_value_matches_snapshot(namespace[key], expected_value)
-        for key, expected_value in expected.items()
     )
 
 
@@ -626,9 +606,11 @@ def _interpreter_import_runtime_matches_snapshot() -> bool:
     modules = _runtime_sys_modules_without_hooks()
     if modules is None or not _runtime_import_containers_are_safe():
         return False
-    if type(_IMPORT_RUNTIME_BUILTINS) is not dict or not _namespace_matches_snapshot(
-        _IMPORT_RUNTIME_BUILTINS,
-        _IMPORT_RUNTIME_BUILTINS_SNAPSHOT,
+    if type(_IMPORT_RUNTIME_BUILTINS) is not dict or not all(
+        key in _IMPORT_RUNTIME_BUILTINS
+        and _IMPORT_RUNTIME_BUILTINS[key] is expected_value[0]
+        and _runtime_value_matches_snapshot(_IMPORT_RUNTIME_BUILTINS[key], expected_value)
+        for key, expected_value in _IMPORT_RUNTIME_BUILTINS_SNAPSHOT.items()
     ):
         return False
     for module_name, expected_module, expected_namespace in _IMPORT_RUNTIME_MODULE_SNAPSHOTS:
@@ -637,7 +619,12 @@ def _interpreter_import_runtime_matches_snapshot() -> bool:
         namespace = ModuleType.__getattribute__(expected_module, "__dict__")
         if (
             type(namespace) is not dict
-            or not _namespace_matches_snapshot(namespace, expected_namespace)
+            or not all(
+                key in namespace
+                and namespace[key] is expected_value[0]
+                and _runtime_value_matches_snapshot(namespace[key], expected_value)
+                for key, expected_value in expected_namespace.items()
+            )
             or any(name in namespace for name in _IMPORT_RUNTIME_MISSING_GLOBAL_NAMES.get(module_name, ()))
         ):
             return False
@@ -1624,10 +1611,6 @@ _PICKLE_ENTERED_IMPORT_EXECUTION_METHODS = (
     *_PICKLE_CONSTRUCTOR_ENTRYPOINT_METHODS,
     *_PICKLE_BUILD_ENTRYPOINT_METHODS,
 )
-_INHERITED_CLASS_ENTRYPOINT_METHODS = (
-    *_PICKLE_CONSTRUCTOR_ENTRYPOINT_METHODS,
-    *_PICKLE_BUILD_ENTRYPOINT_METHODS,
-)
 _SHARED_SOURCE_SENSITIVE_CACHE_DEPTH: ContextVar[int] = ContextVar(
     "_SHARED_SOURCE_SENSITIVE_CACHE_DEPTH",
     default=0,
@@ -2510,13 +2493,6 @@ def _loaded_interpreter_states_match(
     return left[0] is right[0] and left[1] is right[1] and left[2] is right[2] and origins_match and left[4] is right[4]
 
 
-def _loaded_interpreter_module_state_matches(
-    module_name: str,
-    expected: _LoadedInterpreterModuleState,
-) -> bool:
-    return _loaded_interpreter_states_match(_current_loaded_interpreter_module_state(module_name), expected)
-
-
 def _loaded_interpreter_module_matches_startup(module_name: str) -> bool:
     state = _current_loaded_interpreter_module_state(module_name)
     _track_loaded_interpreter_module_state(module_name, state)
@@ -3212,19 +3188,12 @@ def shared_source_sensitive_caches() -> Iterator[None]:
     depth = _SHARED_SOURCE_SENSITIVE_CACHE_DEPTH.get()
     if depth > 0:
         snapshot = _SHARED_SOURCE_SENSITIVE_SNAPSHOT.get()
-        if snapshot is None:
+        with snapshot.lock if snapshot is not None else nullcontext():
             token = _SHARED_SOURCE_SENSITIVE_CACHE_DEPTH.set(depth + 1)
             try:
                 yield
             finally:
                 _SHARED_SOURCE_SENSITIVE_CACHE_DEPTH.reset(token)
-        else:
-            with snapshot.lock:
-                token = _SHARED_SOURCE_SENSITIVE_CACHE_DEPTH.set(depth + 1)
-                try:
-                    yield
-                finally:
-                    _SHARED_SOURCE_SENSITIVE_CACHE_DEPTH.reset(token)
         return
 
     with _SHARED_SOURCE_SENSITIVE_CACHE_LOCK:
@@ -3236,7 +3205,8 @@ def shared_source_sensitive_caches() -> Iterator[None]:
                 search_context=_source_search_context(),
                 resolution_context=resolution_context,
                 import_runtime_trusted=import_runtime_trusted,
-                reusable=import_runtime_trusted and _resolution_context_is_reusable(resolution_context),
+                reusable=import_runtime_trusted
+                and all(":unreusable:" not in identity for identities in resolution_context for identity in identities),
             )
         )
         token = _SHARED_SOURCE_SENSITIVE_CACHE_DEPTH.set(1)
@@ -3398,7 +3368,7 @@ def _iter_callable_invocation_references(callable_invocations: object | None) ->
         invocation_import_reference = f"{module}.{name}"
         for reference_module, reference_name in (
             (module, name),
-            *_callable_singleton_aliases(module, name),
+            *_CALLABLE_SINGLETON_ALIASES.get((module, name), ()),
         ):
             reference_key = (
                 reference_module,
@@ -3594,7 +3564,7 @@ def _callable_invocation_argument_shapes(
             or positional_arg_count < 0
         ):
             continue
-        for reference in ((module, name), *_callable_singleton_aliases(module, name)):
+        for reference in ((module, name), *_CALLABLE_SINGLETON_ALIASES.get((module, name), ())):
             shapes.setdefault(reference, set()).add((positional_arg_count, keyword_arg_names))
             if len(shapes) >= _MAX_IMPORT_REFERENCES:
                 return _sorted_callable_invocation_argument_shapes(shapes)
@@ -3614,10 +3584,6 @@ def _sorted_callable_invocation_argument_shapes(
         )
         for key, value in shapes.items()
     }
-
-
-def _callable_singleton_aliases(module: str, name: str) -> tuple[tuple[str, str], ...]:
-    return _CALLABLE_SINGLETON_ALIASES.get((module, name), ())
 
 
 def _is_pytorch_storage_persistent_id_reference(item: Mapping[str, object]) -> bool:
@@ -3866,22 +3832,6 @@ def _import_hook_identity(hook: object) -> str:
     return f"{module}.{qualname}:{reuse_marker}{digest}"
 
 
-def _resolution_context_is_reusable(
-    context: tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]],
-) -> bool:
-    return all(":unreusable:" not in identity for identities in context for identity in identities)
-
-
-def _path_importer_methods_are_trusted(
-    importer_type: type[object],
-    trusted_methods: tuple[tuple[str, _RuntimeValueSnapshot], ...],
-) -> bool:
-    return all(
-        _runtime_value_matches_snapshot(_type_member_without_hooks(importer_type, name)[1], snapshot)
-        for name, snapshot in trusted_methods
-    )
-
-
 def _is_standard_file_finder_path_hook(hook: object) -> bool:
     if not isinstance(hook, FunctionType) or hook.__code__ is not _STANDARD_FILE_FINDER_PATH_HOOK_CODE:
         return False
@@ -3904,11 +3854,17 @@ def _is_standard_file_finder_path_hook(hook: object) -> bool:
 def _path_hook_resolution_identity(hook: object) -> str:
     """Return a reusable identity only for unmodified standard path hooks."""
     if hook is zipimporter:
-        if _path_importer_methods_are_trusted(zipimporter, _TRUSTED_ZIPIMPORTER_METHODS):
+        if all(
+            _runtime_value_matches_snapshot(_type_member_without_hooks(zipimporter, name)[1], snapshot)
+            for name, snapshot in _TRUSTED_ZIPIMPORTER_METHODS
+        ):
             return "trusted:zipimport.zipimporter"
         return "zipimport.zipimporter:unreusable:methods-changed"
     if _is_standard_file_finder_path_hook(hook):
-        if _path_importer_methods_are_trusted(FileFinder, _TRUSTED_FILE_FINDER_METHODS):
+        if all(
+            _runtime_value_matches_snapshot(_type_member_without_hooks(FileFinder, name)[1], snapshot)
+            for name, snapshot in _TRUSTED_FILE_FINDER_METHODS
+        ):
             return "trusted:importlib.machinery.FileFinder.path_hook"
         return "importlib.machinery.FileFinder.path_hook:unreusable:methods-changed"
     return f"untrusted:unreusable:{_import_hook_identity(hook)}"
@@ -4276,7 +4232,10 @@ def _cached_bounded_zipimporter_excludes_module(
     if (
         type(finder) is not zipimporter
         or not _zipimport_runtime_is_trusted()
-        or not _path_importer_methods_are_trusted(zipimporter, _TRUSTED_ZIPIMPORTER_METHODS)
+        or not all(
+            _runtime_value_matches_snapshot(_type_member_without_hooks(zipimporter, name)[1], snapshot)
+            for name, snapshot in _TRUSTED_ZIPIMPORTER_METHODS
+        )
     ):
         return False
     try:
@@ -4325,9 +4284,9 @@ def _zipimport_archive_files_match(archive: str, files: object) -> bool:
 
 
 def _zipimporter_resolution_identity(finder: object, cache_key: str) -> str | None:
-    if type(finder) is not zipimporter or not _path_importer_methods_are_trusted(
-        zipimporter,
-        _TRUSTED_ZIPIMPORTER_METHODS,
+    if type(finder) is not zipimporter or not all(
+        _runtime_value_matches_snapshot(_type_member_without_hooks(zipimporter, name)[1], snapshot)
+        for name, snapshot in _TRUSTED_ZIPIMPORTER_METHODS
     ):
         return None
     try:
@@ -4428,9 +4387,9 @@ def _file_finder_state(
     ]
     | None
 ):
-    if type(finder) is not FileFinder or not _path_importer_methods_are_trusted(
-        FileFinder,
-        _TRUSTED_FILE_FINDER_METHODS,
+    if type(finder) is not FileFinder or not all(
+        _runtime_value_matches_snapshot(_type_member_without_hooks(FileFinder, name)[1], snapshot)
+        for name, snapshot in _TRUSTED_FILE_FINDER_METHODS
     ):
         return None
     try:
@@ -4692,8 +4651,8 @@ def _path_importer_resolution_context(search_path: Iterable[str]) -> tuple[str, 
 
 def _source_resolution_context() -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
     search_path = _runtime_search_path_without_hooks()
-    meta_path = _runtime_meta_path_without_hooks()
-    path_hooks = _runtime_path_hooks_without_hooks()
+    meta_path = _exact_list_items_without_hooks(sys.meta_path)
+    path_hooks = _exact_list_items_without_hooks(sys.path_hooks)
     path_importer_cache = _runtime_path_importer_cache_without_hooks()
     if search_path is None or meta_path is None or path_hooks is None or path_importer_cache is None:
         unavailable = (_UNREUSABLE_HOOK_STATE_IDENTITY,)
@@ -4859,7 +4818,9 @@ def _reset_shared_source_snapshot(snapshot: _SharedSourceSnapshot) -> None:
     snapshot.generation += 1
     snapshot.stability_reason = None
     snapshot.stable = True
-    snapshot.reusable = snapshot.import_runtime_trusted and _resolution_context_is_reusable(snapshot.resolution_context)
+    snapshot.reusable = snapshot.import_runtime_trusted and all(
+        ":unreusable:" not in identity for identities in snapshot.resolution_context for identity in identities
+    )
 
 
 def _path_importer_context_allows_trusted_cache_population(
@@ -4912,7 +4873,9 @@ def _snapshot_resolution_context_is_current(snapshot: _SharedSourceSnapshot) -> 
     if not _resolution_context_allows_trusted_cache_population(snapshot.resolution_context, current):
         return False
     snapshot.resolution_context = current
-    snapshot.reusable = snapshot.reusable and _resolution_context_is_reusable(current)
+    snapshot.reusable = snapshot.reusable and all(
+        ":unreusable:" not in identity for identities in current for identity in identities
+    )
     return True
 
 
@@ -4986,7 +4949,9 @@ def _shared_source_snapshot_staleness_reason(snapshot: _SharedSourceSnapshot) ->
             current_resolution_context,
         )
     for module_name, expected_module_state in snapshot.loaded_interpreter_modules.items():
-        if not _loaded_interpreter_module_state_matches(module_name, expected_module_state):
+        if not _loaded_interpreter_states_match(
+            _current_loaded_interpreter_module_state(module_name), expected_module_state
+        ):
             return "loaded_interpreter_module_changed"
     if snapshot.loaded_interpreter_modules and not _interpreter_import_runtime_is_trusted():
         return "interpreter_import_runtime_untrusted"
@@ -5685,7 +5650,7 @@ def _known_meta_path_finder_cannot_handle(finder: object, module_name: str) -> b
 
 
 def _untrusted_meta_path_finder_precedes(target: object, module_name: str) -> bool:
-    meta_path = _runtime_meta_path_without_hooks()
+    meta_path = _exact_list_items_without_hooks(sys.meta_path)
     if meta_path is None:
         return True
     for finder in meta_path:
@@ -5704,7 +5669,7 @@ def _is_standard_path_hook(hook: object) -> bool:
 
 
 def _has_untrusted_path_hook() -> bool:
-    path_hooks = _runtime_path_hooks_without_hooks()
+    path_hooks = _exact_list_items_without_hooks(sys.path_hooks)
     search_path = _runtime_search_path_without_hooks()
     if path_hooks is None or search_path is None:
         return True
@@ -5714,12 +5679,12 @@ def _has_untrusted_path_hook() -> bool:
 
 
 def _path_hooks_are_trusted() -> bool:
-    path_hooks = _runtime_path_hooks_without_hooks()
+    path_hooks = _exact_list_items_without_hooks(sys.path_hooks)
     return path_hooks is not None and all(_is_standard_path_hook(hook) for hook in path_hooks)
 
 
 def _fresh_standard_path_importer(entry: str) -> FileFinder | zipimporter | _UnsafePathResolution | None:
-    path_hooks = _runtime_path_hooks_without_hooks()
+    path_hooks = _exact_list_items_without_hooks(sys.path_hooks)
     if path_hooks is None:
         return _UNSAFE_PATH_RESOLUTION
     for hook in path_hooks:
@@ -6268,7 +6233,7 @@ def _analyze_module(module_name: str) -> _ModuleAnalysis | None:
         return None
 
     export_summary = _collect_module_export_summary(context.module_statements, module_name, context.is_package)
-    import_aliases = _collect_aliases(context.module_statements, module_name, context.is_package)
+    import_aliases = _collect_import_aliases(context.module_statements, module_name, context.is_package)
     local_defs = _collect_local_defs(context.module_statements)
     local_class_entrypoints = _collect_local_class_entrypoints(
         context.module_statements,
@@ -6337,7 +6302,7 @@ def _module_source_context(module_name: str) -> _ModuleSourceContext | None:
         return None
 
     is_package = source_path.name == "__init__.py"
-    module_statements = _module_level_statements(tree, module_name)
+    module_statements = _definition_scope_statements(_runtime_selected_module_statements(tree.body, module_name))
     return _ModuleSourceContext(source_path=source_path, module_statements=module_statements, is_package=is_package)
 
 
@@ -6575,13 +6540,6 @@ def _runtime_selected_module_statements(
     return tuple(selected)
 
 
-def _module_level_statements(
-    tree: ast.Module,
-    module_name: str | None = None,
-) -> tuple[ast.stmt, ...]:
-    return _definition_scope_statements(_runtime_selected_module_statements(tree.body, module_name))
-
-
 def _module_initialization_statement_is_inert(statement: ast.stmt) -> bool:
     if isinstance(statement, ast.Pass):
         return True
@@ -6761,10 +6719,6 @@ def _collect_module_export_summary(
     return _WildcardExportSummary(frozenset(direct_names), tuple(wildcard_imports))
 
 
-def _collect_aliases(statements: Iterable[ast.stmt], module_name: str, is_package: bool) -> dict[str, str]:
-    return _collect_import_aliases(statements, module_name, is_package)
-
-
 def _collect_import_aliases(nodes: Iterable[ast.AST], module_name: str, is_package: bool) -> dict[str, str]:
     aliases: dict[str, str] = {}
     for statement in nodes:
@@ -6797,13 +6751,11 @@ def _collect_function_import_aliases(
     aliases: dict[str, str] = {}
 
     class _FunctionImportAliasVisitor(ast.NodeVisitor):
-        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        def visit_FunctionDef(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
             if node is function_node:
                 self.generic_visit(node)
 
-        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
-            if node is function_node:
-                self.generic_visit(node)
+        visit_AsyncFunctionDef = visit_FunctionDef
 
         def visit_ClassDef(self, node: ast.ClassDef) -> None:
             return None
@@ -6811,11 +6763,10 @@ def _collect_function_import_aliases(
         def visit_Lambda(self, node: ast.Lambda) -> None:
             self.visit(node.args)
 
-        def visit_Import(self, node: ast.Import) -> None:
+        def visit_Import(self, node: ast.Import | ast.ImportFrom) -> None:
             aliases.update(_collect_import_aliases((node,), module_name, is_package))
 
-        def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
-            aliases.update(_collect_import_aliases((node,), module_name, is_package))
+        visit_ImportFrom = visit_Import
 
     _FunctionImportAliasVisitor().visit(function_node)
     return aliases
@@ -6857,7 +6808,7 @@ def _collect_local_class_entrypoints(
             f"{class_name}.{method_name}"
             for method_name in _CLASS_ENTRYPOINT_METHODS
             if method_name in method_names
-            or (method_name in inherited_method_names and method_name in _INHERITED_CLASS_ENTRYPOINT_METHODS)
+            or (method_name in inherited_method_names and method_name in _PICKLE_ENTERED_IMPORT_EXECUTION_METHODS)
         )
         existing = class_entrypoints.get(class_name)
         class_entrypoints[class_name] = entrypoints if existing is None else _dedupe_calls((*existing, *entrypoints))
@@ -6888,15 +6839,12 @@ def _class_has_plain_local_method(class_node: ast.ClassDef, method_name: str) ->
                 return False
             plain_method_count += 1
             continue
-        if _class_body_statement_or_nested_statement_binds_name(child, method_name):
+        if any(
+            _class_body_statement_binds_name(candidate, method_name)
+            for candidate in _definition_scope_statements((child,))
+        ):
             return False
     return plain_method_count == 1
-
-
-def _class_body_statement_or_nested_statement_binds_name(statement: ast.stmt, name: str) -> bool:
-    return any(
-        _class_body_statement_binds_name(candidate, name) for candidate in _definition_scope_statements((statement,))
-    )
 
 
 def _class_lookup_has_source_backed_plain_metaclass(
@@ -7071,14 +7019,12 @@ def _statement_contains_runtime_call(statement: ast.stmt) -> bool:
     class RuntimeCallVisitor(ast.NodeVisitor):
         found = False
 
-        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        def visit_FunctionDef(self, node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef) -> None:
             return None
 
-        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
-            return None
+        visit_AsyncFunctionDef = visit_FunctionDef
 
-        def visit_ClassDef(self, node: ast.ClassDef) -> None:
-            return None
+        visit_ClassDef = visit_FunctionDef
 
         def visit_Call(self, node: ast.Call) -> None:
             self.found = True
@@ -7186,7 +7132,7 @@ def _source_function_context(
     except Exception:
         return None
 
-    module_statements = _module_level_statements(tree, module_name)
+    module_statements = _definition_scope_statements(_runtime_selected_module_statements(tree.body, module_name))
     function_node = _find_qualified_function_def(module_statements, qualified_name)
     if function_node is None:
         return _inherited_source_function_context(module_statements, module_name, source_path, qualified_name)
@@ -7206,7 +7152,7 @@ def _inherited_source_function_context(
     if class_node is None:
         return None
     is_package = source_path.name == "__init__.py"
-    aliases = _collect_aliases(module_statements, module_name, is_package)
+    aliases = _collect_import_aliases(module_statements, module_name, is_package)
     local_defs = _collect_local_defs(module_statements)
     inherited_method = _inherited_class_methods(
         class_node,
@@ -7238,12 +7184,12 @@ def _source_class_context(class_name: str) -> _ClassSourceContext | None:
     except Exception:
         return None
 
-    module_statements = _module_level_statements(tree, module_name)
+    module_statements = _definition_scope_statements(_runtime_selected_module_statements(tree.body, module_name))
     class_node = _find_qualified_class_def(module_statements, qualified_name)
     if class_node is None:
         return None
     is_package = source_path.name == "__init__.py"
-    aliases = _collect_aliases(module_statements, module_name, is_package)
+    aliases = _collect_import_aliases(module_statements, module_name, is_package)
     local_defs = _collect_local_defs(module_statements)
     return _ClassSourceContext(
         module_name=module_name,
@@ -7283,13 +7229,6 @@ def _contains_current_loop_break(nodes: Iterable[ast.stmt]) -> bool:
         return any(contains_break(child) for child in ast.iter_child_nodes(node))
 
     return any(contains_break(node) for node in nodes)
-
-
-def _is_exhaustive_match(node: ast.Match) -> bool:
-    return any(
-        isinstance(case.pattern, ast.MatchAs) and case.pattern.pattern is None and case.guard is None
-        for case in node.cases
-    )
 
 
 _TerminalAssignment = ast.Assign | ast.AnnAssign
@@ -7386,7 +7325,10 @@ def _conditionally_rebound_assignment_nodes(
                 deterministic_terminal_bodies = (node.body[:-1], node.orelse)
         elif isinstance(node, ast.Match):
             branch_bodies = tuple(case.body for case in node.cases)
-            if _is_exhaustive_match(node):
+            if any(
+                isinstance(case.pattern, ast.MatchAs) and case.pattern.pattern is None and case.guard is None
+                for case in node.cases
+            ):
                 deterministic_terminal_bodies = branch_bodies
         else:
             continue
@@ -7683,7 +7625,7 @@ def _assignment_alias_value(
     resolved = _resolve_expr(value, module_name, aliases, local_defs, class_name)
     if resolved is None:
         return None
-    if _is_local_class_member_alias(resolved, local_class_targets):
+    if any(resolved == class_target or resolved.startswith(f"{class_target}.") for class_target in local_class_targets):
         return resolved
     if (
         _rce_sink(resolved) is not None
@@ -7789,12 +7731,6 @@ def _assignment_value_read_names(node: ast.Assign | ast.AnnAssign) -> set[str]:
 
     visit(node.value, set())
     return names
-
-
-def _is_local_class_member_alias(resolved: str, local_class_targets: set[str]) -> bool:
-    return any(
-        resolved == class_target or resolved.startswith(f"{class_target}.") for class_target in local_class_targets
-    )
 
 
 def _looks_like_class_reference(function_name: str) -> bool:
@@ -7930,7 +7866,9 @@ def _sink_alias_default_target(
     local_class_targets: set[str],
 ) -> str | None:
     resolved = _resolve_expr(default, module_name, aliases, local_defs)
-    if resolved is None or _is_local_class_member_alias(resolved, local_class_targets):
+    if resolved is None or any(
+        resolved == class_target or resolved.startswith(f"{class_target}.") for class_target in local_class_targets
+    ):
         return None
     alias_target = _static_import_reference_alias(resolved) or resolved
     if (
@@ -8001,7 +7939,9 @@ def _constructor_parameter_self_attribute_targets(class_name: str, parameter_nam
     except Exception:
         return ()
 
-    class_node = _find_qualified_class_def(_module_level_statements(tree, module_name), qualified_name)
+    class_node = _find_qualified_class_def(
+        _definition_scope_statements(_runtime_selected_module_statements(tree.body, module_name)), qualified_name
+    )
     if class_node is None:
         return ()
     init_node = next(
@@ -8201,7 +8141,7 @@ def _calls_in_function(
     dynamic_getattr_callable_names: set[str] | None = None
     getattr_default_callable_names: dict[str, str] | None = None
     assignment_call_candidates: tuple[tuple[set[str], ast.Call], ...] | None = None
-    may_use_getattr_dispatch = _may_use_getattr_dispatch(call_nodes, function_aliases)
+    may_use_getattr_dispatch = any(_call_node_may_be_getattr_call(node, function_aliases) for node in call_nodes)
     for node in call_nodes:
         if may_use_getattr_dispatch:
             if parameter_controlled_names is None:
@@ -8278,7 +8218,7 @@ def _calls_in_function(
                     parameter_controlled_names = _parameter_controlled_names(function_node)
                 if not _call_uses_parameter_controlled_argument(node, parameter_controlled_names):
                     continue
-            if _is_object_subprocess_dispatch_call(resolved):
+            if resolved.endswith(_SUBPROCESS_DISPATCH_SUFFIXES):
                 if parameter_controlled_names is None:
                     parameter_controlled_names = _parameter_controlled_names(function_node)
                 if not _call_uses_parameter_controlled_argument(node, parameter_controlled_names):
@@ -8316,19 +8256,16 @@ def _direct_import_execution_calls(
     imports_user_code = False
 
     class _ExecutedImportVisitor(ast.NodeVisitor):
-        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        def visit_FunctionDef(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
             if node is function_node:
                 self.generic_visit(node)
 
-        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
-            if node is function_node:
-                self.generic_visit(node)
+        visit_AsyncFunctionDef = visit_FunctionDef
 
-        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        def visit_ClassDef(self, node: ast.ClassDef | ast.Lambda) -> None:
             return None
 
-        def visit_Lambda(self, node: ast.Lambda) -> None:
-            return None
+        visit_Lambda = visit_ClassDef
 
         def visit_Import(self, node: ast.Import) -> None:
             nonlocal imports_user_code
@@ -8390,13 +8327,6 @@ def _is_pickle_lifecycle_entrypoint(function_name: str) -> bool:
     _module_name, qualified_name = _split_source_qualified_name(function_name)
     class_name, _separator, method_name = qualified_name.rpartition(".")
     return bool(class_name and method_name in _PICKLE_LIFECYCLE_ENTRYPOINT_METHOD_SET)
-
-
-def _can_enter_function_with_positional_args(
-    function_node: ast.FunctionDef | ast.AsyncFunctionDef,
-    positional_arg_count: int,
-) -> bool:
-    return _can_enter_function_with_arguments(function_node, positional_arg_count, ())
 
 
 def _can_enter_function_with_arguments(
@@ -8499,10 +8429,6 @@ def _import_module_can_execute_user_code(module_name: str) -> bool:
         return False
     interpreter_trusted = _interpreter_module_resolution_is_trusted(module_name)
     return interpreter_trusted is not True
-
-
-def _may_use_getattr_dispatch(call_nodes: tuple[ast.Call, ...], aliases: Mapping[str, str]) -> bool:
-    return any(_call_node_may_be_getattr_call(node, aliases) for node in call_nodes)
 
 
 def _call_node_may_be_getattr_call(call_node: ast.Call, aliases: Mapping[str, str]) -> bool:
@@ -8763,11 +8689,10 @@ def _iter_call_nodes(function_node: ast.FunctionDef | ast.AsyncFunctionDef) -> t
                 return
             self.generic_visit(node)
 
-        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        def visit_FunctionDef(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
             self._visit_nested_function_signature(node)
 
-        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
-            self._visit_nested_function_signature(node)
+        visit_AsyncFunctionDef = visit_FunctionDef
 
         def visit_Lambda(self, node: ast.Lambda) -> None:
             self.visit(node.args)
@@ -9026,7 +8951,7 @@ def _rce_sink(call_name: str) -> str | None:
         return call_name
     if _is_tcl_interpreter_dispatch_call(call_name):
         return call_name
-    if _is_object_subprocess_dispatch_call(call_name):
+    if call_name.endswith(_SUBPROCESS_DISPATCH_SUFFIXES):
         return call_name
     return None
 
@@ -9049,10 +8974,6 @@ def _is_file_write_call(call_name: str) -> bool:
 
 def _is_tcl_interpreter_dispatch_call(call_name: str) -> bool:
     return call_name.endswith(_TCL_CALL_DISPATCH_SUFFIXES) or call_name.endswith(_TCL_EVAL_DISPATCH_SUFFIXES)
-
-
-def _is_object_subprocess_dispatch_call(call_name: str) -> bool:
-    return call_name.endswith(_SUBPROCESS_DISPATCH_SUFFIXES)
 
 
 def _is_import_execution_sink(call_name: str) -> bool:

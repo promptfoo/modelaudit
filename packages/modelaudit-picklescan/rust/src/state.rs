@@ -8364,20 +8364,11 @@ impl<'a> ScanState<'a> {
 
         let metadata = PyDict::new(py);
         metadata.set_item("opcode_count", self.opcode_count)?;
-        let opcode_counts = PyDict::new(py);
-        for (opcode, count) in &self.opcode_counts {
-            opcode_counts.set_item(opcode, count)?;
-        }
+        let opcode_counts = (&self.opcode_counts).into_pyobject(py)?;
         metadata.set_item("opcode_counts", opcode_counts)?;
-        let nested_opcode_counts = PyDict::new(py);
-        for (opcode, count) in &self.nested_opcode_counts {
-            nested_opcode_counts.set_item(opcode, count)?;
-        }
+        let nested_opcode_counts = (&self.nested_opcode_counts).into_pyobject(py)?;
         metadata.set_item("nested_opcode_counts", nested_opcode_counts)?;
-        let follow_on_opcode_counts = PyDict::new(py);
-        for (opcode, count) in &self.follow_on_opcode_counts {
-            follow_on_opcode_counts.set_item(opcode, count)?;
-        }
+        let follow_on_opcode_counts = (&self.follow_on_opcode_counts).into_pyobject(py)?;
         metadata.set_item("follow_on_opcode_counts", follow_on_opcode_counts)?;
         metadata.set_item("globals_count", self.global_count)?;
         let import_references = PyList::empty(py);
