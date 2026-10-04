@@ -3961,6 +3961,7 @@ class PyTorchZipScanner(BaseScanner):
         fail_closed_on_candidate_budget: bool = True,
         nested_literal_depth: int = 0,
         search_end: int | None = None,
+        initial_candidate_offset: int | None = None,
         sample_is_prefix: bool = False,
         work_budget_remaining: list[int] | None = None,
     ) -> bool:
@@ -3983,10 +3984,11 @@ class PyTorchZipScanner(BaseScanner):
             sample_is_prefix=sample_is_prefix,
         )
         unicode_no_newline_start: int | None = None
-        offset = 0
+        text_rejected_until = 0
+        offset = 0 if initial_candidate_offset is None else initial_candidate_offset
         while offset < candidate_search_end:
             marker = value[offset]
-            if marker not in _RAW_NESTED_SECURITY_PICKLE_START_BYTES:
+            if offset != initial_candidate_offset and marker not in _RAW_NESTED_SECURITY_PICKLE_START_BYTES:
                 offset += 1
                 continue
             span = span_at(offset)
@@ -4039,6 +4041,9 @@ class PyTorchZipScanner(BaseScanner):
                 offset = PyTorchZipScanner._raw_nested_offset_after_literal_span(value, offset, span[2])
                 continue
             if PyTorchZipScanner._raw_nested_string_candidate_has_invalid_quote(value, offset):
+                offset += 1
+                continue
+            if marker in b"SV" and offset < text_rejected_until:
                 offset += 1
                 continue
             if marker == ord("V") and not sample_is_prefix:
@@ -4116,6 +4121,16 @@ class PyTorchZipScanner(BaseScanner):
                 return True
             candidate = value[candidate_start : candidate_start + _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES]
             candidate_is_prefix = candidate_start + len(candidate) < len(value) or sample_is_prefix
+            if marker in b"SV" and not candidate_is_prefix:
+                literal_start = 2 if marker == ord("S") else 1
+                line_end = candidate.find(b"\n", literal_start)
+                if line_end < 0:
+                    text_rejected_until = len(value)
+                elif line_end + 1 < len(candidate) and candidate[line_end + 1] not in _PICKLE_OPCODE_BYTES:
+                    text_rejected_until = offset + line_end + 1
+                if offset < text_rejected_until:
+                    offset += 1
+                    continue
             if PyTorchZipScanner._raw_nested_text_candidate_has_later_security_context(
                 value, candidate_start, sample_is_prefix=sample_is_prefix, work_budget_remaining=work_budget_remaining
             ):
@@ -4208,6 +4223,7 @@ class PyTorchZipScanner(BaseScanner):
             sample_is_prefix=sample_is_prefix,
         )
         unicode_no_newline_start: int | None = None
+        text_rejected_until = 0
         offset = max(search_start, 0)
         while offset < len(value):
             marker = value[offset]
@@ -4258,6 +4274,9 @@ class PyTorchZipScanner(BaseScanner):
             if PyTorchZipScanner._raw_nested_string_candidate_has_invalid_quote(value, offset):
                 offset += 1
                 continue
+            if marker in b"SV" and offset < text_rejected_until:
+                offset += 1
+                continue
             if marker == ord("V") and not sample_is_prefix:
                 if unicode_no_newline_start is None and len(value) - offset <= work_budget_remaining[0]:
                     if not PyTorchZipScanner._consume_raw_nested_pickle_work_budget(
@@ -4303,6 +4322,16 @@ class PyTorchZipScanner(BaseScanner):
                 return True
             candidate = value[offset : offset + _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES]
             candidate_is_prefix = offset + len(candidate) < len(value) or sample_is_prefix
+            if marker in b"SV" and not candidate_is_prefix:
+                literal_start = 2 if marker == ord("S") else 1
+                line_end = candidate.find(b"\n", literal_start)
+                if line_end < 0:
+                    text_rejected_until = len(value)
+                elif line_end + 1 < len(candidate) and candidate[line_end + 1] not in _PICKLE_OPCODE_BYTES:
+                    text_rejected_until = offset + line_end + 1
+                if offset < text_rejected_until:
+                    offset += 1
+                    continue
             if PyTorchZipScanner._raw_nested_text_candidate_has_later_security_context(
                 value, offset, sample_is_prefix=sample_is_prefix, work_budget_remaining=work_budget_remaining
             ):
@@ -4399,16 +4428,47 @@ class PyTorchZipScanner(BaseScanner):
         if work_budget_remaining[0] < 0:
             return True
         cross_boundary_security_found = [False]
+        initial_span = (
+            PyTorchZipScanner._raw_nested_enclosing_pickle_literal_span(
+                value,
+                search_start,
+                work_budget_remaining=work_budget_remaining,
+                sample_is_prefix=sample_is_prefix,
+                cross_boundary_security_found=cross_boundary_security_found,
+            )
+            if search_start > 0
+            else None
+        )
+        window_start_spans = {search_start: initial_span}
+        recursive_literal_scanned_until_ref = [search_start]
+        if (
+            work_budget_remaining[0] < 0
+            or cross_boundary_security_found[0]
+            or PyTorchZipScanner._raw_nested_window_has_literal_security_stream(
+                value,
+                search_start,
+                min(len(value), search_start + _PICKLE_DISCOVERY_LONG_PROBE_BYTES),
+                window_start_spans=window_start_spans,
+                recursive_literal_scanned_until_ref=recursive_literal_scanned_until_ref,
+                nested_literal_depth=nested_literal_depth,
+                search_end=search_end,
+                work_budget_remaining=work_budget_remaining,
+                sample_is_prefix=sample_is_prefix,
+                known_size=known_size,
+            )
+        ):
+            return True
         suffix = PyTorchZipScanner._raw_nested_window_with_literal_payloads_masked(
             value,
             search_start,
             len(value),
             inert_only=True,
+            window_start_spans=window_start_spans,
             work_budget_remaining=work_budget_remaining,
             sample_is_prefix=sample_is_prefix,
             cross_boundary_security_found=cross_boundary_security_found,
         )
-        if cross_boundary_security_found[0]:
+        if work_budget_remaining[0] < 0 or cross_boundary_security_found[0]:
             return True
         if PyTorchZipScanner._raw_nested_security_pickle_text_marker_seen(suffix):
             return True
@@ -4460,9 +4520,11 @@ class PyTorchZipScanner(BaseScanner):
                 search_start=search_start,
                 search_end=search_end,
                 nested_literal_depth=nested_literal_depth,
+                recursive_literal_scanned_until_ref=recursive_literal_scanned_until_ref,
                 work_budget_remaining=work_budget_remaining,
                 sample_is_prefix=sample_is_prefix,
                 inst_name_validation=inst_name_validation,
+                known_size=known_size,
             )
         )
 
@@ -4477,9 +4539,13 @@ class PyTorchZipScanner(BaseScanner):
         sample_is_prefix: bool = False,
         work_budget_remaining: list[int] | None = None,
         inst_name_validation: _InstNameValidation | None = None,
+        recursive_literal_scanned_until_ref: list[int] | None = None,
+        known_size: int | None = None,
     ) -> bool:
         if work_budget_remaining is None:
             work_budget_remaining = [_PICKLE_DISCOVERY_LONG_PROBE_BYTES]
+        if work_budget_remaining[0] < 0:
+            return True
         if parse_budget_remaining is None:
             parse_budget_remaining = [_MAX_RAW_NESTED_PICKLE_CANDIDATES]
         candidate_search_end = len(value) if search_end is None else min(search_end, len(value))
@@ -4516,7 +4582,8 @@ class PyTorchZipScanner(BaseScanner):
             window_start_spans[start] = span if span is not None and span[1] <= start else None
 
         global_name_inspection: _GlobalNameInspection = (value, [0, -1, -1, -1])
-        recursive_literal_scanned_until_ref = [search_start]
+        if recursive_literal_scanned_until_ref is None:
+            recursive_literal_scanned_until_ref = [search_start]
         for window_start, window_end in windows:
             if PyTorchZipScanner._raw_nested_window_has_literal_security_stream(
                 value,
@@ -4528,6 +4595,7 @@ class PyTorchZipScanner(BaseScanner):
                 search_end=candidate_search_end,
                 work_budget_remaining=work_budget_remaining,
                 sample_is_prefix=sample_is_prefix,
+                known_size=known_size,
             ):
                 return True
             window = PyTorchZipScanner._raw_nested_window_with_literal_payloads_masked(
@@ -4538,6 +4606,8 @@ class PyTorchZipScanner(BaseScanner):
                 work_budget_remaining=work_budget_remaining,
                 sample_is_prefix=sample_is_prefix,
             )
+            if work_budget_remaining[0] < 0:
+                return True
             if PyTorchZipScanner._raw_nested_security_pickle_candidate_has_structural_signal(
                 window,
                 parse_budget_remaining=parse_budget_remaining,
@@ -5553,6 +5623,7 @@ class PyTorchZipScanner(BaseScanner):
         window_start_spans: dict[int, tuple[int, int, int] | None] | None = None,
         sample_is_prefix: bool = False,
         work_budget_remaining: list[int] | None = None,
+        known_size: int | None = None,
     ) -> bool:
         if work_budget_remaining is None:
             work_budget_remaining = [_PICKLE_DISCOVERY_LONG_PROBE_BYTES]
@@ -5620,6 +5691,18 @@ class PyTorchZipScanner(BaseScanner):
                 )
             if any(cross_boundary_security_found):
                 return True
+            if span is None and PyTorchZipScanner._raw_nested_structural_candidate_has_impossible_size(
+                value,
+                marker_offset,
+                value_is_prefix=sample_is_prefix,
+                known_size=known_size,
+            ):
+                span = span_at(marker_offset)
+                if work_budget_remaining[0] < 0 or any(cross_boundary_security_found):
+                    return True
+                if span is None:
+                    offset = marker_offset + 1
+                    continue
             if span is None:
                 rejected_until = PyTorchZipScanner._raw_nested_proto0_text_literal_rejected_until(
                     value,
@@ -5657,24 +5740,45 @@ class PyTorchZipScanner(BaseScanner):
                 persistent_id_parse_budget_remaining,
             ):
                 return True
-            payload_is_prefix = [False]
-            literal_payload_start, literal_payload_end = (
-                PyTorchZipScanner._raw_nested_literal_payload_bounds_for_recursive_scan(
-                    value,
-                    literal_start,
-                    literal_end,
-                    sample_is_prefix=sample_is_prefix,
-                    payload_is_prefix=payload_is_prefix,
-                    work_budget_remaining=work_budget_remaining,
-                )
-            )
             recursive_payload_end = min(literal_end, candidate_search_end)
+            first_candidate_offset: int | None = None
+            continuation_end = min(len(value), literal_end + _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES)
+            if (
+                literal_start < recursive_payload_end
+                and nested_literal_depth + 1 <= _MAX_NESTED_LITERAL_SCAN_DEPTH
+                and 0 <= continuation_end - literal_end <= work_budget_remaining[0]
+                and value[literal_start] not in _RAW_NESTED_SECURITY_PICKLE_START_BYTES
+            ):
+                # Move the child's leading non-marker walk before its unused continuation.
+                first_candidate_offset = literal_start + 1
+                while first_candidate_offset < recursive_payload_end:
+                    if value[first_candidate_offset] in _RAW_NESTED_SECURITY_PICKLE_START_BYTES:
+                        break
+                    first_candidate_offset += 1
+            payload_is_prefix = [False]
+            if first_candidate_offset is not None and first_candidate_offset == recursive_payload_end:
+                literal_payload_start, literal_payload_end = literal_start, literal_end
+                payload_is_prefix[0] = sample_is_prefix or literal_end < len(value)
+            else:
+                literal_payload_start, literal_payload_end = (
+                    PyTorchZipScanner._raw_nested_literal_payload_bounds_for_recursive_scan(
+                        value,
+                        literal_start,
+                        literal_end,
+                        sample_is_prefix=sample_is_prefix,
+                        payload_is_prefix=payload_is_prefix,
+                        work_budget_remaining=work_budget_remaining,
+                    )
+                )
             if (
                 literal_start < recursive_payload_end
                 and PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(
                     value[literal_payload_start:literal_payload_end],
                     nested_literal_depth=nested_literal_depth + 1,
                     search_end=recursive_payload_end - literal_payload_start,
+                    initial_candidate_offset=(
+                        None if first_candidate_offset is None else first_candidate_offset - literal_payload_start
+                    ),
                     work_budget_remaining=work_budget_remaining,
                     sample_is_prefix=payload_is_prefix[0],
                 )
@@ -6264,6 +6368,32 @@ class PyTorchZipScanner(BaseScanner):
         if payload_is_prefix is not None:
             payload_is_prefix[0] = sample_is_prefix or scan_limit < len(value)
         if (
+            literal_end - literal_start <= _PICKLE_DISCOVERY_SHORT_PROBE_BYTES
+            and value[literal_start] in _RAW_NESTED_SECURITY_PICKLE_START_BYTES
+            and any(
+                ord(opcode.code) == value[literal_start]
+                and opcode.arg is None
+                and opcode.name not in _PICKLE_SECURITY_RELEVANT_OPCODES
+                and not any(operand.name in {"any", "buffer"} for operand in opcode.stack_after)
+                for opcode in pickletools.opcodes
+            )
+        ):
+            probe_end = min(scan_limit, literal_start + _PICKLE_DISCOVERY_SHORT_PROBE_BYTES)
+            if not PyTorchZipScanner._consume_raw_nested_pickle_work_budget(
+                work_budget_remaining, probe_end - literal_start
+            ):
+                return literal_start, literal_end
+            neutral_prefix_end: list[int | None] = [None]
+            PyTorchZipScanner._truncated_text_pickle_has_live_string_operands(
+                value[literal_start:probe_end],
+                neutral_prefix_end=neutral_prefix_end,
+                neutral_prefix_min_end=literal_end - literal_start,
+            )
+            if neutral_prefix_end[0] is not None:
+                # The fresh candidate has no live state after the whole payload;
+                # later starts remain eligible in the enclosing traversal.
+                return literal_start, literal_end
+        if (
             not sample_is_prefix
             and value[literal_start] in _RAW_NESTED_SECURITY_PICKLE_START_BYTES
             and scan_limit == len(value)
@@ -6453,7 +6583,30 @@ class PyTorchZipScanner(BaseScanner):
             if mask_end > mask_start and (
                 not inert_only or PyTorchZipScanner._raw_nested_literal_span_is_mask_only(value, span)
             ):
-                window[mask_start:mask_end] = b"!" * (mask_end - mask_start)
+                if (
+                    value[literal_opcode_start] == ord("S")
+                    and literal_end > literal_start
+                    and value[literal_end - 1] == value[literal_opcode_start + 1]
+                ):
+                    if literal_end - 1 == literal_start:
+                        mask_end = min(window_end, literal_end - 1) - window_start
+                    else:
+                        validation_end = literal_end + 1
+                        if not PyTorchZipScanner._consume_raw_nested_pickle_work_budget(
+                            work_budget_remaining, validation_end - literal_opcode_start
+                        ):
+                            return bytes(window)
+                        try:
+                            opcode, _arg, position = next(
+                                pickletools.genops(value[literal_opcode_start:validation_end])
+                            )
+                        except ValueError:
+                            pass
+                        else:
+                            if opcode.name == "STRING" and position == 0:
+                                mask_end = min(window_end, literal_end - 1) - window_start
+                if mask_end > mask_start:
+                    window[mask_start:mask_end] = b"!" * (mask_end - mask_start)
             offset = PyTorchZipScanner._raw_nested_offset_after_literal_span(value, offset, literal_end)
         return bytes(window)
 
@@ -7105,6 +7258,13 @@ class PyTorchZipScanner(BaseScanner):
                         if text_line_end >= 0:
                             break
                 if (
+                    marker == ord("S")
+                    and not sample_is_prefix
+                    and text_line_end < 0
+                    and literal_start <= text_search_end == len(value)
+                ):
+                    continue
+                if (
                     literal_start <= text_line_end
                     and text_line_end + 1 < len(value)
                     and value[text_line_end + 1] not in _PICKLE_OPCODE_BYTES
@@ -7117,6 +7277,10 @@ class PyTorchZipScanner(BaseScanner):
                 return True
             candidate = value[offset : offset + _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES]
             candidate_is_prefix = offset + len(candidate) < len(value) or sample_is_prefix
+            if marker == ord("S") and not candidate_is_prefix and candidate.find(b"\n", 2) < 0:
+                text_line_end = -1
+                text_search_end = len(value)
+                continue
             if not PyTorchZipScanner._raw_nested_structural_literal_candidate_has_plausible_operand(
                 candidate,
                 candidate_is_prefix=candidate_is_prefix,
@@ -7322,12 +7486,16 @@ class PyTorchZipScanner(BaseScanner):
         *,
         can_reject_inert_gap: list[bool] | None = None,
         prefix_is_terminal: list[bool] | None = None,
+        neutral_prefix_end: list[int | None] | None = None,
+        neutral_prefix_min_end: int = 0,
     ) -> bool:
         if can_reject_inert_gap is not None:
             can_reject_inert_gap[0] = False
         if prefix_is_terminal is not None:
             prefix_is_terminal[0] = False
-        if (
+        if neutral_prefix_end is not None:
+            neutral_prefix_end[0] = None
+        if neutral_prefix_end is None and (
             len(candidate) < _MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES
             or candidate[0] not in _PICKLE_STRING_LITERAL_START_BYTES
         ):
@@ -7341,6 +7509,10 @@ class PyTorchZipScanner(BaseScanner):
         truncated = False
         try:
             for opcode, arg, _pos in pickletools.genops(candidate[: _PICKLE_DISCOVERY_LONG_PROBE_BYTES * 4]):
+                if neutral_prefix_end is not None and opcode.arg is not None:
+                    # Argument-bearing instructions can establish framing or
+                    # other context not represented by this stack/memo model.
+                    return False
                 saw_security_opcode |= opcode.name in _PICKLE_SECURITY_RELEVANT_OPCODES
                 if opcode.name == "STOP":
                     return False
@@ -7389,6 +7561,19 @@ class PyTorchZipScanner(BaseScanner):
                         if (operand.name == "mark") != (item is None) and opcode.name != "POP":
                             return False
                 stack.extend(False for _ in opcode.stack_after)
+                if (
+                    neutral_prefix_end is not None
+                    and _pos is not None
+                    and _pos + 1 >= neutral_prefix_min_end
+                    and not stack
+                    and not memo
+                    and not saw_security_opcode
+                    and not saw_unknown_value
+                ):
+                    # Every admitted instruction in this optional proof has no
+                    # operand, so this yielded boundary is exactly one byte later.
+                    neutral_prefix_end[0] = _pos + 1
+                    return False
         except ValueError as exc:
             message = str(exc)
             if can_reject_inert_gap is not None:
