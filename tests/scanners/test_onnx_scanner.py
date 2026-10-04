@@ -27523,3 +27523,355 @@ class TestOnnxOutputInvarianceReviewRegressions:
         assert plan.oversized_initializers_skipped == 1
         assert plan.extraction_failures == 0
         assert analyzer.retained_tensor_bytes == 0
+
+
+class TestOnnxRecurrentConsumerReviewRegressions:
+    _value = staticmethod(TestOnnxRecurrenceReviewRegressions._value)
+    _tensor = staticmethod(TestOnnxRecurrenceReviewRegressions._tensor)
+    _save = staticmethod(TestOnnxOutputInvarianceReviewRegressions._save)
+
+    @pytest.mark.parametrize("location", ["before", "body"])
+    @pytest.mark.parametrize("update", ["identity", "transpose", "replacement"])
+    @pytest.mark.parametrize("count", [1, 2])
+    def test_body_weight_consumers_require_repeated_value_invariance(
+        self, tmp_path: Path, location: str, update: str, count: int
+    ) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        weights = np.zeros((64, 64), np.float32)
+        weights[0, :5] = 10
+        body_nodes = [helper.make_node("Expand", ["state", "shape"], ["weights"])] if location == "body" else []
+        body_nodes.append(helper.make_node("MatMul", ["X", "weights" if location == "body" else "state"], ["y"]))
+        if update == "replacement":
+            body_nodes.append(helper.make_node("Constant", [], ["next"], value=self._tensor("", weights.T)))
+        else:
+            body_nodes.append(
+                helper.make_node("Transpose" if update == "transpose" else "Identity", ["state"], ["next"])
+            )
+        body = helper.make_graph(
+            body_nodes,
+            "repeated_consumed_weight",
+            [
+                self._value("i", [], TensorProto.INT64),
+                self._value("condition", [], TensorProto.BOOL),
+                self._value("state", [64, 64]),
+            ],
+            [self._value("condition", [], TensorProto.BOOL), self._value("next", [64, 64]), self._value("y", [1, 64])],
+        )
+        nodes = [helper.make_node("Expand", ["W", "shape"], ["initial"])] if location == "before" else []
+        nodes.append(
+            helper.make_node(
+                "Loop", ["count", "start", "initial" if location == "before" else "W"], ["final", "ys"], body=body
+            )
+        )
+        graph = helper.make_graph(
+            nodes,
+            "body_consumer_recurrence",
+            [self._value("X", [1, 64])],
+            [self._value("ys", [count, 1, 64])],
+            [
+                self._tensor("W", weights),
+                self._tensor("shape", [64, 64], np.int64),
+                self._tensor("count", count, np.int64),
+                self._tensor("start", True, np.bool_),
+            ],
+        )
+        path, model = self._save(graph, tmp_path)
+        outputs: Any = ReferenceEvaluator(model).run(None, {"X": np.ones((1, 64), np.float32)})
+        actual = outputs[0]
+        expected_weights = [weights] + ([weights if update == "identity" else weights.T] if count == 2 else [])
+        np.testing.assert_array_equal(
+            actual.reshape(count, 1, 64),
+            np.stack([np.ones((1, 64), np.float32) @ value for value in expected_weights]),
+        )
+        analyzer = WeightDistributionScanner()
+        assert not analyzer._analyze_tensor_weight_extremes("initial", weights, output_axes=(1,))
+        assert bool(analyzer._analyze_tensor_weight_extremes("later", expected_weights[-1], output_axes=(1,))) is (
+            count == 2 and update != "identity"
+        )
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        incomplete = count == 2 and update != "identity"
+        assert bool(plan.coverage_gaps) is incomplete
+        result = OnnxScanner().scan(str(path))
+        assert result.success is not incomplete
+        assert (result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME) is incomplete
+        assert (
+            any(
+                check.name == "Weight Distribution Analysis Coverage" and check.status == CheckStatus.FAILED
+                for check in result.checks
+            )
+            is incomplete
+        )
+
+    @pytest.mark.parametrize("location", ["before", "body"])
+    @pytest.mark.parametrize("consumer", ["final", "body"])
+    def test_shape_control_provenance_does_not_change_carried_values(
+        self, tmp_path: Path, location: str, consumer: str
+    ) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        weights = np.array([[1, 2], [3, 4]], np.float32)
+        body_nodes = (
+            [helper.make_node("Reshape", ["state", "shape"], ["next"])]
+            if location == "body"
+            else [helper.make_node("Identity", ["state"], ["next"])]
+        )
+        if consumer == "body":
+            body_nodes.append(helper.make_node("MatMul", ["X", "next"], ["y"]))
+        body = helper.make_graph(
+            body_nodes,
+            "unchanged_values",
+            [
+                self._value("i", [], TensorProto.INT64),
+                self._value("condition", [], TensorProto.BOOL),
+                self._value("state", [2, 2]),
+            ],
+            [self._value("condition", [], TensorProto.BOOL), self._value("next", [2, 2])]
+            + ([self._value("y", [1, 2])] if consumer == "body" else []),
+        )
+        nodes = [helper.make_node("Reshape", ["W", "shape"], ["initial"])] if location == "before" else []
+        nodes.append(
+            helper.make_node(
+                "Loop",
+                ["count", "start", "initial" if location == "before" else "W"],
+                ["final", "Y"] if consumer == "body" else ["final"],
+                body=body,
+            )
+        )
+        if consumer == "final":
+            nodes.append(helper.make_node("MatMul", ["X", "final"], ["Y"]))
+        graph = helper.make_graph(
+            nodes,
+            "shape_provenance",
+            [self._value("X", [1, 2])],
+            [self._value("Y", [2, 1, 2] if consumer == "body" else [1, 2])],
+            [
+                self._tensor("W", weights),
+                self._tensor("shape", [2, 2], np.int64),
+                self._tensor("count", 2, np.int64),
+                self._tensor("start", True, np.bool_),
+            ],
+        )
+        path, model = self._save(graph, tmp_path)
+        outputs: Any = ReferenceEvaluator(model).run(None, {"X": np.ones((1, 2), np.float32)})
+        actual = outputs[0]
+        expected = np.ones((1, 2), np.float32) @ weights
+        np.testing.assert_array_equal(
+            actual.reshape(2, 1, 2) if consumer == "body" else actual,
+            np.stack([expected] * 2) if consumer == "body" else expected,
+        )
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        assert plan.coverage_gaps == {}
+        assert len(plan.specs) == 1
+        np.testing.assert_array_equal(plan.specs[0].weights, weights)
+        assert OnnxScanner().scan(str(path)).success
+
+    @pytest.mark.parametrize("iterations", [1, 2, None])
+    @pytest.mark.parametrize("consumer", ["final", "stacked", "body"])
+    def test_scan_uses_proven_extent_for_value_invariance(
+        self, tmp_path: Path, iterations: int | None, consumer: str
+    ) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        weights = np.array([[1, 2], [3, 4]], np.float32)
+        nodes = [helper.make_node("Transpose", ["state"], ["next"], perm=[1, 0])]
+        if consumer == "body":
+            nodes.append(helper.make_node("MatMul", ["X", "state"], ["y"]))
+        body = helper.make_graph(
+            nodes,
+            "scan_state",
+            [self._value("state", [2, 2]), self._value("element", [1])],
+            [
+                self._value("next", [2, 2]),
+                self._value("y", [1, 2]) if consumer == "body" else self._value("state", [2, 2]),
+            ],
+        )
+        nodes = [helper.make_node("Scan", ["W", "sequence"], ["final", "stack"], body=body, num_scan_inputs=1)]
+        if consumer != "body":
+            nodes.append(helper.make_node("MatMul", ["X", "stack" if consumer == "stacked" else "final"], ["Y"]))
+        graph = helper.make_graph(
+            nodes,
+            "scan_extent",
+            [self._value("X", [1, 2]), self._value("sequence", [iterations, 1])],
+            [
+                self._value(
+                    "stack" if consumer == "body" else "Y", [iterations, 1, 2] if consumer != "final" else [1, 2]
+                )
+            ],
+            [self._tensor("W", weights)],
+        )
+        path, model = self._save(graph, tmp_path)
+        outputs: Any = ReferenceEvaluator(model).run(
+            None, {"X": np.ones((1, 2), np.float32), "sequence": np.ones((iterations or 2, 1), np.float32)}
+        )
+        actual = outputs[0]
+        expected = np.ones((1, 2), np.float32) @ (weights.T if iterations == 1 else weights)
+        if consumer == "final":
+            np.testing.assert_array_equal(actual, expected)
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        assert bool(plan.coverage_gaps) is (iterations != 1)
+        result = OnnxScanner().scan(str(path))
+        assert result.success is (iterations == 1)
+        if iterations == 1:
+            assert len(plan.specs) == 1
+            np.testing.assert_array_equal(plan.specs[0].weights, weights.T if consumer == "final" else weights)
+
+    @pytest.mark.parametrize("referenced", [False, True])
+    @pytest.mark.parametrize("changing", [False, True])
+    @pytest.mark.parametrize("consumer", ["stacked", "body"])
+    def test_nested_graph_attribute_capture_participates_in_recurrence(
+        self, tmp_path: Path, referenced: bool, changing: bool, consumer: str
+    ) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        leaf = helper.make_graph(
+            [helper.make_node("Expand", ["a", "shape"], ["weight"])], "selected", [], [self._value("weight", [64, 64])]
+        )
+        inner = helper.make_node("If", ["start"], ["selected"])
+        for name in ("then_branch", "else_branch"):
+            inner.attribute.append(
+                onnx.AttributeProto(name=name, ref_attr_name="selection", type=onnx.AttributeProto.GRAPH)
+                if referenced
+                else helper.make_attribute(name, leaf)
+            )
+        middle = helper.make_graph([inner], "nested_selection", [], [self._value("selected", [64, 64])])
+        body = helper.make_graph(
+            [helper.make_node("If", ["start"], ["emitted"], then_branch=middle, else_branch=middle)]
+            + ([helper.make_node("MatMul", ["X", "emitted"], ["y"])] if consumer == "body" else []),
+            "carried_values",
+            [
+                self._value("i", [], TensorProto.INT64),
+                self._value("condition", [], TensorProto.BOOL),
+                self._value("a", [64, 64]),
+                self._value("b", [64, 64]),
+            ],
+            [
+                self._value("condition", [], TensorProto.BOOL),
+                self._value("b" if changing else "a", [64, 64]),
+                self._value("b", [64, 64]),
+                self._value("y", [1, 64]) if consumer == "body" else self._value("emitted", [64, 64]),
+            ],
+        )
+        function = helper.make_function(
+            "local",
+            "Stack",
+            ["count", "start", "W1", "W2", "shape", "X"],
+            ["stack"],
+            [helper.make_node("Loop", ["count", "start", "W1", "W2"], ["final_a", "final_b", "stack"], body=body)],
+            [helper.make_opsetid("", 18)],
+            attribute_protos=[helper.make_attribute("selection", leaf)],
+        )
+        first = np.zeros((64, 64), np.float32)
+        later = first.copy()
+        later[:5, 0] = 10
+        graph = helper.make_graph(
+            [
+                helper.make_node("Stack", ["count", "start", "W1", "W2", "shape", "X"], ["stack"], domain="local"),
+                helper.make_node("Identity", ["stack"], ["Y"])
+                if consumer == "body"
+                else helper.make_node("MatMul", ["X", "stack"], ["Y"]),
+            ],
+            "attribute_capture",
+            [self._value("X", [1, 64])],
+            [self._value("Y", [2, 1, 64])],
+            [
+                self._tensor("W1", first),
+                self._tensor("W2", later),
+                self._tensor("count", 2, np.int64),
+                self._tensor("start", True, np.bool_),
+                self._tensor("shape", [64, 64], np.int64),
+            ],
+        )
+        model = helper.make_model(
+            graph, functions=[function], opset_imports=[helper.make_opsetid("", 18), helper.make_opsetid("local", 1)]
+        )
+        model.ir_version = 10
+        onnx.checker.check_model(model, full_check=True)
+        path = tmp_path / "bound_capture.onnx"
+        onnx.save(model, path)
+        resolved = onnx.GraphProto()
+        resolved.CopyFrom(body)
+
+        def bind_graph(current: Any) -> None:
+            for node in current.node:
+                for attribute in node.attribute:
+                    if attribute.ref_attr_name:
+                        attribute.CopyFrom(helper.make_attribute(attribute.name, leaf))
+                    for nested in onnx_scanner_module._iter_attribute_graphs(attribute):
+                        bind_graph(nested)
+
+        bind_graph(resolved)
+        runner = ReferenceEvaluator(resolved, opsets={"": 18})
+        state = first
+        emitted = []
+        for iteration in range(2):
+            values: Any = runner.run(
+                None,
+                {
+                    "i": np.array(iteration, np.int64),
+                    "condition": np.array(True),
+                    "a": state,
+                    "b": later,
+                    "start": np.array(True),
+                    "shape": np.array([64, 64], np.int64),
+                    "X": np.ones((1, 64), np.float32),
+                },
+            )
+            state = values[1]
+            emitted.append(values[3])
+        expected_second = later if changing else first
+        np.testing.assert_array_equal(emitted[0], np.ones((1, 64), np.float32) @ first if consumer == "body" else first)
+        np.testing.assert_array_equal(
+            emitted[1], np.ones((1, 64), np.float32) @ expected_second if consumer == "body" else expected_second
+        )
+        assert (
+            bool(
+                WeightDistributionScanner()._analyze_tensor_weight_extremes("later", expected_second, output_axes=(1,))
+            )
+            is changing
+        )
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        assert bool(plan.coverage_gaps) is changing
+        result = OnnxScanner().scan(str(path))
+        assert result.success is not changing
+        assert (result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME) is changing
+
+    @pytest.mark.parametrize("count", [1, 2])
+    def test_expanded_vector_carried_weight_does_not_hide_later_matrix(self, tmp_path: Path, count: int) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        later = np.zeros((64, 64), np.float32)
+        later[:5, 0] = 10
+        body = helper.make_graph(
+            [
+                helper.make_node("Expand", ["state", "shape"], ["weight"]),
+                helper.make_node("MatMul", ["X", "weight"], ["y"]),
+                helper.make_node("Constant", [], ["next"], value=self._tensor("", later)),
+            ],
+            "changing_expanded_vector",
+            [
+                self._value("i", [], TensorProto.INT64),
+                self._value("condition", [], TensorProto.BOOL),
+                self._value("state", None),
+            ],
+            [self._value("condition", [], TensorProto.BOOL), self._value("next", None), self._value("y", [1, 64])],
+        )
+        graph = helper.make_graph(
+            [helper.make_node("Loop", ["count", "start", "W"], ["final", "ys"], body=body)],
+            "expanded_vector_consumer",
+            [self._value("X", [1, 64])],
+            [self._value("ys", [count, 1, 64])],
+            [
+                self._tensor("W", np.zeros((64,), np.float32)),
+                self._tensor("shape", [64, 64], np.int64),
+                self._tensor("count", count, np.int64),
+                self._tensor("start", True, np.bool_),
+            ],
+        )
+        path, model = self._save(graph, tmp_path)
+        outputs: Any = ReferenceEvaluator(model).run(None, {"X": np.ones((1, 64), np.float32)})
+        assert outputs[0].reshape(count, 1, 64)[-1, 0, 0] == (50 if count == 2 else 0)
+        assert WeightDistributionScanner()._analyze_tensor_weight_extremes("later", later, output_axes=(1,))
+        result = OnnxScanner().scan(str(path))
+        assert result.success is (count == 1)
+        assert (result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME) is (count == 2)

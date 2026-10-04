@@ -21,8 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Preserve ONNX weight coverage across unknown broadcast ranks, unproven branch annotations, captured runtime inputs, and repeated loop state changes, including initializer-backed states and final transformed weights; avoid false coverage gaps for shape-restoring loops and padded Scan-8 outputs with omitted sequence lengths.
-- Preserve ONNX coverage through successive loop-state transfers and nested branch, skipped-loop, and caller-bound shape attributes; preserve optional control-flow output positions, distinguish immutable caller bindings, and materialize bounded stacked Loop and Scan weight views with their actual output axes only when their values remain invariant.
+- Preserve ONNX weight coverage across unknown broadcast ranks, unproven branch annotations, captured runtime inputs, and repeated loop state changes, including initializer-backed states, repeated body consumers, and final transformed weights; avoid false coverage gaps for unchanged shape-control provenance, single-step Scans, shape-restoring loops, and padded Scan-8 outputs with omitted sequence lengths.
+- Preserve ONNX coverage through successive loop-state transfers and nested branch, skipped-loop, and caller-bound shape and graph attributes; preserve optional control-flow output positions, distinguish immutable caller bindings, and materialize bounded stacked Loop and Scan weight views with their actual output axes only when their values remain invariant.
 - Enforce ONNX tensor budgets on expanded weight views and bound control-value decoding, repeated graph and sibling-state traversal, constant-context copying, dependency-closure work, and analysis-cache retention; reject copying reshapes and preserve independent weight findings and budget capacity when another view cannot be prepared.
 - Preserve UTF-8 pickle GLOBAL discovery in numeric PyTorch storage operands on Python 3.10–3.12.
 - Avoid incomplete PyTorch ZIP storage discovery for benign complete literals, verified padding, and impossible length-prefixed tensor bytes when no hidden payload is present.

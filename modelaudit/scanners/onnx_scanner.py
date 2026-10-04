@@ -2858,7 +2858,9 @@ def _build_onnx_weight_analysis_plan(
                 if resolved_attribute is None:
                     continue
                 for nested_graph in _iter_attribute_graphs(resolved_attribute):
-                    if merge_dependency_names(dependencies, graph_external_reference_names(nested_graph)):
+                    if merge_dependency_names(
+                        dependencies, graph_external_reference_names(nested_graph, local_attribute_bindings)
+                    ):
                         break
                 if dependency_collection_limit_marker in dependencies:
                     break
@@ -3416,7 +3418,7 @@ def _build_onnx_weight_analysis_plan(
                         for graph_input, parent_input in nested_graph_inputs.items()
                         if (shape := reentry_input_shape(parent_input)) is not None
                     }
-                    nested_external_names = graph_external_reference_names(nested_graph)
+                    nested_external_names = graph_external_reference_names(nested_graph, local_attribute_bindings)
                     captured_names = nested_external_names & tainted
                     related_nested_tainted_shapes = {
                         name: shape
@@ -3984,7 +3986,9 @@ def _build_onnx_weight_analysis_plan(
                 if resolved_attribute is None:
                     continue
                 for nested_graph in _iter_attribute_graphs(resolved_attribute):
-                    captured_names = set(graph_external_reference_names(nested_graph) & tainted)
+                    captured_names = set(
+                        graph_external_reference_names(nested_graph, local_attribute_bindings) & tainted
+                    )
                     nested_input_names = set(
                         bound_control_flow_graph_inputs(
                             body_node,
@@ -4286,7 +4290,7 @@ def _build_onnx_weight_analysis_plan(
                         depth=depth + 1,
                     ):
                         continue
-                    dependencies.update(graph_external_reference_names(nested_graph))
+                    dependencies.update(graph_external_reference_names(nested_graph, local_attribute_bindings))
                     if parent_inputs:
                         dependencies.update(
                             bound_control_flow_graph_inputs(
@@ -4392,7 +4396,7 @@ def _build_onnx_weight_analysis_plan(
                             depth=depth + 1,
                         ):
                             continue
-                        external_names = graph_external_reference_names(nested_graph)
+                        external_names = graph_external_reference_names(nested_graph, local_attribute_bindings)
                         live_names.update(external_names)
                         live_node_ids.update(graph_nodes_producing_names(subgraph, external_names))
                 continue
@@ -4404,7 +4408,7 @@ def _build_onnx_weight_analysis_plan(
                 if resolved_attribute is None:
                     continue
                 for nested_graph in _iter_attribute_graphs(resolved_attribute):
-                    external_names = graph_external_reference_names(nested_graph)
+                    external_names = graph_external_reference_names(nested_graph, local_attribute_bindings)
                     live_names.update(external_names)
                     live_node_ids.update(graph_nodes_producing_names(subgraph, external_names))
 
@@ -4481,7 +4485,7 @@ def _build_onnx_weight_analysis_plan(
                             depth=depth + 1,
                         ):
                             continue
-                        if graph_external_reference_names(nested_graph) & tainted:
+                        if graph_external_reference_names(nested_graph, local_attribute_bindings) & tainted:
                             has_tainted_nested_capture = True
                             break
                     if has_tainted_nested_capture:
@@ -5694,6 +5698,8 @@ def _build_onnx_weight_analysis_plan(
         parent_lineages: dict[str, dict[int, _OnnxWeightLineage]],
         opset_versions: dict[str, int],
         attribute_bindings: dict[str, Any],
+        *,
+        required_state_input: str | None = None,
     ) -> bool:
         nonlocal stack_invariance_work_remaining
         input_offset = 2 if node.op_type == "Loop" else 0
@@ -5733,6 +5739,9 @@ def _build_onnx_weight_analysis_plan(
                 continue
             visited.add(output_index)
             dependencies = graph_output_dependency_names(subgraph, (output_index,), attribute_bindings)
+            if required_state_input is not None:
+                dependencies = dependencies | {required_state_input}
+                required_state_input = None
             if dependency_names_exceeded_limit(dependencies) or len(dependencies) > stack_invariance_work_remaining:
                 return False
             stack_invariance_work_remaining -= len(dependencies)
@@ -5743,12 +5752,24 @@ def _build_onnx_weight_analysis_plan(
                 if binding is None:
                     continue
                 next_index, parent_name = binding
-                initial = parent_lineages.get(parent_name, {})
+                initial = {
+                    index: lineage
+                    for index, lineage in parent_lineages.get(parent_name, {}).items()
+                    if lineage.unresolved_reason != "shape_control_lineage"
+                }
+                updated = (
+                    {
+                        index: lineage
+                        for index, lineage in graph_output_lineages[next_index].items()
+                        if lineage.unresolved_reason != "shape_control_lineage"
+                    }
+                    if next_index < len(graph_output_lineages)
+                    else {}
+                )
                 if (
                     not initial
                     or any(lineage.unresolved_reason is not None for lineage in initial.values())
-                    or next_index >= len(graph_output_lineages)
-                    or graph_output_lineages[next_index] != initial
+                    or updated != initial
                 ):
                     return False
                 pending.append(next_index)
@@ -6872,7 +6893,7 @@ def _build_onnx_weight_analysis_plan(
                     }
                     subgraph_trusted_context_shapes = {
                         name: known_value_shapes[name]
-                        for name in graph_external_reference_names(subgraph)
+                        for name in graph_external_reference_names(subgraph, attribute_bindings)
                         if name in known_value_shapes and name in proven_value_ranks and name not in value_lineages
                     }
                     input_pairs: Iterable[tuple[Any, Any]]
@@ -8771,7 +8792,7 @@ def _build_onnx_weight_analysis_plan(
                                         rank_promotable_summary,
                                     )
                                 )
-                    for captured_name in graph_external_reference_names(subgraph):
+                    for captured_name in graph_external_reference_names(subgraph, attribute_bindings):
                         if captured_name in subgraph_input_names:
                             continue
                         if captured_name in known_value_shapes and captured_name not in subgraph_bound_value_shapes:
@@ -8782,6 +8803,12 @@ def _build_onnx_weight_analysis_plan(
                             subgraph_bound_value_ranks[captured_name] = known_value_ranks[captured_name]
                             if captured_name in proven_value_ranks:
                                 subgraph_bound_proven_value_ranks.add(captured_name)
+                    body_consumer_counts = {
+                        index: sum(group.consumer_count for group in groups[index].values())
+                        for lineages in subgraph_bound_lineages.values()
+                        for index, lineage in lineages.items()
+                        if lineage.unresolved_reason is None
+                    }
                     subgraph_results.append(
                         walk_graph(
                             subgraph,
@@ -8830,6 +8857,109 @@ def _build_onnx_weight_analysis_plan(
                             fail_on_unbound_inputs=fail_on_unbound_inputs,
                         ),
                     )
+                    if is_registered_standard_operator and node.op_type in {"Loop", "Scan"}:
+                        # Body consumers also see later carried values, even when
+                        # the final state is unused by the parent graph.
+                        for pair_index, (parent_input, graph_input) in enumerate(
+                            input_pairs, start=input_pair_index_start
+                        ):
+                            graph_input_name = _onnx_value_name(graph_input)
+                            initial_lineages = {
+                                index: lineage
+                                for index, lineage in value_lineages.get(str(parent_input), {}).items()
+                                if lineage.unresolved_reason is None
+                                and sum(group.consumer_count for group in groups[index].values())
+                                > body_consumer_counts.get(index, 0)
+                            }
+                            if (
+                                not initial_lineages
+                                or not is_repeated_control_flow_state_input(pair_index)
+                                or not subgraph_state_input_can_reach_weight_consumer(
+                                    subgraph,
+                                    graph_input_name,
+                                    opset_versions,
+                                    attribute_bindings=attribute_bindings,
+                                    inherited_constants=constants,
+                                )
+                                or control_flow_stack_values_are_invariant(
+                                    node,
+                                    subgraph,
+                                    control_flow_subgraph_state_output_index(node, pair_index, opset_versions),
+                                    subgraph_results[-1][0],
+                                    value_lineages,
+                                    opset_versions,
+                                    attribute_bindings,
+                                    required_state_input=graph_input_name,
+                                )
+                            ):
+                                continue
+                            state_output_index = control_flow_subgraph_state_output_index(
+                                node, pair_index, opset_versions
+                            )
+                            initial_shapes = {lineage.shape for lineage in initial_lineages.values()}
+                            initial_shape = next(iter(initial_shapes)) if len(initial_shapes) == 1 else None
+                            if initial_shape is not None and node.op_type == "Loop" and len(input_pairs) == 1:
+                                body_rank_bounds = subgraph_state_input_consumes_weight_rank_at_or_above_two(
+                                    subgraph,
+                                    graph_input_name,
+                                    initial_shape,
+                                    state_output_index,
+                                    related_repeated_state_shapes,
+                                )
+                                if body_rank_bounds is not None:
+                                    consumes_weight, next_shape = body_rank_bounds
+                                    if next_shape is None:
+                                        next_state_shapes: dict[int, tuple[int, ...]] = {}
+                                        subgraph_reenters_state_with_rank_promotion(
+                                            subgraph,
+                                            graph_input_name,
+                                            state_output_index,
+                                            constants,
+                                            opset_versions,
+                                            initial_shape,
+                                            trusted_context_shapes=subgraph_trusted_context_shapes,
+                                            output_shapes_out=next_state_shapes,
+                                            related_graph_input_shapes=related_repeated_state_shapes,
+                                            related_graph_input_shapes_cache_key=related_repeated_state_shapes_cache_key,
+                                        )
+                                        next_shape = next_state_shapes.get(state_output_index)
+                                    if not consumes_weight and next_shape == initial_shape:
+                                        continue
+                                    if (
+                                        next_shape is not None
+                                        and (
+                                            iterations := loop_exact_iteration_count(
+                                                max_count=_ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
+                                            )
+                                        )
+                                        is not None
+                                    ):
+                                        later_rank_bounds = exact_loop_repeated_state_weight_rank_bounds(
+                                            subgraph,
+                                            graph_input_name,
+                                            state_output_index,
+                                            next_shape,
+                                            len(next_shape),
+                                            max(iterations - 1, 0),
+                                            subgraph_trusted_context_shapes,
+                                            {},
+                                            len(node.input),
+                                        )
+                                        if later_rank_bounds is not None and not later_rank_bounds[0]:
+                                            continue
+                            for lineage in initial_lineages.values():
+                                record_unresolved_lineage(
+                                    _OnnxWeightLineage(
+                                        initializer_index=lineage.initializer_index,
+                                        shape=lineage.shape,
+                                        data_type=lineage.data_type,
+                                        transforms=lineage.transforms,
+                                        unresolved_reason="unresolved_control_flow_stack_lineage",
+                                    ),
+                                    node,
+                                    current_node_index,
+                                    pair_index,
+                                )
 
             function = functions.get(function_key)
             if function is not None and function_depth >= _ONNX_WEIGHT_TRANSFORM_DEPTH_LIMIT:
@@ -9970,7 +10100,21 @@ def _build_onnx_weight_analysis_plan(
                     if (
                         graph_output_parent_lineages
                         and (stacked_scan_output or repeated_carried_state)
-                        and not (node.op_type == "Loop" and loop_exact_iteration_count(max_count=1) is not None)
+                        and (
+                            loop_exact_iteration_count(max_count=1) is None
+                            if node.op_type == "Loop"
+                            else scan_may_repeat_body(
+                                node,
+                                constants,
+                                graph_input_names,
+                                known_value_shapes,
+                                trusted_scan_shape_names,
+                                untrusted_scan_shape_names,
+                                scan_input_axes=resolved_scan_input_axes,
+                                scan_input_offset=resolved_scan_input_offset,
+                                num_scan_inputs=resolved_scan_input_count,
+                            )
+                        )
                         and not control_flow_stack_values_are_invariant(
                             node,
                             subgraph,
