@@ -9,7 +9,7 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Any, BinaryIO
 
-from ..core_results import mark_operational_scan_error
+from ..core_results import _merge_inconclusive_owner_result, mark_operational_scan_error
 from ..scanner_registry_metadata import get_scanner_registry_metadata
 from ..scanner_results import (
     SCAN_OUTCOME_REASONS_METADATA_KEY,
@@ -160,6 +160,27 @@ def _pickle_result_consumes_entire_payload(path: str, result: ScanResult) -> boo
     return positions[0] == positions[1] == positions[2] == file_size
 
 
+def _select_zip_scanner_id(path: str, ext: str, config: dict[str, Any] | None) -> str:
+    """Select a ZIP subtype by trusted structure and suffix fallback."""
+    if config is not None and not allows_zip_structure_analysis(policy_from_config(config), path):
+        return "joblib" if ext == ".joblib" else "zip"
+    if is_torchserve_mar_archive(path, config):
+        return "torchserve_mar"
+    if is_keras_zip_archive(path, allow_config_only=ext == ".keras", config=config):
+        return "keras_zip"
+    if is_pytorch_zip_archive(path, config):
+        return "pytorch_zip"
+    if is_executorch_archive(path, config):
+        return "executorch"
+    if is_skops_archive(path, config):
+        return "skops"
+    if ext == ".skops":
+        return "skops"
+    if ext == ".joblib":
+        return "joblib"
+    return "zip"
+
+
 def _select_nested_scanner_id(
     path: str,
     header_format_override: str | None = None,
@@ -170,23 +191,7 @@ def _select_nested_scanner_id(
     ext = os.path.splitext(path)[1].lower()
 
     if header_format == "zip":
-        if config is not None and not allows_zip_structure_analysis(policy_from_config(config), path):
-            return "joblib" if ext == ".joblib" else "zip"
-        if is_torchserve_mar_archive(path, config):
-            return "torchserve_mar"
-        if is_keras_zip_archive(path, allow_config_only=ext == ".keras", config=config):
-            return "keras_zip"
-        if is_pytorch_zip_archive(path, config):
-            return "pytorch_zip"
-        if is_executorch_archive(path, config):
-            return "executorch"
-        if is_skops_archive(path, config):
-            return "skops"
-        if ext == ".skops":
-            return "skops"
-        if ext == ".joblib":
-            return "joblib"
-        return "zip"
+        return _select_zip_scanner_id(path, ext, config)
 
     if ext == ".joblib" and header_format in _COMPRESSED_HEADER_FORMATS | {"pickle"}:
         return "joblib"
@@ -392,64 +397,62 @@ def _make_unavailable_recognized_format_result(path: str, format_: str, scanner_
     return result
 
 
-def _make_incomplete_xml_model_result(path: str) -> ScanResult:
-    """Fail closed when bounded nested XML routing cannot reach the structural root."""
+def _make_incomplete_routing_result(path: str, *, name: str, message: str, format_: str, reason: str) -> ScanResult:
     result = ScanResult(scanner_name="unknown")
     result.add_check(
-        name="XML Model Routing",
+        name=name,
         passed=False,
+        message=message,
+        severity=IssueSeverity.INFO,
+        location=path,
+        details={"format": format_, "path": path},
+    )
+    mark_inconclusive_scan_result(result, reason)
+    mark_operational_scan_error(result, reason)
+    result.finish(success=False)
+    return result
+
+
+def _make_incomplete_xml_model_result(path: str) -> ScanResult:
+    """Fail closed when bounded XML routing cannot reach the structural root."""
+    return _make_incomplete_routing_result(
+        path,
+        name="XML Model Routing",
         message=(
             "XML model routing was inconclusive because the bounded probe ended "
             "before the first structural root element"
         ),
-        severity=IssueSeverity.INFO,
-        location=path,
-        details={"format": XML_MODEL_INCONCLUSIVE_FORMAT, "path": path},
+        format_=XML_MODEL_INCONCLUSIVE_FORMAT,
+        reason=_XML_MODEL_ROUTING_INCOMPLETE_REASON,
     )
-    mark_inconclusive_scan_result(result, _XML_MODEL_ROUTING_INCOMPLETE_REASON)
-    mark_operational_scan_error(result, _XML_MODEL_ROUTING_INCOMPLETE_REASON)
-    result.finish(success=False)
-    return result
 
 
 def _make_incomplete_protobuf_model_result(path: str) -> ScanResult:
-    """Fail closed when a nested protobuf candidate cannot receive analysis."""
-    result = ScanResult(scanner_name="unknown")
-    result.add_check(
+    """Fail closed when a protobuf candidate cannot receive tentative analysis."""
+    return _make_incomplete_routing_result(
+        path,
         name="Protobuf Model Routing",
-        passed=False,
         message=(
             "Protobuf model routing was inconclusive because tentative protobuf "
             "analysis was unavailable for a bounded-probe candidate"
         ),
-        severity=IssueSeverity.INFO,
-        location=path,
-        details={"format": PROTOBUF_MODEL_CANDIDATE_FORMAT, "path": path},
+        format_=PROTOBUF_MODEL_CANDIDATE_FORMAT,
+        reason=_PROTOBUF_MODEL_ROUTING_INCOMPLETE_REASON,
     )
-    mark_inconclusive_scan_result(result, _PROTOBUF_MODEL_ROUTING_INCOMPLETE_REASON)
-    mark_operational_scan_error(result, _PROTOBUF_MODEL_ROUTING_INCOMPLETE_REASON)
-    result.finish(success=False)
-    return result
 
 
 def _make_incomplete_sentencepiece_model_proto_result(path: str) -> ScanResult:
-    """Fail closed when a nested SentencePiece-like protobuf fails ownership validation."""
-    result = ScanResult(scanner_name="unknown")
-    result.add_check(
+    """Fail closed when a SentencePiece-like protobuf fails ownership validation."""
+    return _make_incomplete_routing_result(
+        path,
         name="SentencePiece ModelProto Routing",
-        passed=False,
         message=(
             "SentencePiece ModelProto routing was inconclusive because the payload "
             "looked like a tokenizer protobuf but failed ownership validation"
         ),
-        severity=IssueSeverity.INFO,
-        location=path,
-        details={"format": SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT, "path": path},
+        format_=SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT,
+        reason=_SENTENCEPIECE_MODEL_PROTO_ROUTING_INCOMPLETE_REASON,
     )
-    mark_inconclusive_scan_result(result, _SENTENCEPIECE_MODEL_PROTO_ROUTING_INCOMPLETE_REASON)
-    mark_operational_scan_error(result, _SENTENCEPIECE_MODEL_PROTO_ROUTING_INCOMPLETE_REASON)
-    result.finish(success=False)
-    return result
 
 
 def _deduplicate_exact_merged_findings(result: ScanResult) -> None:
@@ -459,25 +462,11 @@ def _deduplicate_exact_merged_findings(result: ScanResult) -> None:
         payload = item.model_dump(mode="json", exclude={"timestamp"})
         return json.dumps(payload, sort_keys=True, default=str)
 
-    seen_issues: set[str] = set()
-    unique_issues = []
-    for issue in result.issues:
-        issue_signature = signature(issue)
-        if issue_signature in seen_issues:
-            continue
-        seen_issues.add(issue_signature)
-        unique_issues.append(issue)
-    result.issues = unique_issues
-
-    seen_checks: set[str] = set()
-    unique_checks = []
-    for check in result.checks:
-        check_signature = signature(check)
-        if check_signature in seen_checks:
-            continue
-        seen_checks.add(check_signature)
-        unique_checks.append(check)
-    result.checks = unique_checks
+    for field_name in ("issues", "checks"):
+        unique_items: dict[str, Any] = {}
+        for item in getattr(result, field_name):
+            unique_items.setdefault(signature(item), item)
+        setattr(result, field_name, list(unique_items.values()))
 
 
 def _merge_composed_scan_result(result: ScanResult, other: ScanResult) -> None:
@@ -1035,37 +1024,25 @@ def _make_incomplete_llamafile_routing_result(path: str, config: dict[str, Any] 
 
 
 def _make_incomplete_nemo_routing_result(path: str) -> ScanResult:
-    """Fail closed when bounded nested NeMo structural routing cannot decide."""
-    result = ScanResult(scanner_name="unknown")
-    result.add_check(
+    """Fail closed when bounded NeMo structural routing cannot reach a decision."""
+    return _make_incomplete_routing_result(
+        path,
         name="NeMo Routing",
-        passed=False,
         message="NeMo routing was inconclusive because the bounded TAR member probe reached its limit",
-        severity=IssueSeverity.INFO,
-        location=path,
-        details={"format": NEMO_ROUTING_INCONCLUSIVE_FORMAT, "path": path},
+        format_=NEMO_ROUTING_INCONCLUSIVE_FORMAT,
+        reason="nemo_routing_incomplete",
     )
-    mark_inconclusive_scan_result(result, "nemo_routing_incomplete")
-    mark_operational_scan_error(result, "nemo_routing_incomplete")
-    result.finish(success=False)
-    return result
 
 
 def _make_incomplete_tokenizer_json_routing_result(path: str) -> ScanResult:
-    """Fail closed when bounded nested inspection cannot prove tokenizer ownership."""
-    result = ScanResult(scanner_name="unknown")
-    result.add_check(
+    """Fail closed when bounded inspection cannot prove exact tokenizer ownership."""
+    return _make_incomplete_routing_result(
+        path,
         name="Tokenizer JSON Routing",
-        passed=False,
         message="Tokenizer JSON ownership was inconclusive because the bounded EOF proof could not establish it",
-        severity=IssueSeverity.INFO,
-        location=path,
-        details={"format": TOKENIZER_JSON_ROUTING_INCONCLUSIVE_FORMAT, "path": path},
+        format_=TOKENIZER_JSON_ROUTING_INCONCLUSIVE_FORMAT,
+        reason=_TOKENIZER_JSON_ROUTING_INCOMPLETE_REASON,
     )
-    mark_inconclusive_scan_result(result, _TOKENIZER_JSON_ROUTING_INCOMPLETE_REASON)
-    mark_operational_scan_error(result, _TOKENIZER_JSON_ROUTING_INCOMPLETE_REASON)
-    result.finish(success=False)
-    return result
 
 
 def _make_incomplete_mxnet_symbol_routing_result(path: str, config: dict[str, Any] | None = None) -> ScanResult:
@@ -1089,12 +1066,6 @@ def _make_incomplete_mxnet_symbol_routing_result(path: str, config: dict[str, An
 
     scanner_selection = policy_from_config(config)
 
-    def merge_owner_result(owner_result: ScanResult) -> None:
-        existing_reasons = list(result.metadata.get("scan_outcome_reasons", []))
-        owner_reasons = list(owner_result.metadata.get("scan_outcome_reasons", []))
-        result.merge(owner_result)
-        result.metadata["scan_outcome_reasons"] = list(dict.fromkeys([*owner_reasons, *existing_reasons]))
-
     if os.path.splitext(path)[1].lower() == ".params":
         if scanner_selection.allows("mxnet"):
             MXNetScanner(config=config).scan_params_file_security(path, result)
@@ -1109,7 +1080,7 @@ def _make_incomplete_mxnet_symbol_routing_result(path: str, config: dict[str, An
 
     if os.path.getsize(path) <= JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES:
         if scanner_selection.allows("jax_checkpoint"):
-            merge_owner_result(JaxCheckpointScanner(config=config).scan(path))
+            _merge_inconclusive_owner_result(result, JaxCheckpointScanner(config=config).scan(path))
         elif scanner_selection.active:
             add_scanner_selection_skip_check(
                 result,
@@ -1123,7 +1094,7 @@ def _make_incomplete_mxnet_symbol_routing_result(path: str, config: dict[str, An
     if ManifestScanner.can_handle(path):
         if scanner_selection.allows("manifest"):
             manifest_result = ManifestScanner(config=config).scan(path)
-            merge_owner_result(manifest_result)
+            _merge_inconclusive_owner_result(result, manifest_result)
             manifest_covered_templates = manifest_result.metadata.get("analysis_incomplete") is not True
         elif scanner_selection.active:
             add_scanner_selection_skip_check(
@@ -1135,7 +1106,7 @@ def _make_incomplete_mxnet_symbol_routing_result(path: str, config: dict[str, An
             )
     if not manifest_covered_templates and Jinja2TemplateScanner.can_handle(path):
         if scanner_selection.allows("jinja2_template"):
-            merge_owner_result(Jinja2TemplateScanner(config=config).scan(path))
+            _merge_inconclusive_owner_result(result, Jinja2TemplateScanner(config=config).scan(path))
         elif scanner_selection.active:
             add_scanner_selection_skip_check(
                 result,
@@ -1150,70 +1121,46 @@ def _make_incomplete_mxnet_symbol_routing_result(path: str, config: dict[str, An
 
 def _make_incomplete_xgboost_ubjson_routing_result(path: str) -> ScanResult:
     """Fail closed when bounded nested UBJSON routing cannot decide."""
-    result = ScanResult(scanner_name="unknown")
-    result.add_check(
+    return _make_incomplete_routing_result(
+        path,
         name="XGBoost UBJSON Routing",
-        passed=False,
         message="XGBoost UBJSON routing was inconclusive because the bounded structural probe reached its limit",
-        severity=IssueSeverity.INFO,
-        location=path,
-        details={"format": XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT, "path": path},
+        format_=XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT,
+        reason="xgboost_ubjson_routing_incomplete",
     )
-    mark_inconclusive_scan_result(result, "xgboost_ubjson_routing_incomplete")
-    mark_operational_scan_error(result, "xgboost_ubjson_routing_incomplete")
-    result.finish(success=False)
-    return result
 
 
 def _make_incomplete_tensorflow_protobuf_routing_result(path: str) -> ScanResult:
-    """Fail closed when bounded nested TensorFlow protobuf routing cannot decide."""
-    result = ScanResult(scanner_name="unknown")
-    result.add_check(
+    """Fail closed when bounded TensorFlow protobuf routing cannot decide."""
+    return _make_incomplete_routing_result(
+        path,
         name="TensorFlow Protobuf Routing",
-        passed=False,
         message="TensorFlow protobuf routing was inconclusive because the bounded structural probe reached its limit",
-        severity=IssueSeverity.INFO,
-        location=path,
-        details={"format": TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT, "path": path},
+        format_=TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT,
+        reason=_TENSORFLOW_PROTOBUF_ROUTING_INCOMPLETE_REASON,
     )
-    mark_inconclusive_scan_result(result, _TENSORFLOW_PROTOBUF_ROUTING_INCOMPLETE_REASON)
-    mark_operational_scan_error(result, _TENSORFLOW_PROTOBUF_ROUTING_INCOMPLETE_REASON)
-    result.finish(success=False)
-    return result
 
 
 def _make_incomplete_onnx_routing_result(path: str) -> ScanResult:
-    """Fail closed when bounded nested ONNX protobuf routing cannot decide."""
-    result = ScanResult(scanner_name="unknown")
-    result.add_check(
+    """Fail closed when bounded ONNX protobuf routing cannot decide."""
+    return _make_incomplete_routing_result(
+        path,
         name="ONNX Routing",
-        passed=False,
         message="ONNX routing was inconclusive because the bounded structural probe reached its limit",
-        severity=IssueSeverity.INFO,
-        location=path,
-        details={"format": ONNX_ROUTING_INCONCLUSIVE_FORMAT, "path": path},
+        format_=ONNX_ROUTING_INCONCLUSIVE_FORMAT,
+        reason=_ONNX_ROUTING_INCOMPLETE_REASON,
     )
-    mark_inconclusive_scan_result(result, _ONNX_ROUTING_INCOMPLETE_REASON)
-    mark_operational_scan_error(result, _ONNX_ROUTING_INCOMPLETE_REASON)
-    result.finish(success=False)
-    return result
 
 
 def _make_incomplete_pickle_routing_result(path: str) -> ScanResult:
-    """Fail closed when bounded nested protocol-less Pickle routing cannot decide."""
-    result = ScanResult(scanner_name="unknown")
-    result.add_check(
+    """Fail closed when bounded protocol-less Pickle routing cannot decide."""
+    return _make_incomplete_routing_result(
+        path,
         name="Pickle Routing",
-        passed=False,
         message="Pickle routing was inconclusive because the bounded structural probe reached its limit",
-        severity=IssueSeverity.INFO,
-        location=path,
-        details={"format": PICKLE_ROUTING_INCONCLUSIVE_FORMAT, "path": path},
+        format_=PICKLE_ROUTING_INCONCLUSIVE_FORMAT,
+        reason=_PICKLE_ROUTING_INCOMPLETE_REASON,
     )
-    mark_inconclusive_scan_result(result, _PICKLE_ROUTING_INCOMPLETE_REASON)
-    mark_operational_scan_error(result, _PICKLE_ROUTING_INCOMPLETE_REASON)
-    result.finish(success=False)
-    return result
 
 
 def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanResult:

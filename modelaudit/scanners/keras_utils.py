@@ -592,3 +592,31 @@ def check_subclassed_model(
             location=location,
             details={"model_class": redacted_model_class},
         )
+
+
+def _keras_exact_module_policy() -> tuple[dict[str, frozenset[str]], dict[str, tuple[str, ...]]]:
+    """Create independent exact-module symbol tables for a Keras scanner."""
+    return (
+        {
+            "_ctypes": frozenset({"dlopen"}),
+            "_frozen_importlib": frozenset({"__import__", "_find_and_load", "_find_and_load_unlocked"}),
+            "_imp": frozenset({"create_builtin", "create_dynamic", "exec_builtin", "exec_dynamic", "load_dynamic"}),
+            "_interpreters": frozenset({"call", "exec"}),
+            "_io": frozenset({"open"}),
+            "_operator": frozenset({"attrgetter", "methodcaller"}),
+            "_pickle": frozenset({"load", "loads"}),
+            "_posixsubprocess": frozenset({"fork_exec"}),
+            "_socket": frozenset({"socket"}),
+            "_thread": frozenset({"start_new", "start_new_thread"}),
+            "_winapi": frozenset({"CreateProcess", "ShellExecute"}),
+            "_xxsubinterpreters": frozenset({"run_string"}),
+            "io": frozenset({"open"}),
+            "nt": frozenset({"popen", "startfile", "system"}),
+            "operator": frozenset({"attrgetter", "methodcaller"}),
+            "posix": frozenset({"popen", "system"}),
+        },
+        {
+            "nt": ("exec", "spawn"),
+            "posix": ("exec", "spawn"),
+        },
+    )

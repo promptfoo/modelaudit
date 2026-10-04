@@ -55,6 +55,7 @@ from .core_results import (
     results_have_incomplete_coverage_under_directory,
     results_have_inconclusive_outcome,
 )
+from .finding_identity import finding_identity, preserve_finding_identity
 from .integrations.jfrog import scan_jfrog_artifact
 from .integrations.sarif_formatter import _sarif_source_identifier_key, format_sarif_output
 from .integrations.source_serialization import serialize_source_text, serialize_source_value
@@ -95,7 +96,6 @@ from .utils.helpers.auto_defaults import (
     generate_auto_defaults,
     parse_size_string,
 )
-from .utils.helpers.finding_identity import finding_identity, preserve_finding_identity
 from .utils.helpers.interrupt_handler import interruptible_scan
 from .utils.repository_context import (
     REPOSITORY_CURRENT_FILE_CONFIG_KEY,
@@ -3076,7 +3076,6 @@ def _create_path_progress_callback(
     actual_path: str,
 ) -> Any | None:
     """Build the legacy spinner callback or enhanced tracker callback for one path."""
-    progress_callback = None
     if spinner and not progress_tracker:
 
         def update_progress(message: str, percentage: float, spinner_bound: Any = spinner) -> None:
@@ -3085,7 +3084,7 @@ def _create_path_progress_callback(
         return update_progress
 
     if not progress_tracker:
-        return progress_callback
+        return None
 
     try:
         from .progress import ProgressPhase

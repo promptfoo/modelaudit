@@ -19,6 +19,7 @@ from modelaudit.core_results import (
     results_have_inconclusive_outcome,
     results_have_operational_error,
 )
+from modelaudit.finding_identity import finding_identity
 from modelaudit.integrations._sarif_identity import (
     redact_source_identifier as _identity_location,
 )
@@ -33,7 +34,6 @@ from modelaudit.integrations.source_serialization import (
 )
 from modelaudit.models import ModelAuditResultModel
 from modelaudit.scanner_results import IssueSeverity
-from modelaudit.utils.helpers.finding_identity import finding_identity
 
 _JSON_VALUE_ADAPTER: TypeAdapter[Any] = TypeAdapter(Any)
 

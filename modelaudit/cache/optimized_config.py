@@ -35,6 +35,48 @@ _RUNTIME_ONLY_CONFIG_KEYS = frozenset(
 )
 
 
+def _extract_config_and_path(args: tuple, kwargs: dict) -> tuple[dict[str, Any] | None, str | None]:
+    """
+    Extract config dict and file path from function arguments.
+
+    Supports various argument patterns:
+    - func(path: str, config: dict = None)
+    - func(self, path: str) where self.config exists
+    - func(path: str, **kwargs) where config is in kwargs
+
+    Args:
+        args: Positional arguments
+        kwargs: Keyword arguments
+
+    Returns:
+        Tuple of (config_dict, file_path)
+    """
+    config = None
+    file_path = None
+
+    # Try to extract file path
+    if args:
+        # Check if first arg looks like self (has attributes)
+        if hasattr(args[0], "__dict__") and hasattr(args[0], "config"):
+            # This is a method call: self.scan(path)
+            config = getattr(args[0], "config", {})
+            file_path = args[1] if len(args) > 1 else kwargs.get("path")
+        else:
+            # This is a function call: scan_file(path, config=None)
+            file_path = args[0]
+            config = args[1] if len(args) > 1 else kwargs.get("config")
+    else:
+        # All arguments are keyword arguments
+        file_path = kwargs.get("path")
+        config = kwargs.get("config")
+
+    # Ensure config is a dict
+    if config is None or not isinstance(config, dict):
+        config = {}
+
+    return config, file_path
+
+
 def _serialize_fingerprint_value(value: Any) -> str:
     """Serialize a normalized value into a stable string fingerprint."""
     return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
@@ -181,7 +223,6 @@ class CacheConfiguration:
 
         # Pre-compute common decisions
         self._small_file_extensions = {".txt", ".md", ".json", ".yaml", ".yml"}
-        self._large_file_extensions = {".bin", ".pkl", ".h5", ".onnx", ".pb", ".pth", ".pt"}
 
     def get_version_context(self) -> dict[str, Any]:
         """Return the stable cache-version context for the current scan config."""
@@ -254,23 +295,7 @@ class ConfigurationExtractor:
         Returns:
             Tuple of (cache_config, file_path)
         """
-        config_dict = None
-        file_path = None
-
-        # Fast path: extract file path first
-        if args:
-            if hasattr(args[0], "__dict__") and hasattr(args[0], "config"):
-                # Method call: self.scan(path)
-                config_dict = getattr(args[0], "config", {})
-                file_path = args[1] if len(args) > 1 else kwargs.get("path")
-            else:
-                # Function call: scan_file(path, config=None)
-                file_path = args[0]
-                config_dict = args[1] if len(args) > 1 else kwargs.get("config")
-        else:
-            # Keyword arguments only
-            file_path = kwargs.get("path")
-            config_dict = kwargs.get("config")
+        config_dict, file_path = _extract_config_and_path(args, kwargs)
 
         # If no file path, return minimal config
         if not file_path:

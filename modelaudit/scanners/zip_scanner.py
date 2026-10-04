@@ -1408,26 +1408,6 @@ class ZipScanner(BaseScanner):
 
         return target_bytes.decode("utf-8", "replace")
 
-    @staticmethod
-    def _resolve_symlink_target(
-        target: str,
-        *,
-        resolved_name: str,
-        extraction_root: str,
-    ) -> tuple[str, bool]:
-        """Resolve a relative symlink target while enforcing the archive extraction root."""
-        if is_absolute_archive_path(target):
-            return target, False
-
-        normalized_target = target.replace("\\", os.sep).replace("/", os.sep)
-        target_base = os.path.dirname(resolved_name)
-        target_resolved = os.path.normpath(os.path.join(target_base, normalized_target))
-        try:
-            target_from_root = os.path.relpath(target_resolved, extraction_root)
-        except ValueError:
-            return target_resolved, False
-        return sanitize_archive_path(target_from_root, extraction_root)
-
     @classmethod
     def can_handle(cls, path: str) -> bool:
         """Check if this scanner can handle the given path"""
