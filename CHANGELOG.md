@@ -24,6 +24,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Preserve ONNX weight coverage across unknown broadcast ranks, unproven branch annotations, captured runtime inputs, and repeated loop state changes; avoid false coverage gaps for shape-restoring loops and padded Scan-8 outputs.
 - Preserve ONNX coverage through successive loop-state transfers and nested branch, skipped-loop, and caller-bound shape attributes; preserve optional control-flow output positions and materialize bounded stacked Loop and Scan weight views.
 - Enforce ONNX tensor budgets on expanded weight views and bound control-value decoding, repeated graph and sibling-state traversal, constant-context copying, and analysis-cache retention.
+- Preserve UTF-8 pickle GLOBAL discovery in numeric PyTorch storage operands on Python 3.10–3.12.
+- Avoid incomplete PyTorch ZIP storage discovery for benign complete literals, verified padding, and impossible length-prefixed tensor bytes when no hidden payload is present.
+- Preserve hidden-pickle detection across storage probe limits, nested literals, long global names, and memoized operands; report incomplete coverage without discarding suspicious or malicious verdicts when inspection limits are reached.
+- Preserve benign Unicode metadata when checking line continuations without retaining a per-character copy.
+- Avoid duplicate padding charges when PyTorch ZIP storage probing retries a CRC mismatch.
+- Bound repeated PyTorch literal URL validation and report incomplete coverage when its shared allowance is exhausted.
+- Bound malformed PyTorch GLOBAL recovery across fallback passes and preserve benign protocol-0 FLOAT operands.
 - Preserve native SafeTensors routing when a valid bounded header also resembles an FDICT zlib stream.
 - Avoid false incomplete pickle scans when Python lazily refreshes an import-directory cache after a change made before scanning.
 
