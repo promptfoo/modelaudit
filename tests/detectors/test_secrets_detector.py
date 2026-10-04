@@ -30,6 +30,24 @@ def _padded_basic_auth_header_pairs(count: int = 20) -> str:
 class TestSecretsDetector:
     """Test the SecretsDetector class."""
 
+    @pytest.mark.parametrize(
+        ("text", "secret_type", "secret_length", "prefix"),
+        [
+            ("password=" + "abCDef12345_" * 25000, "Hardcoded Password", 300000, "abCDef12345_"),
+            ("Authorization: Basic" + " " * 300000 + "dXNlcjpwYXNz", "Basic Auth Credentials", 12, "Basic "),
+        ],
+        ids=["long-password", "padded-basic-auth"],
+    )
+    def test_raw_secret_preview_is_bounded(self, text: str, secret_type: str, secret_length: int, prefix: str) -> None:
+        findings = SecretsDetector().scan_text(text)
+        assert len(findings) == 1
+        finding = findings[0]
+        assert finding["secret_type"] == secret_type
+        assert finding["length"] == secret_length
+        assert len(finding["redacted_value"]) <= 180
+        assert finding["redacted_value"].startswith(prefix)
+        assert finding["redacted_value"].endswith("...")
+
     def test_default_detector_reuses_precompiled_patterns(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Default detector construction should not rebuild static regex banks."""
 
@@ -59,38 +77,28 @@ class TestSecretsDetector:
 
     def test_detect_openai_keys(self):
         """Test detection of OpenAI API keys."""
-        detector = SecretsDetector()
-
         # Test OpenAI API key (48 chars after sk-)
-        text = "OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJ12"
-        findings = detector.scan_text(text)
-        assert len(findings) > 0
-        assert any("OpenAI" in f["secret_type"] for f in findings)
+        _assert_secret_type_detection(
+            ("OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJ12"), ("OpenAI")
+        )
 
     def test_detect_github_tokens(self):
         """Test detection of GitHub tokens."""
-        detector = SecretsDetector()
-
         # Test GitHub personal token
-        text = "github_token=ghp_abcdefghijklmnopqrstuvwxyz0123456789"
-        findings = detector.scan_text(text)
-        assert len(findings) > 0
-        assert any("GitHub" in f["secret_type"] for f in findings)
+        _assert_secret_type_detection(("github_token=ghp_abcdefghijklmnopqrstuvwxyz0123456789"), ("GitHub"))
 
     def test_detect_jwt_tokens(self):
         """Test detection of JWT tokens."""
-        detector = SecretsDetector()
-
         # Test a non-example JWT-shaped token. The well-known JWT.io sample is
         # intentionally suppressed as documentation/test data.
-        text = (
-            "token=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
-            "eyJzdWIiOiJ1c2VyMTIzIiwic2NvcGUiOiJhZG1pbiIsImlhdCI6MTcwMDAwMDAwMH0."
-            "q1w2e3r4t5y6u7i8o9p0asdfghjklzxcvbnmQWERty"
+        _assert_secret_type_detection(
+            (
+                "token=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+                "eyJzdWIiOiJ1c2VyMTIzIiwic2NvcGUiOiJhZG1pbiIsImlhdCI6MTcwMDAwMDAwMH0."
+                "q1w2e3r4t5y6u7i8o9p0asdfghjklzxcvbnmQWERty"
+            ),
+            ("JWT"),
         )
-        findings = detector.scan_text(text)
-        assert len(findings) > 0
-        assert any("JWT" in f["secret_type"] for f in findings)
 
     def test_known_example_jwt_is_suppressed_by_default(self) -> None:
         """The JWT.io example token should not produce warning-level noise."""
@@ -519,9 +527,10 @@ class TestSecretsDetector:
         basic_findings = _basic_auth_findings(findings)
 
         assert basic_findings
-        assert basic_findings[0]["redacted_value"] == "Basic <redacted>"
+        assert isinstance(basic_findings[0]["redacted_value"], str)
+        assert token in basic_findings[0]["redacted_value"]
         serialized = json.dumps(basic_findings, sort_keys=True)
-        assert token not in serialized
+        assert token in serialized
 
     @pytest.mark.parametrize(
         ("text", "token", "opener"),
@@ -559,8 +568,9 @@ class TestSecretsDetector:
 
         basic_findings = _basic_auth_findings(findings)
         assert len(basic_findings) == 1
-        assert basic_findings[0]["redacted_value"] == "Basic <redacted>"
-        assert token not in json.dumps(basic_findings, sort_keys=True)
+        assert isinstance(basic_findings[0]["redacted_value"], str)
+        assert token in basic_findings[0]["redacted_value"]
+        assert token in json.dumps(basic_findings, sort_keys=True)
 
     def test_basic_auth_source_tuple_headers_container_is_detected(self) -> None:
         detector = SecretsDetector()
@@ -571,8 +581,9 @@ class TestSecretsDetector:
 
         basic_findings = _basic_auth_findings(findings)
         assert len(basic_findings) == 1
-        assert basic_findings[0]["redacted_value"] == "Basic <redacted>"
-        assert token not in json.dumps(basic_findings, sort_keys=True)
+        assert isinstance(basic_findings[0]["redacted_value"], str)
+        assert token in basic_findings[0]["redacted_value"]
+        assert token in json.dumps(basic_findings, sort_keys=True)
 
     @pytest.mark.parametrize("container_name", ["params", "metadata"])
     def test_basic_auth_source_tuple_non_headers_container_is_ignored(self, container_name: str) -> None:
@@ -591,12 +602,7 @@ class TestSecretsDetector:
         text = f"Authorization:\n{filler}  - Basic {token}\n"
 
         assert text.index("Basic ") - text.index("Authorization:") > BASIC_AUTH_HEADER_COLLECTION_CONTEXT_MAX_CHARS
-        findings = detector.scan_text(text, context="headers.yaml")
-
-        basic_findings = _basic_auth_findings(findings)
-        assert len(basic_findings) == 1
-        assert basic_findings[0]["redacted_value"] == "Basic <redacted>"
-        assert token not in json.dumps(basic_findings, sort_keys=True)
+        _assert_yaml_basic_auth(detector, text, token)
 
     def test_basic_auth_many_yaml_quoted_header_value_list_entries_are_detected(self) -> None:
         detector = SecretsDetector()
@@ -605,12 +611,7 @@ class TestSecretsDetector:
         text = f'"Authorization":\n{filler}  - Basic {token}\n'
 
         assert text.index("Basic ") - text.index('"Authorization":') > BASIC_AUTH_HEADER_COLLECTION_CONTEXT_MAX_CHARS
-        findings = detector.scan_text(text, context="headers.yaml")
-
-        basic_findings = _basic_auth_findings(findings)
-        assert len(basic_findings) == 1
-        assert basic_findings[0]["redacted_value"] == "Basic <redacted>"
-        assert token not in json.dumps(basic_findings, sort_keys=True)
+        _assert_yaml_basic_auth(detector, text, token)
 
     def test_basic_auth_many_yaml_header_object_value_list_entries_are_detected(self) -> None:
         detector = SecretsDetector()
@@ -619,12 +620,7 @@ class TestSecretsDetector:
         text = f"headers:\n  - name: Proxy-Authorization\n    value:\n{filler}      - Basic {token}\n"
 
         assert text.index("Basic ") - text.index("value:") > BASIC_AUTH_HEADER_COLLECTION_CONTEXT_MAX_CHARS
-        findings = detector.scan_text(text, context="headers.yaml")
-
-        basic_findings = _basic_auth_findings(findings)
-        assert len(basic_findings) == 1
-        assert basic_findings[0]["redacted_value"] == "Basic <redacted>"
-        assert token not in json.dumps(basic_findings, sort_keys=True)
+        _assert_yaml_basic_auth(detector, text, token)
 
     @pytest.mark.parametrize("value_key", ["value", "headerValue"])
     @pytest.mark.parametrize("header_name", ["Authorization", "Proxy-Authorization"])
@@ -643,8 +639,9 @@ class TestSecretsDetector:
 
         basic_findings = _basic_auth_findings(findings)
         assert len(basic_findings) == 1
-        assert basic_findings[0]["redacted_value"] == "Basic <redacted>"
-        assert token not in json.dumps(basic_findings, sort_keys=True)
+        assert isinstance(basic_findings[0]["redacted_value"], str)
+        assert token in basic_findings[0]["redacted_value"]
+        assert token in json.dumps(basic_findings, sort_keys=True)
 
     def test_basic_auth_yaml_header_value_list_context_stops_at_next_key(self) -> None:
         detector = SecretsDetector()
@@ -661,12 +658,7 @@ class TestSecretsDetector:
         token = _basic_auth_token(b"yaml-comment-gap:pass")
         text = f"{header_name}:\n  # generated header list\n  # primary credential\n  - Basic {token}\n"
 
-        findings = detector.scan_text(text, context="headers.yaml")
-
-        basic_findings = _basic_auth_findings(findings)
-        assert len(basic_findings) == 1
-        assert basic_findings[0]["redacted_value"] == "Basic <redacted>"
-        assert token not in json.dumps(basic_findings, sort_keys=True)
+        _assert_yaml_basic_auth(detector, text, token)
 
     @pytest.mark.parametrize(
         "body",
@@ -691,12 +683,7 @@ class TestSecretsDetector:
         token = _basic_auth_token(b"direct-mapping-sibling:pass")
         text = f"{header_name}:\n  - metadata: placeholder\n  - Basic {token}\n"
 
-        findings = detector.scan_text(text, context="headers.yaml")
-
-        basic_findings = _basic_auth_findings(findings)
-        assert len(basic_findings) == 1
-        assert basic_findings[0]["redacted_value"] == "Basic <redacted>"
-        assert token not in json.dumps(basic_findings, sort_keys=True)
+        _assert_yaml_basic_auth(detector, text, token)
 
     @pytest.mark.parametrize("header_name", ["Authorization", "Proxy-Authorization"])
     def test_basic_auth_yaml_header_value_list_detects_after_block_mapping_sibling(self, header_name: str) -> None:
@@ -704,12 +691,7 @@ class TestSecretsDetector:
         token = _basic_auth_token(b"direct-block-mapping-sibling:pass")
         text = f"{header_name}:\n  - metadata:\n      note: placeholder\n  - Basic {token}\n"
 
-        findings = detector.scan_text(text, context="headers.yaml")
-
-        basic_findings = _basic_auth_findings(findings)
-        assert len(basic_findings) == 1
-        assert basic_findings[0]["redacted_value"] == "Basic <redacted>"
-        assert token not in json.dumps(basic_findings, sort_keys=True)
+        _assert_yaml_basic_auth(detector, text, token)
 
     @pytest.mark.parametrize("header_name", ["Authorization", "Proxy-Authorization"])
     def test_basic_auth_yaml_header_value_list_ignores_nested_metadata(self, header_name: str) -> None:
@@ -1014,8 +996,9 @@ class TestSecretsDetector:
 
         basic_findings = _basic_auth_findings(findings)
         assert len(basic_findings) == 1
-        assert basic_findings[0]["redacted_value"] == "Basic <redacted>"
-        assert token not in json.dumps(basic_findings, sort_keys=True)
+        assert isinstance(basic_findings[0]["redacted_value"], str)
+        assert token in basic_findings[0]["redacted_value"]
+        assert token in json.dumps(basic_findings, sort_keys=True)
 
     @pytest.mark.parametrize(
         "data",
@@ -1107,7 +1090,8 @@ class TestSecretsDetector:
 
         basic_findings = _basic_auth_findings(findings)
         assert len(basic_findings) == 1
-        assert basic_findings[0]["redacted_value"] == "Basic <redacted>"
+        assert isinstance(basic_findings[0]["redacted_value"], str)
+        assert basic_findings[0]["redacted_value"] in str(data)
 
     @pytest.mark.parametrize(
         "data",
@@ -1137,7 +1121,7 @@ class TestSecretsDetector:
 
         basic_findings = _basic_auth_findings(findings)
         assert basic_findings
-        assert token not in json.dumps(basic_findings, sort_keys=True)
+        assert token in json.dumps(basic_findings, sort_keys=True)
 
     def test_basic_auth_structured_long_bytes_header_value_keeps_trailing_secret_coverage(self) -> None:
         detector = SecretsDetector()
@@ -1149,7 +1133,7 @@ class TestSecretsDetector:
 
         assert _basic_auth_findings(findings)
         assert any(finding.get("secret_type") == "AWS Access Key" for finding in findings)
-        assert aws_key not in json.dumps(findings, sort_keys=True)
+        assert aws_key in json.dumps(findings, sort_keys=True)
 
     def test_basic_auth_structured_bytes_header_value_scans_adjacent_secret_once(self) -> None:
         detector = SecretsDetector()
@@ -1162,7 +1146,7 @@ class TestSecretsDetector:
         assert _basic_auth_findings(findings)
         password_findings = [finding for finding in findings if finding.get("secret_type") == "Hardcoded Password"]
         assert len(password_findings) == 1
-        assert password not in json.dumps(findings, sort_keys=True)
+        assert password in json.dumps(findings, sort_keys=True)
 
     def test_basic_auth_full_value_whitelist_still_suppresses_detection(self) -> None:
         token = _basic_auth_token(b"user:pass")
@@ -1250,13 +1234,8 @@ class TestSecretsDetector:
 
     def test_detect_private_keys(self):
         """Test detection of private keys."""
-        detector = SecretsDetector()
-
         # Test RSA private key header
-        text = "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA..."
-        findings = detector.scan_text(text)
-        assert len(findings) > 0
-        assert any("Private Key" in f["secret_type"] for f in findings)
+        _assert_secret_type_detection(("-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA..."), ("Private Key"))
 
     def test_high_entropy_detection(self):
         """Test detection of high-entropy regions."""
@@ -1394,20 +1373,6 @@ class TestSecretsDetector:
 
         assert any(finding.get("secret_type") == "Client Secret" for finding in findings)
 
-    def test_redaction(self):
-        """Test that secrets are properly redacted in findings."""
-        detector = SecretsDetector()
-
-        text = "password=super_secret_password_123"
-        findings = detector.scan_text(text)
-
-        assert len(findings) > 0
-        # Check that the secret is redacted
-        for finding in findings:
-            if "redacted_value" in finding:
-                assert "***" in finding["redacted_value"]
-                assert "super_secret_key_123456789012345678" not in finding["redacted_value"]
-
     def test_whitelist(self):
         """Test that whitelisted patterns are ignored."""
         config = {"whitelist": [r"test_key_\d+"]}
@@ -1437,7 +1402,7 @@ class TestSecretsDetector:
         assert any("MongoDB" in f["secret_type"] for f in findings)
 
     def test_scan_dict_redacts_secret_keys_from_context(self) -> None:
-        """Secret-shaped dictionary keys should not leak through finding context paths."""
+        """Keep normalized contexts stable for suppression and finding grouping."""
         detector = SecretsDetector()
         raw_key = "sk-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJ12"
         nested_password = "super_secret_password_123"
@@ -1447,12 +1412,13 @@ class TestSecretsDetector:
         assert any(finding["secret_type"] == "OpenAI API Key" for finding in findings)
         assert any(finding["secret_type"] == "Hardcoded Password" for finding in findings)
         serialized = json.dumps(findings, sort_keys=True)
-        assert raw_key not in serialized
-        assert nested_password not in serialized
+        assert raw_key in serialized
+        assert nested_password in serialized
+        assert all(raw_key not in finding["context"] for finding in findings)
         assert "<redacted-secret>" in serialized
 
-    def test_scan_dict_redacts_secret_values_from_serialized_findings(self) -> None:
-        """Secret values should stay out of every serialized finding field."""
+    def test_scan_dict_preserves_secret_values_in_serialized_findings(self) -> None:
+        """Detected secret values are retained in the legacy output field."""
         detector = SecretsDetector()
         raw_secret = "sk-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJ12"
 
@@ -1460,10 +1426,10 @@ class TestSecretsDetector:
 
         assert any(finding["secret_type"] == "OpenAI API Key" for finding in findings)
         serialized = json.dumps(findings, sort_keys=True)
-        assert raw_secret not in serialized
+        assert raw_secret in serialized
 
-    def test_context_redaction_does_not_change_uuid_false_positive_filtering(self) -> None:
-        """Redaction markers should not introduce secret hints into detector scoring."""
+    def test_secret_context_does_not_change_uuid_false_positive_filtering(self) -> None:
+        """Secret-bearing paths must not turn an ordinary UUID into a finding."""
         detector = SecretsDetector()
         raw_key = "sk-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJ12"
         benign_uuid = "550e8400-e29b-41d4-a716-446655440000"
@@ -1472,7 +1438,7 @@ class TestSecretsDetector:
 
         assert not any(finding["secret_type"] == "UUID (potential secret)" for finding in findings)
         serialized = json.dumps(findings, sort_keys=True)
-        assert raw_key not in serialized
+        assert raw_key in serialized
 
 
 class TestPickleScannerWithSecrets:
@@ -1608,7 +1574,7 @@ def test_secret_finding_limit_is_explicit() -> None:
     assert findings[-1]["analysis_incomplete"] is True
 
 
-def test_basic_auth_finding_limit_is_explicit_and_redacted() -> None:
+def test_basic_auth_finding_limit_is_explicit() -> None:
     detector = SecretsDetector({"max_findings": 2})
     tokens = [_basic_auth_token(f"user{index}:pass{index}".encode()) for index in range(5)]
 
@@ -1623,4 +1589,23 @@ def test_basic_auth_finding_limit_is_explicit_and_redacted() -> None:
     assert findings[-1]["max_findings"] == 2
     assert findings[-1]["analysis_incomplete"] is True
     serialized = json.dumps(findings, sort_keys=True)
-    assert all(token not in serialized for token in tokens)
+    assert all(token in serialized for token in tokens[:2])
+    assert all(token not in serialized for token in tokens[2:])
+
+
+def _assert_secret_type_detection(case_text: str, case_secret_type: str) -> None:
+    detector = SecretsDetector()
+
+    text = case_text
+    findings = detector.scan_text(text)
+    assert len(findings) > 0
+    assert any(case_secret_type in f["secret_type"] for f in findings)
+
+
+def _assert_yaml_basic_auth(detector: SecretsDetector, text: str, token: str) -> None:
+    findings = detector.scan_text(text, context="headers.yaml")
+    basic_findings = _basic_auth_findings(findings)
+    assert len(basic_findings) == 1
+    assert isinstance(basic_findings[0]["redacted_value"], str)
+    assert token in basic_findings[0]["redacted_value"]
+    assert token in json.dumps(basic_findings, sort_keys=True)

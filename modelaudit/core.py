@@ -28,6 +28,12 @@ except ImportError:
 
 
 import modelaudit.core_results as core_results
+from modelaudit.finding_identity import preserve_finding_identity
+from modelaudit.integrations._sarif_identity_urls import (
+    redact_cloud_error_for_display,
+    redact_stream_error_for_display,
+    redact_stream_url_for_display,
+)
 from modelaudit.integrations.license_checker import (
     LICENSE_FILES,
     check_commercial_use_warnings,
@@ -62,6 +68,16 @@ from modelaudit.scanner_selection import (
 from modelaudit.scanners import _registry
 from modelaudit.scanners.archive_dispatch import (
     NESTED_SCAN_CALLBACK_CONFIG_KEY,
+    _make_incomplete_nemo_routing_result,
+    _make_incomplete_onnx_routing_result,
+    _make_incomplete_pickle_routing_result,
+    _make_incomplete_protobuf_model_result,
+    _make_incomplete_sentencepiece_model_proto_result,
+    _make_incomplete_tensorflow_protobuf_routing_result,
+    _make_incomplete_tokenizer_json_routing_result,
+    _make_incomplete_xml_model_result,
+    _make_unavailable_recognized_format_result,
+    _select_zip_scanner_id,
     detect_safetensors_overlap_scanner_ids,
     merge_executable_zip_container_findings,
     merge_flax_msgpack_overlap_findings,
@@ -122,14 +138,9 @@ from modelaudit.utils.file.detection import (
     huggingface_tokenizer_json_has_jax_route_evidence,
     huggingface_tokenizer_json_has_template_route_evidence,
     is_confirmed_jax_json_checkpoint_file,
-    is_executorch_archive,
     is_huggingface_tokenizer_json_file,
     is_jax_json_checkpoint_file,
-    is_keras_zip_archive,
-    is_pytorch_zip_archive,
     is_sentencepiece_model_proto_file,
-    is_skops_archive,
-    is_torchserve_mar_archive,
     should_defer_safetensors_header_limit_hash,
     validate_file_type_with_formats,
 )
@@ -154,6 +165,7 @@ from modelaudit.utils.helpers.cache_decorator import (
     should_defer_hash_for_file_backed_onnx,
     should_defer_hash_for_pytorch_read_limit,
 )
+from modelaudit.utils.helpers.evidence import format_terminal_text
 from modelaudit.utils.helpers.interrupt_handler import check_interrupted
 from modelaudit.utils.helpers.types import (
     FilePath,
@@ -168,28 +180,16 @@ from modelaudit.utils.repository_context import (
     normalize_repository_member_path,
     repository_file_inventory_context_from_config,
 )
+from modelaudit.utils.sources import _huggingface_cache as _hf_cache
 from modelaudit.utils.sources._huggingface_cache import (
     _find_hf_cache_root,
     _get_hf_cache_root_spellings,
     _get_hf_cache_roots,
-    _is_hf_cache_snapshot_alias,
     _path_has_part,
     _resolve_hf_cache_path,
     _trusted_hf_blobs_root,
 )
-from modelaudit.utils.sources.cloud_storage import (
-    is_sensitive_credential_key,
-    is_stream_url,
-)
-from modelaudit.utils.sources.cloud_storage import (
-    redact_cloud_error_for_display as _redact_cloud_error_for_display,
-)
-from modelaudit.utils.sources.cloud_storage import (
-    redact_stream_error_for_display as _redact_stream_error_for_display,
-)
-from modelaudit.utils.sources.cloud_storage import (
-    redact_stream_url_for_display as _redact_stream_url_for_display,
-)
+from modelaudit.utils.sources.cloud_storage import is_stream_url
 
 logger = logging.getLogger("modelaudit.core")
 
@@ -399,13 +399,8 @@ _ALTERNATE_VALIDATED_FORMAT_ALLOWED_INCONCLUSIVE_REASONS = {
 }
 _RECOGNIZED_FORMAT_SCANNER_UNAVAILABLE_REASON = "recognized_format_scanner_unavailable"
 _FORMAT_DETECTION_READ_FAILED_REASON = "format_detection_read_failed"
-_XML_MODEL_ROUTING_INCOMPLETE_REASON = "xml_model_routing_incomplete"
-_PROTOBUF_MODEL_ROUTING_INCOMPLETE_REASON = "protobuf_model_routing_incomplete"
-_SENTENCEPIECE_MODEL_PROTO_ROUTING_INCOMPLETE_REASON = "sentencepiece_model_proto_routing_incomplete"
 _LLAMAFILE_ROUTING_INCOMPLETE_REASON = "llamafile_routing_incomplete"
-_TOKENIZER_JSON_ROUTING_INCOMPLETE_REASON = "tokenizer_json_ownership_incomplete"
 _MXNET_SYMBOL_ROUTING_INCOMPLETE_REASON = "mxnet_symbol_routing_incomplete"
-_PICKLE_ROUTING_INCOMPLETE_REASON = "pickle_routing_incomplete"
 _DVC_SCAN_BUDGET_EXHAUSTED_REASON = "dvc_scan_budget_exhausted"
 _DVC_DIRECTORY_WALK_FAILED_REASON = "dvc_directory_walk_failed"
 _DVC_DIRECTORY_SYMLINK_UNSCANNED_REASON = "dvc_directory_symlink_unscanned"
@@ -554,8 +549,6 @@ def _record_directory_special_file_unscanned(
 
 
 _XGBOOST_UBJSON_ROUTING_INCOMPLETE_REASON = "xgboost_ubjson_routing_incomplete"
-_ONNX_ROUTING_INCOMPLETE_REASON = "onnx_routing_incomplete"
-_TENSORFLOW_PROTOBUF_ROUTING_INCOMPLETE_REASON = "tensorflow_protobuf_routing_incomplete"
 _ShardFamilyKey = tuple[str, str, int | None]
 _ScanEntry = tuple[str, list[str], _ShardFamilyKey | None, str | None]
 _FileTargetIdentityKey = tuple[Any, ...]
@@ -949,87 +942,66 @@ def _make_trusted_stream_shard_root(path: FilePath) -> object:
     )
 
 
-def _redacted_stream_url_for_reporting(stream_url: str) -> str:
-    """Return a stream source identifier safe for persisted scan output."""
-    return _redact_stream_url_for_display(stream_url)
-
-
-def _redacted_scan_path_for_reporting(path: str) -> str:
-    if is_stream_url(path):
-        return f"stream://{_redacted_stream_url_for_reporting(path[9:])}"
-    return path
-
-
-def _redacted_scan_error_for_reporting(error: object, path: str) -> str:
-    if is_stream_url(path):
-        return _redact_stream_error_for_display(error, path[9:])
-    return str(error)
-
-
-def _redact_stream_value_for_reporting(value: Any, stream_url: str, report_url: str) -> Any:
+def _replace_report_path_value(value: Any, stream_url: str, report_url: str) -> Any:
     if isinstance(value, BaseModel):
-        return _redact_stream_value_for_reporting(value.model_dump(mode="python"), stream_url, report_url)
+        return _replace_report_path_value(value.model_dump(mode="python"), stream_url, report_url)
     if isinstance(value, AnyUrl):
-        return _redact_stream_value_for_reporting(str(value), stream_url, report_url)
+        return _replace_report_path_value(str(value), stream_url, report_url)
     if isinstance(value, os.PathLike):
-        return _redact_stream_value_for_reporting(os.fspath(value), stream_url, report_url)
+        return _replace_report_path_value(os.fspath(value), stream_url, report_url)
     if isinstance(value, str):
-        return _redact_cloud_error_for_display(value.replace(stream_url, report_url))
+        return value.replace(stream_url, report_url)
     if isinstance(value, bytes):
         try:
             decoded = value.decode("utf-8")
         except UnicodeDecodeError:
             return b"<binary data>"
-        return _redact_stream_value_for_reporting(decoded, stream_url, report_url).encode("utf-8")
+        return _replace_report_path_value(decoded, stream_url, report_url).encode("utf-8")
     if isinstance(value, bytearray):
         try:
             decoded = value.decode("utf-8")
         except UnicodeDecodeError:
             return bytearray(b"<binary data>")
-        return bytearray(_redact_stream_value_for_reporting(decoded, stream_url, report_url), "utf-8")
+        return bytearray(_replace_report_path_value(decoded, stream_url, report_url), "utf-8")
     if isinstance(value, dict):
-        redacted_mapping: dict[Any, Any] = {}
+        rebased_mapping: dict[Any, Any] = {}
         for key, item in value.items():
-            redacted_key = _redact_stream_value_for_reporting(key, stream_url, report_url)
-            redacted_mapping[redacted_key] = (
-                "<redacted>"
-                if is_sensitive_credential_key(key)
-                else _redact_stream_value_for_reporting(item, stream_url, report_url)
-            )
-        return redacted_mapping
+            rebased_key = _replace_report_path_value(key, stream_url, report_url)
+            rebased_mapping[rebased_key] = _replace_report_path_value(item, stream_url, report_url)
+        return rebased_mapping
     if isinstance(value, list):
-        return [_redact_stream_value_for_reporting(item, stream_url, report_url) for item in value]
+        return [_replace_report_path_value(item, stream_url, report_url) for item in value]
     if isinstance(value, tuple):
-        return tuple(_redact_stream_value_for_reporting(item, stream_url, report_url) for item in value)
+        return tuple(_replace_report_path_value(item, stream_url, report_url) for item in value)
     if isinstance(value, set):
-        return {_redact_stream_value_for_reporting(item, stream_url, report_url) for item in value}
+        return {_replace_report_path_value(item, stream_url, report_url) for item in value}
     if isinstance(value, frozenset):
-        return frozenset(_redact_stream_value_for_reporting(item, stream_url, report_url) for item in value)
+        return frozenset(_replace_report_path_value(item, stream_url, report_url) for item in value)
     return value
 
 
-def _redact_stream_record_for_reporting(record: Issue | Check, stream_url: str, report_url: str) -> None:
+def _replace_record_report_path(record: Issue | Check, stream_url: str, report_url: str) -> None:
     for attr in ("location", "message", "why", "rule_code", "type", "name"):
         value = getattr(record, attr, None)
         if isinstance(value, str):
-            setattr(record, attr, _redact_stream_value_for_reporting(value, stream_url, report_url))
+            setattr(record, attr, _replace_report_path_value(value, stream_url, report_url))
     if record.details:
-        record.details = _redact_stream_value_for_reporting(record.details, stream_url, report_url)
+        record.details = _replace_report_path_value(record.details, stream_url, report_url)
     if record.model_extra:
-        redacted_extra = _redact_stream_value_for_reporting(record.model_extra, stream_url, report_url)
+        rebased_extra = _replace_report_path_value(record.model_extra, stream_url, report_url)
         record.model_extra.clear()
-        record.model_extra.update(redacted_extra)
+        record.model_extra.update(rebased_extra)
 
 
-def _redact_stream_scan_result_for_reporting(scan_result: ScanResult, stream_url: str, report_url: str) -> None:
-    """Strip signed query material from scanner-owned records before aggregation."""
+def _replace_result_report_path(scan_result: ScanResult, stream_url: str, report_url: str) -> None:
+    """Replace descriptor-only paths in scanner records before aggregation."""
     for issue in scan_result.issues:
-        _redact_stream_record_for_reporting(issue, stream_url, report_url)
+        _replace_record_report_path(issue, stream_url, report_url)
     for check in scan_result.checks:
-        _redact_stream_record_for_reporting(check, stream_url, report_url)
+        _replace_record_report_path(check, stream_url, report_url)
 
     if scan_result.metadata:
-        scan_result.metadata = _redact_stream_value_for_reporting(scan_result.metadata, stream_url, report_url)
+        scan_result.metadata = _replace_report_path_value(scan_result.metadata, stream_url, report_url)
         scan_result._refresh_metadata_dependent_state()
 
 
@@ -1062,6 +1034,29 @@ def _rebase_bound_directory_owner_value_for_reporting(value: Any, report_root: P
     return value
 
 
+def _preserve_scan_result_identity(scan_result: ScanResult, producer: str, source: str, identity_source: str) -> None:
+    """Retain producer normalization before aggregation consumes identity fields."""
+
+    def normalized(value: str) -> str:
+        return redact_cloud_error_for_display(value.replace(source, identity_source))
+
+    records: list[Issue | Check] = [*scan_result.issues, *scan_result.checks]
+    for record in records:
+        fields: dict[str, Any] = {
+            name: normalized(value)
+            for name in ("message", "location", "type", "rule_code", "name")
+            if isinstance(value := getattr(record, name, None), str)
+        }
+        details = {
+            name: normalized(value)
+            for name in ("evidence_fingerprint", "zip_entry_id", "zip_entry", "check_consolidation_key")
+            if isinstance(value := record.details.get(name), str)
+        }
+        if details:
+            fields["details"] = details
+        preserve_finding_identity(record, producer, **fields)
+
+
 def _normalize_directory_owner_scan_result_for_reporting(
     scan_result: ScanResult,
     owner_scan_path: str,
@@ -1069,7 +1064,8 @@ def _normalize_directory_owner_scan_result_for_reporting(
 ) -> None:
     """Rewrite descriptor-only owner scan paths before aggregate reporting."""
     if owner_scan_path != os.curdir:
-        _redact_stream_scan_result_for_reporting(scan_result, owner_scan_path, report_path)
+        _replace_result_report_path(scan_result, owner_scan_path, report_path)
+        _preserve_scan_result_identity(scan_result, "directory_owner", report_path, report_path)
         return
 
     report_root = Path(report_path)
@@ -2132,23 +2128,7 @@ def _select_non_hdf5_preferred_scanner_id(
         return "zip"
 
     if header_format == "zip":
-        if config is not None and not allows_zip_structure_analysis(policy_from_config(config), path):
-            return "joblib" if ext == ".joblib" else "zip"
-        if is_torchserve_mar_archive(path, config):
-            return "torchserve_mar"
-        if is_keras_zip_archive(path, allow_config_only=ext == ".keras", config=config):
-            return "keras_zip"
-        if is_pytorch_zip_archive(path, config):
-            return "pytorch_zip"
-        if is_executorch_archive(path, config):
-            return "executorch"
-        if is_skops_archive(path, config):
-            return "skops"
-        if ext == ".skops":
-            return "skops"
-        if ext == ".joblib":
-            return "joblib"
-        return "zip"
+        return _select_zip_scanner_id(path, ext, config)
 
     if ext == ".joblib" and header_format in _COMPRESSED_HEADER_FORMATS | {"pickle"}:
         return "joblib"
@@ -2209,16 +2189,6 @@ def _select_non_hdf5_preferred_scanner_id(
             return "jax_checkpoint"
 
     return _registry.get_scanner_id_for_header_format(header_format)
-
-
-def _gzip_tar_trailing_status_for_config(path: str, config: dict[str, Any] | None) -> str | None:
-    """Return invalid/nonzero gzip TAR tail status using configured compressed-wrapper limits."""
-    return gzip_tar_trailing_data_status(
-        path,
-        max_decompressed_bytes=config.get("compressed_max_decompressed_bytes") if config is not None else None,
-        max_decompression_ratio=config.get("compressed_max_decompression_ratio") if config is not None else None,
-        max_entries=config.get("max_tar_entries") if config is not None else None,
-    )
 
 
 def _select_hdf5_userblock_supplemental_scanner_id(
@@ -2521,30 +2491,6 @@ def _mark_xgboost_pickle_extension_spoof(result: ScanResult, path: str, ext: str
     result.success = False
 
 
-def _make_unavailable_recognized_format_result(path: str, format_: str, scanner_id: str | None) -> ScanResult:
-    """Fail closed when routing recognizes a format but no scanner can analyze it."""
-    result = ScanResult(scanner_name="unknown")
-    details: dict[str, Any] = {"format": format_, "path": path}
-    if scanner_id:
-        details["preferred_scanner_id"] = scanner_id
-        scanner_load_error = _registry.get_failed_scanners().get(scanner_id)
-        if scanner_load_error:
-            details["scanner_load_error"] = scanner_load_error
-
-    result.add_check(
-        name="Format Detection",
-        passed=False,
-        message="Recognized format could not be scanned because no scanner was available",
-        severity=IssueSeverity.INFO,
-        location=path,
-        details=details,
-    )
-    _mark_inconclusive_scan_outcome(result, _RECOGNIZED_FORMAT_SCANNER_UNAVAILABLE_REASON)
-    _mark_operational_scan_error(result, _RECOGNIZED_FORMAT_SCANNER_UNAVAILABLE_REASON)
-    result.finish(success=False)
-    return result
-
-
 def _make_incomplete_format_detection_read_result(path: str, error: OSError) -> ScanResult:
     """Fail closed when no owning scanner can classify a file after a read failure."""
     result = ScanResult(scanner_name="unknown")
@@ -2558,66 +2504,6 @@ def _make_incomplete_format_detection_read_result(path: str, error: OSError) -> 
     )
     _mark_inconclusive_scan_outcome(result, _FORMAT_DETECTION_READ_FAILED_REASON)
     _mark_operational_scan_error(result, _FORMAT_DETECTION_READ_FAILED_REASON)
-    result.finish(success=False)
-    return result
-
-
-def _make_incomplete_xml_model_result(path: str) -> ScanResult:
-    """Fail closed when bounded XML routing cannot reach the structural root."""
-    result = ScanResult(scanner_name="unknown")
-    result.add_check(
-        name="XML Model Routing",
-        passed=False,
-        message=(
-            "XML model routing was inconclusive because the bounded probe ended "
-            "before the first structural root element"
-        ),
-        severity=IssueSeverity.INFO,
-        location=path,
-        details={"format": XML_MODEL_INCONCLUSIVE_FORMAT, "path": path},
-    )
-    _mark_inconclusive_scan_outcome(result, _XML_MODEL_ROUTING_INCOMPLETE_REASON)
-    _mark_operational_scan_error(result, _XML_MODEL_ROUTING_INCOMPLETE_REASON)
-    result.finish(success=False)
-    return result
-
-
-def _make_incomplete_protobuf_model_result(path: str) -> ScanResult:
-    """Fail closed when a protobuf candidate cannot receive tentative analysis."""
-    result = ScanResult(scanner_name="unknown")
-    result.add_check(
-        name="Protobuf Model Routing",
-        passed=False,
-        message=(
-            "Protobuf model routing was inconclusive because tentative protobuf "
-            "analysis was unavailable for a bounded-probe candidate"
-        ),
-        severity=IssueSeverity.INFO,
-        location=path,
-        details={"format": PROTOBUF_MODEL_CANDIDATE_FORMAT, "path": path},
-    )
-    _mark_inconclusive_scan_outcome(result, _PROTOBUF_MODEL_ROUTING_INCOMPLETE_REASON)
-    _mark_operational_scan_error(result, _PROTOBUF_MODEL_ROUTING_INCOMPLETE_REASON)
-    result.finish(success=False)
-    return result
-
-
-def _make_incomplete_sentencepiece_model_proto_result(path: str) -> ScanResult:
-    """Fail closed when a SentencePiece-like protobuf fails ownership validation."""
-    result = ScanResult(scanner_name="unknown")
-    result.add_check(
-        name="SentencePiece ModelProto Routing",
-        passed=False,
-        message=(
-            "SentencePiece ModelProto routing was inconclusive because the payload "
-            "looked like a tokenizer protobuf but failed ownership validation"
-        ),
-        severity=IssueSeverity.INFO,
-        location=path,
-        details={"format": SENTENCEPIECE_MODEL_PROTO_INCONCLUSIVE_FORMAT, "path": path},
-    )
-    _mark_inconclusive_scan_outcome(result, _SENTENCEPIECE_MODEL_PROTO_ROUTING_INCOMPLETE_REASON)
-    _mark_operational_scan_error(result, _SENTENCEPIECE_MODEL_PROTO_ROUTING_INCOMPLETE_REASON)
     result.finish(success=False)
     return result
 
@@ -2646,40 +2532,6 @@ def _make_incomplete_llamafile_routing_result(path: str, config: dict[str, Any])
     return result
 
 
-def _make_incomplete_nemo_routing_result(path: str) -> ScanResult:
-    """Fail closed when bounded NeMo structural routing cannot reach a decision."""
-    result = ScanResult(scanner_name="unknown")
-    result.add_check(
-        name="NeMo Routing",
-        passed=False,
-        message="NeMo routing was inconclusive because the bounded TAR member probe reached its limit",
-        severity=IssueSeverity.INFO,
-        location=path,
-        details={"format": NEMO_ROUTING_INCONCLUSIVE_FORMAT, "path": path},
-    )
-    _mark_inconclusive_scan_outcome(result, "nemo_routing_incomplete")
-    _mark_operational_scan_error(result, "nemo_routing_incomplete")
-    result.finish(success=False)
-    return result
-
-
-def _make_incomplete_tokenizer_json_routing_result(path: str) -> ScanResult:
-    """Fail closed when bounded inspection cannot prove exact tokenizer ownership."""
-    result = ScanResult(scanner_name="unknown")
-    result.add_check(
-        name="Tokenizer JSON Routing",
-        passed=False,
-        message="Tokenizer JSON ownership was inconclusive because the bounded EOF proof could not establish it",
-        severity=IssueSeverity.INFO,
-        location=path,
-        details={"format": TOKENIZER_JSON_ROUTING_INCONCLUSIVE_FORMAT, "path": path},
-    )
-    _mark_inconclusive_scan_outcome(result, _TOKENIZER_JSON_ROUTING_INCOMPLETE_REASON)
-    _mark_operational_scan_error(result, _TOKENIZER_JSON_ROUTING_INCOMPLETE_REASON)
-    result.finish(success=False)
-    return result
-
-
 def _make_incomplete_mxnet_symbol_routing_result(path: str, config: dict[str, Any] | None = None) -> ScanResult:
     """Fail closed when bounded MXNet symbol routing cannot decide."""
     result = ScanResult(scanner_name="unknown")
@@ -2701,12 +2553,6 @@ def _make_incomplete_mxnet_symbol_routing_result(path: str, config: dict[str, An
 
     scanner_selection = policy_from_config(config)
 
-    def merge_owner_result(owner_result: ScanResult) -> None:
-        existing_reasons = list(result.metadata.get("scan_outcome_reasons", []))
-        owner_reasons = list(owner_result.metadata.get("scan_outcome_reasons", []))
-        result.merge(owner_result)
-        result.metadata["scan_outcome_reasons"] = list(dict.fromkeys([*owner_reasons, *existing_reasons]))
-
     if Path(path).suffix.lower() == ".params":
         if scanner_selection.allows("mxnet"):
             MXNetScanner(config=config).scan_params_file_security(path, result)
@@ -2725,7 +2571,7 @@ def _make_incomplete_mxnet_symbol_routing_result(path: str, config: dict[str, An
         path
     ):
         if scanner_selection.allows("jax_checkpoint"):
-            merge_owner_result(JaxCheckpointScanner(config=config).scan(path))
+            core_results._merge_inconclusive_owner_result(result, JaxCheckpointScanner(config=config).scan(path))
         elif scanner_selection.active:
             add_scanner_selection_skip_check(
                 result,
@@ -2739,7 +2585,7 @@ def _make_incomplete_mxnet_symbol_routing_result(path: str, config: dict[str, An
     if ManifestScanner.can_handle(path):
         if scanner_selection.allows("manifest"):
             manifest_result = ManifestScanner(config=config).scan(path)
-            merge_owner_result(manifest_result)
+            core_results._merge_inconclusive_owner_result(result, manifest_result)
             manifest_covered_templates = manifest_result.metadata.get("analysis_incomplete") is not True
         elif scanner_selection.active:
             add_scanner_selection_skip_check(
@@ -2751,7 +2597,7 @@ def _make_incomplete_mxnet_symbol_routing_result(path: str, config: dict[str, An
             )
     if not manifest_covered_templates and Jinja2TemplateScanner.can_handle(path):
         if scanner_selection.allows("jinja2_template"):
-            merge_owner_result(Jinja2TemplateScanner(config=config).scan(path))
+            core_results._merge_inconclusive_owner_result(result, Jinja2TemplateScanner(config=config).scan(path))
         elif scanner_selection.active:
             add_scanner_selection_skip_check(
                 result,
@@ -2777,57 +2623,6 @@ def _make_incomplete_xgboost_ubjson_routing_result(path: str) -> ScanResult:
     )
     _mark_inconclusive_scan_outcome(result, _XGBOOST_UBJSON_ROUTING_INCOMPLETE_REASON)
     _mark_operational_scan_error(result, _XGBOOST_UBJSON_ROUTING_INCOMPLETE_REASON)
-    result.finish(success=False)
-    return result
-
-
-def _make_incomplete_tensorflow_protobuf_routing_result(path: str) -> ScanResult:
-    """Fail closed when bounded TensorFlow protobuf routing cannot decide."""
-    result = ScanResult(scanner_name="unknown")
-    result.add_check(
-        name="TensorFlow Protobuf Routing",
-        passed=False,
-        message="TensorFlow protobuf routing was inconclusive because the bounded structural probe reached its limit",
-        severity=IssueSeverity.INFO,
-        location=path,
-        details={"format": TENSORFLOW_PROTOBUF_ROUTING_INCONCLUSIVE_FORMAT, "path": path},
-    )
-    _mark_inconclusive_scan_outcome(result, _TENSORFLOW_PROTOBUF_ROUTING_INCOMPLETE_REASON)
-    _mark_operational_scan_error(result, _TENSORFLOW_PROTOBUF_ROUTING_INCOMPLETE_REASON)
-    result.finish(success=False)
-    return result
-
-
-def _make_incomplete_onnx_routing_result(path: str) -> ScanResult:
-    """Fail closed when bounded ONNX protobuf routing cannot decide."""
-    result = ScanResult(scanner_name="unknown")
-    result.add_check(
-        name="ONNX Routing",
-        passed=False,
-        message="ONNX routing was inconclusive because the bounded structural probe reached its limit",
-        severity=IssueSeverity.INFO,
-        location=path,
-        details={"format": ONNX_ROUTING_INCONCLUSIVE_FORMAT, "path": path},
-    )
-    _mark_inconclusive_scan_outcome(result, _ONNX_ROUTING_INCOMPLETE_REASON)
-    _mark_operational_scan_error(result, _ONNX_ROUTING_INCOMPLETE_REASON)
-    result.finish(success=False)
-    return result
-
-
-def _make_incomplete_pickle_routing_result(path: str) -> ScanResult:
-    """Fail closed when bounded protocol-less Pickle routing cannot decide."""
-    result = ScanResult(scanner_name="unknown")
-    result.add_check(
-        name="Pickle Routing",
-        passed=False,
-        message="Pickle routing was inconclusive because the bounded structural probe reached its limit",
-        severity=IssueSeverity.INFO,
-        location=path,
-        details={"format": PICKLE_ROUTING_INCONCLUSIVE_FORMAT, "path": path},
-    )
-    _mark_inconclusive_scan_outcome(result, _PICKLE_ROUTING_INCOMPLETE_REASON)
-    _mark_operational_scan_error(result, _PICKLE_ROUTING_INCOMPLETE_REASON)
     result.finish(success=False)
     return result
 
@@ -2992,10 +2787,6 @@ _FILE_BACKED_HDF5_UNHASHABLE_PREFIX = "unhashable_file_backed_hdf5_"
 _FILE_BACKED_ONNX_UNHASHABLE_PREFIX = "unhashable_file_backed_onnx_"
 
 
-def _is_file_backed_hdf5_hash_placeholder(content_hash: str) -> bool:
-    return content_hash.startswith(_FILE_BACKED_HDF5_UNHASHABLE_PREFIX)
-
-
 def _directory_owner_hash_is_unverifiable(
     content_hash: str,
     *,
@@ -3003,7 +2794,7 @@ def _directory_owner_hash_is_unverifiable(
 ) -> bool:
     if not content_hash.startswith("unhashable_"):
         return False
-    return not (allow_file_backed_hdf5 and _is_file_backed_hdf5_hash_placeholder(content_hash))
+    return not (allow_file_backed_hdf5 and content_hash.startswith(_FILE_BACKED_HDF5_UNHASHABLE_PREFIX))
 
 
 def _directory_owner_hash_changed(
@@ -3018,22 +2809,8 @@ def _directory_owner_hash_changed(
         allow_file_backed_hdf5
         and isinstance(before_hash, str)
         and isinstance(after_hash, str)
-        and _is_file_backed_hdf5_hash_placeholder(before_hash)
-        and _is_file_backed_hdf5_hash_placeholder(after_hash)
-    )
-
-
-def _is_incomplete_aggregate_hash_placeholder(content_hash: str) -> bool:
-    return content_hash.startswith(
-        (
-            _FILE_BACKED_HDF5_UNHASHABLE_PREFIX,
-            _FILE_BACKED_ONNX_UNHASHABLE_PREFIX,
-            "unhashable_max_file_size_",
-            "unhashable_max_total_size_",
-            "unhashable_timeout_",
-            "unhashable_legacy_pytorch_read_limit_",
-            "unhashable_pytorch_zip_read_limit_",
-        )
+        and before_hash.startswith(_FILE_BACKED_HDF5_UNHASHABLE_PREFIX)
+        and after_hash.startswith(_FILE_BACKED_HDF5_UNHASHABLE_PREFIX)
     )
 
 
@@ -3316,9 +3093,9 @@ def _resolve_directory_scan_target(
         )
         return None, False, True
 
-    # Check if this is a HuggingFace cache symlink scenario
+    # Allow only lexical aliases below snapshots/<revision>/... in the HuggingFace cache.
     is_hf_cache_symlink = False
-    if is_symlink and is_hf_cache and _is_hf_cache_snapshot_alias(file_path, hf_cache_root):
+    if is_symlink and is_hf_cache and _hf_cache._hf_cache_snapshot_revision(file_path, hf_cache_root) is not None:
         # Reuse the canonical target resolved above. On Windows, os.readlink()
         # may expose a device-path spelling that cannot safely be rejoined.
         resolved_target = resolved_file
@@ -3553,7 +3330,7 @@ def scan_model_directory_or_file(
         if is_stream_url(path):
             # Extract the actual URL
             stream_url = path[9:]  # Remove "stream://" prefix
-            report_url = _redacted_stream_url_for_reporting(stream_url)
+            report_url = stream_url
             if progress_callback:
                 progress_callback(f"Streaming analysis: {report_url}", 0.0)
 
@@ -3571,7 +3348,10 @@ def scan_model_directory_or_file(
                 else:
                     scan_result, analysis_complete = stream_analyze_file(stream_url, scanner)
                 if scan_result:
-                    _redact_stream_scan_result_for_reporting(scan_result, stream_url, report_url)
+                    _replace_result_report_path(scan_result, stream_url, stream_url)
+                    identity_source = redact_stream_url_for_display(stream_url)
+                    _preserve_scan_result_identity(scan_result, "stream", stream_url, identity_source)
+                    scan_result.metadata["source_identity"] = {"producer": "stream", "path": identity_source}
                     if not analysis_complete:
                         _mark_inconclusive_scan_outcome(scan_result, "streaming_analysis_incomplete")
                     results.files_scanned += 1
@@ -3589,6 +3369,9 @@ def scan_model_directory_or_file(
                             severity=IssueSeverity.INFO.value,
                             location=report_url,
                             details={"analysis_complete": False},
+                        )
+                        preserve_finding_identity(
+                            results.issues[-1], "stream", location=redact_stream_url_for_display(stream_url)
                         )
                 else:
                     raise ValueError(f"Streaming analysis failed for {report_url}")
@@ -3688,10 +3471,7 @@ def scan_model_directory_or_file(
                 directory_owner_result.add_check(
                     name="Directory Owner Scan",
                     passed=False,
-                    message=(
-                        "Unable to complete logical model-directory analysis: "
-                        f"{_redacted_scan_error_for_reporting(error, path)}"
-                    ),
+                    message=(f"Unable to complete logical model-directory analysis: {error!s}"),
                     severity=IssueSeverity.INFO,
                     location=path,
                     details={
@@ -4778,7 +4558,8 @@ def scan_model_directory_or_file(
                         for source in owner_sources
                     }
                     file_backed_hdf5_owner_source_count = sum(
-                        _is_file_backed_hdf5_hash_placeholder(hash_value) for hash_value in owner_hashes_before.values()
+                        hash_value.startswith(_FILE_BACKED_HDF5_UNHASHABLE_PREFIX)
+                        for hash_value in owner_hashes_before.values()
                     )
                     allow_file_backed_hdf5_owner_hashes = False
                     if owner_block_reason is None:
@@ -4893,10 +4674,7 @@ def scan_model_directory_or_file(
                             directory_owner_result.add_check(
                                 name="Directory Owner Scan",
                                 passed=False,
-                                message=(
-                                    "Unable to complete logical model-directory analysis: "
-                                    f"{_redacted_scan_error_for_reporting(error, path)}"
-                                ),
+                                message=(f"Unable to complete logical model-directory analysis: {error!s}"),
                                 severity=IssueSeverity.INFO,
                                 location=path,
                                 details={
@@ -5046,7 +4824,18 @@ def scan_model_directory_or_file(
                     for scanned_file_path, hash_source in hash_source_by_path.items()
                 }
                 if any(
-                    _is_incomplete_aggregate_hash_placeholder(content_hash) for content_hash in content_hashes.values()
+                    content_hash.startswith(
+                        (
+                            _FILE_BACKED_HDF5_UNHASHABLE_PREFIX,
+                            _FILE_BACKED_ONNX_UNHASHABLE_PREFIX,
+                            "unhashable_max_file_size_",
+                            "unhashable_max_total_size_",
+                            "unhashable_timeout_",
+                            "unhashable_legacy_pytorch_read_limit_",
+                            "unhashable_pytorch_zip_read_limit_",
+                        ),
+                    )
+                    for content_hash in content_hashes.values()
                 ):
                     aggregate_hash_complete = False
                 for external_data_sources in onnx_external_data_sources_by_path.values():
@@ -5745,10 +5534,10 @@ def scan_model_directory_or_file(
             results, "Scan interrupted by user", severity=IssueSeverity.INFO.value, details={"interrupted": True}
         )
     except Exception as e:
-        report_path = _redacted_scan_path_for_reporting(path)
-        report_error = _redacted_scan_error_for_reporting(e, path)
+        report_path = path
+        report_error = str(e)
         if is_stream_url(path):
-            logger.error(f"Error during scan: {report_error}")
+            logger.error(f"Error during scan: {format_terminal_text(report_error)}")
         else:
             logger.exception(f"Error during scan: {report_error}")
         scan_metadata["success"] = False
@@ -5759,6 +5548,17 @@ def scan_model_directory_or_file(
             severity=IssueSeverity.INFO.value,
             details={"exception_type": type(e).__name__},
         )
+        if is_stream_url(path):
+            from .models import FileMetadataModel
+
+            results.file_metadata[report_path] = FileMetadataModel(
+                source_identity={"producer": "stream", "path": f"stream://{redact_stream_url_for_display(path[9:])}"}
+            )
+            preserve_finding_identity(
+                results.issues[-1],
+                "stream",
+                message=f"Error during scan: {redact_stream_error_for_display(e, path[9:])}",
+            )
         _add_error_asset_to_results(results, report_path)
     finally:
         pickle_source_snapshot_stack.close()
@@ -6643,8 +6443,16 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         and ext == ".nemo"
         and (header_format in {"gzip", "nemo", "tar"} or magic_format in {"gzip", "nemo", "tar"})
     )
+    # Return invalid/nonzero gzip TAR tail status using configured compressed-wrapper limits.
     gzip_tar_trailing_status = (
-        _gzip_tar_trailing_status_for_config(path, config) if should_validate_gzip_tar_tail else None
+        gzip_tar_trailing_data_status(
+            path,
+            max_decompressed_bytes=config.get("compressed_max_decompressed_bytes") if config is not None else None,
+            max_decompression_ratio=config.get("compressed_max_decompression_ratio") if config is not None else None,
+            max_entries=config.get("max_tar_entries") if config is not None else None,
+        )
+        if should_validate_gzip_tar_tail
+        else None
     )
 
     if hdf5_signature_offset is not None:

@@ -15,16 +15,9 @@ import pytest
 from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.tf_savedmodel_scanner import TensorFlowSavedModelScanner
 
-
-def has_tensorflow():
-    """Check if TensorFlow is available."""
-    try:
-        import tensorflow as tf
-
-        # Vendored protobuf stubs expose `tensorflow.*` modules but not runtime APIs.
-        return bool(getattr(tf, "__version__", None)) and hasattr(tf, "constant")
-    except Exception:
-        return False
+# Check if TensorFlow is available.
+# Vendored protobuf stubs expose `tensorflow.*` modules but not runtime APIs.
+from tests.helpers.frameworks import has_tensorflow_runtime as has_tensorflow
 
 
 @pytest.mark.tensorflow

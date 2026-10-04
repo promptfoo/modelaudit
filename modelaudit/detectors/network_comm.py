@@ -1113,11 +1113,6 @@ def _redact_network_evidence(text: str) -> str:
     return redact_evidence_string(safe_urls, max_chars=None)
 
 
-def _redact_urls_in_text(text: str) -> str:
-    """Preserve the integration-facing URL redaction and formatting contract."""
-    return _URL_IN_TEXT_PATTERN.sub(lambda match: redact_url_for_finding(match.group()), text)
-
-
 def _url_is_likely_call_endpoint(data: bytes, match_end: int, url_start: int) -> bool:
     cursor = match_end
     while cursor < url_start and data[cursor : cursor + 1] in {b" ", b"\t", b"\r", b"\n"}:
@@ -1374,12 +1369,8 @@ def _uri_text_bounds_containing_offset(
     return None
 
 
-def _url_text_bounds_containing_offset(data: bytes, offset: int) -> tuple[str, int] | None:
-    return _uri_text_bounds_containing_offset(data, offset, _URL_IN_BYTES_PATTERN)
-
-
 def _url_text_containing_offset(data: bytes, offset: int) -> str | None:
-    url_context = _url_text_bounds_containing_offset(data, offset)
+    url_context = _uri_text_bounds_containing_offset(data, offset, _URL_IN_BYTES_PATTERN)
     return url_context[0] if url_context is not None else None
 
 
@@ -1508,7 +1499,7 @@ def _is_active_onnx_metadata_key(key: str) -> bool:
 
 
 def _is_match_redacted_from_url(data: bytes, match_start: int, value: str) -> bool:
-    url_context = _url_text_bounds_containing_offset(data, match_start)
+    url_context = _uri_text_bounds_containing_offset(data, match_start, _URL_IN_BYTES_PATTERN)
     if url_context is None:
         url_context = _uri_text_bounds_containing_offset(data, match_start, _URI_IN_BYTES_PATTERN)
     if url_context is None:
@@ -2008,15 +1999,6 @@ def _has_call_syntax(data: bytes, match_index: int, token_len: int) -> bool:
     cursor = match_index + token_len
     suffix = data[cursor : cursor + _MAX_PROSE_LINE_CONTEXT_BYTES]
     return _CALL_SYNTAX_SUFFIX_PATTERN.match(suffix) is not None
-
-
-def _is_version_literal_context(surrounding_bytes: bytes, token: bytes) -> bool:
-    """Return whether the matched token is explicitly presented as a version literal."""
-    return any(
-        match.group("value") == token
-        for pattern in (_EXPLICIT_VERSION_LITERAL_CONTEXT_PATTERN, _PLAIN_VERSION_LITERAL_CONTEXT_PATTERN)
-        for match in pattern.finditer(surrounding_bytes)
-    )
 
 
 def _is_doc_only_network_reference(
@@ -5331,7 +5313,7 @@ class NetworkCommDetector:
     def _url_context_redaction_decision(self, data: bytes, match_start: int, value: str) -> bool | None:
         """Return a bounded URL-context decision or None when evidence analysis is still needed."""
         if self.max_findings is not None:
-            local_uri_context = _url_text_bounds_containing_offset(data, match_start)
+            local_uri_context = _uri_text_bounds_containing_offset(data, match_start, _URL_IN_BYTES_PATTERN)
             if local_uri_context is None:
                 local_uri_context = _uri_text_bounds_containing_offset(data, match_start, _URI_IN_BYTES_PATTERN)
             if local_uri_context is not None:
@@ -5429,27 +5411,6 @@ class NetworkCommDetector:
                 return context
             self._pending_url_context = None
         return None
-
-    def _iter_indexed_url_contexts(self) -> Iterator[tuple[int, int, str]]:
-        """Yield cached URL contexts followed by the remaining lazy index."""
-        yield from self._url_contexts
-        while not self._url_context_scan_complete:
-            if self._pending_url_context is None:
-                if self._url_context_iterator is None:
-                    self._url_context_scan_complete = True
-                    return
-                try:
-                    self._pending_url_context = next(self._url_context_iterator)
-                except StopIteration:
-                    self._url_context_iterator = None
-                    self._url_context_scan_complete = True
-                    return
-
-            context = self._pending_url_context
-            self._pending_url_context = None
-            self._url_contexts.append(context)
-            self._url_context_starts.append(context[0])
-            yield context
 
     def _scan_network_commands(self, data: bytes, context: str) -> None:
         """Scan for explicit network client commands with concrete destinations."""
@@ -5745,7 +5706,13 @@ class NetworkCommDetector:
             surrounding_bytes = data[start:end]
             surrounding = surrounding_bytes.decode("utf-8", errors="ignore").lower()
 
-            if _is_version_literal_context(surrounding_bytes, match.group()):
+            # Check whether the token is explicitly presented as a version literal.
+            version_token = match.group()
+            if any(
+                match.group("value") == version_token
+                for pattern in (_EXPLICIT_VERSION_LITERAL_CONTEXT_PATTERN, _PLAIN_VERSION_LITERAL_CONTEXT_PATTERN)
+                for match in pattern.finditer(surrounding_bytes)
+            ):
                 continue
 
             # Skip if surrounded by quotes and has typical version patterns

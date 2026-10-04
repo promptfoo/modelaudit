@@ -29,15 +29,6 @@ from .base import (
 logger = logging.getLogger("modelaudit.scanners")
 
 
-def _is_contained_in(child: Path, parent: Path) -> bool:
-    """Return True when child resolves under parent directory."""
-    try:
-        child.relative_to(parent)
-        return True
-    except ValueError:
-        return False
-
-
 def _get_onnx_mapping() -> Any:
     """Get ONNX mapping module from different locations depending on version."""
     try:
@@ -1052,14 +1043,6 @@ def _custom_operator_values_hash(*values: str) -> str:
     return digest.hexdigest()
 
 
-def _custom_operator_domain_hash(domain: str) -> str:
-    return _custom_operator_values_hash(domain)
-
-
-def _custom_operator_identity_hash(domain: str, op_type: str, overload: str) -> str:
-    return _custom_operator_values_hash(domain, op_type, overload)
-
-
 @dataclass
 class _CustomOperatorAggregate:
     occurrence_count: int = 0
@@ -1095,7 +1078,7 @@ class _CustomOperatorAggregate:
                         "domain": domain,
                         "op_type": op_type,
                         "overload": overload,
-                        "operator_identity_hash": _custom_operator_identity_hash(
+                        "operator_identity_hash": _custom_operator_values_hash(
                             raw_domain,
                             raw_op_type,
                             raw_overload,
@@ -1217,16 +1200,6 @@ def _is_external_custom_operator(
     )
 
 
-def _is_explicit_custom_operator(
-    node: Any,
-    local_function_identifiers: frozenset[tuple[str, str, str]],
-) -> bool:
-    """Return whether an actual graph node carries the raw custom-op marker."""
-    return bool(
-        "custom_op" in (node.op_type or "").casefold() and _operator_identifier(node) not in local_function_identifiers
-    )
-
-
 def _check_onnx_traversal_interrupted(interrupt_check: Callable[[], None] | None) -> None:
     if interrupt_check is not None:
         interrupt_check()
@@ -1332,21 +1305,6 @@ def _model_has_external_data(
     return False
 
 
-def _model_declares_python_operator(model: Any) -> bool:
-    """Return True when the parsed ONNX model actually declares a Python operator.
-
-    The raw-byte JIT detector matches short, case-insensitive operator-name
-    tokens (e.g. ``PyOp``) anywhere in the file, so on large models it collides
-    with arbitrary tensor weight bytes. The parsed graph is the authoritative
-    operator inventory, so it is consulted before trusting a raw-byte match.
-    """
-    return any(
-        _is_python_operator(node.op_type or "")
-        for graph in _iter_model_graphs(model)
-        for node in _iter_graph_nodes(graph)
-    )
-
-
 def _jit_finding_type(finding: Any) -> Any:
     """Return the detector finding type across dict and object results."""
     return finding.get("type") if hasattr(finding, "get") else getattr(finding, "type", None)
@@ -1363,7 +1321,17 @@ def _confirmed_python_operator_findings(findings: list[Any], model: Any) -> list
         return findings
 
     try:
-        if _model_declares_python_operator(model):
+        # Return True when the parsed ONNX model actually declares a Python operator.
+        #
+        # The raw-byte JIT detector matches short, case-insensitive operator-name
+        # tokens (e.g. ``PyOp``) anywhere in the file, so on large models it collides
+        # with arbitrary tensor weight bytes. The parsed graph is the authoritative
+        # operator inventory, so it is consulted before trusting a raw-byte match.
+        if any(
+            _is_python_operator(node.op_type or "")
+            for graph in _iter_model_graphs(model)
+            for node in _iter_graph_nodes(graph)
+        ):
             return findings
     except Exception as exc:  # pragma: no cover - defensive: keep finding if unsure
         logger.debug("Unable to validate ONNX python operator finding against graph: %s", exc)
@@ -10702,11 +10670,6 @@ class _OnnxStructureParseError(ValueError):
         self.reason = reason
 
 
-def _is_onnx_structure_safety_budget_reason(reason: str) -> bool:
-    """Return whether a parser failure is an implementation resource bound."""
-    return reason.endswith(("_limit_exceeded", "_budget_exceeded"))
-
-
 class _OnnxOmittedBytes:
     """Length-only stand-in for ONNX tensor payload bytes skipped from disk."""
 
@@ -11244,23 +11207,6 @@ def _increment_onnx_count(
     return current + amount
 
 
-def _read_onnx_packed_varints(
-    handle: BinaryIO,
-    payload_end: int,
-    values: list[int],
-    state: _OnnxStructureParseState,
-    *,
-    signed: bool = False,
-    reason: str = "packed_varint_sequence_limit_exceeded",
-    limit: int = _ONNX_STRUCTURE_MAX_SEQUENCE_VALUES,
-) -> None:
-    while handle.tell() < payload_end:
-        state.check_interrupted()
-        raw_value = _read_onnx_varint(handle, payload_end)
-        value = _decode_int64_varint(raw_value) if signed else raw_value
-        _append_onnx_sequence_value(values, value, state, reason=reason, limit=limit)
-
-
 def _read_onnx_submessage(
     handle: BinaryIO,
     end: int,
@@ -11506,14 +11452,13 @@ def _parse_onnx_attribute(
                 )
             elif wire_type == 2:
                 _length, payload_end = _read_onnx_length_bounds(handle, end)
-                _read_onnx_packed_varints(
-                    handle,
-                    payload_end,
-                    attribute.ints,
-                    state,
-                    signed=True,
-                    reason="attribute_ints_limit_exceeded",
-                )
+                packed_values = attribute.ints
+                while handle.tell() < payload_end:
+                    state.check_interrupted()
+                    raw_value = _read_onnx_varint(handle, payload_end)
+                    value = _decode_int64_varint(raw_value)
+                    _append_onnx_sequence_value(packed_values, value, state, reason="attribute_ints_limit_exceeded")
+                del packed_values
                 handle.seek(payload_end)
             else:
                 _skip_onnx_unknown_field(handle, wire_type, end)
@@ -12407,8 +12352,9 @@ class OnnxScanner(BaseScanner):
                 _finish_scan_result(result)
                 return result
             parse_error_reason = e.reason if isinstance(e, _OnnxStructureParseError) else None
-            safety_budget_exhausted = parse_error_reason is not None and _is_onnx_structure_safety_budget_reason(
-                parse_error_reason
+            # Return whether a parser failure is an implementation resource bound.
+            safety_budget_exhausted = parse_error_reason is not None and parse_error_reason.endswith(
+                ("_limit_exceeded", "_budget_exceeded")
             )
             source_identity_incomplete = parse_error_reason in {
                 "source_changed_before_parse",
@@ -12900,7 +12846,11 @@ class OnnxScanner(BaseScanner):
                     local_function_identifiers,
                     opset_versions,
                 )
-                is_explicit_custom_operator = _is_explicit_custom_operator(node, local_function_identifiers)
+                # Return whether an actual graph node carries the raw custom-op marker.
+                is_explicit_custom_operator = bool(
+                    "custom_op" in (node.op_type or "").casefold()
+                    and _operator_identifier(node) not in local_function_identifiers
+                )
                 if is_external_custom_operator or is_explicit_custom_operator:
                     custom_operators_found += 1
                     retained_group_count = len(custom_domain_findings) + len(explicit_custom_operator_findings)
@@ -12959,7 +12909,7 @@ class OnnxScanner(BaseScanner):
         # not in the ONNX file itself. Emit one bounded aggregate per domain/file.
         for domain, finding in sorted(custom_domain_findings.items()):
             domain_display = _bounded_custom_operator_value(domain)
-            domain_hash = _custom_operator_domain_hash(domain)
+            domain_hash = _custom_operator_values_hash(domain)
             check_consolidation_key = f"onnx_custom_operator_domain:{domain_hash}"
             details = finding.details(
                 domain=domain,
@@ -12986,7 +12936,7 @@ class OnnxScanner(BaseScanner):
             domain_display = _custom_operator_identity_display(domain)
             op_type_display = _bounded_custom_operator_value(op_type)
             overload_display = _custom_operator_identity_display(overload)
-            identity_hash = _custom_operator_identity_hash(domain, op_type, overload)
+            identity_hash = _custom_operator_values_hash(domain, op_type, overload)
             check_consolidation_key = f"onnx_custom_operator_identity:{identity_hash}"
             details = finding.details(
                 domain=domain,
@@ -13108,8 +13058,9 @@ class OnnxScanner(BaseScanner):
                 has_windows_absolute_path = _is_windows_absolute_path(location)
                 lexical_external_path = _resolve_external_location_lexically(model_dir, location)
                 external_path = _resolve_external_location(model_dir, location)
-                lexical_in_model_dir = not has_windows_absolute_path and _is_contained_in(
-                    lexical_external_path, model_dir
+                # Return True when child resolves under parent directory.
+                lexical_in_model_dir = not has_windows_absolute_path and lexical_external_path.is_relative_to(
+                    model_dir,
                 )
                 has_symlink_component = lexical_in_model_dir and _has_symlink_component(
                     lexical_external_path,
@@ -13123,10 +13074,10 @@ class OnnxScanner(BaseScanner):
                 symlink_escapes_model_dir = (
                     has_symlink_component
                     and not trusted_hf_cache_alias
-                    and not _is_contained_in(external_path, resolved_model_dir)
+                    and not external_path.is_relative_to(resolved_model_dir)
                 )
                 escapes_model_dir = has_windows_absolute_path or (
-                    not trusted_hf_cache_alias and not _is_contained_in(external_path, resolved_model_dir)
+                    not trusted_hf_cache_alias and not external_path.is_relative_to(resolved_model_dir)
                 )
                 if symlink_escapes_model_dir:
                     aggregate_location(

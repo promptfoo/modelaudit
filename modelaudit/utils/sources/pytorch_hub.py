@@ -16,6 +16,8 @@ from urllib.parse import unquote, urldefrag, urljoin, urlsplit
 import click
 import requests
 
+from modelaudit._size_format import _format_size_absolute as _format_size
+
 from ..helpers.disk_space import check_disk_space
 
 _PYTORCH_HUB_PATTERN = r"^https://pytorch\.org/hub/[\w\-_.]+/?$"
@@ -104,20 +106,6 @@ def _content_sniff_required_extensions() -> set[str]:
     return artifact_extensions & non_artifact_extensions
 
 
-def _display_model_url(url: str) -> str:
-    """Return an artifact URL without query credentials or fragments."""
-    try:
-        parsed_url = urlsplit(url)
-    except ValueError:
-        return "<PyTorch Hub artifact URL redacted>"
-    return parsed_url._replace(query="", fragment="").geturl()
-
-
-def _redact_model_error(message: object) -> str:
-    """Remove query strings from artifact URLs embedded in an error."""
-    return _PYTORCH_MODEL_URL_PATTERN.sub(lambda match: _display_model_url(match.group(0)), str(message))
-
-
 def _normalized_model_path(url: str) -> str | None:
     """Return a decoded path that remains within download.pytorch.org/models."""
     try:
@@ -178,7 +166,7 @@ def _weight_relative_path(url: str) -> Path:
     """Return a safe local relative path for an extracted PyTorch Hub weight URL."""
     normalized_path = _normalized_model_path(url)
     if normalized_path is None:
-        raise ValueError(f"Unsafe PyTorch Hub model URL: {_display_model_url(url)}")
+        raise ValueError(f"Unsafe PyTorch Hub model URL: {url}")
     relative_parts = PurePosixPath(normalized_path).relative_to("/models").parts
     return Path(*(_safe_local_component(part) for part in relative_parts))
 
@@ -199,14 +187,6 @@ def _supported_model_extension(url: str, model_extensions: set[str] | None = Non
         key=len,
         default=None,
     )
-
-
-def _is_supported_model_url(url: str, model_extensions: set[str] | None = None) -> bool:
-    return _supported_model_extension(url, model_extensions) is not None
-
-
-def _path_collision_key(path: Path) -> tuple[str, ...]:
-    return tuple(unicodedata.normalize("NFC", part).casefold() for part in path.parts)
 
 
 def _paths_conflict(left: tuple[str, ...], right: tuple[str, ...]) -> bool:
@@ -259,11 +239,11 @@ def _artifact_download_paths(urls: list[str]) -> list[tuple[str, Path]]:
         relative_path = _weight_relative_path(url)
         download_path = relative_path
         duplicate_index = 2
-        collision_key = _path_collision_key(download_path)
+        collision_key = tuple(unicodedata.normalize("NFC", part).casefold() for part in download_path.parts)
         while any(_paths_conflict(collision_key, used_path) for used_path in used_paths):
             download_path = Path(f"__modelaudit_duplicate_{duplicate_index}") / relative_path
             duplicate_index += 1
-            collision_key = _path_collision_key(download_path)
+            collision_key = tuple(unicodedata.normalize("NFC", part).casefold() for part in download_path.parts)
 
         used_paths.add(collision_key)
         artifacts.append((url, download_path))
@@ -286,7 +266,7 @@ def _artifact_format(
 ) -> str:
     extension = _supported_model_extension(url, model_extensions)
     if extension is None:
-        raise ValueError(f"Unsafe PyTorch Hub model URL: {_display_model_url(url)}")
+        raise ValueError(f"Unsafe PyTorch Hub model URL: {url}")
     return extension_format_map.get(extension, extension)
 
 
@@ -294,7 +274,7 @@ def _artifact_redirect_url(current_url: str, response: requests.Response) -> str
     location = response.headers.get("location")
     if not isinstance(location, str) or not location:
         response.raise_for_status()
-        raise ValueError(f"PyTorch Hub artifact redirect has no location: {_display_model_url(current_url)}")
+        raise ValueError(f"PyTorch Hub artifact redirect has no location: {current_url}")
     return urljoin(current_url, location)
 
 
@@ -317,7 +297,7 @@ def _open_trusted_artifact_response(
         if current_format != expected_format:
             raise ValueError(
                 "PyTorch Hub artifact redirect changed artifact format "
-                f"from {expected_format} to {current_format}: {_display_model_url(current_url)}"
+                f"from {expected_format} to {current_format}: {current_url}"
             )
 
         with requests.get(
@@ -331,8 +311,7 @@ def _open_trusted_artifact_response(
                 response.raise_for_status()
                 if status_code != 200:
                     raise requests.HTTPError(
-                        "Unexpected status code "
-                        f"{status_code} for PyTorch Hub artifact: {_display_model_url(current_url)}",
+                        f"Unexpected status code {status_code} for PyTorch Hub artifact: {current_url}",
                         response=response,
                     )
                 yield response
@@ -340,7 +319,7 @@ def _open_trusted_artifact_response(
 
             current_url = _artifact_redirect_url(current_url, response)
 
-    raise requests.TooManyRedirects(f"Too many PyTorch Hub artifact redirects: {_display_model_url(url)}")
+    raise requests.TooManyRedirects(f"Too many PyTorch Hub artifact redirects: {url}")
 
 
 class _GithubSourceLinkParser(HTMLParser):
@@ -415,7 +394,7 @@ def _extract_weight_urls(
         for candidate in candidates:
             decoded_candidate = candidate if entity_decoded else html_lib.unescape(candidate)
             url = urldefrag(decoded_candidate).url
-            if _is_supported_model_url(url, model_extensions):
+            if _supported_model_extension(url, model_extensions) is not None:
                 parsed_url = urlsplit(url)
                 url = parsed_url._replace(scheme="https", netloc="download.pytorch.org").geturl()
                 if url not in seen:
@@ -529,7 +508,7 @@ def _get_total_size(urls: list[str], deadline: float | None = None) -> int:
                 if current_format != expected_format:
                     raise ValueError(
                         "PyTorch Hub artifact redirect changed artifact format "
-                        f"from {expected_format} to {current_format}: {_display_model_url(current_url)}"
+                        f"from {expected_format} to {current_format}: {current_url}"
                     )
 
                 response = requests.head(
@@ -551,22 +530,12 @@ def _get_total_size(urls: list[str], deadline: float | None = None) -> int:
                     with suppress(Exception):
                         response.close()
             else:
-                raise requests.TooManyRedirects(f"Too many PyTorch Hub artifact redirects: {_display_model_url(url)}")
+                raise requests.TooManyRedirects(f"Too many PyTorch Hub artifact redirects: {url}")
         except TimeoutError:
             raise
         except Exception:
             continue
     return total
-
-
-def _format_size(size_bytes: int) -> str:
-    units = ["B", "KB", "MB", "GB", "TB", "PB"]
-    absolute_size = abs(size_bytes)
-    for index, unit in enumerate(units):
-        divisor = 1024**index
-        if absolute_size < divisor * 1024:
-            return f"{size_bytes / divisor:.1f} {unit}"
-    return f"{size_bytes} B"
 
 
 def _enforce_max_size(size_bytes: int, max_size: int | None) -> None:
@@ -589,7 +558,7 @@ def _response_content_length(response: requests.Response) -> int | None:
 def _validate_artifact_response_type(url: str, response: requests.Response) -> None:
     content_type = response.headers.get("content-type")
     if isinstance(content_type, str) and content_type.split(";", 1)[0].strip().casefold() in _HTML_CONTENT_TYPES:
-        raise ValueError(f"PyTorch Hub artifact returned HTML content: {_display_model_url(url)}")
+        raise ValueError(f"PyTorch Hub artifact returned HTML content: {url}")
 
 
 def _validate_downloaded_artifact(url: str, path: Path) -> None:
@@ -597,7 +566,7 @@ def _validate_downloaded_artifact(url: str, path: Path) -> None:
     with path.open("rb") as handle:
         prefix = handle.read(4096)
     if _HTML_PREFIX_PATTERN.match(prefix):
-        raise ValueError(f"PyTorch Hub artifact returned HTML content: {_display_model_url(url)}")
+        raise ValueError(f"PyTorch Hub artifact returned HTML content: {url}")
 
     extension = _supported_model_extension(url)
     if extension not in _content_sniff_required_extensions():
@@ -614,13 +583,8 @@ def _validate_downloaded_artifact(url: str, path: Path) -> None:
 
     if detect_file_format_from_magic(str(path)) == "unknown":
         raise ValueError(
-            "PyTorch Hub artifact with an ambiguous suffix did not contain recognizable model content: "
-            f"{_display_model_url(url)}"
+            f"PyTorch Hub artifact with an ambiguous suffix did not contain recognizable model content: {url}"
         )
-
-
-def _path_entry_exists(path: Path) -> bool:
-    return path.exists() or path.is_symlink()
 
 
 def _remove_path_entry(path: Path) -> None:
@@ -705,14 +669,6 @@ def _open_cache_parent_fd(
     return parent_fd
 
 
-def _path_entry_exists_at(parent_fd: int, name: str) -> bool:
-    try:
-        os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-    except FileNotFoundError:
-        return False
-    return True
-
-
 def _remove_path_entry_at(parent_fd: int, name: str) -> None:
     with suppress(FileNotFoundError):
         os.unlink(name, dir_fd=parent_fd)
@@ -757,7 +713,7 @@ def _commit_staged_weight_files_secure(
             for parent_fd, filename, backup_file, had_existing_entry in reversed(committed):
                 try:
                     if had_existing_entry:
-                        if _path_entry_exists(backup_file):
+                        if backup_file.exists() or backup_file.is_symlink():
                             _remove_path_entry_at(parent_fd, filename)
                             os.rename(backup_file, filename, dst_dir_fd=parent_fd)
                     else:
@@ -787,7 +743,7 @@ def _commit_staged_weight_files_path(
             dest_file = _prepare_destination_parent(dest_dir, relative_path, created_dirs)
             backup_file = _safe_destination_path(backup_dir, relative_path)
             backup_file.parent.mkdir(parents=True, exist_ok=True)
-            had_existing_entry = _path_entry_exists(dest_file)
+            had_existing_entry = dest_file.exists() or dest_file.is_symlink()
             if dest_file.is_dir() and not dest_file.is_symlink():
                 raise IsADirectoryError(f"PyTorch Hub cache destination is a directory: {dest_file}")
             committed.append((dest_file, backup_file, had_existing_entry))
@@ -799,7 +755,7 @@ def _commit_staged_weight_files_path(
         for dest_file, backup_file, had_existing_entry in reversed(committed):
             try:
                 if had_existing_entry:
-                    if _path_entry_exists(backup_file):
+                    if backup_file.exists() or backup_file.is_symlink():
                         _remove_path_entry(dest_file)
                         backup_file.replace(dest_file)
                 else:
@@ -936,9 +892,7 @@ def download_pytorch_hub_model(
             except ValueError:
                 raise
             except Exception as error:
-                raise Exception(
-                    f"Failed to download weights from {_display_model_url(weight_url)}: {_redact_model_error(error)}"
-                ) from error
+                raise Exception(f"Failed to download weights from {weight_url}: {error!s}") from error
 
         if staging_dir is not None and backup_dir is not None:
             _commit_staged_weight_files(artifacts, files_dir, backup_dir, dest_root)
@@ -1026,9 +980,7 @@ def download_pytorch_hub_model_streaming(
             except (TimeoutError, ValueError):
                 raise
             except Exception as e:
-                raise Exception(
-                    f"Failed to download weights from {_display_model_url(weight_url)}: {_redact_model_error(e)}"
-                ) from e
+                raise Exception(f"Failed to download weights from {weight_url}: {e!s}") from e
 
             yield (dest_file, is_last)
 

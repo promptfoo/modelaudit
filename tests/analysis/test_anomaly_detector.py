@@ -1,8 +1,25 @@
 """Tests for anomaly detector module."""
 
+from dataclasses import replace
+from typing import Any
+
 import pytest
 
 from modelaudit.analysis.anomaly_detector import AnomalyDetector, StatisticalProfile
+
+
+def _block_numpy_import(monkeypatch: pytest.MonkeyPatch, *, include_scipy: bool = False) -> None:
+    """Block optional numerical imports until the calling test's monkeypatch teardown."""
+    import builtins
+
+    real_import = builtins.__import__
+
+    def mock_import(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name == "numpy" or (include_scipy and name == "scipy"):
+            raise ImportError("No module named 'numpy'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", mock_import)
 
 
 class TestStatisticalProfile:
@@ -146,18 +163,11 @@ class TestAnomalyDetector:
         assert "activation_pattern" in detector.anomaly_thresholds
         assert detector.anomaly_thresholds["weight_distribution"] == 3.0
 
-    def test_compute_statistical_profile_no_numpy(self, detector, monkeypatch):
+    def test_compute_statistical_profile_no_numpy(
+        self, detector: AnomalyDetector, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """Test profile computation falls back gracefully without numpy."""
-        import builtins
-
-        real_import = builtins.__import__
-
-        def mock_import(name, *args, **kwargs):
-            if name == "numpy" or name == "scipy":
-                raise ImportError("No module named 'numpy'")
-            return real_import(name, *args, **kwargs)
-
-        monkeypatch.setattr(builtins, "__import__", mock_import)
+        _block_numpy_import(monkeypatch, include_scipy=True)
 
         # Should return empty profile
         profile = detector.compute_statistical_profile([1, 2, 3])
@@ -208,8 +218,18 @@ class TestAnomalyDetector:
         assert detector._score_to_severity(3.5) == "high"
         assert detector._score_to_severity(6.0) == "critical"
 
-    def test_analyze_anomaly_mean_shift(self, detector):
-        """Test anomaly analysis detects mean shift."""
+    @pytest.mark.parametrize(
+        ("field", "value", "expected_detail"),
+        [
+            pytest.param("mean", 1.0, "mean_shift", id="mean_shift"),
+            pytest.param("std", 0.5, "variance_change", id="variance_change"),  # 5x std change
+            pytest.param("skewness", 5.0, "skewness", id="high_skewness"),
+            pytest.param("kurtosis", 20.0, "kurtosis", id="abnormal_kurtosis"),
+            pytest.param("sparsity", 0.95, "sparsity", id="extreme_sparsity"),
+        ],
+    )
+    def test_analyze_anomaly(self, detector: AnomalyDetector, field: str, value: float, expected_detail: str) -> None:
+        """Detect each statistical anomaly against an otherwise identical profile."""
         expected = StatisticalProfile(
             mean=0.0,
             std=0.1,
@@ -222,136 +242,9 @@ class TestAnomalyDetector:
             zero_ratio=0.01,
             sparsity=0.05,
         )
-        actual = StatisticalProfile(
-            mean=1.0,
-            std=0.1,
-            min_val=-0.5,
-            max_val=0.5,
-            percentiles={},
-            skewness=0.0,
-            kurtosis=3.0,
-            entropy=7.5,
-            zero_ratio=0.01,
-            sparsity=0.05,
-        )
+        actual = replace(expected, percentiles={}, **{field: value})
         details = detector._analyze_anomaly(expected, actual)
-        assert "mean_shift" in details
-
-    def test_analyze_anomaly_variance_change(self, detector):
-        """Test anomaly analysis detects variance change."""
-        expected = StatisticalProfile(
-            mean=0.0,
-            std=0.1,
-            min_val=-0.5,
-            max_val=0.5,
-            percentiles={},
-            skewness=0.0,
-            kurtosis=3.0,
-            entropy=7.5,
-            zero_ratio=0.01,
-            sparsity=0.05,
-        )
-        actual = StatisticalProfile(
-            mean=0.0,
-            std=0.5,
-            min_val=-0.5,
-            max_val=0.5,  # 5x std change
-            percentiles={},
-            skewness=0.0,
-            kurtosis=3.0,
-            entropy=7.5,
-            zero_ratio=0.01,
-            sparsity=0.05,
-        )
-        details = detector._analyze_anomaly(expected, actual)
-        assert "variance_change" in details
-
-    def test_analyze_anomaly_high_skewness(self, detector):
-        """Test anomaly analysis detects high skewness."""
-        expected = StatisticalProfile(
-            mean=0.0,
-            std=0.1,
-            min_val=-0.5,
-            max_val=0.5,
-            percentiles={},
-            skewness=0.0,
-            kurtosis=3.0,
-            entropy=7.5,
-            zero_ratio=0.01,
-            sparsity=0.05,
-        )
-        actual = StatisticalProfile(
-            mean=0.0,
-            std=0.1,
-            min_val=-0.5,
-            max_val=0.5,
-            percentiles={},
-            skewness=5.0,
-            kurtosis=3.0,  # High skewness
-            entropy=7.5,
-            zero_ratio=0.01,
-            sparsity=0.05,
-        )
-        details = detector._analyze_anomaly(expected, actual)
-        assert "skewness" in details
-
-    def test_analyze_anomaly_abnormal_kurtosis(self, detector):
-        """Test anomaly analysis detects abnormal kurtosis."""
-        expected = StatisticalProfile(
-            mean=0.0,
-            std=0.1,
-            min_val=-0.5,
-            max_val=0.5,
-            percentiles={},
-            skewness=0.0,
-            kurtosis=3.0,
-            entropy=7.5,
-            zero_ratio=0.01,
-            sparsity=0.05,
-        )
-        actual = StatisticalProfile(
-            mean=0.0,
-            std=0.1,
-            min_val=-0.5,
-            max_val=0.5,
-            percentiles={},
-            skewness=0.0,
-            kurtosis=20.0,  # Very high kurtosis
-            entropy=7.5,
-            zero_ratio=0.01,
-            sparsity=0.05,
-        )
-        details = detector._analyze_anomaly(expected, actual)
-        assert "kurtosis" in details
-
-    def test_analyze_anomaly_extreme_sparsity(self, detector):
-        """Test anomaly analysis detects extreme sparsity."""
-        expected = StatisticalProfile(
-            mean=0.0,
-            std=0.1,
-            min_val=-0.5,
-            max_val=0.5,
-            percentiles={},
-            skewness=0.0,
-            kurtosis=3.0,
-            entropy=7.5,
-            zero_ratio=0.01,
-            sparsity=0.05,
-        )
-        actual = StatisticalProfile(
-            mean=0.0,
-            std=0.1,
-            min_val=-0.5,
-            max_val=0.5,
-            percentiles={},
-            skewness=0.0,
-            kurtosis=3.0,
-            entropy=7.5,
-            zero_ratio=0.01,
-            sparsity=0.95,  # Extremely sparse
-        )
-        details = detector._analyze_anomaly(expected, actual)
-        assert "sparsity" in details
+        assert expected_detail in details
 
 
 class TestSuspiciousPatternDetection:
@@ -362,63 +255,33 @@ class TestSuspiciousPatternDetection:
         """Create an anomaly detector instance."""
         return AnomalyDetector()
 
-    def test_check_suspicious_patterns_no_numpy(self, detector, monkeypatch):
+    def test_check_suspicious_patterns_no_numpy(
+        self, detector: AnomalyDetector, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """Test suspicious pattern checking falls back without numpy."""
-        import builtins
-
-        real_import = builtins.__import__
-
-        def mock_import(name, *args, **kwargs):
-            if name == "numpy":
-                raise ImportError("No module named 'numpy'")
-            return real_import(name, *args, **kwargs)
-
-        monkeypatch.setattr(builtins, "__import__", mock_import)
+        _block_numpy_import(monkeypatch)
         result = detector._check_suspicious_patterns([1, 2, 3])
         assert result == []
 
-    def test_contains_executable_signature_no_numpy(self, detector, monkeypatch):
+    def test_contains_executable_signature_no_numpy(
+        self, detector: AnomalyDetector, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """Test executable signature check without numpy."""
-        import builtins
-
-        real_import = builtins.__import__
-
-        def mock_import(name, *args, **kwargs):
-            if name == "numpy":
-                raise ImportError("No module named 'numpy'")
-            return real_import(name, *args, **kwargs)
-
-        monkeypatch.setattr(builtins, "__import__", mock_import)
+        _block_numpy_import(monkeypatch)
         result = detector._contains_executable_signature([1, 2, 3])
         assert result is False
 
-    def test_contains_encoded_strings_no_numpy(self, detector, monkeypatch):
+    def test_contains_encoded_strings_no_numpy(
+        self, detector: AnomalyDetector, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """Test encoded strings check without numpy."""
-        import builtins
-
-        real_import = builtins.__import__
-
-        def mock_import(name, *args, **kwargs):
-            if name == "numpy":
-                raise ImportError("No module named 'numpy'")
-            return real_import(name, *args, **kwargs)
-
-        monkeypatch.setattr(builtins, "__import__", mock_import)
+        _block_numpy_import(monkeypatch)
         result = detector._contains_encoded_strings([1, 2, 3])
         assert result is False
 
-    def test_has_repeating_patterns_no_numpy(self, detector, monkeypatch):
+    def test_has_repeating_patterns_no_numpy(self, detector: AnomalyDetector, monkeypatch: pytest.MonkeyPatch) -> None:
         """Test repeating patterns check without numpy."""
-        import builtins
-
-        real_import = builtins.__import__
-
-        def mock_import(name, *args, **kwargs):
-            if name == "numpy":
-                raise ImportError("No module named 'numpy'")
-            return real_import(name, *args, **kwargs)
-
-        monkeypatch.setattr(builtins, "__import__", mock_import)
+        _block_numpy_import(monkeypatch)
         result = detector._has_repeating_patterns([1, 2, 3])
         assert result is False
 
@@ -432,18 +295,11 @@ class TestSuspiciousPatternDetection:
         result = detector._has_repeating_patterns(short_data)
         assert result is False
 
-    def test_violates_distribution_laws_no_numpy(self, detector, monkeypatch):
+    def test_violates_distribution_laws_no_numpy(
+        self, detector: AnomalyDetector, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """Test distribution law check without numpy."""
-        import builtins
-
-        real_import = builtins.__import__
-
-        def mock_import(name, *args, **kwargs):
-            if name == "numpy":
-                raise ImportError("No module named 'numpy'")
-            return real_import(name, *args, **kwargs)
-
-        monkeypatch.setattr(builtins, "__import__", mock_import)
+        _block_numpy_import(monkeypatch)
         result = detector._violates_distribution_laws([1, 2, 3])
         assert result is False
 

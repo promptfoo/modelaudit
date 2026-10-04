@@ -971,22 +971,9 @@ def test_pickle_report_to_scan_result_fails_closed_for_truncated_literal_scan_no
         ),
     )
 
-    result = pickle_report_to_scan_result(report)
-
-    assert result.success is False
-    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-    assert result.metadata["scan_outcome_reasons"] == ["literal_scan_truncated"]
-    assert result.metadata["analysis_incomplete"] is True
-    notice_check = next(
-        check
-        for check in result.checks
-        if check.name == "Standalone Pickle Notice"
-        and check.status.value == "failed"
-        and check.severity == IssueSeverity.INFO
-        and check.rule_code == "S902"
-        and check.details["pickle_notice_code"] == "literal_scan_truncated"
+    _assert_incomplete_notice_check(
+        report, False, "literal_scan_truncated", "String literal scan truncated at configured limit"
     )
-    assert notice_check.message == "String literal scan truncated at configured limit"
 
 
 def test_pickle_report_to_scan_result_fails_closed_for_truncated_import_references() -> None:
@@ -1041,13 +1028,7 @@ def test_pickle_report_to_scan_result_fails_closed_for_legacy_complete_truncated
         ),
     )
 
-    result = pickle_report_to_scan_result(report)
-
-    assert result.success is False
-    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-    assert result.metadata["scan_outcome_reasons"] == ["import_references_truncated"]
-    assert result.metadata["analysis_incomplete"] is True
-    assert should_cache_scan_result(result.to_dict()) is False
+    _assert_incomplete_report_not_cached(report, "import_references_truncated")
 
 
 def test_pickle_report_to_scan_result_keeps_legacy_truncated_findings_successful() -> None:
@@ -1144,13 +1125,7 @@ def test_pickle_report_to_scan_result_fails_closed_for_legacy_complete_truncated
         ),
     )
 
-    result = pickle_report_to_scan_result(report)
-
-    assert result.success is False
-    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-    assert result.metadata["scan_outcome_reasons"] == ["callable_invocations_truncated"]
-    assert result.metadata["analysis_incomplete"] is True
-    assert should_cache_scan_result(result.to_dict()) is False
+    _assert_incomplete_report_not_cached(report, "callable_invocations_truncated")
 
 
 def test_pickle_report_to_scan_result_fails_closed_for_encoded_nested_truncation_notice() -> None:
@@ -1178,22 +1153,12 @@ def test_pickle_report_to_scan_result_fails_closed_for_encoded_nested_truncation
         ),
     )
 
-    result = pickle_report_to_scan_result(report)
-
-    assert result.success is True
-    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-    assert result.metadata["scan_outcome_reasons"] == ["encoded_nested_payload_truncated"]
-    assert result.metadata["analysis_incomplete"] is True
-    notice_check = next(
-        check
-        for check in result.checks
-        if check.name == "Standalone Pickle Notice"
-        and check.status.value == "failed"
-        and check.severity == IssueSeverity.INFO
-        and check.rule_code == "S902"
-        and check.details["pickle_notice_code"] == "encoded_nested_payload_truncated"
+    _assert_incomplete_notice_check(
+        report,
+        True,
+        "encoded_nested_payload_truncated",
+        "Encoded pickle payload exceeds configured deep-scan byte limit",
     )
-    assert notice_check.message == "Encoded pickle payload exceeds configured deep-scan byte limit"
 
 
 def test_pickle_report_to_scan_result_preserves_critical_s601_for_encoded_nested_payload_missing_encoding() -> None:
@@ -1269,22 +1234,9 @@ def test_pickle_report_to_scan_result_fails_closed_for_raw_nested_truncation_not
         ),
     )
 
-    result = pickle_report_to_scan_result(report)
-
-    assert result.success is True
-    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-    assert result.metadata["scan_outcome_reasons"] == ["nested_payload_truncated"]
-    assert result.metadata["analysis_incomplete"] is True
-    notice_check = next(
-        check
-        for check in result.checks
-        if check.name == "Standalone Pickle Notice"
-        and check.status.value == "failed"
-        and check.severity == IssueSeverity.INFO
-        and check.rule_code == "S902"
-        and check.details["pickle_notice_code"] == "nested_payload_truncated"
+    _assert_incomplete_notice_check(
+        report, True, "nested_payload_truncated", "Nested pickle payload exceeds configured deep-scan byte limit"
     )
-    assert notice_check.message == "Nested pickle payload exceeds configured deep-scan byte limit"
 
 
 def test_pickle_report_to_scan_result_fails_closed_for_nested_probe_limit_notice() -> None:
@@ -1352,22 +1304,9 @@ def test_pickle_report_to_scan_result_fails_closed_for_nested_incomplete_notice(
         ),
     )
 
-    result = pickle_report_to_scan_result(report)
-
-    assert result.success is False
-    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-    assert result.metadata["scan_outcome_reasons"] == ["nested_pickle_incomplete"]
-    assert result.metadata["analysis_incomplete"] is True
-    notice_check = next(
-        check
-        for check in result.checks
-        if check.name == "Standalone Pickle Notice"
-        and check.status.value == "failed"
-        and check.severity == IssueSeverity.INFO
-        and check.rule_code == "S902"
-        and check.details["pickle_notice_code"] == "nested_pickle_incomplete"
+    _assert_incomplete_notice_check(
+        report, False, "nested_pickle_incomplete", "Nested pickle analysis did not complete"
     )
-    assert notice_check.message == "Nested pickle analysis did not complete"
 
 
 @pytest.mark.parametrize(
@@ -1500,16 +1439,8 @@ def test_pickle_report_to_scan_result_keeps_trusted_bin_padding_tails_as_inconcl
         metadata={"first_pickle_end_pos": 56, "import_references": _benign_tail_import_references()},
     )
 
-    result = pickle_report_to_scan_result(report)
-
-    assert result.success is False
-    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-    assert not any(issue.message == "Pickle parsing failed before full scan completion" for issue in result.issues)
-    assert any(
-        issue.severity == IssueSeverity.INFO
-        and issue.rule_code == "S902"
-        and issue.message == "Pickle parsing stopped before the stream was fully consumed: ValueError"
-        for issue in result.issues
+    _assert_inconclusive_padding_notice(
+        report, "Pickle parsing stopped before the stream was fully consumed: ValueError"
     )
 
 
@@ -1534,16 +1465,8 @@ def test_pickle_report_to_scan_result_keeps_unicode_decode_tails_as_inconclusive
         metadata={"first_pickle_end_pos": 20, "import_references": _benign_tail_import_references()},
     )
 
-    result = pickle_report_to_scan_result(report)
-
-    assert result.success is False
-    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-    assert not any(issue.message == "Pickle parsing failed before full scan completion" for issue in result.issues)
-    assert any(
-        issue.severity == IssueSeverity.INFO
-        and issue.rule_code == "S902"
-        and issue.message == "Pickle parsing stopped before the stream was fully consumed: UnicodeDecodeError"
-        for issue in result.issues
+    _assert_inconclusive_padding_notice(
+        report, "Pickle parsing stopped before the stream was fully consumed: UnicodeDecodeError"
     )
 
 
@@ -1568,16 +1491,8 @@ def test_pickle_report_to_scan_result_keeps_zero_padding_tails_as_inconclusive_n
         metadata={"first_pickle_end_pos": 19, "import_references": _benign_tail_import_references()},
     )
 
-    result = pickle_report_to_scan_result(report)
-
-    assert result.success is False
-    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-    assert not any(issue.message == "Pickle parsing failed before full scan completion" for issue in result.issues)
-    assert any(
-        issue.severity == IssueSeverity.INFO
-        and issue.rule_code == "S902"
-        and issue.message == "Pickle parsing stopped before the stream was fully consumed: ValueError"
-        for issue in result.issues
+    _assert_inconclusive_padding_notice(
+        report, "Pickle parsing stopped before the stream was fully consumed: ValueError"
     )
 
 
@@ -1803,16 +1718,8 @@ def test_pickle_report_to_scan_result_keeps_joblib_unknown_opcode_tails_as_incon
         },
     )
 
-    result = pickle_report_to_scan_result(report)
-
-    assert result.success is False
-    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-    assert not any(issue.message == "Pickle parsing failed before full scan completion" for issue in result.issues)
-    assert any(
-        issue.severity == IssueSeverity.INFO
-        and issue.rule_code == "S902"
-        and issue.message == "Pickle parsing stopped before the stream was fully consumed: ValueError"
-        for issue in result.issues
+    _assert_inconclusive_padding_notice(
+        report, "Pickle parsing stopped before the stream was fully consumed: ValueError"
     )
 
 
@@ -2184,3 +2091,41 @@ def test_pinned_bge_small_zh_hf_scan_completes_without_private_metadata_error(tm
     assert "pytorch_model/data.pkl" in serialized_report
     assert "pytorch_zip_scan_incomplete" not in serialized_report
     assert "analysis_incomplete" not in serialized_report
+
+
+def _assert_inconclusive_padding_notice(report: PickleReport, message: str) -> None:
+    result = pickle_report_to_scan_result(report)
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert not any(issue.message == "Pickle parsing failed before full scan completion" for issue in result.issues)
+    assert any(
+        issue.severity == IssueSeverity.INFO and issue.rule_code == "S902" and (issue.message == message)
+        for issue in result.issues
+    )
+
+
+def _assert_incomplete_notice_check(report: PickleReport, expected_success: bool, reason: str, message: str) -> None:
+    result = pickle_report_to_scan_result(report)
+    assert result.success is expected_success
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["scan_outcome_reasons"] == [reason]
+    assert result.metadata["analysis_incomplete"] is True
+    notice_check = next(
+        check
+        for check in result.checks
+        if check.name == "Standalone Pickle Notice"
+        and check.status.value == "failed"
+        and (check.severity == IssueSeverity.INFO)
+        and (check.rule_code == "S902")
+        and (check.details["pickle_notice_code"] == reason)
+    )
+    assert notice_check.message == message
+
+
+def _assert_incomplete_report_not_cached(report: PickleReport, reason: str) -> None:
+    result = pickle_report_to_scan_result(report)
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["scan_outcome_reasons"] == [reason]
+    assert result.metadata["analysis_incomplete"] is True
+    assert should_cache_scan_result(result.to_dict()) is False

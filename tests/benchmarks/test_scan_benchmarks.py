@@ -203,25 +203,11 @@ def test_scan_single_checkpoint_before_load(benchmark: Any, benchmark_inputs: di
 
 
 def test_scan_release_candidate_repository(benchmark: Any, benchmark_inputs: dict[str, Path]) -> None:
-    result = _benchmark_scan(
-        benchmark,
-        benchmark_inputs["release_candidate"],
-        workload="mixed-model-repository",
-    )
-
-    assert result.success is True
-    assert result.files_scanned >= 3
+    _assert_benchmark_scan(benchmark, benchmark_inputs, "release_candidate", "mixed-model-repository", 3)
 
 
 def test_scan_duplicate_registry_snapshot(benchmark: Any, benchmark_inputs: dict[str, Path]) -> None:
-    result = _benchmark_scan(
-        benchmark,
-        benchmark_inputs["registry_snapshot"],
-        workload="duplicate-heavy-registry",
-    )
-
-    assert result.success is True
-    assert result.files_scanned >= 4
+    _assert_benchmark_scan(benchmark, benchmark_inputs, "registry_snapshot", "duplicate-heavy-registry", 4)
 
 
 def test_scan_suspicious_pickle_intake(benchmark: Any, benchmark_inputs: dict[str, Path]) -> None:
@@ -287,3 +273,16 @@ def test_rejected_basic_auth_candidates_scan_linearly(benchmark: Any) -> None:
     )
 
     assert not [finding for finding in findings if finding.get("secret_type") == "Basic Auth Credentials"]
+
+
+def _assert_benchmark_scan(
+    benchmark: Any, benchmark_inputs: dict[str, Path], case_input_name: str, case_workload: str, case_minimum_files: int
+) -> None:
+    result = _benchmark_scan(
+        benchmark,
+        benchmark_inputs[case_input_name],
+        workload=case_workload,
+    )
+
+    assert result.success is True
+    assert result.files_scanned >= case_minimum_files

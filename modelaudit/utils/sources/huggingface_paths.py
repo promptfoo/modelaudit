@@ -9,19 +9,6 @@ from urllib.parse import unquote, urlparse, urlunparse
 
 from ._huggingface_cache import _find_hf_cache_root, _resolve_hf_cache_path
 
-HUGGINGFACE_URL_IN_TEXT_PATTERN = re.compile(
-    r"(?i)\b(?:https?://(?:[^\s\"'<>/@]+(?::[^\s\"'<>/@]*)?@)?(?:huggingface\.co|hf\.co)|hf://)"
-    r"[^\s\"'<>]*"
-)
-_SENSITIVE_URL_QUERY_PARAM_PATTERN = re.compile(
-    (
-        r"([?&][^=\s&]*(?:signature|credential|security-token|access-key|access_key|token|"
-        r"secret|api-key|api_key|apikey|sig|sas)[^=\s&]*=)[^\s&#]+"
-    ),
-    re.IGNORECASE,
-)
-_URL_USERINFO_PATTERN = re.compile(r"([a-z][a-z0-9+.-]*://)([^/@\s]+)@", re.IGNORECASE)
-_OPAQUE_URL_USERINFO_PATTERN = re.compile(r"^([a-z][a-z0-9+.-]*:)([^/@\s]+)@", re.IGNORECASE)
 _HF_REPO_COMPONENT_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
 _MALFORMED_PERCENT_ESCAPE_PATTERN = re.compile(r"%(?![0-9A-Fa-f]{2})")
 _HF_REPO_ID_MAX_LENGTH = 96
@@ -167,50 +154,6 @@ def is_huggingface_url(url: str) -> bool:
     return True
 
 
-def redact_huggingface_url_for_display(url: str) -> str:
-    """Remove credentials, query strings, and fragments from HuggingFace URLs for display."""
-    try:
-        parsed = urlparse(url)
-    except ValueError:
-        redacted = _URL_USERINFO_PATTERN.sub(r"\1<credentials-redacted>@", url)
-        if "://" in redacted:
-            scheme, remainder = redacted.split("://", 1)
-            _, separator, path = remainder.partition("/")
-            redacted = f"{scheme}://<invalid-authority>"
-            if separator:
-                redacted = f"{redacted}/{path}"
-        return redacted.split("#", 1)[0].split("?", 1)[0]
-    if not parsed.netloc:
-        if parsed.scheme in {"ftp", "hf", "http", "https"}:
-            redacted = _URL_USERINFO_PATTERN.sub(r"\1<credentials-redacted>@", url)
-            return redacted.split("#", 1)[0].split("?", 1)[0]
-        return url
-
-    netloc = parsed.netloc
-    if "@" in netloc:
-        netloc = netloc.rsplit("@", 1)[1]
-
-    return urlunparse((parsed.scheme, netloc, parsed.path, "", "", ""))
-
-
-def _redact_huggingface_url_for_validation_error(url: str) -> str:
-    """Redact URL-like input before including it in a validation error."""
-    redacted = redact_huggingface_url_for_display(url)
-    redacted = _URL_USERINFO_PATTERN.sub(r"\1<credentials-redacted>@", redacted)
-    redacted = _OPAQUE_URL_USERINFO_PATTERN.sub(r"\1<credentials-redacted>@", redacted)
-    return redacted.split("#", 1)[0].split("?", 1)[0]
-
-
-def redact_huggingface_urls_in_text(text: str) -> str:
-    """Redact Hugging Face and signed transport URLs in display text."""
-    redacted = HUGGINGFACE_URL_IN_TEXT_PATTERN.sub(
-        lambda match: redact_huggingface_url_for_display(match.group(0)),
-        text,
-    )
-    redacted = _URL_USERINFO_PATTERN.sub(r"\1<credentials-redacted>@", redacted)
-    return _SENSITIVE_URL_QUERY_PARAM_PATTERN.sub(r"\1<redacted>", redacted)
-
-
 def is_huggingface_file_url(url: str) -> bool:
     """Check if a URL is a direct HuggingFace file URL."""
     try:
@@ -226,32 +169,30 @@ def parse_huggingface_file_url(url: str) -> tuple[str, str, str]:
     try:
         parsed = urlparse(url)
     except ValueError as exc:
-        raise ValueError(f"Invalid HuggingFace URL: {_redact_huggingface_url_for_validation_error(url)}") from exc
+        raise ValueError(f"Invalid HuggingFace URL: {url}") from exc
     if parsed.scheme not in {"http", "https"} or parsed.hostname not in ["huggingface.co", "hf.co"]:
-        raise ValueError(f"Not a HuggingFace URL: {_redact_huggingface_url_for_validation_error(url)}")
+        raise ValueError(f"Not a HuggingFace URL: {url}")
     try:
         port = parsed.port
     except ValueError as exc:
-        raise ValueError(
-            f"Invalid HuggingFace URL authority: {_redact_huggingface_url_for_validation_error(url)}"
-        ) from exc
+        raise ValueError(f"Invalid HuggingFace URL authority: {url}") from exc
     expected_port = 443 if parsed.scheme == "https" else 80
     if port is not None and port != expected_port:
-        raise ValueError(f"Invalid HuggingFace URL authority: {_redact_huggingface_url_for_validation_error(url)}")
+        raise ValueError(f"Invalid HuggingFace URL authority: {url}")
 
     raw_path = parsed.path[1:] if parsed.path.startswith("/") else parsed.path
     if not raw_path or raw_path.startswith("/") or raw_path.endswith("/") or "//" in raw_path:
-        raise ValueError(f"Invalid HuggingFace file URL format: {_redact_huggingface_url_for_validation_error(url)}")
+        raise ValueError(f"Invalid HuggingFace file URL format: {url}")
 
     path_parts = raw_path.split("/")
     if len(path_parts) >= 5 and path_parts[1:3] == ["resolve", "resolve"]:
-        raise ValueError(f"Ambiguous HuggingFace file URL format: {_redact_huggingface_url_for_validation_error(url)}")
+        raise ValueError(f"Ambiguous HuggingFace file URL format: {url}")
     if len(path_parts) >= 5 and path_parts[2] == "resolve":
         resolve_index = 2
     elif len(path_parts) >= 4 and path_parts[1] == "resolve":
         resolve_index = 1
     else:
-        raise ValueError(f"Invalid HuggingFace file URL format: {_redact_huggingface_url_for_validation_error(url)}")
+        raise ValueError(f"Invalid HuggingFace file URL format: {url}")
 
     if resolve_index == 2:
         namespace = _decode_huggingface_repo_component(path_parts[0], "namespace")
@@ -288,26 +229,26 @@ def parse_huggingface_url_with_revision(url: str) -> tuple[str, str, str | None]
             namespace, repo_name, raw_parts = _split_huggingface_repo_path(raw_repo_path)
             revision = _extract_huggingface_revision_query(parsed.query)
         except ValueError as exc:
-            raise ValueError(f"Invalid HuggingFace URL format: {redact_huggingface_url_for_display(url)}") from exc
+            raise ValueError(f"Invalid HuggingFace URL format: {url}") from exc
         if len(raw_parts) == 1:
             return namespace, "", revision
         if len(raw_parts) == 2:
             return namespace, repo_name, revision
-        raise ValueError(f"Invalid HuggingFace URL format: {redact_huggingface_url_for_display(url)}")
+        raise ValueError(f"Invalid HuggingFace URL format: {url}")
 
     parsed = urlparse(url)
     if parsed.hostname not in ["huggingface.co", "hf.co"]:
-        raise ValueError(f"Not a HuggingFace URL: {redact_huggingface_url_for_display(url)}")
+        raise ValueError(f"Not a HuggingFace URL: {url}")
 
     try:
         namespace, repo_name, raw_parts = _split_huggingface_repo_path(parsed.path)
     except ValueError as exc:
-        raise ValueError(f"Invalid HuggingFace URL format: {redact_huggingface_url_for_display(url)}") from exc
+        raise ValueError(f"Invalid HuggingFace URL format: {url}") from exc
     if len(raw_parts) == 1:
         return namespace, "", _extract_huggingface_revision_query(parsed.query)
     if len(raw_parts) == 2:
         return namespace, repo_name, _extract_huggingface_revision_query(parsed.query)
-    raise ValueError(f"Invalid HuggingFace URL format: {redact_huggingface_url_for_display(url)}")
+    raise ValueError(f"Invalid HuggingFace URL format: {url}")
 
 
 def is_huggingface_cache_path(path: str | Path) -> bool:
@@ -381,3 +322,58 @@ def extract_model_id_from_path(path: str) -> tuple[str | None, str | None]:
         current_path = current_path.parent
 
     return None, None
+
+
+# Classification historically consumed normalized transport errors. Keep that
+# input independent of raw report evidence so token text cannot imply auth failure.
+_HF_CLASSIFICATION_URL_PATTERN = re.compile(
+    r"(?i)\b(?:https?://(?:[^\s\"'<>/@]+(?::[^\s\"'<>/@]*)?@)?(?:huggingface\.co|hf\.co)|hf://)"
+    r"[^\s\"'<>]*"
+)
+
+_HF_CLASSIFICATION_QUERY_PATTERN = re.compile(
+    (
+        r"([?&][^=\s&]*(?:signature|credential|security-token|access-key|access_key|token|"
+        r"secret|api-key|api_key|apikey|sig|sas)[^=\s&]*=)[^\s&#]+"
+    ),
+    re.IGNORECASE,
+)
+
+_HF_CLASSIFICATION_USERINFO_PATTERN = re.compile(r"([a-z][a-z0-9+.-]*://)([^/@\s]+)@", re.IGNORECASE)
+
+
+def _huggingface_classification_url(url: str) -> str:
+    """Normalize transport URL content for acquisition error classification."""
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        redacted = _HF_CLASSIFICATION_USERINFO_PATTERN.sub(r"\1<credentials-redacted>@", url)
+        if "://" in redacted:
+            scheme, remainder = redacted.split("://", 1)
+            _, separator, path = remainder.partition("/")
+            redacted = f"{scheme}://<invalid-authority>"
+            if separator:
+                redacted = f"{redacted}/{path}"
+        return redacted.split("#", 1)[0].split("?", 1)[0]
+    if not parsed.netloc:
+        if parsed.scheme in {"ftp", "hf", "http", "https"}:
+            redacted = _HF_CLASSIFICATION_USERINFO_PATTERN.sub(r"\1<credentials-redacted>@", url)
+            return redacted.split("#", 1)[0].split("?", 1)[0]
+        return url
+
+    netloc = parsed.netloc
+    if "@" in netloc:
+        netloc = netloc.rsplit("@", 1)[1]
+
+    return urlunparse((parsed.scheme, netloc, parsed.path, "", "", ""))
+
+
+def _huggingface_classification_error(text: object) -> str:
+    """Keep credential text from changing acquisition error categories."""
+    text = str(getattr(text, "_modelaudit_classification_text", text))
+    redacted = _HF_CLASSIFICATION_URL_PATTERN.sub(
+        lambda match: _huggingface_classification_url(match.group(0)),
+        text,
+    )
+    redacted = _HF_CLASSIFICATION_USERINFO_PATTERN.sub(r"\1<credentials-redacted>@", redacted)
+    return _HF_CLASSIFICATION_QUERY_PATTERN.sub(r"\1<redacted>", redacted)

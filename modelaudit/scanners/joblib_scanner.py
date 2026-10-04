@@ -24,7 +24,7 @@ import numpy as np
 from modelaudit_picklescan.call_graph import import_only_reference_is_proven_trusted
 
 from ..detectors.cve_patterns import analyze_cve_patterns, enhance_scan_result_with_cve
-from ..scanner_results import ACTIONABLE_FAILED_CHECKS_METADATA_KEY, mark_inconclusive_scan_result
+from ..scanner_results import mark_inconclusive_scan_result
 from ..scanner_selection import add_scanner_selection_skip_check, embedded_pickle_scanner
 from ..utils.file.detection import _LZ4_FRAME_MAGIC, read_magic_bytes
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, Check, CheckStatus, IssueSeverity, ScanResult
@@ -956,37 +956,6 @@ class JoblibScanner(BaseScanner):
         }
 
     @staticmethod
-    def _remove_private_actionable_failed_check_entries(
-        result: ScanResult,
-        entries_to_remove: list[dict[str, str]],
-    ) -> None:
-        private_failed_checks = result._private_metadata.get(ACTIONABLE_FAILED_CHECKS_METADATA_KEY)
-        if not entries_to_remove or not isinstance(private_failed_checks, list):
-            return
-
-        unmatched_entries = list(entries_to_remove)
-        filtered_entries: list[Any] = []
-        for entry in private_failed_checks:
-            if isinstance(entry, dict):
-                matched_index = next(
-                    (
-                        index
-                        for index, candidate in enumerate(unmatched_entries)
-                        if entry.get("name") == candidate["name"] and entry.get("rule_code") == candidate["rule_code"]
-                    ),
-                    None,
-                )
-                if matched_index is not None:
-                    del unmatched_entries[matched_index]
-                    continue
-            filtered_entries.append(entry)
-
-        if filtered_entries:
-            result._private_metadata[ACTIONABLE_FAILED_CHECKS_METADATA_KEY] = filtered_entries
-        else:
-            result._private_metadata.pop(ACTIONABLE_FAILED_CHECKS_METADATA_KEY, None)
-
-    @staticmethod
     def _remove_validated_numpy_array_wrapper_findings(
         result: ScanResult,
         validated_control_occurrences: dict[str, frozenset[int]],
@@ -1254,14 +1223,7 @@ class JoblibScanner(BaseScanner):
         if result.metadata.get("pickle_verdict") in {"suspicious", "unknown"}:
             result.metadata["pickle_verdict"] = "clean"
 
-    @staticmethod
-    def _downgrade_embedded_pickle_parse_errors(result: ScanResult) -> None:
-        for issue in result.issues:
-            if issue.rule_code == "S901" and issue.details.get("category") == "parse_error":
-                issue.severity = IssueSeverity.INFO
-        for check in result.checks:
-            if check.rule_code == "S901" and check.details.get("category") == "parse_error":
-                check.severity = IssueSeverity.INFO
+    _downgrade_embedded_pickle_parse_errors = staticmethod(PickleScanner._downgrade_pickle_parse_error_findings)
 
     def _looks_like_raw_pickle_payload(self, data: bytes) -> bool:
         """Return True when `.joblib` bytes should be scanned directly as pickle."""

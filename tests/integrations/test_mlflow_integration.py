@@ -8,7 +8,6 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
-from urllib.parse import quote
 
 import pytest
 
@@ -31,7 +30,6 @@ from modelaudit.integrations.mlflow import (
     _normalize_mlflow_delegated_artifact_path,
     _opened_local_mlflow_path,
     _partition_mlflow_delegated_targets,
-    _redact_mlflow_error_for_display,
     _runs_mlflow_repository_is_scoped,
     _snapshot_local_mlflow_sources,
     scan_mlflow_model,
@@ -938,6 +936,10 @@ def test_scan_mlflow_model_import_error(monkeypatch):
         scan_mlflow_model("models:/dummy/1")
 
 
+@pytest.mark.parametrize(
+    ("quote", "control"),
+    [("", "")] + [(quote, control) for quote in ["'", '"'] for control in ["\r", "\n", "\t", "\r\n"]],
+)
 @patch("modelaudit.integrations.mlflow.shutil.rmtree")
 @patch("modelaudit.integrations.mlflow.tempfile.mkdtemp")
 @patch("modelaudit.core.scan_model_directory_or_file")
@@ -946,8 +948,15 @@ def test_scan_mlflow_model_success(
     mock_mkdtemp: MagicMock,
     mock_rmtree: MagicMock,
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    quote: str,
+    control: str,
 ) -> None:
     """Test successful MLflow model scanning."""
+    caplog.set_level(logging.DEBUG, logger="modelaudit.integrations.mlflow")
+    source = "models:/TestModel/1"
+    if control:
+        source += f"?token={quote}synthetic-secret{control}FORGED{quote}"
     # Mock MLflow
     mock_mlflow = MagicMock()
     mock_mlflow.artifacts.download_artifacts.return_value = "/tmp/test_model"
@@ -980,7 +989,7 @@ def test_scan_mlflow_model_success(
         patch.dict(sys.modules, {"mlflow": mock_mlflow}),
     ):
         results = scan_mlflow_model(
-            "models:/TestModel/1",
+            source,
             registry_uri="http://localhost:5000",
             timeout=300,
             blacklist_patterns=["malicious"],
@@ -990,7 +999,7 @@ def test_scan_mlflow_model_success(
 
     # Verify MLflow interactions
     mock_mlflow.set_registry_uri.assert_called_once_with("http://localhost:5000")
-    mock_mlflow.artifacts.get_artifact_repository.assert_called_once_with("models:/TestModel/1")
+    mock_mlflow.artifacts.get_artifact_repository.assert_called_once_with(source)
     mock_repo.list_artifacts.assert_called_once_with(None)
     mock_repo._download_file.assert_not_called()
     mock_repo.download_artifacts.assert_not_called()
@@ -1012,6 +1021,12 @@ def test_scan_mlflow_model_success(
 
     # Verify results
     assert results == mock_scan.return_value  # Verify the mock was called correctly
+
+    messages = [record.message for record in caplog.records if record.message.startswith("Downloading MLflow model ")]
+    assert len(messages) == 1 and len(messages[0].splitlines()) == 1
+    if control:
+        assert control + "FORGED" not in messages[0]
+        assert "synthetic-secret" in messages[0]
 
 
 @patch("modelaudit.integrations.mlflow.shutil.rmtree")
@@ -1201,11 +1216,11 @@ def test_scan_mlflow_model_rejects_unknown_size_before_download(
 
 @patch("modelaudit.integrations.mlflow.tempfile.mkdtemp")
 @patch("modelaudit.core.scan_model_directory_or_file")
-def test_scan_mlflow_model_redacts_size_lookup_error_before_reporting(
+def test_scan_mlflow_model_preserves_size_lookup_error_before_reporting(
     mock_scan: MagicMock,
     mock_mkdtemp: MagicMock,
 ) -> None:
-    """Remote size lookup failures should not copy backend credentials into findings."""
+    """Size lookup failures preserve diagnostics and prevent any download or scan."""
     secret_url = "https://user:password@example.com/AKIAIOSFODNN7EXAMPLE?X-Amz-Signature=supersecret"
     mock_mlflow = MagicMock()
     mock_mlflow.artifacts.get_artifact_repository.side_effect = RuntimeError(f"size unavailable for {secret_url}")
@@ -1217,20 +1232,20 @@ def test_scan_mlflow_model_redacts_size_lookup_error_before_reporting(
     mock_scan.assert_not_called()
     reported_error = result.checks[0].details["error"]
     serialized_result = result.model_dump_json()
-    assert "user:password" not in serialized_result
-    assert "AKIAIOSFODNN7EXAMPLE" not in serialized_result
-    assert "supersecret" not in serialized_result
-    assert reported_error == "size unavailable for https://example.com/<redacted>"
+    assert "user:password" in serialized_result
+    assert "AKIAIOSFODNN7EXAMPLE" in serialized_result
+    assert "supersecret" in serialized_result
+    assert reported_error == f"size unavailable for {secret_url}"
     assert result.issues[0].details["error"] == reported_error
 
 
 @patch("modelaudit.integrations.mlflow.tempfile.mkdtemp")
 @patch("modelaudit.core.scan_model_directory_or_file")
-def test_scan_mlflow_model_redacts_header_credentials_from_size_errors(
+def test_scan_mlflow_model_preserves_header_credentials_from_size_errors(
     mock_scan: MagicMock,
     mock_mkdtemp: MagicMock,
 ) -> None:
-    """Backend authorization values must not be retained in budget findings."""
+    """Backend errors remain intact when size discovery prevents a download."""
     mock_mlflow = MagicMock()
     mock_mlflow.artifacts.get_artifact_repository.side_effect = RuntimeError(
         "request failed; headers={'Authorization': 'Bearer very-secret-token', \"api_key\": \"another secret\"}"
@@ -1242,13 +1257,13 @@ def test_scan_mlflow_model_redacts_header_credentials_from_size_errors(
     mock_mkdtemp.assert_not_called()
     mock_scan.assert_not_called()
     reported_error = result.checks[0].details["error"]
-    assert reported_error == "request failed; headers={'Authorization': '<redacted>', \"api_key\": \"<redacted>\"}"
-    assert "very-secret-token" not in result.model_dump_json()
-    assert "another secret" not in result.model_dump_json()
+    assert reported_error == str(mock_mlflow.artifacts.get_artifact_repository.side_effect)
+    assert "very-secret-token" in result.model_dump_json()
+    assert "another secret" in result.model_dump_json()
 
 
-def test_mlflow_budget_failure_redacts_uri_and_artifact_path_evidence() -> None:
-    """Refused downloads must not serialize credentials from source-controlled paths."""
+def test_mlflow_budget_failure_preserves_uri_and_artifact_path_evidence() -> None:
+    """Refused downloads preserve their source and artifact path evidence."""
     model_uri = "https://user:password@example.com/model?token=URI_SECRET"
     result = _mlflow_budget_failure_result(
         model_uri,
@@ -1262,14 +1277,14 @@ def test_mlflow_budget_failure_redacts_uri_and_artifact_path_evidence() -> None:
     )
 
     serialized_result = result.model_dump_json()
-    assert "user:password" not in serialized_result
-    assert "URI_SECRET" not in serialized_result
-    assert "PATH_SECRET" not in serialized_result
-    assert "LIST_SECRET" not in serialized_result
-    expected_uri = "https://<credentials-redacted>@example.com/model?token=<redacted>"
+    assert "user:password" in serialized_result
+    assert "URI_SECRET" in serialized_result
+    assert "PATH_SECRET" in serialized_result
+    assert "LIST_SECRET" in serialized_result
+    expected_uri = model_uri
     assert result.checks[0].location == expected_uri
     assert result.checks[0].details["model_uri"] == expected_uri
-    assert result.checks[0].details["artifact_path"] == "models/token=<redacted>"
+    assert result.checks[0].details["artifact_path"] == "models/token=PATH_SECRET/model.pkl"
 
 
 def test_mlflow_budget_failure_preserves_benign_uri_context() -> None:
@@ -1427,16 +1442,9 @@ def test_scan_mlflow_model_rejects_unallowlisted_logged_model_overlay_before_dow
         def __init__(self) -> None:
             self.repo = RemoteArtifactRepository("s3://trusted-bucket/runs/run-1/model")
 
-        @staticmethod
-        def parse_runs_uri(uri: str) -> tuple[str, str | None]:
-            assert uri == "runs:/run-1/model"
-            return "run-1", "model"
+        parse_runs_uri = staticmethod(_parse_runs_fixture_uri)
 
-        @staticmethod
-        def get_underlying_uri(uri: str, tracking_uri: str | None = None) -> str:
-            assert uri == "runs:/run-1/model"
-            assert tracking_uri is None
-            return "s3://trusted-bucket/runs/run-1/model"
+        get_underlying_uri = staticmethod(_runs_fixture_underlying_uri)
 
         @staticmethod
         def _get_logged_model_artifact_repo(*, run_id: str, name: str) -> RemoteArtifactRepository:
@@ -1519,16 +1527,9 @@ def test_scan_mlflow_model_downloads_from_the_validated_logged_model_repository(
             self.download_artifacts = MagicMock(side_effect=AssertionError("wrapper download must not be used"))
             self._get_logged_model_artifact_repo = MagicMock()
 
-        @staticmethod
-        def parse_runs_uri(uri: str) -> tuple[str, str | None]:
-            assert uri == "runs:/run-1/model"
-            return "run-1", "model"
+        parse_runs_uri = staticmethod(_parse_runs_fixture_uri)
 
-        @staticmethod
-        def get_underlying_uri(uri: str, tracking_uri: str | None = None) -> str:
-            assert uri == "runs:/run-1/model"
-            assert tracking_uri is None
-            return "s3://trusted-bucket/runs/run-1/model"
+        get_underlying_uri = staticmethod(_runs_fixture_underlying_uri)
 
     class ModelsArtifactRepository:
         def __init__(self, repo: Any) -> None:
@@ -2207,7 +2208,7 @@ def test_scan_mlflow_model_copies_local_repository_without_remote_allowlist(
     mock_scan.assert_called_once()
 
 
-def test_mlflow_budget_failure_redacts_mlflow_query_credentials_recursively() -> None:
+def test_mlflow_budget_failure_preserves_mlflow_query_credentials_recursively() -> None:
     model_uri = "models:/PublicModel/1?auth=QUERYSECRET123&session=SESSIONSECRET123"
     boundary_error = "x" * 470 + " artifact_uri=///user:BUDGETPARTIALSECRET1234567890@host/model"
     result = _mlflow_budget_failure_result(
@@ -2222,13 +2223,13 @@ def test_mlflow_budget_failure_redacts_mlflow_query_credentials_recursively() ->
 
     serialized_result = result.model_dump_json()
     for secret in ("QUERYSECRET123", "SESSIONSECRET123", "CODESECRET123", "JWTSECRET123"):
-        assert secret not in serialized_result
-    assert "BUDGETPARTIAL" not in serialized_result
-    assert result.checks[0].location == "models:/PublicModel/1?auth=<redacted>&session=<redacted>"
-    assert result.checks[0].details["nested"]["source"] == ("models:/OtherModel/2?code=<redacted>&jwt=<redacted>")
+        assert secret in serialized_result
+    assert len(result.checks[0].details["boundary_error"]) == 512
+    assert result.checks[0].location == model_uri
+    assert result.checks[0].details["nested"]["source"] == ("models:/OtherModel/2?code=CODESECRET123&jwt=JWTSECRET123")
 
 
-def test_mlflow_download_safety_failure_redacts_source_and_artifact_credentials() -> None:
+def test_mlflow_download_safety_failure_preserves_source_and_artifact_credentials() -> None:
     result = _mlflow_download_safety_failure_result(
         "models:/PublicModel/1?auth=MODELSECRET123",
         "MLflow staging contains an unsupported filesystem object",
@@ -2239,164 +2240,10 @@ def test_mlflow_download_safety_failure_redacts_source_and_artifact_credentials(
     )
 
     serialized_result = result.model_dump_json()
-    assert "MODELSECRET123" not in serialized_result
-    assert "PATHSECRET123" not in serialized_result
-    assert result.checks[0].location == "models:/PublicModel/1?auth=<redacted>"
-    assert result.checks[0].details["artifact_path"] == "model/access_token=<redacted>"
-
-
-@pytest.mark.parametrize(
-    "source",
-    [
-        "//user:RELATIVEPASS123@mlflow.example/model?token=QUERYSECRET123",
-        "///user:RELATIVEPASS123@mlflow.example/model?token=QUERYSECRET123",
-        "\\\\user:RELATIVEPASS123@mlflow.example\\model?token=QUERYSECRET123",
-        "\\/\\/user:RELATIVEPASS123@mlflow.example\\/model?token=QUERYSECRET123",
-        "%2F%2F%2Fuser%3ARELATIVEPASS123%40mlflow.example%2Fmodel%3Ftoken%3DQUERYSECRET123",
-        "%252F%252Fuser%253ARELATIVEPASS123%2540mlflow.example%252Fmodel%253Ftoken%253DQUERYSECRET123",
-    ],
-)
-def test_redact_mlflow_error_handles_protocol_relative_userinfo(source: str) -> None:
-    redacted = _redact_mlflow_error_for_display(f"artifact_uri={source}")
-
-    assert "mlflow.example/model" in redacted
-    assert "RELATIVEPASS123" not in redacted
-    assert "QUERYSECRET123" not in redacted
-
-
-@pytest.mark.parametrize(
-    "source",
-    [
-        "///folder/user@mlflow.example/model",
-        "\\\\mlflow.example\\folder\\user@label",
-    ],
-)
-def test_redact_mlflow_error_preserves_non_authority_at_signs(source: str) -> None:
-    assert _redact_mlflow_error_for_display(f"artifact_uri={source}") == f"artifact_uri={source}"
-
-
-def test_redact_mlflow_error_handles_deeply_encoded_protocol_relative_userinfo() -> None:
-    source = "//user:RELATIVEPASS123@mlflow.example/model?token=QUERYSECRET123"
-    for _ in range(4):
-        source = quote(source, safe="")
-
-    redacted = _redact_mlflow_error_for_display(f"artifact_uri={source}")
-
-    assert "mlflow.example/model" in redacted
-    assert "RELATIVEPASS123" not in redacted
-    assert "QUERYSECRET123" not in redacted
-
-
-@pytest.mark.parametrize(
-    "details",
-    [
-        "credentials=('user', 'CONTAINERSECRET123')",
-        "credentials=['user', 'CONTAINERSECRET123']",
-        "credentials={'username': 'user', 'password': 'CONTAINERSECRET123'}",
-        "credentials=[['user'], 'CONTAINERSECRET123']",
-        "credentials={'primary': {'username': 'user'}, 'value': 'CONTAINERSECRET123'}",
-        "credentials={'username': 'user', 'password': 'CONTAINERSECRET123'",
-    ],
-)
-def test_redact_mlflow_error_handles_credential_containers(details: str) -> None:
-    redacted = _redact_mlflow_error_for_display(details)
-
-    assert redacted == "credentials=<redacted>"
-    assert "CONTAINERSECRET123" not in redacted
-
-
-@pytest.mark.parametrize(
-    "message",
-    [
-        "Permission denied while calling token endpoint",
-        "OAuth token endpoint returned HTTP 401",
-        "Token refresh failed",
-        "Bearer authentication failed",
-        "Basic authentication is required",
-    ],
-)
-def test_redact_mlflow_error_preserves_benign_auth_diagnostics(message: str) -> None:
-    assert _redact_mlflow_error_for_display(message) == message
-
-
-@pytest.mark.parametrize(
-    ("message", "expected"),
-    [
-        ("client_secret='CLIENTSECRET123'", "client_secret='<redacted>'"),
-        ("refresh-token=REFRESHSECRET123", "refresh-token=<redacted>"),
-        ("private_key=PRIVATESECRET123", "private_key=<redacted>"),
-        ("cookie=COOKIESECRET123", "cookie=<redacted>"),
-        ("session=SESSIONSECRET123", "session=<redacted>"),
-        ("jwt=JWTSECRET123", "jwt=<redacted>"),
-        (
-            "auth=AUTHSECRET123&session=SESSIONSECRET123",
-            "auth=<redacted>&session=<redacted>",
-        ),
-        (
-            "credentials=TOPSECRET123&region=us-east-1",
-            "credentials=<redacted>&region=us-east-1",
-        ),
-        (
-            "C:/models auth=AUTHSECRET123&session=SESSIONSECRET123",
-            "C:/models auth=<redacted>&session=<redacted>",
-        ),
-    ],
-)
-def test_redact_mlflow_error_handles_sensitive_aliases(message: str, expected: str) -> None:
-    assert _redact_mlflow_error_for_display(message) == expected
-
-
-@pytest.mark.parametrize(
-    "message",
-    [
-        "Cookie policy rejected request",
-        "JWT validation failed",
-        "Private key file missing",
-        "Client secret provider unavailable",
-        "Refresh token endpoint failed",
-        "monkey=value",
-        "key=value",
-        "session state changed",
-        "tokenizer=bert",
-    ],
-)
-def test_redact_mlflow_error_preserves_benign_sensitive_key_near_matches(message: str) -> None:
-    assert _redact_mlflow_error_for_display(message) == message
-
-
-@pytest.mark.parametrize(
-    "message",
-    [
-        "headers[Authorization]=BRACKETSECRET123",
-        "request.headers[proxy-authorization]=Bearer SHORT",
-        "headers[proxy_authorization]=PROXYSECRET123",
-        "headers[X-Api-Key]=HEADERSECRET123",
-        "headers[Credentials]=CREDENTIALSECRET123",
-        "headers[auth]=AUTHSECRET123",
-        "headers[Cookie]=COOKIESECRET123",
-        "headers[session]=SESSIONSECRET123",
-        "headers[jwt]=JWTSECRET123",
-        "headers[key]=KEYSECRET123",
-        "params[api_key]='PARAMSECRET123'",
-        "params[client_secret]=CLIENTSECRET123",
-        "query[refresh_token]=REFRESHSECRET123",
-    ],
-)
-def test_redact_mlflow_error_handles_bracketed_sensitive_keys(message: str) -> None:
-    redacted = _redact_mlflow_error_for_display(message)
-
-    assert "<redacted>" in redacted
-    assert "SECRET" not in redacted
-    assert "Bearer SHORT" not in redacted
-
-
-def test_redact_mlflow_error_preserves_benign_bracketed_keys() -> None:
-    for message in (
-        "headers[Content-Type]=application/json",
-        "headers[X-Api-Version]=2026-06-08",
-        "params[region]=us-east-1",
-    ):
-        assert _redact_mlflow_error_for_display(message) == message
+    assert "MODELSECRET123" in serialized_result
+    assert "PATHSECRET123" in serialized_result
+    assert result.checks[0].location == "models:/PublicModel/1?auth=MODELSECRET123"
+    assert result.checks[0].details["artifact_path"] == "model/access_token=PATHSECRET123.pkl"
 
 
 @patch("modelaudit.integrations.mlflow.shutil.rmtree")
@@ -3419,7 +3266,7 @@ def test_scan_mlflow_model_download_error(
 
 @patch("modelaudit.integrations.mlflow.shutil.rmtree")
 @patch("modelaudit.integrations.mlflow.tempfile.mkdtemp")
-def test_scan_mlflow_model_debug_log_redacts_source_uri(
+def test_scan_mlflow_model_debug_log_preserves_source_uri(
     mock_mkdtemp: MagicMock,
     mock_rmtree: MagicMock,
     caplog: pytest.LogCaptureFixture,
@@ -3444,8 +3291,8 @@ def test_scan_mlflow_model_debug_log_redacts_source_uri(
     ):
         scan_mlflow_model(model_uri)
 
-    assert "models:/PrivateModel/access_token=<redacted>" in caplog.text
-    assert "DEBUGSECRET123" not in caplog.text
+    assert model_uri in caplog.text
+    assert "DEBUGSECRET123" in caplog.text
     mock_rmtree.assert_called_once_with(str(temp_dir), ignore_errors=True)
 
 
@@ -3470,3 +3317,14 @@ def test_scan_mlflow_model_no_registry_uri(tmp_path: Path, monkeypatch: pytest.M
 
         # Verify set_registry_uri was not called
         mock_mlflow.set_registry_uri.assert_not_called()
+
+
+def _parse_runs_fixture_uri(uri: str) -> tuple[str, str | None]:
+    assert uri == "runs:/run-1/model"
+    return "run-1", "model"
+
+
+def _runs_fixture_underlying_uri(uri: str, tracking_uri: str | None = None) -> str:
+    assert uri == "runs:/run-1/model"
+    assert tracking_uri is None
+    return "s3://trusted-bucket/runs/run-1/model"

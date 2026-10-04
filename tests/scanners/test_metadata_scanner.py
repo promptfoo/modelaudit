@@ -16,20 +16,14 @@ from modelaudit.scanners import metadata_scanner
 from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.scanners.metadata_scanner import MetadataScanner
 from modelaudit.utils.helpers import cache_decorator
+from tests.helpers.text import LowerCountingText
 
 
 class TestMetadataScanner:
     """Test metadata scanner functionality."""
 
     def test_known_secret_format_reuses_lowered_description(self) -> None:
-        class CountingDescription(str):
-            lower_calls = 0
-
-            def lower(self) -> str:
-                self.lower_calls += 1
-                return super().lower()
-
-        description = CountingDescription("OpenAI API Key")
+        description = LowerCountingText("OpenAI API Key")
 
         assert MetadataScanner._is_known_secret_format(description) is True
         assert description.lower_calls == 1
@@ -252,20 +246,11 @@ class TestMetadataScanner:
 
     def test_scan_ignores_suspicious_domain_substrings(self) -> None:
         """Test URLs are matched by hostname, not generic substring."""
-        scanner = MetadataScanner()
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            readme_path = Path(temp_dir) / "README.md"
-            with open(readme_path, "w") as f:
-                f.write(
-                    "# Model Info\n\n"
-                    "- Docs: https://example.com/guide?redirect=bit.ly/suspicious-model\n"
-                    "- API: https://safe-ngrok.io/docs\n"
-                )
-
-            result = scanner.scan(str(readme_path))
-
-        assert len(result.issues) == 0
+        _assert_metadata_near_match_clean(
+            "# Model Info\n\n"
+            "- Docs: https://example.com/guide?redirect=bit.ly/suspicious-model\n"
+            "- API: https://safe-ngrok.io/docs\n"
+        )
 
     def test_scan_detects_suspicious_domains_hidden_in_userinfo(self, tmp_path: Path) -> None:
         """Shorteners and tunnel domains in userinfo should still be flagged."""
@@ -311,8 +296,8 @@ class TestMetadataScanner:
         assert "SECRET_TOKEN" not in serialized
         assert "SECRET_FRAGMENT" not in serialized
 
-    def test_scan_suspicious_urls_redacts_path_tokens_in_outputs(self, tmp_path: Path) -> None:
-        """Suspicious URL findings should not preserve credentials embedded in paths."""
+    def test_scan_suspicious_urls_preserves_classification_and_raw_secret_evidence(self, tmp_path: Path) -> None:
+        """URL classification stays normalized while aggregate reports retain secret evidence."""
         aws_key = "AKIAABCDEFGHIJKLMNOP"
         readme_path = tmp_path / "README.md"
         readme_path.write_text(
@@ -335,8 +320,10 @@ class TestMetadataScanner:
             aggregate.model_dump_json(),
             sarif_output,
         ]
+        assert aws_key not in serialized_outputs[0]
+        assert aws_key in serialized_outputs[1]
+        assert aws_key in serialized_outputs[2]
         for serialized in serialized_outputs:
-            assert aws_key not in serialized
             assert "SECRET_TOKEN" not in serialized
             assert "SECRET_FRAGMENT" not in serialized
 
@@ -369,8 +356,8 @@ class TestMetadataScanner:
         assert len(result.issues) >= 1  # Should detect at least one potential secret
         assert any(issue.severity == IssueSeverity.INFO for issue in result.issues)
 
-    def test_scan_exposed_secrets_redacts_match_preview_in_outputs(self, tmp_path: Path) -> None:
-        """Secret details should not preserve raw prefixes or token values."""
+    def test_scan_exposed_secrets_preserves_classification_and_raw_aggregate_evidence(self, tmp_path: Path) -> None:
+        """Keep metadata classification and raw aggregate secret evidence."""
         aws_key = "AKIAABCDEFGHIJKLMNOP"
         openai_key = "sk-1234567890abcdef1234567890abcdef1234567890abcdef"
         bearer_token = "Bearer AbCdEfGhIjKlMnOpQrStUvWxYz012345"
@@ -396,30 +383,21 @@ class TestMetadataScanner:
         assert len(exposed_secret_issues) >= 3
         assert all(issue.details["match_preview"] == "<redacted>" for issue in exposed_secret_issues)
 
-        serialized_outputs = [
-            json.dumps([issue.details for issue in direct.issues], sort_keys=True),
-            aggregate.model_dump_json(),
-            sarif_output,
-        ]
-        for serialized in serialized_outputs:
-            assert aws_key not in serialized
-            assert openai_key not in serialized
-            assert bearer_token not in serialized
-            assert "AKIAABCDEFGHIJKLMNOP" not in serialized
+        direct_details = json.dumps([issue.details for issue in direct.issues], sort_keys=True)
+        for secret in (aws_key, openai_key, bearer_token):
+            assert secret not in direct_details
+
+        for serialized in (aggregate.model_dump_json(), sarif_output):
+            assert aws_key in serialized
+            assert openai_key in serialized
+            assert bearer_token in serialized
 
     def test_scan_ignores_placeholder_secrets(self) -> None:
         """Test that obvious placeholders are not flagged as secrets."""
-        scanner = MetadataScanner()
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            readme_path = Path(temp_dir) / "README.md"
-            with open(readme_path, "w") as f:
-                f.write("# Setup\n\nAPI Key: your_api_key_here\nToken: placeholder_token\nSecret: XXXXXXXXXX\n")
-
-            result = scanner.scan(str(readme_path))
-
         # Should not flag placeholders
-        assert len(result.issues) == 0
+        _assert_metadata_near_match_clean(
+            "# Setup\n\nAPI Key: your_api_key_here\nToken: placeholder_token\nSecret: XXXXXXXXXX\n"
+        )
 
     def test_scan_nonexistent_file(self):
         """Test handling of nonexistent files."""
@@ -552,3 +530,16 @@ class TestMetadataScanner:
         assert len(timeout_checks) == 1
         assert detected_domains == {"bit.ly"}
         assert not any(check.name == "Metadata Scan Error" for check in result.checks)
+
+
+def _assert_metadata_near_match_clean(contents: str) -> None:
+    scanner = MetadataScanner()
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        readme_path = Path(temp_dir) / "README.md"
+        with open(readme_path, "w") as f:
+            f.write(contents)
+
+        result = scanner.scan(str(readme_path))
+
+    assert len(result.issues) == 0

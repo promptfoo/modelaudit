@@ -41,6 +41,8 @@ from modelaudit.utils.file.detection import PROTOBUF_MODEL_CANDIDATE_FORMAT
 from modelaudit.utils.helpers.file_hash import compute_sha256_hash
 from modelaudit.utils.helpers.secure_hasher import compute_aggregate_hash
 from tests.helpers import is_huggingface_rate_limit_error
+from tests.helpers.file_creators import _encode_protobuf_varint
+from tests.helpers.file_creators import write_binary_fixture as _write_onnx_payload
 
 
 def _make_external_tensor(name: str, data_type: int, dims: list[int], external_path: str) -> Any:
@@ -67,6 +69,18 @@ def assert_only_onnx_external_schema_validation_skipped(result: Any) -> None:
     assert len(schema_issues) == 1
     assert result.issues == schema_issues
     assert result.success is False
+
+
+def _checked_onnx_model(graph: onnx.GraphProto) -> onnx.ModelProto:
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    onnx.checker.check_model(model)
+    return model
+
+
+def _save_onnx_model(model: onnx.ModelProto, path: Path) -> Path:
+    onnx.save(model, str(path))
+    return path
 
 
 def create_onnx_model(
@@ -133,9 +147,7 @@ def create_onnx_model(
         )
     else:
         model = helper.make_model(graph)
-    path = tmp_path / "model.onnx"
-    onnx.save(model, str(path))
-    return path
+    return _save_onnx_model(model, tmp_path / "model.onnx")
 
 
 def create_onnx_weight_model(
@@ -176,9 +188,7 @@ def create_onnx_weight_model(
     graph = helper.make_graph([node], "weighted_graph", [X], [Y], initializer=[weight_tensor])
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 8
-    path = tmp_path / filename
-    onnx.save(model, str(path))
-    return path
+    return _save_onnx_model(model, tmp_path / filename)
 
 
 def create_transformed_onnx_weight_model(
@@ -266,12 +276,8 @@ def create_transformed_onnx_weight_model(
         [Y],
         initializer=initializers,
     )
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-    model.ir_version = 8
-    onnx.checker.check_model(model)
-    path = tmp_path / f"{transform.lower()}-weight.onnx"
-    onnx.save(model, str(path))
-    return path
+    model = _checked_onnx_model(graph)
+    return _save_onnx_model(model, tmp_path / f"{transform.lower()}-weight.onnx")
 
 
 def create_training_transformed_weight_model(tmp_path: Path, *, transform: str) -> Path:
@@ -338,9 +344,7 @@ def create_training_transformed_weight_model(tmp_path: Path, *, transform: str) 
     model.ir_version = 8
     model.training_info.append(training_info)
     onnx.checker.check_model(model)
-    path = tmp_path / f"training-{transform.lower()}-weight.onnx"
-    onnx.save(model, str(path))
-    return path
+    return _save_onnx_model(model, tmp_path / f"training-{transform.lower()}-weight.onnx")
 
 
 def create_nonweight_transformed_matmul_model(tmp_path: Path, *, transform: str) -> Path:
@@ -369,12 +373,8 @@ def create_nonweight_transformed_matmul_model(tmp_path: Path, *, transform: str)
         raise ValueError(f"Unsupported transform: {transform}")
 
     graph = helper.make_graph(nodes, "nonweight_transform", graph_inputs, graph_outputs, initializer=initializers)
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-    model.ir_version = 8
-    onnx.checker.check_model(model)
-    path = tmp_path / f"nonweight-{transform.lower()}.onnx"
-    onnx.save(model, str(path))
-    return path
+    model = _checked_onnx_model(graph)
+    return _save_onnx_model(model, tmp_path / f"nonweight-{transform.lower()}.onnx")
 
 
 def create_zipmap_classifier_model(tmp_path: Path) -> Path:
@@ -402,9 +402,7 @@ def create_zipmap_classifier_model(tmp_path: Path) -> Path:
     )
     model.ir_version = 8
     onnx.checker.check_model(model)
-    path = tmp_path / "zipmap-classifier.onnx"
-    onnx.save(model, str(path))
-    return path
+    return _save_onnx_model(model, tmp_path / "zipmap-classifier.onnx")
 
 
 def create_training_info_weight_model(tmp_path: Path) -> Path:
@@ -454,9 +452,7 @@ def create_training_info_weight_model(tmp_path: Path) -> Path:
     model.ir_version = 8
     model.training_info.append(training_info)
     onnx.checker.check_model(model)
-    path = tmp_path / "training-info-weight.onnx"
-    onnx.save(model, str(path))
-    return path
+    return _save_onnx_model(model, tmp_path / "training-info-weight.onnx")
 
 
 def create_cross_training_info_weight_model(tmp_path: Path) -> Path:
@@ -520,9 +516,7 @@ def create_cross_training_info_weight_model(tmp_path: Path) -> Path:
     model.ir_version = 8
     model.training_info.extend([first_training_info, second_training_info])
     onnx.checker.check_model(model)
-    path = tmp_path / "cross-training-info-weight.onnx"
-    onnx.save(model, str(path))
-    return path
+    return _save_onnx_model(model, tmp_path / "cross-training-info-weight.onnx")
 
 
 def create_training_initializer_shadow_gap_model(tmp_path: Path) -> Path:
@@ -586,9 +580,7 @@ def create_training_initialization_reset_model(tmp_path: Path) -> Path:
     model.ir_version = 8
     model.training_info.append(training_info)
     onnx.checker.check_model(model)
-    path = tmp_path / "training-initialization-reset.onnx"
-    onnx.save(model, str(path))
-    return path
+    return _save_onnx_model(model, tmp_path / "training-initialization-reset.onnx")
 
 
 def create_read_only_main_initializer_training_model(tmp_path: Path) -> Path:
@@ -614,9 +606,7 @@ def create_read_only_main_initializer_training_model(tmp_path: Path) -> Path:
     model.ir_version = 8
     model.training_info.append(training_info)
     onnx.checker.check_model(model)
-    path = tmp_path / "read-only-main-initializer-training.onnx"
-    onnx.save(model, str(path))
-    return path
+    return _save_onnx_model(model, tmp_path / "read-only-main-initializer-training.onnx")
 
 
 def create_non_weight_training_update_model(
@@ -681,9 +671,7 @@ def create_non_weight_training_update_model(
     model.ir_version = 8
     model.training_info.append(training_info)
     onnx.checker.check_model(model)
-    path = tmp_path / f"non-weight-{op_type.lower()}-training-update.onnx"
-    onnx.save(model, str(path))
-    return path
+    return _save_onnx_model(model, tmp_path / f"non-weight-{op_type.lower()}-training-update.onnx")
 
 
 def create_flat_training_initialization_reset_model(tmp_path: Path) -> Path:
@@ -721,9 +709,7 @@ def create_flat_training_initialization_reset_model(tmp_path: Path) -> Path:
     model.ir_version = 8
     model.training_info.append(training_info)
     onnx.checker.check_model(model)
-    path = tmp_path / "flat-training-initialization-reset.onnx"
-    onnx.save(model, str(path))
-    return path
+    return _save_onnx_model(model, tmp_path / "flat-training-initialization-reset.onnx")
 
 
 def create_recurrent_weight_model(
@@ -765,9 +751,7 @@ def create_recurrent_weight_model(
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 14)])
     model.ir_version = 8
     onnx.checker.check_model(model)
-    path = tmp_path / f"{op_type.lower()}-{target_input_index}-{distributed_near_match}.onnx"
-    onnx.save(model, str(path))
-    return path
+    return _save_onnx_model(model, tmp_path / f"{op_type.lower()}-{target_input_index}-{distributed_near_match}.onnx")
 
 
 def create_broadcast_dynamic_weight_model(tmp_path: Path) -> Path:
@@ -781,12 +765,8 @@ def create_broadcast_dynamic_weight_model(tmp_path: Path) -> Path:
         helper.make_node("MatMul", ["X", "W_view"], ["Y"], name="linear"),
     ]
     graph = helper.make_graph(nodes, "broadcast_dynamic_weight_graph", [X, delta], [Y], initializer=[vector])
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-    model.ir_version = 8
-    onnx.checker.check_model(model)
-    path = tmp_path / "broadcast-dynamic-weight.onnx"
-    onnx.save(model, str(path))
-    return path
+    model = _checked_onnx_model(graph)
+    return _save_onnx_model(model, tmp_path / "broadcast-dynamic-weight.onnx")
 
 
 def create_computed_weight_model(tmp_path: Path) -> Path:
@@ -800,12 +780,8 @@ def create_computed_weight_model(tmp_path: Path) -> Path:
         helper.make_node("MatMul", ["X", "W_view"], ["Y"], name="linear"),
     ]
     graph = helper.make_graph(nodes, "computed_weight_graph", [X], [Y], initializer=[left, right])
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-    model.ir_version = 8
-    onnx.checker.check_model(model)
-    path = tmp_path / "computed-weight.onnx"
-    onnx.save(model, str(path))
-    return path
+    model = _checked_onnx_model(graph)
+    return _save_onnx_model(model, tmp_path / "computed-weight.onnx")
 
 
 def create_dynamic_left_weight_model(tmp_path: Path) -> Path:
@@ -819,12 +795,8 @@ def create_dynamic_left_weight_model(tmp_path: Path) -> Path:
         helper.make_node("MatMul", ["W_view", "R"], ["Y"], name="linear"),
     ]
     graph = helper.make_graph(nodes, "dynamic_left_weight_graph", [delta], [Y], initializer=[left, right])
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-    model.ir_version = 8
-    onnx.checker.check_model(model)
-    path = tmp_path / "dynamic-left-weight.onnx"
-    onnx.save(model, str(path))
-    return path
+    model = _checked_onnx_model(graph)
+    return _save_onnx_model(model, tmp_path / "dynamic-left-weight.onnx")
 
 
 def create_left_weight_stack_model(tmp_path: Path) -> Path:
@@ -838,12 +810,8 @@ def create_left_weight_stack_model(tmp_path: Path) -> Path:
         helper.make_node("MatMul", ["W2", "hidden"], ["Y"], name="left_linear_2"),
     ]
     graph = helper.make_graph(nodes, "left_weight_stack", [X], [Y], initializer=[first, second])
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-    model.ir_version = 8
-    onnx.checker.check_model(model)
-    path = tmp_path / "left-weight-stack.onnx"
-    onnx.save(model, str(path))
-    return path
+    model = _checked_onnx_model(graph)
+    return _save_onnx_model(model, tmp_path / "left-weight-stack.onnx")
 
 
 def create_left_weight_gemm_stack_model(tmp_path: Path) -> Path:
@@ -857,12 +825,8 @@ def create_left_weight_gemm_stack_model(tmp_path: Path) -> Path:
         helper.make_node("Gemm", ["W2", "hidden"], ["Y"], name="left_gemm_2"),
     ]
     graph = helper.make_graph(nodes, "left_weight_gemm_stack", [X], [Y], initializer=[first, second])
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-    model.ir_version = 8
-    onnx.checker.check_model(model)
-    path = tmp_path / "left-weight-gemm-stack.onnx"
-    onnx.save(model, str(path))
-    return path
+    model = _checked_onnx_model(graph)
+    return _save_onnx_model(model, tmp_path / "left-weight-gemm-stack.onnx")
 
 
 def create_attention_score_model(tmp_path: Path) -> Path:
@@ -888,12 +852,8 @@ def create_attention_score_model(tmp_path: Path) -> Path:
         [Y],
         initializer=[query_weight, key_weight, value_weight],
     )
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-    model.ir_version = 8
-    onnx.checker.check_model(model)
-    path = tmp_path / "attention-score.onnx"
-    onnx.save(model, str(path))
-    return path
+    model = _checked_onnx_model(graph)
+    return _save_onnx_model(model, tmp_path / "attention-score.onnx")
 
 
 def create_einsum_attention_score_model(tmp_path: Path) -> Path:
@@ -914,12 +874,8 @@ def create_einsum_attention_score_model(tmp_path: Path) -> Path:
         [scores],
         initializer=[query_weight, key_weight],
     )
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-    model.ir_version = 8
-    onnx.checker.check_model(model)
-    path = tmp_path / "einsum-attention-score.onnx"
-    onnx.save(model, str(path))
-    return path
+    model = _checked_onnx_model(graph)
+    return _save_onnx_model(model, tmp_path / "einsum-attention-score.onnx")
 
 
 def create_recurrent_dynamic_weight_model(tmp_path: Path) -> Path:
@@ -946,9 +902,7 @@ def create_recurrent_dynamic_weight_model(tmp_path: Path) -> Path:
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 14)])
     model.ir_version = 8
     onnx.checker.check_model(model)
-    path = tmp_path / "recurrent-dynamic-weight.onnx"
-    onnx.save(model, str(path))
-    return path
+    return _save_onnx_model(model, tmp_path / "recurrent-dynamic-weight.onnx")
 
 
 def create_projected_dynamic_matmul_weight_model(tmp_path: Path, *, left: bool) -> Path:
@@ -971,12 +925,8 @@ def create_projected_dynamic_matmul_weight_model(tmp_path: Path, *, left: bool) 
         helper.make_node("MatMul", linear_inputs, ["Y"], name="linear"),
     ]
     graph = helper.make_graph(nodes, "projected_dynamic_weight_graph", [seed, X], [Y], initializer=[projection])
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-    model.ir_version = 8
-    onnx.checker.check_model(model)
-    path = tmp_path / f"projected-dynamic-matmul-weight-{left}.onnx"
-    onnx.save(model, str(path))
-    return path
+    model = _checked_onnx_model(graph)
+    return _save_onnx_model(model, tmp_path / f"projected-dynamic-matmul-weight-{left}.onnx")
 
 
 def create_mixed_activation_and_raw_lineage_model(tmp_path: Path) -> Path:
@@ -999,12 +949,8 @@ def create_mixed_activation_and_raw_lineage_model(tmp_path: Path) -> Path:
         [Y],
         initializer=[shared_weight, output_weight],
     )
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-    model.ir_version = 8
-    onnx.checker.check_model(model)
-    path = tmp_path / "mixed-activation-raw-lineage.onnx"
-    onnx.save(model, str(path))
-    return path
+    model = _checked_onnx_model(graph)
+    return _save_onnx_model(model, tmp_path / "mixed-activation-raw-lineage.onnx")
 
 
 def create_batched_matmul_weight_model(tmp_path: Path, weights: np.ndarray, *, left: bool) -> Path:
@@ -1020,12 +966,8 @@ def create_batched_matmul_weight_model(tmp_path: Path, weights: np.ndarray, *, l
         node_inputs = ["input", "W"]
     node = helper.make_node("MatMul", node_inputs, ["output"], name="batched_linear")
     graph = helper.make_graph([node], "batched_matmul_graph", [X], [Y], initializer=[weight_tensor])
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-    model.ir_version = 8
-    onnx.checker.check_model(model)
-    path = tmp_path / ("batched-left-matmul.onnx" if left else "batched-right-matmul.onnx")
-    onnx.save(model, str(path))
-    return path
+    model = _checked_onnx_model(graph)
+    return _save_onnx_model(model, tmp_path / ("batched-left-matmul.onnx" if left else "batched-right-matmul.onnx"))
 
 
 def create_collision_named_weight_model(tmp_path: Path) -> Path:
@@ -1063,12 +1005,8 @@ def create_collision_named_weight_model(tmp_path: Path) -> Path:
         ),
     ]
     graph = helper.make_graph(nodes, "collision_graph", [right_input, left_input], outputs, initializer=initializers)
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-    model.ir_version = 8
-    onnx.checker.check_model(model)
-    path = tmp_path / "collision-named-weights.onnx"
-    onnx.save(model, str(path))
-    return path
+    model = _checked_onnx_model(graph)
+    return _save_onnx_model(model, tmp_path / "collision-named-weights.onnx")
 
 
 def create_many_consumer_weight_model(tmp_path: Path, *, consumer_count: int) -> Path:
@@ -1090,12 +1028,8 @@ def create_many_consumer_weight_model(tmp_path: Path, *, consumer_count: int) ->
         for index, output_name in enumerate(output_names)
     ]
     graph = helper.make_graph(nodes, "many_consumer_graph", [X], [Y], initializer=[initializer])
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-    model.ir_version = 8
-    onnx.checker.check_model(model)
-    path = tmp_path / "many-consumer-weights.onnx"
-    onnx.save(model, str(path))
-    return path
+    model = _checked_onnx_model(graph)
+    return _save_onnx_model(model, tmp_path / "many-consumer-weights.onnx")
 
 
 def create_invalid_initializer_name_model(tmp_path: Path, *, duplicate: bool) -> Path:
@@ -1112,9 +1046,9 @@ def create_invalid_initializer_name_model(tmp_path: Path, *, duplicate: bool) ->
     graph = helper.make_graph([node], "invalid_initializer_names", [X], [Y], initializer=initializers)
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
     model.ir_version = 8
-    path = tmp_path / ("duplicate-initializers.onnx" if duplicate else "empty-initializer.onnx")
-    onnx.save(model, str(path))
-    return path
+    return _save_onnx_model(
+        model, tmp_path / ("duplicate-initializers.onnx" if duplicate else "empty-initializer.onnx")
+    )
 
 
 def create_left_equivalent_linear_model(
@@ -1135,12 +1069,8 @@ def create_left_equivalent_linear_model(
         helper.make_node("Transpose", ["output_t"], ["output"], name="transpose_output", perm=[1, 0]),
     ]
     graph = helper.make_graph(nodes, "left_equivalent_graph", [X], [Y], initializer=[weight_tensor])
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-    model.ir_version = 8
-    onnx.checker.check_model(model)
-    path = tmp_path / f"left-equivalent-{op_type.lower()}.onnx"
-    onnx.save(model, str(path))
-    return path
+    model = _checked_onnx_model(graph)
+    return _save_onnx_model(model, tmp_path / f"left-equivalent-{op_type.lower()}.onnx")
 
 
 def create_onnx_conv_weight_model(
@@ -1161,12 +1091,8 @@ def create_onnx_conv_weight_model(
     Y = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, output_channels, spatial_size, spatial_size])
     node = helper.make_node(op_type, ["input", "W"], ["output"], name="convolution", group=group)
     graph = helper.make_graph([node], "conv_weight_graph", [X], [Y], initializer=[weight_tensor])
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-    model.ir_version = 8
-    onnx.checker.check_model(model)
-    path = tmp_path / filename
-    onnx.save(model, str(path))
-    return path
+    model = _checked_onnx_model(graph)
+    return _save_onnx_model(model, tmp_path / filename)
 
 
 def create_control_flow_captured_weight_model(
@@ -1254,12 +1180,8 @@ def create_control_flow_captured_weight_model(
         raise AssertionError(f"Unsupported control-flow operator: {control_flow_op}")
 
     graph = helper.make_graph([control_node], "control_graph", graph_inputs, graph_outputs, initializer=[weight_tensor])
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-    model.ir_version = 8
-    onnx.checker.check_model(model)
-    path = tmp_path / f"captured-{control_flow_op.lower()}.onnx"
-    onnx.save(model, str(path))
-    return path
+    model = _checked_onnx_model(graph)
+    return _save_onnx_model(model, tmp_path / f"captured-{control_flow_op.lower()}.onnx")
 
 
 def create_control_flow_shadowed_weight_model(
@@ -1296,12 +1218,8 @@ def create_control_flow_shadowed_weight_model(
         [Y],
         initializer=[outer_weight_tensor],
     )
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-    model.ir_version = 8
-    onnx.checker.check_model(model)
-    path = tmp_path / "shadowed-captured-weight.onnx"
-    onnx.save(model, str(path))
-    return path
+    model = _checked_onnx_model(graph)
+    return _save_onnx_model(model, tmp_path / "shadowed-captured-weight.onnx")
 
 
 def create_control_flow_returned_weight_model(tmp_path: Path, weights: np.ndarray) -> Path:
@@ -1333,12 +1251,8 @@ def create_control_flow_returned_weight_model(tmp_path: Path, weights: np.ndarra
         helper.make_node("MatMul", ["X", "selected_weight"], ["Y"], name="linear"),
     ]
     graph = helper.make_graph(nodes, "returned_weight_graph", [condition, X], [Y], initializer=[initializer])
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-    model.ir_version = 8
-    onnx.checker.check_model(model)
-    path = tmp_path / "returned-control-flow-weight.onnx"
-    onnx.save(model, str(path))
-    return path
+    model = _checked_onnx_model(graph)
+    return _save_onnx_model(model, tmp_path / "returned-control-flow-weight.onnx")
 
 
 def create_loop_carried_weight_model(tmp_path: Path, weights: np.ndarray) -> Path:
@@ -1380,12 +1294,8 @@ def create_loop_carried_weight_model(tmp_path: Path, weights: np.ndarray) -> Pat
         [Y],
         initializer=[initializer],
     )
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-    model.ir_version = 8
-    onnx.checker.check_model(model)
-    path = tmp_path / "loop-carried-weight.onnx"
-    onnx.save(model, str(path))
-    return path
+    model = _checked_onnx_model(graph)
+    return _save_onnx_model(model, tmp_path / "loop-carried-weight.onnx")
 
 
 def create_activation_bookkeeping_model(tmp_path: Path, *, malicious: bool, rank_two_bias: bool = False) -> Path:
@@ -1411,14 +1321,12 @@ def create_activation_bookkeeping_model(tmp_path: Path, *, malicious: bool, rank
         helper.make_node("MatMul", ["activated", "W2"], ["Y"], name="second_linear"),
     ]
     graph = helper.make_graph(nodes, "activation_bookkeeping_graph", [X], [Y], initializer=initializers)
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-    model.ir_version = 8
-    onnx.checker.check_model(model)
-    path = tmp_path / (
-        f"{'malicious' if malicious else 'benign'}-activation-bookkeeping-{'2d' if rank_two_bias else '1d'}.onnx"
+    model = _checked_onnx_model(graph)
+    return _save_onnx_model(
+        model,
+        tmp_path
+        / (f"{'malicious' if malicious else 'benign'}-activation-bookkeeping-{'2d' if rank_two_bias else '1d'}.onnx"),
     )
-    onnx.save(model, str(path))
-    return path
 
 
 def create_shape_gather_bookkeeping_model(tmp_path: Path, *, malicious: bool) -> Path:
@@ -1442,12 +1350,8 @@ def create_shape_gather_bookkeeping_model(tmp_path: Path, *, malicious: bool) ->
         helper.make_node("MatMul", ["reshaped", "W2"], ["Y"], name="second_linear"),
     ]
     graph = helper.make_graph(nodes, "shape_gather_bookkeeping_graph", [X], [Y], initializer=initializers)
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-    model.ir_version = 8
-    onnx.checker.check_model(model)
-    path = tmp_path / f"{'malicious' if malicious else 'benign'}-shape-gather-bookkeeping.onnx"
-    onnx.save(model, str(path))
-    return path
+    model = _checked_onnx_model(graph)
+    return _save_onnx_model(model, tmp_path / f"{'malicious' if malicious else 'benign'}-shape-gather-bookkeeping.onnx")
 
 
 def create_einsum_weight_model(tmp_path: Path, weights: np.ndarray) -> Path:
@@ -1456,12 +1360,8 @@ def create_einsum_weight_model(tmp_path: Path, weights: np.ndarray) -> Path:
     Y = helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, weights.shape[1]])
     node = helper.make_node("Einsum", ["X", "W"], ["Y"], name="linear", equation="bi,io->bo")
     graph = helper.make_graph([node], "einsum_weight_graph", [X], [Y], initializer=[initializer])
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-    model.ir_version = 8
-    onnx.checker.check_model(model)
-    path = tmp_path / "einsum-weight.onnx"
-    onnx.save(model, str(path))
-    return path
+    model = _checked_onnx_model(graph)
+    return _save_onnx_model(model, tmp_path / "einsum-weight.onnx")
 
 
 def create_qdq_weight_model(tmp_path: Path) -> Path:
@@ -1475,12 +1375,8 @@ def create_qdq_weight_model(tmp_path: Path) -> Path:
         helper.make_node("MatMul", ["X", "dequantized_weight"], ["Y"]),
     ]
     graph = helper.make_graph(nodes, "qdq_weight_graph", [X], [Y], initializer=[quantized_weight, scale, zero_point])
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-    model.ir_version = 8
-    onnx.checker.check_model(model)
-    path = tmp_path / "qdq-weight.onnx"
-    onnx.save(model, str(path))
-    return path
+    model = _checked_onnx_model(graph)
+    return _save_onnx_model(model, tmp_path / "qdq-weight.onnx")
 
 
 def create_sparse_weight_model(tmp_path: Path) -> Path:
@@ -1496,12 +1392,8 @@ def create_sparse_weight_model(tmp_path: Path) -> Path:
     Y = helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 10])
     node = helper.make_node("MatMul", ["X", "W"], ["Y"], name="linear")
     graph = helper.make_graph([node], "sparse_weight_graph", [X], [Y], sparse_initializer=[sparse_weight])
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-    model.ir_version = 8
-    onnx.checker.check_model(model)
-    path = tmp_path / "sparse-weight.onnx"
-    onnx.save(model, str(path))
-    return path
+    model = _checked_onnx_model(graph)
+    return _save_onnx_model(model, tmp_path / "sparse-weight.onnx")
 
 
 def create_constant_weight_model(tmp_path: Path, weights: np.ndarray) -> Path:
@@ -1513,12 +1405,8 @@ def create_constant_weight_model(tmp_path: Path, weights: np.ndarray) -> Path:
         helper.make_node("MatMul", ["X", "W"], ["Y"], name="linear"),
     ]
     graph = helper.make_graph(nodes, "constant_weight_graph", [X], [Y])
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-    model.ir_version = 8
-    onnx.checker.check_model(model)
-    path = tmp_path / "constant-weight.onnx"
-    onnx.save(model, str(path))
-    return path
+    model = _checked_onnx_model(graph)
+    return _save_onnx_model(model, tmp_path / "constant-weight.onnx")
 
 
 def create_local_function_weight_model(tmp_path: Path, weights: np.ndarray) -> Path:
@@ -1543,9 +1431,7 @@ def create_local_function_weight_model(tmp_path: Path, weights: np.ndarray) -> P
     )
     model.ir_version = 8
     onnx.checker.check_model(model)
-    path = tmp_path / "local-function-weight.onnx"
-    onnx.save(model, str(path))
-    return path
+    return _save_onnx_model(model, tmp_path / "local-function-weight.onnx")
 
 
 def create_local_function_default_weight_model(tmp_path: Path, weights: np.ndarray) -> Path:
@@ -1584,9 +1470,7 @@ def create_local_function_default_weight_model(tmp_path: Path, weights: np.ndarr
     )
     model.ir_version = 9
     onnx.checker.check_model(model)
-    path = tmp_path / "local-function-default-weight.onnx"
-    onnx.save(model, str(path))
-    return path
+    return _save_onnx_model(model, tmp_path / "local-function-default-weight.onnx")
 
 
 def create_repeated_local_function_default_weight_model(tmp_path: Path, weights: np.ndarray) -> Path:
@@ -1629,9 +1513,7 @@ def create_repeated_local_function_default_weight_model(tmp_path: Path, weights:
     )
     model.ir_version = 9
     onnx.checker.check_model(model)
-    path = tmp_path / "repeated-local-function-default-weight.onnx"
-    onnx.save(model, str(path))
-    return path
+    return _save_onnx_model(model, tmp_path / "repeated-local-function-default-weight.onnx")
 
 
 def create_many_local_function_weight_overrides_model(tmp_path: Path, *, call_count: int = 100) -> Path:
@@ -1693,9 +1575,7 @@ def create_many_local_function_weight_overrides_model(tmp_path: Path, *, call_co
     )
     model.ir_version = 9
     onnx.checker.check_model(model)
-    path = tmp_path / "many-local-function-weight-overrides.onnx"
-    onnx.save(model, str(path))
-    return path
+    return _save_onnx_model(model, tmp_path / "many-local-function-weight-overrides.onnx")
 
 
 def create_many_if_branch_weight_model(tmp_path: Path, *, branch_count: int = 20) -> Path:
@@ -1734,12 +1614,8 @@ def create_many_if_branch_weight_model(tmp_path: Path, *, branch_count: int = 20
         )
 
     graph = helper.make_graph(nodes, "many_if_branch_weights", [condition, X], [Y])
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-    model.ir_version = 8
-    onnx.checker.check_model(model)
-    path = tmp_path / "many-if-branch-weights.onnx"
-    onnx.save(model, str(path))
-    return path
+    model = _checked_onnx_model(graph)
+    return _save_onnx_model(model, tmp_path / "many-if-branch-weights.onnx")
 
 
 def create_static_shape_transform_weight_model(
@@ -1786,12 +1662,8 @@ def create_static_shape_transform_weight_model(
     Y = helper.make_tensor_value_info("Y", TensorProto.FLOAT, output_shape)
     nodes.append(helper.make_node("MatMul", ["X", "W_view"], ["Y"], name="linear"))
     graph = helper.make_graph(nodes, "static_shape_transform_graph", [X], [Y], initializer=initializers)
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-    model.ir_version = 8
-    onnx.checker.check_model(model)
-    path = tmp_path / f"{transform.lower()}-weight.onnx"
-    onnx.save(model, str(path))
-    return path
+    model = _checked_onnx_model(graph)
+    return _save_onnx_model(model, tmp_path / f"{transform.lower()}-weight.onnx")
 
 
 def create_python_onnx_model(tmp_path: Path) -> Path:
@@ -1800,9 +1672,7 @@ def create_python_onnx_model(tmp_path: Path) -> Path:
     node = helper.make_node("PythonOp", ["input"], ["output"], name="python")
     graph = helper.make_graph([node], "graph", [X], [Y])
     model = helper.make_model(graph)
-    path = tmp_path / "model.onnx"
-    onnx.save(model, str(path))
-    return path
+    return _save_onnx_model(model, tmp_path / "model.onnx")
 
 
 def create_onnx_model_with_nested_external_initializer(
@@ -2069,9 +1939,7 @@ def create_onnx_model_with_function_overload(
         opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
     )
     model.ir_version = 10
-    path = tmp_path / f"function_overload_{function_overload}_{call_overload}.onnx"
-    onnx.save(model, str(path))
-    return path
+    return _save_onnx_model(model, tmp_path / f"function_overload_{function_overload}_{call_overload}.onnx")
 
 
 def create_onnx_model_with_function_preview_operator(
@@ -2104,9 +1972,7 @@ def create_onnx_model_with_function_preview_operator(
         opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
     )
     model.ir_version = 10
-    path = tmp_path / "function_preview_operator.onnx"
-    onnx.save(model, str(path))
-    return path
+    return _save_onnx_model(model, tmp_path / "function_preview_operator.onnx")
 
 
 def create_onnx_model_with_function_body_external_initializer(
@@ -2237,9 +2103,7 @@ def create_onnx_model_with_custom_nodes(
     graph = helper.make_graph(nodes, "custom_nodes", [input_value], [output_value])
     model = helper.make_model(graph, opset_imports=opset_imports)
     model.ir_version = 8
-    model_path = tmp_path / filename
-    onnx.save(model, str(model_path))
-    return model_path
+    return _save_onnx_model(model, tmp_path / filename)
 
 
 def create_onnx_model_with_explicit_custom_operator_identities(
@@ -2267,9 +2131,7 @@ def create_onnx_model_with_explicit_custom_operator_identities(
     graph = helper.make_graph(nodes, "explicit_custom_operator_identities", [input_value], [output_value])
     model = helper.make_model(graph, opset_imports=opset_imports)
     model.ir_version = 8
-    model_path = tmp_path / filename
-    onnx.save(model, str(model_path))
-    return model_path
+    return _save_onnx_model(model, tmp_path / filename)
 
 
 def create_onnx_model_with_repeated_custom_domain_and_missing_external_data(tmp_path: Path) -> Path:
@@ -2286,9 +2148,7 @@ def create_onnx_model_with_repeated_custom_domain_and_missing_external_data(tmp_
         opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("com.external", 1)],
     )
     model.ir_version = 8
-    model_path = tmp_path / "custom_external_data.onnx"
-    onnx.save(model, str(model_path))
-    return model_path
+    return _save_onnx_model(model, tmp_path / "custom_external_data.onnx")
 
 
 def create_onnx_model_with_mixed_custom_domains(tmp_path: Path) -> Path:
@@ -2307,9 +2167,7 @@ def create_onnx_model_with_mixed_custom_domains(tmp_path: Path) -> Path:
             helper.make_opsetid("com.acme.ops", 1),
         ],
     )
-    path = tmp_path / "mixed_custom_domains.onnx"
-    onnx.save(model, str(path))
-    return path
+    return _save_onnx_model(model, tmp_path / "mixed_custom_domains.onnx")
 
 
 def create_onnx_model_with_function_microsoft_operator(tmp_path: Path, *, op_type: str) -> Path:
@@ -2333,9 +2191,7 @@ def create_onnx_model_with_function_microsoft_operator(tmp_path: Path, *, op_typ
         opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
     )
     model.ir_version = 10
-    path = tmp_path / f"function_microsoft_{op_type}.onnx"
-    onnx.save(model, str(path))
-    return path
+    return _save_onnx_model(model, tmp_path / f"function_microsoft_{op_type}.onnx")
 
 
 def test_onnx_scanner_can_handle(tmp_path):
@@ -4217,29 +4073,11 @@ def test_onnx_scanner_custom_operator_emits_one_domain_rule(tmp_path: Path) -> N
 
 
 def test_onnx_scanner_ai_onnx_ml_subdomain_still_flagged(tmp_path: Path) -> None:
-    model_path = create_onnx_model(
-        tmp_path,
-        custom=True,
-        custom_domain="ai.onnx.ml.malicious",
-        custom_op_type="BackdoorOp",
-    )
-    _result, custom_domain_checks, metadata_custom_domains = _scan_and_extract_custom_domains(model_path)
-    assert len(custom_domain_checks) > 0, "Expected non-standard ai.onnx.ml subdomain to be flagged"
-    assert any(c.details.get("domain") == "ai.onnx.ml.malicious" for c in custom_domain_checks)
-    assert "ai.onnx.ml.malicious" in metadata_custom_domains
+    _assert_onnx_domain(tmp_path, "ai.onnx.ml.malicious", "Expected non-standard ai.onnx.ml subdomain to be flagged")
 
 
 def test_onnx_scanner_ai_onnx_training_domain_still_flagged(tmp_path: Path) -> None:
-    model_path = create_onnx_model(
-        tmp_path,
-        custom=True,
-        custom_domain="ai.onnx.training",
-        custom_op_type="BackdoorOp",
-    )
-    _result, custom_domain_checks, metadata_custom_domains = _scan_and_extract_custom_domains(model_path)
-    assert len(custom_domain_checks) > 0, "Expected non-standard ai.onnx.training domain to be flagged"
-    assert any(c.details.get("domain") == "ai.onnx.training" for c in custom_domain_checks)
-    assert "ai.onnx.training" in metadata_custom_domains
+    _assert_onnx_domain(tmp_path, "ai.onnx.training", "Expected non-standard ai.onnx.training domain to be flagged")
 
 
 def test_onnx_scanner_external_data_missing(tmp_path: Path) -> None:
@@ -4365,19 +4203,7 @@ def test_onnx_scanner_uppercase_snake_python_op_wrapper_flagged(tmp_path: Path, 
 
 
 def test_onnx_scanner_python_substring_near_match_not_flagged(tmp_path: Path) -> None:
-    model_path = create_onnx_model(
-        tmp_path,
-        custom=True,
-        custom_domain="",
-        custom_op_type="MyPythonOptimizer",
-    )
-
-    result = OnnxScanner().scan(str(model_path))
-
-    assert result.success is False
-    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-    assert ONNX_SCHEMA_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
-    assert not [c for c in result.checks if c.name == "Python Operator Detection" and c.status == CheckStatus.FAILED]
+    _assert_onnx_python_near_match_clean(tmp_path, ("MyPythonOptimizer"))
 
 
 def test_onnx_scanner_python_doc_string_metadata_not_flagged_as_python_operator(tmp_path: Path) -> None:
@@ -4398,19 +4224,7 @@ def test_onnx_scanner_python_doc_string_metadata_not_flagged_as_python_operator(
 
 
 def test_onnx_scanner_uppercase_snake_python_near_match_not_flagged(tmp_path: Path) -> None:
-    model_path = create_onnx_model(
-        tmp_path,
-        custom=True,
-        custom_domain="",
-        custom_op_type="MY_PYTHON_OPTIMIZER",
-    )
-
-    result = OnnxScanner().scan(str(model_path))
-
-    assert result.success is False
-    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-    assert ONNX_SCHEMA_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
-    assert not [c for c in result.checks if c.name == "Python Operator Detection" and c.status == CheckStatus.FAILED]
+    _assert_onnx_python_near_match_clean(tmp_path, ("MY_PYTHON_OPTIMIZER"))
 
 
 def _save_model_with_int8_weight(tmp_path: Path, weight_bytes: bytes, *, extra_node: Any = None) -> Path:
@@ -5693,40 +5507,10 @@ class TestExternalDataSizeValidation:
         assert determine_exit_code(aggregate) == 1
 
     def test_invalid_offset_metadata_fails_size_validation(self, tmp_path: Path) -> None:
-        model_path = create_onnx_model(
-            tmp_path,
-            external=True,
-            external_path="weights.bin",
-            external_metadata={"offset": "NaN"},
-        )
-
-        result = OnnxScanner().scan(str(model_path))
-
-        assert result.success is False
-        size_checks = [
-            c for c in result.checks if c.name == "External Data Size Validation" and c.status == CheckStatus.FAILED
-        ]
-        assert len(size_checks) > 0
-        assert size_checks[0].severity == IssueSeverity.CRITICAL
-        assert "invalid" in size_checks[0].message.lower()
+        _assert_onnx_invalid_external_offset(tmp_path, ("NaN"), ("invalid"))
 
     def test_negative_offset_metadata_fails_size_validation(self, tmp_path: Path) -> None:
-        model_path = create_onnx_model(
-            tmp_path,
-            external=True,
-            external_path="weights.bin",
-            external_metadata={"offset": "-1"},
-        )
-
-        result = OnnxScanner().scan(str(model_path))
-
-        assert result.success is False
-        size_checks = [
-            c for c in result.checks if c.name == "External Data Size Validation" and c.status == CheckStatus.FAILED
-        ]
-        assert len(size_checks) > 0
-        assert size_checks[0].severity == IssueSeverity.CRITICAL
-        assert "non-negative" in size_checks[0].message.lower()
+        _assert_onnx_invalid_external_offset(tmp_path, ("-1"), ("non-negative"))
 
 
 class TestWeightDistributionCoverage:
@@ -22105,15 +21889,7 @@ class TestWeightDistributionSemantics:
 def _encode_proto_varint(value: int) -> bytes:
     if value < 0:
         raise ValueError("test protobuf helper only encodes non-negative integers")
-    encoded = bytearray()
-    while True:
-        byte = value & 0x7F
-        value >>= 7
-        if value:
-            encoded.append(byte | 0x80)
-        else:
-            encoded.append(byte)
-            return bytes(encoded)
+    return _encode_protobuf_varint(value)
 
 
 def _proto_key(field_number: int, wire_type: int) -> bytes:
@@ -22126,12 +21902,6 @@ def _proto_varint(field_number: int, value: int) -> bytes:
 
 def _proto_bytes(field_number: int, payload: bytes) -> bytes:
     return _proto_key(field_number, 2) + _encode_proto_varint(len(payload)) + payload
-
-
-def _write_onnx_payload(tmp_path: Path, filename: str, payload: bytes) -> Path:
-    path = tmp_path / filename
-    path.write_bytes(payload)
-    return path
 
 
 def _sha256_file(path: Path) -> str:
@@ -24202,20 +23972,7 @@ class TestRawDetectorCoverage:
         )
 
     def test_network_detector_metadata_contact_domain_stays_clean(self, tmp_path: Path) -> None:
-        model_path = create_onnx_model(tmp_path, include_initializer=False)
-        model = onnx.load(str(model_path))
-        metadata = model.metadata_props.add()
-        metadata.key = "contact"
-        metadata.value = "owner@company.com"
-        onnx.save(model, str(model_path))
-
-        result = OnnxScanner(config={"check_jit_script": False}).scan(str(model_path))
-
-        failed_network_checks = [
-            check for check in self._network_detection_checks(result) if check.status == CheckStatus.FAILED
-        ]
-        assert not failed_network_checks
-        assert any(check.status == CheckStatus.PASSED for check in self._network_detection_checks(result))
+        self._assert_onnx_metadata_network_clean(tmp_path, ("contact"), ("owner@company.com"))
 
     def test_network_detector_extensionless_metadata_contact_domain_stays_clean(self, tmp_path: Path) -> None:
         source_path = create_onnx_model(tmp_path, include_initializer=False)
@@ -24235,22 +23992,8 @@ class TestRawDetectorCoverage:
         assert any(check.status == CheckStatus.PASSED for check in self._network_detection_checks(result))
 
     def test_network_detector_extensionless_metadata_callback_domain_remains_actionable(self, tmp_path: Path) -> None:
-        source_path = create_onnx_model(tmp_path, include_initializer=False)
-        model = onnx.load(str(source_path))
-        metadata = model.metadata_props.add()
-        metadata.key = "callback"
-        metadata.value = "host evil.com"
-        model_path = tmp_path / "metadata-callback"
-        onnx.save(model, str(model_path))
-
-        result = OnnxScanner(config={"check_jit_script": False}).scan(str(model_path))
-
-        failed_network_checks = [
-            check for check in self._network_detection_checks(result) if check.status == CheckStatus.FAILED
-        ]
-        assert any(
-            check.details.get("domain") == "evil.com" and check.details.get("onnx_metadata_owned") is True
-            for check in failed_network_checks
+        self._assert_onnx_metadata_network_actionable(
+            tmp_path, ("host evil.com"), ("metadata-callback"), ("domain"), ("evil.com")
         )
 
     def test_network_detector_extensionless_metadata_callback_domain_uses_full_value(self, tmp_path: Path) -> None:
@@ -24273,20 +24016,9 @@ class TestRawDetectorCoverage:
         )
 
     def test_network_detector_metadata_prose_import_requests_stays_clean(self, tmp_path: Path) -> None:
-        model_path = create_onnx_model(tmp_path, include_initializer=False)
-        model = onnx.load(str(model_path))
-        metadata = model.metadata_props.add()
-        metadata.key = "documentation"
-        metadata.value = "This documentation shows how to import requests for the example"
-        onnx.save(model, str(model_path))
-
-        result = OnnxScanner(config={"check_jit_script": False}).scan(str(model_path))
-
-        failed_network_checks = [
-            check for check in self._network_detection_checks(result) if check.status == CheckStatus.FAILED
-        ]
-        assert not failed_network_checks
-        assert any(check.status == CheckStatus.PASSED for check in self._network_detection_checks(result))
+        self._assert_onnx_metadata_network_clean(
+            tmp_path, ("documentation"), ("This documentation shows how to import requests for the example")
+        )
 
     def test_network_detector_metadata_documentation_port_stays_clean(self, tmp_path: Path) -> None:
         model_path = create_onnx_model(tmp_path, include_initializer=False)
@@ -24322,41 +24054,13 @@ class TestRawDetectorCoverage:
         assert any(check.status == CheckStatus.PASSED for check in self._network_detection_checks(result))
 
     def test_network_detector_extensionless_metadata_callback_port_remains_actionable(self, tmp_path: Path) -> None:
-        source_path = create_onnx_model(tmp_path, include_initializer=False)
-        model = onnx.load(str(source_path))
-        metadata = model.metadata_props.add()
-        metadata.key = "callback"
-        metadata.value = "connect port=6379"
-        model_path = tmp_path / "metadata-callback-port"
-        onnx.save(model, str(model_path))
-
-        result = OnnxScanner(config={"check_jit_script": False}).scan(str(model_path))
-
-        failed_network_checks = [
-            check for check in self._network_detection_checks(result) if check.status == CheckStatus.FAILED
-        ]
-        assert any(
-            check.details.get("type") == "suspicious_port" and check.details.get("onnx_metadata_owned") is True
-            for check in failed_network_checks
+        self._assert_onnx_metadata_network_actionable(
+            tmp_path, ("connect port=6379"), ("metadata-callback-port"), ("type"), ("suspicious_port")
         )
 
     def test_network_detector_pb_metadata_port_remains_actionable(self, tmp_path: Path) -> None:
-        source_path = create_onnx_model(tmp_path, include_initializer=False)
-        model = onnx.load(str(source_path))
-        metadata = model.metadata_props.add()
-        metadata.key = "callback"
-        metadata.value = "connect port=6379"
-        model_path = tmp_path / "model.pb"
-        onnx.save(model, str(model_path))
-
-        result = OnnxScanner(config={"check_jit_script": False}).scan(str(model_path))
-
-        failed_network_checks = [
-            check for check in self._network_detection_checks(result) if check.status == CheckStatus.FAILED
-        ]
-        assert any(
-            check.details.get("type") == "suspicious_port" and check.details.get("onnx_metadata_owned") is True
-            for check in failed_network_checks
+        self._assert_onnx_metadata_network_actionable(
+            tmp_path, ("connect port=6379"), ("model.pb"), ("type"), ("suspicious_port")
         )
 
     def test_network_detector_nonmetadata_url_remains_actionable(self, tmp_path: Path) -> None:
@@ -24641,3 +24345,88 @@ class TestRawDetectorCoverage:
         assert leaked_secret not in str(coverage_check.details)
         assert leaked_secret not in caplog.text
         assert "<redacted>" in coverage_check.message
+
+    def _assert_onnx_metadata_network_actionable(
+        self, tmp_path: Path, metadata_value: str, filename: str, evidence_field: str, evidence_value: str
+    ) -> None:
+        source_path = create_onnx_model(tmp_path, include_initializer=False)
+        model = onnx.load(str(source_path))
+        metadata = model.metadata_props.add()
+        metadata.key = "callback"
+        metadata.value = metadata_value
+        model_path = tmp_path / filename
+        onnx.save(model, str(model_path))
+
+        result = OnnxScanner(config={"check_jit_script": False}).scan(str(model_path))
+
+        failed_network_checks = [
+            check for check in self._network_detection_checks(result) if check.status == CheckStatus.FAILED
+        ]
+        assert any(
+            check.details.get(evidence_field) == evidence_value and check.details.get("onnx_metadata_owned") is True
+            for check in failed_network_checks
+        )
+
+    def _assert_onnx_metadata_network_clean(self, tmp_path: Path, metadata_key: str, metadata_value: str) -> None:
+        model_path = create_onnx_model(tmp_path, include_initializer=False)
+        model = onnx.load(str(model_path))
+        metadata = model.metadata_props.add()
+        metadata.key = metadata_key
+        metadata.value = metadata_value
+        onnx.save(model, str(model_path))
+
+        result = OnnxScanner(config={"check_jit_script": False}).scan(str(model_path))
+
+        failed_network_checks = [
+            check for check in self._network_detection_checks(result) if check.status == CheckStatus.FAILED
+        ]
+        assert not failed_network_checks
+        assert any(check.status == CheckStatus.PASSED for check in self._network_detection_checks(result))
+
+
+def _assert_onnx_invalid_external_offset(tmp_path: Path, offset: str, message: str) -> None:
+    model_path = create_onnx_model(
+        tmp_path,
+        external=True,
+        external_path="weights.bin",
+        external_metadata={"offset": offset},
+    )
+
+    result = OnnxScanner().scan(str(model_path))
+
+    assert result.success is False
+    size_checks = [
+        c for c in result.checks if c.name == "External Data Size Validation" and c.status == CheckStatus.FAILED
+    ]
+    assert len(size_checks) > 0
+    assert size_checks[0].severity == IssueSeverity.CRITICAL
+    assert message in size_checks[0].message.lower()
+
+
+def _assert_onnx_python_near_match_clean(tmp_path: Path, operator: str) -> None:
+    model_path = create_onnx_model(
+        tmp_path,
+        custom=True,
+        custom_domain="",
+        custom_op_type=operator,
+    )
+
+    result = OnnxScanner().scan(str(model_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert ONNX_SCHEMA_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
+    assert not [c for c in result.checks if c.name == "Python Operator Detection" and c.status == CheckStatus.FAILED]
+
+
+def _assert_onnx_domain(tmp_path: Path, domain: str, message: str) -> None:
+    model_path = create_onnx_model(
+        tmp_path,
+        custom=True,
+        custom_domain=domain,
+        custom_op_type="BackdoorOp",
+    )
+    _result, custom_domain_checks, metadata_custom_domains = _scan_and_extract_custom_domains(model_path)
+    assert len(custom_domain_checks) > 0, message
+    assert any(c.details.get("domain") == domain for c in custom_domain_checks)
+    assert domain in metadata_custom_domains

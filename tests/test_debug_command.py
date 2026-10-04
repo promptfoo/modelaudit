@@ -8,17 +8,23 @@ from unittest.mock import patch
 import pytest
 from click.testing import CliRunner
 
-from modelaudit.cli import _sanitize_debug_path, cli
-
-
-def _is_private_debug_path(path: str) -> bool:
-    """Path is privacy-safe when home-prefixed or fully redacted."""
-    return path.startswith("~") or path == "<outside-home path redacted>"
+from modelaudit.cli import cli
 
 
 @pytest.mark.unit
 class TestDebugCommand:
     """Tests for the modelaudit debug command."""
+
+    @pytest.fixture(autouse=True)
+    def isolated_debug_environment(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        """Debug tests never inspect the host's credentials, proxies, or config."""
+        for name in tuple(os.environ):
+            if any(
+                marker in name.upper()
+                for marker in ("KEY", "TOKEN", "SECRET", "PASSWORD", "PROXY", "AUTH", "CREDENTIAL")
+            ):
+                monkeypatch.delenv(name, raising=False)
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
 
     @pytest.fixture
     def runner(self) -> CliRunner:
@@ -191,13 +197,15 @@ class TestDebugCommand:
         # Should mention scanners
         assert "scanners" in result.output
 
-    def test_debug_pretty_output_has_issue_url(self, runner):
-        """Pretty output should include GitHub issues URL."""
-        result = runner.invoke(cli, ["debug"])
+    def test_debug_pretty_output_requires_review_before_sharing(self, runner: CliRunner) -> None:
+        """Raw diagnostics should explain what to check before filing an issue."""
+        with patch.dict(os.environ, {"HTTP_PROXY": "http://user:secret@proxy:8080"}):
+            result = runner.invoke(cli, ["debug"])
         assert result.exit_code == 0
 
-        assert "github.com" in result.output
-        assert "issues" in result.output
+        assert "http://user:secret@proxy:8080" in result.output
+        assert "Inspect this output and remove sensitive values before sharing" in result.output
+        assert "https://github.com/promptfoo/modelaudit/issues" in result.output
 
     def test_debug_handles_missing_cache_gracefully(self, runner):
         """Debug should handle cache errors gracefully."""
@@ -259,46 +267,38 @@ class TestDebugCommand:
         # Proxy without credentials should be shown as-is
         assert parsed["env"]["httpProxy"] == "http://proxy:8080"
 
-    def test_debug_proxy_redacts_credentials(self, runner):
-        """Debug should redact credentials from proxy URLs."""
+    def test_debug_proxy_preserves_credentials(self, runner: CliRunner) -> None:
+        """Debug reports configured proxy URLs as provided."""
         with patch.dict(os.environ, {"HTTP_PROXY": "http://user:secret@proxy:8080"}):
             result = runner.invoke(cli, ["debug", "--json"])
 
         assert result.exit_code == 0
         parsed = json.loads(result.output)
-        # Credentials should be stripped, only host:port remains
-        assert parsed["env"]["httpProxy"] == "http://proxy:8080"
-        # Secret should never appear in output
-        assert "secret" not in result.output
-        assert "user:" not in result.output
+        assert parsed["env"]["httpProxy"] == "http://user:secret@proxy:8080"
 
-    def test_debug_path_privacy(self, runner: CliRunner) -> None:
-        """Debug should use ~ for home directory paths."""
-        result = runner.invoke(cli, ["debug", "--json"])
+    @pytest.mark.parametrize("outside_home", [False, True])
+    def test_debug_paths_preserve_configured_paths(self, runner: CliRunner, tmp_path: Path, outside_home: bool) -> None:
+        """Debug shows actual paths while filesystem checks keep using those paths."""
+        base = tmp_path.parent / "outside-home" if outside_home else tmp_path
+        shared_config_dir = base / "shared-config"
+        cache_dir = base / "cache"
+        with (
+            patch("modelaudit.cli.get_config_directory_path", return_value=str(shared_config_dir)),
+            patch("modelaudit.cache.get_cache_manager") as get_cache_manager,
+        ):
+            manager = get_cache_manager.return_value
+            manager.cache.cache_dir = cache_dir
+            manager.get_stats.return_value = {}
+            result = runner.invoke(cli, ["debug", "--json"])
+
         assert result.exit_code == 0
-
         parsed = json.loads(result.output)
-
-        # Config path should use ~
-        config_info = parsed.get("config", {})
-        if "error" in config_info:
-            # If there's an error, skip path privacy check
-            return
-        shared_config_path = config_info.get("sharedConfigPath")
-        if shared_config_path:
-            assert _is_private_debug_path(shared_config_path), (
-                f"Config path should be sanitized, got: {shared_config_path}"
-            )
-
-        # Cache directory should use ~
-        cache_info = parsed.get("cache", {})
-        if cache_info.get("enabled") and cache_info.get("directory"):
-            assert _is_private_debug_path(cache_info["directory"])
-
-    def test_sanitize_debug_path_redacts_outside_home(self) -> None:
-        """Outside-home absolute paths should be redacted."""
-        outside_path = str(Path.home().parent / "__modelaudit_test__" / "promptfoo.yaml")
-        assert _sanitize_debug_path(outside_path) == "<outside-home path redacted>"
+        config_info = parsed["config"]
+        assert config_info["sharedConfigPath"] == str(shared_config_dir / "promptfoo.yaml")
+        assert config_info["sharedConfigExists"] == (shared_config_dir / "promptfoo.yaml").exists()
+        assert config_info["modelauditConfigPath"] == str(tmp_path / ".modelaudit" / "user_config.json")
+        assert config_info["modelauditConfigExists"] == (tmp_path / ".modelaudit" / "user_config.json").exists()
+        assert parsed["cache"]["directory"] == str(cache_dir)
 
     def test_debug_command_is_fast(self, runner):
         """Debug command should complete quickly (under 10 seconds)."""
@@ -325,12 +325,14 @@ class TestDebugCommand:
         assert "apiHost" not in auth_info
         assert "appUrl" not in auth_info
 
-    def test_debug_help_text(self, runner):
+    def test_debug_help_text(self, runner: CliRunner) -> None:
         """Debug command should have helpful description."""
         result = runner.invoke(cli, ["debug", "--help"])
         assert result.exit_code == 0
         assert "troubleshooting" in result.output.lower()
         assert "bug" in result.output.lower() or "issue" in result.output.lower()
+        assert "raw configuration values" in result.output
+        assert "remove sensitive values" in " ".join(result.output.split())
 
     def test_debug_dependencies_structure(self, runner):
         """Dependencies info should have expected structure."""

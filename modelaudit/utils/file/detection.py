@@ -439,9 +439,6 @@ _JSON_PROBE_ESCAPED_TEMPLATE_INDICATOR_RE = re.compile(
     re.IGNORECASE,
 )
 _HF_TOKENIZER_JAX_ROUTE_KEYS = frozenset(_JAX_JSON_CHECKPOINT_IDENTITY_KEYS | _JAX_JSON_CHECKPOINT_MARKER_KEYS)
-_HF_TOKENIZER_SUFFIX_ROUTE_CONFLICT_KEYS = (
-    _HF_TOKENIZER_TEMPLATE_KEYS | _MXNET_SYMBOL_ROOT_KEYS | {"learner"} | _JAX_JSON_CHECKPOINT_MARKER_KEYS
-)
 _HFTokenizerEOFProofKey = tuple[str, int, int, int, int, int, int, int]
 
 
@@ -1121,30 +1118,6 @@ def _hf_tokenizer_probe_model_object(
         raise _JSONProbeInvalid
 
     return None, saw_model_type and saw_vocab
-
-
-def _hf_tokenizer_suffix_has_route_conflict(
-    file_path: Path,
-    file_size: int,
-    *,
-    allow_after_any_value: bool = False,
-    allow_after_vocab_array: bool = False,
-) -> bool:
-    """Return whether a bounded suffix exposes late scanner-owned root evidence."""
-    return _hf_tokenizer_suffix_has_structural_route_key(
-        file_path,
-        file_size,
-        _HF_TOKENIZER_SUFFIX_ROUTE_CONFLICT_KEYS,
-        allow_after_any_value=allow_after_any_value,
-        allow_after_vocab_array=allow_after_vocab_array,
-    ) or _hf_tokenizer_suffix_has_structural_route_key(
-        file_path,
-        file_size,
-        _JAX_JSON_CHECKPOINT_IDENTITY_KEYS,
-        allow_after_any_value=allow_after_any_value,
-        allow_after_vocab_array=allow_after_vocab_array,
-        require_jax_identity_value=True,
-    )
 
 
 def _hf_tokenizer_suffix_has_structural_route_key(
@@ -3323,69 +3296,6 @@ def _decode_bounded_proto_string(data: bytes, start: int, end: int, *, max_bytes
     return value
 
 
-def _parse_sentencepiece_piece_proto(data: bytes, start: int, end: int) -> tuple[str, int | None] | None:
-    """Return the token text and optional type for one SentencePiece piece."""
-    if end - start > _SENTENCEPIECE_MAX_PIECE_MESSAGE_BYTES:
-        return None
-
-    offset = start
-    fields_seen = 0
-    piece_text: str | None = None
-    piece_type: int | None = None
-    has_score = False
-    while offset < end and fields_seen < _SENTENCEPIECE_MAX_PIECE_FIELDS:
-        tag_result = _read_proto_varint(data, offset, end)
-        if tag_result is None:
-            return None
-        tag, value_offset = tag_result
-        field_number = tag >> 3
-        wire_type = tag & 0x07
-        if field_number == 0:
-            return None
-
-        if field_number == 1 and wire_type == 2:
-            bounds = _read_length_delimited_proto_value(data, value_offset, end)
-            if bounds is None:
-                return None
-            length, value_start, _value_end, actual_value_end = bounds
-            if length == 0 or length > _SENTENCEPIECE_MAX_PIECE_TEXT_BYTES or actual_value_end > end:
-                return None
-            piece_text = _decode_bounded_proto_string(
-                data,
-                value_start,
-                actual_value_end,
-                max_bytes=_SENTENCEPIECE_MAX_PIECE_TEXT_BYTES,
-            )
-            if piece_text is None:
-                return None
-            offset = actual_value_end
-        elif field_number == 2 and wire_type == 5:
-            fixed32_end = value_offset + 4
-            if fixed32_end > end:
-                return None
-            has_score = True
-            offset = fixed32_end
-        elif field_number == 3 and wire_type == 0:
-            type_result = _read_proto_varint(data, value_offset, end)
-            if type_result is None:
-                return None
-            piece_type, offset = type_result
-            if not 1 <= piece_type <= 6:
-                return None
-        else:
-            skipped_offset = _skip_proto_value(data, value_offset, wire_type, end)
-            if skipped_offset is None:
-                return None
-            offset = skipped_offset
-        fields_seen += 1
-
-    if offset != end or fields_seen >= _SENTENCEPIECE_MAX_PIECE_FIELDS:
-        return None
-    if piece_text is None or not has_score:
-        return None
-    return piece_text, piece_type
-
-
 def _parse_sentencepiece_trainer_spec_proto(
     data: bytes,
     start: int,
@@ -3470,36 +3380,6 @@ def _parse_sentencepiece_trainer_spec_proto(
     if offset != end or fields_seen >= _SENTENCEPIECE_MAX_TRAINER_SPEC_FIELDS:
         return None
     return signals
-
-
-def _is_well_formed_sentencepiece_submessage(
-    data: bytes,
-    start: int,
-    end: int,
-    *,
-    expected_wire_types: dict[int, int] | None = None,
-    max_fields: int = _SENTENCEPIECE_MAX_TRAINER_SPEC_FIELDS,
-) -> bool:
-    offset = start
-    fields_seen = 0
-    while offset < end and fields_seen < max_fields:
-        tag_result = _read_proto_varint(data, offset, end)
-        if tag_result is None:
-            return False
-        tag, value_offset = tag_result
-        field_number = tag >> 3
-        wire_type = tag & 0x07
-        if field_number == 0:
-            return False
-        if expected_wire_types is not None and expected_wire_types.get(field_number, wire_type) != wire_type:
-            return False
-        next_offset = _skip_proto_value(data, value_offset, wire_type, end)
-        if next_offset is None:
-            return False
-        offset = next_offset
-        fields_seen += 1
-
-    return offset == end and fields_seen < max_fields
 
 
 def _is_well_formed_sentencepiece_submessage_stream(
@@ -3603,129 +3483,6 @@ def _has_sufficient_sentencepiece_piece_scan_evidence(
     return not byte_piece_count or (
         byte_piece_count == _SENTENCEPIECE_BYTE_FALLBACK_PIECE_COUNT
         and len(byte_piece_texts) == _SENTENCEPIECE_BYTE_FALLBACK_PIECE_COUNT
-    )
-
-
-def _has_strong_sentencepiece_model_proto_prefix(data: bytes, *, sample_is_prefix: bool = False) -> bool:
-    """Recognize a SentencePiece ModelProto from repeated scored pieces."""
-    offset = 0
-    fields_seen = 0
-    piece_count = 0
-    typed_piece_count = 0
-    special_identity_piece_count = 0
-    unknown_piece_count = 0
-    unknown_piece_index: int | None = None
-    unknown_piece_text: str | None = None
-    byte_piece_count = 0
-    byte_piece_texts: set[str] = set()
-    malformed_byte_piece = False
-    trainer_spec: _SentencePieceTrainerSpecSignals | None = None
-    strong_match = False
-
-    def accept_incomplete_prefix() -> bool:
-        return False
-
-    while offset < len(data) and fields_seen < _SENTENCEPIECE_MODEL_MAX_FIELDS:
-        tag_result = _read_proto_varint(data, offset)
-        if tag_result is None:
-            return accept_incomplete_prefix()
-        tag, value_offset = tag_result
-        field_number = tag >> 3
-        wire_type = tag & 0x07
-        if field_number == 0:
-            return False
-        if wire_type not in {0, 1, 2, 5}:
-            return False
-        if field_number in {1, 2, 3, 4, 5} and wire_type != 2:
-            return False
-
-        if field_number == 1:
-            bounds = _read_length_delimited_proto_value(data, value_offset)
-            if bounds is None:
-                return accept_incomplete_prefix()
-            length, value_start, _sampled_value_end, actual_value_end = bounds
-            if length == 0 or actual_value_end > len(data):
-                return accept_incomplete_prefix()
-            parsed_piece = _parse_sentencepiece_piece_proto(data, value_start, actual_value_end)
-            if parsed_piece is None:
-                return False
-            piece, piece_type = parsed_piece
-            piece_index = piece_count
-            piece_count += 1
-            if piece_type is not None:
-                typed_piece_count += 1
-            if _is_sentencepiece_special_identity_piece(piece):
-                special_identity_piece_count += 1
-            if piece_type == _SENTENCEPIECE_UNKNOWN_PIECE_TYPE:
-                unknown_piece_count += 1
-                unknown_piece_index = piece_index
-                unknown_piece_text = piece
-            elif piece_type == _SENTENCEPIECE_BYTE_PIECE_TYPE:
-                byte_piece_count += 1
-                if _is_sentencepiece_byte_fallback_piece(piece):
-                    byte_piece_texts.add(piece)
-                else:
-                    malformed_byte_piece = True
-            offset = actual_value_end
-        elif field_number == 2:
-            bounds = _read_length_delimited_proto_value(data, value_offset)
-            if bounds is None:
-                return accept_incomplete_prefix()
-            _length, value_start, _sampled_value_end, actual_value_end = bounds
-            if actual_value_end > len(data):
-                return accept_incomplete_prefix()
-            parsed_trainer_spec = _parse_sentencepiece_trainer_spec_proto(data, value_start, actual_value_end)
-            if parsed_trainer_spec is None:
-                return False
-            if trainer_spec is None:
-                trainer_spec = parsed_trainer_spec
-            else:
-                trainer_spec.merge_from(parsed_trainer_spec)
-            offset = actual_value_end
-        elif field_number == 3:
-            bounds = _read_length_delimited_proto_value(data, value_offset)
-            if bounds is None:
-                return accept_incomplete_prefix()
-            _length, value_start, _sampled_value_end, actual_value_end = bounds
-            if actual_value_end > len(data):
-                return accept_incomplete_prefix()
-            if not _is_well_formed_sentencepiece_submessage(
-                data,
-                value_start,
-                actual_value_end,
-                expected_wire_types=_SENTENCEPIECE_NORMALIZER_SPEC_WIRE_TYPES,
-            ):
-                return False
-            offset = actual_value_end
-        elif field_number in {4, 5}:
-            bounds = _read_length_delimited_proto_value(data, value_offset)
-            if bounds is None:
-                return accept_incomplete_prefix()
-            _length, value_start, _sampled_value_end, actual_value_end = bounds
-            if actual_value_end > len(data):
-                return accept_incomplete_prefix()
-            if not _is_well_formed_sentencepiece_submessage(data, value_start, actual_value_end):
-                return False
-            offset = actual_value_end
-        else:
-            return False
-
-        fields_seen += 1
-        strong_match = _has_strong_sentencepiece_model_proto_evidence(
-            piece_count=piece_count,
-            typed_piece_count=typed_piece_count,
-            special_identity_piece_count=special_identity_piece_count,
-            unknown_piece_count=unknown_piece_count,
-            unknown_piece_index=unknown_piece_index,
-            unknown_piece_text=unknown_piece_text,
-            byte_piece_count=byte_piece_count,
-            byte_piece_texts=byte_piece_texts,
-            malformed_byte_piece=malformed_byte_piece,
-            trainer_spec=trainer_spec,
-        )
-
-    return (
-        strong_match and not sample_is_prefix and offset == len(data) and fields_seen < _SENTENCEPIECE_MODEL_MAX_FIELDS
     )
 
 
@@ -4598,15 +4355,6 @@ def _has_bounded_binary_pickle_security_signal(sample: bytes) -> bool:
     except Exception:
         return has_pre_stop_security_opcode
     return has_pre_stop_security_opcode
-
-
-def _looks_like_protocolless_binary_pickle_security_signal(
-    sample: bytes,
-    *,
-    sample_is_prefix: bool = False,
-) -> bool:
-    """Return whether a PROTO-less binary pickle carries or can hide a security signal."""
-    return _classify_protocolless_binary_pickle_security_signal(sample, sample_is_prefix=sample_is_prefix) is True
 
 
 def _classify_protocolless_binary_pickle_security_signal(
@@ -7959,9 +7707,12 @@ def _compression_route_precedes_safetensors(
         return True
     if not _has_structurally_valid_compression_header(prefix, compression_format):
         return False
-    if compression_format == "zlib" and len(prefix) >= 2 and prefix[1] & 0x20:
-        return True
     header_len, header = validated_header
+    if compression_format == "zlib" and len(prefix) >= 2 and prefix[1] & 0x20:
+        # FDICT streams cannot be decoder-probed without their preset dictionary.
+        # Prefer them unless a native SafeTensors file has a fully parsed bounded header.
+        native_safetensors = get_extension_format_map().get(path.suffix.lower()) == "safetensors"
+        return not native_safetensors or header is None
     if header is None:
         probe_limit = PROTO0_1_MAX_PROBE_BYTES
     else:

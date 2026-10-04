@@ -10,9 +10,10 @@ from __future__ import annotations
 
 import difflib
 import os
-from collections.abc import Iterable, Mapping
+from collections.abc import Collection, Iterable, Mapping
 from dataclasses import dataclass
 from functools import cache, lru_cache
+from pathlib import PurePath
 from typing import Any, Literal
 
 from .scanner_registry_metadata import get_scanner_registry_metadata
@@ -91,10 +92,6 @@ def split_scanner_tokens(values: Iterable[str] | str | None) -> list[str]:
     return tokens
 
 
-def _alias_key(value: str) -> str:
-    return value.strip().lower().replace("_", "").replace("-", "")
-
-
 @lru_cache(maxsize=1)
 def _scanner_metadata() -> dict[str, dict[str, Any]]:
     """Return the static registry metadata used by hot selection paths."""
@@ -107,7 +104,7 @@ def _scanner_aliases() -> dict[str, str]:
     aliases: dict[str, str] = {}
 
     def add(alias: str, scanner_id: str) -> None:
-        key = _alias_key(alias)
+        key = alias.strip().lower().replace("_", "").replace("-", "")
         if key:
             aliases.setdefault(key, scanner_id)
 
@@ -121,11 +118,9 @@ def _scanner_aliases() -> dict[str, str]:
             add(class_name[: -len("Scanner")], scanner_id)
 
     # Common user-facing aliases from docs and issue examples.
-    aliases.setdefault(_alias_key("H5Scanner"), "keras_h5")
-    aliases.setdefault(_alias_key("TensorflowSavedModelScanner"), "tf_savedmodel")
-    aliases.setdefault(_alias_key("TensorFlowSavedModelScanner"), "tf_savedmodel")
-    aliases.setdefault(_alias_key("TensorflowMetaGraphScanner"), "tf_metagraph")
-    aliases.setdefault(_alias_key("TensorFlowMetaGraphScanner"), "tf_metagraph")
+    aliases.setdefault("H5Scanner".strip().lower().replace("_", "").replace("-", ""), "keras_h5")
+    aliases.setdefault("TensorflowSavedModelScanner".strip().lower().replace("_", "").replace("-", ""), "tf_savedmodel")
+    aliases.setdefault("TensorflowMetaGraphScanner".strip().lower().replace("_", "").replace("-", ""), "tf_metagraph")
     return aliases
 
 
@@ -137,7 +132,7 @@ def resolve_scanner_ids(tokens: Iterable[str] | str | None) -> tuple[str, ...]:
     unknown: list[str] = []
 
     for token in split_scanner_tokens(tokens):
-        scanner_id = aliases.get(_alias_key(token))
+        scanner_id = aliases.get(token.strip().lower().replace("_", "").replace("-", ""))
         if scanner_id is None:
             unknown.append(token)
             continue
@@ -606,3 +601,16 @@ def collect_suppressed_preferred_scanners(checks: Iterable[Any]) -> list[dict[st
             {"scanner_id": scanner_id, "location": location, "context": details.get("context")},
         )
     return sorted(aggregated.values(), key=lambda entry: (entry["scanner_id"], entry["location"]))
+
+
+def _matching_path_extensions(path: PurePath, extensions: Collection[str]) -> frozenset[str]:
+    """Match compound suffixes after a source has normalized its path."""
+    suffixes = [suffix.lower() for suffix in path.suffixes]
+    normalized_extensions = frozenset(str(extension).lower() for extension in extensions)
+    if not suffixes:
+        return frozenset({""}) if "" in normalized_extensions else frozenset()
+    return frozenset(
+        candidate
+        for index in range(1, len(suffixes) + 1)
+        if (candidate := "".join(suffixes[-index:])) in normalized_extensions
+    )

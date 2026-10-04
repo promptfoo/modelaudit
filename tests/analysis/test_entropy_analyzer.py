@@ -232,31 +232,11 @@ class TestPatternSearchSkipping:
 
     def test_exact_dangerous_literal_not_skipped_for_ml_weights(self, analyzer: EntropyAnalyzer) -> None:
         """Exact dangerous literals must not be suppressed by weight-like entropy."""
-        import numpy as np
-
-        np.random.seed(42)
-        weights = np.random.normal(0, 0.2, 1000).astype(np.float32)
-        data = weights.tobytes() + b"os.system"
-
-        data_type, confidence = analyzer.classify_data_type(data)
-
-        assert data_type == "ml_weights"
-        assert confidence > 0.8
-        assert analyzer.should_skip_pattern_search(data, b"os.system") is False
+        _assert_exact_dangerous_weight_literal(analyzer, (b"os.system"), (False))
 
     def test_near_match_literal_still_skipped_for_ml_weights(self, analyzer: EntropyAnalyzer) -> None:
         """Near-match text should not disable weight-like skip behavior."""
-        import numpy as np
-
-        np.random.seed(42)
-        weights = np.random.normal(0, 0.2, 1000).astype(np.float32)
-        data = weights.tobytes() + b"os.systemic"
-
-        data_type, confidence = analyzer.classify_data_type(data)
-
-        assert data_type == "ml_weights"
-        assert confidence > 0.8
-        assert analyzer.should_skip_pattern_search(data, b"os.system") is True
+        _assert_exact_dangerous_weight_literal(analyzer, (b"os.systemic"), (True))
 
     def test_exact_literal_still_skipped_for_random_data(self, analyzer: EntropyAnalyzer) -> None:
         """Exact literals in random-looking bytes should not bypass random-data suppression."""
@@ -347,3 +327,19 @@ class TestEdgeCases:
         result = analyzer.analyze_float_patterns(data)
         # Should not raise, should return valid result
         assert "float_ratio" in result
+
+
+def _assert_exact_dangerous_weight_literal(
+    analyzer: EntropyAnalyzer, case_pattern: bytes, case_should_skip: bool
+) -> None:
+    import numpy as np
+
+    np.random.seed(42)
+    weights = np.random.normal(0, 0.2, 1000).astype(np.float32)
+    data = weights.tobytes() + case_pattern
+
+    data_type, confidence = analyzer.classify_data_type(data)
+
+    assert data_type == "ml_weights"
+    assert confidence > 0.8
+    assert analyzer.should_skip_pattern_search(data, b"os.system") is case_should_skip

@@ -23,11 +23,7 @@ from modelaudit.utils.sources.dvc import (
     resolve_dvc_file_status,
     resolve_dvc_file_with_metadata,
 )
-
-
-class _LateMaliciousPayload:
-    def __reduce__(self) -> tuple[Callable[[str], int], tuple[str]]:
-        return (os.system, ("echo c085",))
+from tests.helpers.file_creators import SystemCommandPayload
 
 
 def _write_incomplete_png_payload(path: Path) -> None:
@@ -257,15 +253,9 @@ class TestDvcIntegration:
     def test_missing_dvc_outputs_mark_scan_incomplete_with_resolved_target(self, tmp_path: Path) -> None:
         """Missing declared DVC outputs should not be silently dropped."""
 
-        class MaliciousClass:
-            def __reduce__(self) -> tuple[object, tuple[str]]:
-                import os
-
-                return (os.system, ("echo dvc-existing-malicious",))
-
         existing = tmp_path / "existing_malicious.pkl"
         with existing.open("wb") as f:
-            pickle.dump(MaliciousClass(), f)
+            pickle.dump(SystemCommandPayload("echo dvc-existing-malicious"), f)
 
         missing = tmp_path / "hidden_payload.pkl"
         dvc_file = tmp_path / "partial.dvc"
@@ -360,17 +350,11 @@ class TestDvcIntegration:
     def test_partial_dvc_directory_output_scans_nested_payload(self, tmp_path: Path) -> None:
         """Resolved directories should still be traversed when another output is missing."""
 
-        class MaliciousClass:
-            def __reduce__(self) -> tuple[object, tuple[str]]:
-                import os
-
-                return (os.system, ("echo dvc-directory-malicious",))
-
         output_dir = tmp_path / "model"
         output_dir.mkdir()
         nested_payload = output_dir / "nested.pkl"
         with nested_payload.open("wb") as f:
-            pickle.dump(MaliciousClass(), f)
+            pickle.dump(SystemCommandPayload("echo dvc-directory-malicious"), f)
 
         dvc_file = tmp_path / "partial-directory.dvc"
         dvc_file.write_text("""outs:
@@ -561,14 +545,7 @@ class TestDvcIntegration:
         dvc_file.write_text("outs:\n- path: model\n")
         scanned_paths: list[str] = []
 
-        def fake_scan_file(path: str, _config: dict[str, Any]) -> ScanResult:
-            scanned_paths.append(path)
-            result = ScanResult(scanner_name="test")
-            result.bytes_scanned = Path(path).stat().st_size
-            result.finish(success=True)
-            return result
-
-        monkeypatch.setattr(core_module, "scan_file", fake_scan_file)
+        _record_scanned_paths(monkeypatch, scanned_paths)
 
         result = scan_model_directory_or_file(str(dvc_file), cache_scan_results=False)
         incomplete_issue = next(
@@ -604,14 +581,7 @@ class TestDvcIntegration:
         dvc_file.write_text("outs:\n- path: model\n")
         scanned_paths: list[str] = []
 
-        def fake_scan_file(path: str, _config: dict[str, Any]) -> ScanResult:
-            scanned_paths.append(path)
-            result = ScanResult(scanner_name="test")
-            result.bytes_scanned = Path(path).stat().st_size
-            result.finish(success=True)
-            return result
-
-        monkeypatch.setattr(core_module, "scan_file", fake_scan_file)
+        _record_scanned_paths(monkeypatch, scanned_paths)
 
         result = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
         incomplete_issue = next(
@@ -669,14 +639,7 @@ class TestDvcIntegration:
         dvc_file.write_text("outs:\n- path: model\n")
         scanned_paths: list[str] = []
 
-        def fake_scan_file(path: str, _config: dict[str, Any]) -> ScanResult:
-            scanned_paths.append(path)
-            result = ScanResult(scanner_name="test")
-            result.bytes_scanned = Path(path).stat().st_size
-            result.finish(success=True)
-            return result
-
-        monkeypatch.setattr(core_module, "scan_file", fake_scan_file)
+        _record_scanned_paths(monkeypatch, scanned_paths)
 
         result = scan_model_directory_or_file(str(dvc_file), cache_scan_results=False)
 
@@ -706,14 +669,7 @@ class TestDvcIntegration:
         dvc_file.write_text("outs:\n- path: model\n- path: linked-target\n")
         scanned_paths: list[str] = []
 
-        def fake_scan_file(path: str, _config: dict[str, Any]) -> ScanResult:
-            scanned_paths.append(path)
-            result = ScanResult(scanner_name="test")
-            result.bytes_scanned = Path(path).stat().st_size
-            result.finish(success=True)
-            return result
-
-        monkeypatch.setattr(core_module, "scan_file", fake_scan_file)
+        _record_scanned_paths(monkeypatch, scanned_paths)
 
         result = scan_model_directory_or_file(str(dvc_file), cache_scan_results=False)
 
@@ -743,14 +699,7 @@ class TestDvcIntegration:
         dvc_file.write_text("outs:\n- path: model\n- path: payload.pkl\n")
         scanned_paths: list[str] = []
 
-        def fake_scan_file(path: str, _config: dict[str, Any]) -> ScanResult:
-            scanned_paths.append(path)
-            result = ScanResult(scanner_name="test")
-            result.bytes_scanned = Path(path).stat().st_size
-            result.finish(success=True)
-            return result
-
-        monkeypatch.setattr(core_module, "scan_file", fake_scan_file)
+        _record_scanned_paths(monkeypatch, scanned_paths)
 
         result = scan_model_directory_or_file(str(dvc_file), cache_scan_results=False)
 
@@ -783,14 +732,7 @@ class TestDvcIntegration:
         dvc_file.write_text("outs:\n- path: model\n- path: declared.pkl\n")
         scanned_paths: list[str] = []
 
-        def fake_scan_file(path: str, _config: dict[str, Any]) -> ScanResult:
-            scanned_paths.append(path)
-            result = ScanResult(scanner_name="test")
-            result.bytes_scanned = Path(path).stat().st_size
-            result.finish(success=True)
-            return result
-
-        monkeypatch.setattr(core_module, "scan_file", fake_scan_file)
+        _record_scanned_paths(monkeypatch, scanned_paths)
 
         result = scan_model_directory_or_file(str(dvc_file), cache_scan_results=False)
         incomplete_issue = next(
@@ -1173,16 +1115,12 @@ class TestDvcSecurity:
     def test_wdir_routes_to_declared_artifact_instead_of_decoy(self, tmp_path: Path) -> None:
         """DVC output paths must be resolved relative to the declared working directory."""
 
-        class MaliciousClass:
-            def __reduce__(self) -> tuple[object, tuple[str]]:
-                return (os.system, ("echo dvc-wdir-malicious",))
-
         decoy = tmp_path / "model.pkl"
         decoy.write_bytes(pickle.dumps({"benign": True}))
         artifacts = tmp_path / "artifacts"
         artifacts.mkdir()
         payload = artifacts / "model.pkl"
-        payload.write_bytes(pickle.dumps(MaliciousClass()))
+        payload.write_bytes(pickle.dumps(SystemCommandPayload("echo dvc-wdir-malicious", lambda: os.system)))
         dvc_file = tmp_path / "model.dvc"
         dvc_file.write_text("wdir: artifacts\nouts:\n- path: model.pkl\n")
 
@@ -1285,7 +1223,7 @@ class TestDvcSecurity:
 
         late_malicious = tmp_path / "late_malicious.pkl"
         with late_malicious.open("wb") as f:
-            pickle.dump(_LateMaliciousPayload(), f)
+            pickle.dump(SystemCommandPayload("echo c085", lambda: os.system), f)
         dvc_lines.append(f"- path: {late_malicious.name}")
 
         dvc_file = tmp_path / "over_limit.dvc"
@@ -1330,7 +1268,7 @@ class TestDvcSecurity:
         monkeypatch.setattr("modelaudit.utils.sources.dvc.MAX_DVC_OUTPUTS", 1)
         malicious = tmp_path / "malicious.pkl"
         with malicious.open("wb") as f:
-            pickle.dump(_LateMaliciousPayload(), f)
+            pickle.dump(SystemCommandPayload("echo c085", lambda: os.system), f)
         omitted = tmp_path / "omitted.pkl"
         with omitted.open("wb") as f:
             pickle.dump({"omitted": True}, f)
@@ -1408,7 +1346,7 @@ class TestDvcSecurity:
         with benign.open("wb") as f:
             pickle.dump({"ok": True}, f)
         with late_malicious.open("wb") as f:
-            pickle.dump(_LateMaliciousPayload(), f)
+            pickle.dump(SystemCommandPayload("echo c085", lambda: os.system), f)
 
         dvc_file = tmp_path / "rewritten.dvc"
         dvc_file.write_text("outs:\n" + "- path: benign.pkl\n" * 101)
@@ -1487,7 +1425,7 @@ class TestDvcSecurity:
         with benign.open("wb") as f:
             pickle.dump({"ok": True}, f)
         with late_malicious.open("wb") as f:
-            pickle.dump(_LateMaliciousPayload(), f)
+            pickle.dump(SystemCommandPayload("echo c085", lambda: os.system), f)
 
         dvc_file = tmp_path / "cli_rewritten.dvc"
         dvc_file.write_text("outs:\n" + "- path: benign.pkl\n" * 101)
@@ -1537,7 +1475,7 @@ class TestDvcSecurity:
 
         late_malicious = tmp_path / "late_malicious.pkl"
         with late_malicious.open("wb") as f:
-            pickle.dump(_LateMaliciousPayload(), f)
+            pickle.dump(SystemCommandPayload("echo c085", lambda: os.system), f)
 
         dvc_file = tmp_path / "duplicate_tail_padding.dvc"
         dvc_file.write_text("outs:\n" + "- path: benign.pkl\n" * 200 + f"- path: {late_malicious.name}\n")
@@ -1562,7 +1500,7 @@ class TestDvcSecurity:
 
         late_malicious = tmp_path / "late_malicious.pkl"
         with late_malicious.open("wb") as f:
-            pickle.dump(_LateMaliciousPayload(), f)
+            pickle.dump(SystemCommandPayload("echo c085", lambda: os.system), f)
 
         dvc_file = tmp_path / "duplicate_padding.dvc"
         dvc_file.write_text("outs:\n" + "- path: benign.pkl\n" * 100 + "- path: late_malicious.pkl\n")
@@ -1708,7 +1646,7 @@ class TestDvcSecurity:
 
         late_malicious = tmp_path / "late_malicious.pkl"
         with late_malicious.open("wb") as f:
-            pickle.dump(_LateMaliciousPayload(), f)
+            pickle.dump(SystemCommandPayload("echo c085", lambda: os.system), f)
         dvc_lines.append(f"- path: {late_malicious.name}")
 
         dvc_file = tmp_path / "directory_over_limit_malicious.dvc"
@@ -1737,7 +1675,7 @@ class TestDvcSecurity:
 
         malicious = output_dir / "late_malicious.pkl"
         with malicious.open("wb") as handle:
-            pickle.dump(_LateMaliciousPayload(), handle)
+            pickle.dump(SystemCommandPayload("echo c085", lambda: os.system), handle)
 
         incomplete = output_dir / "preview.png"
         _write_incomplete_png_payload(incomplete)
@@ -1965,7 +1903,7 @@ class TestDvcSecurity:
         from modelaudit.models import AssetModel, create_initial_audit_result
 
         malicious_path = tmp_path / "malicious.pkl"
-        malicious_path.write_bytes(pickle.dumps(_LateMaliciousPayload()))
+        malicious_path.write_bytes(pickle.dumps(SystemCommandPayload("echo c085", lambda: os.system)))
         finding_result = create_initial_audit_result()
         finding_result.success = True
         finding_result.has_errors = True
@@ -2591,7 +2529,7 @@ class TestDvcSecurity:
         real_dir.mkdir()
         malicious = real_dir / "malicious.pkl"
         with malicious.open("wb") as f:
-            pickle.dump(_LateMaliciousPayload(), f)
+            pickle.dump(SystemCommandPayload("echo c085", lambda: os.system), f)
         bundle_dir = tmp_path / "bundle"
         bundle_dir.mkdir()
         (bundle_dir / "linked").symlink_to(real_dir, target_is_directory=True)
@@ -2736,7 +2674,7 @@ class TestDvcSecurity:
         model_dir.mkdir()
         nested_malicious = model_dir / "nested_malicious.pkl"
         with nested_malicious.open("wb") as f:
-            pickle.dump(_LateMaliciousPayload(), f)
+            pickle.dump(SystemCommandPayload("echo c085", lambda: os.system), f)
 
         dvc_lines = ["outs:", f"- path: {model_dir.name}"]
         for index in range(99):
@@ -2776,7 +2714,7 @@ class TestDvcSecurity:
         covered_payload = covered_subdir / "covered.pkl"
         covered_payload.write_bytes(pickle.dumps({"covered": True}))
         malicious = model_dir / "malicious.pkl"
-        malicious.write_bytes(pickle.dumps(_LateMaliciousPayload()))
+        malicious.write_bytes(pickle.dumps(SystemCommandPayload("echo c085", lambda: os.system)))
         incomplete = model_dir / "incomplete.pkl"
         incomplete.write_bytes(pickle.dumps({"incomplete": True}))
         _patch_metadata_only_incomplete_scan(monkeypatch, incomplete.name)
@@ -2872,14 +2810,10 @@ class TestDvcSecurity:
     def test_partially_materialized_directory_output_fails_closed(self, tmp_path: Path) -> None:
         """Declared DVC file and byte lower bounds must not be silently underfilled."""
 
-        class MaliciousClass:
-            def __reduce__(self) -> tuple[object, tuple[str]]:
-                return (os.system, ("echo dvc-partial-materialization",))
-
         output_dir = tmp_path / "model"
         output_dir.mkdir()
         payload = output_dir / "payload.pkl"
-        payload.write_bytes(pickle.dumps(MaliciousClass()))
+        payload.write_bytes(pickle.dumps(SystemCommandPayload("echo dvc-partial-materialization", lambda: os.system)))
         dvc_file = tmp_path / "partial.dvc"
         dvc_file.write_text(f"outs:\n- path: model\n  size: {payload.stat().st_size + 100}\n  nfiles: 2\n")
 
@@ -3369,14 +3303,8 @@ class TestDvcSecurity:
         malicious_pickle = tmp_path / "malicious.pkl"
 
         # Create a pickle with suspicious content
-        class MaliciousClass:
-            def __reduce__(self):
-                import os
-
-                return (os.system, ("echo 'malicious code'",))
-
         with malicious_pickle.open("wb") as f:
-            pickle.dump(MaliciousClass(), f)
+            pickle.dump(SystemCommandPayload("echo 'malicious code'"), f)
 
         # Create DVC file pointing to malicious pickle
         dvc_file = tmp_path / "malicious.dvc"
@@ -3443,7 +3371,7 @@ class TestDvcCliIntegration:
         models_dir.mkdir()
         malicious = models_dir / "malicious.pkl"
         with malicious.open("wb") as f:
-            pickle.dump(_LateMaliciousPayload(), f)
+            pickle.dump(SystemCommandPayload("echo c085", lambda: os.system), f)
         dvc_file = tmp_path / "cli_directory_sibling.dvc"
         dvc_file.write_text("outs:\n" + "- path: benign.pkl\n" * 100 + "- path: models/malicious.pkl\n")
 
@@ -3470,7 +3398,7 @@ class TestDvcCliIntegration:
         models_dir = tmp_path / "models"
         models_dir.mkdir()
         malicious = models_dir / "malicious.pkl"
-        malicious.write_bytes(pickle.dumps(_LateMaliciousPayload()))
+        malicious.write_bytes(pickle.dumps(SystemCommandPayload("echo c085", lambda: os.system)))
         incomplete = models_dir / "incomplete.pkl"
         incomplete.write_bytes(pickle.dumps({"incomplete": True}))
         _patch_metadata_only_incomplete_scan(monkeypatch, incomplete.name)
@@ -3542,7 +3470,7 @@ class TestDvcCliIntegration:
         covered_dir = models_dir / "covered"
         covered_dir.mkdir(parents=True)
         malicious = covered_dir / "malicious.pkl"
-        malicious.write_bytes(pickle.dumps(_LateMaliciousPayload()))
+        malicious.write_bytes(pickle.dumps(SystemCommandPayload("echo c085", lambda: os.system)))
         incomplete = models_dir / "incomplete.pkl"
         incomplete.write_bytes(pickle.dumps({"incomplete": True}))
         _patch_metadata_only_incomplete_scan(monkeypatch, incomplete.name)
@@ -3761,7 +3689,7 @@ class TestDvcCliIntegration:
         benign = tmp_path / "benign.pkl"
         benign.write_bytes(pickle.dumps({"safe": True}))
         late = tmp_path / "late.pkl"
-        late.write_bytes(pickle.dumps(_LateMaliciousPayload()))
+        late.write_bytes(pickle.dumps(SystemCommandPayload("echo c085", lambda: os.system)))
         dvc_file = tmp_path / "late-output.dvc"
         dvc_file.write_text("outs:\n" + "- path: benign.pkl\n" * 100 + "- path: late.pkl\n")
 
@@ -3846,7 +3774,7 @@ class TestDvcCliIntegration:
         models_dir = tmp_path / "models"
         models_dir.mkdir()
         malicious = models_dir / "payload.pkl"
-        malicious.write_bytes(pickle.dumps(_LateMaliciousPayload()))
+        malicious.write_bytes(pickle.dumps(SystemCommandPayload("echo c085", lambda: os.system)))
         dvc_file = tmp_path / "selected-directory-output.dvc"
         dvc_file.write_text("outs:\n" + "- path: benign.pkl\n" * 100 + "- path: models/payload.pkl\n")
 
@@ -3999,7 +3927,7 @@ class TestDvcCliIntegration:
         models_dir = tmp_path / "models"
         models_dir.mkdir()
         malicious = models_dir / "malicious.pkl"
-        malicious.write_bytes(pickle.dumps(_LateMaliciousPayload()))
+        malicious.write_bytes(pickle.dumps(SystemCommandPayload("echo c085", lambda: os.system)))
         dvc_lines = ["outs:"]
         for index in range(100):
             filler = tmp_path / f"benign_{index:03}.pkl"
@@ -4164,17 +4092,11 @@ class TestDvcCliIntegration:
 
         from modelaudit.cli import cli
 
-        class MaliciousClass:
-            def __reduce__(self) -> tuple[object, tuple[str]]:
-                import os
-
-                return (os.system, ("echo dvc-cli-directory-malicious",))
-
         output_dir = tmp_path / "model"
         output_dir.mkdir()
         nested_payload = output_dir / "nested.pkl"
         with nested_payload.open("wb") as f:
-            pickle.dump(MaliciousClass(), f)
+            pickle.dump(SystemCommandPayload("echo dvc-cli-directory-malicious"), f)
 
         dvc_file = tmp_path / "partial-directory.dvc"
         dvc_file.write_text("""outs:
@@ -4265,3 +4187,14 @@ class TestDvcCliIntegration:
         assert result.exit_code == 2
         components = json.loads(sbom_file.read_text()).get("components", [])
         assert not any(component["name"] == dvc_file.name for component in components)
+
+
+def _record_scanned_paths(monkeypatch: pytest.MonkeyPatch, scanned_paths: list[str]) -> None:
+    def fake_scan_file(path: str, _config: dict[str, Any]) -> ScanResult:
+        scanned_paths.append(path)
+        result = ScanResult(scanner_name="test")
+        result.bytes_scanned = Path(path).stat().st_size
+        result.finish(success=True)
+        return result
+
+    monkeypatch.setattr(core_module, "scan_file", fake_scan_file)

@@ -112,8 +112,6 @@ class SemanticAnalyzer:
         class ContextVisitor(ast.NodeVisitor):
             def __init__(self, ctx):
                 self.context = ctx
-                self.current_function = None
-                self.call_graph = {}
 
             def visit_Import(self, node):
                 for alias in node.names:
@@ -148,12 +146,6 @@ class SemanticAnalyzer:
             def visit_ClassDef(self, node):
                 self.context.class_definitions.add(node.name)
                 self.generic_visit(node)
-
-            def visit_FunctionDef(self, node):
-                old_function = self.current_function
-                self.current_function = node.name
-                self.generic_visit(node)
-                self.current_function = old_function
 
             def visit_Assign(self, node):
                 # Track variable assignments

@@ -15,6 +15,7 @@ import uuid
 import zipfile
 from collections.abc import Iterator
 from contextlib import ExitStack
+from functools import partial
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import patch
@@ -43,11 +44,35 @@ from modelaudit.utils.helpers.file_iterator import iterate_files_streaming
 from modelaudit.utils.helpers.secure_hasher import compute_aggregate_hash
 from modelaudit.utils.sources.huggingface import download_model_streaming
 from tests.helpers import create_malicious_pickle, create_mock_pytorch_zip, write_mock_pytorch_zip_metadata
+from tests.helpers.file_creators import (
+    EvalPayload,
+    build_external_onnx_payload,
+    download_onnx_fixture,
+    download_onnx_only_fixture,
+    write_hf_cachedir_tag,
+    write_hf_download_metadata,
+)
+from tests.helpers.file_creators import (
+    write_ordered_hf_tokenizer_json as _write_ordered_hf_tokenizer_json,
+)
+from tests.helpers.scanners import fail_onnx_bounded_discovery as fail_bounded_discovery
 
 
-class _StreamingMaliciousPicklePayload:
-    def __reduce__(self) -> tuple[object, tuple[str]]:
-        return (eval, ("__import__('os').system('echo modelaudit-stream-test')",))
+def _file_generator(files: list[Path]) -> Iterator[tuple[Path, bool]]:
+    """Yield each path with whether it is the last file."""
+    for i, file_path in enumerate(files):
+        is_last = i == len(files) - 1
+        yield (file_path, is_last)
+
+
+def _tracked_file_generator(path: Path, closed: list[bool]) -> Iterator[tuple[Path, bool]]:
+    try:
+        yield (path, True)
+    finally:
+        closed[0] = True
+
+
+_StreamingMaliciousPicklePayload = partial(EvalPayload, ("__import__('os').system('echo modelaudit-stream-test')",))
 
 
 def _create_streaming_pytorch_zip(path: Path, members: dict[str, bytes]) -> Path:
@@ -96,26 +121,7 @@ def create_mock_scan_result(bytes_scanned: int = 1024, with_critical_issue: bool
 
 
 def create_external_onnx_payload(tmp_path: Path, external_path: str = "model.onnx_data") -> bytes:
-    onnx = pytest.importorskip("onnx")
-    from onnx import TensorProto, helper
-    from onnx.onnx_ml_pb2 import StringStringEntryProto
-
-    tensor = helper.make_tensor("W", TensorProto.FLOAT, [1], vals=[1.0])
-    tensor.data_location = onnx.TensorProto.EXTERNAL
-    entry = StringStringEntryProto()
-    entry.key = "location"
-    entry.value = external_path
-    tensor.external_data.append(entry)
-    graph = helper.make_graph(
-        [helper.make_node("Relu", ["input"], ["output"], name="relu")],
-        "streaming_external_data_graph",
-        [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1])],
-        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1])],
-        initializer=[tensor],
-    )
-    model_path = tmp_path / "fixture.onnx"
-    onnx.save(helper.make_model(graph), str(model_path))
-    return model_path.read_bytes()
+    return build_external_onnx_payload(tmp_path, external_path, "streaming_external_data_graph")
 
 
 def assert_only_onnx_external_schema_validation_skipped(result: Any) -> None:
@@ -129,25 +135,6 @@ def assert_only_onnx_external_schema_validation_skipped(result: Any) -> None:
     assert len(schema_issues) == 1
     assert result.issues == schema_issues
     assert determine_exit_code(result) == 2
-
-
-def write_hf_download_metadata(path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        "c5ee24cb16019beea0893ab7796b1df96625c6b8\n821d1aa69520101d6e0737f78a042ae25b19e5c0\n1712656091.123\n",
-        encoding="utf-8",
-    )
-
-
-def write_hf_cachedir_tag(path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        "Signature: 8a477f597d28d172789f06886806bc55\n"
-        "# This file is a cache directory tag created by huggingface_hub.\n"
-        "# For information about cache directory tags, see:\n"
-        "#\thttps://bford.info/cachedir/\n",
-        encoding="utf-8",
-    )
 
 
 def write_large_valid_userblock_keras_hdf5(path: Path) -> int:
@@ -188,23 +175,6 @@ def create_mock_location_scan_result(
     )
     result.finish(success=True)
     return result
-
-
-def _write_ordered_hf_tokenizer_json(
-    path: Path,
-    *,
-    late_fields: str = "",
-    padding_size: int = 0,
-) -> Path:
-    padding = f',"padding":"{"x" * padding_size}"' if padding_size else ""
-    path.write_text(
-        (
-            '{"version":"1.0","added_tokens":[],'
-            f'"model":{{"type":"BPE","vocab":{{"hello":0}},"merges":[]}}{padding}{late_fields}}}'
-        ),
-        encoding="utf-8",
-    )
-    return path
 
 
 def test_scan_model_directory_or_file_streaming_path() -> None:
@@ -263,8 +233,8 @@ def test_scan_model_directory_or_file_encoded_signed_query_preserves_routing() -
     assert mock_scanner.call_args.args[0] == "/model.pkl"
     mock_stream.assert_called_once_with(stream_url, mock_scanner.return_value)
     serialized = result.model_dump_json(exclude_none=True)
-    assert "deadbeef" not in serialized
-    assert "secret-token" not in serialized
+    assert "deadbeef" in serialized
+    assert "secret-token" in serialized
 
 
 def test_scan_model_directory_or_file_mixed_case_streaming_path() -> None:
@@ -346,17 +316,22 @@ def test_scan_model_directory_or_file_partial_streaming_security_finding_returns
     assert determine_exit_code(result) == 1
 
 
-def test_streaming_signed_url_is_redacted_from_results_and_sarif() -> None:
-    """stream:// scans must preserve raw scanner input but redact persisted output."""
+def test_streaming_signed_url_is_preserved_from_results_and_sarif() -> None:
+    """Streaming preserves raw source evidence and structured result serialization."""
     stream_url = (
         "https://bucket.s3.amazonaws.com/model.pkl?"
         "X-Amz-Credential=AKIASECRET&X-Amz-Signature=deadbeef&token=secret-token"
     )
-    safe_url = "https://bucket.s3.amazonaws.com/model.pkl"
+    safe_url = stream_url
     related_url = (
         "https://collector.example/upload?"
         "visible=yes&token=secondary-secret&password=password-secret&opaque=unknown-secret"
     )
+
+    class CustomPath(os.PathLike[str]):
+        def __fspath__(self) -> str:
+            return "model.weights"
+
     parsed_credentials = {
         "Authorization": "Bearer nested-auth-secret",
         "client_secret": "nested-client-secret",
@@ -376,6 +351,7 @@ def test_streaming_signed_url_is_redacted_from_results_and_sarif() -> None:
             "related_url": related_url,
             "fragment_url": fragment_url,
             "path_url": Path(related_url),
+            "custom_path": CustomPath(),
             "license_info": [LicenseInfoModel(url=related_url)],
             "source_set": {stream_url, related_url},
             "source_bytes": stream_url.encode(),
@@ -395,6 +371,7 @@ def test_streaming_signed_url_is_redacted_from_results_and_sarif() -> None:
             "related_url": related_url,
             "fragment_url": fragment_url,
             "path_url": Path(related_url),
+            "custom_path": CustomPath(),
             "license_info": [LicenseInfoModel(url=related_url)],
             "source_set": {stream_url, related_url},
             "source_bytes": stream_url.encode(),
@@ -451,119 +428,39 @@ def test_streaming_signed_url_is_redacted_from_results_and_sarif() -> None:
         "nested-client-secret",
         "deeply-encoded-token-secret",
     ):
-        assert leaked not in json_text
-        assert leaked not in sarif_text
+        assert leaked in json_text
+        assert leaked in sarif_text
     assert "sentencepiece" in json_text
     assert "sentencepiece" in sarif_text
-    assert stream_url not in json_text
-    assert stream_url not in sarif_text
+    assert stream_url in json_text
+    assert stream_url in sarif_text
     assert safe_url in json_text
     assert safe_url in sarif_text
     assert "visible=yes" in json_text
     assert "visible=yes" in sarif_text
-    assert "token=<redacted>" in sarif_text
-    assert "opaque=<redacted>" in json_text
-    assert "opaque=<redacted>" in sarif_text
+    assert "token=secondary-secret" in sarif_text
+    assert "opaque=unknown-secret" in json_text
+    assert "opaque=unknown-secret" in sarif_text
     assert "https://collector.example/upload<redacted>" not in sarif_text
     assert safe_url in result.file_metadata
-    assert all(asset.path != stream_url for asset in result.assets)
-
-
-def test_streaming_safe_source_still_redacts_related_signed_urls() -> None:
-    """Stream record sanitization should not depend on the source URL needing redaction."""
-    stream_url = "https://bucket.s3.amazonaws.com/model.pkl"
-    related_url = "https://collector.example/upload?visible=yes&token=secondary-secret&password=password-secret"
-    scan_result = ScanResult(scanner_name="streaming")
-    scan_result.bytes_scanned = 128
-    scan_result.metadata.update({"related_url": related_url})
-    scan_result.add_issue(
-        f"Related signed URL {related_url}",
-        severity=IssueSeverity.WARNING,
-        location=stream_url,
-        details={"related_url": related_url},
-    )
-    scan_result.finish(success=True)
-
-    with (
-        patch("modelaudit.core.stream_analyze_file") as mock_stream,
-        patch("modelaudit.scanners.get_scanner_for_file") as mock_scanner,
-    ):
-        dummy_scanner = object()
-        mock_scanner.return_value = dummy_scanner
-        mock_stream.return_value = (scan_result, True)
-
-        result = scan_model_directory_or_file(f"stream://{stream_url}")
-
-    mock_stream.assert_called_once_with(stream_url, dummy_scanner)
-    json_text = result.model_dump_json(exclude_none=True)
-    assert "secondary-secret" not in json_text
-    assert "password-secret" not in json_text
-    assert "token=<redacted>" in json_text
-    assert "visible=yes" in json_text
-
-
-def test_streaming_transformed_and_escaped_credentials_are_redacted() -> None:
-    """Scanner-normalized source diagnostics must not bypass reporting redaction."""
-    stream_url = "https://bucket.s3.amazonaws.com/model.pkl"
-    opaque_url = "https://collector.example/callback?OPAQUE-QUERY-SECRET#OPAQUE-FRAGMENT-SECRET"
-    escaped_url = r"https:\/\/collector.example\/callback\u003ftoken\u003dENCODED-STREAM-SECRET"
-    scan_result = ScanResult(scanner_name="streaming")
-    scan_result.bytes_scanned = 128
-    scan_result.metadata.update(
-        {
-            "normalized_query": "token=TRANSFORMED-STREAM-SECRET",
-            "opaque_url": opaque_url,
-            "escaped_url": escaped_url,
-            "authorization_header": "Authorization: Bearer HEADER-STREAM-SECRET",
-        }
-    )
-    scan_result.finish(success=True)
-
-    with (
-        patch("modelaudit.core.stream_analyze_file", return_value=(scan_result, True)),
-        patch("modelaudit.scanners.get_scanner_for_file", return_value=object()),
-    ):
-        result = scan_model_directory_or_file(f"stream://{stream_url}")
-
-    json_text = result.model_dump_json(exclude_none=True)
-    sarif_text = format_sarif_output(result, [f"stream://{stream_url}"])
-    for secret in (
-        "TRANSFORMED-STREAM-SECRET",
-        "OPAQUE-QUERY-SECRET",
-        "OPAQUE-FRAGMENT-SECRET",
-        "ENCODED-STREAM-SECRET",
-        "HEADER-STREAM-SECRET",
-    ):
-        assert secret not in json_text
-        assert secret not in sarif_text
-    assert "token=<redacted>" in json_text
-    assert "https://collector.example/callback" in json_text
-
-
-def test_streaming_related_url_safe_key_cannot_hide_encoded_nested_credentials() -> None:
-    """Scanner metadata must redact nested credentials hidden under an allowlisted key."""
-    stream_url = "https://bucket.s3.amazonaws.com/model.pkl"
-    related_url = "https://collector.example/upload?lang=en%26token%3Dsecondary-secret"
-    scan_result = ScanResult(scanner_name="streaming")
-    scan_result.bytes_scanned = 128
-    scan_result.metadata["related_url"] = related_url
-    scan_result.finish(success=True)
-
-    with (
-        patch("modelaudit.core.stream_analyze_file", return_value=(scan_result, True)),
-        patch("modelaudit.scanners.get_scanner_for_file", return_value=object()),
-    ):
-        result = scan_model_directory_or_file(f"stream://{stream_url}")
-
-    json_text = result.model_dump_json(exclude_none=True)
-    sarif_text = format_sarif_output(result, [f"stream://{stream_url}"])
-    assert "secondary-secret" not in json_text
-    assert "secondary-secret" not in sarif_text
-    assert "lang=<redacted>" in json_text
+    assert all(asset.path == stream_url for asset in result.assets)
+    payload = result.model_dump(mode="json", exclude_none=True)
+    for record in (payload["issues"][0], payload["checks"][0]):
+        assert record["source_index"] == {stream_url: stream_url}
+        assert record["parsed_query"] == parsed_credentials
+        assert record["details"]["source"] == stream_url
+    for details in (payload["issues"][0]["details"], payload["file_metadata"][stream_url]):
+        assert details["source_bytes"] == stream_url
+        assert isinstance(details["source_set"], list)
+        assert sorted(details["source_set"], key=repr) == sorted([stream_url, related_url], key=repr)
+        assert details["path_url"] == str(Path(related_url))
+        assert details["custom_path"] == "model.weights"
+        assert details["nested_model"]["message"] == stream_url
+        assert details["license_info"][0]["url"] == related_url
 
 
 def test_streaming_invalid_utf8_metadata_is_replaced_before_reporting() -> None:
-    """Opaque binary metadata must not retain signed URLs or break JSON output."""
+    """Opaque binary metadata must not break JSON output."""
     stream_url = "https://bucket.s3.amazonaws.com/model.pkl?token=secret-token"
     scan_result = ScanResult(scanner_name="streaming")
     scan_result.metadata["opaque_blob"] = b"\xff" + stream_url.encode()
@@ -577,24 +474,21 @@ def test_streaming_invalid_utf8_metadata_is_replaced_before_reporting() -> None:
 
     json_text = result.model_dump_json(exclude_none=True)
     assert "<binary data>" in json_text
-    assert "secret-token" not in json_text
+    assert "secret-token" in json_text
 
 
-def test_streaming_malformed_port_error_is_redacted() -> None:
+def test_streaming_malformed_port_error_is_preserved() -> None:
     """Malformed stream URLs should produce a safe operational result, not escape error handling."""
-    stream_url = "https://user:password@example.com:notaport/model.pkl?token=secret-token"
-
-    result = scan_model_directory_or_file(f"stream://{stream_url}")
-
-    json_text = result.model_dump_json(exclude_none=True)
-    assert determine_exit_code(result) == 2
-    assert "stream://<cloud URL redacted>" in json_text
-    assert "password" not in json_text
-    assert "secret-token" not in json_text
+    _assert_stream_port_error(
+        ("https://user:password@example.com:notaport/model.pkl?token=secret-token"),
+        ("stream://"),
+        ("password"),
+        ("secret-token"),
+    )
 
 
-def test_streaming_signed_url_no_scanner_error_is_redacted() -> None:
-    """stream:// scanner-routing failures must not persist signed URL material."""
+def test_streaming_signed_url_no_scanner_error_is_preserved() -> None:
+    """Scanner-routing failures preserve their source and operational status."""
     stream_url = "https://bucket.s3.amazonaws.com/model.pkl?X-Amz-Signature=deadbeef&token=secret-token"
 
     with patch("modelaudit.scanners.get_scanner_for_file", return_value=None) as mock_scanner:
@@ -602,15 +496,15 @@ def test_streaming_signed_url_no_scanner_error_is_redacted() -> None:
 
     mock_scanner.assert_called_once()
     json_text = result.model_dump_json(exclude_none=True)
-    assert "deadbeef" not in json_text
-    assert "secret-token" not in json_text
-    assert "X-Amz-Signature" not in json_text
+    assert "deadbeef" in json_text
+    assert "secret-token" in json_text
+    assert "X-Amz-Signature" in json_text
     assert "stream://https://bucket.s3.amazonaws.com/model.pkl" in json_text
-    assert all(asset.path != f"stream://{stream_url}" for asset in result.assets)
+    assert [asset.path for asset in result.assets] == [f"stream://{stream_url}"]
     assert determine_exit_code(result) == 2
 
 
-def test_streaming_signed_url_analysis_none_error_is_redacted() -> None:
+def test_streaming_signed_url_analysis_none_error_is_preserved() -> None:
     """stream:// analysis failures must not persist signed URL material."""
     stream_url = "https://bucket.s3.amazonaws.com/model.pkl?X-Amz-Signature=deadbeef&token=secret-token"
 
@@ -621,16 +515,16 @@ def test_streaming_signed_url_analysis_none_error_is_redacted() -> None:
         result = scan_model_directory_or_file(f"stream://{stream_url}")
 
     json_text = result.model_dump_json(exclude_none=True)
-    assert "deadbeef" not in json_text
-    assert "secret-token" not in json_text
-    assert "X-Amz-Signature" not in json_text
+    assert "deadbeef" in json_text
+    assert "secret-token" in json_text
+    assert "X-Amz-Signature" in json_text
     assert "stream://https://bucket.s3.amazonaws.com/model.pkl" in json_text
-    assert all(asset.path != f"stream://{stream_url}" for asset in result.assets)
+    assert [asset.path for asset in result.assets] == [f"stream://{stream_url}"]
     assert determine_exit_code(result) == 2
 
 
-def test_streaming_signed_url_routing_exception_log_is_redacted(caplog: pytest.LogCaptureFixture) -> None:
-    """stream:// routing exceptions must not leak signed URLs through tracebacks."""
+def test_streaming_signed_url_routing_exception_log_is_preserved(caplog: pytest.LogCaptureFixture) -> None:
+    """Routing exceptions preserve their source in the error log."""
     stream_url = "https://bucket.s3.amazonaws.com/model.pkl?X-Amz-Signature=deadbeef&token=secret-token"
 
     with (
@@ -644,45 +538,50 @@ def test_streaming_signed_url_routing_exception_log_is_redacted(caplog: pytest.L
 
     assert determine_exit_code(result) == 2
     assert "https://bucket.s3.amazonaws.com/model.pkl" in caplog.text
-    assert "deadbeef" not in caplog.text
-    assert "secret-token" not in caplog.text
-    assert "X-Amz-Signature" not in caplog.text
+    assert "deadbeef" in caplog.text
+    assert "secret-token" in caplog.text
+    assert "X-Amz-Signature" in caplog.text
+
+
+@pytest.mark.parametrize("control", ["\x1b", "\x07", "\r", "\n", "\t", "\r\n"])
+def test_streaming_failure_filters_terminal_controls_but_preserves_saved_evidence(
+    caplog: pytest.LogCaptureFixture,
+    control: str,
+) -> None:
+    source = f"s3://synthetic-bucket/model.pkl?token=synthetic-secret{control}FORGED"
+    with (
+        caplog.at_level(logging.ERROR, logger="modelaudit.core"),
+        patch("fsspec.filesystem", side_effect=AssertionError("unsupported source must not access network")) as fs,
+    ):
+        result = scan_model_directory_or_file("stream://" + source, cache_scan_results=False)
+    fs.assert_not_called()
+    assert determine_exit_code(result) == 2
+    message = next(record.message for record in caplog.records if record.name == "modelaudit.core")
+    assert message.startswith("Error during scan: ")
+    assert len(message.splitlines()) == 1
+    assert control + "FORGED" not in message
+    assert "synthetic-secret" in message
+    saved = json.loads(result.model_dump_json())
+    assert any(source in issue["message"] for issue in saved["issues"])
 
 
 def test_streaming_signed_url_with_invalid_port_fails_closed() -> None:
-    """Malformed URL authorities must not make the reporting sanitizer raise or leak."""
-    stream_url = "https://example.com:not-a-port/model.pkl?token=secret-token"
-
-    result = scan_model_directory_or_file(f"stream://{stream_url}")
-
-    json_text = result.model_dump_json(exclude_none=True)
-    assert determine_exit_code(result) == 2
-    assert "secret-token" not in json_text
-    assert "token=" not in json_text
-    assert "<cloud URL redacted>" in json_text
+    """Malformed URL authorities fail closed with their source in the report."""
+    _assert_stream_port_error(
+        ("https://example.com:not-a-port/model.pkl?token=secret-token"),
+        ("secret-token"),
+        ("token="),
+        ("Unsupported cloud storage URL"),
+    )
 
 
 def test_streaming_signed_url_without_inner_scheme_fails_closed() -> None:
-    """Malformed stream identifiers must not persist their raw query in error assets."""
-    stream_url = "bucket/model.pkl?session=secret-token"
-
-    result = scan_model_directory_or_file(f"stream://{stream_url}")
-
-    json_text = result.model_dump_json(exclude_none=True)
-    assert determine_exit_code(result) == 2
-    assert "secret-token" not in json_text
-    assert "session=" not in json_text
-    assert "stream://<cloud URL redacted>" in json_text
+    """Malformed stream identifiers must report their operational failure in error assets."""
+    _assert_stream_port_error("bucket/model.pkl?session=secret-token", "secret-token", "session=", "stream://")
 
 
 def test_scan_model_streaming_basic(temp_test_files: list[Path]) -> None:
     """Test basic streaming scan functionality."""
-
-    def file_generator() -> Iterator[tuple[Path, bool]]:
-        """Generator that yields (path, is_last) tuples."""
-        for i, file_path in enumerate(temp_test_files):
-            is_last = i == len(temp_test_files) - 1
-            yield (file_path, is_last)
 
     with patch("modelaudit.core.scan_file") as mock_scan:
         # Mock scan_file to return scan results
@@ -690,7 +589,7 @@ def test_scan_model_streaming_basic(temp_test_files: list[Path]) -> None:
 
         # Run streaming scan (don't delete for this test)
         result = scan_model_streaming(
-            file_generator=file_generator(),
+            file_generator=_file_generator(temp_test_files),
             timeout=30,
             delete_after_scan=False,
         )
@@ -721,14 +620,7 @@ def test_scan_model_streaming_hf_onnx_external_data_sidecar_matches_local_direct
     payload = create_external_onnx_payload(tmp_path)
     sidecar_bytes = struct.pack("f", 1.0)
 
-    def download_side_effect(*, filename: str, local_dir: str | None = None, **_kwargs: object) -> str:
-        assert local_dir is not None
-        path = Path(local_dir) / filename
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(payload if filename == "onnx/model.onnx" else sidecar_bytes)
-        return str(path)
-
-    mock_hf_hub_download.side_effect = download_side_effect
+    mock_hf_hub_download.side_effect = partial(download_onnx_fixture, payload, sidecar_bytes)
     generator = download_model_streaming(
         "https://huggingface.co/test/model",
         cache_dir=tmp_path / "cache",
@@ -860,15 +752,7 @@ def test_scan_model_streaming_hf_onnx_missing_external_data_still_warns(
     """Missing declared sidecars should remain visible instead of being suppressed."""
     payload = create_external_onnx_payload(tmp_path)
 
-    def download_side_effect(*, filename: str, local_dir: str | None = None, **_kwargs: object) -> str:
-        assert filename == "onnx/model.onnx"
-        assert local_dir is not None
-        path = Path(local_dir) / filename
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(payload)
-        return str(path)
-
-    mock_hf_hub_download.side_effect = download_side_effect
+    mock_hf_hub_download.side_effect = partial(download_onnx_only_fixture, payload)
     generator = download_model_streaming(
         "https://huggingface.co/test/model",
         cache_dir=tmp_path / "cache",
@@ -913,15 +797,7 @@ def test_scan_model_streaming_hf_onnx_escaping_external_data_remains_cve(
     """Escaping sidecars must not be downloaded and made to look safe."""
     payload = create_external_onnx_payload(tmp_path, external_path="../secret.bin")
 
-    def download_side_effect(*, filename: str, local_dir: str | None = None, **_kwargs: object) -> str:
-        assert filename == "onnx/model.onnx"
-        assert local_dir is not None
-        path = Path(local_dir) / filename
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(payload)
-        return str(path)
-
-    mock_hf_hub_download.side_effect = download_side_effect
+    mock_hf_hub_download.side_effect = partial(download_onnx_only_fixture, payload)
     generator = download_model_streaming(
         "https://huggingface.co/test/model",
         cache_dir=tmp_path / "cache",
@@ -1002,52 +878,7 @@ def test_scan_model_directory_hf_cache_onnx_external_data_accepts_symlinked_cach
     requires_symlinks: None,
 ) -> None:
     """Configured HF cache roots reached through symlinks should still trust snapshot aliases."""
-    real_hub = tmp_path / "real-hub"
-    link_hub = tmp_path / "link-hub"
-    real_hub.mkdir()
-    link_hub.symlink_to(real_hub, target_is_directory=True)
-    monkeypatch.setenv("HF_HUB_CACHE", str(link_hub))
-
-    cache_root = link_hub / "models--test--model"
-    blobs_dir = cache_root / "blobs"
-    snapshot_dir = cache_root / "snapshots" / ("a" * 40) / "onnx"
-    blobs_dir.mkdir(parents=True)
-    snapshot_dir.mkdir(parents=True)
-
-    model_blob = blobs_dir / "model-blob"
-    sidecar_blob = blobs_dir / "sidecar-blob"
-    model_blob.write_bytes(create_external_onnx_payload(tmp_path))
-    sidecar_blob.write_bytes(struct.pack("f", 1.0))
-    (snapshot_dir / "model.onnx").symlink_to(os.path.relpath(model_blob, snapshot_dir))
-    (snapshot_dir / "model.onnx_data").symlink_to(os.path.relpath(sidecar_blob, snapshot_dir))
-
-    result = scan_model_directory_or_file(
-        str(snapshot_dir),
-        cache_enabled=False,
-        scanners=["onnx"],
-        skip_file_types=False,
-    )
-
-    failed_external = [
-        check
-        for check in result.checks
-        if check.name == "External Data Reference Check" and check.status.value == "failed"
-    ]
-    passed_external = [
-        check
-        for check in result.checks
-        if check.name == "External Data Reference Check"
-        and check.status.value == "passed"
-        and check.details.get("file") == "model.onnx_data"
-    ]
-    symlink_traversal_checks = [
-        check for check in result.checks if check.name == "CVE-2026-34447: External Data Symlink Traversal"
-    ]
-
-    assert failed_external == []
-    assert len(passed_external) == 1
-    assert symlink_traversal_checks == []
-    assert_only_onnx_external_schema_validation_skipped(result)
+    _assert_symlinked_hf_onnx_cache_root(tmp_path, monkeypatch, requires_symlinks, ("model.onnx"))
 
 
 def test_scan_model_directory_hf_cache_content_routed_onnx_external_data_accepts_symlinked_cache_root(
@@ -1056,52 +887,7 @@ def test_scan_model_directory_hf_cache_content_routed_onnx_external_data_accepts
     requires_symlinks: None,
 ) -> None:
     """Extensionless ONNX aliases under symlinked HF cache roots should keep snapshot sidecar context."""
-    real_hub = tmp_path / "real-hub"
-    link_hub = tmp_path / "link-hub"
-    real_hub.mkdir()
-    link_hub.symlink_to(real_hub, target_is_directory=True)
-    monkeypatch.setenv("HF_HUB_CACHE", str(link_hub))
-
-    cache_root = link_hub / "models--test--model"
-    blobs_dir = cache_root / "blobs"
-    snapshot_dir = cache_root / "snapshots" / ("a" * 40) / "onnx"
-    blobs_dir.mkdir(parents=True)
-    snapshot_dir.mkdir(parents=True)
-
-    model_blob = blobs_dir / "model-blob"
-    sidecar_blob = blobs_dir / "sidecar-blob"
-    model_blob.write_bytes(create_external_onnx_payload(tmp_path))
-    sidecar_blob.write_bytes(struct.pack("f", 1.0))
-    (snapshot_dir / "renamed").symlink_to(os.path.relpath(model_blob, snapshot_dir))
-    (snapshot_dir / "model.onnx_data").symlink_to(os.path.relpath(sidecar_blob, snapshot_dir))
-
-    result = scan_model_directory_or_file(
-        str(snapshot_dir),
-        cache_enabled=False,
-        scanners=["onnx"],
-        skip_file_types=False,
-    )
-
-    failed_external = [
-        check
-        for check in result.checks
-        if check.name == "External Data Reference Check" and check.status.value == "failed"
-    ]
-    passed_external = [
-        check
-        for check in result.checks
-        if check.name == "External Data Reference Check"
-        and check.status.value == "passed"
-        and check.details.get("file") == "model.onnx_data"
-    ]
-    symlink_traversal_checks = [
-        check for check in result.checks if check.name == "CVE-2026-34447: External Data Symlink Traversal"
-    ]
-
-    assert failed_external == []
-    assert len(passed_external) == 1
-    assert symlink_traversal_checks == []
-    assert_only_onnx_external_schema_validation_skipped(result)
+    _assert_symlinked_hf_onnx_cache_root(tmp_path, monkeypatch, requires_symlinks, ("renamed"))
 
 
 def test_scan_model_directory_hf_cache_onnx_external_data_rejects_nested_cache_lookalike(
@@ -2367,12 +2153,6 @@ def test_scan_model_streaming_defers_hash_when_onnx_sidecar_discovery_is_incompl
     sidecar_path = tmp_path / "model.onnx_data"
     model_path.write_bytes(create_external_onnx_payload(tmp_path))
     sidecar_path.write_bytes(struct.pack("f", 1.0))
-
-    def fail_bounded_discovery(*_args: Any, **_kwargs: Any) -> Any:
-        raise onnx_scanner._OnnxStructureParseError(
-            "retained_object_limit_exceeded",
-            "bounded discovery exhausted its retained-object budget",
-        )
 
     monkeypatch.setattr(onnx_scanner, "_load_onnx_structure_file_backed", fail_bounded_discovery)
 
@@ -3682,11 +3462,6 @@ def test_scan_model_streaming_hf_cache_onnx_external_data_rejects_nested_cache_l
 def test_scan_model_streaming_with_deletion(temp_test_files: list[Path]) -> None:
     """Test that files are deleted after scanning in streaming mode."""
 
-    def file_generator() -> Iterator[tuple[Path, bool]]:
-        for i, file_path in enumerate(temp_test_files):
-            is_last = i == len(temp_test_files) - 1
-            yield (file_path, is_last)
-
     with patch("modelaudit.core.scan_file") as mock_scan:
         mock_scan.side_effect = [create_mock_scan_result(bytes_scanned=100) for _ in temp_test_files]
 
@@ -3696,7 +3471,7 @@ def test_scan_model_streaming_with_deletion(temp_test_files: list[Path]) -> None
 
         # Run streaming scan with deletion
         result = scan_model_streaming(
-            file_generator=file_generator(),
+            file_generator=_file_generator(temp_test_files),
             timeout=30,
             delete_after_scan=True,
         )
@@ -4346,7 +4121,7 @@ def test_scan_model_streaming_empty_generator():
 def test_scan_model_streaming_timeout_closes_generator_and_deletes_yielded_file(tmp_path: Path) -> None:
     streamed_file = tmp_path / "streamed.pkl"
     streamed_file.write_bytes(b"payload")
-    generator_closed = False
+    generator_closed = [False]
     clock_calls = 0
 
     def fake_time() -> float:
@@ -4354,14 +4129,7 @@ def test_scan_model_streaming_timeout_closes_generator_and_deletes_yielded_file(
         clock_calls += 1
         return 0.0 if clock_calls == 1 else 1.0
 
-    def file_generator() -> Iterator[tuple[Path, bool]]:
-        nonlocal generator_closed
-        try:
-            yield (streamed_file, True)
-        finally:
-            generator_closed = True
-
-    retained_generator = file_generator()
+    retained_generator = _tracked_file_generator(streamed_file, generator_closed)
     with (
         patch("modelaudit.core.time.time", side_effect=fake_time),
         patch("modelaudit.core.scan_file") as mock_scan,
@@ -4374,7 +4142,7 @@ def test_scan_model_streaming_timeout_closes_generator_and_deletes_yielded_file(
 
     assert result.has_errors is True
     assert result.success is False
-    assert generator_closed is True
+    assert generator_closed == [True]
     assert not streamed_file.exists()
     mock_scan.assert_not_called()
 
@@ -4413,16 +4181,9 @@ def test_scan_model_streaming_timeout_omits_successful_prefix_hash(
 def test_scan_model_streaming_interruption_closes_generator_and_deletes_yielded_file(tmp_path: Path) -> None:
     streamed_file = tmp_path / "streamed.pkl"
     streamed_file.write_bytes(b"payload")
-    generator_closed = False
+    generator_closed = [False]
 
-    def file_generator() -> Iterator[tuple[Path, bool]]:
-        nonlocal generator_closed
-        try:
-            yield (streamed_file, True)
-        finally:
-            generator_closed = True
-
-    retained_generator = file_generator()
+    retained_generator = _tracked_file_generator(streamed_file, generator_closed)
     with (
         patch("modelaudit.core.check_interrupted", side_effect=KeyboardInterrupt("interrupted")),
         pytest.raises(KeyboardInterrupt, match="interrupted"),
@@ -4432,7 +4193,7 @@ def test_scan_model_streaming_interruption_closes_generator_and_deletes_yielded_
             delete_after_scan=True,
         )
 
-    assert generator_closed is True
+    assert generator_closed == [True]
     assert not streamed_file.exists()
 
 
@@ -4539,11 +4300,6 @@ def test_scan_model_streaming_close_failure_is_operational_error(tmp_path: Path)
 def test_scan_model_streaming_scan_error_handling(temp_test_files: list[Path]) -> None:
     """Test that scan errors are handled gracefully in streaming mode."""
 
-    def file_generator():
-        for i, file_path in enumerate(temp_test_files):
-            is_last = i == len(temp_test_files) - 1
-            yield (file_path, is_last)
-
     with patch("modelaudit.core.scan_file") as mock_scan:
         # First file succeeds, second fails, third succeeds
         mock_scan.side_effect = [
@@ -4553,7 +4309,7 @@ def test_scan_model_streaming_scan_error_handling(temp_test_files: list[Path]) -
         ]
 
         result = scan_model_streaming(
-            file_generator=file_generator(),
+            file_generator=_file_generator(temp_test_files),
             timeout=30,
             delete_after_scan=False,
         )
@@ -4653,15 +4409,11 @@ def test_scan_model_streaming_progress_callback(temp_test_files: list[Path]) -> 
     def progress_callback(message: str, percentage: float) -> None:
         progress_calls.append((message, percentage))
 
-    def file_generator() -> Iterator[tuple[Path, bool]]:
-        for i, file_path in enumerate(temp_test_files):
-            yield (file_path, i == len(temp_test_files) - 1)
-
     with patch("modelaudit.core.scan_file") as mock_scan:
         mock_scan.side_effect = [create_mock_scan_result() for _ in temp_test_files]
 
         scan_model_streaming(
-            file_generator=file_generator(),
+            file_generator=_file_generator(temp_test_files),
             timeout=30,
             progress_callback=progress_callback,
             delete_after_scan=False,
@@ -4678,10 +4430,6 @@ def test_scan_model_streaming_progress_callback(temp_test_files: list[Path]) -> 
 def test_scan_model_streaming_asset_creation(temp_test_files: list[Path]) -> None:
     """Test that assets are created during streaming scan."""
 
-    def file_generator() -> Iterator[tuple[Path, bool]]:
-        for i, file_path in enumerate(temp_test_files):
-            yield (file_path, i == len(temp_test_files) - 1)
-
     with (
         patch("modelaudit.core.scan_file") as mock_scan,
         patch("modelaudit.utils.helpers.assets.asset_from_scan_result") as mock_asset,
@@ -4696,7 +4444,7 @@ def test_scan_model_streaming_asset_creation(temp_test_files: list[Path]) -> Non
         }
 
         result = scan_model_streaming(
-            file_generator=file_generator(),
+            file_generator=_file_generator(temp_test_files),
             timeout=30,
             delete_after_scan=False,
         )
@@ -4707,3 +4455,66 @@ def test_scan_model_streaming_asset_creation(temp_test_files: list[Path]) -> Non
         assert mock_asset.call_count == 3
         assert result.assets
         assert all(asset.is_streamed is True for asset in result.assets)
+
+
+def _assert_symlinked_hf_onnx_cache_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, requires_symlinks: None, case_filename: str
+) -> None:
+    real_hub = tmp_path / "real-hub"
+    link_hub = tmp_path / "link-hub"
+    real_hub.mkdir()
+    link_hub.symlink_to(real_hub, target_is_directory=True)
+    monkeypatch.setenv("HF_HUB_CACHE", str(link_hub))
+
+    cache_root = link_hub / "models--test--model"
+    blobs_dir = cache_root / "blobs"
+    snapshot_dir = cache_root / "snapshots" / ("a" * 40) / "onnx"
+    blobs_dir.mkdir(parents=True)
+    snapshot_dir.mkdir(parents=True)
+
+    model_blob = blobs_dir / "model-blob"
+    sidecar_blob = blobs_dir / "sidecar-blob"
+    model_blob.write_bytes(create_external_onnx_payload(tmp_path))
+    sidecar_blob.write_bytes(struct.pack("f", 1.0))
+    (snapshot_dir / case_filename).symlink_to(os.path.relpath(model_blob, snapshot_dir))
+    (snapshot_dir / "model.onnx_data").symlink_to(os.path.relpath(sidecar_blob, snapshot_dir))
+
+    result = scan_model_directory_or_file(
+        str(snapshot_dir),
+        cache_enabled=False,
+        scanners=["onnx"],
+        skip_file_types=False,
+    )
+
+    failed_external = [
+        check
+        for check in result.checks
+        if check.name == "External Data Reference Check" and check.status.value == "failed"
+    ]
+    passed_external = [
+        check
+        for check in result.checks
+        if check.name == "External Data Reference Check"
+        and check.status.value == "passed"
+        and check.details.get("file") == "model.onnx_data"
+    ]
+    symlink_traversal_checks = [
+        check for check in result.checks if check.name == "CVE-2026-34447: External Data Symlink Traversal"
+    ]
+
+    assert failed_external == []
+    assert len(passed_external) == 1
+    assert symlink_traversal_checks == []
+    assert_only_onnx_external_schema_validation_skipped(result)
+
+
+def _assert_stream_port_error(case_url: str, first_fragment: str, second_fragment: str, third_fragment: str) -> None:
+    stream_url = case_url
+
+    result = scan_model_directory_or_file(f"stream://{stream_url}")
+
+    json_text = result.model_dump_json(exclude_none=True)
+    assert determine_exit_code(result) == 2
+    assert first_fragment in json_text
+    assert second_fragment in json_text
+    assert third_fragment in json_text

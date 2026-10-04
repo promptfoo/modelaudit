@@ -10,6 +10,8 @@ from typing import Any, cast
 import pytest
 import yaml
 
+from tests.helpers.workflows import _jobs, _step_by_name, _workflow_triggers
+
 
 def _load_workflow(filename: str) -> dict[str, Any]:
     current_path = Path(__file__).resolve()
@@ -32,19 +34,6 @@ def _load_perf_workflow() -> dict[str, Any]:
     return _load_workflow("perf.yml")
 
 
-def _workflow_triggers(workflow: dict[str, Any]) -> dict[str, Any]:
-    raw_workflow = cast(dict[Any, Any], workflow)
-    triggers = raw_workflow.get("on", raw_workflow.get(True))
-    assert isinstance(triggers, dict)
-    return triggers
-
-
-def _jobs(workflow: dict[str, Any]) -> dict[str, Any]:
-    jobs = workflow["jobs"]
-    assert isinstance(jobs, dict)
-    return jobs
-
-
 def _benchmarks_job(workflow: dict[str, Any]) -> dict[str, Any]:
     job = _jobs(workflow)["benchmarks"]
     assert isinstance(job, dict)
@@ -55,13 +44,6 @@ def _job_steps(workflow: dict[str, Any]) -> list[dict[str, Any]]:
     steps = _benchmarks_job(workflow)["steps"]
     assert isinstance(steps, list)
     return steps
-
-
-def _step_by_name(steps: list[dict[str, Any]], name: str) -> dict[str, Any]:
-    for step in steps:
-        if step.get("name") == name:
-            return step
-    raise AssertionError(f"Step {name!r} not found")
 
 
 def _node_script(step: dict[str, Any]) -> str:

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import ast
 import threading
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from importlib.util import find_spec
 
 import pytest
@@ -24,8 +24,9 @@ from modelaudit_picklescan.call_graph import (
     _CallGraphAnalysisLimitError,
     _collect_assignment_aliases,
     _collect_local_defs,
+    _definition_scope_statements,
     _first_matching_path,
-    _module_level_statements,
+    _runtime_selected_module_statements,
     _safe_call_graph_entrypoints,
     find_dangerous_call_graphs,
     find_startup_hook_write_call_graphs,
@@ -597,6 +598,19 @@ finally:
 """
 
 
+def _reference_callback(
+    references: tuple[dict[str, str], ...] | dict[str, str],
+) -> Callable[[object, tuple[dict[str, object], ...], set[tuple[str, str]]], tuple[dict[str, str], ...]]:
+    def _iter_references(
+        _import_references: object,
+        _callable_references: tuple[dict[str, object], ...],
+        _invoked_references: set[tuple[str, str]],
+    ) -> tuple[dict[str, str], ...]:
+        return (references,) if isinstance(references, dict) else references
+
+    return _iter_references
+
+
 def _run_with_timeout(target: object, timeout: float = 10.0) -> None:
     thread = threading.Thread(target=target)  # type: ignore[arg-type]
     thread.daemon = True
@@ -637,26 +651,11 @@ def _run_with_timeout(target: object, timeout: float = 10.0) -> None:
 )
 def test_collect_assignment_aliases_fails_closed_on_stable_branch_rebind(source: str) -> None:
     tree = ast.parse(source)
-    statements = _module_level_statements(tree)
+    statements = _definition_scope_statements(_runtime_selected_module_statements(tree.body, None))
     local_defs = _collect_local_defs(statements)
     local_class_targets = {"testmod.A", "testmod.B", "testmod.Final"}
 
-    result: dict[str, bool] = {}
-
-    def _collect() -> None:
-        with pytest.raises(_CallGraphAnalysisLimitError, match="ambiguous conditional rebinding"):
-            _collect_assignment_aliases(
-                statements,
-                "testmod",
-                {},
-                local_defs,
-                local_class_targets,
-            )
-        result["limited"] = True
-
-    _run_with_timeout(_collect)
-
-    assert result == {"limited": True}
+    _assert_alias_collection_limited(statements, local_defs, local_class_targets, "ambiguous conditional rebinding")
 
 
 @pytest.mark.parametrize(
@@ -674,7 +673,7 @@ def test_collect_assignment_aliases_converges_on_deterministic_final_rebind(
     expected_target: str,
 ) -> None:
     tree = ast.parse(source)
-    statements = _module_level_statements(tree)
+    statements = _definition_scope_statements(_runtime_selected_module_statements(tree.body, None))
     local_defs = _collect_local_defs(statements)
     local_class_targets = {"testmod.A", "testmod.B", "testmod.Final"}
 
@@ -691,7 +690,7 @@ def test_collect_assignment_aliases_converges_on_deterministic_final_rebind(
 
 def test_collect_assignment_aliases_allows_alias_read_after_deterministic_overwrite() -> None:
     tree = ast.parse(_OVERWRITE_BEFORE_READ_SOURCE)
-    statements = _module_level_statements(tree)
+    statements = _definition_scope_statements(_runtime_selected_module_statements(tree.body, None))
     local_defs = _collect_local_defs(statements)
 
     aliases = _collect_assignment_aliases(
@@ -745,7 +744,7 @@ def test_collect_assignment_aliases_allows_alias_read_after_deterministic_overwr
 )
 def test_collect_assignment_aliases_allows_matching_terminal_branch_overwrites(source: str) -> None:
     tree = ast.parse(source)
-    statements = _module_level_statements(tree)
+    statements = _definition_scope_statements(_runtime_selected_module_statements(tree.body, None))
     local_defs = _collect_local_defs(statements)
 
     aliases = _collect_assignment_aliases(
@@ -762,26 +761,11 @@ def test_collect_assignment_aliases_allows_matching_terminal_branch_overwrites(s
 
 def test_collect_assignment_aliases_fails_closed_on_cyclic_dependency_propagation() -> None:
     tree = ast.parse(_DEPENDENT_CYCLE_SOURCE)
-    statements = _module_level_statements(tree)
+    statements = _definition_scope_statements(_runtime_selected_module_statements(tree.body, None))
     local_defs = _collect_local_defs(statements)
     local_class_targets = {"testmod.A", "testmod.B"}
 
-    result: dict[str, bool] = {}
-
-    def _collect() -> None:
-        with pytest.raises(_CallGraphAnalysisLimitError, match="entered a propagation cycle"):
-            _collect_assignment_aliases(
-                statements,
-                "testmod",
-                {},
-                local_defs,
-                local_class_targets,
-            )
-        result["limited"] = True
-
-    _run_with_timeout(_collect)
-
-    assert result == {"limited": True}
+    _assert_alias_collection_limited(statements, local_defs, local_class_targets, "entered a propagation cycle")
 
 
 def test_collect_assignment_aliases_fails_closed_on_long_period_cycles() -> None:
@@ -799,24 +783,9 @@ def test_collect_assignment_aliases_fails_closed_on_long_period_cycles() -> None
             source_lines.append(f"ring_{ring_index}_{position} = ring_{ring_index}_{next_position}")
 
     tree = ast.parse("\n".join(source_lines))
-    statements = _module_level_statements(tree)
+    statements = _definition_scope_statements(_runtime_selected_module_statements(tree.body, None))
     local_defs = _collect_local_defs(statements)
-    result: dict[str, bool] = {}
-
-    def _collect() -> None:
-        with pytest.raises(_CallGraphAnalysisLimitError):
-            _collect_assignment_aliases(
-                statements,
-                "testmod",
-                {},
-                local_defs,
-                local_class_targets,
-            )
-        result["limited"] = True
-
-    _run_with_timeout(_collect)
-
-    assert result == {"limited": True}
+    _assert_alias_collection_limited(statements, local_defs, local_class_targets)
 
 
 def test_assignment_alias_limit_is_not_hidden_by_safe_entrypoint_wrapper(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -853,83 +822,13 @@ def test_assignment_alias_limit_retains_later_matching_entrypoint_path() -> None
 def test_assignment_alias_limit_preserves_prior_call_graph_findings(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    references = (
-        {"module": "dangerous", "name": "entry"},
-        {"module": "limited", "name": "entry"},
-    )
-
-    def _iter_references(
-        _import_references: object,
-        _callable_references: tuple[dict[str, object], ...],
-        _invoked_references: set[tuple[str, str]],
-    ) -> tuple[dict[str, str], ...]:
-        return references
-
-    def _entrypoints(module: str, name: str, _reference: dict[str, object]) -> tuple[str, ...]:
-        return (f"{module}.{name}",)
-
-    def _path(entrypoints: Iterable[str], _path_for: object) -> tuple[str, ...] | None:
-        if tuple(entrypoints) == ("limited.entry",):
-            raise _CallGraphAnalysisLimitError("assignment alias limit")
-        return ("dangerous.entry", "builtins.exec")
-
-    monkeypatch.setattr("modelaudit_picklescan.call_graph._iter_call_graph_references", _iter_references)
-    monkeypatch.setattr("modelaudit_picklescan.call_graph._call_graph_entrypoints_for_reference", _entrypoints)
-    monkeypatch.setattr("modelaudit_picklescan.call_graph._first_matching_path", _path)
-
-    with pytest.raises(_CallGraphAnalysisLimitError, match="assignment alias limit") as exc_info:
-        find_dangerous_call_graphs(())
-
-    assert exc_info.value.partial_findings == (
-        CallGraphFinding(
-            module="dangerous",
-            name="entry",
-            import_reference="dangerous.entry",
-            sink="builtins.exec",
-            call_path=("dangerous.entry", "builtins.exec"),
-        ),
-    )
+    _assert_alias_limit_findings(monkeypatch, "dangerous", "limited")
 
 
 def test_assignment_alias_limit_preserves_later_call_graph_findings(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    references = (
-        {"module": "limited", "name": "entry"},
-        {"module": "dangerous", "name": "entry"},
-    )
-
-    def _iter_references(
-        _import_references: object,
-        _callable_references: tuple[dict[str, object], ...],
-        _invoked_references: set[tuple[str, str]],
-    ) -> tuple[dict[str, str], ...]:
-        return references
-
-    def _entrypoints(module: str, name: str, _reference: dict[str, object]) -> tuple[str, ...]:
-        return (f"{module}.{name}",)
-
-    def _path(entrypoints: Iterable[str], _path_for: object) -> tuple[str, ...] | None:
-        if tuple(entrypoints) == ("limited.entry",):
-            raise _CallGraphAnalysisLimitError("assignment alias limit")
-        return ("dangerous.entry", "builtins.exec")
-
-    monkeypatch.setattr("modelaudit_picklescan.call_graph._iter_call_graph_references", _iter_references)
-    monkeypatch.setattr("modelaudit_picklescan.call_graph._call_graph_entrypoints_for_reference", _entrypoints)
-    monkeypatch.setattr("modelaudit_picklescan.call_graph._first_matching_path", _path)
-
-    with pytest.raises(_CallGraphAnalysisLimitError, match="assignment alias limit") as exc_info:
-        find_dangerous_call_graphs(())
-
-    assert exc_info.value.partial_findings == (
-        CallGraphFinding(
-            module="dangerous",
-            name="entry",
-            import_reference="dangerous.entry",
-            sink="builtins.exec",
-            call_path=("dangerous.entry", "builtins.exec"),
-        ),
-    )
+    _assert_alias_limit_findings(monkeypatch, "limited", "dangerous")
 
 
 def test_assignment_alias_limit_preserves_invoked_finding_after_sink_limit(
@@ -938,12 +837,7 @@ def test_assignment_alias_limit_preserves_invoked_finding_after_sink_limit(
     reference = {"module": "invoked", "name": "entry"}
     path_calls = 0
 
-    def _iter_references(
-        _import_references: object,
-        _callable_references: tuple[dict[str, object], ...],
-        _invoked_references: set[tuple[str, str]],
-    ) -> tuple[dict[str, str], ...]:
-        return (reference,)
+    _iter_references = _reference_callback(reference)
 
     def _entrypoints(module: str, name: str, _reference: dict[str, object]) -> tuple[str, ...]:
         return (f"{module}.{name}",)
@@ -981,12 +875,7 @@ def test_assignment_alias_limit_preserves_later_entrypoint_finding(
 ) -> None:
     reference = {"module": "constructor", "name": "Type"}
 
-    def _iter_references(
-        _import_references: object,
-        _callable_references: tuple[dict[str, object], ...],
-        _invoked_references: set[tuple[str, str]],
-    ) -> tuple[dict[str, str], ...]:
-        return (reference,)
+    _iter_references = _reference_callback(reference)
 
     def _entrypoints(_module: str, _name: str, _reference: dict[str, object]) -> tuple[str, ...]:
         return ("constructor.Type.__new__", "constructor.Type.__init__")
@@ -1017,91 +906,13 @@ def test_assignment_alias_limit_preserves_later_entrypoint_finding(
 def test_assignment_alias_limit_preserves_prior_startup_hook_findings(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    references = (
-        {"module": "opener", "name": "entry"},
-        {"module": "writer", "name": "entry"},
-        {"module": "limited", "name": "entry"},
-    )
-
-    def _entrypoints(function_name: str) -> tuple[str, ...]:
-        if function_name == "limited.entry":
-            raise _CallGraphAnalysisLimitError("assignment alias limit")
-        return (function_name,)
-
-    def _path(entrypoints: Iterable[str], path_for: object) -> tuple[str, ...] | None:
-        entrypoint = next(iter(entrypoints))
-        path_name = getattr(path_for, "__name__", "")
-        if path_name == "_find_file_open_path" and entrypoint == "opener.entry":
-            return ("opener.entry", "builtins.open")
-        if path_name == "_find_file_write_path" and entrypoint == "writer.entry":
-            return ("writer.entry", "binary_file.write")
-        return None
-
-    monkeypatch.setattr("modelaudit_picklescan.call_graph._safe_call_graph_entrypoints", _entrypoints)
-    monkeypatch.setattr("modelaudit_picklescan.call_graph._first_matching_path", _path)
-
-    with pytest.raises(_CallGraphAnalysisLimitError, match="assignment alias limit") as exc_info:
-        find_startup_hook_write_call_graphs(references)
-
-    assert exc_info.value.partial_startup_hook_write_findings == (
-        StartupHookWriteFinding(
-            opener_module="opener",
-            opener_name="entry",
-            writer_module="writer",
-            writer_name="entry",
-            opener_import_reference="opener.entry",
-            writer_import_reference="writer.entry",
-            open_sink="builtins.open",
-            write_sink="binary_file.write",
-            opener_call_path=("opener.entry", "builtins.open"),
-            writer_call_path=("writer.entry", "binary_file.write"),
-        ),
-    )
+    _assert_alias_limit_startup_findings(monkeypatch, "opener", "writer", "limited")
 
 
 def test_assignment_alias_limit_preserves_later_startup_hook_findings(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    references = (
-        {"module": "limited", "name": "entry"},
-        {"module": "opener", "name": "entry"},
-        {"module": "writer", "name": "entry"},
-    )
-
-    def _entrypoints(function_name: str) -> tuple[str, ...]:
-        if function_name == "limited.entry":
-            raise _CallGraphAnalysisLimitError("assignment alias limit")
-        return (function_name,)
-
-    def _path(entrypoints: Iterable[str], path_for: object) -> tuple[str, ...] | None:
-        entrypoint = next(iter(entrypoints))
-        path_name = getattr(path_for, "__name__", "")
-        if path_name == "_find_file_open_path" and entrypoint == "opener.entry":
-            return ("opener.entry", "builtins.open")
-        if path_name == "_find_file_write_path" and entrypoint == "writer.entry":
-            return ("writer.entry", "binary_file.write")
-        return None
-
-    monkeypatch.setattr("modelaudit_picklescan.call_graph._safe_call_graph_entrypoints", _entrypoints)
-    monkeypatch.setattr("modelaudit_picklescan.call_graph._first_matching_path", _path)
-
-    with pytest.raises(_CallGraphAnalysisLimitError, match="assignment alias limit") as exc_info:
-        find_startup_hook_write_call_graphs(references)
-
-    assert exc_info.value.partial_startup_hook_write_findings == (
-        StartupHookWriteFinding(
-            opener_module="opener",
-            opener_name="entry",
-            writer_module="writer",
-            writer_name="entry",
-            opener_import_reference="opener.entry",
-            writer_import_reference="writer.entry",
-            open_sink="builtins.open",
-            write_sink="binary_file.write",
-            opener_call_path=("opener.entry", "builtins.open"),
-            writer_call_path=("writer.entry", "binary_file.write"),
-        ),
-    )
+    _assert_alias_limit_startup_findings(monkeypatch, "limited", "opener", "writer")
 
 
 def test_assignment_alias_limit_preserves_startup_hook_findings_after_sink_limit(
@@ -1177,3 +988,111 @@ def test_scan_imaplib_reference_terminates_and_flags() -> None:
     report = result["report"]
     severities = {finding.severity for finding in report.findings}
     assert Severity.CRITICAL in severities
+
+
+def _startup_hook_path(entrypoints: Iterable[str], path_for: object) -> tuple[str, ...] | None:
+    entrypoint = next(iter(entrypoints))
+    path_name = getattr(path_for, "__name__", "")
+    if path_name == "_find_file_open_path" and entrypoint == "opener.entry":
+        return ("opener.entry", "builtins.open")
+    if path_name == "_find_file_write_path" and entrypoint == "writer.entry":
+        return ("writer.entry", "binary_file.write")
+    return None
+
+
+def _assignment_alias_limit_path(entrypoints: Iterable[str], _path_for: object) -> tuple[str, ...] | None:
+    if tuple(entrypoints) == ("limited.entry",):
+        raise _CallGraphAnalysisLimitError("assignment alias limit")
+    return ("dangerous.entry", "builtins.exec")
+
+
+def _assignment_alias_limit_entrypoints(function_name: str) -> tuple[str, ...]:
+    if function_name == "limited.entry":
+        raise _CallGraphAnalysisLimitError("assignment alias limit")
+    return (function_name,)
+
+
+def _assert_alias_limit_findings(monkeypatch: pytest.MonkeyPatch, first_module: str, second_module: str) -> None:
+    references = (
+        {"module": first_module, "name": "entry"},
+        {"module": second_module, "name": "entry"},
+    )
+
+    _iter_references = _reference_callback(references)
+
+    def _entrypoints(module: str, name: str, _reference: dict[str, object]) -> tuple[str, ...]:
+        return (f"{module}.{name}",)
+
+    monkeypatch.setattr("modelaudit_picklescan.call_graph._iter_call_graph_references", _iter_references)
+    monkeypatch.setattr("modelaudit_picklescan.call_graph._call_graph_entrypoints_for_reference", _entrypoints)
+    monkeypatch.setattr("modelaudit_picklescan.call_graph._first_matching_path", _assignment_alias_limit_path)
+
+    with pytest.raises(_CallGraphAnalysisLimitError, match="assignment alias limit") as exc_info:
+        find_dangerous_call_graphs(())
+
+    assert exc_info.value.partial_findings == (
+        CallGraphFinding(
+            module="dangerous",
+            name="entry",
+            import_reference="dangerous.entry",
+            sink="builtins.exec",
+            call_path=("dangerous.entry", "builtins.exec"),
+        ),
+    )
+
+
+def _assert_alias_limit_startup_findings(
+    monkeypatch: pytest.MonkeyPatch, first_module: str, second_module: str, third_module: str
+) -> None:
+    references = (
+        {"module": first_module, "name": "entry"},
+        {"module": second_module, "name": "entry"},
+        {"module": third_module, "name": "entry"},
+    )
+
+    monkeypatch.setattr(
+        "modelaudit_picklescan.call_graph._safe_call_graph_entrypoints", _assignment_alias_limit_entrypoints
+    )
+    monkeypatch.setattr("modelaudit_picklescan.call_graph._first_matching_path", _startup_hook_path)
+
+    with pytest.raises(_CallGraphAnalysisLimitError, match="assignment alias limit") as exc_info:
+        find_startup_hook_write_call_graphs(references)
+
+    assert exc_info.value.partial_startup_hook_write_findings == (
+        StartupHookWriteFinding(
+            opener_module="opener",
+            opener_name="entry",
+            writer_module="writer",
+            writer_name="entry",
+            opener_import_reference="opener.entry",
+            writer_import_reference="writer.entry",
+            open_sink="builtins.open",
+            write_sink="binary_file.write",
+            opener_call_path=("opener.entry", "builtins.open"),
+            writer_call_path=("writer.entry", "binary_file.write"),
+        ),
+    )
+
+
+def _assert_alias_collection_limited(
+    statements: Iterable[ast.stmt],
+    local_defs: set[str],
+    local_class_targets: set[str],
+    match: str | None = None,
+) -> None:
+    result: dict[str, bool] = {}
+
+    def _collect() -> None:
+        with pytest.raises(_CallGraphAnalysisLimitError, match=match):
+            _collect_assignment_aliases(
+                statements,
+                "testmod",
+                {},
+                local_defs,
+                local_class_targets,
+            )
+        result["limited"] = True
+
+    _run_with_timeout(_collect)
+
+    assert result == {"limited": True}

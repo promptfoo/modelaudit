@@ -11,6 +11,9 @@ from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
+from pickle_test_helpers import (
+    _proto0_string_literal,
+)
 
 from modelaudit_picklescan import SafetyVerdict, ScanOptions, ScanStatus, scan_bytes, scan_file
 from modelaudit_picklescan import api as picklescan_api
@@ -55,11 +58,6 @@ def _benign_long_scalar_protocol0_pickle(opcode: bytes) -> bytes:
     if prefix.endswith(b"0"):
         prefix = prefix[:-1]
     return prefix + b"."
-
-
-def _proto0_string_literal(value: bytes) -> bytes:
-    literal = value.decode("latin-1").encode("unicode_escape").replace(b"'", b"\\'")
-    return b"S'" + literal + b"'\n."
 
 
 def _binbytes_literal_pickle(value: bytes) -> bytes:
@@ -522,18 +520,7 @@ def test_scan_bytes_keeps_fail_closed_raw_scan_for_truncated_persid_after_encode
     benign_encoded = base64.b64encode(_benign_long_scalar_protocol0_pickle(b"V"))
     payload = benign_encoded + b"!Pevil\n"
 
-    report = scan_bytes(
-        pickle.dumps(container(payload), protocol=5),
-        source=f"encoded-plus-truncated-persid-{container.__name__}.pkl",
-    )
-
-    assert report.status == ScanStatus.INCONCLUSIVE
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert any(finding.rule_code == "PERSISTENT_ID" for finding in report.findings)
-    assert any(
-        finding.rule_code == "S213" and finding.details.get("analysis_incomplete") is True
-        for finding in report.findings
-    )
+    _assert_encoded_raw_scan(container, payload, f"encoded-plus-truncated-persid-{container.__name__}.pkl")
 
 
 @pytest.mark.parametrize("container", [bytes, bytearray])
@@ -543,18 +530,7 @@ def test_scan_bytes_keeps_raw_scan_after_invalid_base64_padding(
     benign_encoded = base64.b64encode(_benign_long_scalar_protocol0_pickle(b"V"))
     payload = benign_encoded + b"NQ"
 
-    report = scan_bytes(
-        pickle.dumps(container(payload), protocol=5),
-        source=f"base64-invalid-padding-raw-suffix-{container.__name__}.pkl",
-    )
-
-    assert report.status == ScanStatus.INCONCLUSIVE
-    assert report.verdict == SafetyVerdict.MALICIOUS
-    assert any(finding.rule_code == "PERSISTENT_ID" for finding in report.findings)
-    assert any(
-        finding.rule_code == "S213" and finding.details.get("analysis_incomplete") is True
-        for finding in report.findings
-    )
+    _assert_encoded_raw_scan(container, payload, f"base64-invalid-padding-raw-suffix-{container.__name__}.pkl")
 
 
 @pytest.mark.parametrize("container", [bytes, bytearray])
@@ -1603,3 +1579,18 @@ def test_scan_bytes_ignores_unstructured_nested_overlong_protocol0_near_match(
     assert report.verdict == SafetyVerdict.CLEAN
     assert not any(finding.rule_code == "S213" for finding in report.findings)
     assert not any(notice.code == "nested_pickle_incomplete" for notice in report.notices)
+
+
+def _assert_encoded_raw_scan(container: type[bytes] | type[bytearray], payload: bytes, source: str) -> None:
+    report = scan_bytes(
+        pickle.dumps(container(payload), protocol=5),
+        source=source,
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(finding.rule_code == "PERSISTENT_ID" for finding in report.findings)
+    assert any(
+        finding.rule_code == "S213" and finding.details.get("analysis_incomplete") is True
+        for finding in report.findings
+    )

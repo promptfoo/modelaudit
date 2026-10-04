@@ -56,63 +56,29 @@ class TestCompileEvalVariants:
 
     def test_globals_detection(self):
         """Test detection of globals() function."""
-        scanner = PickleScanner()
-
         # Create a pickle with globals() reference
-        pickle_bytes = b"\x80\x02cbuiltins\nglobals\nq\x00."
-
-        with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
-            f.write(pickle_bytes)
-            temp_path = f.name
-
-        try:
-            result = scanner.scan(temp_path)
-
-            # Should detect as dangerous
-            assert len(result.issues) > 0, "Should detect globals()"
-
-            # Check that globals was detected in patterns
-            pattern_detected = False
-            for issue in result.issues:
-                if "globals" in issue.message.lower():
-                    pattern_detected = True
-                    assert issue.severity == IssueSeverity.CRITICAL, "globals should be CRITICAL"
-                    break
-
-            assert pattern_detected, "Should detect globals pattern"
-
-        finally:
-            os.unlink(temp_path)
+        # Should detect as dangerous
+        # Check that globals was detected in patterns
+        _assert_critical_builtin_pickle(
+            (b"\x80\x02cbuiltins\nglobals\nq\x00."),
+            ("Should detect globals()"),
+            ("globals"),
+            ("globals should be CRITICAL"),
+            ("Should detect globals pattern"),
+        )
 
     def test_locals_detection(self):
         """Test detection of locals() function."""
-        scanner = PickleScanner()
-
         # Create a pickle with locals() reference
-        pickle_bytes = b"\x80\x02cbuiltins\nlocals\nq\x00."
-
-        with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
-            f.write(pickle_bytes)
-            temp_path = f.name
-
-        try:
-            result = scanner.scan(temp_path)
-
-            # Should detect as dangerous
-            assert len(result.issues) > 0, "Should detect locals()"
-
-            # Check that locals was detected
-            pattern_detected = False
-            for issue in result.issues:
-                if "locals" in issue.message.lower():
-                    pattern_detected = True
-                    assert issue.severity == IssueSeverity.CRITICAL, "locals should be CRITICAL"
-                    break
-
-            assert pattern_detected, "Should detect locals pattern"
-
-        finally:
-            os.unlink(temp_path)
+        # Should detect as dangerous
+        # Check that locals was detected
+        _assert_critical_builtin_pickle(
+            (b"\x80\x02cbuiltins\nlocals\nq\x00."),
+            ("Should detect locals()"),
+            ("locals"),
+            ("locals should be CRITICAL"),
+            ("Should detect locals pattern"),
+        )
 
     def test_builtins_access_detection(self):
         """Test detection of __builtins__ access."""
@@ -348,3 +314,36 @@ class TestCompileEvalVariants:
 
             finally:
                 os.unlink(temp_path)
+
+
+def _assert_critical_builtin_pickle(
+    case_pickle_bytes: bytes,
+    case_nonempty_message: str,
+    case_pattern: str,
+    case_severity_message: str,
+    case_pattern_message: str,
+) -> None:
+    scanner = PickleScanner()
+
+    pickle_bytes = case_pickle_bytes
+
+    with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
+        f.write(pickle_bytes)
+        temp_path = f.name
+
+    try:
+        result = scanner.scan(temp_path)
+
+        assert len(result.issues) > 0, case_nonempty_message
+
+        pattern_detected = False
+        for issue in result.issues:
+            if case_pattern in issue.message.lower():
+                pattern_detected = True
+                assert issue.severity == IssueSeverity.CRITICAL, case_severity_message
+                break
+
+        assert pattern_detected, case_pattern_message
+
+    finally:
+        os.unlink(temp_path)

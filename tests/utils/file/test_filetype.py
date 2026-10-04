@@ -54,15 +54,45 @@ from tests.helpers import (
     prefix_mock_onnx_with_unknown_field,
     prefix_mock_onnx_with_unknown_group,
 )
-from tests.helpers.file_creators import _coreml_field_bytes, _coreml_field_varint, create_v7_tar_archive
-
-
-def _ubjson_key(key: bytes) -> bytes:
-    return b"U" + bytes([len(key)]) + key
-
-
-def _ubjson_string(value: bytes) -> bytes:
-    return b"SL" + len(value).to_bytes(8, byteorder="big", signed=True) + value
+from tests.helpers.file_creators import (
+    _encode_protobuf_varint as _encode_proto_varint,
+)
+from tests.helpers.file_creators import (
+    bert_vocab_payload as _bert_vocab_payload,
+)
+from tests.helpers.file_creators import (
+    bpe_merges_payload as _bpe_merges_payload,
+)
+from tests.helpers.file_creators import (
+    create_v7_tar_archive,
+    write_sparse_safetensors_framing,
+)
+from tests.helpers.file_creators import (
+    printable_unknown_proto_prefix as _printable_unknown_proto_prefix,
+)
+from tests.helpers.file_creators import (
+    protobuf_bytes_field as _coreml_field_bytes,
+)
+from tests.helpers.file_creators import protobuf_bytes_field as _proto_length_field
+from tests.helpers.file_creators import (
+    protobuf_varint_field as _coreml_field_varint,
+)
+from tests.helpers.file_creators import protobuf_varint_field as _proto_varint_field
+from tests.helpers.file_creators import (
+    ubjson_key as _ubjson_key,
+)
+from tests.helpers.file_creators import (
+    ubjson_string as _ubjson_string,
+)
+from tests.helpers.file_creators import (
+    write_hf_tokenizer_json as _write_hf_tokenizer_json,
+)
+from tests.helpers.file_creators import (
+    write_ordered_hf_tokenizer_json as _write_ordered_hf_tokenizer_json,
+)
+from tests.helpers.file_creators import (
+    write_truncated_ordered_hf_tokenizer_json as _write_truncated_ordered_hf_tokenizer_json,
+)
 
 
 def _create_mar_archive(
@@ -78,50 +108,6 @@ def _create_mar_archive(
         archive.writestr("handler.py", b"def handle(data, context):\n    return data\n")
         archive.writestr("weights.bin", b"weights")
     return mar_path
-
-
-def _write_hf_tokenizer_json(path: Path, extra_fields: dict[str, Any] | None = None) -> Path:
-    payload: dict[str, Any] = {
-        "version": "1.0",
-        "added_tokens": [],
-        "model": {
-            "type": "BPE",
-            "vocab": {"hello": 0},
-            "merges": [],
-        },
-    }
-    if extra_fields:
-        payload.update(extra_fields)
-    path.write_text(json.dumps(payload), encoding="utf-8")
-    return path
-
-
-def _write_ordered_hf_tokenizer_json(
-    path: Path,
-    *,
-    late_fields: str = "",
-    padding_size: int = 0,
-    model_fields: str = '"type":"BPE","vocab":{"hello":0},"merges":[]',
-    version_json: str = '"1.0"',
-) -> Path:
-    padding = f',"padding":"{"x" * padding_size}"' if padding_size else ""
-    path.write_text(
-        (f'{{"version":{version_json},"added_tokens":[],"model":{{{model_fields}}}{padding}{late_fields}}}'),
-        encoding="utf-8",
-    )
-    return path
-
-
-def _write_truncated_ordered_hf_tokenizer_json(path: Path, *, padding_size: int) -> Path:
-    path.write_text(
-        (
-            '{"version":"1.0","added_tokens":[],'
-            '"model":{"type":"BPE","vocab":{"hello":0},"merges":[]},'
-            f'"padding":"{"x" * padding_size}'
-        ),
-        encoding="utf-8",
-    )
-    return path
 
 
 def _build_tf_metagraph_bytes() -> bytes:
@@ -208,58 +194,12 @@ def _build_tf_function_graph_bytes() -> bytes:
     return cast(bytes, graph.SerializeToString())
 
 
-def _encode_proto_varint(value: int) -> bytes:
-    out = bytearray()
-    while value >= 0x80:
-        out.append((value & 0x7F) | 0x80)
-        value >>= 7
-    out.append(value)
-    return bytes(out)
-
-
-def _proto_varint_field(field_number: int, value: int) -> bytes:
-    return _encode_proto_varint((field_number << 3) | 0) + _encode_proto_varint(value)
-
-
-def _proto_length_field(field_number: int, payload: bytes) -> bytes:
-    return _encode_proto_varint((field_number << 3) | 2) + _encode_proto_varint(len(payload)) + payload
-
-
 def _write_sparse_oversized_safetensors_candidate(
     path: Path,
     header_len: int = SAFETENSORS_ROUTING_HEADER_PARSE_BYTES + 1,
 ) -> None:
     """Write framing beyond the routing parse budget without allocating its header."""
-    with path.open("wb") as handle:
-        handle.write(struct.pack("<Q", header_len))
-        handle.write(b"{")
-        handle.truncate(8 + header_len + 1)
-
-
-def _printable_unknown_proto_prefix(min_bytes: int) -> bytes:
-    field = b"z " + (b"x" * 32)
-    return field * ((min_bytes // len(field)) + 1)
-
-
-def _bert_vocab_payload(min_bytes: int = 16 * 1024) -> bytes:
-    tokens = ["[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]"]
-    tokens.extend(f"[unused{index}]" for index in range(2048))
-    tokens.extend(f"token_{index}" for index in range(2048))
-    payload = ("\n".join(tokens) + "\n").encode("utf-8")
-    assert len(payload) > min_bytes
-    return payload
-
-
-def _bpe_merges_payload(min_bytes: int = 3 * 1024 * 1024) -> bytes:
-    lines = ["#version: 0.2"]
-    total_bytes = len(lines[0]) + 1
-    index = 0
-    while total_bytes <= min_bytes:
-        line = f"token_{index % 8192} token_{(index * 17) % 8192}"
-        lines.append(line)
-        total_bytes += len(line) + 1
-        index += 1
-    return ("\n".join(lines) + "\n").encode("utf-8")
+    write_sparse_safetensors_framing(path, header_len)
 
 
 def _large_model_card_payload(min_bytes: int = 3 * 1024 * 1024) -> bytes:
@@ -1143,6 +1083,57 @@ def test_detect_preset_dictionary_zlib_safetensors_overlap_retains_compression(t
     assert detect_file_format_from_magic(str(polyglot)) == "zlib"
     assert detect_file_format_for_skip_filter(str(polyglot)) == "zlib"
     assert detect_file_format(str(polyglot)) == "zlib"
+
+
+@pytest.mark.parametrize("header_length", [8312, 16248, 32120, 47992, 63864])
+def test_detect_native_safetensors_fdict_header_prefers_safetensors(tmp_path: Path, header_length: int) -> None:
+    metadata = b'{"tensor":{"dtype":"U8","shape":[1],"data_offsets":[0,1]}}'
+    metadata += b" " * (header_length - len(metadata))
+    safetensors_path = tmp_path / "model.safetensors"
+    safetensors_path.write_bytes(struct.pack("<Q", header_length) + metadata + b"\x00")
+
+    assert safetensors_path.read_bytes()[0] == 0x78
+    assert safetensors_path.read_bytes()[1] & 0x20
+    assert detect_file_format_from_magic(str(safetensors_path)) == "safetensors"
+    assert detect_file_format_for_skip_filter(str(safetensors_path)) == "safetensors"
+    assert detect_file_format(str(safetensors_path)) == "safetensors"
+
+
+@pytest.mark.parametrize("header_kind", ["oversized", "too_deep"])
+def test_detect_inconclusive_native_safetensors_fdict_header_retains_compression(
+    tmp_path: Path, header_kind: str
+) -> None:
+    path = tmp_path / "inconclusive.safetensors"
+    if header_kind == "oversized":
+        header_length = SAFETENSORS_ROUTING_HEADER_PARSE_BYTES + 0x2078
+        _write_sparse_oversized_safetensors_candidate(path, header_length)
+    else:
+        header_length = 0xF978
+        depth = 10_000
+        header = b'{"a":' + b"[" * depth + b"0" + b"]" * depth + b"}"
+        path.write_bytes(struct.pack("<Q", header_length) + header.ljust(header_length) + b"\x00")
+
+    with path.open("rb") as handle:
+        prefix = handle.read(2)
+    assert prefix[0] == 0x78
+    assert prefix[1] & 0x20
+    assert detect_file_format_from_magic(str(path)) == "zlib"
+    assert detect_file_format_for_skip_filter(str(path)) == "zlib"
+    assert detect_file_format(str(path)) == "zlib"
+
+
+def test_detect_genuine_fdict_zlib_named_safetensors_remains_zlib(tmp_path: Path) -> None:
+    zdict = b"modelaudit-preset-dictionary"
+    compressor = zlib.compressobj(level=6, zdict=zdict)
+    payload = compressor.compress(b'{"tensor":{"dtype":"U8"}}') + compressor.flush()
+    zlib_path = tmp_path / "compressed.safetensors"
+    zlib_path.write_bytes(payload)
+
+    assert zlib_path.read_bytes()[0] == 0x78
+    assert zlib_path.read_bytes()[1] & 0x20
+    assert detect_file_format_from_magic(str(zlib_path)) == "zlib"
+    assert detect_file_format_for_skip_filter(str(zlib_path)) == "zlib"
+    assert detect_file_format(str(zlib_path)) == "zlib"
 
 
 def test_oversized_safetensors_compression_probe_keeps_small_bound(
@@ -2286,25 +2277,13 @@ def test_hf_tokenizer_json_jax_identity_is_not_claimed(tmp_path: Path) -> None:
 
 
 def test_hf_tokenizer_json_jax_route_evidence_requires_identity_value(tmp_path: Path) -> None:
-    tokenizer_path = _write_ordered_hf_tokenizer_json(
-        tmp_path / "tokenizer.json",
-        late_fields=(',"chat_template":"{{ harmless_user }}","framework":"transformers"'),
+    _assert_tokenizer_route_evidence(
+        tmp_path, ',"chat_template":"{{ harmless_user }}","framework":"transformers"', False
     )
-
-    assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
-    assert file_detection.huggingface_tokenizer_json_has_template_route_evidence(tokenizer_path) is True
-    assert file_detection.huggingface_tokenizer_json_has_jax_route_evidence(tokenizer_path) is False
 
 
 def test_hf_tokenizer_json_jax_route_evidence_accepts_library_identity_value(tmp_path: Path) -> None:
-    tokenizer_path = _write_ordered_hf_tokenizer_json(
-        tmp_path / "tokenizer.json",
-        late_fields=(',"chat_template":"{{ harmless_user }}","library":"jax"'),
-    )
-
-    assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
-    assert file_detection.huggingface_tokenizer_json_has_template_route_evidence(tokenizer_path) is True
-    assert file_detection.huggingface_tokenizer_json_has_jax_route_evidence(tokenizer_path) is True
+    _assert_tokenizer_route_evidence(tmp_path, ',"chat_template":"{{ harmless_user }}","library":"jax"', True)
 
 
 def test_hf_tokenizer_json_vocab_template_token_is_claimed(tmp_path: Path) -> None:
@@ -2415,14 +2394,7 @@ def test_detect_generic_json_hint_before_value_budget_resolves_later_mxnet_struc
 def test_detect_generic_array_heads_before_value_budget_without_mxnet_structure_remains_unclaimed(
     tmp_path: Path,
 ) -> None:
-    model_path = tmp_path / "config.json"
-    model_path.write_text(
-        '{"heads":["classification"],"padding":[' + ",".join("0" for _ in range(5000)) + "]}",
-        encoding="utf-8",
-    )
-
-    assert detect_file_format(str(model_path)) == "unknown"
-    assert detect_file_format_from_magic(str(model_path)) == "unknown"
+    _assert_generic_json_structure_unclaimed(tmp_path, ("config.json"), ('{"heads":["classification"],"padding":['))
 
 
 def test_detect_oversized_malformed_renamed_mxnet_preserves_established_route(
@@ -2788,14 +2760,7 @@ def test_detect_generic_json_value_budget_without_mxnet_hint_remains_unclaimed(t
 
 
 def test_detect_generic_scalar_heads_value_budget_remains_unclaimed(tmp_path: Path) -> None:
-    model_path = tmp_path / "metadata.json"
-    model_path.write_text(
-        '{"heads":"main","padding":[' + ",".join("0" for _ in range(5000)) + "]}",
-        encoding="utf-8",
-    )
-
-    assert detect_file_format(str(model_path)) == "unknown"
-    assert detect_file_format_from_magic(str(model_path)) == "unknown"
+    _assert_generic_json_structure_unclaimed(tmp_path, ("metadata.json"), ('{"heads":"main","padding":['))
 
 
 def test_detect_mxnet_integer_decode_limit_fails_closed(tmp_path: Path) -> None:
@@ -2922,29 +2887,11 @@ def test_detect_renamed_lightgbm_does_not_promote_embedded_model_text(tmp_path: 
 
 def test_detect_tf_metagraph_by_strict_parse(tmp_path: Path) -> None:
     """Detect TensorFlow MetaGraph `.meta` files through strict protobuf parsing."""
-    if not _has_tf_protos():
-        pytest.skip("TensorFlow protobuf stubs unavailable")
-
-    metagraph_path = tmp_path / "graph.meta"
-    metagraph_path.write_bytes(_build_tf_metagraph_bytes())
-
-    assert detect_format_from_extension(str(metagraph_path)) == "tf_metagraph"
-    assert detect_file_format(str(metagraph_path)) == "tf_metagraph"
-    assert detect_file_format_from_magic(str(metagraph_path)) == "tf_metagraph"
-    assert validate_file_type(str(metagraph_path)) is True
+    _assert_tf_metagraph_structure_routing(tmp_path, ("graph.meta"), ("tf_metagraph"))
 
 
 def test_detect_tf_metagraph_pb_suffix_validates_when_routed_by_content(tmp_path: Path) -> None:
-    if not _has_tf_protos():
-        pytest.skip("TensorFlow protobuf stubs unavailable")
-
-    metagraph_path = tmp_path / "graph.pb"
-    metagraph_path.write_bytes(_build_tf_metagraph_bytes())
-
-    assert detect_format_from_extension(str(metagraph_path)) == "protobuf"
-    assert detect_file_format(str(metagraph_path)) == "tf_metagraph"
-    assert detect_file_format_from_magic(str(metagraph_path)) == "tf_metagraph"
-    assert validate_file_type(str(metagraph_path)) is True
+    _assert_tf_metagraph_structure_routing(tmp_path, ("graph.pb"), ("protobuf"))
 
 
 def test_detect_tf_savedmodel_meta_suffix_validates_when_routed_by_content(tmp_path: Path) -> None:
@@ -3854,16 +3801,7 @@ def test_detect_file_format_disguised_compressed_tar_by_content(tmp_path: Path) 
 
 @pytest.mark.parametrize("config_name", ["model_config.yaml", "./model_config.yaml", "configs/../model_config.yaml"])
 def test_detect_file_format_routes_renamed_nemo_archive_by_root_config(tmp_path: Path, config_name: str) -> None:
-    archive_path = tmp_path / "model.jpg"
-    with tarfile.open(archive_path, "w") as archive:
-        info = tarfile.TarInfo(config_name)
-        payload = b"model:\n  _target_: os.system\n"
-        info.size = len(payload)
-        archive.addfile(info, io.BytesIO(payload))
-
-    assert detect_file_format(str(archive_path)) == "nemo"
-    assert detect_file_format_from_magic(str(archive_path)) == "nemo"
-    assert detect_file_format_for_skip_filter(str(archive_path)) == "nemo"
+    _assert_tar_config_routing(tmp_path, config_name, "model.jpg", "nemo")
 
 
 @pytest.mark.parametrize("link_type", [tarfile.SYMTYPE, tarfile.LNKTYPE])
@@ -4135,16 +4073,7 @@ def test_detect_file_format_routes_cyclic_root_config_symlink_for_fail_closed_sc
     ],
 )
 def test_detect_file_format_keeps_non_root_config_names_on_tar_route(tmp_path: Path, config_name: str) -> None:
-    archive_path = tmp_path / "generic.jpg"
-    with tarfile.open(archive_path, "w") as archive:
-        info = tarfile.TarInfo(config_name)
-        payload = b"model:\n  _target_: os.system\n"
-        info.size = len(payload)
-        archive.addfile(info, io.BytesIO(payload))
-
-    assert detect_file_format(str(archive_path)) == "tar"
-    assert detect_file_format_from_magic(str(archive_path)) == "tar"
-    assert detect_file_format_for_skip_filter(str(archive_path)) == "tar"
+    _assert_tar_config_routing(tmp_path, config_name, "generic.jpg", "tar")
 
 
 @pytest.mark.parametrize("link_type", [tarfile.SYMTYPE, tarfile.LNKTYPE])
@@ -4424,41 +4353,11 @@ def test_extensionless_llamafile_route_preempts_tflite_header_bytes(tmp_path: Pa
 
 
 def test_detect_file_format_routes_extensionless_xgboost_ubjson_by_structure(tmp_path: Path) -> None:
-    model_file = tmp_path / "model"
-    model_file.write_bytes(
-        b"{"
-        + _ubjson_key(b"learner")
-        + b"{"
-        + _ubjson_key(b"learner_model_param")
-        + b"{}"
-        + b"}"
-        + _ubjson_key(b"version")
-        + b"[]"
-        + b"}"
-    )
-
-    assert detect_file_format(str(model_file)) == "xgboost"
-    assert detect_file_format_from_magic(str(model_file)) == "xgboost"
-    assert detect_file_format_for_skip_filter(str(model_file)) == "xgboost"
+    _assert_xgboost_ubjson_structure_routing(tmp_path, (b"{"))
 
 
 def test_detect_file_format_routes_extensionless_xgboost_ubjson_with_noop_before_learner(tmp_path: Path) -> None:
-    model_file = tmp_path / "model"
-    model_file.write_bytes(
-        b"{"
-        + _ubjson_key(b"learner")
-        + b"N{"
-        + _ubjson_key(b"learner_model_param")
-        + b"{}"
-        + b"}"
-        + _ubjson_key(b"version")
-        + b"[]"
-        + b"}"
-    )
-
-    assert detect_file_format(str(model_file)) == "xgboost"
-    assert detect_file_format_from_magic(str(model_file)) == "xgboost"
-    assert detect_file_format_for_skip_filter(str(model_file)) == "xgboost"
+    _assert_xgboost_ubjson_structure_routing(tmp_path, (b"N{"))
 
 
 def test_extensionless_xgboost_route_preempts_incidental_tflite_identifier(tmp_path: Path) -> None:
@@ -5558,3 +5457,70 @@ def test_hf_tokenizer_json_eof_proof_rejects_flat_deep_duplicate_and_invalid_utf
         b'{"version":"1.0","added_tokens":[],"model":{"type":"BPE","vocab":{"\xff":0},"merges":[]}}'
     )
     assert file_detection._hf_tokenizer_json_eof_proves_ownership(invalid_utf8_path) is False
+
+
+def _assert_xgboost_ubjson_structure_routing(tmp_path: Path, case_parameter_marker: bytes) -> None:
+    model_file = tmp_path / "model"
+    model_file.write_bytes(
+        b"{"
+        + _ubjson_key(b"learner")
+        + case_parameter_marker
+        + _ubjson_key(b"learner_model_param")
+        + b"{}"
+        + b"}"
+        + _ubjson_key(b"version")
+        + b"[]"
+        + b"}"
+    )
+
+    assert detect_file_format(str(model_file)) == "xgboost"
+    assert detect_file_format_from_magic(str(model_file)) == "xgboost"
+    assert detect_file_format_for_skip_filter(str(model_file)) == "xgboost"
+
+
+def _assert_tf_metagraph_structure_routing(tmp_path: Path, case_filename: str, case_extension_format: str) -> None:
+    if not _has_tf_protos():
+        pytest.skip("TensorFlow protobuf stubs unavailable")
+
+    metagraph_path = tmp_path / case_filename
+    metagraph_path.write_bytes(_build_tf_metagraph_bytes())
+
+    assert detect_format_from_extension(str(metagraph_path)) == case_extension_format
+    assert detect_file_format(str(metagraph_path)) == "tf_metagraph"
+    assert detect_file_format_from_magic(str(metagraph_path)) == "tf_metagraph"
+    assert validate_file_type(str(metagraph_path)) is True
+
+
+def _assert_generic_json_structure_unclaimed(tmp_path: Path, case_filename: str, case_prefix: str) -> None:
+    model_path = tmp_path / case_filename
+    model_path.write_text(
+        case_prefix + ",".join("0" for _ in range(5000)) + "]}",
+        encoding="utf-8",
+    )
+
+    assert detect_file_format(str(model_path)) == "unknown"
+    assert detect_file_format_from_magic(str(model_path)) == "unknown"
+
+
+def _assert_tar_config_routing(tmp_path: Path, config_name: str, case_filename: str, case_expected_format: str) -> None:
+    archive_path = tmp_path / case_filename
+    with tarfile.open(archive_path, "w") as archive:
+        info = tarfile.TarInfo(config_name)
+        payload = b"model:\n  _target_: os.system\n"
+        info.size = len(payload)
+        archive.addfile(info, io.BytesIO(payload))
+
+    assert detect_file_format(str(archive_path)) == case_expected_format
+    assert detect_file_format_from_magic(str(archive_path)) == case_expected_format
+    assert detect_file_format_for_skip_filter(str(archive_path)) == case_expected_format
+
+
+def _assert_tokenizer_route_evidence(tmp_path: Path, case_late_fields: str, case_expected_jax: bool) -> None:
+    tokenizer_path = _write_ordered_hf_tokenizer_json(
+        tmp_path / "tokenizer.json",
+        late_fields=(case_late_fields),
+    )
+
+    assert is_huggingface_tokenizer_json_file(tokenizer_path) is False
+    assert file_detection.huggingface_tokenizer_json_has_template_route_evidence(tokenizer_path) is True
+    assert file_detection.huggingface_tokenizer_json_has_jax_route_evidence(tokenizer_path) is case_expected_jax

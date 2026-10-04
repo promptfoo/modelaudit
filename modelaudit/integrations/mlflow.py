@@ -14,16 +14,18 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import unquote, urlparse
 
-from ..detectors.network_comm import _redact_urls_in_text
-from ..models import Check, CheckStatus, Issue, IssueSeverity, ModelAuditResultModel, create_initial_audit_result
-from ..scanners._evidence_redaction import (
-    MAX_PERCENT_DECODE_PASSES,
-    MAX_REDACTION_VALUE_DEPTH,
-    SENSITIVE_CONTAINER_KEY,
-    redact_evidence_string,
-    redact_evidence_value,
+from ..finding_identity import preserve_finding_identity
+from ..models import (
+    Check,
+    CheckStatus,
+    FileMetadataModel,
+    Issue,
+    IssueSeverity,
+    ModelAuditResultModel,
+    create_initial_audit_result,
 )
-from ..utils.sources.cloud_storage import redact_cloud_error_for_display, redact_url_for_display
+from ..utils.helpers.evidence import format_evidence_string, format_evidence_value, format_terminal_text
+from ._mlflow_identity import mlflow_source_identity
 
 logger = logging.getLogger(__name__)
 
@@ -52,33 +54,6 @@ _MLFLOW_URI_SCHEMES_REQUIRING_AUTHORITY = {
 _MLFLOW_PERCENT_ESCAPE_RE = re.compile(r"%[0-9A-Fa-f]{2}")
 _OS_OPEN_SUPPORTS_DIR_FD = os.open in os.supports_dir_fd
 _IS_WINDOWS = os.name == "nt"
-_MLFLOW_SENSITIVE_KEY = rf"(?:{SENSITIVE_CONTAINER_KEY}|credentials?|jwt|session)"
-_MLFLOW_SENSITIVE_ASSIGNMENT_RE = re.compile(
-    r"(?ix)"
-    r"(?P<prefix>(?<![\w-])[\"']?"
-    rf"{_MLFLOW_SENSITIVE_KEY}"
-    r"[\"']?\s*[:=]\s*)"
-    r"(?P<value>\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|(?:(?:bearer|basic|token)\s+)?[^\s,;&}\]]+)"
-)
-_MLFLOW_BRACKETED_SENSITIVE_ASSIGNMENT_RE = re.compile(
-    r"(?ix)"
-    r"(?P<prefix>(?<![\w-])(?:[a-z_][\w-]*\.)*(?:headers?|params?|query)\s*\[\s*[\"']?"
-    rf"(?:{_MLFLOW_SENSITIVE_KEY}|key)[\"']?\s*\]\s*[:=]\s*)"
-    r"(?P<value>\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|(?:(?:bearer|basic|token)\s+)?[^\s,;&}\]]+)"
-)
-_MLFLOW_SENSITIVE_CONTAINER_PREFIX_RE = re.compile(
-    r"(?ix)"
-    r"(?P<prefix>(?<![\w-])[\"']?"
-    rf"{_MLFLOW_SENSITIVE_KEY}"
-    r"[\"']?\s*[:=]\s*)"
-    r"(?P<open>[({\[])",
-)
-_MLFLOW_PROTOCOL_RELATIVE_URL_RE = re.compile(
-    r"(?i)(?:(?:[\\/]|%(?:25)*(?:2f|5c)){2,})[^\s\"'<>]+",
-)
-_MLFLOW_BENIGN_AUTH_CONTEXT_RE = re.compile(
-    r"(?i)\b(?:bearer|basic|token)(?=\s+(?:authentication|endpoint|refresh|service)\b)",
-)
 
 
 @dataclass(frozen=True)
@@ -87,13 +62,6 @@ class _MlflowArtifact:
     size: int
     source_root: Path | None = None
     source_path: str | None = None
-
-
-@dataclass(frozen=True)
-class _MlflowArtifactInfo:
-    path: str
-    is_dir: bool
-    file_size: int | None
 
 
 @dataclass(frozen=True)
@@ -154,10 +122,6 @@ class _MlflowArtifactSetChangedError(Exception):
         self.removed_paths = removed_paths
 
 
-def _finite_budget(max_file_size: int, max_total_size: int) -> bool:
-    return max_file_size > 0 or max_total_size > 0
-
-
 def _normalize_max_artifact_entries(value: Any) -> int:
     try:
         normalized = int(value)
@@ -197,24 +161,32 @@ def _split_mlflow_artifact_uri(mlflow_module: Any, model_uri: str) -> tuple[str,
     return f"models:/{parts[0]}/{parts[1]}", "/".join(parts[2:])
 
 
-def _mlflow_budget_failure_result(model_uri: str, message: str, details: dict[str, Any]) -> ModelAuditResultModel:
+def _mlflow_report_source_identifier(model_uri: str) -> str:
+    """Keep lossy source previews distinct without exceeding the evidence bound."""
+    marker = "#modelaudit-source-sha256-"
+    preview = format_evidence_string(model_uri, max_chars=_MAX_MLFLOW_ERROR_DISPLAY_CHARS)
+    if preview == model_uri and marker not in model_uri:
+        return preview
+    # Reserve the suffix syntax so a literal URI cannot impersonate a generated identifier.
+    digest = hashlib.sha256(model_uri.encode("utf-8", errors="surrogatepass")).hexdigest()
+    return preview[: _MAX_MLFLOW_ERROR_DISPLAY_CHARS - len(marker) - len(digest)] + marker + digest
+
+
+def _mlflow_acquisition_failure_result(
+    model_uri: str, message: str, details: dict[str, Any], *, check_name: str, issue_type: str, why: str
+) -> ModelAuditResultModel:
     result = create_initial_audit_result()
     result.scanner_names = ["mlflow"]
     result.has_errors = True
     result.success = False
-    safe_model_uri = _redact_mlflow_detail_value_for_display(model_uri)
-    safe_details = redact_evidence_value(
-        _redact_mlflow_detail_value_for_display(details),
+    safe_model_uri = _mlflow_report_source_identifier(model_uri)
+    safe_details = format_evidence_value(
+        details,
         max_string_chars=_MAX_MLFLOW_ERROR_DISPLAY_CHARS,
-    )
-
-    why = (
-        "ModelAudit cannot safely acquire this MLflow artifact within the configured scan budget. "
-        "Refusing the download avoids unbounded network, disk, or elapsed-time use before scanning begins."
     )
     result.checks.append(
         Check(
-            name=_MLFLOW_DOWNLOAD_BUDGET_CHECK,
+            name=check_name,
             status=CheckStatus.FAILED,
             message=message,
             severity=IssueSeverity.INFO,
@@ -230,11 +202,31 @@ def _mlflow_budget_failure_result(model_uri: str, message: str, details: dict[st
             location=safe_model_uri,
             details=safe_details,
             why=why,
-            type="mlflow_download_budget",
+            type=issue_type,
         )
+    )
+    identity_location = mlflow_source_identity(model_uri)
+    for record in [result.issues[-1], result.checks[-1]]:
+        preserve_finding_identity(record, "mlflow_acquisition", location=identity_location)
+    result.file_metadata[safe_model_uri] = FileMetadataModel(
+        source_identity={"producer": "mlflow_acquisition", "path": identity_location}
     )
     result.finalize_statistics()
     return result
+
+
+def _mlflow_budget_failure_result(model_uri: str, message: str, details: dict[str, Any]) -> ModelAuditResultModel:
+    return _mlflow_acquisition_failure_result(
+        model_uri,
+        message,
+        details,
+        check_name=_MLFLOW_DOWNLOAD_BUDGET_CHECK,
+        issue_type="mlflow_download_budget",
+        why=(
+            "ModelAudit cannot safely acquire this MLflow artifact within the configured scan budget. "
+            "Refusing the download avoids unbounded network, disk, or elapsed-time use before scanning begins."
+        ),
+    )
 
 
 def _mlflow_artifact_trust_failure_result(
@@ -242,44 +234,18 @@ def _mlflow_artifact_trust_failure_result(
     message: str,
     details: dict[str, Any],
 ) -> ModelAuditResultModel:
-    result = create_initial_audit_result()
-    result.scanner_names = ["mlflow"]
-    result.has_errors = True
-    result.success = False
-    safe_model_uri = _redact_mlflow_detail_value_for_display(model_uri)
-    safe_details = redact_evidence_value(
-        _redact_mlflow_detail_value_for_display(details),
-        max_string_chars=_MAX_MLFLOW_ERROR_DISPLAY_CHARS,
+    return _mlflow_acquisition_failure_result(
+        model_uri,
+        message,
+        details,
+        check_name=_MLFLOW_ARTIFACT_TRUST_CHECK,
+        issue_type=_MLFLOW_ARTIFACT_TRUST_FAILURE_TYPE,
+        why=(
+            "ModelAudit requires non-local MLflow artifact repositories to match a local allowlist before delegating "
+            "artifact retrieval to MLflow. Refusing the download avoids fetching from an unapproved "
+            "registry-controlled artifact store before scanners run."
+        ),
     )
-
-    why = (
-        "ModelAudit requires non-local MLflow artifact repositories to match a local allowlist before delegating "
-        "artifact retrieval to MLflow. Refusing the download avoids fetching from an unapproved registry-controlled "
-        "artifact store before scanners run."
-    )
-    result.checks.append(
-        Check(
-            name=_MLFLOW_ARTIFACT_TRUST_CHECK,
-            status=CheckStatus.FAILED,
-            message=message,
-            severity=IssueSeverity.INFO,
-            location=safe_model_uri,
-            details=safe_details,
-            why=why,
-        )
-    )
-    result.issues.append(
-        Issue(
-            message=message,
-            severity=IssueSeverity.INFO,
-            location=safe_model_uri,
-            details=safe_details,
-            why=why,
-            type=_MLFLOW_ARTIFACT_TRUST_FAILURE_TYPE,
-        )
-    )
-    result.finalize_statistics()
-    return result
 
 
 def _mlflow_download_safety_failure_result(
@@ -287,46 +253,20 @@ def _mlflow_download_safety_failure_result(
     message: str,
     details: dict[str, Any],
 ) -> ModelAuditResultModel:
-    result = create_initial_audit_result()
-    result.scanner_names = ["mlflow"]
-    result.has_errors = True
-    result.success = False
-    safe_model_uri = _redact_mlflow_detail_value_for_display(model_uri)
-    safe_details = redact_evidence_value(
-        _redact_mlflow_detail_value_for_display(details),
-        max_string_chars=_MAX_MLFLOW_ERROR_DISPLAY_CHARS,
+    return _mlflow_acquisition_failure_result(
+        model_uri,
+        message,
+        details,
+        check_name="MLflow Download Path Check",
+        issue_type="mlflow_download_path",
+        why=(
+            "ModelAudit stages MLflow downloads in a private directory before scanning. "
+            "Refusing paths outside that directory, unavailable entries, unsupported filesystem objects, directory "
+            "links, and externally linked files "
+            "prevents a registry or artifact backend from redirecting the scan to unintended local files or devices "
+            "and from blocking or bypassing the scanner through the staged filesystem tree."
+        ),
     )
-
-    why = (
-        "ModelAudit stages MLflow downloads in a private directory before scanning. "
-        "Refusing paths outside that directory, unavailable entries, unsupported filesystem objects, directory "
-        "links, and externally linked files "
-        "prevents a registry or artifact backend from redirecting the scan to unintended local files or devices "
-        "and from blocking or bypassing the scanner through the staged filesystem tree."
-    )
-    result.checks.append(
-        Check(
-            name="MLflow Download Path Check",
-            status=CheckStatus.FAILED,
-            message=message,
-            severity=IssueSeverity.INFO,
-            location=safe_model_uri,
-            details=safe_details,
-            why=why,
-        )
-    )
-    result.issues.append(
-        Issue(
-            message=message,
-            severity=IssueSeverity.INFO,
-            location=safe_model_uri,
-            details=safe_details,
-            why=why,
-            type="mlflow_download_path",
-        )
-    )
-    result.finalize_statistics()
-    return result
 
 
 def _configured_mlflow_artifact_uri_prefixes() -> tuple[str, ...]:
@@ -705,147 +645,8 @@ def _trusted_mlflow_delegated_download_plan(
     return _MlflowDelegatedDownloadPlan(remote_targets, local_plan)
 
 
-def _redact_mlflow_error_for_display(error: object) -> str:
-    def _replace_sensitive_value(match: re.Match[str]) -> str:
-        value = match.group("value")
-        quote = value[0] if value[:1] in {'"', "'"} else ""
-        return f"{match.group('prefix')}{quote}<redacted>{quote}"
-
-    def _redact_protocol_relative_url(match: re.Match[str]) -> str:
-        candidate = match.group(0)
-        decoded = candidate
-        for _ in range(MAX_PERCENT_DECODE_PASSES):
-            next_decoded = unquote(decoded)
-            if next_decoded == decoded:
-                break
-            decoded = next_decoded
-
-        normalized = decoded.replace("\\/", "/").replace("\\", "/")
-        if len(normalized) - len(normalized.lstrip("/")) < 2:
-            return candidate
-        normalized = f"//{normalized.lstrip('/')}"
-        authority = normalized[2:].split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
-        if "@" not in authority:
-            return candidate
-
-        safe_url = redact_url_for_display(f"https:{normalized}")
-        return safe_url.removeprefix("https:")
-
-    def _redact_sensitive_containers(text: str) -> str:
-        parts: list[str] = []
-        cursor = 0
-        closing_delimiters = {"(": ")", "[": "]", "{": "}"}
-
-        while match := _MLFLOW_SENSITIVE_CONTAINER_PREFIX_RE.search(text, cursor):
-            parts.append(text[cursor : match.start()])
-            parts.append(f"{match.group('prefix')}<redacted>")
-            stack = [closing_delimiters[match.group("open")]]
-            quote: str | None = None
-            escaped = False
-            index = match.end()
-
-            while index < len(text) and stack:
-                character = text[index]
-                if quote is not None:
-                    if escaped:
-                        escaped = False
-                    elif character == "\\":
-                        escaped = True
-                    elif character == quote:
-                        quote = None
-                elif character in {'"', "'"}:
-                    quote = character
-                elif character in closing_delimiters:
-                    if len(stack) >= MAX_REDACTION_VALUE_DEPTH:
-                        index = len(text)
-                        break
-                    stack.append(closing_delimiters[character])
-                elif character == stack[-1]:
-                    stack.pop()
-                index += 1
-
-            if stack:
-                cursor = len(text)
-                break
-            cursor = index
-
-        parts.append(text[cursor:])
-        return "".join(parts)
-
-    redacted = _MLFLOW_PROTOCOL_RELATIVE_URL_RE.sub(_redact_protocol_relative_url, str(error))
-    redacted = _redact_sensitive_containers(redacted)
-    redacted = _MLFLOW_BRACKETED_SENSITIVE_ASSIGNMENT_RE.sub(_replace_sensitive_value, redacted)
-    redacted = _MLFLOW_SENSITIVE_ASSIGNMENT_RE.sub(_replace_sensitive_value, redacted)
-    contains_url = bool(
-        re.search(r"(?i)(?:\b[a-z][a-z0-9+.-]*://|\bmodels:/)", redacted)
-        or _MLFLOW_PROTOCOL_RELATIVE_URL_RE.search(redacted)
-    )
-    if contains_url:
-        redacted = redact_cloud_error_for_display(_redact_urls_in_text(redacted))
-    redacted = _MLFLOW_PROTOCOL_RELATIVE_URL_RE.sub(_redact_protocol_relative_url, redacted)
-    redacted = _MLFLOW_BRACKETED_SENSITIVE_ASSIGNMENT_RE.sub(_replace_sensitive_value, redacted)
-    redacted = _MLFLOW_SENSITIVE_ASSIGNMENT_RE.sub(_replace_sensitive_value, redacted)
-
-    benign_auth_contexts: list[tuple[str, str]] = []
-
-    def _protect_benign_auth_context(match: re.Match[str]) -> str:
-        placeholder = f"MODELAUDITMLFLOWSAFECONTEXT{len(benign_auth_contexts)}"
-        benign_auth_contexts.append((placeholder, match.group(0)))
-        return placeholder
-
-    redacted = _MLFLOW_BENIGN_AUTH_CONTEXT_RE.sub(_protect_benign_auth_context, redacted)
-    if contains_url:
-        redacted = redact_evidence_string(redacted, max_chars=None)
-    else:
-        redacted = "&".join(redact_evidence_string(part, max_chars=None) for part in redacted.split("&"))
-    for placeholder, original in benign_auth_contexts:
-        redacted = redacted.replace(placeholder, original)
-
-    if len(redacted) <= _MAX_MLFLOW_ERROR_DISPLAY_CHARS:
-        return redacted
-    return f"{redacted[: _MAX_MLFLOW_ERROR_DISPLAY_CHARS - 3]}..."
-
-
-def _mlflow_text_requires_specialized_redaction(text: str) -> bool:
-    if "models:/" in text.lower():
-        return True
-    if _MLFLOW_BRACKETED_SENSITIVE_ASSIGNMENT_RE.search(text) or _MLFLOW_SENSITIVE_CONTAINER_PREFIX_RE.search(text):
-        return True
-    for match in _MLFLOW_PROTOCOL_RELATIVE_URL_RE.finditer(text):
-        candidate = match.group(0)
-        if candidate.startswith("//") and re.search(r"(?i)[a-z][a-z0-9+.-]*:$", text[: match.start()]):
-            continue
-        decoded = candidate
-        for _ in range(MAX_PERCENT_DECODE_PASSES):
-            next_decoded = unquote(decoded)
-            if next_decoded == decoded:
-                break
-            decoded = next_decoded
-        normalized = decoded.replace("\\/", "/").replace("\\", "/")
-        authority = normalized.lstrip("/").split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
-        if "@" in authority:
-            return True
-    return False
-
-
-def _redact_mlflow_detail_value_for_display(value: Any, *, depth: int = 0) -> Any:
-    if depth >= MAX_REDACTION_VALUE_DEPTH:
-        return "<redacted>"
-    if isinstance(value, str):
-        specialized = (
-            _redact_mlflow_error_for_display(value) if _mlflow_text_requires_specialized_redaction(value) else value
-        )
-        return redact_evidence_string(specialized, max_chars=_MAX_MLFLOW_ERROR_DISPLAY_CHARS)
-    if isinstance(value, dict):
-        return {
-            key: _redact_mlflow_detail_value_for_display(nested_value, depth=depth + 1)
-            for key, nested_value in value.items()
-        }
-    if isinstance(value, list):
-        return [_redact_mlflow_detail_value_for_display(item, depth=depth + 1) for item in value]
-    if isinstance(value, tuple):
-        return tuple(_redact_mlflow_detail_value_for_display(item, depth=depth + 1) for item in value)
-    return value
+def _format_mlflow_error(error: object) -> str:
+    return format_evidence_string(str(error), max_chars=_MAX_MLFLOW_ERROR_DISPLAY_CHARS)
 
 
 def _terminal_mlflow_artifact_repository(artifact_repository: Any) -> Any | None:
@@ -1385,7 +1186,7 @@ def _preflight_local_mlflow_sources(
         details.update(
             {
                 "reason": "artifact_size_unavailable",
-                "error": _redact_mlflow_error_for_display(exc),
+                "error": _format_mlflow_error(exc),
             }
         )
         return _mlflow_budget_failure_result(
@@ -1444,7 +1245,7 @@ def _preflight_mlflow_download_budget(
     max_total_size: int,
     max_artifact_entries: int,
 ) -> _MlflowDownloadPlan | _MlflowDelegatedDownloadPlan | ModelAuditResultModel:
-    has_finite_budget = _finite_budget(max_file_size, max_total_size)
+    has_finite_budget = max_file_size > 0 or max_total_size > 0
     root_uri, initial_artifact_path = _split_mlflow_artifact_uri(mlflow_module, model_uri)
     details: dict[str, Any] = {
         "model_uri": model_uri,
@@ -1461,7 +1262,7 @@ def _preflight_mlflow_download_budget(
             raise ValueError("Artifact repository wrapper chain could not be resolved")
     except Exception as e:
         details["reason"] = "artifact_size_unavailable"
-        details["error"] = _redact_mlflow_error_for_display(e)
+        details["error"] = _format_mlflow_error(e)
         return _mlflow_budget_failure_result(
             model_uri,
             "Unable to determine MLflow artifact size before download",
@@ -1475,7 +1276,7 @@ def _preflight_mlflow_download_budget(
             details.update(
                 {
                     "reason": "artifact_size_unavailable",
-                    "error": _redact_mlflow_error_for_display(exc),
+                    "error": _format_mlflow_error(exc),
                 }
             )
             return _mlflow_budget_failure_result(
@@ -1483,34 +1284,19 @@ def _preflight_mlflow_download_budget(
                 "Unable to determine MLflow artifact size before download",
                 details,
             )
-        if local_sources is None:
-            if not has_finite_budget:
-                return _trusted_mlflow_delegated_download_plan(
-                    model_uri,
-                    root_uri,
-                    details,
-                    artifact_repository,
-                    max_file_size=max_file_size,
-                    max_total_size=max_total_size,
-                    max_artifact_entries=max_artifact_entries,
-                )
-            details["reason"] = "artifact_streaming_budget_unavailable"
-            return _mlflow_budget_failure_result(
+        if local_sources is not None:
+            return _preflight_local_mlflow_sources(
                 model_uri,
-                "MLflow artifact repository cannot enforce the configured download budget",
+                root_uri,
+                local_sources,
                 details,
+                max_file_size=max_file_size,
+                max_total_size=max_total_size,
+                max_artifact_entries=max_artifact_entries,
             )
-        return _preflight_local_mlflow_sources(
-            model_uri,
-            root_uri,
-            local_sources,
-            details,
-            max_file_size=max_file_size,
-            max_total_size=max_total_size,
-            max_artifact_entries=max_artifact_entries,
-        )
-
-    local_artifact_root = _local_mlflow_artifact_root(artifact_repository)
+        local_artifact_root = None
+    else:
+        local_artifact_root = _local_mlflow_artifact_root(artifact_repository)
     if local_artifact_root is None:
         if not has_finite_budget:
             return _trusted_mlflow_delegated_download_plan(
@@ -1671,7 +1457,7 @@ def _preflight_mlflow_download_budget(
                     )
     except Exception as e:
         details["reason"] = "artifact_size_unavailable"
-        details["error"] = _redact_mlflow_error_for_display(e)
+        details["error"] = _format_mlflow_error(e)
         return _mlflow_budget_failure_result(
             model_uri,
             "Unable to determine MLflow artifact size before download",
@@ -1702,7 +1488,7 @@ def _preflight_mlflow_download_budget(
                 {
                     "reason": "artifact_size_unavailable",
                     "artifact_file_count": 0,
-                    "error": _redact_mlflow_error_for_display(exc),
+                    "error": _format_mlflow_error(exc),
                 }
             )
             return _mlflow_budget_failure_result(
@@ -1797,7 +1583,7 @@ def _download_preflighted_mlflow_artifacts(
         details.update(
             {
                 "reason": "artifact_download_verification_failed",
-                "error": _redact_mlflow_error_for_display(exc),
+                "error": _format_mlflow_error(exc),
             }
         )
         return _mlflow_budget_failure_result(
@@ -1846,7 +1632,7 @@ def _download_preflighted_mlflow_artifacts(
                 {
                     "reason": "artifact_download_verification_failed",
                     "artifact_path": artifact.path,
-                    "error": _redact_mlflow_error_for_display(exc),
+                    "error": _format_mlflow_error(exc),
                 }
             )
             return _mlflow_budget_failure_result(
@@ -1909,7 +1695,7 @@ def _download_preflighted_mlflow_artifacts(
         details.update(
             {
                 "reason": "artifact_download_verification_failed",
-                "error": _redact_mlflow_error_for_display(exc),
+                "error": _format_mlflow_error(exc),
             }
         )
         return _mlflow_budget_failure_result(
@@ -1921,17 +1707,17 @@ def _download_preflighted_mlflow_artifacts(
     return str(download_root)
 
 
-def _prepare_download_dir(model_uri: str, cache_dir: str | None) -> tuple[str, bool]:
+def _prepare_download_dir(model_uri: str, cache_dir: str | None) -> str:
     """Return an ephemeral per-run staging directory under the configured cache root."""
     if not cache_dir:
-        return tempfile.mkdtemp(prefix="modelaudit_mlflow_"), True
+        return tempfile.mkdtemp(prefix="modelaudit_mlflow_")
 
     cache_key = hashlib.sha256(model_uri.encode("utf-8")).hexdigest()[:16]
     download_root = Path(cache_dir).expanduser() / "mlflow"
     download_root.mkdir(parents=True, exist_ok=True)
     # Use a unique staging directory for this run. ``cache_dir`` controls where
     # temporary downloads live, while scan-result caching is still handled by core.
-    return tempfile.mkdtemp(prefix=f"{cache_key}-", dir=str(download_root)), True
+    return tempfile.mkdtemp(prefix=f"{cache_key}-", dir=str(download_root))
 
 
 def _is_missing_mlflow_artifact_error(error: Exception) -> bool:
@@ -2083,7 +1869,7 @@ def _download_trusted_mlflow_artifacts(
                 "MLflow artifact repository returned an unsafe artifact listing",
                 {
                     "reason": "artifact_listing_unsafe",
-                    "error": _redact_mlflow_error_for_display(exc),
+                    "error": _format_mlflow_error(exc),
                 },
             )
         if target.optional_when_missing and not artifact_paths:
@@ -2255,7 +2041,7 @@ def _capture_mlflow_download_root(
             "Unable to establish the MLflow staging directory",
             {
                 "reason": "artifact_download_root_unavailable",
-                "error": _redact_mlflow_error_for_display(exc),
+                "error": _format_mlflow_error(exc),
             },
         )
 
@@ -2288,7 +2074,7 @@ def _capture_mlflow_download_root(
             "Unable to hold the MLflow staging directory open",
             {
                 "reason": "artifact_download_root_unavailable",
-                "error": _redact_mlflow_error_for_display(exc),
+                "error": _format_mlflow_error(exc),
             },
         )
 
@@ -2415,7 +2201,7 @@ def _validate_mlflow_download_tree(
                 "Unable to validate the MLflow staging directory",
                 {
                     "reason": "artifact_download_path_unavailable",
-                    "error": _redact_mlflow_error_for_display(exc),
+                    "error": _format_mlflow_error(exc),
                 },
             )
 
@@ -2447,7 +2233,7 @@ def _resolve_mlflow_download_path(
             "Unable to verify MLflow artifact download path",
             {
                 "reason": "artifact_download_path_unavailable",
-                "error": _redact_mlflow_error_for_display(exc),
+                "error": _format_mlflow_error(exc),
             },
         )
 
@@ -2463,7 +2249,7 @@ def _resolve_mlflow_download_path(
             "Unable to verify the MLflow staging directory identity",
             {
                 "reason": "artifact_download_root_unavailable",
-                "error": _redact_mlflow_error_for_display(exc),
+                "error": _format_mlflow_error(exc),
             },
         )
 
@@ -2505,7 +2291,7 @@ def _resolve_mlflow_download_path(
             "Unable to inspect MLflow artifact download path",
             {
                 "reason": "artifact_download_path_unavailable",
-                "error": _redact_mlflow_error_for_display(exc),
+                "error": _format_mlflow_error(exc),
             },
         )
 
@@ -2582,11 +2368,10 @@ def scan_mlflow_model(
     if registry_uri:
         mlflow.set_registry_uri(registry_uri)  # type: ignore[possibly-unbound-attribute]
 
-    scan_kwargs = kwargs.copy()
-    cache_enabled = scan_kwargs.pop("cache_enabled", True)
-    raw_cache_dir = scan_kwargs.pop("cache_dir", None)
+    cache_enabled = kwargs.pop("cache_enabled", True)
+    raw_cache_dir = kwargs.pop("cache_dir", None)
     max_artifact_entries = _normalize_max_artifact_entries(
-        scan_kwargs.pop("max_mlflow_artifact_entries", _DEFAULT_MLFLOW_MAX_ARTIFACT_ENTRIES)
+        kwargs.pop("max_mlflow_artifact_entries", _DEFAULT_MLFLOW_MAX_ARTIFACT_ENTRIES)
     )
     scan_cache_dir = str(Path(raw_cache_dir).expanduser()) if cache_enabled and raw_cache_dir else None
 
@@ -2600,7 +2385,7 @@ def scan_mlflow_model(
     if isinstance(download_plan, ModelAuditResultModel):
         return download_plan
 
-    download_dir, cleanup_download_dir = _prepare_download_dir(model_uri, scan_cache_dir)
+    download_dir = _prepare_download_dir(model_uri, scan_cache_dir)
     download_root_identity: _MlflowDownloadRoot | None = None
 
     try:
@@ -2609,7 +2394,9 @@ def scan_mlflow_model(
             return captured_download_root
         download_root_identity = captured_download_root
 
-        logger.debug(f"Downloading MLflow model {_redact_mlflow_error_for_display(model_uri)} to {download_dir}")
+        logger.debug(
+            f"Downloading MLflow model {format_terminal_text(_format_mlflow_error(model_uri))} to {download_dir}"
+        )
         local_path: str | None
         if isinstance(download_plan, _MlflowDownloadPlan):
             download_result = _download_preflighted_mlflow_artifacts(
@@ -2669,10 +2456,9 @@ def scan_mlflow_model(
             max_file_size=max_file_size,
             max_total_size=max_total_size,
             **cache_config,
-            **scan_kwargs,
+            **kwargs,
         )
     finally:
         if download_root_identity is not None and download_root_identity.file_descriptor is not None:
             os.close(download_root_identity.file_descriptor)
-        if cleanup_download_dir:
-            shutil.rmtree(download_dir, ignore_errors=True)
+        shutil.rmtree(download_dir, ignore_errors=True)

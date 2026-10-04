@@ -8,6 +8,7 @@ import pickle
 import tarfile
 import zipfile
 from collections.abc import Callable, Iterator
+from functools import partial
 from pathlib import Path
 from types import TracebackType
 from typing import Any, BinaryIO, cast
@@ -22,11 +23,13 @@ from modelaudit.models import AssetModel, FileHashesModel, FileMetadataModel, cr
 from modelaudit.scanner_results import MAX_MEMBER_FILE_HASH_RECORDS
 from modelaudit.utils.helpers.secure_hasher import compute_aggregate_hash
 from tests.helpers import create_mock_pytorch_zip, write_mock_pytorch_zip_metadata
+from tests.helpers.file_creators import EvalPayload
+from tests.helpers.file_creators import (
+    pickle_binunicode as _binunicode,
+)
+from tests.helpers.scanners import fail_onnx_bounded_discovery as fail_bounded_discovery
 
-
-class _MaliciousPicklePayload:
-    def __reduce__(self) -> tuple[object, tuple[str]]:
-        return (eval, ("__import__('os').system('echo modelaudit-test')",))
+_MaliciousPicklePayload = partial(EvalPayload, ("__import__('os').system('echo modelaudit-test')",))
 
 
 def _pytorch_zip_with_pickle_members(
@@ -63,10 +66,6 @@ def _single_member_record(metadata: dict[str, Any], path_segments: list[str]) ->
 
 _PYTORCH_LEGACY_MAGIC_NUMBER = 0x1950A86A20F9469CFC6C
 _PYTORCH_LEGACY_PROTOCOL_VERSION = 1001
-
-
-def _binunicode(value: bytes) -> bytes:
-    return b"X" + len(value).to_bytes(4, "little") + value
 
 
 def _legacy_pytorch_object_stream(
@@ -848,25 +847,12 @@ class TestHashGenerationEdgeCases:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Aggregate hashing must not full-read oversized ZIP-backed PyTorch containers."""
-        from modelaudit import core
-
-        zip_path = create_mock_pytorch_zip(tmp_path / "large.pt")
-        with zip_path.open("ab") as handle:
-            handle.write(b"A" * 2048)
-
-        def fail_hash(path: str) -> str:
-            if path == str(zip_path):
-                pytest.fail("oversized PyTorch ZIP was content-hashed before bounded scan dispatch")
-            return "a" * 64
-
-        monkeypatch.setattr(core, "_calculate_file_hash", fail_hash)
-
-        content_hashes = core._hash_files_by_path(
-            [str(zip_path)],
-            config={"max_file_read_size": 64},
+        _assert_pytorch_zip_hash_deferral(
+            tmp_path,
+            monkeypatch,
+            ("large.pt"),
+            ("oversized PyTorch ZIP was content-hashed before bounded scan dispatch"),
         )
-
-        assert content_hashes[str(zip_path)].startswith("unhashable_pytorch_zip_read_limit_")
 
     def test_hash_files_by_path_defers_file_backed_onnx(
         self,
@@ -1022,25 +1008,12 @@ class TestHashGenerationEdgeCases:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """All PyTorchZipScanner suffixes should use bounded ZIP hash deferral."""
-        from modelaudit import core
-
-        zip_path = create_mock_pytorch_zip(tmp_path / "large.ckpt")
-        with zip_path.open("ab") as handle:
-            handle.write(b"A" * 2048)
-
-        def fail_hash(path: str) -> str:
-            if path == str(zip_path):
-                pytest.fail("oversized PyTorch ZIP .ckpt was content-hashed before bounded scan dispatch")
-            return "a" * 64
-
-        monkeypatch.setattr(core, "_calculate_file_hash", fail_hash)
-
-        content_hashes = core._hash_files_by_path(
-            [str(zip_path)],
-            config={"max_file_read_size": 64},
+        _assert_pytorch_zip_hash_deferral(
+            tmp_path,
+            monkeypatch,
+            ("large.ckpt"),
+            ("oversized PyTorch ZIP .ckpt was content-hashed before bounded scan dispatch"),
         )
-
-        assert content_hashes[str(zip_path)].startswith("unhashable_pytorch_zip_read_limit_")
 
     @pytest.mark.parametrize("read_size", [None, "invalid", -1])
     def test_hash_files_by_path_uses_default_for_invalid_pytorch_read_limit(
@@ -1553,12 +1526,6 @@ class TestOnnxExternalDataContentHash:
         )
         _skip_path_during_directory_prefilter(monkeypatch, sidecar)
 
-        def fail_bounded_discovery(*_args: Any, **_kwargs: Any) -> Any:
-            raise onnx_scanner._OnnxStructureParseError(
-                "retained_object_limit_exceeded",
-                "bounded discovery exhausted its retained-object budget",
-            )
-
         monkeypatch.setattr(onnx_scanner, "_load_onnx_structure_file_backed", fail_bounded_discovery)
 
         result = scan_model_directory_or_file(
@@ -1720,3 +1687,27 @@ class TestOnnxExternalDataContentHash:
         assert result.bytes_scanned == model_path.stat().st_size + sidecar.stat().st_size
         assert result.content_hash is None
         assert determine_exit_code(result) == 2
+
+
+def _assert_pytorch_zip_hash_deferral(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case_filename: str, case_failure_message: str
+) -> None:
+    from modelaudit import core
+
+    zip_path = create_mock_pytorch_zip(tmp_path / case_filename)
+    with zip_path.open("ab") as handle:
+        handle.write(b"A" * 2048)
+
+    def fail_hash(path: str) -> str:
+        if path == str(zip_path):
+            pytest.fail(case_failure_message)
+        return "a" * 64
+
+    monkeypatch.setattr(core, "_calculate_file_hash", fail_hash)
+
+    content_hashes = core._hash_files_by_path(
+        [str(zip_path)],
+        config={"max_file_read_size": 64},
+    )
+
+    assert content_hashes[str(zip_path)].startswith("unhashable_pytorch_zip_read_limit_")

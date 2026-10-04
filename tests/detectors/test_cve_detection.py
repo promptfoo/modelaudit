@@ -134,18 +134,8 @@ class TestCVE202434997Detection:
         test_file = tmp_path / "numpy_wrapper_attack.pkl"
         test_file.write_bytes(malicious_content)
 
-        result = scan_file(str(test_file))
-
         # Should detect CVE-2024-34997 patterns
-        cve_detections = [
-            issue
-            for issue in result.issues
-            if "CVE-2024-34997" in issue.message or "CVE-2024-34997" in str(issue.details)
-        ]
-
-        assert len(cve_detections) > 0, (
-            f"Should detect CVE-2024-34997. Issues found: {[i.message for i in result.issues]}"
-        )
+        _assert_cve_file(test_file, "CVE-2024-34997", "Should detect CVE-2024-34997. Issues found: ")
 
     def test_detect_cve_2024_34997_cache_exploitation(self, tmp_path):
         """Test detection of NumpyArrayWrapper cache exploitation."""
@@ -479,18 +469,8 @@ class TestCVE202624747Detection:
         test_file = tmp_path / "setitem_attack.pkl"
         test_file.write_bytes(malicious_content)
 
-        result = scan_file(str(test_file))
-
         # Should detect CVE-2026-24747 patterns via CVE attribution system
-        cve_detections = [
-            issue
-            for issue in result.issues
-            if "CVE-2026-24747" in issue.message or "CVE-2026-24747" in str(issue.details)
-        ]
-
-        assert len(cve_detections) > 0, (
-            f"Should detect CVE-2026-24747. Issues found: {[i.message for i in result.issues]}"
-        )
+        _assert_cve_file(test_file, "CVE-2026-24747", "Should detect CVE-2026-24747. Issues found: ")
 
     def test_detect_cve_2026_24747_setitem_after_rebuild(self, tmp_path: Path) -> None:
         """Test detection of SETITEMS applied after tensor reconstruction."""
@@ -933,6 +913,12 @@ def test_cve_detection_with_existing_scanners():
         "JoblibScanner should have specific threat detection"
     )
     assert hasattr(pickle_scanner, "_analyze_cve_patterns"), "PickleScanner should have CVE analysis"
+
+
+def _assert_cve_file(test_file: Path, cve_id: str, failure_prefix: str) -> None:
+    result = scan_file(str(test_file))
+    cve_detections = [issue for issue in result.issues if cve_id in issue.message or cve_id in str(issue.details)]
+    assert len(cve_detections) > 0, f"{failure_prefix}{[i.message for i in result.issues]}"
 
 
 if __name__ == "__main__":
