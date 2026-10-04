@@ -24,7 +24,6 @@ from typing import Any, BinaryIO, cast
 
 from .call_graph import (
     CallGraphFinding,
-    StartupHookWriteFinding,
     UnanalyzedCallGraphReference,
     _begin_shared_source_report,
     _CallGraphAnalysisLimitError,
@@ -425,16 +424,6 @@ _ZIP64_EOCD_MIN_SIZE = 56
 _ZIP64_SENTINEL_ENTRY_COUNT = 0xFFFF
 
 
-def _source_backed_invocation_requires_loaded_identity(
-    reference: tuple[str, str],
-    *,
-    suppress_safe_numpy_reconstruct: bool,
-) -> bool:
-    if suppress_safe_numpy_reconstruct and reference in _NUMPY_SAFE_OBJECT_RECONSTRUCTION_REFERENCES:
-        return False
-    return reference in _SOURCE_BACKED_FRAMEWORK_IDENTITY_REFERENCES
-
-
 def _source_backed_import_requires_initialization_proof(
     reference: tuple[str, str],
     *,
@@ -701,7 +690,33 @@ class PickleScanner:
                     if container_report is not None:
                         return container_report
                     if _has_pytorch_checkpoint_suffix(path_obj):
-                        return _unsupported_zip_report(source=source, size=size)
+                        return PickleReport(
+                            source=source,
+                            status=ScanStatus.ERROR,
+                            verdict=SafetyVerdict.UNKNOWN,
+                            errors=(
+                                ScanError(
+                                    message=(
+                                        "ZIP archive is not a PyTorch checkpoint and cannot be scanned "
+                                        "as a pickle stream"
+                                    ),
+                                    category="unsupported_zip_container",
+                                    location=source,
+                                    exception_type="ValueError",
+                                    details={"analysis_incomplete": True},
+                                ),
+                            ),
+                            coverage=CoverageSummary(
+                                bytes_scanned=0,
+                                bytes_total=size,
+                                raw_scan_complete=False,
+                                opcode_scan_complete=False,
+                            ),
+                            metadata={
+                                "container_type": "zip",
+                                "analysis_incomplete": True,
+                            },
+                        )
                 handle.seek(0)
                 return self.scan_stream(
                     handle,
@@ -855,14 +870,28 @@ class PickleScanner:
                         )
 
                 if budget_skipped_entries:
+                    pickle_member_count = len(pickle_entries)
+                    total_pickle_member_bytes = sum(entry.file_size for entry in pickle_entries)
                     skipped_notices.append(
-                        _pytorch_zip_pickle_member_budget_notice(
-                            source=source,
-                            pickle_member_count=len(pickle_entries),
-                            scanned_pickle_member_count=scanned_pickle_member_count,
-                            total_pickle_member_bytes=sum(entry.file_size for entry in pickle_entries),
-                            scanned_pickle_member_bytes=scanned_pickle_member_bytes,
-                            skipped_entries=budget_skipped_entries,
+                        Notice(
+                            message=(
+                                "PyTorch ZIP analysis stopped scanning pickle members because the archive "
+                                "exceeds the standalone aggregate pickle-member budget"
+                            ),
+                            severity=Severity.INFO,
+                            location=source,
+                            code="pytorch_zip_pickle_member_budget",
+                            details={
+                                "pickle_member_count": pickle_member_count,
+                                "scanned_pickle_member_count": scanned_pickle_member_count,
+                                "skipped_pickle_member_count": len(budget_skipped_entries),
+                                "max_pickle_members": _MAX_PYTORCH_ZIP_PICKLE_MEMBERS,
+                                "total_pickle_member_bytes": total_pickle_member_bytes,
+                                "scanned_pickle_member_bytes": scanned_pickle_member_bytes,
+                                "max_total_pickle_member_bytes": _MAX_PYTORCH_ZIP_PICKLE_TOTAL_MEMBER_BYTES,
+                                "skipped_pickle_members": [entry.filename for entry in budget_skipped_entries[:10]],
+                                "analysis_incomplete": True,
+                            },
                         )
                     )
 
@@ -2153,9 +2182,6 @@ def _has_executable_extension_opcode_before_stop(
             if stack.pop() == "mark":
                 break
 
-    def memo_key(arg: object) -> str:
-        return str(arg)
-
     def callable_is_extension(offset_from_top: int) -> bool:
         return len(stack) >= offset_from_top and stack[-offset_from_top] == "extension"
 
@@ -2190,14 +2216,14 @@ def _has_executable_extension_opcode_before_stop(
                 continue
             if opcode.name in {"BINPUT", "LONG_BINPUT", "PUT"}:
                 if stack:
-                    memo[memo_key(arg)] = stack[-1]
+                    memo[str(arg)] = stack[-1]
                 continue
             if opcode.name == "MEMOIZE":
                 if stack:
                     memo[str(len(memo))] = stack[-1]
                 continue
             if opcode.name in {"BINGET", "LONG_BINGET", "GET"}:
-                push(memo.get(memo_key(arg), "other"))
+                push(memo.get(str(arg), "other"))
                 continue
             if opcode.name == "DUP":
                 push(stack[-1] if stack else "other")
@@ -2947,7 +2973,7 @@ def _trailing_candidate_has_raw_nested_security_pickle(
 
 
 def _raw_nested_security_pickle_candidate_budget_exhausted_needs_scan(value: bytes) -> bool:
-    if _raw_nested_security_pickle_text_marker_seen(value):
+    if any(marker in value for marker in _RAW_NESTED_SECURITY_PICKLE_TEXT_MARKERS):
         return True
     if _budget_exhausted_suffix_is_only_incomplete_extension_after_text_noise(value):
         return False
@@ -2980,7 +3006,7 @@ def _budget_exhausted_suffix_is_only_incomplete_extension_after_text_noise(value
 
 
 def _encoded_raw_nested_security_pickle_candidate_budget_exhausted_needs_scan(value: bytes) -> bool:
-    if _raw_nested_security_pickle_text_marker_seen(value):
+    if any(marker in value for marker in _RAW_NESTED_SECURITY_PICKLE_TEXT_MARKERS):
         return True
     value = value.lstrip(b"c \t\r\n\x00")
     candidate = value[:_MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES]
@@ -3010,11 +3036,7 @@ def _encoded_raw_nested_security_pickle_candidate_budget_exhausted_needs_scan(va
     return _raw_nested_security_pickle_candidate_has_structural_signal(value)
 
 
-def _raw_nested_security_pickle_candidate_has_structural_signal(
-    value: bytes,
-    *,
-    fail_closed_on_truncated_extension: bool = True,
-) -> bool:
+def _raw_nested_security_pickle_candidate_has_structural_signal(value: bytes) -> bool:
     parse_budget_remaining = [_MAX_RAW_NESTED_PICKLE_CANDIDATES]
     if _raw_nested_proto0_global_ref_seen(value):
         return True
@@ -3023,7 +3045,6 @@ def _raw_nested_security_pickle_candidate_has_structural_signal(
     if _raw_nested_extension_opcode_candidate_has_structural_signal(
         value,
         parse_budget_remaining,
-        fail_closed_on_truncated_extension=fail_closed_on_truncated_extension,
     ):
         return True
     if _raw_nested_binary_opcode_candidate_has_structural_signal(value, parse_budget_remaining):
@@ -3035,7 +3056,7 @@ def _raw_nested_security_pickle_candidate_has_structural_signal(
         return False
     marker = candidate[0]
     if marker in _BINARY_EXTENSION_SECURITY_OPCODE_BYTES:
-        return fail_closed_on_truncated_extension or _has_complete_extension_opcode_stream(candidate)
+        return True
     if not _consume_raw_nested_structural_parse_budget(parse_budget_remaining):
         return True
     if marker == 0x80 and _looks_like_binary_pickle_prefix(candidate, sample_is_prefix=candidate_is_prefix):
@@ -3132,7 +3153,6 @@ def _raw_nested_extension_opcode_candidate_has_structural_signal(
     value: bytes,
     parse_budget_remaining: list[int],
     *,
-    fail_closed_on_truncated_extension: bool = True,
     fail_closed_on_unknown_after_extension: bool = False,
 ) -> bool:
     search_limit = min(len(value), _PICKLE_DISCOVERY_LONG_PROBE_BYTES)
@@ -3166,7 +3186,7 @@ def _raw_nested_extension_opcode_candidate_has_structural_signal(
             return True
         if _has_executable_extension_opcode_before_stop(
             candidate,
-            fail_closed_on_truncated_extension=fail_closed_on_truncated_extension,
+            fail_closed_on_truncated_extension=True,
             fail_closed_on_unknown_after_extension=fail_closed_on_unknown_after_extension,
         ):
             return True
@@ -3250,9 +3270,6 @@ def _parsed_raw_nested_extension_candidate_start(
             if stack.pop() is not None:
                 break
 
-    def live_mark() -> int | None:
-        return next((item for item in reversed(stack) if item is not None), None)
-
     try:
         for opcode, _arg, pos in pickletools.genops(value[start:parse_end]):
             if pos is None:
@@ -3260,7 +3277,7 @@ def _parsed_raw_nested_extension_candidate_start(
             absolute_pos = start + pos
             if absolute_pos == offset:
                 if opcode.name in _PICKLE_EXTENSION_OPCODES:
-                    mark = live_mark()
+                    mark = next((item for item in reversed(stack) if item is not None), None)
                     return (mark if mark is not None else offset), None
                 return None, None
             if absolute_pos > offset:
@@ -3390,10 +3407,6 @@ def _headerless_binary_pickle_prefix_needs_more_bytes(candidate: bytes, *, candi
     except Exception:
         return False
     return opcode_count >= 4
-
-
-def _raw_nested_security_pickle_text_marker_seen(value: bytes) -> bool:
-    return any(marker in value for marker in _RAW_NESTED_SECURITY_PICKLE_TEXT_MARKERS)
 
 
 def _literal_value_has_encoded_nested_security_pickle(value: bytes, *, nested_literal_depth: int = 0) -> bool:
@@ -3624,12 +3637,8 @@ def _looks_like_proto0_or_1_pickle(sample: bytes, *, sample_is_prefix: bool) -> 
 
 
 def _is_data_pickle_member(name: str) -> bool:
-    normalized = _normalize_zip_member_name(name).lower()
+    normalized = name.replace("\\", "/").lstrip("/").lower()
     return normalized == "data.pkl" or normalized.endswith("/data.pkl")
-
-
-def _normalize_zip_member_name(name: str) -> str:
-    return name.replace("\\", "/").lstrip("/")
 
 
 def _is_canonical_pytorch_zip_member_name(name: str) -> bool:
@@ -4832,37 +4841,6 @@ def _pytorch_zip_pickle_discovery_probe_budget_notice(
     )
 
 
-def _pytorch_zip_pickle_member_budget_notice(
-    *,
-    source: str,
-    pickle_member_count: int,
-    scanned_pickle_member_count: int,
-    total_pickle_member_bytes: int,
-    scanned_pickle_member_bytes: int,
-    skipped_entries: list[zipfile.ZipInfo],
-) -> Notice:
-    return Notice(
-        message=(
-            "PyTorch ZIP analysis stopped scanning pickle members because the archive exceeds the standalone "
-            "aggregate pickle-member budget"
-        ),
-        severity=Severity.INFO,
-        location=source,
-        code="pytorch_zip_pickle_member_budget",
-        details={
-            "pickle_member_count": pickle_member_count,
-            "scanned_pickle_member_count": scanned_pickle_member_count,
-            "skipped_pickle_member_count": len(skipped_entries),
-            "max_pickle_members": _MAX_PYTORCH_ZIP_PICKLE_MEMBERS,
-            "total_pickle_member_bytes": total_pickle_member_bytes,
-            "scanned_pickle_member_bytes": scanned_pickle_member_bytes,
-            "max_total_pickle_member_bytes": _MAX_PYTORCH_ZIP_PICKLE_TOTAL_MEMBER_BYTES,
-            "skipped_pickle_members": [entry.filename for entry in skipped_entries[:10]],
-            "analysis_incomplete": True,
-        },
-    )
-
-
 def _combine_pytorch_zip_reports(
     *,
     source: str,
@@ -5300,33 +5278,6 @@ def _has_pytorch_checkpoint_suffix(path: Path) -> bool:
     return path.suffix.lower() in _PYTORCH_CHECKPOINT_SUFFIXES
 
 
-def _unsupported_zip_report(*, source: str, size: int) -> PickleReport:
-    return PickleReport(
-        source=source,
-        status=ScanStatus.ERROR,
-        verdict=SafetyVerdict.UNKNOWN,
-        errors=(
-            ScanError(
-                message="ZIP archive is not a PyTorch checkpoint and cannot be scanned as a pickle stream",
-                category="unsupported_zip_container",
-                location=source,
-                exception_type="ValueError",
-                details={"analysis_incomplete": True},
-            ),
-        ),
-        coverage=CoverageSummary(
-            bytes_scanned=0,
-            bytes_total=size,
-            raw_scan_complete=False,
-            opcode_scan_complete=False,
-        ),
-        metadata={
-            "container_type": "zip",
-            "analysis_incomplete": True,
-        },
-    )
-
-
 def _scan_pickle_payload_native(
     payload: bytes,
     *,
@@ -5366,10 +5317,24 @@ def _scan_pickle_payload_native(
             return _with_call_graph_findings(report, payload=payload)
         return _with_import_origin_findings(report)
     except Exception as error:
-        return _engine_error_report(
+        return PickleReport(
             source=source,
-            error=error,
-            bytes_total=native_bytes_total,
+            status=ScanStatus.ERROR,
+            verdict=SafetyVerdict.UNKNOWN,
+            errors=(
+                ScanError(
+                    message=f"Rust pickle scanner failed: {error!s}",
+                    category="rust_engine_error",
+                    location=source,
+                    exception_type=type(error).__name__,
+                ),
+            ),
+            coverage=CoverageSummary(
+                bytes_scanned=0,
+                bytes_total=native_bytes_total,
+                raw_scan_complete=False,
+                opcode_scan_complete=False,
+            ),
         )
 
 
@@ -5813,7 +5778,33 @@ def _with_call_graph_findings(report: PickleReport, *, payload: bytes | None = N
         if finding.severity == Severity.CRITICAL
     }
     rce_findings = tuple(
-        _call_graph_finding_to_report_finding(updated_report, finding)
+        Finding(
+            message=(
+                f"Pickle global '{finding.import_reference}' reaches dangerous Python "
+                f"primitive '{finding.sink}' through the installed call graph"
+            ),
+            severity=Severity.CRITICAL,
+            location=updated_report.source,
+            rule_code="DANGEROUS_CALL_GRAPH",
+            details={
+                "module": finding.module,
+                "name": finding.name,
+                "import_reference": finding.import_reference,
+                "sink": finding.sink,
+                "call_path": list(finding.call_path),
+                "analysis": "python_call_graph",
+                **(
+                    {"invocation_import_reference": finding.invocation_import_reference}
+                    if finding.invocation_import_reference is not None
+                    else {}
+                ),
+                **({"opcode": finding.invocation_opcode} if finding.invocation_opcode is not None else {}),
+            },
+            why=(
+                "The pickle imports a Python wrapper whose source code reaches a known RCE-capable primitive "
+                "when invoked."
+            ),
+        )
         for finding in call_graph_findings
         if (finding.module, finding.name) not in existing_critical_globals
         and not _call_graph_finding_is_safe_numpy_reconstruction_noise(
@@ -5822,13 +5813,55 @@ def _with_call_graph_findings(report: PickleReport, *, payload: bytes | None = N
         )
     )
     startup_findings = tuple(
-        _startup_hook_write_finding_to_report_finding(updated_report, finding)
+        Finding(
+            message=(
+                f"Pickle globals '{finding.opener_import_reference}' and "
+                f"'{finding.writer_import_reference}' can open and write "
+                "attacker-controlled files through the installed call graph"
+            ),
+            severity=Severity.CRITICAL,
+            location=updated_report.source,
+            rule_code="DANGEROUS_CALL_GRAPH_FILE_WRITE",
+            details={
+                "module": finding.writer_module,
+                "name": finding.writer_name,
+                "import_reference": finding.writer_import_reference,
+                "opener_module": finding.opener_module,
+                "opener_name": finding.opener_name,
+                "opener_import_reference": finding.opener_import_reference,
+                "open_sink": finding.open_sink,
+                "write_sink": finding.write_sink,
+                "opener_call_path": list(finding.opener_call_path),
+                "writer_call_path": list(finding.writer_call_path),
+                "analysis": "python_call_graph_startup_hook_write",
+            },
+            why=(
+                "The pickle imports Python wrappers that can open a pickle-controlled path and write "
+                "pickle-controlled content, which can create executable Python startup hooks."
+            ),
+        )
         for finding in startup_hook_write_findings
         if (finding.writer_module, finding.writer_name) not in existing_critical_globals
         and (finding.opener_module, finding.opener_name) not in existing_critical_globals
     )
     limit_findings = (
-        (_call_graph_import_reference_limit_finding_to_report_finding(updated_report),)
+        (
+            Finding(
+                message="Python call-graph analysis skipped import references beyond the unique-reference limit",
+                severity=Severity.CRITICAL,
+                location=updated_report.source,
+                rule_code="DANGEROUS_CALL_GRAPH_LIMIT",
+                details={
+                    "analysis": "python_call_graph_limit",
+                    "max_unique_import_references": 32,
+                    "analysis_incomplete": True,
+                },
+                why=(
+                    "The pickle imports more unique globals than the bounded Python call-graph pass analyzes; "
+                    "unanalyzed globals can hide call-graph-only RCE primitives."
+                ),
+            ),
+        )
         if call_graph_limit_exceeded and not rce_findings and not startup_findings
         else ()
     )
@@ -6141,19 +6174,7 @@ def _with_untrusted_allowlisted_import_findings(
             )
         )
         existing_references.add(key)
-    if not additional_findings:
-        return report
-    return PickleReport(
-        source=report.source,
-        status=report.status,
-        verdict=SafetyVerdict.MALICIOUS if report.verdict == SafetyVerdict.MALICIOUS else SafetyVerdict.SUSPICIOUS,
-        findings=(*report.findings, *additional_findings),
-        notices=report.notices,
-        errors=report.errors,
-        coverage=report.coverage,
-        metadata=report.to_dict()["metadata"],
-        duration_s=report.duration_s,
-    )
+    return _append_untrusted_import_findings(report, additional_findings)
 
 
 def _with_untrusted_invoked_allowlisted_import_findings(
@@ -6227,19 +6248,7 @@ def _with_untrusted_invoked_allowlisted_import_findings(
             )
         )
         existing_references.add(key)
-    if not additional_findings:
-        return report
-    return PickleReport(
-        source=report.source,
-        status=report.status,
-        verdict=SafetyVerdict.MALICIOUS if report.verdict == SafetyVerdict.MALICIOUS else SafetyVerdict.SUSPICIOUS,
-        findings=(*report.findings, *additional_findings),
-        notices=report.notices,
-        errors=report.errors,
-        coverage=report.coverage,
-        metadata=report.to_dict()["metadata"],
-        duration_s=report.duration_s,
-    )
+    return _append_untrusted_import_findings(report, additional_findings)
 
 
 def _invoked_allowlisted_import_reference_is_proven_safe(
@@ -6265,7 +6274,7 @@ def _invoked_allowlisted_import_reference_is_proven_safe(
         return True
     if position in trusted_invocation_global_positions:
         return module in invocation_load_safe_modules
-    if _source_backed_invocation_requires_loaded_identity(
+    if _source_backed_import_requires_initialization_proof(
         reference,
         suppress_safe_numpy_reconstruct=suppress_safe_numpy_reconstruct,
     ):
@@ -6435,7 +6444,7 @@ def _non_allowlisted_import_finding_is_proven_safe(
         if position is not None
         else False
     )
-    requires_loaded_identity = finding_is_invoked and _source_backed_invocation_requires_loaded_identity(
+    requires_loaded_identity = finding_is_invoked and _source_backed_import_requires_initialization_proof(
         reference,
         suppress_safe_numpy_reconstruct=suppress_safe_numpy_reconstruct,
     )
@@ -6812,7 +6821,7 @@ def _pickle_payload_has_only_safe_numpy_ndarray_reconstruction(payload: bytes | 
                             unsafe_numpy_reconstruct = True
                             stack.append(_ABSTRACT_UNKNOWN)
                     elif isinstance(obj, _AbstractNumpyDType):
-                        stack.append(obj if _numpy_dtype_build_state_is_safe(state) else _ABSTRACT_UNKNOWN)
+                        stack.append(obj if _abstract_value_is_inert(state) else _ABSTRACT_UNKNOWN)
                     else:
                         stack.append(obj)
                 elif opcode_name == "POP":
@@ -6870,12 +6879,8 @@ def _numpy_reconstruct_args_are_safe(args: object) -> bool:
         and len(args) == 3
         and _abstract_global_is(args[0], _NUMPY_NDARRAY_REFERENCES)
         and _abstract_int_tuple_is_safe(args[1])
-        and _abstract_bytes_value_is_safe(args[2])
+        and isinstance(args[2], (str, bytes, bytearray, _AbstractBytes))
     )
-
-
-def _numpy_dtype_build_state_is_safe(state: object) -> bool:
-    return _abstract_value_is_inert(state)
 
 
 def _numpy_ndarray_build_state_is_safe(state: object) -> bool:
@@ -6887,7 +6892,7 @@ def _numpy_ndarray_build_state_is_safe(state: object) -> bool:
         and _abstract_int_tuple_is_safe(state[1])
         and isinstance(state[2], _AbstractNumpyDType)
         and isinstance(state[3], bool)
-        and (_abstract_bytes_value_is_safe(state[4]) or _abstract_value_is_inert(state[4]))
+        and (isinstance(state[4], (str, bytes, bytearray, _AbstractBytes)) or _abstract_value_is_inert(state[4]))
     )
 
 
@@ -6922,10 +6927,6 @@ def _pytorch_tensor_view_fits_storage(
         return offset <= storage.element_count
     max_index = offset + sum((dim - 1) * item_stride for dim, item_stride in zip(size, stride, strict=True))
     return max_index < storage.element_count
-
-
-def _abstract_bytes_value_is_safe(value: object) -> bool:
-    return isinstance(value, (str, bytes, bytearray, _AbstractBytes))
 
 
 def _abstract_value_is_inert(value: object) -> bool:
@@ -7078,83 +7079,6 @@ def _direct_critical_call_finding_covers_unanalyzed_reference(
     return False
 
 
-def _call_graph_import_reference_limit_finding_to_report_finding(report: PickleReport) -> Finding:
-    return Finding(
-        message="Python call-graph analysis skipped import references beyond the unique-reference limit",
-        severity=Severity.CRITICAL,
-        location=report.source,
-        rule_code="DANGEROUS_CALL_GRAPH_LIMIT",
-        details={
-            "analysis": "python_call_graph_limit",
-            "max_unique_import_references": 32,
-            "analysis_incomplete": True,
-        },
-        why=(
-            "The pickle imports more unique globals than the bounded Python call-graph pass analyzes; "
-            "unanalyzed globals can hide call-graph-only RCE primitives."
-        ),
-    )
-
-
-def _startup_hook_write_finding_to_report_finding(report: PickleReport, finding: StartupHookWriteFinding) -> Finding:
-    return Finding(
-        message=(
-            f"Pickle globals '{finding.opener_import_reference}' and "
-            f"'{finding.writer_import_reference}' can open and write "
-            "attacker-controlled files through the installed call graph"
-        ),
-        severity=Severity.CRITICAL,
-        location=report.source,
-        rule_code="DANGEROUS_CALL_GRAPH_FILE_WRITE",
-        details={
-            "module": finding.writer_module,
-            "name": finding.writer_name,
-            "import_reference": finding.writer_import_reference,
-            "opener_module": finding.opener_module,
-            "opener_name": finding.opener_name,
-            "opener_import_reference": finding.opener_import_reference,
-            "open_sink": finding.open_sink,
-            "write_sink": finding.write_sink,
-            "opener_call_path": list(finding.opener_call_path),
-            "writer_call_path": list(finding.writer_call_path),
-            "analysis": "python_call_graph_startup_hook_write",
-        },
-        why=(
-            "The pickle imports Python wrappers that can open a pickle-controlled path and write "
-            "pickle-controlled content, which can create executable Python startup hooks."
-        ),
-    )
-
-
-def _call_graph_finding_to_report_finding(report: PickleReport, finding: CallGraphFinding) -> Finding:
-    return Finding(
-        message=(
-            f"Pickle global '{finding.import_reference}' reaches dangerous Python "
-            f"primitive '{finding.sink}' through the installed call graph"
-        ),
-        severity=Severity.CRITICAL,
-        location=report.source,
-        rule_code="DANGEROUS_CALL_GRAPH",
-        details={
-            "module": finding.module,
-            "name": finding.name,
-            "import_reference": finding.import_reference,
-            "sink": finding.sink,
-            "call_path": list(finding.call_path),
-            "analysis": "python_call_graph",
-            **(
-                {"invocation_import_reference": finding.invocation_import_reference}
-                if finding.invocation_import_reference is not None
-                else {}
-            ),
-            **({"opcode": finding.invocation_opcode} if finding.invocation_opcode is not None else {}),
-        },
-        why=(
-            "The pickle imports a Python wrapper whose source code reaches a known RCE-capable primitive when invoked."
-        ),
-    )
-
-
 def _finding_from_native_dict(raw_finding: Mapping[str, Any]) -> Finding:
     return Finding(
         message=str(raw_finding["message"]),
@@ -7300,28 +7224,18 @@ def _known_stream_has_uncovered_data(stream: BinaryIO) -> bool:
     return True
 
 
-def _engine_error_report(
-    *,
-    source: str,
-    error: Exception,
-    bytes_total: int | None,
-) -> PickleReport:
+def _append_untrusted_import_findings(report: PickleReport, additional_findings: list[Finding]) -> PickleReport:
+    """Append untrusted import evidence without losing an existing malicious verdict."""
+    if not additional_findings:
+        return report
     return PickleReport(
-        source=source,
-        status=ScanStatus.ERROR,
-        verdict=SafetyVerdict.UNKNOWN,
-        errors=(
-            ScanError(
-                message=f"Rust pickle scanner failed: {error!s}",
-                category="rust_engine_error",
-                location=source,
-                exception_type=type(error).__name__,
-            ),
-        ),
-        coverage=CoverageSummary(
-            bytes_scanned=0,
-            bytes_total=bytes_total,
-            raw_scan_complete=False,
-            opcode_scan_complete=False,
-        ),
+        source=report.source,
+        status=report.status,
+        verdict=SafetyVerdict.MALICIOUS if report.verdict == SafetyVerdict.MALICIOUS else SafetyVerdict.SUSPICIOUS,
+        findings=(*report.findings, *additional_findings),
+        notices=report.notices,
+        errors=report.errors,
+        coverage=report.coverage,
+        metadata=report.to_dict()["metadata"],
+        duration_s=report.duration_s,
     )

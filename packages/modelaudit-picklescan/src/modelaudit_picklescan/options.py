@@ -17,6 +17,13 @@ DEFAULT_MAX_NESTED_PICKLE_BYTES = 2 * 1024 * 1024
 DEFAULT_MAX_NESTED_DEPTH = 2
 
 
+def _validate_integer(value: object, name: str, minimum: int) -> None:
+    # Preserve the established comparison operators for integer subclasses.
+    if isinstance(value, bool) or not isinstance(value, int) or (value <= 0 if minimum == 1 else value < minimum):
+        requirement = {0: "greater than or equal to 0", 1: "greater than 0", 2: "at least 2"}[minimum]
+        raise ValueError(f"{name} must be {requirement} and an integer, got {value!r}")
+
+
 @dataclass(frozen=True, slots=True)
 class ScanOptions:
     """Resource and metadata controls for a pickle scan."""
@@ -37,65 +44,22 @@ class ScanOptions:
         object.__setattr__(self, "timeout_s", min(float(timeout_s), MAX_TIMEOUT_S))
 
         max_opcodes: object = self.max_opcodes
-        if isinstance(max_opcodes, bool) or not isinstance(max_opcodes, int) or max_opcodes <= 0:
-            raise ValueError(f"max_opcodes must be greater than 0 and an integer, got {max_opcodes!r}")
+        _validate_integer(max_opcodes, "max_opcodes", 1)
 
         post_budget_scan_bytes: object = self.post_budget_scan_bytes
-        if (
-            isinstance(post_budget_scan_bytes, bool)
-            or not isinstance(post_budget_scan_bytes, int)
-            or post_budget_scan_bytes < 0
-        ):
-            raise ValueError(
-                "post_budget_scan_bytes must be greater than or equal to 0 and an integer, "
-                f"got {post_budget_scan_bytes!r}",
-            )
+        _validate_integer(post_budget_scan_bytes, "post_budget_scan_bytes", 0)
 
         max_known_stream_read_bytes: object = self.max_known_stream_read_bytes
-        if (
-            isinstance(max_known_stream_read_bytes, bool)
-            or not isinstance(max_known_stream_read_bytes, int)
-            or max_known_stream_read_bytes <= 0
-        ):
-            raise ValueError(
-                "max_known_stream_read_bytes must be greater than 0 and an integer, "
-                f"got {max_known_stream_read_bytes!r}",
-            )
+        _validate_integer(max_known_stream_read_bytes, "max_known_stream_read_bytes", 1)
 
         max_unbounded_stream_read_bytes: object = self.max_unbounded_stream_read_bytes
-        if (
-            isinstance(max_unbounded_stream_read_bytes, bool)
-            or not isinstance(max_unbounded_stream_read_bytes, int)
-            or max_unbounded_stream_read_bytes <= 0
-        ):
-            raise ValueError(
-                "max_unbounded_stream_read_bytes must be greater than 0 and an integer, "
-                f"got {max_unbounded_stream_read_bytes!r}",
-            )
+        _validate_integer(max_unbounded_stream_read_bytes, "max_unbounded_stream_read_bytes", 1)
 
         max_string_literal_scan_chars: object = self.max_string_literal_scan_chars
-        if (
-            isinstance(max_string_literal_scan_chars, bool)
-            or not isinstance(max_string_literal_scan_chars, int)
-            or max_string_literal_scan_chars < 0
-        ):
-            raise ValueError(
-                "max_string_literal_scan_chars must be greater than or equal to 0 and an integer, "
-                f"got {max_string_literal_scan_chars!r}",
-            )
+        _validate_integer(max_string_literal_scan_chars, "max_string_literal_scan_chars", 0)
 
         max_nested_pickle_bytes: object = self.max_nested_pickle_bytes
-        if (
-            isinstance(max_nested_pickle_bytes, bool)
-            or not isinstance(max_nested_pickle_bytes, int)
-            or max_nested_pickle_bytes < 2
-        ):
-            raise ValueError(
-                f"max_nested_pickle_bytes must be at least 2 and an integer, got {max_nested_pickle_bytes!r}",
-            )
+        _validate_integer(max_nested_pickle_bytes, "max_nested_pickle_bytes", 2)
 
         max_nested_depth: object = self.max_nested_depth
-        if isinstance(max_nested_depth, bool) or not isinstance(max_nested_depth, int) or max_nested_depth < 0:
-            raise ValueError(
-                f"max_nested_depth must be greater than or equal to 0 and an integer, got {max_nested_depth!r}",
-            )
+        _validate_integer(max_nested_depth, "max_nested_depth", 0)

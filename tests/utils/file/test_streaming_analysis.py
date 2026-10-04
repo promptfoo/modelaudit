@@ -4,6 +4,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 from urllib.parse import urlsplit, urlunsplit
 
+import click
 import fsspec
 import pytest
 from fsspec.implementations.local import LocalFileSystem
@@ -99,6 +100,29 @@ def _mock_stream_filesystem(
     monkeypatch.setattr(streaming, "get_fs_protocol", lambda _url: "file")
     monkeypatch.setattr(fsspec, "filesystem", lambda _protocol, **_kwargs: fs)
     return fs
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "denied https://[invalid?token=secret",
+        "denied https://bucket.example:invalid/model.pkl?token=secret",
+    ],
+)
+def test_streaming_failure_retains_malformed_provider_url_and_fallback(
+    message: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fs = _mock_stream_filesystem(monkeypatch, declared_size=4, payload=b"data")
+    fs.info.side_effect = OSError(message)
+
+    ctx = click.Context(click.Command("scan"))
+    ctx.params["verbose"] = True
+    monkeypatch.setattr(click, "get_current_context", lambda silent: ctx)
+    result = streaming.stream_analyze_file("s3://bucket/model.pkl", HeaderOnlyScanner())
+
+    assert result == (None, False)
+    assert capsys.readouterr().out == f"Streaming analysis failed: {message}\n"
+    fs.open.assert_not_called()
 
 
 def test_stream_source_path_distinguishes_encoded_query_from_filename() -> None:
