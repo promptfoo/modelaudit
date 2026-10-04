@@ -284,19 +284,6 @@ def _first_varint(fields: list[_ProtoField], field_number: int) -> int | None:
     return None
 
 
-def _decode_string(value: bytes, max_length: int = 8192) -> str:
-    """Decode UTF-8 safely with bounded length."""
-    return value[:max_length].decode("utf-8", errors="ignore").strip()
-
-
-def _is_within_directory(path: Path, base_dir: Path) -> bool:
-    try:
-        path.relative_to(base_dir)
-        return True
-    except ValueError:
-        return False
-
-
 class CoreMLScanner(BaseScanner):
     """Scanner for CoreML protobuf models."""
 
@@ -894,7 +881,8 @@ class CoreMLScanner(BaseScanner):
             raw_value = values[0].value
             if not isinstance(raw_value, bytes):
                 continue
-            text_value = _decode_string(raw_value)
+            # Decode UTF-8 safely with bounded length.
+            text_value = raw_value[:8192].decode("utf-8", errors="ignore").strip()
             if text_value:
                 model_metadata[field_name] = text_value
                 findings += self._scan_metadata_value(
@@ -940,8 +928,8 @@ class CoreMLScanner(BaseScanner):
             if not isinstance(raw_key, bytes) or not isinstance(raw_value, bytes):
                 continue
 
-            key = _decode_string(raw_key, max_length=512)
-            value = _decode_string(raw_value)
+            key = raw_key[:512].decode("utf-8", errors="ignore").strip()
+            value = raw_value[:8192].decode("utf-8", errors="ignore").strip()
             if not key:
                 key = f"<empty-key-{index}>"
 
@@ -1137,7 +1125,7 @@ class CoreMLScanner(BaseScanner):
                 layer_name = ""
                 layer_name_field = _len_fields(parsed_layer, 1)
                 if layer_name_field and isinstance(layer_name_field[0].value, bytes):
-                    layer_name = _decode_string(layer_name_field[0].value, max_length=256)
+                    layer_name = layer_name_field[0].value[:256].decode("utf-8", errors="ignore").strip()
                 if not layer_name:
                     layer_name = f"layer_{layer_index}"
 
@@ -1166,7 +1154,7 @@ class CoreMLScanner(BaseScanner):
                     class_name = ""
                     class_name_fields = _len_fields(parsed_custom, 10)
                     if class_name_fields and isinstance(class_name_fields[0].value, bytes):
-                        class_name = _decode_string(class_name_fields[0].value, max_length=256)
+                        class_name = class_name_fields[0].value[:256].decode("utf-8", errors="ignore").strip()
 
                     field_path = (
                         f"{model_path}[{model_field.field_number}].layers[{layer_index}].custom"
@@ -1223,7 +1211,7 @@ class CoreMLScanner(BaseScanner):
             class_name = ""
             class_name_fields = _len_fields(custom_model, 10)
             if class_name_fields and isinstance(class_name_fields[0].value, bytes):
-                class_name = _decode_string(class_name_fields[0].value, max_length=256)
+                class_name = class_name_fields[0].value[:256].decode("utf-8", errors="ignore").strip()
 
             result.add_check(
                 name="CoreML Custom Model Class Check",
@@ -1297,7 +1285,7 @@ class CoreMLScanner(BaseScanner):
             if not isinstance(raw_key, bytes):
                 continue
 
-            param_key = _decode_string(raw_key, max_length=256)
+            param_key = raw_key[:256].decode("utf-8", errors="ignore").strip()
             value_message_fields, value_error = self._parse_field_message(value_fields[0], max_fields=32)
             if value_error:
                 result.add_check(
@@ -1322,7 +1310,7 @@ class CoreMLScanner(BaseScanner):
             raw_string_value = string_values[0].value
             if not isinstance(raw_string_value, bytes):
                 continue
-            string_value = _decode_string(raw_string_value)
+            string_value = raw_string_value[:8192].decode("utf-8", errors="ignore").strip()
             if not string_value:
                 continue
 
@@ -1442,7 +1430,7 @@ class CoreMLScanner(BaseScanner):
         if not default_value_fields or not isinstance(default_value_fields[0].value, bytes):
             return None
 
-        value = _decode_string(default_value_fields[0].value, max_length=512)
+        value = default_value_fields[0].value[:512].decode("utf-8", errors="ignore").strip()
         return value if value else None
 
     @staticmethod
@@ -1527,7 +1515,7 @@ class CoreMLScanner(BaseScanner):
                 reason = "path traversal segments in linked model path"
             elif not has_safe_macro_prefix:
                 resolved_path = (base_dir / value_to_check).resolve()
-                if not _is_within_directory(resolved_path, base_dir):
+                if not resolved_path.is_relative_to(base_dir):
                     severity = IssueSeverity.CRITICAL
                     reason = "linked model path resolves outside model directory"
 

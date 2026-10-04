@@ -1,7 +1,10 @@
 """Tests for modelaudit.models module."""
 
 import json
+import subprocess
+import sys
 import time
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -40,6 +43,26 @@ from modelaudit.scanner_results import (
     mark_inconclusive_scan_result,
 )
 from modelaudit.scanners.base import Issue, IssueSeverity, ScanResult
+
+
+@pytest.mark.parametrize(
+    "module", ["modelaudit.models", "modelaudit.core", "modelaudit.cli", "modelaudit.cache.cache_policy"]
+)
+def test_public_modules_import_independently(module: str) -> None:
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import importlib, pathlib, sys; module = importlib.import_module(sys.argv[1]); "
+            "assert pathlib.Path(module.__file__).resolve().is_relative_to(pathlib.Path.cwd())",
+            module,
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stderr
 
 
 class TestDetectorFinding:
@@ -1317,3 +1340,37 @@ class TestRebuildModels:
         """Test that rebuild_models doesn't raise errors."""
         # Should not raise
         rebuild_models()
+
+
+@pytest.mark.parametrize("kind", ["issue", "check"])
+def test_finding_converters_copy_dicts_and_use_current_clock(kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    class TransformingDict(dict[str, object]):
+        def copy(self) -> dict[str, object]:
+            return {**self, "message": "copied"}
+
+    monkeypatch.setattr(time, "time", lambda: 123.0)
+    fields = {"severity": "warning"} if kind == "issue" else {"name": "test", "status": "passed"}
+    record = TransformingDict(message="original", **fields)
+    converter = convert_issues_to_models if kind == "issue" else convert_checks_to_models
+    result = converter([record])[0]
+    assert result.message == "copied"
+    assert result.timestamp == 123.0
+    assert record["message"] == "original"
+    assert "timestamp" not in record
+
+
+@pytest.mark.parametrize("field", ["issues", "checks"])
+def test_aggregate_findings_keep_direct_construction(field: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    class NoCopyDict(dict[str, object]):
+        def copy(self) -> dict[str, object]:
+            raise AssertionError("aggregate records must be constructed directly")
+
+    def unexpected_clock() -> float:
+        raise AssertionError("aggregate records must retain the model timestamp default")
+
+    monkeypatch.setattr(time, "time", unexpected_clock)
+    fields = {"severity": "warning"} if field == "issues" else {"name": "test", "status": "passed"}
+    result = create_audit_result_model({field: [NoCopyDict(message="original", **fields)]})
+    record = getattr(result, field)[0]
+    assert record.message == "original"
+    assert record.timestamp > 0

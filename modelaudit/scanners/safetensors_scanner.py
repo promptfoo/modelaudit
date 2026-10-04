@@ -670,15 +670,7 @@ class SafeTensorsScanner(BaseScanner):
     @staticmethod
     def _mark_inconclusive(result: ScanResult, reason: str) -> None:
         """Mark malformed safetensors framing as an explicit inconclusive scan."""
-        result.metadata["analysis_incomplete"] = True
-        result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
-
-        reasons = result.metadata.get("scan_outcome_reasons")
-        if not isinstance(reasons, list):
-            reasons = []
-            result.metadata["scan_outcome_reasons"] = reasons
-        if reason not in reasons:
-            reasons.append(reason)
+        BaseScanner._mark_inconclusive_metadata_first(result, reason, INCONCLUSIVE_SCAN_OUTCOME)
 
     @staticmethod
     def _is_unreadable_path_result(result: ScanResult) -> bool:

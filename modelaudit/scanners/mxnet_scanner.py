@@ -138,11 +138,6 @@ SUSPICIOUS_TEXT_TOKENS = (
 )
 
 
-def _scan_result_has_security_findings(result: ScanResult) -> bool:
-    """Return True when the result includes WARNING/CRITICAL findings."""
-    return any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
-
-
 class MXNetScanner(BaseScanner):
     """Scanner for MXNet symbol graph and params artifacts."""
 
@@ -197,18 +192,14 @@ class MXNetScanner(BaseScanner):
 
     def _mark_inconclusive_scan_result(self, result: ScanResult, reason: str) -> None:
         """Mark MXNet analysis as incomplete for aggregate exit-code handling."""
-        existing_reasons = result.metadata.get("scan_outcome_reasons")
-        reasons = existing_reasons if isinstance(existing_reasons, list) else []
-        if reason not in reasons:
-            reasons.append(reason)
-
-        result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
-        result.metadata["scan_outcome_reasons"] = reasons
-        result.metadata["analysis_incomplete"] = True
+        BaseScanner._mark_inconclusive_reason_first(result, reason, INCONCLUSIVE_SCAN_OUTCOME)
 
     def _finish_mxnet_result(self, result: ScanResult, *, analysis_complete: bool) -> None:
         """Fail closed for incomplete MXNet scans unless security findings were recovered."""
-        has_security_findings = _scan_result_has_security_findings(result)
+        # Return True when the result includes WARNING/CRITICAL findings.
+        has_security_findings = any(
+            issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues
+        )
         if result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME and not has_security_findings:
             result.finish(success=False)
             return

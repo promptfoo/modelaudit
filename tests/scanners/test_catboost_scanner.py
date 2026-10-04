@@ -14,10 +14,7 @@ from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.integrations.sarif_formatter import format_sarif_output
 from modelaudit.scanners import get_scanner_for_file
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
-from modelaudit.scanners.catboost_scanner import (
-    CatBoostScanner,
-    _format_evidence_for_display,
-)
+from modelaudit.scanners.catboost_scanner import CatBoostScanner, _format_evidence_for_display
 from modelaudit.utils.file.detection import detect_file_format, detect_file_format_from_magic
 
 
