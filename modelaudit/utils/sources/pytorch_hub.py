@@ -16,6 +16,8 @@ from urllib.parse import unquote, urldefrag, urljoin, urlsplit
 import click
 import requests
 
+from modelaudit._size_format import _format_size_absolute as _format_size
+
 from ..helpers.disk_space import check_disk_space
 
 _PYTORCH_HUB_PATTERN = r"^https://pytorch\.org/hub/[\w\-_.]+/?$"
@@ -187,14 +189,6 @@ def _supported_model_extension(url: str, model_extensions: set[str] | None = Non
     )
 
 
-def _is_supported_model_url(url: str, model_extensions: set[str] | None = None) -> bool:
-    return _supported_model_extension(url, model_extensions) is not None
-
-
-def _path_collision_key(path: Path) -> tuple[str, ...]:
-    return tuple(unicodedata.normalize("NFC", part).casefold() for part in path.parts)
-
-
 def _paths_conflict(left: tuple[str, ...], right: tuple[str, ...]) -> bool:
     shared_length = min(len(left), len(right))
     return left[:shared_length] == right[:shared_length]
@@ -245,11 +239,11 @@ def _artifact_download_paths(urls: list[str]) -> list[tuple[str, Path]]:
         relative_path = _weight_relative_path(url)
         download_path = relative_path
         duplicate_index = 2
-        collision_key = _path_collision_key(download_path)
+        collision_key = tuple(unicodedata.normalize("NFC", part).casefold() for part in download_path.parts)
         while any(_paths_conflict(collision_key, used_path) for used_path in used_paths):
             download_path = Path(f"__modelaudit_duplicate_{duplicate_index}") / relative_path
             duplicate_index += 1
-            collision_key = _path_collision_key(download_path)
+            collision_key = tuple(unicodedata.normalize("NFC", part).casefold() for part in download_path.parts)
 
         used_paths.add(collision_key)
         artifacts.append((url, download_path))
@@ -400,7 +394,7 @@ def _extract_weight_urls(
         for candidate in candidates:
             decoded_candidate = candidate if entity_decoded else html_lib.unescape(candidate)
             url = urldefrag(decoded_candidate).url
-            if _is_supported_model_url(url, model_extensions):
+            if _supported_model_extension(url, model_extensions) is not None:
                 parsed_url = urlsplit(url)
                 url = parsed_url._replace(scheme="https", netloc="download.pytorch.org").geturl()
                 if url not in seen:
@@ -544,16 +538,6 @@ def _get_total_size(urls: list[str], deadline: float | None = None) -> int:
     return total
 
 
-def _format_size(size_bytes: int) -> str:
-    units = ["B", "KB", "MB", "GB", "TB", "PB"]
-    absolute_size = abs(size_bytes)
-    for index, unit in enumerate(units):
-        divisor = 1024**index
-        if absolute_size < divisor * 1024:
-            return f"{size_bytes / divisor:.1f} {unit}"
-    return f"{size_bytes} B"
-
-
 def _enforce_max_size(size_bytes: int, max_size: int | None) -> None:
     if max_size is not None and max_size > 0 and size_bytes > max_size:
         raise ValueError(
@@ -601,10 +585,6 @@ def _validate_downloaded_artifact(url: str, path: Path) -> None:
         raise ValueError(
             f"PyTorch Hub artifact with an ambiguous suffix did not contain recognizable model content: {url}"
         )
-
-
-def _path_entry_exists(path: Path) -> bool:
-    return path.exists() or path.is_symlink()
 
 
 def _remove_path_entry(path: Path) -> None:
@@ -689,14 +669,6 @@ def _open_cache_parent_fd(
     return parent_fd
 
 
-def _path_entry_exists_at(parent_fd: int, name: str) -> bool:
-    try:
-        os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-    except FileNotFoundError:
-        return False
-    return True
-
-
 def _remove_path_entry_at(parent_fd: int, name: str) -> None:
     with suppress(FileNotFoundError):
         os.unlink(name, dir_fd=parent_fd)
@@ -741,7 +713,7 @@ def _commit_staged_weight_files_secure(
             for parent_fd, filename, backup_file, had_existing_entry in reversed(committed):
                 try:
                     if had_existing_entry:
-                        if _path_entry_exists(backup_file):
+                        if backup_file.exists() or backup_file.is_symlink():
                             _remove_path_entry_at(parent_fd, filename)
                             os.rename(backup_file, filename, dst_dir_fd=parent_fd)
                     else:
@@ -771,7 +743,7 @@ def _commit_staged_weight_files_path(
             dest_file = _prepare_destination_parent(dest_dir, relative_path, created_dirs)
             backup_file = _safe_destination_path(backup_dir, relative_path)
             backup_file.parent.mkdir(parents=True, exist_ok=True)
-            had_existing_entry = _path_entry_exists(dest_file)
+            had_existing_entry = dest_file.exists() or dest_file.is_symlink()
             if dest_file.is_dir() and not dest_file.is_symlink():
                 raise IsADirectoryError(f"PyTorch Hub cache destination is a directory: {dest_file}")
             committed.append((dest_file, backup_file, had_existing_entry))
@@ -783,7 +755,7 @@ def _commit_staged_weight_files_path(
         for dest_file, backup_file, had_existing_entry in reversed(committed):
             try:
                 if had_existing_entry:
-                    if _path_entry_exists(backup_file):
+                    if backup_file.exists() or backup_file.is_symlink():
                         _remove_path_entry(dest_file)
                         backup_file.replace(dest_file)
                 else:

@@ -5,7 +5,7 @@ import time
 from pathlib import Path
 from typing import TextIO
 
-from .base import ProgressPhase, ProgressReporter, ProgressStats
+from .base import _PROGRESS_STATS_FIELDS, ProgressPhase, ProgressReporter, ProgressStats
 
 
 class FileProgressReporter(ProgressReporter):
@@ -331,17 +331,7 @@ class CSVProgressReporter(ProgressReporter):
         """Report an error during scanning."""
         # Create stats with error information in status message
         error_stats = ProgressStats(
-            start_time=stats.start_time,
-            last_update_time=stats.last_update_time,
-            bytes_processed=stats.bytes_processed,
-            total_bytes=stats.total_bytes,
-            items_processed=stats.items_processed,
-            total_items=stats.total_items,
-            current_phase=stats.current_phase,
-            bytes_per_second=stats.bytes_per_second,
-            items_per_second=stats.items_per_second,
-            estimated_time_remaining=stats.estimated_time_remaining,
-            current_item=stats.current_item,
+            **{name: getattr(stats, name) for name in _PROGRESS_STATS_FIELDS if name != "status_message"},
             status_message=f"ERROR: {type(error).__name__}: {str(error)[:100]}",
         )
         self._write_stats_row(error_stats, "error")

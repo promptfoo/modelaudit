@@ -76,10 +76,6 @@ _MAX_NETWORK_TIMEOUT_SECONDS = 60.0
 ResolvedAddress = tuple[socket.AddressFamily, str, int]
 
 
-def _normalize_destination_host(hostname: str) -> str:
-    return unquote(hostname).strip().lower().rstrip(".")
-
-
 def _host_from_config_value(value: str) -> str:
     candidate = value.strip()
     if not candidate:
@@ -129,7 +125,7 @@ def _parse_ip_literal(hostname: str) -> ipaddress.IPv4Address | ipaddress.IPv6Ad
 
 
 def _canonical_destination_host(hostname: str) -> str:
-    normalized = _normalize_destination_host(hostname)
+    normalized = unquote(hostname).strip().lower().rstrip(".")
     parsed_ip = _parse_ip_literal(normalized)
     if parsed_ip is not None:
         return parsed_ip.compressed
@@ -761,7 +757,6 @@ class EmailProgressHook(ProgressHook):
         self.periodic_interval = periodic_interval
 
         self._last_periodic_email = 0.0
-        self._scan_start_time: float | None = None
 
     def _send_email(self, subject: str, body: str) -> bool:
         """Send email notification.
@@ -858,7 +853,6 @@ class EmailProgressHook(ProgressHook):
 
     def on_start(self, stats: ProgressStats) -> None:
         """Called when scanning starts."""
-        self._scan_start_time = time.time()
 
         if self.send_on_start:
             subject = f"ModelAudit Scan Started - {self.name}"
@@ -1103,45 +1097,34 @@ class CustomFunctionHook(ProgressHook):
         self._on_complete_func = on_complete_func
         self._on_error_func = on_error_func
 
+    def _call_custom(self, event_name: str, *args: Any) -> None:
+        """Invoke the current callback while keeping its failures local to the hook."""
+        callback_name = f"_on_{event_name.replace(' ', '_')}_func"
+        if getattr(self, callback_name):
+            try:
+                getattr(self, callback_name)(*args)
+            except Exception as e:
+                logger.warning(f"Custom {event_name} function failed in hook {self.name}: {e}")
+
     def on_start(self, stats: ProgressStats) -> None:
         """Called when scanning starts."""
-        if self._on_start_func:
-            try:
-                self._on_start_func(stats)
-            except Exception as e:
-                logger.warning(f"Custom start function failed in hook {self.name}: {e}")
+        self._call_custom("start", stats)
 
     def on_progress(self, stats: ProgressStats) -> None:
         """Called on progress updates."""
-        if self._on_progress_func:
-            try:
-                self._on_progress_func(stats)
-            except Exception as e:
-                logger.warning(f"Custom progress function failed in hook {self.name}: {e}")
+        self._call_custom("progress", stats)
 
     def on_phase_change(self, old_phase: ProgressPhase, new_phase: ProgressPhase, stats: ProgressStats) -> None:
         """Called when phase changes."""
-        if self._on_phase_change_func:
-            try:
-                self._on_phase_change_func(old_phase, new_phase, stats)
-            except Exception as e:
-                logger.warning(f"Custom phase change function failed in hook {self.name}: {e}")
+        self._call_custom("phase change", old_phase, new_phase, stats)
 
     def on_complete(self, stats: ProgressStats) -> None:
         """Called when scanning completes."""
-        if self._on_complete_func:
-            try:
-                self._on_complete_func(stats)
-            except Exception as e:
-                logger.warning(f"Custom complete function failed in hook {self.name}: {e}")
+        self._call_custom("complete", stats)
 
     def on_error(self, error: Exception, stats: ProgressStats) -> None:
         """Called when an error occurs."""
-        if self._on_error_func:
-            try:
-                self._on_error_func(error, stats)
-            except Exception as e:
-                logger.warning(f"Custom error function failed in hook {self.name}: {e}")
+        self._call_custom("error", error, stats)
 
 
 class ProgressHookManager:
