@@ -6081,6 +6081,7 @@ def test_pytorch_zip_later_raw_scan_starts_after_scanned_suffix(
         work_budget_remaining: list[int] | None = None,
         inst_name_validation: pytorch_zip_scanner_module._InstNameValidation | None = None,
         inst_name_offset: int | None = None,
+        known_size: int | None = None,
     ) -> bool:
         del fail_closed_on_truncated_extension, parse_budget_remaining
         assert nested_literal_depth == 0
@@ -21669,6 +21670,7 @@ def test_pytorch_zip_literal_work_budget_empty_pop_keeps_candidate_progression(
         nested_literal_depth: int = 0,
         sample_is_prefix: bool = False,
         work_budget_remaining: list[int] | None = None,
+        known_size: int | None = None,
     ) -> bool:
         starts.append(search_start)
         return original(
@@ -21678,6 +21680,7 @@ def test_pytorch_zip_literal_work_budget_empty_pop_keeps_candidate_progression(
             nested_literal_depth=nested_literal_depth,
             sample_is_prefix=sample_is_prefix,
             work_budget_remaining=work_budget_remaining,
+            known_size=known_size,
         )
 
     monkeypatch.setattr(
@@ -22699,6 +22702,17 @@ def _round6_count_ownership_work(monkeypatch: pytest.MonkeyPatch) -> dict[str, i
             counts["searches"] += 1
             counts["search_bytes"] += (limit if match is None else match.end()) - start
             return match
+
+        def finditer(self, source: bytes, start: int = 0, end: int | None = None) -> Any:
+            limit = len(source) if end is None else end
+            cursor = start
+            for match in original_pattern.finditer(source, start, limit):
+                counts["searches"] += 1
+                counts["search_bytes"] += match.end() - cursor
+                cursor = match.end()
+                yield match
+            counts["searches"] += 1
+            counts["search_bytes"] += limit - cursor
 
     monkeypatch.setattr(PyTorchZipScanner, "_raw_nested_pickle_literal_span_starting_at", staticmethod(span))
     monkeypatch.setattr(PyTorchZipScanner, "_raw_nested_literal_span_lookup", staticmethod(lookup))
@@ -24361,3 +24375,660 @@ def test_pytorch_zip_inst_name_validation_preserves_stripped_late_invalid_contro
         is False
     )
     assert remaining[0] >= 0
+
+
+def _native8_literal_counted_bytes(value: bytes) -> tuple[bytes, dict[str, int]]:
+    counts = {"find_bytes": 0, "rfind_bytes": 0, "find_calls": 0, "copied_bytes": 0}
+
+    class CountedBytes(bytes):
+        def __getitem__(self, key: Any) -> Any:
+            item = super().__getitem__(key)
+            if isinstance(item, bytes):
+                counts["copied_bytes"] += len(item)
+                return CountedBytes(item)
+            return item
+
+        def find(self, sub: Any, start: Any = 0, end: Any = None) -> int:
+            stop = len(self) if end is None else min(len(self), end)
+            found = super().find(sub, start, stop)
+            counts["find_bytes"] += max(0, (stop if found < 0 else found + len(sub)) - start)
+            counts["find_calls"] += 1
+            return found
+
+        def rfind(self, sub: Any, start: Any = 0, end: Any = None) -> int:
+            stop = len(self) if end is None else min(len(self), end)
+            found = super().rfind(sub, start, stop)
+            counts["rfind_bytes"] += max(0, stop - (start if found < 0 else found))
+            return found
+
+    return CountedBytes(value), counts
+
+
+@pytest.mark.parametrize("character_count", [65536, 131072])
+@pytest.mark.parametrize("continued", [False, True])
+def test_pytorch_zip_native8_literal_unicode_continuation_memory(character_count: int, continued: bool) -> None:
+    text = "一" * character_count + ("\\\n" if continued else "")
+    encoded = text.encode("utf-8")
+    # Preserve the native review's exact 393,226-byte continuation member.
+    payload = b"\x80\x04X" + len(encoded).to_bytes(4, "little") + encoded + b"."
+    assert len(payload) == character_count * 3 + 8 + (2 if continued else 0)
+    tracemalloc.start()
+    try:
+        assert not PyTorchZipScanner._complete_pickle_literal_member_has_line_continuation_suspicious_text(payload)
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 8 * len(payload)
+
+
+@pytest.mark.parametrize("character", ["一", "💡", "\ud800"])
+@pytest.mark.parametrize(
+    ("tail", "expected"),
+    [
+        (" \t.\u2003system \t(", ".system("),
+        (". \t x", ".x"),
+        ("\u2003x", " x"),
+        (" \t", " "),
+    ],
+)
+def test_pytorch_zip_native8_literal_compactor_keeps_batch_boundary_state(
+    character: str, tail: str, expected: str
+) -> None:
+    capacity = pytorch_zip_scanner_module._STORAGE_LITERAL_DECODED_TEXT_WINDOW_OVERLAP_BYTES
+    for length in (capacity - 1, capacity, 2 * capacity - 1):
+        prefix = character * length
+        assert PyTorchZipScanner._compact_python_member_access_and_calls(prefix + tail) == prefix + expected
+        spaced_prefix = (character + "\u2003\t") * length
+        assert PyTorchZipScanner._compact_python_member_access_and_calls(spaced_prefix + tail) == (
+            " ".join([character] * length) + expected
+        )
+
+
+@pytest.mark.parametrize("continuation", ["\n", "\r\n", "\r"])
+def test_pytorch_zip_native8_literal_compactor_retains_continued_security_at_batch_boundary(continuation: str) -> None:
+    capacity = pytorch_zip_scanner_module._STORAGE_LITERAL_DECODED_TEXT_WINDOW_OVERLAP_BYTES
+    for length in (capacity - 3, capacity - 1):
+        prefix = "一" * length
+        dangerous = prefix + " os \\" + continuation + ". \u2003system ("
+        benign = prefix + " os \\" + continuation + ". \u2003ösystem ("
+        assert PyTorchZipScanner._literal_value_has_line_continuation_suspicious_text(dangerous)
+        assert not PyTorchZipScanner._literal_value_has_line_continuation_suspicious_text(benign)
+
+
+@pytest.mark.parametrize("helper", ["spans", "security", "mask"])
+@pytest.mark.parametrize("unit", [b"V", b"S'"], ids=["unicode", "string"])
+@pytest.mark.parametrize("tail", [b"\n!", b"\n", b""], ids=["invalid-trailer", "eof-trailer", "no-newline"])
+def test_pytorch_zip_native8_literal_rejected_line_work_is_linear(
+    monkeypatch: pytest.MonkeyPatch, helper: str, unit: bytes, tail: bytes
+) -> None:
+    value, byte_counts = _native8_literal_counted_bytes(unit * 4096 + tail)
+    counts = _round6_count_ownership_work(monkeypatch)
+    remaining = [65536]
+    if helper == "spans":
+        assert (
+            list(
+                PyTorchZipScanner._raw_nested_pickle_literal_spans_in_range(
+                    value, 0, len(value), work_budget_remaining=remaining
+                )
+            )
+            == []
+        )
+    elif helper == "security":
+        assert (
+            PyTorchZipScanner._raw_nested_window_has_literal_security_stream(
+                value, 0, len(value), work_budget_remaining=remaining
+            )
+            is False
+        )
+    else:
+        assert (
+            PyTorchZipScanner._raw_nested_window_with_literal_payloads_masked(
+                value, 0, len(value), work_budget_remaining=remaining
+            )
+            == value
+        )
+    assert byte_counts["find_bytes"] + byte_counts["rfind_bytes"] + counts["search_bytes"] <= 8 * len(value)
+    assert counts["span_probes"] <= 4
+    assert remaining == [65536]
+
+
+@pytest.mark.parametrize("helper", ["spans", "security", "mask"])
+@pytest.mark.parametrize("short_first", [False, True])
+def test_pytorch_zip_native8_literal_rejection_is_local_to_immutable_source_view(
+    helper: str, short_first: bool
+) -> None:
+    full = b"V" * 32 + b"\nN."
+    short = full[:-2]
+    views = (short, full) if short_first else (full, short)
+    for value in views:
+        complete = len(value) == len(full)
+        if helper == "spans":
+            expected = [(0, 1, 32)] if complete else []
+            assert list(PyTorchZipScanner._raw_nested_pickle_literal_spans_in_range(value, 0, 32)) == expected
+        elif helper == "security":
+            assert PyTorchZipScanner._raw_nested_window_has_literal_security_stream(value, 0, 32) is False
+            span = PyTorchZipScanner._raw_nested_pickle_literal_span_starting_at(value, 0)
+            assert span == ((0, 1, 32) if complete else None)
+        else:
+            expected_mask = b"V" + b"!" * 31 if complete else b"V" * 32
+            assert PyTorchZipScanner._raw_nested_window_with_literal_payloads_masked(value, 0, 32) == expected_mask
+
+
+@pytest.mark.parametrize("helper", ["security", "mask"])
+@pytest.mark.parametrize("precomputed", [False, True])
+def test_pytorch_zip_native8_literal_rejected_line_keeps_overlapping_window_owner(
+    monkeypatch: pytest.MonkeyPatch, helper: str, precomputed: bool
+) -> None:
+    tail = b"V" * 4096 + b"\n!"
+    value, byte_counts = _native8_literal_counted_bytes(b"B\x04\x00\x00\x00\x80\x04N." + tail)
+    counts = _round6_count_ownership_work(monkeypatch)
+    starts = (6, 7)
+    owners: dict[int, tuple[int, int, int] | None] | None = dict.fromkeys(starts, (0, 5, 9)) if precomputed else None
+    remaining = [65536]
+    for start in starts:
+        if helper == "security":
+            assert (
+                PyTorchZipScanner._raw_nested_window_has_literal_security_stream(
+                    value, start, len(value), window_start_spans=owners, work_budget_remaining=remaining
+                )
+                is False
+            )
+        else:
+            assert (
+                PyTorchZipScanner._raw_nested_window_with_literal_payloads_masked(
+                    value, start, len(value), window_start_spans=owners, work_budget_remaining=remaining
+                )
+                == b"!" * (9 - start) + tail
+            )
+    assert byte_counts["find_bytes"] + byte_counts["rfind_bytes"] + counts["search_bytes"] <= 16 * len(value)
+    assert counts["window_lookups"] == 2
+    assert remaining[0] >= 0
+
+
+@pytest.mark.parametrize("count", [4096, 8192, 16384])
+def test_pytorch_zip_native8_literal_native_unprefixed_newline_work(
+    monkeypatch: pytest.MonkeyPatch, count: int
+) -> None:
+    # Native review inputs are unprefixed; the archive manifest has separate inputs.
+    value, byte_counts = _native8_literal_counted_bytes(b"c\xff" * 65 + b"V" * count + b"\n!")
+    counts = _round6_count_ownership_work(monkeypatch)
+    remaining = [65536]
+    found = PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(value, work_budget_remaining=remaining)
+    assert byte_counts["find_bytes"] + byte_counts["rfind_bytes"] + counts["search_bytes"] <= 16 * len(value)
+    assert found is False
+    assert remaining[0] >= 0
+
+
+@pytest.mark.parametrize("count", [4096, 8192, 16384, 65536])
+def test_pytorch_zip_native8_literal_supplemental_prefixed_newline_archive(tmp_path: Path, count: int) -> None:
+    value = b"X\xff\xff\xff\x7f" + b"c\xff" * 65 + b"V" * count + b"\n!"
+    path = tmp_path / f"native8-prefixed-newline-{count}.pt"
+    result = _scan_referenced_float_storage_blob(tmp_path, path.name, value)
+    assert result.metadata["pickle_verdict"] == "clean"
+    assert result.metadata["pickle_files"] == ["archive/data.pkl"]
+    if count == 65536:
+        # This archive's incomplete result also occurs on the immutable base.
+        _assert_context_discovery_incomplete(result)
+    else:
+        assert result.success is True
+        assert should_cache_scan_result(result.to_dict(include_private_metadata=True)) is True
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+    assert aggregate.success is (count != 65536)
+    assert determine_exit_code(aggregate) == (2 if count == 65536 else 0)
+
+
+@pytest.mark.parametrize("inside_rejected_line", [False, True])
+def test_pytorch_zip_native8_literal_rejected_line_retains_independent_security(inside_rejected_line: bool) -> None:
+    prefix = b"V" * 32
+    payload = b"\x82\x01)R."
+    value = prefix + payload + b"\n!" if inside_rejected_line else prefix + b"\n!" + payload
+    assert PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(value)
+    encoded = base64.b64encode(b"\x80\x04cos\nsystem\n)R.")
+    later_literal = b"C" + bytes([len(encoded)]) + encoded + b"."
+    assert PyTorchZipScanner._literal_value_has_nested_security_pickle(prefix + b"\n!" + later_literal)
+
+
+@pytest.mark.parametrize(
+    "label,storage,digest,expected_exit",
+    [
+        pytest.param(
+            "headers-10-0",
+            b"N.!" + b"c\xff" * 65 + b"X\xff\xff\xff\x7f" * 10 + b"!" * 0,
+            "e40491fce78a24230127bb8eaf4dcb51840d7b52bdfc0c3fb14493524fd71caf",
+            0,
+            id="headers-10-0",
+        ),
+        pytest.param(
+            "headers-100-0",
+            b"N.!" + b"c\xff" * 65 + b"X\xff\xff\xff\x7f" * 100 + b"!" * 0,
+            "eb80ddcaf5aaf9686e2ead11d3c3e7b502a4405f9b940b7271df25d4b3dff228",
+            0,
+            id="headers-100-0",
+        ),
+        pytest.param(
+            "headers-20-9000",
+            b"N.!" + b"c\xff" * 65 + b"X\xff\xff\xff\x7f" * 20 + b"!" * 9000,
+            "3917afdbaf659bc0d0710a1dbfffdb4c69fd55bc3add30cd6bbb146877109280",
+            0,
+            id="headers-20-9000",
+        ),
+        pytest.param(
+            "headers-100-9000",
+            b"N.!" + b"c\xff" * 65 + b"X\xff\xff\xff\x7f" * 100 + b"!" * 9000,
+            "ff6a0e2fe497cdaee404326ebd49ef5ae4202d6dbcfa655674fc1a0be96d0a74",
+            0,
+            id="headers-100-9000",
+        ),
+        pytest.param(
+            "headers-200-0",
+            b"N.!" + b"c\xff" * 65 + b"X\xff\xff\xff\x7f" * 200 + b"!" * 0,
+            "7e848713e417d6f5823e8e709e0e61d3ebc92158687a2e0e7f7cb3ddab0f74e0",
+            0,
+            id="headers-200-0",
+        ),
+        pytest.param(
+            "headers-40-2000",
+            b"N.!" + b"c\xff" * 65 + b"X\xff\xff\xff\x7f" * 40 + b"!" * 2000,
+            "c23765fe42bd07d85e7bed030155ce2ea843a3141ffa85cf5d9ee2b47a86f3d1",
+            0,
+            id="headers-40-2000",
+        ),
+        pytest.param(
+            "headers-32-2200",
+            b"N.!" + b"c\xff" * 65 + b"X\xff\xff\xff\x7f" * 32 + b"!" * 2200,
+            "95a36bdca5cec909d0c80ae0767c34c33fddccd9b26fa4f786c4fcf90ed4044f",
+            0,
+            id="headers-32-2200",
+        ),
+        pytest.param(
+            "headers-30-2400",
+            b"N.!" + b"c\xff" * 65 + b"X\xff\xff\xff\x7f" * 30 + b"!" * 2400,
+            "4b29df62a36b7a53804032bd2ae3a6cd2bb4e1b7b47a28eff3ae2f3a127f382d",
+            0,
+            id="headers-30-2400",
+        ),
+        pytest.param(
+            "headers-no-noise-20-9000",
+            b"N.!" + b"X\xff\xff\xff\x7f" * 20 + b"!" * 9000,
+            "ab662581e755b7925d143a4074f5d7c508c0a2a81872a5835126789b165e2d18",
+            0,
+            id="headers-no-noise-20-9000",
+        ),
+        pytest.param(
+            "inst-K-utf8",
+            b"N.!K(im\xc3\xb3dulo\nthing\n.",
+            "c88b22817267c3c05d58f2d5fe4972c736eeceb6f1822606282fa55934f8cb78",
+            0,
+            id="inst-K-utf8",
+        ),
+        pytest.param(
+            "inst-G-inert",
+            b"N.!G(!!!!!!!im\xc3\xb3dulo\nthing\n.",
+            "c4872d62d24fc40ed409a5b19bf0aefe3fbaba218f640983130863932218fc71",
+            0,
+            id="inst-G-inert",
+        ),
+        pytest.param(
+            "inst-K-ascii",
+            b"N.!K(ix\ny\n.",
+            "deed16ff5346a0884fb65a8d0c145ff35ef715ad0cb06cec3f308c2496d01870",
+            1,
+            id="inst-K-ascii",
+        ),
+        pytest.param(
+            "inst-G-utf8",
+            b"N.!G(im\xc3\xb3dulo\nthing\n.",
+            "f71bf8a45bf21e8590e40b3b721866fe43957a7ab71cf15346304785ffd81bb9",
+            0,
+            id="inst-G-utf8",
+        ),
+        pytest.param(
+            "inst-noise-G-utf8",
+            b"N.!" + b"c\xff" * 65 + b"G(im\xc3\xb3dulo\nthing\n.",
+            "b696ec3225b30183240cceae266c5ce44ce02d26306e1a86d6224b2acd291c97",
+            0,
+            id="inst-noise-G-utf8",
+        ),
+        pytest.param(
+            "inst-utf8-module",
+            b"X\xff\xff\xff\x7f" + b"c\xff" * 65 + b"G(im\xc3\xb3dulo\nthing\n.",
+            "565aa5b1a31a5000a3f46604fe57073f4aabcdbc2109fe80813ce3461544d088",
+            0,
+            id="inst-utf8-module",
+        ),
+        pytest.param(
+            "inst-utf8-name",
+            b"X\xff\xff\xff\x7f" + b"c\xff" * 65 + b"G(imodule\nth\xc3\xadng\n.",
+            "a829bc96418c580be123596449110040f5f0914557a6eac81c03757868163e87",
+            0,
+            id="inst-utf8-name",
+        ),
+        pytest.param(
+            "inst-ascii-thing",
+            b"X\xff\xff\xff\x7f" + b"c\xff" * 65 + b"G(imodule\nthing\n.",
+            "6681d02a555ba15fc1e4591a6f225acba26daa0bf471b8120ecae4a0da9f61c0",
+            2,
+            id="inst-ascii-thing",
+        ),
+        pytest.param(
+            "inst-invalid-thing",
+            b"X\xff\xff\xff\x7f" + b"c\xff" * 65 + b"G(im\xffdulo\nthing\n.",
+            "de5ba2e33be3b39f0d05bc8b8fff930cd8d2afa4774ccf399669674a93a2a651",
+            2,
+            id="inst-invalid-thing",
+        ),
+        pytest.param(
+            "inst-utf8-x",
+            b"X\xff\xff\xff\x7f" + b"c\xff" * 65 + b"G(im\xc3\xb3dulo\nx\n.",
+            "2fb926ebfc5796fd4bc04f7dfbcdfa0e300f01f27cada8204dfefd140937a8a6",
+            0,
+            id="inst-utf8-x",
+        ),
+        pytest.param(
+            "inst-invalid-x",
+            b"X\xff\xff\xff\x7f" + b"c\xff" * 65 + b"G(im\xffdulo\nx\n.",
+            "f74209324f7089cfc407b2abac9a462ea70f4bc8bdc8764616aa1e015e83f513",
+            0,
+            id="inst-invalid-x",
+        ),
+        pytest.param(
+            "inst-ascii-x",
+            b"X\xff\xff\xff\x7f" + b"c\xff" * 65 + b"G(imodule\nx\n.",
+            "3ffd445b77cddf5f996b854453cbe69276640861918364b3c5f9b15f62229410",
+            2,
+            id="inst-ascii-x",
+        ),
+    ],
+)
+def test_pytorch_zip_native8_header_inst_manifest_outcomes(
+    tmp_path: Path, label: str, storage: bytes, digest: str, expected_exit: int
+) -> None:
+    assert hashlib.sha256(storage).hexdigest() == digest
+    for value in (storage, storage + b" " * (-len(storage) % 4)):
+        remaining = [65536]
+        assert PyTorchZipScanner._trailing_candidate_has_raw_nested_security_pickle(
+            value, sample_is_prefix=False, work_budget_remaining=remaining
+        ) is (expected_exit != 0)
+        assert remaining[0] >= 0
+
+    path = tmp_path / f"{label}.pt"
+    result = _scan_referenced_float_storage_blob(tmp_path, path.name, storage)
+    expected_verdict = "suspicious" if expected_exit == 1 else "clean"
+    expected_files = ["archive/data.pkl"] + (["archive/data/0"] if expected_exit == 1 else [])
+    assert result.success is (expected_exit == 0)
+    assert result.metadata["pickle_verdict"] == expected_verdict
+    assert result.metadata["pickle_files"] == expected_files
+    assert should_cache_scan_result(result.to_dict(include_private_metadata=True)) is (expected_exit == 0)
+    if expected_exit:
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        reason = "pickle_analysis_incomplete" if expected_exit == 1 else "pytorch_zip_pickle_discovery_incomplete"
+        assert reason in result.metadata["scan_outcome_reasons"]
+    else:
+        assert not result.metadata.get("analysis_incomplete")
+        assert result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+    assert aggregate.success is (expected_exit == 0)
+    assert aggregate.file_metadata[str(path)]["pickle_verdict"] == expected_verdict
+    assert aggregate.file_metadata[str(path)]["pickle_files"] == expected_files
+    assert determine_exit_code(aggregate) == expected_exit
+
+
+@pytest.mark.parametrize("marker,width", [(b"T", 4), (b"X", 4), (b"\x8d", 8)])
+def test_pytorch_zip_native8_header_rejection_spends_no_suffix_work(
+    monkeypatch: pytest.MonkeyPatch, marker: bytes, width: int
+) -> None:
+    value = (marker + ((1 << (8 * width - 1)) - 1).to_bytes(width, "little")) * 200
+    remaining = [65536]
+    slots = [64]
+
+    def unexpected_parse(*args: object, **kwargs: object) -> Iterator[Any]:
+        raise AssertionError("impossible complete operands must not reach a parser")
+
+    monkeypatch.setattr(pickletools, "genops", unexpected_parse)
+    assert (
+        PyTorchZipScanner._raw_nested_binary_opcode_candidate_has_structural_signal(
+            value, slots, work_budget_remaining=remaining
+        )
+        is False
+    )
+    assert remaining == [65536]
+    assert slots == [64]
+
+
+@pytest.mark.parametrize(
+    "known_size,search_end,expected",
+    [(None, None, True), (5, None, True), (6, None, False), (105, None, True), (6, 1, False)],
+)
+def test_pytorch_zip_native8_header_known_extent_preserves_prefix_uncertainty(
+    known_size: int | None, search_end: int | None, expected: bool
+) -> None:
+    value = b"X" + (100).to_bytes(4, "little") + b"!"
+    remaining = [0]
+    assert (
+        PyTorchZipScanner._raw_nested_binary_opcode_candidate_has_structural_signal(
+            value,
+            [64],
+            sample_is_prefix=True,
+            search_end=search_end,
+            known_size=known_size,
+            work_budget_remaining=remaining,
+        )
+        is expected
+    )
+    assert remaining == ([-1] if expected else [0])
+
+
+@pytest.mark.parametrize("header", [b"X\xff", b"X" + (9000).to_bytes(4, "little") + b"!" * 32])
+def test_pytorch_zip_native8_header_partial_or_whole_member_fitting_operand_stays_uncertain(header: bytes) -> None:
+    remaining = [0]
+    assert PyTorchZipScanner._raw_nested_binary_opcode_candidate_has_structural_signal(
+        header, [64], sample_is_prefix=True, known_size=10000, work_budget_remaining=remaining
+    )
+    assert remaining == [-1]
+
+
+@pytest.mark.parametrize("contextual", [False, True])
+def test_pytorch_zip_native8_header_known_extent_tracks_stripping_and_context(
+    monkeypatch: pytest.MonkeyPatch, contextual: bool
+) -> None:
+    trailing = b" \t#c\xffX\xff\xff\xff\x7f"
+    context = b"prefix!" + trailing if contextual else None
+    seen: list[tuple[bytes, int, int | None]] = []
+
+    def record(value: bytes, *, search_start: int = 0, known_size: int | None = None, **kwargs: Any) -> bool:
+        seen.append((value, search_start, known_size))
+        return False
+
+    monkeypatch.setattr(PyTorchZipScanner, "_trailing_candidate_has_raw_nested_security_pickle", staticmethod(record))
+    PyTorchZipScanner._trailing_pickle_probe_should_scan(
+        trailing,
+        sample_is_prefix=True,
+        context=context,
+        context_start=7 if contextual else 0,
+        known_size=len(trailing) + 9000,
+    )
+    assert seen == ([(context, 10, len(trailing) + 9007)] if contextual else [(trailing[3:], 0, len(trailing) + 8997)])
+
+
+def test_pytorch_zip_native8_header_known_extent_tracks_trivial_and_masked_suffixes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tail = b"!" + b"c\xff" * 65 + b"X\xff\xff\xff\x7f" * 20
+    seen: list[tuple[int, int | None]] = []
+
+    def record_tail(value: bytes, *, known_size: int | None = None, **kwargs: Any) -> bool:
+        seen.append((len(value), known_size))
+        return False
+
+    monkeypatch.setattr(PyTorchZipScanner, "_trailing_pickle_probe_should_scan", staticmethod(record_tail))
+    assert not PyTorchZipScanner._trivial_complete_pickle_prefix_trailing_should_scan(
+        b"N." + tail, sample_is_prefix=True, known_size=len(tail) + 9002
+    )
+    assert seen == [(len(tail), len(tail) + 9000)]
+
+    seen.clear()
+
+    def record_suffix(value: bytes, *, known_size: int | None = None, **kwargs: Any) -> bool:
+        seen.append((len(value), known_size))
+        return True
+
+    monkeypatch.setattr(
+        PyTorchZipScanner, "_raw_nested_security_pickle_candidate_has_structural_signal", staticmethod(record_suffix)
+    )
+    value = b"!" * 17 + tail
+    assert PyTorchZipScanner._raw_nested_security_pickle_candidate_budget_exhausted_needs_scan(
+        value, search_start=17, sample_is_prefix=True, known_size=len(value) + 9000
+    )
+    assert seen == [(len(tail), len(tail) + 9000)]
+
+
+def test_pytorch_zip_native8_header_expanded_short_replay_retains_known_extent() -> None:
+    entry = zipfile.ZipInfo("archive/data/0")
+    entry.file_size = 10000
+    seen: list[tuple[int, bool, int | None]] = []
+
+    def record(
+        sample: bytes,
+        *,
+        sample_is_prefix: bool,
+        known_size: int | None = None,
+        work_budget_remaining: list[int] | None = None,
+    ) -> bool:
+        seen.append((len(sample), sample_is_prefix, known_size))
+        return False
+
+    assert not PyTorchZipScanner._expanded_probe_preserves_trusted_scan(
+        entry, b"!" * 8192, 8192, record, work_budget_remaining=[65536]
+    )
+    assert seen == [(4096, True, 10000)]
+
+
+@pytest.mark.parametrize(
+    "stream",
+    [
+        b"cos\nabort\n)R.",
+        b"\x80\x04\x8c\x02os\x8c\x05abort\x93)R.",
+        b"\x80\x04\x95\x0d\x00\x00\x00\x00\x00\x00\x00cos\nabort\n)R.",
+    ],
+)
+def test_pytorch_zip_native8_header_rejection_preserves_later_security(stream: bytes) -> None:
+    value = b"X\xff\xff\xff\x7f" * 20 + stream
+    assert PyTorchZipScanner._trailing_candidate_has_raw_nested_security_pickle(
+        value, sample_is_prefix=True, known_size=len(value) + 9000
+    )
+    assert PyTorchZipScanner._raw_nested_security_pickle_candidate_has_structural_signal(
+        value, sample_is_prefix=True, known_size=len(value) + 9000
+    )
+
+
+@pytest.mark.parametrize(
+    "payload,expected",
+    [
+        (b"(imodule\nx\n.", True),
+        (b"(im\xc3\xb3dulo\nx\n.", False),
+        (b"(imodule\nth\xc3\xadng\n.", False),
+        (b"cm\xc3\xb3dulo\nx\n.", True),
+        (b"\x80\x04cos\nabort\n0(im\xc3\xb3dulo\nx\n.", True),
+        (b"\x80\x04(im\xc3\xb3dulo\nx\ncos\nabort\n.", False),
+        (b"\x80\x04Nq\x00q\x000cos\nabort\n0(im\xc3\xb3dulo\nx\n.", True),
+        # The first MARK is an independent start inside the numeric operand.
+        (b"\x80\x04h\x00(imodule\nx\n.", True),
+        (b"\x80\x04h\x00" + b"N0" * 6 + b"(imodule\nx\n.", False),
+    ],
+)
+def test_pytorch_zip_native8_inst_numeric_proof_requires_reachable_ascii(payload: bytes, expected: bool) -> None:
+    assert (
+        PyTorchZipScanner._raw_nested_numeric_operand_has_cross_boundary_security_pickle(
+            b"G" + payload, 1, 9, work_budget_remaining=[65536]
+        )
+        is expected
+    )
+    value = b"\x8b" + len(payload).to_bytes(4, "little") + payload + b"."
+    assert (
+        PyTorchZipScanner._raw_nested_numeric_operand_has_cross_boundary_security_pickle(
+            value, 5, 5 + len(payload), work_budget_remaining=[65536]
+        )
+        is False
+    )
+
+
+@pytest.mark.parametrize("later", [b"", b"cos\nabort\n)R.", b"\x80\x04\x8c\x02os\x8c\x05abort\x93)R."])
+def test_pytorch_zip_native8_inst_invalid_name_keeps_independent_later_stream(later: bytes) -> None:
+    value = b"c\xff" * 65 + b"G(im\xc3\xb3dulo\nx\n." + later
+    assert PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(value) is bool(later)
+    assert PyTorchZipScanner._trailing_candidate_has_raw_nested_security_pickle(value, sample_is_prefix=False) is bool(
+        later
+    )
+
+
+@pytest.mark.parametrize("unit,count", [(b"V", 4096), (b"S'", 2048)])
+@pytest.mark.parametrize("sample_is_prefix", [False, True])
+def test_pytorch_zip_native8_header_text_rejection_precharges_one_interval(
+    monkeypatch: pytest.MonkeyPatch, unit: bytes, count: int, sample_is_prefix: bool
+) -> None:
+    admitted = 0
+    searched = 0
+    original = PyTorchZipScanner._consume_raw_nested_pickle_work_budget
+
+    def consume(remaining: list[int], size: int) -> bool:
+        nonlocal admitted
+        allowed = original(remaining, size)
+        if allowed:
+            admitted += size
+        return allowed
+
+    class CountedBytes(bytes):
+        def find(self, sub: Any, start: Any = 0, end: Any = None) -> int:
+            nonlocal searched
+            stop = len(self) if end is None else end
+            searched += stop - start
+            assert searched <= admitted
+            return super().find(sub, start, stop)
+
+        def rfind(self, sub: Any, start: Any = 0, end: Any = None) -> int:
+            nonlocal searched
+            stop = len(self) if end is None else end
+            searched += stop - start
+            assert searched <= admitted
+            return super().rfind(sub, start, stop)
+
+    value = CountedBytes(unit * count + b"\n!")
+    remaining = [65536]
+    monkeypatch.setattr(PyTorchZipScanner, "_consume_raw_nested_pickle_work_budget", staticmethod(consume))
+    assert not PyTorchZipScanner._raw_nested_binary_opcode_candidate_has_structural_signal(
+        value, [64], sample_is_prefix=sample_is_prefix, work_budget_remaining=remaining
+    )
+    interval_work = min(len(value) - len(unit), ((len(unit) * (count - 1)) // 16 + 1) * 16)
+    expected_work = interval_work + (len(value) if unit == b"V" and not sample_is_prefix else 0)
+    assert searched == admitted == expected_work
+    assert remaining == [65536 - expected_work]
+
+
+@pytest.mark.parametrize(
+    "value,sample_is_prefix,allowance",
+    [
+        (b"S'plain'\n.", False, 10),
+        (b"Vplain", True, 6),
+        (b"Vplain\n", True, 7),
+        (b"Vplain\n.", True, 16),
+        (b"V" + b"!" * 10000 + b"\n.", False, 65536),
+    ],
+)
+def test_pytorch_zip_native8_header_optional_text_proof_keeps_normal_path(
+    value: bytes, sample_is_prefix: bool, allowance: int
+) -> None:
+    remaining = [allowance]
+    assert not PyTorchZipScanner._raw_nested_binary_opcode_candidate_has_structural_signal(
+        value, [64], sample_is_prefix=sample_is_prefix, work_budget_remaining=remaining
+    )
+    assert remaining[0] >= 0
+
+
+@pytest.mark.parametrize("sample_is_prefix", [False, True])
+@pytest.mark.parametrize("later", [b"", b"cos\nabort\n)R.", b"\x80\x04\x8c\x02os\x8c\x05abort\x93)R."])
+def test_pytorch_zip_native8_header_rejected_line_keeps_later_candidates(sample_is_prefix: bool, later: bytes) -> None:
+    value = b"V" * 32 + b"\n!" + later
+    assert PyTorchZipScanner._raw_nested_security_pickle_candidate_has_structural_signal(
+        value, sample_is_prefix=sample_is_prefix
+    ) is bool(later)
