@@ -6751,7 +6751,7 @@ def test_scan_file_complete_pickle_does_not_merge_inconclusive_flax(tmp_path: Pa
     result = scan_file(str(target), config={"cache_scan_results": False})
 
     assert result.scanner_name == expected_scanner
-    assert result.success is True
+    assert result.success is True, json.dumps(result.to_dict(include_private_metadata=True), indent=2)
     assert "flax_msgpack_routing_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
     assert not any(check.name == "MessagePack Routing Analysis Incomplete" for check in result.checks)
 

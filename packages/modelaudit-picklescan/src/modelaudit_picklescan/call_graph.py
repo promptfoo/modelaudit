@@ -4447,6 +4447,8 @@ class _FileFinderResolutionSummary:
     identity: str | None = None
 
 
+# A later scan must not mistake a pre-scan directory change for an in-scan change.
+@_register_source_sensitive_cache
 @lru_cache(maxsize=_MAX_FILE_FINDER_IDENTITY_CACHE_SIZE)
 def _cached_file_finder_resolution_summary(finder_id: int) -> _FileFinderResolutionSummary:
     del finder_id

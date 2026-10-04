@@ -2310,6 +2310,72 @@ def test_file_finder_resolution_retries_one_stale_directory_snapshot(
         call_graph._cached_file_finder_resolution_summary.cache_clear()
 
 
+@pytest.mark.parametrize("change_during_scan", [False, True], ids=["before-scan", "during-scan"])
+@pytest.mark.parametrize("dangerous", [False, True], ids=["benign", "dangerous"])
+def test_scan_bytes_distinguishes_previous_file_finder_state_from_in_scan_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    change_during_scan: bool,
+    dangerous: bool,
+) -> None:
+    payload = pickle.dumps((complex(1, 2), os.system) if dangerous else complex(1, 2), protocol=4)
+    path_entry = str(tmp_path)
+    finder = FileFinder(path_entry, *_standard_file_finder_loader_details())
+    assert finder.find_spec("unrelated_module") is None
+
+    def change_directory() -> None:
+        (tmp_path / "unrelated.txt").write_text("not Python source", encoding="utf-8")
+        directory_stat = tmp_path.stat()
+        os.utime(tmp_path, ns=(directory_stat.st_atime_ns, directory_stat.st_mtime_ns + 2_000_000_000))
+
+    with _standard_import_runtime(
+        monkeypatch,
+        module="unrelated_module",
+        importer_cache={**sys.path_importer_cache, path_entry: finder},
+        search_path=[path_entry, *sys.path],
+    ):
+        previous_report = package_api.scan_bytes(payload)
+        assert previous_report.status == ScanStatus.COMPLETE, previous_report.to_dict()
+        if not change_during_scan:
+            change_directory()
+
+        original_begin_report = package_api._begin_shared_source_report
+        refreshes = 0
+
+        def begin_report_with_lazy_finder_refresh() -> int | None:
+            nonlocal refreshes
+            generation = original_begin_report()
+            if change_during_scan:
+                change_directory()
+            # Standard import machinery refreshes its cache lazily; the directory
+            # may already have changed before this scan's source snapshot began.
+            assert finder.find_spec("unrelated_module") is None
+            refreshes += 1
+            return generation
+
+        monkeypatch.setattr(package_api, "_begin_shared_source_report", begin_report_with_lazy_finder_refresh)
+        report = package_api.scan_bytes(payload)
+
+    assert refreshes == 1
+    assert report.coverage.raw_scan_complete is True
+    assert report.coverage.opcode_scan_complete is True
+    if change_during_scan:
+        assert report.status == ScanStatus.INCONCLUSIVE
+        assert any(
+            error.details.get("source_stability_reason") == "resolution_context_changed" for error in report.errors
+        )
+    else:
+        assert report.status == ScanStatus.COMPLETE, report.to_dict()
+        assert not report.errors
+    if dangerous:
+        assert report.verdict == SafetyVerdict.MALICIOUS
+        assert any(
+            finding.details.get("import_reference") in {"nt.system", "posix.system"} for finding in report.findings
+        )
+    else:
+        assert report.verdict == (SafetyVerdict.UNKNOWN if change_during_scan else SafetyVerdict.CLEAN)
+
+
 @pytest.mark.parametrize("mutation", ["remove", "add"])
 def test_file_finder_identity_revalidates_in_place_cache_mutation(
     tmp_path: Path,
