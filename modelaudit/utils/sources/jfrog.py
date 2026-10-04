@@ -17,13 +17,14 @@ from http.cookiejar import CookieJar
 from io import BytesIO
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, TypedDict
-from urllib.parse import ParseResult, unquote, urljoin, urlparse, urlunparse
+from urllib.parse import ParseResult, unquote, urljoin, urlparse
 
 import click
 import requests
 from requests.auth import AuthBase
 
 from ...config.constants import SCANNABLE_MODEL_EXTENSIONS
+from ..helpers.evidence import format_terminal_text
 
 logger = logging.getLogger(__name__)
 
@@ -45,11 +46,6 @@ _JFROG_IPV6_TRANSITION_NETWORKS = (
     ipaddress.ip_network("2001::/32"),
     ipaddress.ip_network("2002::/16"),
 )
-_SENSITIVE_QUERY_PARAM_RE = re.compile(
-    r"([?&][^=\s&]*(?:signature|credential|security-token|access-key|access_key|token|secret|api-key|api_key|apikey|sig)[^=\s&]*=)[^\s&#]+",
-    re.IGNORECASE,
-)
-_URL_USERINFO_RE = re.compile(r"([a-z][a-z0-9+.-]*://)([^/@\s]+)@", re.IGNORECASE)
 _JFROG_CONTENT_SNIFF_BYTES = 64 * 1024
 _TFLITE_MAGIC_OFFSET = 4
 _TFLITE_MAGIC_BYTES = b"TFL3"
@@ -66,39 +62,6 @@ class _NoNetrcAuth(AuthBase):
 
 
 _JFROG_NO_NETRC_AUTH = _NoNetrcAuth()
-
-
-def redact_jfrog_url_for_display(url: str) -> str:
-    """Remove credentials, query strings, and fragments from a JFrog URL for display."""
-    try:
-        parsed = urlparse(url)
-    except Exception:
-        return "<jfrog URL redacted>"
-
-    if not parsed.scheme:
-        return url
-
-    netloc = parsed.netloc
-    if "@" in parsed.netloc:
-        netloc = parsed.hostname or ""
-        try:
-            port = parsed.port
-        except ValueError:
-            port = None
-        if port is not None:
-            netloc = f"{netloc}:{port}"
-        netloc = f"<credentials-redacted>@{netloc}"
-
-    return urlunparse((parsed.scheme, netloc, parsed.path, "", "", ""))
-
-
-def redact_jfrog_error_for_display(message: object, source_url: str | None = None) -> str:
-    """Remove JFrog URL credentials from exception text."""
-    redacted = str(message)
-    if source_url:
-        redacted = redacted.replace(source_url, redact_jfrog_url_for_display(source_url))
-    redacted = _URL_USERINFO_RE.sub(r"\1<credentials-redacted>@", redacted)
-    return _SENSITIVE_QUERY_PARAM_RE.sub(r"\1<redacted>", redacted)
 
 
 def _safe_download_path(download_dir: Path, relative_path: str) -> Path:
@@ -223,17 +186,6 @@ def is_jfrog_url(url: str) -> bool:
     if "/artifactory/" not in parsed.path:
         return False
     return _is_jfrog_service_host(hostname) or hostname in _get_trusted_jfrog_hosts()
-
-
-def is_jfrog_url_like(url: str) -> bool:
-    """Return True for JFrog-shaped URLs that need safe user-facing redaction."""
-    parsed = urlparse(url)
-    hostname = _normalize_hostname(parsed.hostname or "")
-    if parsed.scheme not in {"http", "https"} or not hostname or "/artifactory/" not in parsed.path:
-        return False
-    return (
-        _is_jfrog_service_host(hostname) or _is_local_jfrog_host(hostname) or hostname in _get_configured_jfrog_hosts()
-    )
 
 
 def _normalize_hostname(hostname: str) -> str:
@@ -383,56 +335,56 @@ def _canonical_jfrog_path(url: str) -> tuple[tuple[str, str, int | None], PurePo
     try:
         prepared_url = requests.Request("GET", url).prepare().url
     except requests.exceptions.RequestException as exc:
-        raise ValueError(f"Unsafe JFrog artifact path: {redact_jfrog_url_for_display(url)}") from exc
+        raise ValueError(f"Unsafe JFrog artifact path: {url}") from exc
     if origin is None or not prepared_url:
-        raise ValueError(f"Unsafe JFrog artifact path: {redact_jfrog_url_for_display(url)}")
+        raise ValueError(f"Unsafe JFrog artifact path: {url}")
 
     decoded_path = urlparse(prepared_url).path
     for _ in range(3):
         if re.search(r"%(?:2f|5c)", decoded_path, re.IGNORECASE):
-            raise ValueError(f"Unsafe JFrog artifact path: {redact_jfrog_url_for_display(url)}")
+            raise ValueError(f"Unsafe JFrog artifact path: {url}")
         try:
             next_path = unquote(decoded_path, errors="strict")
         except UnicodeDecodeError as exc:
-            raise ValueError(f"Unsafe JFrog artifact path: {redact_jfrog_url_for_display(url)}") from exc
+            raise ValueError(f"Unsafe JFrog artifact path: {url}") from exc
         if next_path == decoded_path:
             break
         decoded_path = next_path
     else:
-        raise ValueError(f"Unsafe JFrog artifact path: {redact_jfrog_url_for_display(url)}")
+        raise ValueError(f"Unsafe JFrog artifact path: {url}")
 
     path = PurePosixPath(decoded_path)
     if "\x00" in decoded_path or "\\" in decoded_path or any(part in {".", ".."} for part in path.parts):
-        raise ValueError(f"Unsafe JFrog artifact path: {redact_jfrog_url_for_display(url)}")
+        raise ValueError(f"Unsafe JFrog artifact path: {url}")
     return origin, path
 
 
 def _safe_jfrog_child_name(uri: object, folder_url: str) -> str:
     """Validate one Storage API child URI before following it."""
     if not isinstance(uri, str) or not uri:
-        raise ValueError(f"Unsafe JFrog child path in {redact_jfrog_url_for_display(folder_url)}")
+        raise ValueError(f"Unsafe JFrog child path in {folder_url}")
     parsed = urlparse(uri)
     if parsed.scheme or parsed.netloc or parsed.query or parsed.fragment:
-        raise ValueError(f"Unsafe JFrog child path in {redact_jfrog_url_for_display(folder_url)}")
+        raise ValueError(f"Unsafe JFrog child path in {folder_url}")
 
     child_name = uri.lstrip("/")
     decoded_name = child_name
     for _ in range(3):
         if re.search(r"%(?:2f|5c)", decoded_name, re.IGNORECASE):
-            raise ValueError(f"Unsafe JFrog child path in {redact_jfrog_url_for_display(folder_url)}")
+            raise ValueError(f"Unsafe JFrog child path in {folder_url}")
         try:
             next_name = unquote(decoded_name, errors="strict")
         except UnicodeDecodeError as exc:
-            raise ValueError(f"Unsafe JFrog child path in {redact_jfrog_url_for_display(folder_url)}") from exc
+            raise ValueError(f"Unsafe JFrog child path in {folder_url}") from exc
         if next_name == decoded_name:
             break
         decoded_name = next_name
     else:
-        raise ValueError(f"Unsafe JFrog child path in {redact_jfrog_url_for_display(folder_url)}")
+        raise ValueError(f"Unsafe JFrog child path in {folder_url}")
 
     parts = decoded_name.split("/")
     if not decoded_name or "\\" in decoded_name or any(part in {"", ".", ".."} for part in parts):
-        raise ValueError(f"Unsafe JFrog child path in {redact_jfrog_url_for_display(folder_url)}")
+        raise ValueError(f"Unsafe JFrog child path in {folder_url}")
     return child_name
 
 
@@ -441,12 +393,12 @@ def _safe_jfrog_relative_path(base_url: str, artifact_url: str) -> str:
     base_origin, base_path = _canonical_jfrog_path(base_url)
     artifact_origin, artifact_path = _canonical_jfrog_path(artifact_url)
     if artifact_origin != base_origin:
-        raise ValueError(f"Unsafe JFrog artifact path: {redact_jfrog_url_for_display(artifact_url)}")
+        raise ValueError(f"Unsafe JFrog artifact path: {artifact_url}")
 
     base_parts = base_path.parts
     artifact_parts = artifact_path.parts
     if len(artifact_parts) <= len(base_parts) or artifact_parts[: len(base_parts)] != base_parts:
-        raise ValueError(f"Unsafe JFrog artifact path: {redact_jfrog_url_for_display(artifact_url)}")
+        raise ValueError(f"Unsafe JFrog artifact path: {artifact_url}")
 
     prepared_base_url = requests.Request("GET", base_url).prepare().url
     prepared_artifact_url = requests.Request("GET", artifact_url).prepare().url
@@ -513,7 +465,7 @@ def _build_jfrog_auth_headers(
         if api_token or access_token or os.getenv("JFROG_API_TOKEN") or os.getenv("JFROG_ACCESS_TOKEN"):
             logger.warning(
                 "Skipping JFrog credentials for untrusted or insecure URL %s",
-                redact_jfrog_url_for_display(url),
+                format_terminal_text(url),
             )
         return {}
 
@@ -654,9 +606,7 @@ def _get_with_jfrog_redirect_policy(
     for _redirect_count in range(_MAX_JFROG_REDIRECTS + 1):
         current_origin = _get_jfrog_probe_origin(current_url)
         if current_origin is None or not _is_safe_jfrog_download_target(current_url):
-            raise requests.exceptions.RequestException(
-                f"Refusing unsafe JFrog download target {redact_jfrog_url_for_display(current_url)}"
-            )
+            raise requests.exceptions.RequestException(f"Refusing unsafe JFrog download target {current_url}")
         current_cookies = redirect_cookie_jars.setdefault(current_origin, requests.cookies.RequestsCookieJar())
         response = requests.get(
             current_url,
@@ -677,7 +627,7 @@ def _get_with_jfrog_redirect_policy(
         response.close()
         if not location:
             raise requests.exceptions.RequestException(
-                f"JFrog redirect response missing Location header for {redact_jfrog_url_for_display(current_url)}"
+                f"JFrog redirect response missing Location header for {current_url}"
             )
 
         current_url = urljoin(current_url, location)
@@ -689,9 +639,7 @@ def _get_with_jfrog_redirect_policy(
         credentials_allowed = credentials_allowed and next_is_trusted
         current_headers = headers if credentials_allowed else {}
 
-    raise requests.exceptions.TooManyRedirects(
-        f"Exceeded {_MAX_JFROG_REDIRECTS} redirects for JFrog URL {redact_jfrog_url_for_display(url)}"
-    )
+    raise requests.exceptions.TooManyRedirects(f"Exceeded {_MAX_JFROG_REDIRECTS} redirects for JFrog URL {url}")
 
 
 def download_artifact(
@@ -732,7 +680,7 @@ def download_artifact(
         requests.HTTPError: If authentication fails or download fails
         Exception: For other download errors
     """
-    display_url = redact_jfrog_url_for_display(url)
+    display_url = url
     if not is_jfrog_url(url):
         raise ValueError(f"Not a JFrog URL: {display_url}")
     max_download_size = (
@@ -821,7 +769,7 @@ def download_artifact(
 
     except requests.exceptions.HTTPError as e:  # type: ignore[attr-defined]
         _cleanup_failed_artifact_download(temp_dir, partial_path)
-        error_msg = redact_jfrog_error_for_display(e, url)
+        error_msg = str(e)
         if e.response.status_code == 401:
             raise Exception(
                 f"Authentication failed for JFrog URL {display_url}. Please provide a valid API token or access token."
@@ -834,11 +782,11 @@ def download_artifact(
         raise Exception(f"HTTP error {e.response.status_code} downloading from {display_url}: {error_msg}") from e
     except requests.exceptions.RequestException as e:  # type: ignore[attr-defined]
         _cleanup_failed_artifact_download(temp_dir, partial_path)
-        error_msg = redact_jfrog_error_for_display(e, url)
+        error_msg = str(e)
         raise Exception(f"Network error downloading from {display_url}: {error_msg}") from e
     except Exception as e:
         _cleanup_failed_artifact_download(temp_dir, partial_path)
-        error_msg = redact_jfrog_error_for_display(e, url)
+        error_msg = str(e)
         raise Exception(f"Failed to download artifact from {display_url}: {error_msg}") from e
     except BaseException:
         _cleanup_failed_artifact_download(temp_dir, partial_path)
@@ -860,7 +808,7 @@ def get_jfrog_base_url(url: str) -> str:
         base_path = "/".join(path_parts[: artifactory_index + 1])
         return f"{parsed.scheme}://{parsed.netloc}{base_path}"
     except ValueError as e:
-        raise ValueError(f"Invalid JFrog Artifactory URL format: {redact_jfrog_url_for_display(url)}") from e
+        raise ValueError(f"Invalid JFrog Artifactory URL format: {url}") from e
 
 
 def get_storage_api_url(url: str) -> str:
@@ -875,7 +823,7 @@ def get_storage_api_url(url: str) -> str:
         api_path = "/".join(api_parts)
         return f"{parsed.scheme}://{parsed.netloc}{api_path}"
     except (ValueError, IndexError) as e:
-        raise ValueError(f"Invalid JFrog Artifactory URL format: {redact_jfrog_url_for_display(url)}") from e
+        raise ValueError(f"Invalid JFrog Artifactory URL format: {url}") from e
 
 
 def format_size(size_bytes: int) -> str:
@@ -975,7 +923,7 @@ def _build_jfrog_probe_auth_headers(
         return headers
     logger.warning(
         "Skipping JFrog probe credentials for parser-confused or untrusted URL %s",
-        redact_jfrog_url_for_display(url),
+        format_terminal_text(url),
     )
     return {}
 
@@ -990,9 +938,7 @@ def _get_jfrog_response_with_redirect_policy(
     current_url = url
     original_origin = _get_jfrog_probe_origin(url)
     if original_origin is None:
-        raise requests.exceptions.RequestException(
-            f"Refusing parser-confused JFrog URL {redact_jfrog_url_for_display(url)}"
-        )
+        raise requests.exceptions.RequestException(f"Refusing parser-confused JFrog URL {url}")
 
     redirect_cookies = requests.cookies.RequestsCookieJar()
     for _redirect_count in range(_MAX_JFROG_PROBE_REDIRECTS + 1):
@@ -1015,22 +961,18 @@ def _get_jfrog_response_with_redirect_policy(
         if not location:
             response.close()
             raise requests.exceptions.TooManyRedirects(
-                "JFrog probe redirect from "
-                f"{redact_jfrog_url_for_display(current_url)} did not include a Location header"
+                f"JFrog probe redirect from {current_url} did not include a Location header"
             )
 
         response.close()
         redirected_url = urljoin(current_url, location)
         if _get_jfrog_probe_origin(redirected_url) != original_origin:
             raise requests.exceptions.RequestException(
-                "Refusing cross-origin JFrog redirect from "
-                f"{redact_jfrog_url_for_display(current_url)} to {redact_jfrog_url_for_display(redirected_url)}"
+                f"Refusing cross-origin JFrog redirect from {current_url} to {redirected_url}"
             )
         current_url = redirected_url
 
-    raise requests.exceptions.TooManyRedirects(
-        f"Exceeded {_MAX_JFROG_PROBE_REDIRECTS} redirects for JFrog URL {redact_jfrog_url_for_display(url)}"
-    )
+    raise requests.exceptions.TooManyRedirects(f"Exceeded {_MAX_JFROG_PROBE_REDIRECTS} redirects for JFrog URL {url}")
 
 
 def _looks_like_remote_safetensors(prefix: bytes, size_hint: int) -> bool:
@@ -1069,7 +1011,7 @@ def _read_jfrog_content_prefix(
     timeout: int,
     max_bytes: int,
 ) -> tuple[bytes, str]:
-    """Read a bounded JFrog artifact prefix or fail closed with a redacted error."""
+    """Read a bounded JFrog artifact prefix or fail closed with an error."""
     request_headers = {
         **headers,
         "Range": f"bytes=0-{max_bytes - 1}",
@@ -1095,8 +1037,7 @@ def _read_jfrog_content_prefix(
         return b"".join(chunks)[:max_bytes], probe_download_url
     except Exception as exc:
         raise ValueError(
-            "JFrog folder selective filtering incomplete: unable to inspect skipped artifact "
-            f"{redact_jfrog_url_for_display(file_url)}: {redact_jfrog_error_for_display(exc, file_url)}"
+            f"JFrog folder selective filtering incomplete: unable to inspect skipped artifact {file_url}: {exc!s}"
         ) from exc
     finally:
         if response is not None:
@@ -1250,7 +1191,7 @@ def _detect_jfrog_zip_route(
     if not probe_is_complete:
         raise ValueError(
             "JFrog folder selective filtering incomplete: unable to classify skipped ZIP artifact "
-            f"{redact_jfrog_url_for_display(file_url)} within the bounded content inspection budget"
+            f"{file_url} within the bounded content inspection budget"
         )
 
     from modelaudit.utils.file.detection import _is_keras_zip_archive_content
@@ -1263,8 +1204,7 @@ def _detect_jfrog_zip_route(
             return None
     except (OSError, RuntimeError, ValueError, zipfile.BadZipFile, zipfile.LargeZipFile) as exc:
         raise ValueError(
-            "JFrog folder selective filtering incomplete: unable to classify skipped ZIP artifact "
-            f"{redact_jfrog_url_for_display(file_url)}: {redact_jfrog_error_for_display(exc, file_url)}"
+            f"JFrog folder selective filtering incomplete: unable to classify skipped ZIP artifact {file_url}: {exc!s}"
         ) from exc
 
 
@@ -1534,12 +1474,12 @@ def detect_jfrog_target_type(
         ValueError: If URL is not a valid JFrog URL
         Exception: If API request fails
     """
-    display_url = redact_jfrog_url_for_display(url)
+    display_url = url
     if not is_jfrog_url(url):
         raise ValueError(f"Not a JFrog URL: {display_url}")
 
     storage_api_url = get_storage_api_url(url)
-    display_storage_api_url = redact_jfrog_url_for_display(storage_api_url)
+    display_storage_api_url = storage_api_url
 
     headers = _build_jfrog_auth_headers(storage_api_url, api_token=api_token, access_token=access_token)
 
@@ -1575,7 +1515,7 @@ def detect_jfrog_target_type(
             )
 
     except requests.exceptions.HTTPError as e:
-        error_msg = redact_jfrog_error_for_display(e, url)
+        error_msg = str(e)
         if e.response.status_code == 404:
             raise Exception(f"JFrog artifact not found at {display_url}") from e
         elif e.response.status_code in {401, 403}:
@@ -1587,7 +1527,7 @@ def detect_jfrog_target_type(
                 f"HTTP error {e.response.status_code} accessing {display_storage_api_url}: {error_msg}"
             ) from e
     except requests.exceptions.RequestException as e:
-        error_msg = redact_jfrog_error_for_display(e, url)
+        error_msg = str(e)
         raise Exception(f"Network error accessing {display_storage_api_url}: {error_msg}") from e
     finally:
         if response is not None:
@@ -1626,7 +1566,7 @@ def list_jfrog_folder_contents(
     target_info = detect_jfrog_target_type(url, api_token, access_token, timeout)
 
     if target_info["type"] != "folder":
-        raise ValueError(f"URL is not a JFrog folder: {redact_jfrog_url_for_display(url)}")
+        raise ValueError(f"URL is not a JFrog folder: {url}")
 
     files = []
     base_url = url.rstrip("/")
@@ -1640,7 +1580,7 @@ def list_jfrog_folder_contents(
         on a partial file listing.
         """
         if depth > MAX_RECURSION_DEPTH:
-            display_folder_url = redact_jfrog_url_for_display(folder_url)
+            display_folder_url = folder_url
             raise Exception(
                 f"Maximum recursion depth ({MAX_RECURSION_DEPTH}) exceeded listing {display_folder_url}. "
                 "Aborting to avoid incomplete file listing."
@@ -1660,7 +1600,7 @@ def list_jfrog_folder_contents(
         folder_info = detect_jfrog_target_type(folder_url, api_token, access_token, timeout)
 
         if folder_info["type"] != "folder":
-            display_folder_url = redact_jfrog_url_for_display(folder_url)
+            display_folder_url = folder_url
             raise Exception(
                 f"Expected JFrog folder while listing {display_folder_url}, got {folder_info['type']}. "
                 "Aborting to avoid incomplete file listing."
@@ -1697,10 +1637,7 @@ def list_jfrog_folder_contents(
                                 size = fetched_size
                             size_known = bool(file_info.get("size_known", fetched_size is not None))
                     except Exception as e:
-                        logger.warning(
-                            "Failed to fetch size for "
-                            f"{redact_jfrog_url_for_display(child_url)}: {redact_jfrog_error_for_display(e)}"
-                        )
+                        logger.warning(format_terminal_text(f"Failed to fetch size for {child_url}: {e!s}"))
 
                 files.append(
                     {
@@ -1763,7 +1700,7 @@ def download_jfrog_folder(
         ValueError: If URL is not a valid JFrog folder
         Exception: If downloads fail
     """
-    display_url = redact_jfrog_url_for_display(url)
+    display_url = url
     if not is_jfrog_url(url):
         raise ValueError(f"Not a JFrog URL: {display_url}")
 
@@ -1809,7 +1746,7 @@ def download_jfrog_folder(
     declared_total_size = probe_bytes_counter[0]
     for file_info in files:
         file_url = str(file_info["path"])
-        display_file_url = redact_jfrog_url_for_display(file_url)
+        display_file_url = file_url
         file_size = _listed_file_known_size(file_info)
         _require_known_size_within_limit(
             size=file_size,
@@ -1960,9 +1897,9 @@ def download_jfrog_folder(
                 downloaded_files.append(downloaded_file)
 
             except BaseException as e:
-                redacted_error = redact_jfrog_error_for_display(e)
-                error_msg = f"Failed to download {file_info['name']}: {redacted_error}"
-                logger.warning(error_msg)
+                display_error = str(e)
+                error_msg = f"Failed to download {file_info['name']}: {display_error}"
+                logger.warning(format_terminal_text(error_msg))
                 if show_progress:
                     click.echo("❌ Aborting JFrog folder download to avoid scanning a partial dataset")
                 current_file_candidates = [
@@ -1985,7 +1922,7 @@ def download_jfrog_folder(
                     raise
                 raise Exception(
                     "JFrog folder download failed after "
-                    f"{completed_downloads} of {len(files)} file(s) completed. {file_info['name']}: {redacted_error}"
+                    f"{completed_downloads} of {len(files)} file(s) completed. {file_info['name']}: {display_error}"
                 ) from e
 
         return download_dir

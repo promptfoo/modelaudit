@@ -2,22 +2,15 @@
 
 from __future__ import annotations
 
-import ast
 import base64
 import ipaddress
 import os
 import re
 import struct
-import unicodedata
 from typing import Any, ClassVar
-from urllib.parse import unquote, urlparse, urlsplit, urlunsplit
+from urllib.parse import urlparse
 
-from ._catboost_evidence_redaction import (
-    EVIDENCE_REDACTION_LOOKAHEAD_CHARS,
-    REDACTED_EVIDENCE_VALUE,
-    REDACTED_URL_CREDENTIALS,
-    redact_evidence_string,
-)
+from ..utils.helpers.evidence import format_evidence_string
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 
 CATBOOST_MAGIC = b"CBM1"
@@ -50,35 +43,7 @@ _SCRIPT_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\b(?:import\s+os|import\s+subprocess|from\s+os\s+import)\b", re.IGNORECASE), "python import block"),
 ]
 _BASE64_PAYLOAD_PATTERN = re.compile(r"(?:[A-Za-z0-9+/]{100,}={0,2})")
-_BASE64_EVIDENCE_TOKEN_PATTERN = re.compile(r"(?<![A-Za-z0-9+/_-])(?:[A-Za-z0-9+/_-]{8,}={0,2})(?![A-Za-z0-9+/_=-])")
-_BASE64_LITERAL_PART_PATTERN = re.compile(
-    r"(?is)(?:[rubf]{0,3})(?P<quote>[\"'])(?P<payload>[A-Za-z0-9+/_-]{2,}={0,2})(?P=quote)"
-)
-_SPLIT_BASE64_EVIDENCE_PATTERN = re.compile(
-    r"(?is)(?:(?:[rubf]{0,3})[\"'][A-Za-z0-9+/_-]{2,}={0,2}[\"'](?:\s+|\s*\+\s*))+"
-    r"(?:[rubf]{0,3})[\"'][A-Za-z0-9+/_-]{2,}={0,2}[\"']"
-)
-_PYTHON_STRING_LITERAL_PATTERN = r"(?:[rubf]{0,3})(?:\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*')"
-_STRING_LITERAL_COLLECTION_PATTERN = re.compile(
-    rf"(?is)(?P<open>[\[(])\s*{_PYTHON_STRING_LITERAL_PATTERN}"
-    rf"(?:\s*,\s*{_PYTHON_STRING_LITERAL_PATTERN})+\s*,?\s*(?P<close>[\])])"
-)
-_PERCENT_ESCAPE_PATTERN = re.compile(r"%[0-9a-fA-F]{2}")
 _HEX_ESCAPE_PATTERN = re.compile(r"(?:\\x[0-9a-fA-F]{2}){8,}")
-_HEX_EVIDENCE_ESCAPE_PATTERN = re.compile(r"(?:\\x[0-9a-fA-F]{2})+")
-_UNICODE_OR_OCTAL_ESCAPE_PATTERN = re.compile(
-    r"\\(?:u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8}|[0-7]{1,3}|N\{[A-Za-z0-9 -]{1,100}\})"
-)
-_STANDALONE_SECRET_TOKEN_PATTERN = re.compile(
-    r"(?:\b(?:sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16})\b|"
-    r"(?<![A-Za-z0-9_+/=-])[A-Za-z0-9_+/=-]{32,}(?![A-Za-z0-9_+/=-]))"
-)
-_TRUNCATED_SENSITIVE_ASSIGNMENT_PATTERN = re.compile(
-    r"(?is)(?P<prefix>(?<![\w.-])(?:_?(?:auth|key|password|secret|token))\s*[:=]\s*)"
-    r"(?:\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^\s;&|,)]+)"
-)
-_MAX_ENCODED_EVIDENCE_CHARS = 8192
-_MAX_PERCENT_DECODE_PASSES = 16
 
 _SUSPICIOUS_NETWORK_KEYWORDS = (
     "webhook",
@@ -119,252 +84,21 @@ def _decode_hex_escape_payload(payload: str) -> str:
         return ""
 
 
-def _decode_base64_evidence_payload(payload: str) -> str:
-    if len(payload) > _MAX_ENCODED_EVIDENCE_CHARS or len(payload) % 4 == 1:
-        return ""
-    padded_payload = payload + "=" * ((4 - (len(payload) % 4)) % 4)
-    try:
-        return base64.b64decode(padded_payload, altchars=b"-_", validate=True).decode("utf-8", errors="ignore")
-    except Exception:
-        return ""
-
-
-def _neutralize_existing_redaction_markers(text: str) -> str:
-    """Prevent attacker-controlled markers from being mistaken for sanitizer output."""
-    return text.replace(REDACTED_URL_CREDENTIALS, "[credentials-redacted marker]").replace(
-        REDACTED_EVIDENCE_VALUE,
-        "[redacted marker]",
-    )
-
-
-def _sanitize_decoded_reversible_evidence(
-    decoded_text: str,
-    original_text: str,
-    *,
-    fail_closed_on_hidden_redaction: bool = False,
-) -> str:
-    decoded_text = _neutralize_existing_redaction_markers(decoded_text)
-    standalone_redacted = _redact_standalone_secret_tokens(decoded_text)
-    redacted_decoded = redact_evidence_string(standalone_redacted, max_chars=160)
-    if REDACTED_EVIDENCE_VALUE in redacted_decoded or REDACTED_URL_CREDENTIALS in redacted_decoded:
-        return redacted_decoded
-    if fail_closed_on_hidden_redaction:
-        full_redacted = redact_evidence_string(
-            standalone_redacted,
-            max_chars=min(
-                len(standalone_redacted) + EVIDENCE_REDACTION_LOOKAHEAD_CHARS,
-                _MAX_ENCODED_EVIDENCE_CHARS + EVIDENCE_REDACTION_LOOKAHEAD_CHARS,
-            ),
-        )
-        if standalone_redacted != decoded_text or (
-            REDACTED_EVIDENCE_VALUE in full_redacted or REDACTED_URL_CREDENTIALS in full_redacted
-        ):
-            return REDACTED_EVIDENCE_VALUE
-    return original_text
-
-
-def _redact_reversible_base64_evidence(text: str, depth: int = 0) -> str:
-    if depth >= 2:
-        return text
-
-    def replace_payload(match: re.Match[str]) -> str:
-        decoded_text = _decode_base64_evidence_payload(match.group(0))
-        if not decoded_text:
-            return match.group(0)
-
-        decoded_text = _redact_reversible_base64_evidence(decoded_text, depth + 1)
-        return _sanitize_decoded_reversible_evidence(decoded_text, match.group(0))
-
-    return _BASE64_EVIDENCE_TOKEN_PATTERN.sub(replace_payload, text)
-
-
-def _redact_split_base64_evidence(text: str) -> str:
-    """Decode adjacent or concatenated base64 string literals before display."""
-
-    def replace_payload(match: re.Match[str]) -> str:
-        payload = "".join(part.group("payload") for part in _BASE64_LITERAL_PART_PATTERN.finditer(match.group(0)))
-        if len(payload) < 20:
-            return match.group(0)
-        decoded_text = _decode_base64_evidence_payload(payload)
-        if not decoded_text:
-            return match.group(0)
-        return _sanitize_decoded_reversible_evidence(
-            decoded_text,
-            match.group(0),
-            fail_closed_on_hidden_redaction=True,
-        )
-
-    return _SPLIT_BASE64_EVIDENCE_PATTERN.sub(replace_payload, text)
-
-
-def _redact_literal_collection_evidence(text: str) -> str:
-    """Join bounded string-literal collections before reversible decoding."""
-
-    def replace_collection(match: re.Match[str]) -> str:
-        matching_close = "]" if match.group("open") == "[" else ")"
-        if match.group("close") != matching_close:
-            return match.group(0)
-        try:
-            values = ast.literal_eval(match.group(0))
-        except (SyntaxError, ValueError):
-            return match.group(0)
-        if not isinstance(values, (list, tuple)):
-            return match.group(0)
-        if all(isinstance(value, str) for value in values):
-            joined = "".join(values)
-        elif all(isinstance(value, bytes) for value in values):
-            try:
-                joined = b"".join(values).decode("ascii")
-            except UnicodeDecodeError:
-                return match.group(0)
-        else:
-            return match.group(0)
-        if len(joined) > _MAX_ENCODED_EVIDENCE_CHARS:
-            return match.group(0)
-
-        decoded_text = _decode_base64_evidence_payload(joined)
-        if decoded_text:
-            sanitized = _sanitize_decoded_reversible_evidence(
-                decoded_text,
-                match.group(0),
-                fail_closed_on_hidden_redaction=True,
-            )
-            if sanitized != match.group(0):
-                return sanitized
-
-        hex_sanitized = _redact_reversible_hex_evidence(joined)
-        if hex_sanitized != joined:
-            return hex_sanitized
-        return _sanitize_decoded_reversible_evidence(
-            joined,
-            match.group(0),
-            fail_closed_on_hidden_redaction=True,
-        )
-
-    return _STRING_LITERAL_COLLECTION_PATTERN.sub(replace_collection, text)
-
-
-def _redact_reversible_percent_evidence(text: str) -> str:
-    """Decode percent-encoded evidence until a sensitive value can be sanitized."""
-
-    def redact_segment(segment: str) -> str:
-        if _PERCENT_ESCAPE_PATTERN.search(segment) is None:
-            return segment
-
-        decoded = segment
-        for _ in range(_MAX_PERCENT_DECODE_PASSES):
-            next_decoded = unquote(decoded)
-            if next_decoded == decoded:
-                return segment
-            decoded = next_decoded
-            if _PERCENT_ESCAPE_PATTERN.search(decoded) is None:
-                return _sanitize_decoded_reversible_evidence(
-                    decoded,
-                    segment,
-                    fail_closed_on_hidden_redaction=True,
-                )
-
-        return REDACTED_EVIDENCE_VALUE
-
-    pieces: list[str] = []
-    cursor = 0
-    for url_match in _URL_PATTERN.finditer(text):
-        pieces.append(redact_segment(text[cursor : url_match.start()]))
-        pieces.append(url_match.group(0))
-        cursor = url_match.end()
-    pieces.append(redact_segment(text[cursor:]))
-    return "".join(pieces)
-
-
-def _redact_reversible_hex_evidence(text: str) -> str:
-    """Decode and sanitize reversible hex-escaped evidence before display."""
-    if _HEX_EVIDENCE_ESCAPE_PATTERN.search(text) is None:
-        return text
-    decoded_text = _HEX_EVIDENCE_ESCAPE_PATTERN.sub(
-        lambda match: _decode_hex_escape_payload(match.group(0)) or match.group(0),
-        text,
-    )
-    return _sanitize_decoded_reversible_evidence(decoded_text, text)
-
-
-def _redact_reversible_unicode_evidence(text: str) -> str:
-    """Decode bounded Unicode and octal escapes before provider-token redaction."""
-    if _UNICODE_OR_OCTAL_ESCAPE_PATTERN.search(text) is None:
-        return text
-
-    def replace_escape(match: re.Match[str]) -> str:
-        token = match.group(0)[1:]
-        if token.startswith("N{"):
-            try:
-                return unicodedata.lookup(token[2:-1])
-            except KeyError:
-                return match.group(0)
-        base = 16 if token[0] in {"u", "U"} else 8
-        digits = token[1:] if base == 16 else token
-        codepoint = int(digits, base)
-        if codepoint > 0x10FFFF or 0xD800 <= codepoint <= 0xDFFF:
-            return match.group(0)
-        return chr(codepoint)
-
-    decoded_text = _UNICODE_OR_OCTAL_ESCAPE_PATTERN.sub(replace_escape, text)
-    return _sanitize_decoded_reversible_evidence(decoded_text, text)
-
-
-def _redact_standalone_secret_tokens(text: str) -> str:
-    return _STANDALONE_SECRET_TOKEN_PATTERN.sub(REDACTED_EVIDENCE_VALUE, text)
-
-
-def _redact_truncated_sensitive_assignments(text: str) -> str:
-    if not any(pattern.search(text) for pattern, _ in _COMMAND_PATTERNS):
-        return text
-    return _TRUNCATED_SENSITIVE_ASSIGNMENT_PATTERN.sub(
-        rf"\g<prefix>{REDACTED_EVIDENCE_VALUE}",
-        text,
-    )
-
-
 class _CatBoostParseError(ValueError):
     """Raised when CatBoost structure parsing fails."""
 
 
-def _redact_url_for_display(url: str) -> str:
-    try:
-        parsed = urlsplit(url)
-        port = parsed.port
-    except ValueError:
-        return "[invalid-url]"
-
-    if not parsed.scheme or not parsed.hostname:
-        return "[invalid-url]"
-
-    hostname = parsed.hostname
-    if ":" in hostname and not hostname.startswith("["):
-        hostname = f"[{hostname}]"
-
-    netloc = f"{hostname}:{port}" if port is not None else hostname
-    return urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
-
-
-def _redact_urls_for_display(text: str) -> str:
-    return _URL_PATTERN.sub(lambda match: _redact_url_for_display(match.group(0)), text)
-
-
-def _redact_evidence_for_display(text: str, max_chars: int = 160) -> str:
-    evidence_budget = max(0, max_chars) + max(
-        EVIDENCE_REDACTION_LOOKAHEAD_CHARS,
-        _MAX_ENCODED_EVIDENCE_CHARS,
+def _format_evidence_for_display(text: str, max_chars: int = 160) -> str:
+    """Escape terminal controls within the bounded CatBoost excerpt."""
+    escaped = "".join(
+        character.encode("unicode_escape").decode("ascii")
+        if character in "\r\n\t"
+        else (f"\\u{ord(character):04x}" if ord(character) <= 0xFFFF else f"\\U{ord(character):08x}")
+        if not character.isprintable()
+        else character
+        for character in text[: max(0, max_chars) + 1]
     )
-    text = text[:evidence_budget]
-    text = _redact_reversible_hex_evidence(text)
-    text = _redact_reversible_unicode_evidence(text)
-    text = _redact_literal_collection_evidence(text)
-    text = _redact_split_base64_evidence(text)
-    text = _redact_reversible_base64_evidence(text)
-    text = _redact_reversible_percent_evidence(text)
-    text = _redact_urls_for_display(text)
-    text = redact_evidence_string(text, max_chars=max_chars)
-    text = _redact_truncated_sensitive_assignments(text)
-    return _redact_standalone_secret_tokens(text)
+    return format_evidence_string(escaped, max_chars=max_chars)
 
 
 class CatBoostScanner(BaseScanner):
@@ -639,7 +373,7 @@ class CatBoostScanner(BaseScanner):
                 {
                     "section": item.get("section", "unknown"),
                     "pattern": item.get("pattern", ""),
-                    "excerpt": _redact_evidence_for_display(item.get("text", "")),
+                    "excerpt": _format_evidence_for_display(item.get("text", "")),
                 },
             )
         return summarized

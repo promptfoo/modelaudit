@@ -468,7 +468,7 @@ def test_download_pytorch_hub_model_strips_query_from_local_filename(
 @patch("modelaudit.utils.sources.pytorch_hub._get_model_extensions")
 @patch("modelaudit.utils.sources.pytorch_hub.requests.head")
 @patch("modelaudit.utils.sources.pytorch_hub.requests.get")
-def test_download_pytorch_hub_model_redacts_signed_query_from_errors(
+def test_download_pytorch_hub_model_retains_signed_query_in_errors(
     mock_get: MagicMock,
     mock_head: MagicMock,
     mock_extensions: MagicMock,
@@ -492,8 +492,9 @@ def test_download_pytorch_hub_model_redacts_signed_query_from_errors(
             cache_dir=tmp_path,
         )
 
-    assert "top-secret" not in str(exc_info.value)
-    assert "https://download.pytorch.org/models/resnet50.onnx" in str(exc_info.value)
+    assert weight_url in str(exc_info.value)
+    assert "403" in str(exc_info.value)
+    assert not (tmp_path / "resnet50.onnx").exists()
 
 
 @patch("modelaudit.utils.sources.pytorch_hub._get_model_extensions")

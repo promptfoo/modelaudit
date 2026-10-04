@@ -104,20 +104,6 @@ def _content_sniff_required_extensions() -> set[str]:
     return artifact_extensions & non_artifact_extensions
 
 
-def _display_model_url(url: str) -> str:
-    """Return an artifact URL without query credentials or fragments."""
-    try:
-        parsed_url = urlsplit(url)
-    except ValueError:
-        return "<PyTorch Hub artifact URL redacted>"
-    return parsed_url._replace(query="", fragment="").geturl()
-
-
-def _redact_model_error(message: object) -> str:
-    """Remove query strings from artifact URLs embedded in an error."""
-    return _PYTORCH_MODEL_URL_PATTERN.sub(lambda match: _display_model_url(match.group(0)), str(message))
-
-
 def _normalized_model_path(url: str) -> str | None:
     """Return a decoded path that remains within download.pytorch.org/models."""
     try:
@@ -178,7 +164,7 @@ def _weight_relative_path(url: str) -> Path:
     """Return a safe local relative path for an extracted PyTorch Hub weight URL."""
     normalized_path = _normalized_model_path(url)
     if normalized_path is None:
-        raise ValueError(f"Unsafe PyTorch Hub model URL: {_display_model_url(url)}")
+        raise ValueError(f"Unsafe PyTorch Hub model URL: {url}")
     relative_parts = PurePosixPath(normalized_path).relative_to("/models").parts
     return Path(*(_safe_local_component(part) for part in relative_parts))
 
@@ -286,7 +272,7 @@ def _artifact_format(
 ) -> str:
     extension = _supported_model_extension(url, model_extensions)
     if extension is None:
-        raise ValueError(f"Unsafe PyTorch Hub model URL: {_display_model_url(url)}")
+        raise ValueError(f"Unsafe PyTorch Hub model URL: {url}")
     return extension_format_map.get(extension, extension)
 
 
@@ -294,7 +280,7 @@ def _artifact_redirect_url(current_url: str, response: requests.Response) -> str
     location = response.headers.get("location")
     if not isinstance(location, str) or not location:
         response.raise_for_status()
-        raise ValueError(f"PyTorch Hub artifact redirect has no location: {_display_model_url(current_url)}")
+        raise ValueError(f"PyTorch Hub artifact redirect has no location: {current_url}")
     return urljoin(current_url, location)
 
 
@@ -317,7 +303,7 @@ def _open_trusted_artifact_response(
         if current_format != expected_format:
             raise ValueError(
                 "PyTorch Hub artifact redirect changed artifact format "
-                f"from {expected_format} to {current_format}: {_display_model_url(current_url)}"
+                f"from {expected_format} to {current_format}: {current_url}"
             )
 
         with requests.get(
@@ -331,8 +317,7 @@ def _open_trusted_artifact_response(
                 response.raise_for_status()
                 if status_code != 200:
                     raise requests.HTTPError(
-                        "Unexpected status code "
-                        f"{status_code} for PyTorch Hub artifact: {_display_model_url(current_url)}",
+                        f"Unexpected status code {status_code} for PyTorch Hub artifact: {current_url}",
                         response=response,
                     )
                 yield response
@@ -340,7 +325,7 @@ def _open_trusted_artifact_response(
 
             current_url = _artifact_redirect_url(current_url, response)
 
-    raise requests.TooManyRedirects(f"Too many PyTorch Hub artifact redirects: {_display_model_url(url)}")
+    raise requests.TooManyRedirects(f"Too many PyTorch Hub artifact redirects: {url}")
 
 
 class _GithubSourceLinkParser(HTMLParser):
@@ -529,7 +514,7 @@ def _get_total_size(urls: list[str], deadline: float | None = None) -> int:
                 if current_format != expected_format:
                     raise ValueError(
                         "PyTorch Hub artifact redirect changed artifact format "
-                        f"from {expected_format} to {current_format}: {_display_model_url(current_url)}"
+                        f"from {expected_format} to {current_format}: {current_url}"
                     )
 
                 response = requests.head(
@@ -551,7 +536,7 @@ def _get_total_size(urls: list[str], deadline: float | None = None) -> int:
                     with suppress(Exception):
                         response.close()
             else:
-                raise requests.TooManyRedirects(f"Too many PyTorch Hub artifact redirects: {_display_model_url(url)}")
+                raise requests.TooManyRedirects(f"Too many PyTorch Hub artifact redirects: {url}")
         except TimeoutError:
             raise
         except Exception:
@@ -589,7 +574,7 @@ def _response_content_length(response: requests.Response) -> int | None:
 def _validate_artifact_response_type(url: str, response: requests.Response) -> None:
     content_type = response.headers.get("content-type")
     if isinstance(content_type, str) and content_type.split(";", 1)[0].strip().casefold() in _HTML_CONTENT_TYPES:
-        raise ValueError(f"PyTorch Hub artifact returned HTML content: {_display_model_url(url)}")
+        raise ValueError(f"PyTorch Hub artifact returned HTML content: {url}")
 
 
 def _validate_downloaded_artifact(url: str, path: Path) -> None:
@@ -597,7 +582,7 @@ def _validate_downloaded_artifact(url: str, path: Path) -> None:
     with path.open("rb") as handle:
         prefix = handle.read(4096)
     if _HTML_PREFIX_PATTERN.match(prefix):
-        raise ValueError(f"PyTorch Hub artifact returned HTML content: {_display_model_url(url)}")
+        raise ValueError(f"PyTorch Hub artifact returned HTML content: {url}")
 
     extension = _supported_model_extension(url)
     if extension not in _content_sniff_required_extensions():
@@ -614,8 +599,7 @@ def _validate_downloaded_artifact(url: str, path: Path) -> None:
 
     if detect_file_format_from_magic(str(path)) == "unknown":
         raise ValueError(
-            "PyTorch Hub artifact with an ambiguous suffix did not contain recognizable model content: "
-            f"{_display_model_url(url)}"
+            f"PyTorch Hub artifact with an ambiguous suffix did not contain recognizable model content: {url}"
         )
 
 
@@ -936,9 +920,7 @@ def download_pytorch_hub_model(
             except ValueError:
                 raise
             except Exception as error:
-                raise Exception(
-                    f"Failed to download weights from {_display_model_url(weight_url)}: {_redact_model_error(error)}"
-                ) from error
+                raise Exception(f"Failed to download weights from {weight_url}: {error!s}") from error
 
         if staging_dir is not None and backup_dir is not None:
             _commit_staged_weight_files(artifacts, files_dir, backup_dir, dest_root)
@@ -1026,9 +1008,7 @@ def download_pytorch_hub_model_streaming(
             except (TimeoutError, ValueError):
                 raise
             except Exception as e:
-                raise Exception(
-                    f"Failed to download weights from {_display_model_url(weight_url)}: {_redact_model_error(e)}"
-                ) from e
+                raise Exception(f"Failed to download weights from {weight_url}: {e!s}") from e
 
             yield (dest_file, is_last)
 

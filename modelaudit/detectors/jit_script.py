@@ -19,6 +19,8 @@ from bisect import bisect_left, bisect_right
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, Any, TypeVar
 
+from modelaudit.utils.helpers.evidence import format_evidence_string
+
 if TYPE_CHECKING:
     from modelaudit.models import JITScriptFinding
 
@@ -51,13 +53,6 @@ def create_jit_finding(**kwargs: Any) -> "JITScriptFinding":
     if "import_" in kwargs:
         kwargs["import"] = kwargs.pop("import_")
     return JITScriptFinding(**kwargs)
-
-
-def _redact_code_evidence_snippet(code: str, max_chars: int = 200) -> str:
-    """Redact credentials from detector code evidence before serializing it."""
-    from modelaudit.scanners._evidence_redaction import redact_evidence_string
-
-    return redact_evidence_string(code, max_chars=max_chars)
 
 
 # Dangerous TorchScript operations that can execute arbitrary code
@@ -22717,7 +22712,7 @@ class JITScriptDetector:
                                 recommendation=f"Remove {dangerous_import} import - it can be used maliciously",
                                 confidence=0.9,
                                 framework=framework,
-                                code_snippet=_redact_code_evidence_snippet(code_str),
+                                code_snippet=format_evidence_string(code_str, max_chars=200),
                                 type="dangerous_import",
                                 operation=None,
                                 builtin=None,
@@ -22742,7 +22737,7 @@ class JITScriptDetector:
                                 recommendation=f"Remove {builtin} usage - it can execute arbitrary code",
                                 confidence=0.9,
                                 framework=framework,
-                                code_snippet=_redact_code_evidence_snippet(code_str),
+                                code_snippet=format_evidence_string(code_str, max_chars=200),
                                 type="dangerous_builtin",
                                 operation=None,
                                 builtin=builtin,
@@ -22864,7 +22859,7 @@ class JITScriptDetector:
                     recommendation=f"Remove {builtin} usage - it can execute arbitrary code",
                     confidence=0.9,
                     framework=framework,
-                    code_snippet=_redact_code_evidence_snippet(code_str),
+                    code_snippet=format_evidence_string(code_str, max_chars=200),
                     type="dangerous_builtin",
                     operation=None,
                     builtin=builtin,

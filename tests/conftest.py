@@ -135,6 +135,8 @@ def pytest_runtest_setup(item):
 
         # Only allow core XGBoost scanner tests and basic unit tests on problematic Python versions
         allowed_test_files = [
+            "test_retry.py",  # Retry keyword compatibility
+            "test_evidence.py",  # Bounded evidence presentation
             "test_xgboost_scanner.py",
             "test_pickle_scanner.py",
             "test_pickle_binunicode8_setitem.py",
@@ -153,7 +155,6 @@ def pytest_runtest_setup(item):
             "test_cli.py",
             "test_interrupt_handling.py",  # CLI startup and scan interruption regressions
             "test_sarif_formatter.py",  # SARIF output and credential-redaction regressions
-            "test_sarif_redaction.py",  # SARIF exported source credential-redaction regressions
             "test_directory_file_filtering.py",  # Directory prefilter regression tests
             "test_dependency_lock.py",  # Security-sensitive uv.lock dependency guardrails
             "test_perf_workflow.py",  # GitHub Actions workflow contract and benchmark regression tests
@@ -226,7 +227,6 @@ def pytest_runtest_setup(item):
             "test_jinja2_template_scanner.py",  # Jinja2 template parse fallback regression tests
             "test_evidence_redaction.py",  # Shared scanner evidence redaction tests
             "test_evidence_redaction_authorization_continuation.py",  # Folded auth-header redaction regressions
-            "test_catboost_evidence_redaction.py",  # CatBoost command evidence redaction tests
             "test_executorch_scanner.py",  # ExecuTorch scanner tests
             "test_telemetry.py",  # telemetry payload and availability tests
             "test_telemetry_decoupling.py",  # telemetry failure-isolation tests
