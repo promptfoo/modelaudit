@@ -3076,7 +3076,6 @@ def _create_path_progress_callback(
     actual_path: str,
 ) -> Any | None:
     """Build the legacy spinner callback or enhanced tracker callback for one path."""
-    progress_callback = None
     if spinner and not progress_tracker:
 
         def update_progress(message: str, percentage: float, spinner_bound: Any = spinner) -> None:
@@ -3085,7 +3084,7 @@ def _create_path_progress_callback(
         return update_progress
 
     if not progress_tracker:
-        return progress_callback
+        return None
 
     try:
         from .progress import ProgressPhase

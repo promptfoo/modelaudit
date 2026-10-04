@@ -181,6 +181,12 @@ _PICKLE_STRING_LITERAL_START_BYTES = b"STUVX\x8c\x8d"
 _PICKLE_BINARY_BYTE_LITERAL_OPCODES = frozenset({"BINBYTES", "SHORT_BINBYTES", "BINBYTES8", "BYTEARRAY8"})
 _PICKLE_BINARY_BYTE_LITERAL_START_BYTES = b"BC\x8e\x96"
 _PICKLE_PROTO0_TEXT_LITERAL_START_BYTES = b"SV"
+_PICKLE_FLOAT_START_BYTES = b" \t\r\v\f+-.0123456789iInN"
+_PICKLE_FLOAT_OPERAND_RE = re.compile(
+    rb"[ \t\r\v\f]*[+-]?(?:[0-9_]+(?:\.[0-9_]*)?(?:[eE][+-]?[0-9_]+)?"
+    rb"|\.[0-9_]+(?:[eE][+-]?[0-9_]+)?|inf(?:inity)?|nan)[ \t\r\v\f]*\n",
+    re.IGNORECASE,
+)
 _PICKLE_LENGTH_DELIMITED_LITERAL_START_BYTES = b"BCTXU\x8a\x8b\x8c\x8d\x8e\x96"
 _PICKLE_FIXED_WIDTH_LITERAL_SIZES = {
     ord("J"): 4,
@@ -197,9 +203,16 @@ _PICKLE_FIXED_WIDTH_LITERAL_SIZES = {
 _PICKLE_LITERAL_OPERAND_START_BYTES = (
     _PICKLE_LENGTH_DELIMITED_LITERAL_START_BYTES
     + _PICKLE_PROTO0_TEXT_LITERAL_START_BYTES
+    + b"F"
     + bytes(_PICKLE_FIXED_WIDTH_LITERAL_SIZES)
 )
-_PICKLE_OPERAND_OR_GLOBAL_START_RE = re.compile(b"[" + re.escape(_PICKLE_LITERAL_OPERAND_START_BYTES + b"ci") + b"]")
+_PICKLE_OPERAND_OR_GLOBAL_START_RE = re.compile(
+    b"["
+    + re.escape((_PICKLE_LITERAL_OPERAND_START_BYTES + b"ci").replace(b"F", b""))
+    + b"]|F(?=["
+    + re.escape(_PICKLE_FLOAT_START_BYTES)
+    + b"])"
+)
 _PICKLE_LITERAL_OPCODES = _PROTO0_1_LITERAL_OPCODES | _PICKLE_BINARY_BYTE_LITERAL_OPCODES
 _BASE64_NESTED_LITERAL_TOKEN_RE = re.compile(
     rb"[A-Za-z0-9+/_-][A-Za-z0-9+/_=\-\s\r\n\t!\"#$%&'()*.,:;<>?@\[\]\\^`{|}~]{7,}"
@@ -4004,7 +4017,7 @@ class PyTorchZipScanner(BaseScanner):
                 offset += 1
                 continue
             span = span_at(offset)
-            if cross_boundary_security_found[0]:
+            if work_budget_remaining[0] < 0 or cross_boundary_security_found[0]:
                 return True
             if span is not None:
                 _literal_opcode_start, literal_start, literal_end = span
@@ -5650,7 +5663,7 @@ class PyTorchZipScanner(BaseScanner):
     def _raw_nested_literal_span_is_mask_only(value: bytes, span: tuple[int, int, int]) -> bool:
         literal_opcode_start, _literal_start, _literal_end = span
         return (
-            value[literal_opcode_start] in {0x8A, 0x8B}
+            value[literal_opcode_start] in {ord("F"), 0x8A, 0x8B}
             or value[literal_opcode_start] in _PICKLE_FIXED_WIDTH_LITERAL_SIZES
         )
 
@@ -5712,6 +5725,8 @@ class PyTorchZipScanner(BaseScanner):
                 name_span = PyTorchZipScanner._raw_nested_proto0_name_operand_span(
                     value, marker_offset, work_budget_remaining=work_budget_remaining
                 )
+                if work_budget_remaining[0] < 0:
+                    return True
                 offset = name_span[2] if name_span is not None else offset + 1
                 continue
             if span is None and value[marker_offset] not in literal_marker_bytes:
@@ -5903,6 +5918,8 @@ class PyTorchZipScanner(BaseScanner):
                 name_span = PyTorchZipScanner._raw_nested_proto0_name_operand_span(
                     value, literal_opcode_start, work_budget_remaining=work_budget_remaining
                 )
+                if work_budget_remaining[0] < 0:
+                    return
                 if name_span is not None:
                     yield name_span
                     cursor = name_span[2]
@@ -5943,6 +5960,8 @@ class PyTorchZipScanner(BaseScanner):
     ) -> tuple[int, int, int] | None:
         if work_budget_remaining is None:
             work_budget_remaining = [_PICKLE_DISCOVERY_LONG_PROBE_BYTES]
+        if work_budget_remaining[0] < 0:
+            return None
         start = offset + 1
         if start >= len(value):
             return None
@@ -5980,6 +5999,11 @@ class PyTorchZipScanner(BaseScanner):
             work_budget_remaining = [_PICKLE_DISCOVERY_LONG_PROBE_BYTES]
         encoding = "utf-8" if value[offset] == ord("c") else "ascii"
         cursor = offset + 1
+        if cursor >= len(value):
+            return cursor
+        if 0x80 <= value[cursor] < 0xC2 or value[cursor] >= 0xF5 or (encoding == "ascii" and value[cursor] >= 0x80):
+            PyTorchZipScanner._consume_raw_nested_pickle_work_budget(work_budget_remaining, 1)
+            return cursor
         text_newline = -1
         text_no_newline_until = cursor
         for _ in range(2):
@@ -5996,6 +6020,12 @@ class PyTorchZipScanner(BaseScanner):
                 try:
                     decoder.decode(value[cursor:chunk_end], final=newline >= 0)
                 except UnicodeDecodeError as exc:
+                    # Rejected names may recur in every fallback pass without
+                    # producing an owned span that advances the search.
+                    if not PyTorchZipScanner._consume_raw_nested_pickle_work_budget(
+                        work_budget_remaining, max(1, exc.end - pending)
+                    ):
+                        return cursor
                     chunk_end = cursor - pending + exc.start
                     invalid = True
 
@@ -6299,7 +6329,27 @@ class PyTorchZipScanner(BaseScanner):
     ) -> tuple[int, int, int] | None:
         if work_budget_remaining is None:
             work_budget_remaining = [_PICKLE_DISCOVERY_LONG_PROBE_BYTES]
+        if work_budget_remaining[0] < 0:
+            return None
         marker = value[literal_opcode_start]
+        if marker == ord("F"):
+            literal_start = literal_opcode_start + 1
+            if literal_start >= len(value) or value[literal_start] not in _PICKLE_FLOAT_START_BYTES:
+                return None
+            scan_end = min(len(value), literal_start + _PICKLE_DISCOVERY_LONG_PROBE_BYTES + 1)
+            float_operand = _PICKLE_FLOAT_OPERAND_RE.match(value, literal_start, scan_end)
+            if float_operand is None:
+                return None
+            literal_end = float_operand.end() - 1
+            if not PyTorchZipScanner._consume_raw_nested_pickle_work_budget(
+                work_budget_remaining, literal_end + 1 - literal_start
+            ):
+                return None
+            try:
+                float(value[literal_start:literal_end])
+            except ValueError:
+                return None
+            return literal_opcode_start, literal_start, literal_end
         if marker in _PICKLE_FIXED_WIDTH_LITERAL_SIZES:
             header_bytes = 1
             literal_size = _PICKLE_FIXED_WIDTH_LITERAL_SIZES[marker]
@@ -6570,6 +6620,8 @@ class PyTorchZipScanner(BaseScanner):
                 name_span = PyTorchZipScanner._raw_nested_proto0_name_operand_span(
                     value, offset, work_budget_remaining=work_budget_remaining
                 )
+                if work_budget_remaining[0] < 0:
+                    return bytes(window)
                 offset = name_span[2] if name_span is not None else offset + 1
                 continue
             if span is None and value[offset] not in mask_marker_bytes:

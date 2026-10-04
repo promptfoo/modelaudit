@@ -5716,6 +5716,78 @@ def test_pytorch_zip_discovery_routes_global_after_malformed_global_candidate(tm
     _assert_referenced_storage_critical(model_path, storage_blob)
 
 
+@pytest.mark.parametrize("has_global", [False, True], ids=["tuple", "stack-global"])
+def test_pytorch_zip_discovery_preserves_post_budget_string_operands(tmp_path: Path, has_global: bool) -> None:
+    value = b"c\xff" * 65 + b"S'os'\nS'system'\n" + (b"\x93." if has_global else b"\x86.")
+    assert PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(value) is has_global
+
+    result = _scan_referenced_float_storage_blob(tmp_path, "post-budget-strings.pt", b"X\xff\xff\xff\x7f" + value)
+
+    assert result.success is (not has_global)
+    assert ("pytorch_zip_pickle_discovery_incomplete" in result.metadata.get("scan_outcome_reasons", [])) is has_global
+    assert should_cache_scan_result(result.to_dict(include_private_metadata=True)) is (not has_global)
+
+
+@pytest.mark.parametrize("number", [b"inf", b"-inf", b"Infinity", b"nan", b"1.25", b" .5e+2\t", b"1_0.0"])
+@pytest.mark.parametrize("has_global", [False, True], ids=["benign-float", "following-global"])
+def test_pytorch_zip_discovery_preserves_float_operands_after_candidate_budget(
+    tmp_path: Path, number: bytes, has_global: bool
+) -> None:
+    value = b"c!" * 65 + b"(F" + number + b"\n1" + (b"cos\nsystem\n." if has_global else b"N.")
+    assert PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(value) is has_global
+
+    result = _scan_referenced_float_storage_blob(tmp_path, "post-budget-float.pt", b"X\xff\xff\xff\x7f" + value)
+
+    assert result.success is (not has_global)
+    assert ("pytorch_zip_pickle_discovery_incomplete" in result.metadata.get("scan_outcome_reasons", [])) is has_global
+    if not has_global:
+        assert result.metadata["pickle_files"] == ["archive/data.pkl"]
+        assert result.metadata["pickle_verdict"] == "clean"
+    assert should_cache_scan_result(result.to_dict(include_private_metadata=True)) is (not has_global)
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [b"F!" + b"!" * 70000, b"F" * 70000, b"F1" + b"1" * 70000],
+    ids=["invalid-number", "repeated-markers", "unterminated-number"],
+)
+def test_pytorch_zip_float_operand_recovery_preserves_unrelated_storage_bytes(tmp_path: Path, tail: bytes) -> None:
+    value = b"c\xff" * 65 + tail
+    assert PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(value) is False
+
+    result = _scan_referenced_float_storage_blob(tmp_path, "float-prefix-near-match.pt", b"X\xff\xff\xff\x7f" + value)
+
+    assert result.success is True
+    assert result.metadata["pickle_files"] == ["archive/data.pkl"]
+    assert result.metadata["pickle_verdict"] == "clean"
+
+
+@pytest.mark.parametrize("size", [65536, 1048000])
+def test_pytorch_zip_malformed_global_recovery_shares_work_budget(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, size: int
+) -> None:
+    value = b"c\xff" * 65 + b"c\x80" * (size // 2)
+    calls = 0
+    original = PyTorchZipScanner._raw_nested_punctuation_name_operand_end
+
+    def counted_name_end(*args: Any, **kwargs: Any) -> int:
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(PyTorchZipScanner, "_raw_nested_punctuation_name_operand_end", staticmethod(counted_name_end))
+    remaining = [65536]
+    assert PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(value, work_budget_remaining=remaining)
+    assert remaining == [-1]
+    assert calls <= 65537
+
+    result = _scan_referenced_float_storage_blob(tmp_path, "malformed-global-work.pt", b"X\xff\xff\xff\x7f" + value)
+
+    assert result.success is False
+    assert "pytorch_zip_pickle_discovery_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert should_cache_scan_result(result.to_dict(include_private_metadata=True)) is False
+
+
 def test_pytorch_zip_discovery_preserves_embedded_bytes_in_mixed_unicode_literal(tmp_path: Path) -> None:
     model_path = tmp_path / "referenced_mixed_unicode_embedded_bytes.pt"
     nested_pickle = b"\x80\x04\x8c\x02os\x94\x8c\x06system\x94\x93\x8c\x04true\x94\x85R."
