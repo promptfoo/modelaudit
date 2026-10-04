@@ -50,6 +50,8 @@ Files scanned: 1 | Issues found: 2 critical, 1 warning
    Why: Could execute code when the model loads
 ```
 
+Scan evidence and source errors can include original credential values, including in JSON, SARIF, SBOM, and shared reports. Credential normalization remains where it affects detection, grouping, or suppression.
+
 ## What It Detects
 
 - **Code execution attacks** in Pickle, PyTorch, NumPy, and Joblib files
@@ -214,6 +216,15 @@ Common scan options:
 --list-scanners              List scanner IDs, class names, extensions, and dependencies
 ```
 
+Reports retain raw source identifiers and credential-bearing evidence. Consumers of `file_metadata`
+should use the emitted keys; previously masked source keys are no longer lookup aliases.
+Very long source identifiers are shortened consistently within each report.
+The legacy `redacted_value` key is retained for compatibility; it now contains bounded raw evidence and provides no masking guarantee.
+
+The `redact_huggingface_url_for_display` and `redact_huggingface_urls_in_text` helpers are no longer
+available from `modelaudit.utils.sources.huggingface` or `huggingface_paths`. Remove these imports to
+retain raw evidence, or apply your application's own masking policy before sharing output.
+
 Targeted scanner selection:
 
 ```bash
@@ -293,7 +304,7 @@ modelaudit model.pkl --format sarif --output results.sarif
 ## Troubleshooting
 
 - Run `modelaudit doctor --show-failed` to list unavailable scanners and missing optional deps.
-- Run `modelaudit debug --json` to collect environment/config diagnostics for bug reports.
+- Run `modelaudit debug --json` to collect environment/config diagnostics for bug reports. Inspect the raw output and remove sensitive values before sharing it.
 - Use `modelaudit cache cleanup --max-age 30` to remove stale cache entries safely.
 - If `pip` installs an older release, verify Python is supported (`python --version`; ModelAudit supports Python 3.10-3.13).
 - For additional troubleshooting and cloud auth guidance, see:

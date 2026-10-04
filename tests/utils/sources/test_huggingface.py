@@ -4,6 +4,7 @@ import gzip
 import hashlib
 import importlib
 import json
+import logging
 import os
 import pickle
 import shutil
@@ -98,7 +99,6 @@ from modelaudit.utils.sources.huggingface import (
     parse_huggingface_url,
     parse_huggingface_url_with_revision,
     plan_huggingface_streaming_download,
-    redact_huggingface_url_for_display,
 )
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs
 from tests.helpers import create_mock_coreml, create_mock_onnx, is_huggingface_rate_limit_error
@@ -2928,7 +2928,7 @@ class TestModelDownload:
 
     @patch("modelaudit.utils.sources.huggingface.subprocess.Popen")
     def test_download_worker_captures_unredacted_child_stderr(self, mock_popen: MagicMock) -> None:
-        """SDK diagnostics must not bypass the parent's Hugging Face URL redaction."""
+        """SDK diagnostics must remain captured separately from the worker result protocol."""
         process = mock_popen.return_value
         process.communicate.return_value = (
             'MODELAUDIT_HF_DOWNLOAD_RESULT={"ok": true, "path": "/tmp/model"}\n',
@@ -2946,8 +2946,8 @@ class TestModelDownload:
         assert mock_popen.call_args.kwargs["stderr"] is subprocess.PIPE
 
     @patch("modelaudit.utils.sources.huggingface.subprocess.Popen")
-    def test_download_worker_redacts_signed_transport_error(self, mock_popen: MagicMock) -> None:
-        """Serialized worker failures must not expose signed CDN credentials."""
+    def test_download_worker_retains_signed_transport_error(self, mock_popen: MagicMock) -> None:
+        """Serialized worker failures retain their source URL and HTTP failure type."""
         process = mock_popen.return_value
         process.communicate.return_value = (
             "MODELAUDIT_HF_DOWNLOAD_RESULT="
@@ -2966,11 +2966,11 @@ class TestModelDownload:
             )
 
         error = str(exc_info.value)
-        assert "user:pass" not in error
-        assert "secret" not in error
-        assert "signed" not in error
-        assert "X-Amz-Credential=<redacted>" in error
-        assert "X-Amz-Signature=<redacted>" in error
+        assert error == (
+            "HTTPError: "
+            "denied https://user:pass@cas-bridge.xethub.hf.co/object?"
+            "X-Amz-Credential=secret&X-Amz-Signature=signed"
+        )
 
     @patch("modelaudit.utils.sources.huggingface._terminate_huggingface_download_process")
     @patch("modelaudit.utils.sources.huggingface.subprocess.Popen")
@@ -12700,8 +12700,10 @@ class TestGetModelInfo:
     def test_get_model_info_marks_gated_content_probe_only_inventory_incomplete(
         self,
         mock_hf_api_class: MagicMock,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
         """Gated content-probe candidates must not disappear into complete empty inventory."""
+        caplog.set_level(logging.DEBUG, logger="modelaudit.utils.sources.huggingface")
         mock_api = MagicMock()
         mock_hf_api_class.return_value = mock_api
         mock_api.repo_info.return_value = SimpleNamespace(
@@ -12717,7 +12719,9 @@ class TestGetModelInfo:
 
         with patch(
             "modelaudit.utils.sources.huggingface._detect_huggingface_content_route_format",
-            side_effect=PermissionError("401 Unauthorized: gated file https://huggingface.co/test/model?token=secret"),
+            side_effect=PermissionError(
+                "401 Unauthorized: gated file https://huggingface.co/test/model?token=\x1b]52;c;secret\r\n\tFORGED\x07"
+            ),
         ) as mock_detect_content:
             info = get_model_info("https://huggingface.co/test/model")
 
@@ -12731,13 +12735,22 @@ class TestGetModelInfo:
         assert info["unknown_size_count"] == 0
         assert info["file_count"] == 1
         assert info["files"] == [{"name": "hidden.payload", "size": 4096, "access": "gated"}]
-        assert "secret" not in str(info["inventory_error"])
+        assert info["inventory_error"] == "403 Forbidden: gated repository"
         mock_api.get_paths_info.assert_called_once_with(
             "test/model",
             ["hidden.payload"],
             revision=_HF_TEST_REVISION,
         )
         mock_detect_content.assert_called_once_with("test/model", "hidden.payload", _HF_TEST_REVISION, ANY)
+
+        assert "Skipping inaccessible gated" in caplog.text
+        assert "\x1b" not in caplog.text and "\x07" not in caplog.text
+        assert "\tFORGED" not in caplog.text
+        assert all(
+            len(record.message.splitlines()) == 1
+            for record in caplog.records
+            if record.name == "modelaudit.utils.sources.huggingface"
+        )
 
     @patch("huggingface_hub.HfApi")
     def test_get_model_info_counts_unknown_size_for_gated_selected_file(
@@ -12920,7 +12933,7 @@ class TestGetModelInfo:
             {"name": "model.safetensors", "size": 4096, "access": "gated"},
             {"name": "assets/preview.png", "size": 500, "access": "gated"},
         ]
-        assert "secret" not in str(info["inventory_error"])
+        assert "https://huggingface.co/test/model?token=secret" in str(info["inventory_error"])
         mock_detect_content.assert_called_once_with("test/model", "assets/preview.png", _HF_TEST_REVISION, ANY)
 
     @pytest.mark.integration
@@ -12969,32 +12982,15 @@ class TestGetModelInfo:
 class TestHuggingFaceFileURLs:
     """Test HuggingFace direct file URL handling."""
 
-    def test_redact_file_url_for_display(self):
-        """Redact credentials from HuggingFace URLs while keeping useful location context."""
-        url = "https://user:pass@huggingface.co/org/repo/resolve/main/model.bin?token=hf_secret#frag"
-
-        redacted = redact_huggingface_url_for_display(url)
-
-        assert redacted == "https://huggingface.co/org/repo/resolve/main/model.bin"
-        assert "user" not in redacted
-        assert "pass" not in redacted
-        assert "token=" not in redacted
-        assert "hf_secret" not in redacted
-        assert "#frag" not in redacted
-
-    def test_invalid_host_error_redacts_credentials_and_query(self) -> None:
-        """Rejected lookalike hosts must not echo secrets in validation errors."""
+    def test_invalid_host_error_retains_source_url(self) -> None:
+        """Rejected lookalike hosts retain the rejected input in validation errors."""
         url = "https://alice:password@evil.example/org/repo/resolve/main/model.bin?token=secret#frag"
 
         with pytest.raises(ValueError) as exc_info:
             parse_huggingface_file_url(url)
 
         message = str(exc_info.value)
-        assert "evil.example/org/repo/resolve/main/model.bin" in message
-        assert "alice" not in message
-        assert "password" not in message
-        assert "token=" not in message
-        assert "secret" not in message
+        assert message == f"Not a HuggingFace URL: {url}"
 
     @pytest.mark.parametrize(
         "url",
@@ -13008,17 +13004,15 @@ class TestHuggingFaceFileURLs:
             "https://alice:password\uff20huggingface.co/org/repo/resolve/main/model.bin?token=secret#frag",
         ],
     )
-    def test_invalid_url_error_redacts_credentials_and_query(self, url: str) -> None:
-        """Rejected schemes, authorities, and netlocs must not echo embedded secrets."""
+    def test_invalid_url_error_retains_source_url(self, url: str) -> None:
+        """Rejected schemes, authorities, and netlocs report a validation error with the raw input."""
 
         with pytest.raises(ValueError) as exc_info:
             parse_huggingface_file_url(url)
 
         message = str(exc_info.value)
-        assert "alice" not in message
-        assert "password" not in message
-        assert "token=" not in message
-        assert "secret" not in message
+        assert "HuggingFace URL" in message
+        assert url in message
 
     def test_valid_file_urls(self) -> None:
         """Test that valid HuggingFace file URLs are detected."""
@@ -13669,13 +13663,13 @@ class TestHuggingFaceFileURLs:
     )
     @patch("huggingface_hub.HfApi")
     @patch("huggingface_hub.hf_hub_download")
-    def test_download_file_with_max_size_redacts_metadata_errors(
+    def test_download_file_with_max_size_retains_metadata_errors(
         self,
         mock_hf_hub_download: MagicMock,
         mock_hf_api: MagicMock,
         mock_paginated_listing: MagicMock,
     ) -> None:
-        """Metadata preflight errors should not expose direct URL credentials."""
+        """Metadata preflight errors retain direct URL context without starting a download."""
         mock_hf_api.return_value.repo_info.return_value = SimpleNamespace(
             sha=TEST_COMMIT_SHA,
             siblings=[SimpleNamespace(rfilename="model.bin")],
@@ -13691,9 +13685,7 @@ class TestHuggingFaceFileURLs:
             )
 
         error = str(exc_info.value)
-        assert "hf_secret" not in error
-        assert "token=" not in error
-        assert "https://huggingface.co/test/model/resolve/main/model.bin" in error
+        assert "https://huggingface.co/test/model/resolve/main/model.bin?token=hf_secret" in error
         mock_paginated_listing.assert_not_called()
         mock_hf_hub_download.assert_not_called()
 
@@ -13773,7 +13765,7 @@ class TestHuggingFaceFileURLs:
         mock_hf_hub_download.assert_not_called()
 
     @patch("huggingface_hub.hf_hub_download")
-    def test_download_file_failure(self, mock_hf_hub_download):
+    def test_download_file_failure(self, mock_hf_hub_download: MagicMock) -> None:
         """Test that file download failures are handled properly."""
         mock_hf_hub_download.side_effect = Exception(
             "Download failed for https://huggingface.co/test/model/resolve/main/file.bin?token=hf_secret"
@@ -13784,9 +13776,7 @@ class TestHuggingFaceFileURLs:
             download_file_from_hf(url)
 
         error = str(exc_info.value)
-        assert "hf_secret" not in error
-        assert "token=" not in error
-        assert "https://huggingface.co/test/model/resolve/main/file.bin" in error
+        assert error == f"Failed to download file from {url}: Download failed for {url}"
 
     def test_download_file_invalid_url(self):
         """Test that invalid file URLs raise appropriate errors."""
@@ -13942,3 +13932,75 @@ def _assert_streamed_pickle_control(
         filename=case_filename,
         revision=_HF_TEST_REVISION,
     )
+
+
+@pytest.mark.parametrize(
+    "status,expected,unknown",
+    [(503, "partial_unknown_size", 1), (401, "gated_inaccessible", 0), (403, "gated_inaccessible", 0)],
+)
+def test_hf_worker_endpoint_credentials_do_not_change_access_classification(
+    status: int, expected: str, unknown: int
+) -> None:
+    from modelaudit.utils.sources import huggingface
+
+    # SDK HTTP errors include the configured HF_ENDPOINT authority in the URL.
+    endpoint = "https://user:synthetic403value@hub.example"
+    import requests
+    from huggingface_hub import HfApi
+    from huggingface_hub.utils import HfHubHTTPError, hf_raise_for_status
+
+    # Build the real SDK diagnostic in both supported requests and httpx SDKs.
+    url = HfApi(endpoint=endpoint).endpoint + "/api/models/test/model/paths-info/revision"
+    response: Any
+    if issubclass(HfHubHTTPError, requests.HTTPError):
+        response = requests.Response()
+        response.status_code = status
+        response.url = url
+    else:
+        # Resolve the HTTP client supplied by the installed Hub SDK.
+        http_client = importlib.import_module(HfHubHTTPError.__mro__[1].__module__.split(".")[0])
+        response = http_client.Response(status, request=http_client.Request("POST", url))
+    with pytest.raises(HfHubHTTPError) as caught:
+        hf_raise_for_status(response)
+    error = str(caught.value)
+    process = MagicMock()
+    process.communicate.return_value = (
+        "MODELAUDIT_HF_DOWNLOAD_RESULT="
+        + json.dumps({"ok": False, "error_type": "HfHubHTTPError", "error": error})
+        + "\n",
+        "",
+    )
+    repo = SimpleNamespace(gated=False, siblings=[SimpleNamespace(rfilename="model.safetensors", size=32)])
+    with patch.object(huggingface.subprocess, "Popen", return_value=process):
+        info = huggingface._build_huggingface_model_info(
+            "test/model",
+            repo,
+            ["model.safetensors"],
+            "a" * 40,
+            deadline=time.monotonic() + 20,
+            allow_content_probes=False,
+        )
+    assert info["inventory_status"] == expected
+    assert info["unknown_size_count"] == unknown
+    assert info["inaccessible_gated_bytes"] == (0 if status == 503 else 32)
+
+
+@pytest.mark.parametrize("message,blocked", [("synthetic connection reset", False), ("403 Forbidden", True)])
+def test_huggingface_info_source_text_keeps_access_classification(message: str, blocked: bool) -> None:
+    from modelaudit.utils.sources.huggingface import _is_huggingface_gated_or_auth_error, get_model_info
+
+    class RenderedError(RuntimeError):
+        calls = 0
+
+        def __str__(self) -> str:
+            self.calls += 1
+            return message
+
+    error = RenderedError(message)
+    with patch("huggingface_hub.HfApi") as api:
+        api.return_value.repo_info.side_effect = error
+        with pytest.raises(Exception) as caught:
+            get_model_info("https://huggingface.co/org/model?token='403'")
+    assert error.calls == 1
+    assert caught.value.__cause__ is error
+    assert _is_huggingface_gated_or_auth_error(caught.value) is blocked

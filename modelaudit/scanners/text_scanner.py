@@ -21,6 +21,7 @@ from modelaudit.scanner_registry_metadata import TOKENIZER_VOCABULARY_CONTENT_FI
 from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
 from modelaudit.scanners._evidence_redaction import redact_untrusted_error_message
 from modelaudit.scanners.base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
+from modelaudit.utils.helpers.evidence import format_evidence_string
 
 TEXT_CONTENT_SECURITY_SCAN_INCOMPLETE_REASON = "text_content_security_scan_incomplete"
 TEXT_CONTENT_SECURITY_DETECTOR_FAILED_REASON = "text_content_security_detector_failed"
@@ -2494,7 +2495,7 @@ class TextScanner(BaseScanner):
                     "length": len(token),
                     "confidence": 0.8,
                     "pattern": "passive_data_auth_line",
-                    "redacted_value": "Basic <redacted>",
+                    "redacted_value": format_evidence_string("Basic " + token[:180].decode("ascii")),
                     "message": f"{secret_type} detected in passive data sidecar (confidence: 80%)",
                     "context": f"{path} pos:{token_position}",
                     "recommendation": f"Remove {secret_type} from model data immediately",
