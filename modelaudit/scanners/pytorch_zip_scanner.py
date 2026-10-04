@@ -63,8 +63,12 @@ from .archive_member_security import (
 )
 from .base import BaseScanner, Check, CheckStatus, IssueSeverity, ScanResult
 from .pickle_scanner import (
+    _MAX_RAW_CODE_LITERAL_VALIDATION_CHARS,
     _PICKLE_LITERAL_URL_TEXT_RE,
     PickleScanner,
+    _has_active_shell_substitution,
+    _has_adjacent_python_string_tokens,
+    _is_passive_literal_ast,
     _pickle_literal_url_is_proven_inert,
     _pickle_literal_url_stripped_scan_view,
 )
@@ -2656,8 +2660,10 @@ class PyTorchZipScanner(BaseScanner):
 
         member_name = self._get_zip_member_name(entry)
         archive_path = self.current_file_path or member_name
+        mixed_tail_budget_charged = False
 
         def read_verified_tail(*, relaxed_crc: bool, record_relaxed_usage: bool) -> bytes:
+            nonlocal mixed_tail_budget_charged
             if relaxed_crc and record_relaxed_usage:
                 self._relaxed_crc_tracker.record_usage(
                     member_name,
@@ -2686,10 +2692,12 @@ class PyTorchZipScanner(BaseScanner):
                     if retained_chunks:
                         retained_chunks.append(chunk)
                     elif chunk.rstrip(b"\x00"):
-                        PyTorchZipScanner._charge_padding_probe_budget(
-                            padding_probe_bytes_remaining,
-                            remaining_bytes,
-                        )
+                        if not mixed_tail_budget_charged:
+                            PyTorchZipScanner._charge_padding_probe_budget(
+                                padding_probe_bytes_remaining,
+                                remaining_bytes,
+                            )
+                            mixed_tail_budget_charged = True
                         if verified_nul_tail_bytes:
                             retained_chunks.append(b"\x00" * verified_nul_tail_bytes)
                             verified_nul_tail_bytes = 0
@@ -4388,6 +4396,16 @@ class PyTorchZipScanner(BaseScanner):
                     )
                 ):
                     return True
+                if not candidate_is_prefix and not PyTorchZipScanner._consume_raw_nested_pickle_work_budget(
+                    work_budget_remaining, len(candidate)
+                ):
+                    return True
+                if PyTorchZipScanner._complete_trivial_literal_pickle_has_nested_security_pickle(
+                    candidate,
+                    nested_literal_depth=nested_literal_depth + 1,
+                    work_budget_remaining=work_budget_remaining,
+                ):
+                    return True
                 offset += 1
                 continue
             if (
@@ -4548,6 +4566,10 @@ class PyTorchZipScanner(BaseScanner):
             return True
         if parse_budget_remaining is None:
             parse_budget_remaining = [_MAX_RAW_NESTED_PICKLE_CANDIDATES]
+        if known_size is not None and known_size < len(value):
+            known_size = None
+        if known_size is None and not sample_is_prefix:
+            known_size = len(value)
         candidate_search_end = len(value) if search_end is None else min(search_end, len(value))
         if candidate_search_end - search_start <= _PICKLE_DISCOVERY_LONG_PROBE_BYTES:
             return False
@@ -4620,6 +4642,7 @@ class PyTorchZipScanner(BaseScanner):
                 inst_name_validation=inst_name_validation,
                 inst_name_offset=window_start,
                 global_name_inspection=global_name_inspection,
+                known_size=None if known_size is None else known_size - window_start,
             ):
                 return True
             if PyTorchZipScanner._raw_nested_proto0_inst_with_prior_window_mark_seen(
@@ -8000,7 +8023,9 @@ class PyTorchZipScanner(BaseScanner):
         return any(issue.details.get("pickle_rule_code") == "SUSPICIOUS_STRING" for issue in member_result.issues)
 
     @staticmethod
-    def _literal_value_has_line_continuation_suspicious_text(value: str | bytes | bytearray) -> bool:
+    def _literal_value_has_line_continuation_suspicious_text(
+        value: str | bytes | bytearray, *, url_work_budget_remaining: list[int] | None = None
+    ) -> bool:
         if isinstance(value, str):
             text = value
         else:
@@ -8010,26 +8035,99 @@ class PyTorchZipScanner(BaseScanner):
                 text = value.decode("latin-1")
         candidates = PyTorchZipScanner._storage_route_text_candidates(text)
         return len(candidates) > 1 and PyTorchZipScanner._literal_text_has_storage_route_signal(
-            PyTorchZipScanner._strip_inert_literal_urls_from_text(candidates[-1])
+            PyTorchZipScanner._strip_inert_literal_urls_from_text(
+                candidates[-1], url_work_budget_remaining=url_work_budget_remaining
+            )
         )
 
     @staticmethod
-    def _strip_inert_literal_urls_from_text(text: str) -> str:
+    def _strip_inert_literal_urls_from_text(text: str, *, url_work_budget_remaining: list[int] | None = None) -> str:
+        charge_work: Callable[[int], None] | None = None
+        if url_work_budget_remaining is not None:
+            bytes_per_char = 4
+
+            def charge_source(characters: int) -> None:
+                work_bytes = characters * bytes_per_char
+                if url_work_budget_remaining[0] < 0 or work_bytes > url_work_budget_remaining[0]:
+                    url_work_budget_remaining[0] = -1
+                    raise _PickleLiteralPreservationBudgetExceeded(
+                        "pickle literal URL preservation exceeded its shared proof-work budget"
+                    )
+                url_work_budget_remaining[0] -= work_bytes
+
+            charge_work = charge_source
+            charge_work(0)
         if "://" not in text:
             return text
+        if charge_work is not None:
+            # Reserve the classification scan before choosing the UTF-8 bound.
+            charge_work(len(text))
+            bytes_per_char = 1 if text.isascii() else 4
+            charge_work(len(text))
+        replacement = "https://example.invalid/"
+        matches = _PICKLE_LITERAL_URL_TEXT_RE.finditer(text)
+        inert_url_context: tuple[str, frozenset[tuple[int, int]]] | None = None
+        if len(text) <= _MAX_RAW_CODE_LITERAL_VALIDATION_CHARS:
+            bounded_matches = list(matches)
+            matches = iter(bounded_matches)
+            if charge_work is not None:
+                charge_work(len(text))
+            if sum(match.group() != replacement for match in bounded_matches) > 1:
+                if charge_work is not None:
+                    charge_work(len(text))
+                has_shell_substitution = _has_active_shell_substitution(text)
+                if not has_shell_substitution:
+                    if charge_work is not None:
+                        charge_work(len(text))
+                    try:
+                        tree = ast.parse(text)
+                    except (MemoryError, RecursionError, SyntaxError, ValueError):
+                        pass
+                    else:
+                        if charge_work is not None:
+                            charge_work(len(text))
+                        passive = _is_passive_literal_ast(tree)
+                        literal_spans: list[tuple[int, int]] = []
+                        if passive:
+                            if charge_work is not None:
+                                # Tokenization, line positions and the two escape-boundary searches.
+                                charge_work(4 * len(text))
+                            adjacent = _has_adjacent_python_string_tokens(text, literal_string_spans=literal_spans)
+                            if not adjacent:
+                                if charge_work is not None:
+                                    charge_work(len(text))
+                                spans = iter(literal_spans)
+                                span = next(spans, None)
+                                inert_spans: set[tuple[int, int]] = set()
+                                for match in bounded_matches:
+                                    while span is not None and span[1] <= match.start():
+                                        span = next(spans, None)
+                                    if span is not None and span[0] <= match.start() and match.end() <= span[1]:
+                                        inert_spans.add((match.start(), match.end()))
+                                inert_url_context = (text, frozenset(inert_spans))
         parts: list[str] = []
         last_end = 0
         stripped = False
-        for match in _PICKLE_LITERAL_URL_TEXT_RE.finditer(text):
-            if not _pickle_literal_url_is_proven_inert(text, match.start(), match.end()):
+        for match in matches:
+            if charge_work is not None:
+                charge_work(match.end() - match.start())
+            if match.group() == replacement or not _pickle_literal_url_is_proven_inert(
+                text, match.start(), match.end(), inert_url_context=inert_url_context, charge_work=charge_work
+            ):
                 continue
+            if charge_work is not None:
+                charge_work(match.start() - last_end)
             parts.append(text[last_end : match.start()])
-            parts.append("https://example.invalid/")
+            parts.append(replacement)
             last_end = match.end()
             stripped = True
         if not stripped:
             return text
+        if charge_work is not None:
+            charge_work(len(text) - last_end)
         parts.append(text[last_end:])
+        if charge_work is not None:
+            charge_work(sum(map(len, parts)))
         return "".join(parts)
 
     @staticmethod
@@ -8037,9 +8135,14 @@ class PyTorchZipScanner(BaseScanner):
         sample: bytes,
         *,
         opcode_budget_remaining: list[int] | None = None,
+        url_work_budget_remaining: list[int] | None = None,
     ) -> bool:
         if opcode_budget_remaining is None:
             opcode_budget_remaining = [_PICKLE_LITERAL_PRESERVATION_MAX_OPCODES]
+        if url_work_budget_remaining is None:
+            url_work_budget_remaining = [_PICKLE_LITERAL_PRESERVATION_STREAM_PROBE_BYTES]
+        if url_work_budget_remaining[0] < 0:
+            raise _PickleLiteralPreservationBudgetExceeded("pickle literal URL preservation budget is exhausted")
         cursor = 0
         stream = io.BytesIO(sample)
         while cursor < len(sample):
@@ -8063,7 +8166,9 @@ class PyTorchZipScanner(BaseScanner):
                     if (
                         opcode.name in _PICKLE_LITERAL_OPCODES
                         and isinstance(arg, (str, bytes, bytearray))
-                        and PyTorchZipScanner._literal_value_has_line_continuation_suspicious_text(arg)
+                        and PyTorchZipScanner._literal_value_has_line_continuation_suspicious_text(
+                            arg, url_work_budget_remaining=url_work_budget_remaining
+                        )
                     ):
                         return True
                 else:
@@ -8072,7 +8177,7 @@ class PyTorchZipScanner(BaseScanner):
                 raise
             except Exception:
                 return PyTorchZipScanner._complete_proto0_string_literal_has_line_continuation_suspicious_text(
-                    sample[cursor:]
+                    sample[cursor:], url_work_budget_remaining=url_work_budget_remaining
                 )
         return False
 
@@ -8082,6 +8187,7 @@ class PyTorchZipScanner(BaseScanner):
         stream_size: int,
         *,
         opcode_budget_remaining: list[int] | None = None,
+        url_work_budget_remaining: list[int] | None = None,
     ) -> bool:
         stream.seek(0)
         truncated = stream_size > _PICKLE_LITERAL_PRESERVATION_STREAM_PROBE_BYTES
@@ -8090,6 +8196,7 @@ class PyTorchZipScanner(BaseScanner):
             PyTorchZipScanner._complete_pickle_literal_member_has_line_continuation_suspicious_text(
                 sample,
                 opcode_budget_remaining=opcode_budget_remaining,
+                url_work_budget_remaining=url_work_budget_remaining,
             )
         )
         if not has_suspicious_literal and truncated:
@@ -8099,7 +8206,9 @@ class PyTorchZipScanner(BaseScanner):
         return has_suspicious_literal
 
     @staticmethod
-    def _complete_proto0_string_literal_has_line_continuation_suspicious_text(sample: bytes) -> bool:
+    def _complete_proto0_string_literal_has_line_continuation_suspicious_text(
+        sample: bytes, *, url_work_budget_remaining: list[int] | None = None
+    ) -> bool:
         if not sample.startswith(b"S"):
             return False
         line_end = sample.find(b"\n", 1)
@@ -8121,7 +8230,9 @@ class PyTorchZipScanner(BaseScanner):
             if isinstance(decoded_literal, bytes)
             else PyTorchZipScanner._literal_str_to_scan_bytes(decoded_literal)
         )
-        return PyTorchZipScanner._literal_value_has_line_continuation_suspicious_text(literal_value)
+        return PyTorchZipScanner._literal_value_has_line_continuation_suspicious_text(
+            literal_value, url_work_budget_remaining=url_work_budget_remaining
+        )
 
     @staticmethod
     def _preserve_literal_suspicious_text_finding(

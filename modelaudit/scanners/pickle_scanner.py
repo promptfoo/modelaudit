@@ -1720,7 +1720,10 @@ def _is_passive_literal_ast(tree: ast.Module) -> bool:
     )
 
 
-def _has_adjacent_python_string_tokens(text: str) -> bool:
+def _has_adjacent_python_string_tokens(text: str, *, literal_string_spans: list[tuple[int, int]] | None = None) -> bool:
+    line_starts = [0]
+    if literal_string_spans is not None:
+        line_starts.extend(match.end() for match in re.finditer("\n", text))
     previous_type: int | None = None
     ignored_types = {tokenize.NL, tokenize.NEWLINE, tokenize.COMMENT, tokenize.INDENT, tokenize.DEDENT}
     try:
@@ -1729,19 +1732,70 @@ def _has_adjacent_python_string_tokens(text: str) -> bool:
                 continue
             if token.type == tokenize.STRING and previous_type == tokenize.STRING:
                 return True
+            if (
+                literal_string_spans is not None
+                and token.type == tokenize.STRING
+                and token.string.startswith(("'", '"'))
+                and not token.string.startswith(token.string[0] * 3)
+            ):
+                token_start = line_starts[token.start[0] - 1] + token.start[1]
+                literal_end = line_starts[token.end[0] - 1] + token.end[1] - 1
+                first_escape = token.string.find("\\")
+                if first_escape < 0:
+                    literal_string_spans.append((token_start + 1, literal_end))
+                else:
+                    literal_string_spans.append((token_start + 1, token_start + first_escape))
+                    last_escape = token.string.rfind("\\")
+                    if token.string[last_escape + 1 : last_escape + 2] in {
+                        "a",
+                        "b",
+                        "f",
+                        "n",
+                        "r",
+                        "t",
+                        "v",
+                        "\\",
+                        "'",
+                        '"',
+                    }:
+                        # The suffix follows a complete simple escape, never its consumed character.
+                        literal_string_spans.append((token_start + last_escape + 2, literal_end))
             previous_type = token.type
     except (IndentationError, tokenize.TokenError):
         return True
     return False
 
 
-def _pickle_literal_url_is_proven_inert(text: str, url_start: int, url_end: int) -> bool:
+def _pickle_literal_url_is_proven_inert(
+    text: str,
+    url_start: int,
+    url_end: int,
+    *,
+    inert_url_context: tuple[str, frozenset[tuple[int, int]]] | None = None,
+    charge_work: Callable[[int], None] | None = None,
+) -> bool:
+    if charge_work is not None:
+        charge_work(0)
     if (
         max(url_start, len(text) - url_end) > _MAX_PICKLE_LITERAL_URL_CONTEXT_CHARS
         or url_end - url_start > _MAX_RAW_CODE_LITERAL_VALIDATION_CHARS
-        or _has_active_shell_substitution(text)
     ):
         return False
+    if (
+        inert_url_context is not None
+        and inert_url_context[0] is text
+        and (url_start, url_end) in inert_url_context[1]
+        and len(text) - (url_end - url_start) + len("https://example.invalid/")
+        <= _MAX_RAW_CODE_LITERAL_VALIDATION_CHARS
+    ):
+        return True
+    if charge_work is not None:
+        charge_work(len(text))
+    if _has_active_shell_substitution(text):
+        return False
+    if charge_work is not None:
+        # Slices, padding comparisons/copies and the two concatenations.
+        charge_work(5 * len(text) + 2 * len("https://example.invalid/"))
     scan_text = (
         _trim_repeated_literal_padding(text[:url_start])
         + "https://example.invalid/"
@@ -1749,27 +1803,50 @@ def _pickle_literal_url_is_proven_inert(text: str, url_start: int, url_end: int)
     )
     if len(scan_text) > _MAX_RAW_CODE_LITERAL_VALIDATION_CHARS:
         return False
+    if charge_work is not None:
+        charge_work(2 * (len(text) - url_end))
     adjacent = _PICKLE_ADJACENT_SHELL_BOUNDARY_RE.match(text[url_end:]) is not None
-    if not adjacent and _PICKLE_LITERAL_URL_TEXT_RE.fullmatch(scan_text.strip()) is not None:
-        return True
+    if not adjacent:
+        if charge_work is not None:
+            charge_work(2 * len(scan_text))
+        if _PICKLE_LITERAL_URL_TEXT_RE.fullmatch(scan_text.strip()) is not None:
+            return True
+    if charge_work is not None:
+        charge_work(len(scan_text))
     try:
         tree = ast.parse(scan_text)
     except (MemoryError, RecursionError, SyntaxError, ValueError):
-        if adjacent or _has_unquoted_shell_control_grammar(scan_text):
+        if adjacent:
             return False
+        if charge_work is not None:
+            charge_work(len(scan_text))
+        if _has_unquoted_shell_control_grammar(scan_text):
+            return False
+        if charge_work is not None:
+            charge_work(2 * len(scan_text) + 1)
         prose = b" " + scan_text.encode("utf-8")
-        return all(
-            _is_doc_only_network_reference(
+        if charge_work is not None:
+            charge_work(len(prose))
+        for match in _PICKLE_LITERAL_URL_RE.finditer(prose):
+            if charge_work is not None:
+                charge_work(len(prose))
+            if not _is_doc_only_network_reference(
                 prose,
                 match_index=match.start(),
                 token_len=len(match.group()),
                 context="pickle-metadata.txt",
                 requires_call=False,
                 requires_explicit_prefix=True,
-            )
-            for match in _PICKLE_LITERAL_URL_RE.finditer(prose)
-        )
-    return not _has_adjacent_python_string_tokens(scan_text) and _is_passive_literal_ast(tree)
+            ):
+                return False
+        return True
+    if charge_work is not None:
+        charge_work(len(scan_text))
+    if _has_adjacent_python_string_tokens(scan_text):
+        return False
+    if charge_work is not None:
+        charge_work(len(scan_text))
+    return _is_passive_literal_ast(tree)
 
 
 def _inert_literal_url_stripped_scan_view(data: bytes) -> bytes:

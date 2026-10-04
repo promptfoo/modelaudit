@@ -17,10 +17,11 @@ import urllib.request
 import warnings
 import zipfile
 import zlib
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import suppress
 from functools import partial
 from importlib import metadata as importlib_metadata
+from itertools import pairwise
 from pathlib import Path
 from types import ModuleType
 from typing import IO, Any, BinaryIO, cast
@@ -25823,3 +25824,723 @@ def test_pytorch_zip_literal_neutral_prefix_keeps_live_mark_and_later_siblings(
 
     assert PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(value) is expected
     assert PyTorchZipScanner._raw_nested_window_has_literal_security_stream(value, 0, len(value)) is expected
+
+
+@pytest.mark.parametrize(
+    "sample_is_prefix, known_delta, expected",
+    [
+        (False, None, False),
+        (False, -1, False),
+        (True, None, True),
+        (True, -1, True),
+        (True, 0, False),
+        (True, 1 << 31, True),
+    ],
+    ids=["complete", "complete-invalid-bound", "prefix", "prefix-invalid-bound", "known-bound", "fitting-bound"],
+)
+def test_pytorch_zip_later_structural_windows_preserve_remaining_extent(
+    sample_is_prefix: bool, known_delta: int | None, expected: bool
+) -> None:
+    value = b"c\xff" * 65 + b"!" * 70000 + b"X\xff\xff\xff\x7f" * 20 + b"!" * 90000
+    remaining = [65536]
+
+    assert (
+        PyTorchZipScanner._raw_nested_security_pickle_candidate_has_later_structural_signal(
+            value,
+            sample_is_prefix=sample_is_prefix,
+            known_size=None if known_delta is None else len(value) + known_delta,
+            work_budget_remaining=remaining,
+        )
+        is expected
+    )
+    assert (remaining[0] < 0) is expected
+
+
+def test_pytorch_zip_later_impossible_headers_preserve_complete_archive(tmp_path: Path) -> None:
+    storage = b"\x00" * 65536 + b"c\xff" * 65 + b"!" * 70000 + b"X\xff\xff\xff\x7f" * 20 + b"!" * 90000 + b"  "
+    assert len(storage) == 225768
+    assert hashlib.sha256(storage).hexdigest() == "9f1adb270b560a9c3fa597b8f5eb683de4a39f73c4468b6df09cacc241111423"
+    path = tmp_path / "later_impossible_headers.pt"
+    result = _scan_referenced_float_storage_blob(tmp_path, path.name, storage)
+
+    assert result.success
+    assert result.metadata["pickle_files"] == ["archive/data.pkl"]
+    assert result.metadata["pickle_verdict"] == "clean"
+    assert not result.metadata.get("analysis_incomplete")
+    assert result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+    assert should_cache_scan_result(result.to_dict(include_private_metadata=True))
+
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False, check_network_comm=False)
+    assert aggregate.success
+    assert aggregate.file_metadata[str(path)]["pickle_files"] == ["archive/data.pkl"]
+    assert aggregate.file_metadata[str(path)]["pickle_verdict"] == "clean"
+    assert determine_exit_code(aggregate) == 0
+    assert should_cache_scan_result(aggregate.model_dump(mode="json"))
+
+
+@pytest.mark.parametrize(
+    "encoded_security, referenced",
+    [(True, True), (True, False), (False, True)],
+    ids=["referenced-encoded-global", "unreferenced-encoded-global", "referenced-benign-literal"],
+)
+def test_pytorch_zip_complete_proto_encoded_literal_preserves_archive_outcomes(
+    tmp_path: Path, encoded_security: bool, referenced: bool
+) -> None:
+    encoded = base64.b64encode(b"ca\nbb\n.") if encoded_security else base64.b64encode(b"N.") + b" " * 8
+    storage = b"N.!K!!\x80\x04C\x0c" + encoded + b"." + b"!" * 8200
+    assert len(storage) == 8223
+    if encoded_security:
+        assert hashlib.sha256(storage).hexdigest() == "27f3889c56b985461f696903e1a2701bde5a7efcb947d02d00a3bb623ef59edf"
+
+    metadata = (
+        (
+            b"\x80\x04(\x8c\x07storage\x8c\x05torch\x8c\x0bByteStorage\x93\x8c\x010\x8c\x03cpuJ"
+            + struct.pack("<i", len(storage))
+            + b"tQ."
+        )
+        if referenced
+        else b"N."
+    )
+    path = tmp_path / "complete-proto-encoded-literal.pt"
+    with zipfile.ZipFile(path, "w") as archive:
+        for name, content in (
+            ("archive/version", b"3\n"),
+            ("archive/byteorder", b"little"),
+            ("archive/data.pkl", metadata),
+            ("archive/data/0", storage),
+        ):
+            archive.writestr(zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0)), content)
+    if encoded_security and referenced:
+        assert (
+            hashlib.sha256(metadata).hexdigest() == "cf30fd494ae74ba923c751fb50557a3df9374d3d088211eb4b52c88ddbac4c1b"
+        )
+        assert (
+            hashlib.sha256(path.read_bytes()).hexdigest()
+            == "5a876219825bc882bf2de2f994a4581d34e16a2b439520c586e2ab4292b932d3"
+        )
+
+    result = PyTorchZipScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False, check_network_comm=False)
+    expected_signal = encoded_security and referenced
+    outcomes: list[tuple[dict[str, Any], dict[str, Any]]] = [
+        (result.to_dict(include_private_metadata=True), result.metadata),
+        (aggregate.model_dump(mode="json"), aggregate.file_metadata[str(path)].model_dump(mode="json")),
+    ]
+    for serialized, scan_metadata in outcomes:
+        findings = [
+            issue
+            for issue in serialized["issues"]
+            if issue.get("rule_code") == "NON_ALLOWLISTED_GLOBAL"
+            and issue.get("details", {}).get("import_reference") == "a.bb"
+            and issue.get("details", {}).get("pickle_filename") == "archive/data/0"
+            and issue.get("details", {}).get("nested_encoding") == "base64"
+        ]
+        if expected_signal:
+            assert serialized["success"] is False
+            assert scan_metadata["pickle_files"] == ["archive/data.pkl", "archive/data/0"]
+            assert scan_metadata["pickle_verdict"] == "suspicious"
+            assert scan_metadata["pickle_report_status"] == "inconclusive"
+            assert scan_metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+            assert scan_metadata["pickle_coverage"]["bytes_total"] == len(storage)
+            assert scan_metadata["pickle_coverage"]["opcode_scan_complete"] is False
+            assert findings
+            assert should_cache_scan_result(serialized) is False
+        else:
+            assert serialized["success"] is True
+            assert scan_metadata["pickle_files"] == ["archive/data.pkl"]
+            assert scan_metadata["pickle_verdict"] == "clean"
+            assert not findings
+            assert should_cache_scan_result(serialized) is True
+    assert determine_exit_code(aggregate) == (1 if expected_signal else 0)
+
+
+@pytest.mark.parametrize("security_signal", [False, True])
+@pytest.mark.parametrize("trailing_bytes", [0, 8200], ids=["finite", "bounded-prefix"])
+@pytest.mark.parametrize("sample_is_prefix", [False, True])
+def test_pytorch_zip_complete_proto_encoded_literal_checks_complete_and_prefix_views(
+    security_signal: bool, trailing_bytes: int, sample_is_prefix: bool
+) -> None:
+    encoded = base64.b64encode(b"ca\nbb\n." if security_signal else b"N.")
+    value = b"\x80\x04C" + bytes([len(encoded)]) + encoded + b"." + b"!" * trailing_bytes
+    remaining = [pytorch_zip_scanner_module._PICKLE_DISCOVERY_LONG_PROBE_BYTES]
+
+    assert (
+        PyTorchZipScanner._trailing_candidate_has_raw_nested_security_pickle(
+            value, sample_is_prefix=sample_is_prefix, work_budget_remaining=remaining
+        )
+        is security_signal
+    )
+    assert remaining[0] >= 0
+
+
+@pytest.mark.parametrize("trailing_bytes", [0, 8200], ids=["finite", "bounded-prefix"])
+@pytest.mark.parametrize("sample_is_prefix", [False, True])
+def test_pytorch_zip_complete_proto_encoded_literal_reserves_before_inspection(
+    monkeypatch: pytest.MonkeyPatch, trailing_bytes: int, sample_is_prefix: bool
+) -> None:
+    value = b"\x80\x04N." + b"!" * trailing_bytes
+    remaining = [pytorch_zip_scanner_module._PICKLE_DISCOVERY_LONG_PROBE_BYTES]
+    original = PyTorchZipScanner._complete_trivial_literal_pickle_has_nested_security_pickle
+    calls: list[tuple[int, int, int, bool]] = []
+
+    def recorded_inspection(
+        candidate: bytes, *, nested_literal_depth: int = 0, work_budget_remaining: list[int] | None = None
+    ) -> bool:
+        assert work_budget_remaining is not None
+        calls.append(
+            (len(candidate), nested_literal_depth, work_budget_remaining[0], work_budget_remaining is remaining)
+        )
+        return original(
+            candidate, nested_literal_depth=nested_literal_depth, work_budget_remaining=work_budget_remaining
+        )
+
+    monkeypatch.setattr(
+        PyTorchZipScanner,
+        "_complete_trivial_literal_pickle_has_nested_security_pickle",
+        staticmethod(recorded_inspection),
+    )
+    assert not PyTorchZipScanner._trailing_candidate_has_raw_nested_security_pickle(
+        value, sample_is_prefix=sample_is_prefix, nested_literal_depth=2, work_budget_remaining=remaining
+    )
+    candidate_size = min(len(value), pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES)
+    assert calls == [
+        (candidate_size, 3, pytorch_zip_scanner_module._PICKLE_DISCOVERY_LONG_PROBE_BYTES - candidate_size, True)
+    ]
+    assert remaining[0] >= 0
+
+
+@pytest.mark.parametrize("trailing_bytes", [0, 8200], ids=["finite", "bounded-prefix"])
+@pytest.mark.parametrize("sample_is_prefix", [False, True])
+def test_pytorch_zip_complete_proto_encoded_literal_refusal_is_sticky(
+    monkeypatch: pytest.MonkeyPatch, trailing_bytes: int, sample_is_prefix: bool
+) -> None:
+    value = b"\x80\x04N." + b"!" * trailing_bytes
+    candidate_size = min(len(value), pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES)
+    remaining = [candidate_size - 1]
+
+    def unexpected_inspection(
+        candidate: bytes, *, nested_literal_depth: int = 0, work_budget_remaining: list[int] | None = None
+    ) -> bool:
+        pytest.fail("The literal parser must not run after its inspection reservation is refused.")
+
+    monkeypatch.setattr(
+        PyTorchZipScanner,
+        "_complete_trivial_literal_pickle_has_nested_security_pickle",
+        staticmethod(unexpected_inspection),
+    )
+    assert PyTorchZipScanner._trailing_candidate_has_raw_nested_security_pickle(
+        value, sample_is_prefix=sample_is_prefix, work_budget_remaining=remaining
+    )
+    assert remaining == [-1]
+    assert PyTorchZipScanner._trailing_candidate_has_raw_nested_security_pickle(
+        b"\x80\x04N.", sample_is_prefix=False, work_budget_remaining=remaining
+    )
+    assert remaining == [-1]
+
+
+@pytest.mark.parametrize("sample_is_prefix", [False, True])
+def test_pytorch_zip_complete_proto_encoded_literal_keeps_direct_security_precedence(
+    monkeypatch: pytest.MonkeyPatch, sample_is_prefix: bool
+) -> None:
+    remaining = [0]
+
+    def unexpected_inspection(
+        candidate: bytes, *, nested_literal_depth: int = 0, work_budget_remaining: list[int] | None = None
+    ) -> bool:
+        pytest.fail("Known direct security evidence must return before optional literal inspection.")
+
+    monkeypatch.setattr(
+        PyTorchZipScanner,
+        "_complete_trivial_literal_pickle_has_nested_security_pickle",
+        staticmethod(unexpected_inspection),
+    )
+    assert PyTorchZipScanner._trailing_candidate_has_raw_nested_security_pickle(
+        b"\x80\x04ca\nbb\n.", sample_is_prefix=sample_is_prefix, work_budget_remaining=remaining
+    )
+    assert remaining == [0]
+
+
+@pytest.mark.parametrize("at_depth_limit", [False, True])
+def test_pytorch_zip_complete_proto_encoded_literal_keeps_nested_depth_limit(at_depth_limit: bool) -> None:
+    remaining = [pytorch_zip_scanner_module._PICKLE_DISCOVERY_LONG_PROBE_BYTES]
+    depth = pytorch_zip_scanner_module._MAX_NESTED_LITERAL_SCAN_DEPTH if at_depth_limit else 0
+    assert (
+        PyTorchZipScanner._trailing_candidate_has_raw_nested_security_pickle(
+            b"\x80\x04N.", sample_is_prefix=False, nested_literal_depth=depth, work_budget_remaining=remaining
+        )
+        is at_depth_limit
+    )
+    assert remaining[0] >= 0
+
+
+def test_pytorch_zip_complete_proto_encoded_literal_repeated_calls_share_allowance() -> None:
+    candidate_size = pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES
+    value = b"\x80\x04N." + b"!" * candidate_size
+    remaining = [pytorch_zip_scanner_module._PICKLE_DISCOVERY_LONG_PROBE_BYTES]
+    allowed_calls = remaining[0] // candidate_size
+
+    for _ in range(allowed_calls):
+        assert not PyTorchZipScanner._trailing_candidate_has_raw_nested_security_pickle(
+            value, sample_is_prefix=False, work_budget_remaining=remaining
+        )
+    assert remaining == [0]
+    assert PyTorchZipScanner._trailing_candidate_has_raw_nested_security_pickle(
+        value, sample_is_prefix=False, work_budget_remaining=remaining
+    )
+    assert remaining == [-1]
+
+
+@pytest.mark.parametrize("bad_crc", [False, True], ids=["valid-crc", "bad-crc"])
+@pytest.mark.parametrize("mixed_tail", [False, True], ids=["nul-tail", "mixed-tail"])
+def test_pytorch_zip_mixed_tail_crc_retry_charges_member_once(
+    monkeypatch: pytest.MonkeyPatch, bad_crc: bool, mixed_tail: bool
+) -> None:
+    prefix = b"\x00" * 65536
+    tail = (b"\n" if mixed_tail else b"\x00") + b"\x00" * (3 * 1024 * 1024 - 1)
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("archive/version", b"3\n")
+        archive.writestr("archive/data/0", prefix + tail)
+    scanner = PyTorchZipScanner()
+    result = ScanResult(scanner_name="pytorch_zip")
+    padding_budget = [4 * 1024 * 1024]
+    nul_budget = [8 * 1024 * 1024]
+    with zipfile.ZipFile(io.BytesIO(buffer.getvalue())) as archive:
+        entry = archive.getinfo("archive/data/0")
+        if bad_crc:
+            entry.CRC ^= 1
+        original_open = archive.open
+        opens = 0
+
+        def record_open(*args: Any, **kwargs: Any) -> Any:
+            nonlocal opens
+            opens += 1
+            return original_open(*args, **kwargs)
+
+        monkeypatch.setattr(archive, "open", record_open)
+        sample = scanner._verified_nul_padding_storage_probe_sample(
+            archive,
+            entry,
+            prefix,
+            verified_prefix_bytes=len(prefix),
+            result=result,
+            padding_probe_bytes_remaining=padding_budget,
+            nul_padding_verify_bytes_remaining=nul_budget,
+        )
+    assert sample == (prefix + tail if mixed_tail else prefix)
+    assert padding_budget == [(1 if mixed_tail else 4) * 1024 * 1024]
+    assert nul_budget == [5 * 1024 * 1024]
+    assert opens == (2 if bad_crc else 1)
+    assert scanner._relaxed_crc_tracker.has_member("archive/data/0") is bad_crc
+
+
+@pytest.mark.parametrize("bad_crc", [False, True], ids=["valid-crc", "bad-crc"])
+def test_pytorch_zip_mixed_tail_crc_retry_preserves_insufficient_budget(bad_crc: bool) -> None:
+    prefix = b"\x00" * 65536
+    tail = b"\n" + b"\x00" * (3 * 1024 * 1024 - 1)
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("archive/version", b"3\n")
+        archive.writestr("archive/data/0", prefix + tail)
+    remaining = [2 * 1024 * 1024]
+    scanner = PyTorchZipScanner()
+    with zipfile.ZipFile(io.BytesIO(buffer.getvalue())) as archive:
+        entry = archive.getinfo("archive/data/0")
+        if bad_crc:
+            entry.CRC ^= 1
+        with pytest.raises(ValueError, match="padding probe limit reached") as raised:
+            scanner._verified_nul_padding_storage_probe_sample(
+                archive,
+                entry,
+                prefix,
+                verified_prefix_bytes=len(prefix),
+                result=ScanResult(scanner_name="pytorch_zip"),
+                padding_probe_bytes_remaining=remaining,
+                nul_padding_verify_bytes_remaining=[8 * 1024 * 1024],
+            )
+    assert "padding probe budget exceeded" in str(raised.value.__cause__)
+    assert remaining == [2 * 1024 * 1024]
+
+
+@pytest.mark.parametrize("bad_crc", [False, True], ids=["valid-crc", "bad-crc"])
+def test_pytorch_zip_mixed_tail_crc_retry_preserves_complete_archive(tmp_path: Path, bad_crc: bool) -> None:
+    storage = b"\x00" * 65536 + b"\n" + b"\x00" * (3 * 1024 * 1024 - 1)
+    path = tmp_path / "mixed_tail_crc.pt"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("archive/version", b"3\n")
+        archive.writestr("archive/byteorder", b"little")
+        archive.writestr("archive/data.pkl", _float_storage_persistent_id_payload_for_bytes("0", storage))
+        archive.writestr("archive/data/0", storage)
+    if bad_crc:
+        _corrupt_zip_member_crc(path, "archive/data/0")
+    result = PyTorchZipScanner(config={"check_network_comm": False}).scan(str(path))
+    assert result.success
+    assert result.metadata["pickle_files"] == ["archive/data.pkl"]
+    assert not result.metadata.get("analysis_incomplete")
+    assert result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+    assert bool(result.metadata.get("relaxed_crc_used")) is bad_crc
+    assert (
+        any(
+            issue.severity == IssueSeverity.WARNING and "CRC validation failed" in issue.message
+            for issue in result.issues
+        )
+        is bad_crc
+    )
+
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False, check_network_comm=False)
+    assert aggregate.success is (not bad_crc)
+    assert should_cache_scan_result(aggregate.model_dump(mode="json")) is (not bad_crc)
+    assert determine_exit_code(aggregate) == (1 if bad_crc else 0)
+    assert "pytorch_zip_pickle_discovery_incomplete" not in aggregate.file_metadata[str(path)].get(
+        "scan_outcome_reasons", []
+    )
+
+
+@pytest.mark.parametrize("count", [32, 256])
+@pytest.mark.parametrize("url_kind", ["identity", "distinct", "code_path", "escaped_suffix"])
+def test_pytorch_zip_url_proofs_share_passive_literal_analysis(
+    monkeypatch: pytest.MonkeyPatch, count: int, url_kind: str
+) -> None:
+    from modelaudit.scanners import pickle_scanner as pickle_scanner_module
+
+    if url_kind == "identity":
+        urls = ["https://example.invalid/"] * count
+    elif url_kind == "distinct":
+        urls = [f"https://u{i}.invalid/" for i in range(count)]
+    elif url_kind == "escaped_suffix":
+        urls = [f"https://u{i}.invalid/\\n" for i in range(count)]
+    else:
+        urls = [f"https://h{i}/os.system" for i in range(count)]
+    text = "[" + ",".join(f'"{url}"' for url in urls) + "]"
+    assert len(text) <= pickle_scanner_module._MAX_RAW_CODE_LITERAL_VALIDATION_CHARS
+    counts = {"parse_calls": 0, "parse_chars": 0, "tokens": 0}
+    original_parse = pickle_scanner_module.ast.parse
+    original_tokens = pickle_scanner_module.tokenize.generate_tokens
+
+    def counted_parse(source: Any, *args: Any, **kwargs: Any) -> Any:
+        counts["parse_calls"] += 1
+        counts["parse_chars"] += len(source)
+        return original_parse(source, *args, **kwargs)
+
+    def counted_tokens(*args: Any, **kwargs: Any) -> Any:
+        counts["tokens"] += 1
+        return original_tokens(*args, **kwargs)
+
+    monkeypatch.setattr(pickle_scanner_module.ast, "parse", counted_parse)
+    monkeypatch.setattr(pickle_scanner_module.tokenize, "generate_tokens", counted_tokens)
+    assert not PyTorchZipScanner._literal_value_has_line_continuation_suspicious_text(text + "\\\n")
+    expected = 0 if url_kind == "identity" else 1
+    assert counts == {"parse_calls": expected, "parse_chars": expected * len(text), "tokens": expected}
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        '["https://a.invalid/os.system", "https://b.invalid/eval("]',
+        '"前文"\n["https://a.invalid/os.system", "https://b.invalid/"]',
+        '"first https://a.invalid/os.system then https://b.invalid/"',
+        "['https://a.invalid/', 'https://b.invalid/os.system']",
+        '"https://a.invalid/" "https://b.invalid/os.system"',
+        '["https://a.invalid/$(id)", "https://b.invalid/"]',
+        r'["https://a.invalid/\n", "https://b.invalid/os.system"]',
+        r'["\ftp://a.invalid/", "\ftp://b.invalid/", "curl"]',
+        r'["\u012ftp://a.invalid/", "\u012ftp://b.invalid/", "curl"]',
+        '["curl", "https://a.invalid/", "https://b.invalid/"]',
+        '[r"https://a.invalid/os.system", "https://b.invalid/"]',
+        '["""https://a.invalid/os.system""", "https://b.invalid/"]',
+        'os.system("https://a.invalid/"); "https://b.invalid/"',
+        '"' + "a" * 8147 + '"\n["http://a", "http://bb"]',
+        '"' + "a" * 8192 + '"\n["https://a.invalid/", "https://b.invalid/"]',
+    ],
+    ids=[
+        "passive_code_paths",
+        "unicode_previous_line",
+        "two_urls_one_token",
+        "single_quote_boundaries",
+        "adjacent_strings",
+        "shell_substitution",
+        "escaped_token",
+        "scheme_in_simple_escape",
+        "scheme_in_unicode_escape",
+        "downloader_value",
+        "raw_string_prefix",
+        "triple_quoted_string",
+        "active_call",
+        "replacement_length_boundary",
+        "oversized_context",
+    ],
+)
+def test_pytorch_zip_url_proof_batch_preserves_individual_boundary_decisions(
+    monkeypatch: pytest.MonkeyPatch, text: str
+) -> None:
+    from modelaudit.scanners import pickle_scanner as pickle_scanner_module
+
+    original = pickle_scanner_module._pickle_literal_url_is_proven_inert
+    matches = list(pickle_scanner_module._PICKLE_LITERAL_URL_TEXT_RE.finditer(text))
+    expected = {(match.start(), match.end()): original(text, match.start(), match.end()) for match in matches}
+    observed: dict[tuple[int, int], bool] = {}
+
+    def record_proof(
+        value: str,
+        start: int,
+        end: int,
+        *,
+        inert_url_context: tuple[str, frozenset[tuple[int, int]]] | None = None,
+        charge_work: Callable[[int], None] | None = None,
+    ) -> bool:
+        result = original(value, start, end, inert_url_context=inert_url_context, charge_work=charge_work)
+        observed[(start, end)] = result
+        return result
+
+    monkeypatch.setattr(pytorch_zip_scanner_module, "_pickle_literal_url_is_proven_inert", record_proof)
+    filtered = PyTorchZipScanner._strip_inert_literal_urls_from_text(text)
+    assert observed == expected
+    parts: list[str] = []
+    end = 0
+    for match in matches:
+        if expected[(match.start(), match.end())]:
+            parts.extend((text[end : match.start()], "https://example.invalid/"))
+            end = match.end()
+    parts.append(text[end:])
+    assert filtered == "".join(parts)
+
+
+def test_pytorch_zip_url_proof_context_requires_original_text_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from modelaudit.scanners import pickle_scanner as pickle_scanner_module
+
+    text = '["https://a.invalid/", "https://b.invalid/"]'
+    original = pickle_scanner_module._pickle_literal_url_is_proven_inert
+    contexts: list[tuple[str, frozenset[tuple[int, int]]]] = []
+
+    def record_proof(
+        value: str,
+        start: int,
+        end: int,
+        *,
+        inert_url_context: tuple[str, frozenset[tuple[int, int]]] | None = None,
+        charge_work: Callable[[int], None] | None = None,
+    ) -> bool:
+        if inert_url_context is not None:
+            contexts.append(inert_url_context)
+        return original(value, start, end, inert_url_context=inert_url_context, charge_work=charge_work)
+
+    monkeypatch.setattr(pytorch_zip_scanner_module, "_pickle_literal_url_is_proven_inert", record_proof)
+    PyTorchZipScanner._strip_inert_literal_urls_from_text(text)
+    assert contexts and all(context is contexts[0] for context in contexts)
+    start, end = min(contexts[0][1])
+    other_text = (" " + text)[1:]
+    assert other_text == text and other_text is not text
+    shell_checks: list[str] = []
+
+    def active_shell(value: str) -> bool:
+        shell_checks.append(value)
+        return True
+
+    monkeypatch.setattr(pickle_scanner_module, "_has_active_shell_substitution", active_shell)
+    assert original(text, start, end, inert_url_context=contexts[0])
+    assert not original(other_text, start, end, inert_url_context=contexts[0])
+    assert shell_checks == [other_text]
+
+
+@pytest.mark.parametrize("api", ["zip", "root"])
+@pytest.mark.parametrize("distinct_urls", [False, True], ids=["identity_urls", "distinct_urls"])
+def test_pytorch_zip_repeated_url_literals_keep_archive_proof_work_linear(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, api: str, distinct_urls: bool
+) -> None:
+    from modelaudit.scanners import pickle_scanner as pickle_scanner_module
+
+    urls = [f"https://u{i}.invalid/" for i in range(256)] if distinct_urls else ["https://example.invalid/"] * 256
+    text = "[" + ",".join(f'"{url}"' for url in urls) + "]"
+    value = (text + "\\\n").encode()
+    literal = b"X" + len(value).to_bytes(4, "little") + value
+    payload = b"\x80\x04](" + literal * 8 + b"e."
+    if not distinct_urls:
+        assert len(payload) == 55366
+        assert hashlib.sha256(payload).hexdigest() == "300093fae8eb21bb21ab5f7aa751051e7669fc1d70428da6cf1f6a91b711c1ed"
+    model_path = create_mock_pytorch_zip(tmp_path / "url-literals.pt", with_pickle=False, prefix="archive")
+    with zipfile.ZipFile(model_path, "a") as archive:
+        archive.writestr("archive/data.pkl", payload)
+    counts = {"strips": 0, "parse_calls": 0, "parse_chars": 0, "tokens": 0}
+    active = 0
+    original_strip = PyTorchZipScanner._strip_inert_literal_urls_from_text
+    original_parse = pickle_scanner_module.ast.parse
+    original_tokens = pickle_scanner_module.tokenize.generate_tokens
+
+    def counted_strip(candidate: str, *, url_work_budget_remaining: list[int] | None = None) -> str:
+        nonlocal active
+        counts["strips"] += 1
+        active += 1
+        try:
+            return original_strip(candidate, url_work_budget_remaining=url_work_budget_remaining)
+        finally:
+            active -= 1
+
+    def counted_parse(source: Any, *args: Any, **kwargs: Any) -> Any:
+        if active:
+            counts["parse_calls"] += 1
+            counts["parse_chars"] += len(source)
+        return original_parse(source, *args, **kwargs)
+
+    def counted_tokens(*args: Any, **kwargs: Any) -> Any:
+        if active:
+            counts["tokens"] += 1
+        return original_tokens(*args, **kwargs)
+
+    monkeypatch.setattr(PyTorchZipScanner, "_strip_inert_literal_urls_from_text", staticmethod(counted_strip))
+    monkeypatch.setattr(pickle_scanner_module.ast, "parse", counted_parse)
+    monkeypatch.setattr(pickle_scanner_module.tokenize, "generate_tokens", counted_tokens)
+    result: Any
+    if api == "zip":
+        result = PyTorchZipScanner({"check_network_comm": False, "cache_enabled": False}).scan(str(model_path))
+        metadata = result.metadata
+    else:
+        result = scan_model_directory_or_file(str(model_path), check_network_comm=False, cache_enabled=False)
+        assert determine_exit_code(result) == 0
+        metadata = result.file_metadata[str(model_path)].model_dump()
+    assert result.success
+    assert metadata["pickle_verdict"] == "clean"
+    assert metadata["pickle_report_status"] == "complete"
+    expected = 8 if distinct_urls else 0
+    assert counts == {"strips": 8, "parse_calls": expected, "parse_chars": expected * len(text), "tokens": expected}
+
+
+@pytest.mark.parametrize("kind", ["prose", "token_crossing", "mixed"])
+@pytest.mark.parametrize("url_count", [4, 128], ids=["within_budget", "exceeds_budget"])
+def test_pytorch_zip_url_fallback_budget_is_explicit_at_root(tmp_path: Path, kind: str, url_count: int) -> None:
+    urls = [f"https://u{i}.invalid/" for i in range(url_count)]
+    if kind == "prose":
+        text = "\n".join(f"See {url} for documentation." for url in urls)
+    elif kind == "token_crossing":
+        text = "[\n" + ",\n".join(f"'{url}'" for url in urls) + "\n]"
+    else:
+        text = "[" + ",".join(f'"{url}"' for url in urls) + ']\nprint("metadata")'
+    value = (text + "\\\n").encode()
+    payload = b"\x80\x04X" + len(value).to_bytes(4, "little") + value + b"."
+    path = create_mock_pytorch_zip(tmp_path / "bounded-url-proofs.pt", with_pickle=False, prefix="archive")
+    with zipfile.ZipFile(path, "a") as archive:
+        archive.writestr("archive/data.pkl", payload)
+
+    direct = PyTorchZipScanner({"check_network_comm": False, "cache_enabled": False}).scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), check_network_comm=False, cache_enabled=False)
+    exhausted = url_count == 128
+    assert direct.success is not exhausted
+    assert aggregate.success is not exhausted
+    assert determine_exit_code(aggregate) == (2 if exhausted else 0)
+    assert should_cache_scan_result(direct.to_dict()) is not exhausted
+    assert should_cache_scan_result(aggregate.model_dump(mode="json")) is not exhausted
+    reason = "pytorch_zip_literal_preservation_incomplete"
+    for metadata in (direct.metadata, aggregate.file_metadata[str(path)].model_dump()):
+        assert (reason in metadata.get("scan_outcome_reasons", [])) is exhausted
+        if not exhausted:
+            assert metadata["pickle_verdict"] == "clean"
+            assert metadata["pickle_report_status"] == "complete"
+    if exhausted:
+        assert any(
+            check.name == "Suspicious Literal Preservation"
+            and check.details.get("analysis_incomplete") is True
+            and check.details.get("max_bytes")
+            == pytorch_zip_scanner_module._PICKLE_LITERAL_PRESERVATION_STREAM_PROBE_BYTES
+            for check in aggregate.checks
+        )
+
+
+def test_pytorch_zip_url_proofs_allow_an_unrelated_completed_escape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from modelaudit.scanners import pickle_scanner as pickle_scanner_module
+
+    text = '["\\n ' + " ".join(f"https://u{i}.invalid/" for i in range(128)) + '"]'
+    parses: list[int] = []
+    original = pickle_scanner_module.ast.parse
+
+    def counted_parse(source: Any, *args: Any, **kwargs: Any) -> Any:
+        parses.append(len(source))
+        return original(source, *args, **kwargs)
+
+    monkeypatch.setattr(pickle_scanner_module.ast, "parse", counted_parse)
+    remaining = [pytorch_zip_scanner_module._PICKLE_LITERAL_PRESERVATION_STREAM_PROBE_BYTES]
+    assert not PyTorchZipScanner._literal_value_has_line_continuation_suspicious_text(
+        text + "\\\n", url_work_budget_remaining=remaining
+    )
+    assert parses == [len(text)]
+    assert 0 < remaining[0] < pytorch_zip_scanner_module._PICKLE_LITERAL_PRESERVATION_STREAM_PROBE_BYTES
+
+
+@pytest.mark.parametrize("route", ["member", "stream", "proto0"])
+def test_pytorch_zip_url_proof_exhaustion_stays_sticky(route: str) -> None:
+    text = "See https://docs.invalid/ for documentation.\\\n"
+    value = text.encode()
+    if route == "proto0":
+        sample = b"S" + repr(value)[1:].encode("ascii") + b"\n."
+    else:
+        sample = b"\x80\x04X" + len(value).to_bytes(4, "little") + value + b"."
+    remaining = [0]
+    for _ in range(2):
+        with pytest.raises(pytorch_zip_scanner_module._PickleLiteralPreservationBudgetExceeded):
+            if route == "stream":
+                PyTorchZipScanner._complete_pickle_literal_stream_has_line_continuation_suspicious_text(
+                    io.BytesIO(sample), len(sample), url_work_budget_remaining=remaining
+                )
+            elif route == "proto0":
+                PyTorchZipScanner._complete_proto0_string_literal_has_line_continuation_suspicious_text(
+                    sample, url_work_budget_remaining=remaining
+                )
+            else:
+                PyTorchZipScanner._complete_pickle_literal_member_has_line_continuation_suspicious_text(
+                    sample, url_work_budget_remaining=remaining
+                )
+        assert remaining == [-1]
+
+
+def test_pytorch_zip_url_proof_allowance_is_shared_across_literal_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    text = "[" + ",".join(f'"https://u{i}.invalid/"' for i in range(256)) + "]\\\n"
+    value = text.encode()
+    literal = b"X" + len(value).to_bytes(4, "little") + value
+    sample = b"\x80\x04](" + literal * 32 + b"e."
+    counters: list[list[int]] = []
+    balances: list[int] = []
+    original = PyTorchZipScanner._strip_inert_literal_urls_from_text
+
+    def record_strip(text: str, *, url_work_budget_remaining: list[int] | None = None) -> str:
+        assert url_work_budget_remaining is not None
+        counters.append(url_work_budget_remaining)
+        balances.append(url_work_budget_remaining[0])
+        return original(text, url_work_budget_remaining=url_work_budget_remaining)
+
+    monkeypatch.setattr(PyTorchZipScanner, "_strip_inert_literal_urls_from_text", staticmethod(record_strip))
+    with pytest.raises(pytorch_zip_scanner_module._PickleLiteralPreservationBudgetExceeded):
+        PyTorchZipScanner._complete_pickle_literal_member_has_line_continuation_suspicious_text(sample)
+    assert 1 < len(counters) < 32
+    assert all(counter is counters[0] for counter in counters)
+    assert all(before > after for before, after in pairwise(balances))
+    assert counters[0] == [-1]
+
+
+def test_pytorch_zip_url_fallback_charges_each_nested_documentation_proof(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from modelaudit.scanners import pickle_scanner as pickle_scanner_module
+
+    text = "See https://a.invalid/ for documentation.\nSee https://b.invalid/ for documentation."
+    first = next(pickle_scanner_module._PICKLE_LITERAL_URL_TEXT_RE.finditer(text))
+    expected = pickle_scanner_module._pickle_literal_url_is_proven_inert(text, first.start(), first.end())
+    charges: list[int] = []
+    documentation_inputs: list[int] = []
+    original = pickle_scanner_module._is_doc_only_network_reference
+
+    def record_documentation(data: bytes, **kwargs: Any) -> bool:
+        assert charges[-1] == len(data)
+        documentation_inputs.append(len(data))
+        return original(data, **kwargs)
+
+    monkeypatch.setattr(pickle_scanner_module, "_is_doc_only_network_reference", record_documentation)
+    observed = pickle_scanner_module._pickle_literal_url_is_proven_inert(
+        text, first.start(), first.end(), charge_work=charges.append
+    )
+    assert observed is expected is True
+    assert len(documentation_inputs) == 2
+    assert sum(charges) > sum(documentation_inputs)
