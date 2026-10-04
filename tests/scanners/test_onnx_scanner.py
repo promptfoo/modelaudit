@@ -22295,6 +22295,393 @@ def _write_safe_external_data_then_failure_onnx(
     )
 
 
+class TestOnnxReviewShapeRegressions:
+    @staticmethod
+    def _save(graph: Any, tmp_path: Path, *, opset: int = 18, functions: Any = ()) -> Path:
+        model = helper.make_model(
+            graph,
+            opset_imports=[helper.make_opsetid("", opset), helper.make_opsetid("local", 1)],
+            functions=functions,
+        )
+        model.ir_version = 8
+        onnx.checker.check_model(model)
+        path = tmp_path / f"{graph.name}.onnx"
+        onnx.save(model, str(path))
+        return path
+
+    @staticmethod
+    def _assert_clean(path: Path) -> None:
+        direct = OnnxScanner().scan(str(path))
+        assert direct.success is True
+        assert direct.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"] == {}
+        assert direct.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+        aggregate = scan_model_directory_or_file(str(path), recursive=False, cache_enabled=False)
+        assert aggregate.success is True
+        assert determine_exit_code(aggregate) == 0
+
+    @pytest.mark.parametrize("keepdims", [0, 1])
+    def test_unknown_broadcast_rank_does_not_hide_generated_matrix(self, tmp_path: Path, keepdims: int) -> None:
+        source_shape = (1, 1, 4, 4) if keepdims == 0 else (2, 4, 4)
+        graph = helper.make_graph(
+            [
+                helper.make_node("ReduceSum", ["source"], ["reduced"], axes=[0], keepdims=keepdims),
+                helper.make_node("Add", ["reduced", "bias"], ["biased"]),
+                helper.make_node("Squeeze", ["biased"], ["weight"], axes=[0]),
+                helper.make_node("MatMul", ["X", "weight"], ["Y"]),
+            ],
+            "unknown_broadcast_matrix",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 4])],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 4])],
+            initializer=[
+                onnx.numpy_helper.from_array(np.ones(source_shape, dtype=np.float32), name="source"),
+                onnx.numpy_helper.from_array(np.ones((1, 1), dtype=np.float32), name="bias"),
+            ],
+        )
+        path = self._save(graph, tmp_path, opset=11)
+        result = OnnxScanner().scan(str(path))
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert (
+            result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"]["unresolved_initializer_lineage"] > 0
+        )
+        TestWeightDistributionCoverage()._assert_uncached_inconclusive_exit2(path, tmp_path / "cache")
+
+    @pytest.mark.parametrize("with_attribute", [False, True])
+    @pytest.mark.parametrize("consume_matrix", [False, True])
+    def test_exact_loop_local_function_accepts_literal_attributes(
+        self, tmp_path: Path, with_attribute: bool, consume_matrix: bool
+    ) -> None:
+        reshape_attributes: dict[str, Any] = {"allowzero": 0} if with_attribute else {}
+        function = helper.make_function(
+            "local",
+            "Update",
+            ["activation", "state", "vector_shape", "matrix_shape"],
+            ["out"],
+            [
+                helper.make_node(
+                    "Reshape",
+                    ["state", "vector_shape"],
+                    ["vector"],
+                    **reshape_attributes,
+                ),
+                helper.make_node("PRelu", ["activation", "state" if consume_matrix else "vector"], ["unused"]),
+                helper.make_node("Reshape", ["vector", "matrix_shape"], ["out"]),
+            ],
+            [helper.make_opsetid("", 18)],
+        )
+        body = helper.make_graph(
+            [
+                helper.make_node("Update", ["X", "state", "vector_shape", "matrix_shape"], ["out"], domain="local"),
+                helper.make_node("Identity", ["condition_in"], ["condition_out"]),
+            ],
+            "literal_attribute_loop_body",
+            [
+                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
+                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("state", TensorProto.FLOAT, None),
+            ],
+            [
+                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("out", TensorProto.FLOAT, None),
+            ],
+        )
+        graph = helper.make_graph(
+            [helper.make_node("Loop", ["count", "condition", "initial"], ["final"], body=body)],
+            "literal_attribute_loop",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 1])],
+            [helper.make_tensor_value_info("final", TensorProto.FLOAT, [1, 1])],
+            initializer=[
+                onnx.numpy_helper.from_array(np.ones((1,), dtype=np.float32), name="initial"),
+                onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="condition"),
+                onnx.numpy_helper.from_array(np.array(3, dtype=np.int64), name="count"),
+                onnx.numpy_helper.from_array(np.array([1], dtype=np.int64), name="vector_shape"),
+                onnx.numpy_helper.from_array(np.array([1, 1], dtype=np.int64), name="matrix_shape"),
+            ],
+        )
+        path = self._save(graph, tmp_path, functions=[function])
+        if consume_matrix:
+            result = OnnxScanner().scan(str(path))
+            assert result.success is False
+            assert (
+                result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"]["lineages_per_value_limit"] > 0
+            )
+            TestWeightDistributionCoverage()._assert_uncached_inconclusive_exit2(path, tmp_path / "cache")
+        else:
+            self._assert_clean(path)
+
+    @pytest.mark.parametrize("restore_rank", [False, True])
+    @pytest.mark.parametrize("runtime_axes", [False, True])
+    def test_loop_rank_restoration_requires_proven_matching_shape(
+        self, tmp_path: Path, restore_rank: bool, runtime_axes: bool
+    ) -> None:
+        nodes = [
+            helper.make_node("PRelu", ["X", "state"], ["unused"]),
+            helper.make_node("Unsqueeze", ["state", "axes"], ["expanded"]),
+            helper.make_node("Identity", ["condition_in"], ["condition_out"]),
+        ]
+        if restore_rank:
+            nodes.append(helper.make_node("Squeeze", ["expanded", "axes"], ["out"]))
+        else:
+            nodes.append(helper.make_node("Identity", ["expanded"], ["out"]))
+        body = helper.make_graph(
+            nodes,
+            "rank_restoring_loop_body",
+            [
+                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
+                helper.make_tensor_value_info("condition_in", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("state", TensorProto.FLOAT, None),
+            ],
+            [
+                helper.make_tensor_value_info("condition_out", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("out", TensorProto.FLOAT, None),
+            ],
+        )
+        inputs = [
+            helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 1]),
+            helper.make_tensor_value_info("count", TensorProto.INT64, []),
+        ]
+        initializers = [
+            onnx.numpy_helper.from_array(np.ones((1,), dtype=np.float32), name="initial"),
+            onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="condition"),
+        ]
+        if runtime_axes:
+            inputs.append(helper.make_tensor_value_info("axes", TensorProto.INT64, [1]))
+        else:
+            initializers.append(onnx.numpy_helper.from_array(np.array([0], dtype=np.int64), name="axes"))
+        graph = helper.make_graph(
+            [helper.make_node("Loop", ["count", "condition", "initial"], ["final"], body=body)],
+            "rank_restoring_loop",
+            inputs,
+            [helper.make_tensor_value_info("final", TensorProto.FLOAT, [None])],
+            initializer=initializers,
+        )
+        path = self._save(graph, tmp_path)
+        if restore_rank and not runtime_axes:
+            self._assert_clean(path)
+        else:
+            result = OnnxScanner().scan(str(path))
+            assert result.success is False
+            assert result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"]
+            TestWeightDistributionCoverage()._assert_uncached_inconclusive_exit2(path, tmp_path / "cache")
+
+    @pytest.mark.parametrize(("extent", "sequence_length"), [(2, 0), (2, 1), (0, 0)])
+    def test_scan8_explicit_lengths_preserve_padded_extent_for_chained_scan(
+        self, tmp_path: Path, extent: int, sequence_length: int
+    ) -> None:
+        first_body = helper.make_graph(
+            [helper.make_node("Identity", ["element"], ["element_out"])],
+            "padded_scan_body",
+            [helper.make_tensor_value_info("element", TensorProto.FLOAT, [1])],
+            [helper.make_tensor_value_info("element_out", TensorProto.FLOAT, [1])],
+        )
+        second_body = helper.make_graph(
+            [
+                helper.make_node(
+                    "Constant",
+                    [],
+                    ["replacement"],
+                    value=onnx.numpy_helper.from_array(np.zeros((2, 2), dtype=np.float32)),
+                ),
+                helper.make_node("Identity", ["element"], ["element_out"]),
+            ],
+            "replace_weight_scan_body",
+            [
+                helper.make_tensor_value_info("state", TensorProto.FLOAT, [2, 2]),
+                helper.make_tensor_value_info("element", TensorProto.FLOAT, [1]),
+            ],
+            [
+                helper.make_tensor_value_info("replacement", TensorProto.FLOAT, [2, 2]),
+                helper.make_tensor_value_info("element_out", TensorProto.FLOAT, [1]),
+            ],
+        )
+        source_names = [f"W{index}" for index in range(40)]
+        graph = helper.make_graph(
+            [
+                helper.make_node("Sum", source_names, ["initial"]),
+                helper.make_node("Scan", ["lengths", "data"], ["padded"], body=first_body, num_scan_inputs=1),
+                helper.make_node(
+                    "Scan",
+                    ["", "initial", "padded"],
+                    ["final", "elements"],
+                    body=second_body,
+                    num_scan_inputs=1,
+                ),
+                helper.make_node("MatMul", ["X", "final"], ["Y"]),
+            ],
+            "chained_padded_scan",
+            [
+                helper.make_tensor_value_info("data", TensorProto.FLOAT, [1, extent, 1]),
+                helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 1, 2]),
+            ],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 1, 2])],
+            initializer=[
+                onnx.numpy_helper.from_array(np.array([sequence_length], dtype=np.int64), name="lengths"),
+                *[
+                    onnx.numpy_helper.from_array(np.ones((1, 2, 2), dtype=np.float32), name=name)
+                    for name in source_names
+                ],
+            ],
+        )
+        path = self._save(graph, tmp_path, opset=8)
+        model = onnx.load(str(path))
+        onnx.checker.check_model(model, full_check=True)
+        inferred = onnx.shape_inference.infer_shapes(model, strict_mode=True)
+        padded = next(value for value in inferred.graph.value_info if value.name == "padded")
+        assert tuple(dimension.dim_value for dimension in padded.type.tensor_type.shape.dim) == (1, extent, 1)
+        root_shapes: dict[str, tuple[int, ...]] = {}
+
+        def profile(frame: Any, event: str, arg: Any) -> None:
+            del arg
+            if (
+                event == "return"
+                and frame.f_code.co_name == "walk_graph"
+                and frame.f_code.co_filename == onnx_scanner_module.__file__
+                and frame.f_locals["current_graph"].name == graph.name
+            ):
+                root_shapes.update(frame.f_locals["known_value_shapes"])
+
+        previous_profile = sys.getprofile()
+        sys.setprofile(profile)
+        try:
+            plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        finally:
+            sys.setprofile(previous_profile)
+
+        # Scan-8 pads outputs to the input extent even if its body executes zero times.
+        assert root_shapes["padded"] == (1, extent, 1)
+        if extent:
+            assert plan.coverage_gaps == {}
+            assert all(spec.context["initializer"] not in source_names for spec in plan.specs)
+            self._assert_clean(path)
+        else:
+            assert plan.coverage_gaps["lineages_per_value_limit"] > 0
+            TestWeightDistributionCoverage()._assert_uncached_inconclusive_exit2(path, tmp_path / "cache")
+
+    @pytest.mark.parametrize("grows_state", [False, True])
+    @pytest.mark.parametrize("consumes_weight", [False, True])
+    def test_loop_sibling_replay_bounds_full_graph_traversals(
+        self, tmp_path: Path, consumes_weight: bool, grows_state: bool
+    ) -> None:
+        state_count = 64 if grows_state else 128
+        source_names = [f"W{index}" for index in range(40)]
+        body_nodes = [
+            helper.make_node(
+                "Unsqueeze" if grows_state else "Identity",
+                [f"state{index}", "axes"] if grows_state else [f"state{index}"],
+                [f"next{index}"],
+            )
+            for index in range(state_count)
+        ]
+        if consumes_weight:
+            body_nodes.extend(
+                [
+                    *([] if grows_state else [helper.make_node("Unsqueeze", ["state0", "axes"], ["matrix"])]),
+                    helper.make_node("PRelu", ["X", "state0"], ["weight_use"])
+                    if grows_state
+                    else helper.make_node("MatMul", ["X", "matrix"], ["weight_use"]),
+                ]
+            )
+        body = helper.make_graph(
+            body_nodes,
+            "wide_sibling_loop_body",
+            [
+                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
+                helper.make_tensor_value_info("condition", TensorProto.BOOL, []),
+                *[
+                    helper.make_tensor_value_info(f"state{index}", TensorProto.FLOAT, None if grows_state else [1])
+                    for index in range(state_count)
+                ],
+            ],
+            [
+                helper.make_tensor_value_info("condition", TensorProto.BOOL, []),
+                *[
+                    helper.make_tensor_value_info(f"next{index}", TensorProto.FLOAT, None if grows_state else [1])
+                    for index in range(state_count)
+                ],
+            ],
+        )
+        inputs = [
+            helper.make_tensor_value_info(f"input{index}", TensorProto.FLOAT, [1])
+            for index in range(int(consumes_weight), state_count)
+        ]
+        initializers = [
+            onnx.numpy_helper.from_array(np.array(2, dtype=np.int64), name="count"),
+            onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="initial_condition"),
+            onnx.numpy_helper.from_array(np.array([0], dtype=np.int64), name="axes"),
+        ]
+        nodes = []
+        if consumes_weight:
+            nodes.append(helper.make_node("Sum", source_names, ["input0"]))
+            inputs.append(helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 1]))
+            initializers.extend(
+                onnx.numpy_helper.from_array(np.ones((1,), dtype=np.float32), name=name) for name in source_names
+            )
+        nodes.append(
+            helper.make_node(
+                "Loop",
+                ["count", "initial_condition", *[f"input{index}" for index in range(state_count)]],
+                [f"final{index}" for index in range(state_count)],
+                body=body,
+            )
+        )
+        graph = helper.make_graph(
+            nodes,
+            "wide_sibling_loop",
+            inputs,
+            [
+                helper.make_tensor_value_info(f"final{index}", TensorProto.FLOAT, [1, 1, 1] if grows_state else [1])
+                for index in range(state_count)
+            ],
+            initializer=initializers,
+        )
+        path = self._save(graph, tmp_path)
+        model = onnx.load(str(path))
+        onnx.checker.check_model(model, full_check=True)
+        replay_calls = 0
+        replay_node_visits = 0
+        work_limit = onnx_scanner_module._ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
+
+        def profile(frame: Any, event: str, arg: Any) -> None:
+            nonlocal replay_calls, replay_node_visits
+            del arg
+            if event != "call" or frame.f_code.co_filename != onnx_scanner_module.__file__:
+                return
+            replay_name = "subgraph_state_input_consumes_weight_rank_at_or_above_two"
+            if frame.f_code.co_name == replay_name:
+                replay_calls += 1
+            elif (
+                frame.f_code.co_name == "graph_initializer_constants"
+                and frame.f_back is not None
+                and frame.f_back.f_code.co_name == replay_name
+            ):
+                replay_node_visits += len(frame.f_locals["current_graph"].node)
+                assert replay_node_visits <= work_limit, (replay_calls, replay_node_visits)
+
+        previous_profile = sys.getprofile()
+        sys.setprofile(profile)
+        try:
+            onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        finally:
+            sys.setprofile(previous_profile)
+
+        # Count complete traversals, including siblings with no live weight edges.
+        assert replay_calls <= state_count + work_limit // len(body_nodes)
+        assert replay_node_visits <= work_limit
+        if grows_state:
+            assert replay_node_visits > 0
+        result = OnnxScanner().scan(str(path))
+        semantics = result.metadata["onnx_weight_distribution_semantics"]
+        if consumes_weight:
+            assert result.success is False
+            assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+            assert semantics["coverage_gaps"]["lineages_per_value_limit"] > 0
+            TestWeightDistributionCoverage()._assert_uncached_inconclusive_exit2(path, tmp_path / "cache")
+        else:
+            assert result.success is True
+            assert semantics["coverage_gaps"] == {}
+            self._assert_clean(path)
+
+
 class TestLargeOnnxFileBackedInspection:
     """Regression coverage for bounded file-backed ONNX structural scans."""
 

@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Preserve ONNX weight coverage when broadcast ranks are unknown, bound repeated loop analysis, and avoid false coverage gaps for shape-restoring loops and padded Scan-8 outputs.
 - Preserve native SafeTensors routing when a valid bounded header also resembles an FDICT zlib stream.
 
 ## [0.2.53](https://github.com/promptfoo/modelaudit/compare/v0.2.52...v0.2.53) (2026-10-03)
