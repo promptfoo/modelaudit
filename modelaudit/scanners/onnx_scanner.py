@@ -2355,12 +2355,10 @@ def _build_onnx_weight_analysis_plan(
     ) -> tuple[int, ...] | None:
         if value_name in (untrusted_shape_names or set()):
             return None
-        initializer_shape = constant_initializer_shape(constants, value_name)
-        if initializer_shape is not None:
-            return initializer_shape
-        if value_name not in trusted_shape_names:
-            return None
-        return known_shapes.get(value_name)
+        # A bound Scan input describes one slice of its source initializer.
+        if value_name in trusted_shape_names and value_name in known_shapes:
+            return known_shapes[value_name]
+        return constant_initializer_shape(constants, value_name)
 
     def scan_may_skip_body(
         node: Any,
@@ -4313,6 +4311,7 @@ def _build_onnx_weight_analysis_plan(
         depth: int = 0,
         inherited_constants: dict[str, Any] | None = None,
     ) -> bool:
+        nonlocal graph_taint_work_remaining
         if not graph_input_name:
             return False
         if depth > 6:
@@ -4368,7 +4367,7 @@ def _build_onnx_weight_analysis_plan(
             reference_name = str(getattr(attribute, "ref_attr_name", ""))
             return local_attribute_bindings.get(reference_name) if reference_name else attribute
 
-        body_nodes = tuple(getattr(subgraph, "node", ()))
+        body_nodes = graph_nodes_once(subgraph)
         live_names = {name for output in getattr(subgraph, "output", ()) if (name := _onnx_value_name(output))}
         live_names.update(
             subgraph_potential_weight_consumer_dependency_names(
@@ -4381,6 +4380,11 @@ def _build_onnx_weight_analysis_plan(
         live_node_ids = set(graph_nodes_producing_names(subgraph, live_names))
         node_output_is_live_after_node: dict[int, bool] = {}
         for body_node in reversed(body_nodes):
+            work = 1 + len(getattr(body_node, "input", ())) + len(getattr(body_node, "output", ()))
+            if work > graph_taint_work_remaining:
+                graph_taint_work_remaining = 0
+                return finish(True)
+            graph_taint_work_remaining -= work
             output_is_live = id(body_node) in live_node_ids
             node_output_is_live_after_node[id(body_node)] = output_is_live
             if not output_is_live:
@@ -4414,6 +4418,11 @@ def _build_onnx_weight_analysis_plan(
 
         tainted = {graph_input_name}
         for body_node in body_nodes:
+            work = 1 + len(getattr(body_node, "input", ())) + len(getattr(body_node, "output", ()))
+            if work > graph_taint_work_remaining:
+                graph_taint_work_remaining = 0
+                return finish(True)
+            graph_taint_work_remaining -= work
             body_outputs = node_output_names(body_node)
             body_output_slots = [str(output) for output in getattr(body_node, "output", ())]
             if not body_outputs:
@@ -4673,6 +4682,8 @@ def _build_onnx_weight_analysis_plan(
                             graph_external_reference_names(subgraph, attribute_bindings, depth=depth + 1)
                         )
         reference_names = frozenset(referenced_names - produced_names - local_names)
+        if dependency_collection_limit_marker in referenced_names:
+            reference_names |= dependency_collection_limit
         graph_external_reference_in_progress.discard(cache_key)
         graph_external_reference_cache[cache_key] = (graph, reference_names)
         return reference_names
@@ -5688,6 +5699,22 @@ def _build_onnx_weight_analysis_plan(
             )
         return summarize_weight_lineage_gap(promoted_lineages, truncated=summary.truncated)
 
+    def same_carried_weight_view(initial: _OnnxWeightLineage, updated: _OnnxWeightLineage) -> bool:
+        if initial == updated:
+            return initial.unresolved_reason is None
+        if (
+            initial.unresolved_reason is not None
+            or updated.unresolved_reason is not None
+            or initial.initializer_index != updated.initializer_index
+            or initial.shape != updated.shape
+            or initial.data_type != updated.data_type
+            or updated.transforms[: len(initial.transforms)] != initial.transforms
+        ):
+            return False
+        # Consecutive C-order reshapes that restore the original shape restore
+        # the values too; a transpose or other value-changing view does not.
+        return all(transform.kind == "Reshape" for transform in updated.transforms[len(initial.transforms) :])
+
     stack_invariance_work_remaining = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
 
     def control_flow_stack_values_are_invariant(
@@ -5757,6 +5784,21 @@ def _build_onnx_weight_analysis_plan(
                     for index, lineage in parent_lineages.get(parent_name, {}).items()
                     if lineage.unresolved_reason != "shape_control_lineage"
                 }
+                if node.op_type == "Scan" and parent_offset:
+                    # Scan-8 executes its body on an individual batch. Match
+                    # the exact singleton-batch view used when binding inputs.
+                    initial = {
+                        index: _OnnxWeightLineage(
+                            initializer_index=lineage.initializer_index,
+                            shape=lineage.shape[1:],
+                            data_type=lineage.data_type,
+                            transforms=(*lineage.transforms, _OnnxWeightTransform("Reshape", lineage.shape[1:])),
+                            unresolved_reason=lineage.unresolved_reason,
+                        )
+                        if lineage.shape and lineage.shape[0] == 1 and all(dimension > 0 for dimension in lineage.shape)
+                        else lineage
+                        for index, lineage in initial.items()
+                    }
                 updated = (
                     {
                         index: lineage
@@ -5768,8 +5810,8 @@ def _build_onnx_weight_analysis_plan(
                 )
                 if (
                     not initial
-                    or any(lineage.unresolved_reason is not None for lineage in initial.values())
-                    or updated != initial
+                    or initial.keys() != updated.keys()
+                    or any(not same_carried_weight_view(lineage, updated[index]) for index, lineage in initial.items())
                 ):
                     return False
                 pending.append(next_index)
@@ -11445,6 +11487,11 @@ def _build_onnx_weight_analysis_plan(
             accepted_groups: list[tuple[_OnnxWeightConsumerGroup, int]] = []
             oversized_view_skipped = False
             for consumer_group in initializer_groups.values():
+                if consumer_group.lineage.shape is not None and 0 in consumer_group.lineage.shape:
+                    # Empty views have no weights, but a reduction can still
+                    # allocate output proportional to a nonempty axis.
+                    record_exclusion(initializer_index, "empty_weight_view")
+                    continue
                 logical_bytes = max(
                     (
                         estimated_bytes,
