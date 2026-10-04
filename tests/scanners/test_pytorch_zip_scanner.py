@@ -6082,6 +6082,7 @@ def test_pytorch_zip_later_raw_scan_starts_after_scanned_suffix(
         inst_name_validation: pytorch_zip_scanner_module._InstNameValidation | None = None,
         inst_name_offset: int | None = None,
         known_size: int | None = None,
+        global_name_inspection: pytorch_zip_scanner_module._GlobalNameInspection | None = None,
     ) -> bool:
         del fail_closed_on_truncated_extension, parse_budget_remaining
         assert nested_literal_depth == 0
@@ -8087,11 +8088,17 @@ def test_pytorch_zip_structural_fallback_advances_after_malformed_proto0_inst_na
         *,
         work_budget_remaining: list[int] | None = None,
         inst_name_validation: pytorch_zip_scanner_module._InstNameValidation | None = None,
+        global_name_inspection: pytorch_zip_scanner_module._GlobalNameInspection | None = None,
     ) -> tuple[int | None, int, bool]:
         nonlocal calls
         calls += 1
         return original(
-            value, offset, limit, work_budget_remaining=work_budget_remaining, inst_name_validation=inst_name_validation
+            value,
+            offset,
+            limit,
+            work_budget_remaining=work_budget_remaining,
+            inst_name_validation=inst_name_validation,
+            global_name_inspection=global_name_inspection,
         )
 
     monkeypatch.setattr(
@@ -8116,10 +8123,16 @@ def test_pytorch_zip_prior_window_inst_name_parse_is_window_bounded(monkeypatch:
         *,
         work_budget_remaining: list[int] | None = None,
         inst_name_validation: pytorch_zip_scanner_module._InstNameValidation | None = None,
+        global_name_inspection: pytorch_zip_scanner_module._GlobalNameInspection | None = None,
     ) -> tuple[int | None, int, bool]:
         spans.append(limit - offset)
         return original(
-            value, offset, limit, work_budget_remaining=work_budget_remaining, inst_name_validation=inst_name_validation
+            value,
+            offset,
+            limit,
+            work_budget_remaining=work_budget_remaining,
+            inst_name_validation=inst_name_validation,
+            global_name_inspection=global_name_inspection,
         )
 
     monkeypatch.setattr(
@@ -25032,3 +25045,325 @@ def test_pytorch_zip_native8_header_rejected_line_keeps_later_candidates(sample_
     assert PyTorchZipScanner._raw_nested_security_pickle_candidate_has_structural_signal(
         value, sample_is_prefix=sample_is_prefix
     ) is bool(later)
+
+
+def _native9_literal_member(text: str) -> bytes:
+    encoded = text.encode("utf-8")
+    return b"\x80\x04X" + len(encoded).to_bytes(4, "little") + encoded + b"."
+
+
+@pytest.mark.parametrize("count", [65536, 131072])
+@pytest.mark.parametrize(
+    "unit",
+    [
+        pytest.param("一", id="unicode-no-continuation"),
+        pytest.param("一\\\n", id="unicode-repeated-continuation"),
+        pytest.param("a\\\n", id="ascii-repeated-continuation"),
+    ],
+)
+def test_pytorch_zip_native9_literal_repeated_continuation_memory(count: int, unit: str) -> None:
+    payload = _native9_literal_member(unit * count)
+    if count == 131072 and unit == "一\\\n":
+        assert len(payload) == 655368
+        assert hashlib.sha256(payload).hexdigest() == "eee3f879fd3d802079458b5bb526d2b3bf8d86ca69eb552340f930f07d88eec8"
+    tracemalloc.start()
+    try:
+        assert not PyTorchZipScanner._complete_pickle_literal_member_has_line_continuation_suspicious_text(payload)
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 8 * len(payload)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        pytest.param("", id="empty"),
+        pytest.param("notes 一💡\ud800", id="unicode-no-match"),
+        pytest.param("trailing\\", id="unfinished-backslash"),
+        pytest.param(r"literal\r\n", id="literal-escape-letters"),
+        pytest.param("ordinary\r\nline", id="unescaped-newline"),
+        pytest.param("\\\n", id="lf-complete-removal"),
+        pytest.param("\\\r", id="cr-complete-removal"),
+        pytest.param("\\\r\n", id="crlf-complete-removal"),
+        pytest.param("head\\\n \t\f tail", id="lf-indentation"),
+        pytest.param("head\\\r \t\f tail", id="cr-indentation"),
+        pytest.param("head\\\r\n \t\f tail", id="crlf-indentation"),
+        pytest.param("head\\\n\u2003tail", id="non-ascii-space-retained"),
+    ],
+)
+def test_pytorch_zip_native9_literal_normalization_matches_one_regex_pass(text: str) -> None:
+    normalized = pytorch_zip_scanner_module._PYTHON_LINE_CONTINUATION_RE.sub("", text)
+    expected = (text, normalized) if normalized != text else (text,)
+    candidates = PyTorchZipScanner._storage_route_text_candidates(text)
+    assert candidates == expected
+    assert candidates[0] is text
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r", "\r\n"], ids=["lf", "cr", "crlf"])
+@pytest.mark.parametrize("match_offset", [-1, 0, 1], ids=["before-batch-edge", "at-batch-edge", "after-batch-edge"])
+def test_pytorch_zip_native9_literal_normalization_keeps_match_and_indent_boundaries(
+    newline: str, match_offset: int
+) -> None:
+    capacity = pytorch_zip_scanner_module._STORAGE_LITERAL_DECODED_TEXT_WINDOW_OVERLAP_BYTES
+    count = capacity + match_offset
+    indentation = " \t\f" * (capacity + 1)
+    text = "一\\\n" * (count - 1) + "head\\" + newline + indentation + "tail\ud800💡"
+    expected = "一" * (count - 1) + "headtail\ud800💡"
+    assert PyTorchZipScanner._storage_route_text_candidates(text) == (text, expected)
+
+
+def test_pytorch_zip_native9_literal_normalization_does_not_rescan_removal_joins() -> None:
+    capacity = pytorch_zip_scanner_module._STORAGE_LITERAL_DECODED_TEXT_WINDOW_OVERLAP_BYTES
+    for prefix_count in (0, capacity - 1):
+        text = "一\\\n" * prefix_count + "\\" * 2 + "\n\ntail"
+        expected = "一" * prefix_count + "\\\ntail"
+        candidates = PyTorchZipScanner._storage_route_text_candidates(text)
+        assert candidates == (text, expected)
+        assert candidates[-1] != pytorch_zip_scanner_module._PYTHON_LINE_CONTINUATION_RE.sub("", expected)
+
+
+@pytest.mark.parametrize("preservation", [False, True], ids=["generic-single-pass", "existing-preservation-layer"])
+def test_pytorch_zip_native9_literal_reuses_normalization_without_adding_a_pass(
+    monkeypatch: pytest.MonkeyPatch, preservation: bool
+) -> None:
+    text = "os" + "\\" * 2 + "\n\n.system"
+    original = pytorch_zip_scanner_module._PYTHON_LINE_CONTINUATION_RE
+    first_pass = original.sub("", text)
+    assert first_pass == "os\\\n.system"
+    inputs: list[str] = []
+
+    class RecordingRegex:
+        def finditer(self, value: str) -> Iterator[Any]:
+            inputs.append(value)
+            yield from original.finditer(value)
+
+    monkeypatch.setattr(pytorch_zip_scanner_module, "_PYTHON_LINE_CONTINUATION_RE", RecordingRegex())
+    if preservation:
+        assert PyTorchZipScanner._literal_value_has_line_continuation_suspicious_text(text)
+        assert inputs == [text, first_pass]
+    else:
+        assert not PyTorchZipScanner._literal_text_has_storage_route_signal(text)
+        assert inputs == [text]
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r", "\r\n"], ids=["lf", "cr", "crlf"])
+def test_pytorch_zip_native9_literal_batch_boundary_keeps_security_and_passive_url_controls(newline: str) -> None:
+    capacity = pytorch_zip_scanner_module._STORAGE_LITERAL_DECODED_TEXT_WINDOW_OVERLAP_BYTES
+    prefix = "一\\\n" * (capacity - 1) + " "
+    dangerous = prefix + "os.\\" + newline + " \t\fsystem("
+    benign = prefix + "os.\\" + newline + " \t\fösystem("
+    unproven_url = prefix + "https://docs.example.invalid/os.\\" + newline + " \t\fsystem(command)"
+    passive_url = "\\\n" * (capacity - 1) + "https://docs.example.invalid/os.\\" + newline + " \t\fsystem(command)"
+    for value in (dangerous, dangerous.encode("utf-8"), bytearray(dangerous.encode("utf-8"))):
+        assert PyTorchZipScanner._literal_value_has_line_continuation_suspicious_text(value)
+    assert not PyTorchZipScanner._literal_value_has_line_continuation_suspicious_text(benign)
+    assert PyTorchZipScanner._literal_value_has_line_continuation_suspicious_text(unproven_url)
+    assert not PyTorchZipScanner._literal_value_has_line_continuation_suspicious_text(passive_url)
+
+
+@pytest.mark.parametrize("spooled", [False, True], ids=["in-memory", "spooled"])
+@pytest.mark.parametrize("suspicious", [False, True], ids=["exact-native-benign", "security-tail"])
+def test_pytorch_zip_native9_literal_repeated_continuation_archive_and_root_outcomes(
+    tmp_path: Path, spooled: bool, suspicious: bool
+) -> None:
+    text = "一\\\n" * 131072 + (" os.\\\r\n \t\fsystem(" if suspicious else "")
+    payload = _native9_literal_member(text)
+    path = tmp_path / "native9-repeated-continuation.pt"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data.pkl", payload)
+    scanner = PyTorchZipScanner(config={"pickle_max_memory_read": 1} if spooled else None)
+    result = scanner.scan(str(path))
+    expected_verdict = "suspicious" if suspicious else "clean"
+    assert result.success is True
+    assert result.metadata["pickle_verdict"] == expected_verdict
+    assert result.metadata["pickle_files"] == ["archive/data.pkl"]
+    member = result.metadata["pickle_member_outcomes"][0]
+    assert member["scan_outcome"] == "complete"
+    assert member["pickle_verdict"] == expected_verdict
+    assert should_cache_scan_result(result.to_dict(include_private_metadata=True)) is (not suspicious)
+    assert any(issue.details.get("pickle_rule_code") == "SUSPICIOUS_STRING" for issue in result.issues) is suspicious
+
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+    assert aggregate.success is (not suspicious)
+    assert aggregate.file_metadata[str(path)]["pickle_verdict"] == expected_verdict
+    assert aggregate.file_metadata[str(path)]["pickle_coverage"]["raw_scan_complete"] is True
+    assert aggregate.file_metadata[str(path)]["pickle_coverage"]["opcode_scan_complete"] is True
+    assert determine_exit_code(aggregate) == (1 if suspicious else 0)
+
+
+@pytest.mark.parametrize(
+    ("route", "size", "tail", "factor", "bound_reached"),
+    [
+        pytest.param("trusted", 262144, b"\nx\xff\n!", 3, False, id="review1-262144"),
+        pytest.param("trusted", 524288, b"\nx\xff\n!", 3, False, id="review1-524288"),
+        pytest.param("trusted", 1048576, b"\nx\xff\n!", 3, False, id="review1-1048576"),
+        pytest.param("trusted", 262144, b"\xff", 3, False, id="review2-262144"),
+        pytest.param("trusted", 524288, b"\xff", 3, False, id="review2-524288"),
+        pytest.param("trusted", 1048576, b"\xff", 3, False, id="review2-1048576"),
+        pytest.param("trusted", 524288, b"", 3, False, id="review3-524288"),
+        pytest.param("trusted", 1048576, b"", 3, False, id="review3-1048576"),
+        pytest.param("trusted", 2097152, b"", 3, False, id="review3-2097152"),
+        pytest.param("trusted", 4 * 1024 * 1024 - 8, b" " * 3, 3, True, id="review3-4m-limit"),
+        pytest.param("raw", 131072, b"\xff", 3, False, id="raw-fallback"),
+        pytest.param("encoded", 131072, b"\xff", 2, False, id="encoded-fallback"),
+        pytest.param("later", 131072, b"\xff", 1, False, id="later-window"),
+    ],
+)
+def test_pytorch_zip_native9_global_name_work_is_bounded(
+    monkeypatch: pytest.MonkeyPatch, route: str, size: int, tail: bytes, factor: int, bound_reached: bool
+) -> None:
+    value = (b"X\xff\xff\xff\x7f" if route == "trusted" else b"") + b"c" * size + tail
+    decoded_bytes = 0
+    original_decoder = pytorch_zip_scanner_module.codecs.getincrementaldecoder
+
+    def counted_decoder(encoding: str) -> type[Any]:
+        class CountingDecoder:
+            def __init__(self, errors: str = "strict") -> None:
+                self.decoder = original_decoder(encoding)(errors)
+
+            def decode(self, data: bytes, final: bool = False) -> str:
+                nonlocal decoded_bytes
+                decoded_bytes += len(data)
+                return self.decoder.decode(data, final)
+
+            def getstate(self) -> tuple[bytes, int]:
+                return self.decoder.getstate()
+
+        return CountingDecoder
+
+    monkeypatch.setattr(pytorch_zip_scanner_module.codecs, "getincrementaldecoder", counted_decoder)
+    if route == "trusted":
+        scanner = PyTorchZipScanner()
+        result = ScanResult(scanner_name="pytorch_zip", scanner=scanner)
+        with zipfile.ZipFile(io.BytesIO(), "w") as archive:
+            archive.writestr("archive/data/0", value)
+            entry = archive.getinfo("archive/data/0")
+            if bound_reached:
+                with pytest.raises(ValueError, match="trusted PyTorch storage prefix exceeds pickle discovery probe"):
+                    scanner._trusted_storage_entry_looks_like_pickle(
+                        archive, entry, result, padding_probe_bytes_remaining=[4 * 1024 * 1024]
+                    )
+            else:
+                assert (
+                    scanner._trusted_storage_entry_looks_like_pickle(
+                        archive, entry, result, padding_probe_bytes_remaining=[4 * 1024 * 1024]
+                    )
+                    is False
+                )
+    else:
+        remaining = [65536]
+        inspect = {
+            "raw": PyTorchZipScanner._raw_nested_security_pickle_candidate_budget_exhausted_needs_scan,
+            "encoded": PyTorchZipScanner._encoded_raw_nested_security_pickle_candidate_budget_exhausted_needs_scan,
+            "later": PyTorchZipScanner._raw_nested_security_pickle_candidate_has_later_structural_signal,
+        }[route]
+        assert inspect(value, work_budget_remaining=remaining) is False
+        assert remaining[0] >= 0
+    assert 0 < decoded_bytes <= factor * len(value) + 65536
+
+
+@pytest.mark.parametrize("pending", [b"\xc2", b"\xe2\x82", b"\xf0\x90\x80"])
+def test_pytorch_zip_native9_global_rejection_keeps_shorter_utf8_prefix(
+    monkeypatch: pytest.MonkeyPatch, pending: bytes
+) -> None:
+    source = b"cc" + pending + b"!"
+    inspection = (source, [0, -1, -1, -1])
+    remaining = [65536]
+    inspect = PyTorchZipScanner._raw_nested_proto0_global_ref_seen
+    assert (
+        inspect(source[:1], original_value=source, work_budget_remaining=remaining, global_name_inspection=inspection)
+        is False
+    )
+    monkeypatch.setattr(pytorch_zip_scanner_module, "_PICKLE_DISCOVERY_PADDING_PROBE_BUDGET_BYTES", len(source) - 1)
+    assert (
+        inspect(source[:1], original_value=source, work_budget_remaining=remaining, global_name_inspection=inspection)
+        is True
+    )
+    monkeypatch.setattr(pytorch_zip_scanner_module, "_PICKLE_DISCOVERY_PADDING_PROBE_BUDGET_BYTES", len(source))
+    assert (
+        inspect(source[:1], original_value=source, work_budget_remaining=remaining, global_name_inspection=inspection)
+        is False
+    )
+    assert remaining[0] >= 0
+
+
+def test_pytorch_zip_native9_global_rejection_preserves_invalid_continuation_c() -> None:
+    source = b"cc\xc2cmod\nrun\n"
+    inspection = (source, [0, -1, -1, -1])
+    remaining = [65536]
+    assert (
+        PyTorchZipScanner._raw_nested_proto0_global_ref_seen(
+            source[:1], original_value=source, work_budget_remaining=remaining, global_name_inspection=inspection
+        )
+        is False
+    )
+    assert (
+        PyTorchZipScanner._raw_nested_proto0_global_ref_seen(
+            source[1:],
+            original_value=source,
+            original_offset=1,
+            work_budget_remaining=remaining,
+            global_name_inspection=inspection,
+        )
+        is True
+    )
+    assert remaining[0] >= 0
+
+
+def test_pytorch_zip_native9_global_inspection_requires_identity_and_keeps_exhaustion() -> None:
+    source = b"cmod\xff"
+    inspection = (source, [0, -1, -1, -1])
+    remaining = [0]
+    inspect = PyTorchZipScanner._raw_nested_proto0_global_ref_seen
+    assert inspect(source, work_budget_remaining=remaining, global_name_inspection=inspection) is False
+    assert inspect(source, work_budget_remaining=remaining, global_name_inspection=inspection) is False
+    assert remaining == [0]
+    saved = inspection[1].copy()
+    for _ in range(2):
+        different = bytes(bytearray(source))
+        assert different is not source
+        refused = [0]
+        assert inspect(different, work_budget_remaining=refused, global_name_inspection=inspection) is True
+        assert refused == [-1]
+        assert inspection[0] is source
+        assert inspection[1] == saved
+    assert inspect(source, work_budget_remaining=[-1], global_name_inspection=inspection) is True
+
+
+@pytest.mark.parametrize("marker", [b"c", b"i"])
+def test_pytorch_zip_native9_global_credit_does_not_change_default_or_inst_work(marker: bytes) -> None:
+    source = marker + b"mod\nrun\n"
+    remaining = [0]
+    inspection = (source, [0, -1, -1, -1]) if marker == b"i" else None
+    assert PyTorchZipScanner._raw_nested_proto0_name_end(
+        source, 0, len(source), work_budget_remaining=remaining, global_name_inspection=inspection
+    ) == (None, 1, True)
+    assert remaining == [-1]
+
+
+def test_pytorch_zip_native9_global_cross_field_inspection_keeps_exact_allowance() -> None:
+    source = b"c!imod\n" + b"a" * 128 + b"\xff"
+    inspection = (source, [0, -1, -1, -1])
+    remaining = [0]
+    assert PyTorchZipScanner._raw_nested_proto0_name_end(
+        source, 0, len(source), work_budget_remaining=remaining, global_name_inspection=inspection
+    ) == (None, len(source), False)
+    assert remaining == [0]
+    assert PyTorchZipScanner._raw_nested_proto0_name_end(
+        source, 0, len(source), work_budget_remaining=remaining, global_name_inspection=inspection
+    ) == (None, 1, True)
+    assert remaining == [-1]
+
+
+def test_pytorch_zip_native9_global_empty_requested_range_does_not_consume_work() -> None:
+    source = b"c"
+    remaining = [0]
+    inspection = (source, [0, -1, -1, -1])
+    assert PyTorchZipScanner._raw_nested_proto0_name_end(
+        source, 0, 1, work_budget_remaining=remaining, global_name_inspection=inspection
+    ) == (None, 1, True)
+    assert remaining == [0]
+    assert inspection[1] == [0, -1, -1, -1]

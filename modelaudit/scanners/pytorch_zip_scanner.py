@@ -538,6 +538,9 @@ def _build_pytorch_version_cve_metadata(
 
 
 _InstNameValidation = tuple[bytes, dict[int, tuple[tuple[int, ...], int, int | None]]]
+# Fields: inspected high-water, rejected start/end, observed name limit.
+# The high-water mark accounts for work; it never resumes UTF-8 decoding.
+_GlobalNameInspection = tuple[bytes, list[int]]
 
 
 class PyTorchZipScanner(BaseScanner):
@@ -3767,23 +3770,32 @@ class PyTorchZipScanner(BaseScanner):
 
     @staticmethod
     def _literal_text_has_storage_route_signal(text: str) -> bool:
-        for candidate in PyTorchZipScanner._storage_route_text_candidates(text):
+        candidates = PyTorchZipScanner._storage_route_text_candidates(text)
+        for candidate in candidates:
             if any(pattern.search(candidate) for pattern in _SUSPICIOUS_LITERAL_TEXT_PATTERNS) or any(
                 pattern.search(candidate) for pattern in _STORAGE_LITERAL_TEXT_ROUTE_PATTERNS
             ):
                 return True
-        compacted = PyTorchZipScanner._compact_python_member_access_and_calls(
-            _PYTHON_LINE_CONTINUATION_RE.sub("", text)
-        )
+        compacted = PyTorchZipScanner._compact_python_member_access_and_calls(candidates[-1])
         return compacted != text and any(pattern.search(compacted) for pattern in _STORAGE_LITERAL_TEXT_ROUTE_PATTERNS)
 
     @staticmethod
     def _storage_route_text_candidates(text: str) -> tuple[str, ...]:
-        normalized = _PYTHON_LINE_CONTINUATION_RE.sub("", text)
-        candidates = [text]
-        if normalized != text:
-            candidates.append(normalized)
-        return tuple(candidates)
+        chunks: list[str] = []
+        fragments: list[str] = []
+        last_end = 0
+        # Match only the original input; removals must not create new matches.
+        for match in _PYTHON_LINE_CONTINUATION_RE.finditer(text):
+            fragments.append(text[last_end : match.start()])
+            last_end = match.end()
+            if len(fragments) >= _STORAGE_LITERAL_DECODED_TEXT_WINDOW_OVERLAP_BYTES:
+                chunks.append("".join(fragments))
+                fragments.clear()
+        if last_end == 0:
+            return (text,)
+        fragments.append(text[last_end:])
+        chunks.append("".join(fragments))
+        return text, "".join(chunks)
 
     @staticmethod
     def _compact_python_member_access_and_calls(text: str) -> str:
@@ -4503,6 +4515,7 @@ class PyTorchZipScanner(BaseScanner):
                 span = next(spans, None)
             window_start_spans[start] = span if span is not None and span[1] <= start else None
 
+        global_name_inspection: _GlobalNameInspection = (value, [0, -1, -1, -1])
         recursive_literal_scanned_until_ref = [search_start]
         for window_start, window_end in windows:
             if PyTorchZipScanner._raw_nested_window_has_literal_security_stream(
@@ -4536,6 +4549,7 @@ class PyTorchZipScanner(BaseScanner):
                 sample_is_prefix=sample_is_prefix or window_end < len(value),
                 inst_name_validation=inst_name_validation,
                 inst_name_offset=window_start,
+                global_name_inspection=global_name_inspection,
             ):
                 return True
             if PyTorchZipScanner._raw_nested_proto0_inst_with_prior_window_mark_seen(
@@ -5150,6 +5164,7 @@ class PyTorchZipScanner(BaseScanner):
         inst_name_validation: _InstNameValidation | None = None,
         inst_name_offset: int | None = None,
         known_size: int | None = None,
+        global_name_inspection: _GlobalNameInspection | None = None,
     ) -> bool:
         if work_budget_remaining is None:
             work_budget_remaining = [_PICKLE_DISCOVERY_LONG_PROBE_BYTES]
@@ -5163,6 +5178,7 @@ class PyTorchZipScanner(BaseScanner):
             original_value=original_value,
             original_offset=original_offset,
             work_budget_remaining=work_budget_remaining,
+            global_name_inspection=global_name_inspection,
         ):
             return True
         if PyTorchZipScanner._raw_nested_proto0_inst_ref_seen(
@@ -5323,22 +5339,52 @@ class PyTorchZipScanner(BaseScanner):
         original_value: bytes | None = None,
         original_offset: int = 0,
         work_budget_remaining: list[int] | None = None,
+        global_name_inspection: _GlobalNameInspection | None = None,
     ) -> bool:
         if work_budget_remaining is None:
             work_budget_remaining = [_PICKLE_DISCOVERY_LONG_PROBE_BYTES]
+        if work_budget_remaining[0] < 0:
+            return True
         search_limit = min(len(value), _PICKLE_DISCOVERY_LONG_PROBE_BYTES)
         search_start = 0
         source = original_value if original_value is not None else value
+        if global_name_inspection is None:
+            global_name_inspection = (source, [0, -1, -1, -1])
         # A name can outlive the opcode-search window, but not the discovery byte budget.
         name_limit = min(len(source), original_offset + _PICKLE_DISCOVERY_PADDING_PROBE_BUDGET_BYTES)
         while search_start < search_limit:
             offset = value.find(b"c", search_start, search_limit)
             if offset < 0:
                 return False
-            name_end, next_start, truncated = PyTorchZipScanner._raw_nested_proto0_name_end(
-                source, original_offset + offset, name_limit
+            absolute_offset = original_offset + offset
+            inspection = (
+                global_name_inspection[1]
+                if source is global_name_inspection[0] and source[absolute_offset] == ord("c")
+                else None
             )
+            if (
+                inspection is not None
+                and inspection[1] <= absolute_offset < inspection[2]
+                and name_limit >= inspection[3]
+            ):
+                search_start = inspection[2] - original_offset
+                continue
+            name_end, next_start, truncated = PyTorchZipScanner._raw_nested_proto0_name_end(
+                source,
+                absolute_offset,
+                name_limit,
+                work_budget_remaining=work_budget_remaining,
+                global_name_inspection=global_name_inspection,
+            )
+            if work_budget_remaining[0] < 0:
+                return True
             search_start = next_start - original_offset
+            if (
+                inspection is not None
+                and name_end is None
+                and (not truncated or (name_limit == len(source) and next_start == name_limit))
+            ):
+                inspection[1:] = [absolute_offset, next_start, name_limit]
             if name_end is not None:
                 if name_end >= original_offset + search_limit:
                     # A later literal cannot supply delimiters for an earlier decoy GLOBAL.
@@ -5347,6 +5393,8 @@ class PyTorchZipScanner(BaseScanner):
                     )
                     module_end = source.find(b"\n", original_offset + offset + 1, name_end)
                     delimiter_spans = (span_at(module_end), span_at(name_end))
+                    if work_budget_remaining[0] < 0:
+                        return True
                     if any(
                         span is not None and not PyTorchZipScanner._raw_nested_literal_span_is_mask_only(source, span)
                         for span in delimiter_spans
@@ -6432,8 +6480,14 @@ class PyTorchZipScanner(BaseScanner):
         *,
         work_budget_remaining: list[int] | None = None,
         inst_name_validation: _InstNameValidation | None = None,
+        global_name_inspection: _GlobalNameInspection | None = None,
     ) -> tuple[int | None, int, bool]:
         encoding = "utf-8" if value[offset] == ord("c") else "ascii"
+        inspection = (
+            global_name_inspection[1]
+            if global_name_inspection is not None and value is global_name_inspection[0] and value[offset] == ord("c")
+            else None
+        )
         start = offset + 1
         line_ends: tuple[int, ...] = ()
         validated_end = start
@@ -6463,11 +6517,16 @@ class PyTorchZipScanner(BaseScanner):
             while cursor < limit:
                 chunk_bytes = 64 if work_budget_remaining is None else min(64, cursor - start + 1)
                 chunk_limit = min(limit, cursor + chunk_bytes)
+                work_bytes = chunk_limit - cursor
+                if inspection is not None:
+                    work_bytes = max(0, min(chunk_limit, inspection[0]) - cursor)
                 if work_budget_remaining is not None and not PyTorchZipScanner._consume_raw_nested_pickle_work_budget(
-                    work_budget_remaining, chunk_limit - cursor
+                    work_budget_remaining, work_bytes
                 ):
                     return None, cursor, True
                 end = value.find(b"\n", cursor, chunk_limit)
+                if inspection is not None:
+                    inspection[0] = max(inspection[0], end + 1 if end >= 0 else chunk_limit)
                 if end == start:
                     if name_cache is not None:
                         name_cache[offset] = (line_ends, start, start)
@@ -7764,9 +7823,9 @@ class PyTorchZipScanner(BaseScanner):
                 text = value.decode("utf-8")
             except UnicodeDecodeError:
                 text = value.decode("latin-1")
-        normalized = _PYTHON_LINE_CONTINUATION_RE.sub("", text)
-        return normalized != text and PyTorchZipScanner._literal_text_has_storage_route_signal(
-            PyTorchZipScanner._strip_inert_literal_urls_from_text(normalized)
+        candidates = PyTorchZipScanner._storage_route_text_candidates(text)
+        return len(candidates) > 1 and PyTorchZipScanner._literal_text_has_storage_route_signal(
+            PyTorchZipScanner._strip_inert_literal_urls_from_text(candidates[-1])
         )
 
     @staticmethod
