@@ -16,8 +16,6 @@ from urllib.parse import urlparse
 from ..scanner_results import mark_inconclusive_scan_result
 from ..utils import is_absolute_archive_path, is_critical_system_path, is_within_directory, sanitize_archive_path
 from ..utils.file.detection import (
-    MARKED_PROTOCOL0_GLOBAL_RE,
-    PROTOCOL0_GLOBAL_RE,
     detect_file_format,
 )
 from ..utils.model_extensions import get_model_extensions
@@ -1287,69 +1285,6 @@ class OciLayerScanner(BaseScanner):
         """Return a canonical suffix for detected content-based formats."""
         detected_format = detect_file_format(extracted_path)
         return cls._DETECTED_FORMAT_SUFFIXES.get(detected_format)
-
-    @staticmethod
-    def _looks_like_model_member_prefix(data: bytes) -> bool:
-        """Return True when an extensionless or misnamed member has model-like magic bytes."""
-        if len(data) >= 8 and data[4:8] == b"TFL3":
-            return True
-        if data.startswith(
-            (
-                b"\x80\x02",
-                b"\x80\x03",
-                b"\x80\x04",
-                b"\x80\x05",
-                b"\x89HDF\r\n\x1a\n",
-                b"\x93NUMPY",
-                b"GGUF",
-                b"GGML",
-                b"GGMF",
-                b"GGJT",
-                b"GGLA",
-                b"GGSA",
-                b"PK\x03\x04",
-                b"PK\x05\x06",
-                b"PK\x07\x08",
-                b"\x08\x01\x12\x00",
-                b"ONNX",
-                b"onnx",
-                b"<?xml",
-            )
-        ):
-            return True
-        if PROTOCOL0_GLOBAL_RE.match(data) or MARKED_PROTOCOL0_GLOBAL_RE.match(data):
-            return True
-
-        for offset in range(1, len(data)):
-            shifted_prefix = data[offset:]
-            if shifted_prefix.startswith(
-                (
-                    b"\x80\x02",
-                    b"\x80\x03",
-                    b"\x80\x04",
-                    b"\x80\x05",
-                    b"\x89HDF\r\n\x1a\n",
-                    b"\x93NUMPY",
-                    b"GGUF",
-                    b"GGML",
-                    b"GGMF",
-                    b"GGJT",
-                    b"GGLA",
-                    b"GGSA",
-                    b"PK\x03\x04",
-                    b"PK\x05\x06",
-                    b"PK\x07\x08",
-                    b"\x08\x01\x12\x00",
-                    b"ONNX",
-                    b"onnx",
-                    b"<?xml",
-                )
-            ):
-                return True
-            if PROTOCOL0_GLOBAL_RE.match(shifted_prefix) or MARKED_PROTOCOL0_GLOBAL_RE.match(shifted_prefix):
-                return True
-
-        return False
 
     def scan(self, path: str) -> ScanResult:
         path_check = self._check_path(path)

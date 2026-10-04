@@ -31,7 +31,6 @@ from modelaudit.cli import (
     _create_path_progress_callback,
     _display_error,
     _display_path,
-    _display_scan_path,
     _explicit_local_shard_family_groups,
     _format_scan_output,
     _local_path_will_be_scanned,
@@ -311,7 +310,7 @@ def assert_huggingface_acquisition_error_payload(
     assert issue["details"]["scan_outcome_reasons"] == [reason]
 
 
-def test_format_scan_json_redacts_sources_without_corrupting_result_metadata() -> None:
+def test_format_scan_json_preserves_sources_and_result_metadata() -> None:
     first_url = "s3://bucket/model.pkl?token=first-secret"
     second_url = "s3://bucket/model.pkl?token=second-secret"
     result = create_mock_scan_result(
@@ -349,12 +348,12 @@ def test_format_scan_json_redacts_sources_without_corrupting_result_metadata() -
     assert list(payload["issues"][0]["details"].values()) == [
         {"finding": "first"},
         {"finding": "second"},
-        "<redacted>",
+        "nested-secret",
         "preserve-near-match",
     ]
-    assert "first-secret" not in output
-    assert "second-secret" not in output
-    assert "nested-secret" not in output
+    assert "first-secret" in output
+    assert "second-secret" in output
+    assert "nested-secret" in output
 
     text_output = _format_scan_output(
         result,
@@ -362,9 +361,9 @@ def test_format_scan_json_redacts_sources_without_corrupting_result_metadata() -
         output_format="text",
         verbose=True,
     )
-    assert "first-secret" not in text_output
-    assert "second-secret" not in text_output
-    assert "nested-secret" not in text_output
+    assert "first-secret" in text_output
+    assert "second-secret" in text_output
+    assert "nested-secret" in text_output
 
 
 def test_format_scan_json_preserves_pydantic_json_serialization() -> None:
@@ -3240,13 +3239,6 @@ def test_display_helpers_escape_terminal_controls() -> None:
     assert _display_error(error, path) == "failed\\nFORGED\\u200btext"
 
 
-def test_display_scan_path_preserves_exact_local_path_for_reports() -> None:
-    path = "model\nname\u202e.pkl"
-
-    assert _display_scan_path(path) == path
-    assert _display_path(path) == "model\\nname\\u202e.pkl"
-
-
 def test_metadata_terminal_messages_escape_controls(tmp_path: Path) -> None:
     model_path = tmp_path / "model.bin"
     model_path.write_bytes(b"model")
@@ -3908,8 +3900,8 @@ def test_scan_huggingface_metadata_preflight_verbose_log_is_sanitized(
     assert "https://huggingface.co/org/model" in caplog.text
     assert "metadata failed" in caplog.text
     assert "\\nFORGED" in caplog.text
-    assert "secret-token" not in caplog.text
-    assert "?token=" not in caplog.text
+    assert "secret-token" in caplog.text
+    assert "?token=" in caplog.text
 
 
 @patch("modelaudit.cli.is_huggingface_url")
@@ -3954,7 +3946,7 @@ def test_scan_huggingface_gated_text_reports_blocked_without_artifact_scan(
     assert "No model artifacts were scanned for blocked Hugging Face source(s)." in output
     assert "NO FILES SCANNED" not in output
     assert "SCAN COMPLETED WITH OPERATIONAL ERRORS" not in output
-    assert "hf_secret" not in output
+    assert "hf_secret" in output
     mock_scan.assert_not_called()
 
 
@@ -3977,9 +3969,9 @@ def test_scan_huggingface_gated_json_reports_acquisition_error(
         result = CliRunner().invoke(cli, ["scan", "--quiet", "--no-cache", "--format", "json", url])
 
     parsed = parse_click_json_output(result.output)
-    source_key = f"https://huggingface.co/test/gated@{_HF_TEST_REVISION}"
+    source_key = f"{url}@{_HF_TEST_REVISION}"
     assert result.exit_code == 2
-    assert "hf_secret" not in result.output
+    assert "hf_secret" in result.output
     assert "\\nFORGED" in result.output
     assert_huggingface_acquisition_error_payload(
         parsed,
@@ -3993,20 +3985,25 @@ def test_scan_huggingface_gated_json_reports_acquisition_error(
     assert mock_failed.call_args.args[1] == "Model acquisition failed"
 
 
+@pytest.mark.parametrize("token", ["", "abc403def", "unauthorized", "gated", "401"])
 @patch("modelaudit.cli.download_model")
 @patch("modelaudit.cli.scan_model_directory_or_file")
 def test_scan_huggingface_transient_json_reports_acquisition_failed_not_blocked(
     mock_scan: MagicMock,
     mock_download: MagicMock,
+    token: str,
 ) -> None:
     """Non-auth acquisition failures should fail closed without pretending to be gated."""
     url = f"https://huggingface.co/test/model?revision={_HF_TEST_REVISION}"
-    mock_download.side_effect = RuntimeError("Connection timed out while listing repository files")
+    if token:
+        url += f"&token={token}"
+    error = "Connection timed out while listing repository files" + (f" for {url}" if token else "")
+    mock_download.side_effect = RuntimeError(error)
 
     result = CliRunner().invoke(cli, ["scan", "--quiet", "--no-cache", "--format", "json", url])
 
     parsed = parse_click_json_output(result.output)
-    source_key = f"https://huggingface.co/test/model@{_HF_TEST_REVISION}"
+    source_key = f"{url}@{_HF_TEST_REVISION}"
     assert result.exit_code == 2
     assert_huggingface_acquisition_error_payload(
         parsed,
@@ -4014,6 +4011,8 @@ def test_scan_huggingface_transient_json_reports_acquisition_failed_not_blocked(
         blocked=False,
         expected_revision=_HF_TEST_REVISION,
     )
+    if token:
+        assert error in result.output
     mock_scan.assert_not_called()
 
 
@@ -4030,9 +4029,9 @@ def test_scan_huggingface_file_unauthorized_json_reports_acquisition_error(
     result = CliRunner().invoke(cli, ["scan", "--quiet", "--no-cache", "--format", "json", url])
 
     parsed = parse_click_json_output(result.output)
-    source_key = f"https://huggingface.co/test/gated/resolve/{_HF_TEST_REVISION}/model.bin"
+    source_key = url
     assert result.exit_code == 2
-    assert "hf_secret" not in result.output
+    assert "hf_secret" in result.output
     assert_huggingface_acquisition_error_payload(
         parsed,
         source_key,
@@ -4074,13 +4073,22 @@ def test_scan_huggingface_streaming_gated_json_reports_acquisition_error(
     mock_scan_streaming: MagicMock,
 ) -> None:
     """Streaming acquisition failures must not claim a completed stream scan."""
+
+    class ChangingMessageError(RuntimeError):
+        calls = 0
+
+        def __str__(self) -> str:
+            self.calls += 1
+            return "GatedRepoError: 403 Forbidden" if self.calls == 1 else "Connection timed out"
+
+    error = ChangingMessageError()
     url = f"https://huggingface.co/test/gated?revision={_HF_TEST_REVISION}"
-    mock_download_streaming.side_effect = RuntimeError("GatedRepoError: 403 Forbidden")
+    mock_download_streaming.side_effect = error
 
     result = CliRunner().invoke(cli, ["scan", "--quiet", "--stream", "--format", "json", url])
 
     parsed = parse_click_json_output(result.output)
-    source_key = f"https://huggingface.co/test/gated@{_HF_TEST_REVISION}"
+    source_key = f"{url}@{_HF_TEST_REVISION}"
     assert result.exit_code == 2
     assert_huggingface_acquisition_error_payload(
         parsed,
@@ -4090,6 +4098,7 @@ def test_scan_huggingface_streaming_gated_json_reports_acquisition_error(
     )
     mock_scan_streaming.assert_not_called()
     assert "Streaming scan complete" not in result.output
+    assert error.calls == 1
 
 
 @patch("modelaudit.core.scan_model_streaming")
@@ -4231,7 +4240,7 @@ def test_scan_huggingface_blocked_source_does_not_hide_local_malicious_findings(
     )
 
     parsed = parse_click_json_output(result.output)
-    source_key = f"https://huggingface.co/test/gated@{_HF_TEST_REVISION}"
+    source_key = f"{blocked_url}@{_HF_TEST_REVISION}"
     assert result.exit_code == 2
     assert parsed["success"] is False
     assert parsed["files_scanned"] == 1
@@ -4572,7 +4581,7 @@ def test_scan_huggingface_streaming_dry_run_gated_json_reports_acquisition_error
     assert "Selected Hugging Face files are gated/inaccessible" in result.output
     assert_huggingface_acquisition_error_payload(
         parsed,
-        f"hf://test/gated@{_HF_TEST_REVISION}",
+        f"{url}@{_HF_TEST_REVISION}",
         blocked=True,
         expected_revision=_HF_TEST_REVISION,
     )
@@ -4622,7 +4631,7 @@ def test_scan_huggingface_streaming_dry_run_exact_zip_include_all_overflow_repor
 
 
 @patch("modelaudit.cli.download_file_from_hf")
-def test_scan_huggingface_file_download_failure_redacts_url(
+def test_scan_huggingface_file_download_failure_preserves_url(
     mock_download_file: MagicMock,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -4647,11 +4656,11 @@ def test_scan_huggingface_file_download_failure_redacts_url(
 
     output = strip_ansi(result.output)
     assert result.exit_code == 2
-    assert "hf_secret" not in output
-    assert "token=" not in output
+    assert "hf_secret" in output
+    assert "token=" in output
     assert "https://huggingface.co/test/model/resolve/main/file.bin" in output
-    assert "hf_secret" not in caplog.text
-    assert "token=" not in caplog.text
+    assert "hf_secret" in caplog.text
+    assert "token=" in caplog.text
     assert "\nFORGED" not in caplog.text
     assert "\x1b" not in caplog.text
 
@@ -5571,7 +5580,7 @@ def test_scan_huggingface_streaming_dry_run_metadata_failure_fails_closed() -> N
 
     assert result.exit_code == 2
     assert "Error previewing model" in result.output
-    assert "hf_secret" not in result.output
+    assert "hf_secret" in result.output
     assert "\\nFORGED" in result.output
     assert "\nFORGED" not in result.output
     assert "Hugging Face acquisition failed" in result.output
@@ -6145,7 +6154,7 @@ def test_scan_huggingface_file_streaming_dry_run_does_not_download_or_scan() -> 
     assert preview["revision"] == "main"
     assert preview["filename"] == "model.bin"
     assert preview["size_bytes"] == 2048
-    assert "hf_secret" not in result.output
+    assert "hf_secret" in result.output
     assert "bytes_scanned" not in preview
     assert "files_scanned" not in preview
     assert "success" not in preview
@@ -6388,7 +6397,7 @@ def test_scan_huggingface_file_streaming_dry_run_metadata_failure_fails_closed()
 
     assert result.exit_code == 2
     assert "Error previewing file" in result.output
-    assert "hf_secret" not in result.output
+    assert "hf_secret" in result.output
     assert "\\nFORGED" in result.output
     assert "\nFORGED" not in result.output
     assert "Hugging Face acquisition failed" in result.output
@@ -6422,7 +6431,7 @@ def test_scan_huggingface_file_streaming_dry_run_parse_failure_fails_closed() ->
 
     assert result.exit_code == 2
     assert "Error previewing file" in result.output
-    assert "hf_secret" not in result.output
+    assert "hf_secret" in result.output
     assert "\\nFORGED" in result.output
     assert "\nFORGED" not in result.output
     assert "Hugging Face acquisition failed" in result.output
@@ -7619,8 +7628,10 @@ def test_scan_cloud_url_download_failure(mock_download: MagicMock, mock_is_cloud
 
 @patch("modelaudit.cli.is_cloud_url")
 @patch("modelaudit.cli.download_from_cloud")
-def test_scan_cloud_url_download_failure_redacts_signed_url(mock_download: MagicMock, mock_is_cloud: MagicMock) -> None:
-    """Signed cloud URL secrets should not leak through shared CLI output."""
+def test_scan_cloud_url_download_failure_preserves_signed_url(
+    mock_download: MagicMock, mock_is_cloud: MagicMock
+) -> None:
+    """Cloud download failures preserve their source URL and failure status."""
     url = "s3://bucket/model.bin?X-Amz-Signature=secret"
     mock_is_cloud.return_value = True
     mock_download.side_effect = Exception(f"Forbidden while opening {url}")
@@ -7629,13 +7640,13 @@ def test_scan_cloud_url_download_failure_redacts_signed_url(mock_download: Magic
 
     assert result.exit_code == 2
     assert "s3://bucket/model.bin" in result.output
-    assert "X-Amz-Signature" not in result.output
-    assert "secret" not in result.output
+    assert "X-Amz-Signature" in result.output
+    assert "secret" in result.output
 
 
 @patch("modelaudit.cli.is_cloud_url")
 @patch("modelaudit.cli.download_from_cloud")
-def test_scan_cloud_url_download_failure_verbose_log_redacts_signed_url(
+def test_scan_cloud_url_download_failure_verbose_log_preserves_signed_url(
     mock_download: MagicMock,
     mock_is_cloud: MagicMock,
     caplog: pytest.LogCaptureFixture,
@@ -7651,13 +7662,13 @@ def test_scan_cloud_url_download_failure_verbose_log_redacts_signed_url(
 
     assert result.exit_code == 2
     assert "s3://bucket/model.bin" in caplog.text
-    assert "deadbeef" not in caplog.text
-    assert "secret-token" not in caplog.text
-    assert "X-Amz-Signature" not in caplog.text
+    assert "deadbeef" in caplog.text
+    assert "secret-token" in caplog.text
+    assert "X-Amz-Signature" in caplog.text
 
 
-def test_scan_cloud_url_dry_run_failure_redacts_signed_url() -> None:
-    """Cloud preview failures should redact signed URLs embedded in provider errors."""
+def test_scan_cloud_url_dry_run_failure_preserves_signed_url() -> None:
+    """Cloud preview failures preserve source URLs embedded in provider errors."""
     url = "s3://bucket/model.bin?X-Amz-Signature=deadbeef&token=secret-token"
     runner = CliRunner()
 
@@ -7670,14 +7681,14 @@ def test_scan_cloud_url_dry_run_failure_redacts_signed_url() -> None:
 
     assert result.exit_code == 2
     assert "s3://bucket/model.bin" in result.output
-    assert "deadbeef" not in result.output
-    assert "secret-token" not in result.output
-    assert "X-Amz-Signature" not in result.output
+    assert "deadbeef" in result.output
+    assert "secret-token" in result.output
+    assert "X-Amz-Signature" in result.output
 
 
 @patch("modelaudit.cli.is_cloud_url")
 @patch("modelaudit.cli.download_from_cloud")
-def test_scan_cloud_url_download_failure_sbom_redacts_signed_url(
+def test_scan_cloud_url_download_failure_sbom_preserves_signed_url(
     mock_download: MagicMock, mock_is_cloud: MagicMock, tmp_path: Path
 ) -> None:
     """SBOM fallback paths should not persist raw signed cloud URLs."""
@@ -7691,31 +7702,9 @@ def test_scan_cloud_url_download_failure_sbom_redacts_signed_url(
     assert result.exit_code == 2
     sbom_text = sbom_file.read_text()
     assert "s3://bucket/model.bin" in sbom_text
-    assert "deadbeef" not in sbom_text
-    assert "secret-token" not in sbom_text
-    assert "X-Amz-Signature" not in sbom_text
-
-
-def test_display_path_redacts_signed_stream_url() -> None:
-    """stream:// display values should keep routing context without signed query material."""
-    url = "stream://https://models.example/model.bin?X-Amz-Signature=secret&token=hidden"
-
-    display_path = _display_path(url)
-    display_error = _display_error(f"Forbidden while opening {url}", url)
-
-    assert display_path == "stream://https://models.example/model.bin"
-    assert "stream://https://models.example/model.bin" in display_error
-    assert "X-Amz-Signature" not in display_error
-    assert "hidden" not in display_error
-
-
-def test_display_path_redacts_mixed_case_signed_urls() -> None:
-    """URI scheme and host casing must not bypass display redaction."""
-    stream_url = "STREAM://HTTPS://BUCKET.S3.AMAZONAWS.COM/model.bin?X-Amz-Signature=stream-secret"
-    cloud_url = "HTTPS://BUCKET.S3.AMAZONAWS.COM/model.bin?X-Amz-Signature=cloud-secret"
-
-    assert _display_path(stream_url) == "stream://https://bucket.s3.amazonaws.com/model.bin"
-    assert _display_path(cloud_url) == "https://bucket.s3.amazonaws.com/model.bin"
+    assert "deadbeef" in sbom_text
+    assert "secret-token" in sbom_text
+    assert "X-Amz-Signature" in sbom_text
 
 
 @patch("modelaudit.cli.download_from_cloud")
@@ -7727,7 +7716,7 @@ def test_scan_rejects_cleartext_cloud_url_without_leaking_credentials(mock_downl
     assert result.exit_code == 2
     assert "Cleartext cloud storage URL is not supported" in result.output
     assert "http://bucket.s3.amazonaws.com:80/model.bin" in result.output.lower()
-    assert "cloud-secret" not in result.output
+    assert "cloud-secret" in result.output
     mock_download.assert_not_called()
 
 
@@ -7740,12 +7729,12 @@ def test_scan_rejects_cleartext_pytorch_hub_url_without_downloading(mock_downloa
     assert result.exit_code == 2
     assert "Cleartext PyTorch Hub URL is not supported" in result.output
     assert "http://pytorch.org:80/hub/pytorch_vision_resnet/" in result.output.lower()
-    assert "hub-secret" not in result.output
+    assert "hub-secret" in result.output
     mock_download.assert_not_called()
 
 
-def test_progress_initial_status_redacts_signed_stream_url() -> None:
-    """Initial progress status should not expose signed stream URLs."""
+def test_progress_initial_status_preserves_signed_stream_url() -> None:
+    """Initial progress status includes the requested stream URL."""
     url = "stream://https://bucket.s3.amazonaws.com/model.bin?X-Amz-Signature=deadbeef&token=secret-token"
 
     class _Stats:
@@ -7768,17 +7757,17 @@ def test_progress_initial_status_redacts_signed_stream_url() -> None:
     callback = _create_path_progress_callback(spinner=None, progress_tracker=tracker, actual_path=url)
 
     assert callback is not None
-    assert tracker.messages == ["Starting scan: stream://https://bucket.s3.amazonaws.com/model.bin"]
+    assert tracker.messages == [f"Starting scan: {url}"]
 
 
-def test_scan_path_state_redacts_stream_fallback_for_sbom() -> None:
-    """Fallback SBOM paths for stream:// scans must not persist signed query strings."""
+def test_scan_path_state_preserves_stream_fallback_for_sbom() -> None:
+    """Fallback SBOM paths retain the requested stream URL."""
     url = "stream://https://bucket.s3.amazonaws.com/model.bin?X-Amz-Signature=secret"
     path_state = _ScanPathState()
 
     path_state.track_streaming_paths_for_sbom(create_initial_audit_result(), url)
 
-    assert path_state.scanned_paths == ["stream://https://bucket.s3.amazonaws.com/model.bin"]
+    assert path_state.scanned_paths == [url]
 
 
 def test_scan_path_state_omits_empty_local_streaming_inventory_for_sbom(tmp_path: Path) -> None:
@@ -7864,9 +7853,9 @@ def test_scan_stream_unexpected_verbose_error_omits_raw_traceback(caplog: pytest
 
     assert result.exit_code == 2
     assert "stream://https://bucket.s3.amazonaws.com/model.bin" in caplog.text
-    assert "deadbeef" not in caplog.text
-    assert "secret-token" not in caplog.text
-    assert "X-Amz-Signature" not in caplog.text
+    assert "deadbeef" in caplog.text
+    assert "secret-token" in caplog.text
+    assert "X-Amz-Signature" in caplog.text
 
 
 @patch("modelaudit.cli.is_cloud_url")
@@ -7891,9 +7880,9 @@ def test_scan_cloud_stream_verbose_scan_failure_omits_raw_traceback(
 
     assert result.exit_code == 2
     assert "s3://bucket/model.pkl" in caplog.text
-    assert "deadbeef" not in caplog.text
-    assert "secret-token" not in caplog.text
-    assert "X-Amz-Signature" not in caplog.text
+    assert "deadbeef" in caplog.text
+    assert "secret-token" in caplog.text
+    assert "X-Amz-Signature" in caplog.text
 
 
 @patch("modelaudit.cli.is_cloud_url")
@@ -8136,8 +8125,10 @@ def test_scan_jfrog_url_download_failure(mock_scan_jfrog, mock_is_jfrog):
 
 @patch("modelaudit.cli.is_jfrog_url")
 @patch("modelaudit.cli.scan_jfrog_artifact")
-def test_scan_jfrog_url_download_failure_redacts_sensitive_url(mock_scan_jfrog, mock_is_jfrog):
-    """JFrog CLI errors should not print URL credentials or query tokens."""
+def test_scan_jfrog_url_download_failure_preserves_sensitive_url(
+    mock_scan_jfrog: MagicMock, mock_is_jfrog: MagicMock
+) -> None:
+    """JFrog CLI errors preserve the failed source URL."""
     raw_url = "https://user:leaky-pass@company.jfrog.io/artifactory/repo/model.bin?token=leaky-token"
     mock_is_jfrog.return_value = True
     mock_scan_jfrog.side_effect = Exception(f"failed to fetch {raw_url}")
@@ -8146,25 +8137,25 @@ def test_scan_jfrog_url_download_failure_redacts_sensitive_url(mock_scan_jfrog, 
     result = runner.invoke(cli, ["scan", raw_url])
 
     assert result.exit_code == 2
-    assert "https://<credentials-redacted>@company.jfrog.io/artifactory/repo/model.bin" in result.output
-    assert "user:leaky-pass" not in result.output
-    assert "leaky-token" not in result.output
-    assert "?token=" not in result.output
+    assert raw_url in result.output
+    assert "user:leaky-pass" in result.output
+    assert "leaky-token" in result.output
+    assert "?token=" in result.output
 
 
 @pytest.mark.parametrize("scheme", ["http", "https"])
-def test_scan_rejected_jfrog_url_redacts_sensitive_url(scheme: str) -> None:
-    """Rejected local or plaintext JFrog URLs must be redacted in generic path errors."""
+def test_scan_rejected_jfrog_url_preserves_sensitive_url(scheme: str) -> None:
+    """Rejected local or plaintext JFrog URLs remain visible in generic path errors."""
     raw_url = f"{scheme}://user:leaky-pass@localhost/artifactory/repo/model.bin?token=leaky-token"
 
     runner = CliRunner()
     result = runner.invoke(cli, ["scan", raw_url])
 
     assert result.exit_code == 2
-    assert f"{scheme}://<credentials-redacted>@localhost/artifactory/repo/model.bin" in result.output
-    assert "user:leaky-pass" not in result.output
-    assert "leaky-token" not in result.output
-    assert "?token=" not in result.output
+    assert raw_url in result.output
+    assert "user:leaky-pass" in result.output
+    assert "leaky-token" in result.output
+    assert "?token=" in result.output
 
 
 @patch("modelaudit.cli.is_jfrog_url")
@@ -8559,20 +8550,20 @@ def test_scan_mlflow_uri_error(
     assert result.exit_code == 2
     assert "Error downloading model" in result.output
     assert "MLflow connection failed" in result.output
-    assert "mlflow_secret" not in result.output
+    assert "mlflow_secret" in result.output
     assert "\nFORGED" not in result.output
     assert "\x1b" not in result.output
-    assert "mlflow_secret" not in caplog.text
+    assert "mlflow_secret" in caplog.text
     assert "\nFORGED" not in caplog.text
     assert "\x1b" not in caplog.text
 
 
 @patch("modelaudit.integrations.mlflow.scan_mlflow_model")
-def test_scan_mlflow_uri_error_redacts_registry_credentials(
+def test_scan_mlflow_uri_error_preserves_registry_credentials(
     mock_scan_mlflow: MagicMock,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """MLflow client errors must not expose registry URLs or auth material."""
+    """MLflow client errors preserve bounded registry diagnostics."""
     raw_secret_parts = [
         "user:pass",
         "RELATIVEPASS1234567890",
@@ -8596,11 +8587,10 @@ def test_scan_mlflow_uri_error_redacts_registry_credentials(
     )
 
     assert result.exit_code == 2
-    assert "Error downloading model from models:/PrivateModel/access_token=<redacted>" in result.output
-    assert "<redacted>" in result.output
+    assert "Error downloading model from models:/PrivateModel/access_token=PATHSECRET1234567890" in result.output
     for secret in raw_secret_parts:
-        assert secret not in result.output
-        assert secret not in caplog.text
+        assert secret in result.output
+        assert secret in caplog.text
 
 
 @patch("modelaudit.integrations.mlflow.scan_mlflow_model")
@@ -9080,6 +9070,62 @@ class TestScanGlobFailFast:
         mock_flush.assert_called_once()
 
 
+def test_format_scan_output_serializes_pydantic_urls_and_preserves_text_findings() -> None:
+    from uuid import UUID
+
+    from modelaudit.models import Issue, IssueSeverity, LicenseInfoModel
+
+    generated_at = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+    scan_id = UUID("12345678-1234-5678-1234-567812345678")
+    result = create_initial_audit_result()
+    result.issues = [
+        Issue(
+            message="Critical finding",
+            severity=IssueSeverity.CRITICAL,
+            timestamp=1767323045.0,
+            details={
+                "binary": b"\xff",
+                "generated_at": generated_at,
+                "local_path": Path("models/model.pkl"),
+                "scan_id": scan_id,
+            },
+        )
+    ]
+    result.file_metadata = {
+        "model.pkl": FileMetadataModel(
+            license_info=[
+                LicenseInfoModel(
+                    spdx_id="MIT",
+                    name="MIT",
+                    url="https://example.com/license",
+                )
+            ]
+        )
+    }
+    result.finalize_statistics()
+
+    json_output = _format_scan_output(result, ["model.pkl"], output_format="json", verbose=True)
+    payload = json.loads(json_output)
+    assert payload["file_metadata"]["model.pkl"]["license_info"][0]["url"] == "https://example.com/license"
+    assert payload["issues"][0]["details"] == {
+        "binary": "<binary data>",
+        "generated_at": "2026-01-02T03:04:05Z",
+        "local_path": str(Path("models/model.pkl")),
+        "scan_id": "12345678-1234-5678-1234-567812345678",
+    }
+
+    text_output = _format_scan_output(result, ["model.pkl"], output_format="text", verbose=True)
+    assert "Critical Issues" in text_output
+    assert "Critical finding" in text_output
+
+
+def test_mlflow_cli_display_retains_error_and_source_bounds() -> None:
+    source = "models:/" + "x" * 600
+    assert len(_display_path(source)) == 512
+    assert len(_display_error("y" * 600, source)) == 512
+    assert _display_error("token=raw", source) == "token=raw"
+
+
 def _create_file_w_mock(captured: dict[str, object]) -> Any:
     class CreateFileW:
         argtypes: tuple[object, ...] | None = None
@@ -9228,3 +9274,194 @@ def _assert_invalid_cli_rule_option(
     assert result.exit_code == 2
     assert case_message in result.output
     assert case_detail in result.output
+
+
+@pytest.mark.parametrize("control", ["\x1b", "\x07", "\r", "\n", "\t", "\r\n"])
+def test_verbose_streaming_failure_filters_terminal_controls_only(tmp_path: Path, control: str) -> None:
+    source = f"https://bucket.s3.amazonaws.com/model.pkl?token=synthetic-secret{control}FORGED"
+    filesystem = MagicMock()
+    filesystem.info.side_effect = OSError("Cannot read " + source)
+    output = tmp_path / "result.json"
+    with (
+        patch("modelaudit.cli.download_from_cloud", return_value="stream://" + source),
+        patch("fsspec.filesystem", return_value=filesystem),
+    ):
+        invocation = CliRunner().invoke(
+            cli, ["scan", source, "--no-cache", "--verbose", "--format", "json", "--output", str(output)]
+        )
+    filesystem.info.assert_called_once()
+    assert invocation.exit_code == 2
+    lines = [line for line in invocation.output.splitlines() if line.startswith("Streaming analysis failed: ")]
+    assert len(lines) == 1 and "synthetic-secret" in lines[0]
+    assert control + "FORGED" not in invocation.output
+    assert "\nFORGED" not in invocation.output
+    saved = json.loads(output.read_text())
+    assert any(source in issue["message"] for issue in saved["issues"])
+
+
+@pytest.mark.parametrize(
+    "tail,provider_blocked",
+    [
+        ("?token='403'", True),
+        ('?token="forbidden"', True),
+        ("?note=synthetic forbidden", True),
+        ("#note=synthetic unauthorized", True),
+        ("?token=%27403%27", False),
+        ("?token=403", False),
+        ("#403", False),
+    ],
+)
+@pytest.mark.parametrize("error_kind", ["transport", "auth", "provider-url"])
+def test_huggingface_file_source_text_preserves_acquisition_classification(
+    tail: str, provider_blocked: bool, error_kind: str
+) -> None:
+    source = "https://huggingface.co/org/model/resolve/main/model.pkl" + tail
+    error = {
+        "transport": "synthetic connection reset",
+        "auth": "403 Forbidden",
+        "provider-url": "provider rejected " + source,
+    }[error_kind]
+    with (
+        patch(
+            "modelaudit.utils.sources.huggingface._list_repo_files_with_timeout",
+            return_value=(["model.pkl"], "a" * 40, None),
+        ),
+        patch(
+            "modelaudit.utils.sources.huggingface._get_huggingface_path_sizes",
+            return_value=({"model.pkl": 4}, "a" * 40),
+        ),
+        patch(
+            "modelaudit.utils.sources.huggingface._run_huggingface_download_with_deadline",
+            side_effect=RuntimeError(error),
+        ),
+    ):
+        invocation = CliRunner().invoke(cli, ["scan", "--quiet", "--no-cache", "--format", "json", source])
+    assert invocation.exit_code == 2
+    result = json.loads(invocation.output[invocation.output.index("{") :])
+    issue = result["issues"][0]
+    blocked = error_kind == "auth" or (error_kind == "provider-url" and provider_blocked)
+    assert issue["details"]["blocked"] is blocked
+    assert issue["details"]["error_category"] == ("blocked" if blocked else "acquisition_error")
+    assert issue["details"]["scan_outcome_reason"] == (
+        "huggingface_acquisition_blocked" if blocked else "huggingface_acquisition_error"
+    )
+
+
+@pytest.mark.parametrize("route", ["snapshot", "stream", "disk", "inventory", "size", "missing-file", "worker"])
+def test_huggingface_owned_source_classification_survives_nested_failures(route: str) -> None:
+    from contextlib import ExitStack, redirect_stdout
+    from io import StringIO
+
+    from modelaudit.utils.sources import _huggingface_download_worker as worker
+
+    file_route = route in {"inventory", "size", "missing-file", "worker"}
+    source = "https://huggingface.co/org/model" + ("/resolve/main/model.pkl" if file_route else "") + "?token='403'"
+    args = ["scan", "--quiet", "--no-cache", "--format", "json", "--max-size", "1MB", source]
+    if route == "stream":
+        args.append("--stream")
+    if route == "worker":
+        args.extend(["--timeout", "60"])
+    error = "synthetic connection reset"
+    with ExitStack() as stack:
+        stack.enter_context(
+            patch(
+                "modelaudit.utils.sources.huggingface._get_model_size_with_deadline",
+                return_value=1 if route == "disk" else None,
+            )
+        )
+        if route in {"snapshot", "stream"}:
+            planner = "streaming" if route == "stream" else "model"
+            stack.enter_context(
+                patch(
+                    f"modelaudit.utils.sources.huggingface.plan_huggingface_{planner}_download",
+                    side_effect=RuntimeError(error),
+                )
+            )
+        if route == "disk":
+            stack.enter_context(
+                patch("modelaudit.utils.sources.huggingface.check_disk_space", return_value=(False, error))
+            )
+        if file_route:
+            listing = (None, None, error) if route == "inventory" else (["model.pkl"], "a" * 40, None)
+            stack.enter_context(
+                patch("modelaudit.utils.sources.huggingface._list_repo_files_with_timeout", return_value=listing)
+            )
+            stack.enter_context(
+                patch(
+                    "modelaudit.utils.sources.huggingface._get_huggingface_path_sizes",
+                    return_value=({"model.pkl": None if route == "size" else 4}, "a" * 40),
+                )
+            )
+            if route == "missing-file":
+                stack.enter_context(
+                    patch(
+                        "modelaudit.utils.sources.huggingface._run_huggingface_download_with_deadline",
+                        return_value="/nonexistent-synthetic-model.pkl",
+                    )
+                )
+            if route == "worker":
+                output = StringIO()
+                payload = {
+                    "operation": "hf_hub_download",
+                    "operation_kwargs": {"repo_id": "org/model", "filename": "model.pkl"},
+                }
+                with (
+                    patch.object(sys, "stdin", StringIO(json.dumps(payload))),
+                    patch("huggingface_hub.hf_hub_download", side_effect=RuntimeError(error)),
+                    redirect_stdout(output),
+                ):
+                    assert worker.main() == 0
+                process = MagicMock()
+                process.communicate.return_value = (output.getvalue(), "")
+                stack.enter_context(
+                    patch("modelaudit.utils.sources.huggingface.subprocess.Popen", return_value=process)
+                )
+        invocation = CliRunner().invoke(cli, args)
+    assert invocation.exit_code == 2
+    result = json.loads(invocation.output[invocation.output.index("{") :])
+    details = result["issues"][0]["details"]
+    assert details["blocked"] is False
+    assert details["error_category"] == "acquisition_error"
+    assert details["scan_outcome_reason"] == "huggingface_acquisition_error"
+
+
+def test_huggingface_stream_wrapper_renders_provider_error_once() -> None:
+    from modelaudit.cli import _track_huggingface_stream_acquisition
+
+    class RenderedError(RuntimeError):
+        calls = 0
+
+        def __str__(self) -> str:
+            self.calls += 1
+            return "403 Forbidden" if self.calls == 1 else "synthetic connection reset"
+
+    error = RenderedError()
+
+    def files() -> Iterator[tuple[Path, bool]]:
+        yield from ()
+        raise error
+
+    with pytest.raises(RuntimeError) as caught:
+        list(_track_huggingface_stream_acquisition(files()))
+    assert error.calls == 1
+    assert str(caught.value) == "403 Forbidden"
+    assert caught.value.__cause__ is error
+
+
+@pytest.mark.parametrize("missing", ["revision", "size"])
+@pytest.mark.parametrize("suffix", ["?token='403'", '?token="forbidden"', "#note=synthetic unauthorized"])
+def test_huggingface_dry_run_source_does_not_change_access_classification(missing: str, suffix: str) -> None:
+    source = "https://huggingface.co/org/model/resolve/main/model.pkl" + suffix
+    metadata: dict[str, int | str | None] = {"size_bytes": None if missing == "size" else 4}
+    if missing == "size":
+        metadata["resolved_revision"] = "a" * 40
+    with patch("modelaudit.cli._get_huggingface_file_metadata", return_value=metadata):
+        invocation = CliRunner().invoke(
+            cli, ["scan", "--quiet", "--no-cache", "--format", "json", "--dry-run", "--max-size", "1MB", source]
+        )
+    assert invocation.exit_code == 2
+    result = json.loads(invocation.output[invocation.output.index("{") :])
+    details = result["issues"][0]["details"]
+    assert details["blocked"] is False
+    assert details["error_category"] == "acquisition_error"
+    assert details["scan_outcome_reason"] == "huggingface_acquisition_error"

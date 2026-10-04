@@ -984,14 +984,6 @@ class TarScanner(BaseScanner):
         return tmp_path, total_size
 
     @staticmethod
-    def _raw_tar_has_valid_header(path: str) -> bool:
-        with open(path, "rb") as file_obj:
-            prefix = file_obj.read(tarfile.BLOCKSIZE)
-            if prefix == b"\0" * tarfile.BLOCKSIZE:
-                prefix += file_obj.read(tarfile.BLOCKSIZE)
-        return TarScanner._looks_like_empty_tar_prefix(prefix) or _looks_like_uncompressed_tar_header(prefix)
-
-    @staticmethod
     def _detect_compressed_tar_wrapper(path: str) -> str | None:
         """Detect compressed TAR wrappers by content, not by filename suffix."""
         with open(path, "rb") as file_obj:

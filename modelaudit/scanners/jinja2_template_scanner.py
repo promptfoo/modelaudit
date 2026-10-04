@@ -47,6 +47,7 @@ from modelaudit.utils.file.detection import (
     huggingface_tokenizer_json_has_template_route_evidence,
 )
 
+from . import base as scanner_base
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult, logger
 
 # Optional GGUF support with graceful fallback
@@ -393,10 +394,6 @@ class _ExecutableTemplateSpan:
     text: str
 
 
-def _scan_result_has_security_findings(result: ScanResult) -> bool:
-    return any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
-
-
 def _nonnegative_int(value: Any) -> int | None:
     if isinstance(value, bool):
         return None
@@ -442,12 +439,7 @@ class Jinja2TemplateScanner(BaseScanner):
             return default
         return value if math.isfinite(value) and value > 0 else default
 
-    def _positive_int_config(self, key: str, default: int) -> int:
-        try:
-            value = int(self.config.get(key, default))
-        except (OverflowError, TypeError, ValueError):
-            return default
-        return value if value > 0 else default
+    _positive_int_config = scanner_base._scanner_positive_int_config
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
@@ -768,9 +760,9 @@ class Jinja2TemplateScanner(BaseScanner):
 
     @staticmethod
     def _finish_scan_result(result: ScanResult) -> None:
-        if result.metadata.get(
-            _INCONCLUSIVE_METADATA_KEY
-        ) == INCONCLUSIVE_SCAN_OUTCOME and not _scan_result_has_security_findings(result):
+        if result.metadata.get(_INCONCLUSIVE_METADATA_KEY) == INCONCLUSIVE_SCAN_OUTCOME and not any(
+            issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues
+        ):
             result.finish(success=False)
             return
 
@@ -1289,43 +1281,8 @@ class Jinja2TemplateScanner(BaseScanner):
 
         return fallback_windows
 
-    def _raw_template_fallback_windows(self, text: str) -> list[str]:
-        if not self._looks_like_template(text):
-            return []
-
-        window_size = self._raw_template_fallback_window_size(len(text))
-
-        if len(text) <= window_size:
-            return [text]
-
-        windows: list[tuple[int, int]] = []
-        for marker_offset in self._template_marker_offsets(text):
-            if any(start <= marker_offset < end for start, end in windows):
-                continue
-
-            start = max(0, marker_offset - _RAW_PARSE_FALLBACK_CONTEXT_BYTES)
-            end = min(len(text), start + window_size)
-            start = max(0, end - window_size)
-            windows.append((start, end))
-
-            if len(windows) >= _RAW_PARSE_FALLBACK_MAX_WINDOWS:
-                break
-
-        return [text[start:end] for start, end in windows]
-
     def _raw_template_fallback_window_size(self, content_size: int) -> int:
         return self._raw_template_fallback_window_size_for_config(content_size, self.max_template_size)
-
-    @staticmethod
-    def _template_marker_offsets(text: str) -> list[int]:
-        offsets: set[int] = set()
-        for indicator in _JINJA_TEMPLATE_INDICATORS:
-            marker_offset = text.find(indicator)
-            while marker_offset != -1:
-                offsets.add(marker_offset)
-                marker_offset = text.find(indicator, marker_offset + len(indicator))
-
-        return sorted(offsets)
 
     @staticmethod
     def _template_marker_offsets_from_file(path: str, file_size: int, window_size: int) -> list[int]:
@@ -1906,21 +1863,6 @@ class Jinja2TemplateScanner(BaseScanner):
         for node in parsed.find_all(jinja2.nodes.Mul):
             projected_size = self._constant_repeated_sequence_size(node.left, node.right)
             if projected_size is not None and projected_size > self.sandbox_render_max_output_chars:
-                return True
-
-        return False
-
-    def _template_ast_has_static_iterated_range_budget_risk(self, parsed: Any) -> bool:
-        range_threshold = max(1, self.sandbox_render_max_output_chars)
-        for node in parsed.find_all(jinja2.nodes.For):
-            if self._range_iterable_exceeds_static_budget(node.iter, range_threshold):
-                return True
-
-        for node in parsed.find_all(jinja2.nodes.Filter):
-            if node.name in _EAGER_RANGE_ITERATION_FILTERS and self._range_iterable_exceeds_static_budget(
-                node.node,
-                range_threshold,
-            ):
                 return True
 
         return False
@@ -4404,64 +4346,6 @@ class Jinja2TemplateScanner(BaseScanner):
                     range_values_candidates.append(range_values)
         return range_values_candidates, False
 
-    def _template_ast_has_static_range_list_budget_risk(self, parsed: Any) -> bool:
-        range_threshold = max(1, self.sandbox_render_max_output_chars)
-        for node in parsed.find_all(jinja2.nodes.Filter):
-            if node.name != "list":
-                continue
-            range_call = self._iterable_range_call(node.node)
-            if range_call is None:
-                continue
-            projected_size = self._constant_range_rendered_list_size(range_call.args, range_threshold)
-            if projected_size is not None and projected_size > self.sandbox_render_max_output_chars:
-                return True
-
-        return False
-
-    def _template_ast_has_static_range_join_budget_risk(self, parsed: Any) -> bool:
-        range_threshold = max(1, self.sandbox_render_max_output_chars)
-        for node in parsed.find_all(jinja2.nodes.Filter):
-            if node.name != "join":
-                continue
-            range_call = self._iterable_range_call(node.node)
-            if range_call is None:
-                continue
-            projected_size = self._constant_range_joined_size(range_call.args, node.args, range_threshold)
-            if projected_size is not None and projected_size > self.sandbox_render_max_output_chars:
-                return True
-
-        return False
-
-    def _range_iterable_exceeds_static_budget(self, node: Any, threshold: int) -> bool:
-        range_call = self._iterable_range_call(node)
-        if range_call is None:
-            return False
-
-        range_count = self._constant_range_iteration_count(range_call.args, threshold)
-        if range_count is not None:
-            return range_count >= threshold
-
-        stop_arg = range_call.args[1] if len(range_call.args) >= 2 else range_call.args[0]
-        range_bound = self._constant_int_expression_value(stop_arg, threshold)
-        return range_bound is not None and abs(range_bound) >= threshold
-
-    def _iterable_range_call(self, node: Any) -> Any | None:
-        while isinstance(node, jinja2.nodes.Filter) and node.name in _LAZY_RANGE_ITERATION_FILTERS:
-            node = node.node
-        normalized_range_call = self._range_call_with_literal_unpacking(node)
-        return normalized_range_call if self._is_range_call(normalized_range_call) else None
-
-    def _is_range_call(self, node: Any) -> bool:
-        return (
-            isinstance(node, jinja2.nodes.Call)
-            and isinstance(node.node, jinja2.nodes.Name)
-            and node.node.name == "range"
-            and 1 <= len(node.args) <= 3
-            and not node.kwargs
-            and node.dyn_args is None
-            and node.dyn_kwargs is None
-        )
-
     def _parse_template_ast(self, template_content: str) -> Any | None:
         try:
             return jinja2.Environment().parse(template_content)
@@ -4523,12 +4407,6 @@ class Jinja2TemplateScanner(BaseScanner):
             return None
         return self._constant_sequence_size(node)
 
-    def _constant_range_rendered_list_size(self, args: list[Any], cap: int) -> int | None:
-        range_values = self._constant_range_values(args, cap)
-        if range_values is None:
-            return None
-        return self._constant_range_rendered_list_size_from_values(range_values, cap)
-
     def _constant_range_rendered_list_size_with_bindings(
         self,
         args: list[Any],
@@ -4572,17 +4450,6 @@ class Jinja2TemplateScanner(BaseScanner):
         if total + 1 > cap:
             return cap + 1
         return total + 1
-
-    def _constant_range_joined_size(
-        self,
-        args: list[Any],
-        join_args: list[Any],
-        cap: int,
-    ) -> int | None:
-        range_values = self._constant_range_values(args, cap)
-        if range_values is None:
-            return None
-        return self._constant_range_joined_size_from_values(range_values, join_args, cap)
 
     def _constant_range_joined_size_with_bindings(
         self,
@@ -5413,22 +5280,6 @@ class Jinja2TemplateScanner(BaseScanner):
     def _saturated_constant_int_result(self, cap: int, sign: int = 1) -> tuple[int, bool]:
         magnitude = self._constant_int_magnitude_cap(cap) + 1
         return (magnitude if sign >= 0 else -magnitude), True
-
-    def _constant_range_iteration_count(self, args: list[Any], cap: int) -> int | None:
-        range_values = self._constant_range_values(args, cap)
-        if range_values is None:
-            return None
-        return self._range_iteration_count(*range_values, cap)
-
-    def _constant_range_values(self, args: list[Any], cap: int) -> tuple[int, int, int] | None:
-        results: list[tuple[int, bool]] = []
-        for arg in args[:3]:
-            result = self._constant_int_expression_result(arg, cap)
-            if result is None:
-                return None
-            results.append(result)
-
-        return self._constant_range_values_from_results(args, results, cap)
 
     def _constant_range_values_from_results(
         self,

@@ -1,16 +1,30 @@
 """Tests for SARIF formatter module."""
 
+import hashlib
+import io
 import json
+import os
+import sys
 import time
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
+from typing import Any
+from unittest.mock import Mock
 
 import pytest
 
 import modelaudit.integrations.sarif_formatter as sarif_formatter
+from modelaudit.cli import _format_scan_output
 from modelaudit.core import scan_model_directory_or_file
-from modelaudit.models import AssetModel, FileHashesModel, FileMetadataModel, create_initial_audit_result
-from modelaudit.scanners.base import Check, CheckStatus, Issue, IssueSeverity
+from modelaudit.integrations._sarif_identity import redact_source_identifier, redact_source_text
+from modelaudit.models import (
+    AssetModel,
+    FileHashesModel,
+    FileMetadataModel,
+    ModelAuditResultModel,
+    create_initial_audit_result,
+)
+from modelaudit.scanners.base import Check, CheckStatus, Issue, IssueSeverity, ScanResult
 
 _create_artifacts = sarif_formatter._create_artifacts
 _create_results = sarif_formatter._create_results
@@ -23,7 +37,6 @@ _get_rule_name = sarif_formatter._get_rule_name
 _get_rule_short_description = sarif_formatter._get_rule_short_description
 _get_tags_for_issue = sarif_formatter._get_tags_for_issue
 _normalize_path_to_uri = sarif_formatter._normalize_path_to_uri
-_redact_path_for_sarif = sarif_formatter._redact_path_for_sarif
 _severity_to_rank = sarif_formatter._severity_to_rank
 _severity_to_sarif_level = sarif_formatter._severity_to_sarif_level
 format_sarif_output = sarif_formatter.format_sarif_output
@@ -64,13 +77,13 @@ class TestFormatSarifOutput:
         assert len(run["results"]) == 1
         assert len(run["tool"]["driver"]["rules"]) == 1
 
-    def test_signed_stream_paths_are_redacted(self) -> None:
-        """SARIF must not retain signed URL query material in paths."""
+    def test_signed_stream_paths_and_values_are_preserved(self) -> None:
+        """SARIF preserves raw source paths and nested evidence types."""
         raw_path = (
             "stream://https://bucket.s3.amazonaws.com/model.pkl?"
             "X-Amz-Credential=AKIASECRET&X-Amz-Signature=deadbeef&token=secret-token"
         )
-        safe_path = "stream://https://bucket.s3.amazonaws.com/model.pkl"
+        safe_path = raw_path
         result = create_initial_audit_result()
         result.assets = [AssetModel(path=raw_path, type="pickle")]
         result.issues = [
@@ -111,125 +124,12 @@ class TestFormatSarifOutput:
             "standalone-auth-secret",
             "standalone-client-secret",
         ):
-            assert leaked not in output
+            assert leaked in output
         assert "sentencepiece" in output
-        assert raw_path not in output
+        assert raw_path in output
         assert safe_path in output
         assert safe_path in invocation["commandLine"]
         assert invocation["arguments"] == [safe_path]
-
-    def test_mixed_case_signed_stream_paths_are_redacted(self) -> None:
-        """URI scheme casing must not bypass SARIF stream redaction."""
-        raw_path = "STREAM://HTTPS://BUCKET.S3.AMAZONAWS.COM/model.pkl?X-Amz-Signature=secret"
-        result = create_initial_audit_result()
-        result.assets = [AssetModel(path=raw_path, type="pickle")]
-        result.finalize_statistics()
-
-        output = format_sarif_output(result, [raw_path])
-
-        assert "secret" not in output
-        assert "X-Amz-Signature" not in output
-        assert "stream://https://bucket.s3.amazonaws.com/model.pkl" in output
-
-    def test_escaped_url_delimiters_cannot_bypass_sarif_redaction(self) -> None:
-        escaped_url = r"https:\/\/collector.example\/callback\u003ftoken\u003dENCODED-SARIF-SECRET"
-        result = create_initial_audit_result()
-        result.issues = [
-            Issue(
-                message=f"Related endpoint: {escaped_url}",
-                severity=IssueSeverity.WARNING,
-                details={"related_url": escaped_url},
-                timestamp=time.time(),
-            )
-        ]
-        result.finalize_statistics()
-
-        output = format_sarif_output(result, ["/test/path"])
-
-        assert "ENCODED-SARIF-SECRET" not in output
-        assert "https://collector.example/callback" in output
-        assert "token=" not in output
-
-    @pytest.mark.parametrize(
-        "mixed_encoded_url",
-        [
-            "https%3A//user:password@collector.example/model.pkl?token=MIXED-TOKEN-LEAK",
-            "https:%2F%2Fuser:password@collector.example/model.pkl?token=MIXED-TOKEN-LEAK",
-            "https%253A/%252Fuser:password@collector.example/model.pkl?token=MIXED-TOKEN-LEAK",
-        ],
-    )
-    def test_mixed_encoded_url_prefixes_cannot_bypass_sarif_redaction(self, mixed_encoded_url: str) -> None:
-        result = create_initial_audit_result()
-        result.issues = [
-            Issue(
-                message=f"Related endpoint: {mixed_encoded_url}",
-                severity=IssueSeverity.WARNING,
-                details={"related_url": mixed_encoded_url},
-                timestamp=time.time(),
-            )
-        ]
-        result.finalize_statistics()
-
-        output = format_sarif_output(result, ["/test/path"])
-
-        assert "user:password" not in output
-        assert "MIXED-TOKEN-LEAK" not in output
-        assert "https://collector.example/model.pkl" in output
-
-    def test_malformed_stream_paths_fail_closed(self) -> None:
-        """SARIF invocation and asset paths must not retain malformed stream queries."""
-        raw_path = "stream://bucket/model.pkl?token=secret-token"
-        result = create_initial_audit_result()
-        result.assets = [AssetModel(path=raw_path, type="pickle")]
-        result.finalize_statistics()
-
-        output = format_sarif_output(result, [raw_path])
-
-        assert "secret-token" not in output
-        assert "token=" not in output
-        assert "stream://<cloud URL redacted>" in output
-
-    def test_already_redacted_url_preserves_benign_query_context(self) -> None:
-        """Repeated SARIF sanitization must not corrupt safe query context."""
-        safe_url = "https://collector.example/upload?visible=yes&token=<redacted>"
-        partially_redacted_url = f"{safe_url}&Signature=remaining-secret"
-        fully_redacted_url = f"{safe_url}&Signature=<redacted>"
-        result = create_initial_audit_result()
-        result.issues = [
-            Issue(
-                message=f"Related endpoint: {partially_redacted_url}",
-                severity=IssueSeverity.WARNING,
-                details={"related_url": partially_redacted_url},
-                timestamp=time.time(),
-            )
-        ]
-        result.finalize_statistics()
-
-        output = format_sarif_output(result, ["/test/path"])
-
-        assert fully_redacted_url in output
-        assert "remaining-secret" not in output
-        assert "https://collector.example/upload<redacted>" not in output
-
-    def test_signed_url_rotation_preserves_finding_fingerprint(self) -> None:
-        """Renewing a signed URL must not create a different SARIF finding identity."""
-
-        def _fingerprint(signature: str) -> str:
-            raw_url = f"https://bucket.s3.amazonaws.com/model.pkl?X-Amz-Signature={signature}"
-            result = create_initial_audit_result()
-            result.issues = [
-                Issue(
-                    message=f"Dangerous payload from {raw_url}",
-                    severity=IssueSeverity.WARNING,
-                    location=raw_url,
-                    timestamp=time.time(),
-                )
-            ]
-            result.finalize_statistics()
-            parsed = json.loads(format_sarif_output(result, [raw_url]))
-            return str(parsed["runs"][0]["results"][0]["partialFingerprints"]["primaryLocationLineHash"])
-
-        assert _fingerprint("first-secret") == _fingerprint("renewed-secret")
 
     def test_benign_raw_query_context_is_preserved(self) -> None:
         """SARIF text sanitization should retain non-credential query parameters."""
@@ -249,147 +149,13 @@ class TestFormatSarifOutput:
 
         assert documentation_url in output
 
-    def test_raw_url_preserves_benign_query_context_while_redacting_credentials(self) -> None:
-        """Finding evidence keeps useful query context without retaining credentials."""
-        raw_url = "https://evil.example/c2?campaign=test&session=secret-session&token=secret-token"
-        result = create_initial_audit_result()
-        result.issues = [
-            Issue(
-                message=f"Detected callback {raw_url}",
-                severity=IssueSeverity.WARNING,
-                timestamp=time.time(),
-            )
-        ]
-        result.finalize_statistics()
-
-        output = format_sarif_output(result, ["/test/path"])
-
-        assert "campaign=test" in output
-        assert "session=" not in output
-        assert "token=" not in output
-        assert "secret-session" not in output
-        assert "secret-token" not in output
-
-    def test_raw_url_redacts_unknown_query_values(self) -> None:
-        """Unknown evidence parameters must fail closed even without a credential-like key."""
-        raw_url = "https://evil.example/c2?campaign=test&opaque=SUPERSECRET"
-        result = create_initial_audit_result()
-        result.issues = [
-            Issue(
-                message=f"Detected callback {raw_url}",
-                severity=IssueSeverity.WARNING,
-                timestamp=time.time(),
-            )
-        ]
-        result.finalize_statistics()
-
-        output = format_sarif_output(result, ["/test/path"])
-
-        assert "campaign=test" in output
-        assert "opaque=" not in output
-        assert "SUPERSECRET" not in output
-
-    def test_safe_query_key_cannot_hide_encoded_nested_credentials(self) -> None:
-        """Allowlisted evidence keys must not preserve encoded nested credentials."""
-        raw_url = "https://evil.example/c2?lang=en%26access_token%3DSUPERSECRET"
-        result = create_initial_audit_result()
-        result.issues = [
-            Issue(
-                message=f"Detected callback {raw_url}",
-                severity=IssueSeverity.WARNING,
-                details={"callback": raw_url},
-                timestamp=time.time(),
-            )
-        ]
-        result.finalize_statistics()
-
-        output = format_sarif_output(result, ["/test/path"])
-
-        assert "lang=" not in output
-        assert "access_token" not in output
-        assert "SUPERSECRET" not in output
-
-    def test_percent_encoded_url_delimiters_cannot_hide_credentials(self) -> None:
-        """Encoded URL structure must be exposed before SARIF evidence redaction."""
-        raw_url = (
-            "https://bucket.s3.amazonaws.com/model.pkl"
-            "%3Fvisible%3Dyes%26X-Amz-Signature%3Ddeadbeef%26token%3Dprivate-token-value"
-        )
-        result = create_initial_audit_result()
-        result.issues = [
-            Issue(
-                message=f"Provider failed while opening {raw_url}",
-                severity=IssueSeverity.WARNING,
-                details={"source": raw_url},
-                timestamp=time.time(),
-            )
-        ]
-        result.finalize_statistics()
-
-        output = format_sarif_output(result, [raw_url])
-
-        assert "visible=yes" in output
-        assert "X-Amz-Signature" not in output
-        assert "token=" not in output
-        assert "deadbeef" not in output
-        assert "private-token-value" not in output
-
-    def test_percent_encoded_url_userinfo_cannot_hide_credentials(self) -> None:
-        raw_url = (
-            "https%3A%2F%2Fuser%3Aencoded-password%40bucket.s3.amazonaws.com%2Fmodel.pkl"
-            "%3Fvisible%3Dyes%26token%3Dprivate-token-value"
-        )
-        result = create_initial_audit_result()
-        result.issues = [
-            Issue(
-                message=f"Provider failed while opening {raw_url}",
-                severity=IssueSeverity.WARNING,
-                details={"source": raw_url},
-                timestamp=time.time(),
-            )
-        ]
-        result.finalize_statistics()
-
-        output = format_sarif_output(result, [raw_url])
-
-        assert "bucket.s3.amazonaws.com/model.pkl" in output
-        assert "visible=yes" in output
-        assert "encoded-password" not in output
-        assert "private-token-value" not in output
-
-    def test_sarif_path_redaction_does_not_treat_windows_drive_as_url(self) -> None:
+    def test_sarif_windows_path_uri(self) -> None:
         """Local Windows paths must not be rewritten as URL schemes."""
         windows_path = r"C:\models\model.pkl"
 
-        assert _redact_path_for_sarif(windows_path) == windows_path
-
-    def test_sarif_path_redaction_handles_encoded_url_prefix(self) -> None:
-        """Encoded URL-like paths still need credential stripping."""
-        raw_url = (
-            "https%253A%252F%252Fbucket.s3.amazonaws.com%252Fmodel.pkl%253FX-Amz-Signature%253Dprivate-token-value"
-        )
-
-        assert _redact_path_for_sarif(raw_url) == "https://bucket.s3.amazonaws.com/model.pkl"
-
-    def test_bare_query_and_fragment_credentials_are_removed(self) -> None:
-        """Opaque URL components must not bypass key/value redaction."""
-        raw_url = "https://evil.example/c2?campaign=test&BARE-QUERY-SECRET#section=overview&BARE-FRAGMENT-SECRET"
         result = create_initial_audit_result()
-        result.issues = [
-            Issue(
-                message=f"Detected callback {raw_url}",
-                severity=IssueSeverity.WARNING,
-                timestamp=time.time(),
-            )
-        ]
-        result.finalize_statistics()
-
-        output = format_sarif_output(result, ["/test/path"])
-
-        assert "campaign=test" in output
-        assert "section=overview" in output
-        assert "BARE-QUERY-SECRET" not in output
-        assert "BARE-FRAGMENT-SECRET" not in output
+        parsed = json.loads(format_sarif_output(result, [windows_path]))
+        assert parsed["runs"][0]["invocations"][0]["arguments"] == [windows_path]
 
     def test_verbose_includes_debug(self):
         """Test that verbose mode includes debug issues."""
@@ -1184,3 +950,1550 @@ class TestHelperFunctions:
         """Test MIME type is case insensitive."""
         assert _get_mime_type("PICKLE") == "application/octet-stream"
         assert _get_mime_type("PyTorch") == "application/octet-stream"
+
+
+def test_report_value_serialization_preserves_shapes_and_bounds() -> None:
+    from pydantic import AnyUrl, BaseModel
+
+    from modelaudit.integrations.source_serialization import serialize_source_identifier, serialize_source_value
+
+    class Details(BaseModel):
+        url: AnyUrl
+
+    value = {
+        "tuple": (b"plain", bytearray(b"bytes")),
+        "set": {"z", "a"},
+        "frozen": frozenset({2, 1}),
+        "model": Details(url=AnyUrl("https://user:secret@example.com/?token=raw")),
+        "binary": b"\xff",
+        "raw": "password=raw",
+    }
+    assert serialize_source_value(value) == {
+        "tuple": ("plain", "bytes"),
+        "set": ["a", "z"],
+        "frozen": [1, 2],
+        "model": {"url": "https://user:secret@example.com/?token=raw"},
+        "binary": "<binary data>",
+        "raw": "password=raw",
+    }
+    recursive: dict[str, object] = {}
+    recursive["self"] = recursive
+    assert serialize_source_value(recursive) == {"self": "<redacted recursive value>"}
+    nested: object = "leaf"
+    for _ in range(33):
+        nested = [nested]
+    converted = serialize_source_value(nested)
+    for _ in range(33):
+        converted = converted[0]
+    assert converted == "<redacted>"
+    assert serialize_source_value("x" * (256 * 1024)) == "x" * (256 * 1024)
+    oversized = "x" * (256 * 1024 + 1)
+    expected = f"modelaudit-source:{oversized[:256]}...<source sha256:{hashlib.sha256(oversized.encode()).hexdigest()}>"
+    assert serialize_source_value(oversized) == expected
+    assert serialize_source_identifier(oversized) == expected
+    assert serialize_source_value({(1, 2): "tuple", "(1, 2)": "text"}) == {
+        "(1, 2)": "tuple",
+        "(1, 2)#modelaudit-redacted-key-2": "text",
+    }
+
+
+@pytest.mark.parametrize("evidence", ["", "stable-evidence"])
+@pytest.mark.parametrize(
+    "source,normalized",
+    [
+        ("https://user:{secret}@bucket.example/model.pkl?token={secret}", "https://bucket.example/model.pkl"),
+        ("//user:{secret}@bucket.example/model.pkl?token={secret}", "//bucket.example/model.pkl"),
+        (
+            "stream://https://user:{secret}@bucket.example/model.pkl?token={secret}",
+            "stream://https://bucket.example/model.pkl",
+        ),
+    ],
+)
+def test_sarif_credential_rotation_preserves_baseline_identity(source: str, normalized: str, evidence: str) -> None:
+    for secret in ["first-password", "rotated-password"]:
+        raw = source.format(secret=secret)
+        issue = Issue(
+            message=f"Unsafe model from {raw}",
+            severity=IssueSeverity.WARNING,
+            location=raw,
+            details={"evidence_fingerprint": evidence},
+            timestamp=1,
+        )
+        result = _create_results([issue])[0]
+        preimage = (
+            "\x1f".join((evidence, normalized, str(issue.severity)))
+            if evidence
+            else f"Unsafe model from {normalized}{normalized}{issue.severity}"
+        )
+        assert (
+            result["partialFingerprints"]["primaryLocationLineHash"]
+            == hashlib.sha256(preimage.encode()).hexdigest()[:16]
+        )
+
+
+def test_sarif_rotating_assignments_preserve_derived_rule_grouping() -> None:
+    issues = [
+        Issue(
+            message=f"password={secret} unsafe model", severity=IssueSeverity.WARNING, location="model.pkl", timestamp=1
+        )
+        for secret in ["first-token", "rotated-token"]
+    ]
+    assert [rule["id"] for rule in _create_rules(issues)] == ["MA-PASSWORDREDACTED"]
+    assert [_get_rule_name(issue) for issue in issues] == ["password=<redacted>"] * 2
+    assert [r["partialFingerprints"]["primaryLocationLineHash"] for r in _create_results(issues)] == [
+        "dd9a19a60e1407fa"
+    ] * 2
+
+
+def test_sarif_existing_local_assignment_paths_keep_distinct_identity(tmp_path: Path) -> None:
+    fingerprints = []
+    for name in ["session=training", "session=evaluation"]:
+        path = tmp_path / name / "model.pkl"
+        path.parent.mkdir()
+        path.write_bytes(b"model")
+        issue = Issue(message="Unsafe local model", severity=IssueSeverity.WARNING, location=str(path), timestamp=1)
+        fingerprints.append(_create_results([issue])[0]["partialFingerprints"]["primaryLocationLineHash"])
+    assert fingerprints[0] != fingerprints[1]
+
+
+@pytest.mark.parametrize(
+    "source,normalized_message,normalized_location",
+    [
+        ("https://host/model.pkl?version=1", "Unsafe model from https://host/model.pkl", "https://host/model.pkl"),
+        (
+            "https://host/model.pkl?token=first-secret",
+            "Unsafe model from https://host/model.pkl",
+            "https://host/model.pkl",
+        ),
+        (
+            "https://host/token%253Dpath-secret/model.pkl?visible=yes",
+            "Unsafe model from https://host/token=<redacted>/model.pkl?visible=yes",
+            "https://host/token=<redacted>/model.pkl",
+        ),
+        (
+            "//user:first-password@bucket.example/model.pkl?token=secret",
+            "Unsafe model from //bucket.example/model.pkl",
+            "//bucket.example/model.pkl",
+        ),
+        (
+            "https:/user:first-password@bucket.example/model.pkl?token=secret",
+            "Unsafe model from https://bucket.example/model.pkl",
+            "https://bucket.example/model.pkl",
+        ),
+        (
+            "bucket.example/model.pkl?OPAQUE-SECRET",
+            "Unsafe model from bucket.example/model.pkl",
+            "bucket.example/model.pkl",
+        ),
+        (
+            "bucket.example/model.pkl%3FOPAQUE-SECRET",
+            "Unsafe model from bucket.example/model.pkl",
+            "bucket.example/model.pkl",
+        ),
+        ("file:///tmp/model%3Fv1.pkl", "Unsafe model from file:///tmp/model%3Fv1.pkl", "file:///tmp/model%3Fv1.pkl"),
+        ("file://host/tmp/model.pkl", "Unsafe model from file://host/tmp/model.pkl", "file://host/tmp/model.pkl"),
+        (
+            "./artifacts/user@example.com/model.pkl?version=1",
+            "Unsafe model from ./artifacts/user@example.com/model.pkl?version=1",
+            "./artifacts/user@example.com/model.pkl?version=1",
+        ),
+        ("Authorization Bearer first-secret", "Unsafe model from Authorization Bearer <redacted>", "<source redacted>"),
+        ("Unsafe token_count=128", "Unsafe model from Unsafe token_count=128", "Unsafe token_count=128"),
+    ],
+)
+@pytest.mark.parametrize("evidence", ["", "stable-evidence"])
+def test_sarif_historical_normalization_preserves_fingerprint(
+    source: str,
+    normalized_message: str,
+    normalized_location: str,
+    evidence: str,
+) -> None:
+    # These expectations were captured from the parent implementation, including
+    # encoded, malformed, schemeless, and local-looking source identifiers.
+    issue = Issue(
+        message=f"Unsafe model from {source}",
+        severity=IssueSeverity.WARNING,
+        location=source,
+        details={"evidence_fingerprint": evidence},
+        timestamp=1,
+    )
+    result = _create_results([issue])[0]
+    preimage = (
+        "\x1f".join((evidence, normalized_location, str(issue.severity)))
+        if evidence
+        else f"{normalized_message}{normalized_location}{issue.severity}"
+    )
+    assert (
+        result["partialFingerprints"]["primaryLocationLineHash"] == hashlib.sha256(preimage.encode()).hexdigest()[:16]
+    )
+
+
+@pytest.mark.parametrize(
+    "local_path",
+    [
+        r"C:\users\user:password@folder\model.pkl",
+        r"\\server\share\user:password@folder\model.pkl",
+    ],
+)
+def test_windows_and_unc_local_paths_are_preserved(local_path: str) -> None:
+    assert redact_source_identifier(local_path) == local_path
+
+
+@pytest.mark.parametrize(
+    "local_path",
+    [
+        r"C:\models\sessionTokenCache=public\model.pkl",
+        r"\\host\share\password_policy=public\model.pkl",
+    ],
+)
+def test_nonexistent_windows_and_unc_near_matches_are_preserved(local_path: str) -> None:
+    assert redact_source_identifier(local_path) == local_path
+
+
+def test_existing_windows_assignment_filename_is_preserved(monkeypatch: pytest.MonkeyPatch) -> None:
+    local_path = r"C:\models\token=literal-filename\model.pkl"
+    monkeypatch.setattr(
+        "modelaudit.integrations._sarif_identity._local_path_exists",
+        lambda source: source == local_path,
+    )
+
+    assert redact_source_identifier(local_path) == local_path
+
+
+@pytest.mark.parametrize(
+    ("local_path", "safe_path"),
+    [
+        (r"C:\models\model.pkl?token=windows-secret", r"C:\models\model.pkl"),
+        (r"\\server\share\model.pkl?token=unc-secret", r"\\server\share\model.pkl"),
+    ],
+)
+def test_nonexistent_windows_and_unc_credential_suffixes_are_redacted(local_path: str, safe_path: str) -> None:
+    assert redact_source_identifier(local_path) == safe_path
+
+
+@pytest.mark.parametrize(
+    "local_path",
+    [
+        "./api-key@bucket.example/model.pkl?token=secret",
+        r"C:\models\user:password@bucket.example\model.pkl?token=secret",
+    ],
+)
+def test_nonexistent_local_userinfo_with_credential_suffix_fails_closed(local_path: str) -> None:
+    assert redact_source_identifier(local_path) == "<source redacted>"
+    redacted_text = redact_source_text(local_path)
+    assert "<source redacted>" in redacted_text
+    assert "api-key" not in redacted_text
+    assert "password" not in redacted_text
+    assert "secret" not in redacted_text
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "file:///tmp/model%3Fv1.pkl",
+        "file:///tmp/model.pkl%3Fversion%3D1",
+        "user@example.com",
+    ],
+)
+def test_encoded_file_names_and_email_near_matches_are_preserved(source: str) -> None:
+    assert redact_source_identifier(source) == source
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "file://host/tmp/model.pkl",
+        "model.pkl;version=v1",
+        "bucket/model.pkl;version=v1",
+    ],
+)
+def test_authority_and_semicolon_near_matches_are_preserved(source: str) -> None:
+    assert redact_source_identifier(source) == source
+    assert redact_source_text(f"source {source}") == f"source {source}"
+
+
+def test_percent_encoded_at_in_file_path_is_not_treated_as_authority() -> None:
+    source = "file:///tmp/api-key%40host/model.pkl"
+
+    assert redact_source_identifier(source) == source
+
+
+@pytest.mark.parametrize(
+    "raw_path",
+    [
+        "token=scheme-less-secret?revision=v1",
+        "sessionToken=scheme-less-secret?revision=v1",
+        "session%54oken=scheme-less-secret?revision=v1",
+        "bucket/token=path-secret/model.pkl?revision=v1",
+        "bucket/token%3Dpath-secret/model.pkl?revision=v1",
+        "Authorization: Bearer source-secret?revision=v1",
+        "dbPassword: source-secret#tag=v1",
+    ],
+)
+def test_safe_provenance_does_not_restore_sensitive_prefixes(raw_path: str) -> None:
+    assert redact_source_identifier(raw_path) == "<source redacted>"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        'payload={"token":"EXPORT-SECRET-123"}',
+        "token[]=EXPORT-SECRET-123",
+        "headers[token]=EXPORT-SECRET-123",
+        'headers["token"]=EXPORT-SECRET-123',
+        'headers[ "token" ]=EXPORT-SECRET-123',
+        "headers[ token]=EXPORT-SECRET-123",
+        "headers[token ]=EXPORT-SECRET-123",
+        r'payload={"\u0074oken":"EXPORT-SECRET-123"}',
+        r'payload={"to\u006ben":"EXPORT-SECRET-123"}',
+        '"token"=EXPORT-SECRET-123',
+        r"payload={\"token\":\"EXPORT-SECRET-123\"}",
+        "Authorization Bearer EXPORT-SECRET-123",
+        "Authorization Digest EXPORT-SECRET-123",
+        "Authorization ApiKey EXPORT-SECRET-123",
+        "Authorization DPoP EXPORT-SECRET-123",
+        "Authorization Hawk EXPORT-SECRET-123",
+        "Proxy-Authorization NTLM EXPORT-SECRET-123",
+        "Proxy-Authorization ApiKey EXPORT-SECRET-123",
+        "--token EXPORT-SECRET-123 --verbose",
+        "token <- EXPORT-SECRET-123; visible=yes",
+    ],
+)
+def test_serialized_and_argument_credentials_are_redacted(text: str) -> None:
+    redacted = redact_source_text(text)
+
+    assert "EXPORT-SECRET-123" not in redacted
+
+
+def test_redact_source_text_handles_dense_credential_assignments() -> None:
+    text = "token=EXPORT-SECRET-123;" * 5_000
+
+    redacted = redact_source_text(text)
+
+    assert "EXPORT-SECRET-123" not in redacted
+    assert redacted.count("<redacted>") == 5_000
+
+
+@pytest.mark.parametrize("operator", ["!=", ">=", "<="])
+def test_sensitive_key_ordering_comparisons_are_not_treated_as_assignments(operator: str) -> None:
+    text = f'config={{"client_secret" {operator} "public": "os.system(15)"}}'
+
+    assert redact_source_text(text) == text
+
+
+def test_sensitive_key_equality_comparisons_redact_value_and_preserve_context() -> None:
+    text = 'config={"client_secret" == "public": "os.system(15)"}'
+
+    redacted = redact_source_text(text)
+
+    assert redacted == 'config={"client_secret" == <redacted>: "os.system(15)"}'
+
+
+def test_benign_comparisons_are_preserved_in_generic_exports() -> None:
+    text = "status == 200 and count == 5"
+
+    assert redact_source_text(text) == text
+
+
+def test_comparison_marker_tail_is_redacted_in_generic_exports() -> None:
+    text = 'client_secret == <redacted> + "RAW-MARKER-TAIL-SECRET-123456"'
+
+    redacted = redact_source_text(text)
+
+    assert "RAW-MARKER-TAIL-SECRET-123456" not in redacted
+    assert redacted == "client_secret == <redacted>"
+
+
+def test_exactly_redacted_comparison_value_is_preserved() -> None:
+    text = "client_secret == <redacted>"
+
+    assert redact_source_text(text) == text
+
+
+def test_reversed_literal_key_comparison_redacts_value_in_generic_exports() -> None:
+    text = '"OPAQUE-VALUE-CRED-123456" == "client_secret"; os.system("id")'
+
+    redacted = redact_source_text(text)
+
+    assert "OPAQUE-VALUE-CRED-123456" not in redacted
+    assert '<redacted> == "client_secret"' in redacted
+    assert 'os.system("id")' in redacted
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        'label == "client_secret"; os.system("id")',
+        '"OPAQUE-VALUE" == "tokenizer"',
+    ],
+)
+def test_reversed_comparison_near_matches_are_preserved_in_generic_exports(text: str) -> None:
+    assert redact_source_text(text) == text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "https://host/model,Authorization: Bearer URL-ADJACENT-SECRET",
+        "https://host/model;password: URL-ADJACENT-SECRET",
+        "metadata token%3DENCODED-SECRET visible=yes",
+        "metadata token%253DDOUBLE-ENCODED-SECRET",
+        "Authorization%3A%20Bearer%20ENCODED-HEADER-SECRET",
+        r"password\u003aESCAPED-SECRET",
+        '{"token":"QUOTED-SECRET"}',
+        '{"Authorization":"Bearer QUOTED-HEADER-SECRET"}',
+        "token%3DCHAINED-SECRET%26visible%3Dyes",
+        "token%253DDOUBLE-CHAINED-SECRET%2526visible%253Dyes",
+        "Authorization%3A%20Bearer%20HEADER-SECRET%3Btoken%3DSECOND-SECRET",
+    ],
+)
+def test_encoded_quoted_and_url_adjacent_assignments_are_redacted(text: str) -> None:
+    redacted = redact_source_text(text)
+
+    assert "SECRET" not in redacted
+    assert "<redacted>" in redacted
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ('--token "EXPORT SECRET 123" --verbose', "--token <redacted> --verbose"),
+        ('Authorization Bearer "EXPORT SECRET 123" tail', "Authorization Bearer <redacted> tail"),
+        ("payload=[token=EXPORT-SECRET-123] tail", "payload=[token=<redacted>] tail"),
+        ("--token=EXPORT-SECRET-123 --verbose", "--token=<redacted> --verbose"),
+        ("token: |\n  EXPORT-SECRET-123\nnext=safe", "token: <redacted>\nnext=safe"),
+        ("token: >\n  EXPORT SECRET 123\nnext=safe", "token: <redacted>\nnext=safe"),
+    ],
+)
+def test_credential_redaction_preserves_surrounding_context(text: str, expected: str) -> None:
+    assert redact_source_text(text) == expected
+
+
+def test_oversized_export_text_fails_closed() -> None:
+    assert redact_source_text("a" * (256 * 1024 + 1)) == "<redacted oversized value>"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "request_signature_algorithm=rsa",
+        "authorization_method=oauth2",
+        "Authorization method oauth2",
+        "Authorization status disabled",
+        "password_policy=strong",
+        "my_secret_ingredient=salt",
+        "token_count=42",
+        "token_type_ids=[1, 2]",
+        "signature_algorithm=rsa",
+    ],
+)
+def test_export_credential_near_matches_are_preserved(text: str) -> None:
+    assert redact_source_text(text) == text
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("bucket/user:EXPORT-SECRET-123@host/model.pkl", "bucket/host/model.pkl"),
+        ("bucket/user%3AEXPORT-SECRET-123%40host/model.pkl", "bucket/host/model.pkl"),
+        ("bucket/user%253AEXPORT-SECRET-123%2540host/model.pkl", "bucket/host/model.pkl"),
+        ("///user:EXPORT-SECRET-123@host/model.pkl", "<source redacted>"),
+        ("stream://jdbc:postgresql://user:EXPORT-SECRET-123@host/db", "stream://jdbc:postgresql://host/db"),
+    ],
+)
+def test_nested_userinfo_is_redacted_from_direct_identifiers(source: str, expected: str) -> None:
+    assert redact_source_identifier(source) == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "token_count=128",
+        "signature_algorithm=RSA",
+        "auth_method=oauth",
+        "session_duration=10",
+        "password_length=12",
+        "version%3D1",
+        "tokenizer%3Dpublic",
+    ],
+)
+def test_benign_metric_and_encoded_near_matches_are_preserved(text: str) -> None:
+    assert redact_source_text(text) == text
+
+
+def test_escaped_quote_does_not_end_credential_redaction_early() -> None:
+    redacted = redact_source_text('refreshToken="abc\\"quoted-secret"; visible=yes')
+
+    assert "quoted-secret" not in redacted
+    assert "visible=yes" in redacted
+
+
+def test_redacted_url_path_assignment_preserves_safe_path_and_query() -> None:
+    raw_url = "https://example.com/token%253Dpath-secret/model.pkl?visible=yes"
+
+    assert redact_source_text(raw_url) == "https://example.com/token=<redacted>/model.pkl?visible=yes"
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        (
+            "https://example.com/token:URL-SECRET/model.pkl",
+            "https://example.com/token=<redacted>/model.pkl",
+        ),
+        (
+            "https://example.com/sessionToken%253AURL-SECRET/model.pkl",
+            "https://example.com/sessionToken=<redacted>/model.pkl",
+        ),
+        ("bucket/token:PATH-SECRET/model.pkl", "<source redacted>"),
+        ("/tmp/token:PATH-SECRET/model.pkl", "<source redacted>"),
+        (r"C:\models\token:PATH-SECRET\model.pkl", "<source redacted>"),
+    ],
+)
+def test_colon_path_credentials_are_redacted(source: str, expected: str) -> None:
+    assert redact_source_identifier(source) == expected
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "https://example.com/version:1/model.pkl",
+        "bucket/version:1/model.pkl",
+        "/tmp/version:1/model.pkl",
+        r"C:\models\version:1\model.pkl",
+    ],
+)
+def test_benign_colon_path_segments_are_preserved(source: str) -> None:
+    assert redact_source_identifier(source) == source
+
+
+def test_nonexistent_local_suffix_is_redacted_but_literal_filename_is_preserved(tmp_path: Path) -> None:
+    missing_path = tmp_path / "missing.pkl?token=source-secret"
+
+    assert redact_source_identifier(str(missing_path)) == str(tmp_path / "missing.pkl")
+    if os.name != "nt":
+        literal_path = tmp_path / "literal.pkl?token=filename-text"
+        literal_path.write_bytes(b"model")
+        assert redact_source_identifier(str(literal_path)) == str(literal_path)
+    assert redact_source_identifier("./missing.pkl%3Ftoken%3Dsource-secret") == "./missing.pkl"
+
+
+@pytest.mark.parametrize(
+    "raw_path",
+    [
+        "./user:password@bucket.example/model.pkl",
+        "./bucket/token=path-secret/model.pkl?revision=v1",
+        "./bucket/token%3Dpath-secret/model.pkl?revision=v1",
+    ],
+)
+def test_nonexistent_posix_local_credential_prefixes_fail_closed(raw_path: str) -> None:
+    assert redact_source_identifier(raw_path) == "<source redacted>"
+
+
+@pytest.mark.parametrize(
+    "local_path",
+    [
+        "/tmp/build@2026/model.pkl",
+        "./artifacts/user@example.com/model.pkl",
+        "./artifacts/user@example.com/model.pkl?version=1",
+    ],
+)
+def test_nonexistent_posix_at_paths_are_preserved(local_path: str) -> None:
+    assert redact_source_identifier(local_path) == local_path
+    assert redact_source_text(f"source {local_path}") == f"source {local_path}"
+
+
+@pytest.mark.parametrize(
+    ("raw_path", "safe_path"),
+    [
+        ("/bucket/model.pkl;token=source-secret", "/bucket/model.pkl"),
+        ("./bucket/model.pkl%3Btoken%3Dsource-secret", "./bucket/model.pkl"),
+    ],
+)
+def test_nonexistent_local_semicolon_credentials_are_redacted(raw_path: str, safe_path: str) -> None:
+    assert redact_source_identifier(raw_path) == safe_path
+
+
+def test_existing_local_credential_shaped_filename_is_preserved(tmp_path: Path) -> None:
+    literal_path = tmp_path / "model.pkl;token=filename-text"
+    literal_path.write_bytes(b"model")
+
+    assert redact_source_identifier(str(literal_path)) == str(literal_path)
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("model.pkl?OPAQUE-SECRET", "model.pkl"),
+        ("model.pkl%3FOPAQUE-SECRET", "model.pkl"),
+        ("model.pkl;OPAQUE-SECRET", "model.pkl"),
+        ("bucket/model.pkl;OPAQUE-SECRET", "bucket/model.pkl"),
+        (r"bucket/model.pkl\u003btoken\u003descaped-secret", "bucket/model.pkl"),
+        ("source //bucket.example/model.pkl?OPAQUE-SECRET", "source //bucket.example/model.pkl"),
+        ("model.pkl?version=1", "model.pkl?version=1"),
+        ("model.pkl%3Fversion%3D1", "model.pkl%3Fversion%3D1"),
+        ("./bucket/model.pkl;version=1", "./bucket/model.pkl;version=1"),
+        ("release 1.2.3? maybe", "release 1.2.3? maybe"),
+        ("email user@example.com?subject=safe", "email user@example.com?subject=safe"),
+        ("email user@example.com?token=secret", "email user@example.com"),
+    ],
+)
+def test_bare_and_protocol_relative_opaque_source_text_redaction(text: str, expected: str) -> None:
+    assert redact_source_text(text) == expected
+
+
+@pytest.mark.parametrize(
+    "source, expected",
+    [
+        (
+            "https://huggingface.co/synthetic/model?revision=v1&token=first-secret",
+            ("4acb9afec8e4ca09", "c88940f6ed1f1e27"),
+        ),
+        (
+            "https://huggingface.co/synthetic/model?revision=v2&token=rotated-secret",
+            ("c41158d2c9a49cc2", "e1aaaf3843a01e19"),
+        ),
+        (
+            "https://user:password@hf.co/synthetic/model?revision=refs%2Fpr%2F1#fragment",
+            ("df9f6c632af59190", "c8f6914b602735fb"),
+        ),
+        ("hf://synthetic/model?revision=v1&token=first-secret", ("cb66d14a78b3ffa6", "296551dd1511bcb4")),
+        pytest.param(
+            "https://huggingface.co/synthetic/model?revision=v%3F1",
+            ("da65abb18e99561b", "f8bd949293f4aad7"),
+            marks=pytest.mark.skipif(os.name == "nt", reason="Windows revision paths cannot contain a question mark"),
+        ),
+        (
+            "https://huggingface.co/synthetic/model/resolve/refs%2Fpr%2F1/model.pkl?token=first-secret",
+            ("cbd09adff61aa463", "669223b82696b1ec"),
+        ),
+        ("https://huggingface.co/synthetic/model?token=first-secret", ("02bbb8268098d7b7", "09a5413822fb3085")),
+    ],
+)
+@pytest.mark.parametrize("scanned_artifact_count", [0, 2])
+def test_huggingface_acquisition_fingerprints_match_baseline(
+    source: str, expected: tuple[str, str], scanned_artifact_count: int
+) -> None:
+    from modelaudit.cli import _record_huggingface_acquisition_error, _ScanPathState
+    from modelaudit.models import ModelAuditResultModel, create_initial_audit_result
+
+    # Captured from the parent before raw output changes, including punctuation.
+    result = create_initial_audit_result()
+    _record_huggingface_acquisition_error(
+        result, _ScanPathState(), path=source, error_msg="HTTP 503", scanned_artifact_count=scanned_artifact_count
+    )
+    for converted in [result, ModelAuditResultModel.model_validate_json(result.model_dump_json())]:
+        sarif_result = _create_results(converted.issues)[0]
+        assert sarif_result["partialFingerprints"]["primaryLocationLineHash"] == expected[scanned_artifact_count // 2]
+        assert sarif_result["message"]["text"] == converted.issues[0].message
+        assert sarif_result["properties"]["source_url"] == converted.issues[0].location
+
+
+@pytest.mark.parametrize("query", ["?token=synthetic", "?token=synthetic (pos 2)", "%253Ftoken%253Dsynthetic"])
+@pytest.mark.parametrize(
+    "suffix, mode, evidence, rule, fingerprint",
+    [
+        (" (pos 2)", "default", False, "MAUNSAFE_PICKLE", "fa5b7bc43ae2af24"),
+        (" (pos 17)", "default", False, "MAUNSAFE_PICKLE", "d75b755d8cd36d92"),
+        (":archive/data.pkl (pos 2)", "default", False, "MAUNSAFE_PICKLE", "19aa36e2e9eddac1"),
+        ("#member (pos 2)", "default", True, "MAUNSAFE_PICKLE", "433b3f275ec02f61"),
+        ("[member]:4", "type", False, "MAHTTPS://BUCKET.S3.AMAZONAWS.COM/MODEL.PKL[MEMBER]:4", "de3055da08d1ede8"),
+        (" (pos 2)", "rule_code", False, "https://bucket.s3.amazonaws.com/model.pkl (pos 2)", "fa5b7bc43ae2af24"),
+    ],
+)
+def test_stream_fingerprints_preserve_baseline_suffixes(
+    monkeypatch: pytest.MonkeyPatch, query: str, suffix: str, mode: str, evidence: bool, rule: str, fingerprint: str
+) -> None:
+    # Frozen outputs from the parent, where core normalized the source before appending scanner positions.
+    source = "https://bucket.s3.amazonaws.com/model.pkl" + query
+    scanned = ScanResult(scanner_name="streaming")
+    scanned.metadata["streaming_analysis"] = True
+    issue = Issue(
+        message=f"Unsafe pickle from {source}{suffix}; another URL https://user:password@other/model.pkl?token=second.",
+        severity=IssueSeverity.WARNING,
+        location=source + suffix,
+        details={"evidence_fingerprint": "evidence at " + source + suffix if evidence else "", "custom": "retained"},
+        type=source + suffix if mode == "type" else "unsafe_pickle",
+        rule_code=source + suffix if mode == "rule_code" else None,
+    )
+    scanned.issues.append(issue)
+    scanned.finish(success=False)
+    monkeypatch.setattr("modelaudit.core.stream_analyze_file", lambda *args, **kwargs: (scanned, True))
+    monkeypatch.setattr("modelaudit.scanners.get_scanner_for_file", lambda *args, **kwargs: object())
+    result = scan_model_directory_or_file("stream://" + source)
+    before = result.model_dump_json()
+    for converted in [result, ModelAuditResultModel.model_validate_json(before)]:
+        run = _create_run(converted, [], False)
+        finding = run["results"][0]
+        assert finding["ruleId"] == run["tool"]["driver"]["rules"][0]["id"] == rule
+        assert finding["partialFingerprints"]["primaryLocationLineHash"] == fingerprint
+        assert finding["message"]["text"] == issue.message
+        assert converted.issues[0].location == source + suffix
+        assert converted.issues[0].details == issue.details
+        assert getattr(converted.issues[0], "finding_identity", {})["producer"] == "stream"
+        assert finding["properties"]["custom"] == "retained"
+    assert result.model_dump_json() == before
+
+
+def test_overlapping_signed_stream_sources_preserve_baseline_identities(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Exercise the real stream scanner; signed query text can itself look like a scanner position.
+    payload = b"\x80\x04N.\x7fELFsynthetic"
+    merged = create_initial_audit_result()
+    for source in [
+        "https://bucket.s3.amazonaws.com/model.pkl?token=synthetic",
+        "https://bucket.s3.amazonaws.com/model.pkl?token=synthetic (pos 4)",
+    ]:
+        filesystem = Mock()
+        filesystem.info.return_value = {"size": len(payload)}
+        filesystem.open.side_effect = lambda *args: io.BytesIO(payload)
+        transport = Mock(return_value=filesystem)
+        monkeypatch.setattr("fsspec.filesystem", transport)
+        result = scan_model_directory_or_file("stream://" + source)
+        transport.assert_called_once_with("https")
+        filesystem.info.assert_called_once_with(source)
+        filesystem.open.assert_called_once_with(source, "rb")
+        assert all(getattr(issue, "finding_identity", {})["producer"] == "stream" for issue in result.issues)
+        assert result.issues[0].location == source + " (pos 4)"
+        merged.issues.extend(result.issues)
+        merged.assets.extend(result.assets)
+        merged.file_metadata.update(result.file_metadata)
+    expected = [
+        ("S902", "4a206c4a5abbf137"),
+        ("S901", "44b7255a71502074"),
+        ("MA-STREAMING-ANALYSIS-INCOMPLETE-", "81fb33e77d7f4ab9"),
+    ] * 2
+    for converted in [merged, ModelAuditResultModel.model_validate_json(merged.model_dump_json())]:
+        findings = _create_run(converted, [], False)["results"]
+        assert [
+            (item["ruleId"], item["partialFingerprints"]["primaryLocationLineHash"]) for item in findings
+        ] == expected
+
+
+def test_stream_failure_fingerprint_survives_saved_results(monkeypatch: pytest.MonkeyPatch) -> None:
+    source = "https://user:password@bucket.s3.amazonaws.com/model.pkl?token=synthetic (pos 2)"
+    monkeypatch.setattr("modelaudit.core.stream_analyze_file", lambda *args, **kwargs: (None, False))
+    monkeypatch.setattr("modelaudit.scanners.get_scanner_for_file", lambda *args, **kwargs: object())
+    result = scan_model_directory_or_file("stream://" + source)
+    for converted in [result, ModelAuditResultModel.model_validate_json(result.model_dump_json())]:
+        finding = _create_run(converted, [], False)["results"][0]
+        assert finding["partialFingerprints"]["primaryLocationLineHash"] == "5386d5566b6f8146"
+        assert source in finding["message"]["text"]
+        assert getattr(converted.issues[0], "finding_identity", {})["producer"] == "stream"
+
+
+def test_stream_identity_context_excludes_local_and_huggingface_downloads() -> None:
+    source = "https://bucket/model.pkl?token=synthetic"
+    result = create_initial_audit_result()
+    result.issues = [
+        Issue(message=f"Local pickle references {source} (pos 2)", location="local.pkl (pos 2)", type="pickle_ref")
+    ]
+    expected = _create_run(result, [], False)["results"]
+    result.file_metadata[source] = FileMetadataModel(streaming_analysis=True)
+    assert _create_run(result, [], False)["results"] == expected
+    result.file_metadata.clear()
+    result.issues[0].location = source + " (pos 2)"
+    expected = _create_run(result, [], False)["results"]
+    result.assets = [AssetModel(path=source, type="pickle", is_streamed=True)]
+    assert _create_run(result, [], False)["results"] == expected
+
+
+@pytest.mark.parametrize(
+    "mode, hashes",
+    [
+        ("budget", ("cd69d800710289bc", "cc721fc7dc9c02d5")),
+        ("trust", ("db7cf136ad10ad54", "64b60a051d5364bd")),
+        ("path", ("3f8bce7b2d2ed0bd", "e8d603c2a13f4ed9")),
+    ],
+)
+@pytest.mark.parametrize(
+    "query", ["?code=FIRSTSYNTHETIC", "?code=SECONDSYNTHETIC", "?code=" + "x" * 700 + "&version=actual"]
+)
+def test_mlflow_acquisition_identity_survives_bounded_raw_output(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, mode: str, hashes: tuple[str, str], query: str
+) -> None:
+    from modelaudit.integrations.mlflow import scan_mlflow_model
+
+    # Parent-derived hashes include source normalization before the 512-character display limit.
+    source = "models:/PublicModel/1" + query
+    module = ModuleType("mlflow")
+    repository = SimpleNamespace(artifact_uri="s3://trusted-bucket/models")
+    lookup = Mock(side_effect=RuntimeError("unavailable")) if mode == "budget" else Mock(return_value=repository)
+    module.__dict__["artifacts"] = SimpleNamespace(get_artifact_repository=lookup)
+    monkeypatch.setitem(sys.modules, "mlflow", module)
+    monkeypatch.setenv("MODELAUDIT_MLFLOW_ALLOWED_ARTIFACT_URIS", "s3://trusted-bucket" if mode == "path" else "")
+    monkeypatch.setattr("modelaudit.integrations.mlflow.tempfile.mkdtemp", lambda **kwargs: str(tmp_path / "missing"))
+    result = scan_mlflow_model(source, max_file_size=1 if mode == "budget" else 0)
+    expected_location = source
+    if len(source) > 512:
+        suffix = "#modelaudit-source-sha256-" + hashlib.sha256(source.encode()).hexdigest()
+        expected_location = source[: 512 - len(suffix)] + suffix
+    assert result.issues[0].location == result.checks[0].location == expected_location
+    assert len(getattr(result.issues[0], "finding_identity", {})["fields"]["location"]) <= 512
+    aggregate = create_initial_audit_result()
+    aggregate.aggregate_scan_result(result)
+    direct = create_initial_audit_result()
+    scanned = ScanResult(scanner_name="mlflow")
+    scanned.issues, scanned.checks = result.issues, result.checks
+    direct.aggregate_scan_result_direct(scanned)
+    for converted in [
+        result,
+        aggregate,
+        direct,
+        ModelAuditResultModel.model_validate_json(aggregate.model_dump_json()),
+    ]:
+        finding = _create_run(converted, [], False)["results"][0]
+        assert finding["partialFingerprints"]["primaryLocationLineHash"] == hashes[int(len(source) > 512)]
+        assert finding["message"]["text"] == result.issues[0].message
+        assert converted.issues[0].location == expected_location
+        assert getattr(converted.checks[0], "finding_identity", {}) == getattr(result.checks[0], "finding_identity", {})
+
+
+@pytest.mark.parametrize("query", ["", "?revision=main"])
+@pytest.mark.skipif(os.name == "nt", reason="Literal question marks are not valid Windows directory names")
+def test_directory_owner_preserves_parent_finding_and_check_identities(tmp_path: Path, query: str) -> None:
+    from modelaudit.core_results import consolidate_checks
+
+    root = tmp_path / ("owner" + query)
+    root.mkdir()
+    metadata = root / "metadata.json"
+    metadata.write_text(
+        json.dumps({"version": "0.1.0", "type": "orbax_checkpoint", "restore_fn": "lambda x: eval(x.decode())"})
+    )
+    result = scan_model_directory_or_file(str(root), cache_enabled=False)
+    # Parent reports the same restore function through owner and child when normalization makes their keys differ.
+    expected_locations = ([str(tmp_path / "owner") + "?revision=<redacted>"] if query else []) + [str(metadata)]
+    expected_hashes = [
+        hashlib.sha256(
+            ("Dangerous restore function detected in Orbax metadata" + location + "IssueSeverity.CRITICAL").encode()
+        ).hexdigest()[:16]
+        for location in expected_locations
+    ]
+    expected_counts = (9, 7, 2) if query else (8, 7, 1)
+    for converted in [result, ModelAuditResultModel.model_validate_json(result.model_dump_json())]:
+        converted.deduplicate_issues()
+        consolidate_checks(converted)
+        findings = [item for item in _create_run(converted, [], False)["results"] if item["ruleId"] == "S302"]
+        assert [item["partialFingerprints"]["primaryLocationLineHash"] for item in findings] == expected_hashes
+        assert (converted.total_checks, converted.passed_checks, converted.failed_checks) == expected_counts
+        assert all(issue.location == str(metadata) for issue in converted.issues if issue.rule_code == "S302")
+
+
+@pytest.mark.parametrize("owner_path", ["/proc/self/fd/11", "/synthetic/staged-owner", "."])
+def test_directory_owner_identity_keeps_message_rules_and_evidence(tmp_path: Path, owner_path: str) -> None:
+    from modelaudit.core import _normalize_directory_owner_scan_result_for_reporting
+    from modelaudit.finding_identity import finding_identity
+
+    report_path = str(tmp_path / "owner")
+    scanned = ScanResult(scanner_name="jax_checkpoint")
+    url = "https://example.com/a?revision=main"
+    issue = Issue(
+        message="Fetch " + url, location=owner_path, type=url, rule_code=url, details={"evidence_fingerprint": url}
+    )
+    scanned.issues.append(issue)
+    _normalize_directory_owner_scan_result_for_reporting(scanned, owner_path, report_path)
+    identity = finding_identity(issue)
+    expected_url = url if owner_path == "." else "https://example.com/a?revision=<redacted>"
+    assert identity.message == "Fetch " + expected_url
+    assert identity.type == identity.rule_code == identity.details["evidence_fingerprint"] == expected_url
+    assert issue.message == "Fetch " + url
+    assert issue.type == issue.rule_code == issue.details["evidence_fingerprint"] == url
+    assert identity.location == issue.location == report_path
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        None,
+        [],
+        {"producer": []},
+        {"producer": {}},
+        {"producer": "unknown"},
+        {"producer": "directory_owner", "fields": []},
+    ],
+)
+def test_malformed_or_evidence_owned_identity_metadata_is_ignored(metadata: object) -> None:
+    from modelaudit.finding_identity import finding_identity
+
+    issue = Issue(
+        message="original",
+        location="model.pkl",
+        finding_identity=metadata,
+        details={"finding_identity": {"producer": "directory_owner", "fields": {"message": "spoofed"}}},
+    )
+    saved = Issue.model_validate_json(issue.model_dump_json())
+    assert finding_identity(saved).message == "original"
+    assert (
+        _create_results([saved])[0]["partialFingerprints"]
+        == _create_results([Issue(message="original", location="model.pkl")])[0]["partialFingerprints"]
+    )
+
+
+def test_real_stream_aggregation_retains_parent_deduplication(monkeypatch: pytest.MonkeyPatch) -> None:
+    payload = b"cos\nsystem\n(S'printf sample'\ntR."
+    aggregate = create_initial_audit_result()
+    for token in ["alpha", "beta"]:
+        source = "https://bucket.s3.amazonaws.com/model.pkl?token=" + token
+        filesystem = Mock()
+        filesystem.info.return_value = {"size": len(payload)}
+        filesystem.open.side_effect = lambda *args: io.BytesIO(payload)
+        monkeypatch.setattr("fsspec.filesystem", Mock(return_value=filesystem))
+        result = scan_model_directory_or_file("stream://" + source, cache_scan_results=False)
+        assert all(source in issue.location for issue in result.issues if issue.location)
+        aggregate.aggregate_scan_result(result.model_dump())
+    aggregate.finalize_statistics()
+    for converted in [aggregate, ModelAuditResultModel.model_validate_json(aggregate.model_dump_json())]:
+        converted.deduplicate_issues()
+        assert len(converted.issues) == 2
+        assert [
+            item["partialFingerprints"]["primaryLocationLineHash"]
+            for item in _create_run(converted, [], False)["results"]
+        ] == [
+            "fb2ab0e5be0479b9",
+            "141c46e33bef25d8",
+        ]
+
+
+@pytest.mark.parametrize("output_format", ["json", "sarif"])
+def test_huggingface_cli_preserves_parent_source_deduplication(
+    monkeypatch: pytest.MonkeyPatch, output_format: str
+) -> None:
+    from click.testing import CliRunner
+
+    from modelaudit.cli import cli
+
+    paths = [
+        "https://huggingface.co/synthetic/model?revision=v1&token=" + token
+        for token in ["FIRSTSYNTHETIC", "SECONDSYNTHETIC"]
+    ]
+    downloader = Mock(side_effect=RuntimeError("403 Forbidden: gated model"))
+    monkeypatch.setattr("modelaudit.cli.download_model", downloader)
+    result = CliRunner().invoke(cli, ["scan", "--quiet", "--no-cache", "--format", output_format, *paths])
+    assert result.exit_code == 2
+    assert downloader.call_count == 2
+    exported = json.loads(result.output[result.output.index("{") :])
+    if output_format == "json":
+        assert len(exported["issues"]) == 1
+        assert paths[0] in exported["issues"][0]["location"]
+        saved = ModelAuditResultModel.model_validate(exported)
+        saved.deduplicate_issues()
+        findings = _create_run(saved, [], False)["results"]
+    else:
+        findings = exported["runs"][0]["results"]
+    assert len(findings) == 1
+    assert findings[0]["partialFingerprints"]["primaryLocationLineHash"] == "e551792c82a8ce3b"
+
+
+def test_direct_raw_sarif_models_do_not_infer_producer_normalization() -> None:
+    source = "https://bucket.s3.amazonaws.com/model.pkl?token=alpha"
+    result = create_initial_audit_result()
+    result.issues = [
+        Issue(
+            message="Found dangerous pickle global",
+            location=source + suffix,
+            severity=IssueSeverity.CRITICAL,
+            type="pickle_check",
+            rule_code="S201",
+        )
+        for suffix in ["", " (pos 30)", ":42"]
+    ]
+    findings = _create_run(result, ["stream://" + source], False)["results"]
+    assert [item["partialFingerprints"]["primaryLocationLineHash"] for item in findings] == ["69306204a0e4ca52"] * 3
+    source = "https://huggingface.co/org/repo?token=alpha@main"
+    result.issues = [
+        Issue(
+            message="Failed to download " + source + ": unavailable",
+            location=source,
+            severity=IssueSeverity.INFO,
+            type="huggingface_acquisition_error",
+            details={"requested_revision": "main"},
+        )
+    ]
+    assert (
+        _create_run(result, [source], False)["results"][0]["partialFingerprints"]["primaryLocationLineHash"]
+        == "015d415c5d3be61c"
+    )
+
+
+def test_stream_rule_classification_uses_identity_but_keeps_raw_description(monkeypatch: pytest.MonkeyPatch) -> None:
+    source = "stream://https://bucket.s3.amazonaws.com/model.pkl?token=pickle-exec-secret-license-cve-network"
+    filesystem = Mock()
+    filesystem.info.side_effect = RuntimeError("transport unavailable")
+    monkeypatch.setattr("fsspec.filesystem", Mock(return_value=filesystem))
+    result = scan_model_directory_or_file(source, cache_scan_results=False)
+    for converted in [result, ModelAuditResultModel.model_validate_json(result.model_dump_json())]:
+        rule = _create_run(converted, [source], False)["tool"]["driver"]["rules"][0]
+        assert rule["properties"]["tags"] == ["security", "ml-model"]
+        assert rule["shortDescription"]["text"] == converted.issues[0].message[:100]
+        assert "pickle-exec-secret-license-cve-network" in converted.issues[0].message
+
+
+@pytest.mark.parametrize("surrogate", ["\udcff", "\ud800", "\udc00", "\udfff"])
+@pytest.mark.parametrize("transport_failure", [False, True])
+def test_sarif_exports_stream_results_with_surrogates_in_query(
+    monkeypatch: pytest.MonkeyPatch, surrogate: str, transport_failure: bool
+) -> None:
+    source = "stream://https://bucket.s3.amazonaws.com/model.pkl?token=" + surrogate
+    filesystem = Mock()
+    if transport_failure:
+        filesystem.info.side_effect = OSError("synthetic transport error")
+    else:
+        filesystem.info.return_value = {"size": 4}
+        filesystem.open.side_effect = lambda *args, **kwargs: io.BytesIO(b"\x80\x04N.")
+    monkeypatch.setattr("fsspec.filesystem", Mock(return_value=filesystem))
+    result = scan_model_directory_or_file(source, cache_scan_results=False)
+    exported = format_sarif_output(result, [source])
+    run = json.loads(exported)["runs"][0]
+    from modelaudit.core_results import determine_exit_code
+
+    assert run["invocations"][0]["exitCode"] == determine_exit_code(result)
+    assert run["results"]
+    assert run["artifacts"][0]["location"]["uri"].isascii()
+    assert exported.encode("utf-8")
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_source_serialization_keeps_joined_identifiers_and_literal_markers(reverse: bool) -> None:
+    from modelaudit.integrations.source_serialization import serialize_source_value
+
+    source = "https://example.test/model.pkl?token=" + "x" * (256 * 1024) + "\udcff"
+    literal = (
+        f"modelaudit-source:{source[:256]}..."
+        f"<source sha256:{hashlib.sha256(source.encode(errors='surrogatepass')).hexdigest()}>"
+    )
+    paths = [source, literal, literal + "#2"]
+    if reverse:
+        paths.reverse()
+    value = {"paths": [*paths, source], "metadata": {path: {"source": path} for path in paths}}
+    saved = serialize_source_value(value)
+    assert len(saved["metadata"]) == 3
+    assert set(saved["paths"]) == {literal, literal + "#2", literal + "#3"}
+    assert saved["paths"][-1] == literal + "#3"
+    assert all(saved["metadata"][path]["source"] == path for path in saved["paths"])
+    assert serialize_source_value(saved) == saved
+
+
+def test_source_serialization_materializes_model_and_custom_key_once() -> None:
+    from pydantic import BaseModel, model_serializer
+
+    from modelaudit.integrations.source_serialization import serialize_source_value
+
+    calls = []
+
+    class Key:
+        def __str__(self) -> str:
+            calls.append("key")
+            return "key"
+
+    class Details(BaseModel):
+        @model_serializer
+        def serialize(self) -> dict[str, str]:
+            calls.append("model")
+            return {"source": "x" * (256 * 1024 + 1)}
+
+    converted = serialize_source_value({Key(): Details()})
+    assert calls == ["key", "model"]
+    assert len(converted["key"]["source"]) < 256 * 1024
+
+
+@pytest.mark.parametrize("field", ["message", "type", "rule_code", "evidence_fingerprint"])
+@pytest.mark.parametrize("matches_source", [False, True])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_oversized_finding_identity_survives_json_roundtrip(field: str, matches_source: bool, reverse: bool) -> None:
+    source = "https://example.test/model.pkl?token=" + "x" * (256 * 1024)
+    value = source if matches_source else "x" * (256 * 1024 + 1)
+    result = create_initial_audit_result()
+    first = Issue(message="Unsafe operation", type="unsafe", severity=IssueSeverity.WARNING, location="model.pkl")
+    if field == "evidence_fingerprint":
+        first.details[field] = value
+    else:
+        setattr(first, field, value)
+    result.issues = [first, Issue(message="Another operation", type="other", location="other.pkl")]
+    if reverse:
+        result.issues.reverse()
+    result.assets = [AssetModel(path=source, type="pickle")]
+    result.file_metadata = {source: FileMetadataModel(file_size=3)}
+    before = result.model_dump()
+    direct = json.loads(format_sarif_output(result, [source], verbose=True))["runs"][0]
+    saved = ModelAuditResultModel.model_validate_json(
+        _format_scan_output(result, [source], output_format="json", verbose=True)
+    )
+    restored = json.loads(format_sarif_output(saved, [], verbose=True))["runs"][0]
+    assert [r["partialFingerprints"] for r in restored["results"]] == [
+        r["partialFingerprints"] for r in direct["results"]
+    ]
+    assert [(r["id"], r["name"], r["properties"]["tags"]) for r in restored["tool"]["driver"]["rules"]] == [
+        (r["id"], r["name"], r["properties"]["tags"]) for r in direct["tool"]["driver"]["rules"]
+    ]
+    assert result.model_dump() == before
+    assert {asset.path for asset in saved.assets} == set(saved.file_metadata)
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("repeated", [False, True])
+def test_sarif_oversized_sources_cannot_alias_literal_artifacts(reverse: bool, repeated: bool) -> None:
+    source = "stream://https://bucket.s3.amazonaws.com/model.pkl?token=" + "x" * (256 * 1024)
+    literal = f"modelaudit-source:{source[:256]}...<source sha256:{hashlib.sha256(source.encode()).hexdigest()}>"
+    paths = [source, literal, literal + "#2"]
+    if reverse:
+        paths.reverse()
+    if repeated:
+        paths += paths
+    result = create_initial_audit_result()
+    result.assets = [AssetModel(path=path, type="pickle") for path in paths]
+    result.issues = [Issue(message=f"Finding {index}", location=path) for index, path in enumerate(paths)]
+    run = json.loads(format_sarif_output(result, paths, verbose=True))["runs"][0]
+    artifacts = [a["location"]["uri"] for a in run["artifacts"]]
+    findings = [r["locations"][0]["physicalLocation"]["artifactLocation"]["uri"] for r in run["results"]]
+    assert len(set(artifacts)) == 3
+    assert findings == artifacts
+    assert len(set(run["invocations"][0]["arguments"])) == 3
+    if repeated:
+        assert artifacts[:3] == artifacts[3:]
+
+
+@pytest.mark.parametrize("output_format", ["json", "text"])
+def test_saved_oversized_identity_fields_keep_historical_text_bounds(output_format: str) -> None:
+    oversized = "pickle " + "x" * (256 * 1024)
+    result = create_initial_audit_result()
+    producer: dict[str, Any] = {
+        "producer": "stream",
+        "fields": {"message": "Producer message", "location": "producer.pkl"},
+    }
+    result.issues = [Issue(message=oversized, location="raw.pkl", finding_identity=producer)]
+    result.checks = [
+        Check(name=oversized, message=oversized, status=CheckStatus.FAILED, severity=IssueSeverity.WARNING)
+    ]
+    output = _format_scan_output(result, [], output_format=output_format, verbose=True)
+    assert "source sha256:" not in output
+    assert "<redacted oversized value>" in output
+    if output_format == "json":
+        saved = ModelAuditResultModel.model_validate_json(output)
+        assert getattr(saved.issues[0], "finding_identity", {}) == producer
+        assert saved.checks[0].name == "<redacted oversized value>"
+        run = json.loads(format_sarif_output(saved, [], verbose=True))["runs"][0]
+        assert run["tool"]["driver"]["rules"][0]["properties"]["tags"] == ["security", "ml-model"]
+
+
+def test_sarif_two_source_literal_alias_regression() -> None:
+    source = "stream://https://bucket.s3.amazonaws.com/model.pkl?token=" + "x" * (256 * 1024)
+    literal = f"modelaudit-source:{source[:256]}...<source sha256:{hashlib.sha256(source.encode()).hexdigest()}>"
+    result = create_initial_audit_result()
+    result.assets = [AssetModel(path=path, type="pickle") for path in [source, literal]]
+    result.issues = [Issue(message="Finding", location=path) for path in [source, literal]]
+    run = json.loads(format_sarif_output(result, [source, literal], verbose=True))["runs"][0]
+    artifacts = [a["location"]["uri"] for a in run["artifacts"]]
+    assert len(set(artifacts)) == 2
+    assert [r["locations"][0]["physicalLocation"]["artifactLocation"]["uri"] for r in run["results"]] == artifacts
+
+
+@pytest.mark.parametrize("field", ["message", "type", "rule_code", "evidence_fingerprint"])
+def test_saved_oversized_producer_identity_keeps_fingerprints(field: str) -> None:
+    result = create_initial_audit_result()
+    fields: dict[str, Any] = {"location": "producer.pkl"}
+    if field == "evidence_fingerprint":
+        fields["details"] = {field: "x" * (256 * 1024 + 1), "zip_entry": "member.pkl"}
+    else:
+        fields[field] = "x" * (256 * 1024 + 1)
+    result.issues = [
+        Issue(message="Raw message", location="raw.pkl", finding_identity={"producer": "stream", "fields": fields})
+    ]
+    direct = json.loads(format_sarif_output(result, [], verbose=True))["runs"][0]
+    saved = ModelAuditResultModel.model_validate_json(
+        _format_scan_output(result, [], output_format="json", verbose=True)
+    )
+    restored = json.loads(format_sarif_output(saved, [], verbose=True))["runs"][0]
+    assert restored["results"][0]["partialFingerprints"] == direct["results"][0]["partialFingerprints"]
+    assert restored["results"][0]["ruleId"] == direct["results"][0]["ruleId"]
+    saved_identity = getattr(saved.issues[0], "finding_identity", {})
+    assert saved_identity["fields"]["location"] == "producer.pkl"
+    if field == "evidence_fingerprint":
+        assert saved_identity["fields"]["details"]["zip_entry"] == "member.pkl"
+    assert len(str(fields.get(field) or fields.get("details"))) > 256 * 1024
+
+
+@pytest.mark.parametrize("field", ["name", "zip_entry_id", "zip_entry", "check_consolidation_key"])
+def test_saved_oversized_check_identity_keeps_historical_groups(field: str) -> None:
+    from modelaudit.core_results import consolidate_checks
+
+    result = create_initial_audit_result()
+    for suffix in ["a", "b"]:
+        oversized = "x" * (256 * 1024) + suffix
+        check = Check(
+            name="Check",
+            message="Operation failed",
+            location="model.pkl",
+            status=CheckStatus.FAILED,
+            severity=IssueSeverity.WARNING,
+        )
+        if field == "name":
+            check.name = oversized
+        else:
+            check.details[field] = oversized
+        result.checks.append(check)
+    saved = ModelAuditResultModel.model_validate_json(
+        _format_scan_output(result, [], output_format="json", verbose=True)
+    )
+    consolidate_checks(saved)
+    assert len(saved.checks) == 1
+    assert saved.checks[0].details["component_count"] == 2
+
+
+@pytest.mark.parametrize("depth", [30, 31, 32, 33, 34])
+def test_sarif_shared_source_allocation_preserves_detail_depth_budget(depth: int) -> None:
+    from modelaudit.integrations.source_serialization import serialize_source_value
+
+    evidence: Any = "leaf"
+    for _ in range(depth):
+        evidence = [evidence]
+    details = {"evidence": evidence}
+    result = create_initial_audit_result()
+    result.issues = [Issue(message="Synthetic finding", location="model.pkl", details=details)]
+    run = json.loads(format_sarif_output(result, ["model.pkl"], verbose=True))["runs"][0]
+    assert run["results"][0]["properties"] == serialize_source_value(details)
+
+
+def test_sarif_shared_sources_preserve_property_references_and_materialize_once() -> None:
+    from pydantic import BaseModel, model_serializer
+
+    source = "https://example.test/model.pkl?token=" + "x" * (256 * 1024)
+    literal = f"modelaudit-source:{source[:256]}...<source sha256:{hashlib.sha256(source.encode()).hexdigest()}>"
+    calls: list[str] = []
+
+    class Details(BaseModel):
+        @model_serializer
+        def serialize(self) -> dict[str, str]:
+            calls.append("model")
+            return {"source": source}
+
+    result = create_initial_audit_result()
+    result.assets = [AssetModel(path=path, type="pickle") for path in [source, literal]]
+    result.issues = [Issue(message="Finding", location=source, details={"source": source, "model": Details()})]
+    run = json.loads(format_sarif_output(result, [source, literal], verbose=True))["runs"][0]
+    properties = run["results"][0]["properties"]
+    assert properties["source"] == properties["model"]["source"] == run["invocations"][0]["arguments"][0]
+    assert properties["source"] != literal
+    assert calls == ["model"]
+
+
+@pytest.mark.parametrize("variant", ["posix", "cwd-relative", "percent-escaped", "surrogate-backslash"])
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("repeat", [False, True])
+def test_sarif_oversized_aliases_reserve_normalized_literal_uris(
+    variant: str, reverse: bool, repeat: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from urllib.parse import unquote
+
+    from modelaudit.integrations.source_serialization import serialize_source_identifier
+
+    monkeypatch.chdir(tmp_path)
+    if variant == "cwd-relative":
+        source = str(tmp_path / "model.pkl") + "x" * (256 * 1024)
+    elif variant == "surrogate-backslash":
+        source = "stream://https://bucket.s3.amazonaws.com/model-\udcff.pkl?token=" + "x" * (256 * 1024)
+    else:
+        name = "model%2Fpart%25.pkl" if variant == "percent-escaped" else "model.pkl"
+        source = f"stream://https://bucket.s3.amazonaws.com/{name}?token=" + "x" * (256 * 1024)
+    marker = serialize_source_identifier(source)
+    if variant == "cwd-relative":
+        literal = (tmp_path / marker).as_posix()
+    elif variant == "percent-escaped":
+        literal = unquote(_normalize_path_to_uri(marker))
+    else:
+        literal = Path(marker).as_posix()
+    assert marker != literal
+    assert _normalize_path_to_uri(marker) == _normalize_path_to_uri(literal)
+
+    paths = [source, literal, literal + "#2"]
+    if reverse:
+        paths.reverse()
+    if repeat:
+        paths += paths
+    result = create_initial_audit_result()
+    result.assets = [AssetModel(path=path, type="pickle") for path in paths]
+    hashes = {path: hashlib.sha256(path.encode(errors="surrogatepass")).hexdigest() for path in paths}
+    result.file_metadata = {path: FileMetadataModel(file_hashes=FileHashesModel(sha256=hashes[path])) for path in paths}
+    risks = {path: index for index, path in enumerate(dict.fromkeys(paths))}
+    result.issues = [
+        Issue(
+            message=f"Finding {index}",
+            location=path,
+            details={"source": path, path: "evidence", "risk_score": risks[path]},
+        )
+        for index, path in enumerate(paths)
+    ]
+    run = json.loads(format_sarif_output(result, paths, verbose=True))["runs"][0]
+    arguments = run["invocations"][0]["arguments"]
+    artifacts = [artifact["location"]["uri"] for artifact in run["artifacts"]]
+    locations = [finding["locations"][0]["physicalLocation"]["artifactLocation"]["uri"] for finding in run["results"]]
+    assert len(set(artifacts)) == 3
+    assert locations == artifacts
+    assert len(set(arguments)) == 3
+    assert [artifact["hashes"]["sha-256"] for artifact in run["artifacts"]] == [hashes[path] for path in paths]
+    assert [finding["properties"]["risk_score"] for finding in run["results"]] == [risks[path] for path in paths]
+    assert arguments[paths.index(literal)] == literal
+    assert arguments[paths.index(literal + "#2")] == literal + "#2"
+    assert arguments[paths.index(source)] == marker + "#3"
+    for argument, finding in zip(arguments, run["results"], strict=True):
+        assert finding["properties"]["source"] == argument
+        assert finding["properties"][argument] == "evidence"
+    if repeat:
+        assert artifacts[:3] == artifacts[3:]
+
+    saved = ModelAuditResultModel.model_validate_json(
+        _format_scan_output(result, paths, output_format="json", verbose=True)
+    )
+    restored = json.loads(format_sarif_output(saved, [], verbose=True))["runs"][0]
+    assert [artifact["location"]["uri"] for artifact in restored["artifacts"]] == artifacts
+    assert restored["artifacts"] == run["artifacts"]
+    assert [
+        finding["locations"][0]["physicalLocation"]["artifactLocation"]["uri"] for finding in restored["results"]
+    ] == locations
+    assert [finding["properties"] for finding in restored["results"]] == [
+        finding["properties"] for finding in run["results"]
+    ]
+
+
+def test_sarif_preserves_ordinary_path_normalization_equivalences(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    paths = ["models//model.pkl", "models/model.pkl", str(tmp_path / "models/model.pkl")]
+    result = create_initial_audit_result()
+    result.assets = [AssetModel(path=path, type="pickle") for path in paths]
+    run = json.loads(format_sarif_output(result, paths, verbose=True))["runs"][0]
+    assert run["invocations"][0]["arguments"] == paths
+    assert len({artifact["location"]["uri"] for artifact in run["artifacts"]}) == 1
+
+
+def test_sarif_uri_collision_checks_do_not_change_json_source_allocation() -> None:
+    from modelaudit.integrations.source_serialization import serialize_source_identifier, serialize_source_value
+
+    source = "stream://https://bucket.s3.amazonaws.com/model.pkl?token=" + "x" * (256 * 1024)
+    marker = serialize_source_identifier(source)
+    literal = Path(marker).as_posix()
+    value = {"paths": [source, literal], "metadata": {source: {"source": source}, literal: {"source": literal}}}
+    saved = serialize_source_value(value)
+    assert saved["paths"] == [marker, literal]
+    assert set(saved["metadata"]) == {marker, literal}
+    assert all(saved["metadata"][path]["source"] == path for path in saved["paths"])
+
+
+def test_sarif_oversized_asset_uri_cannot_alias_surrogate_backslash_spelling() -> None:
+    from modelaudit.integrations.source_serialization import serialize_source_identifier
+
+    source = "model-\udcff.pkl" + "x" * (256 * 1024)
+    digest = hashlib.sha256(source.encode(errors="surrogatepass")).hexdigest()
+    literal = f"modelaudit-source:{source[:256]}...<source sha256:{digest}>".replace("\udcff", r"\udcff")
+    marker = serialize_source_identifier(source)
+    assert _normalize_path_to_uri(marker) == _normalize_path_to_uri(literal)
+    result = create_initial_audit_result()
+    result.assets = [AssetModel(path=path, type="pickle") for path in [source, literal]]
+    run = json.loads(format_sarif_output(result, [], verbose=True))["runs"][0]
+    uris = [artifact["location"]["uri"] for artifact in run["artifacts"]]
+    assert len(set(uris)) == 2
+    assert uris[1] == _normalize_path_to_uri(literal)
+    assert all(uri.isascii() for uri in uris)
+    saved = ModelAuditResultModel.model_validate_json(
+        _format_scan_output(result, [], output_format="json", verbose=True)
+    )
+    restored = json.loads(format_sarif_output(saved, [], verbose=True))["runs"][0]
+    assert restored["artifacts"] == run["artifacts"]
+
+
+def test_bounded_source_preview_preserves_unicode_and_hashes_original_surrogates() -> None:
+    from modelaudit.integrations.source_serialization import serialize_source_identifier
+
+    prefix = "模型\U0001f600\ud800\udcff"
+    source = prefix + "x" * (256 * 1024)
+    bounded = serialize_source_identifier(source)
+    assert bounded.startswith("modelaudit-source:模型\U0001f600\\ud800\\udcff")
+    assert hashlib.sha256(source.encode(errors="surrogatepass")).hexdigest() in bounded
+    assert len(bounded) < 256 * 1024
+    assert serialize_source_identifier(prefix) == prefix
+
+
+def test_source_serialization_skips_identifier_callback_without_oversized_values() -> None:
+    from modelaudit.integrations.source_serialization import serialize_source_values
+
+    callback = Mock(side_effect=AssertionError("ordinary strings need no identifier allocation"))
+    values = [{"source": "models//model.pkl"}, ["models/model.pkl"]]
+    assert serialize_source_values(values, identifier_key=callback) == values
+    callback.assert_not_called()
+
+
+def test_sarif_oversized_properties_without_sources_do_not_normalize_paths(monkeypatch: pytest.MonkeyPatch) -> None:
+    def unavailable_cwd() -> Path:
+        raise FileNotFoundError("the working directory was removed")
+
+    monkeypatch.setattr(Path, "cwd", unavailable_cwd)
+    result = create_initial_audit_result()
+    result.issues = [Issue(message="Finding", details={"evidence": "x" * (256 * 1024 + 1)})]
+    findings = _create_results(result.issues)
+    assert len(findings[0]["properties"]["evidence"]) < 256 * 1024
+    assert findings[0]["locations"] == []
+    assert _format_scan_output(result, [], output_format="json", verbose=True)
+
+
+@pytest.mark.parametrize("error_type", [FileNotFoundError, PermissionError])
+def test_json_oversized_sources_do_not_require_working_directory(
+    monkeypatch: pytest.MonkeyPatch, error_type: type[OSError]
+) -> None:
+    source = "stream://https://bucket.s3.amazonaws.com/model.pkl?token=" + "x" * (256 * 1024)
+    result = create_initial_audit_result()
+    result.assets = [AssetModel(path=source, type="pickle")]
+    result.issues = [Issue(message="Finding", location=source, severity=IssueSeverity.WARNING)]
+    unavailable_cwd = Mock(side_effect=error_type("working directory unavailable"))
+    monkeypatch.setattr(Path, "cwd", unavailable_cwd)
+
+    saved = json.loads(_format_scan_output(result, [], output_format="json", verbose=True))
+    assert len(saved["assets"]) == len(saved["issues"]) == 1
+    assert len(saved["assets"][0]["path"]) < 256 * 1024
+    assert saved["issues"][0]["message"] == "Finding"
+
+    with pytest.raises(error_type, match="working directory unavailable"):
+        format_sarif_output(result, [source], verbose=True)
+
+
+def test_json_without_working_directory_reserves_uri_equivalent_source_aliases(monkeypatch: pytest.MonkeyPatch) -> None:
+    source = "stream://https://bucket.s3.amazonaws.com/model.pkl?token=" + "x" * (256 * 1024)
+    marker = f"modelaudit-source:{source[:256]}...<source sha256:{hashlib.sha256(source.encode()).hexdigest()}>"
+    literal = Path(marker).as_posix()
+    result = create_initial_audit_result()
+    result.assets = [AssetModel(path=path, type="pickle") for path in [source, literal]]
+    result.issues = [Issue(message="Finding", location=path, details={"source": path}) for path in [source, literal]]
+    with monkeypatch.context() as context:
+        context.setattr(Path, "cwd", Mock(side_effect=FileNotFoundError("working directory unavailable")))
+        output = _format_scan_output(result, [], output_format="json", verbose=True)
+
+    saved = ModelAuditResultModel.model_validate_json(output)
+    run = json.loads(format_sarif_output(saved, [], verbose=True))["runs"][0]
+    uris = [artifact["location"]["uri"] for artifact in run["artifacts"]]
+    assert len(set(uris)) == 2
+    assert [
+        finding["locations"][0]["physicalLocation"]["artifactLocation"]["uri"] for finding in run["results"]
+    ] == uris
+    assert [finding["properties"]["source"] for finding in run["results"]] == [asset.path for asset in saved.assets]
+
+
+@pytest.mark.parametrize("unavailable", [False, True])
+@pytest.mark.parametrize("change_directory", [False, True])
+def test_saved_source_uris_remain_distinct_across_working_directories(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, unavailable: bool, change_directory: bool
+) -> None:
+    from modelaudit.integrations.source_serialization import serialize_source_identifier
+
+    export_dir = tmp_path / "export"
+    render_dir = tmp_path / "render" if change_directory else export_dir
+    export_dir.mkdir()
+    render_dir.mkdir(exist_ok=True)
+    monkeypatch.chdir(export_dir)
+    source = str(export_dir / "model.pkl") + "x" * (256 * 1024)
+    marker = serialize_source_identifier(source)
+    literal = (render_dir / marker).as_posix()
+    result = create_initial_audit_result()
+    paths = [source, literal]
+    hashes = {path: hashlib.sha256(path.encode()).hexdigest() for path in paths}
+    result.assets = [AssetModel(path=path, type="pickle") for path in paths]
+    result.file_metadata = {path: FileMetadataModel(file_hashes=FileHashesModel(sha256=hashes[path])) for path in paths}
+    result.issues = [
+        Issue(message=f"Finding {index}", location=path, details={"source": path, "risk_score": index})
+        for index, path in enumerate(paths)
+    ]
+    with monkeypatch.context() as context:
+        if unavailable:
+            context.setattr(Path, "cwd", Mock(side_effect=FileNotFoundError("working directory unavailable")))
+        output = _format_scan_output(result, [], output_format="json", verbose=True)
+    monkeypatch.chdir(render_dir)
+    saved = ModelAuditResultModel.model_validate_json(output)
+    run = json.loads(format_sarif_output(saved, [], verbose=True))["runs"][0]
+    uris = [artifact["location"]["uri"] for artifact in run["artifacts"]]
+    assert len(set(uris)) == 2
+    assert [artifact["hashes"]["sha-256"] for artifact in run["artifacts"]] == [hashes[path] for path in paths]
+    assert [finding["properties"]["risk_score"] for finding in run["results"]] == [0, 1]
+    assert [
+        finding["locations"][0]["physicalLocation"]["artifactLocation"]["uri"] for finding in run["results"]
+    ] == uris
+    assert [finding["properties"]["source"] for finding in run["results"]] == [asset.path for asset in saved.assets]
+
+
+def test_saved_absolute_source_and_relative_literal_survive_missing_working_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    source = str(tmp_path / "model.pkl") + "x" * (256 * 1024)
+    old_marker = f"{source[:256]}...<source sha256:{hashlib.sha256(source.encode()).hexdigest()}>"
+    literal = Path(old_marker).relative_to(tmp_path).as_posix()
+    result = create_initial_audit_result()
+    result.assets = [AssetModel(path=path, type="pickle") for path in [source, literal]]
+    result.issues = [Issue(message="Finding", location=path) for path in [source, literal]]
+    with monkeypatch.context() as context:
+        context.setattr(Path, "cwd", Mock(side_effect=FileNotFoundError("working directory unavailable")))
+        output = _format_scan_output(result, [], output_format="json", verbose=True)
+    saved = ModelAuditResultModel.model_validate_json(output)
+    run = json.loads(format_sarif_output(saved, [], verbose=True))["runs"][0]
+    assert len({artifact["location"]["uri"] for artifact in run["artifacts"]}) == 2
+
+
+def test_generated_source_cannot_render_as_working_directory_dot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from modelaudit.integrations.source_serialization import serialize_source_identifier
+
+    source = str(tmp_path / ("a" * 60) / ("b" * 60) / "model.pkl") + "x" * (256 * 1024)
+    marker = serialize_source_identifier(source)
+    # Simulate the absolute cwd that an absolute-capable generated identifier could equal.
+    cwd = Path(marker) if Path(marker).is_absolute() else tmp_path / marker
+    monkeypatch.setattr(Path, "cwd", lambda: cwd)
+    result = create_initial_audit_result()
+    result.assets = [AssetModel(path=path, type="pickle") for path in [source, "."]]
+    result.issues = [Issue(message="Finding", location=path) for path in [source, "."]]
+    for current in [
+        result,
+        ModelAuditResultModel.model_validate_json(_format_scan_output(result, [], output_format="json", verbose=True)),
+    ]:
+        run = json.loads(format_sarif_output(current, [], verbose=True))["runs"][0]
+        uris = [artifact["location"]["uri"] for artifact in run["artifacts"]]
+        assert len(set(uris)) == 2
+        assert uris[0] != "." and uris[1] == "."
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "/tmp/model.pkl",
+        "relative/model.pkl",
+        "./model.pkl",
+        "../model.pkl",
+        "//server/share/model.pkl",
+        r"C:\models\model.pkl",
+        r"C:model.pkl",
+        r"\models\model.pkl",
+        r"\\server\share\model.pkl",
+        r"\\?\C:\models\model.pkl",
+        r"\\.\device\model.pkl",
+        "stream://https://bucket.test/model.pkl",
+        "模型/\udcff.pkl",
+    ],
+)
+def test_generated_identifiers_are_unanchored_for_posix_and_windows(
+    prefix: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pathlib import PurePosixPath, PureWindowsPath
+    from urllib.parse import quote
+
+    from modelaudit.integrations.source_serialization import serialize_source_identifier
+
+    marker = serialize_source_identifier(prefix + "x" * (256 * 1024))
+    assert marker.startswith("modelaudit-source:")
+    for path_type, root in [(PurePosixPath, "/workspace"), (PureWindowsPath, "C:/workspace")]:
+        path = path_type(marker)
+        assert not path.is_absolute()
+        assert not path.drive and not path.root and not path.anchor
+        assert path.name and path.as_posix() != "."
+        absolute_literal = path_type(root) / path
+        with monkeypatch.context() as context:
+            context.setattr(sarif_formatter, "Path", path_type)
+            assert sarif_formatter._source_identifier_comparison_key(str(path)) == quote(
+                absolute_literal.name, safe="/", errors="backslashreplace"
+            )
+        assert absolute_literal.relative_to(path_type(root)).name == path.name

@@ -14,6 +14,7 @@ ModelAudit is a static security scanner for model artifacts. It analyzes files a
 - It does not prove a model is safe. A clean scan means "no known indicators were found," not "risk is zero."
 - It does not execute model behavior, so runtime-only backdoors and environment-triggered logic may not be visible.
 - It does not replace environment hardening (sandboxing, network controls, least privilege, egress controls).
+- It does not redact or mask local evidence, reports, diagnostics, logs, or cache metadata, including secrets and credentials. Raw output is intentional; see the [security policy](../../SECURITY.md#raw-local-output-no-redaction).
 - Coverage depends on file format support and installed optional dependencies.
 
 ## Operational assumptions

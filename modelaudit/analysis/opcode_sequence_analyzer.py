@@ -6,7 +6,7 @@ malicious operations.
 """
 
 import logging
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass
 from typing import Any
 
@@ -297,18 +297,10 @@ class OpcodeSequenceAnalyzer:
             return {"patterns_detected": 0, "max_severity": "info", "summary": "No dangerous opcode sequences detected"}
 
         # Group by severity
-        severity_counts: dict[str, int] = {}
-        for result in self.detected_patterns:
-            severity = result.severity
-            severity_counts[severity] = severity_counts.get(severity, 0) + 1
+        severity_counts = dict(Counter(result.severity for result in self.detected_patterns))
 
         # Determine max severity
-        severity_order = ["critical", "warning", "info"]
-        max_severity = "info"
-        for severity in severity_order:
-            if severity in severity_counts:
-                max_severity = severity
-                break
+        max_severity = next((level for level in ("critical", "warning", "info") if level in severity_counts), "info")
 
         return {
             "patterns_detected": len(self.detected_patterns),

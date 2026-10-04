@@ -20,6 +20,7 @@ from urllib.parse import urlparse, urlunparse
 
 from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
 from ..utils import is_absolute_archive_path, is_critical_system_path, sanitize_archive_path
+from ..utils.file.detection import _normalize_archive_member_name
 from ..utils.helpers.assets import asset_from_scan_result
 from ._archive_locations import rewrite_extracted_member_location
 from .archive_member_security import (
@@ -32,7 +33,7 @@ from .archive_member_security import (
     executable_archive_member_rule_code,
     high_risk_python_calls_in_tree,
 )
-from .base import BaseScanner, IssueSeverity, ScanResult
+from .base import BaseScanner, IssueSeverity, ScanResult, _scanner_int_config
 
 CRITICAL_SYSTEM_PATHS = [
     "/etc",
@@ -228,23 +229,11 @@ class TorchServeMarScanner(BaseScanner):
         )
         self.max_depth = self._get_int_config("max_mar_depth", self.DEFAULT_MAX_DEPTH, minimum=1)
 
-    def _get_int_config(self, key: str, default: int, minimum: int = 0) -> int:
-        """Return an integer config value with bounds and safe fallback."""
-        raw_value = self.config.get(key, default)
-        try:
-            parsed = int(raw_value)
-        except (TypeError, ValueError):
-            parsed = default
-        return max(parsed, minimum)
+    _get_int_config = _scanner_int_config
 
     @classmethod
     def _normalize_member_name(cls, member_name: str) -> str:
-        normalized = member_name.replace("\\", "/").strip()
-        while normalized.startswith("./"):
-            normalized = normalized[2:]
-        normalized = normalized.lstrip("/")
-        normalized = re.sub(r"/+", "/", normalized)
-        return str(PurePosixPath(normalized))
+        return _normalize_archive_member_name(member_name)
 
     @classmethod
     def _member_name_set(cls, archive: zipfile.ZipFile) -> set[str]:
@@ -1459,17 +1448,6 @@ class TorchServeMarScanner(BaseScanner):
                 },
             )
 
-    def _collect_import_aliases(self, tree: ast.AST) -> dict[str, str]:
-        aliases: dict[str, str] = {}
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                for alias in node.names:
-                    aliases[alias.asname or alias.name] = alias.name
-            elif isinstance(node, ast.ImportFrom) and node.module:
-                for alias in node.names:
-                    aliases[alias.asname or alias.name] = f"{node.module}.{alias.name}"
-        return aliases
-
     def _resolve_call_name(self, node: ast.AST) -> str | None:
         if isinstance(node, ast.Name):
             return node.id
@@ -2436,7 +2414,6 @@ class TorchServeMarScanner(BaseScanner):
                 self.risky_calls: set[str] = set()
                 self.collecting_module_bindings = False
                 self.collecting_class_attribute_bindings = False
-                self.scope_depth = 0
                 self.module_binding_state: _DynamicAliasState | None = None
                 self.postponed_annotations = isinstance(tree, ast.Module) and any(
                     isinstance(statement, ast.ImportFrom)
@@ -2657,7 +2634,6 @@ class TorchServeMarScanner(BaseScanner):
                 self.scope_kind_stack.append(scope_kind)
                 self.local_binding_name_stack.append(set(parameters))
                 self.function_definition_stack.append(dict(state[9]))
-                self.scope_depth += 1
                 for parameter in parameters:
                     self._invalidate_name(parameter)
 
@@ -2743,7 +2719,6 @@ class TorchServeMarScanner(BaseScanner):
                 self.scope_kind_stack.pop()
                 self.local_binding_name_stack.pop()
                 self.function_definition_stack.pop()
-                self.scope_depth -= 1
 
             @staticmethod
             def _parameter_names(args: ast.arguments) -> set[str]:
@@ -3768,33 +3743,23 @@ class TorchServeMarScanner(BaseScanner):
                         for target in deletion.targets:
                             self._record_target(target)
 
-                    def visit_For(self, loop: ast.For) -> None:
-                        self._record_target(loop.target)
-                        self.visit(loop.iter)
-                        for statement in [*loop.body, *loop.orelse]:
+                    def visit_For(self, node: ast.For | ast.AsyncFor) -> None:
+                        self._record_target(node.target)
+                        self.visit(node.iter)
+                        for statement in [*node.body, *node.orelse]:
                             self.visit(statement)
 
-                    def visit_AsyncFor(self, loop: ast.AsyncFor) -> None:
-                        self._record_target(loop.target)
-                        self.visit(loop.iter)
-                        for statement in [*loop.body, *loop.orelse]:
-                            self.visit(statement)
+                    visit_AsyncFor = visit_For
 
-                    def visit_With(self, with_node: ast.With) -> None:
-                        for item in with_node.items:
+                    def visit_With(self, node: ast.With | ast.AsyncWith) -> None:
+                        for item in node.items:
                             self.visit(item.context_expr)
                             if item.optional_vars is not None:
                                 self._record_target(item.optional_vars)
-                        for statement in with_node.body:
+                        for statement in node.body:
                             self.visit(statement)
 
-                    def visit_AsyncWith(self, with_node: ast.AsyncWith) -> None:
-                        for item in with_node.items:
-                            self.visit(item.context_expr)
-                            if item.optional_vars is not None:
-                                self._record_target(item.optional_vars)
-                        for statement in with_node.body:
-                            self.visit(statement)
+                    visit_AsyncWith = visit_With
 
                     def visit_FunctionDef(self, function: ast.FunctionDef) -> None:
                         return

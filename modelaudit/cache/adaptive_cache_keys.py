@@ -92,26 +92,21 @@ class AdaptiveCacheKeyGenerator:
         cache_key = f"fp_{file_path}"
         current_time = time.time()
 
+        use_cached_fingerprint = False
         if cache_key in self.fingerprint_cache:
             fingerprint, cached_time = self.fingerprint_cache[cache_key]
             if current_time - cached_time < self.cache_expiry:
                 # Use cached fingerprint - avoid redundant stat calls
-                if self._should_use_content_hash(fingerprint.size):
-                    secure_key = fingerprint.secure_key(file_path, self.hasher)
-                    return str(secure_key)
-                else:
-                    quick_key = fingerprint.quick_key()
-                    return str(quick_key)
+                use_cached_fingerprint = True
 
-        # Create new fingerprint
-        fingerprint = FileFingerprint.from_path(file_path)
+        if not use_cached_fingerprint:
+            # Create and briefly cache a fingerprint for potential reuse.
+            fingerprint = FileFingerprint.from_path(file_path)
+            self.fingerprint_cache[cache_key] = (fingerprint, current_time)
 
-        # Cache briefly for potential reuse
-        self.fingerprint_cache[cache_key] = (fingerprint, current_time)
-
-        # Clean old cache entries periodically
-        if len(self.fingerprint_cache) > 100:
-            self._cleanup_fingerprint_cache(current_time)
+            # Clean old cache entries periodically
+            if len(self.fingerprint_cache) > 100:
+                self._cleanup_fingerprint_cache(current_time)
 
         # Generate appropriate key type
         if self._should_use_content_hash(fingerprint.size):

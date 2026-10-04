@@ -350,15 +350,7 @@ class GgufScanner(BaseScanner):
     @staticmethod
     def _mark_inconclusive(result: ScanResult, reason: str) -> None:
         """Mark malformed GGUF/GGML framing as an explicit inconclusive scan."""
-        result.metadata["analysis_incomplete"] = True
-        result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
-
-        reasons = result.metadata.get("scan_outcome_reasons")
-        if not isinstance(reasons, list):
-            reasons = []
-            result.metadata["scan_outcome_reasons"] = reasons
-        if reason not in reasons:
-            reasons.append(reason)
+        BaseScanner._mark_inconclusive_metadata_first(result, reason, INCONCLUSIVE_SCAN_OUTCOME)
 
     @staticmethod
     def _has_security_findings(result: ScanResult) -> bool:
@@ -1515,15 +1507,6 @@ class GgufScanner(BaseScanner):
         return cls._text_contains_only_documentation_reference_urls(text)
 
     @staticmethod
-    def _remote_urls_in_text(text: str) -> tuple[str, ...]:
-        urls: list[str] = []
-        for match in _GGUF_REMOTE_URL_PATTERN.finditer(text):
-            urls.append(match.group(0).rstrip(".,;:"))
-            if len(urls) >= 64:
-                break
-        return tuple(urls)
-
-    @staticmethod
     def _is_documentation_reference_url(url: str) -> bool:
         _scheme, separator, remainder = url.lower().partition("://")
         if not separator:
@@ -2055,11 +2038,6 @@ class GgufScanner(BaseScanner):
                 if depth == 0:
                     return value[open_position : index + 1]
         return value[open_position:end_limit]
-
-    @classmethod
-    def _api_argument_window_has_remote_url(cls, value: str, after_position: int) -> bool:
-        argument_window = cls._api_argument_window(value, after_position)
-        return argument_window is not None and cls._has_remote_url(argument_window)
 
     @staticmethod
     def _remote_url_variable_assignments(value: str) -> _GgufRemoteUrlAssignments:

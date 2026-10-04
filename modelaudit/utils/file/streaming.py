@@ -12,10 +12,10 @@ import click
 if TYPE_CHECKING:
     from modelaudit.scanner_results import ScanResult
     from modelaudit.scanners.base import BaseScanner
+from modelaudit.utils.helpers.evidence import format_terminal_text
 from modelaudit.utils.sources.cloud_storage import (
     get_cloud_filesystem_config,
     get_fs_protocol,
-    redact_cloud_error_for_display,
 )
 
 from .detection import _has_zip_magic
@@ -278,23 +278,18 @@ def stream_analyze_file(
             scan_result = None
 
         if scan_result is None:
-            partial_methods = [
-                ("scan_stream", True),
-                ("scan_bytes", False),
-                ("scan_fileobj", False),
-            ]
-            for method_name, needs_size in partial_methods:
+            for method_name in ("scan_stream", "scan_bytes", "scan_fileobj"):
                 if hasattr(scanner, method_name):
                     method = getattr(scanner, method_name)
                     try:
                         temp_file.seek(0)
-                        if method_name == "scan_stream" and needs_size:
+                        if method_name == "scan_stream":
                             if _scan_stream_accepts_source_keyword(method):
                                 scan_result = method(temp_file, bytes_read, source=url)
                             else:
                                 scan_result = method(temp_file, bytes_read)
                         else:
-                            scan_result = method(temp_file, bytes_to_read) if needs_size else method(temp_file)
+                            scan_result = method(temp_file)
                         break
                     except Exception:
                         scan_result = None
@@ -422,7 +417,7 @@ def stream_analyze_file(
         try:
             ctx = click.get_current_context(silent=True)
             if ctx and ctx.params.get("verbose"):
-                click.echo(f"Streaming analysis failed: {redact_cloud_error_for_display(e, url)}")
+                click.echo(f"Streaming analysis failed: {format_terminal_text(str(e))}")
         except Exception:
             # Not in a Click context, just log silently
             pass

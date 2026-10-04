@@ -10,9 +10,18 @@ from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any
 
-from modelaudit.models import ModelAuditResultModel
+from modelaudit.finding_identity import finding_identity, preserve_finding_identity
+from modelaudit.models import (
+    ModelAuditResultModel,
+    _details_have_incomplete_coverage,
+    _metadata_has_coverage_only_operational_error,
+    _metadata_has_incomplete_coverage,
+    _metadata_value,
+    _normalized_enum_value,
+    _record_has_incomplete_coverage,
+    _record_has_security_severity,
+)
 from modelaudit.scanner_results import (
-    INCONCLUSIVE_SCAN_OUTCOME,
     Check,
     Issue,
     IssueSeverity,
@@ -31,13 +40,6 @@ ANALYSIS_INCOMPLETE_METADATA_KEY = "analysis_incomplete"
 SCAN_OUTCOME_METADATA_KEY = "scan_outcome"
 SCAN_OUTCOME_REASON_METADATA_KEY = "scan_outcome_reason"
 SCAN_OUTCOME_REASONS_METADATA_KEY = "scan_outcome_reasons"
-_COVERAGE_ONLY_OPERATIONAL_ERROR_REASONS = frozenset({"recognized_format_scanner_unavailable"})
-_COVERAGE_ONLY_OPERATIONAL_ERROR_SUFFIXES = ("_routing_incomplete",)
-_RUNTIME_VERSION_SKIP_DETAILS = {
-    "runtime_version_known": False,
-    "runtime_cve_applicability": "unknown",
-    "runtime_cve_version_gate": "local_environment_only",
-}
 _SHARD_FAMILY_PATH_DETAIL_KEYS = frozenset(
     {
         "duplicate_shards",
@@ -57,35 +59,9 @@ _SHARD_FAMILY_PATH_DETAIL_KEYS = frozenset(
 _SHARD_FAMILY_NESTED_DETAIL_KEYS = frozenset({"details", "findings"})
 
 
-def _metadata_value(metadata: Any, key: str) -> Any:
-    if metadata is None:
-        return None
-    if isinstance(metadata, dict):
-        return metadata.get(key)
-
-    getter = getattr(metadata, "get", None)
-    if callable(getter):
-        try:
-            return getter(key)
-        except Exception:
-            return None
-
-    return getattr(metadata, key, None)
-
-
-def _reason_is_coverage_only_operational_error(reason: str) -> bool:
-    return reason in _COVERAGE_ONLY_OPERATIONAL_ERROR_REASONS or reason.endswith(
-        _COVERAGE_ONLY_OPERATIONAL_ERROR_SUFFIXES
-    )
-
-
 def metadata_has_coverage_only_operational_error(metadata: Any) -> bool:
     """Return True when operational_error marks fail-closed coverage, not a scanner failure."""
-    if _metadata_value(metadata, OPERATIONAL_ERROR_METADATA_KEY) is not True:
-        return False
-
-    operational_reason = _metadata_value(metadata, OPERATIONAL_ERROR_REASON_METADATA_KEY)
-    return isinstance(operational_reason, str) and _reason_is_coverage_only_operational_error(operational_reason)
+    return _metadata_has_coverage_only_operational_error(metadata)
 
 
 def mark_operational_scan_error(scan_result: ScanResult, reason: str) -> None:
@@ -122,79 +98,9 @@ def results_have_operational_error(results: ModelAuditResultModel) -> bool:
     )
 
 
-def _metadata_has_scan_outcome(metadata: Any, outcome: str) -> bool:
-    """Return True when metadata reports the requested scan outcome."""
-    if metadata is None:
-        return False
-    if isinstance(metadata, dict):
-        return metadata.get(SCAN_OUTCOME_METADATA_KEY) == outcome
-
-    getter = getattr(metadata, "get", None)
-    if callable(getter):
-        try:
-            value = getter(SCAN_OUTCOME_METADATA_KEY)
-            return bool(value == outcome)
-        except Exception:
-            return False
-
-    return getattr(metadata, SCAN_OUTCOME_METADATA_KEY, None) == outcome
-
-
 def metadata_has_incomplete_coverage(metadata: Any, *, allow_bare_analysis_incomplete: bool = True) -> bool:
     """Return True when metadata identifies incomplete scan coverage."""
-    if _metadata_has_scan_outcome(metadata, INCONCLUSIVE_SCAN_OUTCOME):
-        return True
-    if allow_bare_analysis_incomplete and _metadata_value(metadata, ANALYSIS_INCOMPLETE_METADATA_KEY) is True:
-        return True
-    reason = _metadata_value(metadata, SCAN_OUTCOME_REASON_METADATA_KEY)
-    if isinstance(reason, str):
-        return bool(reason)
-
-    reasons = _metadata_value(metadata, SCAN_OUTCOME_REASONS_METADATA_KEY)
-    if isinstance(reasons, str):
-        return bool(reasons)
-    if isinstance(reasons, (list, tuple, set, frozenset)):
-        return any(bool(reason) for reason in reasons)
-
-    return False
-
-
-def _metadata_has_scan_outcome_or_reason_marker(metadata: Any) -> bool:
-    if _metadata_has_scan_outcome(metadata, INCONCLUSIVE_SCAN_OUTCOME):
-        return True
-    reason = _metadata_value(metadata, SCAN_OUTCOME_REASON_METADATA_KEY)
-    if isinstance(reason, str):
-        return bool(reason)
-
-    reasons = _metadata_value(metadata, SCAN_OUTCOME_REASONS_METADATA_KEY)
-    if isinstance(reasons, str):
-        return bool(reasons)
-    if isinstance(reasons, (list, tuple, set, frozenset)):
-        return any(bool(reason) for reason in reasons)
-
-    return False
-
-
-def _metadata_has_explicit_incomplete_coverage_marker(metadata: Any) -> bool:
-    """Return True when record details explicitly identify incomplete coverage."""
-    if _metadata_has_scan_outcome_or_reason_marker(metadata):
-        return True
-    return _metadata_value(metadata, ANALYSIS_INCOMPLETE_METADATA_KEY) is True
-
-
-def _record_is_clean_runtime_version_skip(record: Any) -> bool:
-    details = _metadata_value(record, "details")
-    status = _metadata_value(record, "status")
-    status_value = getattr(status, "value", status)
-    if not (
-        isinstance(status_value, str)
-        and status_value.lower().split(".", 1)[-1] == "skipped"
-        and _metadata_value(details, ANALYSIS_INCOMPLETE_METADATA_KEY) is True
-        and not _metadata_has_scan_outcome_or_reason_marker(details)
-    ):
-        return False
-
-    return all(_metadata_value(details, key) == expected for key, expected in _RUNTIME_VERSION_SKIP_DETAILS.items())
+    return _metadata_has_incomplete_coverage(metadata, allow_bare_analysis_incomplete=allow_bare_analysis_incomplete)
 
 
 def details_have_incomplete_coverage(
@@ -204,38 +110,9 @@ def details_have_incomplete_coverage(
     _depth: int = 0,
 ) -> bool:
     """Return True when details or consolidated detail findings identify incomplete coverage."""
-    if allow_bare_analysis_incomplete:
-        if _metadata_has_explicit_incomplete_coverage_marker(details):
-            return True
-    elif _metadata_has_scan_outcome_or_reason_marker(details):
-        return True
-    if _depth >= 4:
-        return False
-
-    findings = _metadata_value(details, "findings")
-    if isinstance(findings, dict):
-        return details_have_incomplete_coverage(
-            findings,
-            allow_bare_analysis_incomplete=allow_bare_analysis_incomplete,
-            _depth=_depth + 1,
-        )
-    if isinstance(findings, (list, tuple, set, frozenset)):
-        for finding in findings:
-            if details_have_incomplete_coverage(
-                finding,
-                allow_bare_analysis_incomplete=allow_bare_analysis_incomplete,
-                _depth=_depth + 1,
-            ):
-                return True
-            nested_details = _metadata_value(finding, "details")
-            if nested_details is not finding and details_have_incomplete_coverage(
-                nested_details,
-                allow_bare_analysis_incomplete=allow_bare_analysis_incomplete,
-                _depth=_depth + 1,
-            ):
-                return True
-
-    return False
+    return _details_have_incomplete_coverage(
+        details, allow_bare_analysis_incomplete=allow_bare_analysis_incomplete, _depth=_depth
+    )
 
 
 def details_match_shard_family_paths(
@@ -268,10 +145,7 @@ def record_details_have_incomplete_coverage(
     allow_skipped_check_exemption: bool = False,
 ) -> bool:
     """Return True when a retained issue/check detail object identifies incomplete coverage."""
-    if allow_skipped_check_exemption and _record_is_clean_runtime_version_skip(record):
-        return False
-    details = _metadata_value(record, "details")
-    return details_have_incomplete_coverage(details)
+    return _record_has_incomplete_coverage(record, allow_skipped_check_exemption=allow_skipped_check_exemption)
 
 
 def _location_matches_file_path(location: str, file_path: str) -> bool:
@@ -465,33 +339,13 @@ def results_have_inconclusive_outcome(results: ModelAuditResultModel) -> bool:
     return records_have_incomplete_coverage(results.checks, allow_skipped_check_exemption=True)
 
 
-def _record_has_security_severity(record: Any) -> bool:
-    severity = _metadata_value(record, "severity")
-    raw_severity = getattr(severity, "value", severity)
-    if not isinstance(raw_severity, str):
-        return False
-    return raw_severity.lower().split(".", 1)[-1] in {
-        IssueSeverity.WARNING.value,
-        IssueSeverity.CRITICAL.value,
-    }
-
-
 def _record_has_critical_severity(record: Any) -> bool:
-    severity = _metadata_value(record, "severity")
-    raw_severity = getattr(severity, "value", severity)
-    if not isinstance(raw_severity, str):
-        return False
-    return raw_severity.lower().split(".", 1)[-1] == IssueSeverity.CRITICAL.value
+    return _normalized_enum_value(_metadata_value(record, "severity")) == IssueSeverity.CRITICAL.value
 
 
 def _record_is_failed_security_check(record: Any) -> bool:
-    status = _metadata_value(record, "status")
-    raw_status = getattr(status, "value", status)
-    return (
-        isinstance(raw_status, str)
-        and raw_status.lower().split(".", 1)[-1] == "failed"
-        and _record_has_security_severity(record)
-    )
+    status = _normalized_enum_value(_metadata_value(record, "status"))
+    return status == "failed" and _record_has_security_severity(record)
 
 
 def results_have_security_findings(results: ModelAuditResultModel) -> bool:
@@ -699,10 +553,11 @@ def _group_checks_by_asset(checks_list: list[Any]) -> dict[tuple[str, str], list
             logger.warning(f"Invalid check format at index {i}, skipping: {type(check)}")
             continue
 
-        check_name = check.get("name", "Unknown Check")
-        location = check.get("location", "")
+        identity = finding_identity(check)
+        check_name = identity.get("name", "Unknown Check")
+        location = identity.get("location", "")
         primary_asset = _extract_primary_asset_from_location(location)
-        details = check.get("details")
+        details = identity.get("details")
         zip_entry_id = details.get("zip_entry_id") if isinstance(details, dict) else None
         zip_entry = details.get("zip_entry") if isinstance(details, dict) else None
 
@@ -782,38 +637,18 @@ def _get_consolidated_timestamp(group_checks: list[dict[str, Any]]) -> float:
     return max(timestamps) if timestamps else time.time()
 
 
-def _update_result_counts(
-    results: ModelAuditResultModel, consolidated_checks: list[dict[str, Any]], original_count: int
-) -> None:
+def _update_result_counts(results: ModelAuditResultModel, original_count: int) -> None:
     """Update aggregate check counts after consolidation."""
-
-    def is_failed_info_or_debug(check):
-        if check.get("status") != "failed":
-            return False
-        severity = check.get("severity", "")
-        return severity in ("info", "debug", IssueSeverity.INFO.value, IssueSeverity.DEBUG.value)
-
-    security_checks = [c for c in consolidated_checks if not is_failed_info_or_debug(c)]
-
-    total_checks = len(security_checks)
-    passed_checks = sum(1 for c in security_checks if c.get("status") == "passed")
-    failed_checks = sum(1 for c in security_checks if c.get("status") == "failed")
+    results._finalize_checks()
+    total_checks = results.total_checks
+    passed_checks = results.passed_checks
+    failed_checks = results.failed_checks
     skipped_checks = total_checks - passed_checks - failed_checks
-
-    info_debug_excluded = len(consolidated_checks) - len(security_checks)
+    info_debug_excluded = len(results.checks) - total_checks
     logger.debug(
         f"Check statistics: {total_checks} total ({info_debug_excluded} INFO/DEBUG excluded), "
         f"{passed_checks} passed, {failed_checks} failed"
     )
-
-    if passed_checks + failed_checks + skipped_checks != total_checks:
-        logger.warning(
-            f"Check count mismatch: {passed_checks}P + {failed_checks}F + {skipped_checks}S != {total_checks}T"
-        )
-
-    results.total_checks = total_checks
-    results.passed_checks = passed_checks
-    results.failed_checks = failed_checks
 
     reduction_count = original_count - total_checks
     logger.debug(f"Check consolidation: {original_count} -> {total_checks} ({reduction_count} duplicates removed)")
@@ -848,15 +683,33 @@ def consolidate_checks(results: ModelAuditResultModel) -> None:
         else:
             consolidated_status = "skipped"
 
+        identity_checks = [finding_identity(check) for check in group_checks]
+        identity_message = _create_consolidated_message(check_name, identity_checks, consolidated_status, failed_count)
+        raw_check_name = group_checks[0].get("name", check_name)
+        message = next(
+            (
+                check["message"]
+                for check, identity in zip(group_checks, identity_checks, strict=True)
+                if identity.get("message") == identity_message
+            ),
+            _create_consolidated_message(raw_check_name, identity_checks, consolidated_status, failed_count),
+        )
         consolidated_check = {
-            "name": check_name,
+            "name": raw_check_name,
             "status": consolidated_status,
-            "message": _create_consolidated_message(check_name, group_checks, consolidated_status, failed_count),
+            "message": message,
             "location": group_checks[0].get("location", primary_asset),
             "details": _collect_consolidated_details(group_checks),
             "timestamp": _get_consolidated_timestamp(group_checks),
         }
 
+        preserve_finding_identity(
+            consolidated_check,
+            "check_consolidation",
+            name=check_name,
+            message=identity_message,
+            location=identity_checks[0].get("location", primary_asset),
+        )
         consolidated_severity, consolidated_why = _extract_failure_context(group_checks)
         if consolidated_severity:
             consolidated_check["severity"] = consolidated_severity
@@ -873,7 +726,7 @@ def consolidate_checks(results: ModelAuditResultModel) -> None:
     from .models import Check
 
     results.checks = [Check(**check) if isinstance(check, dict) else check for check in consolidated_checks]
-    _update_result_counts(results, consolidated_checks, len(checks_list))
+    _update_result_counts(results, len(checks_list))
 
 
 def determine_exit_code(results: ModelAuditResultModel) -> int:
@@ -942,3 +795,11 @@ def merge_scan_result(
                 issue_message=issue.get("message") if isinstance(issue.get("message"), str) else None,
             )
         results.aggregate_scan_result(scan_result)
+
+
+def _merge_inconclusive_owner_result(result: ScanResult, owner_result: ScanResult) -> None:
+    """Merge owner findings while preserving both lists of coverage reasons."""
+    existing_reasons = list(result.metadata.get("scan_outcome_reasons", []))
+    owner_reasons = list(owner_result.metadata.get("scan_outcome_reasons", []))
+    result.merge(owner_result)
+    result.metadata["scan_outcome_reasons"] = list(dict.fromkeys([*owner_reasons, *existing_reasons]))

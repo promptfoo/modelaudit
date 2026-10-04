@@ -4137,6 +4137,7 @@ def test_scan_cache_revalidates_sources_after_nested_importer_cache_population(
     path_entry = str(package_path)
     file_path = _make_cacheable_file(tmp_path, "nested-population.pkl")
     cache = ScanResultsCache(str(tmp_path / "cache"))
+    _scope_cache_ancestor_identity_to_tree(cache, tmp_path, monkeypatch)
     version_context = build_cache_version_context({})
     monkeypatch.delitem(sys.path_importer_cache, path_entry, raising=False)
     if context_kind == "loaded":

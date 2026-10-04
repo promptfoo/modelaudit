@@ -7,72 +7,35 @@ import logging
 import shutil
 import tempfile
 import time
-from collections.abc import Collection, Mapping
+from collections.abc import Collection
 from pathlib import Path
 from typing import Any
 
 from ..models import ModelAuditResultModel
 from ..scanner_selection import SCANNER_SELECTION_CONFIG_KEY
+from ..utils.helpers.evidence import format_terminal_text
 from ..utils.sources.jfrog import (
+    _positive_limit,
     detect_jfrog_target_type,
     download_artifact,
     download_jfrog_folder,
     format_size,
-    redact_jfrog_url_for_display,
 )
 
 logger = logging.getLogger(__name__)
 
 
-def _prepare_download_dir(url: str, cache_dir: str | None) -> tuple[Path, bool]:
+def _prepare_download_dir(url: str, cache_dir: str | None) -> Path:
     """Return an ephemeral per-run staging directory under the configured cache root."""
     if not cache_dir:
-        return Path(tempfile.mkdtemp(prefix="modelaudit_jfrog_")), True
+        return Path(tempfile.mkdtemp(prefix="modelaudit_jfrog_"))
 
     cache_key = hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
     download_root = Path(cache_dir).expanduser() / "jfrog"
     download_root.mkdir(parents=True, exist_ok=True)
     # Use a unique staging directory for this run. ``cache_dir`` controls where
     # temporary downloads live, while scan-result caching is still handled by core.
-    return Path(tempfile.mkdtemp(prefix=f"{cache_key}-", dir=str(download_root))), True
-
-
-def _positive_limit(*limits: int | None) -> int | None:
-    positive_limits = [limit for limit in limits if limit is not None and limit > 0]
-    return min(positive_limits) if positive_limits else None
-
-
-def _known_file_size(target_info: Mapping[str, Any]) -> int | None:
-    if target_info.get("size_known") is False:
-        return None
-    size = target_info.get("size")
-    if isinstance(size, bool):
-        return None
-    if isinstance(size, int) and size >= 0:
-        return size
-    return None
-
-
-def _require_known_file_size_within_limit(
-    target_info: Mapping[str, Any],
-    *,
-    limit: int | None,
-    display_url: str,
-) -> None:
-    if limit is None:
-        return
-
-    size = _known_file_size(target_info)
-    if size is None:
-        raise ValueError(
-            f"Cannot verify JFrog artifact size for {display_url}; refusing to download with maximum allowed size "
-            f"{format_size(limit)}"
-        )
-    if size > limit:
-        raise ValueError(
-            f"JFrog artifact size ({format_size(size)}) exceeds maximum allowed size ({format_size(limit)}) "
-            f"for {display_url}"
-        )
+    return Path(tempfile.mkdtemp(prefix=f"{cache_key}-", dir=str(download_root)))
 
 
 def scan_jfrog_artifact(
@@ -138,17 +101,17 @@ def scan_jfrog_artifact(
         ... )
     """
 
-    scan_kwargs = kwargs.copy()
-    cache_enabled = scan_kwargs.pop("cache_enabled", True)
-    raw_cache_dir = scan_kwargs.pop("cache_dir", None)
+    cache_enabled = kwargs.pop("cache_enabled", True)
+    raw_cache_dir = kwargs.pop("cache_dir", None)
     scan_cache_dir = str(Path(raw_cache_dir).expanduser()) if cache_enabled and raw_cache_dir else None
-    download_dir, cleanup_download_dir = _prepare_download_dir(url, scan_cache_dir)
+    download_dir = _prepare_download_dir(url, scan_cache_dir)
     start_time = time.time()
-    display_url = redact_jfrog_url_for_display(url)
+    display_url = url
+    log_url = format_terminal_text(url)
 
     try:
         # Detect if URL points to a file or folder
-        logger.debug(f"Analyzing JFrog target {display_url}")
+        logger.debug(f"Analyzing JFrog target {log_url}")
         target_info = detect_jfrog_target_type(
             url,
             api_token=api_token,
@@ -158,8 +121,23 @@ def scan_jfrog_artifact(
 
         if target_info["type"] == "file":
             file_download_limit = _positive_limit(max_download_size, max_file_size, max_total_size)
-            _require_known_file_size_within_limit(target_info, limit=file_download_limit, display_url=display_url)
-            logger.debug(f"Downloading JFrog file {display_url} to {download_dir}")
+            if file_download_limit is not None:
+                size = None if target_info.get("size_known") is False else target_info.get("size")
+                if isinstance(size, bool) or not (isinstance(size, int) and size >= 0):
+                    size = None
+                if size is None:
+                    raise ValueError(
+                        f"Cannot verify JFrog artifact size for {display_url}; refusing to download with maximum "
+                        f"allowed size {format_size(file_download_limit)}"
+                    )
+                if size > file_download_limit:
+                    raise ValueError(
+                        f"JFrog artifact size ({format_size(size)}) exceeds maximum allowed size "
+                        f"({format_size(file_download_limit)}) for {display_url}"
+                    )
+                # Release metadata temporaries before the download begins.
+                del size
+            logger.debug(f"Downloading JFrog file {log_url} to {download_dir}")
             download_path = download_artifact(
                 url,
                 cache_dir=download_dir,
@@ -169,13 +147,13 @@ def scan_jfrog_artifact(
                 max_size=file_download_limit,
             )
         else:
-            logger.debug(f"Downloading JFrog folder {display_url} to {download_dir}")
+            logger.debug(f"Downloading JFrog folder {log_url} to {download_dir}")
             folder_download_kwargs: dict[str, Any] = {}
             if scannable_extensions is not None:
                 folder_download_kwargs["scannable_extensions"] = scannable_extensions
             if scannable_filenames is not None:
                 folder_download_kwargs["scannable_filenames"] = scannable_filenames
-            scanner_selection = scan_kwargs.get(SCANNER_SELECTION_CONFIG_KEY)
+            scanner_selection = kwargs.get(SCANNER_SELECTION_CONFIG_KEY)
             if isinstance(scanner_selection, dict):
                 folder_download_kwargs["scanner_selection"] = scanner_selection
             download_path = download_jfrog_folder(
@@ -210,7 +188,7 @@ def scan_jfrog_artifact(
             max_file_size=max_file_size,
             max_total_size=max_total_size,
             **cache_config,
-            **scan_kwargs,
+            **kwargs,
         )
 
         # Add metadata about the JFrog source
@@ -227,5 +205,4 @@ def scan_jfrog_artifact(
 
         return result
     finally:
-        if cleanup_download_dir:
-            shutil.rmtree(download_dir, ignore_errors=True)
+        shutil.rmtree(download_dir, ignore_errors=True)

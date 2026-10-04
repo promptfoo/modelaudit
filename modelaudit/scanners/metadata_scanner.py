@@ -29,10 +29,6 @@ _METADATA_TIMEOUT_REASON = "scan_timeout"
 _REDACTED_SECRET_PREVIEW = "<redacted>"
 
 
-def _redact_url_for_display(url: str) -> str:
-    return redact_url_for_finding(url)
-
-
 class MetadataScanner(BaseScanner):
     """Scanner for model documentation files looking for security issues."""
 
@@ -224,7 +220,7 @@ class MetadataScanner(BaseScanner):
             if matched_domain is None:
                 continue
 
-            safe_url = _redact_url_for_display(url)
+            safe_url = redact_url_for_finding(url)
             self._add_issue_check(
                 result,
                 Issue(

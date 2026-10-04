@@ -15,6 +15,7 @@ from modelaudit.core_results import mark_operational_scan_error, scan_result_has
 from modelaudit.scanner_results import mark_inconclusive_scan_result
 
 from ..scanner_selection import add_scanner_selection_skip_check, policy_from_config
+from . import base as scanner_base
 from ._evidence_redaction import redact_evidence_string
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, CheckStatus, IssueSeverity, ScanResult, logger
 
@@ -487,16 +488,6 @@ _PARSE_FAILED: Final = object()
 _INI_SECTION_HEADER_RE = re.compile(r"^\s*\[[A-Za-z0-9_. -]+\]\s*(?:[#;].*)?(?:\r?\n|$)")
 
 
-def _scan_result_has_security_findings(result: ScanResult) -> bool:
-    """Return True when the manifest result includes WARNING/CRITICAL findings."""
-    return any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
-
-
-def _is_trusted_s3_endpoint_host(host: str) -> bool:
-    """Return True for supported S3 endpoint host layouts only."""
-    return any(pattern.match(host) for pattern in _TRUSTED_S3_ENDPOINT_HOST_PATTERNS)
-
-
 def _redact_url_for_display(url: str) -> str:
     """Strip credential-bearing URL components before storing scan output."""
     try:
@@ -535,7 +526,8 @@ def _is_trusted_url_domain(url: str) -> bool:
     if not host:
         return False
 
-    if _is_trusted_s3_endpoint_host(host):
+    # Return True for supported S3 endpoint host layouts only.
+    if any(pattern.match(host) for pattern in _TRUSTED_S3_ENDPOINT_HOST_PATTERNS):
         return True
 
     if host in _NORMALIZED_TRUSTED_URL_DOMAINS:
@@ -803,8 +795,9 @@ class ManifestScanner(BaseScanner):
             result.finish(success=False)
             return
 
-        if result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME and not _scan_result_has_security_findings(
-            result
+        # Return True when the manifest result includes WARNING/CRITICAL findings.
+        if result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME and not any(
+            issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues
         ):
             result.finish(success=False)
             return
@@ -1026,9 +1019,6 @@ class ManifestScanner(BaseScanner):
     def _collect_jinja_template_fields_with_budget(self, value: Any, path: str = "") -> _JinjaTemplateCollection:
         return self._collect_jinja_templates_with_budget(value, path, _JINJA_COLLECTION_MODE_FIELDS)
 
-    def _collect_jinja_template_container(self, value: Any, path: str) -> dict[str, str]:
-        return self._collect_jinja_templates_with_budget(value, path, _JINJA_COLLECTION_MODE_CONTAINER).templates
-
     def _collect_jinja_templates_with_budget(
         self,
         value: Any,
@@ -1155,12 +1145,7 @@ class ManifestScanner(BaseScanner):
 
         return collection
 
-    def _get_positive_int_config(self, key: str, default: int) -> int:
-        try:
-            value = int(self.config.get(key, default))
-        except (OverflowError, TypeError, ValueError):
-            return default
-        return value if value > 0 else default
+    _get_positive_int_config = scanner_base._scanner_positive_int_config
 
     @staticmethod
     def _mark_jinja_collection_budget_exceeded(
@@ -1267,11 +1252,6 @@ class ManifestScanner(BaseScanner):
             duplicate_index += 1
             unique_path = f"{path} [duplicate {duplicate_index}]"
         templates[unique_path] = value
-
-    @classmethod
-    def _merge_jinja_templates(cls, templates: dict[str, str], collected: dict[str, str]) -> None:
-        for path, value in collected.items():
-            cls._record_jinja_template(templates, path, value)
 
     @staticmethod
     def _looks_like_jinja(value: str) -> bool:

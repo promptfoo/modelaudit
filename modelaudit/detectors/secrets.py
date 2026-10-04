@@ -13,6 +13,8 @@ import math
 import re
 from typing import Any
 
+from modelaudit.utils.helpers.evidence import format_evidence_string
+
 logger: logging.Logger = logging.getLogger(__name__)
 
 BASIC_AUTH_SECRET_TYPE = "Basic Auth Credentials"
@@ -480,10 +482,6 @@ def _canonical_basic_auth_header_name(value: str) -> str | None:
         if without_http_prefix in BASIC_AUTH_HEADER_NAMES:
             normalized = without_http_prefix
     return BASIC_AUTH_HEADER_NAMES.get(normalized)
-
-
-def _is_basic_auth_header_name(value: str) -> bool:
-    return _canonical_basic_auth_header_name(value) is not None
 
 
 def _normalize_basic_auth_structured_key(value: object) -> str | None:
@@ -1454,7 +1452,7 @@ class SecretsDetector:
                 "length": len(token),
                 "confidence": round(confidence, 2),
                 "pattern": pattern.pattern[:50] + "..." if len(pattern.pattern) > 50 else pattern.pattern,
-                "redacted_value": "Basic <redacted>",
+                "redacted_value": format_evidence_string(matched_text),
                 "message": f"{BASIC_AUTH_SECRET_TYPE} detected (confidence: {confidence:.0%})",
                 "context": f"{safe_context} pos:{position}" if safe_context else f"pos:{position}",
                 "recommendation": f"Remove {BASIC_AUTH_SECRET_TYPE} from model data immediately",
@@ -1768,9 +1766,6 @@ class SecretsDetector:
                 else:
                     severity = "INFO"
 
-                # Redact the secret for safe reporting
-                redacted = secret_text[:4] + "***" + secret_text[-4:] if len(secret_text) > 10 else "***REDACTED***"
-
                 if not self._record_finding(
                     findings,
                     {
@@ -1781,7 +1776,7 @@ class SecretsDetector:
                         "length": len(secret_text),
                         "confidence": round(confidence, 2),
                         "pattern": pattern.pattern[:50] + "..." if len(pattern.pattern) > 50 else pattern.pattern,
-                        "redacted_value": redacted,
+                        "redacted_value": format_evidence_string(secret_text),
                         "message": f"{description} detected (confidence: {confidence:.0%})",
                         "context": f"{safe_context} pos:{position}" if safe_context else f"pos:{position}",
                         "recommendation": f"Remove {description} from model data immediately"

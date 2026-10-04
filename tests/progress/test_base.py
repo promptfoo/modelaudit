@@ -26,12 +26,17 @@ class TestProgressPhase:
 class TestProgressStats:
     """Tests for ProgressStats dataclass."""
 
-    def test_default_values(self):
+    def test_default_values(self) -> None:
         """Test default values are set correctly."""
         stats = ProgressStats()
         assert stats.bytes_processed == 0
         assert stats.total_bytes == 0
         assert stats.items_processed == 0
+        assert stats.total_items == 0
+        assert stats.current_item == ""
+        assert stats.status_message == ""
+        assert stats.bytes_per_second >= 0
+        assert stats.items_per_second >= 0
         assert stats.current_phase == ProgressPhase.INITIALIZING
 
     def test_elapsed_time(self):
@@ -70,44 +75,49 @@ class TestProgressStats:
         stats = ProgressStats()
         assert stats.format_bytes(500) == "500.0 B"
 
-    def test_format_bytes_kilobytes(self):
+    def test_format_bytes_kilobytes(self) -> None:
         """Test byte formatting for KB values."""
         stats = ProgressStats()
-        assert "KB" in stats.format_bytes(1500)
+        assert stats.format_bytes(1536) == "1.5 KB"
 
-    def test_format_bytes_megabytes(self):
+    def test_format_bytes_megabytes(self) -> None:
         """Test byte formatting for MB values."""
         stats = ProgressStats()
-        assert "MB" in stats.format_bytes(1500000)
+        assert stats.format_bytes(2048 * 1024) == "2.0 MB"
 
-    def test_format_bytes_gigabytes(self):
+    def test_format_bytes_gigabytes(self) -> None:
         """Test byte formatting for GB values."""
         stats = ProgressStats()
-        assert "GB" in stats.format_bytes(1500000000)
+        assert stats.format_bytes(3 * 1024 * 1024 * 1024) == "3.0 GB"
 
-    def test_format_time_seconds(self):
+    def test_format_time_seconds(self) -> None:
         """Test time formatting for seconds."""
         stats = ProgressStats()
-        assert "s" in stats.format_time(30)
+        assert stats.format_time(30) == "30.0s"
 
-    def test_format_time_minutes(self):
+    def test_format_time_minutes(self) -> None:
         """Test time formatting for minutes."""
         stats = ProgressStats()
         result = stats.format_time(90)
-        assert "m" in result
+        assert result == "1m 30s"
 
-    def test_format_time_hours(self):
+    def test_format_time_hours(self) -> None:
         """Test time formatting for hours."""
         stats = ProgressStats()
-        result = stats.format_time(7200)
-        assert "h" in result
+        result = stats.format_time(3661)
+        assert result == "1h 1m"
 
-    def test_update_performance_metrics(self):
+    def test_update_performance_metrics(self) -> None:
         """Test performance metrics update."""
-        stats = ProgressStats(bytes_processed=1000, total_bytes=2000)
+        stats = ProgressStats(total_bytes=2000, total_items=10)
+        stats.bytes_processed = 1000
+        stats.items_processed = 5
         time.sleep(0.01)
         stats.update_performance_metrics()
         assert stats.bytes_per_second > 0
+        assert stats.bytes_percentage == 50.0
+        assert stats.items_percentage == 50.0
+        assert stats.elapsed_time > 0
 
     def test_estimated_time_remaining(self):
         """Test estimated time remaining calculation."""
@@ -160,11 +170,13 @@ class TestProgressReporter:
 class TestProgressTracker:
     """Tests for ProgressTracker class."""
 
-    def test_initialization(self):
+    def test_initialization(self) -> None:
         """Test tracker initialization."""
         tracker = ProgressTracker(total_bytes=1000, total_items=10)
         assert tracker.stats.total_bytes == 1000
         assert tracker.stats.total_items == 10
+        assert tracker.reporters == []
+        assert tracker._callbacks == []
 
     def test_add_reporter(self):
         """Test adding a reporter."""
@@ -196,11 +208,12 @@ class TestProgressTracker:
         assert tracker.stats.bytes_processed == 500
         assert tracker.stats.current_item == "file.pkl"
 
-    def test_increment_bytes(self):
+    def test_increment_bytes(self) -> None:
         """Test incrementing bytes."""
         tracker = ProgressTracker(total_bytes=1000, update_interval=0)
         tracker.increment_bytes(100)
-        tracker.increment_bytes(200)
+        tracker.increment_bytes(200, "file2.txt")
+        assert tracker.stats.current_item == "file2.txt"
         assert tracker.stats.bytes_processed == 300
 
     def test_update_items(self):
@@ -245,14 +258,14 @@ class TestProgressTracker:
         tracker.complete()
         assert len(reporter.completions) == 1
 
-    def test_report_error(self):
+    def test_report_error(self) -> None:
         """Test error reporting."""
         reporter = MockReporter()
         tracker = ProgressTracker(reporters=[reporter])
         error = ValueError("Test error")
         tracker.report_error(error)
         assert len(reporter.errors) == 1
-        assert reporter.errors[0][0] == error
+        assert reporter.errors[0] == (error, tracker.stats)
 
     def test_get_stats_returns_copy(self):
         """Test that get_stats returns a copy."""
@@ -262,13 +275,18 @@ class TestProgressTracker:
         stats2 = tracker.get_stats()
         assert stats1.bytes_processed != stats2.bytes_processed
 
-    def test_callback_invocation(self):
+    def test_callback_invocation(self) -> None:
         """Test that callbacks are invoked."""
         callback = MagicMock()
         tracker = ProgressTracker(update_interval=0)
         tracker.add_callback(callback)
         tracker.force_update()
-        callback.assert_called()
+        callback.assert_called_once()
+        observed = []
+        callback.side_effect = lambda stats: observed.append(stats.bytes_processed)
+        tracker.update_bytes(200)
+        tracker.update_bytes(500)
+        assert observed == [200, 500]
 
     def test_reporter_exception_handling(self):
         """Test that reporter exceptions don't crash tracker."""
