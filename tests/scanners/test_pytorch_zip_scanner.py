@@ -26544,3 +26544,297 @@ def test_pytorch_zip_url_fallback_charges_each_nested_documentation_proof(
     assert observed is expected is True
     assert len(documentation_inputs) == 2
     assert sum(charges) > sum(documentation_inputs)
+
+
+def _write_complete_binary_nested_encoding_archive(
+    tmp_path: Path, storage: bytes, *, global_opcode: bool = False
+) -> Path:
+    storage_type = b"ctorch\nByteStorage\n" if global_opcode else b"\x8c\x05torch\x8c\x0bByteStorage\x93"
+    metadata = (
+        b"\x80\x04(\x8c\x07storage" + storage_type + b"\x8c\x010\x8c\x03cpuJ" + struct.pack("<i", len(storage)) + b"tQ."
+    )
+    path = tmp_path / "complete-binary-nested-encoding.pt"
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_STORED) as archive:
+        for name, content in (
+            ("archive/version", b"3\n"),
+            ("archive/byteorder", b"little"),
+            ("archive/data.pkl", metadata),
+            ("archive/data/0", storage),
+        ):
+            info = zipfile.ZipInfo(name, date_time=(2026, 1, 1, 0, 0, 0))
+            info.create_system = 3
+            info.external_attr = 0o600 << 16
+            archive.writestr(info, content)
+    return path
+
+
+@pytest.mark.parametrize("encoding", ["hex-base64", "base64-hex"])
+@pytest.mark.parametrize("security_signal", [False, True])
+def test_pytorch_zip_complete_binary_nested_encoding_preserves_archive_findings(
+    tmp_path: Path, encoding: str, security_signal: bool
+) -> None:
+    if encoding == "hex-base64":
+        token = base64.b64encode(b"ca\nbb\n.") if security_signal else base64.b64encode(b"N.") + b" " * 8
+        inner = b"\x80\x04C\x0c" + token + b"." + b"!" * 8200
+        storage = b"V" + inner.hex().encode() + b"\n."
+        import_reference = "a.bb"
+        expected_size = 16437
+        expected_storage_hash = "d83199763fa66eaeaef90cc93d0de89dca27d47594a50001423b7c7d1dbebe77"
+        expected_archive_hash = "0987af828d67d2221ec45603a69033791ed0b6b2252dff3b6564ceb25fa3fac8"
+    else:
+        payload = b"cunknown\nthing\n." if security_signal else b"N." + b" " * 14
+        token = payload.hex().upper().encode()
+        inner = b"\x80\x04B" + struct.pack("<I", len(token)) + token + b"." + b"\x00" * 8200
+        storage = b"S'" + base64.b64encode(inner) + b"'\n."
+        import_reference = "unknown.thing"
+        expected_size = 10993
+        expected_storage_hash = "604939f1f948940bbee51b6440ee6a4c57b3882ce655bdca5cf5c7031ee05677"
+        expected_archive_hash = "34977cdab0ec9f7f81487b5d825418ef06815a184381b593867f154cf6bcc9ee"
+    assert len(storage) == expected_size
+    path = _write_complete_binary_nested_encoding_archive(tmp_path, storage, global_opcode=encoding == "base64-hex")
+    if security_signal:
+        assert hashlib.sha256(storage).hexdigest() == expected_storage_hash
+        assert hashlib.sha256(path.read_bytes()).hexdigest() == expected_archive_hash
+
+    result = PyTorchZipScanner({"check_network_comm": False, "cache_enabled": False}).scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False, check_network_comm=False)
+    encoded_notice = security_signal or encoding == "base64-hex"
+    selected = ["archive/data.pkl", "archive/data/0"] if encoded_notice else ["archive/data.pkl"]
+    verdict = "suspicious" if security_signal else "clean"
+
+    assert result.success is (not encoded_notice)
+    assert result.metadata["pickle_files"] == selected
+    assert result.metadata["pickle_verdict"] == verdict
+    assert result.metadata["pickle_report_status"] == "complete"
+    assert result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+    assert not result.metadata.get("analysis_incomplete")
+    assert should_cache_scan_result(result.to_dict(include_private_metadata=True)) is (not encoded_notice)
+    assert aggregate.success is True
+    assert aggregate.file_metadata[str(path)]["pickle_files"] == selected
+    assert aggregate.file_metadata[str(path)]["pickle_verdict"] == verdict
+    assert aggregate.file_metadata[str(path)]["pickle_report_status"] == "complete"
+    assert determine_exit_code(aggregate) == (1 if encoded_notice else 0)
+    # Aggregate eligibility differs from the direct ZIP result in this complete-scan case.
+    assert should_cache_scan_result(aggregate.model_dump(mode="json")) is True
+    for issues in (result.issues, aggregate.issues):
+        assert (
+            any(
+                issue.rule_code == "NON_ALLOWLISTED_GLOBAL"
+                and issue.details.get("import_reference") == import_reference
+                and issue.details.get("pickle_filename") == "archive/data/0"
+                for issue in issues
+            )
+            is security_signal
+        )
+        if not security_signal:
+            assert any(issue.rule_code == "S601" for issue in issues) is encoded_notice
+    metadata_outcome = next(
+        item for item in result.metadata["pickle_member_outcomes"] if item["pickle_filename"] == "archive/data.pkl"
+    )
+    assert metadata_outcome["pickle_verdict"] == "clean"
+    assert metadata_outcome["pickle_report_status"] == "complete"
+    if encoded_notice:
+        storage_outcome = next(
+            item for item in result.metadata["pickle_member_outcomes"] if item["pickle_filename"] == "archive/data/0"
+        )
+        assert storage_outcome["analysis_state"] == "scanned"
+        assert storage_outcome["pickle_verdict"] == verdict
+        assert storage_outcome["pickle_report_status"] == "complete"
+
+
+@pytest.mark.parametrize(
+    "payload, expected_hash, encoded_notice",
+    [
+        (b"ca\nbb\n.", "7d2d1bab7ae71a22ccb0085bfa191a6ca7d2ddbc158f6da1691f442c42f52f60", True),
+        (b"N.", "a50575705da530ec11933153219299c06fae400ae31df9b140910a41a697e305", False),
+    ],
+    ids=["short-generic-hex", "short-inert-hex"],
+)
+def test_pytorch_zip_complete_binary_nested_encoding_keeps_short_hex_threshold(
+    tmp_path: Path, payload: bytes, expected_hash: str, encoded_notice: bool
+) -> None:
+    token = payload.hex().upper().encode()
+    assert len(token) < 16
+    inner = b"\x80\x04C" + bytes([len(token)]) + token + b"." + b"!" * 8200
+    storage = b"S'" + inner.hex().encode() + b"'\n."
+    assert hashlib.sha256(storage).hexdigest() == expected_hash
+    # A sub-threshold hex token can still receive generic admission through Base64 decoding.
+    assert PyTorchZipScanner._literal_value_has_encoded_nested_security_pickle(token) is encoded_notice
+    path = _write_complete_binary_nested_encoding_archive(tmp_path, storage)
+
+    result = PyTorchZipScanner({"check_network_comm": False, "cache_enabled": False}).scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False, check_network_comm=False)
+    selected = ["archive/data.pkl", "archive/data/0"] if encoded_notice else ["archive/data.pkl"]
+    for metadata in (result.metadata, aggregate.file_metadata[str(path)]):
+        assert metadata["pickle_files"] == selected
+        assert metadata["pickle_verdict"] == "clean"
+        assert metadata["pickle_report_status"] == "complete"
+    assert result.success is (not encoded_notice)
+    assert aggregate.success is True
+    assert determine_exit_code(aggregate) == (1 if encoded_notice else 0)
+    assert should_cache_scan_result(result.to_dict(include_private_metadata=True)) is (not encoded_notice)
+    assert should_cache_scan_result(aggregate.model_dump(mode="json")) is True
+    assert not any(issue.rule_code == "NON_ALLOWLISTED_GLOBAL" for issue in result.issues)
+    assert not any(issue.rule_code == "NON_ALLOWLISTED_GLOBAL" for issue in aggregate.issues)
+    assert any(issue.rule_code == "S602" for issue in result.issues) is encoded_notice
+    assert any(issue.rule_code == "S602" for issue in aggregate.issues) is encoded_notice
+
+
+@pytest.mark.parametrize("route", ["raw", "fallback"])
+@pytest.mark.parametrize(
+    "trailing_bytes, sample_is_prefix",
+    [(0, False), (8200, False), (0, True)],
+    ids=["finite", "bounded-prefix", "supplied-prefix"],
+)
+def test_pytorch_zip_complete_binary_nested_encoding_reserves_shared_inspection(
+    monkeypatch: pytest.MonkeyPatch, route: str, trailing_bytes: int, sample_is_prefix: bool
+) -> None:
+    value = b"\x80\x04N." + b"!" * trailing_bytes
+    remaining = [pytorch_zip_scanner_module._PICKLE_DISCOVERY_LONG_PROBE_BYTES]
+    original = PyTorchZipScanner._complete_trivial_literal_pickle_has_nested_security_pickle
+    calls: list[tuple[int, int, int, bool]] = []
+
+    def recorded(
+        candidate: bytes, *, nested_literal_depth: int = 0, work_budget_remaining: list[int] | None = None
+    ) -> bool:
+        assert work_budget_remaining is not None
+        calls.append(
+            (len(candidate), nested_literal_depth, work_budget_remaining[0], work_budget_remaining is remaining)
+        )
+        return original(
+            candidate, nested_literal_depth=nested_literal_depth, work_budget_remaining=work_budget_remaining
+        )
+
+    monkeypatch.setattr(
+        PyTorchZipScanner, "_complete_trivial_literal_pickle_has_nested_security_pickle", staticmethod(recorded)
+    )
+    scan = (
+        PyTorchZipScanner._literal_value_has_raw_nested_security_pickle
+        if route == "raw"
+        else PyTorchZipScanner._encoded_raw_nested_security_pickle_candidate_budget_exhausted_needs_scan
+    )
+    assert (
+        scan(value, sample_is_prefix=sample_is_prefix, nested_literal_depth=2, work_budget_remaining=remaining) is False
+    )
+    size = min(len(value), pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES)
+    assert calls == [(size, 3, pytorch_zip_scanner_module._PICKLE_DISCOVERY_LONG_PROBE_BYTES - size, True)]
+    assert remaining[0] >= 0
+
+
+@pytest.mark.parametrize("route", ["raw", "fallback"])
+@pytest.mark.parametrize("trailing_bytes", [0, 8200], ids=["finite", "bounded-prefix"])
+def test_pytorch_zip_complete_binary_nested_encoding_refusal_stays_sticky(
+    monkeypatch: pytest.MonkeyPatch, route: str, trailing_bytes: int
+) -> None:
+    value = b"\x80\x04N." + b"!" * trailing_bytes
+    size = min(len(value), pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES)
+    remaining = [size - 1]
+
+    def unexpected(
+        candidate: bytes, *, nested_literal_depth: int = 0, work_budget_remaining: list[int] | None = None
+    ) -> bool:
+        pytest.fail("Literal parsing must not run after the shared reservation refuses its input.")
+
+    monkeypatch.setattr(
+        PyTorchZipScanner, "_complete_trivial_literal_pickle_has_nested_security_pickle", staticmethod(unexpected)
+    )
+    scan = (
+        PyTorchZipScanner._literal_value_has_raw_nested_security_pickle
+        if route == "raw"
+        else PyTorchZipScanner._encoded_raw_nested_security_pickle_candidate_budget_exhausted_needs_scan
+    )
+    assert scan(value, sample_is_prefix=False, work_budget_remaining=remaining) is True
+    assert remaining == [-1]
+    assert scan(b"", sample_is_prefix=False, work_budget_remaining=remaining) is True
+    assert remaining == [-1]
+
+
+@pytest.mark.parametrize("route", ["raw", "fallback"])
+def test_pytorch_zip_complete_binary_nested_encoding_keeps_direct_evidence_first(
+    monkeypatch: pytest.MonkeyPatch, route: str
+) -> None:
+    remaining = [0]
+
+    def unexpected(
+        candidate: bytes, *, nested_literal_depth: int = 0, work_budget_remaining: list[int] | None = None
+    ) -> bool:
+        pytest.fail("Already-known direct evidence must precede added literal inspection.")
+
+    monkeypatch.setattr(
+        PyTorchZipScanner, "_complete_trivial_literal_pickle_has_nested_security_pickle", staticmethod(unexpected)
+    )
+    scan = (
+        PyTorchZipScanner._literal_value_has_raw_nested_security_pickle
+        if route == "raw"
+        else PyTorchZipScanner._encoded_raw_nested_security_pickle_candidate_budget_exhausted_needs_scan
+    )
+    assert scan(b"\x80\x04ca\nbb\n.", sample_is_prefix=True, work_budget_remaining=remaining) is True
+    assert remaining == [0]
+
+
+@pytest.mark.parametrize("route", ["raw", "fallback"])
+def test_pytorch_zip_complete_binary_nested_encoding_preserves_depth_limit(route: str) -> None:
+    remaining = [pytorch_zip_scanner_module._PICKLE_DISCOVERY_LONG_PROBE_BYTES]
+    scan = (
+        PyTorchZipScanner._literal_value_has_raw_nested_security_pickle
+        if route == "raw"
+        else PyTorchZipScanner._encoded_raw_nested_security_pickle_candidate_budget_exhausted_needs_scan
+    )
+    assert (
+        scan(
+            b"\x80\x04N.",
+            sample_is_prefix=False,
+            nested_literal_depth=pytorch_zip_scanner_module._MAX_NESTED_LITERAL_SCAN_DEPTH,
+            work_budget_remaining=remaining,
+        )
+        is True
+    )
+    assert remaining[0] >= 0
+
+
+@pytest.mark.parametrize("route", ["raw", "fallback"])
+@pytest.mark.parametrize("security_signal", [False, True])
+def test_pytorch_zip_complete_binary_nested_encoding_keeps_later_independent_stream(
+    route: str, security_signal: bool
+) -> None:
+    token = base64.b64encode(b"ca\nbb\n." if security_signal else b"N.")
+    value = b"\x80\x04N." + b"\x80\x04C" + bytes([len(token)]) + token + b"."
+    remaining = [pytorch_zip_scanner_module._PICKLE_DISCOVERY_LONG_PROBE_BYTES]
+    scan = (
+        PyTorchZipScanner._literal_value_has_raw_nested_security_pickle
+        if route == "raw"
+        else PyTorchZipScanner._encoded_raw_nested_security_pickle_candidate_budget_exhausted_needs_scan
+    )
+    assert scan(value, sample_is_prefix=False, work_budget_remaining=remaining) is security_signal
+    assert remaining[0] >= 0
+
+
+@pytest.mark.parametrize("route", ["raw", "fallback"])
+def test_pytorch_zip_complete_binary_nested_encoding_respects_candidate_origin(route: str) -> None:
+    token = base64.b64encode(b"ca\nbb\n.")
+    value = b"\x80\x04C" + bytes([len(token)]) + token + b"."
+    remaining = [pytorch_zip_scanner_module._PICKLE_DISCOVERY_LONG_PROBE_BYTES]
+    scan = (
+        PyTorchZipScanner._literal_value_has_raw_nested_security_pickle
+        if route == "raw"
+        else PyTorchZipScanner._encoded_raw_nested_security_pickle_candidate_budget_exhausted_needs_scan
+    )
+    assert scan(value, search_end=0, sample_is_prefix=False, work_budget_remaining=remaining) is False
+    assert remaining == [pytorch_zip_scanner_module._PICKLE_DISCOVERY_LONG_PROBE_BYTES]
+
+
+def test_pytorch_zip_complete_binary_nested_encoding_shares_raw_and_fallback_allowance() -> None:
+    size = pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES
+    value = b"\x80\x04N." + b"!" * size
+    remaining = [pytorch_zip_scanner_module._PICKLE_DISCOVERY_LONG_PROBE_BYTES]
+    routes = (
+        PyTorchZipScanner._literal_value_has_raw_nested_security_pickle,
+        PyTorchZipScanner._encoded_raw_nested_security_pickle_candidate_budget_exhausted_needs_scan,
+    )
+    for index in range(remaining[0] // size):
+        assert routes[index % len(routes)](value, sample_is_prefix=False, work_budget_remaining=remaining) is False
+    assert remaining == [0]
+    assert routes[0](value, sample_is_prefix=False, work_budget_remaining=remaining) is True
+    assert remaining == [-1]
+    assert routes[1](value, sample_is_prefix=False, work_budget_remaining=remaining) is True
+    assert remaining == [-1]

@@ -4160,6 +4160,16 @@ class PyTorchZipScanner(BaseScanner):
                     or not PyTorchZipScanner._has_complete_pickle_stream_without_frame_stop_overrun(candidate)
                 ):
                     return True
+                if not candidate_is_prefix and not PyTorchZipScanner._consume_raw_nested_pickle_work_budget(
+                    work_budget_remaining, len(candidate)
+                ):
+                    return True
+                if PyTorchZipScanner._complete_trivial_literal_pickle_has_nested_security_pickle(
+                    candidate,
+                    nested_literal_depth=nested_literal_depth + 1,
+                    work_budget_remaining=work_budget_remaining,
+                ):
+                    return True
                 offset += 1
                 continue
             if (
@@ -5170,12 +5180,22 @@ class PyTorchZipScanner(BaseScanner):
             candidate,
             sample_is_prefix=candidate_is_prefix,
         ):
-            return PyTorchZipScanner._has_security_relevant_pickle_opcode(candidate) or (
+            if PyTorchZipScanner._has_security_relevant_pickle_opcode(candidate) or (
                 candidate_is_prefix
                 and (
                     not PyTorchZipScanner._consume_raw_nested_pickle_work_budget(work_budget_remaining, len(candidate))
                     or not PyTorchZipScanner._has_complete_pickle_stream_without_frame_stop_overrun(candidate)
                 )
+            ):
+                return True
+            if not candidate_is_prefix and not PyTorchZipScanner._consume_raw_nested_pickle_work_budget(
+                work_budget_remaining, len(candidate)
+            ):
+                return True
+            return PyTorchZipScanner._complete_trivial_literal_pickle_has_nested_security_pickle(
+                candidate,
+                nested_literal_depth=nested_literal_depth + 1,
+                work_budget_remaining=work_budget_remaining,
             )
         if (
             marker in _RAW_NESTED_STRUCTURAL_STRING_START_BYTES
