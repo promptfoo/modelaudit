@@ -6079,6 +6079,8 @@ def test_pytorch_zip_later_raw_scan_starts_after_scanned_suffix(
         original_offset: int = 0,
         sample_is_prefix: bool = False,
         work_budget_remaining: list[int] | None = None,
+        inst_name_validation: pytorch_zip_scanner_module._InstNameValidation | None = None,
+        inst_name_offset: int | None = None,
     ) -> bool:
         del fail_closed_on_truncated_extension, parse_budget_remaining
         assert nested_literal_depth == 0
@@ -8077,10 +8079,19 @@ def test_pytorch_zip_structural_fallback_advances_after_malformed_proto0_inst_na
     calls = 0
     original = PyTorchZipScanner._raw_nested_proto0_name_end
 
-    def counted_name_end(value: bytes, offset: int, limit: int) -> tuple[int | None, int, bool]:
+    def counted_name_end(
+        value: bytes,
+        offset: int,
+        limit: int,
+        *,
+        work_budget_remaining: list[int] | None = None,
+        inst_name_validation: pytorch_zip_scanner_module._InstNameValidation | None = None,
+    ) -> tuple[int | None, int, bool]:
         nonlocal calls
         calls += 1
-        return original(value, offset, limit)
+        return original(
+            value, offset, limit, work_budget_remaining=work_budget_remaining, inst_name_validation=inst_name_validation
+        )
 
     monkeypatch.setattr(
         PyTorchZipScanner,
@@ -8097,9 +8108,18 @@ def test_pytorch_zip_prior_window_inst_name_parse_is_window_bounded(monkeypatch:
     spans: list[int] = []
     original = PyTorchZipScanner._raw_nested_proto0_name_end
 
-    def counted_name_end(value: bytes, offset: int, limit: int) -> tuple[int | None, int, bool]:
+    def counted_name_end(
+        value: bytes,
+        offset: int,
+        limit: int,
+        *,
+        work_budget_remaining: list[int] | None = None,
+        inst_name_validation: pytorch_zip_scanner_module._InstNameValidation | None = None,
+    ) -> tuple[int | None, int, bool]:
         spans.append(limit - offset)
-        return original(value, offset, limit)
+        return original(
+            value, offset, limit, work_budget_remaining=work_budget_remaining, inst_name_validation=inst_name_validation
+        )
 
     monkeypatch.setattr(
         PyTorchZipScanner,
@@ -23797,3 +23817,547 @@ def test_pytorch_zip_memo_round6_affordable_ineligible_retry_preserves_allowance
     )
     assert parsed_lengths == [8192]
     assert remaining == [65536 - 8192 - len(b"S'os'\np0\n")]
+
+
+@pytest.mark.parametrize(
+    "prior",
+    [
+        pytest.param(b"\x80\x04Np99\n.", id="sparse-put"),
+        pytest.param(b"\x80\x04Nq\x09.", id="sparse-binput"),
+        pytest.param(b"\x80\x04Nr\xff\xff\xff\x7f.", id="sparse-long-binput"),
+    ],
+)
+@pytest.mark.parametrize("gap_opcode", [b"\x88", b"\x89"], ids=["newtrue", "newfalse"])
+def test_pytorch_zip_native7_memo_independent_stream_keeps_fresh_origin(
+    monkeypatch: pytest.MonkeyPatch, prior: bytes, gap_opcode: bytes
+) -> None:
+    inner = b"S'abort'\n\x940S'os'\n" + (gap_opcode + b"0") * 4200 + b"g0\n\x93."
+    value = prior + inner
+    remaining = [65536]
+    admitted = 0
+    memo_parsed = 0
+    origins: list[tuple[int, int]] = []
+    original_consume = PyTorchZipScanner._consume_raw_nested_pickle_work_budget
+    original_parse = PyTorchZipScanner._parsed_prefix_memo_key_offsets_from_start
+    original_eligibility = PyTorchZipScanner._raw_nested_suffix_uses_prior_memo_security_context
+
+    def consume(budget: list[int], work_bytes: int) -> bool:
+        nonlocal admitted
+        assert budget is remaining
+        allowed = original_consume(budget, work_bytes)
+        if allowed:
+            admitted += work_bytes
+        return allowed
+
+    def parse(prefix: bytes, *, initial_memo_keys: frozenset[str] = frozenset()) -> dict[str, int]:
+        nonlocal memo_parsed
+        memo_parsed += len(prefix)
+        assert memo_parsed <= admitted <= 65536
+        return original_parse(prefix, initial_memo_keys=initial_memo_keys)
+
+    def eligibility(source: bytes, search_start: int, parse_budget_remaining: list[int], **kwargs: Any) -> bool:
+        origin = kwargs.get("memo_origin", 0)
+        if origin:
+            assert source is value
+            assert kwargs["work_budget_remaining"] is remaining
+            origins.append((search_start, origin))
+        return original_eligibility(source, search_start, parse_budget_remaining, **kwargs)
+
+    monkeypatch.setattr(PyTorchZipScanner, "_consume_raw_nested_pickle_work_budget", staticmethod(consume))
+    monkeypatch.setattr(PyTorchZipScanner, "_parsed_prefix_memo_key_offsets_from_start", staticmethod(parse))
+    monkeypatch.setattr(
+        PyTorchZipScanner, "_raw_nested_suffix_uses_prior_memo_security_context", staticmethod(eligibility)
+    )
+
+    assert PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(value, work_budget_remaining=remaining)
+    assert origins == [(len(prior) + 8192, len(prior))]
+    assert 0 < memo_parsed <= admitted == 65536 - remaining[0] <= 65536
+    assert remaining[0] >= 0
+
+
+@pytest.mark.parametrize(
+    "prior",
+    [
+        pytest.param(b"\x80\x04Np99\n.", id="sparse-put"),
+        pytest.param(b"\x80\x04Nq\x09.", id="sparse-binput"),
+        pytest.param(b"\x80\x04Nr\xff\xff\xff\x7f.", id="sparse-long-binput"),
+    ],
+)
+@pytest.mark.parametrize("gap_opcode", [b"\x88", b"\x89"], ids=["newtrue", "newfalse"])
+def test_pytorch_zip_native7_memo_independent_stream_archive_root_outcome(
+    tmp_path: Path, prior: bytes, gap_opcode: bytes
+) -> None:
+    inner = b"S'abort'\n\x940S'os'\n" + (gap_opcode + b"0") * 4200 + b"g0\n\x93."
+    value = prior + inner
+    storage = b"S" + repr(value)[1:].encode("ascii") + b"\n."
+    path = tmp_path / "native7-independent-memo.pt"
+    result = _scan_referenced_float_storage_blob(tmp_path, path.name, storage)
+
+    assert result.success is False
+    assert result.metadata["pickle_verdict"] == "malicious"
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "pickle_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert "archive/data/0" in result.metadata["pickle_files"]
+    assert should_cache_scan_result(result.to_dict(include_private_metadata=True)) is False
+    assert any("os.abort" in issue.message for issue in result.issues)
+
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+    assert aggregate.success is False
+    assert aggregate.file_metadata[str(path)]["pickle_verdict"] == "malicious"
+    assert aggregate.file_metadata[str(path)]["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert determine_exit_code(aggregate) == 1
+
+
+@pytest.mark.parametrize("prior", [b"", b"\x80\x04Np0\n."], ids=["no-predecessor", "same-key-predecessor"])
+@pytest.mark.parametrize("gap_opcode", [b"\x88", b"\x89"], ids=["newtrue", "newfalse"])
+def test_pytorch_zip_native7_memo_fresh_origin_preserves_existing_independent_streams(
+    prior: bytes, gap_opcode: bytes
+) -> None:
+    inner = b"S'abort'\n\x940S'os'\n" + (gap_opcode + b"0") * 4200 + b"g0\n\x93."
+    remaining = [65536]
+    assert PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(
+        prior + inner, work_budget_remaining=remaining
+    )
+    assert remaining[0] >= 0
+
+
+@pytest.mark.parametrize(
+    "definition",
+    [
+        pytest.param(b"p99\n", id="sparse-put"),
+        pytest.param(b"q\x09", id="sparse-binput"),
+        pytest.param(b"r\xff\xff\xff\x7f", id="sparse-long-binput"),
+        pytest.param(b"p99\np99\n", id="overwritten-put"),
+    ],
+)
+def test_pytorch_zip_native7_memo_fresh_origin_keeps_default_enclosing_context(definition: bytes) -> None:
+    prior = b"S'earlier'\n" + definition + b"0"
+    inner = b"S'abort'\n\x940S'os'\n" + b"\x880" * 4200 + b"g1\n\x93."
+    value = prior + inner
+    search_start = len(prior) + 8192
+    enclosing_budget = [65536]
+    fresh_budget = [65536]
+
+    assert PyTorchZipScanner._raw_nested_suffix_uses_prior_memo_security_context(
+        value, search_start, [64], work_budget_remaining=enclosing_budget
+    )
+    assert not PyTorchZipScanner._raw_nested_suffix_uses_prior_memo_security_context(
+        value, search_start, [64], memo_origin=len(prior), work_budget_remaining=fresh_budget
+    )
+    assert enclosing_budget[0] >= 0
+    assert fresh_budget[0] >= 0
+    assert PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(value)
+
+
+@pytest.mark.parametrize("allowance", [0, 64, 65_536])
+def test_pytorch_zip_native7_p2_inst_name_work_is_reserved_before_inspection(
+    monkeypatch: pytest.MonkeyPatch, allowance: int
+) -> None:
+    admitted = 0
+    searched = 0
+    copied = 0
+    original = PyTorchZipScanner._consume_raw_nested_pickle_work_budget
+
+    def consume(remaining: list[int], amount: int) -> bool:
+        nonlocal admitted
+        accepted = original(remaining, amount)
+        if accepted:
+            admitted += amount
+        return accepted
+
+    class CountingBytes(bytes):
+        def find(self, sub: Any, start: Any = 0, end: Any = None) -> int:
+            nonlocal searched
+            if sys._getframe(1).f_code.co_name == "_raw_nested_proto0_name_end":
+                searched += (len(self) if end is None else end) - start
+                assert searched <= admitted <= allowance
+            return super().find(sub, start, len(self) if end is None else end)
+
+        def __getitem__(self, key: Any) -> Any:
+            nonlocal copied
+            result = super().__getitem__(key)
+            if isinstance(result, bytes) and sys._getframe(1).f_code.co_name == "_raw_nested_proto0_name_end":
+                copied += len(result)
+                assert copied <= admitted <= allowance
+            return result
+
+    monkeypatch.setattr(PyTorchZipScanner, "_consume_raw_nested_pickle_work_budget", staticmethod(consume))
+    value = CountingBytes(b"X\xff\xff\xff\x7f" + b"i" * 50_000 + b"\nx\n")
+    remaining = [allowance]
+    assert PyTorchZipScanner._raw_nested_proto0_inst_ref_seen(value, [64], work_budget_remaining=remaining) is True
+    assert remaining == [-1]
+    assert copied <= searched <= admitted <= allowance
+    if allowance == 0:
+        assert searched == copied == 0
+
+
+@pytest.mark.parametrize(
+    ("native_case", "value", "expected"),
+    [
+        (
+            "6ecc80d9",
+            b"X\xff\xff\xff\x7f" + b"c\xff" * 65 + b"C\x01(0" * 2000 + b"ix\nz\n" * 16,
+            False,
+        ),
+        (
+            "951fbd16",
+            b"X\xff\xff\xff\x7f" + b"o!" * 65 + b"C\x01(0" * 512 + b"iA\nB\n" * 32,
+            True,
+        ),
+    ],
+)
+def test_pytorch_zip_native7_p2_contained_mark_ownership_is_linear(
+    monkeypatch: pytest.MonkeyPatch, native_case: str, value: bytes, expected: bool
+) -> None:
+    probes = 0
+    original = PyTorchZipScanner._raw_nested_pickle_literal_span_starting_at
+
+    def span(*args: Any, **kwargs: Any) -> tuple[int, int, int] | None:
+        nonlocal probes
+        probes += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(PyTorchZipScanner, "_raw_nested_pickle_literal_span_starting_at", staticmethod(span))
+    remaining = [65_536]
+    assert (
+        PyTorchZipScanner._trailing_candidate_has_raw_nested_security_pickle(
+            value, sample_is_prefix=False, work_budget_remaining=remaining
+        )
+        is expected
+    ), native_case
+    assert probes <= 2 * len(value)
+    assert remaining[0] >= 0
+
+
+@pytest.mark.parametrize("allowance", [0, 4])
+@pytest.mark.parametrize("window", [False, True])
+def test_pytorch_zip_native7_p2_inst_exhaustion_is_not_absent_mark(allowance: int, window: bool) -> None:
+    value = b"C\x01(0" * 128 + b"ix\nz\n" * 16
+    remaining = [allowance]
+    if window:
+        result = PyTorchZipScanner._raw_nested_proto0_inst_with_prior_window_mark_seen(
+            value, 0, len(value), [64], work_budget_remaining=remaining
+        )
+    else:
+        result = PyTorchZipScanner._raw_nested_proto0_inst_ref_seen(value, [64], work_budget_remaining=remaining)
+    assert result is True
+    assert remaining == [-1]
+
+
+@pytest.mark.parametrize("allowance", [64, 65_536])
+def test_pytorch_zip_native7_p2_backward_mark_recovery_reserves_full_input(
+    monkeypatch: pytest.MonkeyPatch, allowance: int
+) -> None:
+    value = b"(" * 74 + b"imodule\nname\n"
+    reservations: list[int] = []
+    recoveries = 0
+    original_consume = PyTorchZipScanner._consume_raw_nested_pickle_work_budget
+    original_prior = PyTorchZipScanner._raw_nested_prior_mark_outside_literal
+
+    def consume(remaining: list[int], amount: int) -> bool:
+        accepted = original_consume(remaining, amount)
+        if accepted:
+            reservations.append(amount)
+        return accepted
+
+    def prior(source: bytes, start: int, end: int, **kwargs: Any) -> int:
+        nonlocal recoveries
+        recoveries += 1
+        assert reservations[-1] == len(source)
+        return original_prior(source, start, end, **kwargs)
+
+    monkeypatch.setattr(PyTorchZipScanner, "_consume_raw_nested_pickle_work_budget", staticmethod(consume))
+    monkeypatch.setattr(PyTorchZipScanner, "_raw_nested_prior_mark_outside_literal", staticmethod(prior))
+    monkeypatch.setattr(PyTorchZipScanner, "_has_security_relevant_pickle_opcode", staticmethod(lambda _: False))
+    remaining = [allowance]
+    assert PyTorchZipScanner._raw_nested_proto0_inst_ref_seen(value, [64], work_budget_remaining=remaining) is True
+    assert sum(reservations) <= allowance
+    if allowance == 64:
+        assert recoveries == 0
+        assert remaining == [-1]
+    else:
+        assert recoveries == 64
+        assert remaining[0] >= 0
+
+
+@pytest.mark.parametrize(
+    ("native_case", "value", "clean"),
+    [
+        ("237a081b", b"X\xff\xff\xff\x7f" + b"i" * 50_000 + b"\nx\n", False),
+        (
+            "6ecc80d9",
+            b"X\xff\xff\xff\x7f" + b"c\xff" * 65 + b"C\x01(0" * 2000 + b"ix\nz\n" * 16,
+            True,
+        ),
+        (
+            "951fbd16",
+            b"X\xff\xff\xff\x7f" + b"o!" * 65 + b"C\x01(0" * 512 + b"iA\nB\n" * 32,
+            False,
+        ),
+    ],
+)
+def test_pytorch_zip_native7_p2_distinct_inst_archive_controls(
+    tmp_path: Path, native_case: str, value: bytes, clean: bool
+) -> None:
+    result = _scan_referenced_float_storage_blob(tmp_path, f"native7-inst-{native_case}.pt", value)
+    assert result.success is clean
+    assert should_cache_scan_result(result.to_dict()) is clean
+    if clean:
+        assert result.metadata["pickle_verdict"] == "clean"
+        assert result.metadata["pickle_files"] == ["archive/data.pkl"]
+    else:
+        assert "pytorch_zip_pickle_discovery_incomplete" in result.metadata["scan_outcome_reasons"]
+
+
+@pytest.mark.parametrize("unit", [b"U\x000", b"V\n0", b"S''\n0", b'S""\n0', b"X\0\0\0\x000"])
+@pytest.mark.parametrize("count", [65, 128, 200])
+def test_pytorch_zip_native7_p2_protocol01_empty_pop_archive_stays_clean(
+    tmp_path: Path, unit: bytes, count: int
+) -> None:
+    value = b"N.!" + unit * count + b"N."
+    result = _scan_referenced_float_storage_blob(tmp_path, "native7-empty-pop.pt", value)
+    assert result.success is True
+    assert result.metadata["pickle_verdict"] == "clean"
+    assert result.metadata["pickle_files"] == ["archive/data.pkl"]
+    assert should_cache_scan_result(result.to_dict()) is True
+
+
+@pytest.mark.parametrize("count", [128, 200])
+def test_pytorch_zip_native7_p2_original_short_binunicode_budget_stays_conservative(count: int) -> None:
+    value = b"N.!" + b"\x8c\x000" * count + b"N."
+    assert PyTorchZipScanner._trailing_candidate_has_raw_nested_security_pickle(value, sample_is_prefix=False) is True
+    assert PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(value) is True
+
+
+@pytest.mark.parametrize("unit", [b"U\x000", b"V\n0", b"S''\n0", b'S""\n0', b"X\0\0\0\x000"])
+@pytest.mark.parametrize(
+    "tail",
+    [
+        b"cos\nsystem\n)R.",
+        b"(imodule\nname\n.",
+        b"\x82\x01.",
+        b"S'os'\nS'system'\n\x93)R.",
+        b"U\x0dcos\nsystem\n)R.0N.",
+    ],
+)
+def test_pytorch_zip_native7_p2_empty_pop_preserves_later_security(unit: bytes, tail: bytes) -> None:
+    value = unit * 200 + tail
+    assert PyTorchZipScanner._trailing_candidate_has_raw_nested_security_pickle(value, sample_is_prefix=False) is True
+    assert PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(value) is True
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        b"V",
+        b"V\n",
+        b"Vx\n0",
+        b"V\np0\n0",
+        b"V\nN0",
+        b"S''",
+        b"S''\n",
+        b"S'x'\n0",
+        b"S''\np0\n0",
+        b"S'\"\n0",
+        b"U",
+        b"U\x00",
+        b"U\x01x0",
+        b"X\0\0\0",
+        b"X\0\0\0\0",
+    ],
+)
+def test_pytorch_zip_native7_p2_empty_pop_requires_exact_complete_grammar(value: bytes) -> None:
+    assert (
+        PyTorchZipScanner._raw_nested_structural_candidate_is_empty_pop(value, 0, work_budget_remaining=[65_536])
+        is False
+    )
+
+
+@pytest.mark.parametrize(
+    ("value", "queries"),
+    [
+        (
+            b"imod\nname\n.",
+            [
+                (4, (None, 4, True)),
+                (9, (None, 9, True)),
+                (10, (9, 10, False)),
+                (3, (None, 3, True)),
+                (11, (9, 10, False)),
+            ],
+        ),
+        (
+            b"imod\xff\nname\n",
+            [(4, (None, 4, True)), (5, (None, 5, False)), (3, (None, 3, True)), (11, (None, 5, False))],
+        ),
+        (b"imod\nna\xff\n", [(7, (None, 7, True)), (8, (None, 8, False)), (5, (None, 5, True)), (9, (None, 8, False))]),
+        (b"i\nname\n", [(1, (None, 1, True)), (2, (None, 2, False)), (7, (None, 2, False))]),
+        (b"imod\n\n", [(5, (None, 5, True)), (6, (None, 6, False)), (3, (None, 3, True))]),
+    ],
+)
+def test_pytorch_zip_inst_name_validation_preserves_shorter_and_extended_limits(
+    value: bytes, queries: list[tuple[int, tuple[int | None, int, bool]]]
+) -> None:
+    validation: pytorch_zip_scanner_module._InstNameValidation = (value, {})
+    remaining = [65_536]
+    for limit, expected in queries:
+        assert (
+            PyTorchZipScanner._raw_nested_proto0_name_end(
+                value, 0, limit, work_budget_remaining=remaining, inst_name_validation=validation
+            )
+            == expected
+        )
+    before = remaining[0]
+    limit, expected = queries[-1]
+    assert (
+        PyTorchZipScanner._raw_nested_proto0_name_end(
+            value, 0, limit, work_budget_remaining=remaining, inst_name_validation=validation
+        )
+        == expected
+    )
+    assert remaining == [before]
+
+
+@pytest.mark.parametrize("other", [b"imod\nname\n.", b"imod\nna\xffe\n."])
+def test_pytorch_zip_inst_name_validation_requires_original_buffer_identity(other: bytes) -> None:
+    value = b"imod\nname\n."
+    validation: pytorch_zip_scanner_module._InstNameValidation = (value, {})
+    assert PyTorchZipScanner._raw_nested_proto0_name_end(
+        value, 0, len(value), work_budget_remaining=[65_536], inst_name_validation=validation
+    ) == (9, 10, False)
+    recorded = validation[1].copy()
+    other = bytes(bytearray(other))
+    assert other is not value
+    fresh_remaining = [65_536]
+    expected = PyTorchZipScanner._raw_nested_proto0_name_end(
+        other, 0, len(other), work_budget_remaining=fresh_remaining
+    )
+    remaining = [65_536]
+    assert (
+        PyTorchZipScanner._raw_nested_proto0_name_end(
+            other, 0, len(other), work_budget_remaining=remaining, inst_name_validation=validation
+        )
+        == expected
+    )
+    assert remaining == fresh_remaining
+    assert remaining[0] < 65_536
+    assert validation[1] == recorded
+
+
+def test_pytorch_zip_inst_name_validation_cap_keeps_misses_charged() -> None:
+    cap = pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATES
+    value = b"ia\nb\n" * (cap + 1)
+    validation: pytorch_zip_scanner_module._InstNameValidation = (value, {})
+    remaining = [65_536]
+    for index in range(cap):
+        offset = index * 5
+        assert PyTorchZipScanner._raw_nested_proto0_name_end(
+            value, offset, len(value), work_budget_remaining=remaining, inst_name_validation=validation
+        ) == (offset + 4, offset + 5, False)
+    assert len(validation[1]) == cap
+    before = remaining[0]
+    assert PyTorchZipScanner._raw_nested_proto0_name_end(
+        value, 0, len(value), work_budget_remaining=remaining, inst_name_validation=validation
+    ) == (4, 5, False)
+    assert remaining == [before]
+    offset = cap * 5
+    for _ in range(2):
+        before = remaining[0]
+        assert PyTorchZipScanner._raw_nested_proto0_name_end(
+            value, offset, len(value), work_budget_remaining=remaining, inst_name_validation=validation
+        ) == (offset + 4, offset + 5, False)
+        assert remaining[0] < before
+        assert len(validation[1]) == cap
+        assert offset not in validation[1]
+
+
+@pytest.mark.parametrize("value", [b"ia\nb\n", b"ia\nb\xff\n", b"i" + b"a" * 100])
+@pytest.mark.parametrize("empty_range", [False, True])
+def test_pytorch_zip_inst_name_validation_preserves_sticky_exhaustion(value: bytes, empty_range: bool) -> None:
+    validation: pytorch_zip_scanner_module._InstNameValidation = (value, {})
+    PyTorchZipScanner._raw_nested_proto0_name_end(
+        value, 0, len(value), work_budget_remaining=[65_536], inst_name_validation=validation
+    )
+    remaining = [-1]
+    assert PyTorchZipScanner._raw_nested_proto0_name_end(
+        value, 0, 1 if empty_range else len(value), work_budget_remaining=remaining, inst_name_validation=validation
+    ) == (None, 1, True)
+    assert remaining == [-1]
+
+
+@pytest.mark.parametrize("allowance", [0, 1, 4, 64])
+def test_pytorch_zip_inst_name_validation_retains_only_precharged_progress(allowance: int) -> None:
+    value = b"i" + b"a" * 100 + b"\nname\n"
+    validation: pytorch_zip_scanner_module._InstNameValidation = (value, {})
+    remaining = [allowance]
+    name_end, _next_start, truncated = PyTorchZipScanner._raw_nested_proto0_name_end(
+        value, 0, len(value), work_budget_remaining=remaining, inst_name_validation=validation
+    )
+    assert name_end is None
+    assert truncated is True
+    assert remaining == [-1]
+    if allowance == 0:
+        assert not validation[1]
+    for line_ends, validated_end, invalid_at in validation[1].values():
+        assert not line_ends
+        assert invalid_at is None
+        assert validated_end - 1 <= allowance
+
+
+@pytest.mark.parametrize(
+    ("count", "field", "invalid", "prior_mark", "expected"),
+    [
+        (1, "module", False, False, False),
+        (1, "name", False, True, True),
+        (65, "module", False, False, True),
+        (65, "name", True, True, False),
+    ],
+)
+def test_pytorch_zip_inst_name_validation_preserves_beyond_window_accounting(
+    monkeypatch: pytest.MonkeyPatch, count: int, field: str, invalid: bool, prior_mark: bool, expected: bool
+) -> None:
+    probe = pytorch_zip_scanner_module._PICKLE_DISCOVERY_LONG_PROBE_BYTES
+    candidate = pytorch_zip_scanner_module._MAX_RAW_NESTED_PICKLE_CANDIDATE_BYTES
+    local_limit = 128 + (probe - candidate + 1) - candidate + 1 + probe
+    value = bytearray(b"!" * 130_000)
+    value[:130] = b"c\xff" * 65
+    if prior_mark:
+        value[150] = ord("(")
+    start = local_limit - 100
+    payload = b"i" * count + (b"mod\n" if field == "name" else b"")
+    payload += b"a" * (local_limit + 32 - start - len(payload))
+    if invalid:
+        payload += b"\xff"
+    payload += b"\nx\n" if field == "module" else b"\n"
+    value[start : start + len(payload)] = payload
+    slots: list[tuple[int, int, bool]] = []
+    original = PyTorchZipScanner._consume_raw_nested_structural_parse_budget
+
+    def consume(remaining: list[int]) -> bool:
+        before = remaining[0]
+        accepted = original(remaining)
+        slots.append((before, remaining[0], accepted))
+        return accepted
+
+    monkeypatch.setattr(PyTorchZipScanner, "_consume_raw_nested_structural_parse_budget", staticmethod(consume))
+    remaining = [65_536]
+    assert (
+        PyTorchZipScanner._literal_value_has_raw_nested_security_pickle(bytes(value), work_budget_remaining=remaining)
+        is expected
+    )
+    assert remaining[0] >= 0
+    if count == 65 and not invalid and not prior_mark:
+        assert len(slots) == 65
+        assert slots[-1] == (0, 0, False)
+
+
+def test_pytorch_zip_inst_name_validation_preserves_stripped_late_invalid_control() -> None:
+    value = b"!" * 128 + b" \x00\t" * 40 + b"i" + b"a" * 65_500 + b"\xff\nname\n"
+    remaining = [65_536]
+    assert (
+        PyTorchZipScanner._encoded_raw_nested_security_pickle_candidate_budget_exhausted_needs_scan(
+            value, search_start=128, work_budget_remaining=remaining
+        )
+        is False
+    )
+    assert remaining[0] >= 0
