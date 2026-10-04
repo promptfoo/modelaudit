@@ -44,9 +44,7 @@ from modelaudit.utils.sources.jfrog import (
     format_size,
     get_storage_api_url,
     is_jfrog_url,
-    is_jfrog_url_like,
     list_jfrog_folder_contents,
-    redact_jfrog_url_for_display,
 )
 from tests.helpers import create_mock_coreml, create_mock_mxnet_symbol, create_mock_onnx
 from tests.helpers.file_creators import (
@@ -223,32 +221,8 @@ class TestJFrogURLDetection:
 
         assert not is_jfrog_url(f"https://{hostname}/artifactory/libs-release/model.pt")
 
-    def test_rejected_local_jfrog_url_is_still_recognized_for_redaction(self) -> None:
-        assert is_jfrog_url_like("http://user:secret@localhost/artifactory/libs-release/model.pt?token=secret")
-
-    @pytest.mark.parametrize(
-        "url",
-        [
-            "https://localhost/models/model.pt?token=benign",
-            "https://example.com/artifactory/repo/model.pt?token=benign",
-            "https://company.jfrog.io/not-artifactory/repo/model.pt?token=benign",
-        ],
-    )
-    def test_non_jfrog_near_matches_are_not_classified_for_redaction(self, url: str) -> None:
-        assert not is_jfrog_url_like(url)
-
 
 class TestJFrogDownload:
-    def test_redact_jfrog_url_for_display(self) -> None:
-        raw_url = "https://user:leaky-pass@company.jfrog.io/artifactory/repo/model.bin?token=leaky-token#fragment"
-
-        redacted = redact_jfrog_url_for_display(raw_url)
-
-        assert redacted == "https://<credentials-redacted>@company.jfrog.io/artifactory/repo/model.bin"
-        assert "leaky-pass" not in redacted
-        assert "leaky-token" not in redacted
-        assert "fragment" not in redacted
-
     @patch("modelaudit.utils.sources.jfrog.requests.get")
     def test_download_success(self, mock_get: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         # Mock successful response
@@ -1166,8 +1140,8 @@ class TestJFrogDownload:
         assert not call_args[1]["headers"]  # Empty headers dict
 
     @patch("modelaudit.utils.sources.jfrog.requests.get")
-    def test_download_error_redacts_sensitive_url(self, mock_get, tmp_path):
-        """Download errors should not expose URL credentials or query tokens."""
+    def test_download_error_retains_source_url(self, mock_get: MagicMock, tmp_path: Path) -> None:
+        """Authentication failures retain source context and fail without committing a download."""
         mock_response = mock_get.return_value
         mock_error_response = MagicMock(spec=requests.Response)
         mock_error_response.status_code = 401
@@ -1178,10 +1152,9 @@ class TestJFrogDownload:
             download_artifact(raw_url, cache_dir=tmp_path)
 
         message = str(excinfo.value)
-        assert "https://<credentials-redacted>@company.jfrog.io/artifactory/repo/model.bin" in message
-        assert "user:leaky-pass" not in message
-        assert "leaky-token" not in message
-        assert "?token=" not in message
+        assert raw_url in message
+        assert "Authentication failed" in message
+        assert not (tmp_path / "model.bin").exists()
         assert mock_get.call_args[0][0] == raw_url
 
     @patch("modelaudit.utils.sources.jfrog.requests.get")
@@ -3332,9 +3305,7 @@ class TestJFrogFolderDownload:
         error = str(excinfo.value)
         assert "selective filtering incomplete" in error
         assert "evil.payload" in error
-        assert "leaky-pass" not in error
-        assert "leaky-token" not in error
-        assert "?token=" not in error
+        assert hidden_url in error
         mock_download.assert_not_called()
         assert not any(tmp_path.iterdir())
 
@@ -3874,3 +3845,54 @@ def _assert_unsafe_jfrog_child_path(mock_detect: MagicMock, case_child_uri: str)
             recursive=False,
             selective=False,
         )
+
+
+@pytest.mark.parametrize("probe", [False, True])
+def test_jfrog_auth_warnings_filter_controls(probe: bool, caplog: pytest.LogCaptureFixture) -> None:
+    from modelaudit.utils.sources import jfrog
+
+    caplog.set_level(logging.WARNING, logger="modelaudit.utils.sources.jfrog")
+    url = "https://company.jfrog.io/artifactory/repo/model.pkl?token=\x1b]52;c;U1lOVEhFVElD\r\n\tFORGED\x07"
+    with patch.object(jfrog, "_is_trusted_jfrog_auth_target", side_effect=[True, False] if probe else [False]):
+        builder = jfrog._build_jfrog_probe_auth_headers if probe else jfrog._build_jfrog_auth_headers
+        assert builder(url, api_token="synthetic", access_token=None) == {}
+    assert "Skipping JFrog" in caplog.text
+    assert "\x1b" not in caplog.text and "\x07" not in caplog.text
+    assert "\tFORGED" not in caplog.text
+    assert all(
+        len(record.message.splitlines()) == 1
+        for record in caplog.records
+        if record.name == "modelaudit.utils.sources.jfrog"
+    )
+
+
+@pytest.mark.parametrize("download", [False, True])
+def test_jfrog_folder_error_logs_filter_controls(
+    download: bool, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    from modelaudit.utils.sources import jfrog
+
+    caplog.set_level(logging.WARNING, logger="modelaudit.utils.sources.jfrog")
+    source = "https://company.jfrog.io/artifactory/repo/models"
+    error = OSError("Cannot read " + source + "?token=\x1b]52;c;U1lOVEhFVElD\r\n\tFORGED\x07")
+    if download:
+        files = [{"name": "model.pkl", "path": source + "/model.pkl", "size": 4, "human_size": "4 B"}]
+        with (
+            patch.object(jfrog, "list_jfrog_folder_contents", return_value=files),
+            patch.object(jfrog, "download_artifact", side_effect=error),
+            pytest.raises(Exception, match="JFrog folder download failed"),
+        ):
+            jfrog.download_jfrog_folder(source, cache_dir=tmp_path, show_progress=False)
+    else:
+        folder = {"type": "folder", "children": [{"uri": "/model.pkl", "folder": False}]}
+        with patch.object(jfrog, "detect_jfrog_target_type", side_effect=[folder, folder, error]):
+            files = jfrog.list_jfrog_folder_contents(source, fetch_sizes=True, selective=False)
+        assert len(files) == 1 and not files[0]["size_known"]
+    assert "Failed to" in caplog.text
+    assert "\x1b" not in caplog.text and "\x07" not in caplog.text
+    assert "\tFORGED" not in caplog.text
+    assert all(
+        len(record.message.splitlines()) == 1
+        for record in caplog.records
+        if record.name == "modelaudit.utils.sources.jfrog"
+    )

@@ -18,6 +18,7 @@ from .scanner_results import (
     ScanResult,
     normalize_unclassified_scan_failure,
 )
+from .utils.helpers.finding_identity import finding_identity
 
 # We'll use forward references and rebuild models after imports
 
@@ -809,6 +810,7 @@ class ModelAuditResultModel(BaseModel, DictCompatMixin):
                     why=issue.why,
                     type=getattr(issue, "type", None),  # Include type if available
                     rule_code=getattr(issue, "rule_code", None),
+                    **({"finding_identity": issue.finding_identity} if hasattr(issue, "finding_identity") else {}),
                 )
             )
 
@@ -825,6 +827,7 @@ class ModelAuditResultModel(BaseModel, DictCompatMixin):
                     severity=check.severity if check.severity else None,
                     why=check.why,
                     rule_code=getattr(check, "rule_code", None),
+                    **({"finding_identity": check.finding_identity} if hasattr(check, "finding_identity") else {}),
                 )
             )
 
@@ -870,7 +873,8 @@ class ModelAuditResultModel(BaseModel, DictCompatMixin):
         deduplicated_issues = []
         for issue in self.issues:
             # Include location in the deduplication key to avoid hiding issues in different files
-            issue_key = (issue.message, issue.severity, issue.location or "")
+            identity = finding_identity(issue)
+            issue_key = (identity.message, identity.severity, identity.location or "")
             if issue_key not in seen_issues:
                 seen_issues.add(issue_key)
                 deduplicated_issues.append(issue)

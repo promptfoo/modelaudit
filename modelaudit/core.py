@@ -28,6 +28,11 @@ except ImportError:
 
 
 import modelaudit.core_results as core_results
+from modelaudit.integrations._sarif_identity_urls import (
+    redact_cloud_error_for_display,
+    redact_stream_error_for_display,
+    redact_stream_url_for_display,
+)
 from modelaudit.integrations.license_checker import (
     LICENSE_FILES,
     check_commercial_use_warnings,
@@ -154,6 +159,8 @@ from modelaudit.utils.helpers.cache_decorator import (
     should_defer_hash_for_file_backed_onnx,
     should_defer_hash_for_pytorch_read_limit,
 )
+from modelaudit.utils.helpers.evidence import format_terminal_text
+from modelaudit.utils.helpers.finding_identity import preserve_finding_identity
 from modelaudit.utils.helpers.interrupt_handler import check_interrupted
 from modelaudit.utils.helpers.types import (
     FilePath,
@@ -177,19 +184,7 @@ from modelaudit.utils.sources._huggingface_cache import (
     _resolve_hf_cache_path,
     _trusted_hf_blobs_root,
 )
-from modelaudit.utils.sources.cloud_storage import (
-    is_sensitive_credential_key,
-    is_stream_url,
-)
-from modelaudit.utils.sources.cloud_storage import (
-    redact_cloud_error_for_display as _redact_cloud_error_for_display,
-)
-from modelaudit.utils.sources.cloud_storage import (
-    redact_stream_error_for_display as _redact_stream_error_for_display,
-)
-from modelaudit.utils.sources.cloud_storage import (
-    redact_stream_url_for_display as _redact_stream_url_for_display,
-)
+from modelaudit.utils.sources.cloud_storage import is_stream_url
 
 logger = logging.getLogger("modelaudit.core")
 
@@ -949,87 +944,66 @@ def _make_trusted_stream_shard_root(path: FilePath) -> object:
     )
 
 
-def _redacted_stream_url_for_reporting(stream_url: str) -> str:
-    """Return a stream source identifier safe for persisted scan output."""
-    return _redact_stream_url_for_display(stream_url)
-
-
-def _redacted_scan_path_for_reporting(path: str) -> str:
-    if is_stream_url(path):
-        return f"stream://{_redacted_stream_url_for_reporting(path[9:])}"
-    return path
-
-
-def _redacted_scan_error_for_reporting(error: object, path: str) -> str:
-    if is_stream_url(path):
-        return _redact_stream_error_for_display(error, path[9:])
-    return str(error)
-
-
-def _redact_stream_value_for_reporting(value: Any, stream_url: str, report_url: str) -> Any:
+def _replace_report_path_value(value: Any, stream_url: str, report_url: str) -> Any:
     if isinstance(value, BaseModel):
-        return _redact_stream_value_for_reporting(value.model_dump(mode="python"), stream_url, report_url)
+        return _replace_report_path_value(value.model_dump(mode="python"), stream_url, report_url)
     if isinstance(value, AnyUrl):
-        return _redact_stream_value_for_reporting(str(value), stream_url, report_url)
+        return _replace_report_path_value(str(value), stream_url, report_url)
     if isinstance(value, os.PathLike):
-        return _redact_stream_value_for_reporting(os.fspath(value), stream_url, report_url)
+        return _replace_report_path_value(os.fspath(value), stream_url, report_url)
     if isinstance(value, str):
-        return _redact_cloud_error_for_display(value.replace(stream_url, report_url))
+        return value.replace(stream_url, report_url)
     if isinstance(value, bytes):
         try:
             decoded = value.decode("utf-8")
         except UnicodeDecodeError:
             return b"<binary data>"
-        return _redact_stream_value_for_reporting(decoded, stream_url, report_url).encode("utf-8")
+        return _replace_report_path_value(decoded, stream_url, report_url).encode("utf-8")
     if isinstance(value, bytearray):
         try:
             decoded = value.decode("utf-8")
         except UnicodeDecodeError:
             return bytearray(b"<binary data>")
-        return bytearray(_redact_stream_value_for_reporting(decoded, stream_url, report_url), "utf-8")
+        return bytearray(_replace_report_path_value(decoded, stream_url, report_url), "utf-8")
     if isinstance(value, dict):
-        redacted_mapping: dict[Any, Any] = {}
+        rebased_mapping: dict[Any, Any] = {}
         for key, item in value.items():
-            redacted_key = _redact_stream_value_for_reporting(key, stream_url, report_url)
-            redacted_mapping[redacted_key] = (
-                "<redacted>"
-                if is_sensitive_credential_key(key)
-                else _redact_stream_value_for_reporting(item, stream_url, report_url)
-            )
-        return redacted_mapping
+            rebased_key = _replace_report_path_value(key, stream_url, report_url)
+            rebased_mapping[rebased_key] = _replace_report_path_value(item, stream_url, report_url)
+        return rebased_mapping
     if isinstance(value, list):
-        return [_redact_stream_value_for_reporting(item, stream_url, report_url) for item in value]
+        return [_replace_report_path_value(item, stream_url, report_url) for item in value]
     if isinstance(value, tuple):
-        return tuple(_redact_stream_value_for_reporting(item, stream_url, report_url) for item in value)
+        return tuple(_replace_report_path_value(item, stream_url, report_url) for item in value)
     if isinstance(value, set):
-        return {_redact_stream_value_for_reporting(item, stream_url, report_url) for item in value}
+        return {_replace_report_path_value(item, stream_url, report_url) for item in value}
     if isinstance(value, frozenset):
-        return frozenset(_redact_stream_value_for_reporting(item, stream_url, report_url) for item in value)
+        return frozenset(_replace_report_path_value(item, stream_url, report_url) for item in value)
     return value
 
 
-def _redact_stream_record_for_reporting(record: Issue | Check, stream_url: str, report_url: str) -> None:
+def _replace_record_report_path(record: Issue | Check, stream_url: str, report_url: str) -> None:
     for attr in ("location", "message", "why", "rule_code", "type", "name"):
         value = getattr(record, attr, None)
         if isinstance(value, str):
-            setattr(record, attr, _redact_stream_value_for_reporting(value, stream_url, report_url))
+            setattr(record, attr, _replace_report_path_value(value, stream_url, report_url))
     if record.details:
-        record.details = _redact_stream_value_for_reporting(record.details, stream_url, report_url)
+        record.details = _replace_report_path_value(record.details, stream_url, report_url)
     if record.model_extra:
-        redacted_extra = _redact_stream_value_for_reporting(record.model_extra, stream_url, report_url)
+        rebased_extra = _replace_report_path_value(record.model_extra, stream_url, report_url)
         record.model_extra.clear()
-        record.model_extra.update(redacted_extra)
+        record.model_extra.update(rebased_extra)
 
 
-def _redact_stream_scan_result_for_reporting(scan_result: ScanResult, stream_url: str, report_url: str) -> None:
-    """Strip signed query material from scanner-owned records before aggregation."""
+def _replace_result_report_path(scan_result: ScanResult, stream_url: str, report_url: str) -> None:
+    """Replace descriptor-only paths in scanner records before aggregation."""
     for issue in scan_result.issues:
-        _redact_stream_record_for_reporting(issue, stream_url, report_url)
+        _replace_record_report_path(issue, stream_url, report_url)
     for check in scan_result.checks:
-        _redact_stream_record_for_reporting(check, stream_url, report_url)
+        _replace_record_report_path(check, stream_url, report_url)
 
     if scan_result.metadata:
-        scan_result.metadata = _redact_stream_value_for_reporting(scan_result.metadata, stream_url, report_url)
+        scan_result.metadata = _replace_report_path_value(scan_result.metadata, stream_url, report_url)
         scan_result._refresh_metadata_dependent_state()
 
 
@@ -1062,6 +1036,29 @@ def _rebase_bound_directory_owner_value_for_reporting(value: Any, report_root: P
     return value
 
 
+def _preserve_scan_result_identity(scan_result: ScanResult, producer: str, source: str, identity_source: str) -> None:
+    """Retain producer normalization before aggregation consumes identity fields."""
+
+    def normalized(value: str) -> str:
+        return redact_cloud_error_for_display(value.replace(source, identity_source))
+
+    records: list[Issue | Check] = [*scan_result.issues, *scan_result.checks]
+    for record in records:
+        fields: dict[str, Any] = {
+            name: normalized(value)
+            for name in ("message", "location", "type", "rule_code", "name")
+            if isinstance(value := getattr(record, name, None), str)
+        }
+        details = {
+            name: normalized(value)
+            for name in ("evidence_fingerprint", "zip_entry_id", "zip_entry", "check_consolidation_key")
+            if isinstance(value := record.details.get(name), str)
+        }
+        if details:
+            fields["details"] = details
+        preserve_finding_identity(record, producer, **fields)
+
+
 def _normalize_directory_owner_scan_result_for_reporting(
     scan_result: ScanResult,
     owner_scan_path: str,
@@ -1069,7 +1066,8 @@ def _normalize_directory_owner_scan_result_for_reporting(
 ) -> None:
     """Rewrite descriptor-only owner scan paths before aggregate reporting."""
     if owner_scan_path != os.curdir:
-        _redact_stream_scan_result_for_reporting(scan_result, owner_scan_path, report_path)
+        _replace_result_report_path(scan_result, owner_scan_path, report_path)
+        _preserve_scan_result_identity(scan_result, "directory_owner", report_path, report_path)
         return
 
     report_root = Path(report_path)
@@ -3553,7 +3551,7 @@ def scan_model_directory_or_file(
         if is_stream_url(path):
             # Extract the actual URL
             stream_url = path[9:]  # Remove "stream://" prefix
-            report_url = _redacted_stream_url_for_reporting(stream_url)
+            report_url = stream_url
             if progress_callback:
                 progress_callback(f"Streaming analysis: {report_url}", 0.0)
 
@@ -3571,7 +3569,10 @@ def scan_model_directory_or_file(
                 else:
                     scan_result, analysis_complete = stream_analyze_file(stream_url, scanner)
                 if scan_result:
-                    _redact_stream_scan_result_for_reporting(scan_result, stream_url, report_url)
+                    _replace_result_report_path(scan_result, stream_url, stream_url)
+                    identity_source = redact_stream_url_for_display(stream_url)
+                    _preserve_scan_result_identity(scan_result, "stream", stream_url, identity_source)
+                    scan_result.metadata["source_identity"] = {"producer": "stream", "path": identity_source}
                     if not analysis_complete:
                         _mark_inconclusive_scan_outcome(scan_result, "streaming_analysis_incomplete")
                     results.files_scanned += 1
@@ -3589,6 +3590,9 @@ def scan_model_directory_or_file(
                             severity=IssueSeverity.INFO.value,
                             location=report_url,
                             details={"analysis_complete": False},
+                        )
+                        preserve_finding_identity(
+                            results.issues[-1], "stream", location=redact_stream_url_for_display(stream_url)
                         )
                 else:
                     raise ValueError(f"Streaming analysis failed for {report_url}")
@@ -3688,10 +3692,7 @@ def scan_model_directory_or_file(
                 directory_owner_result.add_check(
                     name="Directory Owner Scan",
                     passed=False,
-                    message=(
-                        "Unable to complete logical model-directory analysis: "
-                        f"{_redacted_scan_error_for_reporting(error, path)}"
-                    ),
+                    message=(f"Unable to complete logical model-directory analysis: {error!s}"),
                     severity=IssueSeverity.INFO,
                     location=path,
                     details={
@@ -4893,10 +4894,7 @@ def scan_model_directory_or_file(
                             directory_owner_result.add_check(
                                 name="Directory Owner Scan",
                                 passed=False,
-                                message=(
-                                    "Unable to complete logical model-directory analysis: "
-                                    f"{_redacted_scan_error_for_reporting(error, path)}"
-                                ),
+                                message=(f"Unable to complete logical model-directory analysis: {error!s}"),
                                 severity=IssueSeverity.INFO,
                                 location=path,
                                 details={
@@ -5745,10 +5743,10 @@ def scan_model_directory_or_file(
             results, "Scan interrupted by user", severity=IssueSeverity.INFO.value, details={"interrupted": True}
         )
     except Exception as e:
-        report_path = _redacted_scan_path_for_reporting(path)
-        report_error = _redacted_scan_error_for_reporting(e, path)
+        report_path = path
+        report_error = str(e)
         if is_stream_url(path):
-            logger.error(f"Error during scan: {report_error}")
+            logger.error(f"Error during scan: {format_terminal_text(report_error)}")
         else:
             logger.exception(f"Error during scan: {report_error}")
         scan_metadata["success"] = False
@@ -5759,6 +5757,17 @@ def scan_model_directory_or_file(
             severity=IssueSeverity.INFO.value,
             details={"exception_type": type(e).__name__},
         )
+        if is_stream_url(path):
+            from .models import FileMetadataModel
+
+            results.file_metadata[report_path] = FileMetadataModel(
+                source_identity={"producer": "stream", "path": f"stream://{redact_stream_url_for_display(path[9:])}"}
+            )
+            preserve_finding_identity(
+                results.issues[-1],
+                "stream",
+                message=f"Error during scan: {redact_stream_error_for_display(e, path[9:])}",
+            )
         _add_error_asset_to_results(results, report_path)
     finally:
         pickle_source_snapshot_stack.close()
