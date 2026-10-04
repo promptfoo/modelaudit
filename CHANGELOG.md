@@ -22,8 +22,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Preserve ONNX weight coverage across unknown broadcast ranks, unproven branch annotations, captured runtime inputs, and repeated loop state changes; avoid false coverage gaps for shape-restoring loops and padded Scan-8 outputs.
-- Preserve ONNX coverage through successive loop-state transfers and nested branch, skipped-loop, and caller-bound Gather shape changes; keep stacked initializer analysis consistent with its stored weight view.
-- Enforce ONNX tensor budgets on expanded weight views and bound control-value decoding, repeated graph and sibling-state traversal, and analysis-cache retention.
+- Preserve ONNX coverage through successive loop-state transfers and nested branch, skipped-loop, and caller-bound shape attributes; preserve optional control-flow output positions and materialize bounded stacked Loop and Scan weight views.
+- Enforce ONNX tensor budgets on expanded weight views and bound control-value decoding, repeated graph and sibling-state traversal, constant-context copying, and analysis-cache retention.
 - Preserve native SafeTensors routing when a valid bounded header also resembles an FDICT zlib stream.
 - Avoid false incomplete pickle scans when Python lazily refreshes an import-directory cache after a change made before scanning.
 

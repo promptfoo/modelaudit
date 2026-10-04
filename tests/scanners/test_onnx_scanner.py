@@ -26172,3 +26172,486 @@ class TestOnnxTransferReviewRegressions:
             TestOnnxProofReviewRegressions._assert_gap(path, tmp_path, "unresolved_initializer_lineage")
         else:
             TestOnnxReviewShapeRegressions._assert_clean(path)
+
+
+class TestOnnxRecurrenceReviewRegressions:
+    @staticmethod
+    def _value(name: str, shape: Any, dtype: int = TensorProto.FLOAT) -> Any:
+        return helper.make_tensor_value_info(name, dtype, shape)
+
+    @staticmethod
+    def _tensor(name: str, value: Any, dtype: Any = np.float32) -> Any:
+        return onnx.numpy_helper.from_array(np.asarray(value, dtype=dtype), name=name)
+
+    @pytest.mark.parametrize("axis", [0, 1])
+    @pytest.mark.parametrize("iterations", [1, 3])
+    @pytest.mark.parametrize("storage", ["initializer", "constant"])
+    def test_scan_stacked_vector_materializes_matching_view(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, axis: int, iterations: int, storage: str
+    ) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        weights = np.array([1, 2], dtype=np.float32)
+        tensor = self._tensor("W", weights)
+        body = helper.make_graph(
+            [helper.make_node("Constant", [], ["W"], value=tensor)] if storage == "constant" else [],
+            "stack_body",
+            [self._value("element", [])],
+            [self._value("W", [2])],
+            [tensor] if storage == "initializer" else [],
+        )
+        stacked = np.stack([weights] * iterations, axis=axis)
+        graph = helper.make_graph(
+            [
+                helper.make_node(
+                    "Scan", ["sequence"], ["stacked"], body=body, num_scan_inputs=1, scan_output_axes=[axis]
+                ),
+                helper.make_node("MatMul", ["X", "stacked"], ["Y"]),
+            ],
+            "scan_stacked_vector",
+            [self._value("sequence", [iterations]), self._value("X", [2, stacked.shape[0]])],
+            [self._value("Y", [2, stacked.shape[1]])],
+        )
+        path = TestOnnxReviewShapeRegressions._save(graph, tmp_path)
+        model = onnx.load(str(path))
+        onnx.checker.check_model(model, full_check=True)
+        inferred = onnx.shape_inference.infer_shapes(model, strict_mode=True)
+        inferred_stack = next(value for value in inferred.graph.value_info if value.name == "stacked")
+        assert tuple(dim.dim_value for dim in inferred_stack.type.tensor_type.shape.dim) == stacked.shape
+        x = np.ones((2, stacked.shape[0]), dtype=np.float32)
+        if axis == 0:
+            runtime: Any = ReferenceEvaluator(model).run(
+                None, {"sequence": np.ones(iterations, dtype=np.float32), "X": x}
+            )
+            np.testing.assert_array_equal(runtime[0], x @ stacked)
+        else:
+            # ReferenceEvaluator supports only Scan output axis zero; execute the body and stack explicitly.
+            body_runtime: Any = ReferenceEvaluator(body, opsets={"": 18})
+            slices = [body_runtime.run(None, {"element": np.array(1, dtype=np.float32)})[0] for _ in range(iterations)]
+            np.testing.assert_array_equal(np.stack(slices, axis=axis), stacked)
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        assert plan.extraction_failures == 0
+        assert plan.coverage_gaps == {}
+        assert plan.analyzed_initializer_count == 1
+        assert len(plan.specs) == 1
+        np.testing.assert_array_equal(plan.specs[0].weights, stacked)
+        assert all(0 <= output_axis < 2 for output_axis in plan.specs[0].output_axes)
+        TestOnnxReviewShapeRegressions._assert_clean(path)
+        if iterations == 3:
+            materialized: list[str] = []
+            original_to_array = onnx.numpy_helper.to_array
+
+            def observe_materialization(tensor: Any, *args: Any, **kwargs: Any) -> Any:
+                materialized.append(tensor.name)
+                return original_to_array(tensor, *args, **kwargs)
+
+            with monkeypatch.context() as scoped:
+                scoped.setattr(onnx.numpy_helper, "to_array", observe_materialization)
+                limited = onnx_scanner_module._build_onnx_weight_analysis_plan(
+                    model, onnx=onnx, np=np, max_array_size=16
+                )
+            assert limited.oversized_initializers_skipped == 1
+            assert limited.specs == []
+            assert "W" not in materialized
+            assert not any(spec.context["initializer"] in materialized for spec in plan.specs)
+
+    @pytest.mark.parametrize("matrix_sources", [False, True])
+    @pytest.mark.parametrize("skip", ["zero-trip", "false-condition", "execute"])
+    def test_nested_loop_skipped_state_reaches_weight_consumer(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, matrix_sources: bool, skip: str
+    ) -> None:
+        inner = helper.make_graph(
+            [helper.make_node("Identity", ["replacement"], ["reset"])],
+            "inner_reset",
+            [
+                self._value("ii", [], TensorProto.INT64),
+                self._value("ic", [], TensorProto.BOOL),
+                self._value("is", None),
+            ],
+            [self._value("ic", [], TensorProto.BOOL), self._value("reset", [4])],
+        )
+        source_shape = (4, 4) if matrix_sources else (4,)
+        body = helper.make_graph(
+            [
+                helper.make_node("Loop", ["inner_count", "inner_start", "state"], ["through"], body=inner),
+                helper.make_node("PRelu", ["X", "through"], ["unused"]),
+                helper.make_node("Sum", [f"W{i}" for i in range(40)], ["next"]),
+            ],
+            "outer_skipped_state",
+            [
+                self._value("i", [], TensorProto.INT64),
+                self._value("condition", [], TensorProto.BOOL),
+                self._value("state", None),
+            ],
+            [self._value("condition", [], TensorProto.BOOL), self._value("next", None)],
+        )
+        graph = helper.make_graph(
+            [helper.make_node("Loop", ["two", "start", "initial"], ["final"], body=body)],
+            "skipped_state_reachability",
+            [self._value("X", [4, 4]), self._value("replacement", [4])],
+            [self._value("final", list(source_shape))],
+            [
+                self._tensor("initial", np.ones(4)),
+                self._tensor("two", 2, np.int64),
+                self._tensor("inner_count", 0 if skip == "zero-trip" else 1, np.int64),
+                self._tensor("inner_start", skip != "false-condition", np.bool_),
+                self._tensor("start", True, np.bool_),
+                *[self._tensor(f"W{i}", np.ones(source_shape)) for i in range(40)],
+            ],
+        )
+        path = TestOnnxReviewShapeRegressions._save(graph, tmp_path)
+        slopes = TestOnnxTransferReviewRegressions._observed_slopes(
+            path, monkeypatch, {"X": np.ones((4, 4), dtype=np.float32), "replacement": np.ones(4, dtype=np.float32)}
+        )
+        assert slopes == [(4,), source_shape if skip != "execute" else (4,)]
+        if matrix_sources and skip != "execute":
+            TestOnnxProofReviewRegressions._assert_gap(path, tmp_path, "lineages_per_value_limit")
+        else:
+            TestOnnxReviewShapeRegressions._assert_clean(path)
+
+    @pytest.mark.parametrize("matrix_sources", [False, True])
+    @pytest.mark.parametrize("inner_iterations", [1, 2])
+    def test_nested_loop_reachability_follows_successive_state_transfers(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, matrix_sources: bool, inner_iterations: int
+    ) -> None:
+        inner = helper.make_graph(
+            [
+                helper.make_node("Identity", [source], [target])
+                for source, target in (("b", "na"), ("c", "nb"), ("c", "nc"))
+            ],
+            "inner_transfer",
+            [self._value("j", [], TensorProto.INT64), self._value("condition", [], TensorProto.BOOL)]
+            + [self._value(name, None) for name in ("a", "b", "c")],
+            [self._value("condition", [], TensorProto.BOOL)] + [self._value(name, None) for name in ("na", "nb", "nc")],
+        )
+        source_shape = (4, 4) if matrix_sources else (4,)
+        body = helper.make_graph(
+            [
+                helper.make_node(
+                    "Loop",
+                    ["inner_count", "start", "replacement", "replacement", "state"],
+                    ["through", "unused_b", "unused_c"],
+                    body=inner,
+                ),
+                helper.make_node("PRelu", ["X", "through"], ["unused"]),
+                helper.make_node("Sum", [f"W{i}" for i in range(40)], ["next"]),
+            ],
+            "outer_transfer",
+            [
+                self._value("i", [], TensorProto.INT64),
+                self._value("condition", [], TensorProto.BOOL),
+                self._value("state", None),
+            ],
+            [self._value("condition", [], TensorProto.BOOL), self._value("next", None)],
+        )
+        graph = helper.make_graph(
+            [helper.make_node("Loop", ["two", "start", "initial"], ["final"], body=body)],
+            "successive_nested_transfers",
+            [self._value("X", [4, 4]), self._value("replacement", [4])],
+            [self._value("final", list(source_shape))],
+            [
+                self._tensor("initial", np.ones(4)),
+                self._tensor("two", 2, np.int64),
+                self._tensor("inner_count", inner_iterations, np.int64),
+                self._tensor("start", True, np.bool_),
+                *[self._tensor(f"W{i}", np.ones(source_shape)) for i in range(40)],
+            ],
+        )
+        path = TestOnnxReviewShapeRegressions._save(graph, tmp_path)
+        slopes = TestOnnxTransferReviewRegressions._observed_slopes(
+            path, monkeypatch, {"X": np.ones((4, 4), dtype=np.float32), "replacement": np.ones(4, dtype=np.float32)}
+        )
+        assert slopes == [(4,), source_shape if inner_iterations == 2 else (4,)]
+        if matrix_sources and inner_iterations == 2:
+            TestOnnxProofReviewRegressions._assert_gap(path, tmp_path, "lineages_per_value_limit")
+        else:
+            TestOnnxReviewShapeRegressions._assert_clean(path)
+
+    @pytest.mark.parametrize("grows", [False, True])
+    @pytest.mark.parametrize("variant", ["scan-stack", "omitted-output", "named-output"])
+    def test_nested_control_flow_preserves_stacking_and_output_positions(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, grows: bool, variant: str
+    ) -> None:
+        nextshape: tuple[int, ...]
+        if variant == "scan-stack":
+            inner = helper.make_graph(
+                [helper.make_node("Identity", ["state"], ["stacked_element"])]
+                + ([] if grows else [helper.make_node("Identity", ["carried"], ["carried_out"])]),
+                "inner_scan",
+                ([] if grows else [self._value("carried", None)]) + [self._value("scan_in", [])],
+                ([] if grows else [self._value("carried_out", None)]) + [self._value("stacked_element", None)],
+            )
+            update = helper.make_node(
+                "Scan",
+                ["sequence"] if grows else ["state", "sequence"],
+                ["next"] if grows else ["next", "unused_stack"],
+                body=inner,
+                num_scan_inputs=1,
+            )
+            xshape, finalshape, nextshape = [2, 4], [2, 2, 4], (2, 4)
+        else:
+            inner = helper.make_graph(
+                [
+                    helper.make_node("Identity", ["a"], ["aa"]),
+                    helper.make_node("Unsqueeze", ["b", "axes"], ["bb"])
+                    if grows
+                    else helper.make_node("Identity", ["b"], ["bb"]),
+                ],
+                "inner_optional_outputs",
+                [
+                    self._value("j", [], TensorProto.INT64),
+                    self._value("c", [], TensorProto.BOOL),
+                    self._value("a", None),
+                    self._value("b", None),
+                ],
+                [self._value("c", [], TensorProto.BOOL), self._value("aa", None), self._value("bb", None)],
+            )
+            update = helper.make_node(
+                "Loop",
+                ["two", "start", "state", "state"],
+                ["" if variant == "omitted-output" else "unused", "next"],
+                body=inner,
+            )
+            xshape, finalshape, nextshape = [1, 1, 4], [1, 1, 1, 1, 4], (1, 1, 4)
+        body = helper.make_graph(
+            [
+                helper.make_node("Mul", ["state", "W"], ["weight"]),
+                helper.make_node("PRelu", ["X", "weight"], ["activation"]),
+                update,
+            ],
+            "outer_nested_shape",
+            [
+                self._value("i", [], TensorProto.INT64),
+                self._value("c", [], TensorProto.BOOL),
+                self._value("state", None),
+            ],
+            [self._value("c", [], TensorProto.BOOL), self._value("next", None)],
+        )
+        graph = helper.make_graph(
+            [helper.make_node("Loop", ["count", "start", "initial"], ["final"], body=body)],
+            "nested_control_flow_shape",
+            [self._value("initial", [4]), self._value("count", [], TensorProto.INT64), self._value("X", xshape)],
+            [self._value("final", finalshape if grows else [4])],
+            [
+                self._tensor("W", np.ones(4)),
+                self._tensor("sequence", np.ones(2)),
+                self._tensor("two", 2, np.int64),
+                self._tensor("axes", [0], np.int64),
+                self._tensor("start", True, np.bool_),
+            ],
+        )
+        path = TestOnnxReviewShapeRegressions._save(graph, tmp_path)
+        slopes = TestOnnxTransferReviewRegressions._observed_slopes(
+            path,
+            monkeypatch,
+            {
+                "initial": np.ones(4, dtype=np.float32),
+                "count": np.array(2, dtype=np.int64),
+                "X": np.ones(xshape, dtype=np.float32),
+            },
+        )
+        assert slopes == [(4,), nextshape if grows else (4,)]
+        if grows:
+            TestOnnxProofReviewRegressions._assert_gap(path, tmp_path, "unresolved_initializer_lineage")
+        else:
+            TestOnnxReviewShapeRegressions._assert_clean(path)
+
+    @pytest.mark.parametrize("referenced", [False, True])
+    @pytest.mark.parametrize("axis", [0, 1, -1])
+    def test_referenced_onehot_axis_preserves_recurrence_shape(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, referenced: bool, axis: int
+    ) -> None:
+        hot = helper.make_node("OneHot", ["indices", "depth", "values"], ["out"], axis=axis)
+        if referenced:
+            hot.attribute[0].ClearField("i")
+            hot.attribute[0].ref_attr_name = "axis"
+        function = helper.make_function(
+            "local",
+            "Hot",
+            ["indices", "depth", "values"],
+            ["out"],
+            [hot],
+            [helper.make_opsetid("", 18)],
+            attributes=["axis"] if referenced else [],
+        )
+        call_attributes: dict[str, Any] = {"axis": axis} if referenced else {}
+        body = helper.make_graph(
+            [
+                helper.make_node("Add", ["state", "bias"], ["biased"]),
+                helper.make_node("Squeeze", ["biased"], ["slope"]),
+                helper.make_node("PRelu", ["X", "slope"], ["activation"]),
+                helper.make_node("Squeeze", ["state"], ["vector"]),
+                helper.make_node("Cast", ["vector"], ["indices"], to=TensorProto.INT64),
+                helper.make_node(
+                    "Hot",
+                    ["indices", "depth", "values"],
+                    ["next"],
+                    domain="local",
+                    **call_attributes,
+                ),
+            ],
+            "onehot_recurrence",
+            [
+                self._value("i", [], TensorProto.INT64),
+                self._value("c", [], TensorProto.BOOL),
+                self._value("state", None),
+            ],
+            [self._value("c", [], TensorProto.BOOL), self._value("next", None)],
+        )
+        graph = helper.make_graph(
+            [helper.make_node("Loop", ["count", "start", "initial"], ["final"], body=body)],
+            "caller_bound_onehot_axis",
+            [self._value("initial", [1, 4]), self._value("count", [], TensorProto.INT64), self._value("X", [4, 4])],
+            [self._value("final", [1, 4] if axis == 0 else [4, 1])],
+            [
+                self._tensor("bias", np.ones((1, 4))),
+                self._tensor("depth", 1, np.int64),
+                self._tensor("values", [0, 0]),
+                self._tensor("start", True, np.bool_),
+            ],
+        )
+        path = TestOnnxReviewShapeRegressions._save(graph, tmp_path, functions=[function])
+        slopes = TestOnnxTransferReviewRegressions._observed_slopes(
+            path,
+            monkeypatch,
+            {
+                "initial": np.zeros((1, 4), dtype=np.float32),
+                "count": np.array(2, dtype=np.int64),
+                "X": np.ones((4, 4), dtype=np.float32),
+            },
+        )
+        assert slopes == [(4,), (4,) if axis == 0 else (4, 4)]
+        if axis == 0:
+            TestOnnxReviewShapeRegressions._assert_clean(path)
+        else:
+            TestOnnxProofReviewRegressions._assert_gap(path, tmp_path, "unresolved_initializer_lineage")
+
+    @pytest.mark.parametrize("captured_shape", [False, True])
+    def test_sibling_reentry_constant_context_work_is_linear(self, tmp_path: Path, captured_shape: bool) -> None:
+        width, constant_count = 64, 1024
+        nodes = [helper.make_node("Identity", [f"state{i}"], [f"next{i}"]) for i in range(width)]
+        if captured_shape:
+            branch = helper.make_graph(
+                [
+                    helper.make_node("Reshape", ["W", "shape"], ["matrix"]),
+                    helper.make_node("MatMul", ["X", "matrix"], ["activation"]),
+                ],
+                "captured_constant_branch",
+                [],
+                [self._value("activation", [2, 2])],
+            )
+            nodes.append(helper.make_node("If", ["condition"], ["unused"], then_branch=branch, else_branch=branch))
+        body = helper.make_graph(
+            nodes,
+            "constant_context_body",
+            [self._value("i", [], TensorProto.INT64), self._value("condition", [], TensorProto.BOOL)]
+            + [self._value(f"state{i}", [2]) for i in range(width)],
+            [self._value("condition", [], TensorProto.BOOL)] + [self._value(f"next{i}", [2]) for i in range(width)],
+        )
+        graph = helper.make_graph(
+            [
+                helper.make_node(
+                    "Loop",
+                    ["count", "start", *[f"input{i}" for i in range(width)]],
+                    [f"out{i}" for i in range(width)],
+                    body=body,
+                )
+            ],
+            "bounded_constant_context",
+            [self._value(f"input{i}", [2]) for i in range(width)]
+            + ([self._value("X", [2, 2])] if captured_shape else []),
+            [self._value(f"out{i}", [2]) for i in range(width)],
+            [self._tensor(f"unrelated{i}", [1], np.int64) for i in range(constant_count)]
+            + [self._tensor("count", 2, np.int64), self._tensor("start", True, np.bool_)]
+            + ([self._tensor("shape", [2, 2], np.int64), self._tensor("W", np.ones(4))] if captured_shape else []),
+        )
+        path = TestOnnxReviewShapeRegressions._save(graph, tmp_path)
+        model = onnx.load(str(path))
+        onnx.checker.check_model(model, full_check=True)
+        contexts: dict[int, dict[str, Any]] = {}
+
+        def count_context_entries(frame: Any, event: str, arg: Any) -> None:
+            if (
+                event == "return"
+                and frame.f_code.co_name == "graph_initializer_constants"
+                and frame.f_code.co_filename == onnx_scanner_module.__file__
+                and isinstance(arg, dict)
+            ):
+                contexts[id(arg)] = arg
+
+        previous_profile = sys.getprofile()
+        try:
+            sys.setprofile(count_context_entries)
+            plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        finally:
+            sys.setprofile(previous_profile)
+        # Count distinct allocations while permitting reuse of an immutable context.
+        returned_entries = sum(len(context) for context in contexts.values())
+        assert returned_entries <= 4 * constant_count + 4096, returned_entries
+        assert plan.coverage_gaps == {}
+        assert plan.extraction_failures == 0
+        assert bool(plan.specs) is captured_shape
+        assert plan.analyzed_initializer_count == int(captured_shape)
+        if captured_shape:
+            assert all(spec.weights.shape == (2, 2) for spec in plan.specs)
+        TestOnnxReviewShapeRegressions._assert_clean(path)
+
+    @pytest.mark.parametrize("primed", [False, True])
+    @pytest.mark.parametrize("second_depth", [1, 4])
+    def test_onehot_recurrence_cache_distinguishes_bound_depth_values(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, primed: bool, second_depth: int
+    ) -> None:
+        function = helper.make_function(
+            "local",
+            "HotUpdate",
+            ["state", "depth", "values"],
+            ["next"],
+            [
+                helper.make_node("Squeeze", ["state"], ["vector"]),
+                helper.make_node("Cast", ["vector"], ["indices"], to=TensorProto.INT64),
+                helper.make_node("OneHot", ["indices", "depth", "values"], ["next"], axis=0),
+            ],
+            [helper.make_opsetid("", 18)],
+        )
+        body = helper.make_graph(
+            [
+                helper.make_node("Mul", ["b", "W"], ["weighted"]),
+                helper.make_node("Squeeze", ["weighted"], ["slope"]),
+                helper.make_node("PRelu", ["X", "slope"], ["activation"]),
+                helper.make_node("HotUpdate", ["a", "one", "values"], ["next_a"], domain="local")
+                if primed
+                else helper.make_node("Identity", ["a"], ["next_a"]),
+                helper.make_node("HotUpdate", ["b", "depth_b", "values"], ["next_b"], domain="local"),
+            ],
+            "bound_depth_body",
+            [
+                self._value("i", [], TensorProto.INT64),
+                self._value("condition", [], TensorProto.BOOL),
+                self._value("a", None),
+                self._value("b", None),
+            ],
+            [self._value("condition", [], TensorProto.BOOL), self._value("next_a", None), self._value("next_b", None)],
+        )
+        graph = helper.make_graph(
+            [helper.make_node("Loop", ["count", "start", "initial", "initial"], ["final_a", "final_b"], body=body)],
+            "caller_bound_depth_cache",
+            [self._value("initial", [1, 4]), self._value("X", [4, 4])],
+            [self._value("final_a", [1, 4]), self._value("final_b", [1, 4] if second_depth == 1 else [4, 4, 4])],
+            [
+                self._tensor("W", np.ones(4)),
+                self._tensor("values", [0, 0]),
+                self._tensor("one", 1, np.int64),
+                self._tensor("depth_b", second_depth, np.int64),
+                self._tensor("count", 2, np.int64),
+                self._tensor("start", True, np.bool_),
+            ],
+        )
+        path = TestOnnxReviewShapeRegressions._save(graph, tmp_path, functions=[function])
+        slopes = TestOnnxTransferReviewRegressions._observed_slopes(
+            path, monkeypatch, {"initial": np.zeros((1, 4), dtype=np.float32), "X": np.ones((4, 4), dtype=np.float32)}
+        )
+        assert slopes == [(4,), (4,) if second_depth == 1 else (4, 4)]
+        if second_depth == 1:
+            TestOnnxReviewShapeRegressions._assert_clean(path)
+        else:
+            TestOnnxProofReviewRegressions._assert_gap(path, tmp_path, "unresolved_initializer_lineage")
