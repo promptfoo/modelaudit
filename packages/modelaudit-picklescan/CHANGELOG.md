@@ -7,6 +7,10 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Refresh cached import-directory snapshots between scans so an earlier directory change does not cause a false incomplete call-graph result when Python refreshes its import cache.
+
 ## [0.1.11](https://github.com/promptfoo/modelaudit/compare/modelaudit-picklescan-v0.1.10...modelaudit-picklescan-v0.1.11) (2026-10-03)
 
 ### Bug Fixes

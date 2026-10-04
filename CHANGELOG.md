@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Preserve ONNX weight coverage across unknown broadcast ranks, captured runtime inputs, and repeated loop state changes; avoid false coverage gaps for shape-restoring loops and padded Scan-8 outputs.
 - Enforce ONNX tensor budgets on expanded weight views and bound control-value decoding, repeated graph traversal, and analysis-cache retention.
 - Preserve native SafeTensors routing when a valid bounded header also resembles an FDICT zlib stream.
+- Avoid false incomplete pickle scans when Python lazily refreshes an import-directory cache after a change made before scanning.
 
 ## [0.2.53](https://github.com/promptfoo/modelaudit/compare/v0.2.52...v0.2.53) (2026-10-03)
 
