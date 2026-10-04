@@ -7381,6 +7381,24 @@ def test_trailing_candidate_consumes_repeated_trivial_streams_before_suffix_pars
     assert counted_trivial_prefix_trailing.call_count == 0
 
 
+@pytest.mark.parametrize("count", [4095, 4096, 4097, 8193])
+@pytest.mark.parametrize("scalar", [b"N.", b"I+01\n.", b"I-123\n."])
+@pytest.mark.parametrize("suffix", [b"", b"I+\n.", b"I1\r\n.", b"cposix\nsystem\n.", b"S'os.system'\n."])
+def test_scalar_stream_chunks_preserve_suffix(count: int, scalar: bytes, suffix: bytes) -> None:
+    prefix = (scalar + b" \t\r\n\x00") * count
+    sample = b"ignored" + prefix + suffix
+
+    assert package_api._repeated_trivial_stream_offset(sample, len(b"ignored")) == len(b"ignored") + len(prefix)
+
+
+def test_scalar_stream_chunks_preserve_mixed_streams_and_long_integer() -> None:
+    prefix = (b"N.\x00I-1\n.\r\nI+00\n. ") * 8193 + b"I" + b"9" * 8193 + b"\n.\t"
+    suffix = b"\x80\x04cposix\nsystem\n."
+
+    assert package_api._repeated_trivial_stream_offset(prefix + suffix, 0) == len(prefix)
+    assert package_api._repeated_trivial_stream_offset(suffix, 0) == 0
+
+
 def test_scan_file_scans_comment_prefixed_pickle_after_trivial_scalar_prefix(tmp_path: Path) -> None:
     archive_path = tmp_path / "model.pt"
     storage_blob = b"N.#cposix\nsystem\n(S'echo hidden'\ntR."

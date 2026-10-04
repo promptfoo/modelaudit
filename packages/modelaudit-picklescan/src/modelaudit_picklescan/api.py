@@ -88,7 +88,8 @@ _PROTO0_1_MAX_PROBE_OPCODES = _PICKLE_DISCOVERY_LONG_PROBE_BYTES
 _PROTO0_1_IGNORABLE_TRAILING_BYTES = b" \t\r\n\x00"
 _PROTO0_1_TEXT_WHITESPACE_BYTES = b" \t\r\n"
 _PROTO0_GLOBAL_OR_INST_PREFIX_WITHOUT_NEWLINE_RE = re.compile(rb"[ci][A-Za-z_][A-Za-z0-9_.]*")
-_REPEATED_PROTO0_INT_STREAM_RE = re.compile(rb"(?:I[+-]?\d+\n\.)+")
+# Bound each match's repetition stack; callers continue from the exact end.
+_REPEATED_TRIVIAL_STREAM_RE = re.compile(rb"(?:(?:N|I[+-]?\d+\n)\.[ \t\r\n\x00]*){1,4096}")
 _PROTO0_GLOBAL_NAME_START_BYTES = frozenset(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_")
 _PROTO0_GLOBAL_NAME_BYTES = _PROTO0_GLOBAL_NAME_START_BYTES | frozenset(b"0123456789.")
 _PICKLE_DISCOVERY_PADDING_PROBE_BYTES = 256 * 1024
@@ -3526,21 +3527,13 @@ def _has_complete_pickle_stream_without_frame_stop_overrun(sample: bytes) -> boo
 
 
 def _repeated_trivial_stream_offset(sample: bytes, offset: int) -> int:
-    original_offset = offset
     sample_length = len(sample)
     while offset < sample_length:
-        if offset + 2 <= sample_length and sample[offset : offset + 2] == b"N.":
-            offset += 2
-        elif offset < sample_length and sample[offset : offset + 1] == b"I":
-            match = _REPEATED_PROTO0_INT_STREAM_RE.match(sample, offset)
-            if match is None:
-                break
-            offset = match.end()
-        else:
+        match = _REPEATED_TRIVIAL_STREAM_RE.match(sample, offset)
+        if match is None:
             break
-        while offset < sample_length and sample[offset] in _PROTO0_1_IGNORABLE_TRAILING_BYTES:
-            offset += 1
-    return offset if offset != original_offset else original_offset
+        offset = match.end()
+    return offset
 
 
 def _repeated_none_stream_trailing(sample: bytes) -> bytes | None:
