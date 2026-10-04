@@ -28073,3 +28073,236 @@ class TestOnnxScanInputReviewRegressions:
             sys.setprofile(previous_profile)
         assert 0 < shape_calls <= 8 * count
         assert plan.coverage_gaps == {}
+
+
+class TestOnnxScan8BudgetReviewRegressions:
+    _value = staticmethod(TestOnnxRecurrenceReviewRegressions._value)
+    _tensor = staticmethod(TestOnnxRecurrenceReviewRegressions._tensor)
+    _save = staticmethod(TestOnnxOutputInvarianceReviewRegressions._save)
+
+    @pytest.mark.parametrize("consumer", ["Flatten", "Reshape", "Transpose"])
+    @pytest.mark.parametrize("lengths", [False, True])
+    def test_unmaterialized_scan8_stack_cannot_become_a_resolved_weight(
+        self, tmp_path: Path, consumer: str, lengths: bool
+    ) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        weights = np.arange(6, dtype=np.float32).reshape(2, 3)
+        body = helper.make_graph(
+            [],
+            "constant_scan8_body",
+            [self._value("element", [])],
+            [self._value("W", [2, 3])],
+            [self._tensor("W", weights)],
+        )
+        transform = helper.make_node("Flatten", ["stack"], ["weight"], axis=3)
+        if consumer == "Reshape":
+            transform = helper.make_node("Reshape", ["stack", "shape"], ["weight"])
+        elif consumer == "Transpose":
+            transform = helper.make_node("Transpose", ["stack"], ["weight"], perm=[0, 1, 3, 2])
+        graph = helper.make_graph(
+            [
+                helper.make_node(
+                    "Scan", ["lens" if lengths else "", "sequence"], ["stack"], body=body, num_scan_inputs=1
+                ),
+                transform,
+                helper.make_node("MatMul", ["X", "weight"], ["Y"]),
+            ],
+            "unmaterialized_scan8_transform",
+            [self._value("sequence", [1, 4]), self._value("X", [1, 3] if consumer == "Transpose" else [1, 8])],
+            [self._value("Y", [1, 4, 1, 2] if consumer == "Transpose" else [1, 3])],
+            [self._tensor("shape", [8, 3], np.int64)] + ([self._tensor("lens", [4], np.int64)] if lengths else []),
+        )
+        path, model = self._save(graph, tmp_path, opset=8)
+        # ReferenceEvaluator has no Scan-8 implementation; evaluate its real
+        # body and apply the schema-defined batch and sequence stacking axes.
+        actual_body: Any = ReferenceEvaluator(body, opsets={"": 8}).run(None, {"element": np.array(0, np.float32)})
+        actual_stack = np.stack([actual_body[0]] * 4)[None, ...]
+        actual = actual_stack.transpose(0, 1, 3, 2) if consumer == "Transpose" else actual_stack.reshape(8, 3)
+        assert actual.nbytes == 96
+        assert actual.shape == ((1, 4, 3, 2) if consumer == "Transpose" else (8, 3))
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=24)
+        assert plan.specs == []
+        assert plan.extraction_failures or plan.oversized_initializers_skipped or plan.coverage_gaps
+        result = OnnxScanner({"max_array_size": 24}).scan(str(path))
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+        assert determine_exit_code(aggregate) == 2
+
+    @pytest.mark.parametrize("batch", [1, 3])
+    @pytest.mark.parametrize("transpose", [False, True])
+    def test_scan8_batched_state_keeps_body_axes_separate(self, tmp_path: Path, batch: int, transpose: bool) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        weights = np.zeros((1, 64, 64), np.float32)
+        weights[0, :5, 0] = 10
+        body = helper.make_graph(
+            [helper.make_node("Transpose" if transpose else "Identity", ["state"], ["next"])],
+            "batched_scan8_state",
+            [self._value("state", [64, 64]), self._value("element", [])],
+            [self._value("next", [64, 64])],
+        )
+        graph = helper.make_graph(
+            [
+                helper.make_node("Expand", ["W", "shape"], ["expanded"]),
+                helper.make_node("Scan", ["", "expanded", "sequence"], ["final"], body=body, num_scan_inputs=1),
+                helper.make_node("MatMul", ["X", "final"], ["Y"]),
+            ],
+            "batch_axis_is_not_a_body_axis",
+            [self._value("sequence", [batch, 1]), self._value("X", [1, 64])],
+            [self._value("Y", [batch, 1, 64])],
+            [self._tensor("W", weights), self._tensor("shape", [batch, 64, 64], np.int64)],
+        )
+        path, model = self._save(graph, tmp_path, opset=8)
+        runtime: Any = ReferenceEvaluator(body, opsets={"": 8}).run(
+            None, {"state": weights[0], "element": np.array(0, np.float32)}
+        )
+        actual = np.stack([runtime[0]] * batch)
+        np.testing.assert_array_equal(actual, np.broadcast_to(weights[0].T if transpose else weights[0], actual.shape))
+        analyzer = WeightDistributionScanner()
+        expected_anomalies = analyzer._analyze_tensor_weight_extremes("actual", actual, output_axes=(0, 2))
+        assert bool(expected_anomalies) is not transpose
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        if plan.specs:
+            assert bool(analyzer._analyze_onnx_weight_specs(plan.specs)) is not transpose
+        else:
+            assert plan.coverage_gaps or plan.extraction_failures
+        result = OnnxScanner().scan(str(path))
+        assert bool(result.metadata.get("anomalies_found")) is not transpose
+        if result.success is False:
+            assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+
+    @pytest.mark.parametrize("limit", [32768, 49152, None])
+    def test_default_scanner_enforces_cumulative_expanded_logical_bytes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, limit: int | None
+    ) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        nodes = []
+        tensors = [self._tensor("shape", [64, 64], np.int64)]
+        for index in range(3):
+            tensors.append(self._tensor(f"W{index}", 1))
+            nodes.extend(
+                [
+                    helper.make_node("Expand", [f"W{index}", "shape"], [f"expanded{index}"]),
+                    helper.make_node("MatMul", ["X", f"expanded{index}"], [f"Y{index}"]),
+                ]
+            )
+        graph = helper.make_graph(
+            nodes,
+            "cumulative_expanded_weights",
+            [self._value("X", [1, 64])],
+            [self._value(f"Y{i}", [1, 64]) for i in range(3)],
+            tensors,
+        )
+        path, model = self._save(graph, tmp_path)
+        actual: Any = ReferenceEvaluator(model).run(None, {"X": np.ones((1, 64), np.float32)})
+        assert all(np.array_equal(value, np.full((1, 64), 64, np.float32)) for value in actual)
+        captured: list[Any] = []
+
+        def record_analysis(_scanner: Any, specs: Any) -> list[Any]:
+            captured.extend(specs)
+            return []
+
+        monkeypatch.setattr(WeightDistributionScanner, "_analyze_onnx_weight_specs", record_analysis)
+        result = OnnxScanner({"max_weight_distribution_total_bytes": limit}).scan(str(path))
+        expected_count = 3 if limit is None else min(limit // 16384, 3)
+        assert len(captured) == expected_count
+        assert sum(spec.weights.nbytes for spec in captured) == expected_count * 16384
+        assert result.success is (expected_count == 3)
+        if expected_count < 3:
+            assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+            coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+            assert coverage[0].details["oversized_initializers_skipped"] == 1
+
+    @pytest.mark.parametrize("capture", [False, True])
+    @pytest.mark.parametrize("matrix_consumer", [False, True])
+    def test_scan_captured_initializer_does_not_attribute_consumers_to_state(
+        self, tmp_path: Path, capture: bool, matrix_consumer: bool
+    ) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        weights = np.arange(16, dtype=np.float32).reshape(4, 4)
+        body_nodes = [
+            helper.make_node("Reshape", ["state", "flat_shape"], ["flat"]),
+            helper.make_node("MatMul", ["Xflat", "flat"], ["scalar"]),
+            helper.make_node("Transpose", ["state"], ["next"]),
+        ]
+        body_outputs = [self._value("next", [4, 4]), self._value("scalar", [])]
+        scan_outputs = ["final", "dots"]
+        outputs = [self._value("dots", [2])]
+        if capture:
+            body_nodes.insert(0, helper.make_node("MatMul", ["X", "W"], ["captured"]))
+            body_outputs.append(self._value("captured", [1, 4]))
+            scan_outputs.append("captures")
+            outputs.append(self._value("captures", [2, 1, 4]))
+        if matrix_consumer:
+            body_nodes.insert(0, helper.make_node("MatMul", ["X", "state"], ["carried"]))
+            body_outputs.append(self._value("carried", [1, 4]))
+            scan_outputs.append("carried_outputs")
+            outputs.append(self._value("carried_outputs", [2, 1, 4]))
+        body = helper.make_graph(
+            body_nodes,
+            "separate_capture_and_state",
+            [self._value("state", [4, 4]), self._value("item", [])],
+            body_outputs,
+        )
+        graph = helper.make_graph(
+            [helper.make_node("Scan", ["W", "seq"], scan_outputs, body=body, num_scan_inputs=1)],
+            "state_binding_consumer_attribution",
+            [self._value("X", [1, 4]), self._value("Xflat", [16])],
+            outputs,
+            [self._tensor("W", weights), self._tensor("seq", [0, 0]), self._tensor("flat_shape", [16], np.int64)],
+        )
+        path, model = self._save(graph, tmp_path)
+        actual: Any = ReferenceEvaluator(model).run(
+            None, {"X": np.ones((1, 4), np.float32), "Xflat": np.ones(16, np.float32)}
+        )
+        np.testing.assert_array_equal(actual[0], [120, 120])
+        if capture:
+            np.testing.assert_array_equal(actual[1], np.broadcast_to(weights.sum(axis=0), (2, 1, 4)))
+        if matrix_consumer:
+            np.testing.assert_array_equal(actual[-1], np.stack([weights.sum(axis=0), weights.sum(axis=1)])[:, None, :])
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        assert bool(plan.coverage_gaps) is matrix_consumer
+        result = OnnxScanner().scan(str(path))
+        assert result.success is not matrix_consumer
+        assert (result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME) is matrix_consumer
+
+    @pytest.mark.parametrize("limit", [1, 2, 3])
+    def test_unmaterialized_scan8_stack_remains_incomplete_at_transform_limit(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, limit: int
+    ) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        weights = np.arange(6, dtype=np.float32).reshape(2, 3)
+        body = helper.make_graph(
+            [helper.make_node("Transpose", ["W"], ["body_weight"])],
+            "bounded_stack_body",
+            [self._value("element", [])],
+            [self._value("body_weight", [3, 2])],
+            [self._tensor("W", weights)],
+        )
+        graph = helper.make_graph(
+            [
+                helper.make_node("Scan", ["", "sequence"], ["stack"], body=body, num_scan_inputs=1),
+                helper.make_node("Flatten", ["stack"], ["weight"], axis=3),
+                helper.make_node("MatMul", ["X", "weight"], ["Y"]),
+            ],
+            "bounded_unmaterialized_stack",
+            [self._value("sequence", [1, 4]), self._value("X", [1, 12])],
+            [self._value("Y", [1, 2])],
+        )
+        path, model = self._save(graph, tmp_path, opset=8)
+        actual_body: Any = ReferenceEvaluator(body, opsets={"": 8}).run(None, {"element": np.array(0, np.float32)})
+        actual = np.stack([actual_body[0]] * 4)[None, ...].reshape(12, 2)
+        np.testing.assert_array_equal(actual, np.tile(weights.T, (4, 1)))
+        monkeypatch.setattr(onnx_scanner_module, "_ONNX_WEIGHT_TRANSFORM_DEPTH_LIMIT", limit)
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        assert plan.specs == []
+        assert plan.coverage_gaps or plan.extraction_failures
+        result = OnnxScanner().scan(str(path))
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        TestWeightDistributionCoverage()._assert_uncached_inconclusive_exit2(path, tmp_path / "cache")

@@ -5839,6 +5839,14 @@ def _build_onnx_weight_analysis_plan(
                                 _OnnxWeightTransform("Expand", shape),
                             )
                             unresolved_reason = None
+            elif unresolved_reason is None and shape != lineage.shape:
+                # A rank-only stack shape is not a materialized NumPy view.
+                # Preserve this fact when later transforms erase unknown extents.
+                marker = _OnnxWeightTransform("unmaterialized_stack")
+                if marker not in transforms and len(transforms) >= _ONNX_WEIGHT_TRANSFORM_DEPTH_LIMIT:
+                    unresolved_reason = "lineage_transform_depth_limit"
+                else:
+                    transforms = append_transform_marker(transforms, marker)
             promoted_lineages[initializer_index] = _OnnxWeightLineage(
                 initializer_index=lineage.initializer_index,
                 shape=shape,
@@ -8440,12 +8448,21 @@ def _build_onnx_weight_analysis_plan(
                         parent_name = str(parent_input)
                         graph_input_name = _onnx_value_name(graph_input)
                         parent_shape = known_value_shapes.get(parent_name)
+                        parent_shape_is_proven = parent_name in proven_value_ranks
                         if parent_shape is None:
                             parent_shape = constant_initializer_shape(constants, parent_name)
                         if parent_shape is None and parent_name in value_lineages:
-                            lineage_shapes = {lineage.shape for lineage in value_lineages[parent_name].values()}
+                            parent_data_lineages = [
+                                lineage
+                                for lineage in value_lineages[parent_name].values()
+                                if lineage.unresolved_reason != "shape_control_lineage"
+                            ]
+                            lineage_shapes = {lineage.shape for lineage in parent_data_lineages}
                             if len(lineage_shapes) == 1 and None not in lineage_shapes:
                                 parent_shape = next(iter(lineage_shapes))  # type: ignore[assignment]
+                                parent_shape_is_proven = all(
+                                    lineage.unresolved_reason is None for lineage in parent_data_lineages
+                                )
                         parent_rank = known_value_ranks.get(parent_name)
                         repeated_control_flow_state_input = is_repeated_control_flow_state_input(pair_index)
                         repeated_state_reenters_with_rank_promotion = False
@@ -8686,7 +8703,7 @@ def _build_onnx_weight_analysis_plan(
                                 scan_input_axes=scan_input_axes,
                             )
                             if (
-                                pair_index >= scan_input_start
+                                (pair_index >= scan_input_start or scan_input_offset)
                                 and parent_shape is not None
                                 and graph_input_name in subgraph_bound_lineages
                             ):
@@ -8729,7 +8746,7 @@ def _build_onnx_weight_analysis_plan(
                             parent_rank = None
                         if parent_shape is not None:
                             subgraph_bound_value_shapes[graph_input_name] = parent_shape
-                            if parent_name in proven_value_ranks:
+                            if parent_shape_is_proven:
                                 subgraph_bound_proven_value_ranks.add(graph_input_name)
                         elif parent_rank is not None:
                             subgraph_bound_value_ranks[graph_input_name] = parent_rank
@@ -8921,7 +8938,19 @@ def _build_onnx_weight_analysis_plan(
                             )
                             initial_shapes = {lineage.shape for lineage in initial_lineages.values()}
                             initial_shape = next(iter(initial_shapes)) if len(initial_shapes) == 1 else None
-                            if initial_shape is not None and node.op_type == "Loop" and len(input_pairs) == 1:
+                            if node.op_type == "Scan":
+                                initial_shape, _initial_rank = _onnx_scan_bound_subgraph_input_shape(
+                                    initial_shape,
+                                    len(initial_shape) if initial_shape is not None else None,
+                                    pair_index=pair_index,
+                                    scan_input_start=scan_input_start,
+                                    scan_input_offset=scan_input_offset,
+                                    scan_input_axes=scan_input_axes,
+                                )
+                            if initial_shape is not None and (
+                                (node.op_type == "Loop" and len(input_pairs) == 1)
+                                or (node.op_type == "Scan" and scan_input_start - scan_input_offset == 1)
+                            ):
                                 body_rank_bounds = subgraph_state_input_consumes_weight_rank_at_or_above_two(
                                     subgraph,
                                     graph_input_name,
@@ -8949,7 +8978,8 @@ def _build_onnx_weight_analysis_plan(
                                     if not consumes_weight and next_shape == initial_shape:
                                         continue
                                     if (
-                                        next_shape is not None
+                                        node.op_type == "Loop"
+                                        and next_shape is not None
                                         and (
                                             iterations := loop_exact_iteration_count(
                                                 max_count=_ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
@@ -9196,13 +9226,14 @@ def _build_onnx_weight_analysis_plan(
                 for initializer_index, lineage in data_lineages.items():
                     transform_counts[initializer_index] += 1
                     if (
-                        node.op_type == "Expand"
+                        node.op_type not in {"Identity", "Cast"}
                         and str(node.input[0]) in proven_value_ranks
                         and (input_shape := known_value_shapes.get(str(node.input[0]))) is not None
                         and lineage.shape is not None
                         and input_shape != lineage.shape
                     ):
-                        # A full Scan sequence cannot substitute for its body element.
+                        # Whole Scan sequences and Scan-8 batches cannot stand in
+                        # for the per-iteration value when applying body transforms.
                         lineage = _OnnxWeightLineage(
                             initializer_index=initializer_index,
                             shape=None,
@@ -9920,6 +9951,16 @@ def _build_onnx_weight_analysis_plan(
                 initializer_shape = constant_initializer_shape(constants, value_name)
                 if initializer_shape:
                     return initializer_shape[0]
+                data_lineages = [
+                    lineage
+                    for lineage in value_lineages.get(value_name, {}).values()
+                    if lineage.unresolved_reason != "shape_control_lineage"
+                ]
+                shapes = {lineage.shape for lineage in data_lineages}
+                if len(shapes) == 1 and all(lineage.unresolved_reason is None for lineage in data_lineages):
+                    shape = next(iter(shapes))
+                    if shape:
+                        return shape[0]
                 return -1
 
             def scan_stacked_output_extent(
@@ -10182,6 +10223,7 @@ def _build_onnx_weight_analysis_plan(
                                 and all(
                                     lineage.shape is not None and len(lineage.shape) >= 2
                                     for lineage in graph_output_parent_lineages.values()
+                                    if lineage.unresolved_reason != "shape_control_lineage"
                                 )
                             ),
                         )
@@ -11436,6 +11478,8 @@ def _build_onnx_weight_analysis_plan(
                     if transformed is None:
                         transformed = array
                         for transform in consumer_group.lineage.transforms:
+                            if transform.kind == "unmaterialized_stack":
+                                raise ValueError("ONNX control-flow stack has no proven materialized weight view")
                             if transform.kind == "Identity":
                                 continue
                             if transform.kind == "Transpose":
@@ -14435,6 +14479,8 @@ class OnnxScanner(BaseScanner):
         try:
             import numpy as np
             import onnx
+
+            from modelaudit.scanners.weight_distribution_scanner import WeightDistributionScanner
         except Exception as e:
             self._mark_weight_distribution_incomplete(
                 result,
@@ -14447,9 +14493,12 @@ class OnnxScanner(BaseScanner):
 
         configured_max_array_size = self.config.get("max_array_size", _ONNX_WEIGHT_DEFAULT_MAX_ARRAY_SIZE)
         max_array_size = _configured_onnx_weight_array_limit(configured_max_array_size)
+        wd_scanner = WeightDistributionScanner({**self.config, "max_array_size": max_array_size or 0})
 
-        def inline_storage_fits_budget(initializer: Any, _name: str, _estimated_bytes: int) -> bool:
-            return max_array_size is None or _onnx_inline_storage_nbytes(initializer) <= max_array_size
+        def inline_storage_fits_budget(initializer: Any, name: str, estimated_bytes: int) -> bool:
+            return wd_scanner._tensor_fits_budget(
+                "onnx_initializer_storage_size_limit", name, tensor_nbytes=_onnx_inline_storage_nbytes(initializer)
+            ) and wd_scanner._tensor_fits_budget("onnx_initializer_size_limit", name, tensor_nbytes=estimated_bytes)
 
         plan = _build_onnx_weight_analysis_plan(
             model,
@@ -14457,6 +14506,9 @@ class OnnxScanner(BaseScanner):
             np=np,
             max_array_size=max_array_size,
             pre_materialization_check=inline_storage_fits_budget,
+            retain_array_check=lambda name, nbytes: wd_scanner._tensor_fits_budget(
+                "onnx_initializer_size_limit", name, tensor_nbytes=nbytes, retain=True
+            ),
         )
         result.metadata["onnx_weight_distribution_semantics"] = plan.metadata
 
@@ -14496,9 +14548,6 @@ class OnnxScanner(BaseScanner):
             if any(spec.matrix_analysis for spec in plan.specs):
                 from scipy import stats as _stats  # noqa: F401
 
-            # Lazy-import the weight distribution scanner to avoid circular deps
-            # and heavy library loads when the scanner is not needed.
-            from modelaudit.scanners.weight_distribution_scanner import WeightDistributionScanner
         except Exception as e:
             self._mark_weight_distribution_incomplete(
                 result,
@@ -14510,7 +14559,6 @@ class OnnxScanner(BaseScanner):
             return
 
         try:
-            wd_scanner = WeightDistributionScanner(self.config)
             analyzed = wd_scanner._analyze_onnx_weight_specs(plan.specs)
             for anomaly, spec in analyzed:
                 details = dict(anomaly["details"])
