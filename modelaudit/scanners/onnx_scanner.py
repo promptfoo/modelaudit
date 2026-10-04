@@ -6867,6 +6867,17 @@ def _build_onnx_weight_analysis_plan(
                 ]
             ] = []
             node_loop_may_repeat = node.op_type == "Loop" and loop_may_repeat_body(node, constants, graph_input_names)
+            node_scan_may_repeat = node.op_type == "Scan" and scan_may_repeat_body(
+                node,
+                constants,
+                graph_input_names,
+                known_value_shapes,
+                proven_value_ranks,
+                {name for name in graph_input_names & set(value_lineages) if name not in proven_value_ranks},
+                scan_input_axes=resolved_int_sequence_attribute(node, "scan_input_axes") or (),
+                scan_input_offset=scan_sequence_lens_input_offset(node, opset_versions),
+                num_scan_inputs=resolved_int_attribute(node, "num_scan_inputs", 1),
+            )
             for attribute_position, attribute in enumerate(getattr(node, "attribute", ())):
                 resolved_attribute = resolve_attribute(attribute)
                 if resolved_attribute is None:
@@ -6967,7 +6978,6 @@ def _build_onnx_weight_analysis_plan(
                         ):
                             subgraph_trusted_context_shapes[loop_body_condition_name] = loop_condition_shape
 
-                    scan_num_inputs = num_scan_inputs if node.op_type == "Scan" else 0
                     loop_exact_count_cache: dict[tuple[int, int, int], int | None] = {}
 
                     def loop_exact_iteration_count(
@@ -8307,29 +8317,13 @@ def _build_onnx_weight_analysis_plan(
                         *,
                         current_node: Any = node,
                         current_scan_input_start: int = scan_input_start,
-                        current_scan_input_axes: tuple[int, ...] = scan_input_axes,
-                        current_scan_input_offset: int = scan_input_offset,
-                        current_scan_num_inputs: int = scan_num_inputs,
+                        current_scan_may_repeat: bool = node_scan_may_repeat,
                         current_loop_may_repeat: bool = node_loop_may_repeat,
                     ) -> bool:
                         if current_node.op_type == "Loop":
                             return pair_index >= 2 and current_loop_may_repeat
                         if current_node.op_type == "Scan":
-                            return pair_index < current_scan_input_start and scan_may_repeat_body(
-                                current_node,
-                                constants,
-                                graph_input_names,
-                                known_value_shapes,
-                                proven_value_ranks,
-                                {
-                                    name
-                                    for name in graph_input_names & set(value_lineages)
-                                    if name not in proven_value_ranks
-                                },
-                                scan_input_axes=current_scan_input_axes,
-                                scan_input_offset=current_scan_input_offset,
-                                num_scan_inputs=current_scan_num_inputs,
-                            )
+                            return pair_index < current_scan_input_start and current_scan_may_repeat
                         return False
 
                     trusted_repeated_context_candidates: list[tuple[int, str, tuple[int, ...]]] = []
@@ -8691,6 +8685,35 @@ def _build_onnx_weight_analysis_plan(
                                 scan_input_offset=scan_input_offset,
                                 scan_input_axes=scan_input_axes,
                             )
+                            if (
+                                pair_index >= scan_input_start
+                                and parent_shape is not None
+                                and graph_input_name in subgraph_bound_lineages
+                            ):
+                                subgraph_bound_lineages[graph_input_name] = dict(
+                                    subgraph_bound_lineages[graph_input_name]
+                                )
+                                for initializer_index, lineage in value_lineages.get(parent_name, {}).items():
+                                    if (
+                                        lineage.shape is not None
+                                        and lineage.shape != parent_shape
+                                        and all(dimension > 0 for dimension in lineage.shape)
+                                        and math.prod(lineage.shape) == math.prod(parent_shape)
+                                        and len(lineage.transforms) < _ONNX_WEIGHT_TRANSFORM_DEPTH_LIMIT
+                                    ):
+                                        # Removing singleton Scan axes is the exact per-iteration view.
+                                        subgraph_bound_lineages[graph_input_name][initializer_index] = (
+                                            _OnnxWeightLineage(
+                                                initializer_index=initializer_index,
+                                                shape=parent_shape,
+                                                data_type=lineage.data_type,
+                                                transforms=(
+                                                    *lineage.transforms,
+                                                    _OnnxWeightTransform("Reshape", parent_shape),
+                                                ),
+                                                unresolved_reason=lineage.unresolved_reason,
+                                            )
+                                        )
                         if (
                             repeated_control_flow_state_input
                             and graph_input_name not in subgraph_trusted_context_shapes
@@ -9172,6 +9195,21 @@ def _build_onnx_weight_analysis_plan(
                 data_lineages = value_lineages.get(str(node.input[0]), {}) if node.input else {}
                 for initializer_index, lineage in data_lineages.items():
                     transform_counts[initializer_index] += 1
+                    if (
+                        node.op_type == "Expand"
+                        and str(node.input[0]) in proven_value_ranks
+                        and (input_shape := known_value_shapes.get(str(node.input[0]))) is not None
+                        and lineage.shape is not None
+                        and input_shape != lineage.shape
+                    ):
+                        # A full Scan sequence cannot substitute for its body element.
+                        lineage = _OnnxWeightLineage(
+                            initializer_index=initializer_index,
+                            shape=None,
+                            data_type=lineage.data_type,
+                            transforms=lineage.transforms,
+                            unresolved_reason=lineage.unresolved_reason or "unresolved_scan_input_lineage",
+                        )
                     output_lineages[initializer_index] = transformed_lineage(
                         lineage,
                         node,
@@ -10028,23 +10066,7 @@ def _build_onnx_weight_analysis_plan(
                     repeated_carried_state = (
                         standard_control_flow_operator
                         and not stacked_scan_output
-                        and (
-                            node_loop_may_repeat
-                            or (
-                                node.op_type == "Scan"
-                                and scan_may_repeat_body(
-                                    node,
-                                    constants,
-                                    graph_input_names,
-                                    known_value_shapes,
-                                    trusted_scan_shape_names,
-                                    untrusted_scan_shape_names,
-                                    scan_input_axes=resolved_scan_input_axes,
-                                    scan_input_offset=resolved_scan_input_offset,
-                                    num_scan_inputs=resolved_scan_input_count,
-                                )
-                            )
-                        )
+                        and (node_loop_may_repeat or (node.op_type == "Scan" and node_scan_may_repeat))
                     )
                     subgraph_state_input_name = ""
                     if standard_control_flow_operator and node.op_type == "Loop" and not stacked_scan_output:
@@ -10103,17 +10125,7 @@ def _build_onnx_weight_analysis_plan(
                         and (
                             loop_exact_iteration_count(max_count=1) is None
                             if node.op_type == "Loop"
-                            else scan_may_repeat_body(
-                                node,
-                                constants,
-                                graph_input_names,
-                                known_value_shapes,
-                                trusted_scan_shape_names,
-                                untrusted_scan_shape_names,
-                                scan_input_axes=resolved_scan_input_axes,
-                                scan_input_offset=resolved_scan_input_offset,
-                                num_scan_inputs=resolved_scan_input_count,
-                            )
+                            else node_scan_may_repeat
                         )
                         and not control_flow_stack_values_are_invariant(
                             node,
@@ -10208,23 +10220,7 @@ def _build_onnx_weight_analysis_plan(
                         and node.op_type in {"Loop", "Scan"}
                         and not stacked_scan_output
                         and graph_output_non_shape_lineage_gap_counts[graph_output_index]
-                        and (
-                            node_loop_may_repeat
-                            or (
-                                node.op_type == "Scan"
-                                and scan_may_repeat_body(
-                                    node,
-                                    constants,
-                                    graph_input_names,
-                                    known_value_shapes,
-                                    trusted_scan_shape_names,
-                                    untrusted_scan_shape_names,
-                                    scan_input_axes=resolved_scan_input_axes,
-                                    scan_input_offset=resolved_scan_input_offset,
-                                    num_scan_inputs=resolved_scan_input_count,
-                                )
-                            )
-                        )
+                        and (node_loop_may_repeat or (node.op_type == "Scan" and node_scan_may_repeat))
                     ):
                         state_input_name = control_flow_state_input_name(output_index)
                         if gap_summary_may_exceed_input_rank(
@@ -10330,23 +10326,7 @@ def _build_onnx_weight_analysis_plan(
                         and not stacked_scan_output
                         and graph_output_rank_promotable_gap_count
                         and repeated_carried_state_input_may_feed_weight
-                        and (
-                            node_loop_may_repeat
-                            or (
-                                node.op_type == "Scan"
-                                and scan_may_repeat_body(
-                                    node,
-                                    constants,
-                                    graph_input_names,
-                                    known_value_shapes,
-                                    trusted_scan_shape_names,
-                                    untrusted_scan_shape_names,
-                                    scan_input_axes=resolved_scan_input_axes,
-                                    scan_input_offset=resolved_scan_input_offset,
-                                    num_scan_inputs=resolved_scan_input_count,
-                                )
-                            )
-                        )
+                        and (node_loop_may_repeat or (node.op_type == "Scan" and node_scan_may_repeat))
                     ):
                         state_rank_gap_summary = known_weight_gap_summary(
                             graph_output_rank_promotable_lineage_gap_summaries[graph_output_index],
@@ -10674,7 +10654,16 @@ def _build_onnx_weight_analysis_plan(
                         )
                     ):
                         transform_output_rank = len(target_shape)
-                        if transform_input_shape is not None and shape_initializer is not None:
+                        shape_depends_on_input = -1 in target_shape or (
+                            0 in target_shape and not resolved_int_attribute(node, "allowzero")
+                        )
+                        if not transform_input_rank_proven and not shape_depends_on_input:
+                            transform_output_shape = target_shape
+                        elif (
+                            transform_input_shape is not None
+                            and shape_initializer is not None
+                            and (transform_input_rank_proven or not shape_depends_on_input)
+                        ):
                             transform_output_shape = _resolve_onnx_reshape_shape(
                                 transform_input_shape,
                                 shape_initializer,
