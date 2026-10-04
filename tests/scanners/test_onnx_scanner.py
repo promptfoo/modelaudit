@@ -22682,6 +22682,440 @@ class TestOnnxReviewShapeRegressions:
             self._assert_clean(path)
 
 
+class TestOnnxFinalReviewRegressions:
+    @pytest.mark.parametrize(
+        ("iterations", "capped_state", "promotes"),
+        [(2, "b", True), (3, "b", True), (4, "b", True), (4, "a", True), (4, "a", False), (4, "b", False)],
+    )
+    def test_loop_follows_weight_lineage_across_carried_state_cycle(
+        self, tmp_path: Path, iterations: int, capped_state: str, promotes: bool
+    ) -> None:
+        source_names = [f"W{index}" for index in range(40)]
+        body = helper.make_graph(
+            [
+                helper.make_node("PRelu", ["X", "b"], ["activation"]),
+                helper.make_node("Unsqueeze", ["b", "axes"], ["a_next"])
+                if promotes
+                else helper.make_node("Identity", ["b"], ["a_next"]),
+                helper.make_node("Identity", ["a"], ["b_next"]),
+            ],
+            "cross_state_cycle_body",
+            [
+                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
+                helper.make_tensor_value_info("condition", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("a", TensorProto.FLOAT, None),
+                helper.make_tensor_value_info("b", TensorProto.FLOAT, None),
+            ],
+            [
+                helper.make_tensor_value_info("condition", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("a_next", TensorProto.FLOAT, None),
+                helper.make_tensor_value_info("b_next", TensorProto.FLOAT, None),
+            ],
+        )
+        graph = helper.make_graph(
+            [
+                helper.make_node("Sum", source_names, [f"initial_{capped_state}"]),
+                helper.make_node(
+                    "Loop", ["count", "start", "initial_a", "initial_b"], ["a_final", "b_final"], body=body
+                ),
+            ],
+            "cross_state_cycle",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 1, 1, 1])],
+            [
+                helper.make_tensor_value_info(
+                    "a_final", TensorProto.FLOAT, [1] * (1 + (iterations + 1) // 2 if promotes else 1)
+                ),
+                helper.make_tensor_value_info(
+                    "b_final", TensorProto.FLOAT, [1] * (1 + iterations // 2 if promotes else 1)
+                ),
+            ],
+            initializer=[
+                *[onnx.numpy_helper.from_array(np.ones((1,), dtype=np.float32), name=name) for name in source_names],
+                onnx.numpy_helper.from_array(
+                    np.ones((1,), dtype=np.float32), name="initial_a" if capped_state == "b" else "initial_b"
+                ),
+                onnx.numpy_helper.from_array(np.array([0], dtype=np.int64), name="axes"),
+                onnx.numpy_helper.from_array(np.array(iterations, dtype=np.int64), name="count"),
+                onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="start"),
+            ],
+        )
+        path = TestOnnxReviewShapeRegressions._save(graph, tmp_path)
+        onnx.checker.check_model(onnx.load(str(path)), full_check=True)
+        result = OnnxScanner().scan(str(path))
+        if promotes and iterations >= (3 if capped_state == "b" else 4):
+            assert result.success is False
+            assert (
+                result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"]["lineages_per_value_limit"] > 0
+            )
+            TestWeightDistributionCoverage()._assert_uncached_inconclusive_exit2(path, tmp_path / "cache")
+        else:
+            TestOnnxReviewShapeRegressions._assert_clean(path)
+
+    @pytest.mark.parametrize("permutation", [None, [1, 0]])
+    @pytest.mark.parametrize("restore_rank", [False, True])
+    def test_loop_transpose_preserves_proven_rank_restoration(
+        self, tmp_path: Path, permutation: list[int] | None, restore_rank: bool
+    ) -> None:
+        transpose_attributes: dict[str, Any] = {} if permutation is None else {"perm": permutation}
+        body = helper.make_graph(
+            [
+                helper.make_node("PRelu", ["X", "state"], ["activation"]),
+                helper.make_node("Unsqueeze", ["state", "insert_axis"], ["wide"]),
+                helper.make_node("Transpose", ["wide"], ["transposed"], **transpose_attributes),
+                helper.make_node("Squeeze", ["transposed", "remove_axis"], ["next"])
+                if restore_rank
+                else helper.make_node("Identity", ["transposed"], ["next"]),
+            ],
+            "transpose_restoring_loop_body",
+            [
+                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
+                helper.make_tensor_value_info("condition", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("state", TensorProto.FLOAT, None),
+            ],
+            [
+                helper.make_tensor_value_info("condition", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("next", TensorProto.FLOAT, None),
+            ],
+        )
+        graph = helper.make_graph(
+            [helper.make_node("Loop", ["count", "start", "initial"], ["final"], body=body)],
+            "transpose_restoring_loop",
+            [
+                helper.make_tensor_value_info("X", TensorProto.FLOAT, [4, 4]),
+                helper.make_tensor_value_info("count", TensorProto.INT64, []),
+            ],
+            [helper.make_tensor_value_info("final", TensorProto.FLOAT, [None])],
+            initializer=[
+                onnx.numpy_helper.from_array(np.ones((4,), dtype=np.float32), name="initial"),
+                onnx.numpy_helper.from_array(np.array([0], dtype=np.int64), name="insert_axis"),
+                onnx.numpy_helper.from_array(np.array([1], dtype=np.int64), name="remove_axis"),
+                onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="start"),
+            ],
+        )
+        path = TestOnnxReviewShapeRegressions._save(graph, tmp_path)
+        onnx.checker.check_model(onnx.load(str(path)), full_check=True)
+        if restore_rank:
+            TestOnnxReviewShapeRegressions._assert_clean(path)
+        else:
+            TestWeightDistributionCoverage()._assert_uncached_inconclusive_exit2(path, tmp_path / "cache")
+
+    @pytest.mark.parametrize("storage", ["valid", "int64_data", "raw_data"])
+    def test_loop_scalar_control_storage_is_bounded_before_to_array(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, storage: str
+    ) -> None:
+        source_names = [f"W{index}" for index in range(40)]
+        body = helper.make_graph(
+            [
+                helper.make_node("PRelu", ["X", "state"], ["activation"]),
+                helper.make_node("Unsqueeze", ["state", "axes"], ["next"]),
+            ],
+            "bounded_scalar_control_body",
+            [
+                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
+                helper.make_tensor_value_info("condition", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("state", TensorProto.FLOAT, None),
+            ],
+            [
+                helper.make_tensor_value_info("condition", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("next", TensorProto.FLOAT, None),
+            ],
+        )
+        count = onnx.numpy_helper.from_array(np.array(1, dtype=np.int64), name="count")
+        if storage != "valid":
+            count.ClearField("raw_data")
+            if storage == "int64_data":
+                count.int64_data.extend([2] * 128)
+            else:
+                count.raw_data = np.full(128, 2, dtype=np.int64).tobytes()
+        graph = helper.make_graph(
+            [
+                helper.make_node("Sum", source_names, ["initial"]),
+                helper.make_node("Loop", ["count", "start", "initial"], ["final"], body=body),
+            ],
+            "bounded_scalar_control",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 1])],
+            [helper.make_tensor_value_info("final", TensorProto.FLOAT, [None, None])],
+            initializer=[
+                *[onnx.numpy_helper.from_array(np.ones((1,), dtype=np.float32), name=name) for name in source_names],
+                onnx.numpy_helper.from_array(np.array([0], dtype=np.int64), name="axes"),
+                onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="start"),
+                count,
+            ],
+        )
+        path = TestOnnxReviewShapeRegressions._save(graph, tmp_path)
+        original_to_array = onnx.numpy_helper.to_array
+        scalar_materializations = 0
+
+        def track_to_array(tensor: Any, *args: Any, **kwargs: Any) -> Any:
+            nonlocal scalar_materializations
+            if tensor.name == "count":
+                scalar_materializations += 1
+            return original_to_array(tensor, *args, **kwargs)
+
+        monkeypatch.setattr(onnx.numpy_helper, "to_array", track_to_array)
+        result = OnnxScanner().scan(str(path))
+        if storage == "valid":
+            assert scalar_materializations > 0
+            assert result.success is True
+            TestOnnxReviewShapeRegressions._assert_clean(path)
+        else:
+            assert scalar_materializations == 0
+            assert result.success is False
+            assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+            TestWeightDistributionCoverage()._assert_uncached_inconclusive_exit2(path, tmp_path / "cache")
+
+    def test_reentry_probes_do_not_reenumerate_dead_body_per_state(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        state_count = 64
+        state_names = [f"state{index}" for index in range(state_count)]
+        body = helper.make_graph(
+            [helper.make_node("Identity", ["state0"], [f"dead{index}"]) for index in range(512)],
+            "dead_reentry_body",
+            [
+                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
+                helper.make_tensor_value_info("condition", TensorProto.BOOL, []),
+                *[helper.make_tensor_value_info(name, TensorProto.FLOAT, [1]) for name in state_names],
+            ],
+            [
+                helper.make_tensor_value_info("condition", TensorProto.BOOL, []),
+                *[helper.make_tensor_value_info(name, TensorProto.FLOAT, [1]) for name in state_names],
+            ],
+        )
+        graph = helper.make_graph(
+            [
+                helper.make_node(
+                    "Loop", ["count", "start", *state_names], [f"out{index}" for index in range(state_count)], body=body
+                )
+            ],
+            "dead_reentry",
+            [
+                helper.make_tensor_value_info("count", TensorProto.INT64, []),
+                helper.make_tensor_value_info("start", TensorProto.BOOL, []),
+                *[helper.make_tensor_value_info(name, TensorProto.FLOAT, [1]) for name in state_names],
+            ],
+            [helper.make_tensor_value_info(f"out{index}", TensorProto.FLOAT, [1]) for index in range(state_count)],
+        )
+        path = TestOnnxReviewShapeRegressions._save(graph, tmp_path)
+        model = onnx.load(str(path))
+        onnx.checker.check_model(model, full_check=True)
+        enumerations: dict[str, int] = {}
+
+        class CountedNodes(list[Any]):
+            def __iter__(self) -> Any:
+                caller = sys._getframe(1).f_code.co_name
+                enumerations[caller] = enumerations.get(caller, 0) + 1
+                return super().__iter__()
+
+        class CountedBody:
+            def __init__(self, wrapped: Any) -> None:
+                self.wrapped = wrapped
+                self.node = CountedNodes(wrapped.node)
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self.wrapped, name)
+
+        original_iter = onnx_scanner_module._iter_attribute_graphs
+        wrapped_bodies: dict[int, CountedBody] = {}
+
+        def counted_attribute_graphs(attribute: Any) -> Any:
+            for child in original_iter(attribute):
+                if child.name == body.name:
+                    if id(child) not in wrapped_bodies:
+                        wrapped_bodies[id(child)] = CountedBody(child)
+                    yield wrapped_bodies[id(child)]
+                else:
+                    yield child
+
+        monkeypatch.setattr(onnx_scanner_module, "_iter_attribute_graphs", counted_attribute_graphs)
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        assert enumerations
+        assert enumerations.get("subgraph_analysis_work_exceeds_limit", 0) <= 1, enumerations
+        assert sum(enumerations.values()) <= 16, enumerations
+        assert plan.coverage_gaps == {}
+        assert plan.specs == []
+        TestOnnxReviewShapeRegressions._assert_clean(path)
+
+    @pytest.mark.parametrize("iterations", [2, 3, 4])
+    def test_loop_later_iteration_weight_growth_is_not_limited_to_first_update(
+        self, tmp_path: Path, iterations: int
+    ) -> None:
+        source_names = [f"W{index}" for index in range(40)]
+        body = helper.make_graph(
+            [
+                helper.make_node("PRelu", ["X", "state"], ["activation"]),
+                helper.make_node("Squeeze", ["state"], ["squeezed"]),
+                helper.make_node("Unsqueeze", ["squeezed", "axes"], ["wide"]),
+                helper.make_node("Expand", ["wide", "shape"], ["next"]),
+            ],
+            "later_growth_body",
+            [
+                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
+                helper.make_tensor_value_info("condition", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("state", TensorProto.FLOAT, None),
+            ],
+            [
+                helper.make_tensor_value_info("condition", TensorProto.BOOL, []),
+                helper.make_tensor_value_info("next", TensorProto.FLOAT, None),
+            ],
+        )
+        graph = helper.make_graph(
+            [
+                helper.make_node("Sum", source_names, ["initial"]),
+                helper.make_node("Loop", ["count", "start", "initial"], ["final"], body=body),
+            ],
+            "later_growth",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 4])],
+            [helper.make_tensor_value_info("final", TensorProto.FLOAT, [1, 4])],
+            initializer=[
+                *[onnx.numpy_helper.from_array(np.ones((1,), dtype=np.float32), name=name) for name in source_names],
+                onnx.numpy_helper.from_array(np.array([0], dtype=np.int64), name="axes"),
+                onnx.numpy_helper.from_array(np.array([4], dtype=np.int64), name="shape"),
+                onnx.numpy_helper.from_array(np.array(iterations, dtype=np.int64), name="count"),
+                onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="start"),
+            ],
+        )
+        path = TestOnnxReviewShapeRegressions._save(graph, tmp_path)
+        onnx.checker.check_model(onnx.load(str(path)), full_check=True)
+        if iterations >= 3:
+            result = OnnxScanner().scan(str(path))
+            assert result.success is False
+            assert (
+                result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"]["lineages_per_value_limit"] > 0
+            )
+            TestWeightDistributionCoverage()._assert_uncached_inconclusive_exit2(path, tmp_path / "cache")
+        else:
+            TestOnnxReviewShapeRegressions._assert_clean(path)
+
+    @pytest.mark.parametrize("input_kind", ["constant", "fixed_input", "dynamic_input"])
+    def test_if_captured_input_shape_uses_contract_instead_of_overridable_default(
+        self, tmp_path: Path, input_kind: str
+    ) -> None:
+        source_names = [f"W{index}" for index in range(40)]
+        branch = helper.make_graph(
+            [
+                helper.make_node("Squeeze", ["runtime_weight"], ["squeezed"]),
+                helper.make_node("Add", ["squeezed", "scalar"], ["generated"]),
+            ],
+            "captured_weight_branch",
+            [],
+            [helper.make_tensor_value_info("generated", TensorProto.FLOAT, None)],
+        )
+        inputs = [
+            helper.make_tensor_value_info("X", TensorProto.FLOAT, [4, 4]),
+            helper.make_tensor_value_info("condition", TensorProto.BOOL, []),
+        ]
+        if input_kind != "constant":
+            inputs.append(
+                helper.make_tensor_value_info(
+                    "runtime_weight", TensorProto.FLOAT, [None, None] if input_kind == "dynamic_input" else [1, 1]
+                )
+            )
+        graph = helper.make_graph(
+            [
+                helper.make_node("Sum", source_names, ["scalar"]),
+                helper.make_node("If", ["condition"], ["weight"], then_branch=branch, else_branch=branch),
+                helper.make_node("PRelu", ["X", "weight"], ["Y"]),
+            ],
+            "captured_overridable_weight",
+            inputs,
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [4, 4])],
+            initializer=[
+                *[onnx.numpy_helper.from_array(np.array(1, dtype=np.float32), name=name) for name in source_names],
+                onnx.numpy_helper.from_array(np.ones((1, 1), dtype=np.float32), name="runtime_weight"),
+            ],
+        )
+        path = TestOnnxReviewShapeRegressions._save(graph, tmp_path)
+        onnx.checker.check_model(onnx.load(str(path)), full_check=True)
+        if input_kind == "dynamic_input":
+            result = OnnxScanner().scan(str(path))
+            assert result.success is False
+            assert (
+                result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"]["lineages_per_value_limit"] > 0
+            )
+            TestWeightDistributionCoverage()._assert_uncached_inconclusive_exit2(path, tmp_path / "cache")
+        else:
+            TestOnnxReviewShapeRegressions._assert_clean(path)
+
+    @pytest.mark.parametrize("loop_count", [8, 24])
+    def test_reentry_caches_do_not_retain_unrelated_constant_mappings(self, tmp_path: Path, loop_count: int) -> None:
+        constant_count = 64
+        nodes = []
+        for index in range(loop_count):
+            branch = helper.make_graph(
+                [helper.make_node("Identity", ["state"], ["branch_out"])],
+                f"branch{index}",
+                [],
+                [helper.make_tensor_value_info("branch_out", TensorProto.FLOAT, [4])],
+            )
+            body = helper.make_graph(
+                [helper.make_node("If", ["condition"], ["next"], then_branch=branch, else_branch=branch)],
+                f"body{index}",
+                [
+                    helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
+                    helper.make_tensor_value_info("condition", TensorProto.BOOL, []),
+                    helper.make_tensor_value_info("state", TensorProto.FLOAT, [4]),
+                ],
+                [
+                    helper.make_tensor_value_info("condition", TensorProto.BOOL, []),
+                    helper.make_tensor_value_info("next", TensorProto.FLOAT, [4]),
+                ],
+            )
+            nodes.append(helper.make_node("Loop", ["count", "start", "X"], [f"out{index}"], body=body))
+        graph = helper.make_graph(
+            nodes,
+            "unrelated_constant_mappings",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, [4])],
+            [helper.make_tensor_value_info(f"out{loop_count - 1}", TensorProto.FLOAT, [4])],
+            initializer=[
+                *[
+                    onnx.numpy_helper.from_array(np.array(1, dtype=np.float32), name=f"unused{index}")
+                    for index in range(constant_count)
+                ],
+                onnx.numpy_helper.from_array(np.array(2, dtype=np.int64), name="count"),
+                onnx.numpy_helper.from_array(np.array(True, dtype=np.bool_), name="start"),
+            ],
+        )
+        path = TestOnnxReviewShapeRegressions._save(graph, tmp_path)
+        model = onnx.load(str(path))
+        onnx.checker.check_model(model, full_check=True)
+        retained_mapping_sizes: dict[int, int] = {}
+
+        def record_retained_mappings(value: Any, seen: set[int]) -> None:
+            if id(value) in seen:
+                return
+            seen.add(id(value))
+            if isinstance(value, dict):
+                if "unused0" in value:
+                    retained_mapping_sizes[id(value)] = len(value)
+                for child in value.values():
+                    record_retained_mappings(child, seen)
+            elif isinstance(value, (list, tuple, set, frozenset)):
+                for child in value:
+                    record_retained_mappings(child, seen)
+
+        def profile(frame: Any, event: str, arg: Any) -> None:
+            del arg
+            if (
+                event == "return"
+                and frame.f_code.co_name == "_build_onnx_weight_analysis_plan"
+                and frame.f_code.co_filename == onnx_scanner_module.__file__
+            ):
+                record_retained_mappings(frame.f_locals, set())
+
+        previous_profile = sys.getprofile()
+        sys.setprofile(profile)
+        try:
+            plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        finally:
+            sys.setprofile(previous_profile)
+        assert retained_mapping_sizes
+        assert sum(retained_mapping_sizes.values()) <= 4 * (constant_count + 2), retained_mapping_sizes
+        assert plan.coverage_gaps == {}
+        assert plan.specs == []
+        TestOnnxReviewShapeRegressions._assert_clean(path)
+
+
 class TestLargeOnnxFileBackedInspection:
     """Regression coverage for bounded file-backed ONNX structural scans."""
 
