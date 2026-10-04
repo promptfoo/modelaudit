@@ -803,7 +803,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.integration == 'true' || needs.changes.outputs.picklescan == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+    timeout-minutes: ${{ matrix.os == 'macos-15-intel' && 30 || 15 }}
     strategy:
       fail-fast: false
       matrix:
