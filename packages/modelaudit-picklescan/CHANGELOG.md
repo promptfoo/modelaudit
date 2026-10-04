@@ -7,6 +7,10 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Reuse scalar-stream skipping during nested storage probes so long runs of harmless scalar pickles do not delay scan timeout handling; preserve nested payload detection.
+
 ## [0.1.11](https://github.com/promptfoo/modelaudit/compare/modelaudit-picklescan-v0.1.10...modelaudit-picklescan-v0.1.11) (2026-10-03)
 
 ### Bug Fixes

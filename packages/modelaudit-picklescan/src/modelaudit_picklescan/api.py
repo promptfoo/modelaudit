@@ -2538,6 +2538,11 @@ def _complete_trivial_literal_pickle_has_nested_security_pickle(
     cursor = 0
     stream = io.BytesIO(sample)
     while cursor < len(sample):
+        # Scalar-only streams cannot contain nested byte or string literals.
+        scalar_end = _repeated_trivial_stream_offset(sample, cursor)
+        if scalar_end != cursor:
+            cursor = scalar_end
+            continue
         if (
             cursor + 1 < len(sample)
             and sample[cursor : cursor + 1] == b"#"

@@ -6161,6 +6161,33 @@ def test_trivial_literal_probe_skips_scanner_for_literal_free_streams(monkeypatc
     assert calls == 0
 
 
+@pytest.mark.parametrize("scalar", [b"N.", b"I1\n."], ids=["none", "int"])
+@pytest.mark.parametrize("nested", [False, True], ids=["benign", "nested-pickle"])
+def test_trivial_literal_probe_bounds_scalar_opcode_decoding(
+    monkeypatch: pytest.MonkeyPatch, scalar: bytes, nested: bool
+) -> None:
+    original = package_api.pickletools.genops
+    decoded_opcodes = 0
+
+    def counted_genops(*args: Any, **kwargs: Any) -> collections.abc.Iterator[Any]:
+        nonlocal decoded_opcodes
+        for operation in original(*args, **kwargs):
+            decoded_opcodes += 1
+            yield operation
+
+    monkeypatch.setattr(package_api.pickletools, "genops", counted_genops)
+    suffix = pickle.dumps(b"cposix\nsystem\n(S'echo nested'\ntR.", protocol=4) if nested else b""
+
+    assert package_api._complete_trivial_literal_pickle_has_nested_security_pickle(scalar * 65536 + suffix) is nested
+    assert decoded_opcodes <= 32
+
+
+@pytest.mark.parametrize("scalar", [b"N.", b"I1\n."], ids=["none", "int"])
+def test_scan_file_preserves_nested_pickle_after_long_scalar_prefix(tmp_path: Path, scalar: bytes) -> None:
+    nested_pickle = pickle.dumps(pickle.dumps(MaliciousPayload(), protocol=4), protocol=4)
+    _assert_storage_pickle_detected(tmp_path / "model.pt", scalar * 2048 + nested_pickle)
+
+
 def test_scan_file_scans_proto0_string_operand_split_at_trusted_probe_boundary(tmp_path: Path) -> None:
     archive_path = tmp_path / "model.pt"
     storage_prefix = b"N." + (b" " * (package_api._TRUSTED_STORAGE_PICKLE_PROBE_BYTES - len(b"N.") - len(b"S"))) + b"S"
