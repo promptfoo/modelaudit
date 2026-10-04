@@ -16,7 +16,6 @@ import modelaudit_picklescan.api as picklescan_api
 import modelaudit_picklescan.call_graph as picklescan_call_graph
 import pytest
 from modelaudit_picklescan import Notice, PickleReport, ScanStatus
-from modelaudit_picklescan.call_graph import _clear_source_sensitive_caches
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.cache.cache_policy import should_cache_scan_result
@@ -3107,11 +3106,11 @@ def test_returned_class_coverage_gap_preserves_outcome_and_cache_policy(
     payload = b"\x80\x04c" + module_name.encode() + b"\n" + export_name + b"\n)R."
     path = tmp_path / "returned-local-class.pkl"
     path.write_bytes(payload)
-    _clear_source_sensitive_caches()
+    picklescan_call_graph._clear_source_sensitive_caches()
     try:
         result = PickleScanner().scan(str(path))
     finally:
-        _clear_source_sensitive_caches()
+        picklescan_call_graph._clear_source_sensitive_caches()
     aggregate = create_initial_audit_result()
     merge_scan_result(aggregate, result)
 
@@ -3148,11 +3147,11 @@ def test_returned_class_partial_coverage_preserves_malicious_verdict(
     monkeypatch.syspath_prepend(str(tmp_path))
     path = tmp_path / "returned-alternatives.pkl"
     path.write_bytes(b"\x80\x04c" + module_name.encode() + b"\nGadget.run\n)R.")
-    _clear_source_sensitive_caches()
+    picklescan_call_graph._clear_source_sensitive_caches()
     try:
         result = PickleScanner().scan(str(path))
     finally:
-        _clear_source_sensitive_caches()
+        picklescan_call_graph._clear_source_sensitive_caches()
     aggregate = create_initial_audit_result()
     merge_scan_result(aggregate, result)
 
@@ -3180,11 +3179,11 @@ def test_export_deletion_preserves_paths_outcome_and_cache_policy(
     monkeypatch.syspath_prepend(str(tmp_path))
     path = tmp_path / "deleted-export.pkl"
     path.write_bytes(b"\x80\x04c" + module_name.encode() + b"\nGadget\n)R.")
-    _clear_source_sensitive_caches()
+    picklescan_call_graph._clear_source_sensitive_caches()
     try:
         result = PickleScanner().scan(str(path))
     finally:
-        _clear_source_sensitive_caches()
+        picklescan_call_graph._clear_source_sensitive_caches()
     aggregate = create_initial_audit_result()
     merge_scan_result(aggregate, result)
 
@@ -3212,11 +3211,11 @@ def test_export_deletion_loop_reachability_preserves_root_outcome(
     monkeypatch.syspath_prepend(str(tmp_path))
     path = tmp_path / "deletion-loop.pkl"
     path.write_bytes(b"\x80\x04c" + module_name.encode() + b"\nGadget\n)R.")
-    _clear_source_sensitive_caches()
+    picklescan_call_graph._clear_source_sensitive_caches()
     try:
         result = PickleScanner().scan(str(path))
     finally:
-        _clear_source_sensitive_caches()
+        picklescan_call_graph._clear_source_sensitive_caches()
     aggregate = create_initial_audit_result()
     merge_scan_result(aggregate, result)
 
@@ -3254,11 +3253,11 @@ def test_partial_invocation_coverage_keeps_root_file_write_finding(
         + encoded_path
         + b"\x85R\x8c\x07payloadb."
     )
-    _clear_source_sensitive_caches()
+    picklescan_call_graph._clear_source_sensitive_caches()
     try:
         result = PickleScanner().scan(str(path))
     finally:
-        _clear_source_sensitive_caches()
+        picklescan_call_graph._clear_source_sensitive_caches()
     aggregate = create_initial_audit_result()
     merge_scan_result(aggregate, result)
 
@@ -3290,11 +3289,11 @@ def test_reexported_hook_binding_preserves_root_outcome(
     monkeypatch.syspath_prepend(str(tmp_path))
     path = tmp_path / "reexported-hook.pkl"
     path.write_bytes(b"\x80\x04c" + module_name.encode() + b"\nGadget\n)R.")
-    _clear_source_sensitive_caches()
+    picklescan_call_graph._clear_source_sensitive_caches()
     try:
         result = PickleScanner().scan(str(path))
     finally:
-        _clear_source_sensitive_caches()
+        picklescan_call_graph._clear_source_sensitive_caches()
     aggregate = create_initial_audit_result()
     merge_scan_result(aggregate, result)
 
@@ -3323,11 +3322,11 @@ def test_deep_module_condition_preserves_root_outcome(
     monkeypatch.syspath_prepend(str(tmp_path))
     path = tmp_path / "deep-condition.pkl"
     path.write_bytes(b"\x80\x04c" + module_name.encode() + b"\nGadget\n)R.")
-    _clear_source_sensitive_caches()
+    picklescan_call_graph._clear_source_sensitive_caches()
     try:
         result = PickleScanner().scan(str(path))
     finally:
-        _clear_source_sensitive_caches()
+        picklescan_call_graph._clear_source_sensitive_caches()
     aggregate = create_initial_audit_result()
     merge_scan_result(aggregate, result)
 
@@ -3374,11 +3373,11 @@ def test_metaclass_proof_budget_preserves_root_outcome(
     monkeypatch.setattr(picklescan_call_graph, "_class_definition_has_dynamic_lookup_context", count_class_visits)
     path = tmp_path / "metaclass-diamond.pkl"
     path.write_bytes(b"\x80\x04c" + module_name.encode() + b"\nGadget.run\n)R.")
-    _clear_source_sensitive_caches()
+    picklescan_call_graph._clear_source_sensitive_caches()
     try:
         result = PickleScanner().scan(str(path))
     finally:
-        _clear_source_sensitive_caches()
+        picklescan_call_graph._clear_source_sensitive_caches()
     aggregate = create_initial_audit_result()
     merge_scan_result(aggregate, result)
     incomplete = layers == 60 and not dangerous
@@ -3420,11 +3419,11 @@ def test_source_context_failure_preserves_root_outcome(
         + b"".join(b"c" + module.encode() + b"\n" + name.encode() + b"\n)R0" for module, name in references)
         + b"N."
     )
-    _clear_source_sensitive_caches()
+    picklescan_call_graph._clear_source_sensitive_caches()
     try:
         result = PickleScanner().scan(str(path))
     finally:
-        _clear_source_sensitive_caches()
+        picklescan_call_graph._clear_source_sensitive_caches()
     aggregate = create_initial_audit_result()
     merge_scan_result(aggregate, result)
     incomplete = branches == 1100
@@ -3479,11 +3478,11 @@ def test_metaclass_probe_error_preserves_root_file_write(
         + _short_binunicode(b"not-executed")
         + b"\x86R."
     )
-    _clear_source_sensitive_caches()
+    picklescan_call_graph._clear_source_sensitive_caches()
     try:
         result = PickleScanner().scan(str(path))
     finally:
-        _clear_source_sensitive_caches()
+        picklescan_call_graph._clear_source_sensitive_caches()
     aggregate = create_initial_audit_result()
     merge_scan_result(aggregate, result)
     incomplete = ambiguous_helper or custom_metaclass
@@ -3532,7 +3531,7 @@ def test_call_graph_gap_preserves_supplemental_checks_and_finalization(
     )
     path = tmp_path / "supplemental-gap.pkl"
     path.write_bytes(payload)
-    _clear_source_sensitive_caches()
+    picklescan_call_graph._clear_source_sensitive_caches()
     try:
         if route == "file":
             result = PickleScanner().scan(str(path))
@@ -3540,7 +3539,7 @@ def test_call_graph_gap_preserves_supplemental_checks_and_finalization(
             stream = io.BytesIO(payload) if route == "seekable" else NonSeekableBytesIO(payload)
             result = PickleScanner().scan_stream(stream, len(payload), source=str(path))
     finally:
-        _clear_source_sensitive_caches()
+        picklescan_call_graph._clear_source_sensitive_caches()
     aggregate = create_initial_audit_result()
     merge_scan_result(aggregate, result)
 
@@ -3575,11 +3574,11 @@ def test_pytorch_zip_preserves_supplemental_findings_after_call_graph_gap(
     path = create_mock_pytorch_zip(tmp_path / "supplemental-gap.pt", with_pickle=False)
     with zipfile.ZipFile(path, "a") as archive:
         archive.writestr("data.pkl", payload)
-    _clear_source_sensitive_caches()
+    picklescan_call_graph._clear_source_sensitive_caches()
     try:
         result = PyTorchZipScanner().scan(str(path))
     finally:
-        _clear_source_sensitive_caches()
+        picklescan_call_graph._clear_source_sensitive_caches()
     aggregate = create_initial_audit_result()
     merge_scan_result(aggregate, result)
 
@@ -3659,11 +3658,11 @@ def test_hook_binding_recursion_preserves_root_outcome(
         + b"".join(b"c" + module.encode() + b"\n" + name.encode() + b"\n)R0" for module, name in references)
         + b"N."
     )
-    _clear_source_sensitive_caches()
+    picklescan_call_graph._clear_source_sensitive_caches()
     try:
         result = PickleScanner().scan(str(path))
     finally:
-        _clear_source_sensitive_caches()
+        picklescan_call_graph._clear_source_sensitive_caches()
     aggregate = create_initial_audit_result()
     merge_scan_result(aggregate, result)
     incomplete = any("recursion" in issue.message for issue in result.issues)
