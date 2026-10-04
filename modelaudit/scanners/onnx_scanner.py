@@ -2373,6 +2373,7 @@ def _build_onnx_weight_analysis_plan(
         scan_input_axes: tuple[int, ...] | None = None,
         scan_input_offset: int = 0,
         num_scan_inputs: int | None = None,
+        produced_sequence_extent: Callable[[str], int] | None = None,
     ) -> bool:
         num_scan_inputs = (
             _onnx_int_attribute(node, "num_scan_inputs", 1) if num_scan_inputs is None else num_scan_inputs
@@ -2401,6 +2402,10 @@ def _build_onnx_weight_analysis_plan(
         trusted_shape_names = trusted_shape_names or set()
         for input_index, scan_input in enumerate(scan_inputs):
             shape = scan_input_shape(constants, known_shapes, scan_input, trusted_shape_names, untrusted_shape_names)
+            # Scan-8 pads a produced sequence even when its body executes less
+            # often. This bounds iteration without changing observed shapes.
+            if scan_input_offset and produced_sequence_extent is not None and produced_sequence_extent(scan_input) > 0:
+                continue
             if not shape:
                 if constant_sequence_lens:
                     continue
@@ -5768,10 +5773,8 @@ def _build_onnx_weight_analysis_plan(
                 lineage.unresolved_reason is None
                 and target_rank is not None
                 and lineage_rank is not None
-                and (target_rank <= lineage_rank or lineage_rank >= 2)
+                and target_rank <= lineage_rank
             ):
-                # Analyze an immutable matrix once, as for a Constant output;
-                # stacking duplicates its values without changing the stored view.
                 promoted_lineages[initializer_index] = lineage
                 continue
             shape = None
@@ -6912,7 +6915,7 @@ def _build_onnx_weight_analysis_plan(
                                 scan_input_offset=scan_input_offset,
                                 scan_input_axes=scan_input_axes,
                             )
-                        if parent_shape is None or parent_name in value_lineages:
+                        if parent_shape is None:
                             return None
                         if parent_name in proven_value_ranks:
                             return parent_shape
@@ -8435,7 +8438,13 @@ def _build_onnx_weight_analysis_plan(
                         exact_repeated_state_consumes_weight_rank = False
                         repeated_state_output_shapes: dict[int, tuple[int, ...]] = {}
                         graph_output_index = control_flow_subgraph_state_output_index(node, pair_index, opset_versions)
-                        if repeated_control_flow_state_input:
+                        if (
+                            repeated_control_flow_state_input
+                            and parent_shape is not None
+                            and subgraph_trusted_context_shapes.get(graph_input_name) == parent_shape
+                        ):
+                            repeated_state_output_shapes[graph_output_index] = parent_shape
+                        elif repeated_control_flow_state_input:
                             recurrent_dependencies = None
                             if node.op_type == "Loop" and len(repeated_state_output_indexes_by_input) > 1:
                                 recurrent_dependencies = repeated_state_update_dependency_names_bounded(
@@ -8663,11 +8672,15 @@ def _build_onnx_weight_analysis_plan(
                             )
                         if (
                             repeated_control_flow_state_input
-                            and parent_name in dynamic_values
                             and graph_input_name not in subgraph_trusted_context_shapes
+                            and (
+                                parent_name in dynamic_values
+                                or finite_repeated_state_consumes_weight_rank
+                                or sibling_state_rank_promotion_may_affect_weight
+                            )
                         ):
-                            # A root input contract describes the initial state only.
-                            # Unproven recurrent shapes must not exclude generated weights.
+                            # Both runtime and initializer shapes describe only the initial state.
+                            # Only invariance or finite replay can exclude later matrix weights.
                             parent_shape = None
                             parent_rank = None
                         if parent_shape is not None:
@@ -9747,6 +9760,7 @@ def _build_onnx_weight_analysis_plan(
                 *,
                 trusted_shape_names: set[str] = trusted_scan_shape_names,
                 untrusted_shape_names: set[str] = untrusted_scan_shape_names,
+                allow_omitted_sequence_lens: bool = False,
             ) -> int:
                 num_scan_inputs = resolved_int_attribute(current_node, "num_scan_inputs", 1)
                 if num_scan_inputs <= 0:
@@ -9761,11 +9775,12 @@ def _build_onnx_weight_analysis_plan(
                 # sequence_lens processes fewer elements (including zero).
                 if input_offset and current_node.input:
                     sequence_lens_input = str(current_node.input[0] or "")
-                    if graph_input_is_runtime_overridable(sequence_lens_input, graph_input_names, constants):
-                        return -1
-                    sequence_lens = constant_int64_vector_values(constants.get(sequence_lens_input))
-                    if sequence_lens is None or not sequence_lens or any(length < 0 for length in sequence_lens):
-                        return -1
+                    if sequence_lens_input or not allow_omitted_sequence_lens:
+                        if graph_input_is_runtime_overridable(sequence_lens_input, graph_input_names, constants):
+                            return -1
+                        sequence_lens = constant_int64_vector_values(constants.get(sequence_lens_input))
+                        if sequence_lens is None or not sequence_lens or any(length < 0 for length in sequence_lens):
+                            return -1
                 if value_name not in trusted_shape_names or value_name in untrusted_shape_names:
                     return -1
                 value_shape = known_value_shapes.get(value_name)
@@ -9780,6 +9795,20 @@ def _build_onnx_weight_analysis_plan(
                 if axis < 0 or axis >= len(value_shape):
                     return -1
                 return value_shape[axis]
+
+            def produced_scan8_sequence_extent(value_name: str) -> int:
+                producers = graph_output_producer_nodes_by_name(current_graph).get(value_name, ())
+                if len(producers) != 1:
+                    return -1
+                producer = producers[0]
+                if producer.op_type != "Scan" or not scan_sequence_lens_input_offset(producer, opset_versions):
+                    return -1
+                output_index = tuple(str(name) for name in producer.output).index(value_name)
+                if output_index < scan_stacked_output_start(
+                    producer, opset_versions, resolve_attribute=resolve_attribute
+                ):
+                    return -1
+                return scan_stacked_output_extent(producer, output_index, allow_omitted_sequence_lens=True)
 
             subgraph_output_offset = 1 if standard_control_flow_operator and node.op_type == "Loop" else 0
             for (
@@ -9940,7 +9969,7 @@ def _build_onnx_weight_analysis_plan(
                             )
                     if (
                         graph_output_parent_lineages
-                        and stacked_scan_output
+                        and (stacked_scan_output or repeated_carried_state)
                         and not (node.op_type == "Loop" and loop_exact_iteration_count(max_count=1) is not None)
                         and not control_flow_stack_values_are_invariant(
                             node,
@@ -9983,8 +10012,22 @@ def _build_onnx_weight_analysis_plan(
                                 if node.op_type == "Loop" and stacked_scan_output
                                 else None
                             ),
-                            materialize_stack_output=stacked_scan_output
-                            and (node.op_type == "Loop" or (node.op_type == "Scan" and not resolved_scan_input_offset)),
+                            materialize_stack_output=(
+                                stacked_scan_output
+                                and (
+                                    node.op_type == "Loop"
+                                    or (node.op_type == "Scan" and not resolved_scan_input_offset)
+                                )
+                            )
+                            or (
+                                node.op_type == "Scan"
+                                and bool(resolved_scan_input_offset)
+                                and not stacked_scan_output
+                                and all(
+                                    lineage.shape is not None and len(lineage.shape) >= 2
+                                    for lineage in graph_output_parent_lineages.values()
+                                )
+                            ),
                         )
                     merge_lineages(
                         subgraph_output_lineages[output_index],
@@ -10364,6 +10407,7 @@ def _build_onnx_weight_analysis_plan(
                     scan_input_axes=resolved_scan_input_axes,
                     scan_input_offset=resolved_scan_input_offset,
                     num_scan_inputs=resolved_scan_input_count,
+                    produced_sequence_extent=produced_scan8_sequence_extent,
                 )
             ):
                 scan_state_input_count = max(
@@ -11184,6 +11228,15 @@ def _build_onnx_weight_analysis_plan(
             )
             record_exclusion(initializer_index, reason)
 
+    def reshape_without_copy(array: Any, shape: tuple[int, ...]) -> Any:
+        try:
+            return np.reshape(array, shape, copy=False)
+        except TypeError:
+            # NumPy 1.x has no copy argument; shape assignment to a view never copies.
+            view = array.view()
+            view.shape = shape
+            return view
+
     analyzed_initializer_indexes: set[int] = set()
     eligible_metadata: list[dict[str, Any]] = []
     analysis_id = 0
@@ -11214,8 +11267,7 @@ def _build_onnx_weight_analysis_plan(
                 plan.oversized_initializers_skipped += 1
                 continue
 
-            accepted_groups: list[_OnnxWeightConsumerGroup] = []
-            retained_logical_bytes = estimated_bytes
+            accepted_groups: list[tuple[_OnnxWeightConsumerGroup, int]] = []
             oversized_view_skipped = False
             for consumer_group in initializer_groups.values():
                 logical_bytes = max(
@@ -11237,20 +11289,15 @@ def _build_onnx_weight_analysis_plan(
                         plan.oversized_initializers_skipped += 1
                         oversized_view_skipped = True
                     continue
-                accepted_groups.append(consumer_group)
-                retained_logical_bytes = max(retained_logical_bytes, logical_bytes)
+                accepted_groups.append((consumer_group, logical_bytes))
             if not accepted_groups:
                 continue
 
             array = onnx.numpy_helper.to_array(initializer)
-            if retain_array_check is not None and not retain_array_check(
-                bounded_name, max(int(array.nbytes), retained_logical_bytes)
-            ):
-                plan.oversized_initializers_skipped += 1
-                continue
-
+            retained_logical_bytes = int(array.nbytes)
+            prepared_specs: list[_OnnxWeightAnalysisSpec] = []
             transformed_views: dict[tuple[_OnnxWeightTransform, ...], Any] = {(): array}
-            for consumer_group in accepted_groups:
+            for consumer_group, logical_bytes in accepted_groups:
                 try:
                     transformed = transformed_views.get(consumer_group.lineage.transforms)
                     if transformed is None:
@@ -11261,7 +11308,7 @@ def _build_onnx_weight_analysis_plan(
                             if transform.kind == "Transpose":
                                 transformed = np.transpose(transformed, axes=transform.parameters)
                             elif transform.kind == "Reshape":
-                                transformed = np.reshape(transformed, transform.parameters)
+                                transformed = reshape_without_copy(transformed, transform.parameters)
                             elif transform.kind == "Expand":
                                 transformed = np.broadcast_to(transformed, transform.parameters)
                             if transformed.size and not np.shares_memory(array, transformed):
@@ -11285,21 +11332,44 @@ def _build_onnx_weight_analysis_plan(
                         group_value = consumer_group.group
                         if group_value <= 0 or int(transformed.shape[0]) % group_value != 0:
                             raise ValueError("ConvTranspose initializer has an incompatible group")
-                        tensor_weights = transformed.reshape(
-                            group_value,
-                            int(transformed.shape[0]) // group_value,
-                            *transformed.shape[1:],
+                        tensor_weights = reshape_without_copy(
+                            transformed,
+                            (group_value, int(transformed.shape[0]) // group_value, *transformed.shape[1:]),
                         )
                         conceptual_output_axes = (0, 2)
                     if tensor_weights.size and not np.shares_memory(array, tensor_weights):
                         raise RuntimeError("ONNX weight analysis requires a full-tensor copy")
 
-                    matrix_analysis = consumer_group.analysis_kind == "matrix"
+                    # Broadcast output axes duplicate complete output neurons.
+                    # Remove only those axes, preserving the other axes' roles.
+                    # This retains the established one-copy statistical view of
+                    # constant stacks without reinterpreting an input as an output.
+                    deduplicated_output = False
+                    for axis in reversed(conceptual_output_axes):
+                        if (
+                            tensor_weights.ndim <= 2
+                            or len(conceptual_output_axes) <= 1
+                            or tensor_weights.shape[axis] == 0
+                            or tensor_weights.strides[axis] != 0
+                        ):
+                            continue
+                        selection = tuple(0 if index == axis else slice(None) for index in range(tensor_weights.ndim))
+                        tensor_weights = tensor_weights[selection]
+                        conceptual_output_axes = tuple(
+                            index - (index > axis) for index in conceptual_output_axes if index != axis
+                        )
+                        deduplicated_output = True
+                    matrix_analysis = consumer_group.analysis_kind == "matrix" or (
+                        deduplicated_output
+                        and tensor_weights.ndim == 2
+                        and len(conceptual_output_axes) == 1
+                        and consumer_group.node.op_type == "MatMul"
+                    )
                     analysis_weights = tensor_weights
                     if matrix_analysis:
-                        if len(output_axes) != 1 or transformed.ndim != 2:
+                        if len(conceptual_output_axes) != 1 or tensor_weights.ndim != 2:
                             raise ValueError("Matrix weight analysis requires exactly one output axis")
-                        analysis_weights = np.moveaxis(transformed, output_axes[0], -1)
+                        analysis_weights = np.moveaxis(tensor_weights, conceptual_output_axes[0], -1)
                         conceptual_output_axes = (analysis_weights.ndim - 1,)
                     input_axes = tuple(
                         axis for axis in range(analysis_weights.ndim) if axis not in conceptual_output_axes
@@ -11310,7 +11380,7 @@ def _build_onnx_weight_analysis_plan(
                     ]
                     first_consumer = consumer_group.consumers[0]
                     context = {
-                        "analysis_id": analysis_id,
+                        "analysis_id": analysis_id + len(prepared_specs),
                         **_bounded_onnx_metadata_fields(plan, "initializer", initializer.name),
                         "initializer_graph_index": initializer_graph_indexes[initializer_index],
                         "consumer_op": first_consumer["op"],
@@ -11339,20 +11409,17 @@ def _build_onnx_weight_analysis_plan(
                         "consumers": consumer_group.consumers,
                         "consumers_truncated": consumer_group.consumer_count > len(consumer_group.consumers),
                     }
-                    plan.specs.append(
+                    prepared_specs.append(
                         _OnnxWeightAnalysisSpec(
                             initializer_index=initializer_index,
-                            analysis_id=analysis_id,
+                            analysis_id=analysis_id + len(prepared_specs),
                             weights=analysis_weights,
                             output_axes=conceptual_output_axes,
                             matrix_analysis=matrix_analysis,
                             context=context,
                         ),
                     )
-                    analysis_id += 1
-                    analyzed_initializer_indexes.add(initializer_index)
-                    if len(eligible_metadata) < _ONNX_WEIGHT_METADATA_SAMPLE_LIMIT:
-                        eligible_metadata.append(context)
+                    retained_logical_bytes = max(retained_logical_bytes, logical_bytes)
                 except Exception as exc:
                     plan.extraction_failures += 1
                     logger.warning(
@@ -11360,6 +11427,16 @@ def _build_onnx_weight_analysis_plan(
                         bounded_name,
                         type(exc).__name__,
                     )
+            if prepared_specs:
+                if retain_array_check is not None and not retain_array_check(bounded_name, retained_logical_bytes):
+                    plan.oversized_initializers_skipped += 1
+                    continue
+                plan.specs.extend(prepared_specs)
+                analysis_id += len(prepared_specs)
+                analyzed_initializer_indexes.add(initializer_index)
+                for prepared_spec in prepared_specs:
+                    if len(eligible_metadata) < _ONNX_WEIGHT_METADATA_SAMPLE_LIMIT:
+                        eligible_metadata.append(prepared_spec.context)
         except Exception as exc:
             plan.extraction_failures += 1
             bounded_name, _, _ = _bounded_onnx_metadata_text(plan, initializer.name)

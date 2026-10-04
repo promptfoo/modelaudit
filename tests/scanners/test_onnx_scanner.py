@@ -27096,3 +27096,430 @@ class TestOnnxViewProofReviewRegressions:
             assert len(plan.specs) == 1
             np.testing.assert_array_equal(plan.specs[0].weights, weights)
             TestOnnxReviewShapeRegressions._assert_clean(path)
+
+
+class TestOnnxOutputInvarianceReviewRegressions:
+    _value = staticmethod(TestOnnxRecurrenceReviewRegressions._value)
+    _tensor = staticmethod(TestOnnxRecurrenceReviewRegressions._tensor)
+
+    @staticmethod
+    def _save(graph: Any, tmp_path: Path, *, opset: int = 18) -> tuple[Path, Any]:
+        path = TestOnnxReviewShapeRegressions._save(graph, tmp_path, opset=opset)
+        model = onnx.load(str(path))
+        onnx.checker.check_model(model, full_check=True)
+        return path, model
+
+    @pytest.mark.parametrize("update", ["identity", "transpose", "transpose_expand", "replacement"])
+    @pytest.mark.parametrize("count", [1, 2, 3])
+    def test_final_carried_weight_requires_repeated_value_invariance(
+        self, tmp_path: Path, update: str, count: int
+    ) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        weights = np.zeros((1, 64) if update == "transpose_expand" else (64, 64), np.float32)
+        weights[:5, 0] = 10
+        if update == "identity":
+            nodes = [helper.make_node("Identity", ["state"], ["next"])]
+        elif update == "replacement":
+            nodes = [helper.make_node("Constant", [], ["next"], value=self._tensor("", np.zeros((64, 64))))]
+        else:
+            nodes = [
+                helper.make_node(
+                    "Transpose", ["state"], ["transposed" if update == "transpose_expand" else "next"], perm=[1, 0]
+                )
+            ]
+            if update == "transpose_expand":
+                nodes.append(helper.make_node("Expand", ["transposed", "shape"], ["next"]))
+        body = helper.make_graph(
+            nodes,
+            "changing_carried_weight",
+            [
+                self._value("i", [], TensorProto.INT64),
+                self._value("condition", [], TensorProto.BOOL),
+                self._value("state", None),
+            ],
+            [self._value("condition", [], TensorProto.BOOL), self._value("next", None)],
+        )
+        graph = helper.make_graph(
+            [
+                helper.make_node("Loop", ["count", "start", "W"], ["final"], body=body),
+                helper.make_node("MatMul", ["X", "final"], ["Y"]),
+            ],
+            "final_repeated_weight",
+            [self._value("X", [1, 64])],
+            [self._value("final", [64, 64]), self._value("Y", [1, 64])],
+            [
+                self._tensor("W", weights),
+                self._tensor("count", count, np.int64),
+                self._tensor("start", True, np.bool_),
+                self._tensor("shape", [64, 64], np.int64),
+            ],
+        )
+        path, model = self._save(graph, tmp_path)
+        runtime: Any = ReferenceEvaluator(model).run(None, {"X": np.ones((1, 64), np.float32)})
+        actual = runtime[0]
+        expected = weights.copy()
+        for _ in range(count):
+            if update == "transpose":
+                expected = expected.T
+            elif update == "transpose_expand":
+                expected = np.broadcast_to(expected.T, (64, 64))
+            elif update == "replacement":
+                expected = np.zeros((64, 64), np.float32)
+        np.testing.assert_array_equal(actual, expected)
+        if count > 1 and update in {"transpose", "transpose_expand"}:
+            TestOnnxProofReviewRegressions._assert_gap(path, tmp_path, "unresolved_initializer_lineage")
+        else:
+            plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+            assert plan.coverage_gaps == {}
+            assert plan.extraction_failures == 0
+            assert len(plan.specs) == 1
+            np.testing.assert_array_equal(plan.specs[0].weights, expected)
+            assert OnnxScanner().scan(str(path)).success is True
+
+    @pytest.mark.parametrize("axis", [0, 1, 2])
+    @pytest.mark.parametrize("extreme", [False, True])
+    def test_scan_stack_keeps_input_and_output_axis_roles(self, tmp_path: Path, axis: int, extreme: bool) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        weights = np.zeros((64, 64), np.float32)
+        if extreme:
+            weights[0, :5] = 10
+        body = helper.make_graph(
+            [helper.make_node("Expand", ["W", "shape"], ["weight"])],
+            "stacked_matrix",
+            [self._value("element", [1])],
+            [self._value("weight", [64, 64])],
+        )
+        stacked_shape = list(weights.shape)
+        stacked_shape.insert(axis, 1)
+        x_shape = [stacked_shape[0], 1, stacked_shape[1]]
+        graph = helper.make_graph(
+            [
+                helper.make_node("Scan", ["data"], ["stack"], body=body, num_scan_inputs=1, scan_output_axes=[axis]),
+                helper.make_node("MatMul", ["X", "stack"], ["Y"]),
+            ],
+            "scan_output_axis",
+            [self._value("data", [1, 1]), self._value("X", x_shape)],
+            [self._value("stack", stacked_shape), self._value("Y", [stacked_shape[0], 1, stacked_shape[2]])],
+            [self._tensor("W", weights), self._tensor("shape", [64, 64], np.int64)],
+        )
+        path, model = self._save(graph, tmp_path)
+        # The installed reference Scan only supports axis zero. Execute its body
+        # and apply the schema's output stacking axis independently of the planner.
+        runtime: Any = ReferenceEvaluator(body, opsets={"": 18}).run(
+            None, {"element": np.ones(1, np.float32), "W": weights, "shape": np.array([64, 64], np.int64)}
+        )
+        actual = np.stack([runtime[0]], axis=axis)
+        np.testing.assert_array_equal(actual, np.expand_dims(weights, axis))
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        assert plan.coverage_gaps == {}
+        assert plan.extraction_failures == 0
+        assert len(plan.specs) == 1
+        spec = plan.specs[0]
+        expected_view = weights if axis == 0 else weights.T if axis == 2 else actual
+        np.testing.assert_array_equal(spec.weights, expected_view)
+        assert spec.output_axes == ((0, 2) if axis == 1 else (1,))
+        analyzer = WeightDistributionScanner()
+        runtime_anomalies = analyzer._analyze_tensor_weight_extremes("runtime", actual, output_axes=(0, 2))
+        assert bool(analyzer._analyze_onnx_weight_specs(plan.specs)) is bool(runtime_anomalies)
+        result = OnnxScanner().scan(str(path))
+        assert result.success is True
+        assert any(
+            check.name == "Weight Distribution Anomaly Detection" and check.status == CheckStatus.FAILED
+            for check in result.checks
+        ) is bool(runtime_anomalies)
+        if not runtime_anomalies:
+            TestOnnxReviewShapeRegressions._assert_clean(path)
+
+    @pytest.mark.parametrize("growing", [False, True])
+    def test_initializer_shape_is_not_a_recurrent_runtime_contract(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, growing: bool
+    ) -> None:
+        body = helper.make_graph(
+            [
+                helper.make_node("Unsqueeze", ["state", "axes"], ["column"]),
+                helper.make_node("Mul", ["column", "state"], ["product"]),
+                helper.make_node("Squeeze", ["product"], ["slope"]),
+                helper.make_node("PRelu", ["X", "slope"], ["activation"]),
+                helper.make_node("Concat", ["state", "tail"], ["next"], axis=0),
+            ],
+            "initializer_recurrence",
+            [
+                self._value("i", [], TensorProto.INT64),
+                self._value("condition", [], TensorProto.BOOL),
+                self._value("state", None),
+            ],
+            [self._value("condition", [], TensorProto.BOOL), self._value("next", None)],
+        )
+        graph = helper.make_graph(
+            [helper.make_node("Loop", ["count", "start", "initial"], ["final"], body=body)],
+            "initializer_bound_shape",
+            [self._value("X", [2, 2]), self._value("count", [], TensorProto.INT64)],
+            [self._value("final", [None])],
+            [
+                self._tensor("initial", [1]),
+                self._tensor("tail", [100] if growing else []),
+                self._tensor("axes", [1], np.int64),
+                self._tensor("start", True, np.bool_),
+                self._tensor("count", 2, np.int64),
+            ],
+        )
+        path, _ = self._save(graph, tmp_path)
+        slopes = TestOnnxTransferReviewRegressions._observed_slopes(
+            path, monkeypatch, {"X": -np.ones((2, 2), np.float32)}
+        )
+        assert slopes == [(), (2, 2) if growing else ()]
+        if growing:
+            TestOnnxProofReviewRegressions._assert_gap(path, tmp_path, "unresolved_initializer_lineage")
+        else:
+            TestOnnxReviewShapeRegressions._assert_clean(path)
+
+    @pytest.mark.parametrize("extent", [0, 2])
+    @pytest.mark.parametrize("lengths", ["omitted", "zero", "full"])
+    def test_scan8_producer_padding_bounds_later_iterations(self, tmp_path: Path, extent: int, lengths: str) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        first = helper.make_graph(
+            [helper.make_node("Identity", ["element"], ["element_out"])],
+            "first",
+            [self._value("element", [1])],
+            [self._value("element_out", [1])],
+        )
+        replacement = np.zeros((2, 2), np.float32)
+        second = helper.make_graph(
+            [
+                helper.make_node("Constant", [], ["replacement"], value=self._tensor("", replacement)),
+                helper.make_node("Identity", ["element"], ["element_out"]),
+            ],
+            "second",
+            [self._value("state", [2, 2]), self._value("element", [1])],
+            [self._value("replacement", [2, 2]), self._value("element_out", [1])],
+        )
+        graph = helper.make_graph(
+            [
+                helper.make_node("Add", ["W", "W"], ["initial"]),
+                helper.make_node(
+                    "Scan",
+                    ["" if lengths == "omitted" else "lengths", "data"],
+                    ["padded"],
+                    body=first,
+                    num_scan_inputs=1,
+                ),
+                helper.make_node(
+                    "Scan", ["", "initial", "padded"], ["final", "elements"], body=second, num_scan_inputs=1
+                ),
+                helper.make_node("MatMul", ["X", "final"], ["Y"]),
+            ],
+            "scan8_produced_padding",
+            [self._value("data", [1, extent, 1]), self._value("X", [1, 1, 2])],
+            [self._value("Y", [1, 1, 2])],
+            [
+                self._tensor("lengths", [extent if lengths == "full" else 0], np.int64),
+                self._tensor("W", np.ones((1, 2, 2))),
+            ],
+        )
+        path, _ = self._save(graph, tmp_path, opset=8)
+        # Scan-8 pads to the input sequence extent even for zero sequence_lens;
+        # omitting sequence_lens consumes that whole extent in the second Scan.
+        state = np.full((2, 2), 2, np.float32)
+        evaluator = ReferenceEvaluator(second, opsets={"": 8})
+        for _ in range(extent):
+            runtime: Any = evaluator.run(None, {"state": state, "element": np.zeros(1, np.float32)})
+            state = runtime[0]
+        np.testing.assert_array_equal(state, replacement if extent else np.full((2, 2), 2, np.float32))
+        if extent:
+            TestOnnxReviewShapeRegressions._assert_clean(path)
+        else:
+            TestOnnxProofReviewRegressions._assert_gap(path, tmp_path, "unresolved_initializer_lineage")
+
+    @pytest.mark.parametrize("failed_first", [False, True])
+    @pytest.mark.parametrize("legacy_numpy", [False, True])
+    @pytest.mark.parametrize("extreme", [False, True])
+    def test_failed_view_does_not_reserve_independent_weight_budget(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failed_first: bool, legacy_numpy: bool, extreme: bool
+    ) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        weights = np.zeros((64, 64), np.float32)
+        if extreme:
+            weights[:5, 0] = 10
+        bad_nodes = [
+            helper.make_node("Expand", ["Bad", "shape"], ["wide"]),
+            helper.make_node("Reshape", ["wide", "reshape"], ["flat"]),
+            helper.make_node("MatMul", ["X", "flat"], ["Y"]),
+        ]
+        good = helper.make_node("MatMul", ["Z", "W"], ["V"])
+        initializers = [self._tensor("Bad", [[1], [2]]), self._tensor("W", weights)]
+        graph = helper.make_graph(
+            [*bad_nodes, good] if failed_first else [good, *bad_nodes],
+            "failed_reservation",
+            [self._value("X", [1, 4096]), self._value("Z", [1, 64])],
+            [self._value("Y", [1, 2]), self._value("V", [1, 64])],
+            (initializers if failed_first else initializers[::-1])
+            + [self._tensor("shape", [2, 4096], np.int64), self._tensor("reshape", [4096, 2], np.int64)],
+        )
+        path, model = self._save(graph, tmp_path)
+        actual: Any = ReferenceEvaluator(model).run(
+            None, {"X": np.ones((1, 4096), np.float32), "Z": np.ones((1, 64), np.float32)}
+        )
+        assert actual[1][0, 0] == (50 if extreme else 0)
+        reshape = np.reshape
+        calls = 0
+
+        def require_no_copy(array: Any, shape: Any, **kwargs: Any) -> Any:
+            nonlocal calls
+            calls += 1
+            assert kwargs.get("copy") is False
+            if legacy_numpy:
+                raise TypeError("NumPy 1.x rejects the copy argument")
+            return reshape(array, shape, **kwargs)
+
+        originals: list[tuple[Any, tuple[int, ...], tuple[int, ...]]] = []
+        to_array = onnx.numpy_helper.to_array
+
+        def record_original(tensor: Any, *args: Any, **kwargs: Any) -> Any:
+            array = to_array(tensor, *args, **kwargs)
+            originals.append((array, array.shape, array.strides))
+            return array
+
+        monkeypatch.setattr(np, "reshape", require_no_copy)
+        monkeypatch.setattr(onnx.numpy_helper, "to_array", record_original)
+        analyzer = WeightDistributionScanner(
+            config={"max_array_size": None, "max_weight_distribution_total_bytes": 32768}
+        )
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(
+            model,
+            onnx=onnx,
+            np=np,
+            max_array_size=None,
+            pre_materialization_check=lambda _tensor, name, size: analyzer._tensor_fits_budget(
+                "onnx_initializer_size_limit", name, tensor_nbytes=size
+            ),
+            retain_array_check=lambda name, size: analyzer._tensor_fits_budget(
+                "onnx_initializer_size_limit", name, tensor_nbytes=size, retain=True
+            ),
+        )
+        assert calls == int(failed_first)
+        assert plan.extraction_failures == int(failed_first)
+        assert plan.analyzed_initializer_count == 1
+        assert [spec.context["initializer"] for spec in plan.specs] == ["W"]
+        assert analyzer.retained_tensor_bytes == weights.nbytes
+        assert all(array.shape == shape and array.strides == strides for array, shape, strides in originals)
+        np.testing.assert_array_equal(plan.specs[0].weights, weights)
+        monkeypatch.undo()
+        assert bool(analyzer._analyze_onnx_weight_specs(plan.specs)) is extreme
+        result = OnnxScanner(config={"max_array_size": None, "max_weight_distribution_total_bytes": 32768}).scan(
+            str(path)
+        )
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert (
+            any(
+                check.name == "Weight Distribution Anomaly Detection" and check.status == CheckStatus.FAILED
+                for check in result.checks
+            )
+            is extreme
+        )
+
+    @pytest.mark.parametrize("legacy_numpy", [False, True])
+    def test_zero_copy_reshape_preserves_original_array(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, legacy_numpy: bool
+    ) -> None:
+        weights = np.arange(12, dtype=np.float32).reshape(3, 4)
+        graph = helper.make_graph(
+            [
+                helper.make_node("Reshape", ["W", "shape"], ["matrix"]),
+                helper.make_node("MatMul", ["X", "matrix"], ["Y"]),
+            ],
+            "zero_copy_reshape",
+            [self._value("X", [1, 2])],
+            [self._value("Y", [1, 6])],
+            [self._tensor("W", weights), self._tensor("shape", [2, 6], np.int64)],
+        )
+        _, model = self._save(graph, tmp_path)
+        reshape = np.reshape
+        originals: list[Any] = []
+        to_array = onnx.numpy_helper.to_array
+        calls = 0
+
+        def record_original(tensor: Any, *args: Any, **kwargs: Any) -> Any:
+            array = to_array(tensor, *args, **kwargs)
+            if tensor.name == "W":
+                originals.append(array)
+            return array
+
+        def require_no_copy(array: Any, shape: Any, **kwargs: Any) -> Any:
+            nonlocal calls
+            calls += 1
+            assert kwargs.get("copy") is False
+            if legacy_numpy:
+                raise TypeError("NumPy 1.x rejects the copy argument")
+            return reshape(array, shape, **kwargs)
+
+        monkeypatch.setattr(np, "reshape", require_no_copy)
+        monkeypatch.setattr(onnx.numpy_helper, "to_array", record_original)
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        assert calls == 1
+        assert plan.extraction_failures == 0
+        assert len(plan.specs) == 1
+        assert len(originals) == 1
+        assert originals[0].shape == (3, 4)
+        assert originals[0].strides == weights.strides
+        assert np.shares_memory(originals[0], plan.specs[0].weights)
+        np.testing.assert_array_equal(originals[0], weights)
+        np.testing.assert_array_equal(plan.specs[0].weights, weights.reshape(2, 6))
+
+    def test_oversized_expanded_reshape_is_rejected_before_materialization(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        extent = 2**35
+        graph = helper.make_graph(
+            [
+                helper.make_node("Expand", ["W", "wide_shape"], ["wide"]),
+                helper.make_node("Reshape", ["wide", "matrix_shape"], ["matrix"]),
+                helper.make_node("MatMul", ["X", "matrix"], ["Y"]),
+            ],
+            "huge_zero_copy_guard",
+            [self._value("X", [1, extent])],
+            [self._value("Y", [1, 2])],
+            [
+                self._tensor("W", [[1], [2]]),
+                self._tensor("wide_shape", [2, extent], np.int64),
+                self._tensor("matrix_shape", [extent, 2], np.int64),
+            ],
+        )
+        _, model = self._save(graph, tmp_path)
+        original_to_array = onnx.numpy_helper.to_array
+        converted = []
+
+        def reject_weight(tensor: Any, *args: Any, **kwargs: Any) -> Any:
+            converted.append(tensor.name)
+            assert tensor.name != "W", "Budget rejection must precede weight materialization"
+            return original_to_array(tensor, *args, **kwargs)
+
+        def reject_reshape(*args: Any, **kwargs: Any) -> Any:
+            pytest.fail("Rejected logical weights must not reach any reshape")
+
+        monkeypatch.setattr(onnx.numpy_helper, "to_array", reject_weight)
+        monkeypatch.setattr(np, "reshape", reject_reshape)
+        analyzer = WeightDistributionScanner(
+            config={"max_array_size": None, "max_weight_distribution_total_bytes": 32768}
+        )
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(
+            model,
+            onnx=onnx,
+            np=np,
+            max_array_size=None,
+            pre_materialization_check=lambda _tensor, name, size: analyzer._tensor_fits_budget(
+                "onnx_initializer_size_limit", name, tensor_nbytes=size
+            ),
+            retain_array_check=lambda name, size: analyzer._tensor_fits_budget(
+                "onnx_initializer_size_limit", name, tensor_nbytes=size, retain=True
+            ),
+        )
+        assert "W" not in converted
+        assert plan.specs == []
+        assert plan.oversized_initializers_skipped == 1
+        assert plan.extraction_failures == 0
+        assert analyzer.retained_tensor_bytes == 0
