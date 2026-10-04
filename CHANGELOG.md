@@ -9,7 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- Require patched GitPython and AnyIO releases in published package dependencies as well as the lockfile.
+- Require GitPython 3.2.0 or newer in the `mlflow`, `all-ci`, and `all` extras and lockfile to fix `Remote.pull()` refspec option injection ([GHSA-f9j4-qggq-h239](https://github.com/gitpython-developers/GitPython/security/advisories/GHSA-f9j4-qggq-h239)).
+- Require AnyIO 4.14.2 or newer in published package dependencies as well as the lockfile.
 
 ### Changed
 
