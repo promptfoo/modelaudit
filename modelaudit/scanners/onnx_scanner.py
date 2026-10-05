@@ -8652,6 +8652,8 @@ def _build_onnx_weight_analysis_plan(
                         input_pairs,
                         start=input_pair_index_start,
                     ):
+                        if node.op_type == "Scan" and related_pair_index >= scan_input_start:
+                            continue
                         related_graph_input_name = _onnx_value_name(related_graph_input)
                         if not related_graph_input_name:
                             continue

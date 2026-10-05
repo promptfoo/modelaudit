@@ -32587,3 +32587,128 @@ class TestOnnxLoopReplacementProofs:
             assert plan.coverage_gaps.get("lineages_per_value_limit", 0) > 0
             assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
             assert any(check.details.get("coverage_gap") == "lineages_per_value_limit" for check in result.checks)
+
+
+class TestOnnxScanFeedbackPartition:
+    @pytest.mark.parametrize(
+        ("kind", "mode"),
+        [("Scan", mode) for mode in ("one", "state", "slice", "inputs", "states", "final", "feedback")]
+        + [("Scan8", mode) for mode in ("state", "inputs", "feedback")]
+        + [("Loop", mode) for mode in ("state", "feedback")],
+    )
+    def test_only_carried_states_feed_later_iterations(self, tmp_path: Path, kind: str, mode: str) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        value, tensor = TestOnnxShapeContinuity._v, TestOnnxShapeContinuity._t
+        count, states, sequences = (
+            1 if mode == "one" else 3,
+            2 if mode in {"states", "feedback"} else 1,
+            2 if mode == "inputs" else 1,
+        )
+        batched, feedback = kind == "Scan8", mode == "feedback"
+        weights = np.arange(16, dtype=np.float32).reshape(4, 4) / 16
+        if batched:
+            weights = weights[None]
+        state_names = ["state"] + (["other"] if states == 2 else [])
+        parent_states = ["W"] + (["Z"] if states == 2 else [])
+        next_names = ["next"] + (["next_other"] if states == 2 else [])
+        nodes = [helper.make_node("Identity", ["state"], ["next"])]
+        if states == 2:
+            nodes.append(helper.make_node("Identity", ["state" if feedback else "other"], ["next_other"]))
+        nodes.extend(
+            [
+                helper.make_node("Identity", ["slice" if mode == "slice" else "state"], ["stacked"]),
+                helper.make_node("MatMul", ["X", "other" if feedback else "slice"], ["activation"]),
+            ]
+        )
+        slice_names = ["slice"] + (["slice1"] if sequences == 2 else [])
+        body_inputs = [value(name, [4, 4]) for name in state_names + slice_names]
+        body_outputs = [value(name, [4, 4]) for name in [*next_names, "stacked"]] + [value("activation", [1, 4])]
+        initializers = [tensor("W", weights)] + ([tensor("Z", np.zeros_like(weights))] if states == 2 else [])
+        inputs = [value("X", [1, 4])]
+        feeds: dict[str, Any] = {"X": np.ones((1, 4), np.float32)}
+        if kind == "Loop":
+            body_inputs = [
+                value("i", [], TensorProto.INT64),
+                value("condition", [], TensorProto.BOOL),
+                *body_inputs[:states],
+            ]
+            body_outputs = [value("condition", [], TensorProto.BOOL), *body_outputs]
+            inputs.append(value("slice", [4, 4]))
+            feeds["slice"] = np.ones((4, 4), np.float32)
+            initializers.extend([tensor("count", np.int64(count)), tensor("start", np.bool_(True))])
+            parent_inputs = ["count", "start", *parent_states]
+        else:
+            parent_inputs = ([""] if batched else []) + parent_states
+            for index in range(sequences):
+                name, shape = f"seq{index}", ([1] if batched else []) + [count, 4, 4]
+                inputs.append(value(name, shape))
+                feeds[name] = np.arange(np.prod(shape), dtype=np.float32).reshape(shape) / 16 + index
+                parent_inputs.append(name)
+        body = helper.make_graph(nodes, "independent_scan_slices", body_inputs, body_outputs)
+        final_names = ["final"] + (["final_other"] if states == 2 else [])
+        attributes: dict[str, Any] = {"body": body}
+        if kind != "Loop":
+            attributes["num_scan_inputs"] = sequences
+        nodes = [
+            helper.make_node(
+                "Loop" if kind == "Loop" else "Scan", parent_inputs, [*final_names, "stack", "computed"], **attributes
+            )
+        ]
+        outputs = [value(name, ([1] if batched else []) + [4, 4]) for name in final_names] + [
+            value("stack", ([1] if batched else []) + [count, 4, 4]),
+            value("computed", ([1] if batched else []) + [count, 1, 4]),
+        ]
+        if mode == "final":
+            nodes.append(helper.make_node("MatMul", ["X", "final"], ["used"]))
+            outputs.append(value("used", [1, 4]))
+        model = helper.make_model(
+            helper.make_graph(nodes, "scan_feedback_partition", inputs, outputs, initializers),
+            opset_imports=[helper.make_opsetid("", 8 if batched else 18)],
+            ir_version=8,
+        )
+        path = TestOnnxLoopControlProofs._save(model, tmp_path)
+        if batched:
+            # The installed evaluator supports modern Scan; execute the actual
+            # Scan8 body with its separate batch and sequence dimensions.
+            runtime = ReferenceEvaluator(body, opsets={"": 8})
+            state: list[Any] = [weights[0]] + ([np.zeros_like(weights[0])] if states == 2 else [])
+            collected: list[list[Any]] = [[], []]
+            for iteration in range(count):
+                bound = dict(feeds)
+                bound.update(zip(state_names, state, strict=False))
+                bound.update({name: feeds[f"seq{index}"][0, iteration] for index, name in enumerate(slice_names)})
+                values: Any = runtime.run(None, bound)
+                state = values[:states]
+                for index, array in enumerate(values[states:]):
+                    collected[index].append(array)
+            actual: Any = [array[None] for array in state] + [np.stack(arrays)[None] for arrays in collected]
+        else:
+            actual = ReferenceEvaluator(model).run(None, feeds)
+        np.testing.assert_array_equal(actual[0], weights)
+        expected_stack = feeds["seq0"] if mode == "slice" else np.stack([weights] * count, axis=1 if batched else 0)
+        # Loop's installed evaluator concatenates scan outputs; compare the
+        # actual elements with their known per-iteration dimensions.
+        np.testing.assert_array_equal(actual[states].reshape(expected_stack.shape), expected_stack)
+        if feedback:
+            expected = np.stack([np.zeros((1, 4), np.float32)] + [feeds["X"] @ weights.reshape(4, 4)] * (count - 1))
+            if batched:
+                expected = expected[None]
+        else:
+            expected = feeds["X"] @ feeds["slice" if kind == "Loop" else "seq0"]
+            if kind == "Loop":
+                expected = np.stack([expected] * count)
+        np.testing.assert_array_equal(actual[states + 1].reshape(expected.shape), expected)
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        result = OnnxScanner().scan(str(path))
+        assert result.success is not feedback
+        if feedback:
+            assert plan.coverage_gaps.get("unresolved_initializer_lineage", 0) > 0
+            assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+            assert any(check.details.get("coverage_gap") == "unresolved_initializer_lineage" for check in result.checks)
+        else:
+            assert plan.coverage_gaps == {}
+            assert len(plan.specs) == (1 if mode == "final" else 0)
+            if mode == "final":
+                np.testing.assert_array_equal(plan.specs[0].weights, actual[0])
+        assert not TestWeightDistributionSemantics._extreme_checks(result)
