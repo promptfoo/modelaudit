@@ -2488,6 +2488,17 @@ def _build_onnx_weight_analysis_plan(
             break
         return node.op_type == "Squeeze" and not axes and bool(noop_value)
 
+    def implicit_squeeze_shape(
+        node: Any,
+        shape: tuple[int, ...],
+        resolve_attribute: Callable[[Any], Any | None] | None = None,
+    ) -> tuple[int, ...] | None:
+        if squeeze_with_empty_axes_is_noop(node, (), resolve_attribute):
+            return shape
+        if any(dimension < 0 for dimension in shape):
+            return None
+        return tuple(dimension for dimension in shape if dimension != 1)
+
     def gathernd_output_shape(
         node: Any,
         *,
@@ -4038,10 +4049,9 @@ def _build_onnx_weight_analysis_plan(
                     if axes is not None:
                         normalized_axes = tuple(axis if axis >= 0 else len(data_input_shape) + axis for axis in axes)
                         if not normalized_axes:
-                            if squeeze_with_empty_axes_is_noop(body_node, axes, resolve_reentry_attribute):
-                                output_shape = data_input_shape
-                            else:
-                                output_shape = tuple(dimension for dimension in data_input_shape if dimension != 1)
+                            output_shape = implicit_squeeze_shape(
+                                body_node, data_input_shape, resolve_reentry_attribute
+                            )
                         elif len(set(normalized_axes)) == len(normalized_axes) and all(
                             0 <= axis < len(data_input_shape) and data_input_shape[axis] == 1
                             for axis in normalized_axes
@@ -5125,9 +5135,8 @@ def _build_onnx_weight_analysis_plan(
                 return True
             normalized_axes = tuple(axis if axis >= 0 else len(input_shape) + axis for axis in axes)
             if not normalized_axes:
-                if squeeze_with_empty_axes_is_noop(node, axes, resolve_attribute):
-                    return len(input_shape) >= 2
-                normalized_axes = tuple(index for index, dimension in enumerate(input_shape) if dimension == 1)
+                output_shape = implicit_squeeze_shape(node, input_shape, resolve_attribute)
+                return output_shape is None or len(output_shape) >= 2
             if (
                 len(set(normalized_axes)) != len(normalized_axes)
                 or any(axis < 0 or axis >= len(input_shape) for axis in normalized_axes)
@@ -5150,7 +5159,7 @@ def _build_onnx_weight_analysis_plan(
             return resolved_shape is None or len(resolved_shape) >= 2
         return False
 
-    def value_info_shape(value_info: Any) -> tuple[int, ...] | None:
+    def value_info_shape(value_info: Any, *, preserve_unknown: bool = False) -> tuple[int, ...] | None:
         try:
             tensor_type = value_info.type.tensor_type
             if not tensor_type.HasField("shape"):
@@ -5160,8 +5169,11 @@ def _build_onnx_weight_analysis_plan(
             dimensions: list[int] = []
             for dimension in tensor_type.shape.dim:
                 if not dimension.HasField("dim_value"):
-                    return None
-                dimensions.append(int(dimension.dim_value))
+                    if not preserve_unknown:
+                        return None
+                    dimensions.append(-1)
+                else:
+                    dimensions.append(int(dimension.dim_value))
             return tuple(dimensions)
         except (AttributeError, TypeError, ValueError):
             return None
@@ -5425,7 +5437,7 @@ def _build_onnx_weight_analysis_plan(
         node: Any,
         constants: dict[str, Any],
         *,
-        value_shapes: dict[str, tuple[int, ...]],
+        resolve_value_shape: Callable[[str], tuple[int, ...] | None],
         cast_target_data_type: int | None = None,
         resolve_attribute: Callable[[Any], Any | None] | None = None,
     ) -> _OnnxWeightLineage:
@@ -5516,7 +5528,8 @@ def _build_onnx_weight_analysis_plan(
                         return transformed if transformed != lineage else lineage
                     normalized_axes = tuple(index for index, dimension in enumerate(lineage.shape) if dimension == 1)
                 if (
-                    len(set(normalized_axes)) != len(normalized_axes)
+                    (not axes and implicit_squeeze_shape(node, lineage.shape) is None)
+                    or len(set(normalized_axes)) != len(normalized_axes)
                     or any(axis < 0 or axis >= len(lineage.shape) for axis in normalized_axes)
                     or any(lineage.shape[axis] != 1 for axis in normalized_axes)
                 ):
@@ -5579,7 +5592,7 @@ def _build_onnx_weight_analysis_plan(
             output_shape = expanded_shape
             transform = _OnnxWeightTransform("Expand", output_shape)
         elif node.op_type == "Gather":
-            index_shape = value_shapes.get(str(node.input[1])) if len(node.input) >= 2 else None
+            index_shape = resolve_value_shape(str(node.input[1])) if len(node.input) >= 2 else None
             gather_axis = _onnx_gather_axis(node, len(lineage.shape))
             if gather_axis is None or index_shape is None:
                 return _OnnxWeightLineage(
@@ -5601,7 +5614,7 @@ def _build_onnx_weight_analysis_plan(
             output_shape = gather_shape
             transform = _OnnxWeightTransform("Reshape", output_shape)
         elif node.op_type == "GatherND":
-            index_shape = value_shapes.get(str(node.input[1])) if len(node.input) >= 2 else None
+            index_shape = resolve_value_shape(str(node.input[1])) if len(node.input) >= 2 else None
             if not index_shape:
                 return _OnnxWeightLineage(
                     initializer_index=lineage.initializer_index,
@@ -5775,7 +5788,7 @@ def _build_onnx_weight_analysis_plan(
         node: Any,
         constants: dict[str, Any],
         *,
-        value_shapes: dict[str, tuple[int, ...]],
+        resolve_value_shape: Callable[[str], tuple[int, ...] | None],
         cast_target_data_type: int | None = None,
         resolve_attribute: Callable[[Any], Any | None] | None = None,
     ) -> bool:
@@ -5787,7 +5800,7 @@ def _build_onnx_weight_analysis_plan(
                     lineage,
                     node,
                     constants,
-                    value_shapes=value_shapes,
+                    resolve_value_shape=resolve_value_shape,
                     cast_target_data_type=cast_target_data_type,
                     resolve_attribute=resolve_attribute,
                 )
@@ -5800,7 +5813,7 @@ def _build_onnx_weight_analysis_plan(
         node: Any,
         constants: dict[str, Any],
         *,
-        value_shapes: dict[str, tuple[int, ...]],
+        resolve_value_shape: Callable[[str], tuple[int, ...] | None],
         cast_target_data_type: int | None = None,
         resolve_attribute: Callable[[Any], Any | None] | None = None,
     ) -> bool:
@@ -5811,7 +5824,7 @@ def _build_onnx_weight_analysis_plan(
                 lineage,
                 node,
                 constants,
-                value_shapes=value_shapes,
+                resolve_value_shape=resolve_value_shape,
                 cast_target_data_type=cast_target_data_type,
                 resolve_attribute=resolve_attribute,
             )
@@ -5825,7 +5838,7 @@ def _build_onnx_weight_analysis_plan(
         constants: dict[str, Any],
         predicate: Callable[[_OnnxWeightLineage], bool],
         *,
-        value_shapes: dict[str, tuple[int, ...]],
+        resolve_value_shape: Callable[[str], tuple[int, ...] | None],
         cast_target_data_type: int | None = None,
         resolve_attribute: Callable[[Any], Any | None] | None = None,
     ) -> _OnnxWeightLineageGapSummary:
@@ -5837,7 +5850,7 @@ def _build_onnx_weight_analysis_plan(
                     lineage,
                     node,
                     constants,
-                    value_shapes=value_shapes,
+                    resolve_value_shape=resolve_value_shape,
                     cast_target_data_type=cast_target_data_type,
                     resolve_attribute=resolve_attribute,
                 )
@@ -5852,7 +5865,7 @@ def _build_onnx_weight_analysis_plan(
         node: Any,
         constants: dict[str, Any],
         *,
-        value_shapes: dict[str, tuple[int, ...]],
+        resolve_value_shape: Callable[[str], tuple[int, ...] | None],
         cast_target_data_type: int | None = None,
         resolve_attribute: Callable[[Any], Any | None] | None = None,
     ) -> _OnnxWeightLineageGapSummary:
@@ -5861,7 +5874,7 @@ def _build_onnx_weight_analysis_plan(
             node,
             constants,
             lineage_could_be_weight,
-            value_shapes=value_shapes,
+            resolve_value_shape=resolve_value_shape,
             cast_target_data_type=cast_target_data_type,
             resolve_attribute=resolve_attribute,
         )
@@ -5871,7 +5884,7 @@ def _build_onnx_weight_analysis_plan(
         node: Any,
         constants: dict[str, Any],
         *,
-        value_shapes: dict[str, tuple[int, ...]],
+        resolve_value_shape: Callable[[str], tuple[int, ...] | None],
         cast_target_data_type: int | None = None,
         resolve_attribute: Callable[[Any], Any | None] | None = None,
     ) -> _OnnxWeightLineageGapSummary:
@@ -5880,7 +5893,7 @@ def _build_onnx_weight_analysis_plan(
             node,
             constants,
             lambda lineage: lineage.unresolved_reason != "shape_control_lineage",
-            value_shapes=value_shapes,
+            resolve_value_shape=resolve_value_shape,
             cast_target_data_type=cast_target_data_type,
             resolve_attribute=resolve_attribute,
         )
@@ -5890,7 +5903,7 @@ def _build_onnx_weight_analysis_plan(
         node: Any,
         constants: dict[str, Any],
         *,
-        value_shapes: dict[str, tuple[int, ...]],
+        resolve_value_shape: Callable[[str], tuple[int, ...] | None],
         cast_target_data_type: int | None = None,
         resolve_attribute: Callable[[Any], Any | None] | None = None,
     ) -> _OnnxWeightLineageGapSummary:
@@ -5899,7 +5912,7 @@ def _build_onnx_weight_analysis_plan(
             node,
             constants,
             lineage_could_be_weight_after_rank_increase,
-            value_shapes=value_shapes,
+            resolve_value_shape=resolve_value_shape,
             cast_target_data_type=cast_target_data_type,
             resolve_attribute=resolve_attribute,
         )
@@ -5910,7 +5923,7 @@ def _build_onnx_weight_analysis_plan(
         constants: dict[str, Any],
         count: int,
         *,
-        value_shapes: dict[str, tuple[int, ...]],
+        resolve_value_shape: Callable[[str], tuple[int, ...] | None],
         resolve_attribute: Callable[[Any], Any | None] | None = None,
     ) -> _OnnxWeightLineageGapSummary:
         if count <= 0:
@@ -5921,7 +5934,7 @@ def _build_onnx_weight_analysis_plan(
             summary,
             node,
             constants,
-            value_shapes=value_shapes,
+            resolve_value_shape=resolve_value_shape,
             resolve_attribute=resolve_attribute,
         )
         if transformed_summary.lineages or transformed_summary.truncated:
@@ -6553,6 +6566,9 @@ def _build_onnx_weight_analysis_plan(
             known_value_ranks.pop(name, None)
             proven_value_ranks.discard(name)
 
+        def proven_value_shape(name: str) -> tuple[int, ...] | None:
+            return known_value_shapes.get(name) if name in proven_value_ranks else None
+
         def proven_value_rank(name: str) -> int | None:
             if name in proven_value_ranks:
                 return known_value_ranks.get(name)
@@ -6596,7 +6612,7 @@ def _build_onnx_weight_analysis_plan(
 
         for value_info in getattr(current_graph, "input", ()):
             name = _onnx_value_name(value_info)
-            shape = value_info_shape(value_info)
+            shape = value_info_shape(value_info, preserve_unknown=root_graph)
             if name and shape is not None:
                 set_known_value_shape(name, shape, proven=root_graph)
             elif name and (rank := value_info_rank(value_info)) is not None:
@@ -6662,15 +6678,25 @@ def _build_onnx_weight_analysis_plan(
                 return int(getattr(resolved_attribute, "i", default)) if resolved_attribute is not None else default
             return default
 
+        int_sequence_attribute_cache: dict[tuple[int, str], tuple[Any, tuple[int, ...] | None]] = {}
+
         def resolved_int_sequence_attribute(node: Any, name: str) -> tuple[int, ...] | None:
+            key = (id(node), name)
+            cached = int_sequence_attribute_cache.get(key)
+            if cached is not None and cached[0] is node:
+                return cached[1]
+            result = None
             for attribute in getattr(node, "attribute", []):
                 if attribute.name != name:
                     continue
                 resolved_attribute = resolve_attribute(attribute)
-                if resolved_attribute is None:
-                    return None
-                return tuple(int(value) for value in getattr(resolved_attribute, "ints", ()))
-            return None
+                if resolved_attribute is not None:
+                    result = tuple(int(value) for value in getattr(resolved_attribute, "ints", ()))
+                break
+            # The retained owner and this invocation's immutable attribute bindings
+            # make both successful and missing proofs safe to reuse.
+            int_sequence_attribute_cache[key] = (node, result)
+            return result
 
         def attribute_source_key(
             attribute: Any,
@@ -7721,9 +7747,7 @@ def _build_onnx_weight_analysis_plan(
                                     axis if axis >= 0 else len(data_input_shape) + axis for axis in axes
                                 )
                                 if not normalized_axes:
-                                    if squeeze_with_empty_axes_is_noop(body_node, axes, None):
-                                        return data_input_shape
-                                    return tuple(dimension for dimension in data_input_shape if dimension != 1)
+                                    return implicit_squeeze_shape(body_node, data_input_shape)
                                 if (
                                     len(set(normalized_axes)) != len(normalized_axes)
                                     or any(axis < 0 or axis >= len(data_input_shape) for axis in normalized_axes)
@@ -7882,9 +7906,7 @@ def _build_onnx_weight_analysis_plan(
                                         axis if axis >= 0 else len(data_input_shape) + axis for axis in axes
                                     )
                                     if not normalized_axes:
-                                        if squeeze_with_empty_axes_is_noop(function_node, axes, None):
-                                            return data_input_shape
-                                        return tuple(dimension for dimension in data_input_shape if dimension != 1)
+                                        return implicit_squeeze_shape(function_node, data_input_shape)
                                     if (
                                         len(set(normalized_axes)) != len(normalized_axes)
                                         or any(axis < 0 or axis >= len(data_input_shape) for axis in normalized_axes)
@@ -9680,7 +9702,7 @@ def _build_onnx_weight_analysis_plan(
                         lineage,
                         node,
                         constants,
-                        value_shapes=known_value_shapes,
+                        resolve_value_shape=proven_value_shape,
                         cast_target_data_type=resolved_cast_target_data_type,
                         resolve_attribute=resolve_attribute,
                     )
@@ -9874,7 +9896,7 @@ def _build_onnx_weight_analysis_plan(
                     node,
                     constants,
                     transform_data_input_rank_promotable_lineage_limit_gap_count,
-                    value_shapes=known_value_shapes,
+                    resolve_value_shape=proven_value_shape,
                     resolve_attribute=resolve_attribute,
                 )
                 rank_gap_promotion_known_not_weight = (
@@ -9886,8 +9908,8 @@ def _build_onnx_weight_analysis_plan(
                     not rank_gap_promotion_known_not_weight
                     and operator_output_may_have_weight_rank(
                         node,
-                        input_shape=known_value_shapes.get(input_names[0]) if input_names else None,
-                        index_shape=known_value_shapes.get(input_names[1]) if len(input_names) > 1 else None,
+                        input_shape=proven_value_shape(input_names[0]) if input_names else None,
+                        index_shape=proven_value_shape(input_names[1]) if len(input_names) > 1 else None,
                         constants=constants,
                         resolve_attribute=resolve_attribute,
                     )
@@ -9944,7 +9966,7 @@ def _build_onnx_weight_analysis_plan(
                     cast_non_shape_gap_summary,
                     node,
                     constants,
-                    value_shapes=known_value_shapes,
+                    resolve_value_shape=proven_value_shape,
                     cast_target_data_type=resolved_cast_target_data_type,
                     resolve_attribute=resolve_attribute,
                 ):
@@ -9953,7 +9975,7 @@ def _build_onnx_weight_analysis_plan(
                         cast_non_shape_gap_summary,
                         node,
                         constants,
-                        value_shapes=known_value_shapes,
+                        resolve_value_shape=proven_value_shape,
                         cast_target_data_type=resolved_cast_target_data_type,
                         resolve_attribute=resolve_attribute,
                     )
@@ -9990,7 +10012,7 @@ def _build_onnx_weight_analysis_plan(
                     cast_output_non_shape_gap_summary,
                     node,
                     constants,
-                    value_shapes=known_value_shapes,
+                    resolve_value_shape=proven_value_shape,
                     cast_target_data_type=resolved_cast_target_data_type,
                     resolve_attribute=resolve_attribute,
                 ):
@@ -10001,7 +10023,7 @@ def _build_onnx_weight_analysis_plan(
                             cast_output_non_shape_gap_summary,
                             node,
                             constants,
-                            value_shapes=known_value_shapes,
+                            resolve_value_shape=proven_value_shape,
                             cast_target_data_type=resolved_cast_target_data_type,
                             resolve_attribute=resolve_attribute,
                         ),
@@ -10017,7 +10039,7 @@ def _build_onnx_weight_analysis_plan(
                             cast_output_non_shape_gap_summary,
                             node,
                             constants,
-                            value_shapes=known_value_shapes,
+                            resolve_value_shape=proven_value_shape,
                             cast_target_data_type=resolved_cast_target_data_type,
                             resolve_attribute=resolve_attribute,
                         ),
@@ -10037,7 +10059,7 @@ def _build_onnx_weight_analysis_plan(
                     all_input_output_weight_lineage_gap_summary,
                     node,
                     constants,
-                    value_shapes=known_value_shapes,
+                    resolve_value_shape=proven_value_shape,
                     cast_target_data_type=resolved_cast_target_data_type,
                     resolve_attribute=resolve_attribute,
                 )
@@ -10050,7 +10072,7 @@ def _build_onnx_weight_analysis_plan(
                         pre_promotion_weight_lineage_gap_summary,
                         node,
                         constants,
-                        value_shapes=known_value_shapes,
+                        resolve_value_shape=proven_value_shape,
                         cast_target_data_type=resolved_cast_target_data_type,
                         resolve_attribute=resolve_attribute,
                     )
@@ -10066,7 +10088,7 @@ def _build_onnx_weight_analysis_plan(
                     all_input_non_shape_lineage_gap_summary,
                     node,
                     constants,
-                    value_shapes=known_value_shapes,
+                    resolve_value_shape=proven_value_shape,
                     cast_target_data_type=resolved_cast_target_data_type,
                     resolve_attribute=resolve_attribute,
                 )
@@ -10075,7 +10097,7 @@ def _build_onnx_weight_analysis_plan(
                     all_input_output_rank_promotable_lineage_gap_summary,
                     node,
                     constants,
-                    value_shapes=known_value_shapes,
+                    resolve_value_shape=proven_value_shape,
                     cast_target_data_type=resolved_cast_target_data_type,
                     resolve_attribute=resolve_attribute,
                 )
@@ -11167,7 +11189,9 @@ def _build_onnx_weight_analysis_plan(
                             0 in target_shape and not resolved_int_attribute(node, "allowzero")
                         )
                         if not shape_depends_on_input and (
-                            transform_input_shape is None or not transform_input_rank_proven
+                            transform_input_shape is None
+                            or not transform_input_rank_proven
+                            or any(dimension < 0 for dimension in transform_input_shape)
                         ):
                             transform_output_shape = target_shape
                         elif (
@@ -11188,18 +11212,16 @@ def _build_onnx_weight_analysis_plan(
                     axes = resolve_axes(node, constants, onnx=onnx, resolve_attribute=resolve_attribute)
                     if axes is not None:
                         if not axes:
-                            if squeeze_with_empty_axes_is_noop(node, axes, resolve_attribute):
-                                transform_output_shape = transform_input_shape
-                                transform_output_rank = (
-                                    len(transform_output_shape)
-                                    if transform_output_shape is not None
-                                    else transform_input_rank
+                            if transform_input_shape is not None:
+                                transform_output_shape = implicit_squeeze_shape(
+                                    node, transform_input_shape, resolve_attribute
                                 )
-                            elif transform_input_shape is not None:
-                                transform_output_shape = tuple(
-                                    dimension for dimension in transform_input_shape if dimension != 1
-                                )
-                                transform_output_rank = len(transform_output_shape)
+                                if transform_output_shape is not None:
+                                    transform_output_rank = len(transform_output_shape)
+                                else:
+                                    clear_transform_output_rank = True
+                            elif squeeze_with_empty_axes_is_noop(node, axes, resolve_attribute):
+                                transform_output_rank = transform_input_rank
                             else:
                                 clear_transform_output_rank = True
                         else:

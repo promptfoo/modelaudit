@@ -30854,3 +30854,305 @@ class TestOnnxBuiltinOperatorIdentity:
         assert result.success is not matrix
         plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
         assert bool(plan.coverage_gaps) is matrix
+
+
+class TestOnnxProvenShapesAndScanExtents:
+    @pytest.mark.parametrize("producer", ["nonzero", "reshape"])
+    @pytest.mark.parametrize("declared_shape", [[2], [64, 2]])
+    @pytest.mark.parametrize("capped", [False, True])
+    @pytest.mark.parametrize("alias", ["direct", "Identity", "Cast", "Transpose"])
+    def test_unproven_gathernd_dimensions_cannot_exclude_matrix_weights(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        producer: str,
+        declared_shape: list[int],
+        capped: bool,
+        alias: str,
+    ) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        value = TestOnnxRecurrenceReviewRegressions._value
+        weights = np.zeros((64, 64), np.float32)
+        weights[:5, 0] = 10
+        initializers = [onnx.numpy_helper.from_array(weights, name="W")]
+        inputs = [value("X", [1, 64])]
+        feeds = {"X": np.ones((1, 64), np.float32)}
+        if producer == "nonzero":
+            initializers.append(onnx.numpy_helper.from_array(np.ones(64, np.int64), name="mask"))
+            nodes = [
+                helper.make_node("NonZero", ["mask"], ["positions"]),
+                helper.make_node("Transpose", ["positions"], ["indices"]),
+            ]
+        else:
+            initializers.append(onnx.numpy_helper.from_array(np.arange(64, dtype=np.int64), name="positions"))
+            inputs.append(value("shape", [2], TensorProto.INT64))
+            feeds["shape"] = np.array([64, 1], np.int64)
+            nodes = [helper.make_node("Reshape", ["positions", "shape"], ["indices"])]
+        index_name = "indices"
+        if alias != "direct":
+            attributes = (
+                {"to": TensorProto.INT64} if alias == "Cast" else {"perm": [0, 1]} if alias == "Transpose" else {}
+            )
+            nodes.append(helper.make_node(alias, [index_name], ["alias"], **attributes))
+            index_name = "alias"
+        data = "W"
+        if capped:
+            monkeypatch.setattr(onnx_scanner_module, "_ONNX_WEIGHT_LINEAGES_PER_VALUE_LIMIT", 1)
+            initializers.insert(0, onnx.numpy_helper.from_array(np.array(0, np.float32), name="zero"))
+            initializers.append(onnx.numpy_helper.from_array(np.zeros_like(weights), name="other"))
+            nodes.append(helper.make_node("Sum", ["zero", "W", "other"], ["sum"]))
+            data = "sum"
+        nodes.extend(
+            [
+                helper.make_node("GatherND", [data, index_name], ["weight"]),
+                helper.make_node("MatMul", ["X", "weight"], ["Y"]),
+            ]
+        )
+        graph = helper.make_graph(
+            nodes,
+            "unproven_gathernd_dimensions",
+            inputs,
+            [value("Y", [1, 64])],
+            initializers,
+            value_info=[value("indices", declared_shape, TensorProto.INT64)],
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18)], ir_version=8)
+        # The scanner's ordinary checker accepts inconsistent intermediate shape
+        # declarations. Executed values, rather than those declarations, are the oracle.
+        onnx.checker.check_model(model)
+        actual: Any = ReferenceEvaluator(model).run(None, feeds)
+        np.testing.assert_array_equal(actual[0], feeds["X"] @ weights)
+        path = tmp_path / "unproven-gathernd-dimensions.onnx"
+        onnx.save(model, str(path))
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        assert plan.coverage_gaps
+        if capped:
+            assert plan.coverage_gaps.get("lineages_per_value_limit", 0) > 0
+        result = OnnxScanner().scan(str(path))
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert any(
+            check.name == "Weight Distribution Analysis Coverage" and check.status == CheckStatus.FAILED
+            for check in result.checks
+        )
+
+    @pytest.mark.parametrize("width", [64, 512])
+    @pytest.mark.parametrize("explicit_axes", [False, True])
+    def test_scan_axis_decoding_is_linear_across_stacked_outputs(
+        self, tmp_path: Path, width: int, explicit_axes: bool
+    ) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        value = TestOnnxRecurrenceReviewRegressions._value
+        body = helper.make_graph(
+            [],
+            "identity_scan",
+            [value(f"element{i}", [4]) for i in range(width)],
+            [value(f"element{i}", [4]) for i in range(width)],
+        )
+        attributes: dict[str, Any] = (
+            {"scan_input_axes": [0] * width, "scan_output_axes": [0] * width} if explicit_axes else {}
+        )
+        model = TestOnnxBuiltinOperatorIdentity._model(
+            [
+                helper.make_node(
+                    "Scan",
+                    [f"x{i}" for i in range(width)],
+                    [f"y{i}" for i in range(width)],
+                    body=body,
+                    num_scan_inputs=width,
+                    **attributes,
+                )
+            ],
+            [value(f"x{i}", [1, 4]) for i in range(width)],
+            [value(f"y{i}", [1, 4]) for i in range(width)],
+            [],
+            [],
+        )
+        onnx.checker.check_model(model, full_check=True)
+        feeds = {f"x{i}": np.full((1, 4), i, np.float32) for i in range(width)}
+        actual: Any = ReferenceEvaluator(model).run(None, feeds)
+        for index, output in enumerate(actual):
+            np.testing.assert_array_equal(output, feeds[f"x{index}"])
+        decoded = 0
+
+        def count_decoding(frame: Any, event: str, argument: Any) -> None:
+            nonlocal decoded
+            if event != "return" or argument is None or frame.f_code.co_name != "<genexpr>":
+                return
+            caller = frame.f_back
+            if caller is not None and caller.f_code.co_name == "resolved_int_sequence_attribute":
+                decoded += 1
+                assert decoded <= 2 * width
+
+        previous = sys.getprofile()
+        try:
+            sys.setprofile(count_decoding)
+            plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        finally:
+            sys.setprofile(previous)
+        assert decoded == (2 * width if explicit_axes else 0)
+        assert plan.coverage_gaps == {}
+        assert plan.specs == []
+        result = OnnxScanner().scan(str(TestOnnxLoopControlProofs._save(model, tmp_path)))
+        assert result.success is True
+
+    @pytest.mark.parametrize("route", ["direct", "Identity", "function"])
+    @pytest.mark.parametrize("steps", [1, 2])
+    @pytest.mark.parametrize("symmetric", [False, True])
+    def test_symbolic_scan_feature_width_preserves_fixed_iteration_extent(
+        self, tmp_path: Path, route: str, steps: int, symmetric: bool
+    ) -> None:
+        value = TestOnnxRecurrenceReviewRegressions._value
+        weights = np.arange(16, dtype=np.float32).reshape(4, 4)
+        if symmetric:
+            weights = weights + weights.T
+        body = helper.make_graph(
+            [helper.make_node("Transpose", ["state"], ["next"], perm=[1, 0])],
+            "symbolic_features_body",
+            [value("state", [4, 4]), value("element", ["features"])],
+            [value("next", [4, 4])],
+        )
+        prefix = [helper.make_node("Identity", ["seq"], ["alias"])] if route == "Identity" else []
+        sequence = "alias" if route == "Identity" else "seq"
+        scan_nodes = [
+            helper.make_node("Scan", ["W", sequence], ["final"], body=body, num_scan_inputs=1),
+            helper.make_node("MatMul", ["X", "final"], ["Y"]),
+        ]
+        functions = []
+        if route == "function":
+            functions.append(
+                helper.make_function(
+                    "local", "ScanState", ["seq", "W", "X"], ["Y"], scan_nodes, [helper.make_opsetid("", 18)]
+                )
+            )
+            nodes = [helper.make_node("ScanState", ["seq", "W", "X"], ["Y"], domain="local")]
+        else:
+            nodes = [*prefix, *scan_nodes]
+        model = TestOnnxBuiltinOperatorIdentity._model(
+            nodes,
+            [value("seq", [steps, "features"]), value("X", [1, 4])],
+            [value("Y", [1, 4])],
+            [onnx.numpy_helper.from_array(weights, name="W")],
+            functions,
+        )
+        feeds = {"seq": np.ones((steps, 3), np.float32), "X": np.ones((1, 4), np.float32)}
+        expected_weight = weights.T if steps == 1 else weights
+        actual = TestOnnxBuiltinOperatorIdentity._inlined_runtime(model, feeds)
+        np.testing.assert_array_equal(actual[0], feeds["X"] @ expected_weight)
+        path = TestOnnxLoopControlProofs._save(model, tmp_path)
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        if steps == 1:
+            assert plan.coverage_gaps == {}
+            assert len(plan.specs) == 1
+            np.testing.assert_array_equal(plan.specs[0].weights, expected_weight)
+        else:
+            assert plan.coverage_gaps
+        result = OnnxScanner().scan(str(path))
+        assert result.success is (steps == 1)
+
+    def test_symbolic_squeeze_cannot_fabricate_a_single_scan_iteration(self, tmp_path: Path) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        value = TestOnnxRecurrenceReviewRegressions._value
+        weights = np.arange(4, dtype=np.float32).reshape(2, 2)
+        body = helper.make_graph(
+            [helper.make_node("Transpose", ["state"], ["next"], perm=[1, 0])],
+            "squeeze_scan_body",
+            [value("state", [2, 2]), value("element", [1])],
+            [value("next", [2, 2])],
+        )
+        prefix = [
+            helper.make_node("Squeeze", ["source"], ["squeezed"]),
+            helper.make_node("Unsqueeze", ["squeezed", "axes"], ["seq"]),
+        ]
+        axes = onnx.numpy_helper.from_array(np.array([1], np.int64), name="axes")
+        model = TestOnnxBuiltinOperatorIdentity._model(
+            [
+                *prefix,
+                helper.make_node("Scan", ["W", "seq"], ["final"], body=body, num_scan_inputs=1, scan_input_axes=[-2]),
+                helper.make_node("MatMul", ["X", "final"], ["Y"]),
+            ],
+            [value("source", ["unknown", 2, 1]), value("X", [1, 2])],
+            [value("Y", [1, 2])],
+            [axes, onnx.numpy_helper.from_array(weights, name="W")],
+            [],
+        )
+        onnx.checker.check_model(model, full_check=True)
+        feeds = {"source": np.ones((1, 2, 1), np.float32), "X": np.ones((1, 2), np.float32)}
+        prefix_graph = helper.make_graph(
+            prefix, "squeeze_prefix", [value("source", ["unknown", 2, 1])], [value("seq", None)], [axes]
+        )
+        prefix_outputs: Any = ReferenceEvaluator(prefix_graph, opsets={"": 18}).run(None, {"source": feeds["source"]})
+        sequence = prefix_outputs[0]
+        assert sequence.shape == (2, 1)
+        # The reference Scan implements only axis 0. Execute its actual body
+        # twice using the proven runtime slices along -2, which is axis 0 here.
+        state = weights
+        for index in range(sequence.shape[-2]):
+            body_outputs: Any = ReferenceEvaluator(body, opsets={"": 18}).run(
+                None, {"state": state, "element": np.take(sequence, index, axis=-2)}
+            )
+            state = body_outputs[0]
+        np.testing.assert_array_equal(state, weights)
+        path = TestOnnxLoopControlProofs._save(model, tmp_path)
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        assert plan.coverage_gaps
+        assert all(np.array_equal(spec.weights, state) for spec in plan.specs)
+        result = OnnxScanner().scan(str(path))
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+
+    def test_scan_axis_attribute_memo_is_separate_for_each_function_call(self, tmp_path: Path) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        value = TestOnnxRecurrenceReviewRegressions._value
+        weights = np.arange(4, dtype=np.float32).reshape(2, 2)
+        body = helper.make_graph(
+            [helper.make_node("Transpose", ["state"], ["next"], perm=[1, 0])],
+            "bound_axes_body",
+            [value("state", [2, 2]), value("element", [None])],
+            [value("next", [2, 2])],
+        )
+        scan = helper.make_node("Scan", ["W", "seq"], ["final"], body=body, num_scan_inputs=1)
+        axes = scan.attribute.add()
+        axes.name = "scan_input_axes"
+        axes.ref_attr_name = "axes"
+        axes.type = onnx.AttributeProto.INTS
+        function = helper.make_function(
+            "local",
+            "BoundScan",
+            ["seq", "W", "X"],
+            ["Y"],
+            [scan, helper.make_node("MatMul", ["X", "final"], ["Y"])],
+            [helper.make_opsetid("", 18)],
+            attributes=["axes"],
+        )
+        model = TestOnnxBuiltinOperatorIdentity._model(
+            [
+                helper.make_node("BoundScan", ["seq", "W", "X"], [f"Y{axis}"], domain="local", axes=[axis])
+                for axis in (0, 1)
+            ],
+            [value("seq", [1, 2]), value("X", [1, 2])],
+            [value("Y0", [1, 2]), value("Y1", [1, 2])],
+            [onnx.numpy_helper.from_array(weights, name="W")],
+            [function],
+        )
+        onnx.checker.check_model(model, full_check=True)
+        sequence = np.ones((1, 2), np.float32)
+        for axis in (0, 1):
+            state = weights
+            for index in range(sequence.shape[axis]):
+                body_outputs: Any = ReferenceEvaluator(body, opsets={"": 18}).run(
+                    None, {"state": state, "element": np.take(sequence, index, axis=axis)}
+                )
+                state = body_outputs[0]
+            np.testing.assert_array_equal(state, weights.T if axis == 0 else weights)
+        path = TestOnnxLoopControlProofs._save(model, tmp_path)
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        assert plan.coverage_gaps
+        assert len(plan.specs) == 1
+        np.testing.assert_array_equal(plan.specs[0].weights, weights.T)
+        result = OnnxScanner().scan(str(path))
+        assert result.success is False
