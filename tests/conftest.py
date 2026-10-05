@@ -278,6 +278,7 @@ def pytest_runtest_setup(item):
             "test_sbom_url_fixes.py",  # SBOM URL handling and credential-redaction regressions
         ]
         allowed_test_nodeids = [
+            "tests/test_false_positive_fixes.py::TestFalsePositiveFixes::test_bert_model_no_false_positive_executables",
             "tests/scanners/test_weight_distribution_scanner.py::TestWeightDistributionScanner::test_blocks_torch_load_for_vulnerable_pytorch_prereleases",
             "tests/scanners/test_weight_distribution_scanner.py::TestWeightDistributionScanner::test_allows_torch_load_for_stable_patched_pytorch",
             "tests/scanners/test_weight_distribution_scanner.py::TestWeightDistributionScanner::test_blocks_torch_load_for_unknown_pytorch_version",
