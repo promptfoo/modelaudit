@@ -2701,11 +2701,9 @@ def _build_onnx_weight_analysis_plan(
         )
 
     def scan_sequence_lens_input_offset(node: Any, opset_versions: dict[str, int]) -> int:
-        if node.op_type != "Scan":
+        if not builtin_operator(node, "Scan"):
             return 0
         domain = str(getattr(node, "domain", "") or "")
-        if domain not in _STANDARD_NEURAL_NETWORK_DOMAINS:
-            return 0
         version = opset_versions.get(domain)
         if version is None and domain in {"", "ai.onnx"}:
             version = opset_versions.get("ai.onnx" if domain == "" else "")
@@ -4567,6 +4565,7 @@ def _build_onnx_weight_analysis_plan(
                 ):
                     potential_weight_consumer_cache[cache_key] = True
                     return True
+                continue
             elif any(
                 _onnx_potential_weight_input(
                     body_node,
@@ -6244,14 +6243,8 @@ def _build_onnx_weight_analysis_plan(
             return lineages
         promoted_lineages: dict[int, _OnnxWeightLineage] = {}
         for initializer_index, lineage in lineages.items():
-            target_rank = len(output_shape) if output_shape is not None else output_rank
-            lineage_rank = len(lineage.shape) if lineage.shape is not None else None
-            if (
-                lineage.unresolved_reason is None
-                and target_rank is not None
-                and lineage_rank is not None
-                and target_rank <= lineage_rank
-            ):
+            # Empty source views stay empty; rank alone cannot identify a final state.
+            if lineage.unresolved_reason is None and lineage.shape is not None and 0 in lineage.shape:
                 promoted_lineages[initializer_index] = lineage
                 continue
             shape = None
@@ -10607,6 +10600,14 @@ def _build_onnx_weight_analysis_plan(
                 and node.op_type == "Loop"
                 and loop_body_is_proven_skipped(node, constants, graph_input_names)
             )
+            scan8_returns_initial_state = (
+                bool(resolved_scan_input_offset)
+                and bool(node.input)
+                and not graph_input_is_runtime_overridable(str(node.input[0]), graph_input_names, constants)
+                and (lengths := constant_int64_vector_values(constants.get(str(node.input[0])))) is not None
+                and bool(lengths)
+                and all(length == 0 for length in lengths)
+            )
             subgraph_output_offset = 1 if standard_control_flow_operator and node.op_type == "Loop" else 0
             for (
                 graph_output_lineages,
@@ -10632,7 +10633,9 @@ def _build_onnx_weight_analysis_plan(
                         resolve_attribute=resolve_attribute,
                     )
                 for output_index in range(len(node.output)):
-                    if loop_returns_initial_state and output_index < stacked_scan_output_start:
+                    if (
+                        loop_returns_initial_state or scan8_returns_initial_state
+                    ) and output_index < stacked_scan_output_start:
                         continue
                     graph_output_index = output_index + subgraph_output_offset
                     if graph_output_index >= len(graph_output_lineages):

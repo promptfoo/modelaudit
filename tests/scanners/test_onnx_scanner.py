@@ -4073,11 +4073,29 @@ def test_onnx_scanner_custom_operator_emits_one_domain_rule(tmp_path: Path) -> N
 
 
 def test_onnx_scanner_ai_onnx_ml_subdomain_still_flagged(tmp_path: Path) -> None:
-    _assert_onnx_domain(tmp_path, "ai.onnx.ml.malicious", "Expected non-standard ai.onnx.ml subdomain to be flagged")
+    model_path = create_onnx_model(
+        tmp_path,
+        custom=True,
+        custom_domain="ai.onnx.ml.malicious",
+        custom_op_type="BackdoorOp",
+    )
+    _result, custom_domain_checks, metadata_custom_domains = _scan_and_extract_custom_domains(model_path)
+    assert len(custom_domain_checks) > 0, "Expected non-standard ai.onnx.ml subdomain to be flagged"
+    assert any(c.details.get("domain") == "ai.onnx.ml.malicious" for c in custom_domain_checks)
+    assert "ai.onnx.ml.malicious" in metadata_custom_domains
 
 
 def test_onnx_scanner_ai_onnx_training_domain_still_flagged(tmp_path: Path) -> None:
-    _assert_onnx_domain(tmp_path, "ai.onnx.training", "Expected non-standard ai.onnx.training domain to be flagged")
+    model_path = create_onnx_model(
+        tmp_path,
+        custom=True,
+        custom_domain="ai.onnx.training",
+        custom_op_type="BackdoorOp",
+    )
+    _result, custom_domain_checks, metadata_custom_domains = _scan_and_extract_custom_domains(model_path)
+    assert len(custom_domain_checks) > 0, "Expected non-standard ai.onnx.training domain to be flagged"
+    assert any(c.details.get("domain") == "ai.onnx.training" for c in custom_domain_checks)
+    assert "ai.onnx.training" in metadata_custom_domains
 
 
 def test_onnx_scanner_external_data_missing(tmp_path: Path) -> None:
@@ -4203,7 +4221,19 @@ def test_onnx_scanner_uppercase_snake_python_op_wrapper_flagged(tmp_path: Path, 
 
 
 def test_onnx_scanner_python_substring_near_match_not_flagged(tmp_path: Path) -> None:
-    _assert_onnx_python_near_match_clean(tmp_path, ("MyPythonOptimizer"))
+    model_path = create_onnx_model(
+        tmp_path,
+        custom=True,
+        custom_domain="",
+        custom_op_type="MyPythonOptimizer",
+    )
+
+    result = OnnxScanner().scan(str(model_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert ONNX_SCHEMA_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
+    assert not [c for c in result.checks if c.name == "Python Operator Detection" and c.status == CheckStatus.FAILED]
 
 
 def test_onnx_scanner_python_doc_string_metadata_not_flagged_as_python_operator(tmp_path: Path) -> None:
@@ -4224,7 +4254,19 @@ def test_onnx_scanner_python_doc_string_metadata_not_flagged_as_python_operator(
 
 
 def test_onnx_scanner_uppercase_snake_python_near_match_not_flagged(tmp_path: Path) -> None:
-    _assert_onnx_python_near_match_clean(tmp_path, ("MY_PYTHON_OPTIMIZER"))
+    model_path = create_onnx_model(
+        tmp_path,
+        custom=True,
+        custom_domain="",
+        custom_op_type="MY_PYTHON_OPTIMIZER",
+    )
+
+    result = OnnxScanner().scan(str(model_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert ONNX_SCHEMA_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
+    assert not [c for c in result.checks if c.name == "Python Operator Detection" and c.status == CheckStatus.FAILED]
 
 
 def _save_model_with_int8_weight(tmp_path: Path, weight_bytes: bytes, *, extra_node: Any = None) -> Path:
@@ -5507,10 +5549,40 @@ class TestExternalDataSizeValidation:
         assert determine_exit_code(aggregate) == 1
 
     def test_invalid_offset_metadata_fails_size_validation(self, tmp_path: Path) -> None:
-        _assert_onnx_invalid_external_offset(tmp_path, ("NaN"), ("invalid"))
+        model_path = create_onnx_model(
+            tmp_path,
+            external=True,
+            external_path="weights.bin",
+            external_metadata={"offset": "NaN"},
+        )
+
+        result = OnnxScanner().scan(str(model_path))
+
+        assert result.success is False
+        size_checks = [
+            c for c in result.checks if c.name == "External Data Size Validation" and c.status == CheckStatus.FAILED
+        ]
+        assert len(size_checks) > 0
+        assert size_checks[0].severity == IssueSeverity.CRITICAL
+        assert "invalid" in size_checks[0].message.lower()
 
     def test_negative_offset_metadata_fails_size_validation(self, tmp_path: Path) -> None:
-        _assert_onnx_invalid_external_offset(tmp_path, ("-1"), ("non-negative"))
+        model_path = create_onnx_model(
+            tmp_path,
+            external=True,
+            external_path="weights.bin",
+            external_metadata={"offset": "-1"},
+        )
+
+        result = OnnxScanner().scan(str(model_path))
+
+        assert result.success is False
+        size_checks = [
+            c for c in result.checks if c.name == "External Data Size Validation" and c.status == CheckStatus.FAILED
+        ]
+        assert len(size_checks) > 0
+        assert size_checks[0].severity == IssueSeverity.CRITICAL
+        assert "non-negative" in size_checks[0].message.lower()
 
 
 class TestWeightDistributionCoverage:
@@ -24793,7 +24865,20 @@ class TestRawDetectorCoverage:
         )
 
     def test_network_detector_metadata_contact_domain_stays_clean(self, tmp_path: Path) -> None:
-        self._assert_onnx_metadata_network_clean(tmp_path, ("contact"), ("owner@company.com"))
+        model_path = create_onnx_model(tmp_path, include_initializer=False)
+        model = onnx.load(str(model_path))
+        metadata = model.metadata_props.add()
+        metadata.key = "contact"
+        metadata.value = "owner@company.com"
+        onnx.save(model, str(model_path))
+
+        result = OnnxScanner(config={"check_jit_script": False}).scan(str(model_path))
+
+        failed_network_checks = [
+            check for check in self._network_detection_checks(result) if check.status == CheckStatus.FAILED
+        ]
+        assert not failed_network_checks
+        assert any(check.status == CheckStatus.PASSED for check in self._network_detection_checks(result))
 
     def test_network_detector_extensionless_metadata_contact_domain_stays_clean(self, tmp_path: Path) -> None:
         source_path = create_onnx_model(tmp_path, include_initializer=False)
@@ -24813,8 +24898,22 @@ class TestRawDetectorCoverage:
         assert any(check.status == CheckStatus.PASSED for check in self._network_detection_checks(result))
 
     def test_network_detector_extensionless_metadata_callback_domain_remains_actionable(self, tmp_path: Path) -> None:
-        self._assert_onnx_metadata_network_actionable(
-            tmp_path, ("host evil.com"), ("metadata-callback"), ("domain"), ("evil.com")
+        source_path = create_onnx_model(tmp_path, include_initializer=False)
+        model = onnx.load(str(source_path))
+        metadata = model.metadata_props.add()
+        metadata.key = "callback"
+        metadata.value = "host evil.com"
+        model_path = tmp_path / "metadata-callback"
+        onnx.save(model, str(model_path))
+
+        result = OnnxScanner(config={"check_jit_script": False}).scan(str(model_path))
+
+        failed_network_checks = [
+            check for check in self._network_detection_checks(result) if check.status == CheckStatus.FAILED
+        ]
+        assert any(
+            check.details.get("domain") == "evil.com" and check.details.get("onnx_metadata_owned") is True
+            for check in failed_network_checks
         )
 
     def test_network_detector_extensionless_metadata_callback_domain_uses_full_value(self, tmp_path: Path) -> None:
@@ -24837,9 +24936,20 @@ class TestRawDetectorCoverage:
         )
 
     def test_network_detector_metadata_prose_import_requests_stays_clean(self, tmp_path: Path) -> None:
-        self._assert_onnx_metadata_network_clean(
-            tmp_path, ("documentation"), ("This documentation shows how to import requests for the example")
-        )
+        model_path = create_onnx_model(tmp_path, include_initializer=False)
+        model = onnx.load(str(model_path))
+        metadata = model.metadata_props.add()
+        metadata.key = "documentation"
+        metadata.value = "This documentation shows how to import requests for the example"
+        onnx.save(model, str(model_path))
+
+        result = OnnxScanner(config={"check_jit_script": False}).scan(str(model_path))
+
+        failed_network_checks = [
+            check for check in self._network_detection_checks(result) if check.status == CheckStatus.FAILED
+        ]
+        assert not failed_network_checks
+        assert any(check.status == CheckStatus.PASSED for check in self._network_detection_checks(result))
 
     def test_network_detector_metadata_documentation_port_stays_clean(self, tmp_path: Path) -> None:
         model_path = create_onnx_model(tmp_path, include_initializer=False)
@@ -24875,13 +24985,41 @@ class TestRawDetectorCoverage:
         assert any(check.status == CheckStatus.PASSED for check in self._network_detection_checks(result))
 
     def test_network_detector_extensionless_metadata_callback_port_remains_actionable(self, tmp_path: Path) -> None:
-        self._assert_onnx_metadata_network_actionable(
-            tmp_path, ("connect port=6379"), ("metadata-callback-port"), ("type"), ("suspicious_port")
+        source_path = create_onnx_model(tmp_path, include_initializer=False)
+        model = onnx.load(str(source_path))
+        metadata = model.metadata_props.add()
+        metadata.key = "callback"
+        metadata.value = "connect port=6379"
+        model_path = tmp_path / "metadata-callback-port"
+        onnx.save(model, str(model_path))
+
+        result = OnnxScanner(config={"check_jit_script": False}).scan(str(model_path))
+
+        failed_network_checks = [
+            check for check in self._network_detection_checks(result) if check.status == CheckStatus.FAILED
+        ]
+        assert any(
+            check.details.get("type") == "suspicious_port" and check.details.get("onnx_metadata_owned") is True
+            for check in failed_network_checks
         )
 
     def test_network_detector_pb_metadata_port_remains_actionable(self, tmp_path: Path) -> None:
-        self._assert_onnx_metadata_network_actionable(
-            tmp_path, ("connect port=6379"), ("model.pb"), ("type"), ("suspicious_port")
+        source_path = create_onnx_model(tmp_path, include_initializer=False)
+        model = onnx.load(str(source_path))
+        metadata = model.metadata_props.add()
+        metadata.key = "callback"
+        metadata.value = "connect port=6379"
+        model_path = tmp_path / "model.pb"
+        onnx.save(model, str(model_path))
+
+        result = OnnxScanner(config={"check_jit_script": False}).scan(str(model_path))
+
+        failed_network_checks = [
+            check for check in self._network_detection_checks(result) if check.status == CheckStatus.FAILED
+        ]
+        assert any(
+            check.details.get("type") == "suspicious_port" and check.details.get("onnx_metadata_owned") is True
+            for check in failed_network_checks
         )
 
     def test_network_detector_nonmetadata_url_remains_actionable(self, tmp_path: Path) -> None:
@@ -31934,3 +32072,280 @@ class TestOnnxNestedScanBindings:
         else:
             assert {spec.context["initializer"] for spec in plan.specs} == {"Good", "Bad"}
             assert TestWeightDistributionSemantics._extreme_checks(report)
+
+
+class TestOnnxScan8Boundaries:
+    _value = staticmethod(TestOnnxRecurrenceReviewRegressions._value)
+    _tensor = staticmethod(TestOnnxShapeContinuity._t)
+    _save = staticmethod(TestOnnxLoopControlProofs._save)
+
+    @classmethod
+    def _model(
+        cls, nodes: list[Any], inputs: list[Any], outputs: list[Any], tensors: list[Any], functions: list[Any]
+    ) -> Any:
+        model = TestOnnxBuiltinOperatorIdentity._model(nodes, inputs, outputs, tensors, functions)
+        model.opset_import[0].version = 8
+        return model
+
+    @classmethod
+    def _producer_model(cls, mode: str) -> Any:
+        value, tensor = cls._value, cls._tensor
+        bad = np.zeros((1, 64, 64), np.float32)
+        bad[0, :5, 0] = 10
+        body = helper.make_graph(
+            [helper.make_node("Identity", ["slice"], ["o"])],
+            "producer_body",
+            [value("slice", [64, 64])],
+            [value("o", [64, 64])],
+        )
+        replace = helper.make_graph(
+            [helper.make_node("Identity", ["slice"], ["o"])],
+            "replace",
+            [value("state", [64, 64]), value("slice", [64, 64])],
+            [value("o", [64, 64])],
+        )
+        domain = "local" if mode in {"local-domain", "renamed"} else ""
+        operator = "MakeEmpty" if mode == "renamed" else "Scan"
+        extent = 1 if mode == "nonempty" else 0
+        function = helper.make_function(
+            domain,
+            operator,
+            ["lens", "seq"],
+            ["empty"],
+            [helper.make_node("Constant", [], ["empty"], value=tensor("", np.zeros((1, extent, 64, 64), np.float32)))],
+            [helper.make_opsetid("", 8)],
+            attributes=["body", "num_scan_inputs"],
+            overload="other" if mode == "unmatched" else "empty",
+        )
+        model = cls._model(
+            [
+                helper.make_node(
+                    operator,
+                    ["lens", "sequence"],
+                    ["empty"],
+                    domain=domain,
+                    body=body,
+                    num_scan_inputs=1,
+                    overload="empty",
+                ),
+                helper.make_node("Scan", ["", "Bad", "empty"], ["final"], body=replace, num_scan_inputs=1),
+                helper.make_node("MatMul", ["X", "final"], ["Y"]),
+            ],
+            [value("X", [1, 64])],
+            [value("Y", [1, 1, 64])],
+            [
+                tensor("Bad", bad),
+                tensor("sequence", np.zeros((1, 0 if mode == "unmatched" else 1, 64, 64), np.float32)),
+                tensor("lens", np.array([0 if mode == "unmatched" else 1], np.int64)),
+            ],
+            [function],
+        )
+        if mode == "inlined":
+            from onnx.inliner import inline_local_functions
+
+            model = inline_local_functions(model)
+        return model
+
+    @pytest.mark.parametrize("mode", ["matching", "local-domain", "renamed", "nonempty", "unmatched", "inlined"])
+    def test_scan8_padding_proof_requires_builtin_producer(self, tmp_path: Path, mode: str) -> None:
+        from onnx.inliner import inline_local_functions
+        from onnx.reference import ReferenceEvaluator
+
+        model = self._producer_model(mode)
+        path = self._save(model, tmp_path)
+        expected = np.zeros((1, 64, 64), np.float32)
+        if mode != "nonempty":
+            expected[0, :5, 0] = 10
+        if mode != "unmatched":
+            producer = inline_local_functions(model).graph.node[0]
+            graph = helper.make_graph(
+                [producer], "actual_producer", [], [self._value("empty", [1, 1 if mode == "nonempty" else 0, 64, 64])]
+            )
+            produced_values: Any = ReferenceEvaluator(graph, opsets={"": 8}).run(None, {})
+            produced = produced_values[0]
+            assert produced.shape[1] == (1 if mode == "nonempty" else 0)
+        # Legacy Scan8 skips an empty sequence; a one-element sequence replaces
+        # the state with its only slice. The runtime above proves that extent.
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        assert plan.coverage_gaps == {}
+        assert len(plan.specs) == 1
+        np.testing.assert_array_equal(plan.specs[0].weights.reshape(expected.shape), expected)
+        result = OnnxScanner().scan(str(path))
+        assert result.success is True
+        assert bool(TestWeightDistributionSemantics._extreme_checks(result)) is (mode != "nonempty")
+
+    @classmethod
+    def _state_model(cls, lengths: tuple[int, ...], hot: int, mode: str = "replace") -> Any:
+        value, tensor = cls._value, cls._tensor
+        batch = len(lengths)
+        weights = np.zeros((batch, 2, 64, 1), np.float32)
+        weights[:, hot, :5, 0] = 10
+        body = helper.make_graph(
+            [helper.make_node("Identity", ["state" if mode == "unchanged" else "slice"], ["o"])],
+            "state_body",
+            [value("state", [64, 64]), value("slice", [64, 64])],
+            [value("o", [64, 64])],
+        )
+        inputs = [value("X", [1, 64])]
+        if mode == "runtime":
+            inputs.append(value("lens", [batch], TensorProto.INT64))
+        return cls._model(
+            [
+                helper.make_node("Expand", ["W", "shape"], ["expanded"]),
+                helper.make_node(
+                    "Scan",
+                    ["" if mode == "omitted" else "lens", "initial", "expanded"],
+                    ["final"],
+                    body=body,
+                    num_scan_inputs=1,
+                ),
+                helper.make_node("MatMul", ["X", "final"], ["Y"]),
+            ],
+            inputs,
+            [value("Y", [batch, 1, 64])],
+            [
+                tensor("W", weights),
+                tensor("shape", np.array([batch, 2, 64, 64], np.int64)),
+                tensor("lens", np.array(lengths, np.int64)),
+                tensor("initial", np.zeros((batch, 64, 64), np.float32)),
+            ],
+            [],
+        )
+
+    @pytest.mark.parametrize(
+        "lengths,mode",
+        [
+            ((0,), "replace"),
+            ((1,), "replace"),
+            ((2,), "replace"),
+            ((0, 1), "replace"),
+            ((0,), "runtime"),
+            ((0,), "omitted"),
+            ((1,), "unchanged"),
+            ((0, 1), "unchanged"),
+        ],
+    )
+    @pytest.mark.parametrize("hot", [0, 1])
+    def test_scan8_final_state_does_not_reuse_unsliced_sequence(
+        self, tmp_path: Path, lengths: tuple[int, ...], mode: str, hot: int
+    ) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        model = self._state_model(lengths, hot, mode)
+        path = self._save(model, tmp_path)
+        actual_lengths = (1,) if mode == "runtime" else (2,) if mode == "omitted" else lengths
+        source = onnx.numpy_helper.to_array(model.graph.initializer[0])
+        expanded = np.broadcast_to(source, (len(lengths), 2, 64, 64))
+        actual = np.zeros((len(lengths), 64, 64), np.float32)
+        body = next(attribute.g for attribute in model.graph.node[1].attribute if attribute.name == "body")
+        runtime = ReferenceEvaluator(body, opsets={"": 8})
+        for batch, count in enumerate(actual_lengths):
+            for index in range(count):
+                values: Any = runtime.run(None, {"state": actual[batch], "slice": expanded[batch, index]})
+                actual[batch] = values[0]
+        expected_hot = mode != "unchanged" and any(count == hot + 1 for count in actual_lengths)
+        assert bool(actual.any()) is expected_hot
+        complete = mode == "unchanged" or (mode == "replace" and not any(lengths))
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        result = OnnxScanner().scan(str(path))
+        assert result.success is complete
+        if complete:
+            assert plan.coverage_gaps == {}
+            assert len(plan.specs) == 1
+            np.testing.assert_array_equal(plan.specs[0].weights.reshape(actual.shape), actual)
+        else:
+            assert plan.coverage_gaps.get("unresolved_initializer_lineage", 0) > 0
+            assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert not TestWeightDistributionSemantics._extreme_checks(result)
+
+    @classmethod
+    def _graph_argument_model(cls, mode: str) -> Any:
+        value, tensor = cls._value, cls._tensor
+        attributes = []
+        defaults = []
+        graph = helper.make_graph(
+            [helper.make_node("MatMul", ["state", "state"], ["used"])], "graph_argument", [], [value("used", [2, 2])]
+        )
+        nodes = [
+            helper.make_node("Constant", [], ["axes"], value=tensor("", np.array([0], np.int64))),
+            helper.make_node("Unsqueeze", ["state", "axes"], ["y"]),
+        ]
+        if mode in {"used", "default", "override"}:
+            passthrough = helper.make_graph(
+                [helper.make_node("Identity", ["state"], ["unused"])], "other", [], [value("unused", [2, 2])]
+            )
+            choose = helper.make_node("If", ["condition"], ["y"], else_branch=passthrough)
+            choose.attribute.extend([helper.make_attribute_ref("then_branch", onnx.AttributeProto.GRAPH)])
+            choose.attribute[-1].ref_attr_name = "branch"
+            nodes = [helper.make_node("Constant", [], ["condition"], value=tensor("", np.bool_(True))), choose]
+        if mode != "absent":
+            if mode in {"default", "override"}:
+                defaults = [helper.make_attribute("branch", passthrough if mode == "override" else graph)]
+            else:
+                attributes = ["branch"]
+        function = helper.make_function(
+            "local",
+            "Apply",
+            ["state"],
+            ["y"],
+            nodes,
+            [helper.make_opsetid("", 18)],
+            attributes=attributes,
+            attribute_protos=defaults,
+        )
+        call = helper.make_node("Apply", ["state"], ["next"], domain="local")
+        if mode in {"unused", "inlined", "used", "override"}:
+            call.attribute.extend([helper.make_attribute("branch", graph)])
+        body = helper.make_graph(
+            [call],
+            "loop_body",
+            [value("i", [], TensorProto.INT64), value("condition", [], TensorProto.BOOL), value("state", None)],
+            [value("condition", [], TensorProto.BOOL), value("next", None)],
+        )
+        used = mode in {"used", "default", "override"}
+        model = TestOnnxBuiltinOperatorIdentity._model(
+            [helper.make_node("Loop", ["count", "start", "W"], ["final"], body=body)],
+            [],
+            [value("final", [2, 2] if used else [1, 1, 2])],
+            [
+                tensor("W", np.eye(2, dtype=np.float32) if used else np.ones(2, np.float32)),
+                tensor("count", np.int64(2)),
+                tensor("start", np.bool_(True)),
+            ],
+            [function],
+        )
+        if mode == "inlined":
+            from onnx.inliner import inline_local_functions
+
+            model = inline_local_functions(model)
+        return model
+
+    @pytest.mark.parametrize("mode", ["absent", "unused", "inlined", "used", "default", "override"])
+    def test_function_graph_arguments_require_an_executable_reference(self, tmp_path: Path, mode: str) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        model = self._graph_argument_model(mode)
+        path = self._save(model, tmp_path)
+        runtime_model: Any = onnx.ModelProto()
+        runtime_model.CopyFrom(model)
+        if mode == "default":
+            # The installed inliner omits defaults on calls inside graph attributes.
+            runtime_body = next(
+                attribute.g for attribute in runtime_model.graph.node[0].attribute if attribute.name == "body"
+            )
+            runtime_body.node[0].attribute.extend(runtime_model.functions[0].attribute_proto)
+        inlined = TestOnnxLoopControlProofs._inline_with_defaults(runtime_model)
+        runtime_values: Any = ReferenceEvaluator(inlined).run(None, {})
+        actual = runtime_values[0]
+        used = mode in {"used", "default", "override"}
+        np.testing.assert_array_equal(actual, np.eye(2, dtype=np.float32) if used else np.ones((1, 1, 2), np.float32))
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        result = OnnxScanner().scan(str(path))
+        if used:
+            assert any(spec.context["initializer"] == "W" for spec in plan.specs)
+            if plan.coverage_gaps:
+                assert result.success is False
+        else:
+            assert plan.coverage_gaps == {}
+            assert plan.specs == []
+            assert result.success is True
