@@ -493,35 +493,6 @@ jobs:
 
       - *sync-all-ci-dependencies
 
-      - name: Diagnose Codecov transport
-        if: matrix.shard == 0
-        timeout-minutes: 2
-        run: |
-          command -v pip python3 || true
-          pip --version || true
-          curl --version || true
-          python3 - <<'PYPROFILE' || true
-          import ssl
-          import sys
-
-          import requests
-
-          print(sys.executable, sys.version, ssl.OPENSSL_VERSION)
-          print("requests", requests.__version__, requests.__file__, "CA", requests.certs.where())
-          PYPROFILE
-          for url in https://cli.codecov.io/latest/linux/codecov https://ingest.codecov.io/upload/github/promptfoo::::modelaudit/upload-coverage; do
-            curl --silent --show-error --head --output /dev/null --connect-timeout 5 --max-time 15 --write-out 'url=%{url_effective} status=%{http_code} verify=%{ssl_verify_result} dns=%{time_namelookup} connect=%{time_connect} tls=%{time_appconnect}\n' "$url" || true
-            timeout 20s python3 - "$url" <<'PYPROBE' || true
-          import sys
-
-          import requests
-
-          # Keep this diagnostic unauthenticated, including when netrc exists.
-          response = requests.head(sys.argv[1], auth=lambda request: request, allow_redirects=False, timeout=(5, 10))
-          print(sys.argv[1], "status", response.status_code)
-          PYPROBE
-          done
-
       - name: Run branch coverage shard
         run: |
           uv run pytest tests -n auto \
@@ -532,6 +503,8 @@ jobs:
 
       # Codecov automatically merges separate reports for the same commit.
       - name: Upload coverage to Codecov
+        id: codecov-upload
+        continue-on-error: true
         uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7
         with:
           name: python-coverage-${{ matrix.shard }}
@@ -541,6 +514,41 @@ jobs:
           # Avoid depending on the separate CLI binary-download host.
           use_pypi: true
           verbose: true
+
+      # A failed primary upload must succeed through the documented legacy route.
+      - name: Upload coverage through Codecov legacy API
+        if: steps.codecov-upload.outcome == 'failure'
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        env:
+          CODECOV_UPLOAD_NAME: python-coverage-${{ matrix.shard }}
+        with:
+          script: |
+            await exec.exec('pip', ['install', 'codecov-cli==11.3.1']);
+            const pullRequest = context.payload.pull_request;
+            const slug = `${context.repo.owner}/${context.repo.repo}`;
+            const isFork = pullRequest && pullRequest.head.repo.full_name !== slug;
+            const token = isFork
+              ? process.env.CODECOV_TOKEN
+              : await core.getIDToken('https://codecov.io');
+            const args = [
+              '--verbose', 'do-upload', '--legacy', '--fail-on-error',
+              '--file', './coverage.xml',
+              '--name', process.env.CODECOV_UPLOAD_NAME,
+              '--sha', pullRequest?.head.sha || context.sha,
+              '--slug', slug,
+              '--git-service', 'github',
+            ];
+            if (token) {
+              core.setSecret(token);
+              args.push('--token', token);
+            }
+            if (pullRequest) {
+              args.push('--pr', String(pullRequest.number));
+            }
+            if (isFork && !token) {
+              args.push('--branch', pullRequest.head.label);
+            }
+            await exec.exec('codecovcli', args);
 
   test-numpy-compatibility:
     name: Test NumPy ${{ matrix.numpy-mode }} - Python ${{ matrix.python-version }}
