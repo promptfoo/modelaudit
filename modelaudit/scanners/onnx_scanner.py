@@ -11,6 +11,7 @@ import stat
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field
+from itertools import chain, repeat
 from pathlib import Path
 from typing import Any, BinaryIO, ClassVar, NoReturn
 
@@ -116,6 +117,8 @@ _ONNX_WEIGHT_LINEAGES_PER_VALUE_LIMIT = 32
 _ONNX_WEIGHT_LINEAGE_GAP_COUNT_LIMIT = 1_000_000
 _ONNX_WEIGHT_TRANSFORM_DEPTH_LIMIT = 32
 _ONNX_WEIGHT_RESHAPE_RANK_LIMIT = 64
+_ONNX_INFERRED_SHAPE_DIMENSION_LIMIT = 1_000_000
+_ONNX_SHAPE_EXTENT_LIMIT = (1 << 63) - 1
 _ONNX_RUNTIME_BOOKKEEPING_LINEAGE_REASONS: frozenset[str] = frozenset(
     {"dynamic_activation_lineage", "dynamic_input_lineage"}
 )
@@ -321,6 +324,23 @@ def _onnx_int_sequence_attribute(node: Any, name: str) -> tuple[int, ...] | None
     return None
 
 
+def _onnx_shape_extent_product(dimensions: Iterable[int]) -> int:
+    """Keep symbolic and overflowing products unknown without growing Python integers."""
+    result = 1
+    unknown = False
+    overflow = False
+    for dimension in dimensions:
+        if dimension < 0 or dimension > _ONNX_SHAPE_EXTENT_LIMIT:
+            unknown = True
+        elif dimension == 0:
+            result = 0
+        elif result > _ONNX_SHAPE_EXTENT_LIMIT // dimension:
+            overflow = True
+        else:
+            result *= dimension
+    return -1 if unknown or (overflow and result != 0) else result
+
+
 def _onnx_concat_output_shape(
     node: Any,
     input_shapes: Iterable[tuple[int, ...] | None],
@@ -344,7 +364,11 @@ def _onnx_concat_output_shape(
         for index, dimension in enumerate(shape):
             current = output_dimensions[index]
             if index == axis:
-                output_dimensions[index] = -1 if current < 0 or dimension < 0 else current + dimension
+                output_dimensions[index] = (
+                    -1
+                    if current < 0 or dimension < 0 or current > _ONNX_SHAPE_EXTENT_LIMIT - dimension
+                    else current + dimension
+                )
             elif current < 0 or dimension < 0:
                 output_dimensions[index] = -1
             elif dimension != current:
@@ -1637,7 +1661,7 @@ def _resolve_onnx_reshape_shape(
     if any(dimension < 0 for dimension in input_shape):
         return None
     dims = tuple(int(dimension) for dimension in getattr(shape_initializer, "dims", ()))
-    element_count = math.prod(dims) if dims else 0
+    element_count = dims[0] if len(dims) == 1 else 0
     if (
         len(dims) != 1
         or element_count < 0
@@ -1667,13 +1691,15 @@ def _resolve_onnx_reshape_shape(
         else:
             normalized.append(value)
 
-    input_size = math.prod(input_shape)
-    known_size = math.prod(value for value in normalized if value != -1)
+    input_size = _onnx_shape_extent_product(input_shape)
+    known_size = _onnx_shape_extent_product(value for value in normalized if value != -1)
+    if input_size < 0 or known_size < 0:
+        return None
     if -1 in normalized:
         if known_size <= 0 or input_size % known_size != 0:
             return None
         normalized[normalized.index(-1)] = input_size // known_size
-    elif math.prod(normalized) != input_size:
+    elif known_size != input_size:
         return None
     return tuple(normalized)
 
@@ -1684,13 +1710,19 @@ def _resolve_onnx_axes(
     *,
     onnx: Any,
     resolve_attribute: Callable[[Any], Any | None] | None = None,
+    on_limit: Callable[[], None] | None = None,
 ) -> tuple[int, ...] | None:
     for attribute in getattr(node, "attribute", ()):
         if attribute.name == "axes":
             resolved_attribute = resolve_attribute(attribute) if resolve_attribute is not None else attribute
             if resolved_attribute is None or bool(getattr(resolved_attribute, "ref_attr_name", "")):
                 return None
-            return tuple(int(value) for value in getattr(resolved_attribute, "ints", ()))
+            values = getattr(resolved_attribute, "ints", ())
+            if len(values) > _ONNX_WEIGHT_RESHAPE_RANK_LIMIT:
+                if on_limit is not None:
+                    on_limit()
+                return None
+            return tuple(int(value) for value in values)
     if len(getattr(node, "input", ())) < 2:
         return ()
 
@@ -1698,7 +1730,9 @@ def _resolve_onnx_axes(
     if axes_initializer is None:
         return None
     dims = tuple(int(dimension) for dimension in getattr(axes_initializer, "dims", ()))
-    element_count = math.prod(dims) if dims else 0
+    element_count = dims[0] if len(dims) == 1 else 0
+    if element_count > _ONNX_WEIGHT_RESHAPE_RANK_LIMIT and on_limit is not None:
+        on_limit()
     if (
         len(dims) != 1
         or element_count < 0
@@ -1819,6 +1853,66 @@ def _build_onnx_weight_analysis_plan(
 ) -> _OnnxWeightAnalysisPlan:
     """Build a bounded, semantically oriented plan for ONNX weight analysis."""
     plan = _OnnxWeightAnalysisPlan()
+    inferred_dimensions = 0
+
+    def shape_inference_available(rank: int) -> bool:
+        if rank > _ONNX_WEIGHT_RESHAPE_RANK_LIMIT:
+            plan.coverage_gaps.setdefault("inferred_shape_rank_limit", 1)
+            return False
+        if inferred_dimensions + rank > _ONNX_INFERRED_SHAPE_DIMENSION_LIMIT:
+            plan.coverage_gaps.setdefault("inferred_shape_dimension_limit", 1)
+            return False
+        return True
+
+    def inferred_shape(rank: int, dimensions: Iterable[int]) -> tuple[int, ...] | None:
+        nonlocal inferred_dimensions
+        if not shape_inference_available(rank):
+            return None
+        inferred_dimensions += rank
+        return tuple(dimension if -1 <= dimension <= _ONNX_SHAPE_EXTENT_LIMIT else -1 for dimension in dimensions)
+
+    def resolve_axes(
+        node: Any,
+        constants: dict[str, Any],
+        *,
+        onnx: Any,
+        resolve_attribute: Callable[[Any], Any | None] | None = None,
+    ) -> tuple[int, ...] | None:
+        def exhausted() -> None:
+            plan.coverage_gaps.setdefault("inferred_shape_rank_limit", 1)
+
+        return _resolve_onnx_axes(node, constants, onnx=onnx, resolve_attribute=resolve_attribute, on_limit=exhausted)
+
+    def unsqueezed_shape(shape: tuple[int, ...], axes: tuple[int, ...]) -> tuple[int, ...] | None:
+        rank = len(shape) + len(axes)
+        if not shape_inference_available(rank):
+            return None
+        normalized = {axis if axis >= 0 else rank + axis for axis in axes}
+        if not normalized or len(normalized) != len(axes) or any(axis < 0 or axis >= rank for axis in normalized):
+            return None
+        dimensions = iter(shape)
+        return inferred_shape(rank, (1 if index in normalized else next(dimensions) for index in range(rank)))
+
+    def inserted_shape(shape: tuple[int, ...], axis: int, dimensions: tuple[int, ...]) -> tuple[int, ...] | None:
+        return inferred_shape(len(shape) + len(dimensions), chain(shape[:axis], dimensions, shape[axis:]))
+
+    def promoted_shape(shape: tuple[int, ...], axis: int, rank: int, extent: int = -1) -> tuple[int, ...] | None:
+        return inferred_shape(rank, chain(shape[:axis], repeat(extent, rank - len(shape)), shape[axis:]))
+
+    def gather_shape_from_indices(
+        shape: tuple[int, ...], indices: tuple[int, ...], axis: int
+    ) -> tuple[int, ...] | None:
+        return inferred_shape(len(shape) + len(indices) - 1, chain(shape[:axis], indices, shape[axis + 1 :]))
+
+    def concat_shape(
+        node: Any, input_shapes: Iterable[tuple[int, ...] | None], *, axis: int | None = None
+    ) -> tuple[int, ...] | None:
+        shapes = list(input_shapes)
+        if any(shape is not None and not shape_inference_available(len(shape)) for shape in shapes):
+            return None
+        result = _onnx_concat_output_shape(node, shapes, axis=axis)
+        return inferred_shape(len(result), result) if result is not None else None
+
     graph = model.graph
     functions = {
         (
@@ -1964,7 +2058,7 @@ def _build_onnx_weight_analysis_plan(
         if initializer is None:
             return None
         dims = tuple(int(dimension) for dimension in getattr(initializer, "dims", ()))
-        element_count = math.prod(dims) if dims else 0
+        element_count = dims[0] if len(dims) == 1 else 0
         if (
             len(dims) != 1
             or element_count < 0
@@ -1984,7 +2078,7 @@ def _build_onnx_weight_analysis_plan(
         if initializer is None:
             return None
         dims = tuple(int(dimension) for dimension in getattr(initializer, "dims", ()))
-        element_count = math.prod(dims) if dims else 1
+        element_count = _onnx_shape_extent_product(dims) if dims else 1
         if (
             element_count != 1
             or int(getattr(initializer, "data_type", -1)) != expected_data_type
@@ -2306,7 +2400,7 @@ def _build_onnx_weight_analysis_plan(
         if initializer is None:
             return None
         try:
-            return tuple(int(dimension) for dimension in initializer.dims)
+            return inferred_shape(len(initializer.dims), (int(dimension) for dimension in initializer.dims))
         except (AttributeError, TypeError, ValueError):
             return None
 
@@ -2344,7 +2438,10 @@ def _build_onnx_weight_analysis_plan(
             or batch_dims + index_depth > len(input_shape)
         ):
             return None
-        return (*index_shape[:-1], *input_shape[batch_dims + index_depth :])
+        output_rank = len(index_shape) - 1 + len(input_shape) - batch_dims - index_depth
+        if not shape_inference_available(output_rank):
+            return None
+        return inferred_shape(output_rank, chain(index_shape[:-1], input_shape[batch_dims + index_depth :]))
 
     def scan_input_shape(
         constants: dict[str, Any],
@@ -3698,7 +3795,7 @@ def _build_onnx_weight_analysis_plan(
                         body_node, "axis", resolve_attribute=resolve_reentry_attribute
                     )
                     if concat_axis is not None:
-                        output_shape = _onnx_concat_output_shape(
+                        output_shape = concat_shape(
                             body_node,
                             (input_shapes_by_name.get(input_name) for input_name in body_inputs),
                             axis=concat_axis,
@@ -3728,11 +3825,7 @@ def _build_onnx_weight_analysis_plan(
                     if index_input_shape is not None:
                         gather_axis = _onnx_gather_axis(body_node, len(data_input_shape), resolve_reentry_attribute)
                         if gather_axis is not None:
-                            output_shape = (
-                                *data_input_shape[:gather_axis],
-                                *index_input_shape,
-                                *data_input_shape[gather_axis + 1 :],
-                            )
+                            output_shape = gather_shape_from_indices(data_input_shape, index_input_shape, gather_axis)
                 elif standard_reentry_operator and body_node.op_type == "GatherElements":
                     output_shape = index_input_shape
                 elif standard_reentry_operator and body_node.op_type == "GatherND" and data_input_shape is not None:
@@ -3757,27 +3850,16 @@ def _build_onnx_weight_analysis_plan(
                             onnx=onnx,
                         )
                 elif standard_reentry_operator and body_node.op_type == "Unsqueeze" and data_input_shape is not None:
-                    axes = _resolve_onnx_axes(
+                    axes = resolve_axes(
                         body_node,
                         subgraph_constants,
                         onnx=onnx,
                         resolve_attribute=resolve_reentry_attribute,
                     )
                     if axes is not None:
-                        output_rank = len(data_input_shape) + len(axes)
-                        normalized_axes = tuple(axis if axis >= 0 else output_rank + axis for axis in axes)
-                        if (
-                            normalized_axes
-                            and len(set(normalized_axes)) == len(normalized_axes)
-                            and all(0 <= axis < output_rank for axis in normalized_axes)
-                        ):
-                            source_dimensions = iter(data_input_shape)
-                            output_shape = tuple(
-                                1 if index in normalized_axes else next(source_dimensions)
-                                for index in range(output_rank)
-                            )
+                        output_shape = unsqueezed_shape(data_input_shape, axes)
                 elif standard_reentry_operator and body_node.op_type == "Squeeze" and data_input_shape is not None:
-                    axes = _resolve_onnx_axes(
+                    axes = resolve_axes(
                         body_node,
                         subgraph_constants,
                         onnx=onnx,
@@ -4640,7 +4722,9 @@ def _build_onnx_weight_analysis_plan(
         axis = raw_axis if raw_axis >= 0 else output_rank + raw_axis
         if axis < 0 or axis > len(shape):
             return None
-        return (*shape[:axis], extent, *shape[axis:])
+        if not shape_inference_available(output_rank):
+            return None
+        return inserted_shape(shape, axis, (extent,))
 
     def insert_rank_axis(rank: int, raw_axis: int) -> int | None:
         output_rank = rank + 1
@@ -4719,12 +4803,14 @@ def _build_onnx_weight_analysis_plan(
                     label_dimensions[label] = dimension
                 elif existing_dimension != dimension:
                     label_dimensions[label] = -1
+        if not shape_inference_available(len(output_expression)):
+            return None
         output_dimensions: list[int] = []
         for label in output_expression:
             if label not in label_dimensions:
                 return None
             output_dimensions.append(label_dimensions[label])
-        return tuple(output_dimensions)
+        return inferred_shape(len(output_dimensions), output_dimensions)
 
     def gap_summary_may_exceed_input_rank(summary: _OnnxWeightLineageGapSummary, input_rank: int | None) -> bool:
         if summary.truncated:
@@ -4833,7 +4919,7 @@ def _build_onnx_weight_analysis_plan(
         if node.op_type == "Flatten":
             return True
         if node.op_type == "Unsqueeze":
-            axes = _resolve_onnx_axes(node, constants, onnx=onnx, resolve_attribute=resolve_attribute)
+            axes = resolve_axes(node, constants, onnx=onnx, resolve_attribute=resolve_attribute)
             if axes is None or input_shape is None:
                 return True
             output_rank = len(input_shape) + len(axes)
@@ -4846,7 +4932,7 @@ def _build_onnx_weight_analysis_plan(
                 return True
             return output_rank >= 2
         if node.op_type == "Squeeze":
-            axes = _resolve_onnx_axes(node, constants, onnx=onnx, resolve_attribute=resolve_attribute)
+            axes = resolve_axes(node, constants, onnx=onnx, resolve_attribute=resolve_attribute)
             if axes is None or input_shape is None:
                 return True
             normalized_axes = tuple(axis if axis >= 0 else len(input_shape) + axis for axis in axes)
@@ -4881,6 +4967,8 @@ def _build_onnx_weight_analysis_plan(
             tensor_type = value_info.type.tensor_type
             if not tensor_type.HasField("shape"):
                 return None
+            if not shape_inference_available(len(tensor_type.shape.dim)):
+                return None
             dimensions: list[int] = []
             for dimension in tensor_type.shape.dim:
                 if not dimension.HasField("dim_value"):
@@ -4905,6 +4993,8 @@ def _build_onnx_weight_analysis_plan(
             return None
         known_shapes = [shape for shape in concrete_shapes if shape is not None]
         output_rank = max((len(shape) for shape in known_shapes), default=0)
+        if not shape_inference_available(output_rank):
+            return None
         output_dimensions: list[int] = []
         for offset in range(1, output_rank + 1):
             dimensions = [shape[-offset] if len(shape) >= offset else 1 for shape in known_shapes]
@@ -4912,7 +5002,7 @@ def _build_onnx_weight_analysis_plan(
             if len(non_singleton_dimensions) > 1:
                 return None
             output_dimensions.append(next(iter(non_singleton_dimensions), 1))
-        return tuple(reversed(output_dimensions))
+        return inferred_shape(output_rank, reversed(output_dimensions))
 
     def matmul_output_shape(
         left_shape: tuple[int, ...] | None,
@@ -4927,13 +5017,13 @@ def _build_onnx_weight_analysis_plan(
         if left_rank == 1 and right_rank == 1:
             return ()
         if left_rank == 1:
-            return (*right_shape[:-2], right_shape[-1])
+            return inferred_shape(right_rank - 1, chain(right_shape[:-2], (right_shape[-1],)))
         if right_rank == 1:
             return left_shape[:-1]
         batch_shape = broadcast_shapes((left_shape[:-2], right_shape[:-2]))
         if batch_shape is None:
             return None
-        return (*batch_shape, left_shape[-2], right_shape[-1])
+        return inferred_shape(len(batch_shape) + 2, chain(batch_shape, (left_shape[-2], right_shape[-1])))
 
     def onehot_output_shape(
         node: Any,
@@ -4958,10 +5048,12 @@ def _build_onnx_weight_analysis_plan(
                 depth_extent = max(int(depth_value), -1)
             except (TypeError, ValueError):
                 depth_extent = -1
-        return (*indices_shape[:axis], depth_extent, *indices_shape[axis:])
+        if not shape_inference_available(output_rank):
+            return None
+        return inserted_shape(indices_shape, axis, (depth_extent,))
 
     def flattened_shape_extent(dimensions: tuple[int, ...]) -> int:
-        return -1 if any(dimension < 0 for dimension in dimensions) else math.prod(dimensions)
+        return _onnx_shape_extent_product(dimensions)
 
     def broadcast_rank_from_input_ranks(ranks: Iterable[int | None]) -> int | None:
         observed_ranks = list(ranks)
@@ -5207,10 +5299,10 @@ def _build_onnx_weight_analysis_plan(
                     transforms=lineage.transforms,
                     unresolved_reason=lineage.unresolved_reason or "invalid_flatten_lineage",
                 )
-            output_shape = (math.prod(lineage.shape[:axis]), math.prod(lineage.shape[axis:]))
+            output_shape = (flattened_shape_extent(lineage.shape[:axis]), flattened_shape_extent(lineage.shape[axis:]))
             transform = _OnnxWeightTransform("Reshape", output_shape)
         elif node.op_type in {"Squeeze", "Unsqueeze"}:
-            axes = _resolve_onnx_axes(node, constants, onnx=onnx)
+            axes = resolve_axes(node, constants, onnx=onnx)
             if axes is None:
                 return _OnnxWeightLineage(
                     initializer_index=lineage.initializer_index,
@@ -5250,13 +5342,8 @@ def _build_onnx_weight_analysis_plan(
                     dimension for index, dimension in enumerate(lineage.shape) if index not in normalized_axes
                 )
             else:
-                output_rank = len(lineage.shape) + len(axes)
-                normalized_axes = tuple(axis if axis >= 0 else output_rank + axis for axis in axes)
-                if (
-                    not normalized_axes
-                    or len(set(normalized_axes)) != len(normalized_axes)
-                    or any(axis < 0 or axis >= output_rank for axis in normalized_axes)
-                ):
+                unsqueezed = unsqueezed_shape(lineage.shape, axes)
+                if unsqueezed is None:
                     return _OnnxWeightLineage(
                         initializer_index=lineage.initializer_index,
                         shape=None,
@@ -5264,10 +5351,7 @@ def _build_onnx_weight_analysis_plan(
                         transforms=lineage.transforms,
                         unresolved_reason=lineage.unresolved_reason or "invalid_unsqueeze_lineage",
                     )
-                source_dimensions = iter(lineage.shape)
-                output_shape = tuple(
-                    1 if index in normalized_axes else next(source_dimensions) for index in range(output_rank)
-                )
+                output_shape = unsqueezed
             transform = _OnnxWeightTransform("Reshape", output_shape)
         elif node.op_type == "Transpose":
             permutation = tuple(
@@ -5322,7 +5406,16 @@ def _build_onnx_weight_analysis_plan(
                     transforms=lineage.transforms,
                     unresolved_reason=lineage.unresolved_reason or "unresolved_gather_lineage",
                 )
-            output_shape = (*lineage.shape[:gather_axis], *index_shape, *lineage.shape[gather_axis + 1 :])
+            gather_shape = gather_shape_from_indices(lineage.shape, index_shape, gather_axis)
+            if gather_shape is None:
+                return _OnnxWeightLineage(
+                    initializer_index=lineage.initializer_index,
+                    shape=None,
+                    data_type=lineage.data_type,
+                    transforms=lineage.transforms,
+                    unresolved_reason=lineage.unresolved_reason or "unresolved_gather_lineage",
+                )
+            output_shape = gather_shape
             transform = _OnnxWeightTransform("Reshape", output_shape)
         elif node.op_type == "GatherND":
             index_shape = constant_initializer_shape(constants, node.input[1]) if len(node.input) >= 2 else None
@@ -5665,12 +5758,7 @@ def _build_onnx_weight_analysis_plan(
                     axis = insert_axis if insert_axis >= 0 else target_rank + insert_axis
                     if axis < 0 or axis > target_rank:
                         axis = 0
-                    added_rank = target_rank - len(lineage.shape)
-                    shape = (
-                        *lineage.shape[:axis],
-                        *(-1 for _ in range(added_rank)),
-                        *lineage.shape[axis:],
-                    )
+                    shape = promoted_shape(lineage.shape, axis, target_rank)
             promoted_lineages.append(
                 _OnnxWeightLineage(
                     initializer_index=lineage.initializer_index,
@@ -5861,12 +5949,7 @@ def _build_onnx_weight_analysis_plan(
                     axis = insert_axis if insert_axis >= 0 else target_rank + insert_axis
                     if axis < 0 or axis > target_rank:
                         axis = 0
-                    added_rank = target_rank - len(lineage.shape)
-                    shape = (
-                        *lineage.shape[:axis],
-                        *(-1 for _ in range(added_rank)),
-                        *lineage.shape[axis:],
-                    )
+                    shape = promoted_shape(lineage.shape, axis, target_rank)
             transforms = lineage.transforms
             unresolved_reason = lineage.unresolved_reason
             if materialize_stack_output and unresolved_reason is None and shape != lineage.shape:
@@ -5875,11 +5958,12 @@ def _build_onnx_weight_analysis_plan(
                     axis = insert_axis if insert_axis >= 0 else len(shape) + insert_axis
                     added_rank = len(shape) - len(lineage.shape)
                     if 0 <= axis <= len(lineage.shape):
-                        view_shape = (*lineage.shape[:axis], *(1 for _ in range(added_rank)), *lineage.shape[axis:])
+                        view_shape = promoted_shape(lineage.shape, axis, len(shape), 1)
                         if added_rank == 1 and stack_extent is not None:
                             shape = (*shape[:axis], stack_extent, *shape[axis + 1 :])
                         if (
-                            all(dimension >= 0 for dimension in shape)
+                            view_shape is not None
+                            and all(dimension >= 0 for dimension in shape)
                             and broadcast_shapes((view_shape, shape)) == shape
                             and len(transforms) + 2 <= _ONNX_WEIGHT_TRANSFORM_DEPTH_LIMIT
                         ):
@@ -5924,11 +6008,7 @@ def _build_onnx_weight_analysis_plan(
                 axis = insert_axis if insert_axis >= 0 else target_rank + insert_axis
                 if axis < 0 or axis > target_rank:
                     axis = 0
-                shape = (
-                    *lineage.shape[:axis],
-                    -1,
-                    *lineage.shape[axis:],
-                )
+                shape = inserted_shape(lineage.shape, axis, (-1,))
             promoted_lineages.append(
                 _OnnxWeightLineage(
                     initializer_index=lineage.initializer_index,
@@ -6245,8 +6325,12 @@ def _build_onnx_weight_analysis_plan(
         proven_value_ranks: set[str] = set()
 
         def set_known_value_shape(name: str, shape: tuple[int, ...], *, proven: bool) -> None:
-            known_value_shapes[name] = shape
-            known_value_ranks[name] = len(shape)
+            bounded_shape = inferred_shape(len(shape), shape)
+            if bounded_shape is None:
+                set_known_value_rank(name, len(shape), proven=proven)
+                return
+            known_value_shapes[name] = bounded_shape
+            known_value_ranks[name] = len(bounded_shape)
             if proven:
                 proven_value_ranks.add(name)
             else:
@@ -7346,7 +7430,7 @@ def _build_onnx_weight_analysis_plan(
                             ):
                                 return data_input_shape
                             if body_node.op_type in _RANK_PRESERVING_VARIADIC_OPERATORS:
-                                return _onnx_concat_output_shape(
+                                return concat_shape(
                                     body_node,
                                     (tainted_shapes.get(input_name) for input_name in body_inputs),
                                     axis=_onnx_int_attribute(body_node, "axis"),
@@ -7380,11 +7464,7 @@ def _build_onnx_weight_analysis_plan(
                                 gather_axis = _onnx_gather_axis(body_node, len(data_input_shape))
                                 if gather_axis is None:
                                     return None
-                                return (
-                                    *data_input_shape[:gather_axis],
-                                    *index_input_shape,
-                                    *data_input_shape[gather_axis + 1 :],
-                                )
+                                return gather_shape_from_indices(data_input_shape, index_input_shape, gather_axis)
                             if body_node.op_type == "GatherElements":
                                 return index_input_shape
                             if body_node.op_type == "GatherND" and data_input_shape is not None:
@@ -7408,24 +7488,12 @@ def _build_onnx_weight_analysis_plan(
                                     onnx=onnx,
                                 )
                             if body_node.op_type == "Unsqueeze" and data_input_shape is not None:
-                                axes = _resolve_onnx_axes(body_node, subgraph_constants, onnx=onnx)
+                                axes = resolve_axes(body_node, subgraph_constants, onnx=onnx)
                                 if axes is None:
                                     return None
-                                output_rank = len(data_input_shape) + len(axes)
-                                normalized_axes = tuple(axis if axis >= 0 else output_rank + axis for axis in axes)
-                                if (
-                                    not normalized_axes
-                                    or len(set(normalized_axes)) != len(normalized_axes)
-                                    or any(axis < 0 or axis >= output_rank for axis in normalized_axes)
-                                ):
-                                    return None
-                                source_dimensions = iter(data_input_shape)
-                                return tuple(
-                                    1 if index in normalized_axes else next(source_dimensions)
-                                    for index in range(output_rank)
-                                )
+                                return unsqueezed_shape(data_input_shape, axes)
                             if body_node.op_type == "Squeeze" and data_input_shape is not None:
-                                axes = _resolve_onnx_axes(body_node, subgraph_constants, onnx=onnx)
+                                axes = resolve_axes(body_node, subgraph_constants, onnx=onnx)
                                 if axes is None:
                                     return None
                                 normalized_axes = tuple(
@@ -7535,7 +7603,7 @@ def _build_onnx_weight_analysis_plan(
                                 ):
                                     return data_input_shape
                                 if function_node.op_type in _RANK_PRESERVING_VARIADIC_OPERATORS:
-                                    return _onnx_concat_output_shape(
+                                    return concat_shape(
                                         function_node,
                                         (local_tainted_shapes.get(input_name) for input_name in function_inputs),
                                         axis=_onnx_int_attribute(function_node, "axis"),
@@ -7581,24 +7649,12 @@ def _build_onnx_weight_analysis_plan(
                                         onnx=onnx,
                                     )
                                 if function_node.op_type == "Unsqueeze" and data_input_shape is not None:
-                                    axes = _resolve_onnx_axes(function_node, function_constants, onnx=onnx)
+                                    axes = resolve_axes(function_node, function_constants, onnx=onnx)
                                     if axes is None:
                                         return None
-                                    output_rank = len(data_input_shape) + len(axes)
-                                    normalized_axes = tuple(axis if axis >= 0 else output_rank + axis for axis in axes)
-                                    if (
-                                        not normalized_axes
-                                        or len(set(normalized_axes)) != len(normalized_axes)
-                                        or any(axis < 0 or axis >= output_rank for axis in normalized_axes)
-                                    ):
-                                        return None
-                                    source_dimensions = iter(data_input_shape)
-                                    return tuple(
-                                        1 if index in normalized_axes else next(source_dimensions)
-                                        for index in range(output_rank)
-                                    )
+                                    return unsqueezed_shape(data_input_shape, axes)
                                 if function_node.op_type == "Squeeze" and data_input_shape is not None:
-                                    axes = _resolve_onnx_axes(function_node, function_constants, onnx=onnx)
+                                    axes = resolve_axes(function_node, function_constants, onnx=onnx)
                                     if axes is None:
                                         return None
                                     normalized_axes = tuple(
@@ -8817,7 +8873,8 @@ def _build_onnx_weight_analysis_plan(
                                         lineage.shape is not None
                                         and lineage.shape != parent_shape
                                         and all(dimension > 0 for dimension in lineage.shape)
-                                        and math.prod(lineage.shape) == math.prod(parent_shape)
+                                        and (lineage_size := _onnx_shape_extent_product(lineage.shape)) >= 0
+                                        and lineage_size == _onnx_shape_extent_product(parent_shape)
                                     ):
                                         # Removing singleton Scan axes is the exact per-iteration view.
                                         subgraph_bound_lineages[graph_input_name][initializer_index] = (
@@ -10762,7 +10819,7 @@ def _build_onnx_weight_analysis_plan(
                         )
                         elementwise_output_rank_proven = value_rank_is_proven_or_unknown(input_names[0])
                 elif rank_preserving_variadic_operator:
-                    elementwise_output_shape = _onnx_concat_output_shape(
+                    elementwise_output_shape = concat_shape(
                         node,
                         (known_value_shapes.get(input_name) for input_name in input_names),
                         axis=resolved_int_attribute(node, "axis", 0),
@@ -10853,7 +10910,7 @@ def _build_onnx_weight_analysis_plan(
                                 transform_output_rank = None
                 elif node.op_type == "Squeeze" and transform_input_rank is not None:
                     transform_output_rank_proven = transform_input_rank_proven
-                    axes = _resolve_onnx_axes(node, constants, onnx=onnx, resolve_attribute=resolve_attribute)
+                    axes = resolve_axes(node, constants, onnx=onnx, resolve_attribute=resolve_attribute)
                     if axes is not None:
                         if not axes:
                             if squeeze_with_empty_axes_is_noop(node, axes, resolve_attribute):
@@ -10885,7 +10942,7 @@ def _build_onnx_weight_analysis_plan(
                                     )
                 elif node.op_type == "Unsqueeze" and transform_input_rank is not None:
                     transform_output_rank_proven = transform_input_rank_proven
-                    axes = _resolve_onnx_axes(node, constants, onnx=onnx, resolve_attribute=resolve_attribute)
+                    axes = resolve_axes(node, constants, onnx=onnx, resolve_attribute=resolve_attribute)
                     if axes is not None:
                         output_rank = transform_input_rank + len(axes)
                         normalized_axes = tuple(axis if axis >= 0 else output_rank + axis for axis in axes)
@@ -10896,11 +10953,7 @@ def _build_onnx_weight_analysis_plan(
                         ):
                             transform_output_rank = output_rank
                             if transform_input_shape is not None:
-                                source_dimensions = iter(transform_input_shape)
-                                transform_output_shape = tuple(
-                                    1 if index in normalized_axes else next(source_dimensions)
-                                    for index in range(output_rank)
-                                )
+                                transform_output_shape = unsqueezed_shape(transform_input_shape, axes)
 
             for output_index, output_name in enumerate(node.output):
                 if not output_name:
@@ -11562,7 +11615,7 @@ def _build_onnx_weight_analysis_plan(
             continue
 
         try:
-            numel = math.prod(int(dimension) for dimension in initializer.dims)
+            numel = _onnx_shape_extent_product(int(dimension) for dimension in initializer.dims)
             itemsize = int(_tensor_data_type_to_np_dtype(initializer.data_type).itemsize)
             estimated_bytes = numel * itemsize
             if estimated_bytes < 0 or (
@@ -11591,7 +11644,11 @@ def _build_onnx_weight_analysis_plan(
                     (
                         estimated_bytes,
                         *(
-                            math.prod(transform.parameters) * itemsize
+                            (
+                                extent * itemsize
+                                if (extent := _onnx_shape_extent_product(transform.parameters)) >= 0
+                                else (_ONNX_SHAPE_EXTENT_LIMIT + 1) * itemsize
+                            )
                             for transform in consumer_group.lineage.transforms
                             if transform.kind == "Expand"
                         ),

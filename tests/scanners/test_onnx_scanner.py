@@ -28903,3 +28903,207 @@ class TestOnnxSiblingClosureReviewRegressions:
         else:
             assert result.success is True
             assert not result.metadata.get("anomalies_found")
+
+
+class TestOnnxInferredShapeBounds:
+    @staticmethod
+    def _save(graph: Any, tmp_path: Path, *, opset: int = 18, full_check: bool = True) -> tuple[Path, Any]:
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", opset)], ir_version=8)
+        onnx.checker.check_model(model, full_check=full_check)
+        path = tmp_path / "shape_bounds.onnx"
+        onnx.save(model, path)
+        return path, model
+
+    @staticmethod
+    def _retained_shapes(model: Any) -> tuple[Any, dict[str, tuple[int, ...]]]:
+        shapes: dict[str, tuple[int, ...]] = {}
+
+        def profile(frame: Any, event: str, value: Any) -> None:
+            if event == "return" and frame.f_code.co_name == "walk_graph":
+                shapes.update(frame.f_locals.get("known_value_shapes", {}))
+
+        previous = sys.getprofile()
+        sys.setprofile(profile)
+        try:
+            plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=1024)
+        finally:
+            sys.setprofile(previous)
+        return plan, shapes
+
+    @pytest.mark.parametrize("literal", [False, True])
+    @pytest.mark.parametrize("rank", [3, 128])
+    def test_runtime_unsqueeze_shape_work_is_bounded(self, tmp_path: Path, literal: bool, rank: int) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        if literal:
+            nodes = [helper.make_node("Unsqueeze", ["X"], ["up"], axes=list(range(rank)))]
+            initializers = []
+        else:
+            nodes = [
+                helper.make_node("Unsqueeze", ["X" if index == 0 else f"v{index - 1}", "axes"], [f"v{index}"])
+                for index in range(rank)
+            ]
+            nodes.append(helper.make_node("Identity", [f"v{rank - 1}"], ["up"]))
+            initializers = [onnx.numpy_helper.from_array(np.array([0], np.int64), "axes")]
+        nodes.append(helper.make_node("Flatten", ["up"], ["Y"]))
+        graph = helper.make_graph(
+            nodes,
+            "runtime_rank",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, [])],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 1])],
+            initializers,
+        )
+        path, model = self._save(graph, tmp_path, opset=11 if literal else 18)
+        plan, shapes = self._retained_shapes(model)
+        assert max(map(len, shapes.values()), default=0) <= 64
+        assert sum(map(len, shapes.values())) <= 64 * 65 // 2 + 4
+        result = OnnxScanner().scan(str(path))
+        if rank > 64:
+            assert plan.coverage_gaps
+            assert result.success is False
+            assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        else:
+            outputs: Any = ReferenceEvaluator(model).run(None, {"X": np.array(7, np.float32)})
+            np.testing.assert_array_equal(outputs[0], [[7]])
+            assert result.success is True
+            assert plan.coverage_gaps == {}
+
+    def test_aggregate_shape_budget_applies_without_weights(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(onnx_scanner_module, "_ONNX_INFERRED_SHAPE_DIMENSION_LIMIT", 32, raising=False)
+        nodes = [helper.make_node("Identity", ["X"], [f"v{index}"]) for index in range(40)]
+        graph = helper.make_graph(
+            nodes,
+            "many_shapes",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 2])],
+            [helper.make_tensor_value_info("v39", TensorProto.FLOAT, [1, 2])],
+        )
+        path, model = self._save(graph, tmp_path)
+        plan, shapes = self._retained_shapes(model)
+        assert sum(map(len, shapes.values())) <= 32
+        assert "inferred_shape_dimension_limit" in plan.coverage_gaps
+        result = OnnxScanner().scan(str(path))
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+
+    @pytest.mark.parametrize("count", [3, 128])
+    @pytest.mark.parametrize("extent", [0, 1])
+    def test_concat_extent_growth_stays_representable(self, tmp_path: Path, count: int, extent: int) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        nodes = [
+            helper.make_node("Concat", ["X" if index == 0 else f"v{index - 1}"] * 2, [f"v{index}"], axis=0)
+            for index in range(count)
+        ]
+        graph = helper.make_graph(
+            nodes,
+            "concat_growth",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, [extent])],
+            [helper.make_tensor_value_info(f"v{count - 1}", TensorProto.FLOAT, [None])],
+        )
+        path, model = self._save(graph, tmp_path, full_check=False)
+        plan, shapes = self._retained_shapes(model)
+        assert all(-1 <= dimension <= (1 << 63) - 1 for shape in shapes.values() for dimension in shape)
+        if count == 3 or extent == 0:
+            outputs: Any = ReferenceEvaluator(model).run(None, {"X": np.ones(extent, np.float32)})
+            actual = outputs[0]
+            assert actual.shape == (extent * 2**count,)
+            assert shapes[f"v{count - 1}"] == actual.shape
+            assert plan.coverage_gaps == {}
+        else:
+            assert shapes[f"v{count - 1}"] == (-1,)
+        assert OnnxScanner().scan(str(path)).success is True
+
+    @pytest.mark.parametrize("symbolic", [False, True])
+    @pytest.mark.parametrize("extreme", [False, True])
+    def test_scan8_flatten_preserves_unknown_products(self, tmp_path: Path, symbolic: bool, extreme: bool) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        weights = np.zeros(64, np.float32)
+        if extreme:
+            weights[0] = 10
+        body = helper.make_graph(
+            [helper.make_node("Identity", ["W"], ["emit"])],
+            "emit_vector",
+            [helper.make_tensor_value_info("element", TensorProto.FLOAT, [])],
+            [helper.make_tensor_value_info("emit", TensorProto.FLOAT, [64])],
+            [onnx.numpy_helper.from_array(weights, "W")],
+        )
+        post = [
+            helper.make_node("Flatten", ["stack"], ["flat"], axis=2),
+            helper.make_node("Squeeze", ["flat"], ["weights"]),
+            helper.make_node("MatMul", ["X", "weights"], ["Y"]),
+        ]
+        graph = helper.make_graph(
+            [helper.make_node("Scan", ["", "seq"], ["stack"], body=body, num_scan_inputs=1), *post],
+            "unknown_product",
+            [
+                helper.make_tensor_value_info("seq", TensorProto.FLOAT, [None, None] if symbolic else [2, 3]),
+                helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, None] if symbolic else [1, 6]),
+            ],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 64])],
+        )
+        path, _model = self._save(graph, tmp_path, opset=8)
+        emitted_outputs: Any = ReferenceEvaluator(body, opsets={"": 8}).run(None, {"element": np.array(0, np.float32)})
+        emitted = emitted_outputs[0]
+        stacked = np.stack([np.stack([emitted] * 3)] * 2)
+        runtime_graph = helper.make_graph(
+            post,
+            "post_scan",
+            [
+                helper.make_tensor_value_info("stack", TensorProto.FLOAT, [2, 3, 64]),
+                helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 6]),
+            ],
+            [
+                helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 64]),
+                helper.make_tensor_value_info("weights", TensorProto.FLOAT, [6, 64]),
+            ],
+        )
+        runtime_model = helper.make_model(runtime_graph, opset_imports=[helper.make_opsetid("", 8)], ir_version=8)
+        onnx.checker.check_model(runtime_model, full_check=True)
+        actual_outputs: Any = ReferenceEvaluator(runtime_model).run(
+            None, {"stack": stacked, "X": np.ones((1, 6), np.float32)}
+        )
+        actual = actual_outputs[1]
+        assert actual.shape == (6, 64)
+        detector = WeightDistributionScanner()
+        anomalies = detector._analyze_layer_weights(
+            "actual", actual, detector._analyze_architecture_properties({"actual": actual})
+        )
+        assert bool(anomalies) is extreme
+        result = OnnxScanner().scan(str(path))
+        # Batched Scan-8 views are not materialized here even with concrete input
+        # dimensions. Preserve that baseline coverage gap for both weight controls.
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+
+    @pytest.mark.parametrize(
+        "shape, expected",
+        [([2, 3, 4], (24, 1)), ([0, 3, 4], (0, 1)), ([1 << 62, 4], (-1, 1)), ([1 << 62, 4, 0], (0, 1))],
+    )
+    def test_flatten_products_preserve_empty_and_bounded_extents(
+        self, tmp_path: Path, shape: list[int], expected: tuple[int, ...]
+    ) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        graph = helper.make_graph(
+            [helper.make_node("Flatten", ["X"], ["Y"], axis=len(shape))],
+            "bounded_product",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, shape)],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [None, 1])],
+        )
+        path, model = self._save(graph, tmp_path, full_check=max(shape) < 100)
+        plan, shapes = self._retained_shapes(model)
+        assert shapes["Y"] == expected
+        assert plan.coverage_gaps == {}
+        if max(shape) < 100:
+            values = np.ones(shape, np.float32)
+            # ONNX's reference Flatten uses reshape(0, -1), which NumPy rejects.
+            # The schema's explicit product dimensions still define the empty view.
+            outputs: Any = (
+                [values.reshape(expected)] if 0 in shape else ReferenceEvaluator(model).run(None, {"X": values})
+            )
+            actual = outputs[0]
+            assert actual.shape == expected
+        assert OnnxScanner().scan(str(path)).success is True
