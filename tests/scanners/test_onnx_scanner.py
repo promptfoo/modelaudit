@@ -28588,3 +28588,318 @@ class TestOnnxFinalShapeReviewRegressions:
         assert 0 < visits <= onnx_scanner_module._ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
         assert plan.specs
         assert not WeightDistributionScanner()._analyze_onnx_weight_specs(plan.specs)
+
+
+class TestOnnxSiblingClosureReviewRegressions:
+    _value = staticmethod(TestOnnxRecurrenceReviewRegressions._value)
+    _tensor = staticmethod(TestOnnxRecurrenceReviewRegressions._tensor)
+    _save = staticmethod(TestOnnxOutputInvarianceReviewRegressions._save)
+
+    @pytest.mark.parametrize("sources", [1, 40])
+    @pytest.mark.parametrize("matrix_source", [False, True])
+    @pytest.mark.parametrize("hops", [1, 2])
+    @pytest.mark.parametrize("iterations", [1, 2, 3])
+    def test_deferred_coverage_follows_sibling_state_transfers(
+        self, tmp_path: Path, sources: int, matrix_source: bool, hops: int, iterations: int
+    ) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        weights = np.zeros((64, 64) if matrix_source else (32,), np.float32)
+        if matrix_source:
+            weights[:5, 0] = 10
+        body_inputs = [
+            helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
+            helper.make_tensor_value_info("condition", TensorProto.BOOL, []),
+            self._value("a", None),
+            self._value("b", None),
+        ]
+        body_outputs = [
+            helper.make_tensor_value_info("condition", TensorProto.BOOL, []),
+            self._value("next_a", None),
+            self._value("next_b", None),
+        ]
+        body_nodes = [
+            helper.make_node("PRelu", ["X", "a"], ["used"]),
+            helper.make_node("Concat", ["b", "b"], ["next_a"], axis=0),
+        ]
+        state_names = ["initial_a", "initial_b"]
+        state_outputs = ["final_a", "final_b"]
+        if hops == 2:
+            body_inputs.append(self._value("c", None))
+            body_outputs.append(self._value("next_c", None))
+            body_nodes.extend(
+                [helper.make_node("Identity", ["c"], ["next_b"]), helper.make_node("Identity", ["zero"], ["next_c"])]
+            )
+            state_names.append("summed")
+            state_outputs.append("final_c")
+        else:
+            state_names[1] = "summed"
+            body_nodes.append(helper.make_node("Identity", ["zero"], ["next_b"]))
+        body_outputs.append(self._value("used", [128, 64]))
+        body = helper.make_graph(body_nodes, "sibling_transfer", body_inputs, body_outputs)
+        graph = helper.make_graph(
+            [
+                helper.make_node("Sum", [f"W{i}" for i in range(sources)], ["summed"]),
+                helper.make_node("Loop", ["count", "start", *state_names], [*state_outputs, "uses"], body=body),
+            ],
+            "deferred_sibling_weight",
+            [self._value("X", [128, 64])],
+            [self._value("uses", [iterations, 128, 64])],
+            [self._tensor(f"W{i}", weights / sources) for i in range(sources)]
+            + [
+                self._tensor("initial_a", np.zeros(64, np.float32)),
+                self._tensor("initial_b", np.zeros(32, np.float32)),
+                self._tensor("zero", np.zeros(32, np.float32)),
+                self._tensor("count", iterations, np.int64),
+                self._tensor("start", True, np.bool_),
+            ],
+        )
+        path, model = self._save(graph, tmp_path)
+        actual: Any = ReferenceEvaluator(model).run(None, {"X": -np.ones((128, 64), np.float32)})
+        observed = actual[0].reshape(iterations, 128, 64)[:, 0, 0]
+        expected = np.zeros(iterations, np.float32)
+        matrix_consumed = matrix_source and iterations > hops
+        if matrix_consumed:
+            expected[hops] = -10
+        np.testing.assert_allclose(observed, expected)
+        result = OnnxScanner().scan(str(path))
+        if matrix_consumed:
+            assert result.metadata.get("anomalies_found") or result.success is False
+            if result.success is False:
+                assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        else:
+            assert result.success is True
+            assert not result.metadata.get("anomalies_found")
+
+    @pytest.mark.parametrize("overridable", [False, True])
+    @pytest.mark.parametrize("growing", [False, True])
+    @pytest.mark.parametrize("iterations", [1, 2, 3])
+    def test_scalar_rank_growth_accumulates_across_iterations(
+        self, tmp_path: Path, overridable: bool, growing: bool, iterations: int
+    ) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        nodes = [helper.make_node("PRelu", ["X", "state"], ["activation"])]
+        if growing:
+            nodes.extend(
+                [
+                    helper.make_node("Unsqueeze", ["state", "axes"], ["up"]),
+                    helper.make_node("Concat", ["up"] * 8, ["next"], axis=0),
+                ]
+            )
+        else:
+            nodes.append(helper.make_node("Identity", ["state"], ["next"]))
+        body = helper.make_graph(
+            nodes,
+            "scalar_rank_growth",
+            [
+                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
+                helper.make_tensor_value_info("condition", TensorProto.BOOL, []),
+                self._value("state", None),
+            ],
+            [helper.make_tensor_value_info("condition", TensorProto.BOOL, []), self._value("next", None)],
+        )
+        graph = helper.make_graph(
+            [
+                helper.make_node("Expand", ["W", "shape"], ["initial"]),
+                helper.make_node("Loop", ["count", "start", "initial"], ["final"], body=body),
+            ],
+            "cumulative_scalar_rank",
+            [self._value("X", [8, 8])]
+            + ([helper.make_tensor_value_info("count", TensorProto.INT64, [])] if overridable else []),
+            [self._value("final", [8] * iterations if growing else [])],
+            [
+                self._tensor("W", np.nan),
+                self._tensor("shape", [], np.int64),
+                self._tensor("axes", [0], np.int64),
+                self._tensor("count", iterations, np.int64),
+                self._tensor("start", True, np.bool_),
+            ],
+        )
+        path, model = self._save(graph, tmp_path)
+        feed = {"X": -np.ones((8, 8), np.float32)}
+        if overridable:
+            feed["count"] = np.array(iterations, np.int64)
+        actual: Any = ReferenceEvaluator(model).run(None, feed)
+        assert actual[0].shape == ((8,) * iterations if growing else ())
+        assert np.isnan(actual[0]).all()
+        result = OnnxScanner().scan(str(path))
+        if growing and (overridable or iterations >= 3):
+            assert result.metadata.get("anomalies_found") or result.success is False
+            if result.success is False:
+                assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        else:
+            assert result.success is True
+
+    @pytest.mark.parametrize("iterations", [1, 2, 3])
+    def test_changed_scalar_state_does_not_keep_its_first_iteration_shape(
+        self, tmp_path: Path, iterations: int
+    ) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        body = helper.make_graph(
+            [helper.make_node("Unsqueeze", ["state", "axes"], ["next"])],
+            "changing_scalar_shape",
+            [
+                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
+                helper.make_tensor_value_info("condition", TensorProto.BOOL, []),
+                self._value("state", None),
+            ],
+            [helper.make_tensor_value_info("condition", TensorProto.BOOL, []), self._value("next", None)],
+        )
+        weight_shape = [1] * (iterations - 1) + [64]
+        graph = helper.make_graph(
+            [
+                helper.make_node("Loop", ["count", "start", "W"], ["final"], body=body),
+                helper.make_node("Expand", ["final", "shape"], ["weight"]),
+                helper.make_node("MatMul", ["X", "weight"], ["Y"]),
+            ],
+            "final_rank_after_recurrence",
+            [self._value("X", [1, 64] if iterations == 1 else [1, 1])],
+            [self._value("Y", [1] if iterations == 1 else weight_shape), self._value("weight", weight_shape)],
+            [
+                self._tensor("W", np.nan),
+                self._tensor("axes", [0], np.int64),
+                self._tensor("shape", [64], np.int64),
+                self._tensor("count", iterations, np.int64),
+                self._tensor("start", True, np.bool_),
+            ],
+        )
+        path, model = self._save(graph, tmp_path)
+        actual: Any = ReferenceEvaluator(model).run(
+            None, {"X": np.ones((1, 64) if iterations == 1 else (1, 1), np.float32)}
+        )
+        assert actual[1].shape == tuple(weight_shape)
+        assert np.isnan(actual[1]).all()
+        result = OnnxScanner().scan(str(path))
+        if iterations > 1:
+            assert result.metadata.get("anomalies_found") or result.success is False
+            if result.success is False:
+                assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        else:
+            assert result.success is True
+
+    @pytest.mark.parametrize("transposes", [1, 31])
+    @pytest.mark.parametrize("extreme", [False, True])
+    def test_scan_slice_transform_limit_never_retains_the_unsliced_view(
+        self, tmp_path: Path, transposes: int, extreme: bool
+    ) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        weights = np.zeros((64, 64), np.float32)
+        if extreme:
+            weights[:5, 0] = 10
+        nodes = [
+            helper.make_node("Expand", ["W", "shape"], ["expanded"]),
+            helper.make_node("Reshape", ["expanded", "shape"], ["p0"]),
+        ]
+        for index in range(1, transposes + 1):
+            nodes.append(helper.make_node("Transpose", [f"p{index - 1}"], [f"p{index}"], perm=[0, 2, 1]))
+        body = helper.make_graph(
+            [helper.make_node("Identity", ["element"], ["out"])],
+            "singleton_slice",
+            [self._value("element", [64, 64])],
+            [self._value("out", [64, 64])],
+        )
+        nodes.extend(
+            [
+                helper.make_node(
+                    "Scan",
+                    [f"p{transposes}"],
+                    ["weight"],
+                    body=body,
+                    num_scan_inputs=1,
+                    scan_input_axes=[0],
+                    scan_output_axes=[2],
+                ),
+                helper.make_node("MatMul", ["X", "weight"], ["Y"]),
+            ]
+        )
+        graph = helper.make_graph(
+            nodes,
+            "bounded_slice_view",
+            [self._value("X", [1, 64])],
+            [self._value("Y", [64, 1, 1])],
+            [self._tensor("W", weights), self._tensor("shape", [1, 64, 64], np.int64)],
+            value_info=[self._value("expanded", [1, 64, 64])],
+        )
+        path, model = self._save(graph, tmp_path)
+        # ReferenceEvaluator does not support a nonzero Scan output axis.
+        actual_body: Any = ReferenceEvaluator(body, opsets={"": 18}).run(None, {"element": weights.T})
+        actual = np.stack([actual_body[0]], axis=2)
+        np.testing.assert_array_equal(actual, weights.T[:, :, None])
+        expected_anomalies = WeightDistributionScanner()._analyze_tensor_weight_extremes(
+            "actual", actual, output_axes=(0, 2)
+        )
+        assert bool(expected_anomalies) is extreme
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        result = OnnxScanner().scan(str(path))
+        if transposes == 31:
+            assert plan.specs == []
+            assert result.success is False
+            assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        else:
+            assert result.success is True
+            assert bool(result.metadata.get("anomalies_found")) is extreme
+
+    @pytest.mark.parametrize("overridable", [False, True])
+    @pytest.mark.parametrize("matrix_output", [False, True])
+    @pytest.mark.parametrize("iterations", [2, 3])
+    def test_sibling_transfer_preserves_proven_vector_consumers(
+        self, tmp_path: Path, overridable: bool, matrix_output: bool, iterations: int
+    ) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        shape = [64, 64] if matrix_output else [4096]
+        input_shape = [64, 64] if matrix_output else [1, 4096]
+        body = helper.make_graph(
+            [
+                helper.make_node("PRelu", ["X", "a"], ["used"]),
+                helper.make_node("Reshape", ["b", "shape"], ["next_a"]),
+                helper.make_node("Identity", ["b"], ["next_b"]),
+            ],
+            "vector_sibling_transfer",
+            [
+                helper.make_tensor_value_info("iteration", TensorProto.INT64, []),
+                helper.make_tensor_value_info("condition", TensorProto.BOOL, []),
+                self._value("a", None),
+                self._value("b", None),
+            ],
+            [
+                helper.make_tensor_value_info("condition", TensorProto.BOOL, []),
+                self._value("next_a", None),
+                self._value("next_b", None),
+                self._value("used", input_shape),
+            ],
+        )
+        graph = helper.make_graph(
+            [helper.make_node("Loop", ["count", "start", "A", "B"], ["final_a", "final_b", "uses"], body=body)],
+            "bounded_vector_sibling",
+            [self._value("X", input_shape)]
+            + ([helper.make_tensor_value_info("count", TensorProto.INT64, [])] if overridable else []),
+            [self._value("uses", [iterations, *input_shape])],
+            [
+                self._tensor("A", np.zeros(input_shape[-1], np.float32)),
+                self._tensor("B", np.full((64, 64), np.nan, np.float32)),
+                self._tensor("shape", shape, np.int64),
+                self._tensor("count", iterations, np.int64),
+                self._tensor("start", True, np.bool_),
+            ],
+        )
+        path, model = self._save(graph, tmp_path)
+        feed = {"X": -np.ones(input_shape, np.float32)}
+        if overridable:
+            feed["count"] = np.array(iterations, np.int64)
+        actual: Any = ReferenceEvaluator(model).run(None, feed)
+        # ReferenceEvaluator concatenates Loop scan outputs; restore the schema's iteration axis.
+        stacked = actual[0].reshape(iterations, *input_shape)
+        np.testing.assert_array_equal(stacked[0], np.zeros(input_shape, np.float32))
+        assert np.isnan(stacked[1:]).all()
+        result = OnnxScanner().scan(str(path))
+        if matrix_output:
+            assert result.metadata.get("anomalies_found") or result.success is False
+            if result.success is False:
+                assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        else:
+            assert result.success is True
+            assert not result.metadata.get("anomalies_found")
