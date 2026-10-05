@@ -1808,6 +1808,8 @@ def _onnx_potential_weight_input(
     is_registered_standard_operator: bool = True,
 ) -> bool:
     """Return whether initializer lineage at this input needs weight coverage."""
+    if is_model_local_function:
+        return False
     domain = getattr(node, "domain", "")
     if domain not in _STANDARD_NEURAL_NETWORK_DOMAINS:
         # ONNX-ML operators store learned parameters in attributes; tensor inputs are data.
@@ -2233,12 +2235,13 @@ def _build_onnx_weight_analysis_plan(
                 inherited[captured_name] = constants[captured_name]
         return inherited, bound_inputs
 
-    def builtin_operator(node: Any, op_type: str) -> bool:
+    def builtin_operator(node: Any, op_type: str | None = None) -> bool:
+        # Overloads select an exact local function; an unmatched overload still
+        # uses the registered builtin schema.
         return (
             getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
-            and node.op_type == op_type
-            and not getattr(node, "overload", "")
-            and (str(getattr(node, "domain", "")), op_type, "") not in functions
+            and (op_type is None or node.op_type == op_type)
+            and _operator_identifier(node) not in functions
         )
 
     def resolved_constant_node_tensor(
@@ -3192,7 +3195,7 @@ def _build_onnx_weight_analysis_plan(
 
     def reentry_shape_preserving_unary_operator(node: Any, inputs: Sequence[str]) -> bool:
         return (
-            getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
+            builtin_operator(node)
             and node.op_type in (_SHAPE_PRESERVING_UNARY_RANK_OPERATORS | {"Cast", "Identity"})
             and (len(inputs) == 1 or node.op_type in {"Clip", "Dropout"})
         )
@@ -5422,6 +5425,7 @@ def _build_onnx_weight_analysis_plan(
         node: Any,
         constants: dict[str, Any],
         *,
+        value_shapes: dict[str, tuple[int, ...]],
         cast_target_data_type: int | None = None,
         resolve_attribute: Callable[[Any], Any | None] | None = None,
     ) -> _OnnxWeightLineage:
@@ -5575,7 +5579,7 @@ def _build_onnx_weight_analysis_plan(
             output_shape = expanded_shape
             transform = _OnnxWeightTransform("Expand", output_shape)
         elif node.op_type == "Gather":
-            index_shape = constant_initializer_shape(constants, node.input[1]) if len(node.input) >= 2 else None
+            index_shape = value_shapes.get(str(node.input[1])) if len(node.input) >= 2 else None
             gather_axis = _onnx_gather_axis(node, len(lineage.shape))
             if gather_axis is None or index_shape is None:
                 return _OnnxWeightLineage(
@@ -5597,7 +5601,7 @@ def _build_onnx_weight_analysis_plan(
             output_shape = gather_shape
             transform = _OnnxWeightTransform("Reshape", output_shape)
         elif node.op_type == "GatherND":
-            index_shape = constant_initializer_shape(constants, node.input[1]) if len(node.input) >= 2 else None
+            index_shape = value_shapes.get(str(node.input[1])) if len(node.input) >= 2 else None
             if not index_shape:
                 return _OnnxWeightLineage(
                     initializer_index=lineage.initializer_index,
@@ -5771,6 +5775,7 @@ def _build_onnx_weight_analysis_plan(
         node: Any,
         constants: dict[str, Any],
         *,
+        value_shapes: dict[str, tuple[int, ...]],
         cast_target_data_type: int | None = None,
         resolve_attribute: Callable[[Any], Any | None] | None = None,
     ) -> bool:
@@ -5782,6 +5787,7 @@ def _build_onnx_weight_analysis_plan(
                     lineage,
                     node,
                     constants,
+                    value_shapes=value_shapes,
                     cast_target_data_type=cast_target_data_type,
                     resolve_attribute=resolve_attribute,
                 )
@@ -5794,6 +5800,7 @@ def _build_onnx_weight_analysis_plan(
         node: Any,
         constants: dict[str, Any],
         *,
+        value_shapes: dict[str, tuple[int, ...]],
         cast_target_data_type: int | None = None,
         resolve_attribute: Callable[[Any], Any | None] | None = None,
     ) -> bool:
@@ -5804,6 +5811,7 @@ def _build_onnx_weight_analysis_plan(
                 lineage,
                 node,
                 constants,
+                value_shapes=value_shapes,
                 cast_target_data_type=cast_target_data_type,
                 resolve_attribute=resolve_attribute,
             )
@@ -5817,6 +5825,7 @@ def _build_onnx_weight_analysis_plan(
         constants: dict[str, Any],
         predicate: Callable[[_OnnxWeightLineage], bool],
         *,
+        value_shapes: dict[str, tuple[int, ...]],
         cast_target_data_type: int | None = None,
         resolve_attribute: Callable[[Any], Any | None] | None = None,
     ) -> _OnnxWeightLineageGapSummary:
@@ -5828,6 +5837,7 @@ def _build_onnx_weight_analysis_plan(
                     lineage,
                     node,
                     constants,
+                    value_shapes=value_shapes,
                     cast_target_data_type=cast_target_data_type,
                     resolve_attribute=resolve_attribute,
                 )
@@ -5842,6 +5852,7 @@ def _build_onnx_weight_analysis_plan(
         node: Any,
         constants: dict[str, Any],
         *,
+        value_shapes: dict[str, tuple[int, ...]],
         cast_target_data_type: int | None = None,
         resolve_attribute: Callable[[Any], Any | None] | None = None,
     ) -> _OnnxWeightLineageGapSummary:
@@ -5850,6 +5861,7 @@ def _build_onnx_weight_analysis_plan(
             node,
             constants,
             lineage_could_be_weight,
+            value_shapes=value_shapes,
             cast_target_data_type=cast_target_data_type,
             resolve_attribute=resolve_attribute,
         )
@@ -5859,6 +5871,7 @@ def _build_onnx_weight_analysis_plan(
         node: Any,
         constants: dict[str, Any],
         *,
+        value_shapes: dict[str, tuple[int, ...]],
         cast_target_data_type: int | None = None,
         resolve_attribute: Callable[[Any], Any | None] | None = None,
     ) -> _OnnxWeightLineageGapSummary:
@@ -5867,6 +5880,7 @@ def _build_onnx_weight_analysis_plan(
             node,
             constants,
             lambda lineage: lineage.unresolved_reason != "shape_control_lineage",
+            value_shapes=value_shapes,
             cast_target_data_type=cast_target_data_type,
             resolve_attribute=resolve_attribute,
         )
@@ -5876,6 +5890,7 @@ def _build_onnx_weight_analysis_plan(
         node: Any,
         constants: dict[str, Any],
         *,
+        value_shapes: dict[str, tuple[int, ...]],
         cast_target_data_type: int | None = None,
         resolve_attribute: Callable[[Any], Any | None] | None = None,
     ) -> _OnnxWeightLineageGapSummary:
@@ -5884,6 +5899,7 @@ def _build_onnx_weight_analysis_plan(
             node,
             constants,
             lineage_could_be_weight_after_rank_increase,
+            value_shapes=value_shapes,
             cast_target_data_type=cast_target_data_type,
             resolve_attribute=resolve_attribute,
         )
@@ -5894,6 +5910,7 @@ def _build_onnx_weight_analysis_plan(
         constants: dict[str, Any],
         count: int,
         *,
+        value_shapes: dict[str, tuple[int, ...]],
         resolve_attribute: Callable[[Any], Any | None] | None = None,
     ) -> _OnnxWeightLineageGapSummary:
         if count <= 0:
@@ -5904,6 +5921,7 @@ def _build_onnx_weight_analysis_plan(
             summary,
             node,
             constants,
+            value_shapes=value_shapes,
             resolve_attribute=resolve_attribute,
         )
         if transformed_summary.lineages or transformed_summary.truncated:
@@ -6718,17 +6736,15 @@ def _build_onnx_weight_analysis_plan(
         for local_node_index, node in enumerate(getattr(current_graph, "node", ())):
             current_node_index = node_counter
             node_counter += 1
-            function_key = (
-                str(getattr(node, "domain", "")),
-                str(getattr(node, "op_type", "")),
-                str(getattr(node, "overload", "")),
-            )
+            function_key = _operator_identifier(node)
             is_model_local_function = function_key in functions
-            is_registered_standard_operator = is_model_local_function or has_registered_standard_operator(
+            is_builtin_standard_operator = not is_model_local_function and has_registered_standard_operator(
                 node,
                 opset_versions,
             )
-            supported_transform = getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS and node.op_type in {
+            is_registered_standard_operator = is_model_local_function or is_builtin_standard_operator
+            is_builtin_neural_operator = is_builtin_standard_operator and builtin_operator(node)
+            supported_transform = builtin_operator(node) and node.op_type in {
                 "Cast",
                 "Expand",
                 "Flatten",
@@ -6739,11 +6755,7 @@ def _build_onnx_weight_analysis_plan(
                 "Transpose",
                 "Unsqueeze",
             }
-            rank_gap_promoting_operator = (
-                getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
-                and not is_model_local_function
-                and is_rank_gap_promoting_operator(node)
-            )
+            rank_gap_promoting_operator = builtin_operator(node) and is_rank_gap_promoting_operator(node)
             all_input_lineages: dict[int, _OnnxWeightLineage] = {}
             all_input_lineage_limit_gap_count = 0
             all_input_non_shape_lineage_limit_gap_count = 0
@@ -6779,7 +6791,8 @@ def _build_onnx_weight_analysis_plan(
                 input_index
                 for input_index, input_name in enumerate(node.input)
                 for lineage in value_lineages.get(str(input_name), {}).values()
-                if lineage.unresolved_reason is None
+                if is_builtin_standard_operator
+                and lineage.unresolved_reason is None
                 and _onnx_weight_output_axes(node, input_index, len(lineage.shape or ()))[0] is not None
             }
             lineage_input_indexes = {
@@ -6796,8 +6809,7 @@ def _build_onnx_weight_analysis_plan(
             }
             batch_normalization_activation_parameter_lineages: set[int] = set()
             if (
-                is_registered_standard_operator
-                and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
+                is_builtin_neural_operator
                 and node.op_type == "BatchNormalization"
                 and input_names
                 and (
@@ -6814,7 +6826,7 @@ def _build_onnx_weight_analysis_plan(
                 for parameter_name in input_names[1:5]:
                     batch_normalization_activation_parameter_lineages.update(value_lineages.get(parameter_name, {}))
             all_lineage_inputs_are_activation_contraction = (
-                getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
+                is_builtin_neural_operator
                 and node.op_type in {"Einsum", "MatMul"}
                 and len(lineage_input_indexes) >= 2
                 and lineage_input_indexes == dynamic_activation_input_indexes
@@ -6852,35 +6864,22 @@ def _build_onnx_weight_analysis_plan(
                         input_rank_promotable_lineage_limit_gap_summary
                     )
                 is_array_feature_selector = (
-                    is_registered_standard_operator
+                    is_builtin_standard_operator
                     and getattr(node, "domain", "") == "ai.onnx.ml"
                     and node.op_type == "ArrayFeatureExtractor"
                     and input_index == 1
                 )
-                is_non_data_standard_input = (
-                    is_registered_standard_operator
-                    and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
-                    and (
-                        (node.op_type == "Clip" and input_index > 0)
-                        or (
-                            not is_model_local_function
-                            and node.op_type in _RECURRENT_WEIGHT_OPERATORS
-                            and input_index == 4
-                        )
-                    )
+                is_non_data_standard_input = is_builtin_neural_operator and (
+                    (node.op_type == "Clip" and input_index > 0)
+                    or (node.op_type in _RECURRENT_WEIGHT_OPERATORS and input_index == 4)
                 )
-                is_shape_control_input = (
-                    is_registered_standard_operator
-                    and not is_model_local_function
-                    and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
-                    and (
-                        (node.op_type in {"Expand", "Gather", "GatherElements", "GatherND"} and input_index == 1)
-                        or (node.op_type == "Reshape" and input_index == 1)
-                        or (node.op_type == "Slice" and input_index > 0)
-                        or (node.op_type in {"Squeeze", "Unsqueeze"} and input_index == 1)
-                        or (node.op_type == "Tile" and input_index == 1)
-                        or (node.op_type == "Where" and input_index == 0)
-                    )
+                is_shape_control_input = is_builtin_neural_operator and (
+                    (node.op_type in {"Expand", "Gather", "GatherElements", "GatherND"} and input_index == 1)
+                    or (node.op_type == "Reshape" and input_index == 1)
+                    or (node.op_type == "Slice" and input_index > 0)
+                    or (node.op_type in {"Squeeze", "Unsqueeze"} and input_index == 1)
+                    or (node.op_type == "Tile" and input_index == 1)
+                    or (node.op_type == "Where" and input_index == 0)
                 )
                 if is_shape_control_input:
                     # Shape and Size can later turn output dimensions into numeric data.
@@ -6963,9 +6962,7 @@ def _build_onnx_weight_analysis_plan(
                         )
                         all_input_lineage_limit_gap_names.add(input_name)
                 recurrent_initial_state_input = (
-                    is_registered_standard_operator
-                    and not is_model_local_function
-                    and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
+                    is_builtin_neural_operator
                     and node.op_type in _RECURRENT_WEIGHT_OPERATORS
                     and (input_index == 5 or (node.op_type == "LSTM" and input_index == 6))
                 )
@@ -6982,9 +6979,10 @@ def _build_onnx_weight_analysis_plan(
                     lineage.unresolved_reason == "dynamic_activation_lineage" for lineage in input_lineages.values()
                 )
                 activation_input_role = prior_layer_activation_input and (
-                    (is_registered_standard_operator and _onnx_opaque_activation_input_candidate(node, input_index))
+                    (is_builtin_standard_operator and _onnx_opaque_activation_input_candidate(node, input_index))
                     or (
-                        _onnx_activation_input_candidate(node, input_index)
+                        is_builtin_neural_operator
+                        and _onnx_activation_input_candidate(node, input_index)
                         and (opposite_resolved_weight_for_input or all_lineage_inputs_are_activation_contraction)
                     )
                 )
@@ -7018,8 +7016,7 @@ def _build_onnx_weight_analysis_plan(
                     recorded_input_lineage_limit_gap = True
                 for initializer_index, lineage in input_lineages.items():
                     invalid_clip_bound = (
-                        is_registered_standard_operator
-                        and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
+                        is_builtin_neural_operator
                         and node.op_type == "Clip"
                         and input_index > 0
                         and lineage.unresolved_reason != "shape_control_lineage"
@@ -7082,11 +7079,12 @@ def _build_onnx_weight_analysis_plan(
                         )
                         recognized_activation_input = prior_layer_activation and (
                             (
-                                is_registered_standard_operator
+                                is_builtin_standard_operator
                                 and _onnx_opaque_activation_input_candidate(node, input_index)
                             )
                             or (
-                                _onnx_activation_input_candidate(node, input_index)
+                                is_builtin_neural_operator
+                                and _onnx_activation_input_candidate(node, input_index)
                                 and (opposite_resolved_weight or all_lineage_inputs_are_activation_contraction)
                             )
                         )
@@ -7135,6 +7133,8 @@ def _build_onnx_weight_analysis_plan(
                                 input_index,
                             )
                         continue
+                    if is_model_local_function:
+                        continue  # The function body determines operand roles and weight axes.
                     output_axes, reason = _onnx_weight_output_axes(node, input_index, len(lineage.shape or ()))
                     if output_axes is None:
                         if reason != "non_weight_input" and potential_weight_input:
@@ -7197,21 +7197,30 @@ def _build_onnx_weight_analysis_plan(
                     list[bool],
                 ]
             ] = []
-            node_loop_may_repeat = node.op_type == "Loop" and loop_may_repeat_body(
-                node, constants, graph_input_names, attribute_bindings
+            node_loop_may_repeat = (
+                is_builtin_neural_operator
+                and node.op_type == "Loop"
+                and loop_may_repeat_body(node, constants, graph_input_names, attribute_bindings)
             )
-            node_scan_may_repeat = node.op_type == "Scan" and scan_may_repeat_body(
-                node,
-                constants,
-                graph_input_names,
-                known_value_shapes,
-                proven_value_ranks,
-                {name for name in graph_input_names & set(value_lineages) if name not in proven_value_ranks},
-                scan_input_axes=resolved_int_sequence_attribute(node, "scan_input_axes") or (),
-                scan_input_offset=scan_sequence_lens_input_offset(node, opset_versions),
-                num_scan_inputs=resolved_int_attribute(node, "num_scan_inputs", 1),
+            node_scan_may_repeat = (
+                is_builtin_neural_operator
+                and node.op_type == "Scan"
+                and scan_may_repeat_body(
+                    node,
+                    constants,
+                    graph_input_names,
+                    known_value_shapes,
+                    proven_value_ranks,
+                    {name for name in graph_input_names & set(value_lineages) if name not in proven_value_ranks},
+                    scan_input_axes=resolved_int_sequence_attribute(node, "scan_input_axes") or (),
+                    scan_input_offset=scan_sequence_lens_input_offset(node, opset_versions),
+                    num_scan_inputs=resolved_int_attribute(node, "num_scan_inputs", 1),
+                )
             )
             for attribute_position, attribute in enumerate(getattr(node, "attribute", ())):
+                if is_model_local_function:
+                    # Graph attributes are evaluated where the function body uses them.
+                    continue
                 resolved_attribute = resolve_attribute(attribute)
                 if resolved_attribute is None:
                     plan.record_coverage_gap("unresolved_function_attribute")
@@ -9335,7 +9344,7 @@ def _build_onnx_weight_analysis_plan(
                             fail_on_unbound_inputs=fail_on_unbound_inputs,
                         ),
                     )
-                    if is_registered_standard_operator and node.op_type in {"Loop", "Scan"}:
+                    if is_builtin_neural_operator and node.op_type in {"Loop", "Scan"}:
                         # Body consumers also see later carried values, even when
                         # the final state is unused by the parent graph.
                         for pair_index, (parent_input, graph_input) in enumerate(
@@ -9596,37 +9605,19 @@ def _build_onnx_weight_analysis_plan(
                 )
 
             # Keep dimension provenance: a later Cast can turn dimensions into weights.
-            is_shape_query = (
-                is_registered_standard_operator
-                and not is_model_local_function
-                and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
-                and node.op_type in {"Shape", "Size"}
-            )
+            is_shape_query = is_builtin_neural_operator and node.op_type in {"Shape", "Size"}
             output_lineages: dict[int, _OnnxWeightLineage] = {}
             broadcast_operator_promotes_deferred_gap = False
             elementwise_output_shape: tuple[int, ...] | None = None
             elementwise_output_rank: int | None = None
-            same_type_elementwise = (
-                is_registered_standard_operator
-                and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
-                and node.op_type in _SAME_TYPE_ELEMENTWISE_OPERATORS
-            )
+            same_type_elementwise = is_builtin_neural_operator and node.op_type in _SAME_TYPE_ELEMENTWISE_OPERATORS
             same_type_unary_elementwise = (
-                is_registered_standard_operator
-                and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
+                is_builtin_neural_operator
                 and node.op_type in _SAME_TYPE_UNARY_ELEMENTWISE_OPERATORS
                 and len(input_names) == 1
             )
-            clip_operator = (
-                is_registered_standard_operator
-                and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
-                and node.op_type == "Clip"
-            )
-            pow_operator = (
-                is_registered_standard_operator
-                and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
-                and node.op_type == "Pow"
-            )
+            clip_operator = is_builtin_neural_operator and node.op_type == "Clip"
+            pow_operator = is_builtin_neural_operator and node.op_type == "Pow"
             size_operator = is_shape_query and node.op_type == "Size" and not all_input_lineages
             elementwise_has_unknown_dynamic_rank = False
             elementwise_output_rank_proven = True
@@ -9689,6 +9680,7 @@ def _build_onnx_weight_analysis_plan(
                         lineage,
                         node,
                         constants,
+                        value_shapes=known_value_shapes,
                         cast_target_data_type=resolved_cast_target_data_type,
                         resolve_attribute=resolve_attribute,
                     )
@@ -9713,8 +9705,7 @@ def _build_onnx_weight_analysis_plan(
                 and not subgraph_results
             ):
                 prelu_data_is_activation = (
-                    is_registered_standard_operator
-                    and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
+                    is_builtin_neural_operator
                     and node.op_type == "PRelu"
                     and bool(input_names)
                     and (
@@ -9738,40 +9729,33 @@ def _build_onnx_weight_analysis_plan(
                 carries_dynamic_activation |= any(
                     lineage.unresolved_reason == "dynamic_activation_lineage" for lineage in all_input_lineages.values()
                 )
-                preserves_shape_control = (
-                    is_registered_standard_operator
-                    and not is_model_local_function
-                    and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
-                    and (
-                        same_type_elementwise
-                        or (
-                            same_type_unary_elementwise
-                            and node.op_type not in {"Hardmax", "LogSoftmax", "LpNormalization", "Softmax"}
-                        )
-                        or clip_operator
-                        or pow_operator
-                        or node.op_type
-                        in {
-                            "AveragePool",
-                            "BatchNormalization",
-                            "Concat",
-                            "Conv",
-                            "ConvTranspose",
-                            "GlobalAveragePool",
-                            "GlobalMaxPool",
-                            "MaxPool",
-                        }
-                        or node.op_type in {"Expand", "Gather", "GatherElements", "GatherND", "Slice", "Tile"}
+                preserves_shape_control = is_builtin_neural_operator and (
+                    same_type_elementwise
+                    or (
+                        same_type_unary_elementwise
+                        and node.op_type not in {"Hardmax", "LogSoftmax", "LpNormalization", "Softmax"}
                     )
+                    or clip_operator
+                    or pow_operator
+                    or node.op_type
+                    in {
+                        "AveragePool",
+                        "BatchNormalization",
+                        "Concat",
+                        "Conv",
+                        "ConvTranspose",
+                        "GlobalAveragePool",
+                        "GlobalMaxPool",
+                        "MaxPool",
+                    }
+                    or node.op_type in {"Expand", "Gather", "GatherElements", "GatherND", "Slice", "Tile"}
                 )
                 preserves_data_type = (
                     same_type_elementwise
                     or same_type_unary_elementwise
                     or clip_operator
                     or (
-                        is_registered_standard_operator
-                        and not is_model_local_function
-                        and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
+                        is_builtin_neural_operator
                         and node.op_type
                         in {"Concat", "Expand", "Gather", "GatherElements", "GatherND", "Slice", "Tile"}
                     )
@@ -9890,6 +9874,7 @@ def _build_onnx_weight_analysis_plan(
                     node,
                     constants,
                     transform_data_input_rank_promotable_lineage_limit_gap_count,
+                    value_shapes=known_value_shapes,
                     resolve_attribute=resolve_attribute,
                 )
                 rank_gap_promotion_known_not_weight = (
@@ -9959,6 +9944,7 @@ def _build_onnx_weight_analysis_plan(
                     cast_non_shape_gap_summary,
                     node,
                     constants,
+                    value_shapes=known_value_shapes,
                     cast_target_data_type=resolved_cast_target_data_type,
                     resolve_attribute=resolve_attribute,
                 ):
@@ -9967,6 +9953,7 @@ def _build_onnx_weight_analysis_plan(
                         cast_non_shape_gap_summary,
                         node,
                         constants,
+                        value_shapes=known_value_shapes,
                         cast_target_data_type=resolved_cast_target_data_type,
                         resolve_attribute=resolve_attribute,
                     )
@@ -10003,6 +9990,7 @@ def _build_onnx_weight_analysis_plan(
                     cast_output_non_shape_gap_summary,
                     node,
                     constants,
+                    value_shapes=known_value_shapes,
                     cast_target_data_type=resolved_cast_target_data_type,
                     resolve_attribute=resolve_attribute,
                 ):
@@ -10013,6 +10001,7 @@ def _build_onnx_weight_analysis_plan(
                             cast_output_non_shape_gap_summary,
                             node,
                             constants,
+                            value_shapes=known_value_shapes,
                             cast_target_data_type=resolved_cast_target_data_type,
                             resolve_attribute=resolve_attribute,
                         ),
@@ -10028,6 +10017,7 @@ def _build_onnx_weight_analysis_plan(
                             cast_output_non_shape_gap_summary,
                             node,
                             constants,
+                            value_shapes=known_value_shapes,
                             cast_target_data_type=resolved_cast_target_data_type,
                             resolve_attribute=resolve_attribute,
                         ),
@@ -10047,6 +10037,7 @@ def _build_onnx_weight_analysis_plan(
                     all_input_output_weight_lineage_gap_summary,
                     node,
                     constants,
+                    value_shapes=known_value_shapes,
                     cast_target_data_type=resolved_cast_target_data_type,
                     resolve_attribute=resolve_attribute,
                 )
@@ -10059,6 +10050,7 @@ def _build_onnx_weight_analysis_plan(
                         pre_promotion_weight_lineage_gap_summary,
                         node,
                         constants,
+                        value_shapes=known_value_shapes,
                         cast_target_data_type=resolved_cast_target_data_type,
                         resolve_attribute=resolve_attribute,
                     )
@@ -10074,6 +10066,7 @@ def _build_onnx_weight_analysis_plan(
                     all_input_non_shape_lineage_gap_summary,
                     node,
                     constants,
+                    value_shapes=known_value_shapes,
                     cast_target_data_type=resolved_cast_target_data_type,
                     resolve_attribute=resolve_attribute,
                 )
@@ -10082,6 +10075,7 @@ def _build_onnx_weight_analysis_plan(
                     all_input_output_rank_promotable_lineage_gap_summary,
                     node,
                     constants,
+                    value_shapes=known_value_shapes,
                     cast_target_data_type=resolved_cast_target_data_type,
                     resolve_attribute=resolve_attribute,
                 )
@@ -10343,11 +10337,7 @@ def _build_onnx_weight_analysis_plan(
                     len(state_input_shape) if state_input_shape is not None else known_value_ranks.get(state_input_name)
                 )
 
-            standard_control_flow_operator = (
-                is_registered_standard_operator
-                and not is_model_local_function
-                and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
-            )
+            standard_control_flow_operator = is_builtin_neural_operator
             scan_output_axes = (
                 resolved_int_sequence_attribute(node, "scan_output_axes") or ()
                 if standard_control_flow_operator and node.op_type == "Scan"
@@ -11080,16 +11070,12 @@ def _build_onnx_weight_analysis_plan(
 
             if elementwise_output_shape is None and elementwise_output_rank is None and input_names:
                 common_output_rank_operator = (
-                    is_registered_standard_operator
-                    and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
+                    is_builtin_neural_operator
                     and (node.op_type in _SHAPE_PRESERVING_UNARY_RANK_OPERATORS or node.op_type == "Slice")
                     and (len(input_names) == 1 or node.op_type in {"Clip", "Dropout", "Slice"})
                 )
                 rank_preserving_variadic_operator = (
-                    is_registered_standard_operator
-                    and not is_model_local_function
-                    and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
-                    and node.op_type in _RANK_PRESERVING_VARIADIC_OPERATORS
+                    is_builtin_neural_operator and node.op_type in _RANK_PRESERVING_VARIADIC_OPERATORS
                 )
                 if common_output_rank_operator:
                     if value_has_unknown_dynamic_rank(input_names[0]):
@@ -11290,9 +11276,7 @@ def _build_onnx_weight_analysis_plan(
                 per_output_lineages = dict(output_lineages)
                 if (
                     recurrent_state_lineages
-                    and is_registered_standard_operator
-                    and not is_model_local_function
-                    and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
+                    and is_builtin_neural_operator
                     and node.op_type in _RECURRENT_WEIGHT_OPERATORS
                 ):
                     for initializer_index in recurrent_state_lineages:

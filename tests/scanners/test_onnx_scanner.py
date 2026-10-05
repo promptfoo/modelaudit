@@ -30546,3 +30546,311 @@ class TestOnnxCanonicalControlConstants:
         result = OnnxScanner().scan(str(path))
         assert result.success is False
         assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+
+
+class TestOnnxBuiltinOperatorIdentity:
+    @staticmethod
+    def _model(
+        nodes: list[Any], inputs: list[Any], outputs: list[Any], initializers: list[Any], functions: list[Any]
+    ) -> Any:
+        return helper.make_model(
+            helper.make_graph(nodes, "operator_identity", inputs, outputs, initializers),
+            functions=functions,
+            opset_imports=[helper.make_opsetid("", 18), helper.make_opsetid("local", 1)],
+            ir_version=10,
+        )
+
+    @staticmethod
+    def _inlined_runtime(model: Any, feeds: dict[str, Any]) -> list[Any]:
+        from onnx.inliner import inline_local_functions
+        from onnx.reference import ReferenceEvaluator
+
+        onnx.checker.check_model(model, full_check=True)
+        # ReferenceEvaluator resolves default-domain builtins before local
+        # overloads. The official inliner applies exact function identity first.
+        inlined = inline_local_functions(model)
+        onnx.checker.check_model(inlined, full_check=True)
+        return list(ReferenceEvaluator(inlined).run(None, feeds))
+
+    @pytest.mark.parametrize(
+        "mode", ["ordinary", "unmatched", "different_overload", "different_domain", "matching", "matching_empty"]
+    )
+    def test_constant_tensor_uses_exact_function_identity(self, tmp_path: Path, mode: str) -> None:
+        value = TestOnnxRecurrenceReviewRegressions._value
+        weights = np.zeros((64, 64), np.float32)
+        weights[:5, 0] = 10
+        matched = mode in {"matching", "matching_empty"}
+        overload = "" if mode in {"ordinary", "matching_empty"} else "custom"
+        functions = []
+        if mode not in {"ordinary", "unmatched"}:
+            functions.append(
+                helper.make_function(
+                    "local" if mode == "different_domain" else "",
+                    "Constant",
+                    [],
+                    ["body_weight"],
+                    [
+                        helper.make_node(
+                            "Constant",
+                            [],
+                            ["body_weight"],
+                            value=onnx.numpy_helper.from_array(np.eye(64, dtype=np.float32)),
+                            overload="body_builtin",
+                        )
+                    ],
+                    [helper.make_opsetid("", 18)],
+                    overload="other" if mode == "different_overload" else overload,
+                )
+            )
+        model = self._model(
+            [
+                helper.make_node("Constant", [], ["W"], value=onnx.numpy_helper.from_array(weights), overload=overload),
+                helper.make_node("MatMul", ["X", "W"], ["Y"]),
+            ],
+            [value("X", [1, 64])],
+            [value("Y", [1, 64])],
+            [],
+            functions,
+        )
+        actual = self._inlined_runtime(model, {"X": np.ones((1, 64), np.float32)})[0]
+        expected = np.eye(64, dtype=np.float32) if matched else weights
+        np.testing.assert_array_equal(actual, np.ones((1, 64), np.float32) @ expected)
+        path = TestOnnxLoopControlProofs._save(model, tmp_path)
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        assert plan.coverage_gaps == {}
+        assert len(plan.specs) == 1
+        np.testing.assert_array_equal(plan.specs[0].weights, expected)
+        result = OnnxScanner().scan(str(path))
+        assert result.success is True
+        assert bool(result.metadata.get("anomalies_found")) is not matched
+        assert all(issue.severity == IssueSeverity.INFO for issue in result.issues)
+
+    @pytest.mark.parametrize("operator", ["Relu", "Abs", "Clip", "Add", "Pow", "Identity", "Dropout", "Slice"])
+    def test_function_matrix_output_does_not_inherit_builtin_vector_rank(self, tmp_path: Path, operator: str) -> None:
+        value = TestOnnxRecurrenceReviewRegressions._value
+        args, formals = ["W"], ["a"]
+        initializers = [
+            onnx.numpy_helper.from_array(np.ones(64, np.float32), name="W"),
+            onnx.numpy_helper.from_array(np.array([1, 1], np.int64), name="shape"),
+        ]
+        if operator in {"Add", "Pow"}:
+            args.append("rhs")
+            formals.append("unused")
+            initializers.append(onnx.numpy_helper.from_array(np.ones(64, np.float32), name="rhs"))
+        elif operator == "Slice":
+            args.extend(["starts", "ends"])
+            formals.extend(["unused_start", "unused_end"])
+            initializers.extend(
+                [
+                    onnx.numpy_helper.from_array(np.array([0], np.int64), name="starts"),
+                    onnx.numpy_helper.from_array(np.array([64], np.int64), name="ends"),
+                ]
+            )
+        function = helper.make_function(
+            "",
+            operator,
+            formals,
+            ["b"],
+            [
+                helper.make_node("NonZero", ["a"], ["nz"]),
+                helper.make_node("Transpose", ["nz"], ["tr"]),
+                helper.make_node("Cast", ["tr"], ["b"], to=TensorProto.FLOAT),
+            ],
+            [helper.make_opsetid("", 18)],
+            overload="custom",
+            value_info=[value("b", ["N", 1])],
+        )
+        model = self._model(
+            [
+                helper.make_node(operator, args, ["V"], overload="custom"),
+                helper.make_node("MatMul", ["X", "V"], ["Y0"]),
+                helper.make_node("Reshape", ["Y0", "shape"], ["Y"]),
+            ],
+            [value("X", [1, 64])],
+            [value("Y", [1, 1])],
+            initializers,
+            [function],
+        )
+        actual = self._inlined_runtime(model, {"X": np.ones((1, 64), np.float32)})[0]
+        np.testing.assert_array_equal(actual, np.array([[sum(range(64))]], np.float32))
+        path = TestOnnxLoopControlProofs._save(model, tmp_path)
+        result = OnnxScanner().scan(str(path))
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        assert plan.coverage_gaps["unresolved_initializer_lineage"] > 0
+        if operator == "Relu":
+            model.graph.node[0].overload = "other"
+            actual = self._inlined_runtime(model, {"X": np.ones((1, 64), np.float32)})[0]
+            np.testing.assert_array_equal(actual, np.array([[64]], np.float32))
+            path = TestOnnxLoopControlProofs._save(model, tmp_path)
+            result = OnnxScanner().scan(str(path))
+            assert result.success is True
+            assert not result.metadata.get("anomalies_found")
+
+    @pytest.mark.parametrize("matched", [False, True])
+    def test_expand_function_and_unmatched_builtin_keep_distinct_views(self, tmp_path: Path, matched: bool) -> None:
+        value = TestOnnxRecurrenceReviewRegressions._value
+        function = helper.make_function(
+            "",
+            "Expand",
+            ["data", "shape"],
+            ["out"],
+            [helper.make_node("Identity", ["data"], ["out"])],
+            [helper.make_opsetid("", 18)],
+            overload="identity",
+        )
+        model = self._model(
+            [
+                helper.make_node("Expand", ["W", "shape"], ["act"], overload="identity" if matched else "other"),
+                helper.make_node("MatMul", ["X", "act"], ["logits"]),
+                helper.make_node("ReduceSum", ["logits"], ["Y"], keepdims=0),
+            ],
+            [value("X", [1, 64])],
+            [value("Y", [])],
+            [
+                onnx.numpy_helper.from_array(np.zeros((64, 64), np.float32), name="W"),
+                onnx.numpy_helper.from_array(np.array([1, 64, 64], np.int64), name="shape"),
+            ],
+            [function],
+        )
+        np.testing.assert_array_equal(self._inlined_runtime(model, {"X": np.ones((1, 64), np.float32)})[0], 0)
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        assert plan.coverage_gaps == {}
+        assert len(plan.specs) == 1
+        np.testing.assert_array_equal(plan.specs[0].weights, np.zeros((64, 64), np.float32))
+        path = TestOnnxLoopControlProofs._save(model, tmp_path)
+        assert OnnxScanner().scan(str(path)).success is True
+
+    def test_local_matmul_does_not_analyze_unused_builtin_operand(self, tmp_path: Path) -> None:
+        value = TestOnnxRecurrenceReviewRegressions._value
+        unused = np.zeros((64, 64), np.float32)
+        unused[:5, 0] = 10
+        function = helper.make_function(
+            "",
+            "MatMul",
+            ["a", "b"],
+            ["out"],
+            [helper.make_node("Identity", ["a"], ["out"])],
+            [helper.make_opsetid("", 18)],
+            overload="first",
+        )
+        model = self._model(
+            [
+                helper.make_node("MatMul", ["W", "unused"], ["V"], overload="first"),
+                helper.make_node("MatMul", ["X", "V"], ["Y"]),
+            ],
+            [value("X", [1, 64])],
+            [value("Y", [1, 64])],
+            [
+                onnx.numpy_helper.from_array(np.zeros((64, 64), np.float32), name="W"),
+                onnx.numpy_helper.from_array(unused, name="unused"),
+            ],
+            [function],
+        )
+        np.testing.assert_array_equal(
+            self._inlined_runtime(model, {"X": np.ones((1, 64), np.float32)})[0], np.zeros((1, 64), np.float32)
+        )
+        path = TestOnnxLoopControlProofs._save(model, tmp_path)
+        result = OnnxScanner().scan(str(path))
+        assert result.success is True
+        assert not result.metadata.get("anomalies_found")
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        assert len(plan.specs) == 1
+        assert plan.coverage_gaps == {}
+
+    @pytest.mark.parametrize("axis", [0, 1])
+    @pytest.mark.parametrize("capped", [False, True])
+    def test_gathernd_uses_scan_body_indices_shape(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, axis: int, capped: bool
+    ) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        value = TestOnnxRecurrenceReviewRegressions._value
+        weights = np.zeros((3, 64, 64), np.float32)
+        weights[0, :, 0] = 1e6
+        indices = np.array([[0, 1, 2]], np.int64) if axis == 1 else np.array([[0], [1], [2]], np.int64)
+        initializers = [
+            onnx.numpy_helper.from_array(weights, name="W"),
+            onnx.numpy_helper.from_array(indices, name="indices"),
+        ]
+        prefix = []
+        data = "W"
+        if capped:
+            # One retained scalar evicts both contributing matrices. The same
+            # bound shape must reach summary transforms as direct lineages.
+            monkeypatch.setattr(onnx_scanner_module, "_ONNX_WEIGHT_LINEAGES_PER_VALUE_LIMIT", 1)
+            initializers.insert(0, onnx.numpy_helper.from_array(np.array(0, np.float32), name="zero"))
+            initializers.append(onnx.numpy_helper.from_array(np.zeros_like(weights), name="other"))
+            prefix = [helper.make_node("Sum", ["zero", "W", "other"], ["sum"])]
+            data = "sum"
+        body = helper.make_graph(
+            [
+                helper.make_node("GatherND", [data, "index"], ["slice"]),
+                helper.make_node("MatMul", ["X", "slice"], ["z"]),
+            ],
+            "gather_scan_body",
+            [value("index", [1], TensorProto.INT64)],
+            [value("z", [1, 64]), value("slice", [64, 64])],
+        )
+        model = self._model(
+            [
+                *prefix,
+                helper.make_node(
+                    "Scan", ["indices"], ["Y", "slices"], body=body, num_scan_inputs=1, scan_input_axes=[axis]
+                ),
+            ],
+            [value("X", [1, 64])],
+            [value("Y", [3, 1, 64]), value("slices", [3, 64, 64])],
+            initializers,
+            [],
+        )
+        onnx.checker.check_model(model, full_check=True)
+        feeds = {"X": np.ones((1, 64), np.float32)}
+        for index in range(3):
+            # ReferenceEvaluator does not implement nonzero Scan input axes;
+            # execute its body with the actual per-iteration input in both cases.
+            actual: Any = ReferenceEvaluator(body, opsets={"": 18}).run(
+                None,
+                {
+                    **feeds,
+                    data: weights,
+                    "index": np.take(indices, index, axis=axis),
+                },
+            )
+            np.testing.assert_array_equal(actual[1], weights[index])
+        if axis == 0:
+            actual = ReferenceEvaluator(model).run(None, feeds)
+            np.testing.assert_array_equal(actual[1], weights)
+        path = TestOnnxLoopControlProofs._save(model, tmp_path)
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        assert plan.coverage_gaps
+        if capped:
+            assert plan.coverage_gaps.get("lineages_per_value_limit", 0) > 0
+        result = OnnxScanner().scan(str(path))
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+
+    @pytest.mark.parametrize("matrix", [False, True])
+    def test_gathernd_static_indices_distinguish_matrix_from_vector(self, tmp_path: Path, matrix: bool) -> None:
+        value = TestOnnxRecurrenceReviewRegressions._value
+        weights = np.arange(3 * 4 * 4, dtype=np.float32).reshape(3, 4, 4)
+        indices = np.array([0], np.int64) if matrix else np.array([[0, 0, 0]], np.int64)
+        model = self._model(
+            [
+                helper.make_node("GatherND", ["W", "indices"], ["slice"]),
+                helper.make_node("MatMul", ["X", "slice"], ["Y"]),
+            ],
+            [value("X", [1, 4] if matrix else [1, 1])],
+            [value("Y", [1, 4] if matrix else [1])],
+            [onnx.numpy_helper.from_array(weights, name="W"), onnx.numpy_helper.from_array(indices, name="indices")],
+            [],
+        )
+        x = np.ones((1, 4) if matrix else (1, 1), np.float32)
+        expected = x @ (weights[0] if matrix else np.array([weights[0, 0, 0]]))
+        np.testing.assert_array_equal(self._inlined_runtime(model, {"X": x})[0], expected)
+        path = TestOnnxLoopControlProofs._save(model, tmp_path)
+        result = OnnxScanner().scan(str(path))
+        assert result.success is not matrix
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        assert bool(plan.coverage_gaps) is matrix
