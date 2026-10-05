@@ -2781,10 +2781,22 @@ def _build_onnx_weight_analysis_plan(
             return ()
         return semantic_mapping_cache_key(attribute_bindings)
 
+    constant_binding_work_remaining = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
+
     def constant_binding_cache_key(
         constants: dict[str, Any],
         names: frozenset[str],
-    ) -> tuple[tuple[str, str, str], ...]:
+    ) -> tuple[tuple[str, str, str], ...] | None:
+        nonlocal constant_binding_work_remaining
+        if not constants or not names:
+            return ()
+        # Charge before allocating: sibling-state keys can each contain the same
+        # whole binding environment even when the graph traversal itself is tiny.
+        if len(names) > constant_binding_work_remaining:
+            constant_binding_work_remaining = 0
+            plan.coverage_gaps.setdefault("constant_binding_work_limit", 1)
+            return None
+        constant_binding_work_remaining -= len(names)
         return semantic_mapping_cache_key(constants, names)
 
     def trusted_context_shape_cache_key(
@@ -3272,6 +3284,10 @@ def _build_onnx_weight_analysis_plan(
         constant_names = rank_reentry_constant_names(subgraph, attribute_bindings)
         if dependency_names_exceeded_limit(constant_names):
             return True
+        constants_key = constant_binding_cache_key(constants, constant_names)
+        bound_constants_key = constant_binding_cache_key(bound_input_constants or {}, constant_names)
+        if constants_key is None or bound_constants_key is None:
+            return True
         cache_key = (
             id(subgraph),
             graph_input_name,
@@ -3282,8 +3298,8 @@ def _build_onnx_weight_analysis_plan(
             related_graph_input_shapes_cache_key,
             opset_cache_key(opset_versions),
             attribute_binding_cache_key(attribute_bindings),
-            constant_binding_cache_key(constants, constant_names),
-            constant_binding_cache_key(bound_input_constants or {}, constant_names),
+            constants_key,
+            bound_constants_key,
             depth,
         )
         if cache_key in reentry_promotion_cache:
@@ -3584,10 +3600,14 @@ def _build_onnx_weight_analysis_plan(
                     nested_tainted_shapes.update(
                         {captured_name: tainted_shapes.get(captured_name) for captured_name in captured_names}
                     )
+                    external_constants_key = constant_binding_cache_key(subgraph_constants, nested_external_names)
+                    if external_constants_key is None:
+                        reentry_promotion_in_progress.discard(cache_key)
+                        return True
                     external_context_cache_key = (
                         id(nested_graph),
                         trusted_context_shape_cache_key(trusted_context_shapes, nested_external_names),
-                        constant_binding_cache_key(subgraph_constants, nested_external_names),
+                        external_constants_key,
                         depth,
                     )
                     external_context_shapes = reentry_external_context_shape_cache.get(external_context_cache_key)
@@ -4032,13 +4052,16 @@ def _build_onnx_weight_analysis_plan(
         constant_names = rank_reentry_constant_names(subgraph, attribute_bindings)
         if dependency_names_exceeded_limit(constant_names):
             return set(range(len(graph_outputs)))
+        constants_key = constant_binding_cache_key(inherited_constants or {}, constant_names)
+        if constants_key is None:
+            return set(range(len(graph_outputs)))
         cache_key = (
             id(subgraph),
             tuple(sorted(graph_input_names)),
             opset_cache_key(opset_versions),
             attribute_binding_cache_key(attribute_bindings),
             depth,
-            constant_binding_cache_key(inherited_constants or {}, constant_names),
+            constants_key,
         )
         if cache_key in graph_taint_cache:
             return set(graph_taint_cache[cache_key])
@@ -4191,6 +4214,9 @@ def _build_onnx_weight_analysis_plan(
         constant_names = rank_reentry_constant_names(subgraph, attribute_bindings)
         if dependency_names_exceeded_limit(constant_names):
             return set(range(len(subgraph.output))), {_onnx_value_name(value) for value in subgraph.input} | input_names
+        constants_key = constant_binding_cache_key(constants, constant_names | frozenset(node_input_slots(node)[:2]))
+        if constants_key is None:
+            return set(range(len(subgraph.output))), {_onnx_value_name(value) for value in subgraph.input} | input_names
         key = (
             id(node),
             id(subgraph),
@@ -4198,7 +4224,7 @@ def _build_onnx_weight_analysis_plan(
             opset_cache_key(opset_versions),
             attribute_binding_cache_key(attribute_bindings),
             depth,
-            constant_binding_cache_key(constants, constant_names | frozenset(node_input_slots(node)[:2])),
+            constants_key,
         )
         if key in control_flow_taint_cache:
             cached_outputs, cached_names = control_flow_taint_cache[key]
@@ -4461,13 +4487,16 @@ def _build_onnx_weight_analysis_plan(
         constant_names = rank_reentry_constant_names(subgraph, attribute_bindings)
         if dependency_names_exceeded_limit(constant_names):
             return True
+        constants_key = constant_binding_cache_key(inherited_constants or {}, constant_names)
+        if constants_key is None:
+            return True
         cache_key = (
             id(subgraph),
             graph_input_name,
             opset_cache_key(opset_versions),
             attribute_binding_cache_key(attribute_bindings),
             depth,
-            constant_binding_cache_key(inherited_constants or {}, constant_names),
+            constants_key,
         )
         if cache_key in weight_reachability_cache:
             return weight_reachability_cache[cache_key]
@@ -6409,7 +6438,10 @@ def _build_onnx_weight_analysis_plan(
         def value_has_unknown_dynamic_rank(name: str) -> bool:
             return (
                 name in dynamic_values
-                and name not in value_lineages
+                and not any(
+                    lineage.unresolved_reason != "shape_control_lineage"
+                    for lineage in value_lineages.get(name, {}).values()
+                )
                 and name not in constants
                 and name not in known_value_shapes
                 and name not in proven_value_ranks
@@ -10907,8 +10939,8 @@ def _build_onnx_weight_analysis_plan(
                 common_output_rank_operator = (
                     is_registered_standard_operator
                     and getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
-                    and node.op_type in _SHAPE_PRESERVING_UNARY_RANK_OPERATORS
-                    and (len(input_names) == 1 or node.op_type in {"Clip", "Dropout"})
+                    and (node.op_type in _SHAPE_PRESERVING_UNARY_RANK_OPERATORS or node.op_type == "Slice")
+                    and (len(input_names) == 1 or node.op_type in {"Clip", "Dropout", "Slice"})
                 )
                 rank_preserving_variadic_operator = (
                     is_registered_standard_operator
@@ -10920,7 +10952,10 @@ def _build_onnx_weight_analysis_plan(
                     if value_has_unknown_dynamic_rank(input_names[0]):
                         elementwise_has_unknown_dynamic_rank = True
                     else:
-                        elementwise_output_shape = known_value_shapes.get(input_names[0])
+                        # Slice preserves rank, but its bounds can change every extent.
+                        elementwise_output_shape = (
+                            None if node.op_type == "Slice" else known_value_shapes.get(input_names[0])
+                        )
                         elementwise_output_rank = (
                             len(elementwise_output_shape)
                             if elementwise_output_shape is not None
