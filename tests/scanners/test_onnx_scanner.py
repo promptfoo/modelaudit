@@ -33309,3 +33309,457 @@ class TestOnnxScopedConsumerCertificates:
                 (IssueSeverity.INFO, "Weight distribution analysis skipped one or more eligible ONNX initializers")
             ]
             assert not TestWeightDistributionSemantics._extreme_checks(result)
+
+
+class TestOnnxInvariantControlFlowStateProofs:
+    @staticmethod
+    def _weight_model(mode: str) -> tuple[Any, dict[str, Any], Any]:
+        v, t = TestOnnxShapeContinuity._v, TestOnnxShapeContinuity._t
+        W = np.array([[1, 0.25], [0, 0.5]], np.float32)
+        H = np.zeros((2, 2), np.float32)
+        initializers = [
+            t("H", H),
+            t("W", W),
+            t("count", np.int64(3)),
+            t("one", np.int64(1)),
+            t("start", np.bool_(True)),
+        ]
+        functions: list[Any] = []
+        inputs = [] if mode == "constant-activation" else [v("H", [2, 2])]
+        feeds: dict[str, Any] = {} if not inputs else {"H": np.eye(2, dtype=np.float32)}
+        if mode == "default-weight":
+            inputs.append(v("W", [2, 2]))
+            feeds["W"] = W * 2
+        carried = mode != "capture"
+        weight = "w" if carried else "W"
+        nodes = [helper.make_node("MatMul", ["h", weight], ["hn"], name="linear")]
+        wout = "w"
+        if mode in ["identity", "unmatched-identity"]:
+            wout = "wn"
+            nodes.append(
+                helper.make_node(
+                    "Identity", ["w"], ["wn"], overload="unmatched" if mode == "unmatched-identity" else ""
+                )
+            )
+        if mode == "alias":
+            wout = "wn"
+            nodes.extend(
+                [helper.make_node("Identity", ["w"], ["alias"]), helper.make_node("Identity", ["alias"], ["wn"])]
+            )
+        if mode in ["changing", "nested-changing", "overloaded-identity"]:
+            wout = "wn"
+            nodes.append(helper.make_node("Transpose", ["w"], ["wn"]))
+        if mode == "overloaded-identity":
+            nodes[-1] = helper.make_node("Identity", ["w"], ["wn"], overload="changing")
+            functions = [
+                helper.make_function(
+                    "",
+                    "Identity",
+                    ["a"],
+                    ["b"],
+                    [helper.make_node("Transpose", ["a"], ["b"])],
+                    [helper.make_opsetid("", 18)],
+                    overload="changing",
+                )
+            ]
+        if mode == "sibling-weight":
+            wout = "wn"
+            nodes.append(helper.make_node("Identity", ["h"], ["wn"]))
+        if mode == "mixed-slots":
+            nodes[0] = helper.make_node("MatMul", ["h", "h"], ["hn"], name="both_roles")
+        if mode == "function":
+            functions = [
+                helper.make_function(
+                    "local",
+                    "Linear",
+                    ["A", "B"],
+                    ["Y"],
+                    [helper.make_node("MatMul", ["A", "B"], ["Y"], name="linear")],
+                    [helper.make_opsetid("", 18)],
+                )
+            ]
+            nodes[0] = helper.make_node("Linear", ["h", weight], ["hn"], domain="local")
+        if mode == "nested-if":
+            b = helper.make_graph(
+                [helper.make_node("MatMul", ["h", weight], ["z"], name="linear")], "branch", [], [v("z", [2, 2])]
+            )
+            nodes[0] = helper.make_node("If", ["start"], ["hn"], then_branch=b, else_branch=b)
+        if mode in ["nested-loop", "nested-changing"]:
+            b = helper.make_graph(
+                [helper.make_node("MatMul", ["a", "W"], ["an"], name="linear")],
+                "inner",
+                [v("i", [], TensorProto.INT64), v("c", [], TensorProto.BOOL), v("a", [2, 2]), v("W", [2, 2])],
+                [v("c", [], TensorProto.BOOL), v("an", [2, 2]), v("W", [2, 2])],
+            )
+            nodes[0] = helper.make_node("Loop", ["one", "start", "h", "w"], ["hn", "unused"], body=b)
+        ins = [v("iteration", [], TensorProto.INT64), v("condition", [], TensorProto.BOOL), v("h", [2, 2])]
+        outs = [v("condition", [], TensorProto.BOOL), v("hn", [2, 2])]
+        rinputs = ["count", "start", "H"]
+        routputs = ["result"]
+        if carried:
+            ins.append(v("w", [2, 2]))
+            outs.append(v(wout, [2, 2]))
+            rinputs.append("W")
+            routputs.append("final_weight")
+        op = "Loop"
+        attrs: dict[str, Any] = {}
+        if mode.startswith("scan-"):
+            op = "Scan"
+            attrs = {"num_scan_inputs": 1}
+            ins = ins[2:]
+            outs = outs[1:]
+            rinputs = rinputs[2:]
+            initializers.append(t("sequence", np.zeros((3, 1), np.float32)))
+            ins.append(v("slice", [1]))
+            rinputs.append("sequence")
+            if mode == "scan-sequence":
+                ins = [v("h", [2, 2]), v("w", [2, 2])]
+                outs = [v("hn", [2, 2])]
+                rinputs = ["H", "sequence"]
+                routputs = ["result"]
+                initializers[-1] = t("sequence", np.stack([W] * 3))
+        body = helper.make_graph(nodes, "body", ins, outs)
+        model = helper.make_model(
+            helper.make_graph(
+                [helper.make_node(op, rinputs, routputs, body=body, **attrs)],
+                mode,
+                inputs,
+                [v("result", [2, 2])],
+                initializers,
+            ),
+            opset_imports=[helper.make_opsetid("", 18), helper.make_opsetid("local", 1)],
+            ir_version=10,
+            functions=functions,
+        )
+        return model, feeds, W
+
+    @staticmethod
+    def _shape_model(mode: str) -> tuple[Any, dict[str, Any], Any]:
+        v, t = TestOnnxShapeContinuity._v, TestOnnxShapeContinuity._t
+        W = np.zeros((64, 64), np.float32)
+        if mode != "benign":
+            W[:5, 0] = 10
+        initializers = [t("S", np.array([64, 64], np.int64)), t("W", W)]
+        feeds: dict[str, Any] = {"X": np.ones((3, 1, 64), np.float32)}
+        functions: list[Any] = []
+        carry = helper.make_node(
+            "Identity", ["shape"], ["next_shape"], overload="unmatched" if mode == "unmatched-identity" else ""
+        )
+        if mode == "changing":
+            carry = helper.make_node("Constant", [], ["next_shape"], value=t("", np.array([-1, 64], np.int64)))
+        if mode == "overloaded-identity":
+            carry.overload = "replacement"
+            functions = [
+                helper.make_function(
+                    "",
+                    "Identity",
+                    ["A"],
+                    ["B"],
+                    [helper.make_node("Constant", [], ["B"], value=t("", np.array([-1, 64], np.int64)))],
+                    [helper.make_opsetid("", 18)],
+                    overload="replacement",
+                )
+            ]
+        nodes = [
+            carry,
+            helper.make_node("Reshape", ["W", "shape"], ["view"]),
+            helper.make_node("MatMul", ["xi", "view"], ["yi"]),
+        ]
+        if mode == "alias":
+            nodes[:1] = [
+                helper.make_node("Identity", ["shape"], ["alias"]),
+                helper.make_node("Identity", ["alias"], ["next_shape"]),
+            ]
+        body_inputs = [v("shape", [2], TensorProto.INT64), v("xi", [1, 64])]
+        body_outputs = [v("shape" if mode == "direct" else "next_shape", [2], TensorProto.INT64), v("yi", [1, 64])]
+        root_inputs = ["S", "X"]
+        root_outputs = ["Sout", "Y"]
+        outputs = [v("Sout", [2], TensorProto.INT64), v("Y", [3, 1, 64])]
+        inputs = [v("X", [3, 1, 64])]
+        op = "Scan"
+        attrs: dict[str, Any] = {"num_scan_inputs": 1}
+        if mode == "direct":
+            nodes.pop(0)
+        if mode == "sequence":
+            nodes.pop(0)
+            body_outputs.pop(0)
+            root_inputs = ["Shapes", "X"]
+            root_outputs = ["Y"]
+            outputs.pop(0)
+            attrs["num_scan_inputs"] = 2
+            initializers.append(t("Shapes", np.tile(np.array([64, 64], np.int64), (3, 1))))
+        if mode == "loop":
+            op = "Loop"
+            attrs = {}
+            nodes[-1].input[0] = "X"
+            body_inputs = [
+                v("i", [], TensorProto.INT64),
+                v("condition", [], TensorProto.BOOL),
+                v("shape", [2], TensorProto.INT64),
+            ]
+            body_outputs.insert(0, v("condition", [], TensorProto.BOOL))
+            root_inputs = ["count", "start", "S"]
+            initializers.extend([t("count", np.int64(3)), t("start", np.bool_(True))])
+            feeds["X"] = feeds["X"][0]
+            inputs = [v("X", [1, 64])]
+        body = helper.make_graph(nodes, "body", body_inputs, body_outputs)
+        model = helper.make_model(
+            helper.make_graph(
+                [helper.make_node(op, root_inputs, root_outputs, body=body, **attrs)],
+                mode,
+                inputs,
+                outputs,
+                initializers,
+            ),
+            opset_imports=[helper.make_opsetid("", 18)],
+            ir_version=10,
+            functions=functions,
+        )
+        return model, feeds, W
+
+    @pytest.mark.parametrize(
+        "mode",
+        [
+            "direct",
+            "identity",
+            "alias",
+            "capture",
+            "default-weight",
+            "constant-activation",
+            "nested-if",
+            "nested-loop",
+            "function",
+            "changing",
+            "nested-changing",
+            "sibling-weight",
+            "mixed-slots",
+            "overloaded-identity",
+            "unmatched-identity",
+            "scan-state",
+            "scan-sequence",
+        ],
+    )
+    def test_invariant_carried_weights_keep_activation_coverage(self, tmp_path: Path, mode: str) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        model, feeds, stored_weight = self._weight_model(mode)
+        path = TestOnnxLoopControlProofs._save(model, tmp_path)
+        state = feeds.get("H", np.zeros((2, 2), np.float32)).copy()
+        weight = feeds.get("W", stored_weight).copy()
+        expected = state.copy()
+        expected_weight = weight.copy()
+        body = next(attribute.g for attribute in model.graph.node[0].attribute if attribute.name == "body")
+        for iteration in range(3):
+            previous = expected
+            expected = expected @ (expected if mode == "mixed-slots" else expected_weight)
+            if mode in {"changing", "nested-changing", "overloaded-identity"}:
+                expected_weight = expected_weight.T
+            if mode == "sibling-weight":
+                expected_weight = previous
+            if mode in {"nested-loop", "nested-changing"}:
+                # Loop's installed evaluator overwrites a nested formal named W
+                # with an unrelated root W. Execute the unmodified original body
+                # with only its real captures and independently bound formals.
+                actual: Any = ReferenceEvaluator(body, opsets={"": 18}).run(
+                    None,
+                    {
+                        "iteration": np.int64(iteration),
+                        "condition": np.bool_(True),
+                        "h": state,
+                        "w": weight,
+                        "one": np.int64(1),
+                        "start": np.bool_(True),
+                    },
+                )
+                np.testing.assert_array_equal(actual[1], expected)
+                np.testing.assert_array_equal(actual[2], expected_weight)
+                state, weight = actual[1:]
+        if mode not in {"nested-loop", "nested-changing"}:
+            actual = TestOnnxBuiltinOperatorIdentity._inlined_runtime(model, feeds)[0]
+            np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=0)
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        result = OnnxScanner().scan(str(path))
+        gap_count = (
+            1
+            if mode == "mixed-slots"
+            else 2
+            if mode in {"changing", "nested-changing", "sibling-weight", "overloaded-identity", "scan-sequence"}
+            else 0
+        )
+        assert plan.coverage_gaps == ({"unresolved_initializer_lineage": gap_count} if gap_count else {})
+        assert result.success is (gap_count == 0)
+        assert [(issue.severity, issue.message) for issue in result.issues] == (
+            [(IssueSeverity.INFO, "Weight distribution analysis skipped one or more eligible ONNX initializers")]
+            if gap_count
+            else []
+        )
+        expected_names = ["H"] if mode == "scan-sequence" else ["H", "H" if mode == "mixed-slots" else "W"]
+        assert [spec.context["initializer"] for spec in plan.specs] == expected_names
+        for spec, name in zip(plan.specs, expected_names, strict=True):
+            np.testing.assert_array_equal(spec.weights, stored_weight if name == "W" else np.zeros((2, 2)))
+
+    @pytest.mark.parametrize(
+        "mode",
+        [
+            "identity",
+            "direct",
+            "alias",
+            "unmatched-identity",
+            "loop",
+            "changing",
+            "sequence",
+            "overloaded-identity",
+            "benign",
+            "runtime-shape",
+        ],
+    )
+    def test_only_invariant_modern_scan_shape_values_remain_constants(self, tmp_path: Path, mode: str) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        model, feeds, stored_weight = self._shape_model("identity" if mode == "runtime-shape" else mode)
+        if mode == "runtime-shape":
+            model.graph.input.append(TestOnnxShapeContinuity._v("S", [2], TensorProto.INT64))
+            body = next(attribute.g for attribute in model.graph.node[0].attribute if attribute.name == "body")
+            for value, index in [
+                (model.graph.input[0], 2),
+                (model.graph.output[-1], 2),
+                (body.input[1], 1),
+                (body.output[1], 1),
+            ]:
+                dimension = value.type.tensor_type.shape.dim[index]
+                dimension.ClearField("dim_value")
+                dimension.dim_param = "runtime_extent"
+        path = TestOnnxLoopControlProofs._save(model, tmp_path)
+        for shape in [[64, 64], [1, 4096]] if mode == "runtime-shape" else [[64, 64]]:
+            if mode == "runtime-shape":
+                feeds = {"S": np.array(shape, np.int64), "X": np.ones((3, 1, shape[0]), np.float32)}
+            outputs: Any = ReferenceEvaluator(TestOnnxLoopControlProofs._inline_with_defaults(model)).run(None, feeds)
+            actual = outputs[-1]
+            expected = np.ones((3, 1, shape[0]), np.float32) @ stored_weight.reshape(shape)
+            # The installed Loop evaluator concatenates stack values; the Scan
+            # cases must preserve the exact spec shape as well as values.
+            if mode == "loop":
+                actual = actual.reshape(expected.shape)
+            np.testing.assert_array_equal(actual, expected)
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        result = OnnxScanner().scan(str(path))
+        unresolved = mode in {"changing", "sequence", "overloaded-identity", "runtime-shape"}
+        assert result.success is not unresolved
+        assert plan.coverage_gaps == ({"unresolved_initializer_lineage": 1} if unresolved else {})
+        assert len(plan.specs) == (0 if unresolved else 1)
+        if unresolved:
+            assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+            assert [(issue.severity, issue.message) for issue in result.issues] == [
+                (IssueSeverity.INFO, "Weight distribution analysis skipped one or more eligible ONNX initializers")
+            ]
+        else:
+            np.testing.assert_array_equal(plan.specs[0].weights, stored_weight)
+            assert bool(TestWeightDistributionSemantics._extreme_checks(result)) is (mode != "benign")
+
+    @pytest.mark.parametrize(
+        ("shape", "axis", "hot", "overridable", "transpose", "extra", "fixed_input"),
+        [
+            ((0, 1), 0, True, False, True, False, False),
+            ((0, 1), 0, False, False, True, False, False),
+            ((1, 0), 1, True, False, True, False, False),
+            ((1, 0), -1, True, False, True, False, False),
+            ((1, 1), 0, True, False, True, False, False),
+            ((1, 1), 1, True, False, True, False, False),
+            ((1, 0), 0, True, False, True, False, False),
+            ((0, 1), 0, True, True, True, False, False),
+            ((1, 0), 1, True, True, True, False, False),
+            ((0, 1), 0, True, False, True, False, True),
+            ((0, 1), 0, True, False, False, False, False),
+            ((0, 1), 0, True, False, True, True, False),
+        ],
+    )
+    def test_zero_modern_scan_keeps_only_reachable_initial_weight(
+        self,
+        tmp_path: Path,
+        shape: tuple[int, int],
+        axis: int,
+        hot: bool,
+        overridable: bool,
+        transpose: bool,
+        extra: bool,
+        fixed_input: bool,
+    ) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        v, t = TestOnnxShapeContinuity._v, TestOnnxShapeContinuity._t
+        weights = np.zeros((64, 64), np.float32) if hot else np.eye(64, dtype=np.float32)
+        if hot:
+            weights[:, 0] = 1000
+        normalized_axis = axis % len(shape)
+        body_inputs = [v("state", [64, 64]), v("slice", [shape[1 - normalized_axis]])]
+        inputs = [v("X", [1, 64])]
+        if overridable or fixed_input:
+            declared: list[Any] = list(shape)
+            if overridable:
+                declared[normalized_axis] = "N"
+            inputs.append(v("seq", declared))
+        scan_inputs, axes = ["W", "seq"], [axis]
+        if extra:
+            scan_inputs.append("seq2")
+            axes.append(0)
+            inputs.append(v("seq2", ["N", 1]))
+            body_inputs.append(v("slice2", [1]))
+        body = helper.make_graph(
+            [helper.make_node("Transpose" if transpose else "Identity", ["state"], ["next"])],
+            "body",
+            body_inputs,
+            [v("next", [64, 64])],
+        )
+        model = TestOnnxBuiltinOperatorIdentity._model(
+            [
+                helper.make_node(
+                    "Scan", scan_inputs, ["final"], body=body, num_scan_inputs=len(axes), scan_input_axes=axes
+                ),
+                helper.make_node("MatMul", ["X", "final"], ["Y"]),
+            ],
+            inputs,
+            [v("Y", [1, 64]), v("final", [64, 64])],
+            [t("W", weights), t("seq", np.zeros(shape, np.float32))],
+            [],
+        )
+        path = TestOnnxLoopControlProofs._save(model, tmp_path)
+        for extent in [shape[normalized_axis], 1] if overridable else [shape[normalized_axis]]:
+            runtime_shape = list(shape)
+            runtime_shape[normalized_axis] = extent
+            sequence = np.zeros(runtime_shape, np.float32)
+            expected = weights.T if transpose and extent % 2 else weights
+            if normalized_axis == 0:
+                feeds: dict[str, Any] = {"X": np.ones((1, 64), np.float32)}
+                if overridable or fixed_input:
+                    feeds["seq"] = sequence
+                if extra:
+                    feeds["seq2"] = np.zeros((extent, 1), np.float32)
+                actual: Any = ReferenceEvaluator(model).run(None, feeds)
+                np.testing.assert_array_equal(actual[0], feeds["X"] @ expected)
+                np.testing.assert_array_equal(actual[1], expected)
+            else:
+                # The installed Scan evaluator supports axis0 only. Execute the
+                # exact original body on the schema-selected alternative axis.
+                state = weights
+                for index in range(extent):
+                    body_runtime: Any = ReferenceEvaluator(body, opsets={"": 18})
+                    state = body_runtime.run(
+                        None, {"state": state, "slice": np.take(sequence, index, axis=normalized_axis)}
+                    )[0]
+                np.testing.assert_array_equal(state, expected)
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        result = OnnxScanner().scan(str(path))
+        assert result.success is not overridable
+        assert plan.coverage_gaps == ({"unresolved_initializer_lineage": 1} if overridable else {})
+        assert len(plan.specs) == (0 if overridable else 1)
+        if overridable:
+            assert [(issue.severity, issue.message) for issue in result.issues] == [
+                (IssueSeverity.INFO, "Weight distribution analysis skipped one or more eligible ONNX initializers")
+            ]
+        else:
+            np.testing.assert_array_equal(plan.specs[0].weights, expected)
+            assert [(issue.severity, issue.message) for issue in result.issues] == (
+                [(IssueSeverity.INFO, "Layer 'W' has 1 output neurons with abnormal weight magnitudes")]
+                if hot and not shape[normalized_axis]
+                else []
+            )

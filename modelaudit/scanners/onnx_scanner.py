@@ -4690,6 +4690,7 @@ def _build_onnx_weight_analysis_plan(
         proven_weight_inputs: dict[tuple[int, ...], tuple[Any, frozenset[int]]] | None = None,
         proven_weight_inputs_path: tuple[int, ...] = (),
         inherited_independent_value: Callable[[str], bool] | None = None,
+        control_flow_owner: Any | None = None,
     ) -> bool:
         nonlocal graph_taint_work_remaining
         if not graph_input_name:
@@ -4760,7 +4761,12 @@ def _build_onnx_weight_analysis_plan(
                 if inherited_constants is not None and name in inherited_constants
             )
 
-        graph_formals = {_onnx_value_name(value) for value in getattr(subgraph, "input", ())}
+        graph_inputs = getattr(subgraph, "input", ()) if exclude_activation_inputs else ()
+        if len(graph_inputs) > graph_taint_work_remaining:
+            graph_taint_work_remaining = 0
+            return finish(True)
+        graph_taint_work_remaining -= len(graph_inputs)
+        graph_formals = {_onnx_value_name(value): index for index, value in enumerate(graph_inputs)}
         current_graph_external_names = graph_external_reference_names(subgraph, attribute_bindings)
 
         def independent_value(name: str) -> bool:
@@ -4772,9 +4778,34 @@ def _build_onnx_weight_analysis_plan(
             graph_taint_work_remaining -= len(dependencies)
             for dependency in dependencies:
                 if dependency in graph_formals:
-                    if not isinstance(subgraph, onnx.FunctionProto) or inherited_independent_value is None:
+                    if isinstance(subgraph, onnx.FunctionProto):
+                        if inherited_independent_value is None or not inherited_independent_value(dependency):
+                            return False
+                        continue
+                    if control_flow_owner is None or not builtin_operator(control_flow_owner):
                         return False
-                    if not inherited_independent_value(dependency):
+                    input_index = graph_formals[dependency]
+                    if control_flow_owner.op_type == "Loop" and input_index >= 2:
+                        parent_input_index = input_index
+                        output_index = input_index - 1
+                    elif control_flow_owner.op_type == "Scan" and input_index < scan_stacked_output_start(
+                        control_flow_owner, opset_versions, resolve_reentry_attribute
+                    ):
+                        parent_input_index = input_index + scan_sequence_lens_input_offset(
+                            control_flow_owner, opset_versions
+                        )
+                        output_index = input_index
+                    else:
+                        return False
+                    if (
+                        dependency == graph_input_name
+                        or parent_input_index >= len(control_flow_owner.input)
+                        or not state_output_preserves_input(subgraph, dependency, output_index)
+                    ):
+                        return False
+                    if inherited_independent_value is not None and not inherited_independent_value(
+                        str(control_flow_owner.input[parent_input_index])
+                    ):
                         return False
                 elif dependency in current_graph_external_names and inherited_independent_value is not None:
                     if not inherited_independent_value(dependency):
@@ -5029,6 +5060,7 @@ def _build_onnx_weight_analysis_plan(
                                 proven_weight_inputs=proven_weight_inputs,
                                 proven_weight_inputs_path=(*proven_weight_inputs_path, id(body_node), id(nested_graph)),
                                 inherited_independent_value=independent_value,
+                                control_flow_owner=body_node,
                             ):
                                 return finish(True)
                     if body_outputs_live_after:
@@ -9359,7 +9391,7 @@ def _build_onnx_weight_analysis_plan(
                         if parent_name in constants and (
                             not repeated_control_flow_state_input
                             or (
-                                node.op_type == "Loop"
+                                (node.op_type == "Loop" or (node.op_type == "Scan" and not scan_input_offset))
                                 and state_output_preserves_input(subgraph, graph_input_name, graph_output_index)
                             )
                         ):
@@ -9414,6 +9446,7 @@ def _build_onnx_weight_analysis_plan(
                                         )
                                     elif (
                                         lineage.shape is not None
+                                        and not (lineage.unresolved_reason is None and 0 in lineage.shape)
                                         and (
                                             len(parent_shape) != len(lineage.shape)
                                             or any(
@@ -9679,6 +9712,7 @@ def _build_onnx_weight_analysis_plan(
                                     exclude_activation_inputs=True,
                                     proven_weight_inputs=subgraph_proven_weight_inputs,
                                     proven_weight_inputs_path=subgraph_proof_path,
+                                    control_flow_owner=node,
                                 )
                                 and not any(
                                     output_index in state_input_by_output
@@ -10839,7 +10873,7 @@ def _build_onnx_weight_analysis_plan(
                     )
                 for output_index in range(len(node.output)):
                     if (
-                        loop_returns_initial_state or scan8_returns_initial_state
+                        loop_returns_initial_state or scan8_returns_initial_state or common_scan_extent == 0
                     ) and output_index < stacked_scan_output_start:
                         continue
                     graph_output_index = output_index + subgraph_output_offset
