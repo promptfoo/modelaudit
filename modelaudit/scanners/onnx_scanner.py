@@ -9419,11 +9419,10 @@ def _build_onnx_weight_analysis_plan(
                                     if (
                                         lineage.shape is not None
                                         and lineage.shape != parent_shape
-                                        and all(dimension > 0 for dimension in lineage.shape)
                                         and (lineage_size := _onnx_shape_extent_product(lineage.shape)) >= 0
                                         and lineage_size == _onnx_shape_extent_product(parent_shape)
                                     ):
-                                        # Removing singleton Scan axes is the exact per-iteration view.
+                                        # Singleton Scan axes and empty arrays have exact per-iteration views.
                                         subgraph_bound_lineages[graph_input_name][initializer_index] = (
                                             _OnnxWeightLineage(
                                                 initializer_index=initializer_index,
@@ -10721,12 +10720,17 @@ def _build_onnx_weight_analysis_plan(
                 else set()
             )
 
+            scan_has_concrete_input_shape = False
+
             def trusted_scan_input_shape(
                 scan_name: str,
                 trusted: set[str] = trusted_scan_shape_names,
                 untrusted: set[str] = untrusted_scan_shape_names,
             ) -> tuple[int, ...] | None:
-                return scan_input_shape(constants, known_value_shapes, scan_name, trusted, untrusted)
+                nonlocal scan_has_concrete_input_shape
+                shape = scan_input_shape(constants, known_value_shapes, scan_name, trusted, untrusted)
+                scan_has_concrete_input_shape |= shape is not None and all(dimension >= 0 for dimension in shape)
+                return shape
 
             common_scan_extent = None
             if (
@@ -10873,7 +10877,9 @@ def _build_onnx_weight_analysis_plan(
                     )
                 for output_index in range(len(node.output)):
                     if (
-                        loop_returns_initial_state or scan8_returns_initial_state or common_scan_extent == 0
+                        loop_returns_initial_state
+                        or scan8_returns_initial_state
+                        or (common_scan_extent == 0 and scan_has_concrete_input_shape)
                     ) and output_index < stacked_scan_output_start:
                         continue
                     graph_output_index = output_index + subgraph_output_offset

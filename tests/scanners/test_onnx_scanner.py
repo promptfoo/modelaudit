@@ -33763,3 +33763,154 @@ class TestOnnxInvariantControlFlowStateProofs:
                 if hot and not shape[normalized_axis]
                 else []
             )
+
+
+class TestOnnxEmptyScanTransformShapes:
+    @pytest.mark.parametrize(
+        ("legacy", "extent", "width", "axis", "mode"),
+        [
+            (False, 1, 0, 0, "ordinary"),
+            (False, 2, 0, 0, "ordinary"),
+            (False, 1, 0, 1, "ordinary"),
+            (False, 1, 0, -1, "ordinary"),
+            (False, 1, 2, 0, "ordinary"),
+            (False, 2, 2, 0, "ordinary"),
+            (False, 1, 0, 0, "unmatched"),
+            (False, 1, 0, 0, "matched"),
+            (False, 1, 0, 0, "override"),
+            (True, 1, 0, 0, "ordinary"),
+            (True, 2, 0, 0, "ordinary"),
+            (True, 1, 2, 0, "ordinary"),
+            (True, 2, 2, 0, "short"),
+            (True, 1, 0, 0, "matched"),
+            (True, 1, 0, 0, "override"),
+        ],
+    )
+    def test_empty_scan_views_keep_their_actual_body_shape(
+        self, tmp_path: Path, legacy: bool, extent: int, width: int, axis: int, mode: str
+    ) -> None:
+        from onnx.inliner import inline_local_functions
+        from onnx.reference import ReferenceEvaluator
+
+        value, tensor = TestOnnxShapeContinuity._v, TestOnnxShapeContinuity._t
+        sequence = np.zeros((extent, width, 64), np.float32)
+        if width:
+            sequence[:, :, 0] = 25
+        sequence = sequence[None] if legacy else np.moveaxis(sequence, 0, axis)
+        matched = mode == "matched"
+        opset = 8 if legacy else 18
+        body = helper.make_graph(
+            [
+                helper.make_node(
+                    "Transpose", ["slice"], ["wt"], overload=mode if mode in {"matched", "unmatched"} else ""
+                ),
+                helper.make_node("MatMul", ["X", "wt"], ["y"]),
+            ],
+            "empty_slice_view",
+            [value("slice", [None if mode == "override" else width, 64])],
+            [value("y", [1, None])],
+        )
+        functions = (
+            [
+                helper.make_function(
+                    "",
+                    "Transpose",
+                    ["a"],
+                    ["b"],
+                    [helper.make_node("Identity", ["a"], ["b"])],
+                    [helper.make_opsetid("", opset)],
+                    overload="matched",
+                )
+            ]
+            if matched
+            else []
+        )
+        initializers = [tensor("seq", sequence)]
+        inputs = [value("X", [1, None])]
+        feeds: dict[str, Any] = {"X": np.ones((1, width if matched else 64), np.float32)}
+        if mode == "override":
+            declared_shape: list[Any] = list(sequence.shape)
+            declared_shape[2 if legacy else 1] = "width"
+            inputs.append(value("seq", declared_shape))
+            replacement = np.zeros((1, extent, 2, 64) if legacy else (extent, 2, 64), np.float32)
+            replacement[..., 0] = 25
+            feeds["seq"] = replacement
+        scan_inputs = ["seq"]
+        scan_attributes: dict[str, Any] = {"num_scan_inputs": 1}
+        iterations = 1 if mode == "short" else extent
+        if legacy:
+            initializers.append(tensor("lengths", np.array([iterations], np.int64)))
+            scan_inputs.insert(0, "lengths")
+        else:
+            scan_attributes["scan_input_axes"] = [axis]
+        model = helper.make_model(
+            helper.make_graph(
+                [helper.make_node("Scan", scan_inputs, ["Y"], body=body, **scan_attributes)],
+                "empty_scan_transform",
+                inputs,
+                [value("Y", [None] * (4 if legacy else 3))],
+                initializers,
+            ),
+            opset_imports=[helper.make_opsetid("", opset)],
+            functions=functions,
+            ir_version=10,
+        )
+        onnx.checker.check_model(model, full_check=True)
+        path = TestOnnxLoopControlProofs._save(model, tmp_path)
+        runtime_model = inline_local_functions(model) if functions else model
+        runtime_body = next(
+            attribute.g for attribute in runtime_model.graph.node[0].attribute if attribute.name == "body"
+        )
+        used_sequence = feeds.get("seq", sequence)
+        expected_outputs = []
+        # Scan8 and alternative Scan axes use the original body with schema-selected slices.
+        for index in range(iterations):
+            sliced = used_sequence[0, index] if legacy else np.take(used_sequence, index, axis=axis)
+            expected = feeds["X"] @ (sliced if matched else sliced.T)
+            actual: Any = ReferenceEvaluator(runtime_body, opsets={"": opset}).run(
+                None, {"slice": sliced, "X": feeds["X"]}
+            )
+            np.testing.assert_array_equal(actual[0], expected)
+            expected_outputs.append(expected)
+        if not legacy and axis == 0:
+            whole: Any = ReferenceEvaluator(runtime_model).run(None, feeds)
+            np.testing.assert_array_equal(whole[0], np.stack(expected_outputs))
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        incomplete = mode == "override" or (extent > 1 and width > 0)
+        assert plan.coverage_gaps == ({"unresolved_initializer_lineage": 1} if incomplete else {})
+        if width and not incomplete:
+            assert len(plan.specs) == 1
+            np.testing.assert_array_equal(plan.specs[0].weights, sequence[0, 0].T if legacy else sequence[0].T)
+        else:
+            assert plan.specs == []
+        result = OnnxScanner().scan(str(path))
+        assert result.success is not incomplete
+        assert (result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME) is incomplete
+        assert [(issue.severity, issue.message) for issue in result.issues] == (
+            [(IssueSeverity.INFO, "Weight distribution analysis skipped one or more eligible ONNX initializers")]
+            if incomplete
+            else []
+        )
+        cache_dir = tmp_path / "scan-cache"
+        reset_cache_manager()
+        try:
+            aggregate = scan_model_directory_or_file(
+                str(path), recursive=False, cache_enabled=True, cache_dir=str(cache_dir), min_cache_file_size=0
+            )
+            assert aggregate.success is not incomplete
+            assert determine_exit_code(aggregate) == (2 if incomplete else 0)
+            cache_manager = get_cache_manager(str(cache_dir), enabled=True)
+            hits = cache_manager.get_stats()["cache_hits"]
+            repeated = scan_model_directory_or_file(
+                str(path), recursive=False, cache_enabled=True, cache_dir=str(cache_dir), min_cache_file_size=0
+            )
+            assert repeated.success == aggregate.success
+            assert determine_exit_code(repeated) == determine_exit_code(aggregate)
+            assert [(issue.severity, issue.message) for issue in repeated.issues] == [
+                (issue.severity, issue.message) for issue in aggregate.issues
+            ]
+            assert (cache_manager.get_stats()["cache_hits"] > hits) is not incomplete
+            if incomplete:
+                assert cache_manager.get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
