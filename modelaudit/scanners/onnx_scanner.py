@@ -9793,7 +9793,13 @@ def _build_onnx_weight_analysis_plan(
                         and str(node.input[0]) in proven_value_ranks
                         and (input_shape := known_value_shapes.get(str(node.input[0]))) is not None
                         and lineage.shape is not None
-                        and input_shape != lineage.shape
+                        and (
+                            len(input_shape) != len(lineage.shape)
+                            or any(
+                                dimension >= 0 and dimension != lineage.shape[index]
+                                for index, dimension in enumerate(input_shape)
+                            )
+                        )
                     ):
                         # Whole Scan sequences and Scan-8 batches cannot stand in
                         # for the per-iteration value when applying body transforms.
