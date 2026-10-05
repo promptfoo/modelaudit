@@ -29107,3 +29107,395 @@ class TestOnnxInferredShapeBounds:
             actual = outputs[0]
             assert actual.shape == expected
         assert OnnxScanner().scan(str(path)).success is True
+
+
+class TestOnnxShapeContinuity:
+    @staticmethod
+    def _v(name: str, shape: Any, dtype: int = TensorProto.FLOAT) -> Any:
+        return helper.make_tensor_value_info(name, dtype, shape)
+
+    @staticmethod
+    def _t(name: str, value: Any) -> Any:
+        return onnx.numpy_helper.from_array(np.asarray(value), name)
+
+    @pytest.mark.parametrize("alias", [False, True])
+    @pytest.mark.parametrize("extreme", [False, True])
+    def test_invariant_loop_shape_control_keeps_weight_findings(
+        self, tmp_path: Path, alias: bool, extreme: bool
+    ) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        weights = np.zeros((100, 10), np.float32)
+        if extreme:
+            weights[50:55, 3] = 10
+        nodes = [
+            helper.make_node("Reshape", ["W", "shape_state"], ["weights"]),
+            helper.make_node("MatMul", ["X", "weights"], ["y"]),
+        ]
+        if alias:
+            nodes.append(helper.make_node("Identity", ["shape_state"], ["next"]))
+        body = helper.make_graph(
+            nodes,
+            "body",
+            [
+                self._v("i", [], TensorProto.INT64),
+                self._v("cond", [], TensorProto.BOOL),
+                self._v("shape_state", [2], TensorProto.INT64),
+            ],
+            [
+                self._v("cond", [], TensorProto.BOOL),
+                self._v("next" if alias else "shape_state", [2], TensorProto.INT64),
+                self._v("y", [1, 10]),
+            ],
+        )
+        graph = helper.make_graph(
+            [helper.make_node("Loop", ["count", "start", "shape"], ["final", "Y"], body=body)],
+            "invariant",
+            [self._v("X", [1, 100])],
+            [self._v("Y", [2, 1, 10])],
+            [
+                self._t("count", np.int64(2)),
+                self._t("start", np.bool_(True)),
+                self._t("shape", np.array([100, 10], np.int64)),
+                self._t("W", weights.reshape(-1)),
+            ],
+        )
+        path, model = TestOnnxInferredShapeBounds._save(graph, tmp_path)
+        actual: Any = ReferenceEvaluator(model).run(None, {"X": np.ones((1, 100), np.float32)})
+        np.testing.assert_array_equal(
+            actual[0].reshape(2, 1, 10), np.stack([np.ones((1, 100), np.float32) @ weights] * 2)
+        )
+        result = OnnxScanner().scan(str(path))
+        assert result.success is True
+        assert bool(result.metadata.get("anomalies_found")) is extreme
+
+    @pytest.mark.parametrize("symbolic", [False, True])
+    @pytest.mark.parametrize("steps", [1, 2])
+    def test_fixed_reshape_dimensions_prove_scan_iteration_count(
+        self, tmp_path: Path, symbolic: bool, steps: int
+    ) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        body = helper.make_graph(
+            [helper.make_node("MatMul", ["X", "state"], ["y"]), helper.make_node("Transpose", ["state"], ["next"])],
+            "body",
+            [self._v("state", [2, 2]), self._v("element", [])],
+            [self._v("next", [2, 2]), self._v("y", [1, 2])],
+        )
+        graph = helper.make_graph(
+            [
+                helper.make_node("Reshape", ["seq_input", "target"], ["seq"]),
+                helper.make_node("Scan", ["W", "seq"], ["final", "Y"], body=body, num_scan_inputs=1),
+            ],
+            "fixed",
+            [self._v("seq_input", [None] if symbolic else [steps]), self._v("X", [1, 2])],
+            [self._v("Y", [steps, 1, 2])],
+            [self._t("target", np.array([steps], np.int64)), self._t("W", np.array([[1, 2], [3, 4]], np.float32))],
+        )
+        path, model = TestOnnxInferredShapeBounds._save(graph, tmp_path)
+        actual: Any = ReferenceEvaluator(model).run(
+            None, {"X": np.ones((1, 2), np.float32), "seq_input": np.ones(steps, np.float32)}
+        )
+        assert actual[0].shape == (steps, 1, 2)
+        result = OnnxScanner().scan(str(path))
+        assert result.success is (steps == 1)
+        if steps > 1:
+            assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+
+    @pytest.mark.parametrize("sources", [1, 40])
+    @pytest.mark.parametrize("matrix", [False, True])
+    @pytest.mark.parametrize("iterations, runtime_count", [(1, False), (2, False), (2, True)])
+    def test_replacement_state_keeps_future_weight_coverage(
+        self, tmp_path: Path, sources: int, matrix: bool, iterations: int, runtime_count: bool
+    ) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        weights = np.zeros((64, 64) if matrix else (64,), np.float32)
+        weights[:5] = 10 if not matrix else weights[:5]
+        if matrix:
+            weights[:5, 0] = 10
+        body = helper.make_graph(
+            [
+                helper.make_node("MatMul", ["X", "state"], ["activation"]),
+                helper.make_node("ReduceSum", ["activation"], ["score"], keepdims=0),
+                helper.make_node("Identity", ["later"], ["next"]),
+            ],
+            "body",
+            [self._v("i", [], TensorProto.INT64), self._v("condition", [], TensorProto.BOOL), self._v("state", None)],
+            [self._v("condition", [], TensorProto.BOOL), self._v("next", None), self._v("score", [])],
+        )
+        graph = helper.make_graph(
+            [
+                helper.make_node("Sum", [f"w{i}" for i in range(sources)], ["initial"]),
+                helper.make_node("Loop", ["count", "start", "initial"], ["final", "scores"], body=body),
+            ],
+            "replacement",
+            [self._v("X", [1, 64])] + ([self._v("count", [], TensorProto.INT64)] if runtime_count else []),
+            [self._v("scores", [None])],
+            [
+                *[self._t(f"w{i}", np.zeros(64, np.float32)) for i in range(sources)],
+                self._t("later", weights),
+                self._t("start", np.bool_(True)),
+                self._t("count", np.int64(iterations)),
+            ],
+        )
+        path, model = TestOnnxInferredShapeBounds._save(graph, tmp_path, full_check=False)
+        feeds = {"X": np.ones((1, 64), np.float32)}
+        if runtime_count:
+            feeds["count"] = np.array(iterations, np.int64)
+        actual: Any = ReferenceEvaluator(model).run(None, feeds)
+        np.testing.assert_array_equal(actual[0].reshape(-1), [0] + [50] * (iterations - 1))
+        result = OnnxScanner().scan(str(path))
+        if matrix and iterations > 1:
+            assert result.metadata.get("anomalies_found") or result.success is False
+            if result.success is False:
+                assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        else:
+            assert result.success is True
+            assert not result.metadata.get("anomalies_found")
+
+    @pytest.mark.parametrize(
+        "rank, axes_count, pairs, explicit",
+        [(1, 1, 3, False), (64, 64, 8, False), (129, 0, 4, False), (129, 0, 4, True)],
+    )
+    def test_rank_only_transforms_obey_metadata_work_limits(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, rank: int, axes_count: int, pairs: int, explicit: bool
+    ) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        nodes = []
+        previous = "X"
+        for index in range(pairs):
+            if axes_count:
+                nodes.append(helper.make_node("Unsqueeze", [previous, "axes"], [f"u{index}"]))
+                previous = f"u{index}"
+            transpose_attributes: dict[str, Any] = {"perm": list(reversed(range(rank)))} if explicit else {}
+            nodes.append(helper.make_node("Transpose", [previous], [f"v{index}"], **transpose_attributes))
+            previous = f"v{index}"
+        nodes.append(helper.make_node("Flatten", [previous], ["Y"]))
+        graph = helper.make_graph(
+            nodes,
+            "rank_only",
+            [self._v("X", [None] * rank)],
+            [self._v("Y", [None, None])],
+            [self._t("axes", np.arange(axes_count, dtype=np.int64))] if axes_count else [],
+        )
+        path, model = TestOnnxInferredShapeBounds._save(graph, tmp_path)
+        observed_ranks: list[int] = []
+        range_sizes: list[int] = []
+
+        def bounded_range(*args: int) -> range:
+            value = range(*args)
+            range_sizes.append(len(value))
+            assert len(value) <= 64, "rank-sized metadata allocation escaped the inference limit"
+            return value
+
+        monkeypatch.setattr(onnx_scanner_module, "range", bounded_range, raising=False)
+
+        def profile(frame: Any, event: str, arg: Any) -> None:
+            if event == "return" and frame.f_code.co_name == "walk_graph":
+                observed_ranks.extend(frame.f_locals.get("known_value_ranks", {}).values())
+
+        prior = sys.getprofile()
+        sys.setprofile(profile)
+        try:
+            plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=1024)
+        finally:
+            sys.setprofile(prior)
+        assert max(observed_ranks, default=0) <= 64
+        assert max(range_sizes, default=0) <= 64
+        result = OnnxScanner().scan(str(path))
+        if rank == 1:
+            actual: Any = ReferenceEvaluator(model).run(None, {"X": np.ones((1,), np.float32)})
+            assert actual[0].shape == (1, 1)
+            assert result.success is True
+        else:
+            assert "inferred_shape_rank_limit" in plan.coverage_gaps
+            assert result.success is False
+            assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+
+    @pytest.mark.parametrize("referenced", [False, True])
+    @pytest.mark.parametrize("iterations", [1, 2])
+    def test_recurrence_keeps_caller_bound_graph_attributes(
+        self, tmp_path: Path, referenced: bool, iterations: int
+    ) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        leaf = helper.make_graph(
+            [helper.make_node("Unsqueeze", ["state", "axes"], ["grown"])], "leaf", [], [self._v("grown", None)]
+        )
+        branch = helper.make_node("If", ["condition"], ["next"])
+        for name in ("then_branch", "else_branch"):
+            branch.attribute.append(
+                onnx.AttributeProto(name=name, ref_attr_name="update", type=onnx.AttributeProto.GRAPH)
+                if referenced
+                else helper.make_attribute(name, leaf)
+            )
+        body = helper.make_graph(
+            [helper.make_node("MatMul", ["X", "state"], ["product"]), branch],
+            "body",
+            [self._v("i", [], TensorProto.INT64), self._v("condition", [], TensorProto.BOOL), self._v("state", None)],
+            [self._v("condition", [], TensorProto.BOOL), self._v("next", None)],
+        )
+        function = helper.make_function(
+            "local",
+            "Repeat",
+            ["initial", "X", "count", "start", "axes"],
+            ["final"],
+            [helper.make_node("Loop", ["count", "start", "initial"], ["final"], body=body)],
+            [helper.make_opsetid("", 18)],
+            attribute_protos=[helper.make_attribute("update", leaf)],
+        )
+        weights = np.concatenate([np.full(5, 10, np.float32), np.zeros(59, np.float32)])
+        graph = helper.make_graph(
+            [
+                helper.make_node("Expand", ["W", "shape"], ["initial"]),
+                helper.make_node("Repeat", ["initial", "X", "count", "start", "axes"], ["Y"], domain="local"),
+            ],
+            "bound_graph",
+            [self._v("X", [2, 64])],
+            [self._v("Y", [64] + [1] * iterations)],
+            [
+                self._t("W", weights),
+                self._t("count", np.int64(iterations)),
+                self._t("start", np.bool_(True)),
+                self._t("axes", np.array([1], np.int64)),
+                self._t("shape", np.array([64], np.int64)),
+            ],
+        )
+        model = helper.make_model(
+            graph,
+            functions=[function],
+            opset_imports=[helper.make_opsetid("", 18), helper.make_opsetid("local", 1)],
+            ir_version=10,
+        )
+        onnx.checker.check_model(model, full_check=True)
+        path = tmp_path / "bound_graph.onnx"
+        onnx.save(model, path)
+        # ReferenceEvaluator cannot bind graph attributes inside a nested graph;
+        # execute the exact body with the caller's declared graph value substituted.
+        bound_body = onnx.GraphProto()
+        bound_body.CopyFrom(body)
+        for node in bound_body.node:
+            for attribute in node.attribute:
+                if attribute.ref_attr_name:
+                    attribute.CopyFrom(helper.make_attribute(attribute.name, leaf))
+        runner = ReferenceEvaluator(bound_body, opsets={"": 18})
+        state = weights
+        for index in range(iterations):
+            assert state.shape == tuple([64] + [1] * index)
+            actual: Any = runner.run(
+                None,
+                {
+                    "i": np.array(index, np.int64),
+                    "condition": np.array(True),
+                    "state": state,
+                    "X": np.ones((2, 64), np.float32),
+                    "axes": np.array([1], np.int64),
+                },
+            )
+            state = actual[1]
+        result = OnnxScanner().scan(str(path))
+        if iterations > 1:
+            assert result.metadata.get("anomalies_found") or result.success is False
+            if result.success is False:
+                assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        else:
+            assert result.success is True
+
+    def test_explicit_rank_only_permutations_charge_the_shared_work_budget(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        rank = 64
+        graph = helper.make_graph(
+            [
+                helper.make_node("Transpose", [f"v{i}"], [f"v{i + 1}"], perm=list(reversed(range(rank))))
+                for i in range(20)
+            ],
+            "explicit_work",
+            [self._v("v0", [None] * rank)],
+            [self._v("v20", [None] * rank)],
+        )
+        path, model = TestOnnxInferredShapeBounds._save(graph, tmp_path)
+        monkeypatch.setattr(onnx_scanner_module, "_ONNX_INFERRED_SHAPE_DIMENSION_LIMIT", 128)
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=1024)
+        assert "inferred_shape_dimension_limit" in plan.coverage_gaps
+        result = OnnxScanner().scan(str(path))
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+
+    @pytest.mark.parametrize("mutable", [False, True])
+    def test_loop_shape_control_values_require_value_invariance(self, tmp_path: Path, mutable: bool) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        body = helper.make_graph(
+            [
+                helper.make_node("Reshape", ["W", "shape_state"], ["weights"]),
+                helper.make_node("MatMul", ["X", "weights"], ["y"]),
+                helper.make_node("Identity", ["changed" if mutable else "shape_state"], ["next"]),
+            ],
+            "control",
+            [
+                self._v("i", [], TensorProto.INT64),
+                self._v("cond", [], TensorProto.BOOL),
+                self._v("shape_state", [2], TensorProto.INT64),
+            ],
+            [self._v("cond", [], TensorProto.BOOL), self._v("next", [2], TensorProto.INT64)],
+        )
+        graph = helper.make_graph(
+            [helper.make_node("Loop", ["count", "start", "shape"], ["Y"], body=body)],
+            "control_values",
+            [self._v("X", [1, 1])],
+            [self._v("Y", [2], TensorProto.INT64)],
+            [
+                self._t("W", np.arange(8, dtype=np.float32)),
+                self._t("shape", np.array([1, 8], np.int64)),
+                self._t("changed", np.array([8, 1], np.int64)),
+                self._t("count", np.int64(2)),
+                self._t("start", np.bool_(True)),
+            ],
+        )
+        # PRelu accepts both views; the constant control itself keeps shape [2].
+        body.node[1].CopyFrom(helper.make_node("PRelu", ["X", "weights"], ["y"]))
+        graph.node[0].attribute[0].g.CopyFrom(body)
+        path, model = TestOnnxInferredShapeBounds._save(graph, tmp_path)
+        actual: Any = ReferenceEvaluator(model).run(None, {"X": np.ones((1, 1), np.float32)})
+        np.testing.assert_array_equal(actual[0], [8, 1] if mutable else [1, 8])
+        result = OnnxScanner().scan(str(path))
+        assert result.success is not mutable
+        if mutable:
+            assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+
+    def test_replaced_matrix_keeps_fixed_vector_consumers_complete(self, tmp_path: Path) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        body = helper.make_graph(
+            [
+                helper.make_node("Reshape", ["state", "shape"], ["vector"]),
+                helper.make_node("MatMul", ["X", "vector"], ["y"]),
+                helper.make_node("Identity", ["later"], ["next"]),
+            ],
+            "vector_consumer",
+            [self._v("i", [], TensorProto.INT64), self._v("cond", [], TensorProto.BOOL), self._v("state", None)],
+            [self._v("cond", [], TensorProto.BOOL), self._v("next", None), self._v("y", [1])],
+        )
+        graph = helper.make_graph(
+            [helper.make_node("Loop", ["count", "start", "initial"], ["final", "Y"], body=body)],
+            "vector_replacement",
+            [self._v("count", [], TensorProto.INT64), self._v("X", [1, 64])],
+            [self._v("Y", [None, 1])],
+            [
+                self._t("initial", np.zeros(64, np.float32)),
+                self._t("later", np.ones((64, 1), np.float32)),
+                self._t("shape", np.array([64], np.int64)),
+                self._t("start", np.bool_(True)),
+            ],
+        )
+        path, model = TestOnnxInferredShapeBounds._save(graph, tmp_path, full_check=False)
+        actual: Any = ReferenceEvaluator(model).run(
+            None, {"count": np.array(2, np.int64), "X": np.ones((1, 64), np.float32)}
+        )
+        np.testing.assert_array_equal(actual[0].reshape(-1), [0, 64])
+        result = OnnxScanner().scan(str(path))
+        assert result.success is True
+        assert not result.metadata.get("anomalies_found")
