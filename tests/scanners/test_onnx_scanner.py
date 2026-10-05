@@ -29503,7 +29503,7 @@ class TestOnnxShapeContinuity:
 
 class TestOnnxRankCacheBounds:
     @pytest.mark.parametrize("states", [8, 100, 300])
-    def test_sibling_constant_cache_keys_charge_aggregate_work(self, tmp_path: Path, states: int) -> None:
+    def test_shadowed_sibling_constants_do_not_multiply_cache_keys(self, tmp_path: Path, states: int) -> None:
         import cProfile
 
         from onnx.reference import ReferenceEvaluator
@@ -29545,12 +29545,8 @@ class TestOnnxRankCacheBounds:
         assert len(plan.specs) == 1
         np.testing.assert_array_equal(plan.specs[0].weights, weights)
         result = OnnxScanner().scan(str(path))
-        assert result.success is (states == 8)
-        if states == 8:
-            assert plan.coverage_gaps == {}
-        else:
-            assert plan.coverage_gaps["constant_binding_work_limit"] == 1
-            assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert result.success is True
+        assert plan.coverage_gaps == {}
 
     @pytest.mark.parametrize("rank", [1, 2])
     @pytest.mark.parametrize("length", [2, 4])
@@ -29616,3 +29612,302 @@ class TestOnnxRankCacheBounds:
         if final_rank == 2:
             assert plan.coverage_gaps["lineages_per_value_limit"] >= 1
             assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+
+
+class TestOnnxRelevantBindingBudgets:
+    @pytest.mark.parametrize("states", [8, 100, 300])
+    def test_captured_constant_entries_keep_aggregate_work_bounded(self, tmp_path: Path, states: int) -> None:
+        import cProfile
+
+        from onnx.reference import ReferenceEvaluator
+
+        value = TestOnnxShapeContinuity._v
+        tensor = TestOnnxShapeContinuity._t
+        names = [f"state{index}" for index in range(states)]
+        captured = [f"weight{index}" for index in range(16)]
+        body = helper.make_graph(
+            [helper.make_node("MatMul", ["X", name], [f"unused{index}"]) for index, name in enumerate(captured)],
+            "captured_constants",
+            [value("i", [], TensorProto.INT64), value("condition", [], TensorProto.BOOL)]
+            + [value(name, [2]) for name in names],
+            [value("condition", [], TensorProto.BOOL)] + [value(name, [2]) for name in names],
+        )
+        graph = helper.make_graph(
+            [helper.make_node("Loop", ["count", "start", *names], [f"out{i}" for i in range(states)], body=body)],
+            "relevant_cache_work",
+            [value("X", [1, 2])],
+            [value("out0", [2])],
+            [tensor(name, np.array([1, 2], np.float32)) for name in names]
+            + [tensor(name, np.full((2, 2), index + 1, np.float32)) for index, name in enumerate(captured)]
+            + [tensor("count", np.int64(2)), tensor("start", np.bool_(True))],
+        )
+        path, model = TestOnnxInferredShapeBounds._save(graph, tmp_path)
+        actual: Any = ReferenceEvaluator(model).run(None, {"X": np.ones((1, 2), np.float32)})
+        np.testing.assert_array_equal(actual[0], [1, 2])
+        with cProfile.Profile() as profile:
+            plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        fingerprint_calls = sum(
+            entry.callcount
+            for entry in profile.getstats()
+            if not isinstance(entry.code, str) and entry.code.co_name == "semantic_cache_fingerprint"
+        )
+        assert fingerprint_calls <= onnx_scanner_module._ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
+        assert len(plan.specs) == len(captured)
+        assert sorted(float(spec.weights[0, 0]) for spec in plan.specs) == list(range(1, 17))
+        result = OnnxScanner().scan(str(path))
+        assert result.success is (states == 8)
+        if states == 8:
+            assert plan.coverage_gaps == {}
+        else:
+            assert plan.coverage_gaps["constant_binding_work_limit"] == 1
+            assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+
+
+class TestOnnxBindingAndTerminationProofs:
+    @pytest.mark.parametrize("termination", ["zero_count", "false_initial", "false_body"])
+    @pytest.mark.parametrize("extreme", [False, True])
+    @pytest.mark.parametrize("overridable", [False, True])
+    def test_known_loop_termination_preserves_weight_evidence(
+        self, tmp_path: Path, termination: str, extreme: bool, overridable: bool
+    ) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        value = TestOnnxShapeContinuity._v
+        tensor = TestOnnxShapeContinuity._t
+        weights = np.zeros((64, 64), np.float32)
+        if extreme:
+            weights[:5, 0] = 10
+        body_inputs = [value("i", [], TensorProto.INT64), value("c", [], TensorProto.BOOL), value("state", [64, 64])]
+        if termination == "false_body":
+            body = helper.make_graph(
+                [
+                    helper.make_node("Constant", [], ["stop"], value=tensor("", np.bool_(False))),
+                    helper.make_node("Identity", ["state"], ["next"]),
+                    helper.make_node("Identity", ["state"], ["stack"]),
+                ],
+                "single_iteration",
+                body_inputs,
+                [value("stop", [], TensorProto.BOOL), value("next", [64, 64]), value("stack", [64, 64])],
+            )
+            loop_outputs = ["last", "stacked"]
+            weight_name, output_shape = "stacked", [1, 1, 64]
+        else:
+            body = helper.make_graph(
+                [
+                    helper.make_node("Reshape", ["state", "flat"], ["flat_state"]),
+                    helper.make_node("Reshape", ["flat_state", "matrix"], ["next"]),
+                ],
+                "skipped_transform",
+                body_inputs,
+                [value("c", [], TensorProto.BOOL), value("next", [64, 64])],
+                [tensor("flat", np.array([4096], np.int64)), tensor("matrix", np.array([64, 64], np.int64))],
+            )
+            loop_outputs = ["last"]
+            weight_name, output_shape = "last", [1, 64]
+        control_name = "start" if termination == "false_initial" else "count"
+        control_type = TensorProto.BOOL if termination == "false_initial" else TensorProto.INT64
+        inputs = [value("X", [1, 64])] + ([value(control_name, [], control_type)] if overridable else [])
+        graph = helper.make_graph(
+            [
+                helper.make_node("Loop", ["count", "start", "W"], loop_outputs, body=body),
+                helper.make_node("MatMul", ["X", weight_name], ["Y"]),
+            ],
+            "known_termination",
+            inputs,
+            [value("Y", output_shape)],
+            [
+                tensor("W", weights),
+                tensor("count", np.int64(0 if termination == "zero_count" else 2)),
+                tensor("start", np.bool_(termination != "false_initial")),
+            ],
+        )
+        path, model = TestOnnxInferredShapeBounds._save(graph, tmp_path)
+        feeds = {"X": np.ones((1, 64), np.float32)}
+        if overridable:
+            feeds[control_name] = np.array(
+                True if control_type == TensorProto.BOOL else 2,
+                dtype=(np.bool_ if control_type == TensorProto.BOOL else np.int64),
+            )
+        actual: Any = ReferenceEvaluator(model).run(None, feeds)
+        # The installed reference Loop omits the leading singleton stack axis;
+        # its values still prove which state reaches the matrix consumer.
+        np.testing.assert_array_equal(actual[0], feeds["X"] @ weights)
+        if termination == "false_body":
+            body_result: Any = ReferenceEvaluator(body, opsets={"": 18}).run(
+                None, {"i": np.int64(0), "c": np.bool_(True), "state": weights}
+            )
+            assert bool(body_result[0]) is False
+            np.testing.assert_array_equal(body_result[2], weights)
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        result = OnnxScanner().scan(str(path))
+        if overridable:
+            assert plan.coverage_gaps
+            assert result.success is False
+            assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        else:
+            assert plan.coverage_gaps == {}
+            assert len(plan.specs) == 1
+            np.testing.assert_array_equal(plan.specs[0].weights, weights)
+            assert result.success is True
+            analyzer = WeightDistributionScanner()
+            expected = analyzer._analyze_tensor_weight_extremes("runtime", weights, output_axes=(1,))
+            assert bool(expected) is extreme
+            assert (
+                any(
+                    check.name == "Weight Distribution Anomaly Detection" and check.status == CheckStatus.FAILED
+                    for check in result.checks
+                )
+                is extreme
+            )
+
+    @staticmethod
+    def _attribute_loop_model(width: int, attributes: int, referenced: int) -> Any:
+        value = TestOnnxShapeContinuity._v
+        tensor = TestOnnxShapeContinuity._t
+        names = [f"state{i}" for i in range(width)]
+        nodes = [helper.make_node("Identity", [name], [f"next{i}"]) for i, name in enumerate(names)]
+        for index in range(referenced):
+            constant = helper.make_node("Constant", [], [f"tag_value{index}"])
+            constant.attribute.append(helper.make_attribute_ref("value_int", onnx.AttributeProto.INT))
+            constant.attribute[0].ref_attr_name = f"tag{index}"
+            nodes.append(constant)
+        body = helper.make_graph(
+            nodes,
+            "attribute_body",
+            [value("i", [], TensorProto.INT64), value("condition", [], TensorProto.BOOL)]
+            + [value(name, [1]) for name in names],
+            [value("condition", [], TensorProto.BOOL)] + [value(f"next{i}", [1]) for i in range(width)],
+        )
+        function = helper.make_function(
+            "local",
+            "Wrapper",
+            ["count", "start", *names],
+            [f"out{i}" for i in range(width)],
+            [helper.make_node("Loop", ["count", "start", *names], [f"out{i}" for i in range(width)], body=body)],
+            [helper.make_opsetid("", 18)],
+            attributes=[f"tag{i}" for i in range(attributes)],
+        )
+        attribute_values: dict[str, Any] = {f"tag{i}": i for i in range(attributes)}
+        graph = helper.make_graph(
+            [
+                helper.make_node(
+                    "Wrapper",
+                    ["count", "start", *names],
+                    [f"Y{i}" for i in range(width)],
+                    domain="local",
+                    **attribute_values,
+                )
+            ],
+            "attribute_environment",
+            [],
+            [value(f"Y{i}", [1]) for i in range(width)],
+            [tensor("count", np.int64(2)), tensor("start", np.bool_(True))]
+            + [tensor(name, np.ones(1, np.float32)) for name in names],
+        )
+        model = helper.make_model(
+            graph,
+            functions=[function],
+            opset_imports=[helper.make_opsetid("", 18), helper.make_opsetid("local", 1)],
+            ir_version=8,
+        )
+        return model
+
+    @pytest.mark.parametrize(
+        "width, attributes, referenced, work_limit",
+        [(128, 1024, 0, None), (128, 1024, 1, None), (1, 16, 16, 8)],
+        ids=["unused", "referenced", "exhausted"],
+    )
+    def test_local_loop_attribute_environment_is_scoped_and_reused(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        width: int,
+        attributes: int,
+        referenced: int,
+        work_limit: int | None,
+    ) -> None:
+        import cProfile
+
+        from onnx.reference import ReferenceEvaluator
+
+        model = self._attribute_loop_model(width, attributes, referenced)
+        onnx.checker.check_model(model, full_check=True)
+        path = tmp_path / "attributes.onnx"
+        onnx.save(model, str(path))
+        actual: Any = ReferenceEvaluator(model).run(None, {})
+        assert len(actual) == width
+        assert all(np.array_equal(array, np.ones(1, np.float32)) for array in actual)
+        if work_limit is not None:
+            monkeypatch.setattr(onnx_scanner_module, "_ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK", work_limit)
+        with cProfile.Profile() as profile:
+            plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        calls = sum(
+            entry.callcount
+            for entry in profile.getstats()
+            if not isinstance(entry.code, str) and entry.code.co_name == "semantic_cache_fingerprint"
+        )
+        assert calls <= 4
+        assert plan.specs == []
+        result = OnnxScanner().scan(str(path))
+        if work_limit is None:
+            assert plan.coverage_gaps == {}
+            assert result.success is True
+        else:
+            assert plan.coverage_gaps["attribute_binding_work_limit"] == 1
+            assert result.success is False
+            assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+
+    @pytest.mark.parametrize("width", [16, 64, 128])
+    def test_exhausted_attribute_proofs_stop_work_and_keep_independent_findings(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, width: int
+    ) -> None:
+        import sys
+        from types import FrameType
+
+        from onnx.reference import ReferenceEvaluator
+
+        model = self._attribute_loop_model(width, 16, 16)
+        weights = np.zeros((64, 64), np.float32)
+        weights[:5, 0] = 10
+        model.graph.input.append(TestOnnxShapeContinuity._v("X", [1, 64]))
+        model.graph.initializer.append(TestOnnxShapeContinuity._t("W", weights))
+        model.graph.node.append(helper.make_node("MatMul", ["X", "W"], ["product"]))
+        model.graph.output.append(TestOnnxShapeContinuity._v("product", [1, 64]))
+        onnx.checker.check_model(model, full_check=True)
+        actual: Any = ReferenceEvaluator(model).run(None, {"X": np.ones((1, 64), np.float32)})
+        assert len(actual) == width + 1
+        assert all(np.array_equal(array, np.ones(1, np.float32)) for array in actual[:-1])
+        np.testing.assert_array_equal(actual[-1], np.ones((1, 64), np.float32) @ weights)
+        path = tmp_path / "exhausted_attributes.onnx"
+        onnx.save(model, str(path))
+        monkeypatch.setattr(onnx_scanner_module, "_ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK", 8)
+        node_visits = 0
+
+        def profile(frame: FrameType, event: str, argument: Any) -> None:
+            nonlocal node_visits
+            if (
+                event == "return"
+                and frame.f_code.co_name == "graph_external_reference_names"
+                and frame.f_code.co_filename == onnx_scanner_module.__file__
+                and "reference_names" in frame.f_locals
+                and frame.f_locals.get("cached_reference_names") is None
+            ):
+                node_visits += len(frame.f_locals["graph"].node)
+
+        prior_profile = sys.getprofile()
+        sys.setprofile(profile)
+        try:
+            plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        finally:
+            sys.setprofile(prior_profile)
+        assert node_visits <= 4 * (width + 16)
+        assert plan.coverage_gaps["attribute_binding_work_limit"] == 1
+        assert len(plan.specs) == 1
+        np.testing.assert_array_equal(plan.specs[0].weights, weights)
+        result = OnnxScanner().scan(str(path))
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert any(
+            check.name == "Weight Distribution Anomaly Detection" and check.status == CheckStatus.FAILED
+            for check in result.checks
+        )

@@ -2375,6 +2375,16 @@ def _build_onnx_weight_analysis_plan(
     ) -> bool:
         return bool(value_name) and value_name in graph_input_names and value_name not in constants
 
+    def loop_body_is_proven_skipped(node: Any, constants: dict[str, Any], graph_input_names: set[str]) -> bool:
+        for index, data_type in ((0, onnx.TensorProto.INT64), (1, onnx.TensorProto.BOOL)):
+            name = str(node.input[index]) if len(node.input) > index and node.input[index] else ""
+            if graph_input_is_runtime_overridable(name, graph_input_names, constants):
+                continue
+            value = constant_scalar_value(constants.get(name), int(data_type))
+            if value is not None and ((index == 0 and int(value) <= 0) or (index == 1 and value is False)):
+                return True
+        return False
+
     def loop_may_skip_body(node: Any, constants: dict[str, Any], graph_input_names: set[str]) -> bool:
         trip_input = str(node.input[0]) if len(node.input) > 0 and node.input[0] else ""
         condition_input = str(node.input[1]) if len(node.input) > 1 and node.input[1] else ""
@@ -2776,10 +2786,29 @@ def _build_onnx_weight_analysis_plan(
         )
         return tuple((str(name), *semantic_cache_fingerprint(value)) for name, value in items)
 
-    def attribute_binding_cache_key(attribute_bindings: dict[str, Any] | None) -> tuple[tuple[str, str, str], ...]:
+    attribute_binding_keys: dict[int, tuple[dict[str, Any], tuple[tuple[str, str, str], ...]]] = {}
+    attribute_binding_work_remaining = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
+
+    def attribute_binding_cache_key(
+        attribute_bindings: dict[str, Any] | None,
+    ) -> tuple[tuple[str, str, str], ...] | None:
+        nonlocal attribute_binding_work_remaining
         if not attribute_bindings:
             return ()
-        return semantic_mapping_cache_key(attribute_bindings)
+        # Attribute environments are built before traversal and never rebound.
+        # Retain their owners so a later protobuf wrapper cannot reuse an id.
+        cached = attribute_binding_keys.get(id(attribute_bindings))
+        if cached is not None and cached[0] is attribute_bindings:
+            return cached[1]
+        if len(attribute_bindings) > attribute_binding_work_remaining:
+            plan.coverage_gaps.setdefault("attribute_binding_work_limit", 1)
+            # Dependent proofs must stop instead of aliasing or repeatedly
+            # traversing an unexamined binding environment.
+            return None
+        attribute_binding_work_remaining -= len(attribute_bindings)
+        key = semantic_mapping_cache_key(attribute_bindings)
+        attribute_binding_keys[id(attribute_bindings)] = (attribute_bindings, key)
+        return key
 
     constant_binding_work_remaining = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
 
@@ -2790,14 +2819,18 @@ def _build_onnx_weight_analysis_plan(
         nonlocal constant_binding_work_remaining
         if not constants or not names:
             return ()
-        # Charge before allocating: sibling-state keys can each contain the same
-        # whole binding environment even when the graph traversal itself is tiny.
-        if len(names) > constant_binding_work_remaining:
+        # Scope filtering is bounded by the graph dependency-name limit. Only
+        # actual bindings allocate fingerprints and retained cache-key entries.
+        if len(names) > _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK or constant_binding_work_remaining <= 0:
+            plan.coverage_gaps.setdefault("constant_binding_work_limit", 1)
+            return None
+        relevant_names = frozenset(constants.keys() & names)
+        if len(relevant_names) > constant_binding_work_remaining:
             constant_binding_work_remaining = 0
             plan.coverage_gaps.setdefault("constant_binding_work_limit", 1)
             return None
-        constant_binding_work_remaining -= len(names)
-        return semantic_mapping_cache_key(constants, names)
+        constant_binding_work_remaining -= len(relevant_names)
+        return semantic_mapping_cache_key(constants, relevant_names)
 
     def trusted_context_shape_cache_key(
         trusted_context_shapes: dict[str, tuple[int, ...]],
@@ -2860,14 +2893,23 @@ def _build_onnx_weight_analysis_plan(
                 bindings[graph_input_name] = parent_name
         return bindings
 
-    def rank_reentry_constant_names(subgraph: Any, attribute_bindings: dict[str, Any] | None = None) -> frozenset[str]:
-        cache_key = (id(subgraph), attribute_binding_cache_key(attribute_bindings))
+    def rank_reentry_constant_names(
+        subgraph: Any,
+        attribute_bindings: dict[str, Any] | None = None,
+        *,
+        include_bound_inputs: bool = False,
+    ) -> frozenset[str]:
+        attribute_key = attribute_binding_cache_key(attribute_bindings)
+        if attribute_key is None:
+            return dependency_collection_limit
+        cache_key = (id(subgraph), attribute_key, include_bound_inputs)
         if cache_key in rank_reentry_constant_name_cache:
             return rank_reentry_constant_name_cache[cache_key]
-        # Immutable body-local tensors are fixed by graph identity. Every
-        # caller-dependent value enters through a formal input or capture.
+        # Caller names shadowed by body declarations do not enter its constant
+        # environment. Formal inputs matter only for explicit argument bindings.
         names: set[str] = set()
-        merge_dependency_names(names, (_onnx_value_name(value) for value in getattr(subgraph, "input", ())))
+        if include_bound_inputs:
+            merge_dependency_names(names, (_onnx_value_name(value) for value in getattr(subgraph, "input", ())))
         merge_dependency_names(names, graph_external_reference_names(subgraph, attribute_bindings))
         result = frozenset(names)
         rank_reentry_constant_name_cache[cache_key] = result
@@ -2976,6 +3018,8 @@ def _build_onnx_weight_analysis_plan(
         local_attribute_bindings: dict[str, Any],
     ) -> frozenset[str]:
         attribute_key = attribute_binding_cache_key(local_attribute_bindings)
+        if attribute_key is None:
+            return dependency_collection_limit
         cache_key = (id(node), attribute_key)
         cached = graph_node_direct_dependency_cache.get(cache_key)
         if cached is not None and cached[0] is node:
@@ -3073,6 +3117,9 @@ def _build_onnx_weight_analysis_plan(
         output_indexes: Iterable[int] | None = None,
         attribute_bindings: dict[str, Any] | None = None,
     ) -> frozenset[str]:
+        attribute_key = attribute_binding_cache_key(attribute_bindings)
+        if attribute_key is None:
+            return dependency_collection_limit
         graph_outputs = getattr(subgraph, "output", ())
         if len(graph_outputs) > _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_OUTPUTS:
             return dependency_collection_limit
@@ -3082,7 +3129,7 @@ def _build_onnx_weight_analysis_plan(
             else tuple(sorted({index for index in output_indexes if 0 <= index < len(graph_outputs)}))
         )
         cache_output_indexes = tuple(range(len(graph_outputs))) if output_index_key is None else output_index_key
-        cache_key = (id(subgraph), cache_output_indexes, attribute_binding_cache_key(attribute_bindings))
+        cache_key = (id(subgraph), cache_output_indexes, attribute_key)
         if cache_key in graph_output_dependency_cache:
             return graph_output_dependency_cache[cache_key]
         initial_outputs = {
@@ -3099,6 +3146,8 @@ def _build_onnx_weight_analysis_plan(
     ) -> frozenset[str]:
         value_name_key = tuple(sorted(str(value_name) for value_name in value_names if value_name))
         attribute_key = attribute_binding_cache_key(attribute_bindings)
+        if attribute_key is None:
+            return dependency_collection_limit
         cache_key = (id(subgraph), value_name_key, attribute_key)
         cached_dependencies = graph_value_dependency_cache.get(cache_key)
         if cached_dependencies is not None and cached_dependencies[0] is subgraph:
@@ -3125,6 +3174,9 @@ def _build_onnx_weight_analysis_plan(
         opset_versions: dict[str, int] | None = None,
         attribute_bindings: dict[str, Any] | None = None,
     ) -> bool:
+        attribute_key = attribute_binding_cache_key(attribute_bindings)
+        if attribute_key is None:
+            return True
         graph_nodes = graph_nodes_once(subgraph)
         potential_weight_consumer_seen = False
         potential_weight_consumer_input_edges = 0
@@ -3163,7 +3215,7 @@ def _build_onnx_weight_analysis_plan(
                 cache_key = (
                     id(subgraph),
                     opset_cache_key(opset_versions or {}),
-                    attribute_binding_cache_key(attribute_bindings),
+                    attribute_key,
                 )
                 cached_work = graph_potential_weight_work_cache.get(cache_key)
                 if cached_work is None or cached_work[0] is not subgraph:
@@ -3285,7 +3337,14 @@ def _build_onnx_weight_analysis_plan(
         if dependency_names_exceeded_limit(constant_names):
             return True
         constants_key = constant_binding_cache_key(constants, constant_names)
-        bound_constants_key = constant_binding_cache_key(bound_input_constants or {}, constant_names)
+        bound_constant_names = (
+            rank_reentry_constant_names(subgraph, attribute_bindings, include_bound_inputs=True)
+            if bound_input_constants
+            else frozenset()
+        )
+        if dependency_names_exceeded_limit(bound_constant_names):
+            return True
+        bound_constants_key = constant_binding_cache_key(bound_input_constants or {}, bound_constant_names)
         if constants_key is None or bound_constants_key is None:
             return True
         cache_key = (
@@ -4324,10 +4383,13 @@ def _build_onnx_weight_analysis_plan(
     ) -> bool:
         if depth > 6:
             return True
+        attribute_key = attribute_binding_cache_key(attribute_bindings)
+        if attribute_key is None:
+            return True
         cache_key = (
             id(subgraph),
             opset_cache_key(opset_versions),
-            attribute_binding_cache_key(attribute_bindings),
+            attribute_key,
             depth,
         )
         if cache_key in potential_weight_consumer_cache:
@@ -4396,10 +4458,13 @@ def _build_onnx_weight_analysis_plan(
         attribute_bindings: dict[str, Any] | None = None,
         depth: int = 0,
     ) -> frozenset[str]:
+        attribute_key = attribute_binding_cache_key(attribute_bindings)
+        if attribute_key is None:
+            return dependency_collection_limit
         cache_key = (
             id(subgraph),
             opset_cache_key(opset_versions),
-            attribute_binding_cache_key(attribute_bindings),
+            attribute_key,
             depth,
         )
         if cache_key in potential_weight_consumer_dependency_cache:
@@ -4820,7 +4885,10 @@ def _build_onnx_weight_analysis_plan(
     def graph_external_reference_names(
         graph: Any, attribute_bindings: dict[str, Any] | None = None, *, depth: int = 0
     ) -> frozenset[str]:
-        cache_key = (id(graph), attribute_binding_cache_key(attribute_bindings), depth)
+        attribute_key = attribute_binding_cache_key(attribute_bindings)
+        if attribute_key is None:
+            return dependency_collection_limit
+        cache_key = (id(graph), attribute_key, depth)
         if depth > 6 or cache_key in graph_external_reference_in_progress:
             return frozenset({dependency_collection_limit_marker})
         cached_reference_names = graph_external_reference_cache.get(cache_key)
@@ -7201,19 +7269,23 @@ def _build_onnx_weight_analysis_plan(
                         ):
                             subgraph_trusted_context_shapes[loop_body_condition_name] = loop_condition_shape
 
-                    loop_exact_count_cache: dict[tuple[int, int, int], int | None] = {}
+                    loop_exact_count_cache: dict[tuple[int, int, int, bool], int | None] = {}
 
                     def loop_exact_iteration_count(
                         current_node: Any = node,
                         current_subgraph: Any = subgraph,
                         *,
                         max_count: int = 1,
-                        count_cache: dict[tuple[int, int, int], int | None] = loop_exact_count_cache,
+                        require_bounded_trip_count: bool = False,
+                        count_cache: dict[tuple[int, int, int, bool], int | None] = loop_exact_count_cache,
                     ) -> int | None:
-                        cache_key = (id(current_node), id(current_subgraph), max_count)
+                        cache_key = (id(current_node), id(current_subgraph), max_count, require_bounded_trip_count)
                         if cache_key in count_cache:
                             return count_cache[cache_key]
                         count_cache[cache_key] = None
+                        if loop_body_is_proven_skipped(current_node, constants, graph_input_names):
+                            count_cache[cache_key] = 0
+                            return 0
                         trip_input = (
                             str(current_node.input[0]) if len(current_node.input) > 0 and current_node.input[0] else ""
                         )
@@ -7234,7 +7306,19 @@ def _build_onnx_weight_analysis_plan(
                             if condition_input
                             else True
                         )
-                        if trip_count is None or initial_condition is not True:
+                        if initial_condition is not True:
+                            return None
+                        if require_bounded_trip_count and (trip_count is None or int(trip_count) > max_count):
+                            return None
+                        if (not trip_input or (trip_count is not None and int(trip_count) > 0)) and (
+                            bool(getattr(current_subgraph, "output", ()))
+                            and graph_value_is_constant_false(
+                                current_subgraph, _onnx_value_name(current_subgraph.output[0]), constants
+                            )
+                        ):
+                            count_cache[cache_key] = 1 if max_count >= 1 else None
+                            return count_cache[cache_key]
+                        if trip_count is None:
                             return None
                         exact_count = max(int(trip_count), 0)
                         if exact_count > 1 and not loop_body_condition_remains_true(
@@ -9359,8 +9443,11 @@ def _build_onnx_weight_analysis_plan(
                 function_source_scope = ("function", *function_key)
                 function_bound_attributes: dict[str, Any] = {}
                 function_bound_attribute_keys: dict[str, tuple[Any, ...]] = {}
+                referenced_attributes = referenced_function_attributes(function)
                 for default_position, attribute in enumerate(getattr(function, "attribute_proto", ())):
                     attribute_name = str(attribute.name)
+                    if referenced_attributes is not None and attribute_name not in referenced_attributes:
+                        continue
                     function_bound_attributes[attribute_name] = attribute
                     function_bound_attribute_keys[attribute_name] = (
                         *function_source_scope,
@@ -9368,9 +9455,11 @@ def _build_onnx_weight_analysis_plan(
                         default_position,
                     )
                 for attribute_position, attribute in enumerate(getattr(node, "attribute", ())):
+                    attribute_name = str(attribute.name)
+                    if referenced_attributes is not None and attribute_name not in referenced_attributes:
+                        continue
                     resolved_attribute = resolve_attribute(attribute)
                     if resolved_attribute is not None:
-                        attribute_name = str(attribute.name)
                         function_bound_attributes[attribute_name] = resolved_attribute
                         function_bound_attribute_keys[attribute_name] = attribute_source_key(
                             attribute,
@@ -10328,6 +10417,11 @@ def _build_onnx_weight_analysis_plan(
                     return -1
                 return scan_stacked_output_extent(producer, output_index, allow_omitted_sequence_lens=True)
 
+            loop_returns_initial_state = (
+                standard_control_flow_operator
+                and node.op_type == "Loop"
+                and loop_body_is_proven_skipped(node, constants, graph_input_names)
+            )
             subgraph_output_offset = 1 if standard_control_flow_operator and node.op_type == "Loop" else 0
             for (
                 graph_output_lineages,
@@ -10353,6 +10447,8 @@ def _build_onnx_weight_analysis_plan(
                         resolve_attribute=resolve_attribute,
                     )
                 for output_index in range(len(node.output)):
+                    if loop_returns_initial_state and output_index < stacked_scan_output_start:
+                        continue
                     graph_output_index = output_index + subgraph_output_offset
                     if graph_output_index >= len(graph_output_lineages):
                         continue
@@ -10375,7 +10471,8 @@ def _build_onnx_weight_analysis_plan(
                     if stacked_scan_output and standard_control_flow_operator:
                         if (
                             node.op_type == "Loop"
-                            and (exact_loop_iterations := loop_exact_iteration_count()) is not None
+                            and (exact_loop_iterations := loop_exact_iteration_count(require_bounded_trip_count=True))
+                            is not None
                         ):
                             scan_output_extent = exact_loop_iterations
                         elif node.op_type == "Scan":
