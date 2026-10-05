@@ -31643,3 +31643,294 @@ class TestOnnxControlExtentProofs:
             assert plan.coverage_gaps == {}
             np.testing.assert_array_equal(plan.specs[0].weights, actual[1])
             assert OnnxScanner().scan(str(path)).success is True
+
+
+class TestOnnxNestedScanBindings:
+    _value = staticmethod(TestOnnxRecurrenceReviewRegressions._value)
+    _model = staticmethod(TestOnnxBuiltinOperatorIdentity._model)
+    _save = staticmethod(TestOnnxLoopControlProofs._save)
+
+    @classmethod
+    def _nested_model(
+        cls, sources: int, trip: int, axis: int = 0, *, captured: bool = False, binding: str = "literal"
+    ) -> Any:
+        value, tensor = cls._value, TestOnnxShapeContinuity._t
+        bad = np.zeros((64, 64), np.float32)
+        bad[:5, 0] = 10
+        replace = helper.make_graph(
+            [helper.make_node("Identity", ["Good"], ["replacement"])],
+            "replace",
+            [value("weight", [64, 64]), value("sample", [])],
+            [value("replacement", [64, 64])],
+        )
+        shrink = helper.make_graph(
+            [
+                helper.make_node("Shape", ["state" if captured else "element"], ["dims"]),
+                helper.make_node("Cast", ["dims"], ["next_element"], to=TensorProto.FLOAT),
+            ],
+            "shrink",
+            [value("held", [None]), value("element", [])],
+            [value("next_element", [None])],
+        )
+        nested = helper.make_node(
+            "Scan", ["state", "state"], ["next"], body=shrink, num_scan_inputs=1, scan_input_axes=[axis]
+        )
+        body = helper.make_graph(
+            [
+                helper.make_node("Scan", ["Bad", "state"], ["selected"], body=replace, num_scan_inputs=1),
+                helper.make_node("MatMul", ["X", "selected"], ["Y"]),
+                helper.make_node("Identity", ["condition"], ["condition_out"]),
+                nested,
+            ],
+            "body",
+            [value("i", [], TensorProto.INT64), value("condition", [], TensorProto.BOOL), value("state", [None])],
+            [value("condition_out", [], TensorProto.BOOL), value("next", [None]), value("Y", [1, 64])],
+        )
+        names = [f"source{index}" for index in range(sources)]
+        model = cls._model(
+            [
+                helper.make_node("Sum", names, ["initial"]),
+                helper.make_node("Loop", ["count", "start", "initial"], ["final", "Ys"], body=body),
+            ],
+            [value("X", [1, 64])],
+            [value("final", [None]), value("Ys", [trip, 1, 64])],
+            [tensor(name, np.zeros(1, np.float32)) for name in names]
+            + [
+                tensor("count", np.int64(trip)),
+                tensor("start", np.bool_(True)),
+                tensor("Bad", bad),
+                tensor("Good", np.zeros_like(bad)),
+            ],
+            [],
+        )
+        return cls._bind_attributes(model, binding, axis)
+
+    @staticmethod
+    def _bind_attributes(model: Any, binding: str, axis: int) -> Any:
+        if binding != "literal":
+            nested = next(node for node in reversed(model.graph.node[-1].attribute[0].g.node) if node.op_type == "Scan")
+            shrink = next(attribute.g for attribute in nested.attribute if attribute.name == "body")
+            body_attribute = helper.make_attribute("body", shrink)
+            del nested.attribute[:]
+            nested.attribute.extend(
+                [
+                    body_attribute,
+                    onnx.AttributeProto(name="num_scan_inputs", ref_attr_name="count", type=onnx.AttributeProto.INT),
+                    onnx.AttributeProto(name="scan_input_axes", ref_attr_name="axes", type=onnx.AttributeProto.INTS),
+                ]
+            )
+            names = ["X", *[item.name for item in model.graph.initializer]]
+            function = helper.make_function(
+                "local",
+                "NestedLoop",
+                names,
+                ["final", "Ys"],
+                list(model.graph.node),
+                [helper.make_opsetid("", 18)],
+                attributes=["count", "axes"] if binding == "caller" else [],
+                attribute_protos=[]
+                if binding == "caller"
+                else [
+                    helper.make_attribute("count", 1),
+                    helper.make_attribute("axes", [1 if binding == "override" else axis]),
+                ],
+            )
+            model.functions.append(function)
+            del model.graph.node[:]
+            call = helper.make_node("NestedLoop", names, ["final", "Ys"], domain="local")
+            if binding != "default":
+                call.attribute.extend([helper.make_attribute("count", 1), helper.make_attribute("axes", [axis])])
+            model.graph.node.append(call)
+        return model
+
+    @pytest.mark.parametrize("sources", [1, 33])
+    @pytest.mark.parametrize("trip", [1, 2])
+    @pytest.mark.parametrize("axis", [0, -1])
+    @pytest.mark.parametrize("captured", [False, True])
+    def test_nested_scan_formals_use_per_iteration_shapes(
+        self, tmp_path: Path, sources: int, trip: int, axis: int, captured: bool
+    ) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        model = self._nested_model(sources, trip, axis, captured=captured)
+        path = self._save(model, tmp_path)
+        # The reference Scan implementation only accepts axis0. All sequence
+        # inputs here have rank1, so the separately built axis0 oracle is exact.
+        oracle = self._nested_model(sources, trip, 0, captured=captured)
+        runtime: Any = ReferenceEvaluator(oracle).run(None, {"X": np.ones((1, 64), np.float32)})
+        bad_reached = trip == 2 and not captured
+        assert runtime[0].shape == ((1,) if captured else (0,))
+        assert float(runtime[1].sum()) == (50 if bad_reached else 0)
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        assert plan.coverage_gaps == {}
+        assert {spec.context["initializer"] for spec in plan.specs} == ({"Bad", "Good"} if bad_reached else {"Good"})
+        result = OnnxScanner().scan(str(path))
+        assert result.success is True
+        assert bool(TestWeightDistributionSemantics._extreme_checks(result)) is bad_reached
+        if bad_reached:
+            bad = next(spec.weights for spec in plan.specs if spec.context["initializer"] == "Bad")
+            np.testing.assert_array_equal(runtime[1][-1].reshape(1, 64), np.ones((1, 64), np.float32) @ bad)
+
+    @pytest.mark.parametrize("binding", ["caller", "default", "override"])
+    @pytest.mark.parametrize("axis", [0, -1])
+    @pytest.mark.parametrize("captured", [False, True])
+    def test_nested_scan_shape_binding_uses_active_function_attributes(
+        self, tmp_path: Path, binding: str, axis: int, captured: bool
+    ) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        model = self._nested_model(33, 2, axis, captured=captured, binding=binding)
+        path = self._save(model, tmp_path)
+        oracle = self._nested_model(33, 2, 0, captured=captured, binding=binding)
+        runtime: Any = ReferenceEvaluator(TestOnnxLoopControlProofs._inline_with_defaults(oracle)).run(
+            None, {"X": np.ones((1, 64), np.float32)}
+        )
+        assert float(runtime[1].sum()) == (0 if captured else 50)
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        assert plan.coverage_gaps == {}
+        assert {spec.context["initializer"] for spec in plan.specs} == ({"Good"} if captured else {"Good", "Bad"})
+        result = OnnxScanner().scan(str(path))
+        assert result.success is True
+        assert bool(TestWeightDistributionSemantics._extreme_checks(result)) is not captured
+
+    @pytest.mark.parametrize("width", [128, 512])
+    @pytest.mark.parametrize("scan", [False, True])
+    def test_lineage_name_bookkeeping_does_not_copy_all_prior_aliases(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, width: int, scan: bool
+    ) -> None:
+        value, tensor = self._value, TestOnnxShapeContinuity._t
+        nodes = [
+            helper.make_node("Identity", ["W" if index == 0 else f"a{index - 1}"], [f"a{index}"])
+            for index in range(width)
+        ]
+        weight = f"a{width - 1}"
+        if scan:
+            body = helper.make_graph(
+                [helper.make_node("Identity", ["state"], ["next"])],
+                "keep",
+                [value("state", [2, 2]), value("element", [])],
+                [value("next", [2, 2])],
+            )
+            nodes.append(helper.make_node("Scan", [weight, "sequence"], ["final"], body=body, num_scan_inputs=1))
+            weight = "final"
+        nodes.append(helper.make_node("MatMul", ["X", weight], ["Y"]))
+        model = self._model(
+            nodes,
+            [value("X", [1, 2]), value("sequence", [1])],
+            [value("Y", [1, 2])],
+            [tensor("W", np.ones((2, 2), np.float32))],
+            [],
+        )
+        path = self._save(model, tmp_path)
+        copied_entries = 0
+
+        class CountedSet(set[Any]):
+            def __init__(self, values: Any = ()) -> None:
+                nonlocal copied_entries
+                lineages = sys._getframe(1).f_locals.get("value_lineages")
+                if values is lineages and isinstance(lineages, dict):
+                    copied_entries += len(lineages)
+                super().__init__(values)
+
+        monkeypatch.setattr(onnx_scanner_module, "set", CountedSet, raising=False)
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        assert copied_entries == 0
+        assert plan.coverage_gaps == {}
+        assert len(plan.specs) == 1
+        np.testing.assert_array_equal(plan.specs[0].weights, np.ones((2, 2), np.float32))
+        assert OnnxScanner().scan(str(path)).success is True
+
+    @pytest.mark.parametrize("identity", ["matching", "different_overload", "different_domain"])
+    def test_nested_scan_shape_binding_respects_local_operator_identity(self, tmp_path: Path, identity: str) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        model = self._nested_model(33, 2)
+        nested = model.graph.node[-1].attribute[0].g.node[-1]
+        nested.overload = "custom"
+        model.functions.append(
+            helper.make_function(
+                "local" if identity == "different_domain" else "",
+                "Scan",
+                ["left", "right"],
+                ["out"],
+                [helper.make_node("Identity", ["left"], ["out"])],
+                [helper.make_opsetid("", 18)],
+                attributes=["body", "num_scan_inputs", "scan_input_axes"],
+                overload="other" if identity == "different_overload" else "custom",
+            )
+        )
+        path = self._save(model, tmp_path)
+        runtime: Any = ReferenceEvaluator(TestOnnxLoopControlProofs._inline_with_defaults(model)).run(
+            None, {"X": np.ones((1, 64), np.float32)}
+        )
+        changed = identity != "matching"
+        assert float(runtime[1].sum()) == (50 if changed else 0)
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        assert plan.coverage_gaps == {}
+        assert {spec.context["initializer"] for spec in plan.specs} == ({"Good", "Bad"} if changed else {"Good"})
+        result = OnnxScanner().scan(str(path))
+        assert result.success is True
+        assert bool(TestWeightDistributionSemantics._extreme_checks(result)) is changed
+
+    @pytest.mark.parametrize("invalid", ["axis", "bound-axis", "count", "unresolved"])
+    def test_unproven_nested_scan_binding_retains_weight_taint(self, invalid: str) -> None:
+        model = self._nested_model(33, 2, binding="caller" if invalid == "bound-axis" else "literal")
+        nested = model.graph.node[0] if invalid == "bound-axis" else model.graph.node[-1].attribute[0].g.node[-1]
+        field = "axes" if invalid == "bound-axis" else "scan_input_axes" if invalid == "axis" else "num_scan_inputs"
+        attribute = next(attribute for attribute in nested.attribute if attribute.name == field)
+        if invalid in {"axis", "bound-axis"}:
+            attribute.ints[0] = 2
+        elif invalid == "count":
+            attribute.i = 0
+        else:
+            attribute.ClearField("i")
+            attribute.ref_attr_name = "missing"
+        with pytest.raises((onnx.checker.ValidationError, onnx.shape_inference.InferenceError)):
+            onnx.checker.check_model(model, full_check=True)
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        assert plan.coverage_gaps or any(spec.context["initializer"] == "Bad" for spec in plan.specs)
+
+    @pytest.mark.parametrize("sources", [1, 33])
+    def test_nested_scan8_removes_batch_and_sequence_axes(self, tmp_path: Path, sources: int) -> None:
+        model = self._nested_model(sources, 2)
+        model.opset_import[0].version = 8
+        body = model.graph.node[-1].attribute[0].g
+        shrink: Any = onnx.GraphProto()
+        shrink.CopyFrom(next(attribute.g for attribute in body.node[-1].attribute if attribute.name == "body"))
+        replace: Any = onnx.GraphProto()
+        replace.CopyFrom(next(attribute.g for attribute in body.node[0].attribute if attribute.name == "body"))
+        del body.node[:]
+        body.node.extend(
+            [
+                helper.make_node("Unsqueeze", ["state"], ["batched"], axes=[0]),
+                helper.make_node("Unsqueeze", ["Bad"], ["Bad_batch"], axes=[0]),
+                helper.make_node(
+                    "Scan", ["", "Bad_batch", "batched"], ["selected_batch"], body=replace, num_scan_inputs=1
+                ),
+                helper.make_node("Squeeze", ["selected_batch"], ["selected"], axes=[0]),
+                helper.make_node("MatMul", ["X", "selected"], ["Y"]),
+                helper.make_node("Identity", ["condition"], ["condition_out"]),
+                helper.make_node("Scan", ["", "batched", "batched"], ["next_batch"], body=shrink, num_scan_inputs=1),
+                helper.make_node("Squeeze", ["next_batch"], ["next"], axes=[0]),
+            ]
+        )
+        path = self._save(model, tmp_path)
+        # Scan8 iterates each batch/sequence slice; the reference runtime cannot
+        # execute its legacy input signature. Execute that body with scalar
+        # elements, including the second invocation's empty sequence, instead.
+        from onnx.reference import ReferenceEvaluator
+
+        state = np.zeros((1, 1), np.float32)
+        runtime = ReferenceEvaluator(shrink, opsets={"": 8})
+        for element in state[0]:
+            result: Any = runtime.run(None, {"held": state[0], "element": element})
+            state = np.stack([result[0]])
+        assert state.shape == (1, 0)
+        assert list(state[0]) == []
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        report = OnnxScanner().scan(str(path))
+        if plan.coverage_gaps:
+            assert report.success is False
+        else:
+            assert {spec.context["initializer"] for spec in plan.specs} == {"Good", "Bad"}
+            assert TestWeightDistributionSemantics._extreme_checks(report)

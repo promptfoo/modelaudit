@@ -538,7 +538,7 @@ def _onnx_scan_bound_subgraph_input_shape(
     pair_index: int,
     scan_input_start: int,
     scan_input_offset: int,
-    scan_input_axes: tuple[int, ...],
+    scan_input_axes: Sequence[int],
 ) -> tuple[tuple[int, ...] | None, int | None]:
     scan8_batched_input = bool(scan_input_offset and pair_index >= scan_input_offset)
     if scan8_batched_input and pair_index < scan_input_start:
@@ -3712,6 +3712,45 @@ def _build_onnx_weight_analysis_plan(
                     output_shape = function_output_shapes.get(output_index)
                     if output_shape is not None:
                         tainted_shapes[output_name] = output_shape
+            nested_scan = builtin_operator(body_node, "Scan") and is_registered_standard_operator
+            nested_scan_offset = scan_sequence_lens_input_offset(body_node, opset_versions) if nested_scan else 0
+            nested_scan_count = (
+                resolved_onnx_int_attribute(body_node, "num_scan_inputs", 1, resolve_reentry_attribute)
+                if nested_scan and standard_reentry_operator
+                else None
+            )
+            nested_scan_axes: Sequence[int] = ()
+            if nested_scan and standard_reentry_operator:
+                for scan_attribute in body_node.attribute:
+                    if scan_attribute.name == "scan_input_axes":
+                        resolved_scan_attribute = resolve_reentry_attribute(scan_attribute)
+                        if resolved_scan_attribute is not None:
+                            nested_scan_axes = resolved_scan_attribute.ints
+                        break
+
+            def nested_bound_shape(
+                shape: tuple[int, ...] | None,
+                pair_index: int,
+                *,
+                is_scan: bool = nested_scan,
+                count: int | None = nested_scan_count,
+                input_count: int = len(body_node.input),
+                offset: int = nested_scan_offset,
+                axes: Sequence[int] = nested_scan_axes,
+            ) -> tuple[int, ...] | None:
+                if not is_scan:
+                    return shape
+                if count is None or not (0 < count <= input_count - offset):
+                    return None
+                return _onnx_scan_bound_subgraph_input_shape(
+                    shape,
+                    len(shape) if shape is not None else None,
+                    pair_index=pair_index,
+                    scan_input_start=input_count - count,
+                    scan_input_offset=offset,
+                    scan_input_axes=axes,
+                )[0]
+
             nested_branch_shapes: list[dict[str, tuple[int, ...]]] = []
             for attribute in getattr(body_node, "attribute", ()):
                 resolved_attribute = resolve_reentry_attribute(attribute)
@@ -3733,15 +3772,19 @@ def _build_onnx_weight_analysis_plan(
                         tainted,
                         opset_versions,
                     )
-                    nested_tainted_shapes = {
-                        graph_input: tainted_shapes.get(parent_input)
-                        for graph_input, parent_input in nested_graph_inputs.items()
-                    }
-                    nested_context_shapes = {
-                        graph_input: shape
-                        for graph_input, parent_input in nested_graph_inputs.items()
-                        if (shape := reentry_input_shape(parent_input)) is not None
-                    }
+                    nested_tainted_shapes: dict[str, tuple[int, ...] | None] = {}
+                    nested_context_shapes: dict[str, tuple[int, ...]] = {}
+                    for pair_index, graph_input in enumerate(nested_graph.input, start=nested_scan_offset):
+                        input_name = _onnx_value_name(graph_input)
+                        parent_name = nested_graph_inputs.get(input_name)
+                        if parent_name is None:
+                            continue
+                        nested_tainted_shapes[input_name] = nested_bound_shape(
+                            tainted_shapes.get(parent_name), pair_index
+                        )
+                        shape = nested_bound_shape(reentry_input_shape(parent_name), pair_index)
+                        if shape is not None:
+                            nested_context_shapes[input_name] = shape
                     nested_external_names = graph_external_reference_names(nested_graph, local_attribute_bindings)
                     captured_names = nested_external_names & tainted
                     related_nested_tainted_shapes = {
@@ -7298,7 +7341,7 @@ def _build_onnx_weight_analysis_plan(
                     graph_input_names,
                     known_value_shapes,
                     proven_value_ranks,
-                    {name for name in graph_input_names & set(value_lineages) if name not in proven_value_ranks},
+                    {name for name in graph_input_names & value_lineages.keys() if name not in proven_value_ranks},
                     scan_input_axes=resolved_int_sequence_attribute(node, "scan_input_axes") or (),
                     scan_input_offset=scan_sequence_lens_input_offset(node, opset_versions),
                     num_scan_inputs=resolved_int_attribute(node, "num_scan_inputs", 1),
@@ -10440,9 +10483,11 @@ def _build_onnx_weight_analysis_plan(
                 else 0
             )
             trusted_scan_shape_names = proven_value_ranks
-            untrusted_scan_shape_names = {
-                name for name in graph_input_names & set(value_lineages) if name not in proven_value_ranks
-            }
+            untrusted_scan_shape_names = (
+                {name for name in graph_input_names & value_lineages.keys() if name not in proven_value_ranks}
+                if standard_control_flow_operator and node.op_type == "Scan"
+                else set()
+            )
 
             def trusted_scan_input_shape(
                 scan_name: str,
