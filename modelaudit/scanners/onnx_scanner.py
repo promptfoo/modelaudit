@@ -2233,10 +2233,21 @@ def _build_onnx_weight_analysis_plan(
                 inherited[captured_name] = constants[captured_name]
         return inherited, bound_inputs
 
+    def builtin_operator(node: Any, op_type: str) -> bool:
+        return (
+            getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
+            and node.op_type == op_type
+            and not getattr(node, "overload", "")
+            and (str(getattr(node, "domain", "")), op_type, "") not in functions
+        )
+
     def resolved_constant_node_tensor(
         node: Any,
         resolve_attribute: Callable[[Any], Any | None],
     ) -> Any | None:
+        if not builtin_operator(node, "Constant"):
+            return None
+
         def repeated_attribute_tensor_values(values: Any) -> list[Any] | None:
             if len(values) > _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK:
                 return None
@@ -2276,14 +2287,6 @@ def _build_onnx_weight_analysis_plan(
                 return resolved_attribute.sparse_tensor
         return None
 
-    def builtin_condition_operator(node: Any, op_type: str) -> bool:
-        return (
-            getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
-            and node.op_type == op_type
-            and not getattr(node, "overload", "")
-            and (str(getattr(node, "domain", "")), op_type, "") not in functions
-        )
-
     def graph_value_is_constant_bool(
         current_graph: Any,
         value_name: str,
@@ -2292,12 +2295,7 @@ def _build_onnx_weight_analysis_plan(
         attribute_bindings: dict[str, Any] | None = None,
     ) -> bool:
         graph_constants = graph_initializer_constants(current_graph, inherited_constants, attribute_bindings)
-        producers = {
-            str(output_name): node
-            for node in getattr(current_graph, "node", ())
-            for output_name in getattr(node, "output", ())
-            if output_name
-        }
+        producers = graph_output_producer_nodes_by_name(current_graph)
         seen: set[str] = set()
         current_name = value_name
         for _ in range(8):
@@ -2307,16 +2305,17 @@ def _build_onnx_weight_analysis_plan(
             constant_value = constant_scalar_value(graph_constants.get(current_name), int(onnx.TensorProto.BOOL))
             if constant_value is not None:
                 return constant_value is expected_value
-            producer = producers.get(current_name)
+            candidates = producers.get(current_name, ())
+            producer = candidates[0] if len(candidates) == 1 else None
             if (
                 producer is not None
-                and builtin_condition_operator(producer, "Identity")
+                and builtin_operator(producer, "Identity")
                 and bool(getattr(producer, "input", ()))
                 and producer.input[0]
             ):
                 current_name = str(producer.input[0])
                 continue
-            if producer is not None and builtin_condition_operator(producer, "Constant"):
+            if producer is not None and builtin_operator(producer, "Constant"):
                 tensor = resolved_constant_node_tensor(
                     producer,
                     lambda attribute: (
@@ -2381,12 +2380,7 @@ def _build_onnx_weight_analysis_plan(
         condition_input_name = _onnx_value_name(graph_inputs[1]) if len(graph_inputs) > 1 else ""
         if condition_output_name and condition_output_name == condition_input_name:
             return True
-        producers = {
-            str(output_name): body_node
-            for body_node in getattr(subgraph, "node", ())
-            for output_name in getattr(body_node, "output", ())
-            if output_name
-        }
+        producers = graph_output_producer_nodes_by_name(subgraph)
         seen: set[str] = set()
         current_name = condition_output_name
         for _ in range(8):
@@ -2395,12 +2389,9 @@ def _build_onnx_weight_analysis_plan(
             seen.add(current_name)
             if current_name == condition_input_name:
                 return True
-            producer = producers.get(current_name)
-            if (
-                producer is None
-                or not builtin_condition_operator(producer, "Identity")
-                or not getattr(producer, "input", ())
-            ):
+            candidates = producers.get(current_name, ())
+            producer = candidates[0] if len(candidates) == 1 else None
+            if producer is None or not builtin_operator(producer, "Identity") or not getattr(producer, "input", ()):
                 break
             current_name = str(producer.input[0])
         return graph_value_is_constant_true(subgraph, condition_output_name, constants, attribute_bindings)
@@ -10114,7 +10105,7 @@ def _build_onnx_weight_analysis_plan(
                     )
             constant_output_names: set[str] = set()
             constant_output_lineages: dict[str, dict[int, _OnnxWeightLineage]] = {}
-            if getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS and node.op_type == "Constant":
+            if builtin_operator(node, "Constant"):
                 constant_tensor = None
                 sparse_constant = None
                 unresolved_constant_attribute = False

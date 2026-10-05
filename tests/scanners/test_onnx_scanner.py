@@ -30301,3 +30301,248 @@ class TestOnnxLoopControlProofs:
             check.name == "Weight Distribution Anomaly Detection" and check.status == CheckStatus.FAILED
             for check in result.checks
         )
+
+
+class TestOnnxCanonicalControlConstants:
+    @pytest.mark.parametrize("control", ["condition", "count"])
+    @pytest.mark.parametrize("scope", ["root", "function", "nested_loop"])
+    @pytest.mark.parametrize("overloaded", [False, True])
+    def test_local_constant_arguments_do_not_prove_loop_controls(
+        self, tmp_path: Path, control: str, scope: str, overloaded: bool
+    ) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        value = TestOnnxRecurrenceReviewRegressions._value
+
+        def tensor(name: str, array: Any) -> Any:
+            return onnx.numpy_helper.from_array(np.asarray(array), name=name)
+
+        scalar_type = np.bool_ if control == "condition" else np.int64
+        literal = scalar_type(False if control == "condition" else 0)
+        actual_control = scalar_type(True if control == "condition" else 1)
+        function = helper.make_function(
+            "",
+            "Constant",
+            [],
+            ["actual"],
+            [helper.make_node("Constant", [], ["actual"], value=tensor("", actual_control))],
+            [helper.make_opsetid("", 18)],
+            attributes=["value"],
+            overload="actual_control",
+        )
+        weights = np.zeros((64, 64), np.float32)
+        anomalous = weights.copy()
+        anomalous[:, 0] = 1e6
+        body = helper.make_graph(
+            [
+                helper.make_node("Identity", ["anomalous"], ["next"]),
+                helper.make_node("Identity", ["c"], ["next_condition"]),
+            ],
+            "replace_state",
+            [value("i", [], TensorProto.INT64), value("c", [], TensorProto.BOOL), value("s", [64, 64])],
+            [value("next_condition", [], TensorProto.BOOL), value("next", [64, 64])],
+        )
+        produced = "start" if control == "condition" else "count"
+        other = tensor("count", np.int64(1)) if control == "condition" else tensor("start", np.bool_(True))
+        constant = helper.make_node(
+            "Constant",
+            [],
+            [produced],
+            value=tensor("", literal),
+            **({"overload": "actual_control"} if overloaded else {}),
+        )
+        loop = helper.make_node("Loop", ["count", "start", "W"], ["last"], body=body)
+        nodes = [constant, loop, helper.make_node("MatMul", ["X", "last"], ["Y"])]
+        functions = [function] if overloaded else []
+        if scope == "function":
+            functions.append(
+                helper.make_function(
+                    "controls",
+                    "Run",
+                    ["X", "W", "anomalous", other.name],
+                    ["Y"],
+                    nodes,
+                    [helper.make_opsetid("", 18)],
+                )
+            )
+            nodes = [helper.make_node("Run", ["X", "W", "anomalous", other.name], ["Y"], domain="controls")]
+        elif scope == "nested_loop":
+            loop.input[2] = "outer_state"
+            outer = helper.make_graph(
+                [constant, loop],
+                "outer_body",
+                [
+                    value("outer_i", [], TensorProto.INT64),
+                    value("outer_c", [], TensorProto.BOOL),
+                    value("outer_state", [64, 64]),
+                ],
+                [value("outer_c", [], TensorProto.BOOL), value("last", [64, 64])],
+            )
+            nodes = [helper.make_node("Loop", ["twice", "outer_start", "W"], ["last"], body=outer), nodes[-1]]
+        graph = helper.make_graph(
+            nodes,
+            "canonical_control_constants",
+            [value("X", [1, 64])],
+            [value("Y", [1, 64])],
+            [
+                other,
+                tensor("W", weights),
+                tensor("anomalous", anomalous),
+                tensor("twice", np.int64(2)),
+                tensor("outer_start", np.bool_(True)),
+            ],
+        )
+        model = helper.make_model(
+            graph,
+            functions=functions,
+            opset_imports=[helper.make_opsetid("", 18), helper.make_opsetid("controls", 1)],
+            ir_version=10,
+        )
+        path = TestOnnxLoopControlProofs._save(model, tmp_path)
+        runtime = TestOnnxLoopControlProofs._inline_with_defaults(model)
+        output: Any = ReferenceEvaluator(runtime).run(None, {"X": np.ones((1, 64), np.float32)})
+        expected = anomalous if overloaded else weights
+        np.testing.assert_array_equal(output[0], np.ones((1, 64), np.float32) @ expected)
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        result = OnnxScanner().scan(str(path))
+        if overloaded:
+            assert any(np.array_equal(spec.weights, anomalous) for spec in plan.specs) or plan.coverage_gaps
+            assert result.metadata.get("anomalies_found") or result.success is False
+            if not result.metadata.get("anomalies_found"):
+                assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        else:
+            assert plan.coverage_gaps == {}
+            assert all(np.array_equal(spec.weights, weights) for spec in plan.specs)
+            assert result.success is True
+            assert not result.metadata.get("anomalies_found")
+
+    @pytest.mark.parametrize(("width", "dead"), [(8, 256), (32, 1024), (64, 4096)])
+    def test_loop_condition_proofs_share_producer_indexes(self, tmp_path: Path, width: int, dead: int) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        value = TestOnnxRecurrenceReviewRegressions._value
+        inputs = [value("i", [], TensorProto.INT64), value("c", [], TensorProto.BOOL)] + [
+            value(f"s{i}", [1]) for i in range(width)
+        ]
+        outputs = [value("c", [], TensorProto.BOOL)] + [value(f"o{i}", [1]) for i in range(width)]
+        inner = helper.make_graph(
+            [helper.make_node("Identity", [f"s{i}"], [f"o{i}"]) for i in range(width)]
+            + [helper.make_node("Identity", ["c"], [f"dead{i}"]) for i in range(dead)],
+            "inner",
+            inputs,
+            outputs,
+        )
+        loop_inputs = ["count", "start", *[f"s{i}" for i in range(width)]]
+        loop_outputs = [f"o{i}" for i in range(width)]
+        outer = helper.make_graph(
+            [helper.make_node("Loop", loop_inputs, loop_outputs, body=inner)], "outer", inputs, outputs
+        )
+        graph = helper.make_graph(
+            [helper.make_node("Loop", loop_inputs, loop_outputs, body=outer)],
+            "shared_condition_indexes",
+            [value(f"s{i}", [1]) for i in range(width)],
+            [value(f"o{i}", [1]) for i in range(width)],
+            [
+                onnx.numpy_helper.from_array(np.array(2, np.int64), name="count"),
+                onnx.numpy_helper.from_array(np.array(True, np.bool_), name="start"),
+            ],
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18)], ir_version=8)
+        path = TestOnnxLoopControlProofs._save(model, tmp_path)
+        feeds = {f"s{i}": np.array([i], np.float32) for i in range(width)}
+        actual: Any = ReferenceEvaluator(model).run(None, feeds)
+        for index, output in enumerate(actual):
+            np.testing.assert_array_equal(output, feeds[f"s{index}"])
+        mappings: dict[int, dict[str, Any]] = {}
+        proof_count = 0
+
+        def collect_indexes(frame: Any, event: str, arg: Any) -> None:
+            nonlocal proof_count
+            if (
+                event == "return"
+                and frame.f_code.co_filename == onnx_scanner_module.__file__
+                and frame.f_code.co_name in {"graph_value_is_constant_bool", "loop_body_condition_remains_true"}
+            ):
+                mapping = frame.f_locals.get("producers")
+                if isinstance(mapping, dict):
+                    proof_count += 1
+                    mappings[id(mapping)] = mapping
+
+        previous = sys.getprofile()
+        try:
+            sys.setprofile(collect_indexes)
+            plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        finally:
+            sys.setprofile(previous)
+        # Retain the maps so allocator id reuse cannot hide per-proof rebuilding.
+        assert proof_count > width
+        assert sum(len(mapping) for mapping in mappings.values()) <= 2 * (dead + width + 2)
+        assert plan.coverage_gaps == {}
+        assert plan.specs == []
+        result = OnnxScanner().scan(str(path))
+        assert result.success is True
+        assert not result.metadata.get("anomalies_found")
+
+    @pytest.mark.parametrize("invalid", ["duplicate", "cycle"])
+    def test_ambiguous_or_cyclic_condition_producers_do_not_prove_termination(
+        self, tmp_path: Path, invalid: str
+    ) -> None:
+        value = TestOnnxRecurrenceReviewRegressions._value
+        if invalid == "duplicate":
+            conditions = [
+                helper.make_node("Identity", ["c"], ["condition"]),
+                helper.make_node(
+                    "Constant", [], ["condition"], value=onnx.numpy_helper.from_array(np.array(False, np.bool_))
+                ),
+            ]
+        else:
+            conditions = [
+                helper.make_node("Identity", ["condition"], ["cycle"]),
+                helper.make_node("Identity", ["cycle"], ["condition"]),
+            ]
+        body = helper.make_graph(
+            [*conditions, helper.make_node("Transpose", ["s"], ["next"])],
+            "invalid_condition",
+            [value("i", [], TensorProto.INT64), value("c", [], TensorProto.BOOL), value("s", [2, 2])],
+            [value("condition", [], TensorProto.BOOL), value("next", [2, 2])],
+        )
+        graph = helper.make_graph(
+            [
+                helper.make_node("Loop", ["count", "start", "W"], ["last"], body=body),
+                helper.make_node("MatMul", ["X", "last"], ["Y"]),
+            ],
+            "invalid_producers",
+            [value("X", [1, 2])],
+            [value("Y", [1, 2])],
+            [
+                onnx.numpy_helper.from_array(np.array(2, np.int64), name="count"),
+                onnx.numpy_helper.from_array(np.array(True, np.bool_), name="start"),
+                onnx.numpy_helper.from_array(np.arange(4, dtype=np.float32).reshape(2, 2), name="W"),
+            ],
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18)], ir_version=8)
+        with pytest.raises(onnx.checker.ValidationError):
+            onnx.checker.check_model(model, full_check=True)
+        path = TestOnnxLoopControlProofs._save(model, tmp_path, validate=False)
+        proofs: list[bool] = []
+
+        def collect_proofs(frame: Any, event: str, arg: Any) -> None:
+            if (
+                event == "return"
+                and frame.f_code.co_filename == onnx_scanner_module.__file__
+                and frame.f_code.co_name == "graph_value_is_constant_bool"
+                and frame.f_locals["current_graph"].name == "invalid_condition"
+            ):
+                proofs.append(bool(arg))
+
+        previous = sys.getprofile()
+        try:
+            sys.setprofile(collect_proofs)
+            plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        finally:
+            sys.setprofile(previous)
+        assert proofs and not any(proofs)
+        assert plan.coverage_gaps
+        result = OnnxScanner().scan(str(path))
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
