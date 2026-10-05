@@ -1660,8 +1660,10 @@ def _resolve_onnx_reshape_shape(
 ) -> tuple[int, ...] | None:
     if any(dimension < 0 for dimension in input_shape):
         return None
-    dims = tuple(int(dimension) for dimension in getattr(shape_initializer, "dims", ()))
-    element_count = dims[0] if len(dims) == 1 else 0
+    dims: Any = getattr(shape_initializer, "dims", ())
+    if len(dims) != 1:
+        return None
+    element_count = int(dims[0])
     if (
         len(dims) != 1
         or element_count < 0
@@ -1729,8 +1731,10 @@ def _resolve_onnx_axes(
     axes_initializer = constants.get(str(node.input[1]))
     if axes_initializer is None:
         return None
-    dims = tuple(int(dimension) for dimension in getattr(axes_initializer, "dims", ()))
-    element_count = dims[0] if len(dims) == 1 else 0
+    dims: Any = getattr(axes_initializer, "dims", ())
+    if len(dims) != 1:
+        return None
+    element_count = int(dims[0])
     if element_count > _ONNX_WEIGHT_RESHAPE_RANK_LIMIT and on_limit is not None:
         on_limit()
     if (
@@ -2081,8 +2085,10 @@ def _build_onnx_weight_analysis_plan(
     def constant_int64_vector_values(initializer: Any | None) -> tuple[int, ...] | None:
         if initializer is None:
             return None
-        dims = tuple(int(dimension) for dimension in getattr(initializer, "dims", ()))
-        element_count = dims[0] if len(dims) == 1 else 0
+        dims: Any = getattr(initializer, "dims", ())
+        if len(dims) != 1:
+            return None
+        element_count = int(dims[0])
         if (
             len(dims) != 1
             or element_count < 0
@@ -2098,22 +2104,35 @@ def _build_onnx_weight_analysis_plan(
             return None
         return values if len(values) == element_count else None
 
+    scalar_control_cache: dict[tuple[int, int], tuple[Any, Any | None]] = {}
+
     def constant_scalar_value(initializer: Any | None, expected_data_type: int) -> Any | None:
         if initializer is None:
             return None
-        dims = tuple(int(dimension) for dimension in getattr(initializer, "dims", ()))
-        element_count = _onnx_shape_extent_product(dims) if dims else 1
-        if (
-            element_count != 1
-            or int(getattr(initializer, "data_type", -1)) != expected_data_type
-            or _onnx_inline_storage_nbytes(initializer) > 8
-            or _onnx_tensor_uses_external_storage(initializer, onnx=onnx)
+        key = (id(initializer), expected_data_type)
+        cached = scalar_control_cache.get(key)
+        if cached is not None and cached[0] is initializer:
+            return cached[1]
+        if len(scalar_control_cache) >= _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK:
+            plan.coverage_gaps.setdefault("control_value_work_limit", 1)
+            return None
+        raw_dims = getattr(initializer, "dims", ())
+        value = None
+        if len(raw_dims) > _ONNX_WEIGHT_RESHAPE_RANK_LIMIT:
+            plan.coverage_gaps.setdefault("inferred_shape_rank_limit", 1)
+        elif (
+            int(getattr(initializer, "data_type", -1)) == expected_data_type
+            and _onnx_inline_storage_nbytes(initializer) <= 8
+            and not _onnx_tensor_uses_external_storage(initializer, onnx=onnx)
         ):
-            return None
-        try:
-            return onnx.numpy_helper.to_array(initializer).reshape(-1)[0].item()
-        except Exception:
-            return None
+            dims = tuple(int(dimension) for dimension in raw_dims)
+            if (_onnx_shape_extent_product(dims) if dims else 1) == 1:
+                with suppress(Exception):
+                    value = onnx.numpy_helper.to_array(initializer).reshape(-1)[0].item()
+        # Keep the immutable protobuf owner, including failed proofs, so repeated
+        # queries neither decode again nor reuse an unrelated wrapper's id.
+        scalar_control_cache[key] = (initializer, value)
+        return value
 
     graph_constant_context_cache: dict[int, tuple[Any, frozenset[str], dict[str, Any]]] = {}
     graph_constant_context_work_remaining = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
@@ -2214,12 +2233,6 @@ def _build_onnx_weight_analysis_plan(
                 inherited[captured_name] = constants[captured_name]
         return inherited, bound_inputs
 
-    def constant_node_tensor(node: Any) -> Any | None:
-        for attribute in getattr(node, "attribute", ()):
-            if attribute.name == "value" and _onnx_has_singular_field(attribute, "t"):
-                return attribute.t
-        return None
-
     def resolved_constant_node_tensor(
         node: Any,
         resolve_attribute: Callable[[Any], Any | None],
@@ -2263,13 +2276,22 @@ def _build_onnx_weight_analysis_plan(
                 return resolved_attribute.sparse_tensor
         return None
 
+    def builtin_condition_operator(node: Any, op_type: str) -> bool:
+        return (
+            getattr(node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
+            and node.op_type == op_type
+            and not getattr(node, "overload", "")
+            and (str(getattr(node, "domain", "")), op_type, "") not in functions
+        )
+
     def graph_value_is_constant_bool(
         current_graph: Any,
         value_name: str,
         inherited_constants: dict[str, Any],
         expected_value: bool,
+        attribute_bindings: dict[str, Any] | None = None,
     ) -> bool:
-        graph_constants = graph_initializer_constants(current_graph, inherited_constants)
+        graph_constants = graph_initializer_constants(current_graph, inherited_constants, attribute_bindings)
         producers = {
             str(output_name): node
             for node in getattr(current_graph, "node", ())
@@ -2288,19 +2310,22 @@ def _build_onnx_weight_analysis_plan(
             producer = producers.get(current_name)
             if (
                 producer is not None
-                and getattr(producer, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
-                and producer.op_type == "Identity"
-                and getattr(producer, "input", ())
+                and builtin_condition_operator(producer, "Identity")
+                and bool(getattr(producer, "input", ()))
                 and producer.input[0]
             ):
                 current_name = str(producer.input[0])
                 continue
-            if (
-                producer is not None
-                and getattr(producer, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
-                and producer.op_type == "Constant"
-            ):
-                constant_value = constant_scalar_value(constant_node_tensor(producer), int(onnx.TensorProto.BOOL))
+            if producer is not None and builtin_condition_operator(producer, "Constant"):
+                tensor = resolved_constant_node_tensor(
+                    producer,
+                    lambda attribute: (
+                        (attribute_bindings or {}).get(str(attribute.ref_attr_name))
+                        if getattr(attribute, "ref_attr_name", "")
+                        else attribute
+                    ),
+                )
+                constant_value = constant_scalar_value(tensor, int(onnx.TensorProto.BOOL))
                 return constant_value is expected_value if constant_value is not None else False
             return False
         return False
@@ -2309,28 +2334,41 @@ def _build_onnx_weight_analysis_plan(
         current_graph: Any,
         value_name: str,
         inherited_constants: dict[str, Any],
+        attribute_bindings: dict[str, Any] | None = None,
     ) -> bool:
-        return graph_value_is_constant_bool(current_graph, value_name, inherited_constants, False)
+        return graph_value_is_constant_bool(current_graph, value_name, inherited_constants, False, attribute_bindings)
 
     def graph_value_is_constant_true(
         current_graph: Any,
         value_name: str,
         inherited_constants: dict[str, Any],
+        attribute_bindings: dict[str, Any] | None = None,
     ) -> bool:
-        return graph_value_is_constant_bool(current_graph, value_name, inherited_constants, True)
+        return graph_value_is_constant_bool(current_graph, value_name, inherited_constants, True, attribute_bindings)
 
-    def loop_body_condition_is_constant_false(node: Any, constants: dict[str, Any]) -> bool:
+    def loop_body_condition_is_constant_false(
+        node: Any, constants: dict[str, Any], attribute_bindings: dict[str, Any] | None = None
+    ) -> bool:
         for attribute in getattr(node, "attribute", ()):
             if getattr(attribute, "name", "") != "body":
                 continue
-            for body in _iter_attribute_graphs(attribute):
+            resolved = (
+                (attribute_bindings or {}).get(str(attribute.ref_attr_name))
+                if getattr(attribute, "ref_attr_name", "")
+                else attribute
+            )
+            if resolved is None:
+                return False
+            for body in _iter_attribute_graphs(resolved):
                 if not getattr(body, "output", ()):
                     return False
                 condition_output_name = _onnx_value_name(body.output[0])
-                return graph_value_is_constant_false(body, condition_output_name, constants)
+                return graph_value_is_constant_false(body, condition_output_name, constants, attribute_bindings)
         return False
 
-    def loop_body_condition_remains_true(node: Any, subgraph: Any, constants: dict[str, Any]) -> bool:
+    def loop_body_condition_remains_true(
+        node: Any, subgraph: Any, constants: dict[str, Any], attribute_bindings: dict[str, Any] | None = None
+    ) -> bool:
         if node.op_type != "Loop":
             return True
         graph_outputs = getattr(subgraph, "output", ())
@@ -2360,13 +2398,12 @@ def _build_onnx_weight_analysis_plan(
             producer = producers.get(current_name)
             if (
                 producer is None
-                or getattr(producer, "domain", "") not in _STANDARD_NEURAL_NETWORK_DOMAINS
-                or producer.op_type != "Identity"
+                or not builtin_condition_operator(producer, "Identity")
                 or not getattr(producer, "input", ())
             ):
                 break
             current_name = str(producer.input[0])
-        return graph_value_is_constant_true(subgraph, condition_output_name, constants)
+        return graph_value_is_constant_true(subgraph, condition_output_name, constants, attribute_bindings)
 
     def graph_input_is_runtime_overridable(
         value_name: str,
@@ -2408,10 +2445,15 @@ def _build_onnx_weight_analysis_plan(
         condition_guarantees_iteration = not condition_input or initial_condition is True
         return not (trip_guarantees_iteration and condition_guarantees_iteration)
 
-    def loop_may_repeat_body(node: Any, constants: dict[str, Any], graph_input_names: set[str]) -> bool:
+    def loop_may_repeat_body(
+        node: Any,
+        constants: dict[str, Any],
+        graph_input_names: set[str],
+        attribute_bindings: dict[str, Any] | None = None,
+    ) -> bool:
         trip_input = str(node.input[0]) if len(node.input) > 0 and node.input[0] else ""
         condition_input = str(node.input[1]) if len(node.input) > 1 and node.input[1] else ""
-        if loop_body_condition_is_constant_false(node, constants):
+        if loop_body_condition_is_constant_false(node, constants, attribute_bindings):
             return False
         if graph_input_is_runtime_overridable(trip_input, graph_input_names, constants) or (
             graph_input_is_runtime_overridable(condition_input, graph_input_names, constants)
@@ -3695,6 +3737,7 @@ def _build_onnx_weight_analysis_plan(
                         body_node,
                         available_nested_constants,
                         set(),
+                        local_attribute_bindings,
                     ):
                         nested_bound_input_constants = {
                             graph_input: available_nested_constants[parent_input]
@@ -3742,7 +3785,9 @@ def _build_onnx_weight_analysis_plan(
                         body_node.op_type == "Scan"
                         or (
                             body_node.op_type == "Loop"
-                            and loop_may_repeat_body(body_node, available_nested_constants, set())
+                            and loop_may_repeat_body(
+                                body_node, available_nested_constants, set(), local_attribute_bindings
+                            )
                         )
                     )
                     if nested_state_repeats:
@@ -4327,7 +4372,7 @@ def _build_onnx_weight_analysis_plan(
                 iterations = max(int(count), 0)
             if condition is False:
                 iterations = 0
-            elif not loop_may_repeat_body(node, constants, set()):
+            elif not loop_may_repeat_body(node, constants, set(), attribute_bindings):
                 iterations = min(iterations, 1) if iterations is not None else 1
         elif not is_scan:
             iterations = 1
@@ -5984,7 +6029,7 @@ def _build_onnx_weight_analysis_plan(
                 ),
             )
         )
-        graph_inputs = getattr(subgraph, "input", ())
+        graph_inputs: Any = getattr(subgraph, "input", ())
         if len(graph_inputs) > stack_invariance_work_remaining:
             return False
         stack_invariance_work_remaining -= len(graph_inputs)
@@ -5997,6 +6042,10 @@ def _build_onnx_weight_analysis_plan(
             if index + input_offset < len(graph_inputs) and index + parent_offset < len(node.input)
         }
         varying_inputs = {_onnx_value_name(value) for value in graph_inputs} - state_inputs.keys()
+        if node.op_type == "Loop" and len(graph_inputs) > 1:
+            # Each executed iteration receives True; only its output condition
+            # decides whether another iteration executes.
+            varying_inputs.discard(_onnx_value_name(graph_inputs[1]))
         pending = [graph_output_index]
         visited: set[int] = set()
         while pending:
@@ -7157,7 +7206,9 @@ def _build_onnx_weight_analysis_plan(
                     list[bool],
                 ]
             ] = []
-            node_loop_may_repeat = node.op_type == "Loop" and loop_may_repeat_body(node, constants, graph_input_names)
+            node_loop_may_repeat = node.op_type == "Loop" and loop_may_repeat_body(
+                node, constants, graph_input_names, attribute_bindings
+            )
             node_scan_may_repeat = node.op_type == "Scan" and scan_may_repeat_body(
                 node,
                 constants,
@@ -7313,7 +7364,10 @@ def _build_onnx_weight_analysis_plan(
                         if (not trip_input or (trip_count is not None and int(trip_count) > 0)) and (
                             bool(getattr(current_subgraph, "output", ()))
                             and graph_value_is_constant_false(
-                                current_subgraph, _onnx_value_name(current_subgraph.output[0]), constants
+                                current_subgraph,
+                                _onnx_value_name(current_subgraph.output[0]),
+                                constants,
+                                attribute_bindings,
                             )
                         ):
                             count_cache[cache_key] = 1 if max_count >= 1 else None
@@ -7325,6 +7379,7 @@ def _build_onnx_weight_analysis_plan(
                             current_node,
                             current_subgraph,
                             constants,
+                            attribute_bindings,
                         ):
                             return None
                         count_cache[cache_key] = exact_count if exact_count <= max_count else None

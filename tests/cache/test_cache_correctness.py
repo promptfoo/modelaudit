@@ -2172,7 +2172,8 @@ def test_darwin_path_monitor_allows_read_between_capture_and_store(
 
         def control(self, changes: Any, _max_events: int, _timeout: int) -> list[Any]:
             if changes is not None:
-                self.registered_events.extend(changes)
+                # Each monitor opens a fresh kqueue, so old descriptor registrations expire.
+                self.registered_events = list(changes)
                 return []
             if self.pending_file_attributes:
                 self.pending_file_attributes -= 1
@@ -6422,3 +6423,48 @@ def _assert_uncached_missing_package(tmp_path: Path, case_message: str) -> None:
     assert second["scan_count"] == 2
     assert calls["count"] == 2
     assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+
+
+def test_darwin_read_attribute_queue_tracks_new_descriptor_after_capture_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_monitor = ScanResultsCache._monitor_ancestor_identity
+    original_matches = ScanResultsCache._ancestor_identity_matches
+    monitor_descriptors: list[int] = []
+    held_descriptors: list[int] = []
+    pending_ancestor_change = False
+    injected_changes = 0
+
+    def monitor_with_descriptor_reuse(file_path: str, identity: AncestorIdentity) -> AncestorIdentity:
+        nonlocal pending_ancestor_change
+        if len(monitor_descriptors) == 1:
+            # Occupy the released descriptor as another concurrent reader could.
+            held_descriptors.append(os.open(file_path, os.O_RDONLY))
+        monitored = original_monitor(file_path, identity)
+        descriptor = getattr(monitored.monitor, "_file_descriptor", None)
+        assert isinstance(descriptor, int)
+        monitor_descriptors.append(descriptor)
+        if len(monitor_descriptors) == 1:
+            pending_ancestor_change = True
+        return monitored
+
+    def matches_after_transient_change(expected: AncestorIdentity, current: AncestorIdentity) -> bool:
+        nonlocal pending_ancestor_change, injected_changes
+        if pending_ancestor_change:
+            pending_ancestor_change = False
+            injected_changes += 1
+            return False
+        return original_matches(expected, current)
+
+    monkeypatch.setattr(ScanResultsCache, "_monitor_ancestor_identity", staticmethod(monitor_with_descriptor_reuse))
+    monkeypatch.setattr(ScanResultsCache, "_ancestor_identity_matches", staticmethod(matches_after_transient_change))
+    try:
+        test_darwin_path_monitor_allows_read_between_capture_and_store(tmp_path, monkeypatch)
+    finally:
+        for descriptor in held_descriptors:
+            os.close(descriptor)
+
+    assert injected_changes == 1
+    assert len(monitor_descriptors) >= 2
+    assert monitor_descriptors[0] != monitor_descriptors[1]
