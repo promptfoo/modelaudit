@@ -493,6 +493,17 @@ jobs:
 
       - *sync-all-ci-dependencies
 
+      - name: Install verified Codecov CLI
+        run: |
+          set -euo pipefail
+          codecov_binary="$RUNNER_TEMP/modelaudit-codecov"
+          curl --fail --location --retry 3 --connect-timeout 15 --max-time 120 \
+            --proto '=https' --proto-redir '=https' --output "$codecov_binary" \
+            https://github.com/codecov/codecov-cli/releases/download/v11.3.1/codecovcli_linux
+          printf '%s  %s\n' \
+            'ca1d64196d2d34771084afe76ea657d581bf628e31d993ff8e52ea09cc88a56d' "$codecov_binary" | sha256sum --check
+          chmod +x "$codecov_binary"
+
       - name: Run branch coverage shard
         run: |
           uv run pytest tests -n auto \
@@ -503,13 +514,51 @@ jobs:
 
       # Codecov automatically merges separate reports for the same commit.
       - name: Upload coverage to Codecov
+        id: codecov-upload
+        continue-on-error: true
         uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7
         with:
           name: python-coverage-${{ matrix.shard }}
           files: ./coverage.xml
           fail_ci_if_error: true
           use_oidc: true
+          binary: ${{ runner.temp }}/modelaudit-codecov
           verbose: true
+
+      # A failed primary upload must succeed through the documented legacy route.
+      - name: Upload coverage through Codecov legacy API
+        if: steps.codecov-upload.outcome == 'failure'
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        env:
+          CODECOV_UPLOAD_NAME: python-coverage-${{ matrix.shard }}
+          CODECOV_CLI: ${{ runner.temp }}/modelaudit-codecov
+        with:
+          script: |
+            const pullRequest = context.payload.pull_request;
+            const slug = `${context.repo.owner}/${context.repo.repo}`;
+            const isFork = pullRequest && pullRequest.head.repo.full_name !== slug;
+            const token = isFork
+              ? process.env.CODECOV_TOKEN
+              : await core.getIDToken('https://codecov.io');
+            const args = [
+              '--verbose', 'do-upload', '--legacy', '--fail-on-error',
+              '--file', './coverage.xml',
+              '--name', process.env.CODECOV_UPLOAD_NAME,
+              '--sha', pullRequest?.head.sha || context.sha,
+              '--slug', slug,
+              '--git-service', 'github',
+            ];
+            if (token) {
+              core.setSecret(token);
+              args.push('--token', token);
+            }
+            if (pullRequest) {
+              args.push('--pr', String(pullRequest.number));
+            }
+            if (isFork && !token) {
+              args.push('--branch', pullRequest.head.label);
+            }
+            await exec.exec(process.env.CODECOV_CLI, args);
 
   test-numpy-compatibility:
     name: Test NumPy ${{ matrix.numpy-mode }} - Python ${{ matrix.python-version }}
