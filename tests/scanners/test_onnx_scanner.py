@@ -33914,3 +33914,166 @@ class TestOnnxEmptyScanTransformShapes:
                 assert cache_manager.get_stats()["total_entries"] == 0
         finally:
             reset_cache_manager()
+
+
+class TestOnnxSiblingOutputRank:
+    @pytest.mark.parametrize(
+        ("count", "states", "mode", "parts", "gaps"),
+        [
+            (2, 2, "reshape", 33, {"unresolved_initializer_lineage": 32}),
+            (3, 3, "reshape", 33, {"unresolved_initializer_lineage": 32}),
+            (1, 2, "reshape", 33, {}),
+            (2, 2, "identity", 33, {}),
+            (2, 2, "vector", 33, {}),
+            (2, 2, "reshape", 2, {"unresolved_initializer_lineage": 2}),
+            (2, 2, "runtime-count", 33, {"unresolved_initializer_lineage": 32}),
+            (0, 2, "reshape", 33, {}),
+            (3, 2, "early-false", 33, {}),
+            (3, 2, "independent", 33, {}),
+            (3, 2, "partial-independent", 33, {}),
+            (2, 2, "constant", 33, {"unresolved_initializer_lineage": 32}),
+            (2, 2, "matrix-reshape", 33, {"lineages_per_value_limit": 1, "unresolved_initializer_lineage": 32}),
+        ],
+    )
+    def test_final_rank_requires_all_recurrent_dependencies(
+        self, tmp_path: Path, count: int, states: int, mode: str, parts: int, gaps: dict[str, int]
+    ) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        value, tensor = TestOnnxShapeContinuity._v, TestOnnxShapeContinuity._t
+        weights = np.zeros((64, 64), np.float32)
+        weights[:5, 0] = 100
+        part = (weights if mode == "matrix-reshape" else weights.ravel()) / parts
+        seed: Any = sum([part] * parts)
+        names, outputs = [f"s{i}" for i in range(states)], [f"n{i}" for i in range(states)]
+        nodes = [helper.make_node("Identity", [names[i + 1]], [outputs[i]]) for i in range(states - 1)]
+        if mode == "identity":
+            nodes.append(helper.make_node("Identity", [names[0]], [outputs[-1]]))
+        elif mode == "constant":
+            nodes.append(
+                helper.make_node("Constant", [], [outputs[-1]], value=tensor("replacement", seed.reshape(64, 64)))
+            )
+        else:
+            nodes.append(helper.make_node("Reshape", [names[0], "target"], [outputs[-1]]))
+        if mode in {"independent", "partial-independent"}:
+            nodes[0] = helper.make_node("Identity", [names[0]], [outputs[0]])
+        if mode == "early-false":
+            nodes.append(helper.make_node("Constant", [], ["stop"], value=tensor("stop_value", np.bool_(False))))
+        body = helper.make_graph(
+            nodes,
+            "sibling_rank_body",
+            [value("i", [], TensorProto.INT64), value("c", [], TensorProto.BOOL), *[value(n, None) for n in names]],
+            [value("stop" if mode == "early-false" else "c", [], TensorProto.BOOL), *[value(n, None) for n in outputs]],
+        )
+        initializers = [tensor(f"part{i}", part) for i in range(parts)] + [
+            tensor("M", np.int64(count)),
+            tensor("cond", np.bool_(True)),
+            tensor(
+                "target",
+                np.array([4096] if mode == "vector" else [32, 128] if mode == "matrix-reshape" else [64, 64], np.int64),
+            ),
+        ]
+        # Simultaneous NumPy updates are independent of scanner shape/rank inference.
+        values: list[Any] = [seed] * states
+        for _ in range(1 if mode == "early-false" else count):
+            if mode == "identity":
+                replacement = values[0]
+            elif mode == "constant":
+                replacement = seed.reshape(64, 64)
+            else:
+                replacement = (
+                    values[0].reshape(-1)
+                    if mode == "vector"
+                    else values[0].reshape(32, 128)
+                    if mode == "matrix-reshape"
+                    else values[0].reshape(64, 64)
+                )
+            values = (
+                [values[0], replacement]
+                if mode in {"independent", "partial-independent"}
+                else [*values[1:], replacement]
+            )
+        expected = values[0]
+        activation = np.ones((1, expected.shape[-2] if expected.ndim >= 2 else expected.shape[0]), np.float32)
+        inputs = [value("X", list(activation.shape))]
+        feeds: dict[str, Any] = {"X": activation}
+        if mode == "runtime-count":
+            inputs.append(value("M", [], TensorProto.INT64))
+            feeds["M"] = np.int64(count)
+        if mode == "partial-independent":
+            inputs.extend(value(f"part{i}", [None]) for i in range(parts))
+        model = helper.make_model(
+            helper.make_graph(
+                [
+                    helper.make_node("Sum", [f"part{i}" for i in range(parts)], ["seed"]),
+                    helper.make_node(
+                        "Loop",
+                        ["M", "cond", *(["seed"] * states)],
+                        ["weights", *[f"unused{i}" for i in range(states - 1)]],
+                        body=body,
+                    ),
+                    helper.make_node("MatMul", ["X", "weights"], ["Y"]),
+                ],
+                "sibling_rank",
+                inputs,
+                [value("Y", list((activation @ expected).shape)), value("weights", list(expected.shape))],
+                initializers,
+            ),
+            opset_imports=[helper.make_opsetid("", 18)],
+            ir_version=10,
+        )
+        path = TestOnnxLoopControlProofs._save(model, tmp_path)
+        actual: Any = ReferenceEvaluator(model).run(None, feeds)
+        np.testing.assert_array_equal(actual[1], expected)
+        np.testing.assert_array_equal(actual[0], activation @ expected)
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        assert plan.coverage_gaps == gaps
+        assert plan.specs == []
+        result = OnnxScanner().scan(str(path))
+        assert result.success is not bool(gaps)
+        assert [(issue.severity, issue.message) for issue in result.issues] == (
+            [(IssueSeverity.INFO, "Weight distribution analysis skipped one or more eligible ONNX initializers")]
+            if gaps
+            else []
+        )
+        if mode == "reshape" and count == states == 2 and parts == 33:
+            direct = helper.make_model(
+                helper.make_graph(
+                    [helper.make_node("MatMul", ["X", "W"], ["Y"])],
+                    "direct",
+                    [value("X", [1, 64])],
+                    [value("Y", [1, 64])],
+                    [tensor("W", expected)],
+                ),
+                opset_imports=[helper.make_opsetid("", 18)],
+                ir_version=10,
+            )
+            direct_plan = onnx_scanner_module._build_onnx_weight_analysis_plan(
+                direct, onnx=onnx, np=np, max_array_size=None
+            )
+            assert direct_plan.coverage_gaps == {}
+            assert len(direct_plan.specs) == 1
+            np.testing.assert_array_equal(direct_plan.specs[0].weights, expected)
+        cache_dir = tmp_path / "scan-cache"
+        reset_cache_manager()
+        try:
+            aggregate = scan_model_directory_or_file(
+                str(path), recursive=False, cache_enabled=True, cache_dir=str(cache_dir), min_cache_file_size=0
+            )
+            assert aggregate.success is not bool(gaps)
+            assert determine_exit_code(aggregate) == (2 if gaps else 0)
+            manager = get_cache_manager(str(cache_dir), enabled=True)
+            hits = manager.get_stats()["cache_hits"]
+            repeated = scan_model_directory_or_file(
+                str(path), recursive=False, cache_enabled=True, cache_dir=str(cache_dir), min_cache_file_size=0
+            )
+            assert repeated.success == aggregate.success
+            assert determine_exit_code(repeated) == determine_exit_code(aggregate)
+            assert [(issue.severity, issue.message) for issue in repeated.issues] == [
+                (issue.severity, issue.message) for issue in aggregate.issues
+            ]
+            assert (manager.get_stats()["cache_hits"] > hits) is not bool(gaps)
+            if gaps:
+                assert manager.get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()

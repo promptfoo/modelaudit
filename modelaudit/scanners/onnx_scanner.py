@@ -10995,9 +10995,16 @@ def _build_onnx_weight_analysis_plan(
                             if state_input_shape is not None
                             else known_value_ranks.get(state_input_name)
                         )
-                        if graph_output_rank != state_input_rank:
+                        sibling_state_shape_is_unproven = (
+                            node.op_type == "Loop"
+                            and len(repeated_state_output_indexes_by_input) > 1
+                            and subgraph_state_input_name not in subgraph_trusted_context_shapes
+                            and repeated_state_fallback_reachability.get(id(subgraph)) is not False
+                        )
+                        if graph_output_rank != state_input_rank or sibling_state_shape_is_unproven:
                             repeated_carried_state_rank_may_increase = (
-                                graph_output_rank is None
+                                sibling_state_shape_is_unproven
+                                or graph_output_rank is None
                                 or state_input_rank is None
                                 or graph_output_rank > state_input_rank
                             )
