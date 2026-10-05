@@ -4686,13 +4686,19 @@ def _build_onnx_weight_analysis_plan(
         attribute_bindings: dict[str, Any] | None = None,
         depth: int = 0,
         inherited_constants: dict[str, Any] | None = None,
+        exclude_activation_inputs: bool = False,
+        inherited_activation_lineages: dict[str, dict[int, _OnnxWeightLineage]] | None = None,
     ) -> bool:
         nonlocal graph_taint_work_remaining
         if not graph_input_name:
             return False
         if depth > 6:
             return True
-        constant_names = rank_reentry_constant_names(subgraph, attribute_bindings)
+        constant_names = rank_reentry_constant_names(
+            subgraph,
+            attribute_bindings,
+            include_bound_inputs=exclude_activation_inputs and isinstance(subgraph, onnx.FunctionProto),
+        )
         if dependency_names_exceeded_limit(constant_names):
             return True
         constants_key = constant_binding_cache_key(inherited_constants or {}, constant_names)
@@ -4705,13 +4711,15 @@ def _build_onnx_weight_analysis_plan(
             attribute_binding_cache_key(attribute_bindings),
             depth,
             constants_key,
+            exclude_activation_inputs,
         )
-        if cache_key in weight_reachability_cache:
+        if not exclude_activation_inputs and cache_key in weight_reachability_cache:
             return weight_reachability_cache[cache_key]
         if not subgraph_has_potential_weight_consumer(
             subgraph, opset_versions, attribute_bindings=attribute_bindings, depth=depth
         ):
-            weight_reachability_cache[cache_key] = False
+            if not exclude_activation_inputs:
+                weight_reachability_cache[cache_key] = False
             return False
         if graph_taint_work_remaining <= 0:
             return True
@@ -4728,7 +4736,8 @@ def _build_onnx_weight_analysis_plan(
                 attribute_bindings=attribute_bindings,
                 depth=depth,
             )
-            weight_reachability_cache[cache_key] = result
+            if not exclude_activation_inputs:
+                weight_reachability_cache[cache_key] = result
             return result
         if cache_key in weight_reachability_in_progress:
             return True
@@ -4736,11 +4745,42 @@ def _build_onnx_weight_analysis_plan(
 
         def finish(result: bool) -> bool:
             weight_reachability_in_progress.discard(cache_key)
-            weight_reachability_cache[cache_key] = result
+            if not exclude_activation_inputs:
+                weight_reachability_cache[cache_key] = result
             return result
 
+        if exclude_activation_inputs and len(constant_names) > graph_taint_work_remaining:
+            graph_taint_work_remaining = 0
+            return finish(True)
+        activation_lineages = {}
+        if exclude_activation_inputs:
+            graph_taint_work_remaining -= len(constant_names)
+            activation_lineages = {
+                name: inherited_activation_lineages[name]
+                for name in constant_names
+                if inherited_activation_lineages is not None and name in inherited_activation_lineages
+            }
         local_attribute_bindings = attribute_bindings or {}
         graph_constants = graph_initializer_constants(subgraph, inherited_constants or {}, attribute_bindings)
+        if exclude_activation_inputs and isinstance(subgraph, onnx.FunctionProto):
+            graph_constants.update(
+                (name, inherited_constants[name])
+                for name in subgraph.input
+                if inherited_constants is not None and name in inherited_constants
+            )
+
+        def activation_weight_rank(name: str) -> int | None:
+            nonlocal graph_taint_work_remaining
+            lineages = activation_lineages.get(name, {})
+            if len(lineages) > graph_taint_work_remaining:
+                graph_taint_work_remaining = 0
+                return None
+            graph_taint_work_remaining -= len(lineages)
+            shape = resolved_lineage_shape(lineages.values())
+            if shape is not None:
+                return len(shape)
+            constant = graph_constants.get(name)
+            return len(constant.dims) if constant is not None else None
 
         def resolve_reentry_attribute(attribute: Any) -> Any | None:
             reference_name = str(getattr(attribute, "ref_attr_name", ""))
@@ -4857,6 +4897,22 @@ def _build_onnx_weight_analysis_plan(
                 if constant is not None:
                     for name in node_output_names(body_node):
                         graph_constants[name] = constant
+            if (
+                exclude_activation_inputs
+                and builtin_operator(body_node, "Identity")
+                and len(body_node.input) == 1
+                and (constant := graph_constants.get(str(body_node.input[0]))) is not None
+            ):
+                for name in body_outputs:
+                    graph_constants[name] = constant
+            if (
+                exclude_activation_inputs
+                and builtin_operator(body_node, "Identity")
+                and len(body_node.input) == 1
+                and str(body_node.input[0]) in activation_lineages
+            ):
+                for name in body_outputs:
+                    activation_lineages[name] = activation_lineages[str(body_node.input[0])]
             body_inputs = node_input_names(body_node)
             any_tainted = any(input_name in tainted for input_name in body_inputs)
             has_tainted_nested_capture = False
@@ -4910,6 +4966,10 @@ def _build_onnx_weight_analysis_plan(
                         depth=depth + 1,
                         inherited_constants=bound_function_constants(
                             function, node_input_slots(body_node), graph_constants
+                        )[0],
+                        exclude_activation_inputs=exclude_activation_inputs,
+                        inherited_activation_lineages=bound_function_constants(
+                            function, node_input_slots(body_node), activation_lineages
                         )[0],
                     ):
                         return finish(True)
@@ -4979,8 +5039,26 @@ def _build_onnx_weight_analysis_plan(
                                 graph_output_offset=control_flow_output_offset(body_node),
                             )
                         )
+            activation_weight_inputs = {
+                input_index
+                for input_index, input_name in enumerate(node_input_slots(body_node))
+                if exclude_activation_inputs
+                and builtin_operator(body_node)
+                and is_registered_standard_operator
+                and input_name not in tainted
+                and (rank := activation_weight_rank(input_name)) is not None
+                and rank <= _ONNX_WEIGHT_RESHAPE_RANK_LIMIT
+                and _onnx_weight_output_axes(body_node, input_index, rank)[0] is not None
+            }
+            if exclude_activation_inputs and graph_taint_work_remaining <= 0:
+                return finish(True)
             if any(
                 input_name in tainted
+                and not (
+                    _onnx_activation_input_candidate(body_node, input_index)
+                    and activation_weight_inputs
+                    and (len(activation_weight_inputs) > 1 or input_index not in activation_weight_inputs)
+                )
                 and _onnx_potential_weight_input(
                     body_node,
                     input_index,
@@ -9513,6 +9591,40 @@ def _build_onnx_weight_analysis_plan(
                             state_output_index = control_flow_subgraph_state_output_index(
                                 node, pair_index, opset_versions
                             )
+                            next_state_lineages = (
+                                subgraph_results[-1][0][state_output_index]
+                                if state_output_index < len(subgraph_results[-1][0])
+                                else {}
+                            )
+                            if (
+                                next_state_lineages
+                                and not subgraph_results[-1][2][state_output_index]
+                                and all(
+                                    lineage.unresolved_reason == "dynamic_activation_lineage"
+                                    for lineage in next_state_lineages.values()
+                                )
+                                and not subgraph_state_input_can_reach_weight_consumer(
+                                    subgraph,
+                                    graph_input_name,
+                                    opset_versions,
+                                    attribute_bindings=attribute_bindings,
+                                    inherited_constants=constants,
+                                    exclude_activation_inputs=True,
+                                    inherited_activation_lineages=value_lineages,
+                                )
+                                and not any(
+                                    output_index in state_input_by_output
+                                    and state_input_by_output[output_index] != graph_input_name
+                                    for output_index in graph_tainted_output_indexes(
+                                        subgraph,
+                                        {graph_input_name},
+                                        opset_versions,
+                                        inherited_constants=constants,
+                                        attribute_bindings=attribute_bindings,
+                                    )
+                                )
+                            ):
+                                continue
                             initial_shapes = {lineage.shape for lineage in initial_lineages.values()}
                             initial_shape = next(iter(initial_shapes)) if len(initial_shapes) == 1 else None
                             if node.op_type == "Scan":

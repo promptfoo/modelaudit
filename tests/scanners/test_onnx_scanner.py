@@ -32712,3 +32712,269 @@ class TestOnnxScanFeedbackPartition:
             if mode == "final":
                 np.testing.assert_array_equal(plan.specs[0].weights, actual[0])
         assert not TestWeightDistributionSemantics._extreme_checks(result)
+
+
+class TestOnnxRecurrentActivationProof:
+    @staticmethod
+    def _model(kind: str) -> tuple[Any, dict[str, Any], Any]:
+        v, t = TestOnnxShapeContinuity._v, TestOnnxShapeContinuity._t
+        count = 1 if kind == "single" else 3
+        shape = (
+            (1, 4)
+            if kind
+            in {
+                "reported",
+                "single",
+                "unrolled",
+                "local-weight",
+                "alias-weight",
+                "body-constant",
+                "runtime-weight",
+                "nested-consumer",
+                "runtime-weight-unrolled",
+                "nested-runtime-weight",
+            }
+            else (4, 4)
+        )
+        W = np.random.default_rng(42).normal(size=(4, 4)).astype(np.float32) / 4
+        H = np.zeros(shape, np.float32)
+        init = [t("H", H), t("W", W), t("count", np.int64(count)), t("start", np.bool_(True))]
+        ins = [v("H", list(shape))]
+        feeds: dict[str, Any] = {"H": np.arange(np.prod(shape), dtype=np.float32).reshape(shape) / 16}
+        nodes: list[Any] = []
+        body_init: list[Any] = []
+        functions: list[Any] = []
+        weight = "W"
+        if kind in {"runtime-weight", "runtime-weight-unrolled", "nested-runtime-weight"}:
+            ins.append(v("W", [4, 4]))
+            feeds["W"] = W * 2
+        if kind == "local-weight":
+            body_init = [init.pop(1)]
+        if kind == "body-constant":
+            weight = "bodyW"
+            nodes.append(helper.make_node("Constant", [], ["bodyW"], value=init.pop(1)))
+        if kind == "alias-weight":
+            weight = "aliasW"
+            nodes.append(helper.make_node("Identity", ["W"], ["aliasW"]))
+        if kind == "right-weight":
+            ins.append(v("X", [4, 4]))
+            feeds["X"] = W
+            nodes.append(helper.make_node("MatMul", ["X", "state"], ["next"]))
+        elif kind in {"nested-consumer", "nested-mixed", "nested-runtime-weight"}:
+            f = helper.make_function(
+                "local",
+                "Layer",
+                ["A", "B"],
+                ["Y"],
+                [helper.make_node("MatMul", ["A", "B"], ["Y"])],
+                [helper.make_opsetid("", 18)],
+            )
+            functions = [f]
+            nodes.append(helper.make_node("Layer", ["state", "W"], ["next"], domain="local"))
+        elif kind == "overloaded-consumer":
+            f = helper.make_function(
+                "",
+                "MatMul",
+                ["A", "B"],
+                ["Y"],
+                [helper.make_node("PRelu", ["B", "A"], ["Y"])],
+                [helper.make_opsetid("", 18)],
+                overload="weight-path",
+            )
+            functions = [f]
+            nodes.append(helper.make_node("MatMul", ["state", "W"], ["next"], overload="weight-path"))
+        else:
+            nodes.append(helper.make_node("MatMul", ["state", weight], ["next"]))
+        body_ins = [v("i", [], TensorProto.INT64), v("cond", [], TensorProto.BOOL), v("state", list(shape))]
+        body_outs = [v("cond", [], TensorProto.BOOL), v("next", list(shape))]
+        root_inputs = ["count", "start", "H"]
+        root_outputs = ["Y"]
+        outs = [v("Y", list(shape))]
+        if kind in {"mixed-consumers", "mixed-consumers-reversed", "later-weight", "nested-mixed"}:
+            ins.append(v("X", [4, 4]))
+            feeds["X"] = W
+            extra = helper.make_node("MatMul", ["next" if kind == "later-weight" else "state", "X"], ["used"])
+            if kind == "nested-mixed":
+                extra = helper.make_node("Layer", ["state", "X"], ["used"], domain="local")
+            if kind == "mixed-consumers-reversed":
+                nodes.insert(0, extra)
+            else:
+                nodes.append(extra)
+            body_outs.append(v("used", [4, 4]))
+            root_outputs.append("used_stack")
+            outs.append(v("used_stack", [count, 4, 4]))
+        if kind in {"sibling-feedback", "sibling-weight", "sibling-invariant", "independent-state"}:
+            init.append(t("B", np.zeros((4, 4), np.float32)))
+            if kind == "independent-state":
+                ins.append(v("B", [4, 4]))
+                feeds["B"] = W
+            body_ins.append(v("other", [4, 4]))
+            root_inputs.append("B")
+            root_outputs.insert(1, "Bfinal")
+            outs.insert(1, v("Bfinal", [4, 4]))
+            body_outs.insert(2, v("other_next", [4, 4]))
+            nodes.append(
+                helper.make_node("Identity", ["next" if kind == "sibling-feedback" else "other"], ["other_next"])
+            )
+            ins.append(v("X", [4, 4]))
+            feeds["X"] = W
+            nodes.append(helper.make_node("MatMul", ["X", "other"], ["used"]))
+            body_outs.append(v("used", [4, 4]))
+            root_outputs.append("used_stack")
+            outs.append(v("used_stack", [count, 4, 4]))
+            if kind == "sibling-weight":
+                nodes[0] = helper.make_node("MatMul", ["state", "other"], ["next"])
+                nodes[-2] = helper.make_node("MatMul", ["other", "W"], ["other_next"])
+        if kind == "independent-state":
+            nodes.pop()
+            body_outs.pop()
+            root_outputs.pop()
+            outs.pop()
+        if kind in {"unrolled", "runtime-weight-unrolled"}:
+            root_nodes = [helper.make_node("MatMul", [a, "W"], [b]) for a, b in [("H", "a"), ("a", "b"), ("b", "Y")]]
+        else:
+            body = helper.make_graph(nodes, "body", body_ins, body_outs, body_init)
+            root_nodes = [helper.make_node("Loop", root_inputs, root_outputs, body=body)]
+        model = helper.make_model(
+            helper.make_graph(root_nodes, kind, ins, outs, init),
+            opset_imports=[helper.make_opsetid("", 18), helper.make_opsetid("local", 1)],
+            functions=functions,
+            ir_version=10,
+        )
+        if kind in {"matmul-both", "gemm-both-with-bias", "gemm-activation-and-bias"}:
+            op, operands = {
+                "matmul-both": ("MatMul", ["state", "state"]),
+                "gemm-both-with-bias": ("Gemm", ["state", "state", "W"]),
+                "gemm-activation-and-bias": ("Gemm", ["state", "W", "state"]),
+            }[kind]
+            model.graph.node[0].attribute[0].g.node[0].CopyFrom(helper.make_node(op, operands, ["next"]))
+        return model, feeds, W
+
+    @pytest.mark.parametrize(
+        ("kind", "gap_count"),
+        [
+            (kind, 0)
+            for kind in (
+                "reported",
+                "unrolled",
+                "single",
+                "local-weight",
+                "body-constant",
+                "alias-weight",
+                "runtime-weight",
+                "sibling-invariant",
+                "independent-state",
+                "nested-consumer",
+                "runtime-weight-unrolled",
+                "nested-runtime-weight",
+                "gemm-activation-and-bias",
+            )
+        ]
+        + [
+            (kind, gaps)
+            for kind, gaps in (
+                ("right-weight", 1),
+                ("mixed-consumers", 1),
+                ("mixed-consumers-reversed", 1),
+                ("later-weight", 3),
+                ("sibling-feedback", 2),
+                ("sibling-weight", 2),
+                ("nested-mixed", 1),
+                ("overloaded-consumer", 1),
+                ("matmul-both", 1),
+                ("gemm-both-with-bias", 1),
+            )
+        ],
+    )
+    def test_repeated_activation_keeps_independent_weight_coverage(
+        self, tmp_path: Path, kind: str, gap_count: int
+    ) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        model, feeds, stored_weight = self._model(kind)
+        path = TestOnnxLoopControlProofs._save(model, tmp_path)
+        # Inline exact overloads because the installed evaluator otherwise
+        # dispatches default-domain names to their builtin implementations.
+        runtime = TestOnnxLoopControlProofs._inline_with_defaults(model)
+        actual: Any = ReferenceEvaluator(runtime).run(None, feeds)
+        state = feeds["H"]
+        other = feeds.get("B", np.zeros((4, 4), np.float32))
+        weight = feeds.get("W", stored_weight)
+        uses: list[Any] = []
+        siblings = kind in {"sibling-feedback", "sibling-weight", "sibling-invariant", "independent-state"}
+        for _ in range(1 if kind == "single" else 3):
+            previous = state
+            if kind == "right-weight":
+                state = feeds["X"] @ previous
+            elif kind == "sibling-weight":
+                state = previous @ other
+            elif kind == "overloaded-consumer":
+                state = np.where(stored_weight >= 0, stored_weight, stored_weight * previous)
+            elif kind in {"matmul-both", "gemm-both-with-bias"}:
+                state = previous @ previous
+                if kind == "gemm-both-with-bias":
+                    state = state + stored_weight
+            else:
+                state = previous @ weight
+                if kind == "gemm-activation-and-bias":
+                    state = state + previous
+            if kind in {"mixed-consumers", "mixed-consumers-reversed", "nested-mixed", "later-weight"}:
+                uses.append((state if kind == "later-weight" else previous) @ feeds["X"])
+            elif siblings and kind != "independent-state":
+                uses.append(feeds["X"] @ other)
+            if kind == "sibling-feedback":
+                other = state
+            elif kind == "sibling-weight":
+                other = other @ stored_weight
+        np.testing.assert_array_equal(actual[0], state)
+        if siblings:
+            np.testing.assert_array_equal(actual[1], other)
+        if uses:
+            expected = np.stack(uses)
+            # The installed Loop evaluator concatenates scan outputs; compare
+            # the actual per-iteration matrices with their explicit dimensions.
+            np.testing.assert_array_equal(actual[2 if siblings else 1].reshape(expected.shape), expected)
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        result = OnnxScanner().scan(str(path))
+        assert result.success is (gap_count == 0)
+        assert plan.coverage_gaps == ({"unresolved_initializer_lineage": gap_count} if gap_count else {})
+        assert [(issue.severity, issue.message) for issue in result.issues] == (
+            [(IssueSeverity.INFO, "Weight distribution analysis skipped one or more eligible ONNX initializers")]
+            if gap_count
+            else []
+        )
+        if gap_count:
+            assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+            assert any(check.details.get("coverage_gap") == "unresolved_initializer_lineage" for check in result.checks)
+        assert plan.specs
+        if kind == "overloaded-consumer":
+            # The exact local function uses H as PRelu's slope and W as data.
+            assert [(spec.context["initializer"], spec.weights.shape) for spec in plan.specs] == [
+                ("H", (4, 4)),
+                ("H", (4, 4)),
+            ]
+        elif kind not in {"right-weight", "matmul-both", "gemm-both-with-bias"}:
+            assert any(np.array_equal(spec.weights, stored_weight) for spec in plan.specs)
+        for spec in plan.specs:
+            assert np.array_equal(spec.weights, stored_weight) or np.array_equal(
+                spec.weights, np.zeros_like(spec.weights)
+            )
+        assert not TestWeightDistributionSemantics._extreme_checks(result)
+
+    def test_exhausted_activation_proof_keeps_gap_and_independent_weights(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        model, _feeds, stored_weight = self._model("reported")
+        path = TestOnnxLoopControlProofs._save(model, tmp_path)
+        monkeypatch.setattr(onnx_scanner_module, "_ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK", 16)
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        result = OnnxScanner().scan(str(path))
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert plan.coverage_gaps == {"unresolved_initializer_lineage": 1}
+        assert len(plan.specs) == 2
+        np.testing.assert_array_equal(plan.specs[0].weights, np.zeros((4, 1), np.float32))
+        np.testing.assert_array_equal(plan.specs[1].weights, stored_weight)
+        assert [(issue.severity, issue.message) for issue in result.issues] == [
+            (IssueSeverity.INFO, "Weight distribution analysis skipped one or more eligible ONNX initializers")
+        ]
