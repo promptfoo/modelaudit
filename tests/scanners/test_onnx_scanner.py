@@ -31156,3 +31156,490 @@ class TestOnnxProvenShapesAndScanExtents:
         np.testing.assert_array_equal(plan.specs[0].weights, weights.T)
         result = OnnxScanner().scan(str(path))
         assert result.success is False
+
+
+class TestOnnxControlExtentProofs:
+    _value = staticmethod(TestOnnxRecurrenceReviewRegressions._value)
+    _model = staticmethod(TestOnnxBuiltinOperatorIdentity._model)
+    _save = staticmethod(TestOnnxLoopControlProofs._save)
+
+    @classmethod
+    def _recurrent_model(
+        cls,
+        kind: str,
+        slot: int,
+        *,
+        symmetric: bool = False,
+        layout: int = 0,
+        direction: str = "forward",
+        missing: int = -1,
+        symbolic: bool = False,
+    ) -> tuple[Any, dict[str, Any], Any]:
+        value = cls._value
+        directions = 2 if direction == "bidirectional" else 1
+        state_shape = [1, directions, 2] if layout else [directions, 1, 2]
+        sequence_shape = [1, 2, 2] if layout else [2, 1, 2]
+        multiplier = {"RNN": 1, "GRU": 3, "LSTM": 4}[kind]
+        weights = np.zeros((64, 64), np.float32)
+        weights[:5, 0] = 10
+        if symmetric:
+            weights[0, :5] = 10
+        inputs = [
+            value("x", sequence_shape),
+            value("rw", [directions, multiplier * 2, 2]),
+            value("rr", [directions, multiplier * 2, 2]),
+            value("X", [1, 64]),
+        ]
+        initializers = [onnx.numpy_helper.from_array(weights, name="W")]
+        feeds = {
+            "x": np.zeros(sequence_shape, np.float32),
+            "rw": np.zeros((directions, multiplier * 2, 2), np.float32),
+            "rr": np.zeros((directions, multiplier * 2, 2), np.float32),
+            "X": np.ones((1, 64), np.float32),
+        }
+        recurrent_inputs = ["x", "rw", "rr", "", ""]
+        for index, name in enumerate(["hidden", "cell"] if kind == "LSTM" else ["hidden"], start=1):
+            recurrent_inputs.append("" if missing == index and not symbolic else name)
+            if missing == index:
+                if symbolic:
+                    inputs.append(value(name, [None, None, None]))
+                    feeds[name] = np.zeros(state_shape, np.float32)
+            else:
+                initializers.append(onnx.numpy_helper.from_array(np.zeros(state_shape, np.float32), name=name))
+        output_shape = ([1, 2, directions, 2] if layout else [2, directions, 1, 2]) if slot == 0 else state_shape
+        outputs = [""] * (slot + 1)
+        outputs[slot] = "sequence"
+        body = helper.make_graph(
+            [helper.make_node("Transpose", ["state"], ["next"], perm=[1, 0])],
+            "body",
+            [value("state", [64, 64]), value("element", output_shape[1:])],
+            [value("next", [64, 64])],
+        )
+        model = cls._model(
+            [
+                helper.make_node(kind, recurrent_inputs, outputs, hidden_size=2, layout=layout, direction=direction),
+                helper.make_node("Scan", ["W", "sequence"], ["final"], body=body, num_scan_inputs=1),
+                helper.make_node("MatMul", ["X", "final"], ["Y"]),
+            ],
+            inputs,
+            [value("Y", [1, 64]), value("final", [64, 64]), value("sequence", output_shape)],
+            initializers,
+            [],
+        )
+        return model, feeds, weights
+
+    @pytest.mark.parametrize("kind", ["RNN", "GRU", "LSTM"])
+    @pytest.mark.parametrize("slot", [0, 1])
+    @pytest.mark.parametrize("symmetric", [False, True])
+    def test_recurrent_source_shape_cannot_certify_sequence_extent(
+        self, tmp_path: Path, kind: str, slot: int, symmetric: bool
+    ) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        model, feeds, weights = self._recurrent_model(kind, slot, symmetric=symmetric)
+        path = self._save(model, tmp_path)
+        runtime: Any = ReferenceEvaluator(model).run(None, feeds)
+        np.testing.assert_array_equal(runtime[1], weights if slot == 0 else weights.T)
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        if slot == 0:
+            assert plan.specs == []
+            TestOnnxProofReviewRegressions._assert_gap(path, tmp_path, "unresolved_initializer_lineage")
+        else:
+            assert plan.coverage_gaps == {}
+            assert len(plan.specs) == 1
+            np.testing.assert_array_equal(plan.specs[0].weights, runtime[1])
+            assert OnnxScanner().scan(str(path)).success is True
+
+    @pytest.mark.parametrize("kind", ["RNN", "GRU", "LSTM"])
+    @pytest.mark.parametrize("layout", [0, 1])
+    @pytest.mark.parametrize("direction", ["forward", "reverse", "bidirectional"])
+    def test_final_state_shape_preserves_layout_and_direction(
+        self, tmp_path: Path, kind: str, layout: int, direction: str
+    ) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        model, feeds, weights = self._recurrent_model(kind, 1, layout=layout, direction=direction)
+        path = self._save(model, tmp_path)
+        runtime: Any = ReferenceEvaluator(model).run(None, feeds)
+        steps = runtime[2].shape[0]
+        np.testing.assert_array_equal(runtime[1], weights.T if steps == 1 else weights)
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        assert OnnxScanner().scan(str(path)).success is (steps == 1)
+        if steps == 1:
+            assert plan.coverage_gaps == {}
+            np.testing.assert_array_equal(plan.specs[0].weights, runtime[1])
+        else:
+            assert plan.coverage_gaps["unresolved_initializer_lineage"] > 0
+
+    @pytest.mark.parametrize("missing", [1, 2])
+    @pytest.mark.parametrize("slot", [1, 2])
+    @pytest.mark.parametrize("symbolic", [False, True])
+    def test_hidden_and_cell_shape_proofs_stay_separate(
+        self, tmp_path: Path, missing: int, slot: int, symbolic: bool
+    ) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        model, feeds, weights = self._recurrent_model("LSTM", slot, missing=missing, symbolic=symbolic)
+        path = self._save(model, tmp_path)
+        runtime: Any = ReferenceEvaluator(model).run(None, feeds)
+        np.testing.assert_array_equal(runtime[1], weights.T)
+        if slot == missing:
+            TestOnnxProofReviewRegressions._assert_gap(path, tmp_path, "unresolved_initializer_lineage")
+        else:
+            plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+            assert plan.coverage_gaps == {}
+            np.testing.assert_array_equal(plan.specs[0].weights, runtime[1])
+            assert OnnxScanner().scan(str(path)).success is True
+
+    @classmethod
+    def _shape_model(cls, source_count: int, bounds: dict[str, int]) -> Any:
+        value, tensor = cls._value, TestOnnxShapeContinuity._t
+        bad = np.zeros((64, 64), np.float32)
+        bad[:5, 0] = 10
+        inner = helper.make_graph(
+            [helper.make_node("Identity", ["Good"], ["replacement"])],
+            "inner",
+            [value("state", [64, 64]), value("element", [])],
+            [value("replacement", [64, 64])],
+        )
+        shape_node = helper.make_node("Shape", ["state"], ["dims"])
+        shape_node.attribute.extend(helper.make_attribute(name, value) for name, value in bounds.items())
+        body = helper.make_graph(
+            [
+                helper.make_node("Scan", ["Bad", "state"], ["selected"], body=inner, num_scan_inputs=1),
+                helper.make_node("MatMul", ["X", "selected"], ["Y"]),
+                helper.make_node("Identity", ["condition"], ["condition_out"]),
+                shape_node,
+                helper.make_node("Cast", ["dims"], ["next"], to=TensorProto.FLOAT),
+            ],
+            "body",
+            [value("i", [], TensorProto.INT64), value("condition", [], TensorProto.BOOL), value("state", [None])],
+            [value("condition_out", [], TensorProto.BOOL), value("next", [None]), value("Y", [1, 64])],
+        )
+        names = [f"source{index}" for index in range(source_count)]
+        model = cls._model(
+            [
+                helper.make_node("Sum", names, ["initial"]),
+                helper.make_node("Loop", ["count", "start", "initial"], ["final", "Ys"], body=body),
+            ],
+            [value("X", [1, 64])],
+            [value("final", [None]), value("Ys", [2, 1, 64])],
+            [tensor(name, np.zeros(1, np.float32)) for name in names]
+            + [
+                tensor("count", np.int64(2)),
+                tensor("start", np.bool_(True)),
+                tensor("Bad", bad),
+                tensor("Good", np.zeros_like(bad)),
+            ],
+            [],
+        )
+        return model
+
+    @pytest.mark.parametrize("source_count", [1, 33])
+    @pytest.mark.parametrize(
+        "bounds", [{}, {"start": 1}, {"end": 0}, {"start": -1}, {"start": -20, "end": 20}, {"start": 20}]
+    )
+    def test_sliced_shape_reentry_keeps_reachable_zero_iteration_weights(
+        self, tmp_path: Path, source_count: int, bounds: dict[str, int]
+    ) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        model = self._shape_model(source_count, bounds)
+        path = self._save(model, tmp_path)
+        runtime: Any = ReferenceEvaluator(model).run(None, {"X": np.ones((1, 64), np.float32)})
+        empty = len(range(1)[bounds.get("start", 0) : bounds.get("end", 1)]) == 0
+        assert runtime[0].shape == ((0,) if empty else (1,))
+        # Reference Loop concatenates this singleton output axis; its values
+        # still expose the second iteration's independently executed weight.
+        assert float(runtime[1].sum()) == (50 if empty else 0)
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        assert plan.coverage_gaps == {}
+        assert {spec.context["initializer"] for spec in plan.specs} == ({"Bad", "Good"} if empty else {"Good"})
+        result = OnnxScanner().scan(str(path))
+        assert result.success is True
+        assert bool(TestWeightDistributionSemantics._extreme_checks(result)) is empty
+
+    @pytest.mark.parametrize("trip", [0, 1, 2])
+    @pytest.mark.parametrize("runtime_condition", [False, True])
+    def test_loop_trip_bound_is_independent_of_entry_condition(
+        self, tmp_path: Path, trip: int, runtime_condition: bool
+    ) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        value, tensor = self._value, TestOnnxShapeContinuity._t
+        weights = np.arange(4, dtype=np.float32).reshape(2, 2)
+        body = helper.make_graph(
+            [
+                helper.make_node("MatMul", ["X", "state"], ["product"]),
+                helper.make_node("Transpose", ["state"], ["next"], perm=[1, 0]),
+            ],
+            "body",
+            [value("i", [], TensorProto.INT64), value("condition", [], TensorProto.BOOL), value("state", [2, 2])],
+            [value("condition", [], TensorProto.BOOL), value("next", [2, 2]), value("product", [1, 2])],
+        )
+        inputs = [value("X", [1, 2])]
+        initializers = [tensor("W", weights), tensor("count", np.int64(trip))]
+        if runtime_condition:
+            inputs.append(value("start", [], TensorProto.BOOL))
+        else:
+            initializers.append(tensor("start", np.bool_(True)))
+        model = self._model(
+            [helper.make_node("Loop", ["count", "start", "W"], ["final", "Ys"], body=body)],
+            inputs,
+            [value("final", [2, 2]), value("Ys", [None, 1, 2])],
+            initializers,
+            [],
+        )
+        path = self._save(model, tmp_path)
+        runtime_model = onnx.ModelProto()
+        runtime_model.CopyFrom(model)
+        # Reference Loop cannot concatenate an empty sequence. Its final-state
+        # oracle needs no scan output; keep the scanner's original model intact.
+        del runtime_model.graph.output[1:]
+        del runtime_model.graph.node[0].output[1:]
+        del runtime_model.graph.node[0].attribute[0].g.output[2:]
+        for condition in [False, True] if runtime_condition else [True]:
+            feeds = {"X": np.ones((1, 2), np.float32)}
+            if runtime_condition:
+                feeds["start"] = np.array(condition)
+            runtime: Any = ReferenceEvaluator(runtime_model).run(None, feeds)
+            np.testing.assert_array_equal(runtime[0], weights.T if condition and trip == 1 else weights)
+        if trip > 1:
+            TestOnnxProofReviewRegressions._assert_gap(path, tmp_path, "unresolved_initializer_lineage")
+        else:
+            plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+            assert plan.coverage_gaps == {}
+            # Static body coverage remains present for skipped loops, as on
+            # the baseline; the bound must not invent repeated-weight gaps.
+            assert len(plan.specs) == 1
+            if plan.specs:
+                np.testing.assert_array_equal(plan.specs[0].weights, weights)
+            assert OnnxScanner().scan(str(path)).success is True
+
+    @pytest.mark.parametrize("mode", ["concrete", "mixed", "reverse", "unknown", "two", "mismatch", "unproven"])
+    @pytest.mark.parametrize("axis", [0, -1])
+    @pytest.mark.parametrize("body_consumer", [False, True])
+    @pytest.mark.parametrize("bound", [False, True])
+    def test_scan_inputs_share_only_a_consistent_proven_extent(
+        self, tmp_path: Path, mode: str, axis: int, body_consumer: bool, bound: bool
+    ) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        value = self._value
+        weights = np.array([[0, 1], [1, 3]], np.float32)
+        left, right = {
+            "concrete": (1, 1),
+            "mixed": (1, "steps"),
+            "reverse": ("steps", 1),
+            "unknown": ("a", "b"),
+            "unproven": ("a", "b"),
+            "two": (2, "steps"),
+            "mismatch": (1, 2),
+        }[mode]
+        shape_a, shape_b = ([left, 3], [right, 3]) if axis == 0 else ([3, left], [3, right])
+        body_nodes = [helper.make_node("Transpose", ["state"], ["next"], perm=[1, 0])]
+        body_outputs = [value("next", [2, 2])]
+        if body_consumer:
+            body_nodes.insert(0, helper.make_node("MatMul", ["X", "state"], ["product"]))
+            body_outputs.append(value("product", [1, 2]))
+        body = helper.make_graph(
+            body_nodes, "body", [value("state", [2, 2]), value("a", [3]), value("b", [3])], body_outputs
+        )
+        nodes = [
+            helper.make_node(
+                "Scan",
+                ["W", "A", "B"],
+                ["final", "Y"] if body_consumer else ["final"],
+                body=body,
+                num_scan_inputs=2,
+                scan_input_axes=[axis, axis],
+            )
+        ]
+        if not body_consumer:
+            nodes.append(helper.make_node("MatMul", ["X", "final"], ["Y"]))
+        model = self._model(
+            nodes,
+            [value("X", [1, 2]), value("A", shape_a), value("B", shape_b)],
+            [value("final", [2, 2]), value("Y", [None, 1, 2] if body_consumer else [1, 2])],
+            [onnx.numpy_helper.from_array(weights, name="W")],
+            [],
+        )
+        if mode == "unproven":
+            model.graph.node[0].input[1:3] = ["alias_a", "alias_b"]
+            model.graph.node.insert(0, helper.make_node("Identity", ["B"], ["alias_b"]))
+            model.graph.node.insert(0, helper.make_node("Identity", ["A"], ["alias_a"]))
+            model.graph.value_info.extend(
+                [value("alias_a", [1, 3] if axis == 0 else [3, 1]), value("alias_b", [1, 3] if axis == 0 else [3, 1])]
+            )
+        if bound:
+            function_nodes = list(model.graph.node)
+            scan = next(node for node in function_nodes if node.op_type == "Scan")
+            for attribute in scan.attribute:
+                if attribute.name == "scan_input_axes":
+                    attribute.ClearField("ints")
+                    attribute.ref_attr_name = "axes"
+            function = helper.make_function(
+                "local",
+                "BoundScan",
+                ["W", "A", "B", "X"],
+                ["final", "Y"],
+                function_nodes,
+                [helper.make_opsetid("", 18)],
+                attributes=["axes"],
+            )
+            model.functions.append(function)
+            del model.graph.node[:]
+            model.graph.node.append(
+                helper.make_node("BoundScan", ["W", "A", "B", "X"], ["final", "Y"], domain="local", axes=[axis, axis])
+            )
+        if mode == "mismatch":
+            with pytest.raises(onnx.shape_inference.InferenceError):
+                onnx.checker.check_model(model, full_check=True)
+            onnx.checker.check_model(model)
+        path = self._save(model, tmp_path, validate=mode != "mismatch")
+        if mode != "mismatch":
+            steps = 2 if mode == "two" else 1
+            state = weights
+            for _ in range(steps):
+                # Reference Scan only implements axis zero. Execute its body
+                # with schema-correct slices for the negative-axis control.
+                runtime: Any = ReferenceEvaluator(body, opsets={"": 18}).run(
+                    None,
+                    {
+                        "state": state,
+                        "a": np.ones(3, np.float32),
+                        "b": np.ones(3, np.float32),
+                        "X": np.ones((1, 2), np.float32),
+                    },
+                )
+                state = runtime[0]
+            np.testing.assert_array_equal(state, weights)
+        if mode in {"unknown", "two", "mismatch", "unproven"}:
+            TestOnnxProofReviewRegressions._assert_gap(path, tmp_path, "unresolved_initializer_lineage")
+        else:
+            plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+            assert plan.coverage_gaps == {}
+            assert len(plan.specs) == 1
+            np.testing.assert_array_equal(plan.specs[0].weights, weights)
+            assert OnnxScanner().scan(str(path)).success is True
+
+    @pytest.mark.parametrize("binding", ["caller", "default", "override"])
+    @pytest.mark.parametrize("empty", [False, True])
+    def test_shape_slice_uses_active_function_attributes(self, tmp_path: Path, binding: str, empty: bool) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        model = self._shape_model(33, {})
+        body = model.graph.node[-1].attribute[0].g
+        shape = next(node for node in body.node if node.op_type == "Shape")
+        shape.attribute.append(onnx.AttributeProto(name="start", ref_attr_name="start", type=onnx.AttributeProto.INT))
+        names = ["X", *[tensor.name for tensor in model.graph.initializer]]
+        function = helper.make_function(
+            "local",
+            "SlicedLoop",
+            names,
+            ["final", "Ys"],
+            list(model.graph.node),
+            [helper.make_opsetid("", 18)],
+            attributes=["start"] if binding == "caller" else [],
+            attribute_protos=[]
+            if binding == "caller"
+            else [helper.make_attribute("start", int(not empty if binding == "override" else empty))],
+        )
+        model.functions.append(function)
+        del model.graph.node[:]
+        call = helper.make_node("SlicedLoop", names, ["final", "Ys"], domain="local")
+        if binding != "default":
+            call.attribute.append(helper.make_attribute("start", int(empty)))
+        model.graph.node.append(call)
+        path = self._save(model, tmp_path)
+        runtime: Any = ReferenceEvaluator(TestOnnxLoopControlProofs._inline_with_defaults(model)).run(
+            None, {"X": np.ones((1, 64), np.float32)}
+        )
+        assert float(runtime[1].sum()) == (50 if empty else 0)
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        assert plan.coverage_gaps == {}
+        assert {spec.context["initializer"] for spec in plan.specs} == ({"Bad", "Good"} if empty else {"Good"})
+        result = OnnxScanner().scan(str(path))
+        assert result.success is True
+        assert bool(TestWeightDistributionSemantics._extreme_checks(result)) is empty
+
+    @pytest.mark.parametrize("width", [64, 512])
+    @pytest.mark.parametrize("symbolic", [False, True])
+    def test_shared_scan_extent_work_is_linear_in_inputs(self, tmp_path: Path, width: int, symbolic: bool) -> None:
+        import cProfile
+
+        from onnx.reference import ReferenceEvaluator
+
+        value = self._value
+        body = helper.make_graph(
+            [],
+            "identity_scan",
+            [value(f"e{i}", [4]) for i in range(width)],
+            [value(f"e{i}", [4]) for i in range(width)],
+        )
+        model = self._model(
+            [
+                helper.make_node(
+                    "Scan",
+                    [f"x{i}" for i in range(width)],
+                    [f"y{i}" for i in range(width)],
+                    body=body,
+                    num_scan_inputs=width,
+                )
+            ],
+            [value(f"x{i}", [None if symbolic and i else 1, 4]) for i in range(width)],
+            [value(f"y{i}", [1, 4]) for i in range(width)],
+            [],
+            [],
+        )
+        path = self._save(model, tmp_path)
+        feeds = {f"x{i}": np.full((1, 4), i, np.float32) for i in range(width)}
+        runtime: Any = ReferenceEvaluator(model).run(None, feeds)
+        for index, output in enumerate(runtime):
+            np.testing.assert_array_equal(output, feeds[f"x{index}"])
+        with cProfile.Profile() as profile:
+            plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        calls = {
+            name: sum(
+                entry.callcount
+                for entry in profile.getstats()
+                if not isinstance(entry.code, str) and entry.code.co_name == name
+            )
+            for name in ("scan_common_sequence_extent", "scan_input_shape")
+        }
+        assert calls["scan_common_sequence_extent"] <= 3
+        assert calls["scan_input_shape"] <= 3 * width
+        assert plan.coverage_gaps == {}
+        assert OnnxScanner().scan(str(path)).success is True
+
+    @pytest.mark.parametrize("identity", ["matching", "different_overload", "different_domain"])
+    def test_recurrent_state_proof_requires_exact_builtin_identity(self, tmp_path: Path, identity: str) -> None:
+        model, feeds, weights = self._recurrent_model("RNN", 1)
+        function = helper.make_function(
+            "local" if identity == "different_domain" else "",
+            "RNN",
+            ["x", "w", "r", "b", "lens", "h"],
+            ["ignored", "state"],
+            [
+                helper.make_node("Identity", ["h"], ["ignored"]),
+                helper.make_node("Concat", ["h", "h"], ["state"], axis=0),
+            ],
+            [helper.make_opsetid("", 18)],
+            overload="other" if identity == "different_overload" else "custom",
+        )
+        model.functions.append(function)
+        model.graph.node[0].overload = "custom"
+        if identity == "matching":
+            # Shape inference resolves builtin RNN before local overloads;
+            # leave this extent symbolic in both the original and inlined model.
+            model.graph.output[2].type.tensor_type.shape.dim[0].dim_param = "states"
+        path = self._save(model, tmp_path)
+        actual = TestOnnxBuiltinOperatorIdentity._inlined_runtime(model, feeds)
+        np.testing.assert_array_equal(actual[1], weights if identity == "matching" else weights.T)
+        if identity == "matching":
+            TestOnnxProofReviewRegressions._assert_gap(path, tmp_path, "unresolved_initializer_lineage")
+        else:
+            plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+            assert plan.coverage_gaps == {}
+            np.testing.assert_array_equal(plan.specs[0].weights, actual[1])
+            assert OnnxScanner().scan(str(path)).success is True

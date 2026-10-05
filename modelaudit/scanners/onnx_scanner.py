@@ -2449,19 +2449,21 @@ def _build_onnx_weight_analysis_plan(
         condition_input = str(node.input[1]) if len(node.input) > 1 and node.input[1] else ""
         if loop_body_condition_is_constant_false(node, constants, attribute_bindings):
             return False
-        if graph_input_is_runtime_overridable(trip_input, graph_input_names, constants) or (
-            graph_input_is_runtime_overridable(condition_input, graph_input_names, constants)
-        ):
-            return True
         trip_count = (
-            constant_scalar_value(constants.get(trip_input), int(onnx.TensorProto.INT64)) if trip_input else None
+            constant_scalar_value(constants.get(trip_input), int(onnx.TensorProto.INT64))
+            if trip_input and not graph_input_is_runtime_overridable(trip_input, graph_input_names, constants)
+            else None
         )
         initial_condition = (
             constant_scalar_value(constants.get(condition_input), int(onnx.TensorProto.BOOL))
             if condition_input
             else True
         )
-        if condition_input and initial_condition is False:
+        if (
+            condition_input
+            and initial_condition is False
+            and not graph_input_is_runtime_overridable(condition_input, graph_input_names, constants)
+        ):
             return False
         return trip_count is None or int(trip_count) > 1
 
@@ -2538,6 +2540,32 @@ def _build_onnx_weight_analysis_plan(
             return known_shapes[value_name]
         return constant_initializer_shape(constants, value_name)
 
+    def scan_common_sequence_extent(
+        scan_inputs: Sequence[str],
+        scan_input_axes: tuple[int, ...],
+        resolve_shape: Callable[[str], tuple[int, ...] | None],
+    ) -> int | None:
+        # Valid Scan inputs share their sequence extent, even when some shapes
+        # are symbolic. Conflicting declarations cannot establish that proof.
+        common_extent = None
+        for index, name in enumerate(scan_inputs):
+            if not name:
+                return None
+            shape = resolve_shape(name)
+            if shape is None:
+                continue
+            raw_axis = scan_input_axes[index] if index < len(scan_input_axes) else 0
+            axis = raw_axis if raw_axis >= 0 else len(shape) + raw_axis
+            if axis < 0 or axis >= len(shape):
+                return None
+            extent = shape[axis]
+            if extent < 0:
+                continue
+            if common_extent is not None and common_extent != extent:
+                return None
+            common_extent = extent
+        return common_extent
+
     def scan_may_skip_body(
         node: Any,
         constants: dict[str, Any],
@@ -2576,6 +2604,15 @@ def _build_onnx_weight_analysis_plan(
         )
         known_shapes = known_shapes or {}
         trusted_shape_names = trusted_shape_names or set()
+        if not scan_input_offset:
+            extent = scan_common_sequence_extent(
+                scan_inputs,
+                scan_input_axes,
+                lambda name: scan_input_shape(
+                    constants, known_shapes, name, trusted_shape_names, untrusted_shape_names
+                ),
+            )
+            return extent is None or extent == 0
         for input_index, scan_input in enumerate(scan_inputs):
             shape = scan_input_shape(constants, known_shapes, scan_input, trusted_shape_names, untrusted_shape_names)
             # Scan-8 pads a produced sequence even when its body executes less
@@ -2591,7 +2628,7 @@ def _build_onnx_weight_analysis_plan(
             axis = raw_axis if raw_axis >= 0 else len(shape) + raw_axis
             if axis < 0 or axis >= len(shape):
                 return True
-            if shape[axis] <= 0:
+            if shape[axis] == 0 or (shape[axis] < 0 and not constant_sequence_lens):
                 return True
         return False
 
@@ -2635,6 +2672,15 @@ def _build_onnx_weight_analysis_plan(
             else _onnx_int_sequence_attribute(node, "scan_input_axes") or ()
         )
         trusted_shape_names = trusted_shape_names or set()
+        if not scan_input_offset:
+            extent = scan_common_sequence_extent(
+                scan_inputs,
+                scan_input_axes,
+                lambda name: scan_input_shape(
+                    constants, known_shapes, name, trusted_shape_names, untrusted_shape_names
+                ),
+            )
+            return extent is None or extent > 1
         for input_index, scan_input in enumerate(scan_inputs):
             shape = scan_input_shape(constants, known_shapes, scan_input, trusted_shape_names, untrusted_shape_names)
             if not shape:
@@ -4063,7 +4109,12 @@ def _build_onnx_weight_analysis_plan(
                                 if index not in squeeze_axes
                             )
                 elif is_shape_query and body_node.op_type == "Shape" and data_input_shape is not None:
-                    output_shape = (len(data_input_shape),)
+                    start = resolved_onnx_int_attribute(body_node, "start", 0, resolve_reentry_attribute)
+                    end = resolved_onnx_int_attribute(
+                        body_node, "end", len(data_input_shape), resolve_reentry_attribute
+                    )
+                    if start is not None and end is not None:
+                        output_shape = (len(range(len(data_input_shape))[start:end]),)
                 elif is_shape_query and body_node.op_type == "Size" and not any_tainted:
                     output_shape = ()
                 if output_shape is not None:
@@ -5306,6 +5357,16 @@ def _build_onnx_weight_analysis_plan(
             data_type=int(initializer.data_type),
             unresolved_reason=unresolved_reason,
         )
+
+    def resolved_lineage_shape(lineages: Iterable[_OnnxWeightLineage]) -> tuple[int, ...] | None:
+        shape = None
+        for lineage in lineages:
+            if lineage.unresolved_reason is not None or lineage.shape is None:
+                return None
+            if shape is not None and shape != lineage.shape:
+                return None
+            shape = lineage.shape
+        return shape
 
     def record_exclusion(
         initializer_index: int,
@@ -6636,9 +6697,9 @@ def _build_onnx_weight_analysis_plan(
         for name, lineages in value_lineages.items():
             if name in graph_input_names or name in dynamic_values:
                 continue
-            lineage_shapes = {lineage.shape for lineage in lineages.values()}
-            if len(lineage_shapes) == 1 and None not in lineage_shapes:
-                set_known_value_shape(name, next(iter(lineage_shapes)), proven=True)  # type: ignore[arg-type]
+            lineage_shape = resolved_lineage_shape(lineages.values())
+            if lineage_shape is not None:
+                set_known_value_shape(name, lineage_shape, proven=True)
         for name, constant in constants.items():
             if name in graph_input_names or name in dynamic_values:
                 continue
@@ -8784,9 +8845,7 @@ def _build_onnx_weight_analysis_plan(
                         if related_parent_shape is None:
                             related_parent_shape = constant_initializer_shape(constants, parent_name)
                         if related_parent_shape is None and parent_name in value_lineages:
-                            lineage_shapes = {lineage.shape for lineage in value_lineages[parent_name].values()}
-                            if len(lineage_shapes) == 1 and None not in lineage_shapes:
-                                related_parent_shape = next(iter(lineage_shapes))  # type: ignore[assignment]
+                            related_parent_shape = resolved_lineage_shape(value_lineages[parent_name].values())
                         if node.op_type == "Scan":
                             related_parent_shape, _related_parent_rank = _onnx_scan_bound_subgraph_input_shape(
                                 related_parent_shape,
@@ -10385,6 +10444,26 @@ def _build_onnx_weight_analysis_plan(
                 name for name in graph_input_names & set(value_lineages) if name not in proven_value_ranks
             }
 
+            def trusted_scan_input_shape(
+                scan_name: str,
+                trusted: set[str] = trusted_scan_shape_names,
+                untrusted: set[str] = untrusted_scan_shape_names,
+            ) -> tuple[int, ...] | None:
+                return scan_input_shape(constants, known_value_shapes, scan_name, trusted, untrusted)
+
+            common_scan_extent = None
+            if (
+                standard_control_flow_operator
+                and node.op_type == "Scan"
+                and not resolved_scan_input_offset
+                and 0 < resolved_scan_input_count <= len(node.input)
+            ):
+                common_scan_extent = scan_common_sequence_extent(
+                    node.input[-resolved_scan_input_count:],
+                    resolved_scan_input_axes,
+                    trusted_scan_input_shape,
+                )
+
             def scan8_batch_extent(
                 output_index: int,
                 *,
@@ -10426,12 +10505,15 @@ def _build_onnx_weight_analysis_plan(
                 trusted_shape_names: set[str] = trusted_scan_shape_names,
                 untrusted_shape_names: set[str] = untrusted_scan_shape_names,
                 allow_omitted_sequence_lens: bool = False,
+                common_extent: int | None = common_scan_extent,
             ) -> int:
                 num_scan_inputs = resolved_int_attribute(current_node, "num_scan_inputs", 1)
                 if num_scan_inputs <= 0:
                     return -1
                 input_offset = scan_sequence_lens_input_offset(current_node, opset_versions)
                 scan_input_start = max(len(current_node.input) - num_scan_inputs, input_offset)
+                if not input_offset:
+                    return common_extent if common_extent is not None else -1
                 scan_output_index = output_index - max(len(current_node.input) - input_offset - num_scan_inputs, 0)
                 scan_input_index = min(max(scan_output_index, 0), max(num_scan_inputs - 1, 0))
                 value_index = scan_input_start + scan_input_index
@@ -11315,6 +11397,15 @@ def _build_onnx_weight_analysis_plan(
                             for initializer_index, lineage in recurrent_state_lineages.items()
                         }
                     else:
+                        # Final hidden/cell states preserve their corresponding
+                        # initial state's shape; sequence outputs do not.
+                        state_input_index = output_index + 4
+                        state_input = str(node.input[state_input_index]) if state_input_index < len(node.input) else ""
+                        state_shape = proven_value_shape(state_input)
+                        if state_shape is not None:
+                            inferred_output_shape = state_shape
+                            inferred_output_rank = len(state_shape)
+                            inferred_output_rank_proven = True
                         state_lineages = {
                             initializer_index: _OnnxWeightLineage(
                                 initializer_index=initializer_index,
@@ -11521,15 +11612,14 @@ def _build_onnx_weight_analysis_plan(
                     else:
                         value_rank_promotable_lineage_limit_gap_counts.pop(name, None)
                         value_rank_promotable_lineage_limit_gap_summaries.pop(name, None)
-                    lineage_shapes = {lineage.shape for lineage in per_output_lineages.values()}
                     if inferred_output_shape is not None:
                         set_known_value_shape(name, inferred_output_shape, proven=inferred_output_rank_proven)
                     elif inferred_output_rank is not None:
                         set_known_value_rank(name, inferred_output_rank, proven=inferred_output_rank_proven)
                     elif clear_output_rank:
                         clear_known_value_rank(name)
-                    elif len(lineage_shapes) == 1 and None not in lineage_shapes:
-                        set_known_value_shape(name, next(iter(lineage_shapes)), proven=True)  # type: ignore[arg-type]
+                    elif (lineage_shape := resolved_lineage_shape(per_output_lineages.values())) is not None:
+                        set_known_value_shape(name, lineage_shape, proven=True)
                 else:
                     value_lineages.pop(name, None)
                     value_lineage_limit_gap_counts.pop(name, None)
