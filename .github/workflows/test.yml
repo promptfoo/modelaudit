@@ -493,6 +493,35 @@ jobs:
 
       - *sync-all-ci-dependencies
 
+      - name: Diagnose Codecov transport
+        if: matrix.shard == 0
+        timeout-minutes: 2
+        run: |
+          command -v pip python3 || true
+          pip --version || true
+          curl --version || true
+          python3 - <<'PYPROFILE' || true
+          import ssl
+          import sys
+
+          import requests
+
+          print(sys.executable, sys.version, ssl.OPENSSL_VERSION)
+          print("requests", requests.__version__, requests.__file__, "CA", requests.certs.where())
+          PYPROFILE
+          for url in https://cli.codecov.io/latest/linux/codecov https://ingest.codecov.io/upload/github/promptfoo::::modelaudit/upload-coverage; do
+            curl --silent --show-error --head --output /dev/null --connect-timeout 5 --max-time 15 --write-out 'url=%{url_effective} status=%{http_code} verify=%{ssl_verify_result} dns=%{time_namelookup} connect=%{time_connect} tls=%{time_appconnect}\n' "$url" || true
+            timeout 20s python3 - "$url" <<'PYPROBE' || true
+          import sys
+
+          import requests
+
+          # Keep this diagnostic unauthenticated, including when netrc exists.
+          response = requests.head(sys.argv[1], auth=lambda request: request, allow_redirects=False, timeout=(5, 10))
+          print(sys.argv[1], "status", response.status_code)
+          PYPROBE
+          done
+
       - name: Run branch coverage shard
         run: |
           uv run pytest tests -n auto \
