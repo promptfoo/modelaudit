@@ -34077,3 +34077,208 @@ class TestOnnxSiblingOutputRank:
                 assert manager.get_stats()["total_entries"] == 0
         finally:
             reset_cache_manager()
+
+
+class TestOnnxEmptyScanShapeCertificates:
+    @pytest.mark.parametrize(
+        "case",
+        [
+            "stack-one",
+            "stack-two",
+            "stack-body-transpose",
+            "stack-axis-last",
+            "stack-override",
+            "second-varying",
+            "zero-symbolic",
+            "zero-concrete",
+            "zero-identity",
+            "zero-function",
+            "zero-nested-function",
+            "zero-default",
+            "zero-default-alias",
+            "symbolic-default",
+            "one-symbolic",
+            "zero-axis-last",
+            "nonempty-axis",
+        ],
+    )
+    def test_empty_views_and_declared_zero_preserve_scan_contract(self, tmp_path: Path, case: str) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        value, tensor = TestOnnxShapeContinuity._v, TestOnnxShapeContinuity._t
+        functions: list[Any] = []
+        feeds: dict[str, Any] = {}
+        if case.startswith("stack-"):
+            count = 2 if case in {"stack-two", "stack-override"} else 1
+            sequence = np.empty((count, 0, 64), np.float32)
+            transpose_body = case == "stack-body-transpose"
+            axis = -1 if case == "stack-axis-last" else 0
+            body = helper.make_graph(
+                [helper.make_node("Transpose" if transpose_body else "Identity", ["slice"], ["out"])],
+                "body",
+                [value("slice", [None, 64])],
+                [value("out", [64, None] if transpose_body else [None, 64])],
+            )
+            used_sequence = sequence
+            if case == "stack-override":
+                used_sequence = np.zeros((2, 2, 64), np.float32)
+                used_sequence[1, :, 0] = 100
+                feeds["seq"] = used_sequence
+            stacked = np.stack([item.T if transpose_body else item for item in used_sequence], axis=axis)
+            permutation = [2, 1, 0] if axis == -1 else [0, 1, 2] if transpose_body else [0, 2, 1]
+            expected_weight = stacked.transpose(permutation)
+            x = np.ones((1, expected_weight.shape[-2]), np.float32)
+            inputs = [value("X", list(x.shape))]
+            if case == "stack-override":
+                inputs.append(value("seq", [2, "D", 64]))
+            initializers = [tensor("seq", sequence)]
+            nodes = [
+                helper.make_node("Scan", ["seq"], ["stack"], body=body, num_scan_inputs=1, scan_output_axes=[axis]),
+                helper.make_node("Transpose", ["stack"], ["weight"], perm=permutation),
+                helper.make_node("MatMul", ["X", "weight"], ["Y"]),
+            ]
+        elif case == "second-varying":
+            sequence = np.empty((2, 0, 64), np.float32)
+            expected_weight = np.zeros((2, 64, 64), np.float32)
+            expected_weight[1, :5, 0] = 100
+            body = helper.make_graph(
+                [
+                    helper.make_node("ReduceSum", ["empty"], ["zero"], keepdims=0),
+                    helper.make_node("Add", ["zero", "other"], ["out"]),
+                ],
+                "body",
+                [value("empty", [0, 64]), value("other", [64, 64])],
+                [value("out", [64, 64])],
+            )
+            x = np.ones((1, 64), np.float32)
+            inputs = [value("X", [1, 64])]
+            initializers = [tensor("seq", sequence), tensor("other", expected_weight)]
+            nodes = [
+                helper.make_node("Scan", ["seq", "other"], ["weight"], body=body, num_scan_inputs=2),
+                helper.make_node("MatMul", ["X", "weight"], ["Y"]),
+            ]
+        else:
+            weights = np.zeros((64, 64), np.float32)
+            weights[:5, 0] = 100
+            axis = -1 if case == "zero-axis-last" else 0
+            declared_shape: list[Any] = (
+                [0, 3]
+                if case == "zero-concrete"
+                else ["N", "D"]
+                if case == "symbolic-default"
+                else [1, "D"]
+                if case == "one-symbolic"
+                else ["D", 0]
+                if axis == -1
+                else [1, 0]
+                if case == "nonempty-axis"
+                else [0, "D"]
+            )
+            sequence = np.empty(
+                (3, 0)
+                if axis == -1
+                else (1, 0)
+                if case == "nonempty-axis"
+                else (1, 3)
+                if case in {"symbolic-default", "one-symbolic"}
+                else (0, 3),
+                np.float32,
+            )
+            expected_weight = weights.T if sequence.shape[axis] % 2 else weights
+            x = np.ones((1, 64), np.float32)
+            inputs = [value("X", [1, 64]), value("seq", declared_shape)]
+            initializers = [tensor("W", weights)]
+            feeds["seq"] = sequence
+            if case in {"zero-default", "zero-default-alias", "symbolic-default"}:
+                initializers.append(tensor("seq", np.empty((0, 3), np.float32)))
+            body = helper.make_graph(
+                [helper.make_node("Transpose", ["state"], ["out"])],
+                "body",
+                [value("state", [64, 64]), value("slice", [sequence.shape[0 if axis == -1 else 1]])],
+                [value("out", [64, 64])],
+            )
+            nodes = []
+            data_name = "seq"
+            if case in {"zero-identity", "zero-default-alias", "zero-function"}:
+                data_name = "alias"
+                if case == "zero-function":
+                    functions.append(
+                        helper.make_function(
+                            "local",
+                            "Alias",
+                            ["a"],
+                            ["b"],
+                            [helper.make_node("Identity", ["a"], ["b"])],
+                            [helper.make_opsetid("", 18)],
+                        )
+                    )
+                    nodes.append(helper.make_node("Alias", ["seq"], [data_name], domain="local"))
+                else:
+                    nodes.append(helper.make_node("Identity", ["seq"], [data_name]))
+            scan = helper.make_node(
+                "Scan", ["W", data_name], ["final"], body=body, num_scan_inputs=1, scan_input_axes=[axis]
+            )
+            if case == "zero-nested-function":
+                functions.append(
+                    helper.make_function(
+                        "local",
+                        "Wrap",
+                        ["state", "data"],
+                        ["out"],
+                        [helper.make_node("Scan", ["state", "data"], ["out"], body=body, num_scan_inputs=1)],
+                        [helper.make_opsetid("", 18)],
+                    )
+                )
+                scan = helper.make_node("Wrap", ["W", "seq"], ["final"], domain="local")
+            nodes.extend([scan, helper.make_node("MatMul", ["X", "final"], ["Y"])])
+        feeds["X"] = x
+        expected = x @ expected_weight
+        model = helper.make_model(
+            helper.make_graph(nodes, case, inputs, [value("Y", list(expected.shape))], initializers),
+            functions=functions,
+            opset_imports=[helper.make_opsetid("", 18), helper.make_opsetid("local", 1)],
+            ir_version=10,
+        )
+        onnx.checker.check_model(model, full_check=True)
+        if case == "stack-axis-last":
+            # The installed whole evaluator omits alternate Scan axes; execute its body on schema-selected slices.
+            outputs = []
+            for item in sequence:
+                body_outputs: Any = ReferenceEvaluator(body, opsets={"": 18}).run(None, {"slice": item})
+                outputs.append(body_outputs[0])
+            np.testing.assert_array_equal(np.stack(outputs, axis=-1).transpose(2, 1, 0), expected_weight)
+        elif case == "zero-axis-last":
+            # The declared selected extent is zero, so no body call is reachable, regardless of feature width.
+            assert sequence.shape[-1] == 0
+            np.testing.assert_array_equal(expected_weight, weights)
+        else:
+            actual: Any = ReferenceEvaluator(model).run(None, feeds)
+            np.testing.assert_array_equal(actual[0], expected)
+        path = TestOnnxLoopControlProofs._save(model, tmp_path)
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        incomplete = case in {"symbolic-default", "stack-override", "second-varying"}
+        gap_count = 2 if case == "second-varying" else 1
+        assert plan.coverage_gaps == ({"unresolved_initializer_lineage": gap_count} if incomplete else {})
+        if incomplete or expected_weight.size == 0:
+            assert plan.specs == []
+        else:
+            assert len(plan.specs) == 1
+            assert plan.specs[0].context["initializer"] == "W"
+            np.testing.assert_array_equal(plan.specs[0].weights, expected_weight)
+        result = OnnxScanner().scan(str(path))
+        assert result.success is not incomplete
+        messages = (
+            ["Weight distribution analysis skipped one or more eligible ONNX initializers"]
+            if incomplete
+            else (
+                [
+                    "Layer 'W' has 1 output neurons with abnormal weight magnitudes",
+                    "Layer 'W' has neurons with extremely large weight values",
+                ]
+                if case.startswith("zero-")
+                else []
+            )
+        )
+        assert [(issue.severity, issue.message) for issue in result.issues] == [
+            (IssueSeverity.INFO, message) for message in messages
+        ]

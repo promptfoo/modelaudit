@@ -6247,22 +6247,27 @@ def _build_onnx_weight_analysis_plan(
         attribute_bindings: dict[str, Any],
         *,
         required_state_input: str | None = None,
+        input_shape: Callable[[str], tuple[int, ...] | None],
     ) -> bool:
         nonlocal stack_invariance_work_remaining
         input_offset = 2 if node.op_type == "Loop" else 0
         output_offset = 1 if node.op_type == "Loop" else 0
         parent_offset = 2 if node.op_type == "Loop" else scan_sequence_lens_input_offset(node, opset_versions)
+
+        def resolve_attribute(attribute: Any) -> Any | None:
+            return (
+                attribute_bindings.get(str(attribute.ref_attr_name))
+                if getattr(attribute, "ref_attr_name", "")
+                else attribute
+            )
+
         state_count = (
             len(node.input) - 2
             if node.op_type == "Loop"
             else scan_stacked_output_start(
                 node,
                 opset_versions,
-                resolve_attribute=lambda attribute: (
-                    attribute_bindings.get(str(attribute.ref_attr_name))
-                    if getattr(attribute, "ref_attr_name", "")
-                    else attribute
-                ),
+                resolve_attribute=resolve_attribute,
             )
         )
         graph_inputs: Any = getattr(subgraph, "input", ())
@@ -6282,6 +6287,34 @@ def _build_onnx_weight_analysis_plan(
             # Each executed iteration receives True; only its output condition
             # decides whether another iteration executes.
             varying_inputs.discard(_onnx_value_name(graph_inputs[1]))
+        elif node.op_type == "Scan":
+            scan_axes: Sequence[int] = ()
+            for attribute in node.attribute:
+                if attribute.name == "scan_input_axes":
+                    resolved_attribute = resolve_attribute(attribute)
+                    if resolved_attribute is not None:
+                        scan_axes = resolved_attribute.ints
+                    break
+            for index in range(max(state_count, 0), len(graph_inputs)):
+                parent_index = index + parent_offset
+                if parent_index >= len(node.input):
+                    continue
+                shape = input_shape(str(node.input[parent_index]))
+                if shape is None:
+                    continue
+                if len(shape) > stack_invariance_work_remaining:
+                    return False
+                stack_invariance_work_remaining -= len(shape)
+                shape, _rank = _onnx_scan_bound_subgraph_input_shape(
+                    shape,
+                    len(shape),
+                    pair_index=parent_index,
+                    scan_input_start=state_count + parent_offset,
+                    scan_input_offset=parent_offset,
+                    scan_input_axes=scan_axes,
+                )
+                if shape is not None and _onnx_shape_extent_product(shape) == 0:
+                    varying_inputs.discard(_onnx_value_name(graph_inputs[index]))
         pending = [graph_output_index]
         visited: set[int] = set()
         while pending:
@@ -6355,7 +6388,12 @@ def _build_onnx_weight_analysis_plan(
         promoted_lineages: dict[int, _OnnxWeightLineage] = {}
         for initializer_index, lineage in lineages.items():
             # Empty source views stay empty; rank alone cannot identify a final state.
-            if lineage.unresolved_reason is None and lineage.shape is not None and 0 in lineage.shape:
+            if (
+                lineage.unresolved_reason is None
+                and lineage.shape is not None
+                and 0 in lineage.shape
+                and (output_shape is None or _onnx_shape_extent_product(output_shape) != 0)
+            ):
                 promoted_lineages[initializer_index] = lineage
                 continue
             shape = None
@@ -9688,6 +9726,7 @@ def _build_onnx_weight_analysis_plan(
                                     opset_versions,
                                     attribute_bindings,
                                     required_state_input=graph_input_name,
+                                    input_shape=proven_value_shape,
                                 )
                             ):
                                 continue
@@ -10729,7 +10768,18 @@ def _build_onnx_weight_analysis_plan(
             ) -> tuple[int, ...] | None:
                 nonlocal scan_has_concrete_input_shape
                 shape = scan_input_shape(constants, known_value_shapes, scan_name, trusted, untrusted)
-                scan_has_concrete_input_shape |= shape is not None and all(dimension >= 0 for dimension in shape)
+                scan_has_concrete_input_shape |= shape is not None and (
+                    all(dimension >= 0 for dimension in shape)
+                    or not value_lineages.get(scan_name)
+                    or (
+                        (lineage_shape := resolved_lineage_shape(value_lineages[scan_name].values())) is not None
+                        and _onnx_shape_extent_product(lineage_shape) == 0
+                        and len(lineage_shape) == len(shape)
+                        and all(
+                            known < 0 or known == actual for known, actual in zip(shape, lineage_shape, strict=True)
+                        )
+                    )
+                )
                 return shape
 
             common_scan_extent = None
@@ -11049,6 +11099,7 @@ def _build_onnx_weight_analysis_plan(
                             value_lineages,
                             opset_versions,
                             attribute_bindings,
+                            input_shape=proven_value_shape,
                         )
                     ):
                         # Shape invariance does not imply value invariance. A
