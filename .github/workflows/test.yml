@@ -493,6 +493,17 @@ jobs:
 
       - *sync-all-ci-dependencies
 
+      - name: Install verified Codecov CLI
+        run: |
+          set -euo pipefail
+          codecov_binary="$RUNNER_TEMP/modelaudit-codecov"
+          curl --fail --location --retry 3 --connect-timeout 15 --max-time 120 \
+            --proto '=https' --proto-redir '=https' --output "$codecov_binary" \
+            https://github.com/codecov/codecov-cli/releases/download/v11.3.1/codecovcli_linux
+          printf '%s  %s\n' \
+            'ca1d64196d2d34771084afe76ea657d581bf628e31d993ff8e52ea09cc88a56d' "$codecov_binary" | sha256sum --check
+          chmod +x "$codecov_binary"
+
       - name: Run branch coverage shard
         run: |
           uv run pytest tests -n auto \
@@ -511,8 +522,7 @@ jobs:
           files: ./coverage.xml
           fail_ci_if_error: true
           use_oidc: true
-          # Avoid depending on the separate CLI binary-download host.
-          use_pypi: true
+          binary: ${{ runner.temp }}/modelaudit-codecov
           verbose: true
 
       # A failed primary upload must succeed through the documented legacy route.
@@ -521,9 +531,9 @@ jobs:
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
         env:
           CODECOV_UPLOAD_NAME: python-coverage-${{ matrix.shard }}
+          CODECOV_CLI: ${{ runner.temp }}/modelaudit-codecov
         with:
           script: |
-            await exec.exec('pip', ['install', 'codecov-cli==11.3.1']);
             const pullRequest = context.payload.pull_request;
             const slug = `${context.repo.owner}/${context.repo.repo}`;
             const isFork = pullRequest && pullRequest.head.repo.full_name !== slug;
@@ -548,7 +558,7 @@ jobs:
             if (isFork && !token) {
               args.push('--branch', pullRequest.head.label);
             }
-            await exec.exec('codecovcli', args);
+            await exec.exec(process.env.CODECOV_CLI, args);
 
   test-numpy-compatibility:
     name: Test NumPy ${{ matrix.numpy-mode }} - Python ${{ matrix.python-version }}
