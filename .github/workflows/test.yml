@@ -848,15 +848,22 @@ jobs:
           path: dist/
 
   picklescan-package:
-    name: Standalone Pickle Package (${{ matrix.python-version }})
+    name: Standalone Pickle Package (${{ matrix.os }}, ${{ matrix.python-version }})
     needs: changes
     if: needs.changes.outputs.integration == 'true' || needs.changes.outputs.picklescan == 'true' || needs.changes.outputs.workflows == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: ${{ matrix.os == 'macos-15-intel' && 30 || 15 }}
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest]
         python-version: ["3.10", "3.11", "3.12", "3.13"]
+        include:
+          # Exercise the release platform where scalar-probe timing regressed.
+          - os: macos-15-intel
+            python-version: "3.11"
+          - os: macos-15-intel
+            python-version: "3.12"
     defaults:
       run:
         working-directory: packages/modelaudit-picklescan
