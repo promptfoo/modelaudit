@@ -4182,7 +4182,8 @@ def _build_onnx_weight_analysis_plan(
             promoted.update(
                 output_name
                 for output_name in output_indexes_by_name
-                if output_name in tainted_shapes
+                if output_name in tainted
+                and output_name in tainted_shapes
                 and (shape := tainted_shapes.get(output_name)) is not None
                 and len(shape) > len(graph_input_shape)
             )
@@ -4200,7 +4201,7 @@ def _build_onnx_weight_analysis_plan(
             output_index: output_shape
             for output_index in sorted(restorable_output_indexes)
             if 0 <= output_index < len(graph_outputs)
-            and (output_shape := tainted_shapes.get(_onnx_value_name(graph_outputs[output_index]))) is not None
+            and (output_shape := reentry_input_shape(_onnx_value_name(graph_outputs[output_index]))) is not None
         }
         reentry_promotion_in_progress.discard(cache_key)
         reentry_promotion_cache[cache_key] = promoted_output_indexes
@@ -9155,6 +9156,15 @@ def _build_onnx_weight_analysis_plan(
                             )
                             if (
                                 repeated_state_reaches_recurrent_use is False
+                                and repeated_state_output_shapes.get(graph_output_index) is None
+                                and repeated_state_output_may_reach_future_weight(
+                                    subgraph, graph_input_name, include_current_iteration=True
+                                )
+                            ):
+                                repeated_state_reenters_with_rank_promotion = True
+                                repeated_state_reaches_recurrent_use = True
+                            if (
+                                repeated_state_reaches_recurrent_use is False
                                 and (replacement_shape := repeated_state_output_shapes.get(graph_output_index))
                                 is not None
                                 and len(replacement_shape) >= 2
@@ -9171,6 +9181,7 @@ def _build_onnx_weight_analysis_plan(
                                 repeated_state_reaches_recurrent_use = (
                                     replacement_bounds is None or replacement_bounds[0]
                                 )
+                                repeated_state_reenters_with_rank_promotion |= repeated_state_reaches_recurrent_use
                                 if replacement_bounds is not None and not replacement_bounds[0]:
                                     finite_repeated_state_consumes_weight_rank = False
                             if repeated_state_reaches_recurrent_use is False:
@@ -10672,7 +10683,16 @@ def _build_onnx_weight_analysis_plan(
                                 scan_output_insert_axis,
                                 scan_output_extent,
                             )
-                            graph_output_rank_proven = graph_output_rank_proven and scan_output_extent >= 0
+                            graph_output_rank_proven = graph_output_rank_proven and (
+                                scan_output_extent >= 0
+                                or (
+                                    node.op_type == "Loop"
+                                    and loop_exact_iteration_count(
+                                        max_count=_ONNX_SHAPE_EXTENT_LIMIT, require_bounded_trip_count=True
+                                    )
+                                    is not None
+                                )
+                            )
                             if graph_output_shape is not None and resolved_scan_input_offset:
                                 graph_output_shape = insert_shape_axis(
                                     graph_output_shape,

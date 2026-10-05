@@ -32349,3 +32349,241 @@ class TestOnnxScan8Boundaries:
             assert plan.coverage_gaps == {}
             assert plan.specs == []
             assert result.success is True
+
+
+class TestOnnxLoopReplacementProofs:
+    _value = staticmethod(TestOnnxRecurrenceReviewRegressions._value)
+    _tensor = staticmethod(TestOnnxShapeContinuity._t)
+    _model = staticmethod(TestOnnxBuiltinOperatorIdentity._model)
+    _save = staticmethod(TestOnnxLoopControlProofs._save)
+
+    @classmethod
+    def _extent_model(cls, count: int, mode: str) -> Any:
+        value, tensor = cls._value, cls._tensor
+        condition = "stop" if mode == "early_false" else "condition"
+        width = 0 if mode == "empty" else 1
+        body = helper.make_graph(
+            [],
+            "stack_body",
+            [value("i", [], TensorProto.INT64), value("condition", [], TensorProto.BOOL)],
+            [value(condition, [], TensorProto.BOOL), value("row", [width])],
+            [tensor("row", np.ones(width, np.float32))]
+            + ([tensor("stop", np.bool_(False))] if mode == "early_false" else []),
+        )
+        inputs = [value("X", [1, 64])]
+        if mode == "overridable":
+            inputs.append(value("trip", [], TensorProto.INT64))
+        if mode == "symbolic":
+            del body.initializer[:]
+            body.node.append(helper.make_node("Identity", ["external"], ["row"]))
+            body.output[1].CopyFrom(value("row", ["width"]))
+            inputs.append(value("external", ["width"]))
+        scan_body = helper.make_graph(
+            [helper.make_node("Identity", ["replacement"], ["next"])],
+            "replace_body",
+            [value("state", [64, 64]), value("item", [None])],
+            [value("next", [64, 64])],
+        )
+        bad = np.zeros((64, 64), np.float32)
+        bad[:5, 0] = 100
+        return cls._model(
+            [
+                helper.make_node("Loop", ["trip", "entry"], ["stack"], body=body),
+                helper.make_node("Transpose", ["stack"], ["data"]),
+                helper.make_node("Scan", ["initial", "data"], ["final"], body=scan_body, num_scan_inputs=1),
+                helper.make_node("MatMul", ["X", "final"], ["Y"]),
+            ],
+            inputs,
+            [value("Y", [1, 64]), value("final", [64, 64])],
+            [
+                tensor("trip", np.int64(count)),
+                tensor("entry", np.bool_(True)),
+                tensor("initial", bad),
+                tensor("replacement", np.eye(64, dtype=np.float32)),
+            ],
+            [],
+        )
+
+    @pytest.mark.parametrize(
+        ("count", "mode"),
+        [(1, "fixed"), (2, "fixed"), (4096, "fixed"), (4097, "fixed"), ((1 << 63) - 1, "fixed")]
+        + [(2, mode) for mode in ("early_false", "overridable", "symbolic", "empty")],
+    )
+    def test_loop_stack_known_axes_preserve_scan_execution_without_publishing_extent(
+        self, tmp_path: Path, count: int, mode: str
+    ) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        model = self._extent_model(count, mode)
+        path = self._save(model, tmp_path)
+        calls = 0
+        stack_shape = None
+
+        def profile(frame: Any, event: str, _arg: Any) -> None:
+            nonlocal calls, stack_shape
+            if frame.f_code.co_filename == onnx_scanner_module.__file__:
+                calls += event == "call"
+                if event == "return" and frame.f_code.co_name == "walk_graph":
+                    stack_shape = frame.f_locals.get("known_value_shapes", {}).get("stack", stack_shape)
+
+        prior_profile = sys.getprofile()
+        sys.setprofile(profile)
+        try:
+            plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        finally:
+            sys.setprofile(prior_profile)
+        # Metadata proof must not replay a large immutable iteration count.
+        assert calls < 2048
+        expected_extent = 1 if count == 1 else -1
+        assert stack_shape == (expected_extent, -1 if mode == "symbolic" else 0 if mode == "empty" else 1)
+        initial_reachable = mode in {"overridable", "symbolic", "empty"}
+        assert {spec.context["initializer"] for spec in plan.specs} == (
+            {"initial", "replacement"} if initial_reachable else {"replacement"}
+        )
+        assert plan.coverage_gaps == {}
+        result = OnnxScanner().scan(str(path))
+        assert result.success is True
+        assert bool(TestWeightDistributionSemantics._extreme_checks(result)) is initial_reachable
+        if count <= 4097:
+            feeds: dict[str, Any] = {"X": np.ones((1, 64), np.float32)}
+            if mode == "overridable":
+                feeds["trip"] = np.array(1, dtype=np.int64)
+            if mode == "symbolic":
+                feeds["external"] = np.ones(1, np.float32)
+            runtime_values: Any = ReferenceEvaluator(model).run(["final"], feeds)
+            actual = runtime_values[0]
+            selected = "initial" if mode == "empty" else "replacement"
+            weights = next(spec.weights for spec in plan.specs if spec.context["initializer"] == selected)
+            np.testing.assert_array_equal(weights, actual)
+
+    @classmethod
+    def _replacement_model(cls, count: int, mode: str) -> Any:
+        value, tensor = cls._value, cls._tensor
+        replacement = np.zeros(64 if mode in {"vector", "if_vector", "override_vector"} else (64, 64), np.float32)
+        if replacement.ndim == 2:
+            replacement[:5, 0] = 100
+        constant = helper.make_node("Constant", [], ["next"], value=tensor("", replacement))
+        nodes = [
+            helper.make_node("MatMul", ["X", "state"], ["activation"]),
+            helper.make_node("ReduceSum", ["activation"], ["score"], keepdims=0),
+            constant,
+        ]
+        body_tensors = []
+        functions = []
+        if mode == "initializer":
+            nodes.pop()
+            body_tensors.append(tensor("next", replacement))
+        elif mode == "identity":
+            constant.output[0] = "raw"
+            nodes.append(helper.make_node("Identity", ["raw"], ["next"]))
+        elif mode == "unmatched":
+            constant.overload = "unused"
+        elif mode in {"matched", "local"}:
+            domain, name, overload = ("", "Constant", "replace") if mode == "matched" else ("local", "Replace", "")
+            functions.append(
+                helper.make_function(
+                    domain,
+                    name,
+                    [],
+                    ["next"],
+                    [constant],
+                    [helper.make_opsetid("", 18)],
+                    attributes=["value"] if mode == "matched" else [],
+                    overload=overload,
+                )
+            )
+            nodes[-1] = helper.make_node(name, [], ["next"], domain=domain, overload=overload)
+            if mode == "matched":
+                nodes[-1].attribute.extend(constant.attribute)
+        elif mode in {"if_matrix", "if_vector"}:
+            branch = helper.make_graph([constant], "replacement_branch", [], [value("next", None)])
+            nodes[-1] = helper.make_node("If", ["condition"], ["next"], then_branch=branch, else_branch=branch)
+        body = helper.make_graph(
+            nodes,
+            "loop_body",
+            [value("i", [], TensorProto.INT64), value("condition", [], TensorProto.BOOL), value("state", None)],
+            [value("condition", [], TensorProto.BOOL), value("next", None), value("score", [])],
+            body_tensors,
+        )
+        loop = helper.make_node("Loop", ["trip", "entry", "vector"], ["final", "scores"], body=body)
+        if mode in {"default", "bound", "override_vector"}:
+            body.node[-1].attribute[0].CopyFrom(
+                onnx.AttributeProto(name="value", ref_attr_name="weights", type=onnx.AttributeProto.TENSOR)
+            )
+            # Keep the condition output distinct when the runtime inlines the wrapper.
+            body.node.insert(0, helper.make_node("Identity", ["condition"], ["continue"]))
+            body.output[0].name = "continue"
+            loop.attribute[0].g.CopyFrom(body)
+            default = np.zeros((64, 64), np.float32)
+            default[:5, 0] = 100
+            functions.append(
+                helper.make_function(
+                    "local",
+                    "Run",
+                    ["trip", "entry", "vector", "X"],
+                    ["final", "scores"],
+                    [loop],
+                    [helper.make_opsetid("", 18)],
+                    attributes=["weights"] if mode == "bound" else [],
+                    attribute_protos=[] if mode == "bound" else [helper.make_attribute("weights", tensor("", default))],
+                )
+            )
+            loop = helper.make_node("Run", ["trip", "entry", "vector", "X"], ["final", "scores"], domain="local")
+            if mode in {"bound", "override_vector"}:
+                loop.attribute.append(helper.make_attribute("weights", tensor("", replacement)))
+        return cls._model(
+            [helper.make_node("Expand", ["initial", "shape"], ["vector"]), loop],
+            [value("X", [1, 64])],
+            [value("scores", [None])],
+            [
+                tensor("initial", np.float32(0)),
+                tensor("shape", np.array([64], np.int64)),
+                tensor("trip", np.int64(count)),
+                tensor("entry", np.bool_(True)),
+            ],
+            functions,
+        )
+
+    @pytest.mark.parametrize(
+        ("count", "mode"),
+        [(1, "matrix"), (3, "matrix")]
+        + [
+            (2, mode)
+            for mode in (
+                "matrix",
+                "vector",
+                "initializer",
+                "identity",
+                "unmatched",
+                "matched",
+                "local",
+                "default",
+                "bound",
+                "override_vector",
+                "if_matrix",
+                "if_vector",
+            )
+        ],
+    )
+    def test_discarded_state_replacement_requires_future_weight_coverage(
+        self, tmp_path: Path, count: int, mode: str
+    ) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        model = self._replacement_model(count, mode)
+        path = self._save(model, tmp_path)
+        runtime = TestOnnxLoopControlProofs._inline_with_defaults(model)
+        runtime_values: Any = ReferenceEvaluator(runtime).run(["scores"], {"X": np.ones((1, 64), np.float32)})
+        expected_score = 0 if mode in {"vector", "override_vector", "if_vector"} else 500
+        np.testing.assert_array_equal(runtime_values[0].reshape(-1), np.array([0] + [expected_score] * (count - 1)))
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        result = OnnxScanner().scan(str(path))
+        complete = count == 1 or mode in {"vector", "override_vector"}
+        assert result.success is complete
+        if complete:
+            assert plan.coverage_gaps == {}
+            assert plan.specs == []
+        else:
+            assert plan.coverage_gaps.get("lineages_per_value_limit", 0) > 0
+            assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+            assert any(check.details.get("coverage_gap") == "lineages_per_value_limit" for check in result.checks)
