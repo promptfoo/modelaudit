@@ -509,6 +509,8 @@ jobs:
           files: ./coverage.xml
           fail_ci_if_error: true
           use_oidc: true
+          # Avoid depending on the separate CLI binary-download host.
+          use_pypi: true
           verbose: true
 
   test-numpy-compatibility:
