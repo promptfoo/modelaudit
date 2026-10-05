@@ -21,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Avoid repeatedly decoding literal-free scalar pickle streams during nested PyTorch storage discovery, preserving nested payload detection and scan limits.
 - Preserve UTF-8 pickle GLOBAL discovery in numeric PyTorch storage operands on Python 3.10–3.12.
 - Avoid incomplete PyTorch ZIP storage discovery for benign complete literals, verified padding, and impossible length-prefixed tensor bytes when no hidden payload is present.
 - Preserve hidden-pickle detection across storage probe limits, nested literals, long global names, and memoized operands; report incomplete coverage without discarding suspicious or malicious verdicts when inspection limits are reached.
