@@ -4687,7 +4687,9 @@ def _build_onnx_weight_analysis_plan(
         depth: int = 0,
         inherited_constants: dict[str, Any] | None = None,
         exclude_activation_inputs: bool = False,
-        inherited_activation_lineages: dict[str, dict[int, _OnnxWeightLineage]] | None = None,
+        proven_weight_inputs: dict[tuple[int, ...], tuple[Any, frozenset[int]]] | None = None,
+        proven_weight_inputs_path: tuple[int, ...] = (),
+        inherited_independent_value: Callable[[str], bool] | None = None,
     ) -> bool:
         nonlocal graph_taint_work_remaining
         if not graph_input_name:
@@ -4749,17 +4751,6 @@ def _build_onnx_weight_analysis_plan(
                 weight_reachability_cache[cache_key] = result
             return result
 
-        if exclude_activation_inputs and len(constant_names) > graph_taint_work_remaining:
-            graph_taint_work_remaining = 0
-            return finish(True)
-        activation_lineages = {}
-        if exclude_activation_inputs:
-            graph_taint_work_remaining -= len(constant_names)
-            activation_lineages = {
-                name: inherited_activation_lineages[name]
-                for name in constant_names
-                if inherited_activation_lineages is not None and name in inherited_activation_lineages
-            }
         local_attribute_bindings = attribute_bindings or {}
         graph_constants = graph_initializer_constants(subgraph, inherited_constants or {}, attribute_bindings)
         if exclude_activation_inputs and isinstance(subgraph, onnx.FunctionProto):
@@ -4769,18 +4760,26 @@ def _build_onnx_weight_analysis_plan(
                 if inherited_constants is not None and name in inherited_constants
             )
 
-        def activation_weight_rank(name: str) -> int | None:
+        graph_formals = {_onnx_value_name(value) for value in getattr(subgraph, "input", ())}
+        current_graph_external_names = graph_external_reference_names(subgraph, attribute_bindings)
+
+        def independent_value(name: str) -> bool:
             nonlocal graph_taint_work_remaining
-            lineages = activation_lineages.get(name, {})
-            if len(lineages) > graph_taint_work_remaining:
+            dependencies = graph_value_dependency_names(subgraph, (name,), attribute_bindings)
+            if dependency_names_exceeded_limit(dependencies) or len(dependencies) > graph_taint_work_remaining:
                 graph_taint_work_remaining = 0
-                return None
-            graph_taint_work_remaining -= len(lineages)
-            shape = resolved_lineage_shape(lineages.values())
-            if shape is not None:
-                return len(shape)
-            constant = graph_constants.get(name)
-            return len(constant.dims) if constant is not None else None
+                return False
+            graph_taint_work_remaining -= len(dependencies)
+            for dependency in dependencies:
+                if dependency in graph_formals:
+                    if not isinstance(subgraph, onnx.FunctionProto) or inherited_independent_value is None:
+                        return False
+                    if not inherited_independent_value(dependency):
+                        return False
+                elif dependency in current_graph_external_names and inherited_independent_value is not None:
+                    if not inherited_independent_value(dependency):
+                        return False
+            return True
 
         def resolve_reentry_attribute(attribute: Any) -> Any | None:
             reference_name = str(getattr(attribute, "ref_attr_name", ""))
@@ -4905,14 +4904,6 @@ def _build_onnx_weight_analysis_plan(
             ):
                 for name in body_outputs:
                     graph_constants[name] = constant
-            if (
-                exclude_activation_inputs
-                and builtin_operator(body_node, "Identity")
-                and len(body_node.input) == 1
-                and str(body_node.input[0]) in activation_lineages
-            ):
-                for name in body_outputs:
-                    activation_lineages[name] = activation_lineages[str(body_node.input[0])]
             body_inputs = node_input_names(body_node)
             any_tainted = any(input_name in tainted for input_name in body_inputs)
             has_tainted_nested_capture = False
@@ -4951,6 +4942,11 @@ def _build_onnx_weight_analysis_plan(
                         depth=depth + 1,
                     )
                 function_input_names: set[str] = set()
+                function_bindings = dict(zip(function.input, node_input_slots(body_node), strict=False))
+
+                def independent_function_value(name: str, bindings: Mapping[str, str] = function_bindings) -> bool:
+                    return name in bindings and independent_value(bindings[name])
+
                 for input_index, input_name in enumerate(node_input_slots(body_node)):
                     if input_name not in tainted or input_index >= len(getattr(function, "input", ())):
                         continue
@@ -4968,9 +4964,9 @@ def _build_onnx_weight_analysis_plan(
                             function, node_input_slots(body_node), graph_constants
                         )[0],
                         exclude_activation_inputs=exclude_activation_inputs,
-                        inherited_activation_lineages=bound_function_constants(
-                            function, node_input_slots(body_node), activation_lineages
-                        )[0],
+                        proven_weight_inputs=proven_weight_inputs,
+                        proven_weight_inputs_path=(*proven_weight_inputs_path, id(body_node), id(function)),
+                        inherited_independent_value=independent_function_value,
                     ):
                         return finish(True)
                 if function_input_names:
@@ -5029,6 +5025,10 @@ def _build_onnx_weight_analysis_plan(
                                 attribute_bindings=local_attribute_bindings,
                                 depth=depth + 1,
                                 inherited_constants=graph_constants,
+                                exclude_activation_inputs=exclude_activation_inputs,
+                                proven_weight_inputs=proven_weight_inputs,
+                                proven_weight_inputs_path=(*proven_weight_inputs_path, id(body_node), id(nested_graph)),
+                                inherited_independent_value=independent_value,
                             ):
                                 return finish(True)
                     if body_outputs_live_after:
@@ -5039,16 +5039,16 @@ def _build_onnx_weight_analysis_plan(
                                 graph_output_offset=control_flow_output_offset(body_node),
                             )
                         )
+            recorded_weights = (proven_weight_inputs or {}).get((*proven_weight_inputs_path, id(body_node)))
             activation_weight_inputs = {
                 input_index
                 for input_index, input_name in enumerate(node_input_slots(body_node))
                 if exclude_activation_inputs
-                and builtin_operator(body_node)
-                and is_registered_standard_operator
+                and recorded_weights is not None
+                and recorded_weights[0] is body_node
+                and input_index in recorded_weights[1]
                 and input_name not in tainted
-                and (rank := activation_weight_rank(input_name)) is not None
-                and rank <= _ONNX_WEIGHT_RESHAPE_RANK_LIMIT
-                and _onnx_weight_output_axes(body_node, input_index, rank)[0] is not None
+                and independent_value(input_name)
             }
             if exclude_activation_inputs and graph_taint_work_remaining <= 0:
                 return finish(True)
@@ -6599,6 +6599,8 @@ def _build_onnx_weight_analysis_plan(
         bound_attribute_keys: dict[str, tuple[Any, ...]] | None = None,
         function_depth: int = 0,
         fail_on_unbound_inputs: bool = False,
+        proven_weight_inputs_out: dict[tuple[int, ...], tuple[Any, frozenset[int]]] | None = None,
+        proven_weight_inputs_path: tuple[int, ...] = (),
         captured_state: tuple[
             dict[str, dict[int, _OnnxWeightLineage]],
             dict[str, Any],
@@ -6626,7 +6628,7 @@ def _build_onnx_weight_analysis_plan(
         list[int | None],
         list[bool],
     ]:
-        nonlocal graph_counter, node_counter, total_consumer_count
+        nonlocal graph_counter, node_counter, total_consumer_count, graph_taint_work_remaining
         current_graph_index = graph_counter
         graph_counter += 1
         inherited_lineage_limit_gap_counts = inherited_lineage_limit_gap_counts or {}
@@ -6935,7 +6937,7 @@ def _build_onnx_weight_analysis_plan(
             if name and name not in value_lineages and name not in constants:
                 dynamic_values.add(name)
 
-        for local_node_index, node in enumerate(getattr(current_graph, "node", ())):
+        for local_node_index, node in enumerate(graph_nodes_once(current_graph)):
             current_node_index = node_counter
             node_counter += 1
             function_key = _operator_identifier(node)
@@ -6997,6 +6999,33 @@ def _build_onnx_weight_analysis_plan(
                 and lineage.unresolved_reason is None
                 and _onnx_weight_output_axes(node, input_index, len(lineage.shape or ()))[0] is not None
             }
+            if proven_weight_inputs_out is not None:
+                proof_work = (
+                    1
+                    + len(node.input)
+                    + len(proven_weight_inputs_path)
+                    + sum(
+                        len(value_lineages.get(str(node.input[index]), {})) for index in resolved_weight_input_indexes
+                    )
+                )
+                if proof_work > graph_taint_work_remaining:
+                    graph_taint_work_remaining = 0
+                else:
+                    graph_taint_work_remaining -= proof_work
+                    proven_slots = frozenset(
+                        index
+                        for index in resolved_weight_input_indexes
+                        if not value_lineage_limit_gap_counts.get(str(node.input[index]), 0)
+                        and all(
+                            lineage.unresolved_reason in {None, "shape_control_lineage"}
+                            for lineage in value_lineages.get(str(node.input[index]), {}).values()
+                        )
+                    )
+                    proof_key = (*proven_weight_inputs_path, id(node))
+                    previous = proven_weight_inputs_out.get(proof_key)
+                    if previous is not None:
+                        proven_slots &= previous[1]
+                    proven_weight_inputs_out[proof_key] = (node, proven_slots)
             lineage_input_indexes = {
                 input_index for input_index, input_name in enumerate(node.input) if value_lineages.get(str(input_name))
             }
@@ -9383,6 +9412,37 @@ def _build_onnx_weight_analysis_plan(
                                                 ),
                                             )
                                         )
+                                    elif (
+                                        lineage.shape is not None
+                                        and (
+                                            len(parent_shape) != len(lineage.shape)
+                                            or any(
+                                                dimension >= 0 and dimension != lineage.shape[index]
+                                                for index, dimension in enumerate(parent_shape)
+                                            )
+                                        )
+                                        and (
+                                            pair_index >= scan_input_start
+                                            or subgraph_state_input_can_reach_weight_consumer(
+                                                subgraph,
+                                                graph_input_name,
+                                                opset_versions,
+                                                attribute_bindings=attribute_bindings,
+                                                inherited_constants=constants,
+                                            )
+                                        )
+                                    ):
+                                        subgraph_bound_lineages[graph_input_name][initializer_index] = (
+                                            _OnnxWeightLineage(
+                                                initializer_index=initializer_index,
+                                                shape=None,
+                                                data_type=lineage.data_type,
+                                                transforms=lineage.transforms,
+                                                unresolved_reason=(
+                                                    lineage.unresolved_reason or "unresolved_scan_input_lineage"
+                                                ),
+                                            )
+                                        )
                         if (
                             repeated_control_flow_state_input
                             and graph_input_name not in subgraph_trusted_context_shapes
@@ -9504,6 +9564,15 @@ def _build_onnx_weight_analysis_plan(
                         for index, lineage in lineages.items()
                         if lineage.unresolved_reason is None
                     }
+                    subgraph_proven_weight_inputs = proven_weight_inputs_out
+                    subgraph_proof_path = (
+                        (*proven_weight_inputs_path, id(node), id(subgraph))
+                        if proven_weight_inputs_out is not None and graph_taint_work_remaining > 0
+                        else ()
+                    )
+                    if subgraph_proven_weight_inputs is None and (node_loop_may_repeat or node_scan_may_repeat):
+                        subgraph_proven_weight_inputs = {}
+                        subgraph_proof_path = ()
                     subgraph_results.append(
                         walk_graph(
                             subgraph,
@@ -9550,6 +9619,8 @@ def _build_onnx_weight_analysis_plan(
                             bound_attribute_keys=attribute_binding_keys,
                             function_depth=function_depth,
                             fail_on_unbound_inputs=fail_on_unbound_inputs,
+                            proven_weight_inputs_out=subgraph_proven_weight_inputs,
+                            proven_weight_inputs_path=subgraph_proof_path,
                         ),
                     )
                     if is_builtin_neural_operator and node.op_type in {"Loop", "Scan"}:
@@ -9599,10 +9670,6 @@ def _build_onnx_weight_analysis_plan(
                             if (
                                 next_state_lineages
                                 and not subgraph_results[-1][2][state_output_index]
-                                and all(
-                                    lineage.unresolved_reason == "dynamic_activation_lineage"
-                                    for lineage in next_state_lineages.values()
-                                )
                                 and not subgraph_state_input_can_reach_weight_consumer(
                                     subgraph,
                                     graph_input_name,
@@ -9610,7 +9677,8 @@ def _build_onnx_weight_analysis_plan(
                                     attribute_bindings=attribute_bindings,
                                     inherited_constants=constants,
                                     exclude_activation_inputs=True,
-                                    inherited_activation_lineages=value_lineages,
+                                    proven_weight_inputs=subgraph_proven_weight_inputs,
+                                    proven_weight_inputs_path=subgraph_proof_path,
                                 )
                                 and not any(
                                     output_index in state_input_by_output
@@ -9843,6 +9911,12 @@ def _build_onnx_weight_analysis_plan(
                         bound_attribute_keys=function_bound_attribute_keys,
                         function_depth=function_depth + 1,
                         fail_on_unbound_inputs=fail_on_unbound_inputs,
+                        proven_weight_inputs_out=proven_weight_inputs_out,
+                        proven_weight_inputs_path=(
+                            (*proven_weight_inputs_path, id(node), id(function))
+                            if proven_weight_inputs_out is not None and graph_taint_work_remaining > 0
+                            else ()
+                        ),
                     ),
                 )
 

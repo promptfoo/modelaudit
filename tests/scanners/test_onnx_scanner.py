@@ -32978,3 +32978,334 @@ class TestOnnxRecurrentActivationProof:
         assert [(issue.severity, issue.message) for issue in result.issues] == [
             (IssueSeverity.INFO, "Weight distribution analysis skipped one or more eligible ONNX initializers")
         ]
+
+
+class TestOnnxScopedConsumerCertificates:
+    @staticmethod
+    def _activation_model(case: str) -> tuple[Any, dict[str, Any], Any, Any]:
+        if case == "separate-function-calls":
+            m, feeds, W = TestOnnxRecurrentActivationProof._model("nested-consumer")
+            body = m.graph.node[0].attribute[0].g
+            for name in ["U", "V"]:
+                m.graph.input.append(TestOnnxShapeContinuity._v(name, [1, 4] if name == "U" else [4, 4]))
+                feeds[name] = np.ones((1, 4) if name == "U" else (4, 4), np.float32) / 8
+            body.node.append(helper.make_node("Layer", ["U", "V"], ["independent"], domain="local"))
+            body.output.append(TestOnnxShapeContinuity._v("independent", [1, 4]))
+            m.graph.node[0].output.append("independent_stack")
+            m.graph.output.append(TestOnnxShapeContinuity._v("independent_stack", [3, 1, 4]))
+            expected = feeds["H"].copy()
+            for _ in range(3):
+                expected = expected @ W
+            return m, feeds, expected, W
+        if case in ["local-transpose", "constant-transpose", "runtime-transpose", "function-transpose"]:
+            kind = {
+                "local-transpose": "local-weight",
+                "constant-transpose": "body-constant",
+                "runtime-transpose": "runtime-weight",
+                "function-transpose": "nested-consumer",
+            }[case]
+            m, feeds, W = TestOnnxRecurrentActivationProof._model(kind)
+            body = m.graph.node[0].attribute[0].g
+            if case == "function-transpose":
+                function = m.functions[0]
+                function.node.insert(0, helper.make_node("Transpose", ["B"], ["view"], perm=[1, 0]))
+                function.node[-1].input[1] = "view"
+            else:
+                weight = "bodyW" if case == "constant-transpose" else "W"
+                body.node.insert(len(body.node) - 1, helper.make_node("Transpose", [weight], ["view"], perm=[1, 0]))
+                body.node[-1].input[1] = "view"
+            expected = feeds["H"].copy()
+            for _ in range(3):
+                expected = expected @ feeds.get("W", W).T
+            return m, feeds, expected, W.T
+        m, feeds, W = TestOnnxRecurrentActivationProof._model("reported")
+        body = m.graph.node[0].attribute[0].g
+        # Symmetric W makes the baseline's stored view equal the actual transpose;
+        # keep a distinct asymmetric transpose control to expose its older view limitation.
+        W = (W + W.T) / 2 if case != "transpose-asymmetric" else W
+        next(t for t in m.graph.initializer if t.name == "W").CopyFrom(onnx.numpy_helper.from_array(W, "W"))
+        wn = "W"
+        if case.startswith("transpose"):
+            body.node.insert(0, helper.make_node("Transpose", ["W"], ["view"], perm=[1, 0]))
+            wn = "view"
+        elif case == "reshape":
+            body.initializer.append(onnx.numpy_helper.from_array(np.array([4, 4], np.int64), "target"))
+            body.node.insert(0, helper.make_node("Reshape", ["W", "target"], ["view"]))
+            wn = "view"
+        elif case == "cast":
+            body.node.insert(0, helper.make_node("Cast", ["W"], ["view"], to=TensorProto.FLOAT))
+            wn = "view"
+        elif case == "unsqueeze-squeeze":
+            body.initializer.append(onnx.numpy_helper.from_array(np.array([0], np.int64), "axes"))
+            body.node.insert(0, helper.make_node("Unsqueeze", ["W", "axes"], ["wide"]))
+            body.node.insert(1, helper.make_node("Squeeze", ["wide", "axes"], ["view"]))
+            wn = "view"
+        body.node[-1].input[1] = wn
+        if case in ["nested-if", "nested-if-transpose", "nested-if-later-weight"]:
+            nodes = [helper.make_node("MatMul", ["state", "W"], ["Z"])]
+            if case == "nested-if-transpose":
+                nodes = [
+                    helper.make_node("Transpose", ["W"], ["view"], perm=[1, 0]),
+                    helper.make_node("MatMul", ["state", "view"], ["Z"]),
+                ]
+            if case == "nested-if-later-weight":
+                nodes = [helper.make_node("PRelu", ["W", "state"], ["Z"])]
+            if case == "nested-if-later-weight":
+                # A square carried activation also reaches the right-hand weight slot.
+                m, feeds, W = TestOnnxRecurrentActivationProof._model("matmul-both")
+                body = m.graph.node[0].attribute[0].g
+            shape = [4, 4] if case == "nested-if-later-weight" else [1, 4]
+            branch = helper.make_graph(nodes, "branch", [], [TestOnnxShapeContinuity._v("Z", shape)])
+            del body.node[:]
+            body.node.append(helper.make_node("If", ["cond"], ["next"], then_branch=branch, else_branch=branch))
+        elif case in ["nested-loop", "nested-loop-changing"]:
+            body.initializer.append(
+                onnx.numpy_helper.from_array(np.array(1 if case == "nested-loop" else 2, np.int64), "once")
+            )
+            inner = helper.make_graph(
+                [helper.make_node("MatMul", ["innerstate", "W"], ["innernext"])],
+                "inner",
+                [
+                    TestOnnxShapeContinuity._v("ii", [], TensorProto.INT64),
+                    TestOnnxShapeContinuity._v("ic", [], TensorProto.BOOL),
+                    TestOnnxShapeContinuity._v("innerstate", [1, 4]),
+                ],
+                [
+                    TestOnnxShapeContinuity._v("ic", [], TensorProto.BOOL),
+                    TestOnnxShapeContinuity._v("innernext", [1, 4]),
+                ],
+            )
+            del body.node[:]
+            body.node.append(helper.make_node("Loop", ["once", "cond", "state"], ["next"], body=inner))
+        if case in ["constant-loop", "constant-scan"]:
+            del m.graph.input[:]
+            m.graph.input.append(TestOnnxShapeContinuity._v("X", [1, 4] if case == "constant-loop" else [3, 1, 4]))
+            body.node[-1].output[0] = "linear"
+            body.node.extend(
+                [
+                    helper.make_node("Add", ["linear", "X" if case == "constant-loop" else "slice"], ["sum"]),
+                    helper.make_node("Tanh", ["sum"], ["next"]),
+                ]
+            )
+            if case == "constant-scan":
+                del body.input[:2]
+                body.input.append(TestOnnxShapeContinuity._v("slice", [1, 4]))
+                del body.output[0]
+                m.graph.node[0].CopyFrom(helper.make_node("Scan", ["H", "X"], ["Y"], body=body, num_scan_inputs=1))
+            feeds = {"X": np.full([1, 4] if case == "constant-loop" else [3, 1, 4], 0.25, np.float32)}
+        if case == "nested-if-later-weight":
+            expected = feeds["H"].copy()
+            for _ in range(3):
+                expected = np.where(W >= 0, W, W * expected)
+        else:
+            actual_W = W.T if case.startswith("transpose") or case == "nested-if-transpose" else W
+            expected = np.zeros((1, 4), np.float32) if case.startswith("constant-") else feeds["H"].copy()
+            for _ in range(3 * (2 if case == "nested-loop-changing" else 1)):
+                expected = expected @ actual_W
+                if case.startswith("constant-"):
+                    expected = np.tanh(expected + 0.25)
+        return m, feeds, expected, W.T if case.startswith("transpose") or case == "nested-if-transpose" else W
+
+    @pytest.mark.parametrize(
+        "case",
+        [
+            "separate-function-calls",
+            "local-transpose",
+            "constant-transpose",
+            "runtime-transpose",
+            "function-transpose",
+            "direct",
+            "transpose",
+            "transpose-asymmetric",
+            "reshape",
+            "cast",
+            "unsqueeze-squeeze",
+            "nested-if",
+            "nested-if-transpose",
+            "nested-loop",
+            "nested-loop-changing",
+            "constant-loop",
+            "constant-scan",
+            "nested-if-later-weight",
+        ],
+    )
+    def test_ordinary_weight_views_certify_recurrent_activation_slots(self, tmp_path: Path, case: str) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        model, feeds, expected, stored_view = self._activation_model(case)
+        path = TestOnnxLoopControlProofs._save(model, tmp_path)
+        actual: Any = ReferenceEvaluator(TestOnnxLoopControlProofs._inline_with_defaults(model)).run(None, feeds)
+        np.testing.assert_allclose(actual[0], expected, rtol=1e-6, atol=1e-7)
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        result = OnnxScanner().scan(str(path))
+        negative = case == "nested-if-later-weight"
+        assert result.success is not negative
+        assert plan.coverage_gaps == ({"unresolved_initializer_lineage": 1} if negative else {})
+        assert len(plan.specs) == 2
+        if negative:
+            for spec in plan.specs:
+                np.testing.assert_array_equal(spec.weights, np.zeros((4, 4), np.float32))
+            assert [(issue.severity, issue.message) for issue in result.issues] == [
+                (IssueSeverity.INFO, "Weight distribution analysis skipped one or more eligible ONNX initializers")
+            ]
+        else:
+            np.testing.assert_array_equal(plan.specs[0].weights, np.zeros((4, 1), np.float32))
+            np.testing.assert_array_equal(plan.specs[1].weights, stored_view)
+        assert not TestWeightDistributionSemantics._extreme_checks(result)
+
+    def test_nested_capture_independence_uses_its_own_graph_scope(self, tmp_path: Path) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        model, feeds, weight = TestOnnxRecurrentActivationProof._model("sibling-weight")
+        body = model.graph.node[0].attribute[0].g
+        next(t for t in model.graph.initializer if t.name == "B").CopyFrom(
+            onnx.numpy_helper.from_array(np.eye(4, dtype=np.float32), "B")
+        )
+        v = TestOnnxShapeContinuity._v
+        inner = helper.make_graph([helper.make_node("Identity", ["X"], ["z"])], "inner", [], [v("z", [4, 4])])
+        branch = helper.make_graph(
+            [
+                helper.make_node("MatMul", ["state", "other"], ["mid"]),
+                helper.make_node("If", ["cond"], ["extra"], then_branch=inner, else_branch=inner),
+                helper.make_node("Add", ["mid", "extra"], ["out"]),
+            ],
+            "branch",
+            [],
+            [v("out", [4, 4])],
+        )
+        body.node[0].CopyFrom(helper.make_node("If", ["cond"], ["next"], then_branch=branch, else_branch=branch))
+        path = TestOnnxLoopControlProofs._save(model, tmp_path)
+        a, b = feeds["H"].copy(), np.eye(4, dtype=np.float32)
+        uses = []
+        for _ in range(3):
+            uses.append(feeds["X"] @ b)
+            a, b = a @ b + feeds["X"], b @ weight
+        actual: Any = ReferenceEvaluator(model).run(None, feeds)
+        np.testing.assert_allclose(actual[0], a, rtol=1e-6, atol=1e-7)
+        np.testing.assert_allclose(actual[1], b, rtol=1e-6, atol=1e-7)
+        # This evaluator concatenates Loop scan outputs instead of adding the
+        # schema's sequence axis; only compare its values after explicit reshape.
+        np.testing.assert_allclose(actual[2].reshape(3, 4, 4), np.stack(uses), rtol=1e-6, atol=1e-7)
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        result = OnnxScanner().scan(str(path))
+        assert result.success is False
+        assert plan.coverage_gaps == {"unresolved_initializer_lineage": 2}
+        assert [sample["initializer"] for sample in plan.unresolved_lineage_samples] == ["H", "B"]
+        assert [(issue.severity, issue.message) for issue in result.issues] == [
+            (IssueSeverity.INFO, "Weight distribution analysis skipped one or more eligible ONNX initializers")
+        ]
+
+    @pytest.mark.parametrize("case", ["direct", "function-transpose", "separate-function-calls"])
+    def test_consumer_certificate_storage_and_work_are_bounded(
+        self, monkeypatch: pytest.MonkeyPatch, case: str
+    ) -> None:
+        model, _feeds, _expected, stored_view = self._activation_model(case)
+        limit = 16
+        monkeypatch.setattr(onnx_scanner_module, "_ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK", limit)
+        observations: list[tuple[int, int]] = []
+
+        def profile(frame: Any, event: str, arg: Any) -> None:
+            if (
+                frame.f_code.co_filename == onnx_scanner_module.__file__
+                and event == "return"
+                and frame.f_code.co_name == "walk_graph"
+            ):
+                pool = frame.f_locals.get("proven_weight_inputs_out")
+                if pool is not None:
+                    observations.append((len(pool), sum(len(key) for key in pool)))
+
+        previous = sys.getprofile()
+        sys.setprofile(profile)
+        try:
+            plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        finally:
+            sys.setprofile(previous)
+        assert observations
+        assert all(entries <= limit and key_cells <= limit for entries, key_cells in observations)
+        assert plan.coverage_gaps
+        assert len(plan.specs) == 2
+        np.testing.assert_array_equal(plan.specs[1].weights, stored_view)
+
+    @pytest.mark.parametrize(
+        ("lengths", "extent", "direction", "hot", "omit_lengths"),
+        [
+            *[
+                (lengths, 2, direction, hot, False)
+                for direction in (0, 1)
+                for lengths, hot_values in (
+                    ([1], (None, (0, 0), (0, 1))),
+                    ([2], ((0, 0), (0, 1))),
+                    ([1, 2], ((0, 1), (1, 1))),
+                )
+                for hot in hot_values
+            ],
+            ([1], 1, 0, None, False),
+            ([1], 1, 0, (0, 0), False),
+            ([2], 2, 0, (0, 1), True),
+        ],
+    )
+    def test_scan8_weights_require_an_exact_selected_body_view(
+        self,
+        tmp_path: Path,
+        lengths: list[int],
+        extent: int,
+        direction: int,
+        hot: tuple[int, int] | None,
+        omit_lengths: bool,
+    ) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        v, t = TestOnnxShapeContinuity._v, TestOnnxShapeContinuity._t
+        weights = np.zeros((len(lengths), extent, 64, 64), np.float32)
+        if hot is not None:
+            weights[hot[0], hot[1], :5, 0] = 10
+        body = helper.make_graph(
+            [helper.make_node("MatMul", ["X", "slice"], ["o"])], "body", [v("slice", [64, 64])], [v("o", [1, 64])]
+        )
+        initializers = [t("W", weights)]
+        if not omit_lengths:
+            initializers.append(t("lens", np.asarray(lengths, np.int64)))
+        model = helper.make_model(
+            helper.make_graph(
+                [
+                    helper.make_node(
+                        "Scan",
+                        ["" if omit_lengths else "lens", "W"],
+                        ["stack"],
+                        body=body,
+                        num_scan_inputs=1,
+                        directions=[direction],
+                    )
+                ],
+                "scan8_selected_weights",
+                [v("X", [1, 64])],
+                [v("stack", [len(lengths), extent, 1, 64])],
+                initializers,
+            ),
+            opset_imports=[helper.make_opsetid("", 8)],
+            ir_version=8,
+        )
+        path = TestOnnxLoopControlProofs._save(model, tmp_path)
+        # Legacy Scan8 is unavailable in the installed evaluator. Execute the
+        # actual body on schema-selected valid prefixes, reversing within each
+        # prefix rather than consuming padding from the physical sequence end.
+        runtime = ReferenceEvaluator(body, opsets={"": 8})
+        for batch, length in enumerate(lengths):
+            for index in range(length) if direction == 0 else range(length - 1, -1, -1):
+                actual: Any = runtime.run(None, {"X": np.ones((1, 64), np.float32), "slice": weights[batch, index]})
+                np.testing.assert_array_equal(actual[0], np.ones((1, 64), np.float32) @ weights[batch, index])
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        result = OnnxScanner().scan(str(path))
+        assert result.success is (extent == 1)
+        if extent == 1:
+            assert plan.coverage_gaps == {}
+            assert len(plan.specs) == 1
+            np.testing.assert_array_equal(plan.specs[0].weights, weights[0, 0])
+            assert bool(TestWeightDistributionSemantics._extreme_checks(result)) is (hot is not None)
+        else:
+            assert plan.specs == []
+            assert plan.coverage_gaps == {"unresolved_initializer_lineage": 1}
+            assert [(issue.severity, issue.message) for issue in result.issues] == [
+                (IssueSeverity.INFO, "Weight distribution analysis skipped one or more eligible ONNX initializers")
+            ]
+            assert not TestWeightDistributionSemantics._extreme_checks(result)
