@@ -601,3 +601,229 @@ def test_python_ci_requires_successful_coverage_when_scheduled() -> None:
     ]
     for expectation, result in expected_results:
         assert f'require_success "${expectation}" "${result}"' in gate_script
+
+
+def test_python_ci_requires_a_real_primary_upload_or_fatal_legacy_fallback() -> None:
+    coverage = _jobs(_load_workflow("test.yml"))["coverage"]
+    steps = coverage["steps"]
+    primary = _step_by_name(steps, "Upload coverage to Codecov")
+    fallback = _step_by_name(steps, "Upload coverage through Codecov legacy API")
+
+    assert primary["id"] == "codecov-upload"
+    assert primary["continue-on-error"] is True
+    assert primary.get("if") is None
+    assert primary["with"] == {
+        "name": "python-coverage-${{ matrix.shard }}",
+        "files": "./coverage.xml",
+        "fail_ci_if_error": True,
+        "use_oidc": True,
+        "binary": "${{ runner.temp }}/modelaudit-codecov",
+        "verbose": True,
+    }
+    assert fallback["if"] == "steps.codecov-upload.outcome == 'failure'"
+    assert fallback.get("continue-on-error") is None
+    assert fallback["uses"] == "actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd"
+    assert fallback["env"] == {
+        "CODECOV_UPLOAD_NAME": "python-coverage-${{ matrix.shard }}",
+        "CODECOV_CLI": "${{ runner.temp }}/modelaudit-codecov",
+    }
+    installer = _step_by_name(steps, "Install verified Codecov CLI")
+    assert installer.get("continue-on-error") is None
+    assert installer.get("if") is None
+    install_run = installer["run"]
+    assert "set -euo pipefail" in install_run
+    assert "https://github.com/codecov/codecov-cli/releases/download/v11.3.1/codecovcli_linux" in install_run
+    assert "ca1d64196d2d34771084afe76ea657d581bf628e31d993ff8e52ea09cc88a56d" in install_run
+    assert "--proto '=https' --proto-redir '=https'" in install_run
+    assert install_run.index("sha256sum --check") < install_run.index("chmod +x")
+    assert steps.index(installer) < steps.index(_step_by_name(steps, "Run branch coverage shard"))
+    assert steps.index(primary) < steps.index(fallback)
+    assert coverage.get("continue-on-error") is None
+
+
+def _run_codecov_fallback(
+    tmp_path: Path,
+    *,
+    outcome: str = "failure",
+    event: str = "push",
+    fail_at: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    steps = _jobs(_load_workflow("test.yml"))["coverage"]["steps"]
+    fallback = _step_by_name(steps, "Upload coverage through Codecov legacy API")
+    config = {
+        "outcome": outcome,
+        "event": event,
+        "failAt": fail_at,
+        "script": fallback["with"]["script"],
+        "condition": fallback["if"],
+    }
+    return _run_node_script(
+        """
+const config = JSON.parse(process.env.CODECOV_TEST_CONFIG);
+const calls = [];
+const isFork = config.event.startsWith('fork');
+const pullRequest = config.event === 'push' ? undefined : {
+  number: 1881,
+  head: {
+    sha: 'pr-head-sha',
+    label: 'contributor:branch; $(must-stay-data)',
+    repo: {full_name: isFork ? 'contributor/modelaudit' : 'promptfoo/modelaudit'},
+  },
+};
+const context = {
+  payload: {pull_request: pullRequest},
+  repo: {owner: 'promptfoo', repo: 'modelaudit'},
+  sha: 'push-or-merge-sha',
+};
+const env = {
+  CODECOV_UPLOAD_NAME: 'python-coverage-3',
+  CODECOV_CLI: '/runner-temp/modelaudit-codecov',
+  CC_TOKEN: 'unused-private-output',
+};
+if (config.event !== 'fork-tokenless') env.CODECOV_TOKEN = 'synthetic-existing-token';
+const exec = {exec: async (command, args, options) => {
+  calls.push({command, args, options});
+  if (config.failAt === command) throw new Error(`failed ${command}`);
+  return 0;
+}};
+const core = {
+  getIDToken: async audience => {
+    calls.push({command: 'oidc', args: [audience]});
+    if (config.failAt === 'oidc') throw new Error('failed oidc');
+    return 'synthetic-oidc-token';
+  },
+  setSecret: token => calls.push({command: 'mask', args: [token]}),
+};
+const condition = config.condition.replace('steps.codecov-upload.outcome', 'outcome');
+const shouldRun = new Function('outcome', `return ${condition}`)(config.outcome);
+const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+(async () => {
+  try {
+    if (shouldRun) {
+      await new AsyncFunction('exec', 'context', 'core', 'process', config.script)(
+        exec, context, core, {env},
+      );
+    }
+  } catch (error) {
+    process.stderr.write(error.message);
+    process.exitCode = 1;
+  } finally {
+    process.stdout.write(JSON.stringify(calls));
+  }
+})();
+""",
+        tmp_path,
+        {"CODECOV_TEST_CONFIG": json.dumps(config)},
+    )
+
+
+@pytest.mark.parametrize("outcome", ["success", "skipped", "cancelled"])
+def test_python_ci_skips_legacy_upload_without_primary_failure(tmp_path: Path, outcome: str) -> None:
+    result = _run_codecov_fallback(tmp_path, outcome=outcome)
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == []
+
+
+@pytest.mark.parametrize("event", ["push", "same-repo-pr", "fork-tokenless", "fork-token"])
+def test_python_ci_legacy_fallback_uploads_the_same_artifact_and_pr_head(tmp_path: Path, event: str) -> None:
+    result = _run_codecov_fallback(tmp_path, event=event)
+
+    assert result.returncode == 0, result.stderr
+    calls = json.loads(result.stdout)
+    oidc_calls = [call for call in calls if call["command"] == "oidc"]
+    assert oidc_calls == ([] if event.startswith("fork") else [{"command": "oidc", "args": ["https://codecov.io"]}])
+    expected_args = [
+        "--verbose",
+        "do-upload",
+        "--legacy",
+        "--fail-on-error",
+        "--file",
+        "./coverage.xml",
+        "--name",
+        "python-coverage-3",
+        "--sha",
+        "push-or-merge-sha" if event == "push" else "pr-head-sha",
+        "--slug",
+        "promptfoo/modelaudit",
+        "--git-service",
+        "github",
+    ]
+    if event != "fork-tokenless":
+        token = "synthetic-existing-token" if event == "fork-token" else "synthetic-oidc-token"
+        expected_args.extend(["--token", token])
+        assert {"command": "mask", "args": [token]} in calls
+    if event != "push":
+        expected_args.extend(["--pr", "1881"])
+    if event == "fork-tokenless":
+        expected_args.extend(["--branch", "contributor:branch; $(must-stay-data)"])
+    assert calls[-1] == {"command": "/runner-temp/modelaudit-codecov", "args": expected_args}
+
+
+@pytest.mark.parametrize("fail_at", ["oidc", "/runner-temp/modelaudit-codecov"])
+def test_python_ci_legacy_fallback_cannot_hide_an_upload_failure(tmp_path: Path, fail_at: str) -> None:
+    result = _run_codecov_fallback(tmp_path, fail_at=fail_at)
+
+    assert result.returncode == 1
+    assert result.stderr.endswith(f"failed {fail_at}")
+    calls = json.loads(result.stdout)
+    assert calls[-1]["command"] == fail_at
+
+
+@pytest.mark.skipif(
+    os.name != "posix" or os.uname().sysname != "Linux", reason="The coverage uploader job runs on Linux"
+)
+@pytest.mark.parametrize("scenario", ["valid", "download-error", "hash-mismatch"])
+def test_python_ci_verifies_download_before_enabling_uploader(tmp_path: Path, scenario: str) -> None:
+    import hashlib
+    import sys
+
+    steps = _jobs(_load_workflow("test.yml"))["coverage"]["steps"]
+    script = _step_by_name(steps, "Install verified Codecov CLI")["run"]
+    trusted_contents = b"#!/bin/sh\nexit 0\n"
+    # Exercise the real shell control flow against a known offline fixture.
+    script = script.replace(
+        "ca1d64196d2d34771084afe76ea657d581bf628e31d993ff8e52ea09cc88a56d",
+        hashlib.sha256(trusted_contents).hexdigest(),
+    )
+    downloaded = tmp_path / "download"
+    downloaded.write_bytes(trusted_contents + (b"tampered" if scenario == "hash-mismatch" else b""))
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    curl = tools / "curl"
+    curl.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, pathlib, shutil, sys\n"
+        "pathlib.Path(os.environ['CURL_ARGS']).write_text(json.dumps(sys.argv[1:]))\n"
+        "if os.environ['DOWNLOAD_SCENARIO'] == 'download-error':\n"
+        "    sys.exit(22)\n"
+        "shutil.copyfile(os.environ['DOWNLOAD_SOURCE'], sys.argv[sys.argv.index('--output') + 1])\n",
+        encoding="utf-8",
+    )
+    curl.chmod(0o755)
+    runner_temp = tmp_path / "runner-temp"
+    runner_temp.mkdir()
+    curl_args = tmp_path / "curl-args.json"
+    result = subprocess.run(
+        ["bash", "--noprofile", "--norc", "-c", script],
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "PATH": f"{tools}{os.pathsep}{os.environ['PATH']}",
+            "RUNNER_TEMP": str(runner_temp),
+            "DOWNLOAD_SOURCE": str(downloaded),
+            "DOWNLOAD_SCENARIO": scenario,
+            "CURL_ARGS": str(curl_args),
+        },
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+
+    binary = runner_temp / "modelaudit-codecov"
+    assert result.returncode == {"valid": 0, "download-error": 22, "hash-mismatch": 1}[scenario], result.stderr
+    assert os.access(binary, os.X_OK) is (scenario == "valid")
+    assert binary.is_file() is (scenario != "download-error")
+    assert json.loads(curl_args.read_text())[-1] == (
+        "https://github.com/codecov/codecov-cli/releases/download/v11.3.1/codecovcli_linux"
+    )
