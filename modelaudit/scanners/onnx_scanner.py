@@ -6317,6 +6317,14 @@ def _build_onnx_weight_analysis_plan(
                 )
                 if shape is not None and _onnx_shape_extent_product(shape) == 0:
                     varying_inputs.discard(_onnx_value_name(graph_inputs[index]))
+
+        def input_affects_output(names: set[str], output_index: int) -> bool:
+            return output_index in graph_tainted_output_indexes(
+                subgraph, names, opset_versions, attribute_bindings=attribute_bindings
+            )
+
+        # Local calls can be nested inside control-flow graphs.
+        may_call_functions = bool(functions)
         pending = [graph_output_index]
         visited: set[int] = set()
         while pending:
@@ -6325,17 +6333,23 @@ def _build_onnx_weight_analysis_plan(
                 continue
             visited.add(output_index)
             dependencies = graph_output_dependency_names(subgraph, (output_index,), attribute_bindings)
+            forced_state_input = required_state_input
             if required_state_input is not None:
                 dependencies = dependencies | {required_state_input}
                 required_state_input = None
             if dependency_names_exceeded_limit(dependencies) or len(dependencies) > stack_invariance_work_remaining:
                 return False
             stack_invariance_work_remaining -= len(dependencies)
-            if varying_inputs.intersection(dependencies):
+            varying_dependencies = varying_inputs.intersection(dependencies)
+            if varying_dependencies and (
+                not may_call_functions or input_affects_output(varying_dependencies, output_index)
+            ):
                 return False
             for name in dependencies:
                 binding = state_inputs.get(name)
                 if binding is None:
+                    continue
+                if may_call_functions and name != forced_state_input and not input_affects_output({name}, output_index):
                     continue
                 next_index, parent_name = binding
                 initial = {

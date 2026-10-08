@@ -34386,3 +34386,203 @@ class TestOnnxEmptyScanShapeCertificates:
         assert [(issue.severity, issue.message) for issue in result.issues] == [
             (IssueSeverity.INFO, message) for message in messages
         ]
+
+
+class TestOnnxStackFunctionDependencies:
+    @pytest.mark.parametrize(
+        "case",
+        [
+            "ignored_iteration",
+            "used_iteration",
+            "ignored_state",
+            "used_state",
+            "second_output",
+            "bound_ignored",
+            "bound_used",
+            "nested_ignored",
+            "nested_used",
+            "nested_bound_ignored",
+            "nested_bound_used",
+            "constant_return",
+            "body_constant_return",
+            "deep_ignored",
+        ],
+    )
+    def test_invariant_weights_follow_selected_function_output(self, tmp_path: Path, case: str) -> None:
+        from onnx.inliner import inline_local_functions
+        from onnx.reference import ReferenceEvaluator
+
+        value = TestOnnxRecurrenceReviewRegressions._value
+
+        def tensor(array: Any, name: str | None = None) -> Any:
+            return onnx.numpy_helper.from_array(np.asarray(array), name=name)
+
+        weights = np.zeros((64, 64), np.float32)
+        weights[:5, 0] = 10
+        replacement = np.zeros_like(weights)
+        has_other_state = case in {"ignored_state", "used_state"}
+        changes = case in {"used_iteration", "used_state", "bound_used", "nested_used", "nested_bound_used"}
+        replaces = case in {"constant_return", "body_constant_return"}
+        function_nodes = []
+        if changes:
+            function_nodes = [
+                helper.make_node("Cast", ["arg"], ["delta"], to=TensorProto.FLOAT),
+                helper.make_node("Add", ["A", "delta"], ["B"]),
+            ]
+        elif replaces:
+            function_nodes = [helper.make_node("Constant", [], ["B"], value=tensor(replacement))]
+        else:
+            function_nodes = [helper.make_node("Identity", ["A"], ["B"])]
+        bound_graph = None
+        if "bound_" in case:
+            bound_graph = helper.make_graph(
+                [
+                    helper.make_node("Cast", ["i"], ["delta"], to=TensorProto.FLOAT),
+                    helper.make_node("Add", ["state", "delta"], ["Z"]),
+                ]
+                if changes
+                else [helper.make_node("Identity", ["state"], ["Z"])],
+                "bound_branch",
+                [],
+                [value("Z", [64, 64])],
+            )
+            choose = helper.make_node(
+                "If",
+                ["flag"],
+                ["B"],
+                else_branch=helper.make_graph(
+                    [helper.make_node("Identity", ["state"], ["Z"])], "else_branch", [], [value("Z", [64, 64])]
+                ),
+            )
+            choose.attribute.append(
+                onnx.AttributeProto(name="then_branch", ref_attr_name="branch", type=onnx.AttributeProto.GRAPH)
+            )
+            function_nodes = [helper.make_node("Constant", [], ["flag"], value=tensor(np.bool_(True))), choose]
+        function_outputs = ["B"]
+        call_outputs = ["next"]
+        if case == "second_output":
+            function_nodes.append(helper.make_node("Identity", ["arg"], ["unused"]))
+            function_outputs = ["unused", "B"]
+            call_outputs = ["", "next"]
+        functions = [
+            helper.make_function(
+                "local",
+                "F",
+                ["state", "i"] if bound_graph is not None else ["A", "arg"],
+                function_outputs,
+                function_nodes,
+                [helper.make_opsetid("", 18)],
+                attributes=["branch"] if bound_graph is not None else [],
+            )
+        ]
+        called_function = "F"
+        if case == "deep_ignored":
+            for index in range(8):
+                name = f"Wrapper{index}"
+                functions.append(
+                    helper.make_function(
+                        "local",
+                        name,
+                        ["A", "arg"],
+                        ["B"],
+                        [helper.make_node(called_function, ["A", "arg"], ["B"], domain="local")],
+                        [helper.make_opsetid("", 18), helper.make_opsetid("local", 1)],
+                    )
+                )
+                called_function = name
+        body_nodes = [
+            helper.make_node(
+                called_function, ["state", "other" if has_other_state else "i"], call_outputs, domain="local"
+            ),
+            helper.make_node("Identity", ["next"], ["slice"]),
+        ]
+        if bound_graph is not None:
+            body_nodes[0].attribute.append(helper.make_attribute("branch", bound_graph))
+        if case.startswith("nested_"):
+            nested_call = body_nodes[0]
+            body_nodes[0] = helper.make_node(
+                "If",
+                ["c"],
+                ["next"],
+                then_branch=helper.make_graph([nested_call], "then_call", [], [value("next", [64, 64])]),
+                else_branch=helper.make_graph([nested_call], "else_call", [], [value("next", [64, 64])]),
+            )
+        body_inputs = [value("i", [], TensorProto.INT64), value("c", [], TensorProto.BOOL), value("state", [64, 64])]
+        body_outputs = [value("c", [], TensorProto.BOOL), value("next", [64, 64])]
+        initializers = [tensor(np.int64(2), name="M"), tensor(np.bool_(True), name="C"), tensor(weights, name="W")]
+        loop_inputs = ["M", "C", "W"]
+        loop_outputs = ["final"]
+        inputs = [value("X", [2, 1, 64])]
+        if has_other_state:
+            body_inputs.append(value("other", []))
+            body_nodes.append(helper.make_node("Add", ["other", "one"], ["next_other"]))
+            body_outputs.append(value("next_other", []))
+            initializers.extend([tensor(np.float32(0), name="initial_other"), tensor(np.float32(1), name="one")])
+            loop_inputs.append("initial_other")
+            loop_outputs.append("final_other")
+        body_outputs.append(value("slice", [64, 64]))
+        loop_outputs.append("stack")
+        if case == "body_constant_return":
+            body_nodes.append(helper.make_node("MatMul", ["body_X", "state"], ["used"]))
+            body_outputs.append(value("used", [1, 64]))
+            loop_outputs.append("used_stack")
+            inputs.append(value("body_X", [1, 64]))
+        body = helper.make_graph(body_nodes, "body", body_inputs, body_outputs)
+        model = TestOnnxBuiltinOperatorIdentity._model(
+            [
+                helper.make_node("Loop", loop_inputs, loop_outputs, body=body),
+                helper.make_node("MatMul", ["X", "stack"], ["Y"]),
+            ],
+            inputs,
+            [value("Y", [2, 1, 64]), value("stack", [2, 64, 64])],
+            initializers,
+            functions,
+        )
+        onnx.checker.check_model(model, full_check=True)
+        inlined = inline_local_functions(model)
+        runtime_body = next(attribute.g for attribute in inlined.graph.node[0].attribute if attribute.name == "body")
+        state = weights.copy()
+        other = np.float32(0)
+        slices = []
+        for iteration in range(2):
+            actual: Any = ReferenceEvaluator(runtime_body, opsets={"": 18}).run(
+                None,
+                {
+                    "i": np.int64(iteration),
+                    "c": np.bool_(True),
+                    "state": state,
+                    "other": other,
+                    "one": np.float32(1),
+                    "body_X": np.ones((1, 64), np.float32),
+                },
+            )
+            state = actual[1]
+            if has_other_state:
+                other = actual[2]
+            slices.append(actual[3 if has_other_state else 2])
+        expected = np.stack(
+            [replacement, replacement] if replaces else [weights, weights + 1] if changes else [weights, weights]
+        )
+        # The installed Loop evaluator concatenates scan outputs; execute the
+        # actual body and apply the schema's stacking rule independently.
+        np.testing.assert_array_equal(np.stack(slices), expected)
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        path = _save_onnx_model(model, tmp_path / "function-stack.onnx")
+        result = OnnxScanner().scan(str(path))
+        if changes or case == "deep_ignored":
+            assert plan.coverage_gaps
+            assert result.success is False
+            assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        elif case == "body_constant_return":
+            if not plan.coverage_gaps:
+                assert any(np.array_equal(spec.weights, weights) for spec in plan.specs)
+                assert any(np.array_equal(spec.weights, replacement) for spec in plan.specs)
+            else:
+                assert result.success is False
+                assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        else:
+            assert plan.coverage_gaps == {}
+            assert len(plan.specs) == 1
+            np.testing.assert_array_equal(plan.specs[0].weights, replacement if replaces else weights)
+            assert result.success is True
+            assert bool(result.metadata.get("anomalies_found")) is not replaces
