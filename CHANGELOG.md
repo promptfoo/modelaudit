@@ -5,21 +5,9 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.2.54](https://github.com/promptfoo/modelaudit/compare/v0.2.53...v0.2.54) (2026-10-06)
-
-### Features
-
-- preserve raw evidence in scan output and diagnostics ([#1870](https://github.com/promptfoo/modelaudit/issues/1870)) ([86c40e4](https://github.com/promptfoo/modelaudit/commit/86c40e49b97fcc6b87b6cc44ef5e7fa15f715844))
-
-### Bug Fixes
-
-- avoid PyTorch storage prefix discovery gaps ([#1853](https://github.com/promptfoo/modelaudit/issues/1853)) ([fd02475](https://github.com/promptfoo/modelaudit/commit/fd024759e36f50da5d36d1d5923ad1c4cabb160d))
-- **deps:** enforce GitPython and AnyIO security floors ([#1857](https://github.com/promptfoo/modelaudit/issues/1857)) ([b80c705](https://github.com/promptfoo/modelaudit/commit/b80c70516e446b48ef3e86d94910db9000539ecb))
-- **picklescan:** bound repeated scalar probe work ([#1878](https://github.com/promptfoo/modelaudit/issues/1878)) ([3b63c24](https://github.com/promptfoo/modelaudit/commit/3b63c240906122cbd95f573baa3c82901a38b0cf))
-- refresh importer snapshots between pickle scans ([#1877](https://github.com/promptfoo/modelaudit/issues/1877)) ([9b60dd2](https://github.com/promptfoo/modelaudit/commit/9b60dd239f7b0bd20a6016afda97275c7b40bb4f))
-- **safetensors:** preserve native FDICT-shaped headers ([#1863](https://github.com/promptfoo/modelaudit/issues/1863)) ([2a5185a](https://github.com/promptfoo/modelaudit/commit/2a5185a32a3993ac6188b20a04fe6cec7cc2eddc))
-
 ## [Unreleased]
+
+## [0.2.54](https://github.com/promptfoo/modelaudit/compare/v0.2.53...v0.2.54) (2026-10-06)
 
 ### Security
 
@@ -45,6 +33,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Bound malformed PyTorch GLOBAL recovery across fallback passes and preserve benign protocol-0 FLOAT operands.
 - Preserve native SafeTensors routing when a valid bounded header also resembles an FDICT zlib stream.
 - Avoid false incomplete pickle scans when Python lazily refreshes an import-directory cache after a change made before scanning.
+
+### Features
+
+- preserve raw evidence in scan output and diagnostics ([#1870](https://github.com/promptfoo/modelaudit/issues/1870)) ([86c40e4](https://github.com/promptfoo/modelaudit/commit/86c40e49b97fcc6b87b6cc44ef5e7fa15f715844))
+
+### Bug Fixes
+
+- avoid PyTorch storage prefix discovery gaps ([#1853](https://github.com/promptfoo/modelaudit/issues/1853)) ([fd02475](https://github.com/promptfoo/modelaudit/commit/fd024759e36f50da5d36d1d5923ad1c4cabb160d))
+- **deps:** enforce GitPython and AnyIO security floors ([#1857](https://github.com/promptfoo/modelaudit/issues/1857)) ([b80c705](https://github.com/promptfoo/modelaudit/commit/b80c70516e446b48ef3e86d94910db9000539ecb))
+- **picklescan:** bound repeated scalar probe work ([#1878](https://github.com/promptfoo/modelaudit/issues/1878)) ([3b63c24](https://github.com/promptfoo/modelaudit/commit/3b63c240906122cbd95f573baa3c82901a38b0cf))
+- refresh importer snapshots between pickle scans ([#1877](https://github.com/promptfoo/modelaudit/issues/1877)) ([9b60dd2](https://github.com/promptfoo/modelaudit/commit/9b60dd239f7b0bd20a6016afda97275c7b40bb4f))
+- **safetensors:** preserve native FDICT-shaped headers ([#1863](https://github.com/promptfoo/modelaudit/issues/1863)) ([2a5185a](https://github.com/promptfoo/modelaudit/commit/2a5185a32a3993ac6188b20a04fe6cec7cc2eddc))
 
 ## [0.2.53](https://github.com/promptfoo/modelaudit/compare/v0.2.52...v0.2.53) (2026-10-03)
 
