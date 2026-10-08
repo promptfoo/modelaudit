@@ -34586,3 +34586,272 @@ class TestOnnxStackFunctionDependencies:
             np.testing.assert_array_equal(plan.specs[0].weights, replacement if replaces else weights)
             assert result.success is True
             assert bool(result.metadata.get("anomalies_found")) is not replaces
+
+
+class TestOnnxCapturedFunctionGaps:
+    @staticmethod
+    def _model(
+        counts: tuple[int, ...], *, vector: bool, shadow: bool = False, default_graph: bool = False
+    ) -> tuple[Any, dict[str, Any], list[Any]]:
+        value = TestOnnxRecurrenceReviewRegressions._value
+        shape = [4096] if vector else [64, 64]
+        matrices = [np.zeros((64, 64), np.float32) for _ in range(max(counts))]
+        matrices[0][:5, 0] = 10
+        matrices[-1][:5, 0] = 10
+        conditions: list[str] = []
+        nodes = []
+        root_names = []
+
+        def selection(lo: int, hi: int, prefix: str) -> Any:
+            output = f"{prefix}_v{lo}_{hi}"
+            if hi - lo == 1:
+                return helper.make_graph(
+                    [helper.make_node("Identity", [f"W{lo}"], [output])], output, [], [value(output, shape)]
+                )
+            middle = (lo + hi) // 2
+            condition = f"{prefix}_c{lo}_{hi}"
+            conditions.append(condition)
+            return helper.make_graph(
+                [
+                    helper.make_node(
+                        "If",
+                        [condition],
+                        [output],
+                        then_branch=selection(lo, middle, prefix),
+                        else_branch=selection(middle, hi, prefix),
+                    )
+                ],
+                output,
+                [],
+                [value(output, shape)],
+            )
+
+        for index, count in enumerate(counts):
+            selected = selection(0, count, f"tree{index}")
+            name = "K" if shadow else f"K{index}"
+            selected.node[0].output[0] = name
+            nodes.extend(selected.node)
+            root_names.append(name)
+        branch = helper.make_graph(
+            [helper.make_node("Identity", ["K"], ["R"])],
+            "capture_branch",
+            [],
+            [value("R", shape)],
+            value_info=[value("K", shape)],
+        )
+        choose = helper.make_node("If", ["flag"], ["Y"])
+        for name in ("then_branch", "else_branch"):
+            choose.attribute.append(
+                onnx.AttributeProto(name=name, ref_attr_name="branch", type=onnx.AttributeProto.GRAPH)
+            )
+        capture = helper.make_function(
+            "local",
+            "Capture",
+            ["dummy"],
+            ["Y"],
+            [helper.make_node("Constant", [], ["flag"], value=onnx.numpy_helper.from_array(np.asarray(True))), choose],
+            [helper.make_opsetid("", 18)],
+            attributes=[] if default_graph else ["branch"],
+        )
+        inner_call = helper.make_node("Capture", ["dummy"], ["wrapped"], domain="local")
+        if default_graph:
+            capture.attribute_proto.append(helper.make_attribute("branch", branch))
+        else:
+            inner_call.attribute.append(helper.make_attribute("branch", branch))
+        wrapper = helper.make_function(
+            "local",
+            "Wrapper",
+            ["K", "dummy"],
+            ["wrapped"],
+            [inner_call],
+            [helper.make_opsetid("", 18), helper.make_opsetid("local", 1)],
+        )
+        outputs = []
+        expected = []
+        for index, (name, count) in enumerate(zip(root_names, counts, strict=True)):
+            returned = f"returned{index}"
+            nodes.append(helper.make_node("Wrapper", ["W0" if shadow else name, "dummy"], [returned], domain="local"))
+            if vector:
+                nodes.append(helper.make_node("Reshape", [returned, "matrix_shape"], [f"matrix{index}"]))
+                returned = f"matrix{index}"
+            nodes.append(helper.make_node("MatMul", ["X", returned], [f"Y{index}"]))
+            outputs.append(value(f"Y{index}", [1, 64]))
+            expected.append(np.ones((1, 64), np.float32) @ matrices[0 if shadow else count - 1])
+        initializers = [
+            onnx.numpy_helper.from_array(matrix.reshape(shape), name=f"W{index}")
+            for index, matrix in enumerate(matrices)
+        ]
+        if vector:
+            initializers.append(onnx.numpy_helper.from_array(np.array([64, 64], np.int64), name="matrix_shape"))
+        model = TestOnnxBuiltinOperatorIdentity._model(
+            nodes,
+            [value("X", [1, 64]), value("dummy", []), *[value(name, [], TensorProto.BOOL) for name in conditions]],
+            outputs,
+            initializers,
+            [capture, wrapper],
+        )
+        feeds = {
+            "X": np.ones((1, 64), np.float32),
+            "dummy": np.asarray(0, np.float32),
+            **{name: np.asarray(False) for name in conditions},
+        }
+        return model, feeds, expected
+
+    @pytest.mark.parametrize("vector", [False, True])
+    @pytest.mark.parametrize("counts", [(32,), (40,), (32, 40), (40, 32)])
+    def test_captured_coverage_gaps_survive_shared_function_invocations(
+        self, tmp_path: Path, vector: bool, counts: tuple[int, ...]
+    ) -> None:
+        from onnx.inliner import inline_local_functions
+        from onnx.reference import ReferenceEvaluator
+
+        model, feeds, expected = self._model(counts, vector=vector)
+        onnx.checker.check_model(model, full_check=True)
+        inlined = inline_local_functions(model)
+        onnx.checker.check_model(inlined, full_check=True)
+        actual: Any = ReferenceEvaluator(inlined).run(None, feeds)
+        for output, reference in zip(actual, expected, strict=True):
+            np.testing.assert_array_equal(output, reference)
+        path = _save_onnx_model(model, tmp_path / "captured-gaps.onnx")
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        incomplete = 40 in counts
+        # Each If alternative returns the eight deferred lineages.
+        assert plan.coverage_gaps == ({"lineages_per_value_limit": 16} if incomplete else {})
+        result = OnnxScanner().scan(str(path))
+        assert result.success is not incomplete
+        assert result.metadata.get("anomalies_found", 0) >= 2
+        if incomplete:
+            assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+            assert any(
+                check.name == "Weight Distribution Analysis Coverage" and check.status == CheckStatus.FAILED
+                for check in result.checks
+            )
+        reset_cache_manager()
+        cache_dir = tmp_path / "cache"
+        try:
+            for _ in range(2):
+                aggregate = scan_model_directory_or_file(
+                    str(path), cache_enabled=True, cache_dir=str(cache_dir), min_cache_file_size=0
+                )
+                assert aggregate.success is not incomplete
+                assert determine_exit_code(aggregate) == (2 if incomplete else 0)
+            stats = get_cache_manager(str(cache_dir), enabled=True).get_stats()
+            assert stats["cache_hits"] == (0 if incomplete else 1)
+            if incomplete:
+                assert stats["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
+    @pytest.mark.parametrize("vector", [False, True])
+    @pytest.mark.parametrize("default_graph", [False, True])
+    def test_formal_binding_shadows_inherited_capture_gaps(
+        self, tmp_path: Path, vector: bool, default_graph: bool
+    ) -> None:
+        from onnx.inliner import inline_local_functions
+        from onnx.reference import ReferenceEvaluator
+
+        model, feeds, expected = self._model((40,), vector=vector, shadow=True, default_graph=default_graph)
+        onnx.checker.check_model(model, full_check=True)
+        oracle = onnx.ModelProto()
+        oracle.CopyFrom(model)
+        if default_graph:
+            # The inliner needs the declared default materialized at its call.
+            # The scanner receives the unchanged model with its real default.
+            oracle.functions[1].node[0].attribute.append(oracle.functions[0].attribute_proto[0])
+        inlined = inline_local_functions(oracle)
+        onnx.checker.check_model(inlined, full_check=True)
+        actual: Any = ReferenceEvaluator(inlined).run(None, feeds)
+        np.testing.assert_array_equal(actual[0], expected[0])
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        assert plan.coverage_gaps == {}
+        assert len(plan.specs) == 1
+        result = OnnxScanner().scan(str(_save_onnx_model(model, tmp_path / "shadowed-gaps.onnx")))
+        assert result.success is True
+        assert result.metadata.get("anomalies_found", 0) >= 2
+
+
+class TestOnnxUnusedFunctionGraphs:
+    @pytest.mark.parametrize("proof", ["shape", "reachability"])
+    @pytest.mark.parametrize("unused_graph", [False, True])
+    def test_only_executed_function_graphs_affect_recurrence(
+        self, tmp_path: Path, proof: str, unused_graph: bool
+    ) -> None:
+        from onnx.inliner import inline_local_functions
+        from onnx.reference import ReferenceEvaluator
+
+        value = TestOnnxRecurrenceReviewRegressions._value
+
+        def tensor(name: str, array: Any) -> Any:
+            return onnx.numpy_helper.from_array(np.asarray(array), name=name)
+
+        growth = [
+            helper.make_node("Constant", [], ["axes"], value=tensor("", np.array([0], np.int64))),
+            helper.make_node("Unsqueeze", ["state", "axes"], ["next"]),
+        ]
+        function = helper.make_function(
+            "local",
+            "StateFunction",
+            ["state"],
+            ["next"],
+            [helper.make_node("Identity", ["state"], ["next"])] if proof == "shape" else growth,
+            [helper.make_opsetid("", 18)],
+            attributes=["unused"] if unused_graph else [],
+        )
+        call = helper.make_node("StateFunction", ["state"], ["next"], domain="local")
+        if unused_graph:
+            argument = helper.make_graph(
+                growth if proof == "shape" else [helper.make_node("MatMul", ["state", "state"], ["next"])],
+                "unused_graph",
+                [],
+                [value("next", [1, 64] if proof == "shape" else None)],
+            )
+            call.attribute.append(helper.make_attribute("unused", argument))
+        body = helper.make_graph(
+            [call, helper.make_node("MatMul", ["X", "state" if proof == "shape" else "R"], ["used"])],
+            "body",
+            [value("i", [], TensorProto.INT64), value("c", [], TensorProto.BOOL), value("state", None)],
+            [
+                value("c", [], TensorProto.BOOL),
+                value("next", None),
+                value("used", [1] if proof == "shape" else [1, 64]),
+            ],
+        )
+        seed = np.ones(64 if proof == "shape" else 2, np.float32)
+        real_weight = np.eye(64, dtype=np.float32)
+        model = TestOnnxBuiltinOperatorIdentity._model(
+            [helper.make_node("Loop", ["M", "C", "W"], ["final", "used_stack"], body=body)],
+            [value("X", [1, 64])],
+            [
+                value("final", [64] if proof == "shape" else [1, 1, 2]),
+                value("used_stack", [2, 1] if proof == "shape" else [2, 1, 64]),
+            ],
+            [tensor("M", np.int64(2)), tensor("C", np.bool_(True)), tensor("W", seed), tensor("R", real_weight)],
+            [function],
+        )
+        onnx.checker.check_model(model, full_check=True)
+        inlined = inline_local_functions(model)
+        runtime_body = next(attribute.g for attribute in inlined.graph.node[0].attribute if attribute.name == "body")
+        state = seed.copy()
+        for iteration in range(2):
+            actual: Any = ReferenceEvaluator(runtime_body, opsets={"": 18}).run(
+                None,
+                {
+                    "i": np.int64(iteration),
+                    "c": np.bool_(True),
+                    "state": state,
+                    "X": np.ones((1, 64), np.float32),
+                    "R": real_weight,
+                },
+            )
+            state = actual[1]
+            np.testing.assert_array_equal(
+                state, seed if proof == "shape" else seed.reshape((1,) * (iteration + 1) + (2,))
+            )
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        assert plan.coverage_gaps == {}
+        assert len(plan.specs) == (0 if proof == "shape" else 1)
+        if proof == "reachability":
+            np.testing.assert_array_equal(plan.specs[0].weights, real_weight)
+        result = OnnxScanner().scan(str(_save_onnx_model(model, tmp_path / "unused-graph.onnx")))
+        assert result.success is True
+        assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)

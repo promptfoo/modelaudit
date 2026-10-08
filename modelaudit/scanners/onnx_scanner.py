@@ -3752,7 +3752,10 @@ def _build_onnx_weight_analysis_plan(
                 )[0]
 
             nested_branch_shapes: list[dict[str, tuple[int, ...]]] = []
+            function_references = referenced_function_attributes(function) if function is not None else None
             for attribute in getattr(body_node, "attribute", ()):
+                if function_references is not None and str(attribute.name) not in function_references:
+                    continue
                 resolved_attribute = resolve_reentry_attribute(attribute)
                 if resolved_attribute is None:
                     continue
@@ -5019,7 +5022,10 @@ def _build_onnx_weight_analysis_plan(
                         )
                     )
                 tainted.update(function_tainted_outputs)
+            function_references = referenced_function_attributes(function) if function is not None else None
             for attribute in getattr(body_node, "attribute", ()):
+                if function_references is not None and str(attribute.name) not in function_references:
+                    continue
                 resolved_attribute = resolve_reentry_attribute(attribute)
                 if resolved_attribute is None:
                     continue
@@ -9980,6 +9986,13 @@ def _build_onnx_weight_analysis_plan(
                         dynamic_values,
                         root_graph=False,
                         source_scope=function_source_scope,
+                        inherited_lineage_limit_gap_counts=value_lineage_limit_gap_counts,
+                        inherited_non_shape_lineage_limit_gap_counts=value_non_shape_lineage_limit_gap_counts,
+                        inherited_non_shape_lineage_limit_gap_summaries=value_non_shape_lineage_limit_gap_summaries,
+                        inherited_weight_lineage_limit_gap_counts=value_weight_lineage_limit_gap_counts,
+                        inherited_weight_lineage_limit_gap_summaries=value_weight_lineage_limit_gap_summaries,
+                        inherited_rank_promotable_lineage_limit_gap_counts=value_rank_promotable_lineage_limit_gap_counts,
+                        inherited_rank_promotable_lineage_limit_gap_summaries=value_rank_promotable_lineage_limit_gap_summaries,
                         opset_versions={
                             str(getattr(opset, "domain", "") or ""): int(opset.version)
                             for opset in getattr(function, "opset_import", ())
