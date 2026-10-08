@@ -7,10 +7,17 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.12](https://github.com/promptfoo/modelaudit/compare/modelaudit-picklescan-v0.1.11...modelaudit-picklescan-v0.1.12) (2026-10-06)
+
 ### Fixed
 
 - Reuse scalar-stream skipping during nested storage probes and bound matcher repetition memory so long runs of harmless scalar pickles do not delay scan timeout handling; preserve nested payload detection.
 - Refresh cached import-directory snapshots between scans so an earlier directory change does not cause a false incomplete call-graph result when Python refreshes its import cache.
+
+### Bug Fixes
+
+- **picklescan:** bound repeated scalar probe work ([#1878](https://github.com/promptfoo/modelaudit/issues/1878)) ([3b63c24](https://github.com/promptfoo/modelaudit/commit/3b63c240906122cbd95f573baa3c82901a38b0cf))
+- refresh importer snapshots between pickle scans ([#1877](https://github.com/promptfoo/modelaudit/issues/1877)) ([9b60dd2](https://github.com/promptfoo/modelaudit/commit/9b60dd239f7b0bd20a6016afda97275c7b40bb4f))
 
 ## [0.1.11](https://github.com/promptfoo/modelaudit/compare/modelaudit-picklescan-v0.1.10...modelaudit-picklescan-v0.1.11) (2026-10-03)
 
