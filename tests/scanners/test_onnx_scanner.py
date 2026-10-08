@@ -31136,6 +31136,110 @@ class TestOnnxProvenShapesAndScanExtents:
         result = OnnxScanner().scan(str(TestOnnxLoopControlProofs._save(model, tmp_path)))
         assert result.success is True
 
+    @pytest.mark.parametrize("attribute_name", ["scan_input_axes", "scan_output_axes"])
+    @pytest.mark.parametrize("bound_attribute", [False, True])
+    def test_scan_axis_decode_limit_preserves_incomplete_coverage(
+        self, tmp_path: Path, attribute_name: str, bound_attribute: bool
+    ) -> None:
+        value = TestOnnxRecurrenceReviewRegressions._value
+        body = helper.make_graph([], "identity_scan", [value("element", [4])], [value("element", [4])])
+        scan = helper.make_node("Scan", ["X"], ["Y"], body=body, num_scan_inputs=1)
+        axes = helper.make_attribute(
+            attribute_name, [0] * (onnx_scanner_module._ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK + 1)
+        )
+        functions = []
+        if bound_attribute:
+            scan.attribute.append(
+                onnx.AttributeProto(name=attribute_name, ref_attr_name="axes", type=onnx.AttributeProto.INTS)
+            )
+            functions.append(
+                helper.make_function(
+                    "local", "ScanAxes", ["X"], ["Y"], [scan], [helper.make_opsetid("", 18)], attributes=["axes"]
+                )
+            )
+            node = helper.make_node("ScanAxes", ["X"], ["Y"], domain="local")
+            axes.name = "axes"
+            node.attribute.append(axes)
+        else:
+            scan.attribute.append(axes)
+            node = scan
+        model = TestOnnxBuiltinOperatorIdentity._model(
+            [node], [value("X", [1, 4])], [value("Y", [1, 4])], [], functions
+        )
+        decoded = 0
+
+        def count_decoding(frame: Any, event: str, argument: Any) -> None:
+            nonlocal decoded
+            if event == "return" and argument is not None and frame.f_code.co_name == "<genexpr>":
+                caller = frame.f_back
+                if caller is not None and caller.f_code.co_name == "resolved_int_sequence_attribute":
+                    decoded += 1
+
+        previous = sys.getprofile()
+        try:
+            sys.setprofile(count_decoding)
+            plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        finally:
+            sys.setprofile(previous)
+        assert decoded == 0
+        assert plan.coverage_gaps["scan_axis_decode_work_limit"] == 1
+        path = _save_onnx_model(model, tmp_path / "oversized-axes.onnx")
+        result = OnnxScanner().scan(str(path))
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert any(
+            check.name == "Weight Distribution Analysis Coverage"
+            and check.status == CheckStatus.FAILED
+            and check.details["coverage_gaps"]["scan_axis_decode_work_limit"] == 1
+            for check in result.checks
+        )
+        reset_cache_manager()
+        cache_dir = tmp_path / "cache"
+        try:
+            for _ in range(2):
+                aggregate = scan_model_directory_or_file(
+                    str(path), cache_enabled=True, cache_dir=str(cache_dir), min_cache_file_size=0
+                )
+                assert aggregate.success is False
+                assert determine_exit_code(aggregate) == 2
+            stats = get_cache_manager(str(cache_dir), enabled=True).get_stats()
+            assert stats["total_entries"] == stats["cache_hits"] == 0
+        finally:
+            reset_cache_manager()
+
+    @pytest.mark.parametrize("budget", [3, 4])
+    def test_scan_axis_decode_budget_is_shared_between_graph_invocations(
+        self, monkeypatch: pytest.MonkeyPatch, budget: int
+    ) -> None:
+        value = TestOnnxRecurrenceReviewRegressions._value
+        body = helper.make_graph([], "identity_scan", [value("element", [4])], [value("element", [4])])
+        function = helper.make_function(
+            "local",
+            "ScanAxes",
+            ["X"],
+            ["Y"],
+            [
+                helper.make_node(
+                    "Scan", ["X"], ["Y"], body=body, num_scan_inputs=1, scan_input_axes=[0], scan_output_axes=[0]
+                )
+            ],
+            [helper.make_opsetid("", 18)],
+        )
+        model = TestOnnxBuiltinOperatorIdentity._model(
+            [
+                helper.make_node("ScanAxes", ["X"], ["A"], domain="local"),
+                helper.make_node("ScanAxes", ["Z"], ["B"], domain="local"),
+            ],
+            [value("X", [1, 4]), value("Z", [2, 4])],
+            [value("A", [1, 4]), value("B", [2, 4])],
+            [],
+            [function],
+        )
+        onnx.checker.check_model(model, full_check=True)
+        monkeypatch.setattr(onnx_scanner_module, "_ONNX_SCAN_AXIS_DECODE_WORK_LIMIT", budget)
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        assert plan.coverage_gaps == ({"scan_axis_decode_work_limit": 1} if budget == 3 else {})
+
     @pytest.mark.parametrize("route", ["direct", "Identity", "function"])
     @pytest.mark.parametrize("steps", [1, 2])
     @pytest.mark.parametrize("symmetric", [False, True])

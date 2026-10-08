@@ -171,6 +171,7 @@ _ONNX_STRUCTURE_RETAINED_STRING_OVERHEAD_BYTES = 64
 _ONNX_SEMANTIC_FINGERPRINT_MAX_SERIALIZED_BYTES = _ONNX_STRUCTURE_STRING_MAX_BYTES
 _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_OUTPUTS = 1024
 _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK = 4096
+_ONNX_SCAN_AXIS_DECODE_WORK_LIMIT = 4096
 _ONNX_RESULT_MAX_DISTINCT_GROUPS = 1024
 _STANDARD_NEURAL_NETWORK_DOMAINS: frozenset[str] = frozenset({"", "ai.onnx"})
 _SAME_TYPE_ELEMENTWISE_OPERATORS: frozenset[str] = frozenset(
@@ -1860,6 +1861,7 @@ def _build_onnx_weight_analysis_plan(
     """Build a bounded, semantically oriented plan for ONNX weight analysis."""
     plan = _OnnxWeightAnalysisPlan()
     inferred_dimensions = 0
+    scan_axis_decode_work_remaining = _ONNX_SCAN_AXIS_DECODE_WORK_LIMIT
 
     def shape_inference_available(rank: int) -> bool:
         if rank > _ONNX_WEIGHT_RESHAPE_RANK_LIMIT:
@@ -6929,6 +6931,7 @@ def _build_onnx_weight_analysis_plan(
         int_sequence_attribute_cache: dict[tuple[int, str], tuple[Any, tuple[int, ...] | None]] = {}
 
         def resolved_int_sequence_attribute(node: Any, name: str) -> tuple[int, ...] | None:
+            nonlocal scan_axis_decode_work_remaining
             key = (id(node), name)
             cached = int_sequence_attribute_cache.get(key)
             if cached is not None and cached[0] is node:
@@ -6939,7 +6942,12 @@ def _build_onnx_weight_analysis_plan(
                     continue
                 resolved_attribute = resolve_attribute(attribute)
                 if resolved_attribute is not None:
-                    result = tuple(int(value) for value in getattr(resolved_attribute, "ints", ()))
+                    values = getattr(resolved_attribute, "ints", ())
+                    if len(values) > scan_axis_decode_work_remaining:
+                        plan.coverage_gaps.setdefault("scan_axis_decode_work_limit", 1)
+                    else:
+                        scan_axis_decode_work_remaining -= len(values)
+                        result = tuple(int(value) for value in values)
                 break
             # The retained owner and this invocation's immutable attribute bindings
             # make both successful and missing proofs safe to reuse.
