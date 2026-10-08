@@ -3119,6 +3119,20 @@ def _build_onnx_weight_analysis_plan(
             return cached[1]
         dependencies: set[str] = set()
         merge_dependency_names(dependencies, getattr(node, "input", ()))
+        function = functions.get(
+            (str(getattr(node, "domain", "")), str(node.op_type), str(getattr(node, "overload", "")))
+        )
+        if function is not None:
+            function_attributes = bound_function_attributes(
+                function,
+                node,
+                lambda attribute: (
+                    local_attribute_bindings.get(str(attribute.ref_attr_name))
+                    if getattr(attribute, "ref_attr_name", "")
+                    else attribute
+                ),
+            )
+            merge_dependency_names(dependencies, graph_external_reference_names(function, function_attributes))
         if not dependency_names_exceeded_limit(frozenset(dependencies)):
             for attribute in getattr(node, "attribute", ()):
                 reference_name = str(getattr(attribute, "ref_attr_name", ""))
@@ -4240,6 +4254,9 @@ def _build_onnx_weight_analysis_plan(
     graph_taint_nodes_cache: dict[tuple[Any, ...], tuple[Any, ...]] = {}
     graph_taint_work_remaining = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
 
+    def graph_taint_work_is_exhausted() -> bool:
+        return graph_taint_work_remaining <= 0
+
     def graph_tainted_output_indexes(
         subgraph: Any,
         graph_input_names: set[str],
@@ -4318,17 +4335,22 @@ def _build_onnx_weight_analysis_plan(
             function = functions.get(function_key)
             any_tainted = any(input_name in tainted for input_name in body_inputs)
             inspected_function_taint = False
-            if function is not None and any_tainted:
+            if function is not None:
                 inspected_function_taint = True
                 mapped_outputs: set[str] = set()
                 function_attributes = bound_function_attributes(function, body_node, resolve_reentry_attribute)
                 function_versions = function_opset_versions(function, opset_versions)
+                function_captures = graph_external_reference_names(function, function_attributes)
+                if dependency_names_exceeded_limit(function_captures):
+                    tainted.update(body_outputs)
+                    continue
                 function_input_names = {
                     _onnx_value_name(function.input[input_index])
                     for input_index, input_name in enumerate(node_input_slots(body_node))
                     if input_name in tainted and input_index < len(getattr(function, "input", ()))
                 }
                 function_input_names.discard("")
+                function_input_names.update(function_captures & tainted)
                 if function_input_names:
                     mapped_outputs.update(
                         mapped_node_outputs(
@@ -4345,9 +4367,8 @@ def _build_onnx_weight_analysis_plan(
                             ),
                         )
                     )
-                if mapped_outputs:
-                    tainted.update(mapped_outputs)
-                    continue
+                tainted.update(mapped_outputs)
+                continue
             nested_outputs: set[str] = set()
             inspected_nested_taint = False
             for attribute in getattr(body_node, "attribute", ()):
@@ -5142,19 +5163,47 @@ def _build_onnx_weight_analysis_plan(
 
     graph_external_reference_cache: dict[tuple[Any, ...], tuple[Any, frozenset[str]]] = {}
     graph_external_reference_in_progress: set[tuple[Any, ...]] = set()
+    graph_external_function_owners = {id(function) for function in functions.values()}
+    graph_external_function_work_remaining = _ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK
 
     def graph_external_reference_names(
         graph: Any, attribute_bindings: dict[str, Any] | None = None, *, depth: int = 0
     ) -> frozenset[str]:
+        nonlocal graph_external_function_work_remaining
         attribute_key = attribute_binding_cache_key(attribute_bindings)
         if attribute_key is None:
             return dependency_collection_limit
+        # Name discovery unions structural references; scalar values cannot
+        # select a different reference set, but graph bindings can.
+        attribute_key = tuple(
+            entry
+            for entry in attribute_key
+            if (binding := (attribute_bindings or {}).get(entry[0])) is not None
+            and (
+                getattr(binding, "type", None) in {onnx.AttributeProto.GRAPH, onnx.AttributeProto.GRAPHS}
+                or _onnx_has_singular_field(binding, "g")
+                or bool(getattr(binding, "graphs", ()))
+                or bool(getattr(binding, "ref_attr_name", ""))
+            )
+        )
         cache_key = (id(graph), attribute_key, depth)
         if depth > 6 or cache_key in graph_external_reference_in_progress:
             return frozenset({dependency_collection_limit_marker})
         cached_reference_names = graph_external_reference_cache.get(cache_key)
         if cached_reference_names is not None and cached_reference_names[0] is graph:
             return cached_reference_names[1]
+        if id(graph) in graph_external_function_owners:
+            work = max(len(getattr(graph, "input", ())) + len(getattr(graph, "output", ())) + len(graph.node), 1)
+            if work <= graph_external_function_work_remaining:
+                for function_node in graph.node:
+                    work += len(function_node.input) + len(function_node.output) + len(function_node.attribute)
+                    if work > graph_external_function_work_remaining:
+                        break
+            if work > graph_external_function_work_remaining:
+                graph_external_function_work_remaining = 0
+                plan.coverage_gaps.setdefault("function_capture_work_limit", 1)
+                return dependency_collection_limit
+            graph_external_function_work_remaining -= work
         graph_external_reference_in_progress.add(cache_key)
         local_names = {name for value_info in getattr(graph, "input", ()) if (name := _onnx_value_name(value_info))}
         local_names.update(
@@ -5175,6 +5224,24 @@ def _build_onnx_weight_analysis_plan(
         for graph_node in getattr(graph, "node", ()):
             referenced_names.update(str(input_name) for input_name in getattr(graph_node, "input", ()) if input_name)
             produced_names.update(str(output_name) for output_name in getattr(graph_node, "output", ()) if output_name)
+            function = functions.get(
+                (
+                    str(getattr(graph_node, "domain", "")),
+                    str(graph_node.op_type),
+                    str(getattr(graph_node, "overload", "")),
+                )
+            )
+            if function is not None:
+                function_attributes = bound_function_attributes(
+                    function,
+                    graph_node,
+                    lambda attribute: (
+                        (attribute_bindings or {}).get(str(attribute.ref_attr_name))
+                        if getattr(attribute, "ref_attr_name", "")
+                        else attribute
+                    ),
+                )
+                referenced_names.update(graph_external_reference_names(function, function_attributes, depth=depth + 1))
             for attribute in getattr(graph_node, "attribute", ()):
                 reference_name = str(getattr(attribute, "ref_attr_name", ""))
                 resolved_attribute = (attribute_bindings or {}).get(reference_name) if reference_name else attribute
@@ -7858,6 +7925,10 @@ def _build_onnx_weight_analysis_plan(
                             dict[int, tuple[Any, tuple[tuple[Any, frozenset[str] | None], ...]]],
                             dict[int, tuple[Any, frozenset[str] | None]],
                         ] = nested_reference_state,
+                        *,
+                        require_floating: bool = False,
+                        initial_data_type: int | None = None,
+                        trusted_body_shapes: Mapping[str, tuple[int, ...]] = subgraph_trusted_context_shapes,
                     ) -> tuple[bool, tuple[int, ...] | None] | None:
                         nonlocal exact_loop_replay_work_exhausted, exact_loop_replay_work_remaining
                         if not reserve_exact_loop_replay_traversal(
@@ -7952,14 +8023,83 @@ def _build_onnx_weight_analysis_plan(
                         output_dependency_names = frozenset(combined_dependency_names)
                         output_dependency_node_ids = graph_nodes_producing_names(subgraph, output_dependency_names)
                         tainted_shapes: dict[str, tuple[int, ...] | None] = {graph_input_name: initial_shape}
+                        tainted_data_types: dict[str, int | None] = {graph_input_name: initial_data_type}
+
+                        def output_data_type(
+                            replay_node: Any,
+                            output_index: int,
+                            data_types: Mapping[str, int | None],
+                            replay_constants: Mapping[str, Any],
+                            attribute_resolver: Callable[[Any], Any | None],
+                            standard_operator: bool,
+                        ) -> int | None:
+                            if not standard_operator:
+                                return None
+                            if replay_node.op_type == "Cast":
+                                return cast_output_data_type(replay_node, attribute_resolver)
+                            if replay_node.op_type in {"Shape", "Size"} or (
+                                replay_node.op_type == "MaxPool" and output_index == 1
+                            ):
+                                return onnx.TensorProto.INT64
+                            if len(getattr(replay_node, "output", ())) > 1:
+                                return None
+                            if replay_node.op_type not in (
+                                _SAME_TYPE_ELEMENTWISE_OPERATORS
+                                | _SAME_TYPE_UNARY_ELEMENTWISE_OPERATORS
+                                | {
+                                    "Concat",
+                                    "Expand",
+                                    "Flatten",
+                                    "Gather",
+                                    "GatherElements",
+                                    "GatherND",
+                                    "Identity",
+                                    "MatMul",
+                                    "Reshape",
+                                    "Slice",
+                                    "Squeeze",
+                                    "Tile",
+                                    "Transpose",
+                                    "Unsqueeze",
+                                }
+                            ):
+                                return None
+                            inputs = node_input_slots(replay_node)
+                            if not inputs:
+                                return None
+                            if replay_node.op_type == "Where":
+                                data_inputs = inputs[1:3]
+                            elif replay_node.op_type in _SAME_TYPE_ELEMENTWISE_OPERATORS | {"Concat", "MatMul"}:
+                                data_inputs = inputs
+                            else:
+                                data_inputs = inputs[:1]
+                            known_types: set[int] = set()
+                            for input_name in data_inputs:
+                                if input_name in data_types:
+                                    data_type = data_types[input_name]
+                                else:
+                                    constant = replay_constants.get(input_name)
+                                    data_type = int(constant.data_type) if constant is not None else None
+                                if data_type is not None:
+                                    known_types.add(data_type)
+                            return next(iter(known_types)) if len(known_types) == 1 else None
+
                         context_shapes = related_input_shapes or {}
+                        external_shape_names = graph_external_reference_names(subgraph, attribute_bindings)
+                        if dependency_names_exceeded_limit(external_shape_names):
+                            return None
 
                         def known_input_shape(input_name: str) -> tuple[int, ...] | None:
                             if input_name in tainted_shapes:
                                 return tainted_shapes[input_name]
                             if input_name in context_shapes:
                                 return context_shapes[input_name]
-                            return constant_initializer_shape(subgraph_constants, input_name)
+                            constant_shape = constant_initializer_shape(subgraph_constants, input_name)
+                            if constant_shape is not None:
+                                return constant_shape
+                            if input_name in external_shape_names:
+                                return trusted_body_shapes.get(input_name)
+                            return None
 
                         def transformed_output_shape(
                             body_node: Any,
@@ -8074,6 +8214,8 @@ def _build_onnx_weight_analysis_plan(
                             function_constants: dict[str, Any],
                             function_context_shapes: dict[str, tuple[int, ...]],
                             output_shapes_out: dict[str, tuple[int, ...]] | None = None,
+                            input_data_type: int | None = None,
+                            output_data_types_out: dict[str, int | None] | None = None,
                         ) -> bool | None:
                             nonlocal exact_loop_replay_work_exhausted, exact_loop_replay_work_remaining
                             if not reserve_exact_loop_replay_traversal(
@@ -8125,6 +8267,11 @@ def _build_onnx_weight_analysis_plan(
                             local_tainted_shapes: dict[str, tuple[int, ...] | None] = {
                                 function_input_name: function_input_shape
                             }
+                            local_data_types: dict[str, int | None] = {function_input_name: input_data_type}
+
+                            def function_attribute(attribute: Any) -> Any | None:
+                                reference = str(getattr(attribute, "ref_attr_name", ""))
+                                return function_attributes.get(reference) if reference else attribute
 
                             def local_known_input_shape(input_name: str) -> tuple[int, ...] | None:
                                 if input_name in local_tainted_shapes:
@@ -8246,6 +8393,7 @@ def _build_onnx_weight_analysis_plan(
                                         for output_name in function_outputs:
                                             function_constants[output_name] = constant_tensor
                                             local_tainted_shapes.pop(output_name, None)
+                                            local_data_types.pop(output_name, None)
                                         continue
                                 nested_function = functions.get(function_key)
                                 if nested_function is not None or any(
@@ -8305,6 +8453,11 @@ def _build_onnx_weight_analysis_plan(
                                     ):
                                         continue
                                     has_tainted_weight_input = True
+                                    if require_floating and (
+                                        local_data_types.get(input_name) is not None
+                                        and local_data_types[input_name] not in floating_types
+                                    ):
+                                        continue
                                     input_shape = local_tainted_shapes[input_name]
                                     if input_shape is None:
                                         return None
@@ -8317,7 +8470,17 @@ def _build_onnx_weight_analysis_plan(
                                     if function_standard_domain
                                     else None
                                 )
-                                for output_name in function_outputs:
+                                for output_index, output_name in enumerate(getattr(function_node, "output", ())):
+                                    if not output_name:
+                                        continue
+                                    local_data_types[output_name] = output_data_type(
+                                        function_node,
+                                        output_index,
+                                        local_data_types,
+                                        function_constants,
+                                        function_attribute,
+                                        function_standard_domain and is_registered_standard_operator,
+                                    )
                                     local_tainted_shapes[output_name] = output_shape
                             if output_shapes_out is not None:
                                 for function_output in getattr(function_graph, "output", ()):
@@ -8331,6 +8494,14 @@ def _build_onnx_weight_analysis_plan(
                                     ):
                                         return None
                                     output_shapes_out[output_name] = known_output_shape
+                                    if output_data_types_out is not None:
+                                        data_type = local_data_types.get(output_name)
+                                        if (
+                                            output_name in output_data_types_out
+                                            and output_data_types_out[output_name] != data_type
+                                        ):
+                                            data_type = None
+                                        output_data_types_out[output_name] = data_type
                             return False
 
                         for body_node in getattr(subgraph, "node", ()):
@@ -8372,6 +8543,20 @@ def _build_onnx_weight_analysis_plan(
                                 and not is_model_local_function
                                 and getattr(body_node, "domain", "") in _STANDARD_NEURAL_NETWORK_DOMAINS
                             )
+                            if (
+                                standard_operator
+                                and body_node.op_type == "Loop"
+                                and loop_body_is_proven_skipped(body_node, subgraph_constants, set())
+                            ):
+                                state_inputs = node_input_slots(body_node)[2:]
+                                for output_index, output_name in enumerate(getattr(body_node, "output", ())):
+                                    if not output_name or output_index >= len(state_inputs):
+                                        continue
+                                    input_name = state_inputs[output_index]
+                                    if input_name in tainted_shapes:
+                                        tainted_shapes[output_name] = tainted_shapes[input_name]
+                                        tainted_data_types[output_name] = tainted_data_types.get(input_name)
+                                continue
                             nested_attribute_references = nested_attribute_graph_references(
                                 body_node,
                                 attribute_reference_cache,
@@ -8458,6 +8643,7 @@ def _build_onnx_weight_analysis_plan(
                                                 {},
                                                 nested_constants,
                                                 captured_shapes,
+                                                input_data_type=tainted_data_types.get(captured_name),
                                             )
                                         )
                                         if nested_consumes_weight_rank is None:
@@ -8486,6 +8672,7 @@ def _build_onnx_weight_analysis_plan(
                                     if function_input_name and input_shape is not None:
                                         function_context_shapes[function_input_name] = input_shape
                                 function_output_shapes: dict[str, tuple[int, ...]] = {}
+                                function_output_data_types: dict[str, int | None] = {}
                                 for input_index, input_name in enumerate(function_actuals):
                                     if input_name not in tainted_shapes or input_index >= len(
                                         getattr(function, "input", ())
@@ -8515,6 +8702,8 @@ def _build_onnx_weight_analysis_plan(
                                         function_constants,
                                         function_context_shapes,
                                         function_output_shapes if node_is_live_for_output else None,
+                                        tainted_data_types.get(input_name),
+                                        function_output_data_types if node_is_live_for_output else None,
                                     )
                                     if function_consumes_weight_rank is None:
                                         return None
@@ -8531,9 +8720,121 @@ def _build_onnx_weight_analysis_plan(
                                         if known_output_shape is None:
                                             return None
                                         tainted_shapes[output_name] = known_output_shape
+                                        tainted_data_types[output_name] = function_output_data_types.get(
+                                            function_output_name
+                                        )
                                 continue
                             if nested_attribute_references:
-                                return None
+                                if (
+                                    not standard_operator
+                                    or body_node.op_type != "Loop"
+                                    or len(nested_attribute_references) != 1
+                                ):
+                                    return None
+                                nested_graph, nested_external_names = nested_attribute_references[0]
+                                if nested_external_names is None:
+                                    return None
+                                nested_seeds = set(
+                                    bound_control_flow_graph_inputs(
+                                        body_node, nested_graph, set(tainted_inputs), opset_versions
+                                    )
+                                )
+                                nested_outputs, recurrent_names = control_flow_tainted_outputs(
+                                    body_node,
+                                    nested_graph,
+                                    nested_seeds,
+                                    opset_versions,
+                                    subgraph_constants,
+                                    attribute_bindings,
+                                    depth=1,
+                                )
+                                if graph_taint_work_is_exhausted():
+                                    return None
+                                for input_name in recurrent_names:
+                                    if subgraph_state_input_can_reach_weight_consumer(
+                                        nested_graph,
+                                        input_name,
+                                        opset_versions,
+                                        attribute_bindings=attribute_bindings,
+                                        inherited_constants=subgraph_constants,
+                                    ):
+                                        return None
+                                input_slots = node_input_slots(body_node)
+                                state_count = max(len(input_slots) - 2, 0)
+                                nested_state_outputs = {
+                                    _onnx_value_name(value): index - 1
+                                    for index, value in enumerate(getattr(nested_graph, "input", ()))
+                                    if 2 <= index < state_count + 2
+                                }
+                                live_names = output_dependency_names | potential_weight_dependency_names
+                                relevant_outputs = {
+                                    index
+                                    for index in nested_outputs
+                                    if 0 < index <= len(body_node.output)
+                                    and str(body_node.output[index - 1]) in live_names
+                                }
+                                if any(index > state_count for index in relevant_outputs):
+                                    return None
+                                used_outputs = set(relevant_outputs)
+                                pending_outputs = list(relevant_outputs)
+                                while pending_outputs:
+                                    dependencies = graph_output_dependency_names(
+                                        nested_graph, (pending_outputs.pop(),), attribute_bindings=attribute_bindings
+                                    )
+                                    work = max(len(dependencies), 1)
+                                    if (
+                                        dependency_names_exceeded_limit(dependencies)
+                                        or work > exact_loop_replay_work_remaining
+                                    ):
+                                        exact_loop_replay_work_exhausted = True
+                                        return None
+                                    exact_loop_replay_work_remaining -= work
+                                    for dependency in dependencies:
+                                        sibling_output = nested_state_outputs.get(dependency)
+                                        if sibling_output is not None and sibling_output not in relevant_outputs:
+                                            relevant_outputs.add(sibling_output)
+                                            pending_outputs.append(sibling_output)
+                                nested_shapes: dict[str, tuple[int, ...]] = {}
+                                for input_name, output_index in nested_state_outputs.items():
+                                    if output_index not in relevant_outputs:
+                                        continue
+                                    shape = known_input_shape(input_slots[output_index + 1])
+                                    if shape is None:
+                                        return None
+                                    nested_shapes[input_name] = shape
+                                nested_context = {
+                                    name: shape
+                                    for name in nested_external_names
+                                    if (shape := known_input_shape(name)) is not None
+                                }
+                                for input_name, shape in nested_shapes.items():
+                                    if not reserve_exact_loop_replay_traversal(
+                                        nested_graph, len(subgraph_constants), len(nested_shapes) + len(nested_context)
+                                    ):
+                                        return None
+                                    output_shapes: dict[int, tuple[int, ...]] = {}
+                                    output_index = nested_state_outputs[input_name]
+                                    promoted = subgraph_reenters_state_with_rank_promotion(
+                                        nested_graph,
+                                        input_name,
+                                        output_index,
+                                        subgraph_constants,
+                                        opset_versions,
+                                        shape,
+                                        attribute_bindings=attribute_bindings,
+                                        trusted_context_shapes=nested_context,
+                                        related_graph_input_shapes=dict(nested_shapes),
+                                        output_shapes_out=output_shapes,
+                                        depth=1,
+                                    )
+                                    if promoted or output_shapes.get(output_index) != shape:
+                                        return None
+                                for output_index in used_outputs:
+                                    output_name = str(body_node.output[output_index - 1])
+                                    input_name = _onnx_value_name(nested_graph.input[output_index + 1])
+                                    tainted_shapes[output_name] = nested_shapes[input_name]
+                                    tainted_data_types[output_name] = None
+                                continue
                             for input_index, input_name in enumerate(body_inputs):
                                 if input_name not in tainted_shapes:
                                     continue
@@ -8544,6 +8845,11 @@ def _build_onnx_weight_analysis_plan(
                                     is_registered_standard_operator=is_registered_standard_operator,
                                 ):
                                     continue
+                                if require_floating and (
+                                    tainted_data_types.get(input_name) is not None
+                                    and tainted_data_types[input_name] not in floating_types
+                                ):
+                                    continue
                                 tainted_input_shape = tainted_shapes[input_name]
                                 if tainted_input_shape is None:
                                     return None
@@ -8552,7 +8858,17 @@ def _build_onnx_weight_analysis_plan(
                             output_shape = (
                                 transformed_output_shape(body_node, body_inputs) if standard_operator else None
                             )
-                            for output_name in body_outputs:
+                            for output_index, output_name in enumerate(getattr(body_node, "output", ())):
+                                if not output_name:
+                                    continue
+                                tainted_data_types[output_name] = output_data_type(
+                                    body_node,
+                                    output_index,
+                                    tainted_data_types,
+                                    subgraph_constants,
+                                    resolve_attribute,
+                                    standard_operator,
+                                )
                                 tainted_shapes[output_name] = output_shape
                         return False, tainted_shapes.get(graph_output_name) if graph_output_name else None
 
@@ -8569,6 +8885,9 @@ def _build_onnx_weight_analysis_plan(
                         current_node: Any = node,
                         current_input_pairs: Iterable[tuple[Any, Any]] = input_pairs,
                         current_input_pair_index_start: int = input_pair_index_start,
+                        *,
+                        require_floating: bool = False,
+                        initial_data_type: int | None = None,
                     ) -> tuple[bool, bool, tuple[int, ...]] | None:
                         current_shape = initial_shape
                         current_rank = len(current_shape) if current_shape is not None else initial_rank
@@ -8599,6 +8918,8 @@ def _build_onnx_weight_analysis_plan(
                                 current_shape,
                                 graph_output_index,
                                 current_related_shapes,
+                                require_floating=require_floating,
+                                initial_data_type=initial_data_type,
                             )
                             if body_analysis is None:
                                 return None
@@ -11288,6 +11609,7 @@ def _build_onnx_weight_analysis_plan(
                                 subgraph_output_ranks[output_index] = finite_loop_output_rank
                                 subgraph_output_rank_seen[output_index] = True
                                 subgraph_output_rank_unknown[output_index] = False
+                    recorded_future_body_gap = False
                     if (
                         repeated_carried_state_input_may_feed_weight
                         and graph_output_weight_lineage_gap_counts[graph_output_index]
@@ -11300,6 +11622,7 @@ def _build_onnx_weight_analysis_plan(
                             "lineages_per_value_limit",
                             graph_output_weight_lineage_gap_counts[graph_output_index],
                         )
+                        recorded_future_body_gap = True
                     if stacked_scan_output and graph_output_weight_lineage_gap_counts[graph_output_index]:
                         graph_output_weight_gap_summary = rank_gap_weight_summary_after_rank_increase(
                             graph_output_weight_gap_summary,
@@ -11402,6 +11725,7 @@ def _build_onnx_weight_analysis_plan(
                                     "lineages_per_value_limit",
                                     graph_output_rank_promotable_gap_count,
                                 )
+                                recorded_future_body_gap = True
                             subgraph_output_weight_lineage_gap_counts[output_index] = (
                                 _bounded_onnx_weight_lineage_gap_count(
                                     subgraph_output_weight_lineage_gap_counts[output_index],
@@ -11415,6 +11739,101 @@ def _build_onnx_weight_analysis_plan(
                                 )
                             )
                             rank_promotable_gap_promoted = True
+                    if (
+                        standard_control_flow_operator
+                        and node.op_type == "Loop"
+                        and node_loop_may_repeat
+                        and not stacked_scan_output
+                        and repeated_carried_state_input_may_feed_weight
+                        and graph_output_non_shape_lineage_gap_counts[graph_output_index]
+                        and not recorded_future_body_gap
+                    ):
+                        # A later body can reshape or cast a deferred state into a
+                        # weight even when the returned state stays rank-one or integer.
+                        future_state_summary = known_weight_gap_summary(
+                            graph_output_non_shape_lineage_gap_summaries[graph_output_index],
+                            graph_output_non_shape_lineage_gap_counts[graph_output_index],
+                        )
+                        future_iterations = loop_exact_iteration_count(
+                            max_count=_ONNX_REENTRY_ANALYSIS_MAX_GRAPH_WORK,
+                        )
+                        incoming_summary = subgraph_bound_non_shape_lineage_gap_summaries.get(subgraph_state_input_name)
+                        invariant_shape = subgraph_trusted_context_shapes.get(subgraph_state_input_name)
+                        already_analyzed_gap = (
+                            len(getattr(node, "input", ())) <= 3
+                            and invariant_shape is not None
+                            and len(invariant_shape) == 1
+                            and all(dimension >= 0 for dimension in invariant_shape)
+                            and graph_output_rank_proven
+                            and graph_output_shape == invariant_shape
+                            and subgraph_bound_non_shape_lineage_gaps.get(subgraph_state_input_name, 0) > 0
+                            and incoming_summary is not None
+                            and not incoming_summary.truncated
+                            and bool(incoming_summary.lineages)
+                            and incoming_summary == future_state_summary
+                            and all(
+                                lineage.shape == invariant_shape and lineage.data_type in floating_types
+                                for lineage in incoming_summary.lineages
+                            )
+                        )
+                        # The normal body walk already analyzed this exact invariant
+                        # summary; branch multiplicity does not create a new context.
+                        future_body_may_consume_gap = (
+                            not already_analyzed_gap
+                            and repeated_state_output_may_reach_future_weight(
+                                subgraph, subgraph_state_input_name, include_current_iteration=True
+                            )
+                        )
+                        future_related_shapes = dict(related_repeated_state_shapes)
+                        if len(future_related_shapes) > 1:
+                            update_dependencies = repeated_state_update_dependency_names_bounded(
+                                subgraph, graph_output_index
+                            )
+                            consumer_dependencies = state_weight_consumer_dependency_names_bounded(
+                                subgraph, subgraph_state_input_name
+                            )
+                            if update_dependencies is not None and consumer_dependencies is not None:
+                                future_related_shapes = {
+                                    name: shape
+                                    for name, shape in future_related_shapes.items()
+                                    if name == subgraph_state_input_name
+                                    or name in update_dependencies
+                                    or name in consumer_dependencies
+                                }
+                        if (
+                            future_body_may_consume_gap
+                            and future_iterations is not None
+                            and future_iterations > 1
+                            and not future_state_summary.truncated
+                            and future_state_summary.lineages
+                            and len(future_related_shapes) <= 1
+                        ):
+                            future_body_may_consume_gap = False
+                            for deferred_lineage in future_state_summary.lineages:
+                                if deferred_lineage.shape is None:
+                                    future_body_may_consume_gap = True
+                                    break
+                                future_bounds = exact_loop_repeated_state_weight_rank_bounds(
+                                    subgraph,
+                                    subgraph_state_input_name,
+                                    graph_output_index,
+                                    deferred_lineage.shape,
+                                    len(deferred_lineage.shape),
+                                    future_iterations - 1,
+                                    subgraph_trusted_context_shapes,
+                                    future_related_shapes,
+                                    len(getattr(node, "input", ())),
+                                    require_floating=True,
+                                    initial_data_type=deferred_lineage.data_type,
+                                )
+                                if future_bounds is None or future_bounds[0]:
+                                    future_body_may_consume_gap = True
+                                    break
+                        if future_body_may_consume_gap:
+                            plan.record_coverage_gap(
+                                "lineages_per_value_limit",
+                                graph_output_non_shape_lineage_gap_counts[graph_output_index],
+                            )
                     if (
                         standard_control_flow_operator
                         and node.op_type == "Scan"
@@ -11773,6 +12192,21 @@ def _build_onnx_weight_analysis_plan(
                     and inferred_output_rank is None
                 )
                 per_output_lineages = dict(output_lineages)
+                if is_builtin_neural_operator and node.op_type == "MaxPool" and output_index == 1:
+                    per_output_lineages = {
+                        initializer_index: (
+                            _OnnxWeightLineage(
+                                initializer_index=lineage.initializer_index,
+                                shape=lineage.shape,
+                                data_type=onnx.TensorProto.INT64,
+                                transforms=lineage.transforms,
+                                unresolved_reason="shape_dimensions_lineage",
+                            )
+                            if lineage.unresolved_reason == "shape_control_lineage"
+                            else lineage
+                        )
+                        for initializer_index, lineage in per_output_lineages.items()
+                    }
                 if (
                     recurrent_state_lineages
                     and is_builtin_neural_operator

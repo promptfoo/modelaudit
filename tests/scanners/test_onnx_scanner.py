@@ -34855,3 +34855,418 @@ class TestOnnxUnusedFunctionGraphs:
         result = OnnxScanner().scan(str(_save_onnx_model(model, tmp_path / "unused-graph.onnx")))
         assert result.success is True
         assert not any(check.name == "Weight Distribution Analysis Coverage" for check in result.checks)
+
+
+class TestOnnxDeferredNumericCoverage:
+    _value = staticmethod(TestOnnxRecurrenceReviewRegressions._value)
+    _tensor = staticmethod(TestOnnxShapeContinuity._t)
+    _model = staticmethod(TestOnnxBuiltinOperatorIdentity._model)
+
+    @staticmethod
+    def _assert_contract(model: Any, tmp_path: Path, incomplete: bool) -> None:
+        onnx.checker.check_model(model, full_check=True)
+        path = _save_onnx_model(model, tmp_path / "deferred.onnx")
+        result = OnnxScanner().scan(str(path))
+        assert result.success is not incomplete
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        assert bool(coverage) is incomplete
+        assert all(check.status == CheckStatus.FAILED for check in coverage)
+        assert bool(result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"]) is incomplete
+        assert WeightDistributionScanner().scan(str(path)).success is not incomplete
+        if incomplete:
+            TestWeightDistributionCoverage()._assert_uncached_inconclusive_exit2(path, tmp_path / "cache")
+        else:
+            reset_cache_manager()
+            try:
+                for _ in range(2):
+                    aggregate = scan_model_directory_or_file(
+                        str(path), cache_enabled=True, cache_dir=str(tmp_path / "cache"), min_cache_file_size=0
+                    )
+                    assert aggregate.success is True
+                    assert determine_exit_code(aggregate) == 0
+                assert get_cache_manager(str(tmp_path / "cache"), enabled=True).get_stats()["cache_hits"] > 0
+            finally:
+                reset_cache_manager()
+
+    @pytest.mark.parametrize("mode", ["indices", "data", "shape", "rank_one"])
+    def test_maxpool_numeric_indices_are_distinct_from_pooled_data(self, tmp_path: Path, mode: str) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        value, tensor = self._value, self._tensor
+        nodes = [
+            helper.make_node("Expand", ["runtime", "extent"], ["expanded"]),
+            helper.make_node("MaxPool", ["expanded"], ["pooled", "indices"], kernel_shape=[1, 1]),
+        ]
+        inputs = [value("runtime", [1])]
+        tensors = [tensor("extent", np.array([1, 1, 2, 2], np.int64))]
+        feeds = {"runtime": np.array([3], np.float32)}
+        if mode == "shape":
+            nodes.extend(
+                [
+                    helper.make_node("Shape", ["indices"], ["dimensions"]),
+                    helper.make_node("Reshape", ["expanded", "dimensions"], ["Y"]),
+                ]
+            )
+            expected = np.full((1, 1, 2, 2), 3, np.float32)
+        else:
+            shape = [4] if mode == "rank_one" else [2, 2]
+            if mode == "data":
+                source = "pooled"
+                weights = np.full(shape, 3, np.float32)
+            else:
+                nodes.append(helper.make_node("Cast", ["indices"], ["cast_indices"], to=TensorProto.FLOAT))
+                source = "cast_indices"
+                weights = np.arange(4, dtype=np.float32).reshape(shape)
+            tensors.append(tensor("target", np.asarray(shape, np.int64)))
+            feeds["X"] = np.ones((1, 4) if mode == "rank_one" else (1, 2), np.float32)
+            inputs.append(value("X", list(feeds["X"].shape)))
+            nodes.extend(
+                [
+                    helper.make_node("Reshape", [source, "target"], ["weight"]),
+                    helper.make_node("MatMul", ["X", "weight"], ["Y"]),
+                ]
+            )
+            expected = feeds["X"] @ weights
+        model = self._model(nodes, inputs, [value("Y", list(expected.shape))], tensors, [])
+        actual: Any = ReferenceEvaluator(model).run(None, feeds)
+        np.testing.assert_array_equal(actual[0], expected)
+        self._assert_contract(model, tmp_path, mode == "indices")
+
+    @pytest.mark.parametrize(
+        "mode", ["capture", "formal", "unchanged", "unused", "absent", "nested_default", "nested_no_input", "nested_if"]
+    )
+    @pytest.mark.parametrize("iterations", [1, 2])
+    def test_function_taint_follows_executed_graph_captures(self, tmp_path: Path, mode: str, iterations: int) -> None:
+        from onnx.inliner import inline_local_functions
+        from onnx.reference import ReferenceEvaluator
+
+        value, tensor = self._value, self._tensor
+        nested = mode.startswith("nested_")
+        captured = mode in {"capture", "formal", "unchanged"} or nested
+        first = np.zeros((64, 64), np.float32)
+        replacement = first.copy()
+        replacement[0, :5] = 100
+        branch = helper.make_graph(
+            [helper.make_node("Identity", ["state"], ["captured"])],
+            "capture",
+            [],
+            [value("captured", [64, 64])],
+            value_info=[value("state", [64, 64])],
+        )
+        formal = "state" if mode == "formal" else "A"
+        function_nodes = [helper.make_node("Identity", [formal], ["passthrough"])]
+        if captured:
+            choose = helper.make_node("If", ["flag"], ["selected"])
+            for name in ("then_branch", "else_branch"):
+                choose.attribute.append(
+                    onnx.AttributeProto(name=name, ref_attr_name="branch", type=onnx.AttributeProto.GRAPH)
+                )
+            function_nodes.extend(
+                [helper.make_node("Constant", [], ["flag"], value=tensor("", np.bool_(True))), choose]
+            )
+        functions = []
+        if nested:
+            functions.append(
+                helper.make_function(
+                    "local",
+                    "Inner",
+                    [],
+                    ["selected"],
+                    function_nodes[1:],
+                    [helper.make_opsetid("", 18)],
+                    attribute_protos=[helper.make_attribute("branch", branch)],
+                )
+            )
+            function_nodes[1:] = [helper.make_node("Inner", [], ["selected"], domain="local")]
+            if mode == "nested_if":
+                inner_branch = helper.make_graph(
+                    [helper.make_node("Inner", [], ["inner_selected"], domain="local")],
+                    "inner_branch",
+                    [],
+                    [value("inner_selected", [64, 64])],
+                )
+                function_nodes[1:] = [
+                    helper.make_node("Constant", [], ["outer_flag"], value=tensor("", np.bool_(True))),
+                    helper.make_node(
+                        "If", ["outer_flag"], ["selected"], then_branch=inner_branch, else_branch=inner_branch
+                    ),
+                ]
+        function = helper.make_function(
+            "local",
+            "F",
+            [formal],
+            ["passthrough", "selected"] if captured else ["passthrough"],
+            function_nodes,
+            [helper.make_opsetid("", 18)],
+            attributes=["branch"] if mode != "absent" and not nested else [],
+        )
+        if nested:
+            function.opset_import.append(helper.make_opsetid("local", 1))
+        call = helper.make_node(
+            "F",
+            ["state" if captured and mode != "nested_no_input" else "W"],
+            ["unused", "slice"] if captured else ["slice"],
+            domain="local",
+        )
+        if mode != "absent" and not nested:
+            call.attribute.append(helper.make_attribute("branch", branch))
+        body = helper.make_graph(
+            [call, helper.make_node("Identity", ["state" if mode == "unchanged" else "R"], ["next"])],
+            "body",
+            [value("i", [], TensorProto.INT64), value("c", [], TensorProto.BOOL), value("state", [64, 64])],
+            [value("c", [], TensorProto.BOOL), value("next", [64, 64]), value("slice", [64, 64])],
+        )
+        model = self._model(
+            [
+                helper.make_node("Loop", ["M", "C", "W"], ["final", "stack"], body=body),
+                helper.make_node("Transpose", ["stack"], ["weight"], perm=[0, 2, 1])
+                if captured
+                else helper.make_node("Identity", ["stack"], ["weight"]),
+                helper.make_node("MatMul", ["X", "weight"], ["Y"]),
+            ],
+            [value("X", [1, 64])],
+            [value("Y", [iterations, 1, 64])],
+            [
+                tensor("W", first),
+                tensor("R", replacement),
+                tensor("M", np.int64(iterations)),
+                tensor("C", np.bool_(True)),
+            ],
+            [function, *functions],
+        )
+        onnx.checker.check_model(model, full_check=True)
+        oracle = onnx.ModelProto()
+        oracle.CopyFrom(model)
+        if nested:
+            # Materialize the declared default only for the inliner's runtime oracle.
+            def materialize_default(graph: Any) -> None:
+                for node in graph.node:
+                    if node.domain == "local" and node.op_type == "Inner":
+                        node.attribute.append(oracle.functions[1].attribute_proto[0])
+                    for attribute in node.attribute:
+                        if attribute.type == onnx.AttributeProto.GRAPH and not attribute.ref_attr_name:
+                            materialize_default(attribute.g)
+
+            for oracle_function in oracle.functions:
+                materialize_default(oracle_function)
+        inlined = inline_local_functions(oracle)
+        onnx.checker.check_model(inlined, full_check=True)
+        runtime_body = next(attribute.g for attribute in inlined.graph.node[0].attribute if attribute.name == "body")
+        state = first.copy()
+        slices = []
+        for iteration in range(iterations):
+            actual: Any = ReferenceEvaluator(runtime_body, opsets={"": 18}).run(
+                None, {"i": np.int64(iteration), "c": np.bool_(True), "state": state, "R": replacement, "W": first}
+            )
+            state = actual[1]
+            slices.append(actual[2])
+        expected_slices = [first] + [replacement if captured and mode != "unchanged" else first] * (iterations - 1)
+        np.testing.assert_array_equal(np.stack(slices), np.stack(expected_slices))
+        incomplete = captured and mode != "unchanged" and iterations > 1
+        if incomplete:
+            actual_weight = np.stack(slices).transpose(0, 2, 1)
+            direct = self._model(
+                [helper.make_node("MatMul", ["X", "actual"], ["Y"])],
+                [value("X", [1, 64])],
+                [value("Y", [iterations, 1, 64])],
+                [tensor("actual", actual_weight)],
+                [],
+            )
+            direct_result = OnnxScanner().scan(str(_save_onnx_model(direct, tmp_path / "actual.onnx")))
+            assert direct_result.metadata.get("anomalies_found")
+        self._assert_contract(model, tmp_path, incomplete)
+
+    @pytest.mark.parametrize(
+        "mode",
+        [
+            "vector",
+            "vector_untransformed",
+            "integer",
+            "integer_untransformed",
+            "integer_roundtrip",
+            "function_cast",
+            "function_integer",
+            "integer_where",
+            "integer_add_left",
+            "integer_add_right",
+        ],
+    )
+    @pytest.mark.parametrize("count", [32, 33])
+    @pytest.mark.parametrize("iterations", [1, 2])
+    def test_generated_state_gaps_follow_future_body_weight_conversions(
+        self, tmp_path: Path, mode: str, count: int, iterations: int
+    ) -> None:
+        from copy import deepcopy
+
+        from onnx.inliner import inline_local_functions
+        from onnx.reference import ReferenceEvaluator
+
+        value, tensor = self._value, self._tensor
+        integer = not mode.startswith("vector")
+        dtype = np.int64 if integer else np.float32
+        tensor_type = TensorProto.INT64 if integer else TensorProto.FLOAT
+        shape = [4, 4] if integer else [16]
+        names = [f"W{index}" for index in range(count)]
+        arrays: dict[str, Any] = {name: np.full(shape, index + 1, dtype=dtype) for index, name in enumerate(names)}
+        arrays.update(
+            {
+                "M": np.int64(iterations),
+                "C": np.bool_(True),
+                "target": np.array([4, 4], np.int64),
+                "dummy": np.float32(0),
+            }
+        )
+        functions = []
+        nodes = []
+        if mode == "vector":
+            nodes.append(helper.make_node("Reshape", ["state", "target"], ["weight"]))
+        elif mode in {"function_cast", "function_integer"}:
+            cast = helper.make_node("Cast", ["A"], ["B"])
+            cast.attribute.append(onnx.AttributeProto(name="to", ref_attr_name="target", type=onnx.AttributeProto.INT))
+            functions.append(
+                helper.make_function(
+                    "local", "Convert", ["A"], ["B"], [cast], [helper.make_opsetid("", 18)], attributes=["target"]
+                )
+            )
+            nodes.append(
+                helper.make_node(
+                    "Convert",
+                    ["state"],
+                    ["weight"],
+                    domain="local",
+                    target=TensorProto.INT64 if mode == "function_integer" else TensorProto.FLOAT,
+                )
+            )
+        elif mode in {"integer_add_left", "integer_add_right"}:
+            nodes.append(helper.make_node("Identity", ["state"], ["weight0"]))
+            nodes.append(
+                helper.make_node(
+                    "Add", ["D", "weight0"] if mode == "integer_add_left" else ["weight0", "D"], ["weight"]
+                )
+            )
+        elif mode in {"integer", "integer_roundtrip", "integer_where"}:
+            nodes.append(helper.make_node("Cast", ["state"], ["floating"], to=TensorProto.FLOAT))
+            nodes.append(
+                helper.make_node("Cast", ["floating"], ["weight"], to=TensorProto.INT64)
+                if mode == "integer_roundtrip"
+                else helper.make_node("Where", ["C", "floating", "floating"], ["weight"])
+                if mode == "integer_where"
+                else helper.make_node("Identity", ["floating"], ["weight"])
+            )
+        else:
+            nodes.append(helper.make_node("Identity", ["state"], ["weight"]))
+        floating_weight = mode not in {
+            "integer_untransformed",
+            "integer_roundtrip",
+            "function_integer",
+            "integer_add_left",
+            "integer_add_right",
+        }
+        xshape = [1, 16] if mode == "vector_untransformed" else [1, 4]
+        xtype = TensorProto.FLOAT if floating_weight else TensorProto.INT64
+        nodes.append(helper.make_node("MatMul", ["X", "weight"], ["body_y"]))
+        if integer:
+            current = names[0]
+            for index, name in enumerate(names[1:], 1):
+                output = "next_state" if index == count - 1 else f"sum{index}"
+                nodes.append(helper.make_node("Add", [current, name], [output]))
+                current = output
+        else:
+            nodes.append(helper.make_node("Sum", names, ["next_state"]))
+        body = helper.make_graph(
+            nodes,
+            "body",
+            [value("i", [], TensorProto.INT64), value("c", [], TensorProto.BOOL), value("state", shape, tensor_type)],
+            [value("c", [], TensorProto.BOOL), value("next_state", shape, tensor_type)],
+        )
+        graph_inputs = [value("initial", shape, tensor_type), value("X", xshape, xtype)]
+        if mode in {"integer_add_left", "integer_add_right"}:
+            graph_inputs.append(value("D", shape, TensorProto.INT64))
+        model = self._model(
+            [
+                helper.make_node("Loop", ["M", "C", "initial"], ["final"], body=body),
+                helper.make_node("Identity", ["dummy"], ["Y"]),
+            ],
+            graph_inputs,
+            [value("Y", [])],
+            [tensor(name, array) for name, array in arrays.items()],
+            functions,
+        )
+        onnx.checker.check_model(model, full_check=True)
+        inlined = inline_local_functions(model)
+        onnx.checker.check_model(inlined, full_check=True)
+        runtime_body = deepcopy(
+            next(attribute.g for attribute in inlined.graph.node[0].attribute if attribute.name == "body")
+        )
+        runtime_body.output.append(value("body_y", [1] if mode == "vector_untransformed" else [1, 4], xtype))
+        state = np.zeros(shape, dtype=dtype)
+        x: Any = np.ones(xshape, dtype=np.float32 if floating_weight else np.int64)
+        for iteration in range(iterations):
+            actual: Any = ReferenceEvaluator(runtime_body, opsets={"": 18}).run(
+                None,
+                {
+                    **arrays,
+                    "i": np.int64(iteration),
+                    "c": np.bool_(True),
+                    "state": state,
+                    "X": x,
+                    "D": np.ones(shape, np.int64),
+                },
+            )
+            weights = (
+                state.reshape(4, 4) if mode == "vector" else state.astype(np.float32) if floating_weight else state
+            )
+            if mode in {"integer_add_left", "integer_add_right"}:
+                weights = weights + np.ones(shape, np.int64)
+            np.testing.assert_array_equal(actual[2], x @ weights)
+            np.testing.assert_array_equal(actual[1], sum(arrays[name] for name in names))
+            state = actual[1]
+        incomplete = count > 32 and iterations > 1 and mode in {"vector", "integer", "function_cast", "integer_where"}
+        self._assert_contract(model, tmp_path, incomplete)
+
+    def test_invariant_incoming_gap_still_reports_internal_matrix_consumer(self, tmp_path: Path) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        value, tensor = self._value, self._tensor
+        names = [f"W{index}" for index in range(33)]
+        body = helper.make_graph(
+            [
+                helper.make_node("Reshape", ["state", "target"], ["weight"]),
+                helper.make_node("MatMul", ["X", "weight"], ["body_y"]),
+            ],
+            "body",
+            [value("i", [], TensorProto.INT64), value("c", [], TensorProto.BOOL), value("state", [16])],
+            [value("c", [], TensorProto.BOOL), value("state", [16])],
+        )
+        model = self._model(
+            [
+                helper.make_node("Sum", names, ["initial"]),
+                helper.make_node("Loop", ["M", "C", "initial"], ["final"], body=body),
+            ],
+            [value("X", [1, 4])],
+            [value("final", [16])],
+            [
+                *[tensor(name, np.ones(16, np.float32)) for name in names],
+                tensor("target", np.array([4, 4], np.int64)),
+                tensor("M", np.int64(2)),
+                tensor("C", np.bool_(True)),
+            ],
+            [],
+        )
+        runtime = onnx.GraphProto()
+        runtime.CopyFrom(body)
+        runtime.output.append(value("body_y", [1, 4]))
+        state = np.full(16, 33, np.float32)
+        actual: Any = ReferenceEvaluator(runtime, opsets={"": 18}).run(
+            None,
+            {
+                "i": np.int64(1),
+                "c": np.bool_(True),
+                "state": state,
+                "target": np.array([4, 4], np.int64),
+                "X": np.ones((1, 4), np.float32),
+            },
+        )
+        np.testing.assert_array_equal(actual[1], state)
+        np.testing.assert_array_equal(actual[2], np.ones((1, 4), np.float32) @ state.reshape(4, 4))
+        self._assert_contract(model, tmp_path, True)
