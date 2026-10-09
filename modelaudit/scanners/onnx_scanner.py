@@ -3134,7 +3134,10 @@ def _build_onnx_weight_analysis_plan(
             )
             merge_dependency_names(dependencies, graph_external_reference_names(function, function_attributes))
         if not dependency_names_exceeded_limit(frozenset(dependencies)):
+            function_references = referenced_function_attributes(function) if function is not None else None
             for attribute in getattr(node, "attribute", ()):
+                if function_references is not None and str(attribute.name) not in function_references:
+                    continue
                 reference_name = str(getattr(attribute, "ref_attr_name", ""))
                 resolved_attribute = local_attribute_bindings.get(reference_name) if reference_name else attribute
                 if resolved_attribute is None:
@@ -4410,6 +4413,8 @@ def _build_onnx_weight_analysis_plan(
                 tainted.update(nested_outputs)
             elif any_tainted and not inspected_nested_taint and not inspected_function_taint:
                 tainted.update(body_outputs)
+            if any_tainted and builtin_operator(body_node, "If"):
+                tainted.update(body_outputs)
         result = {
             output_index for output_index, output in enumerate(graph_outputs) if _onnx_value_name(output) in tainted
         }
@@ -4668,6 +4673,11 @@ def _build_onnx_weight_analysis_plan(
                     depth=depth + 1,
                 ):
                     dependencies.update(input_name for input_name in body_input_slots if input_name)
+                    if merge_dependency_names(
+                        dependencies, graph_external_reference_names(function, function_attributes)
+                    ):
+                        potential_weight_consumer_dependency_cache[cache_key] = dependency_collection_limit
+                        return dependency_collection_limit
                 continue
             for input_index, input_name in enumerate(body_input_slots):
                 if input_name and _onnx_potential_weight_input(
@@ -4862,8 +4872,14 @@ def _build_onnx_weight_analysis_plan(
             graph_taint_work_remaining -= work
             output_is_live = id(body_node) in live_node_ids
             node_output_is_live_after_node[id(body_node)] = output_is_live
+            body_function = functions.get(_operator_identifier(body_node))
+            body_function_references = (
+                referenced_function_attributes(body_function) if body_function is not None else None
+            )
             if not output_is_live:
                 for attribute in getattr(body_node, "attribute", ()):
+                    if body_function_references is not None and str(attribute.name) not in body_function_references:
+                        continue
                     resolved_attribute = resolve_reentry_attribute(attribute)
                     if resolved_attribute is None:
                         continue
@@ -4883,6 +4899,8 @@ def _build_onnx_weight_analysis_plan(
             live_names.update(live_body_inputs)
             live_node_ids.update(graph_nodes_producing_names(subgraph, live_body_inputs))
             for attribute in getattr(body_node, "attribute", ()):
+                if body_function_references is not None and str(attribute.name) not in body_function_references:
+                    continue
                 resolved_attribute = resolve_reentry_attribute(attribute)
                 if resolved_attribute is None:
                     continue
@@ -4963,9 +4981,20 @@ def _build_onnx_weight_analysis_plan(
                     graph_constants[name] = constant
             body_inputs = node_input_names(body_node)
             any_tainted = any(input_name in tainted for input_name in body_inputs)
+            function_captures: frozenset[str] = frozenset()
+            if function is not None:
+                if function_attributes is None:
+                    function_attributes = bound_function_attributes(function, body_node, resolve_reentry_attribute)
+                function_captures = graph_external_reference_names(function, function_attributes)
+                if dependency_names_exceeded_limit(function_captures):
+                    return finish(True)
+            tainted_function_captures = function_captures & tainted
             has_tainted_nested_capture = False
+            function_references = referenced_function_attributes(function) if function is not None else None
             if not any_tainted:
                 for attribute in getattr(body_node, "attribute", ()):
+                    if function_references is not None and str(attribute.name) not in function_references:
+                        continue
                     resolved_attribute = resolve_reentry_attribute(attribute)
                     if resolved_attribute is None:
                         continue
@@ -4982,11 +5011,16 @@ def _build_onnx_weight_analysis_plan(
                             break
                     if has_tainted_nested_capture:
                         break
-            if not body_outputs_live_after and not any_tainted and not has_tainted_nested_capture:
+            if (
+                not body_outputs_live_after
+                and not any_tainted
+                and not has_tainted_nested_capture
+                and not tainted_function_captures
+            ):
                 continue
             function_tainted_outputs: set[str] = set()
             inspected_nested_taint = False
-            if any_tainted and function is not None:
+            if (any_tainted or tainted_function_captures) and function is not None:
                 if function_attributes is None:
                     function_attributes = bound_function_attributes(function, body_node, resolve_reentry_attribute)
                 if function_versions is None:
@@ -4998,11 +5032,17 @@ def _build_onnx_weight_analysis_plan(
                         attribute_bindings=function_attributes,
                         depth=depth + 1,
                     )
-                function_input_names: set[str] = set()
+                function_input_names = set(tainted_function_captures)
                 function_bindings = dict(zip(function.input, node_input_slots(body_node), strict=False))
 
-                def independent_function_value(name: str, bindings: Mapping[str, str] = function_bindings) -> bool:
-                    return name in bindings and independent_value(bindings[name])
+                def independent_function_value(
+                    name: str,
+                    bindings: Mapping[str, str] = function_bindings,
+                    captures: frozenset[str] = function_captures,
+                ) -> bool:
+                    if name in bindings:
+                        return independent_value(bindings[name])
+                    return name in captures and independent_value(name)
 
                 for input_index, input_name in enumerate(node_input_slots(body_node)):
                     if input_name not in tainted or input_index >= len(getattr(function, "input", ())):
@@ -5011,6 +5051,7 @@ def _build_onnx_weight_analysis_plan(
                     if not function_input_name:
                         continue
                     function_input_names.add(function_input_name)
+                for function_input_name in sorted(function_input_names):
                     if function_has_weight_consumer and subgraph_state_input_can_reach_weight_consumer(
                         function,
                         function_input_name,
@@ -5043,7 +5084,6 @@ def _build_onnx_weight_analysis_plan(
                         )
                     )
                 tainted.update(function_tainted_outputs)
-            function_references = referenced_function_attributes(function) if function is not None else None
             for attribute in getattr(body_node, "attribute", ()):
                 if function_references is not None and str(attribute.name) not in function_references:
                     continue
@@ -5242,7 +5282,10 @@ def _build_onnx_weight_analysis_plan(
                     ),
                 )
                 referenced_names.update(graph_external_reference_names(function, function_attributes, depth=depth + 1))
+            function_references = referenced_function_attributes(function) if function is not None else None
             for attribute in getattr(graph_node, "attribute", ()):
+                if function_references is not None and str(attribute.name) not in function_references:
+                    continue
                 reference_name = str(getattr(attribute, "ref_attr_name", ""))
                 resolved_attribute = (attribute_bindings or {}).get(reference_name) if reference_name else attribute
                 if resolved_attribute is not None:
@@ -8582,6 +8625,24 @@ def _build_onnx_weight_analysis_plan(
                                 input_name in tainted_shapes for input_name in body_inputs
                             )
                             node_is_live_for_output = id(body_node) in output_dependency_node_ids
+                            if function is not None:
+                                function_captures = graph_external_reference_names(function, function_attributes)
+                                if dependency_names_exceeded_limit(function_captures):
+                                    return None
+                                for captured_name in sorted(function_captures & tainted_shape_names):
+                                    if node_is_live_for_output or (
+                                        function_has_weight_consumer
+                                        and function_versions is not None
+                                        and subgraph_state_input_can_reach_weight_consumer(
+                                            function,
+                                            captured_name,
+                                            function_versions,
+                                            attribute_bindings=function_attributes,
+                                            inherited_constants=subgraph_constants,
+                                        )
+                                    ):
+                                        has_tainted_nested_capture = True
+                                        break
                             if (
                                 not node_is_live_for_output
                                 and not has_tainted_potential_weight_input

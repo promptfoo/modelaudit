@@ -35270,3 +35270,289 @@ class TestOnnxDeferredNumericCoverage:
         np.testing.assert_array_equal(actual[1], state)
         np.testing.assert_array_equal(actual[2], np.ones((1, 4), np.float32) @ state.reshape(4, 4))
         self._assert_contract(model, tmp_path, True)
+
+
+class TestOnnxFunctionCaptureReachability:
+    _value = staticmethod(TestOnnxRecurrenceReviewRegressions._value)
+    _tensor = staticmethod(TestOnnxShapeContinuity._t)
+    _model = staticmethod(TestOnnxBuiltinOperatorIdentity._model)
+    _assert_contract = staticmethod(TestOnnxDeferredNumericCoverage._assert_contract)
+
+    @pytest.mark.parametrize("node_count,mode", [(8, "unused"), (1400, "unused"), (1400, "absent"), (1400, "used")])
+    def test_unused_graph_does_not_spend_function_capture_budget(
+        self, tmp_path: Path, node_count: int, mode: str
+    ) -> None:
+        from onnx.inliner import inline_local_functions
+        from onnx.reference import ReferenceEvaluator
+
+        value, tensor = self._value, self._tensor
+        heavy = helper.make_function(
+            "local",
+            "Heavy",
+            ["A"],
+            [f"v{node_count - 1}"],
+            [
+                helper.make_node("Identity", ["A" if index == 0 else f"v{index - 1}"], [f"v{index}"])
+                for index in range(node_count)
+            ],
+            [helper.make_opsetid("", 18)],
+        )
+        argument = helper.make_graph(
+            [helper.make_node("Heavy", ["state"], ["ignored"], domain="local")],
+            "argument",
+            [],
+            [value("ignored", [64])],
+        )
+        if mode == "used":
+            choose = helper.make_node("If", ["flag"], ["Y"])
+            for name in ("then_branch", "else_branch"):
+                choose.attribute.append(
+                    onnx.AttributeProto(name=name, ref_attr_name="branch", type=onnx.AttributeProto.GRAPH)
+                )
+            function_nodes = [helper.make_node("Constant", [], ["flag"], value=tensor("", np.bool_(True))), choose]
+        else:
+            function_nodes = [helper.make_node("Identity", ["state"], ["Y"])]
+        function = helper.make_function(
+            "local",
+            "Apply",
+            ["state"],
+            ["Y"],
+            function_nodes,
+            [helper.make_opsetid("", 18), helper.make_opsetid("local", 1)],
+            attributes=[] if mode == "absent" else ["branch"],
+        )
+        call = helper.make_node("Apply", ["state"], ["next"], domain="local")
+        if mode != "absent":
+            call.attribute.append(helper.make_attribute("branch", argument))
+        body = helper.make_graph(
+            [call, helper.make_node("MatMul", ["X", "state"], ["used"])],
+            "body",
+            [value("i", [], TensorProto.INT64), value("c", [], TensorProto.BOOL), value("state", [64])],
+            [value("c", [], TensorProto.BOOL), value("next", [64]), value("used", [1])],
+        )
+        model = self._model(
+            [helper.make_node("Loop", ["M", "C", "W"], ["final", "stack"], body=body)],
+            [value("X", [1, 64])],
+            [value("final", [64]), value("stack", [2, 1])],
+            [tensor("M", np.int64(2)), tensor("C", np.bool_(True)), tensor("W", np.ones(64, np.float32))],
+            [function, heavy],
+        )
+        onnx.checker.check_model(model, full_check=True)
+        inlined = inline_local_functions(model)
+        onnx.checker.check_model(inlined, full_check=True)
+        runtime_body = next(attribute.g for attribute in inlined.graph.node[0].attribute if attribute.name == "body")
+        for iteration in range(2):
+            actual: Any = ReferenceEvaluator(runtime_body, opsets={"": 18}).run(
+                None,
+                {
+                    "i": np.int64(iteration),
+                    "c": np.bool_(True),
+                    "state": np.ones(64, np.float32),
+                    "X": np.ones((1, 64), np.float32),
+                },
+            )
+            np.testing.assert_array_equal(actual[1], np.ones(64, np.float32))
+            np.testing.assert_array_equal(actual[2], np.array([64], np.float32))
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        assert bool(plan.coverage_gaps.get("function_capture_work_limit")) is (mode == "used")
+        self._assert_contract(model, tmp_path, mode == "used")
+
+    @pytest.mark.parametrize(
+        "mode", ["default", "alias", "used", "override", "unused", "nested", "formal_shadow", "local_shadow"]
+    )
+    @pytest.mark.parametrize("count,iterations", [(32, 2), (33, 1), (33, 2)])
+    def test_repeated_body_weight_use_follows_function_captures(
+        self, tmp_path: Path, mode: str, count: int, iterations: int
+    ) -> None:
+        from copy import deepcopy
+
+        from onnx.inliner import inline_local_functions
+        from onnx.reference import ReferenceEvaluator
+
+        value, tensor = self._value, self._tensor
+        arrays: dict[str, Any] = {f"W{index}": np.full((2, 2), index + 1, np.float32) for index in range(count)}
+        arrays.update({"M": np.int64(iterations), "C": np.bool_(True)})
+        captured_name = "captured" if mode == "alias" else "state"
+        active = helper.make_graph(
+            [helper.make_node("MatMul", ["X", captured_name], ["Y"])],
+            "active",
+            [],
+            [value("Y", [1, 2])],
+            value_info=[value("X", [1, 2]), value(captured_name, [2, 2])],
+        )
+        inactive = helper.make_graph(
+            [helper.make_node("Constant", [], ["Y"], value=tensor("", np.zeros((1, 2), np.float32)))],
+            "inactive",
+            [],
+            [value("Y", [1, 2])],
+        )
+        choose = helper.make_node("If", ["flag"], ["Y"])
+        for name in ("then_branch", "else_branch"):
+            choose.attribute.append(
+                onnx.AttributeProto(name=name, ref_attr_name="branch", type=onnx.AttributeProto.GRAPH)
+            )
+        function_nodes = [helper.make_node("Constant", [], ["flag"], value=tensor("", np.bool_(True))), choose]
+        if mode == "unused":
+            function_nodes = list(inactive.node)
+        elif mode == "local_shadow":
+            function_nodes.insert(0, helper.make_node("Constant", [], ["state"], value=tensor("", arrays["W0"])))
+        function = helper.make_function(
+            "local",
+            "F",
+            ["state"] if mode == "formal_shadow" else [],
+            ["Y"],
+            function_nodes,
+            [helper.make_opsetid("", 18)],
+            attributes=["branch"] if mode == "used" else [],
+            attribute_protos=[] if mode == "used" else [helper.make_attribute("branch", active)],
+        )
+        functions = [function]
+        call = helper.make_node("F", ["W0"] if mode == "formal_shadow" else [], ["body_y"], domain="local")
+        if mode in {"used", "override"}:
+            call.attribute.append(helper.make_attribute("branch", inactive if mode == "override" else active))
+        if mode == "nested":
+            functions.append(
+                helper.make_function(
+                    "local",
+                    "Wrapper",
+                    [],
+                    ["Y"],
+                    [helper.make_node("F", [], ["Y"], domain="local")],
+                    [helper.make_opsetid("", 18), helper.make_opsetid("local", 1)],
+                )
+            )
+            call = helper.make_node("Wrapper", [], ["body_y"], domain="local")
+        body_nodes = [helper.make_node("Identity", ["state"], ["captured"])] if mode == "alias" else []
+        body_nodes.extend([call, helper.make_node("Sum", [f"W{index}" for index in range(count)], ["next"])])
+        body = helper.make_graph(
+            body_nodes,
+            "body",
+            [value("i", [], TensorProto.INT64), value("c", [], TensorProto.BOOL), value("state", [2, 2])],
+            [value("c", [], TensorProto.BOOL), value("next", [2, 2])],
+        )
+        model = self._model(
+            [helper.make_node("Loop", ["M", "C", "initial"], ["final"], body=body)],
+            [value("initial", [2, 2]), value("X", [1, 2])],
+            [value("final", [2, 2])],
+            [tensor(name, array) for name, array in arrays.items()],
+            functions,
+        )
+        onnx.checker.check_model(model, full_check=True)
+        oracle = deepcopy(model)
+        defaults = {function.name: list(function.attribute_proto) for function in oracle.functions}
+
+        def materialize_defaults(graph: Any) -> None:
+            for node in graph.node:
+                if node.domain == "local":
+                    explicit = {attribute.name for attribute in node.attribute}
+                    node.attribute.extend(
+                        attribute for attribute in defaults.get(node.op_type, ()) if attribute.name not in explicit
+                    )
+                for attribute in node.attribute:
+                    if attribute.type == onnx.AttributeProto.GRAPH and not attribute.ref_attr_name:
+                        materialize_defaults(attribute.g)
+
+        materialize_defaults(oracle.graph)
+        for oracle_function in oracle.functions:
+            materialize_defaults(oracle_function)
+        inlined = inline_local_functions(oracle)
+        onnx.checker.check_model(inlined, full_check=True)
+        runtime_body = next(attribute.g for attribute in inlined.graph.node[0].attribute if attribute.name == "body")
+        runtime_body.output.append(value("body_y", [1, 2]))
+        state = np.zeros((2, 2), np.float32)
+        replacement = sum(arrays[f"W{index}"] for index in range(count))
+        executed_weight = mode not in {"override", "unused", "formal_shadow", "local_shadow"}
+        for iteration in range(iterations):
+            actual: Any = ReferenceEvaluator(runtime_body, opsets={"": 18}).run(
+                None,
+                {
+                    **arrays,
+                    "state": state,
+                    "i": np.int64(iteration),
+                    "c": np.bool_(True),
+                    "X": np.ones((1, 2), np.float32),
+                },
+            )
+            expected_weight = state if executed_weight else arrays["W0"]
+            expected = (
+                np.zeros((1, 2), np.float32)
+                if mode in {"override", "unused"}
+                else np.ones((1, 2), np.float32) @ expected_weight
+            )
+            np.testing.assert_array_equal(actual[2], expected)
+            np.testing.assert_array_equal(actual[1], replacement)
+            state = actual[1]
+        self._assert_contract(model, tmp_path, executed_weight and count > 32 and iterations > 1)
+
+    @pytest.mark.parametrize("mode", ["unused_capture", "selector_only", "invariant_condition", "unchanged_branches"])
+    def test_if_selector_taint_is_independent_of_branch_capture_taint(self, tmp_path: Path, mode: str) -> None:
+        from onnx.inliner import inline_local_functions
+        from onnx.reference import ReferenceEvaluator
+
+        value, tensor = self._value, self._tensor
+        first = np.ones(64, np.float32)
+        second = first.copy()
+        if mode != "unchanged_branches":
+            second[:5] = 100
+        branches = []
+        for name, row in (("then", first), ("else", second)):
+            nodes = []
+            if mode != "selector_only":
+                nodes.append(helper.make_node("Identity", ["counter"], ["unused_counter"]))
+            nodes.append(helper.make_node("Constant", [], ["row"], value=tensor("", row)))
+            branches.append(helper.make_graph(nodes, name, [], [value("row", [64])]))
+        varying = mode != "invariant_condition"
+        select_nodes = (
+            [
+                helper.make_node("Constant", [], ["one"], value=tensor("", np.int64(1))),
+                helper.make_node("Less", ["counter", "one"], ["condition"]),
+            ]
+            if varying
+            else [helper.make_node("Constant", [], ["condition"], value=tensor("", np.bool_(True)))]
+        )
+        function = helper.make_function(
+            "local",
+            "SelectRow",
+            ["counter"],
+            ["selected"],
+            [
+                *select_nodes,
+                helper.make_node("If", ["condition"], ["selected"], then_branch=branches[0], else_branch=branches[1]),
+            ],
+            [helper.make_opsetid("", 18)],
+        )
+        body = helper.make_graph(
+            [helper.make_node("SelectRow", ["i"], ["slice"], domain="local")],
+            "body",
+            [value("i", [], TensorProto.INT64), value("c", [], TensorProto.BOOL)],
+            [value("c", [], TensorProto.BOOL), value("slice", [64])],
+        )
+        model = self._model(
+            [
+                helper.make_node("Loop", ["M", "C"], ["stack"], body=body),
+                helper.make_node("MatMul", ["X", "stack"], ["Y"]),
+            ],
+            [value("X", [1, 2])],
+            [value("Y", [1, 64])],
+            [tensor("M", np.int64(2)), tensor("C", np.bool_(True))],
+            [function],
+        )
+        onnx.checker.check_model(model, full_check=True)
+        inlined = inline_local_functions(model)
+        onnx.checker.check_model(inlined, full_check=True)
+        runtime_body = next(attribute.g for attribute in inlined.graph.node[0].attribute if attribute.name == "body")
+        rows = []
+        for iteration in range(2):
+            actual: Any = ReferenceEvaluator(runtime_body, opsets={"": 18}).run(
+                None, {"i": np.int64(iteration), "c": np.bool_(True)}
+            )
+            rows.append(actual[1])
+        expected = np.stack([first, second if varying else first])
+        np.testing.assert_array_equal(np.stack(rows), expected)
+        actual_output: Any = ReferenceEvaluator(inlined).run(None, {"X": np.ones((1, 2), np.float32)})
+        np.testing.assert_array_equal(actual_output[0], np.ones((1, 2), np.float32) @ expected)
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        if varying:
+            # Separate constant declarations have no equality certificate in identifier taint.
+            assert not plan.specs
+        self._assert_contract(model, tmp_path, varying)
