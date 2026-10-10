@@ -7088,6 +7088,111 @@ def _build_onnx_weight_analysis_plan(
             int_sequence_attribute_cache[key] = (node, result)
             return result
 
+        def value_is_proven_nonempty_uniform(name: str) -> bool:
+            for depth in range(7):
+                shape = proven_value_shape(name)
+                if shape is not None and all(dimension == 1 for dimension in shape):
+                    return True
+                if depth == 6:
+                    return False
+                producers = graph_output_producer_nodes_by_name(current_graph).get(name, ())
+                if len(producers) != 1:
+                    return False
+                producer = producers[0]
+                if not builtin_operator(producer) or not producer.input:
+                    return False
+                if producer.op_type in {"Expand", "Tile"}:
+                    if len(producer.input) != 2:
+                        return False
+                    extent_name = str(producer.input[1])
+                    extents = constant_int64_vector_values(constants.get(extent_name))
+                    if extents is None and producer.op_type == "Expand":
+                        extent_producers = graph_output_producer_nodes_by_name(current_graph).get(extent_name, ())
+                        if len(extent_producers) == 1:
+                            extent_producer = extent_producers[0]
+                            if (
+                                builtin_operator(extent_producer)
+                                and extent_producer.op_type == "Shape"
+                                and len(extent_producer.input) == 1
+                                and not extent_producer.attribute
+                            ):
+                                extents = proven_value_shape(str(extent_producer.input[0]))
+                    if extents is None or any(dimension <= 0 for dimension in extents):
+                        return False
+                structural_alias = producer.op_type in {
+                    "Cast",
+                    "Expand",
+                    "Flatten",
+                    "Identity",
+                    "Reshape",
+                    "Squeeze",
+                    "Tile",
+                    "Transpose",
+                    "Unsqueeze",
+                }
+                pointwise_unary = (
+                    producer.op_type in _SAME_TYPE_UNARY_ELEMENTWISE_OPERATORS
+                    and producer.op_type not in {"Hardmax", "LogSoftmax", "LpNormalization", "Softmax"}
+                    and len(producer.input) == 1
+                )
+                if not structural_alias and not pointwise_unary:
+                    return False
+                name = str(producer.input[0])
+            return False
+
+        def has_no_padding(node: Any) -> bool:
+            for attribute in getattr(node, "attribute", ()):
+                if attribute.name not in {"pads", "auto_pad", "output_padding", "output_shape"}:
+                    continue
+                resolved = resolve_attribute(attribute)
+                if resolved is None or attribute.name == "output_shape":
+                    return False
+                if attribute.name == "auto_pad":
+                    if resolved.s not in {b"", b"NOTSET", b"VALID"}:
+                        return False
+                elif len(resolved.ints) > 2 * _ONNX_WEIGHT_RESHAPE_RANK_LIMIT or any(resolved.ints):
+                    return False
+            return True
+
+        def aggregation_preserves_shape_control(node: Any) -> bool:
+            if not node.input or not value_is_proven_nonempty_uniform(str(node.input[0])):
+                return False
+            if node.op_type == "GlobalAveragePool":
+                return True
+            if node.op_type == "AveragePool":
+                includes_padding = False
+                for attribute in getattr(node, "attribute", ()):
+                    if attribute.name == "count_include_pad":
+                        resolved = resolve_attribute(attribute)
+                        if resolved is None:
+                            return False
+                        includes_padding = bool(resolved.i)
+                # Ceil-only overhang is excluded from the divisor, unlike explicit padding.
+                return not includes_padding or has_no_padding(node)
+            if not has_no_padding(node):
+                return False
+            if node.op_type == "Conv":
+                return True
+            kernel_shape = proven_value_shape(str(node.input[1])) if len(node.input) > 1 else None
+            if kernel_shape is None or len(kernel_shape) < 3 or any(dimension <= 0 for dimension in kernel_shape):
+                return False
+            spatial_shape = kernel_shape[2:]
+            strides = (1,) * len(spatial_shape)
+            for attribute in getattr(node, "attribute", ()):
+                if attribute.name not in {"kernel_shape", "strides", "dilations"}:
+                    continue
+                resolved = resolve_attribute(attribute)
+                if resolved is None or len(resolved.ints) != len(spatial_shape):
+                    return False
+                values = tuple(int(value) for value in resolved.ints)
+                if attribute.name == "strides":
+                    strides = values
+                elif (attribute.name == "kernel_shape" and values != spatial_shape) or (
+                    attribute.name == "dilations" and any(value != 1 for value in values)
+                ):
+                    return False
+            return strides == spatial_shape
+
         def attribute_source_key(
             attribute: Any,
             node_position: int,
@@ -10418,7 +10523,6 @@ def _build_onnx_weight_analysis_plan(
             # Keep dimension provenance: a later Cast can turn dimensions into weights.
             is_shape_query = is_builtin_neural_operator and node.op_type in {"Shape", "Size"}
             output_lineages: dict[int, _OnnxWeightLineage] = {}
-            broadcast_operator_promotes_deferred_gap = False
             elementwise_output_shape: tuple[int, ...] | None = None
             elementwise_output_rank: int | None = None
             same_type_elementwise = is_builtin_neural_operator and node.op_type in _SAME_TYPE_ELEMENTWISE_OPERATORS
@@ -10537,15 +10641,6 @@ def _build_onnx_weight_analysis_plan(
                         )
                     )
                 )
-                broadcast_operator_promotes_deferred_gap = (
-                    (same_type_elementwise or pow_operator or batch_normalization_operator)
-                    and all_input_rank_promotable_lineage_limit_gap_count > 0
-                    and (
-                        not elementwise_output_rank_proven
-                        or elementwise_output_rank is None
-                        or elementwise_output_rank >= 2
-                    )
-                )
                 carries_dynamic_activation = bool(terminal_weight_lineages) and has_dynamic_input
                 carries_dynamic_activation |= prelu_data_is_activation
                 carries_dynamic_activation |= any(
@@ -10561,17 +10656,31 @@ def _build_onnx_weight_analysis_plan(
                     or pow_operator
                     or node.op_type
                     in {
-                        "AveragePool",
                         "BatchNormalization",
                         "Concat",
-                        "Conv",
-                        "ConvTranspose",
-                        "GlobalAveragePool",
                         "GlobalMaxPool",
                         "MaxPool",
                     }
                     or node.op_type in {"Expand", "Gather", "GatherElements", "GatherND", "Slice", "Tile"}
                 )
+                preserved_shape_control_sources: frozenset[int] = frozenset()
+                if is_builtin_neural_operator and node.op_type in {
+                    "AveragePool",
+                    "GlobalAveragePool",
+                    "Conv",
+                    "ConvTranspose",
+                }:
+                    data_sources = set(value_lineages.get(input_names[0], {})) if input_names else set()
+                    kernel_sources = (
+                        set(value_lineages.get(input_names[1], {}))
+                        if node.op_type in {"Conv", "ConvTranspose"} and len(input_names) > 1
+                        else set()
+                    )
+                    # Bias layout does not determine aggregation multiplicities.
+                    preserved_sources = set(all_input_lineages) - data_sources - kernel_sources
+                    if data_sources and aggregation_preserves_shape_control(node):
+                        preserved_sources.update(data_sources - kernel_sources)
+                    preserved_shape_control_sources = frozenset(preserved_sources)
                 preserves_data_type = (
                     same_type_elementwise
                     or same_type_unary_elementwise
@@ -10582,32 +10691,92 @@ def _build_onnx_weight_analysis_plan(
                         in {"Concat", "Expand", "Gather", "GatherElements", "GatherND", "Slice", "Tile"}
                     )
                 )
-                for initializer_index, lineage in all_input_lineages.items():
-                    lineage_output_shape = elementwise_output_shape if elementwise_output_rank_proven else None
-                    if initializer_index in activation_input_lineages:
-                        continue
+
+                lineage_output_shape = elementwise_output_shape if elementwise_output_rank_proven else None
+                if (
+                    lineage_output_shape is None
+                    and elementwise_output_rank_proven
+                    and elementwise_output_rank is not None
+                ):
+                    lineage_output_shape = inferred_shape(
+                        elementwise_output_rank, (-1 for _ in range(elementwise_output_rank))
+                    )
+
+                def unresolved_operator_output_lineage(
+                    lineage: _OnnxWeightLineage,
+                    *,
+                    output_shape: tuple[int, ...] | None = lineage_output_shape,
+                    keeps_shape_control: bool = preserves_shape_control,
+                    shape_control_sources: frozenset[int] = preserved_shape_control_sources,
+                    keeps_data_type: bool = preserves_data_type,
+                    activation_parameters: set[int] = batch_normalization_activation_parameter_lineages,
+                    fallback_reason: str = (
+                        "dynamic_activation_lineage"
+                        if carries_dynamic_activation
+                        else ("dynamic_input_lineage" if has_dynamic_input else "unsupported_lineage_operator")
+                    ),
+                ) -> _OnnxWeightLineage:
                     unresolved_reason = lineage.unresolved_reason
-                    if unresolved_reason == "shape_control_lineage" and not preserves_shape_control:
+                    if (
+                        unresolved_reason == "shape_control_lineage"
+                        and not keeps_shape_control
+                        and lineage.initializer_index not in shape_control_sources
+                    ):
                         # Reductions, normalization and unknown operators can turn extents into data values.
-                        unresolved_reason = "shape_dimensions_lineage"
+                        unresolved_reason = (
+                            "dynamic_activation_lineage"
+                            if fallback_reason == "dynamic_activation_lineage"
+                            else "shape_dimensions_lineage"
+                        )
                     if unresolved_reason is None:
-                        if (
-                            initializer_index in batch_normalization_activation_parameter_lineages
-                            or carries_dynamic_activation
-                        ):
-                            unresolved_reason = "dynamic_activation_lineage"
-                        else:
-                            unresolved_reason = (
-                                "dynamic_input_lineage" if has_dynamic_input else "unsupported_lineage_operator"
-                            )
-                    output_lineages[initializer_index] = _OnnxWeightLineage(
-                        initializer_index=initializer_index,
-                        shape=lineage_output_shape,
-                        data_type=lineage.data_type if preserves_data_type else None,
+                        unresolved_reason = (
+                            "dynamic_activation_lineage"
+                            if lineage.initializer_index in activation_parameters
+                            else fallback_reason
+                        )
+                    return _OnnxWeightLineage(
+                        initializer_index=lineage.initializer_index,
+                        shape=output_shape,
+                        data_type=lineage.data_type if keeps_data_type else None,
                         transforms=lineage.transforms,
                         unresolved_reason=unresolved_reason,
                     )
 
+                for initializer_index, lineage in all_input_lineages.items():
+                    if initializer_index not in activation_input_lineages:
+                        output_lineages[initializer_index] = unresolved_operator_output_lineage(lineage)
+                # Exact rank-transform rules below own their input-role and gap accounting.
+                if not rank_gap_promoting_operator:
+                    # Deferred numeric provenance must obey the same output facts as
+                    # retained provenance; input rank and dtype are not output proofs.
+                    all_input_non_shape_lineage_gap_summary = summarize_non_shape_lineage_gap(
+                        (
+                            unresolved_operator_output_lineage(lineage)
+                            for lineage in all_input_non_shape_lineage_gap_summary.lineages
+                            if lineage.initializer_index not in activation_input_lineages
+                        ),
+                        truncated=all_input_non_shape_lineage_gap_summary.truncated,
+                    )
+                    if all_input_non_shape_lineage_gap_summary == empty_weight_gap_summary:
+                        all_input_non_shape_lineage_limit_gap_count = 0
+                    all_input_weight_lineage_limit_gap_summary = summarize_weight_lineage_gap(
+                        all_input_non_shape_lineage_gap_summary.lineages,
+                        truncated=all_input_non_shape_lineage_gap_summary.truncated,
+                    )
+                    all_input_weight_lineage_limit_gap_count = (
+                        all_input_non_shape_lineage_limit_gap_count
+                        if all_input_weight_lineage_limit_gap_summary != empty_weight_gap_summary
+                        else 0
+                    )
+                    all_input_rank_promotable_lineage_limit_gap_summary = summarize_rank_promotable_lineage_gap(
+                        all_input_non_shape_lineage_gap_summary.lineages,
+                        truncated=all_input_non_shape_lineage_gap_summary.truncated,
+                    )
+                    all_input_rank_promotable_lineage_limit_gap_count = (
+                        all_input_non_shape_lineage_limit_gap_count
+                        if all_input_rank_promotable_lineage_limit_gap_summary != empty_weight_gap_summary
+                        else 0
+                    )
             (
                 output_lineages,
                 output_lineage_limit_gap_count,
@@ -10718,22 +10887,6 @@ def _build_onnx_weight_analysis_plan(
                     promoted_rank_lineage_gap_summary = known_weight_gap_summary(
                         candidate_promoted_summary,
                         promoted_rank_lineage_limit_gap_count,
-                    )
-            if broadcast_operator_promotes_deferred_gap:
-                broadcast_promoted_summary = rank_gap_weight_summary_after_rank_increase(
-                    all_input_rank_promotable_lineage_limit_gap_summary,
-                    all_input_rank_promotable_lineage_limit_gap_count,
-                    output_shape=elementwise_output_shape if elementwise_output_rank_proven else None,
-                    output_rank=elementwise_output_rank if elementwise_output_rank_proven else None,
-                )
-                if broadcast_promoted_summary != empty_weight_gap_summary:
-                    promoted_rank_lineage_limit_gap_count = _bounded_onnx_weight_lineage_gap_count(
-                        promoted_rank_lineage_limit_gap_count,
-                        all_input_rank_promotable_lineage_limit_gap_count,
-                    )
-                    promoted_rank_lineage_gap_summary = merge_weight_lineage_gap_summaries(
-                        promoted_rank_lineage_gap_summary,
-                        broadcast_promoted_summary,
                     )
             rank_operator_promotes_deferred_gap = promoted_rank_lineage_limit_gap_count > 0
             if rank_operator_promotes_deferred_gap:

@@ -35822,3 +35822,321 @@ class TestOnnxControlAndNumericProofGaps:
         assert result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"]
         assert WeightDistributionScanner().scan(str(path)).success is False
         TestWeightDistributionCoverage()._assert_uncached_inconclusive_exit2(path, tmp_path / "cache")
+
+
+class TestOnnxDeferredPropagationProofs:
+    _value = staticmethod(TestOnnxRecurrenceReviewRegressions._value)
+    _tensor = staticmethod(TestOnnxShapeContinuity._t)
+    _model = staticmethod(TestOnnxBuiltinOperatorIdentity._model)
+    _assert_contract = staticmethod(TestOnnxDeferredNumericCoverage._assert_contract)
+
+    @pytest.mark.parametrize(
+        ("operator", "count", "numeric", "mode"),
+        [
+            (op, count, numeric, mode)
+            for op in ("Conv", "ConvTranspose")
+            for count, numeric, mode in (
+                (31, True, "matrix"),
+                (32, True, "matrix"),
+                (32, False, "matrix"),
+                (32, True, "unused"),
+            )
+        ]
+        + [
+            ("Pow", count, numeric, mode)
+            for count, numeric, mode in (
+                (31, True, "integer"),
+                (32, True, "integer"),
+                (32, True, "floating"),
+                (32, False, "integer"),
+                (32, True, "vector"),
+                (32, True, "unused"),
+            )
+        ],
+    )
+    def test_deferred_parameters_follow_operator_output_semantics(
+        self, tmp_path: Path, operator: str, count: int, numeric: bool, mode: str
+    ) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        value, tensor = self._value, self._tensor
+        length = 2 if operator == "Pow" else 4
+        dtype = np.float32 if operator != "Pow" or mode == "floating" else np.int64
+        nodes, tensors = [], []
+        current = "runtime_parameter"
+        for index in range(count):
+            tensors.append(tensor(f"shape{index}", np.array([length], np.int64)))
+            nodes.append(helper.make_node("Reshape", [current, f"shape{index}"], [f"view{index}"]))
+            current = f"view{index}"
+        offset: Any = np.arange(1, length + 1, dtype=dtype)
+        if numeric:
+            tensors.append(tensor("numeric", offset))
+            nodes.append(helper.make_node("Add", [current, "numeric"], ["parameter"]))
+            current = "parameter"
+        parameter: Any = np.ones(length, dtype=dtype)
+        feeds: dict[str, Any] = {"runtime_parameter": parameter}
+        actual_parameter: Any = parameter + (offset if numeric else 0)
+        if operator == "Pow":
+            base = np.array([2, 3], np.float32) if mode == "vector" else np.array([[2, 3], [4, 5]], np.float32)
+            feeds.update({"base": base, "left": np.array([[2, 3]], np.float32)})
+            nodes.append(helper.make_node("Pow", ["base", current], ["generated"]))
+            weights = np.power(base, actual_parameter).astype(np.float32)
+        else:
+            data = np.array([[[[1, 2], [3, 4]]]], np.float32)
+            kernel = np.arange(1, 5, dtype=np.float32).reshape((4, 1, 1, 1) if operator == "Conv" else (1, 4, 1, 1))
+            feeds.update({"data": data, "kernel": kernel, "left": np.array([[2, 3]], np.float32)})
+            nodes.append(helper.make_node(operator, ["data", "kernel", current], ["generated"], kernel_shape=[1, 1]))
+            weights = data * np.arange(1, 5, dtype=np.float32).reshape(1, 4, 1, 1) + actual_parameter.reshape(
+                1, 4, 1, 1
+            )
+        if mode == "unused":
+            nodes.append(helper.make_node("Identity", ["generated"], ["Y"]))
+            expected = weights
+        else:
+            nodes.append(helper.make_node("MatMul", ["left", "generated"], ["Y"]))
+            expected = np.matmul(feeds["left"], weights)
+        model = self._model(
+            nodes,
+            [
+                value(name, list(array.shape), helper.np_dtype_to_tensor_dtype(array.dtype))
+                for name, array in feeds.items()
+            ],
+            [value("Y", list(expected.shape))],
+            tensors,
+            [],
+        )
+        onnx.checker.check_model(model, full_check=True)
+        actual: Any = ReferenceEvaluator(model).run(None, feeds)
+        np.testing.assert_allclose(actual[0], expected, rtol=1e-6, atol=1e-6)
+        assert actual[0].dtype == np.float32
+        self._assert_contract(model, tmp_path, numeric and mode not in {"vector", "unused"})
+
+    @pytest.mark.parametrize(
+        "mode",
+        [
+            "padded_include",
+            "padded_exclude",
+            "no_pad",
+            "ceil_without_pad",
+            "same_include",
+            "same_exclude",
+            "unused_padded",
+            "no_initializer",
+        ],
+    )
+    def test_averagepool_padding_can_convert_extent_provenance_to_coefficients(self, tmp_path: Path, mode: str) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        value, tensor = self._value, self._tensor
+        include = mode not in {"padded_exclude", "same_exclude"}
+        padding = mode not in {"no_pad", "ceil_without_pad"}
+        attrs: dict[str, Any] = {
+            "kernel_shape": [2, 2] if mode == "ceil_without_pad" else [3, 3],
+            "strides": [2, 2] if mode == "ceil_without_pad" else [1, 1],
+            "ceil_mode": int(mode == "ceil_without_pad"),
+            "count_include_pad": int(include),
+        }
+        if mode.startswith("same_"):
+            attrs["auto_pad"] = "SAME_UPPER"
+        else:
+            attrs["pads"] = [int(padding)] * 4
+        if padding and include:
+            pooled = (np.array([[4, 6, 4], [6, 9, 6], [4, 6, 4]], np.float32) / 9).reshape(1, 1, 3, 3)
+        else:
+            extent = 1 if mode == "no_pad" else (2 if mode == "ceil_without_pad" else 3)
+            pooled = np.ones((1, 1, extent, extent), np.float32)
+        nodes = [
+            helper.make_node("Shape", ["source"], ["dimensions"]),
+            helper.make_node("Expand", ["runtime", "dimensions"], ["expanded"]),
+            helper.make_node("AveragePool", ["expanded"], ["pooled"], **attrs),
+        ]
+        feeds = {"runtime": np.asarray(1, np.float32)}
+        inputs = [value("runtime", [])]
+        tensors = []
+        if mode == "no_initializer":
+            inputs.append(value("source", [1, 1, 3, 3]))
+            feeds["source"] = np.zeros((1, 1, 3, 3), np.float32)
+        else:
+            tensors.append(tensor("source", np.zeros((1, 1, 3, 3), np.float32)))
+        if mode == "unused_padded":
+            nodes.append(helper.make_node("Identity", ["pooled"], ["Y"]))
+            expected = pooled
+        else:
+            extent = pooled.shape[-1]
+            inputs.append(value("left", [1, extent]))
+            feeds["left"] = np.arange(1, extent + 1, dtype=np.float32).reshape(1, extent)
+            nodes.append(helper.make_node("MatMul", ["left", "pooled"], ["Y"]))
+            expected = np.matmul(feeds["left"], pooled)
+        model = self._model(
+            nodes, inputs, [value("Y", list(expected.shape)), value("pooled", list(pooled.shape))], tensors, []
+        )
+        onnx.checker.check_model(model, full_check=True)
+        actual: Any = ReferenceEvaluator(model).run(None, feeds)
+        np.testing.assert_allclose(actual[0], expected, rtol=1e-6, atol=1e-6)
+        np.testing.assert_allclose(actual[1], pooled, rtol=1e-6, atol=1e-6)
+        self._assert_contract(model, tmp_path, mode in {"padded_include", "same_include"})
+
+    @pytest.mark.parametrize(
+        ("operator", "mode", "padding", "stride"),
+        [
+            ("Conv", "padded", 1, 1),
+            ("Conv", "no_pad", 0, 1),
+            ("Conv", "unused", 1, 1),
+            ("Conv", "no_initializer", 1, 1),
+            ("ConvTranspose", "overlap", 0, 1),
+            ("ConvTranspose", "padded_overlap", 1, 1),
+            ("ConvTranspose", "nonoverlap", 0, 3),
+            ("ConvTranspose", "unused", 0, 1),
+            ("ConvTranspose", "no_initializer", 0, 1),
+        ],
+    )
+    def test_convolution_geometry_can_turn_extents_into_coefficients(
+        self, tmp_path: Path, operator: str, mode: str, padding: int, stride: int
+    ) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        value, tensor = self._value, self._tensor
+        extent, kernel = 3, 3
+        side = (
+            (extent + 2 * padding - kernel) // stride + 1
+            if operator == "Conv"
+            else (extent - 1) * stride + kernel - 2 * padding
+        )
+        weights = np.zeros((1, 1, side, side), np.float32)
+        if operator == "Conv":
+            for iy in range(side):
+                for ix in range(side):
+                    weights[0, 0, iy, ix] = sum(
+                        0 <= y < extent and 0 <= x < extent
+                        for y in range(iy * stride - padding, iy * stride - padding + kernel)
+                        for x in range(ix * stride - padding, ix * stride - padding + kernel)
+                    )
+        else:
+            for iy in range(extent):
+                for ix in range(extent):
+                    for ky in range(kernel):
+                        for kx in range(kernel):
+                            y, x = iy * stride + ky - padding, ix * stride + kx - padding
+                            if 0 <= y < side and 0 <= x < side:
+                                weights[0, 0, y, x] += 1
+        nodes = [
+            helper.make_node("Shape", ["source"], ["dimensions"]),
+            helper.make_node("Expand", ["runtime", "dimensions"], ["expanded"]),
+            helper.make_node(
+                operator,
+                ["expanded", "kernel"],
+                ["generated"],
+                kernel_shape=[kernel, kernel],
+                pads=[padding] * 4,
+                strides=[stride, stride],
+            ),
+        ]
+        feeds: dict[str, Any] = {"runtime": np.float32(1), "kernel": np.ones((1, 1, kernel, kernel), np.float32)}
+        inputs = [value("runtime", []), value("kernel", [1, 1, kernel, kernel])]
+        tensors = []
+        if mode == "no_initializer":
+            inputs.append(value("source", [1, 1, extent, extent]))
+            feeds["source"] = np.zeros((1, 1, extent, extent), np.float32)
+        else:
+            tensors.append(tensor("source", np.zeros((1, 1, extent, extent), np.float32)))
+        if mode == "unused":
+            nodes.append(helper.make_node("Identity", ["generated"], ["Y"]))
+            expected = weights
+        else:
+            feeds["left"] = np.arange(1, side + 1, dtype=np.float32).reshape(1, side)
+            inputs.append(value("left", [1, side]))
+            nodes.append(helper.make_node("MatMul", ["left", "generated"], ["Y"]))
+            expected = np.matmul(feeds["left"], weights)
+        model = self._model(
+            nodes, inputs, [value("Y", list(expected.shape)), value("generated", list(weights.shape))], tensors, []
+        )
+        onnx.checker.check_model(model, full_check=True)
+        actual: Any = ReferenceEvaluator(model).run(None, feeds)
+        np.testing.assert_array_equal(actual[0], expected)
+        np.testing.assert_array_equal(actual[1], weights)
+        self._assert_contract(model, tmp_path, mode in {"padded", "overlap", "padded_overlap"})
+
+    @pytest.mark.parametrize("operator", ["AveragePool", "GlobalAveragePool"])
+    @pytest.mark.parametrize("mode", ["mixed", "uniform", "unused", "no_initializer"])
+    def test_numeric_reductions_require_uniform_input_proof(self, tmp_path: Path, operator: str, mode: str) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        value, tensor = self._value, self._tensor
+        nodes, tensors = [], []
+        feeds: dict[str, Any] = {"one": np.float32(1), "zero": np.float32(0)}
+        inputs = [value("one", []), value("zero", [])]
+        lengths = [4] if mode == "uniform" else [1, 3]
+        for index, length in enumerate(lengths):
+            name = f"source{index}"
+            shape = [1, 1, 1, length]
+            if mode == "no_initializer":
+                inputs.append(value(name, shape))
+                feeds[name] = np.zeros(shape, np.float32)
+            else:
+                tensors.append(tensor(name, np.zeros(shape, np.float32)))
+            nodes.extend(
+                [
+                    helper.make_node("Shape", [name], [f"dimensions{index}"]),
+                    helper.make_node(
+                        "Expand", ["one" if index == 0 else "zero", f"dimensions{index}"], [f"expanded{index}"]
+                    ),
+                ]
+            )
+        source = "expanded0"
+        if mode != "uniform":
+            nodes.append(helper.make_node("Concat", ["expanded0", "expanded1"], ["joined"], axis=3))
+            source = "joined"
+        attributes: dict[str, Any] = {"kernel_shape": [1, 4]} if operator == "AveragePool" else {}
+        nodes.append(helper.make_node(operator, [source], ["generated"], **attributes))
+        weights = np.full((1, 1, 1, 1), 1 if mode == "uniform" else 0.25, np.float32)
+        if mode == "unused":
+            nodes.append(helper.make_node("Identity", ["generated"], ["Y"]))
+            expected = weights
+        else:
+            inputs.append(value("left", [1, 1]))
+            feeds["left"] = np.array([[2]], np.float32)
+            nodes.append(helper.make_node("MatMul", ["left", "generated"], ["Y"]))
+            expected = feeds["left"] @ weights
+        model = self._model(
+            nodes, inputs, [value("Y", list(expected.shape)), value("generated", list(weights.shape))], tensors, []
+        )
+        onnx.checker.check_model(model, full_check=True)
+        actual: Any = ReferenceEvaluator(model).run(None, feeds)
+        np.testing.assert_array_equal(actual[0], expected)
+        np.testing.assert_array_equal(actual[1], weights)
+        self._assert_contract(model, tmp_path, mode == "mixed")
+
+    @pytest.mark.parametrize("mode", ["zero", "positive", "unknown", "unused", "no_initializer"])
+    def test_uniform_aggregation_requires_proven_nonempty_input(self, tmp_path: Path, mode: str) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        value, tensor = self._value, self._tensor
+        height = 3 if mode in {"positive", "unknown"} else 0
+        source = np.zeros((1, 1, height, 4), np.float32)
+        tensors = [] if mode == "no_initializer" else [tensor("source", source)]
+        inputs = [value("fill", [])]
+        if mode in {"unknown", "no_initializer"}:
+            inputs.append(value("source", [1, 1, "N" if mode == "unknown" else 0, 4]))
+        nodes = [
+            helper.make_node("Shape", ["source"], ["dimensions"]),
+            helper.make_node("Expand", ["fill", "dimensions"], ["expanded"]),
+            helper.make_node("GlobalAveragePool", ["expanded"], ["generated"]),
+        ]
+        if mode == "unused":
+            nodes.append(helper.make_node("Identity", ["generated"], ["Y"]))
+        else:
+            inputs.append(value("left", [1, 1]))
+            nodes.append(helper.make_node("MatMul", ["left", "generated"], ["Y"]))
+        model = self._model(nodes, inputs, [value("Y", [1, 1, 1, 1]), value("generated", [1, 1, 1, 1])], tensors, [])
+        onnx.checker.check_model(model, full_check=True)
+        for actual_height in (0, 3) if mode == "unknown" else (height,):
+            feeds: dict[str, Any] = {"fill": np.float32(1)}
+            if mode != "unused":
+                feeds["left"] = np.ones((1, 1), np.float32)
+            if mode in {"unknown", "no_initializer"}:
+                feeds["source"] = np.zeros((1, 1, actual_height, 4), np.float32)
+            actual: Any = ReferenceEvaluator(model).run(None, feeds)
+            expected = np.full((1, 1, 1, 1), np.nan if actual_height == 0 else 1, np.float32)
+            np.testing.assert_allclose(actual[0], expected, equal_nan=True)
+            np.testing.assert_allclose(actual[1], expected, equal_nan=True)
+        self._assert_contract(model, tmp_path, mode in {"zero", "unknown"})
