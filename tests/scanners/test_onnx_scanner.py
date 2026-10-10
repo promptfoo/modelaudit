@@ -35556,3 +35556,269 @@ class TestOnnxFunctionCaptureReachability:
             # Separate constant declarations have no equality certificate in identifier taint.
             assert not plan.specs
         self._assert_contract(model, tmp_path, varying)
+
+
+class TestOnnxControlAndNumericProofGaps:
+    _value = staticmethod(TestOnnxRecurrenceReviewRegressions._value)
+    _tensor = staticmethod(TestOnnxShapeContinuity._t)
+    _model = staticmethod(TestOnnxBuiltinOperatorIdentity._model)
+    _assert_contract = staticmethod(TestOnnxDeferredNumericCoverage._assert_contract)
+
+    @pytest.mark.parametrize("control", ["count", "condition", "invariant"])
+    @pytest.mark.parametrize("unused_capture", [False, True])
+    def test_loop_control_taint_survives_unused_capture(
+        self, tmp_path: Path, control: str, unused_capture: bool
+    ) -> None:
+        from onnx.inliner import inline_local_functions
+        from onnx.reference import ReferenceEvaluator
+
+        value, tensor = self._value, self._tensor
+        first = np.ones(64, np.float32)
+        second = first.copy()
+        second[:5] = 100
+        inner_nodes = [helper.make_node("Identity", ["counter"], ["unused_counter"])] if unused_capture else []
+        inner_nodes.extend(
+            [
+                helper.make_node("Identity", ["inner_condition"], ["next_condition"]),
+                helper.make_node("Constant", [], ["replacement"], value=tensor("", second)),
+            ]
+        )
+        inner = helper.make_graph(
+            inner_nodes,
+            "inner",
+            [value("j", [], TensorProto.INT64), value("inner_condition", [], TensorProto.BOOL), value("state", [64])],
+            [value("next_condition", [], TensorProto.BOOL), value("replacement", [64])],
+        )
+        nodes = [
+            helper.make_node("Constant", [], ["initial"], value=tensor("", first)),
+            helper.make_node("Constant", [], ["true"], value=tensor("", np.bool_(True))),
+            helper.make_node("Constant", [], ["one"], value=tensor("", np.int64(1))),
+        ]
+        inputs = ["one" if control == "invariant" else "counter", "true", "initial"]
+        if control == "condition":
+            nodes.extend(
+                [
+                    helper.make_node("Constant", [], ["zero"], value=tensor("", np.int64(0))),
+                    helper.make_node("Greater", ["counter", "zero"], ["choose"]),
+                ]
+            )
+            inputs = ["one", "choose", "initial"]
+        nodes.append(helper.make_node("Loop", inputs, ["selected"], body=inner))
+        function = helper.make_function(
+            "local", "SelectRow", ["counter"], ["selected"], nodes, [helper.make_opsetid("", 18)]
+        )
+        outer = helper.make_graph(
+            [helper.make_node("SelectRow", ["i"], ["slice"], domain="local")],
+            "outer",
+            [value("i", [], TensorProto.INT64), value("c", [], TensorProto.BOOL)],
+            [value("c", [], TensorProto.BOOL), value("slice", [64])],
+        )
+        model = self._model(
+            [
+                helper.make_node("Loop", ["M", "C"], ["stack"], body=outer),
+                helper.make_node("MatMul", ["X", "stack"], ["Y"]),
+            ],
+            [value("X", [1, 2])],
+            [value("Y", [1, 64]), value("stack", [2, 64])],
+            [tensor("M", np.int64(2)), tensor("C", np.bool_(True))],
+            [function],
+        )
+        onnx.checker.check_model(model, full_check=True)
+        inlined = inline_local_functions(model)
+        onnx.checker.check_model(inlined, full_check=True)
+        expected = np.stack([second, second] if control == "invariant" else [first, second])
+        left = np.array([[2, 3]], np.float32)
+        actual: Any = ReferenceEvaluator(inlined).run(None, {"X": left})
+        np.testing.assert_array_equal(actual[0], left @ expected)
+        np.testing.assert_array_equal(actual[1], expected)
+        plan = onnx_scanner_module._build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+        if control == "invariant":
+            assert plan.specs
+            for spec in plan.specs:
+                np.testing.assert_array_equal(spec.weights, expected)
+        else:
+            assert not plan.specs
+        self._assert_contract(model, tmp_path, control != "invariant")
+
+    @pytest.mark.parametrize(
+        ("count", "numeric", "mode"),
+        [
+            (0, True, "batchnorm"),
+            (31, True, "batchnorm"),
+            (32, True, "batchnorm"),
+            (32, False, "batchnorm"),
+            (32, True, "vector"),
+            (32, True, "unconsumed"),
+            (32, True, "elementwise"),
+        ],
+    )
+    def test_batchnorm_promotes_deferred_numeric_parameter_coverage(
+        self, tmp_path: Path, count: int, numeric: bool, mode: str
+    ) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        value, tensor = self._value, self._tensor
+        nodes, tensors = [], []
+        current = "runtime_scale"
+        for index in range(count):
+            tensors.append(tensor(f"shape{index}", np.array([4], np.int64)))
+            nodes.append(helper.make_node("Reshape", [current, f"shape{index}"], [f"view{index}"]))
+            current = f"view{index}"
+        offset = np.array([10, 20, 30, 40], np.float32)
+        if numeric:
+            tensors.append(tensor("numeric", offset))
+            nodes.append(helper.make_node("Add", [current, "numeric"], ["scale"]))
+            current = "scale"
+        feeds = {
+            "runtime_scale": np.array([1, 2, 3, 4], np.float32),
+            "data": np.array([[2, 4, 6, 8]], np.float32),
+            "bias": np.array([0, 1, 2, 3], np.float32),
+            "mean": np.array([0.5, 1, 1.5, 2], np.float32),
+            "variance": np.array([1, 4, 9, 16], np.float32),
+            "left": np.array([[1], [2]], np.float32),
+        }
+        scale = feeds["runtime_scale"] + (offset if numeric else 0)
+        if mode == "vector":
+            feeds["left"] = np.array([[1, 2, 3, 4]], np.float32)
+            nodes.append(helper.make_node("MatMul", ["left", current], ["Y"]))
+            expected = feeds["left"] @ scale
+        else:
+            if mode == "elementwise":
+                nodes.append(helper.make_node("Add", ["data", current], ["normalized"]))
+                normalized = feeds["data"] + scale
+            else:
+                nodes.append(
+                    helper.make_node(
+                        "BatchNormalization", ["data", current, "bias", "mean", "variance"], ["normalized"], epsilon=0.0
+                    )
+                )
+                normalized = (feeds["data"] - feeds["mean"]) / np.sqrt(feeds["variance"]) * scale + feeds["bias"]
+            if mode == "unconsumed":
+                nodes.append(helper.make_node("Identity", ["normalized"], ["Y"]))
+                expected = normalized
+            else:
+                nodes.append(helper.make_node("MatMul", ["left", "normalized"], ["Y"]))
+                expected = feeds["left"] @ normalized
+        model = self._model(
+            nodes,
+            [value(name, list(array.shape)) for name, array in feeds.items()],
+            [value("Y", list(expected.shape))],
+            tensors,
+            [],
+        )
+        actual: Any = ReferenceEvaluator(model).run(None, feeds)
+        np.testing.assert_allclose(actual[0], expected, rtol=1e-6, atol=1e-6)
+        self._assert_contract(model, tmp_path, numeric and mode in {"batchnorm", "elementwise"})
+
+    @pytest.mark.parametrize(
+        ("count", "annotation"), [(32, "misleading"), (32, "accurate"), (32, "absent"), (31, "misleading")]
+    )
+    def test_loop_entry_rank_requires_source_proof(self, tmp_path: Path, count: int, annotation: str) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        value, tensor = self._value, self._tensor
+        shape = [1, 1, 4, 4]
+        weights = np.arange(16, dtype=np.float32).reshape(shape)
+        tensors = [tensor(f"shape{index}", np.array(shape, np.int64)) for index in range(count)]
+        tensors.extend([tensor("W", weights), tensor("M", np.int64(2)), tensor("C", np.bool_(True))])
+        nodes = []
+        current = "W"
+        for index in range(count):
+            nodes.append(helper.make_node("Reshape", [current, f"shape{index}"], [f"view{index}"]))
+            current = f"view{index}"
+        nodes.append(helper.make_node("MaxPool", [current], ["pooled"], kernel_shape=[1, 1]))
+        declared = [4] if annotation == "misleading" else shape
+        body = helper.make_graph(
+            [
+                helper.make_node("Identity", ["cond"], ["next_cond"]),
+                helper.make_node("Identity", ["state"], ["next_state"]),
+                helper.make_node("MatMul", ["X", "state"], ["body_y"]),
+            ],
+            "body",
+            [value("i", [], TensorProto.INT64), value("cond", [], TensorProto.BOOL), value("state", declared)],
+            [value("next_cond", [], TensorProto.BOOL), value("next_state", declared)],
+        )
+        nodes.append(helper.make_node("Loop", ["M", "C", "pooled"], ["Y"], body=body))
+        model = self._model(nodes, [value("X", [4, 4])], [value("Y", declared)], tensors, [])
+        if annotation != "absent":
+            model.graph.value_info.append(value("pooled", declared))
+        onnx.checker.check_model(model)
+        if annotation == "misleading":
+            # Deliberately false metadata is structurally valid, but not shape-valid.
+            with pytest.raises(onnx.shape_inference.InferenceError):
+                onnx.checker.check_model(model, full_check=True)
+        else:
+            onnx.checker.check_model(model, full_check=True)
+        actual: Any = ReferenceEvaluator(model).run(None, {"X": np.eye(4, dtype=np.float32)})
+        np.testing.assert_array_equal(actual[0], weights)
+        body.output.append(value("body_y", shape))
+        body_actual: Any = ReferenceEvaluator(body, opsets={"": 18}).run(
+            None, {"i": np.int64(0), "cond": np.bool_(True), "state": weights, "X": np.eye(4, dtype=np.float32)}
+        )
+        np.testing.assert_array_equal(body_actual[2], weights)
+        path = _save_onnx_model(model, tmp_path / "unproven-rank.onnx")
+        result = OnnxScanner().scan(str(path))
+        assert result.success is False
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
+        assert result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"]
+        assert WeightDistributionScanner().scan(str(path)).success is False
+        TestWeightDistributionCoverage()._assert_uncached_inconclusive_exit2(path, tmp_path / "cache")
+
+    @pytest.mark.parametrize("annotation", ["misleading", "accurate", "absent"])
+    def test_batchnorm_output_rank_requires_source_proof(self, tmp_path: Path, annotation: str) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        value, tensor = self._value, self._tensor
+        nodes, tensors = [], []
+        current = "runtime_scale"
+        for index in range(32):
+            tensors.append(tensor(f"shape{index}", np.array([4], np.int64)))
+            nodes.append(helper.make_node("Reshape", [current, f"shape{index}"], [f"view{index}"]))
+            current = f"view{index}"
+        offset = np.arange(1, 5, dtype=np.float32)
+        tensors.append(tensor("numeric", offset))
+        nodes.extend(
+            [
+                helper.make_node("Add", [current, "numeric"], ["scale"]),
+                helper.make_node("MaxPool", ["data"], ["pooled"], kernel_shape=[1, 1]),
+                helper.make_node(
+                    "BatchNormalization", ["pooled", "scale", "bias", "mean", "variance"], ["normalized"], epsilon=0.0
+                ),
+                helper.make_node("MatMul", ["left", "normalized"], ["Y"]),
+            ]
+        )
+        feeds = {
+            "runtime_scale": np.arange(1, 5, dtype=np.float32),
+            "data": np.arange(2, 6, dtype=np.float32).reshape(1, 4, 1, 1),
+            "bias": np.zeros(4, np.float32),
+            "mean": np.zeros(4, np.float32),
+            "variance": np.ones(4, np.float32),
+            "left": np.ones((1, 1), np.float32),
+        }
+        expected = feeds["data"] * (feeds["runtime_scale"] + offset).reshape(1, 4, 1, 1)
+        model = self._model(
+            nodes,
+            [value(name, list(array.shape)) for name, array in feeds.items()],
+            [value("Y", list(expected.shape))],
+            tensors,
+            [],
+        )
+        if annotation != "absent":
+            model.graph.value_info.append(value("pooled", [4] if annotation == "misleading" else [1, 4, 1, 1]))
+        onnx.checker.check_model(model)
+        if annotation == "misleading":
+            with pytest.raises(onnx.shape_inference.InferenceError):
+                onnx.checker.check_model(model, full_check=True)
+        else:
+            onnx.checker.check_model(model, full_check=True)
+        actual: Any = ReferenceEvaluator(model).run(None, feeds)
+        np.testing.assert_array_equal(actual[0], expected)
+        path = _save_onnx_model(model, tmp_path / "batchnorm-rank.onnx")
+        result = OnnxScanner().scan(str(path))
+        assert result.success is False
+        coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+        assert coverage and all(check.status == CheckStatus.FAILED for check in coverage)
+        assert result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"]
+        assert WeightDistributionScanner().scan(str(path)).success is False
+        TestWeightDistributionCoverage()._assert_uncached_inconclusive_exit2(path, tmp_path / "cache")

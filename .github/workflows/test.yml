@@ -916,11 +916,11 @@ jobs:
 
       - name: Lint standalone package with Ruff
         run: |
-          uv run --with 'ruff==0.16.10' ruff check src tests
+          uv run --with 'ruff==0.17.0' ruff check src tests
 
       - name: Check standalone package formatting with Ruff
         run: |
-          uv run --with 'ruff==0.16.10' ruff format --check src tests
+          uv run --with 'ruff==0.17.0' ruff format --check src tests
 
       - name: Type check standalone package with mypy
         run: |

@@ -4413,7 +4413,11 @@ def _build_onnx_weight_analysis_plan(
                 tainted.update(nested_outputs)
             elif any_tainted and not inspected_nested_taint and not inspected_function_taint:
                 tainted.update(body_outputs)
-            if any_tainted and builtin_operator(body_node, "If"):
+            if (any_tainted and builtin_operator(body_node, "If")) or (
+                builtin_operator(body_node, "Loop") and any(name in tainted for name in node_input_slots(body_node)[:2])
+            ):
+                # Entry and trip-count controls affect outputs even when the body
+                # discards every tainted capture or recurrent input.
                 tainted.update(body_outputs)
         result = {
             output_index for output_index, output in enumerate(graph_outputs) if _onnx_value_name(output) in tainted
@@ -9570,7 +9574,9 @@ def _build_onnx_weight_analysis_plan(
                                 parent_shape_is_proven = all(
                                     lineage.unresolved_reason is None for lineage in parent_data_lineages
                                 )
-                        parent_rank = known_value_ranks.get(parent_name)
+                        if not parent_shape_is_proven:
+                            parent_shape = None
+                        parent_rank = known_value_ranks.get(parent_name) if parent_shape_is_proven else None
                         repeated_control_flow_state_input = is_repeated_control_flow_state_input(pair_index)
                         repeated_state_reenters_with_rank_promotion = False
                         repeated_state_exact_loop_inconclusive = False
@@ -10422,6 +10428,7 @@ def _build_onnx_weight_analysis_plan(
                 and len(input_names) == 1
             )
             clip_operator = is_builtin_neural_operator and node.op_type == "Clip"
+            batch_normalization_operator = is_builtin_neural_operator and node.op_type == "BatchNormalization"
             pow_operator = is_builtin_neural_operator and node.op_type == "Pow"
             size_operator = is_shape_query and node.op_type == "Size" and not all_input_lineages
             elementwise_has_unknown_dynamic_rank = False
@@ -10445,7 +10452,7 @@ def _build_onnx_weight_analysis_plan(
                 elementwise_output_rank_proven = all(
                     value_rank_is_proven_or_unknown(input_name) for input_name in input_names
                 )
-            elif clip_operator and input_names:
+            elif (clip_operator or batch_normalization_operator) and input_names:
                 elementwise_output_shape = known_value_shapes.get(input_names[0])
                 elementwise_output_rank = (
                     len(elementwise_output_shape)
@@ -10531,9 +10538,13 @@ def _build_onnx_weight_analysis_plan(
                     )
                 )
                 broadcast_operator_promotes_deferred_gap = (
-                    (same_type_elementwise or pow_operator)
+                    (same_type_elementwise or pow_operator or batch_normalization_operator)
                     and all_input_rank_promotable_lineage_limit_gap_count > 0
-                    and (elementwise_output_rank is None or elementwise_output_rank >= 2)
+                    and (
+                        not elementwise_output_rank_proven
+                        or elementwise_output_rank is None
+                        or elementwise_output_rank >= 2
+                    )
                 )
                 carries_dynamic_activation = bool(terminal_weight_lineages) and has_dynamic_input
                 carries_dynamic_activation |= prelu_data_is_activation
@@ -10712,8 +10723,8 @@ def _build_onnx_weight_analysis_plan(
                 broadcast_promoted_summary = rank_gap_weight_summary_after_rank_increase(
                     all_input_rank_promotable_lineage_limit_gap_summary,
                     all_input_rank_promotable_lineage_limit_gap_count,
-                    output_shape=elementwise_output_shape,
-                    output_rank=elementwise_output_rank,
+                    output_shape=elementwise_output_shape if elementwise_output_rank_proven else None,
+                    output_rank=elementwise_output_rank if elementwise_output_rank_proven else None,
                 )
                 if broadcast_promoted_summary != empty_weight_gap_summary:
                     promoted_rank_lineage_limit_gap_count = _bounded_onnx_weight_lineage_gap_count(
