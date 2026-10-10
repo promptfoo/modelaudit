@@ -36140,3 +36140,270 @@ class TestOnnxDeferredPropagationProofs:
             np.testing.assert_allclose(actual[0], expected, equal_nan=True)
             np.testing.assert_allclose(actual[1], expected, equal_nan=True)
         self._assert_contract(model, tmp_path, mode in {"zero", "unknown"})
+
+
+class TestOnnxReviewedExitAndTrainingSemantics:
+    _value = staticmethod(TestOnnxRecurrenceReviewRegressions._value)
+    _tensor = staticmethod(TestOnnxShapeContinuity._t)
+    _model = staticmethod(TestOnnxBuiltinOperatorIdentity._model)
+    _assert_contract = staticmethod(TestOnnxDeferredNumericCoverage._assert_contract)
+
+    @pytest.mark.parametrize(
+        ("family", "count", "mode"),
+        [("unproven", 32, mode) for mode in ("misleading", "accurate", "absent", "unused")]
+        + [("unproven", 31, "misleading")]
+        + [("demotion", 32, mode) for mode in ("matrix", "vector", "no_initializer", "identity")]
+        + [("demotion", 31, "matrix")],
+    )
+    def test_loop_exit_preserves_deferred_numeric_provenance(
+        self, tmp_path: Path, family: str, count: int, mode: str
+    ) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        from modelaudit.scanners.onnx_scanner import _build_onnx_weight_analysis_plan
+
+        value, tensor = self._value, self._tensor
+        shape = [1, 1, 4, 4] if family == "unproven" else [1, 4]
+        weights = np.arange(np.prod(shape), dtype=np.float32).reshape(shape)
+        tensors = [tensor(f"shape{index}", np.array(shape, np.int64)) for index in range(count)]
+        inputs, feeds = [], {}
+        if mode == "no_initializer":
+            inputs.append(value("W", shape))
+            feeds["W"] = weights
+        else:
+            tensors.append(tensor("W", weights))
+        tensors.extend([tensor("M", np.int64(2 if family == "unproven" else 1)), tensor("C", np.bool_(True))])
+        nodes = []
+        current = "W"
+        for index in range(count):
+            nodes.append(helper.make_node("Reshape", [current, f"shape{index}"], [f"view{index}"]))
+            current = f"view{index}"
+        declared = [4] if mode in {"misleading", "unused"} else shape
+        if family == "unproven":
+            nodes.append(helper.make_node("MaxPool", [current], ["pooled"], kernel_shape=[1, 1]))
+            current = "pooled"
+            body_nodes = [helper.make_node("Identity", ["state"], ["next_state"])]
+            body_input_shape, body_output_shape = declared, declared
+        else:
+            tensors.append(tensor("axes", np.array([0], np.int64)))
+            body_nodes = [
+                helper.make_node("Identity", ["state"], ["next_state"])
+                if mode == "identity"
+                else helper.make_node("Squeeze", ["state", "axes"], ["next_state"])
+            ]
+            body_input_shape, body_output_shape = shape, shape if mode == "identity" else [4]
+        body = helper.make_graph(
+            [helper.make_node("Identity", ["cond"], ["next_cond"]), *body_nodes],
+            "body",
+            [
+                value("i", [], TensorProto.INT64),
+                value("cond", [], TensorProto.BOOL),
+                value("state", body_input_shape),
+            ],
+            [value("next_cond", [], TensorProto.BOOL), value("next_state", body_output_shape)],
+        )
+        nodes.append(helper.make_node("Loop", ["M", "C", current], ["final"], body=body))
+        if mode in {"unused", "vector"}:
+            nodes.append(helper.make_node("Identity", ["final"], ["Y"]))
+            expected = weights.reshape(4) if mode == "vector" else weights
+        else:
+            operand = "final"
+            if family == "demotion" and mode != "identity":
+                nodes.append(helper.make_node("Unsqueeze", ["final", "axes"], ["restored"]))
+                operand = "restored"
+            left_shape = [4, 4] if family == "unproven" else [1, 1]
+            inputs.append(value("X", left_shape))
+            feeds["X"] = np.eye(4, dtype=np.float32) if family == "unproven" else np.ones((1, 1), np.float32)
+            nodes.append(helper.make_node("MatMul", ["X", operand], ["Y"]))
+            expected = weights
+        model = self._model(nodes, inputs, [value("Y", list(expected.shape))], tensors, [])
+        if family == "unproven" and mode != "absent":
+            model.graph.value_info.append(value("pooled", declared))
+        onnx.checker.check_model(model)
+        if family == "unproven" and mode in {"misleading", "unused"}:
+            with pytest.raises(onnx.shape_inference.InferenceError):
+                onnx.checker.check_model(model, full_check=True)
+        else:
+            onnx.checker.check_model(model, full_check=True)
+        actual: Any = ReferenceEvaluator(model).run(None, feeds)
+        np.testing.assert_array_equal(actual[0], expected)
+        incomplete = mode != "unused" if family == "unproven" else count == 32 and mode in {"matrix", "identity"}
+        if family == "demotion" and count == 31:
+            plan = _build_onnx_weight_analysis_plan(model, onnx=onnx, np=np, max_array_size=None)
+            assert len(plan.specs) == 1
+        if family == "unproven" and mode in {"misleading", "unused"}:
+            path = _save_onnx_model(model, tmp_path / "unproven-exit.onnx")
+            result = OnnxScanner().scan(str(path))
+            assert result.success is not incomplete
+            coverage = [check for check in result.checks if check.name == "Weight Distribution Analysis Coverage"]
+            assert bool(coverage) is incomplete
+            assert all(check.status == CheckStatus.FAILED for check in coverage)
+            assert bool(result.metadata["onnx_weight_distribution_semantics"]["coverage_gaps"]) is incomplete
+            assert WeightDistributionScanner().scan(str(path)).success is not incomplete
+            if incomplete:
+                TestWeightDistributionCoverage()._assert_uncached_inconclusive_exit2(path, tmp_path / "cache")
+            else:
+                reset_cache_manager()
+                try:
+                    for _ in range(2):
+                        aggregate = scan_model_directory_or_file(
+                            str(path), cache_enabled=True, cache_dir=str(tmp_path / "cache"), min_cache_file_size=0
+                        )
+                        assert aggregate.success is True
+                        assert determine_exit_code(aggregate) == 0
+                    assert get_cache_manager(str(tmp_path / "cache"), enabled=True).get_stats()["cache_hits"] > 0
+                finally:
+                    reset_cache_manager()
+        else:
+            self._assert_contract(model, tmp_path, incomplete)
+
+    @pytest.mark.parametrize(
+        ("opset", "mode"),
+        [(14, "mean")]
+        + [(18, mode) for mode in ("mean", "variance", "data", "inference", "unused", "no_initializer", "uniform")]
+        + [(9, "mean"), (9, "data")],
+    )
+    def test_batchnorm_training_reductions_preserve_numeric_shape_provenance(
+        self, tmp_path: Path, opset: int, mode: str
+    ) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        value, tensor = self._value, self._tensor
+        arrays = {
+            "source_a": np.zeros((1, 1, 4 if mode == "uniform" else 1), np.float32),
+            "source_b": np.zeros((1, 1, 3), np.float32),
+        }
+        tensors = [] if mode == "no_initializer" else [tensor(name, array) for name, array in arrays.items()]
+        feeds = {
+            "one": np.array(1, np.float32),
+            "zero": np.array(0, np.float32),
+            "scale": np.ones(1, np.float32),
+            "bias": np.zeros(1, np.float32),
+            "prior_mean": np.zeros(1, np.float32),
+            "prior_var": np.ones(1, np.float32),
+        }
+        inputs = [value(name, list(array.shape)) for name, array in feeds.items()]
+        if mode == "no_initializer":
+            inputs.extend(value(name, list(array.shape)) for name, array in arrays.items())
+            feeds.update(arrays)
+        nodes = [
+            helper.make_node("Shape", ["source_a"], ["dims_a"]),
+            helper.make_node("Expand", ["one", "dims_a"], ["a"]),
+        ]
+        if mode == "uniform":
+            nodes.append(helper.make_node("Identity", ["a"], ["data"]))
+        else:
+            nodes.extend(
+                [
+                    helper.make_node("Shape", ["source_b"], ["dims_b"]),
+                    helper.make_node("Expand", ["zero", "dims_b"], ["b"]),
+                    helper.make_node("Concat", ["a", "b"], ["data"], axis=2),
+                ]
+            )
+        training = mode != "inference"
+        bn_outputs = ["normalized", "running_mean", "running_var"] if training else ["normalized"]
+        if opset < 14 and training:
+            bn_outputs.extend(["saved_mean", "saved_var"])
+        attrs: dict[str, Any] = {"momentum": 0.0, "epsilon": 1e-5}
+        if opset >= 14:
+            attrs["training_mode"] = int(training)
+        nodes.append(
+            helper.make_node(
+                "BatchNormalization", ["data", "scale", "bias", "prior_mean", "prior_var"], bn_outputs, **attrs
+            )
+        )
+        selected = (
+            "normalized" if mode in {"data", "inference"} else "running_var" if mode == "variance" else "running_mean"
+        )
+        raw = (
+            np.ones((1, 1, 4), np.float32) if mode == "uniform" else np.array([1, 0, 0, 0], np.float32).reshape(1, 1, 4)
+        )
+        mean, variance = raw.mean(axis=(0, 2)), raw.var(axis=(0, 2))
+        normalized = (
+            (raw - mean.reshape(1, 1, 1)) / np.sqrt(variance.reshape(1, 1, 1) + np.float32(1e-5))
+            if training
+            else raw / np.sqrt(np.float32(1) + np.float32(1e-5))
+        )
+        selected_array = normalized if selected == "normalized" else variance if selected == "running_var" else mean
+        matrix_shape = [1, selected_array.size]
+        tensors.append(tensor("matrix_shape", np.array(matrix_shape, np.int64)))
+        nodes.append(helper.make_node("Reshape", [selected, "matrix_shape"], ["weight"]))
+        if mode == "unused":
+            nodes.append(helper.make_node("Identity", ["weight"], ["Y"]))
+        else:
+            feeds["left"] = np.ones((1, 1), np.float32)
+            inputs.append(value("left", [1, 1]))
+            nodes.append(helper.make_node("MatMul", ["left", "weight"], ["Y"]))
+        model = self._model(nodes, inputs, [value("Y", matrix_shape)], tensors, [])
+        model.opset_import[0].version = opset
+        onnx.checker.check_model(model, full_check=True)
+        evaluation_model = model
+        if opset == 9 and mode == "mean":
+            # The reference evaluator omits legacy statistic outputs; execute the equivalent modern schema.
+            evaluation_model = onnx.ModelProto()
+            evaluation_model.CopyFrom(model)
+            evaluation_model.opset_import[0].version = 18
+            bn = next(node for node in evaluation_model.graph.node if node.op_type == "BatchNormalization")
+            del bn.output[3:]
+            bn.attribute.append(helper.make_attribute("training_mode", 1))
+            onnx.checker.check_model(evaluation_model, full_check=True)
+        actual: Any = ReferenceEvaluator(evaluation_model).run(None, feeds)
+        np.testing.assert_allclose(actual[0], selected_array.reshape(matrix_shape), rtol=1e-5, atol=1e-6)
+        self._assert_contract(model, tmp_path, mode in {"mean", "variance", "data"})
+
+    @pytest.mark.parametrize("is_test", [None, 0, 1])
+    def test_legacy_batchnorm_requires_explicit_inference_mode(self, tmp_path: Path, is_test: int | None) -> None:
+        from onnx.reference import ReferenceEvaluator
+
+        value, tensor = self._value, self._tensor
+        training = is_test != 1
+        attrs: dict[str, Any] = {"momentum": 0.0, "epsilon": 1e-5}
+        if is_test is not None:
+            attrs["is_test"] = is_test
+        outputs = ["normalized", "mean", "var", "saved_mean", "saved_var"] if training else ["normalized"]
+        nodes = [
+            helper.make_node("Reshape", ["raw", "shape"], ["data"]),
+            helper.make_node(
+                "BatchNormalization", ["data", "scale", "bias", "prior_mean", "prior_var"], outputs, **attrs
+            ),
+            helper.make_node("MatMul", ["left", "normalized"], ["Y"]),
+        ]
+        feeds = {
+            "raw": np.array([1, 0, 0, 0], np.float32),
+            "scale": np.ones(1, np.float32),
+            "bias": np.zeros(1, np.float32),
+            "prior_mean": np.zeros(1, np.float32),
+            "prior_var": np.ones(1, np.float32),
+            "left": np.ones((1, 1), np.float32),
+        }
+        model = self._model(
+            nodes,
+            [value(name, list(array.shape)) for name, array in feeds.items()],
+            [value("Y", [1, 1, 4])],
+            [tensor("shape", np.array([1, 1, 4], np.int64))],
+            [],
+        )
+        model.opset_import[0].version = 6
+        onnx.checker.check_model(model, full_check=True)
+        evaluation_model = model
+        if training:
+            # Legacy training returns are unsupported by the evaluator; retain the original scan target.
+            evaluation_model = onnx.ModelProto()
+            evaluation_model.CopyFrom(model)
+            evaluation_model.opset_import[0].version = 18
+            bn = evaluation_model.graph.node[1]
+            del bn.output[3:]
+            kept_attributes = [attribute for attribute in bn.attribute if attribute.name != "is_test"]
+            del bn.attribute[:]
+            bn.attribute.extend(kept_attributes)
+            bn.attribute.append(helper.make_attribute("training_mode", 1))
+            onnx.checker.check_model(evaluation_model, full_check=True)
+        raw = feeds["raw"].reshape(1, 1, 4)
+        expected = (
+            (raw - np.float32(0.25)) / np.sqrt(np.float32(0.1875) + np.float32(1e-5))
+            if training
+            else raw / np.sqrt(np.float32(1) + np.float32(1e-5))
+        )
+        actual: Any = ReferenceEvaluator(evaluation_model).run(None, feeds)
+        np.testing.assert_allclose(actual[0], expected, rtol=1e-5, atol=1e-6)
+        self._assert_contract(model, tmp_path, training)

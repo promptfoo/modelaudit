@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Preserve ONNX training-normalization and loop-exit weight coverage when entry shapes are unproven or state ranks later increase.
 - Apply ONNX output rank and type semantics to deferred numeric provenance, and retain coverage when pooling or convolution turns dimensions into numeric coefficients.
 - Retain nested ONNX Loop control dependencies despite unused captures, promote deferred BatchNormalization parameter coverage to matrix outputs, and require proven entry ranks before suppressing recurrent weight gaps.
 - Preserve ONNX weight coverage across unknown broadcast ranks, including runtime values with only shape-control provenance, unproven branch and Reshape dimensions, captured runtime inputs, and repeated loop state changes, including initializer-backed states, cumulative scalar rank growth, repeated body consumers, and final transformed weights without stale first-iteration shapes or fabricated products of symbolic dimensions; distinguish builtin operators from exact local-function overloads in weight roles, transforms, and shape proofs while retaining unmatched builtin overloads; avoid false coverage gaps for unchanged shape-control values and provenance, separately captured constants, and fixed-shape single-step Scans including shared sequence extents beside symbolic inputs and feature widths, no-op shape-restoring loops, unchanged Scan-8 batch views, and padded Scan-8 outputs with omitted sequence lengths only for builtin Scan producers.

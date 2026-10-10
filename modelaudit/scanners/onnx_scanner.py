@@ -7154,10 +7154,32 @@ def _build_onnx_weight_analysis_plan(
                     return False
             return True
 
+        def batch_normalization_is_inference(node: Any) -> bool:
+            if any(node.output[1:]):
+                return False
+            domain = str(getattr(node, "domain", "") or "")
+            version = opset_versions.get(domain)
+            if version is None and domain in {"", "ai.onnx"}:
+                version = opset_versions.get("ai.onnx" if domain == "" else "")
+            if version is None:
+                return False
+            inference = version >= 7
+            for attribute in getattr(node, "attribute", ()):
+                if attribute.name not in {"is_test", "training_mode"}:
+                    continue
+                resolved = resolve_attribute(attribute)
+                if resolved is None:
+                    return False
+                if attribute.name == "is_test":
+                    inference = bool(resolved.i)
+                elif resolved.i:
+                    return False
+            return inference
+
         def aggregation_preserves_shape_control(node: Any) -> bool:
             if not node.input or not value_is_proven_nonempty_uniform(str(node.input[0])):
                 return False
-            if node.op_type == "GlobalAveragePool":
+            if node.op_type in {"GlobalAveragePool", "BatchNormalization"}:
                 return True
             if node.op_type == "AveragePool":
                 includes_padding = False
@@ -10654,9 +10676,9 @@ def _build_onnx_weight_analysis_plan(
                     )
                     or clip_operator
                     or pow_operator
+                    or (batch_normalization_operator and batch_normalization_is_inference(node))
                     or node.op_type
                     in {
-                        "BatchNormalization",
                         "Concat",
                         "GlobalMaxPool",
                         "MaxPool",
@@ -10666,6 +10688,7 @@ def _build_onnx_weight_analysis_plan(
                 preserved_shape_control_sources: frozenset[int] = frozenset()
                 if is_builtin_neural_operator and node.op_type in {
                     "AveragePool",
+                    "BatchNormalization",
                     "GlobalAveragePool",
                     "Conv",
                     "ConvTranspose",
@@ -11307,10 +11330,7 @@ def _build_onnx_weight_analysis_plan(
 
             def control_flow_state_input_rank(output_index: int) -> int | None:
                 state_input_name = control_flow_state_input_name(output_index)
-                state_input_shape = known_value_shapes.get(state_input_name)
-                return (
-                    len(state_input_shape) if state_input_shape is not None else known_value_ranks.get(state_input_name)
-                )
+                return proven_value_rank(state_input_name)
 
             standard_control_flow_operator = is_builtin_neural_operator
             scan_output_axes = (
@@ -11620,12 +11640,8 @@ def _build_onnx_weight_analysis_plan(
                             repeated_carried_state_input_may_feed_weight = (
                                 repeated_carried_state_cross_state_weight_transfer
                             )
-                        state_input_shape = known_value_shapes.get(state_input_name)
-                        state_input_rank = (
-                            len(state_input_shape)
-                            if state_input_shape is not None
-                            else known_value_ranks.get(state_input_name)
-                        )
+                        state_input_shape = proven_value_shape(state_input_name)
+                        state_input_rank = proven_value_rank(state_input_name)
                         sibling_state_shape_is_unproven = (
                             node.op_type == "Loop"
                             and len(repeated_state_output_indexes_by_input) > 1
@@ -11690,7 +11706,7 @@ def _build_onnx_weight_analysis_plan(
                                 initializer_index=lineage.initializer_index,
                                 shape=(
                                     graph_output_shape
-                                    if graph_output_shape is not None
+                                    if graph_output_shape is not None and graph_output_rank_proven
                                     else tuple(-1 for _ in range(graph_output_rank))
                                     if graph_output_rank is not None and graph_output_rank_proven
                                     else None
@@ -11816,7 +11832,7 @@ def _build_onnx_weight_analysis_plan(
                             subgraph,
                             subgraph_state_input_name,
                             graph_output_index,
-                            known_value_shapes.get(state_input_name),
+                            proven_value_shape(state_input_name),
                             state_input_rank,
                             exact_loop_iterations,
                             subgraph_trusted_context_shapes,
@@ -11876,6 +11892,33 @@ def _build_onnx_weight_analysis_plan(
                             subgraph_output_weight_lineage_gap_summaries[output_index],
                             graph_output_weight_gap_summary,
                         )
+                    else:
+                        assert finite_loop_rank_bounds is not None
+                        demoted_weight_summary = summarize_rank_promotable_lineage_gap(
+                            (
+                                _OnnxWeightLineage(
+                                    initializer_index=lineage.initializer_index,
+                                    shape=finite_loop_rank_bounds[2],
+                                    data_type=lineage.data_type,
+                                    transforms=lineage.transforms,
+                                    unresolved_reason=lineage.unresolved_reason,
+                                )
+                                for lineage in graph_output_weight_gap_summary.lineages
+                            ),
+                            truncated=graph_output_weight_gap_summary.truncated,
+                        )
+                        subgraph_output_rank_promotable_lineage_gap_counts[output_index] = (
+                            _bounded_onnx_weight_lineage_gap_count(
+                                subgraph_output_rank_promotable_lineage_gap_counts[output_index],
+                                graph_output_weight_lineage_gap_counts[graph_output_index],
+                            )
+                        )
+                        subgraph_output_rank_promotable_lineage_gap_summaries[output_index] = (
+                            merge_weight_lineage_gap_summaries(
+                                subgraph_output_rank_promotable_lineage_gap_summaries[output_index],
+                                demoted_weight_summary,
+                            )
+                        )
                     rank_promotable_gap_promoted = False
                     if (
                         standard_control_flow_operator
@@ -11908,7 +11951,7 @@ def _build_onnx_weight_analysis_plan(
                                     subgraph,
                                     subgraph_state_input_name,
                                     graph_output_index,
-                                    known_value_shapes.get(state_input_name),
+                                    proven_value_shape(state_input_name),
                                     state_input_rank,
                                     exact_loop_iterations,
                                     subgraph_trusted_context_shapes,
