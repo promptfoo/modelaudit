@@ -9,6 +9,13 @@ from framework_fixtures import SystemCommandPayload
 
 from modelaudit_picklescan import SafetyVerdict, ScanOptions, ScanStatus, scan_bytes
 
+NESTED_ENCODING_RULES = (
+    ("raw", "S213"),
+    ("unicode", "S213"),
+    ("base64", "S601"),
+    ("hex", "S602"),
+)
+
 LONG_PROTOCOL0_LITERAL_PAYLOADS = [
     pytest.param(b"cattacker\nfactory\n(V" + (b"A" * 2000) + b"\ntR.", id="unicode"),
     pytest.param(
@@ -28,15 +35,7 @@ def _encode_nested_value(payload: bytes, encoding: str) -> bytes | str:
     return payload.hex()
 
 
-@pytest.mark.parametrize(
-    ("encoding", "expected_rule"),
-    [
-        ("raw", "S213"),
-        ("unicode", "S213"),
-        ("base64", "S601"),
-        ("hex", "S602"),
-    ],
-)
+@pytest.mark.parametrize(("encoding", "expected_rule"), NESTED_ENCODING_RULES)
 @pytest.mark.parametrize("protocol", range(pickle.HIGHEST_PROTOCOL + 1))
 def test_minimum_nested_budget_fails_closed(
     protocol: int,
@@ -44,15 +43,7 @@ def test_minimum_nested_budget_fails_closed(
     expected_rule: str,
 ) -> None:
     nested_payload = pickle.dumps(SystemCommandPayload("echo pwned", lambda: os.system), protocol=protocol)
-    nested_value: bytes | str
-    if encoding == "raw":
-        nested_value = nested_payload
-    elif encoding == "unicode":
-        nested_value = nested_payload.decode("latin1")
-    elif encoding == "base64":
-        nested_value = base64.b64encode(nested_payload).decode("ascii")
-    else:
-        nested_value = nested_payload.hex()
+    nested_value = _encode_nested_value(nested_payload, encoding)
 
     report = scan_bytes(
         pickle.dumps({"outer": nested_value}, protocol=4),
@@ -79,15 +70,7 @@ def test_minimum_nested_budget_fails_closed_for_unknown_protocol0_global() -> No
     assert any(finding.rule_code == "S213" for finding in report.findings)
 
 
-@pytest.mark.parametrize(
-    ("encoding", "expected_rule"),
-    [
-        ("raw", "S213"),
-        ("unicode", "S213"),
-        ("base64", "S601"),
-        ("hex", "S602"),
-    ],
-)
+@pytest.mark.parametrize(("encoding", "expected_rule"), NESTED_ENCODING_RULES)
 def test_minimum_nested_budget_fails_closed_for_mark_prefixed_inst(
     encoding: str,
     expected_rule: str,
@@ -105,29 +88,13 @@ def test_minimum_nested_budget_fails_closed_for_mark_prefixed_inst(
     assert any(finding.rule_code == expected_rule for finding in report.findings)
 
 
-@pytest.mark.parametrize(
-    ("encoding", "expected_rule"),
-    [
-        ("raw", "S213"),
-        ("unicode", "S213"),
-        ("base64", "S601"),
-        ("hex", "S602"),
-    ],
-)
+@pytest.mark.parametrize(("encoding", "expected_rule"), NESTED_ENCODING_RULES)
 def test_minimum_nested_budget_fails_closed_for_explicit_protocol0_header(
     encoding: str,
     expected_rule: str,
 ) -> None:
     nested_payload = b"\x80\x00X\x08\x00\x00\x00attackerQ."
-    nested_value: bytes | str
-    if encoding == "raw":
-        nested_value = nested_payload
-    elif encoding == "unicode":
-        nested_value = nested_payload.decode("latin1")
-    elif encoding == "base64":
-        nested_value = base64.b64encode(nested_payload).decode("ascii")
-    else:
-        nested_value = nested_payload.hex()
+    nested_value = _encode_nested_value(nested_payload, encoding)
 
     report = scan_bytes(
         pickle.dumps({"outer": nested_value}, protocol=4),
@@ -178,15 +145,7 @@ def test_minimum_nested_budget_leaves_invalid_protocol6_header_clean(encoding: s
     assert not any(finding.rule_code in {"S213", "S601", "S602"} for finding in report.findings)
 
 
-@pytest.mark.parametrize(
-    ("encoding", "expected_rule"),
-    [
-        ("raw", "S213"),
-        ("unicode", "S213"),
-        ("base64", "S601"),
-        ("hex", "S602"),
-    ],
-)
+@pytest.mark.parametrize(("encoding", "expected_rule"), NESTED_ENCODING_RULES)
 @pytest.mark.parametrize("budget", [2, 8, 16, 64])
 @pytest.mark.parametrize("filler_len", [0, 1, 47, 48, 63, 64])
 def test_nested_budget_detects_valid_pickle_after_invalid_protocol_header(
@@ -258,15 +217,7 @@ def test_nested_budget_leaves_multiline_opcode_like_prose_clean(
 @pytest.mark.parametrize("encoding", ["raw", "unicode", "base64", "hex"])
 def test_truncated_opaque_binary_prefix_remains_clean(encoding: str) -> None:
     opaque_value = b"\x80\x04" + (b"A" * 8)
-    nested_value: bytes | str
-    if encoding == "raw":
-        nested_value = opaque_value
-    elif encoding == "unicode":
-        nested_value = opaque_value.decode("latin1")
-    elif encoding == "base64":
-        nested_value = base64.b64encode(opaque_value).decode("ascii")
-    else:
-        nested_value = opaque_value.hex()
+    nested_value = _encode_nested_value(opaque_value, encoding)
 
     report = scan_bytes(
         pickle.dumps({"outer": nested_value}, protocol=4),
@@ -279,15 +230,7 @@ def test_truncated_opaque_binary_prefix_remains_clean(encoding: str) -> None:
     assert not any(finding.rule_code in {"S213", "S601", "S602"} for finding in report.findings)
 
 
-@pytest.mark.parametrize(
-    ("encoding", "expected_rule"),
-    [
-        ("raw", "S213"),
-        ("unicode", "S213"),
-        ("base64", "S601"),
-        ("hex", "S602"),
-    ],
-)
+@pytest.mark.parametrize(("encoding", "expected_rule"), NESTED_ENCODING_RULES)
 @pytest.mark.parametrize("budget", [2, 8, 1024])
 def test_minimum_nested_budget_fails_closed_for_long_protocol0_global(
     encoding: str,
@@ -308,15 +251,7 @@ def test_minimum_nested_budget_fails_closed_for_long_protocol0_global(
     assert any(finding.rule_code == expected_rule for finding in report.findings)
 
 
-@pytest.mark.parametrize(
-    ("encoding", "expected_rule"),
-    [
-        ("raw", "S213"),
-        ("unicode", "S213"),
-        ("base64", "S601"),
-        ("hex", "S602"),
-    ],
-)
+@pytest.mark.parametrize(("encoding", "expected_rule"), NESTED_ENCODING_RULES)
 @pytest.mark.parametrize("budget", [2, 8, 1024])
 @pytest.mark.parametrize("nested_payload", LONG_PROTOCOL0_LITERAL_PAYLOADS)
 def test_nested_budget_fails_closed_for_long_protocol0_literal(

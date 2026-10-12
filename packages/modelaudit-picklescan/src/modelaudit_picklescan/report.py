@@ -42,10 +42,6 @@ def _immutable_mapping(value: Mapping[str, Any]) -> Mapping[str, Any]:
     return frozen
 
 
-def _mapping_to_dict(value: Mapping[str, Any]) -> dict[str, Any]:
-    return {key: _deep_mutable_copy(item) for key, item in value.items()}
-
-
 def _deep_freeze(value: Any) -> Any:
     if isinstance(value, Mapping):
         return MappingProxyType({key: _deep_freeze(item) for key, item in value.items()})
@@ -108,7 +104,7 @@ class Finding:
             "severity": self.severity.value,
             "location": self.location,
             "rule_code": self.rule_code,
-            "details": _mapping_to_dict(self.details),
+            "details": _deep_mutable_copy(self.details),
             "why": self.why,
         }
 
@@ -134,7 +130,7 @@ class Notice:
             "severity": self.severity.value,
             "location": self.location,
             "code": self.code,
-            "details": _mapping_to_dict(self.details),
+            "details": _deep_mutable_copy(self.details),
         }
 
 
@@ -157,7 +153,7 @@ class ScanError:
             "category": self.category,
             "location": self.location,
             "exception_type": self.exception_type,
-            "details": _mapping_to_dict(self.details),
+            "details": _deep_mutable_copy(self.details),
         }
 
 
@@ -197,7 +193,7 @@ class PickleReport:
             "notices": [notice.to_dict() for notice in self.notices],
             "errors": [error.to_dict() for error in self.errors],
             "coverage": self.coverage.to_dict(),
-            "metadata": _mapping_to_dict(self.metadata),
+            "metadata": _deep_mutable_copy(self.metadata),
             "duration_s": self.duration_s,
             "has_security_findings": self.has_security_findings,
             "is_clean": self.is_clean,

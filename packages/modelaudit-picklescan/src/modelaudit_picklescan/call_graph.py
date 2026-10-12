@@ -35,7 +35,7 @@ from importlib.machinery import (
     SourcelessFileLoader,
 )
 from importlib.metadata import distribution, packages_distributions
-from importlib.util import MAGIC_NUMBER, cache_from_source, source_hash
+from importlib.util import MAGIC_NUMBER, cache_from_source
 from pathlib import Path
 from types import (
     BuiltinFunctionType,
@@ -1919,8 +1919,6 @@ class UnanalyzedCallGraphReference:
 
 @dataclass(frozen=True)
 class _ModuleAnalysis:
-    module: str
-    source_path: str
     aliases: dict[str, str]
     direct_names: frozenset[str]
     calls_by_function: dict[str, tuple[str, ...]]
@@ -5488,45 +5486,6 @@ def _source_cache_path(source_path: Path) -> Path | None:
         return None
 
 
-def _effective_bytecode_matches_source(source_path: Path) -> bool:
-    cache_path = _source_cache_path(source_path)
-    if cache_path is None:
-        return True
-    try:
-        bytecode, _bytecode_stat = _read_bounded_regular_file(cache_path, _MAX_SOURCE_BYTES * 2)
-    except FileNotFoundError:
-        return True
-    except OSError:
-        return False
-    try:
-        source, source_stat = _read_bounded_regular_file(source_path, _MAX_SOURCE_BYTES)
-    except OSError:
-        return False
-    if len(bytecode) < 16:
-        return False
-    if bytecode[:4] != MAGIC_NUMBER:
-        return True
-    flags = int.from_bytes(bytecode[4:8], "little")
-    if flags & ~0b11:
-        return True
-    if flags & 0b1:
-        check_hash_policy = _imp.check_hash_based_pycs
-        should_check_hash = check_hash_policy == "always" or (check_hash_policy == "default" and bool(flags & 0b10))
-        if should_check_hash and bytecode[8:16] != source_hash(source):
-            return True
-    elif (
-        int.from_bytes(bytecode[8:12], "little") != int(source_stat.st_mtime) & 0xFFFFFFFF
-        or int.from_bytes(bytecode[12:16], "little") != source_stat.st_size & 0xFFFFFFFF
-    ):
-        return True
-    try:
-        cached_code = marshal.loads(bytecode[16:])
-        source_code = compile(source, str(source_path), "exec", dont_inherit=True, optimize=sys.flags.optimize)
-    except (EOFError, TypeError, ValueError):
-        return False
-    return isinstance(cached_code, CodeType) and cached_code == source_code
-
-
 def _current_module_source_path(module_name: str) -> str | None:
     if len(module_name) > _MAX_SOURCE_MODULE_NAME_CHARS:
         return None
@@ -6273,8 +6232,6 @@ def _analyze_module(module_name: str) -> _ModuleAnalysis | None:
         local_class_entrypoints,
     )
     return _ModuleAnalysis(
-        module=module_name,
-        source_path=str(context.source_path),
         aliases=aliases,
         direct_names=export_summary.direct_names,
         calls_by_function=calls_by_function,

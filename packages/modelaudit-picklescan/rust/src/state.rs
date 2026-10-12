@@ -31,11 +31,10 @@ use crate::options::{deadline_from_timeout, ScanOptions};
 use crate::policy::{
     callable_severity, global_import_is_allowlisted, global_import_requires_review, global_severity,
 };
-use crate::post_budget::{post_budget_absolute_position, post_budget_global_matches};
+use crate::post_budget::post_budget_global_matches;
 use crate::report::{
-    detail_string, detail_usize, empty_private_metadata, notice_to_detail_value,
-    scan_error_to_detail_value, DetailValue, Finding, FindingDedupeKey, Notice, NoticeDedupeKey,
-    ScanError,
+    detail_string, detail_usize, notice_to_detail_value, scan_error_to_detail_value, DetailValue,
+    Finding, FindingDedupeKey, Notice, NoticeDedupeKey, ScanError,
 };
 use crate::stack::{
     collapse_tuple_values, is_known_pytorch_storage_global, operand_preview,
@@ -405,12 +404,6 @@ impl ScanStatus {
     }
 }
 
-impl PartialEq<&str> for ScanStatus {
-    fn eq(&self, other: &&str) -> bool {
-        self.as_str() == *other
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ScanVerdict {
     Clean,
@@ -427,12 +420,6 @@ impl ScanVerdict {
             Self::Malicious => "malicious",
             Self::Unknown => "unknown",
         }
-    }
-}
-
-impl PartialEq<&str> for ScanVerdict {
-    fn eq(&self, other: &&str) -> bool {
-        self.as_str() == *other
     }
 }
 
@@ -1399,8 +1386,8 @@ impl<'a> ScanState<'a> {
                         }
                     }
                     "STRING" => {
-                        if let Some(bytes) = opcode.arg.raw_bytes(self.payload) {
-                            self.scan_raw_nested_pickle_bytes(bytes.as_ref(), position);
+                        if let ArgValue::DecodedString { bytes, .. } = &opcode.arg {
+                            self.scan_raw_nested_pickle_bytes(bytes, position);
                         }
                     }
                     "UNICODE" => {
@@ -1696,7 +1683,7 @@ impl<'a> ScanState<'a> {
                 }
             }
             "GLOBAL" => {
-                let (module, name) = opcode.arg.global_parts(self.payload);
+                let (module, name) = opcode.arg.global_parts();
                 let reference = GlobalRef {
                     module,
                     name,
@@ -2135,7 +2122,8 @@ impl<'a> ScanState<'a> {
                             unknown_key_values_overflowed = true;
                             entry_budget_exhausted = true;
                         }
-                    } else if !self.insert_optional_tracked_dict_shadow_entry(&mut entries, key) {
+                    } else if !Self::insert_tracked_dict_entry(&mut entries, key, StackValue::Other)
+                    {
                         unknown_key_values_overflowed = true;
                     }
                 } else {
@@ -2291,22 +2279,6 @@ impl<'a> ScanState<'a> {
         }
     }
 
-    fn insert_optional_tracked_dict_shadow_entry(
-        &mut self,
-        entries: &mut Vec<(String, StackValue)>,
-        key: String,
-    ) -> bool {
-        if let Some((_, value)) = entries.iter_mut().find(|(candidate, _)| candidate == &key) {
-            *value = StackValue::Other;
-            true
-        } else if entries.len() < MAX_TRACKED_DICT_ENTRIES {
-            entries.push((key, StackValue::Other));
-            true
-        } else {
-            false
-        }
-    }
-
     fn insert_tracked_dict_unknown_key_value(
         unknown_key_values: &mut Vec<StackValue>,
         unknown_key_values_overflowed: &mut bool,
@@ -2424,7 +2396,7 @@ impl<'a> ScanState<'a> {
             }
             "INST" => {
                 let values = self.pop_to_mark();
-                let (module, name) = opcode.arg.global_parts(self.payload);
+                let (module, name) = opcode.arg.global_parts();
                 let reference = GlobalRef {
                     module,
                     name,
@@ -2997,7 +2969,7 @@ impl<'a> ScanState<'a> {
         let key = stack_value_string(key, self.payload);
         if key.is_some() && !Self::tracked_dict_value_is_security_relevant(value) {
             if let Some(key) = key.as_deref() {
-                self.record_memoized_tracked_dict_shadow_entry(memo_index, key);
+                self.record_top_tracked_dict_shadow_entry(key, Some(memo_index));
             }
             return;
         }
@@ -3034,26 +3006,6 @@ impl<'a> ScanState<'a> {
         }
     }
 
-    fn record_memoized_tracked_dict_shadow_entry(&mut self, memo_index: i64, key: &str) {
-        let Some(mut tracked_dict) = self.memo.get(&memo_index).cloned() else {
-            return;
-        };
-        if let StackValue::TrackedDict {
-            entries,
-            unknown_key_values_overflowed,
-            ..
-        } = &mut tracked_dict
-        {
-            entries.retain(|(candidate, _)| candidate != key);
-            if entries.len() < MAX_TRACKED_DICT_ENTRIES {
-                entries.push((key.to_string(), StackValue::Other));
-            } else {
-                *unknown_key_values_overflowed = true;
-            }
-        }
-        self.replace_memo_value(memo_index, tracked_dict, "tracked_dict_shadow");
-    }
-
     fn record_tracked_dict_setdefault_mutation(
         &mut self,
         target: &StackValue,
@@ -3085,7 +3037,7 @@ impl<'a> ScanState<'a> {
         });
         if key.is_some() && !Self::tracked_dict_value_is_security_relevant(&value) {
             if let Some(key) = key.as_deref() {
-                self.record_memoized_tracked_dict_shadow_entry(memo_index, key);
+                self.record_top_tracked_dict_shadow_entry(key, Some(memo_index));
             }
             return;
         }
@@ -5211,29 +5163,7 @@ impl<'a> ScanState<'a> {
                 reference.memo_read |= memo_read;
                 StackValue::Constructed(reference)
             }
-            StackValue::Text {
-                value,
-                memo_read: existing_memo_read,
-            } => StackValue::Text {
-                value: value.clone(),
-                memo_read: *existing_memo_read || memo_read,
-            },
-            StackValue::TextSpan {
-                start,
-                end,
-                memo_read: existing_memo_read,
-            } => StackValue::TextSpan {
-                start: *start,
-                end: *end,
-                memo_read: *existing_memo_read || memo_read,
-            },
-            StackValue::Tuple(values) => StackValue::Tuple(
-                values
-                    .iter()
-                    .map(|item| Self::memo_read_stack_value(item, memo_read))
-                    .collect(),
-            ),
-            value => value.clone(),
+            value => Self::memo_read_stack_value(value, memo_read),
         }
     }
 
@@ -5934,7 +5864,7 @@ impl<'a> ScanState<'a> {
                         unknown_key_values_overflowed = true;
                         entry_budget_exhausted = true;
                     }
-                } else if !self.insert_optional_tracked_dict_shadow_entry(&mut entries, key) {
+                } else if !Self::insert_tracked_dict_entry(&mut entries, key, StackValue::Other) {
                     unknown_key_values_overflowed = true;
                 }
             } else {
@@ -6325,7 +6255,7 @@ impl<'a> ScanState<'a> {
                         ),
                         surface_outcome.promote_complete_payload(nested_has_execution_opcode),
                     );
-                    if surface_outcome.should_stop_raw_probe_scan(nested_has_execution_opcode) {
+                    if surface_outcome.should_stop_raw_probe_scan() {
                         return;
                     }
                     skip_offsets_before = offset.saturating_add(payload_len);
@@ -6352,9 +6282,6 @@ impl<'a> ScanState<'a> {
                     raw_nested_payload_finding(probe.len(), position + offset, true, true),
                     true,
                 );
-                if surface_outcome.should_stop_raw_probe_scan(true) {
-                    return;
-                }
                 return;
             }
             let candidate_truncated = remaining_len > self.options.max_nested_pickle_bytes;
@@ -6379,7 +6306,6 @@ impl<'a> ScanState<'a> {
 
     fn raw_nested_unicode_probe_offsets(&self, value: &[u8]) -> NestedProbeOffsets {
         let mut offsets = Vec::new();
-        let last_stop_offset = value.iter().rposition(|byte| *byte == b'.');
         let mut search_start = 0usize;
         while search_start < value.len().saturating_sub(1) {
             let probe_offsets = nested_pickle_probe_offsets(&value[search_start..]);
@@ -6392,8 +6318,7 @@ impl<'a> ScanState<'a> {
                 let probe = &value[offset..end];
                 let payload_extent =
                     pickle_payload_extent_result(probe, self.options.max_nested_pickle_bytes);
-                let complete_payload = last_stop_offset.is_some_and(|stop| offset < stop)
-                    && matches!(&payload_extent, Ok(Some(_)));
+                let complete_payload = matches!(&payload_extent, Ok(Some(_)));
                 let operand_limit_exceeded = payload_extent
                     .as_ref()
                     .is_err_and(|error| error.is_structured_protocol0_line_operand_limit());
@@ -7555,18 +7480,12 @@ impl<'a> ScanState<'a> {
         self.emit_collected_expansion_finding();
         self.emit_buffer_opcode_notice();
         self.emit_persistent_id_notice();
-        self.rebuild_seen_notice_keys();
-        self.emit_non_allowlisted_import_only_global_findings();
-        self.coalesce_redundant_global_findings();
+        self.finalize_global_findings();
         self.finalize_verdict();
     }
 
-    fn emit_non_allowlisted_import_only_global_findings(&mut self) {
-        if self.non_allowlisted_global_imports.is_empty() {
-            return;
-        }
-
-        let mut reported_dangerous_call_keys = HashSet::new();
+    fn finalize_global_findings(&mut self) {
+        let mut called_global_keys = HashSet::new();
         for finding in &self.findings {
             if finding.rule_code != Some("DANGEROUS_CALL") {
                 continue;
@@ -7576,13 +7495,13 @@ impl<'a> ScanState<'a> {
             if let (Some(import_reference), Some(global_position)) =
                 (import_reference, global_position)
             {
-                reported_dangerous_call_keys.insert((import_reference, global_position));
+                called_global_keys.insert((import_reference, global_position));
             }
         }
 
         for (symbol, position, details) in std::mem::take(&mut self.non_allowlisted_global_imports)
         {
-            if reported_dangerous_call_keys.contains(&(symbol.clone(), position)) {
+            if called_global_keys.contains(&(symbol.clone(), position)) {
                 continue;
             }
             self.add_finding(Finding {
@@ -7596,6 +7515,23 @@ impl<'a> ScanState<'a> {
                 ),
             });
         }
+        if called_global_keys.is_empty() {
+            return;
+        }
+
+        self.findings.retain(|finding| {
+            if finding.rule_code != Some("DANGEROUS_GLOBAL") {
+                return true;
+            }
+            let import_reference = detail_string(&finding.details, "import_reference");
+            let location_position = detail_usize(&finding.details, "position");
+            match (import_reference, location_position) {
+                (Some(import_reference), Some(position)) => {
+                    !called_global_keys.contains(&(import_reference, position))
+                }
+                _ => true,
+            }
+        });
     }
 
     fn emit_collected_expansion_finding(&mut self) {
@@ -7964,7 +7900,6 @@ impl<'a> ScanState<'a> {
             .saturating_add(self.options.post_budget_scan_bytes)
             .min(self.payload.len());
         self.scan_post_budget_structural_opcodes(tail_start, tail_end);
-        let tail_prefix_len = 0;
         let tail = &self.payload[tail_start..tail_end];
         self.bytes_scanned = self
             .bytes_scanned
@@ -7980,19 +7915,12 @@ impl<'a> ScanState<'a> {
             .iter()
             .map(|(index, value)| (*index, post_budget_owned_stack_value(value, self.payload)))
             .collect::<HashMap<_, _>>();
-        for global_match in post_budget_global_matches(
-            tail,
-            tail_prefix_len,
-            &initial_stack,
-            memo_snapshot.len(),
-            |memo_index| memo_snapshot.get(&memo_index).cloned(),
-        ) {
-            let absolute_position = post_budget_absolute_position(
-                read_offset,
-                read_offset,
-                tail_prefix_len,
-                global_match.pattern_start,
-            );
+        for global_match in
+            post_budget_global_matches(tail, &initial_stack, memo_snapshot.len(), |memo_index| {
+                memo_snapshot.get(&memo_index).cloned()
+            })
+        {
+            let absolute_position = read_offset.saturating_add(global_match.pattern_start);
             let severity = if global_match.reduce_proximate {
                 "critical"
             } else {
@@ -8033,13 +7961,8 @@ impl<'a> ScanState<'a> {
             });
         }
 
-        let expansion_findings = detect_expansion_findings_in_tail(
-            tail,
-            read_offset,
-            read_offset,
-            tail_prefix_len,
-            self.position_offset,
-        );
+        let expansion_findings =
+            detect_expansion_findings_in_tail(tail, read_offset, self.position_offset);
         if !expansion_findings.is_empty() {
             self.add_expansion_finding(&expansion_findings, true);
         }
@@ -8261,50 +8184,6 @@ impl<'a> ScanState<'a> {
         ))
     }
 
-    fn coalesce_redundant_global_findings(&mut self) {
-        let mut called_global_keys = HashSet::new();
-        for finding in &self.findings {
-            if finding.rule_code != Some("DANGEROUS_CALL") {
-                continue;
-            }
-            let import_reference = detail_string(&finding.details, "import_reference");
-            let global_position = detail_usize(&finding.details, "global_position");
-            if let (Some(import_reference), Some(global_position)) =
-                (import_reference, global_position)
-            {
-                called_global_keys.insert((import_reference, global_position));
-            }
-        }
-        if called_global_keys.is_empty() {
-            return;
-        }
-
-        self.findings.retain(|finding| {
-            if finding.rule_code != Some("DANGEROUS_GLOBAL") {
-                return true;
-            }
-            let import_reference = detail_string(&finding.details, "import_reference");
-            let location_position = detail_usize(&finding.details, "position");
-            match (import_reference, location_position) {
-                (Some(import_reference), Some(position)) => {
-                    !called_global_keys.contains(&(import_reference, position))
-                }
-                _ => true,
-            }
-        });
-        self.seen_finding_keys = self
-            .findings
-            .iter()
-            .map(|finding| {
-                (
-                    finding.message.clone(),
-                    finding.location.clone(),
-                    finding.rule_code,
-                )
-            })
-            .collect();
-    }
-
     fn finalize_verdict(&mut self) {
         if self
             .findings
@@ -8406,7 +8285,7 @@ impl<'a> ScanState<'a> {
             metadata.set_item("first_pickle_end_pos", first_pickle_end_pos)?;
         }
         report.set_item("metadata", metadata)?;
-        report.set_item("private_metadata", empty_private_metadata(py))?;
+        report.set_item("private_metadata", PyDict::new(py))?;
         report.set_item("duration_s", duration_s)?;
         Ok(report.unbind())
     }
@@ -8661,68 +8540,99 @@ mod tests {
     #[test]
     fn inert_tracked_dict_overwrite_replaces_security_relevant_entry_with_shadow() {
         let options = default_test_options();
-        let payload = b".";
-        let mut scan = ScanState::new(
-            "tracked-dict-inert-overwrite.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
-        scan.push_stack_value(StackValue::TrackedDict {
-            entries: vec![(
-                "callback".to_string(),
-                StackValue::Global(GlobalRef {
-                    module: "builtins".to_string(),
-                    name: "help".to_string(),
-                    position: 0,
-                    malformed: false,
-                    memo_index: None,
-                    memo_read: false,
-                }),
-            )],
-            unknown_key_values: Vec::new(),
-            unknown_key_values_overflowed: false,
+        let callable = StackValue::Global(GlobalRef {
+            module: "os".to_string(),
+            name: "system".to_string(),
+            position: 0,
+            malformed: false,
             memo_index: None,
+            memo_read: false,
         });
-
-        scan.record_top_tracked_dict_entry("callback", StackValue::Other);
-
-        let Some(StackValue::TrackedDict { entries, .. }) = scan.stack.last() else {
-            panic!("tracked dictionary was replaced");
+        let key = StackValue::Text {
+            value: "callback".to_string(),
+            memo_read: false,
         };
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].0, "callback");
-        assert!(matches!(entries[0].1, StackValue::Other));
+        for memoized in [false, true] {
+            let mut scan = run_test_scan("tracked-dict-shadow.pkl", b"\x80\x04N.", &options);
+            scan.push_stack_value(StackValue::TrackedDict {
+                entries: vec![
+                    ("callback".to_string(), callable.clone()),
+                    ("sentinel".to_string(), StackValue::Other),
+                ],
+                unknown_key_values: Vec::new(),
+                unknown_key_values_overflowed: false,
+                memo_index: None,
+            });
+            if memoized {
+                let value = scan.with_memo_index(scan.stack.last().unwrap().clone(), 0);
+                assert!(scan.store_top_stack_value_in_memo(0, value, "memo_store"));
+            }
+            let target = scan.stack.last().unwrap().clone();
+            let before = scan.tracked_state_bytes + scan.tracked_stack_bytes;
+            let notices = scan.notices.len();
+            if memoized {
+                let StackValue::TrackedDict { entries, .. } = &target else {
+                    unreachable!()
+                };
+                assert!(entries.is_empty());
+                for default in [Some(&StackValue::Other), None] {
+                    scan.record_tracked_dict_setdefault_mutation(&target, &key, default);
+                }
+                let Some(StackValue::TrackedDict { entries, .. }) = scan.memo.get(&0) else {
+                    unreachable!()
+                };
+                assert_eq!(entries.len(), 2);
+                assert_eq!(entries[0].0, "callback");
+                assert_eq!(entries[1].0, "sentinel");
+                assert_eq!(
+                    operand_preview(Some(&entries[0].1)),
+                    "_GlobalRef(os.system)"
+                );
+                assert_eq!(scan.tracked_state_bytes, before);
+                assert_eq!(scan.tracked_stack_bytes, 0);
+                scan.record_tracked_dict_mutation(&target, &key, &StackValue::Other);
+                for default in [Some(&callable), None] {
+                    scan.record_tracked_dict_setdefault_mutation(&target, &key, default);
+                }
+            } else {
+                scan.record_top_tracked_dict_entry("callback", StackValue::Other);
+            }
+            let value = if memoized {
+                scan.memo.get(&0)
+            } else {
+                scan.stack.last()
+            };
+            let Some(StackValue::TrackedDict { entries, .. }) = value else {
+                panic!("tracked dictionary was replaced");
+            };
+            assert_eq!(entries.len(), 2);
+            assert_eq!(entries[0].0, "sentinel");
+            assert_eq!(entries[1].0, "callback");
+            assert!(entries
+                .iter()
+                .all(|(_, value)| matches!(value, StackValue::Other)));
+            let after = before - 8;
+            assert_eq!(
+                (scan.tracked_state_bytes, scan.tracked_stack_bytes),
+                if memoized { (after, 0) } else { (0, after) }
+            );
+            assert_eq!(scan.notices.len(), notices);
+            assert_eq!(scan.status, ScanStatus::Complete);
+        }
     }
 
     #[test]
     fn discarded_inert_tracked_dict_shadows_do_not_consume_optional_bytes() {
-        let options = default_test_options();
-        let payload = b".";
-        let mut scan = ScanState::new(
-            "tracked-dict-discarded-shadow-budget.pkl".to_string(),
-            payload,
-            &options,
-            Some(payload.len()),
-            0,
-            0,
-            None,
-        );
         let mut entries = Vec::new();
         for index in 0..(MAX_TRACKED_DICT_ENTRIES * 5) {
-            scan.insert_optional_tracked_dict_shadow_entry(
+            ScanState::insert_tracked_dict_entry(
                 &mut entries,
                 format!("{index:04}-{}", "A".repeat(1024)),
+                StackValue::Other,
             );
         }
 
         assert_eq!(entries.len(), MAX_TRACKED_DICT_ENTRIES);
-        assert!(scan.tracked_state_bytes < MAX_TRACKED_STATE_BYTES / 2);
-        assert_eq!(scan.status, ScanStatus::Complete);
-        assert!(!has_notice_code(&scan, "tracked_state_budget"));
     }
 
     #[test]
@@ -9524,7 +9434,7 @@ mod tests {
 
             scan.run();
 
-            assert_eq!(scan.verdict, "clean", "{name} should be opaque");
+            assert_eq!(scan.verdict.as_str(), "clean", "{name} should be opaque");
             assert!(scan.import_references.is_empty(), "{name} import refs");
             assert!(
                 scan.findings
@@ -9619,11 +9529,6 @@ mod tests {
         };
 
         scan.findings = vec![call_finding.clone(), global_without_position];
-        scan.coalesce_redundant_global_findings();
-        assert!(scan
-            .findings
-            .iter()
-            .any(|finding| finding.rule_code == Some("DANGEROUS_GLOBAL")));
 
         let global_with_position = Finding {
             details: vec![
@@ -9635,19 +9540,42 @@ mod tests {
             ],
             ..call_finding.clone()
         };
-        scan.findings = vec![
-            call_finding,
-            Finding {
+        for position in [4, 5] {
+            let mut details = global_with_position.details.clone();
+            details[1].1 = DetailValue::UInt(position);
+            scan.add_finding(Finding {
                 message: "global".to_string(),
+                location: Some(format!("structured-position.pkl (pos {position})")),
                 rule_code: Some("DANGEROUS_GLOBAL"),
-                ..global_with_position
-            },
-        ];
-        scan.coalesce_redundant_global_findings();
-        assert!(scan
-            .findings
-            .iter()
-            .all(|finding| finding.rule_code != Some("DANGEROUS_GLOBAL")));
+                details: details.clone(),
+                ..global_with_position.clone()
+            });
+            for _ in 0..2 {
+                scan.non_allowlisted_global_imports.push((
+                    "os.system".to_string(),
+                    position as usize,
+                    details.clone(),
+                ));
+            }
+        }
+        scan.finish_analysis();
+        assert!(scan.non_allowlisted_global_imports.is_empty());
+        assert_eq!(
+            scan.findings
+                .iter()
+                .map(|finding| (
+                    finding.rule_code,
+                    detail_usize(&finding.details, "position")
+                ))
+                .collect::<Vec<_>>(),
+            [
+                (Some("DANGEROUS_CALL"), None),
+                (Some("DANGEROUS_GLOBAL"), None),
+                (Some("DANGEROUS_GLOBAL"), Some(5)),
+                (Some("NON_ALLOWLISTED_GLOBAL"), Some(5)),
+            ]
+        );
+        assert_eq!(scan.verdict, ScanVerdict::Malicious);
     }
 
     #[test]
@@ -9687,7 +9615,7 @@ mod tests {
 
             scan.run();
 
-            assert_eq!(scan.verdict, "malicious", "{name}");
+            assert_eq!(scan.verdict.as_str(), "malicious", "{name}");
             assert!(
                 scan.findings
                     .iter()
@@ -9907,7 +9835,7 @@ mod tests {
 
         scan.run();
 
-        assert_eq!(scan.verdict, "malicious");
+        assert_eq!(scan.verdict.as_str(), "malicious");
         let finding = scan
             .findings
             .iter()
@@ -9972,7 +9900,7 @@ mod tests {
             .any(|(key, value)| key == "analysis_incomplete"
                 && matches!(value, DetailValue::Bool(true))));
         assert_eq!(scan.status, ScanStatus::Inconclusive);
-        assert_eq!(scan.verdict, "unknown");
+        assert_eq!(scan.verdict.as_str(), "unknown");
     }
 
     #[test]
@@ -10004,7 +9932,7 @@ mod tests {
             .find(|notice| notice.code == Some("buffer_opcode"))
             .expect("buffer opcode notice");
         assert_eq!(scan.status, ScanStatus::Complete);
-        assert_eq!(scan.verdict, "clean");
+        assert_eq!(scan.verdict.as_str(), "clean");
         assert_eq!(detail_usize(&notice.details, "next_buffer_count"), Some(0));
         assert_eq!(
             detail_usize(&notice.details, "readonly_buffer_count"),
@@ -10051,7 +9979,7 @@ mod tests {
             .find(|notice| notice.code == Some("buffer_opcode"))
             .expect("buffer opcode notice");
         assert_eq!(scan.status, ScanStatus::Inconclusive);
-        assert_eq!(scan.verdict, "unknown");
+        assert_eq!(scan.verdict.as_str(), "unknown");
         assert_eq!(
             detail_usize(&notice.details, "readonly_buffer_empty_stack_count"),
             Some(0)
@@ -10104,7 +10032,7 @@ mod tests {
             .find(|notice| notice.code == Some("buffer_opcode"))
             .expect("buffer opcode notice");
         assert_eq!(scan.status, ScanStatus::Inconclusive);
-        assert_eq!(scan.verdict, "malicious");
+        assert_eq!(scan.verdict.as_str(), "malicious");
         assert_eq!(
             detail_usize(&notice.details, "readonly_buffer_empty_stack_count"),
             Some(1)
@@ -10194,7 +10122,7 @@ mod tests {
 
         scan.run();
 
-        assert_eq!(scan.status, "inconclusive");
+        assert_eq!(scan.status.as_str(), "inconclusive");
         assert!(scan.findings.iter().any(|finding| {
             finding.rule_code == Some("S213")
                 && finding.details.iter().any(|(key, value)| {
@@ -10235,7 +10163,7 @@ mod tests {
         scan.run();
 
         assert_eq!(scan.status, ScanStatus::Inconclusive);
-        assert_eq!(scan.verdict, "malicious");
+        assert_eq!(scan.verdict.as_str(), "malicious");
         assert!(scan.findings.iter().any(|finding| {
             finding.rule_code == Some("S601")
                 && detail_string(&finding.details, "encoding").as_deref() == Some("base64")
@@ -10818,7 +10746,7 @@ mod tests {
 
         scan.run();
 
-        assert_eq!(scan.verdict, "suspicious");
+        assert_eq!(scan.verdict.as_str(), "suspicious");
         let finding = scan
             .findings
             .iter()
@@ -10894,7 +10822,7 @@ mod tests {
 
         scan.run();
 
-        assert_eq!(scan.verdict, "clean");
+        assert_eq!(scan.verdict.as_str(), "clean");
         assert!(scan.findings.is_empty());
         let notice = scan
             .notices
@@ -10934,7 +10862,7 @@ mod tests {
 
         scan.run();
 
-        assert_eq!(scan.verdict, "clean");
+        assert_eq!(scan.verdict.as_str(), "clean");
         assert!(scan.findings.is_empty());
         let notice = scan
             .notices
@@ -10979,7 +10907,7 @@ mod tests {
 
         scan.run();
 
-        assert_eq!(scan.verdict, "malicious");
+        assert_eq!(scan.verdict.as_str(), "malicious");
         assert!(scan
             .notices
             .iter()
@@ -11027,7 +10955,8 @@ mod tests {
             scan.run();
 
             assert_eq!(
-                scan.status, "inconclusive",
+                scan.status.as_str(),
+                "inconclusive",
                 "literal budget was not surfaced for {label}"
             );
             assert!(
@@ -11087,7 +11016,7 @@ mod tests {
 
             scan.run();
 
-            assert_eq!(scan.verdict, "malicious", "missed {label}");
+            assert_eq!(scan.verdict.as_str(), "malicious", "missed {label}");
             assert!(scan.findings.iter().any(|finding| {
                 finding.rule_code == Some("S213")
                     && detail_string(&finding.details, "encoding").as_deref() == Some("raw")
@@ -11152,7 +11081,7 @@ mod tests {
 
             scan.run();
 
-            assert_eq!(scan.verdict, "malicious", "missed {label}");
+            assert_eq!(scan.verdict.as_str(), "malicious", "missed {label}");
             assert!(scan.findings.iter().any(|finding| {
                 finding.rule_code == Some("S213")
                     && detail_string(&finding.details, "encoding").as_deref() == Some("raw")
@@ -11192,8 +11121,8 @@ mod tests {
 
         scan.run();
 
-        assert_eq!(scan.status, "inconclusive");
-        assert_eq!(scan.verdict, "malicious");
+        assert_eq!(scan.status.as_str(), "inconclusive");
+        assert_eq!(scan.verdict.as_str(), "malicious");
         assert!(scan.findings.iter().any(|finding| {
             finding.rule_code == Some("S213")
                 && detail_string(&finding.details, "encoding").as_deref() == Some("raw")
@@ -11231,8 +11160,8 @@ mod tests {
 
         scan.run();
 
-        assert_eq!(scan.status, "inconclusive");
-        assert_eq!(scan.verdict, "malicious");
+        assert_eq!(scan.status.as_str(), "inconclusive");
+        assert_eq!(scan.verdict.as_str(), "malicious");
         assert!(scan.findings.iter().any(|finding| {
             finding.rule_code == Some("DANGEROUS_CALL")
                 && detail_string(&finding.details, "import_reference").as_deref()
@@ -11264,7 +11193,7 @@ mod tests {
         scan.scan_raw_nested_unicode_text(&value, 0);
         scan.finalize_verdict();
 
-        assert_eq!(scan.verdict, "malicious");
+        assert_eq!(scan.verdict.as_str(), "malicious");
         assert!(scan.findings.iter().any(|finding| {
             finding.rule_code == Some("S213")
                 && detail_string(&finding.details, "encoding").as_deref() == Some("raw")
@@ -11323,7 +11252,7 @@ mod tests {
         );
         assert_eq!(detail_usize(&finding.details, "remaining_bytes"), Some(2));
         assert_eq!(scan.status, ScanStatus::Complete);
-        assert_eq!(scan.verdict, "suspicious");
+        assert_eq!(scan.verdict.as_str(), "suspicious");
     }
 
     #[test]
@@ -11361,7 +11290,7 @@ mod tests {
         assert_eq!(detail_usize(&finding.details, "frame_length"), Some(3));
         assert_eq!(detail_usize(&finding.details, "remaining_bytes"), Some(2));
         assert_eq!(scan.status, ScanStatus::Complete);
-        assert_eq!(scan.verdict, "suspicious");
+        assert_eq!(scan.verdict.as_str(), "suspicious");
     }
 
     #[test]
@@ -11399,7 +11328,7 @@ mod tests {
         assert_eq!(detail_usize(&finding.details, "frame_length"), Some(5));
         assert_eq!(detail_usize(&finding.details, "remaining_bytes"), Some(2));
         assert_eq!(scan.status, ScanStatus::Complete);
-        assert_eq!(scan.verdict, "suspicious");
+        assert_eq!(scan.verdict.as_str(), "suspicious");
     }
 
     #[test]
@@ -11433,7 +11362,7 @@ mod tests {
             .iter()
             .all(|notice| notice.code != Some("oversized_frame")));
         assert_eq!(scan.status, ScanStatus::Complete);
-        assert_eq!(scan.verdict, "clean");
+        assert_eq!(scan.verdict.as_str(), "clean");
     }
 
     #[test]
@@ -11471,7 +11400,7 @@ mod tests {
         assert_eq!(detail_usize(&finding.details, "frame_length"), Some(3));
         assert_eq!(detail_usize(&finding.details, "remaining_bytes"), Some(2));
         assert_eq!(scan.status, ScanStatus::Inconclusive);
-        assert_eq!(scan.verdict, "suspicious");
+        assert_eq!(scan.verdict.as_str(), "suspicious");
     }
 
     #[test]
@@ -12040,6 +11969,60 @@ mod tests {
                 }),
                 "missing critical memoized post-budget finding for {label}"
             );
+        }
+    }
+
+    #[test]
+    fn post_budget_tail_promotes_distant_memoized_calls_at_nonzero_positions() {
+        let options = ScanOptions {
+            max_opcodes: 2,
+            ..default_test_options()
+        };
+        for suffix in [b")R.".as_slice(), b")\x81.", b")}\x92.", b")b."] {
+            for (invoke, severity, verdict) in [
+                (false, "warning", "suspicious"),
+                (true, "critical", "malicious"),
+            ] {
+                let mut tail = short_binunicode(b"__main__");
+                tail.extend_from_slice(&short_binunicode(b"callback"));
+                tail.extend_from_slice(b"\x93q\x070");
+                tail.extend_from_slice(&b"N0".repeat(40));
+                tail.extend_from_slice(b"h\x07");
+                tail.extend_from_slice(if invoke { suffix } else { b")." });
+                let payload = tail_only_post_budget_payload(&tail);
+                let mut scan = ScanState::new(
+                    "distant.pkl".to_string(),
+                    &payload,
+                    &options,
+                    Some(payload.len()),
+                    137,
+                    0,
+                    None,
+                );
+                scan.run();
+                let findings: Vec<_> = scan
+                    .findings
+                    .iter()
+                    .filter(|finding| finding.rule_code == Some("POST_BUDGET_GLOBAL"))
+                    .collect();
+                assert_eq!(findings.len(), 1);
+                let finding = findings[0];
+                assert_eq!(finding.severity, severity);
+                assert_eq!(
+                    detail_string(&finding.details, "pattern").as_deref(),
+                    Some("__main__\ncallback")
+                );
+                assert_eq!(detail_usize(&finding.details, "position"), Some(160));
+                assert_eq!(finding.location.as_deref(), Some("distant.pkl (pos 160)"));
+                assert!(finding.details.iter().any(|(key, value)| {
+                    key == "reduce_proximate"
+                        && matches!(value, DetailValue::Bool(flag) if *flag == invoke)
+                }));
+                assert_eq!(scan.bytes_scanned, payload.len());
+                assert_eq!(scan.status, ScanStatus::Inconclusive);
+                assert_eq!(scan.verdict.as_str(), verdict);
+                assert!(has_notice_code(&scan, "opcode_budget"));
+            }
         }
     }
 
