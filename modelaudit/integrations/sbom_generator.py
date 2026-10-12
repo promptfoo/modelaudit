@@ -633,9 +633,14 @@ def _calculate_legacy_risk_score(path: str, issues: Iterable[dict[str, Any]]) ->
     return min(score, 10)
 
 
+def _license_expressions(identifiers: list[str]) -> list[LicenseExpression]:
+    """Combine identifiers in order into a single CycloneDX license expression."""
+    unique_licenses = list(dict.fromkeys(identifiers))
+    return [LicenseExpression(" OR ".join(unique_licenses))] if unique_licenses else []
+
+
 def _extract_license_expressions(metadata: FileMetadataModel) -> list[LicenseExpression]:
     """Extract license expressions from file metadata."""
-    license_expressions: list[LicenseExpression] = []
     license_identifiers: list[str] = []
 
     # Check for legacy license field
@@ -650,22 +655,7 @@ def _extract_license_expressions(metadata: FileMetadataModel) -> list[LicenseExp
             elif lic.name:
                 license_identifiers.append(str(lic.name))
 
-    # Remove duplicates while preserving order
-    unique_licenses: list[str] = []
-    seen = set()
-    for lic_id in license_identifiers:
-        if lic_id not in seen:
-            unique_licenses.append(lic_id)
-            seen.add(lic_id)
-
-    # Create license expressions
-    if len(unique_licenses) == 1:
-        license_expressions.append(LicenseExpression(unique_licenses[0]))
-    elif len(unique_licenses) > 1:
-        compound_expression = " OR ".join(unique_licenses)
-        license_expressions.append(LicenseExpression(compound_expression))
-
-    return license_expressions
+    return _license_expressions(license_identifiers)
 
 
 def _create_metadata_properties(metadata: FileMetadataModel) -> list[Property]:
@@ -788,22 +778,7 @@ def _component_for_file(
             elif isinstance(lic, dict) and lic.get("name"):
                 license_identifiers.append(str(lic["name"]))
 
-        # Create a single license expression to comply with CycloneDX
-        if license_identifiers:
-            # Remove duplicates while preserving order
-            unique_licenses = []
-            seen = set()
-            for lic_id in license_identifiers:
-                if lic_id not in seen:
-                    unique_licenses.append(lic_id)
-                    seen.add(lic_id)
-
-            if len(unique_licenses) == 1:
-                license_expressions.append(LicenseExpression(unique_licenses[0]))
-            else:
-                # Create compound license expression for multiple licenses
-                compound_expression = " OR ".join(unique_licenses)
-                license_expressions.append(LicenseExpression(compound_expression))
+        license_expressions = _license_expressions(license_identifiers)
 
         # Add ML/AI-related properties (enhanced for v1.6 ML-BOM support)
         if metadata.get("is_dataset"):

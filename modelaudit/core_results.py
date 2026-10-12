@@ -80,10 +80,7 @@ def scan_result_has_operational_error(scan_result: ScanResult) -> bool:
     """Return True when a scan result represents an operational failure."""
     metadata = scan_result.metadata or {}
     explicit_flag = metadata.get(OPERATIONAL_ERROR_METADATA_KEY)
-    if explicit_flag is not None:
-        return bool(explicit_flag) and not metadata_has_coverage_only_operational_error(metadata)
-
-    return False
+    return bool(explicit_flag) and not metadata_has_coverage_only_operational_error(metadata)
 
 
 def results_have_operational_error(results: ModelAuditResultModel) -> bool:

@@ -18,6 +18,30 @@ from modelaudit.utils import tensorflow_compat
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
 
 
+def _record_metadata_scans(monkeypatch: pytest.MonkeyPatch, *, file_size: int | None = None) -> list[str]:
+    scanned_paths: list[str] = []
+
+    class FakeScanner:
+        name = "fake"
+
+        def extract_metadata(self, file_path: str) -> dict[str, Any]:
+            scanned_paths.append(file_path)
+            size = Path(file_path).stat().st_size if file_size is None else file_size
+            return {"format": "fake", "file_size": size}
+
+    monkeypatch.setattr(
+        metadata_extractor_module,
+        "get_scanner_for_file",
+        lambda _path, _config=None: FakeScanner(),
+    )
+    return scanned_paths
+
+
+def _write_safetensors(path: Path, header: dict[str, Any], payload: bytes) -> None:
+    header_json = json.dumps(header).encode("utf-8")
+    path.write_bytes(struct.pack("<Q", len(header_json)) + header_json + payload)
+
+
 def test_has_tensorflow_protobuf_stubs_fails_closed_on_probe_error(monkeypatch: pytest.MonkeyPatch) -> None:
     """Probe failures should return False instead of raising into scanner routing."""
     import modelaudit.protos
@@ -36,6 +60,9 @@ def test_has_tensorflow_protobuf_stubs_fails_closed_on_probe_error(monkeypatch: 
 class TestModelMetadataExtractor:
     """Test the ModelMetadataExtractor class."""
 
+    def setup_method(self) -> None:
+        self.extractor = metadata_extractor_module.ModelMetadataExtractor()
+
     def test_filter_security_metadata_reuses_lowered_keys(self) -> None:
         class CountingKey(str):
             lower_calls = 0
@@ -44,10 +71,9 @@ class TestModelMetadataExtractor:
                 self.lower_calls += 1
                 return super().lower()
 
-        extractor = metadata_extractor_module.ModelMetadataExtractor()
         key = CountingKey("risk_profile")
 
-        assert extractor._filter_security_metadata({key: True}) == {"risk_profile": True}
+        assert self.extractor._filter_security_metadata({key: True}) == {"risk_profile": True}
         assert key.lower_calls == 1
 
     def test_extract_metadata_uses_scanner_helper_with_deserialization_config(
@@ -56,7 +82,6 @@ class TestModelMetadataExtractor:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Metadata extraction should route through the helper-based scanner lookup."""
-        extractor = metadata_extractor_module.ModelMetadataExtractor()
         target = tmp_path / "helper-routed.model"
         target.write_bytes(b"placeholder")
         helper_calls: list[tuple[str, dict[str, Any] | None]] = []
@@ -75,7 +100,7 @@ class TestModelMetadataExtractor:
 
         monkeypatch.setattr(metadata_extractor_module, "get_scanner_for_file", fake_get_scanner_for_file)
 
-        metadata = extractor.extract(str(target), allow_deserialization=True)
+        metadata = self.extractor.extract(str(target), allow_deserialization=True)
 
         assert helper_calls == [(str(target), {"allow_metadata_deserialization": True})]
         assert metadata["format"] == "helper_selected"
@@ -85,13 +110,11 @@ class TestModelMetadataExtractor:
 
     def test_extract_metadata_unknown_format(self) -> None:
         """Test metadata extraction with unknown file format."""
-        extractor = metadata_extractor_module.ModelMetadataExtractor()
-
         with tempfile.NamedTemporaryFile(suffix=".unknown") as tmp:
             tmp.write(b"some random data")
             tmp.flush()
 
-            metadata = extractor.extract(tmp.name)
+            metadata = self.extractor.extract(tmp.name)
 
             assert metadata["format"] == "unknown"
             assert "error" in metadata
@@ -99,20 +122,13 @@ class TestModelMetadataExtractor:
 
     def test_extract_metadata_basic(self, tmp_path: Path) -> None:
         """Test basic metadata extraction functionality."""
-        extractor = metadata_extractor_module.ModelMetadataExtractor()
-
         # Create a simple safetensors file
         header = {"tensor1": {"dtype": "F32", "shape": [2, 2], "data_offsets": [0, 16]}}
-        header_json = json.dumps(header).encode("utf-8")
-        header_len = len(header_json)
 
         st_file = tmp_path / "model.safetensors"
-        with open(st_file, "wb") as f:
-            f.write(struct.pack("<Q", header_len))
-            f.write(header_json)
-            f.write(b"\x00" * 16)  # Dummy tensor data
+        _write_safetensors(st_file, header, b"\x00" * 16)  # Dummy tensor data
 
-        metadata = extractor.extract(str(st_file))
+        metadata = self.extractor.extract(str(st_file))
 
         assert metadata["format"] == "safetensors"
         assert metadata["file_size"] > 0
@@ -120,33 +136,26 @@ class TestModelMetadataExtractor:
         assert metadata["total_parameters"] == 4
         assert "tensors" in metadata
 
-    def test_extract_directory_metadata(self) -> None:
+    def test_extract_directory_metadata(self, tmp_path: Path) -> None:
         """Test directory metadata extraction."""
-        extractor = metadata_extractor_module.ModelMetadataExtractor()
-
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with tempfile.TemporaryDirectory(dir=tmp_path) as temp_dir:
+            scan_root = Path(temp_dir)
             # Create multiple test files
-            safetensors_file = os.path.join(tmpdir, "model.safetensors")
-            pkl_file = os.path.join(tmpdir, "model.pkl")
+            safetensors_file = scan_root / "model.safetensors"
+            pkl_file = scan_root / "model.pkl"
 
             # Create safetensors file
             header = {"test": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]}}
-            header_json = json.dumps(header).encode("utf-8")
-            with open(safetensors_file, "wb") as f:
-                f.write(struct.pack("<Q", len(header_json)))
-                f.write(header_json)
-                f.write(b"\x00\x00\x00\x00")
+            _write_safetensors(safetensors_file, header, b"\x00\x00\x00\x00")
 
             # Create pickle file (empty for simplicity)
-            with open(pkl_file, "wb") as f:
-                import pickle
-
+            with pkl_file.open("wb") as f:
                 pickle.dump({"test": "data"}, f)
 
-            metadata = extractor.extract(tmpdir)
+            metadata = self.extractor.extract(str(scan_root))
 
             assert "directory" in metadata
-            assert metadata["directory"] == tmpdir
+            assert metadata["directory"] == str(scan_root)
             assert metadata["summary"]["total_files"] >= 2
             assert "safetensors" in metadata["summary"]["formats"]
             assert "pickle" in metadata["summary"]["formats"]
@@ -157,7 +166,6 @@ class TestModelMetadataExtractor:
         requires_symlinks: None,
     ) -> None:
         """Directory metadata extraction should not read symlinks outside the scan root."""
-        extractor = metadata_extractor_module.ModelMetadataExtractor()
         scan_dir = tmp_path / "scan"
         scan_dir.mkdir()
         outside_dir = tmp_path / "outside"
@@ -169,7 +177,7 @@ class TestModelMetadataExtractor:
         escaped_link = scan_dir / "model.pkl"
         escaped_link.symlink_to(outside_model)
 
-        metadata = extractor.extract(str(scan_dir))
+        metadata = self.extractor.extract(str(scan_dir))
 
         assert metadata["summary"]["total_files"] == 0
         assert metadata["files"] == [
@@ -187,29 +195,15 @@ class TestModelMetadataExtractor:
         requires_symlinks: None,
     ) -> None:
         """A symlink to a regular file inside the scan root should remain scannable."""
-        extractor = metadata_extractor_module.ModelMetadataExtractor()
         scan_dir = tmp_path / "scan"
         scan_dir.mkdir()
         target = scan_dir / "target.fake"
         target.write_bytes(b"metadata")
         linked_model = scan_dir / "linked.fake"
         linked_model.symlink_to(target)
-        scanned_paths: list[str] = []
+        scanned_paths = _record_metadata_scans(monkeypatch)
 
-        class FakeScanner:
-            name = "fake"
-
-            def extract_metadata(self, file_path: str) -> dict[str, Any]:
-                scanned_paths.append(file_path)
-                return {"format": "fake", "file_size": Path(file_path).stat().st_size}
-
-        monkeypatch.setattr(
-            metadata_extractor_module,
-            "get_scanner_for_file",
-            lambda _path, _config=None: FakeScanner(),
-        )
-
-        metadata = extractor.extract(str(scan_dir))
+        metadata = self.extractor.extract(str(scan_dir))
 
         assert scanned_paths == [str(linked_model), str(target)]
         assert metadata["summary"]["total_files"] == 2
@@ -222,28 +216,15 @@ class TestModelMetadataExtractor:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Directory metadata extraction should not scan beyond the aggregate file budget."""
-        extractor = metadata_extractor_module.ModelMetadataExtractor()
         scan_dir = tmp_path / "scan"
         scan_dir.mkdir()
         for index in range(3):
             (scan_dir / f"model-{index}.fake").write_bytes(b"metadata")
-        scanned_paths: list[str] = []
-
-        class FakeScanner:
-            name = "fake"
-
-            def extract_metadata(self, file_path: str) -> dict[str, Any]:
-                scanned_paths.append(file_path)
-                return {"format": "fake", "file_size": Path(file_path).stat().st_size}
+        scanned_paths = _record_metadata_scans(monkeypatch)
 
         monkeypatch.setattr(metadata_extractor_module, "MAX_METADATA_DIRECTORY_FILES", 2)
-        monkeypatch.setattr(
-            metadata_extractor_module,
-            "get_scanner_for_file",
-            lambda _path, _config=None: FakeScanner(),
-        )
 
-        metadata = extractor.extract(str(scan_dir))
+        metadata = self.extractor.extract(str(scan_dir))
 
         assert len(scanned_paths) == 2
         assert metadata["summary"]["total_files"] == 2
@@ -261,30 +242,17 @@ class TestModelMetadataExtractor:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Directory metadata extraction should not scan files that exceed the aggregate byte budget."""
-        extractor = metadata_extractor_module.ModelMetadataExtractor()
         scan_dir = tmp_path / "scan"
         scan_dir.mkdir()
         first = scan_dir / "a.fake"
         second = scan_dir / "b.fake"
         first.write_bytes(b"123")
         second.write_bytes(b"4567")
-        scanned_paths: list[str] = []
-
-        class FakeScanner:
-            name = "fake"
-
-            def extract_metadata(self, file_path: str) -> dict[str, Any]:
-                scanned_paths.append(file_path)
-                return {"format": "fake", "file_size": Path(file_path).stat().st_size}
+        scanned_paths = _record_metadata_scans(monkeypatch)
 
         monkeypatch.setattr(metadata_extractor_module, "MAX_METADATA_DIRECTORY_BYTES", 5)
-        monkeypatch.setattr(
-            metadata_extractor_module,
-            "get_scanner_for_file",
-            lambda _path, _config=None: FakeScanner(),
-        )
 
-        metadata = extractor.extract(str(scan_dir))
+        metadata = self.extractor.extract(str(scan_dir))
 
         assert scanned_paths == [str(first)]
         assert metadata["summary"]["total_files"] == 1
@@ -299,7 +267,6 @@ class TestModelMetadataExtractor:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Broken links should not bypass the aggregate file budget."""
-        extractor = metadata_extractor_module.ModelMetadataExtractor()
         scan_dir = tmp_path / "scan"
         scan_dir.mkdir()
         for index in range(3):
@@ -307,7 +274,7 @@ class TestModelMetadataExtractor:
 
         monkeypatch.setattr(metadata_extractor_module, "MAX_METADATA_DIRECTORY_FILES", 2)
 
-        metadata = extractor.extract(str(scan_dir))
+        metadata = self.extractor.extract(str(scan_dir))
 
         assert metadata["analysis_incomplete"] is True
         assert metadata["budget_events"][0]["limit"] == "max_files"
@@ -324,27 +291,13 @@ class TestModelMetadataExtractor:
         if mkfifo is None:
             pytest.skip("named pipes are not supported on this platform")
 
-        extractor = metadata_extractor_module.ModelMetadataExtractor()
         scan_dir = tmp_path / "scan"
         scan_dir.mkdir()
         named_pipe = scan_dir / "blocking.pkl"
         mkfifo(named_pipe)
-        scanned_paths: list[str] = []
+        scanned_paths = _record_metadata_scans(monkeypatch, file_size=0)
 
-        class FakeScanner:
-            name = "fake"
-
-            def extract_metadata(self, file_path: str) -> dict[str, Any]:
-                scanned_paths.append(file_path)
-                return {"format": "fake", "file_size": 0}
-
-        monkeypatch.setattr(
-            metadata_extractor_module,
-            "get_scanner_for_file",
-            lambda _path, _config=None: FakeScanner(),
-        )
-
-        metadata = extractor.extract(str(scan_dir))
+        metadata = self.extractor.extract(str(scan_dir))
 
         assert scanned_paths == []
         assert metadata["summary"]["total_files"] == 0
@@ -367,29 +320,15 @@ class TestModelMetadataExtractor:
         if mkfifo is None:
             pytest.skip("named pipes are not supported on this platform")
 
-        extractor = metadata_extractor_module.ModelMetadataExtractor()
         scan_dir = tmp_path / "scan"
         scan_dir.mkdir()
         named_pipe = scan_dir / "target.pipe"
         mkfifo(named_pipe)
         linked_model = scan_dir / "blocking.pkl"
         linked_model.symlink_to(named_pipe)
-        scanned_paths: list[str] = []
+        scanned_paths = _record_metadata_scans(monkeypatch, file_size=0)
 
-        class FakeScanner:
-            name = "fake"
-
-            def extract_metadata(self, file_path: str) -> dict[str, Any]:
-                scanned_paths.append(file_path)
-                return {"format": "fake", "file_size": 0}
-
-        monkeypatch.setattr(
-            metadata_extractor_module,
-            "get_scanner_for_file",
-            lambda _path, _config=None: FakeScanner(),
-        )
-
-        metadata = extractor.extract(str(scan_dir))
+        metadata = self.extractor.extract(str(scan_dir))
 
         assert scanned_paths == []
         assert metadata["summary"]["total_files"] == 0
@@ -404,29 +343,16 @@ class TestModelMetadataExtractor:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Directory metadata extraction should not scan files below the aggregate depth budget."""
-        extractor = metadata_extractor_module.ModelMetadataExtractor()
         scan_dir = tmp_path / "scan"
         nested_dir = scan_dir / "level1" / "level2"
         nested_dir.mkdir(parents=True)
         nested_file = nested_dir / "deep.fake"
         nested_file.write_bytes(b"metadata")
-        scanned_paths: list[str] = []
-
-        class FakeScanner:
-            name = "fake"
-
-            def extract_metadata(self, file_path: str) -> dict[str, Any]:
-                scanned_paths.append(file_path)
-                return {"format": "fake", "file_size": Path(file_path).stat().st_size}
+        scanned_paths = _record_metadata_scans(monkeypatch)
 
         monkeypatch.setattr(metadata_extractor_module, "MAX_METADATA_DIRECTORY_DEPTH", 1)
-        monkeypatch.setattr(
-            metadata_extractor_module,
-            "get_scanner_for_file",
-            lambda _path, _config=None: FakeScanner(),
-        )
 
-        metadata = extractor.extract(str(scan_dir))
+        metadata = self.extractor.extract(str(scan_dir))
 
         assert scanned_paths == []
         assert metadata["summary"]["total_files"] == 0
@@ -441,7 +367,6 @@ class TestModelMetadataExtractor:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Empty directory trees should remain bounded."""
-        extractor = metadata_extractor_module.ModelMetadataExtractor()
         scan_dir = tmp_path / "scan"
         scan_dir.mkdir()
         for index in range(3):
@@ -449,7 +374,7 @@ class TestModelMetadataExtractor:
 
         monkeypatch.setattr(metadata_extractor_module, "MAX_METADATA_DIRECTORY_ENTRIES", 2)
 
-        metadata = extractor.extract(str(scan_dir))
+        metadata = self.extractor.extract(str(scan_dir))
 
         assert metadata["analysis_incomplete"] is True
         assert metadata["budget_events"][0]["limit"] == "max_entries"
@@ -461,7 +386,6 @@ class TestModelMetadataExtractor:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Flat directories should stop enumeration after the bounded sentinel."""
-        extractor = metadata_extractor_module.ModelMetadataExtractor()
         scan_dir = tmp_path / "scan"
         scan_dir.mkdir()
         yielded_names: list[str] = []
@@ -493,7 +417,7 @@ class TestModelMetadataExtractor:
         monkeypatch.setattr(metadata_extractor_module, "MAX_METADATA_DIRECTORY_FILES", 2)
         monkeypatch.setattr(metadata_extractor_module.os, "scandir", fake_scandir)
 
-        metadata = extractor.extract(str(scan_dir))
+        metadata = self.extractor.extract(str(scan_dir))
 
         assert yielded_names == ["file-0.fake", "file-1.fake", "file-2.fake"]
         assert metadata["analysis_incomplete"] is True
@@ -505,30 +429,17 @@ class TestModelMetadataExtractor:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """In-budget directory metadata extraction should not report incomplete coverage."""
-        extractor = metadata_extractor_module.ModelMetadataExtractor()
         scan_dir = tmp_path / "scan"
         scan_dir.mkdir()
         files = [scan_dir / "a.fake", scan_dir / "b.fake"]
         for path in files:
             path.write_bytes(b"metadata")
-        scanned_paths: list[str] = []
-
-        class FakeScanner:
-            name = "fake"
-
-            def extract_metadata(self, file_path: str) -> dict[str, Any]:
-                scanned_paths.append(file_path)
-                return {"format": "fake", "file_size": Path(file_path).stat().st_size}
+        scanned_paths = _record_metadata_scans(monkeypatch)
 
         monkeypatch.setattr(metadata_extractor_module, "MAX_METADATA_DIRECTORY_FILES", 5)
         monkeypatch.setattr(metadata_extractor_module, "MAX_METADATA_DIRECTORY_BYTES", 100)
-        monkeypatch.setattr(
-            metadata_extractor_module,
-            "get_scanner_for_file",
-            lambda _path, _config=None: FakeScanner(),
-        )
 
-        metadata = extractor.extract(str(scan_dir))
+        metadata = self.extractor.extract(str(scan_dir))
 
         assert scanned_paths == [str(path) for path in files]
         assert metadata["summary"]["total_files"] == 2
@@ -538,23 +449,17 @@ class TestModelMetadataExtractor:
 
     def test_security_only_filter(self, tmp_path: Path) -> None:
         """Test security-only metadata filtering."""
-        extractor = metadata_extractor_module.ModelMetadataExtractor()
-
         header = {
             "tensor1": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
             "__metadata__": {"framework": "test", "version": "1.0", "api_key": "SECRET_METADATA_TOKEN"},
         }
-        header_json = json.dumps(header).encode("utf-8")
 
         st_file = tmp_path / "model.safetensors"
-        with open(st_file, "wb") as f:
-            f.write(struct.pack("<Q", len(header_json)))
-            f.write(header_json)
-            f.write(b"\x00\x00\x00\x00")
+        _write_safetensors(st_file, header, b"\x00\x00\x00\x00")
 
         # Test with security_only=True
-        metadata = extractor.extract(str(st_file), security_only=True)
-        full_metadata = extractor.extract(str(st_file), security_only=False)
+        metadata = self.extractor.extract(str(st_file), security_only=True)
+        full_metadata = self.extractor.extract(str(st_file), security_only=False)
 
         # Should contain basic info
         assert "file" in metadata
@@ -575,21 +480,16 @@ class TestModelMetadataExtractor:
 
     def test_security_only_directory_omits_custom_metadata_values(self, tmp_path: Path) -> None:
         """Directory security output should summarize custom metadata without exposing values."""
-        extractor = metadata_extractor_module.ModelMetadataExtractor()
         metadata_owner = "private-training-team"
         metadata_source = "https://example.com/model.bin?download=private"
         header = {
             "tensor1": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
             "__metadata__": {"owner": metadata_owner, "source": metadata_source},
         }
-        header_json = json.dumps(header).encode("utf-8")
         st_file = tmp_path / "model.safetensors"
-        with st_file.open("wb") as f:
-            f.write(struct.pack("<Q", len(header_json)))
-            f.write(header_json)
-            f.write(b"\x00\x00\x00\x00")
+        _write_safetensors(st_file, header, b"\x00\x00\x00\x00")
 
-        metadata = extractor.extract(str(tmp_path), security_only=True)
+        metadata = self.extractor.extract(str(tmp_path), security_only=True)
 
         assert metadata["summary"]["total_files"] == 1
         assert len(metadata["files"]) == 1
@@ -620,16 +520,14 @@ class TestModelMetadataExtractor:
         expected_flags: list[str],
     ) -> None:
         """Malformed custom metadata should fail closed without exposing its contents."""
-        extractor = metadata_extractor_module.ModelMetadataExtractor()
         header = {
             "tensor1": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
             "__metadata__": custom_metadata,
         }
-        header_json = json.dumps(header).encode("utf-8")
         st_file = tmp_path / "malformed-metadata.safetensors"
-        st_file.write_bytes(struct.pack("<Q", len(header_json)) + header_json + b"\x00\x00\x00\x00")
+        _write_safetensors(st_file, header, b"\x00\x00\x00\x00")
 
-        metadata = extractor.extract(str(st_file), security_only=True)
+        metadata = self.extractor.extract(str(st_file), security_only=True)
 
         assert "custom_metadata" not in metadata
         assert metadata["has_custom_metadata"] is True
@@ -647,7 +545,6 @@ class TestModelMetadataExtractor:
 
     def test_security_only_distinguishes_absent_and_empty_custom_metadata(self, tmp_path: Path) -> None:
         """An empty valid map is distinct from a file without custom metadata."""
-        extractor = metadata_extractor_module.ModelMetadataExtractor()
 
         def write_model(path: Path, custom_metadata: dict[str, str] | None, *, include_metadata: bool) -> None:
             header: dict[str, Any] = {
@@ -655,16 +552,15 @@ class TestModelMetadataExtractor:
             }
             if include_metadata:
                 header["__metadata__"] = custom_metadata
-            header_json = json.dumps(header).encode("utf-8")
-            path.write_bytes(struct.pack("<Q", len(header_json)) + header_json + b"\x00\x00\x00\x00")
+            _write_safetensors(path, header, b"\x00\x00\x00\x00")
 
         empty_file = tmp_path / "empty.safetensors"
         absent_file = tmp_path / "absent.safetensors"
         write_model(empty_file, {}, include_metadata=True)
         write_model(absent_file, None, include_metadata=False)
 
-        empty_metadata = extractor.extract(str(empty_file), security_only=True)
-        absent_metadata = extractor.extract(str(absent_file), security_only=True)
+        empty_metadata = self.extractor.extract(str(empty_file), security_only=True)
+        absent_metadata = self.extractor.extract(str(absent_file), security_only=True)
 
         assert empty_metadata["has_custom_metadata"] is True
         assert empty_metadata["custom_metadata_entry_count"] == 0
@@ -830,8 +726,6 @@ class TestModelMetadataExtractor:
 
     def test_pickle_metadata_no_deserialization(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         """Ensure pickle metadata extraction does not deserialize by default."""
-        extractor = metadata_extractor_module.ModelMetadataExtractor()
-
         import pickle
 
         pkl_file = tmp_path / "test.pkl"
@@ -845,7 +739,7 @@ class TestModelMetadataExtractor:
 
         monkeypatch.setattr(std_pickle, "load", fail_load, raising=True)
 
-        metadata = extractor.extract(str(pkl_file))
+        metadata = self.extractor.extract(str(pkl_file))
 
         assert metadata.get("deserialization_skipped") is True
         assert metadata.get("safe_loading") is False
@@ -853,8 +747,6 @@ class TestModelMetadataExtractor:
     def test_joblib_metadata_no_deserialization(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         """Ensure joblib metadata extraction does not deserialize by default."""
         joblib_mod = pytest.importorskip("joblib")
-        extractor = metadata_extractor_module.ModelMetadataExtractor()
-
         joblib_file = tmp_path / "model.joblib"
         joblib_mod.dump({"x": 1}, joblib_file)
 
@@ -863,7 +755,7 @@ class TestModelMetadataExtractor:
 
         monkeypatch.setattr(joblib_mod, "load", fail_load, raising=True)
 
-        metadata = extractor.extract(str(joblib_file))
+        metadata = self.extractor.extract(str(joblib_file))
 
         assert metadata.get("deserialization_skipped") is True
         assert metadata.get("reason") == "Unsafe in-process joblib deserialization is disabled for metadata extraction"
@@ -873,14 +765,12 @@ class TestModelMetadataExtractor:
         if not _has_tf_protos():
             pytest.skip("TensorFlow protobuf stubs unavailable")
 
-        extractor = metadata_extractor_module.ModelMetadataExtractor()
-
         saved_model_dir = tmp_path / "saved_model"
         saved_model_dir.mkdir()
         saved_model_pb = saved_model_dir / "saved_model.pb"
         saved_model_pb.write_bytes(b"")  # Minimal placeholder
 
-        metadata = extractor.extract(str(saved_model_pb))
+        metadata = self.extractor.extract(str(saved_model_pb))
 
         assert metadata.get("deserialization_skipped") is True
         assert metadata.get("reason") == "Deserialization disabled for metadata extraction"
@@ -916,8 +806,7 @@ class TestModelMetadataExtractor:
         saved_model_pb = saved_model_dir / "saved_model.pb"
         saved_model_pb.write_bytes(saved_model.SerializeToString())
 
-        extractor = metadata_extractor_module.ModelMetadataExtractor()
-        metadata = extractor.extract(str(saved_model_pb), allow_deserialization=True)
+        metadata = self.extractor.extract(str(saved_model_pb), allow_deserialization=True)
 
         assert metadata["format"] == "tf_savedmodel"
         assert metadata.get("deserialization_skipped") is not True
@@ -935,14 +824,12 @@ class TestModelMetadataExtractor:
     def test_numpy_metadata_no_deserialization(self, tmp_path: Path) -> None:
         """Ensure NumPy metadata extraction uses allow_pickle=False by default."""
         np = pytest.importorskip("numpy")
-        extractor = metadata_extractor_module.ModelMetadataExtractor()
-
         # Create a simple numeric .npy file
         arr = np.array([1.0, 2.0, 3.0], dtype=np.float32)
         npy_file = tmp_path / "test.npy"
         np.save(str(npy_file), arr)
 
-        metadata = extractor.extract(str(npy_file))
+        metadata = self.extractor.extract(str(npy_file))
 
         # Numeric arrays should extract fine without pickle
         assert metadata["format"] == "numpy"
@@ -953,14 +840,12 @@ class TestModelMetadataExtractor:
     def test_numpy_object_array_blocked_without_deserialization(self, tmp_path: Path) -> None:
         """Ensure NumPy object arrays are blocked by default (require pickle)."""
         np = pytest.importorskip("numpy")
-        extractor = metadata_extractor_module.ModelMetadataExtractor()
-
         # Create an object-dtype .npy file that requires pickle to load
         obj_arr = np.array([{"a": 1}, {"b": 2}], dtype=object)
         npy_file = tmp_path / "object_array.npy"
         np.save(str(npy_file), obj_arr, allow_pickle=True)
 
-        metadata = extractor.extract(str(npy_file))
+        metadata = self.extractor.extract(str(npy_file))
 
         # Should be blocked: object arrays require allow_pickle=True
         assert metadata.get("deserialization_skipped") is True
@@ -969,14 +854,12 @@ class TestModelMetadataExtractor:
     def test_numpy_object_array_deserialization_opt_in_is_ignored(self, tmp_path: Path) -> None:
         """Ensure NumPy object-array metadata never performs unsafe deserialization."""
         np = pytest.importorskip("numpy")
-        extractor = metadata_extractor_module.ModelMetadataExtractor()
-
         obj_arr = np.array([{"a": 1}, {"b": 2}], dtype=object)
         npy_file = tmp_path / "object_array.npy"
         np.save(str(npy_file), obj_arr, allow_pickle=True)
 
-        metadata = extractor.extract(str(npy_file), allow_deserialization=True)
-        security_metadata = extractor.extract(
+        metadata = self.extractor.extract(str(npy_file), allow_deserialization=True)
+        security_metadata = self.extractor.extract(
             str(npy_file),
             security_only=True,
             allow_deserialization=True,
@@ -991,8 +874,6 @@ class TestModelMetadataExtractor:
 
     def test_xgboost_metadata_no_deserialization(self, tmp_path: Path) -> None:
         """Ensure XGBoost metadata extraction is blocked without deserialization flag."""
-        extractor = metadata_extractor_module.ModelMetadataExtractor()
-
         # Create a minimal XGBoost JSON model
         xgb_model = {
             "version": [2, 0, 3],
@@ -1001,7 +882,7 @@ class TestModelMetadataExtractor:
         model_file = tmp_path / "model.json"
         model_file.write_text(json.dumps(xgb_model))
 
-        metadata = extractor.extract(str(model_file))
+        metadata = self.extractor.extract(str(model_file))
 
         # XGBoost extract_metadata should skip deserialization by default
         assert metadata.get("deserialization_skipped") is True
@@ -1009,19 +890,13 @@ class TestModelMetadataExtractor:
 
     def test_metadata_extractor_setdefault_preserves_scanner_values(self, tmp_path: Path) -> None:
         """Ensure scanner metadata isn't overwritten by extractor's setdefault calls."""
-        extractor = metadata_extractor_module.ModelMetadataExtractor()
-
         # Create a safetensors file - the scanner sets format to "safetensors"
         header = {"t": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]}}
-        header_json = json.dumps(header).encode("utf-8")
 
         st_file = tmp_path / "model.safetensors"
-        with open(st_file, "wb") as f:
-            f.write(struct.pack("<Q", len(header_json)))
-            f.write(header_json)
-            f.write(b"\x00\x00\x00\x00")
+        _write_safetensors(st_file, header, b"\x00\x00\x00\x00")
 
-        metadata = extractor.extract(str(st_file))
+        metadata = self.extractor.extract(str(st_file))
 
         # Scanner-provided values must not be overwritten
         assert metadata["format"] == "safetensors"
@@ -1030,8 +905,6 @@ class TestModelMetadataExtractor:
 
     def test_security_only_includes_deserialization_keys(self) -> None:
         """Ensure security filter preserves deserialization-related keys."""
-        extractor = metadata_extractor_module.ModelMetadataExtractor()
-
         metadata = {
             "file": "test.pkl",
             "format": "pickle",
@@ -1045,7 +918,7 @@ class TestModelMetadataExtractor:
             "learning_rate": 0.001,
         }
 
-        filtered = extractor._filter_security_metadata(metadata)
+        filtered = self.extractor._filter_security_metadata(metadata)
 
         assert filtered["deserialization_skipped"] is True
         assert filtered["allow_metadata_deserialization_ignored"] is True
@@ -1058,17 +931,11 @@ class TestModelMetadataExtractor:
 
     def test_extract_metadata_handles_scanner_exception(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Ensure metadata extraction gracefully handles scanner exceptions."""
-        extractor = metadata_extractor_module.ModelMetadataExtractor()
-
         # Create a safetensors file
         header = {"t": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]}}
-        header_json = json.dumps(header).encode("utf-8")
 
         st_file = tmp_path / "broken.safetensors"
-        with open(st_file, "wb") as f:
-            f.write(struct.pack("<Q", len(header_json)))
-            f.write(header_json)
-            f.write(b"\x00\x00\x00\x00")
+        _write_safetensors(st_file, header, b"\x00\x00\x00\x00")
 
         # Monkey-patch the scanner's extract_metadata to raise
         from modelaudit.scanners.safetensors_scanner import SafeTensorsScanner
@@ -1078,7 +945,7 @@ class TestModelMetadataExtractor:
 
         monkeypatch.setattr(SafeTensorsScanner, "extract_metadata", broken_extract)
 
-        metadata = extractor.extract(str(st_file))
+        metadata = self.extractor.extract(str(st_file))
 
         # Should gracefully return error info, not crash
         assert "extraction_error" in metadata
@@ -1092,7 +959,6 @@ class TestModelMetadataExtractor:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Helper-selected scanners should still populate format from the instance on failure."""
-        extractor = metadata_extractor_module.ModelMetadataExtractor()
         target = tmp_path / "instance-name-only.model"
         target.write_bytes(b"placeholder")
 
@@ -1110,7 +976,7 @@ class TestModelMetadataExtractor:
 
         monkeypatch.setattr(metadata_extractor_module, "get_scanner_for_file", fake_get_scanner_for_file)
 
-        metadata = extractor.extract(str(target))
+        metadata = self.extractor.extract(str(target))
 
         assert metadata["format"] == "instance_only_format"
         assert metadata["file"] == target.name
@@ -1248,13 +1114,9 @@ class TestCLIMetadataCommand:
 
         # Create a safetensors file
         header = {"t": {"dtype": "F32", "shape": [2], "data_offsets": [0, 8]}}
-        header_json = json.dumps(header).encode("utf-8")
 
         st_file = tmp_path / "test.safetensors"
-        with open(st_file, "wb") as f:
-            f.write(struct.pack("<Q", len(header_json)))
-            f.write(header_json)
-            f.write(b"\x00" * 8)
+        _write_safetensors(st_file, header, b"\x00" * 8)
 
         runner = CliRunner()
         result = runner.invoke(cli, ["metadata", str(st_file), "--format", "json"])
@@ -1276,13 +1138,9 @@ class TestCLIMetadataCommand:
             "t": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
             "__metadata__": {"owner": metadata_owner, "source": metadata_source},
         }
-        header_json = json.dumps(header).encode("utf-8")
 
         st_file = tmp_path / "model.safetensors"
-        with open(st_file, "wb") as f:
-            f.write(struct.pack("<Q", len(header_json)))
-            f.write(header_json)
-            f.write(b"\x00\x00\x00\x00")
+        _write_safetensors(st_file, header, b"\x00\x00\x00\x00")
 
         runner = CliRunner()
         result = runner.invoke(cli, ["metadata", str(st_file), "--format", "json", "--security-only"])
@@ -1309,9 +1167,8 @@ class TestCLIMetadataCommand:
             "t": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
             "__metadata__": {"api_key": secret},
         }
-        header_json = json.dumps(header).encode("utf-8")
         st_file = tmp_path / "model.safetensors"
-        st_file.write_bytes(struct.pack("<Q", len(header_json)) + header_json + b"\x00\x00\x00\x00")
+        _write_safetensors(st_file, header, b"\x00\x00\x00\x00")
 
         result = CliRunner().invoke(cli, ["metadata", str(tmp_path), "--security-only"])
 
@@ -1328,13 +1185,9 @@ class TestCLIMetadataCommand:
         from modelaudit.cli import cli
 
         header = {"t": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]}}
-        header_json = json.dumps(header).encode("utf-8")
 
         st_file = tmp_path / "model.safetensors"
-        with open(st_file, "wb") as f:
-            f.write(struct.pack("<Q", len(header_json)))
-            f.write(header_json)
-            f.write(b"\x00\x00\x00\x00")
+        _write_safetensors(st_file, header, b"\x00\x00\x00\x00")
 
         runner = CliRunner()
         result = runner.invoke(cli, ["metadata", str(st_file)])
